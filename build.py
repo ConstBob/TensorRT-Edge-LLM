@@ -16,22 +16,21 @@ def parse_arguments():
 
 def create_optimization_profiles(config, batch_size, max_length, max_input_length):
     hidden_size_per_head = config.hidden_size // config.num_attention_heads
-    opt_input_length = max_input_length // 2
+    # Pad to the max input length
     context_profile = {
-        'input_ids': ((batch_size, 1), (batch_size, opt_input_length), (batch_size, max_input_length)),
-        'attention_mask': ((batch_size, 1), (batch_size, opt_input_length), (batch_size, max_input_length)),
-        'position_ids': ((batch_size, 1), (batch_size, opt_input_length), (batch_size, max_input_length)),
+        'input_ids': ((batch_size, max_input_length), (batch_size, max_input_length), (batch_size, max_input_length)),
+        'attention_mask': ((batch_size, max_input_length), (batch_size, max_input_length), (batch_size, max_input_length)),
+        'position_ids': ((batch_size, max_input_length), (batch_size, max_input_length), (batch_size, max_input_length)),
         **{f'past_key_values.{i}.key': ((batch_size, config.num_key_value_heads, 0, hidden_size_per_head),(batch_size, config.num_key_value_heads, 0, hidden_size_per_head), (batch_size, config.num_key_value_heads, 0, hidden_size_per_head)) for i in range(config.num_hidden_layers)},
         **{f'past_key_values.{i}.value': ((batch_size, config.num_key_value_heads, 0, hidden_size_per_head),(batch_size, config.num_key_value_heads, 0, hidden_size_per_head), (batch_size, config.num_key_value_heads, 0, hidden_size_per_head)) for i in range(config.num_hidden_layers)},
     }
-
-    opt_output_length = (max_input_length + max_length) // 2
+    # Pad to max length
     generation_profile = {
         'input_ids': ((batch_size, 1), (batch_size, 1), (batch_size, 1)),
-        'attention_mask': ((batch_size, 1), (batch_size, opt_output_length + 1), (batch_size, max_length)),
+        'attention_mask': ((batch_size, max_length), (batch_size, max_length), (batch_size, max_length)),
         'position_ids': ((batch_size, 1), (batch_size, 1), (batch_size, 1)),
-        **{f'past_key_values.{i}.key': ((batch_size, config.num_key_value_heads, 1, hidden_size_per_head),(batch_size, config.num_key_value_heads, opt_output_length, hidden_size_per_head), (batch_size, config.num_key_value_heads, max_length - 1, hidden_size_per_head)) for i in range(config.num_hidden_layers)},
-        **{f'past_key_values.{i}.value': ((batch_size, config.num_key_value_heads, 1, hidden_size_per_head),(batch_size, config.num_key_value_heads, opt_output_length, hidden_size_per_head), (batch_size, config.num_key_value_heads, max_length - 1, hidden_size_per_head)) for i in range(config.num_hidden_layers)},
+        **{f'past_key_values.{i}.key': ((batch_size, config.num_key_value_heads, max_length - 1, hidden_size_per_head),(batch_size, config.num_key_value_heads, max_length - 1, hidden_size_per_head), (batch_size, config.num_key_value_heads, max_length - 1, hidden_size_per_head)) for i in range(config.num_hidden_layers)},
+        **{f'past_key_values.{i}.value': ((batch_size, config.num_key_value_heads, max_length - 1, hidden_size_per_head),(batch_size, config.num_key_value_heads, max_length - 1, hidden_size_per_head), (batch_size, config.num_key_value_heads, max_length - 1, hidden_size_per_head)) for i in range(config.num_hidden_layers)},
     }
     return [context_profile, generation_profile]
 
@@ -80,6 +79,13 @@ def main():
     assert max_input_length < max_length, f"max_input_length {max_input_length} should < max_length {max_length}"
     batch_size = args.batch_size
     opt_profiles = create_optimization_profiles(config, batch_size, max_length, max_input_length)
+    engine_config = {
+        "onnx_path": onnx_file_path,
+        "onnx_config": config,
+        "max_length": max_length,
+        "max_input_length", max_input_length,
+        "batch_size": batch_size,
+    }
 
     # Build the engine
     engine = build_engine(onnx_file_path, opt_profiles)
