@@ -3,3 +3,4 @@ build/
 *_onnx/
 __pycache__/
 .vscode
+*.json
