@@ -44,7 +44,7 @@
 
 // nbQHeads / nbKHeads for MQA/GQA
 #ifndef HEAD_GRP_SIZE
-#define HEAD_GRP_SIZE 8
+#define HEAD_GRP_SIZE 4
 #endif
 
 // 0: half/bf16 based on INPUT_FP16; 1: int8_t; 2: __nv_fp8_e4m3
