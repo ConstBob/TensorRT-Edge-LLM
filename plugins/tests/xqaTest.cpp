@@ -381,6 +381,6 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 
 TEST(Perf, llama_V2_70b_256)
 {
-    void const* cubinData = tensorrt_llm::kernels::xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_8_m_8_sm_86_cubin;
+    void const* cubinData = xqa::kernels::xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_4_m_8_sm_86_cubin;
     runTest<8>(1, 960, true, true, cubinData, true);
 }
