@@ -1,0 +1,406 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "contextFMHARunner.h"
+#include "pluginUtils.h"
+#include "fmha-v2/cubin/fmha_cubin.h"
+
+#include <cuda_fp16.h>
+#include <math.h>
+#include <memory>
+#include <unordered_map>
+
+using namespace nvinfer1;
+using namespace drivellm;
+
+using Data_type = fmha_v2::Data_type;
+
+namespace
+{
+union __half2_uint32_t_union
+{
+    half2 fp162;
+    uint32_t u32;
+};
+
+union __float_uint32_t_union
+{
+    float fp32;
+    uint32_t u32;
+};
+
+static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
+{
+    if (dtype == Data_type::DATA_TYPE_FP16)
+    {
+        // Convert the float value into two fp16 value and pack into the uint32_t buffer.
+        __half2_uint32_t_union temp;
+        temp.fp162 = __float2half2_rn(norm);
+        alpha = temp.u32;
+    }
+    else if (dtype == Data_type::DATA_TYPE_FP32)
+    {
+        __float_uint32_t_union temp;
+        temp.fp32 = norm;
+        alpha = temp.u32;
+    }
+    else if (dtype == Data_type::DATA_TYPE_INT32)
+    {
+        int32_t inorm = static_cast<int32_t>(norm);
+        alpha = reinterpret_cast<const uint32_t&>(inorm);
+    }
+    else if (dtype == Data_type::DATA_TYPE_BF16)
+    {
+        // TODO HACK!! BF16 Outputs are computed in FP32 for FP8.
+        // This is because cublas does not allow current FP32 output.
+        alpha = reinterpret_cast<const uint32_t&>(norm);
+    }
+    else
+    {
+        check(false, "Unsupported type for alpha value");
+    }
+}
+
+Data_type trtToFMHADataType(nvinfer1::DataType type)
+{
+    Data_type fmhaType{Data_type::DATA_TYPE_FP16};
+    switch (type)
+    {
+    case nvinfer1::DataType::kFLOAT: fmhaType = Data_type::DATA_TYPE_FP32; break;
+    case nvinfer1::DataType::kHALF: fmhaType = Data_type::DATA_TYPE_FP16; break;
+    case nvinfer1::DataType::kBF16: fmhaType = Data_type::DATA_TYPE_BF16; break;
+    case nvinfer1::DataType::kFP8: fmhaType = Data_type::DATA_TYPE_E4M3; break;
+    default:
+        throw std::runtime_error("Unsupported datatype for FMHA_v2.");
+    }
+    return fmhaType;
+}
+
+int32_t attentionMaskTypeToInt(ContextAttentionMaskType type)
+{
+    int32_t result{};
+    switch (type)
+    {
+    case ContextAttentionMaskType::PADDING: result = 0; break;
+    case ContextAttentionMaskType::CAUSAL: result = 1; break;
+    case ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL: result = 2; break;
+    }
+    return result;
+}
+
+struct FMHAKernelLoadHashKey
+{
+    Data_type data_type;
+    int32_t sm;
+
+    bool operator==(FMHAKernelLoadHashKey const& other) const
+    {
+        return data_type == other.data_type && sm == other.sm;
+    }
+};
+
+struct FMHAKernelLoadHasher
+{
+    size_t operator()(FMHAKernelLoadHashKey const& s) const
+    {
+        size_t key = s.data_type;
+        key <<= 16;
+        key ^= s.sm;
+        return key;
+    }
+};
+
+struct FMHAKernelHashKey
+{
+    Data_type data_type;
+    int32_t sequenceLen;
+    int32_t headSize;
+    bool unroll;
+    bool force_fp32_acc;
+    bool flash_attention;
+    int32_t attention_mask_type;
+    bool tiled;
+
+    bool operator==(FMHAKernelHashKey const& other) const
+    {
+        return data_type == other.data_type && sequenceLen == other.sequenceLen && headSize == other.headSize
+            && unroll == other.unroll && force_fp32_acc == other.force_fp32_acc && flash_attention == other.flash_attention
+            && attention_mask_type && other.attention_mask_type && tiled == other.tiled;
+    }
+};
+
+struct FMHAKernelHasher
+{
+    size_t operator()(FMHAKernelHashKey const& hashKey) const
+    {
+        // flash attention support unlimited-sequence length
+        int32_t s = hashKey.flash_attention ? 0 : hashKey.sequenceLen;
+        // D <= 2048
+        return (size_t) s << 32 | hashKey.headSize << 16 | (hashKey.attention_mask_type << 6)
+            | (hashKey.tiled ? 16ull : 0ull) | (hashKey.force_fp32_acc ? 8ull : 0ull)
+            | (hashKey.flash_attention ? 4ull : 0ull) | (hashKey.unroll ? 2ull : 0ull);
+    }
+};
+
+struct FMHAKernelFuncInfo
+{
+    uint32_t mThreadsPerCTA;
+    uint32_t mUnrollStep;
+    uint32_t mSharedMemBytes{0};
+    CUfunction mDeviceFunction{0};
+};
+
+class FMHAKernelList
+{
+using TKernelMetaInfo = fmha_v2::FusedMultiHeadAttentionKernelMetaInfoV2;
+
+public:
+    FMHAKernelList(Data_type type, int32_t sm)
+        : mDataType(type)
+        , mSMVersion(sm)
+    {
+        mKernelMeta = &(fmha_v2::sMhaKernelMetaInfosV2[0]);
+        mKernelMetaCount = sizeof(fmha_v2::sMhaKernelMetaInfosV2) / sizeof(fmha_v2::sMhaKernelMetaInfosV2[0]);
+    }
+
+    void loadFMHAKernels()
+    {
+        if (!mFunctions.empty())
+        {
+            return;
+        }
+        for (int32_t i = 0; i < mKernelMetaCount; ++i)
+        {
+            auto const& kernelMeta = mKernelMeta[i];
+            if (kernelMeta.mDataType != mDataType || kernelMeta.mSM != mSMVersion || kernelMeta.mCubin == nullptr)
+            {
+                continue;
+            }
+
+            // load CUmodule. Each module can contain multiple kernel function.
+            CUmodule hModule;
+            auto findModuleIter = mModules.find(kernelMeta.mCubin);
+            if (findModuleIter != mModules.end())
+            {
+                hModule = findModuleIter->second;
+            }
+            else
+            {
+                checkCu(cuModuleLoadData(&hModule, kernelMeta.mCubin));
+                mModules.insert(std::make_pair(kernelMeta.mCubin, hModule));
+            }
+
+            FMHAKernelFuncInfo funcInfo{};
+            checkCu(cuModuleGetFunction(&funcInfo.mDeviceFunction, hModule, kernelMeta.mFuncName));
+            funcInfo.mSharedMemBytes = kernelMeta.mSharedMemBytes;
+            funcInfo.mThreadsPerCTA = kernelMeta.mThreadsPerCTA;
+            funcInfo.mUnrollStep = kernelMeta.mUnrollStep;
+
+            if (funcInfo.mSharedMemBytes >= 48 * 1024)
+            {
+                checkCu(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes));
+            }
+            FMHAKernelHashKey hashKey{kernelMeta.mDataType, kernelMeta.mS, kernelMeta.mD, kernelMeta.mUnrollStep != 0,
+                kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType, kernelMeta.mTiled};
+            mFunctions.insert(std::make_pair(hashKey, funcInfo));
+        }
+    }
+
+    FMHAKernelFuncInfo findKernelFunction(FMHAKernelHashKey const& key) const
+    {
+        auto const findIter = mFunctions.find(key);
+        if (findIter == mFunctions.end())
+        {
+            // Return empty function info.
+            return FMHAKernelFuncInfo{};
+        }
+
+        return findIter->second;
+    }
+
+protected:
+    TKernelMetaInfo const* mKernelMeta;
+    int32_t mKernelMetaCount;
+    Data_type mDataType;
+    int32_t mSMVersion;
+    std::unordered_map<unsigned char const*, CUmodule> mModules;
+
+    std::unordered_map<FMHAKernelHashKey, FMHAKernelFuncInfo, FMHAKernelHasher> mFunctions;
+};
+
+class FMHAKernelLoader
+{
+
+public:
+    FMHAKernelList const* getFMHAKernelList(Data_type type, int32_t sm)
+    {
+        static std::mutex s_mutex;
+        std::lock_guard<std::mutex> lg(s_mutex);
+
+        FMHAKernelLoadHashKey hash_key{type, sm};
+
+        auto const findIter = mKernels.find(hash_key);
+        if (findIter == mKernels.end())
+        {
+            FMHAKernelList* newKernel = new FMHAKernelList{type, sm};
+            newKernel->loadFMHAKernels();
+            mKernels.insert(std::make_pair(hash_key, std::unique_ptr<FMHAKernelList>(newKernel)));
+            return newKernel;
+        }
+        return findIter->second.get();
+    }
+
+    static FMHAKernelLoader& Get()
+    {
+        static std::unique_ptr<FMHAKernelLoader> kernelLoader = nullptr;
+        if (kernelLoader == nullptr)
+        {
+            kernelLoader = std::make_unique<FMHAKernelLoader>(FMHAKernelLoader());
+        }
+
+        return *kernelLoader;
+    }
+
+private:
+    FMHAKernelLoader() = default;
+
+    std::unordered_map<FMHAKernelLoadHashKey, const std::unique_ptr<FMHAKernelList>, FMHAKernelLoadHasher> mKernels;
+};
+
+inline FMHAKernelList const* getFMHAKernels(Data_type type, int32_t sm)
+{
+    return FMHAKernelLoader::Get().getFMHAKernelList(type, sm);
+}
+
+};
+
+ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t seqLen, int32_t numQHeads,
+    int32_t numKvHeads, int32_t headSize, int32_t smVersion)
+    : mBatchSize(batchSize)
+    , mSequenceLen(seqLen)
+    , mNumHeads(numQHeads)
+    , mNumKVHeads(numKvHeads)
+    , mHeadSize(headSize)
+    , mDataType(dataType)
+    , mSmVersion(smVersion)
+{
+    mLaunchParams = Launch_params();
+    mLaunchParams.set_default_kernel_selection_params();
+    mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
+
+    bool const isSm90 = (smVersion == fmha_v2::kSM_90);
+    bool const isSm8x = (smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_89);
+    bool const isSm80 = (smVersion == fmha_v2::kSM_80);
+
+    // We handle sm80/sm86 at first.
+    if (isSm80 && isSm8x)
+    {
+        // always use flash attention kernels for Ampere/Ada
+        mLaunchParams.flash_attention = true;
+        // flash attention kernles s = 0 (support any seq length)
+        mLaunchParams.kernel_s = 0;
+        mLaunchParams.force_unroll = true;
+
+        // Use same code as TRT-LLM for kernel selection
+        if (mLaunchParams.flash_attention && mSequenceLen <= 64)
+        {
+            // flash attention tiled kernels allows larger free dim tile size (M, N) with flexibility
+            // in unroll dimension tile size (K). for short sequence length (s<=128), tiled kernels
+            // can suffer from tile quantization loss therefore use flash attention non-tiled instead
+            mLaunchParams.granular_tiling = false;
+        }
+        else if (isSm8x && mHeadSize < 256)
+        {
+            // flash attention tiled kernel is faster on Ada and Ampere derivatives when head_size>=256
+            mLaunchParams.granular_tiling = false;
+        }
+        else if (isSm80 || isSm8x)
+        {
+            // otherwise, choose tiled kernel for Ampere/Ada
+            mLaunchParams.granular_tiling = true;
+        }
+    }
+}
+
+size_t ContextFMHARunner::getWorkspaceSize()
+{
+    // TODO: Find the workspace requirements for FMHA runner.
+    return 0;
+}
+
+void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
+{
+    float const invSqrtScale = (1.f / sqrtf(mHeadSize));
+
+    // The kernel picked up by the project use the LOG2 optimization. At softmax(Qk^T), the kernel use 
+    // LOG2 instead of LOGE for computation. The optimization is removed for TRT-LLM for precision issue.
+    // TODO: Check precision and switch to another FMHA kernel branch for the project.
+    float const scale_bmm1 = invSqrtScale * float(M_LOG2E);
+    float const scale_softmax = 1.f; // Seems to be only required for int8
+    float const scale_bmm2 = 1.f;
+
+    Data_type scale_type = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
+    set_alpha(params.scale_bmm1, scale_bmm1, scale_type);
+    set_alpha(params.scale_softmax, scale_softmax, scale_type);
+    set_alpha(params.scale_bmm2, scale_bmm2, scale_type);
+
+    params.b = mBatchSize;
+    params.h = mNumHeads;
+    params.s = mSequenceLen;    // max sequence length
+    params.d = mHeadSize;
+
+    params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
+    params.qkv_stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
+    params.h_kv = mNumKVHeads;
+
+    // Always use padded sequence length now.
+    params.is_s_padded = true;
+}
+
+int32_t ContextFMHARunner::prepareToRun()
+{
+    FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
+    FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mSequenceLen, mHeadSize, mLaunchParams.force_unroll,
+        mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention, attentionMaskTypeToInt(mLaunchParams.attention_mask_type), 
+        mLaunchParams.granular_tiling};
+    FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
+
+    // Validate there is a kernel function to implement the MHA
+    int32_t status = kernelInfo.mSharedMemBytes != 0;
+    return status;
+}
+
+void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2 & params, cudaStream_t const& stream)
+{
+    check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_seqlens != nullptr,
+        "Device pointers are supposed to be valid");
+    FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mSequenceLen, mHeadSize, mLaunchParams.force_unroll,
+        mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention, attentionMaskTypeToInt(mLaunchParams.attention_mask_type),
+        mLaunchParams.granular_tiling};
+    
+    FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
+    FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
+
+    void* kernelParams[] = {&params, nullptr};
+    // Right now we onlu use flash attention kernel
+    // flash attention supports any sequence length (0 in kernel meta)
+    int32_t unroll = (params.s + kernelInfo.mUnrollStep - 1) / kernelInfo.mUnrollStep;
+    // on Ampere/Ada flash attention, we launch blocks (steps, h, b)
+    // TODO: Generalize the logic for more architectures.
+    checkCu(cuLaunchKernel(kernelInfo.mDeviceFunction , unroll, params.h, params.b, kernelInfo.mThreadsPerCTA, 1, 1,
+                               kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
+}

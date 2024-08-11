@@ -46,9 +46,6 @@ struct XQALaunchParams
 
     // I/O type of the kernel
     nvinfer1::DataType dataType;
-
-    // Hardware specific config.
-    int32_t mSmVersion;
 };
 
 class DecoderXQARunner
@@ -62,7 +59,7 @@ public:
 
     // The call load and prepare kernel to dispatch. After the call, the CUmodule will be loaded to device
     // and kernel functions are prepared to launch.
-    int32_t prepareToRun(XQALaunchParams const& params);
+    int32_t prepareToRun();
 
     // Dispatch XQA kernel and compute the attention result.
     void dispatchXQAKernel(XQALaunchParams & params, cudaStream_t const& stream);

@@ -19,10 +19,8 @@
 #include "pluginUtils.h"
 #include "xqa/cubin/xqa_kernel_cubin.h"
 
-#include <cassert>
 #include <memory>
 #include <unordered_map>
-#include <stdexcept>
 
 using namespace nvinfer1;
 using namespace drivellm;
@@ -115,7 +113,7 @@ class XQAKernelList
 using TKernelMetaInfo = xqa::kernels::XQAKernelMetaInfo;
 
 public:
-    XQAKernelList(Data_type type, unsigned int sm)
+    XQAKernelList(Data_type type, int32_t sm)
         : mDataType(type)
         , mSMVersion(sm)
     {
@@ -255,18 +253,31 @@ DecoderXQARunner::DecoderXQARunner(nvinfer1::DataType const dataType, int32_t ba
 size_t DecoderXQARunner::getWorkspaceSize(int max_num_tokens)
 {
     // Right now we don't enable multiple block launch for XQA kernel, so it doesn't need additional
+    return 0;
 }
 
-int32_t DecoderXQARunner::prepareToRun(XQALaunchParams const& params)
+int32_t DecoderXQARunner::prepareToRun()
 {
     // Load CUmodules to device and collect device functions.
     XQAKernelList const* xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion);
-    auto hashKey = getRuntimeHashKeyFromXQAParams(params);
+    XQAKernelRuntimeHashKey hashKey{trtToXqaDataType(mDataType), mHeadSize, mNumHeads / mNumKVHeads, 1};
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
 
     // check if there is a valid kernel corresponding to the requested config.
     int32_t status = kernelInfo.mSharedMemBytes != 0;
     return status;
+}
+
+XQALaunchParams DecoderXQARunner::initXQAParams()
+{
+    XQALaunchParams params{};
+    params.numQheads = mNumHeads;
+    params.numKVheads = mNumKVHeads;
+    params.headSize = mHeadSize;
+    params.batchSize = mBatchSize;
+    params.dataType = mDataType;
+
+    return params;
 }
 
 void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)
