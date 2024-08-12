@@ -36,6 +36,8 @@ def surgeon_graph(graph):
             removed_inputs.append(clear_outputs(input))
         if "past_key_values" in input.name:
             kv_inputs[input.name] = clear_outputs(input)
+            # Remove kv inputs
+            removed_inputs.append(kv_inputs[input.name])
 
     # Should not remove while iterating, so remove them separately
     for i in removed_inputs:
@@ -49,6 +51,10 @@ def surgeon_graph(graph):
     for output in graph.outputs:
         if "present" in output.name:
             kv_outputs[output.name] = clear_inputs(output)
+    
+    # Remove kv outputs
+    for name in kv_outputs:
+        graph.outputs.remove(kv_outputs[name])
 
     # Look for qkv gemm and end of MHA nodes.
     q_outputs = {}
@@ -112,19 +118,22 @@ def surgeon_graph(graph):
         )
 
         k_cache = kv_inputs[f"past_key_values.{i}.key"]
-        v_cache = kv_inputs[f"past_key_values.{i}.value"]
+        kv_input_shape = (k_cache.shape[0], 2, k_cache.shape[1], k_cache.shape[2], k_cache.shape[3])
+        kv_input = gs.Variable(f"past_key_values.{i}", dtype=k_cache.dtype, shape=kv_input_shape)
+        graph.inputs.append(kv_input)
+
         attn_output = attention_outputs[f"/model/layers.{i}/self_attn/MatMul_1_output_0"]
-        # Rename the kv cache output so they have the same name as past
+        attn_output.name = "/model/layers.{i}/self_attn/attention_output"
         k_cache_output = kv_outputs[f"present.{i}.key"]
-        k_cache_output.name = f"present_key_values.{i}.key"
-        v_cache_output = kv_outputs[f"present.{i}.value"]
-        v_cache_output.name = f"present_key_values.{i}.value"
+        kv_output_shape = (k_cache_output.shape[0], 2, k_cache_output.shape[1], k_cache_output.shape[2], k_cache_output.shape[3])
+        kv_output = gs.Variable(f"present_key_values.{i}", dtype=k_cache_output.dtype, shape=kv_output_shape)
+        graph.outputs.append(kv_output)
 
         graph.layer(
-            name=f"MultiHeadAttention-{i}",
-            op="MultiHeadAttentionPlugin",
-            inputs=[qkv,k_cache,v_cache, context_length],
-            outputs=[attn_output, k_cache_output, v_cache_output],
+            name=f"Attention-{i}",
+            op="AttentionPlugin",
+            inputs=[qkv,kv_input, context_length],
+            outputs=[attn_output, kv_output],
         )
 
     graph.cleanup().toposort()
