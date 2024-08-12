@@ -153,7 +153,7 @@ int main(int argc, char** argv){
 
     int32_t nbInputs = network->getNbInputs();
     // Excluding input_ids and context length
-    int32_t nbLayers = (nbInputs - 2) / 2;
+    int32_t nbLayers = nbInputs - 2;
 
     auto* contextProfile = builder->createOptimizationProfile();
     auto* generationProfile = builder->createOptimizationProfile();
@@ -175,23 +175,23 @@ int main(int argc, char** argv){
         setStaticProfile(generationProfile, fmtstr("past_key_values.%d", i), kvCacheGenerationShape);
     }
 
-    // Set the shape inputs
+    // Set the shape inputs, this might not be needed in build phase
+    
+    // vector<int32_t> lengthContextMin = {1};
+    // vector<int32_t> lengthContextOpt = {args.maxInputLen / 2};
+    // vector<int32_t> lengthContextMax = {args.maxInputLen};
 
-    vector<int32_t> lengthContextMin = {1};
-    vector<int32_t> lengthContextOpt = {args.maxInputLen / 2};
-    vector<int32_t> lengthContextMax = {args.maxInputLen};
+    // vector<int32_t> lengthGenerationMin = {1};
+    // vector<int32_t> lengthGenerationOpt = {args.maxSeqLen / 2};
+    // vector<int32_t> lengthGenerationMax = {args.maxSeqLen - 1};
 
-    vector<int32_t> lengthGenerationMin = {1};
-    vector<int32_t> lengthGenerationOpt = {args.maxSeqLen / 2};
-    vector<int32_t> lengthGenerationMax = {args.maxSeqLen - 1};
+    // contextProfile->setShapeValues("context_length", OptProfileSelector::kMIN, lengthContextMin.data(), lengthContextMin.size());
+    // contextProfile->setShapeValues("context_length", OptProfileSelector::kOPT, lengthContextOpt.data(), lengthContextOpt.size());
+    // contextProfile->setShapeValues("context_length", OptProfileSelector::kMAX, lengthContextMax.data(), lengthContextMax.size());
 
-    contextProfile->setShapeValues("context_length", OptProfileSelector::kMIN, lengthContextMin.data(), lengthContextMin.size());
-    contextProfile->setShapeValues("context_length", OptProfileSelector::kOPT, lengthContextOpt.data(), lengthContextOpt.size());
-    contextProfile->setShapeValues("context_length", OptProfileSelector::kMAX, lengthContextMax.data(), lengthContextMax.size());
-
-    generationProfile->setShapeValues("context_length", OptProfileSelector::kMIN, lengthGenerationMin.data(), lengthGenerationMin.size());
-    generationProfile->setShapeValues("context_length", OptProfileSelector::kOPT, lengthGenerationOpt.data(), lengthGenerationOpt.size());
-    generationProfile->setShapeValues("context_length", OptProfileSelector::kMAX, lengthGenerationMax.data(), lengthGenerationMax.size());
+    // generationProfile->setShapeValues("context_length", OptProfileSelector::kMIN, lengthGenerationMin.data(), lengthGenerationMin.size());
+    // generationProfile->setShapeValues("context_length", OptProfileSelector::kOPT, lengthGenerationOpt.data(), lengthGenerationOpt.size());
+    // generationProfile->setShapeValues("context_length", OptProfileSelector::kMAX, lengthGenerationMax.data(), lengthGenerationMax.size());
 
     config->addOptimizationProfile(contextProfile);
     config->addOptimizationProfile(generationProfile);
