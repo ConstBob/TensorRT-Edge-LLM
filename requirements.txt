@@ -1,3 +1,5 @@
 optimum
 transformers
 onnx
+onnx_graphsurgeon
+numpy
