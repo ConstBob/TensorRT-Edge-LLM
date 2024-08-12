@@ -123,7 +123,7 @@ def surgeon_graph(graph):
         graph.inputs.append(kv_input)
 
         attn_output = attention_outputs[f"/model/layers.{i}/self_attn/MatMul_1_output_0"]
-        attn_output.name = "/model/layers.{i}/self_attn/attention_output"
+        attn_output.name = f"/model/layers.{i}/self_attn/attention_output"
         k_cache_output = kv_outputs[f"present.{i}.key"]
         kv_output_shape = (k_cache_output.shape[0], 2, k_cache_output.shape[1], k_cache_output.shape[2], k_cache_output.shape[3])
         kv_output = gs.Variable(f"present_key_values.{i}", dtype=k_cache_output.dtype, shape=kv_output_shape)
