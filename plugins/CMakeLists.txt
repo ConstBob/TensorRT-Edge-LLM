@@ -4,7 +4,7 @@ project(llama_plugin LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 90a-real)
+set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(TRT_PATH "TensorRT-10.3")
 
@@ -32,7 +32,7 @@ add_executable(unitTests tests/xqaTest.cpp tests/refAttention.cpp ${XQA_CUBIN_SR
 target_include_directories (unitTests PUBLIC ${EIGEN3_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(unitTests PUBLIC GTest::gtest GTest::gtest_main cuda cudart Eigen3::Eigen)
 
-set(PLUGIN_SRCS llamaAttentionPlugin.cpp decoderXQARunner.cpp contextFMHARunner.cpp ${XQA_CUBIN_SRCS})
+set(PLUGIN_SRCS llamaAttentionPlugin.cpp decoderXQARunner.cpp contextFMHARunner.cpp ${XQA_CUBIN_SRCS} ${FMHA_CUBIN_SRCS} utilKernels.cu)
 add_library(libLLamaPlugin SHARED ${PLUGIN_SRCS})
 set_target_properties(libLLamaPlugin PROPERTIES
     VERSION 1.0
