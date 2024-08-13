@@ -347,7 +347,7 @@ void invokeBatchTopKSampling(TopKSamplingKernelParams<T> const &params,
   case 9: // 64 < maxTopK <= 1024
     CASE_K(1024, 256, 256, 8);
     break;
-  default:; // TLLM_CHECK_WITH_INFO(false, "TopK kernel supports 1 <= k <= 1024
+  default:; // assert_WITH_INFO(false, "TopK kernel supports 1 <= k <= 1024
             // but got k=%d", params.maxTopK);
   }
 }

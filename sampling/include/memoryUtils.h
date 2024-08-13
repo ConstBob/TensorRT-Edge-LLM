@@ -9,6 +9,7 @@
 #include <numeric>
 #include <optional>
 #include <vector>
+#include "pluginUtils.h"
 
 inline size_t calcAlignedSize(std::vector<size_t> const &sizes,
                               const size_t ALIGN_BYTES = 256) {
@@ -112,8 +113,7 @@ constexpr static size_t getDTypeSize(nvinfer1::DataType type) {
     [[fallthrough]];
   case nvinfer1::DataType::kFP8:
     return 1;
-  // case nvinfer1::DataType::kINT4: TLLM_THROW("Cannot determine size of INT4
-  // data type");
+  case nvinfer1::DataType::kINT4: check(false, "Cannot determine size of INT4 data type");
   default:
     return 0;
   }

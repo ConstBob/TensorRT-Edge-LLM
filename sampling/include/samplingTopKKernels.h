@@ -94,34 +94,34 @@ template <typename T> struct TopKSamplingKernelParams {
   bool returnAllTopK{false};
 
   void checkParams() const {
-    TLLM_CHECK(batchSize > 0);
-    TLLM_CHECK(maxBatchSize > 0);
-    TLLM_CHECK(maxBatchSize >= batchSize);
-    TLLM_CHECK(vocabSizePadded > 0);
-    TLLM_CHECK(maxTokensPerStep > 0);
+    assert(batchSize > 0);
+    assert(maxBatchSize > 0);
+    assert(maxBatchSize >= batchSize);
+    assert(vocabSizePadded > 0);
+    assert(maxTokensPerStep > 0);
 
-    TLLM_CHECK(logProbs || logProbsPtrs);
-    TLLM_CHECK(outputIds || outputIdsPtrs);
+    assert(logProbs || logProbsPtrs);
+    assert(outputIds || outputIdsPtrs);
 
     if (maxTokensPerStep > 1) {
-      TLLM_CHECK(tokensPerStep);
+      assert(tokensPerStep);
     }
 
     if (outputIds) {
-      TLLM_CHECK(maxSeqLen > 0);
+      assert(maxSeqLen > 0);
     }
 
-    TLLM_CHECK(workspace);
-    TLLM_CHECK(curandState);
+    assert(workspace);
+    assert(curandState);
 
-    TLLM_CHECK(maxTokensPerStep != 1 || returnAllTopK || sequenceLengths);
-    TLLM_CHECK(maxTokensPerStep != 1 || returnAllTopK || endIds);
+    assert(maxTokensPerStep != 1 || returnAllTopK || sequenceLengths);
+    assert(maxTokensPerStep != 1 || returnAllTopK || endIds);
     if (cumLogProbs != nullptr || outputLogProbs != nullptr) {
-      TLLM_CHECK(maxTokensPerStep == 1 && !returnAllTopK);
+      assert(maxTokensPerStep == 1 && !returnAllTopK);
     }
 
-    TLLM_CHECK(0 < maxTopP && maxTopP <= 1.f);
-    TLLM_CHECK(0 <= maxTopK && maxTopK <= TOP_K_MAX);
+    assert(0 < maxTopP && maxTopP <= 1.f);
+    assert(0 <= maxTopK && maxTopK <= TOP_K_MAX);
   }
 };
 

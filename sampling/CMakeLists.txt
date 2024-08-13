@@ -26,6 +26,7 @@ set_ifndef(CUDA_VERSION 12.5)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
 set_ifndef(TRT_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+set_ifndef(COMMON_INCLUDE_DIR /)
 
 find_path(
   _CUDA_INCLUDE_DIR cuda_runtime_api.h
@@ -54,6 +55,7 @@ set_ifndef(NVINFER_LIB ${_NVINFER_LIB})
 # Include directories
 include_directories(${TRT_INCLUDE_DIR})
 include_directories(${CUDA_INCLUDE_DIR})
+include_directories(${COMMON_INCLUDE_DIR})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
 add_executable(sampling tests/samplingTest.cpp)

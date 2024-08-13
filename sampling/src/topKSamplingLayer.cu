@@ -76,10 +76,10 @@ void TopKSamplingLayer<T>::allocateBuffer(std::int32_t const batchSize) {
   std::int32_t *int32Buffer;
   bool *boolBuffer, *boolHostBuffer = new bool[batchSize];
   float *floatBuffer;
-  check_cuda_error(
+  checkCuda(
       cudaMalloc(&int32Buffer, sizeof(std::int32_t) * batchSize * 2));
-  check_cuda_error(cudaMalloc(&boolBuffer, sizeof(bool) * batchSize));
-  check_cuda_error(cudaMalloc(&floatBuffer, sizeof(float) * batchSize));
+  checkCuda(cudaMalloc(&boolBuffer, sizeof(bool) * batchSize));
+  checkCuda(cudaMalloc(&floatBuffer, sizeof(float) * batchSize));
 
   mRuntimeTopKDevice =
       TensorWrapper(int32Buffer, {batchSize}, TRTDataType<std::int32_t>::value);
@@ -123,17 +123,17 @@ void TopKSamplingLayer<T>::setup(
 
   for (auto &topP : runtimeTopP) {
     if (topP < 0.f || topP > 1.0f) {
-      // TLLM_LOG_WARNING(
-      //     "TopP (%f) is out of range ([0.0, 1.0f]). Clip to closest number.",
-      //     topP);
+      printf(
+          "TopP (%f) is out of range ([0.0, 1.0f]). Clip to closest number.",
+          topP);
       topP = std::clamp(topP, 0.f, 1.f);
     }
   }
   for (auto &topK : runtimeTopK) {
     if (topK < 0 || topK > TOP_K_MAX) {
-      // TLLM_LOG_WARNING("TopK (%d) is larger than max supported number (%d). "
-      //                  "Clip to max supported number.",
-      //                  topK, TOP_K_MAX);
+      printf("TopK (%d) is larger than max supported number (%d). "
+                        "Clip to max supported number.",
+                        topK, TOP_K_MAX);
       topK = std::clamp(topK, 0, static_cast<std::int32_t>(TOP_K_MAX));
     }
   }
@@ -153,11 +153,10 @@ void TopKSamplingLayer<T>::setup(
       tensorCastOrNull<std::int32_t>(mRuntimeTopKDevice);
   auto runtimeTopPDevicePtr = tensorCastOrNull<float>(mRuntimeTopPDevice);
   if (runtimeTopKSize > 1) {
-    // TLLM_CHECK_WITH_INFO(
-    //     runtimeTopK.size() == batchSize,
-    //     fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not
-    //     satisfied!",
-    //            runtimeTopK.size(), batchSize));
+    check(
+        runtimeTopK.size() == batchSize,
+        fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!",
+               runtimeTopK.size(), batchSize));
     // BufferPtr runtimeTopKSetupWorkspaceSlice =
     //     IBuffer::slice(mSetupWorkspaceDevice, 0, batchSize);
     // mBufferManager->copy(runtimeTopK.data(), *runtimeTopKSetupWorkspaceSlice,
@@ -168,11 +167,10 @@ void TopKSamplingLayer<T>::setup(
     assert(false);
   }
   if (runtimeTopPSize > 1) {
-    // TLLM_CHECK_WITH_INFO(
-    //     runtimeTopP.size() == batchSize,
-    //     fmtstr("runtimeTopP.size() (%lu) == batchSize (%d) is not
-    //     satisfied!",
-    //            runtimeTopP.size(), batchSize));
+    check(
+        runtimeTopP.size() == batchSize,
+        fmtstr("runtimeTopP.size() (%lu) == batchSize (%d) is not satisfied!",
+               runtimeTopP.size(), batchSize));
     // BufferPtr runtimeTopKSetupWorkspaceSlice =
     //     IBuffer::slice(mSetupWorkspaceDevice, 0, batchSize);
     // mBufferManager->copy(runtimeTopP.data(), *runtimeTopKSetupWorkspaceSlice,

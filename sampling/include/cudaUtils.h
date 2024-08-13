@@ -3,6 +3,7 @@
 #include "common.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include "pluginUtils.h"
 
 static char const *_cudaGetErrorEnum(cublasStatus_t error) {
   switch (error) {
@@ -43,23 +44,9 @@ static char const *_cudaGetErrorEnum(cudaError_t error) {
   return cudaGetErrorString(error);
 }
 
-template <typename T>
-void check(T result, char const *const func, char const *const file,
-           int const line) {
-  if (result) {
-    throw TllmException(
-        file, line,
-        fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func,
-               _cudaGetErrorEnum(result)));
-  }
-}
-
-#define check_cuda_error(val) check((val), #val, __FILE__, __LINE__)
-#define check_cuda_error_2(val, file, line) check((val), #val, file, line)
-
 inline int getDevice() {
   int current_dev_id = 0;
-  check_cuda_error(cudaGetDevice(&current_dev_id));
+  checkCuda(cudaGetDevice(&current_dev_id));
   return current_dev_id;
 }
 
@@ -92,7 +79,7 @@ inline void syncAndCheck(char const *const file, int const line) {
 
   if (checkError) {
     cudaError_t result = cudaDeviceSynchronize();
-    check(result, "cudaDeviceSynchronize", file, line);
+    checkCuda(result);
   }
 }
 
