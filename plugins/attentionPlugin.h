@@ -22,20 +22,20 @@
 
 namespace drivellm
 {
-class LlamaAttentionPlugin : public nvinfer1::IPluginV3,
+class AttentionPlugin : public nvinfer1::IPluginV3,
                              public nvinfer1::IPluginV3OneCore,
                              public nvinfer1::IPluginV3OneBuild,
                              public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    LlamaAttentionPlugin(std::string const& name);
+    AttentionPlugin(std::string const& name);
 
     // Force to distinguish different instances of the plugin.
-    LlamaAttentionPlugin() = delete;
+    AttentionPlugin() = delete;
 
-    LlamaAttentionPlugin(LlamaAttentionPlugin const&) = delete;
+    AttentionPlugin(AttentionPlugin const&) = delete;
     
-    ~LlamaAttentionPlugin() override;
+    ~AttentionPlugin() override;
 
     // IPluginV3 Methods
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
@@ -110,12 +110,12 @@ protected:
     // Requires FMHA runner, GQA runner, pre-processing runners for context/generation phase
 };
 
-class LlamaAttentionPluginCreator : public nvinfer1::IPluginCreatorV3One
+class AttentionPluginCreator : public nvinfer1::IPluginCreatorV3One
 {
 public:
-    LlamaAttentionPluginCreator();
+    AttentionPluginCreator();
 
-    ~LlamaAttentionPluginCreator();
+    ~AttentionPluginCreator() = default;
 
     char const* getPluginName() const noexcept override;
 
@@ -128,6 +128,10 @@ public:
     char const* getPluginVersion() const noexcept override;
 
     nvinfer1::IPluginV3* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
+
+private:
+
+    nvinfer1::PluginFieldCollection mFieldCollection;
 };
 
 } // namespace drivellm
