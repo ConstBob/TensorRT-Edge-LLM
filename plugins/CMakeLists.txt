@@ -21,9 +21,12 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler --expt-rel
 set(CUDA_PTXAS_FLAGS "-warn-lmem-usage -warn-double-usage -warn-spills") # -Werror -v
 set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo -res-usage -keep --use_fast_math -Xptxas='${CUDA_PTXAS_FLAGS}'")
 set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -O0 -G")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 
 file(GLOB XQA_CUBIN_SRCS "xqa/cubin/*.cpp")
 file(GLOB FMHA_CUBIN_SRCS "fmha-v2/cubin/*.cpp")
+
+message(STATUS "MY_VARIABLE = ${FMHA_CUBIN_SRCS}")
 
 find_package(GTest REQUIRED)
 find_package (Eigen3 REQUIRED NO_MODULE)
@@ -32,11 +35,11 @@ add_executable(unitTests tests/xqaTest.cpp tests/refAttention.cpp ${XQA_CUBIN_SR
 target_include_directories (unitTests PUBLIC ${EIGEN3_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(unitTests PUBLIC GTest::gtest GTest::gtest_main cuda cudart Eigen3::Eigen)
 
-set(PLUGIN_SRCS llamaAttentionPlugin.cpp decoderXQARunner.cpp contextFMHARunner.cpp ${XQA_CUBIN_SRCS} ${FMHA_CUBIN_SRCS} utilKernels.cu)
-add_library(libLLamaPlugin SHARED ${PLUGIN_SRCS})
-set_target_properties(libLLamaPlugin PROPERTIES
+set(PLUGIN_SRCS attentionPlugin.cpp decoderXQARunner.cpp contextFMHARunner.cpp ${XQA_CUBIN_SRCS} ${FMHA_CUBIN_SRCS} utilKernels.cu)
+add_library(LLamaPlugin SHARED ${PLUGIN_SRCS})
+set_target_properties(LLamaPlugin PROPERTIES
     VERSION 1.0
     SOVERSION 1
 )
-target_include_directories(libLLamaPlugin PRIVATE ${TRT_PATH}/include)
-target_link_libraries(libLLamaPlugin nvinfer cuda cudart)
+target_include_directories(LLamaPlugin PRIVATE ${TRT_PATH}/include)
+target_link_libraries(LLamaPlugin nvinfer cuda cudart)

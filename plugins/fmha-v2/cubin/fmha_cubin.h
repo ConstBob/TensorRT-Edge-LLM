@@ -18,9 +18,6 @@
 #pragma once
 #include <stdint.h>
 
-namespace fmha_v2
-{
-
 extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_128_S_128_sm80_cu_cubin[];
 extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_32_S_128_sm80_cu_cubin[];
 extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_128_S_128_sm86_cu_cubin[];
@@ -30,6 +27,9 @@ extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_128_sm80_cu_cubin_le
 extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_32_S_128_sm80_cu_cubin_len;
 extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_128_sm86_cu_cubin_len;
 extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_32_S_128_sm86_cu_cubin_len;
+
+namespace fmha_v2
+{
 
 enum Data_type
 {
