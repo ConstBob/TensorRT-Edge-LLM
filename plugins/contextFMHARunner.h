@@ -26,7 +26,7 @@ namespace drivellm
 class ContextFMHARunner
 {
 public:
-    ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t numQHeads, int32_t seqLen,
+    ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t seqLen, int32_t mNumQHeads,
         int32_t numKvHeads, int32_t headSize, int32_t smVersion);
 
     ~ContextFMHARunner() = default;
@@ -41,7 +41,7 @@ public:
 
     // The call load and prepare kernel to dispatch. After the call, the CUmodule will be loaded to device
     // and kernel functions are prepared to launch.
-    int32_t prepareToRun();
+    bool prepareToRun();
 
 private:
     Launch_params mLaunchParams;
