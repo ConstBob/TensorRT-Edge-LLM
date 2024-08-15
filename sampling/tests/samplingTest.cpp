@@ -7,7 +7,8 @@
 
 int main() {
   uint64_t seed = 42;
-  int64_t batchSize = 1, vocabSize = 8, maxBatchSize = 64, maxSeqlen = 32, beam = 1;
+  int64_t batchSize = 1, vocabSize = 8, maxBatchSize = 64, maxSeqlen = 32,
+          beam = 1;
   DecoderDomain domain(maxBatchSize, beam, vocabSize);
   TopKSamplingLayer<half> topkLayer(domain);
 
@@ -47,8 +48,8 @@ int main() {
   half *logitsDevice;
   curandState *devStates;
   void *workspace;
-  int32_t **outputIdsPtr;
-  int32_t *seqlen, *outputIds, *endIds, outputIdsHost[maxBatchSize * maxSeqlen];
+  int64_t **outputIdsPtr, outputIdsHost[maxBatchSize * maxSeqlen], *outputIds;
+  int32_t *seqlen, *endIds;
   FinishedState::UnderlyingType *finished;
 
   auto workspaceSize = topkLayer.getWorkspaceSize();
@@ -56,10 +57,10 @@ int main() {
   cudaMalloc(&devStates, sizeof(curandState) * maxBatchSize);
   cudaMalloc(&workspace, sizeof(int8_t) * workspaceSize);
   cudaMalloc(&seqlen, sizeof(int32_t) * maxBatchSize);
-  cudaMalloc(&outputIds, sizeof(int32_t) * maxBatchSize * maxSeqlen);
+  cudaMalloc(&outputIds, sizeof(int64_t) * maxBatchSize * maxSeqlen);
   cudaMalloc(&endIds, sizeof(int32_t) * maxBatchSize);
   cudaMalloc(&finished, sizeof(FinishedState::UnderlyingType) * maxBatchSize);
-  cudaMallocHost(&outputIdsPtr, sizeof(int32_t *) * maxBatchSize);
+  cudaMallocHost(&outputIdsPtr, sizeof(int64_t *) * maxBatchSize);
   for (int i = 0; i < batchSize; i++) {
     outputIdsPtr[i] = outputIds + i * maxSeqlen;
   }
@@ -69,11 +70,9 @@ int main() {
   cudaMemcpy(logitsDevice, halfLogit.data(), sizeof(half) * logit.size(),
              cudaMemcpyHostToDevice);
 
-  auto inputs = std::make_shared<SamplingInputs>(
-      std::make_shared<TensorWrapper>(endIds,
-                                      std::vector<int64_t>{maxBatchSize},
-                                      TRTDataType<int32_t>::value),
-      batchSize);
+  auto inputs = std::make_shared<SamplingInputs>(batchSize);
+  inputs->endIds = std::make_shared<TensorWrapper>(
+      endIds, std::vector<int64_t>{maxBatchSize}, TRTDataType<int32_t>::value);
   inputs->logits = std::make_shared<TensorWrapper>(
       logitsDevice, std::vector<int64_t>{batchSize, vocabSize},
       TRTDataType<half>::value);
@@ -87,9 +86,10 @@ int main() {
   auto outputs =
       std::make_shared<BaseDecodingOutputs>(std::make_shared<TensorWrapper>(
           outputIds, std::vector<int64_t>{maxBatchSize, maxSeqlen},
-          TRTDataType<int32_t>::value));
+          TRTDataType<int64_t>::value));
   outputs->outputIdsPtr = std::make_shared<TensorWrapper>(
-      outputIdsPtr, std::vector<int64_t>{maxBatchSize}, TRTDataType<int32_t *>::value);
+      outputIdsPtr, std::vector<int64_t>{maxBatchSize},
+      TRTDataType<int32_t *>::value);
   outputs->sequenceLength = std::make_shared<TensorWrapper>(
       seqlen, std::vector<int64_t>{maxBatchSize}, TRTDataType<int32_t>::value);
   outputs->finished = std::make_shared<TensorWrapper>(
@@ -108,7 +108,7 @@ int main() {
 
     for (int i = 0; i < batchSize; i++) {
       for (int j = 0; j < maxSeqlen; j++) {
-        printf("%d ", outputIdsHost[i * maxSeqlen + j]);
+        printf("%d ", int(outputIdsHost[i * maxSeqlen + j]));
       }
       printf("\n");
     }

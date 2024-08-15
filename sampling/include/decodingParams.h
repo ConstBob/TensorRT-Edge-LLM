@@ -101,29 +101,29 @@ static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 
 class DecoderDomain {
 public:
-  DecoderDomain(std::int32_t batchSize, std::int32_t beamWidth,
-                std::int32_t vocabSize,
-                std::optional<std::int32_t> vocabSizePadded = std::nullopt)
+  DecoderDomain(std::int64_t batchSize, std::int64_t beamWidth,
+                std::int64_t vocabSize,
+                std::optional<std::int64_t> vocabSizePadded = std::nullopt)
       : mBatchSize(batchSize), mBeamWidth(beamWidth), mVocabSize(vocabSize),
         mVocabSizePadded(vocabSizePadded.value_or(vocabSize)) {}
 
-  [[nodiscard]] std::int32_t getBatchSize() const { return mBatchSize; }
+  [[nodiscard]] std::int64_t getBatchSize() const { return mBatchSize; }
 
-  [[nodiscard]] std::int32_t getBeamWidth() const { return mBeamWidth; }
+  [[nodiscard]] std::int64_t getBeamWidth() const { return mBeamWidth; }
 
-  [[nodiscard]] std::int32_t getVocabSize() const { return mVocabSize; }
+  [[nodiscard]] std::int64_t getVocabSize() const { return mVocabSize; }
 
-  [[nodiscard]] std::int32_t getVocabSizePadded() const {
+  [[nodiscard]] std::int64_t getVocabSizePadded() const {
     return mVocabSizePadded;
   }
 
   [[nodiscard]] std::int32_t getMaxDecodingTokens() const { return 1; }
 
 private:
-  std::int32_t mBatchSize;
-  std::int32_t mBeamWidth;
-  std::int32_t mVocabSize;
-  std::int32_t mVocabSizePadded;
+  std::int64_t mBatchSize;
+  std::int64_t mBeamWidth;
+  std::int64_t mVocabSize;
+  std::int64_t mVocabSizePadded;
 };
 
 class BaseSetupParams {
@@ -177,6 +177,7 @@ public:
 
   // mandatory parameters
   TensorPtr outputIds; // [maxBatchSize, maxSeqLen]
+  std::int64_t maxSeqLen;
 
   // optional parameters
   //! [maxBatchSize * maxBeamWidth], optional
@@ -302,18 +303,11 @@ public:
 
 class DecodingInputs : public BaseDecodingInputs {
 public:
-  DecodingInputs(TensorConstPtr endIds, std::int32_t localBatchSize = 0,
-                 std::int32_t maxAttentionWindow = 0,
-                 std::int32_t sinkTokenLength = 0)
-      : BaseDecodingInputs(localBatchSize), endIds{std::move(endIds)},maxAttentionWindow{maxAttentionWindow},
-        sinkTokenLength{sinkTokenLength} {}
+  DecodingInputs(std::int32_t localBatchSize = 0)
+      : BaseDecodingInputs(localBatchSize) {}
 
   //! [maxBatchSize]
-  TensorConstPtr endIds;
-
-  // mandatory parameters
-  std::int32_t maxAttentionWindow;
-  std::int32_t sinkTokenLength;
+  std::optional<TensorConstPtr> endIds;
 
   //! One of these two fields has to be set
   //! DynamicDecodeLayer::forward checks for it
@@ -343,8 +337,8 @@ public:
 
 class SamplingInputs : public DecodingInputs {
 public:
-  explicit SamplingInputs(TensorConstPtr endIds,std::int32_t localBatchSize)
-      : DecodingInputs{std::move(endIds),localBatchSize} {}
+  explicit SamplingInputs(std::int32_t localBatchSize)
+      : DecodingInputs{localBatchSize} {}
 
   //! optional parameters
   //! [localBatchSize]

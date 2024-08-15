@@ -76,8 +76,7 @@ void TopKSamplingLayer<T>::allocateBuffer(std::int32_t const batchSize) {
   std::int32_t *int32Buffer;
   bool *boolBuffer, *boolHostBuffer = new bool[batchSize];
   float *floatBuffer;
-  checkCuda(
-      cudaMalloc(&int32Buffer, sizeof(std::int32_t) * batchSize * 2));
+  checkCuda(cudaMalloc(&int32Buffer, sizeof(std::int32_t) * batchSize * 2));
   checkCuda(cudaMalloc(&boolBuffer, sizeof(bool) * batchSize));
   checkCuda(cudaMalloc(&floatBuffer, sizeof(float) * batchSize));
 
@@ -101,7 +100,6 @@ void TopKSamplingLayer<T>::deallocateBuffer(std::int32_t const batchSize) {
   cudaFree(mRuntimeTopPDevice.data());
   cudaFree(mSkipDecodeDevice.data());
   delete static_cast<bool *>(mSkipDecodeHost.data());
-
 }
 
 template <typename T>
@@ -123,17 +121,16 @@ void TopKSamplingLayer<T>::setup(
 
   for (auto &topP : runtimeTopP) {
     if (topP < 0.f || topP > 1.0f) {
-      printf(
-          "TopP (%f) is out of range ([0.0, 1.0f]). Clip to closest number.",
-          topP);
+      printf("TopP (%f) is out of range ([0.0, 1.0f]). Clip to closest number.",
+             topP);
       topP = std::clamp(topP, 0.f, 1.f);
     }
   }
   for (auto &topK : runtimeTopK) {
     if (topK < 0 || topK > TOP_K_MAX) {
       printf("TopK (%d) is larger than max supported number (%d). "
-                        "Clip to max supported number.",
-                        topK, TOP_K_MAX);
+             "Clip to max supported number.",
+             topK, TOP_K_MAX);
       topK = std::clamp(topK, 0, static_cast<std::int32_t>(TOP_K_MAX));
     }
   }
@@ -153,10 +150,9 @@ void TopKSamplingLayer<T>::setup(
       tensorCastOrNull<std::int32_t>(mRuntimeTopKDevice);
   auto runtimeTopPDevicePtr = tensorCastOrNull<float>(mRuntimeTopPDevice);
   if (runtimeTopKSize > 1) {
-    check(
-        runtimeTopK.size() == batchSize,
-        fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!",
-               runtimeTopK.size(), batchSize));
+    check(runtimeTopK.size() == batchSize,
+          fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!",
+                 runtimeTopK.size(), batchSize));
     // BufferPtr runtimeTopKSetupWorkspaceSlice =
     //     IBuffer::slice(mSetupWorkspaceDevice, 0, batchSize);
     // mBufferManager->copy(runtimeTopK.data(), *runtimeTopKSetupWorkspaceSlice,
@@ -167,10 +163,9 @@ void TopKSamplingLayer<T>::setup(
     assert(false);
   }
   if (runtimeTopPSize > 1) {
-    check(
-        runtimeTopP.size() == batchSize,
-        fmtstr("runtimeTopP.size() (%lu) == batchSize (%d) is not satisfied!",
-               runtimeTopP.size(), batchSize));
+    check(runtimeTopP.size() == batchSize,
+          fmtstr("runtimeTopP.size() (%lu) == batchSize (%d) is not satisfied!",
+                 runtimeTopP.size(), batchSize));
     // BufferPtr runtimeTopKSetupWorkspaceSlice =
     //     IBuffer::slice(mSetupWorkspaceDevice, 0, batchSize);
     // mBufferManager->copy(runtimeTopP.data(), *runtimeTopKSetupWorkspaceSlice,
@@ -219,9 +214,9 @@ void TopKSamplingLayer<T>::forwardAsync(
 
   auto const batchSize = inputs->logits.value()->getDimension<0>();
 
-  auto logits = tensorCastOrNull<T>(inputs->logits->get());
-  auto endIds = tensorCastOrNull<std::int32_t>(inputs->endIds.get());
-  auto batchSlots = tensorCastOrNull<std::int32_t>(inputs->batchSlots->get());
+  auto logits = tensorCastOrNull<T>(inputs->logits);
+  auto endIds = tensorCastOrNull<std::int32_t>(inputs->endIds);
+  auto batchSlots = tensorCastOrNull<std::int32_t>(inputs->batchSlots);
   auto curandStatesDevice = inputs->curandStates;
   auto samplingWorkspaceDevice = inputs->samplingWorkspace;
   auto const probsComputed = inputs->probsComputed;
@@ -254,7 +249,9 @@ void TopKSamplingLayer<T>::forwardAsync(
   TopKSamplingKernelParams<T> params;
   params.logProbs = logits;
   params.outputIdsPtrs =
-      tensorCastOrNull<std::int32_t *>(outputs->outputIdsPtr);
+      tensorCastOrNull<std::int64_t *>(outputs->outputIdsPtr);
+  params.outputIds = tensorCastOrNull<std::int64_t>(outputs->outputIds);
+  params.maxSeqLen = outputs->maxSeqLen;
   params.workspace = samplingWorkspaceDevice;
   params.maxTopP = 1.0f;
   params.topPs = tensorCastOrNull<float>(mRuntimeTopPDevice);

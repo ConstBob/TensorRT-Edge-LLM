@@ -21,10 +21,10 @@ template <typename T> struct TopKSamplingKernelParams {
   //! output buffer [maxBatchSize][maxSeqLen], optional. Contains pointers to
   //! rows with output tokens per request. If nullptr, outputIds must be
   //! provided.
-  std::int32_t **outputIdsPtrs{nullptr};
+  std::int64_t **outputIdsPtrs{nullptr};
   //! output buffer [maxBatchSize, maxSeqLen], optional. Tensor to store output
   //! tokens. Not used if outputIdsPtrs != nullptr
-  std::int32_t *outputIds{nullptr};
+  std::int64_t *outputIds{nullptr};
 
   //! Required. Pointer to the workspace of size returned by
   //! getTopKWorkspaceSize. Has to be pre-allocated by caller. Function does not
@@ -114,8 +114,6 @@ template <typename T> struct TopKSamplingKernelParams {
     assert(workspace);
     assert(curandState);
 
-    assert(maxTokensPerStep != 1 || returnAllTopK || sequenceLengths);
-    assert(maxTokensPerStep != 1 || returnAllTopK || endIds);
     if (cumLogProbs != nullptr || outputLogProbs != nullptr) {
       assert(maxTokensPerStep == 1 && !returnAllTopK);
     }

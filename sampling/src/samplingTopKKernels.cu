@@ -83,14 +83,8 @@ topKStage1(T const *__restrict logProbs,
   if (finished != nullptr && finishState.isFinished()) {
     if (tid < k) {
       auto const index = tmpTopKBufIndex + tid;
-      if (blockLane == 0 && tid == 0) {
-        auto const endId = endIds[batchSlot];
-        topKTmpIdBuf[index] = tmpLogBufIndex + endId;
-        topKTmpValBuf[index] = logProbsSlot[endId];
-      } else {
-        topKTmpIdBuf[index] = -1;
-        topKTmpValBuf[index] = -MAX_T_VAL;
-      }
+      topKTmpIdBuf[index] = -1;
+      topKTmpValBuf[index] = -MAX_T_VAL;
     }
     return;
   }
@@ -128,7 +122,7 @@ topKStage1(T const *__restrict logProbs,
 template <typename T, int BLOCK_SIZE_, int BLOCKS_PER_BEAM_>
 __global__ void topKStage2Sampling(
     std::int32_t const *__restrict topKTmpIdBuf, T *topKTmpValBuf,
-    std::int32_t **idsPtrs, std::int32_t *ids, std::int32_t *sequenceLengths,
+    std::int64_t **idsPtrs, std::int64_t *ids, std::int32_t *sequenceLengths,
     FinishedState const *finishedInput, FinishedState *finishedOutput,
     float *cumLogProbs, float *outputLogProbs, std::int32_t maxTopK,
     std::int32_t const *topKs, float topP, float const *topPs,

@@ -59,6 +59,7 @@ include_directories(${COMMON_INCLUDE_DIR})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
 add_executable(sampling tests/samplingTest.cpp)
+add_executable(sampler tests/samplerTest.cpp)
 
 link_directories(${TRT_LIB_DIR})
 link_directories(${CUDA_DIR}/lib64)
@@ -74,3 +75,4 @@ endforeach()
 add_subdirectory(src)
 
 target_link_libraries(sampling SamplingTopkLayer)
+target_link_libraries(sampler SamplingTopkLayer)
