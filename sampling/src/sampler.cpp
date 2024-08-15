@@ -36,12 +36,13 @@ template <typename T> Sampler<T>::~Sampler() {
 }
 
 template <typename T>
-const std::vector<int64_t> &Sampler<T>::greedySample(T *logits) {
+const std::vector<int64_t> &Sampler<T>::greedySample(const T *logits) {
   int64_t batchSize = mOutputIds.size();
 
   auto inputs = std::make_shared<SamplingInputs>(batchSize);
-  inputs->logits = std::make_shared<TensorWrapper>(
-      logits, std::vector<int64_t>{batchSize, mDecoderDomain.getVocabSize()},
+  inputs->logits = std::make_shared<const TensorWrapper>(
+      const_cast<T *>(logits),
+      std::vector<int64_t>{batchSize, mDecoderDomain.getVocabSize()},
       TRTDataType<T>::value);
   inputs->probsComputed = false;
   inputs->curandStates = mDevStates;

@@ -73,7 +73,7 @@ int main() {
   auto inputs = std::make_shared<SamplingInputs>(batchSize);
   inputs->endIds = std::make_shared<TensorWrapper>(
       endIds, std::vector<int64_t>{maxBatchSize}, TRTDataType<int32_t>::value);
-  inputs->logits = std::make_shared<TensorWrapper>(
+  inputs->logits = std::make_shared<const TensorWrapper>(
       logitsDevice, std::vector<int64_t>{batchSize, vocabSize},
       TRTDataType<half>::value);
   inputs->probsComputed = false;

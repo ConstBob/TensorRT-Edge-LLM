@@ -313,7 +313,7 @@ public:
   //! DynamicDecodeLayer::forward checks for it
   //! Need both of these fields to support legacy code during transition period
   //! to the batched decoder [forwardBatchSize, beamWidth, vocabSizePadded]
-  std::optional<TensorPtr> logits;
+  std::optional<TensorConstPtr> logits;
   //! [forwardBatchSize][beamWidth, vocabSizePadded], on gpu
   std::optional<std::vector<TensorPtr>> logitsVec;
 

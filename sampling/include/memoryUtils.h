@@ -163,7 +163,7 @@ public:
 
   void const *data() const { return _data; }
 
-  template <int64_t rank> auto getDimension() { return _dim[rank]; }
+  template <int64_t rank> auto getDimension() const { return _dim[rank]; }
 
   auto getSizeInBytes() const {
     auto size =

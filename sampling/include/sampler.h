@@ -10,7 +10,7 @@ public:
   Sampler(int64_t batchSize, int64_t vocabSize);
   ~Sampler();
 
-  const std::vector<int64_t> &greedySample(T *logits);
+  const std::vector<int64_t> &greedySample(const T *logits);
 
   Sampler(Sampler const &) = delete;
   Sampler &operator=(Sampler const &) = delete;
