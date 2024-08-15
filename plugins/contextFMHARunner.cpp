@@ -137,7 +137,8 @@ struct FMHAKernelHashKey
 
     bool operator==(FMHAKernelHashKey const& other) const
     {
-        return data_type == other.data_type && sequenceLen == other.sequenceLen && headSize == other.headSize
+        // Flash attention kernel supports any sequence length. So for this set of kernel, we will match any sequence length.
+        return data_type == other.data_type && (sequenceLen == other.sequenceLen || flash_attention == true) && headSize == other.headSize
             && unroll == other.unroll && force_fp32_acc == other.force_fp32_acc && flash_attention == other.flash_attention
             && attention_mask_type && other.attention_mask_type && tiled == other.tiled;
     }
@@ -162,6 +163,7 @@ struct FMHAKernelFuncInfo
     uint32_t mUnrollStep;
     uint32_t mSharedMemBytes{0};
     CUfunction mDeviceFunction{0};
+    std::string mFuncName{};
 };
 
 class FMHAKernelList
@@ -209,6 +211,7 @@ public:
             funcInfo.mSharedMemBytes = kernelMeta.mSharedMemBytes;
             funcInfo.mThreadsPerCTA = kernelMeta.mThreadsPerCTA;
             funcInfo.mUnrollStep = kernelMeta.mUnrollStep;
+            funcInfo.mFuncName = std::string(kernelMeta.mFuncName);
 
             if (funcInfo.mSharedMemBytes >= 48 * 1024)
             {
@@ -298,7 +301,6 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     , mDataType(dataType)
     , mSmVersion(smVersion)
 {
-    mLaunchParams = Launch_params();
     mLaunchParams.set_default_kernel_selection_params();
     mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
 
@@ -307,7 +309,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     bool const isSm80 = (smVersion == fmha_v2::kSM_80);
 
     // We handle sm80/sm86 at first.
-    if (isSm80 && isSm8x)
+    if (isSm80 || isSm8x)
     {
         // always use flash attention kernels for Ampere/Ada
         mLaunchParams.flash_attention = true;
@@ -354,7 +356,7 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
     float const scale_bmm2 = 1.f;
 
     Data_type scale_type = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
-    set_alpha(params.scale_bmm1, scale_bmm1, scale_type);
+    set_alpha(params.scale_bmm1, scale_bmm1, fmha_v2::DATA_TYPE_FP32);
     set_alpha(params.scale_softmax, scale_softmax, scale_type);
     set_alpha(params.scale_bmm2, scale_bmm2, scale_type);
 
@@ -371,7 +373,7 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
     params.is_s_padded = true;
 }
 
-int32_t ContextFMHARunner::prepareToRun()
+bool ContextFMHARunner::prepareToRun()
 {
     FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mSequenceLen, mHeadSize, mLaunchParams.force_unroll,
@@ -391,9 +393,9 @@ void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2 &
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention, attentionMaskTypeToInt(mLaunchParams.attention_mask_type),
         mLaunchParams.granular_tiling};
-    
     FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
     FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
+    check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
 
     void* kernelParams[] = {&params, nullptr};
     // Right now we onlu use flash attention kernel

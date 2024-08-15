@@ -24,15 +24,14 @@ struct AlibiParams
 
     AlibiParams() = default;
 
-    AlibiParams(int h, float scale_after_alibi)
-        : scale_after_alibi(scale_after_alibi)
+    AlibiParams(int h)
     {
         h_pow_2 = round_down_to_power_two(h);
         alibi_neg4_div_h = -4.0f / h_pow_2;
     }
 
-    AlibiParams(int h, int s, int tp_size, int rank, float scale_after_alibi)
-        : AlibiParams(h * tp_size, scale_after_alibi)
+    AlibiParams(int h, int s, int tp_size, int rank)
+        : AlibiParams(h * tp_size)
     {
         head_idx_offset = h * rank;
         sequence_pos_offset = s * rank;
@@ -40,7 +39,6 @@ struct AlibiParams
 
     int h_pow_2{};
     float alibi_neg4_div_h{};
-    float scale_after_alibi{};
     // Could be simplified to `int rank` derive the others as `num_heads * rank, s * rank` at
     // runtime, but this makes assumptions about the layout downstream
     // (e.g. downstream may only split across the head dimension, so s would be the full sequence)
@@ -108,15 +106,23 @@ struct Fused_multihead_attention_params_v2
     bool is_s_padded = false;
 
     // tma descriptors
-    cudaTmaDesc tma_desc_q;
-    cudaTmaDesc tma_desc_k;
-    cudaTmaDesc tma_desc_v;
+    cudaTmaDesc tma_desc_q{};
+    cudaTmaDesc tma_desc_k{};
+    cudaTmaDesc tma_desc_v{};
 
     void clear()
     {
         qkv_ptr = nullptr;
         packed_mask_ptr = nullptr;
         o_ptr = nullptr;
+
+        counters = nullptr;
+        max_barriers = nullptr;
+        sum_barriers = nullptr;
+        locks = nullptr;
+        max_scratch_ptr = nullptr;
+        sum_scratch_ptr = nullptr;
+        o_scratch_ptr = nullptr;
 
         qkv_stride_in_bytes = 0;
         packed_mask_stride_in_bytes = 0;
