@@ -7,8 +7,8 @@
 
 int main() {
   uint64_t seed = 42;
-  DecoderDomain domin(64, 1, 8);
-  TopKSamplingLayer<half> topkLayer(domin);
+  DecoderDomain domain(64, 1, 8);
+  TopKSamplingLayer<half> topkLayer(domain);
   int64_t batchSize = 1, vocabSize = 8;
 
   auto setupParams = std::make_shared<SamplingSetupParams>();
