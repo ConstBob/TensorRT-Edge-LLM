@@ -7,9 +7,9 @@
 
 int main() {
   uint64_t seed = 42;
-  DecoderDomain domain(64, 1, 8);
+  int64_t batchSize = 1, vocabSize = 8, maxBatchSize = 64, maxSeqlen = 32, beam = 1;
+  DecoderDomain domain(maxBatchSize, beam, vocabSize);
   TopKSamplingLayer<half> topkLayer(domain);
-  int64_t batchSize = 1, vocabSize = 8;
 
   auto setupParams = std::make_shared<SamplingSetupParams>();
 
@@ -48,31 +48,32 @@ int main() {
   curandState *devStates;
   void *workspace;
   int32_t **outputIdsPtr;
-  int32_t *seqlen, *outputIds, *endIds, outputIdsHost[64 * 64];
+  int32_t *seqlen, *outputIds, *endIds, outputIdsHost[maxBatchSize * maxSeqlen];
   FinishedState::UnderlyingType *finished;
 
   auto workspaceSize = topkLayer.getWorkspaceSize();
   cudaMalloc(&logitsDevice, sizeof(half) * batchSize * vocabSize);
-  cudaMalloc(&devStates, sizeof(curandState) * 64);
+  cudaMalloc(&devStates, sizeof(curandState) * maxBatchSize);
   cudaMalloc(&workspace, sizeof(int8_t) * workspaceSize);
-  cudaMalloc(&seqlen, sizeof(int32_t) * 64);
-  cudaMalloc(&outputIds, sizeof(int32_t) * 64 * 64);
-  cudaMalloc(&endIds, sizeof(int32_t) * 64);
-  cudaMalloc(&finished, sizeof(FinishedState::UnderlyingType) * 64 * 64);
-  cudaMallocHost(&outputIdsPtr, sizeof(int32_t *) * 64);
+  cudaMalloc(&seqlen, sizeof(int32_t) * maxBatchSize);
+  cudaMalloc(&outputIds, sizeof(int32_t) * maxBatchSize * maxSeqlen);
+  cudaMalloc(&endIds, sizeof(int32_t) * maxBatchSize);
+  cudaMalloc(&finished, sizeof(FinishedState::UnderlyingType) * maxBatchSize);
+  cudaMallocHost(&outputIdsPtr, sizeof(int32_t *) * maxBatchSize);
   for (int i = 0; i < batchSize; i++) {
-    outputIdsPtr[i] = outputIds + i * 64;
+    outputIdsPtr[i] = outputIds + i * maxSeqlen;
   }
 
-  cudaMemset(endIds, -1, sizeof(int32_t) * 64);
-  cudaMemset(finished, 0, sizeof(FinishedState::UnderlyingType) * 64 * 64);
+  cudaMemset(endIds, -1, sizeof(int32_t) * maxBatchSize);
+  cudaMemset(finished, 0, sizeof(FinishedState::UnderlyingType) * maxBatchSize);
   cudaMemcpy(logitsDevice, halfLogit.data(), sizeof(half) * logit.size(),
              cudaMemcpyHostToDevice);
 
   auto inputs = std::make_shared<SamplingInputs>(
-      std::make_shared<TensorWrapper>(endIds, std::vector<int64_t>{64},
+      std::make_shared<TensorWrapper>(endIds,
+                                      std::vector<int64_t>{maxBatchSize},
                                       TRTDataType<int32_t>::value),
-      64, 0, batchSize);
+      batchSize);
   inputs->logits = std::make_shared<TensorWrapper>(
       logitsDevice, std::vector<int64_t>{batchSize, vocabSize},
       TRTDataType<half>::value);
@@ -80,36 +81,34 @@ int main() {
   inputs->curandStates = devStates;
   inputs->samplingWorkspace = workspace;
   inputs->finished = std::make_shared<TensorWrapper>(
-      finished, std::vector<int64_t>{64, 64},
+      finished, std::vector<int64_t>{maxBatchSize},
       TRTDataType<FinishedState::UnderlyingType>::value);
 
-  auto outputs = std::make_shared<BaseDecodingOutputs>(
-      std::make_shared<TensorWrapper>(outputIds, std::vector<int64_t>{64, 64},
-                                      TRTDataType<int32_t>::value));
+  auto outputs =
+      std::make_shared<BaseDecodingOutputs>(std::make_shared<TensorWrapper>(
+          outputIds, std::vector<int64_t>{maxBatchSize, maxSeqlen},
+          TRTDataType<int32_t>::value));
   outputs->outputIdsPtr = std::make_shared<TensorWrapper>(
-      outputIdsPtr, std::vector<int64_t>{64}, TRTDataType<int32_t *>::value);
+      outputIdsPtr, std::vector<int64_t>{maxBatchSize}, TRTDataType<int32_t *>::value);
   outputs->sequenceLength = std::make_shared<TensorWrapper>(
-      seqlen, std::vector<int64_t>{64}, TRTDataType<int32_t>::value);
+      seqlen, std::vector<int64_t>{maxBatchSize}, TRTDataType<int32_t>::value);
   outputs->finished = std::make_shared<TensorWrapper>(
-      finished, std::vector<int64_t>{64, 64},
+      finished, std::vector<int64_t>{maxBatchSize},
       TRTDataType<FinishedState::UnderlyingType>::value);
 
   for (int step = 0; step < 5; step++) {
     cudaMemcpy(logitsDevice, halfLogit.data() + step * vocabSize,
                sizeof(half) * vocabSize, cudaMemcpyHostToDevice);
 
-    sync_check_cuda_error();
-
     topkLayer.forwardAsync(outputs, inputs);
-
     sync_check_cuda_error();
 
     cudaMemcpy(outputIdsHost, outputIds, sizeof(outputIdsHost),
                cudaMemcpyDeviceToHost);
 
     for (int i = 0; i < batchSize; i++) {
-      for (int j = 0; j < 64; j++) {
-        printf("%d ", outputIdsHost[i * 64 + j]);
+      for (int j = 0; j < maxSeqlen; j++) {
+        printf("%d ", outputIdsHost[i * maxSeqlen + j]);
       }
       printf("\n");
     }

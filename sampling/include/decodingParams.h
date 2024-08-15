@@ -302,20 +302,14 @@ public:
 
 class DecodingInputs : public BaseDecodingInputs {
 public:
-  DecodingInputs(TensorConstPtr endIds, std::int32_t step = 0,
-                 std::int32_t ite = 0, std::int32_t localBatchSize = 0,
+  DecodingInputs(TensorConstPtr endIds, std::int32_t localBatchSize = 0,
                  std::int32_t maxAttentionWindow = 0,
                  std::int32_t sinkTokenLength = 0)
-      : BaseDecodingInputs(localBatchSize), endIds{std::move(endIds)},
-        step{step}, ite{ite}, maxAttentionWindow{maxAttentionWindow},
+      : BaseDecodingInputs(localBatchSize), endIds{std::move(endIds)},maxAttentionWindow{maxAttentionWindow},
         sinkTokenLength{sinkTokenLength} {}
 
   //! [maxBatchSize]
   TensorConstPtr endIds;
-
-  // used only for python runtime
-  std::int32_t step;
-  std::int32_t ite;
 
   // mandatory parameters
   std::int32_t maxAttentionWindow;
@@ -349,9 +343,8 @@ public:
 
 class SamplingInputs : public DecodingInputs {
 public:
-  explicit SamplingInputs(TensorConstPtr endIds, std::int32_t step,
-                          std::int32_t ite, std::int32_t localBatchSize)
-      : DecodingInputs{std::move(endIds), step, ite, localBatchSize} {}
+  explicit SamplingInputs(TensorConstPtr endIds,std::int32_t localBatchSize)
+      : DecodingInputs{std::move(endIds),localBatchSize} {}
 
   //! optional parameters
   //! [localBatchSize]
