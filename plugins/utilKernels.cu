@@ -53,7 +53,7 @@ inline __device__ float2 half2_to_float2(uint32_t v)
 }
 
 inline __device__ float2 rotary_embedding_coefficient(
-    const int zid, const int rot_embed_dim, const float base, const float scale, const float t_step)
+    const int zid, const int rot_embed_dim, const float base, const float scale, const int t_step)
 {
     const float inv_freq = (t_step * scale) / pow(base, zid / (float) rot_embed_dim);
     return {cos(inv_freq), sin(inv_freq)};
@@ -123,7 +123,7 @@ struct Vec_t<half>
 template <typename T, bool IsGenerate>
 __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    const int rotary_embedding_dim, float rotary_embedding_base, float rotary_embedding_scale)
+    float rotary_embedding_base, float rotary_embedding_scale)
 {
     // The kernel take QKV tensor, apply rotary embedding, and
     //      1. At context phase, write qkv back to original QKV tensor and fill in KVcache
@@ -190,16 +190,16 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, const
     v = *reinterpret_cast<const Vec_t*>(&QKV[src_v_idx]);
 
     // rotary position encoding will apply transformation to pair of data based on token_index in the sequence and
-    // position of pair of data in the D dimension.
+    // position of pair of data in the D dimension. From original paper, theta_i = 10000^(-2(i)/d) where i = tidx.
     apply_rotary_embedding(
-        q, k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_idx_in_seq);
+        q, k, tidx, size_per_head, rotary_embedding_base, rotary_embedding_scale, token_idx_in_seq);
 
     // KV-cache is of shape [B, 2, H, S, D] where S is the capacity of the kvcache buffer (max total context length).
     // K shape is [B, 1, H, S, D]
     // V shape is [B, 1, H, S, D]
     int const bytes_per_seq = kv_head_num * kv_cache_capacity * size_per_head;  // max bytes of K or V per (total) sequence
     int const offset_sequence = k_BatchIndex * (2 * bytes_per_seq);            // offset of the currect sequence in linear buffer. 
-    int const offset_local_kv = kv_head_idx * kv_cache_capacity * size_per_head + token_idx * size_per_head + tidx * vec_size;
+    int const offset_local_kv = kv_head_idx * kv_cache_capacity * size_per_head + token_idx_in_seq * size_per_head + tidx * vec_size;
 
     int const cache_offset_k = offset_sequence + offset_local_kv;
     int const cache_offset_v = offset_sequence + bytes_per_seq + offset_local_kv;
@@ -231,7 +231,7 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, const
 template <typename T, bool IsGenerate>
 void dispatchApplyRopeUpdateKV(T* QKV, T* Q, T* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    const int rotary_embedding_dim, float rotary_embedding_base, float rotary_embedding_scale,
+    float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream)
 {
     check(QKV != nullptr && kvCacheBuffer != nullptr && seq_lens != nullptr, "Data pointers of qkv, kvcache, and sequence length shall be valid");
@@ -249,25 +249,25 @@ void dispatchApplyRopeUpdateKV(T* QKV, T* Q, T* kvCacheBuffer, const int* seq_le
     size_t const smem_size = 0;
     applyBiasRopeUpdateKVCache<T, IsGenerate><<<grid, block, smem_size, stream>>>(
         QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head, kv_cache_capacity,
-        rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale);
+        rotary_embedding_base, rotary_embedding_scale);
 }
 
 void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    const int rotary_embedding_dim, float rotary_embedding_base, float rotary_embedding_scale,
+    float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream)
 {
     dispatchApplyRopeUpdateKV<half, false>(
         QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head, kv_cache_capacity,
-        rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_to_process, stream);
+        rotary_embedding_base, rotary_embedding_scale, token_to_process, stream);
 }
 
 void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    const int rotary_embedding_dim, float rotary_embedding_base, float rotary_embedding_scale,
+    float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream)
 {
     dispatchApplyRopeUpdateKV<half, true>(
         QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head, kv_cache_capacity,
-        rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_to_process, stream);
+        rotary_embedding_base, rotary_embedding_scale, token_to_process, stream);
 }

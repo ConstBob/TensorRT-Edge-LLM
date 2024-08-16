@@ -31,7 +31,7 @@ message(STATUS "MY_VARIABLE = ${FMHA_CUBIN_SRCS}")
 find_package(GTest REQUIRED)
 find_package (Eigen3 REQUIRED NO_MODULE)
 
-add_executable(unitTests tests/xqaTest.cpp tests/fmhaTest.cpp contextFMHARunner.cpp tests/refAttention.cpp ${XQA_CUBIN_SRCS} ${FMHA_CUBIN_SRCS})
+add_executable(unitTests tests/xqaTest.cpp tests/fmhaTest.cpp tests/ropeTest.cpp utilKernels.cu contextFMHARunner.cpp tests/refAttention.cpp ${XQA_CUBIN_SRCS} ${FMHA_CUBIN_SRCS})
 target_include_directories (unitTests PUBLIC ${EIGEN3_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${TRT_PATH}/include)
 target_link_libraries(unitTests PUBLIC GTest::gtest GTest::gtest_main cuda cudart Eigen3::Eigen)
 
