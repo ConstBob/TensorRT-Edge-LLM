@@ -51,8 +51,11 @@ struct XQALaunchParams
 class DecoderXQARunner
 {
 public:
-    DecoderXQARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion);
+    DecoderXQARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t numQHeads,
+        int32_t numKvHeads, int32_t headSize, int32_t smVersion);
 
+    DecoderXQARunner() = default;
+    
     ~DecoderXQARunner() = default;
 
     size_t getWorkspaceSize(int max_num_tokens);
