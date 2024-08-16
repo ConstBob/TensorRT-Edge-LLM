@@ -29,6 +29,8 @@ public:
     ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t seqLen, int32_t mNumQHeads,
         int32_t numKvHeads, int32_t headSize, int32_t smVersion);
 
+    ContextFMHARunner() = default;
+
     ~ContextFMHARunner() = default;
 
     size_t getWorkspaceSize();

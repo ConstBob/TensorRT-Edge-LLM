@@ -17,9 +17,11 @@
 
 #pragma once
 
+#include "contextFMHARunner.h"
+#include "decoderXQARunner.h"
+
 #include <NvInferRuntime.h>
 #include <string>
-
 namespace drivellm
 {
 class AttentionPlugin : public nvinfer1::IPluginV3,
@@ -88,6 +90,7 @@ protected:
     std::string mLayerName;
     std::string mNamespace;
 
+    nvinfer1::DataType mDataType{nvinfer1::DataType::kHALF};
     // Fields to specify Multihead attention configuration
     int32_t const mBatchSize{1};
     int32_t const mNumHeadQ{32};
@@ -108,6 +111,8 @@ protected:
     //     At execution time, onShapeChange will be invoked when optimization profile is switched,
     //     and we will know the exact set of kernels to dispatch.
     // Requires FMHA runner, GQA runner, pre-processing runners for context/generation phase
+    ContextFMHARunner mFMHARunner;
+    DecoderXQARunner mGQARunner;
 };
 
 class AttentionPluginCreator : public nvinfer1::IPluginCreatorV3One
