@@ -1,0 +1,15 @@
+CompileFlags:
+  Add:
+    - --cuda-path=/home/yizhan/scratch/cuda-12.5
+    - --cuda-gpu-arch=sm_86
+    - -DCUDART_VERSION=12000
+    - -I/home/yizhan/scratch/cuda-12.5/include
+    - -xcuda
+    - -I/home/yizhan/scratch/llm-for-auto-sampling/include
+    - -I/home/yizhan/scratch/trt/include
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - --options-file
+    - "-gencode*"
+    - "--generate-code*"
+    - "--expt-relaxed-constexpr"
