@@ -21,11 +21,11 @@
 
 void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    const int rotary_embedding_dim, float rotary_embedding_base, float rotary_embedding_scale,
+    float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream);
 
 void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    const int rotary_embedding_dim, float rotary_embedding_base, float rotary_embedding_scale,
+    float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream);
 
