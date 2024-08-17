@@ -21,8 +21,8 @@
 
 #include <cassert>
 #include <iostream>
-#include <tokenizer.h>
-#include <NvInferRuntime.h>
+#include "tokenizer.h"
+#include "common.h"
 
 /**
  * Helper functions
@@ -38,40 +38,6 @@ BPERanksToToken reverseEncoder(const BPETokenToRanks& encoder);
 
 // decode hf format token str to normal utf-8
 std::string decodeHFTokenToNormal(const std::string& hfToken);
-
-/**
- * Logger
- */
-using Severity = nvinfer1::ILogger::Severity;
-
-class Logger : public nvinfer1::ILogger
-{
-public:
-    void log(Severity severity, char const* msg) noexcept override
-    {
-        if (severity <= Severity::kERROR)
-            std::cerr << "[ERROR]: " << msg << std::endl;
-        else if (severity == Severity::kWARNING)
-            std::cerr << "[WARNING]: " << msg << std::endl;
-        else
-            std::cout << "[LOG]: " << msg << std::endl;
-    }
-
-    void warn(const std::string& msg) noexcept
-    {
-        log(Severity::kWARNING, msg.c_str());
-    }
-
-    void error(const std::string& msg) noexcept
-    {
-        log(Severity::kERROR, msg.c_str());
-    }
-
-    void info(const std::string& msg) noexcept
-    {
-        log(Severity::kINFO, msg.c_str());
-    }
-};
 
 extern Logger gLogger;
 

@@ -17,14 +17,7 @@
 
 #include <cstdint>
 #include <stdexcept>
-#ifndef CUDART_VERSION
-#error CUDART_VERSION Undefined!
-#elif (CUDART_VERSION >= 11050)
 #include <cub/cub.cuh>
-#else
-#include "3rdparty/cub/cub.cuh"
-#endif
-
 #include "decodingParams.h"
 #include "reduceKernelUtils.h"
 #include "samplingTopKKernels.h"

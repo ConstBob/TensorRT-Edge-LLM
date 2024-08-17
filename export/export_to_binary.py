@@ -35,7 +35,7 @@ def main():
     with open(f"{args.output_dir}/info.json", 'w') as json_file:
         json.dump(shape_dict, json_file)
 
-    print(f"Model exported to {args.output_dir} with {args.dtype} precision")
+    print(f"Model binary exported to {args.output_dir} with {args.dtype} precision")
 
 if __name__ == '__main__':
     main()

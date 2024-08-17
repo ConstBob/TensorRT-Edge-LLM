@@ -23,6 +23,13 @@
 #include <float.h>
 #include <numeric>
 
+template <typename T>
+bool allOfBatchSlots(std::int32_t const *batchSlotsHost, T const *data,
+                            std::int32_t batchSize, T value) {
+  return std::all_of(batchSlotsHost, batchSlotsHost + batchSize,
+                     [&](std::int32_t b) { return data[b] == value; });
+}
+
 template <int32_t TOP_K_MAX>
 __global__ void
 setupTopKRuntimeArgs(std::int32_t batchSize, std::int32_t topK,
@@ -76,9 +83,9 @@ void TopKSamplingLayer<T>::allocateBuffer(std::int32_t const batchSize) {
   std::int32_t *int32Buffer;
   bool *boolBuffer, *boolHostBuffer = new bool[batchSize];
   float *floatBuffer;
-  checkCuda(cudaMalloc(&int32Buffer, sizeof(std::int32_t) * batchSize * 2));
-  checkCuda(cudaMalloc(&boolBuffer, sizeof(bool) * batchSize));
-  checkCuda(cudaMalloc(&floatBuffer, sizeof(float) * batchSize));
+  CUDA_CHECK(cudaMalloc(&int32Buffer, sizeof(std::int32_t) * batchSize * 2));
+  CUDA_CHECK(cudaMalloc(&boolBuffer, sizeof(bool) * batchSize));
+  CUDA_CHECK(cudaMalloc(&floatBuffer, sizeof(float) * batchSize));
 
   mRuntimeTopKDevice =
       TensorWrapper(int32Buffer, {batchSize}, TRTDataType<std::int32_t>::value);

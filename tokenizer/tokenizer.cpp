@@ -19,9 +19,8 @@
 #include <fstream>
 #include <cassert>
 
-#include <tokenizer.h>
-#include <tokenizerUtils.h>
-#include <NvInferRuntime.h>
+#include "tokenizer.h"
+#include "tokenizerUtils.h"
 
 // BPE
 BPE::BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, const std::string& patStr)
@@ -106,7 +105,7 @@ bool BPE::specialTokenPartition(const std::string& text, std::forward_list<textP
     }
     catch(const std::exception& e)
     {
-        gLogger.error("BPE::specialTokenPartition failed on text: " + text);
+        gLogger.error(fmtstr("BPE::specialTokenPartition failed on text: %s ", text).c_str());
         return false;
     }
 }
@@ -133,7 +132,7 @@ bool BPE::tokenize(const std::string& piece, std::vector<Rank>& output) const no
     }
     catch(const std::exception& e)
     {
-        gLogger.error("BPE::tokenize failed on piece: " + piece);
+        gLogger.error(fmtstr("BPE::tokenize failed on piece: %s", piece).c_str());
         return false;
     }
     
@@ -363,7 +362,7 @@ void Tokenizer::appendBos(std::vector<Rank>& output) const noexcept
     }
     else
     {
-        gLogger.warn("BOS ID is not set. Not appending BOS token.");
+        gLogger.warning("BOS ID is not set. Not appending BOS token.");
     }
 }
 
@@ -375,7 +374,7 @@ void Tokenizer::appendEos(std::vector<Rank>& output) const noexcept
     }
     else
     {
-        gLogger.warn("EOS ID is not set. Not appending EOS token.");
+        gLogger.warning("EOS ID is not set. Not appending EOS token.");
     }
 }
 
@@ -429,7 +428,7 @@ bool Tokenizer::loadTikTokenVocab(std::filesystem::path const& tiktokenFile, BPE
     }
     catch(const std::exception& e)
     {
-        gLogger.error(std::string("Failed to load Tokenizer from Tiktoken:") + tiktokenFile.c_str());
+        gLogger.error(fmtstr("Failed to load Tokenizer from Tiktoken: %s", tiktokenFile).c_str());
         return false;
     }
 }
@@ -543,7 +542,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
     }
     catch(const std::exception& e)
     {
-        gLogger.error(std::string("Failed to load Tokenizer from HF:") + modelDir.c_str());
+        gLogger.error(fmtstr("Failed to load Tokenizer from HF: %s", modelDir).c_str());
         return false;
     }
 }
@@ -600,7 +599,7 @@ void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
         specialTokens["<|eot_id|>"]
     };
 
-    gLogger.info(std::string("Loaded LlamaV3Tokenizer from ") + modelPath.c_str());
+    gLogger.info(fmtstr("Loaded LlamaV3Tokenizer from %s", modelPath.c_str()).c_str());
 }
 
 void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
@@ -629,6 +628,6 @@ void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
         specialTokens["<|eot_id|>"]
     };
 
-    gLogger.info(std::string("Loaded LlamaV3Tokenizer from ") + modelDir.c_str());
+    gLogger.info(fmtstr("Loaded LlamaV3Tokenizer from %s", modelDir.c_str()).c_str());
 }
 

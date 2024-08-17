@@ -6,7 +6,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(TRT_PATH "TensorRT-10.3")
+
+macro(set_ifndef var val)
+    if(NOT ${var})
+        set(${var} ${val})
+    endif()
+    message(STATUS "Configurable variable ${var} set to ${${var}}")
+endmacro()
+
+set_ifndef(TRT_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+
+find_path(_TRT_INCLUDE_DIR NvInfer.h HINTS ${TRT_INCLUDE_DIR} PATH_SUFFIXES include ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+set_ifndef(TRT_INCLUDE_DIR ${_TRT_INCLUDE_DIR})
+
+find_library(_NVINFER_LIB nvinfer HINTS ${TRT_LIB_DIR} PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
+set_ifndef(NVINFER_LIB ${_NVINFER_LIB})
 
 include_directories(
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -14,7 +29,7 @@ include_directories(
 link_directories(
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib64
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib
-    ${TRT_PATH}/lib)
+)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=haswell -Wfatal-errors -Wreturn-type -Wall -Wextra -Wno-unknown-pragmas -Wno-deprecated -Wno-deprecated-declarations")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler --expt-relaxed-constexpr -t 0") # -res-usage
@@ -26,7 +41,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 file(GLOB XQA_CUBIN_SRCS "xqa/cubin/*.cpp")
 file(GLOB FMHA_CUBIN_SRCS "fmha-v2/cubin/*.cpp")
 
-message(STATUS "MY_VARIABLE = ${FMHA_CUBIN_SRCS}")
+message(STATUS "FMHA_CUBIN_SRCS = ${FMHA_CUBIN_SRCS}")
 
 find_package(GTest REQUIRED)
 find_package (Eigen3 REQUIRED NO_MODULE)
@@ -41,5 +56,5 @@ set_target_properties(LLamaPlugin PROPERTIES
     VERSION 1.0
     SOVERSION 1
 )
-target_include_directories(LLamaPlugin PRIVATE ${TRT_PATH}/include)
-target_link_libraries(LLamaPlugin nvinfer cuda cudart)
+target_include_directories(LLamaPlugin PRIVATE ${TRT_INCLUDE_DIR})
+target_link_libraries(LLamaPlugin ${NVINFER_LIB} cuda cudart)

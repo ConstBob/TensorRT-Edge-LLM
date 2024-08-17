@@ -8,7 +8,8 @@ import time
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', type=str, help="The name or path of HF model ckpt", required=True)
+    parser.add_argument('--torch_dir', type=str, help="The name or path of HF PyTorch model ckpt", required=False)
+    parser.add_argument('--onnx_path', type=str, help="The path of original ONNX model", required=False)
     parser.add_argument('--output_dir', type=str, help="The directory to store the generated ONNX model", required=True)
     parser.add_argument('--dtype', type=str, default="fp16", help="The floating point precision to use for export")
     args = parser.parse_args()
@@ -48,9 +49,14 @@ def surgeon_graph(graph):
 
     # Look for kv cache outputs
     kv_outputs = {}
+    logits = None
     for output in graph.outputs:
         if "present" in output.name:
             kv_outputs[output.name] = clear_inputs(output)
+        if "logits" in output.name:
+            logits = output
+    
+    assert logits, "There should be logits output"
     
     # Remove kv outputs
     for name in kv_outputs:
@@ -82,7 +88,6 @@ def surgeon_graph(graph):
     assert len(kv_inputs) % 2 == 0, "kv inputs should be multiples of 2"
     assert len(kv_outputs) % 2 == 0, "kv outputs should be multiples of 2"
     num_layers = len(kv_inputs) // 2
-    print(f"Number of Layers is {num_layers}")
     num_layers_check_list = [len(kv_outputs) // 2, len(q_outputs), len(k_outputs), len(v_outputs), len(attention_outputs)]
     for i in num_layers_check_list:
         assert i == num_layers, f"Uneven number of I/O nodes detected: {num_layers_check_list}"
@@ -135,9 +140,36 @@ def surgeon_graph(graph):
             inputs=[qkv,kv_input, context_length],
             outputs=[attn_output, kv_output],
         )
+    
+    # Insert Slice node for lm_head's input.
+    lm_head_matmul = clear_outputs(logits.inputs[0].inputs[0].inputs[0])
+    assert lm_head_matmul.name == "/lm_head/MatMul", f"You did not reach lm_head, but you reached {lm_head.name}"
+    lm_head_weight = lm_head_matmul.inputs[1]
+    lm_head_weight.name = "/lm_head/MatMul/weight"
+    lm_head_input = lm_head_matmul.inputs[0]
 
-    graph.cleanup().toposort()
-    graph.fold_constants()
+    # Insert a Slice node for lm_head_input
+    slice_output = gs.Variable("/lm_head/Slice_Output")
+    starts = gs.Constant(name="/lm_head/Slice/starts", values=np.array([0, -1, 0], dtype=np.int32))
+    ends = gs.Constant(name="/lm_head/Slice/ends", values=np.array([np.iinfo(np.int32).max, np.iinfo(np.int32).max, np.iinfo(np.int32).max], dtype=np.int32))
+
+    graph.layer(
+        name="/lm_head/Slice",
+        op="Slice",
+        inputs = [lm_head_input, starts, ends],
+        outputs = [slice_output],
+    )
+
+    slice_output.outputs = [lm_head_matmul]
+    lm_head_matmul.inputs[0] = slice_output
+
+    # Remove the last cast layer so logits are in fp16 instead of fp32
+    logits = clear_inputs(logits)
+    lm_head_matmul.outputs = [logits]
+    logits.inputs = [lm_head_matmul]
+    logits.dtype = np.float16
+    # Force logits shape to be 1 for both context phase and generation phase
+    logits.shape = [logits.shape[0], 1, logits.shape[2]]
     graph.cleanup().toposort()
 
     return graph
@@ -146,39 +178,55 @@ def surgeon_graph(graph):
 def main():
     t0 = time.time()
     args = parse_arguments()
-    main_export(
-        args.model_dir,
-        task="text-generation-with-past",
-        output=args.output_dir,
-        opset=17,
-        dtype=args.dtype,
-        device="cuda",
-        framework="pt",
-        no_post_process=True,
-        do_validation=False,
-    )
 
+    assert args.torch_dir or args.onnx_path, "You need to provide either --torch_dir or --onnx_path to process the export script"
+    if args.torch_dir:
+        print(f"Exporting ONNX from {args.torch_dir} to {args.output_dir}.")
+        main_export(
+            args.torch_dir,
+            task="text-generation-with-past",
+            output=args.output_dir,
+            opset=17,
+            dtype=args.dtype,
+            device="cuda",
+            framework="pt",
+            no_post_process=True,
+            do_validation=False,
+        )
+    else:
+        print(f"ONNX path given. Importing ONNX from {args.onnx_path}")
+    
+    input_onnx_name = f"{args.output_dir}/model.onnx" if args.torch_dir else args.onnx_path
+    graph = gs.import_onnx(onnx.load(input_onnx_name))
     t1 = time.time()
-    print(f"ONNX Initial Export takes {t1 - t0} seconds.")
-    onnx_name = f"{args.output_dir}/model.onnx"
-    graph = gs.import_onnx(onnx.load(onnx_name))
+    print(f"ONNX export and load takes {t1 - t0}s. Using onnx_graphsurgeon to insert plugin.")
+
     graph = surgeon_graph(graph)
+    print("Start to export model to onnx")
     model = gs.export_onnx(graph)
-    folder = args.output_dir
-    for filename in os.listdir(folder):
-        file_path = os.path.join(folder, filename)
+    print("Finish exporting to onnx")
+
+    t2 = time.time()
+    print(f"ONNX Graphsurgeon takes {t2 - t1}s.")
+
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Saving ONNX files in {output_dir}. All existing ONNX in the folder will be overwritten.")
+    for filename in os.listdir(output_dir):
+        file_path = os.path.join(output_dir, filename)
         try:
             if os.path.isfile(file_path) or os.path.islink(file_path):
-                os.unlink(file_path)
+                if ".json" not in file_path:
+                    os.unlink(file_path)
 
         except Exception as e:
             print('Failed to delete %s. Reason: %s' % (file_path, e))
-
-    t2 = time.time()
-    print(f"ONNX Graphsurgeon takes {t2 - t1} seconds.")
+    
+    output_onnx_name = f"{args.output_dir}/model.onnx"
     onnx.save_model(
         model,
-        onnx_name,
+        output_onnx_name,
         save_as_external_data=True,
         all_tensors_to_one_file = True,
         location=f"onnx_model.data",
@@ -186,9 +234,8 @@ def main():
     )
 
     t3 = time.time()
-    print(f"ONNX Save takes {t3 - t2} seconds.")
-    print(f"Total onnx export time: {t3 - t0}.")
-    print(f"Model exported to {args.output_dir} with {args.dtype} precision successfully.")
+    print(f"ONNX save takes {t3 - t2} seconds.")
+    print(f"Model ONNX saved to {args.output_dir} with {args.dtype} precision in {t3 - t0}s.")
 
 if __name__ == '__main__':
     main()

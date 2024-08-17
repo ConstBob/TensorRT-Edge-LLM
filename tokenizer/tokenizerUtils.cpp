@@ -18,8 +18,8 @@
 #include <stdexcept>
 #include <cassert>
 
-#include <tokenizerUtils.h>
-#include <unicodeData.h>
+#include "tokenizerUtils.h"
+#include "unicodeData.h"
 
 Logger gLogger{};
 
@@ -364,7 +364,7 @@ bool unicodeCollapseRegex(const std::string& expr, std::regex& regex)
 
         } catch (std::regex_error & e)
         {
-            gLogger.error("Failed to process regex: " + expr);
+            gLogger.error(fmtstr("Failed to process regex: %s", expr).c_str());
             throw std::runtime_error("Failed to process regex");
         }
     }
