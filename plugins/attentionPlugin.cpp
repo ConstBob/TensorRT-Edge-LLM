@@ -371,6 +371,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nv
         params.kvCache.data = kvCacheDevicePtr;
         params.kvCache.sequence_lengths = seqLengthDevicePtr;
         params.kvCache.capacity = mTotalContextLen;
+
+        // dispatch GQA runner.
+        mGQARunner.dispatchXQAKernel(params, stream);
     }
     return 0;
 }

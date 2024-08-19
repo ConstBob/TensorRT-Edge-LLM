@@ -184,7 +184,7 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
     }
 }
 
-TEST(sanity, llama_V3_8b_128)
+TEST(sanity, fmha_llama_V3_8b_128)
 {
     runFMHATest<8, 128>(1, 128, true, true);
 }
