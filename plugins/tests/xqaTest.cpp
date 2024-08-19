@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include "refAttention.h"
 #include "xqa/cubin/xqa_kernel_cubin.h"
+#include "../decoderXQARunner.h"
 
 #include <random>
 #include <algorithm>
@@ -92,10 +93,10 @@ void save(char const* file, S const* src, size_t size) {
     fout.close();
 }
 
-template <uint32_t nbKHeads>
-void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, void const* cubinData, bool verbose = false, bool saveData = false, uint32_t ctxLen = ~0U) {
-    constexpr uint32_t nbVHeads = nbKHeads;
-    constexpr uint32_t nbQHeads = nbKHeads * headGrpSize;
+template <int32_t nbKHeads>
+void runTest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck, bool verbose = false, bool saveData = false) {
+    constexpr int32_t nbVHeads = nbKHeads;
+    constexpr int32_t nbQHeads = nbKHeads * headGrpSize;
 
     checkCuda(cudaFree(nullptr));
     int device;
@@ -121,7 +122,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     if (seqLen == 0) {
         seqLen = (16U << 20) / gmemCacheHeadBytes; // 32MB per K+V head.
     }
-    ctxLen = std::min(ctxLen, seqLen);
+    int32_t ctxLen = seqLen;
     float const kScale = cacheElemSize == 2 ? 1.f : 1/4.f;
     float const vScale = kScale;
     float const qkScale = sqrtf(1.f / validElemsPerHead) * kScale;
@@ -130,8 +131,8 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         printf("batchSize=%u, nbKHeads=%u, seqLen=%u, histLen=%lu\n", batchSize, nbKHeads, seqLen, histLen);
     }
 
-    uint32_t const maxSeqLen = seqLen;
-    uint32_t const totalNbCacheHeads = (nbKHeads + nbVHeads)*maxSeqLen*beamWidth*batchSize;
+    int32_t const maxSeqLen = seqLen;
+    int32_t const totalNbCacheHeads = (nbKHeads + nbVHeads)*maxSeqLen*beamWidth*batchSize;
     size_t const totalNbCacheElems = validElemsPerHead * size_t(totalNbCacheHeads);
     size_t const qElems = validElemsPerHead * nbQHeads * beamWidth * batchSize;
     size_t const outElems = validElemsPerHead * nbQHeads * beamWidth * batchSize;
@@ -233,38 +234,53 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     auto const scratch = reinterpret_cast<void*>(roundUp<uintptr_t>(reinterpret_cast<uintptr_t>(scratchBuf.get()),
         (useQGMMA ? ioHeadBytes : paddedInputHeadBytes) * headGrpSize * beamWidth)); // 8 is sufficent for qgmma kernel.
 
-    CUmodule cuModule;
-    CUfunction kernelFunction;
-    checkCu(cuModuleLoadData(&cuModule, cubinData));
-    checkCu(cuModuleGetFunction(&kernelFunction, cuModule, "kernel_mha"));
+    // CUmodule cuModule;
+    // CUfunction kernelFunction;
+    // checkCu(cuModuleLoadData(&cuModule, cubinData));
+    // checkCu(cuModuleGetFunction(&kernelFunction, cuModule, "kernel_mha"));
 
-    uint32_t smemSize;
-    uint32_t* deviceSmemSize{nullptr};
-    size_t dataSize{0};
-    checkCu(cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&deviceSmemSize), &dataSize, cuModule, "smemSize"));
-    checkCuda(cudaMemcpy(&smemSize, deviceSmemSize, dataSize, cudaMemcpyDeviceToHost));
+    // uint32_t smemSize;
+    // uint32_t* deviceSmemSize{nullptr};
+    // size_t dataSize{0};
+    // checkCu(cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&deviceSmemSize), &dataSize, cuModule, "smemSize"));
+    // checkCuda(cudaMemcpy(&smemSize, deviceSmemSize, dataSize, cudaMemcpyDeviceToHost));
 
-    if (smemSize >= 46 * 1024)
-    {
-        checkCu(cuFuncSetAttribute(kernelFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemSize));
-    }
+    // if (smemSize >= 46 * 1024)
+    // {
+    //     checkCu(cuFuncSetAttribute(kernelFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smemSize));
+    // }
 
-    KVCache kvCache{cacheHeads.get(), &seqLenList[0][0], maxSeqLen};
-    XQALaunchParam xqaParams{nbKHeads, &output[0][0][0], &qHeads[0][0][0], kvCache, batchSize, kvCacheScale.get(), semaphores.get(), scratch};
-    void* kernelParams[] = {&xqaParams.numKHeads, &xqaParams.output, &xqaParams.qVecs, &xqaParams.kvCache, &xqaParams.batchSize,
-        &xqaParams.kvScale, &xqaParams.semaphores, &xqaParams.scratch, nullptr};
+    // KVCache kvCache{cacheHeads.get(), &seqLenList[0][0], maxSeqLen};
+    // XQALaunchParam xqaParams{nbKHeads, &output[0][0][0], &qHeads[0][0][0], kvCache, batchSize, kvCacheScale.get(), semaphores.get(), scratch};
+    // void* kernelParams[] = {&xqaParams.numKHeads, &xqaParams.output, &xqaParams.qVecs, &xqaParams.kvCache, &xqaParams.batchSize,
+    //     &xqaParams.kvScale, &xqaParams.semaphores, &xqaParams.scratch, nullptr};
 
-    uint32_t const nbSubSeqPerSeq = [&]()->uint32_t {
-        return std::min<uint32_t>(std::max<uint32_t>(1U, prop.multiProcessorCount / (batchSize * nbKHeads)), divUp(maxSeqLen, ctaTile.x));
-    }();
+    // uint32_t const nbSubSeqPerSeq = [&]()->uint32_t {
+    //     return std::min<uint32_t>(std::max<uint32_t>(1U, prop.multiProcessorCount / (batchSize * nbKHeads)), divUp(maxSeqLen, ctaTile.x));
+    // }();
 
-    dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
-    dim3 const dimCta{warpSize * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
+    // dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
+    // dim3 const dimCta{warpSize * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
     
+    // auto runKernel = [&](){
+    //     checkCu(cuLaunchKernel(kernelFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y, dimCta.z, smemSize, stream, kernelParams, nullptr));
+    //     checkCuda(cudaGetLastError());
+    // };
+
+    drivellm::DecoderXQARunner runner(nvinfer1::DataType::kHALF, batchSize, nbQHeads, nbVHeads, 128, 86);
+    drivellm::XQALaunchParams params = runner.initXQAParams();
+    runner.prepareToRun();
+
+    params.output = &(output[0][0][0]);
+    params.qInputPtr = &(qHeads[0][0][0]);
+    params.kvCache.data = &(cacheHeads[0]);
+    params.kvCache.sequence_lengths = reinterpret_cast<int32_t const*>(&(seqLenList[0][0]));
+    params.kvCache.capacity = maxSeqLen;
+
     auto runKernel = [&](){
-        checkCu(cuLaunchKernel(kernelFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y, dimCta.z, smemSize, stream, kernelParams, nullptr));
+        runner.dispatchXQAKernel(params, stream);
         checkCuda(cudaGetLastError());
-    };
+     };
 
     checkCuda(cudaGetLastError());
 
@@ -379,8 +395,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     }
 }
 
-TEST(Perf, llama_V2_70b_256)
+TEST(sanity, gqa_llama_V3_8b_128)
 {
-    void const* cubinData = xqa::kernels::xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_4_m_8_sm_86_cubin;
-    runTest<8>(1, 960, true, true, cubinData, true);
+    runTest<8>(1, 960, true, true, true);
 }
