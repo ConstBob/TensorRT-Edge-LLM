@@ -26,10 +26,10 @@ int main() {
   }
 
   half *logitsDevice;
-  checkCuda(cudaMalloc(&logitsDevice, sizeof(half) * batchSize * vocabSize));
+  CUDA_CHECK(cudaMalloc(&logitsDevice, sizeof(half) * batchSize * vocabSize));
 
   for (int64_t i = 0; i < 5; i++) {
-    checkCuda(cudaMemcpy(logitsDevice, halfLogit.data() + vocabSize * i,
+    CUDA_CHECK(cudaMemcpy(logitsDevice, halfLogit.data() + vocabSize * i,
                          sizeof(half) * vocabSize * batchSize,
                          cudaMemcpyHostToDevice));
     auto &a = sampler.greedySample(logitsDevice);

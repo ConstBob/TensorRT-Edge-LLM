@@ -3,7 +3,6 @@
 #include "common.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include "pluginUtils.h"
 
 static char const *_cudaGetErrorEnum(cublasStatus_t error) {
   switch (error) {
@@ -46,7 +45,7 @@ static char const *_cudaGetErrorEnum(cudaError_t error) {
 
 inline int getDevice() {
   int current_dev_id = 0;
-  checkCuda(cudaGetDevice(&current_dev_id));
+  CUDA_CHECK(cudaGetDevice(&current_dev_id));
   return current_dev_id;
 }
 
@@ -79,7 +78,7 @@ inline void syncAndCheck(char const *const file, int const line) {
 
   if (checkError) {
     cudaError_t result = cudaDeviceSynchronize();
-    checkCuda(result);
+    CUDA_CHECK(result);
   }
 }
 

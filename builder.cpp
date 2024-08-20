@@ -7,6 +7,7 @@
 #include <NvInfer.h>
 #include "NvOnnxParser.h"
 #include "common.h"
+#include <dlfcn.h>
 
 using namespace std;
 using namespace nvinfer1;
@@ -16,8 +17,8 @@ struct BuilderArgs{
     std::string onnxPath;
     std::string enginePath;
     int batchSize{1};
-    int maxInputLen{20};
-    int maxSeqLen{40};
+    int maxInputLen{128};
+    int maxSeqLen{256};
 };
 
 void printUsage(const char* programName) {
@@ -104,9 +105,18 @@ bool setStaticProfile(IOptimizationProfile* profile, const char* inputName, Dims
     );
 }
 
+Dims createDims(const std::vector<int64_t>& shape){
+    Dims dims;
+    dims.nbDims = shape.size();
+    for (int i = 0; i < shape.size(); ++i){
+        dims.d[i] = shape[i];
+    }
+    return dims;
+}
+
 int main(int argc, char** argv){
     BuilderArgs args;
-    if (!parseBuilderArgs(args, argc, argv)){
+    if ((argc < 2) || (!parseBuilderArgs(args, argc, argv))){
         printUsage(argv[0]);
         return false;
     }
@@ -114,12 +124,18 @@ int main(int argc, char** argv){
         printUsage(argv[0]);
         return true;
     }
-
+    
     Logger gLogger;
+    void* handle = dlopen("/home/luxiaoz/drive-llm/plugins/build/libLLamaPlugin.so", RTLD_LAZY);
+    if (!handle) {
+        gLogger.error(fmtstr("Cannot open library: %s", dlerror()).c_str());
+        return false;
+    }
+
     // Create the builder
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
     if (!builder) {
-        std::cerr << "Failed to create builder." << std::endl;
+        gLogger.error("Failed to create builder.");
         return false;
     }
 
@@ -127,27 +143,27 @@ int main(int argc, char** argv){
     const auto stronglyTyped = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
     auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(stronglyTyped));
     if (!network) {
-        std::cerr << "Failed to create network." << std::endl;
+        gLogger.error("Failed to create network.");
         return false;
     }
 
     // Create the ONNX parser
     auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, gLogger));
     if (!parser) {
-        std::cerr << "Failed to create parser." << std::endl;
+        gLogger.error("Failed to create parser.");
         return false;
     }
 
     // Parse the ONNX model
     if (!parser->parseFromFile(args.onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
-        std::cerr << "Failed to parse ONNX file." << std::endl;
+        gLogger.error("Failed to parse ONNX file.");
         return false;
     }
 
     // Build the engine
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config) {
-        std::cerr << "Failed to create builder config." << std::endl;
+        gLogger.error("Failed to create builder config.");
         return false;
     }
 
@@ -160,38 +176,20 @@ int main(int argc, char** argv){
 
     // Location 2 is guaranteed to be one of the KV Cache inputs
     Dims kvDims = network->getInput(2)->getDimensions();
-    int64_t numKVHeads = kvDims.d[1];
-    int64_t hiddenSizePerHead = kvDims.d[3];
+    int64_t numKVHeads = kvDims.d[2];
+    int64_t hiddenSizePerHead = kvDims.d[4];
 
-    Dims inputIdsContextShape = {args.batchSize, args.maxInputLen};
-    Dims kvCacheContextShape = {args.batchSize, 2, numKVHeads, 0, hiddenSizePerHead};
-    Dims inputIdsGenerationShape = {args.batchSize, 1};
-    Dims kvCacheGenerationShape = {args.batchSize, 2, numKVHeads, args.maxSeqLen - 1, hiddenSizePerHead};
+    Dims inputIdsContextShape = createDims({args.batchSize, args.maxInputLen});
+    Dims kvCacheContextShape = createDims({args.batchSize, 2, numKVHeads, 0, hiddenSizePerHead});
+    Dims inputIdsGenerationShape = createDims({args.batchSize, 1});
+    Dims kvCacheGenerationShape = createDims({args.batchSize, 2, numKVHeads, args.maxSeqLen, hiddenSizePerHead});
 
     setStaticProfile(contextProfile, "input_ids", inputIdsContextShape);
     setStaticProfile(generationProfile, "input_ids", inputIdsGenerationShape);
     for (int i = 0; i< nbLayers; ++i){
-        setStaticProfile(contextProfile, fmtstr("past_key_values.%d", i), kvCacheContextShape);
-        setStaticProfile(generationProfile, fmtstr("past_key_values.%d", i), kvCacheGenerationShape);
+        setStaticProfile(contextProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheContextShape);
+        setStaticProfile(generationProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheGenerationShape);
     }
-
-    // Set the shape inputs, this might not be needed in build phase
-    
-    // vector<int32_t> lengthContextMin = {1};
-    // vector<int32_t> lengthContextOpt = {args.maxInputLen / 2};
-    // vector<int32_t> lengthContextMax = {args.maxInputLen};
-
-    // vector<int32_t> lengthGenerationMin = {1};
-    // vector<int32_t> lengthGenerationOpt = {args.maxSeqLen / 2};
-    // vector<int32_t> lengthGenerationMax = {args.maxSeqLen - 1};
-
-    // contextProfile->setShapeValues("context_length", OptProfileSelector::kMIN, lengthContextMin.data(), lengthContextMin.size());
-    // contextProfile->setShapeValues("context_length", OptProfileSelector::kOPT, lengthContextOpt.data(), lengthContextOpt.size());
-    // contextProfile->setShapeValues("context_length", OptProfileSelector::kMAX, lengthContextMax.data(), lengthContextMax.size());
-
-    // generationProfile->setShapeValues("context_length", OptProfileSelector::kMIN, lengthGenerationMin.data(), lengthGenerationMin.size());
-    // generationProfile->setShapeValues("context_length", OptProfileSelector::kOPT, lengthGenerationOpt.data(), lengthGenerationOpt.size());
-    // generationProfile->setShapeValues("context_length", OptProfileSelector::kMAX, lengthGenerationMax.data(), lengthGenerationMax.size());
 
     config->addOptimizationProfile(contextProfile);
     config->addOptimizationProfile(generationProfile);
@@ -200,7 +198,7 @@ int main(int argc, char** argv){
 
     if (!engine) {
         std::cerr << "Failed to build engine." << std::endl;
-        return;
+        return false;
     }
 
     std::ofstream ofs(args.enginePath, std::ios::out | std::ios::binary);
@@ -211,4 +209,6 @@ int main(int argc, char** argv){
     ofs.write(static_cast<char*>(engine->data()), engine->size());
     ofs.close();
     std::cout << "Engine saved to " << args.enginePath << std::endl;
+    dlclose(handle);
+    return true;
 }

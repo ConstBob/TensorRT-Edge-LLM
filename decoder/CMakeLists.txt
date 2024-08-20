@@ -15,6 +15,10 @@
 # limitations under the License.
 # 
 
-file(GLOB TOKENIZER_SRCS *.cpp)
-add_library(tokenizer ${TOKENIZER_SRCS})
+# project(runtime VERSION 1.0 LANGUAGES CXX)
 
+# include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
+file(GLOB RUNTIME_SRCS *.cpp)
+
+add_library(decoder ${RUNTIME_SRCS})

@@ -20,7 +20,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <unicodeData.h>
+#include "unicodeData.h"
 
 const std::vector<std::pair<uint32_t, uint16_t>> unicodeRangesFlags = {  // start, flags // last=next_start-1
 {0x000000, 0x0080},

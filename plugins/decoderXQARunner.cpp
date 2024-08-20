@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <mutex>
 
 using namespace nvinfer1;
 using namespace drivellm;

@@ -9,7 +9,7 @@
 #include <numeric>
 #include <optional>
 #include <vector>
-#include "pluginUtils.h"
+#include "common.h"
 
 inline size_t calcAlignedSize(std::vector<size_t> const &sizes,
                               const size_t ALIGN_BYTES = 256) {
