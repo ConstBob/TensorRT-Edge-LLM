@@ -68,7 +68,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name)
     checkCuda(cudaGetDevice(&device));
     cudaDeviceProp prop;
     checkCuda(cudaGetDeviceProperties(&prop, device));
-    int32_t smVersion = prop.major + prop.minor;
+    int32_t smVersion = prop.major * 10 + prop.minor;
 
     mFMHARunner = ContextFMHARunner(mDataType, mBatchSize, mInputContextLen,
         mNumHeadQ, mNumHeadK, mNumElemPerHead, smVersion);

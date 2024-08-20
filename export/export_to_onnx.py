@@ -80,8 +80,8 @@ def surgeon_graph(graph):
             assert len(node.outputs) == 1, "You did not reach the proper v_proj MatMul tensor!"
             v_output = node.outputs[0]
             v_outputs[v_output.name] = clear_outputs(v_output)
-        if "self_attn/MatMul_1" in node.name and node.op == "MatMul":
-            assert len(node.outputs) == 1, "You did not reach the proper MatMul tensor!"
+        if "self_attn/Transpose_4" in node.name and node.op == "Transpose":
+            assert len(node.outputs) == 1, "You did not reach the proper self_attn Transpose tensor!"
             attention_output = node.outputs[0]
             attention_outputs[attention_output.name] = clear_inputs(attention_output)
 
@@ -127,7 +127,7 @@ def surgeon_graph(graph):
         kv_input = gs.Variable(f"past_key_values.{i}", dtype=k_cache.dtype, shape=kv_input_shape)
         graph.inputs.append(kv_input)
 
-        attn_output = attention_outputs[f"/model/layers.{i}/self_attn/MatMul_1_output_0"]
+        attn_output = attention_outputs[f"/model/layers.{i}/self_attn/Transpose_4_output_0"]
         attn_output.name = f"/model/layers.{i}/self_attn/attention_output"
         k_cache_output = kv_outputs[f"present.{i}.key"]
         kv_output_shape = (k_cache_output.shape[0], 2, k_cache_output.shape[1], k_cache_output.shape[2], k_cache_output.shape[3])
@@ -170,7 +170,7 @@ def surgeon_graph(graph):
     logits.dtype = np.float16
     # Force logits shape to be 1 for both context phase and generation phase
     logits.shape = [logits.shape[0], 1, logits.shape[2]]
-    graph.cleanup().toposort()
+    graph.cleanup().toposort().fold_constants().cleanup().toposort()
 
     return graph
 
