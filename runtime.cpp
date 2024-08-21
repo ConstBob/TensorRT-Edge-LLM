@@ -125,6 +125,7 @@ int main(int argc, char* argv[])
         outputIdsInt32.push_back(static_cast<int32_t>(outputIds[i]));
     }
     std::string output = tokenizer->decode(outputIdsInt32);
+    std::cout << "Output is" << output << std::endl;
     dlclose(handle);
 
     return true;

@@ -158,6 +158,7 @@ void Decoder::generate(const std::vector<int64_t>& inputIds, std::vector<int64_t
     while ((contextLength < generationConfig.maxLength)){
         const std::vector<int64_t>& generatedToken = mSampler->greedySample(reinterpret_cast<half*>(mDeviceBuffer["logits"]));
         outputIds.push_back(generatedToken[0]);
+        std::cout << "Generated token is " << generatedToken[0] << std::endl;
         ++contextLength;
         // Reaches eos token and reaches minLength.
         if ((generatedToken[0] == 128001) && (contextLength > generationConfig.minLength)){

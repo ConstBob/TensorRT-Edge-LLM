@@ -161,7 +161,7 @@ def surgeon_graph(graph):
     )
 
     slice_output.outputs = [lm_head_matmul]
-    lm_head_matmul.inputs[0] = slice_output
+    lm_head_matmul.inputs = [slice_output, lm_head_weight]
 
     # Remove the last cast layer so logits are in fp16 instead of fp32
     logits = clear_inputs(logits)
