@@ -19,13 +19,19 @@
 
 #include <cuda_fp16.h>
 
+enum class PositionEmbeddingType : int8_t
+{
+    kROPE_ORIGINAL = 1,
+    kROPE_ROTATE_HALF = 2,
+};
+
 void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    float rotary_embedding_base, float rotary_embedding_scale,
+    PositionEmbeddingType positionEmbedType, float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream);
 
 void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    float rotary_embedding_base, float rotary_embedding_scale,
+    PositionEmbeddingType positionEmbedType, float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream);
 
