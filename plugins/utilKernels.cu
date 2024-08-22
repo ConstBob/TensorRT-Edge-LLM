@@ -52,6 +52,33 @@ inline __device__ float2 half2_to_float2(uint32_t v)
     return make_float2(half_to_float(lo), half_to_float(hi));
 }
 
+__device__ __inline__ void load_vec_from_smem(uint32_t& vec, half* smem, int base_idx, int smem_pitch)
+{
+    union
+    {
+        uint32_t u32;
+        half u16[2];
+    } tmp;
+
+    tmp.u16[0] = smem[base_idx];
+    tmp.u16[1] = smem[base_idx + smem_pitch];
+
+    vec = tmp.u32;
+}
+
+__device__ __inline__ void write_vec_to_smem(uint32_t const& vec, half* smem, int base_idx, int smem_pitch)
+{
+    union
+    {
+        uint32_t u32;
+        half u16[2];
+    } tmp;
+
+    tmp.u32 = vec;
+    smem[base_idx] = tmp.u16[0];
+    smem[base_idx + smem_pitch] = tmp.u16[1];
+}
+
 inline __device__ float2 rotary_embedding_coefficient(
     const int zid, const int rot_embed_dim, const float base, const float scale, const int t_step)
 {
@@ -123,7 +150,7 @@ struct Vec_t<half>
 template <typename T, bool IsGenerate>
 __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    float rotary_embedding_base, float rotary_embedding_scale)
+    PositionEmbeddingType positionEmbedType, float rotary_embedding_base, float rotary_embedding_scale)
 {
     // The kernel take QKV tensor, apply rotary embedding, and
     //      1. At context phase, write qkv back to original QKV tensor and fill in KVcache
@@ -137,6 +164,8 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, const
 
     // We currently only handle case with batch size = 1.
     // TODO: Need a proper way to deal with un-equal batch of sequences.
+
+    extern __shared__ __align__(sizeof(float2)) char smem_[];
 
     constexpr int vec_size = Vec_t<T>::size;
     using Vec_t = typename Vec_t<T>::Type;
@@ -189,10 +218,46 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, const
     k = *reinterpret_cast<const Vec_t*>(&QKV[src_k_idx]);
     v = *reinterpret_cast<const Vec_t*>(&QKV[src_v_idx]);
 
-    // rotary position encoding will apply transformation to pair of data based on token_index in the sequence and
-    // position of pair of data in the D dimension. From original paper, theta_i = 10000^(-2(i)/d) where i = tidx.
-    apply_rotary_embedding(
-        q, k, tidx, size_per_head, rotary_embedding_base, rotary_embedding_scale, token_idx_in_seq);
+    switch (positionEmbedType)
+    {
+    case PositionEmbeddingType::kROPE_ORIGINAL:
+    {
+        // Original rotary position encoding will apply transformation to adjacent pair of data.
+        apply_rotary_embedding(
+            q, k, tidx, size_per_head, rotary_embedding_base, rotary_embedding_scale, token_idx_in_seq);
+        break;
+    }
+    case PositionEmbeddingType::kROPE_ROTATE_HALF:
+    {
+        // With Rotate Half RoPE position embeddeding, the transformation will apply to pair of data
+        // with D dimension [tIDX, tIDX + size_per_head / 2]. We first store the adjacent q/k data pair
+        // into shared memory and read the two data from tIDX and tIDX + size_per_head / 2
+        T* q_smem = reinterpret_cast<T*>(smem_);
+        T* k_smem = q_smem + size_per_head;
+
+        *reinterpret_cast<Vec_t*>(q_smem + tidx * vec_size) = q;
+        *reinterpret_cast<Vec_t*>(k_smem + tidx * vec_size) = k;
+        __syncthreads();
+
+        int32_t const half_head_dim = size_per_head / 2;
+        load_vec_from_smem(q, q_smem, tidx, half_head_dim);
+        load_vec_from_smem(k, k_smem, tidx, half_head_dim);
+
+        apply_rotary_embedding(
+            q, k, tidx, size_per_head, rotary_embedding_base, rotary_embedding_scale, token_idx_in_seq);
+
+        write_vec_to_smem(q, q_smem, tidx, half_head_dim);
+        write_vec_to_smem(k, k_smem, tidx, half_head_dim);
+        __syncthreads();
+
+        // Load adjacent pair of data after rope transformation from shared memory.
+        q = *reinterpret_cast<Vec_t*>(q_smem + tidx * vec_size);
+        k = *reinterpret_cast<Vec_t*>(k_smem + tidx * vec_size);
+
+        break;
+    }
+    }
+    
 
     // KV-cache is of shape [B, 2, H, S, D] where S is the capacity of the kvcache buffer (max total context length).
     // K shape is [B, 1, H, S, D]
@@ -231,7 +296,7 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, const
 template <typename T, bool IsGenerate>
 void dispatchApplyRopeUpdateKV(T* QKV, T* Q, T* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    float rotary_embedding_base, float rotary_embedding_scale,
+    PositionEmbeddingType positionEmbedType, float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream)
 {
     check(QKV != nullptr && kvCacheBuffer != nullptr && seq_lens != nullptr, "Data pointers of qkv, kvcache, and sequence length shall be valid");
@@ -245,29 +310,34 @@ void dispatchApplyRopeUpdateKV(T* QKV, T* Q, T* kvCacheBuffer, const int* seq_le
     dim3 block(size_per_head / Vec_t<T>::size);
     dim3 grid(token_to_process, head_num);
 
-    // Basic rope only involve pair of data next to each other which doesn't need shared memory.
-    size_t const smem_size = 0;
+    // Determine required shared memory size by type of rope.
+    size_t smem_size{0};
+    if (positionEmbedType == PositionEmbeddingType::kROPE_ROTATE_HALF)
+    {
+        // The shared memory should be large enough to contain the data of single head q + k vector.
+        smem_size = 2 * size_per_head * sizeof(T);
+    }
     applyBiasRopeUpdateKVCache<T, IsGenerate><<<grid, block, smem_size, stream>>>(
         QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head, kv_cache_capacity,
-        rotary_embedding_base, rotary_embedding_scale);
+        positionEmbedType, rotary_embedding_base, rotary_embedding_scale);
 }
 
 void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    float rotary_embedding_base, float rotary_embedding_scale,
+    PositionEmbeddingType positionEmbedType, float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream)
 {
     dispatchApplyRopeUpdateKV<half, false>(
         QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head, kv_cache_capacity,
-        rotary_embedding_base, rotary_embedding_scale, token_to_process, stream);
+        positionEmbedType, rotary_embedding_base, rotary_embedding_scale, token_to_process, stream);
 }
 
 void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    float rotary_embedding_base, float rotary_embedding_scale,
+    PositionEmbeddingType positionEmbedType, float rotary_embedding_base, float rotary_embedding_scale,
     const int token_to_process, cudaStream_t stream)
 {
     dispatchApplyRopeUpdateKV<half, true>(
         QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head, kv_cache_capacity,
-        rotary_embedding_base, rotary_embedding_scale, token_to_process, stream);
+        positionEmbedType, rotary_embedding_base, rotary_embedding_scale, token_to_process, stream);
 }
