@@ -35,6 +35,7 @@ constexpr float kROPE_SCALE = 1.0f;
 
 // Huggingface use rotate-half rope which is different from original Meta implementation.
 constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_HALF;
+constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kLLAMA3;
 
 void loadDataFromFile(std::string name, std::vector<half>& dataVec, int32_t nbData)
 {
@@ -103,7 +104,8 @@ void testRope()
 
     cudaStream_t const stream = nullptr;
     invokeContextApplyRopeUpdateKVFP16(qkv_device_ptr, nullptr, kvcache_ptr, seqlen_device_ptr,
-        kNUM_Q_HEADS, kNUM_K_HEADS, kDIM_HEAD, kKV_CACHE_CAPACITY, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kINPUT_LENGTH_PADDED, stream);
+        kNUM_Q_HEADS, kNUM_K_HEADS, kDIM_HEAD, kKV_CACHE_CAPACITY, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
+        kROPE_INIT_TYPE, kINPUT_LENGTH_PADDED, stream);
     checkCuda(cudaStreamSynchronize(stream));
     checkCuda(cudaGetLastError());
 
@@ -128,10 +130,10 @@ void testRope()
         float const diff = std::abs(val - refVal);
         totalDiff += diff;
 
-        if (diff >= 0.03)
+        if (diff >= 4e-3)
         {
             float const srcData0 = __half2float(concatQKV[i]);
-            float const srcData1 = __half2float(concatQKV[i + 1]);
+            float const srcData1 = __half2float(concatQKV[i - 64]);
             printf("At %d index. value is %f refValue is %f.\n", i, val, refVal);
             printf("Source data are %f %f.\n", srcData0, srcData1);
             check(false, "Mismatch data in rope computation.");
@@ -203,7 +205,7 @@ void test_fmha()
         float const diff = std::abs(val - refVal);
         totalDiff += diff;
 
-        if (diff >= 1e-2)
+        if (diff >= 5e-3)
         {
             printf("At %d index. value is %f refValue is %f.\n", i, val, refVal);
             check(false, "Mismatch data in rope computation.");

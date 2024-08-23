@@ -25,13 +25,21 @@ enum class PositionEmbeddingType : int8_t
     kROPE_ROTATE_HALF = 2,
 };
 
+enum class RopeInitType : int8_t
+{
+    // Theta = 1 / (pow(rotary_embedding_freq, 2 * zid / headSize))
+    kDEFAULT = 1,
+    // On the basis of RopeInit, apply factors and smoothing factors based on wave_length
+    kLLAMA3 = 2,
+};
+
 void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    PositionEmbeddingType positionEmbedType, float rotary_embedding_base, float rotary_embedding_scale,
-    const int token_to_process, cudaStream_t stream);
+    PositionEmbeddingType positionEmbedType, float rotary_embedding_freq, float rotary_embedding_scale,
+    RopeInitType rope_init_type, const int token_to_process, cudaStream_t stream);
 
 void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
     const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
-    PositionEmbeddingType positionEmbedType, float rotary_embedding_base, float rotary_embedding_scale,
-    const int token_to_process, cudaStream_t stream);
+    PositionEmbeddingType positionEmbedType, float rotary_embedding_freq, float rotary_embedding_scale,
+    RopeInitType rope_init_type, const int token_to_process, cudaStream_t stream);
 

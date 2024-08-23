@@ -12,6 +12,7 @@
 constexpr float kROPE_BASE_FREQUENCY = 10000.f;
 constexpr float kROPE_SCALE = 1.0f;
 constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ORIGINAL;
+constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kDEFAULT;
 
 float2 applyRopeTransformation(float2 src, int32_t seqIdx, int32_t tIdx, int32_t embed_dim)
 {
@@ -91,7 +92,8 @@ void runRopeTestContext(int32_t batchSize, int32_t sequenceLen)
 
     cudaStream_t const stream = nullptr;
     invokeContextApplyRopeUpdateKVFP16(qkv_device_ptr, nullptr, kvcache_ptr, seqlen_device_ptr,
-        nbQHeads, nbKHeads, sizePerHead, kvcacheCapacity, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, sequenceLen, stream);
+        nbQHeads, nbKHeads, sizePerHead, kvcacheCapacity, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
+        kROPE_INIT_TYPE, sequenceLen, stream);
     
     checkCuda(cudaStreamSynchronize(stream));
     checkCuda(cudaGetLastError());
@@ -286,7 +288,8 @@ void runRopeTestGeneration(int32_t batchSize, int32_t sequenceLen)
 
     cudaStream_t const stream = nullptr;
     invokeGenerationApplyRopeUpdateKVFP16(qkv_device_ptr, q_ptr, kvcache_ptr, seqlen_device_ptr,
-        nbQHeads, nbKHeads, sizePerHead, kvcacheCapacity, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, 1, stream);
+        nbQHeads, nbKHeads, sizePerHead, kvcacheCapacity, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
+        kROPE_INIT_TYPE, 1, stream);
 
     // Check output data contents, based on the nature of rope, we will compare the data pair by pair.
     std::vector<float> kvCacheHost(totalKVCacheElems);
