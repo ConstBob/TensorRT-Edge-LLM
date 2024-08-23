@@ -39,8 +39,6 @@ BPERanksToToken reverseEncoder(const BPETokenToRanks& encoder);
 // decode hf format token str to normal utf-8
 std::string decodeHFTokenToNormal(const std::string& hfToken);
 
-extern Logger gLogger;
-
 /**
  * Unicode Utils
  * Reference: https://github.com/ggerganov/llama.cpp/src/unicode.cpp

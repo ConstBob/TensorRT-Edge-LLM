@@ -1,6 +1,0 @@
-[submodule "3rdparty/json"]
-	path = 3rdparty/json
-	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git
-[submodule "3rdparty/cxxopts"]
-	path = 3rdparty/cxxopts
-	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/cxxopts-mirror.git

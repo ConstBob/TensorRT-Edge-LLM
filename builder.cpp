@@ -19,6 +19,7 @@ struct BuilderArgs{
     int batchSize{1};
     int maxInputLen{128};
     int maxSeqLen{256};
+    bool debug;
 };
 
 void printUsage(const char* programName) {
@@ -28,8 +29,9 @@ void printUsage(const char* programName) {
     std::cerr << "  --onnxPath       Provide the input onnx file path. Required. " << std::endl;
     std::cerr << "  --enginePath     Provide the output TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --batchSize      Provide the desired batch_size for builder. Default = 1" << std::endl;
-    std::cerr << "  --maxInputLen    Provide the maximum input length for the model. Default = 20" << std::endl;
-    std::cerr << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 40" << std::endl;
+    std::cerr << "  --maxInputLen    Provide the maximum input length for the model. Default = 128" << std::endl;
+    std::cerr << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 256" << std::endl;
+    std::cerr << "  --debug          Use debug mode, which outputs more logs." << std::endl;
 };
 
 bool parseBuilderArgs(BuilderArgs& args, int argc, char* argv[]){
@@ -40,6 +42,7 @@ bool parseBuilderArgs(BuilderArgs& args, int argc, char* argv[]){
         {"batchSize", required_argument, 0, 'b'},
         {"maxInputLen", required_argument,0, 'c'},
         {"maxSeqLen", required_argument,0, 's'},
+        {"debug", no_argument, 0, 'd'},
         {0, 0, 0, 0}
     };
 
@@ -84,8 +87,11 @@ bool parseBuilderArgs(BuilderArgs& args, int argc, char* argv[]){
                     args.maxSeqLen = std::stoi(optarg);
                 }
                 break;
+            case 'd':
+                args.debug = true;
+                break;
             default:
-                printUsage(argv[0]);
+                std::cerr << "ERROR: Output Dir requires option argument" << fmtstr("%c is %s", opt, optarg) <<  std::endl;
                 return false;
         }
     }
@@ -124,18 +130,24 @@ int main(int argc, char** argv){
         printUsage(argv[0]);
         return true;
     }
-    
-    Logger gLogger;
-    void* handle = dlopen("/home/luxiaoz/drive-llm/plugins/build/libLLamaPlugin.so", RTLD_LAZY);
+
+    if (args.debug){
+        gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
+    }
+    else{
+        gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
+    }
+
+    void* handle = dlopen("../plugins/build/libLLamaPlugin.so", RTLD_LAZY);
     if (!handle) {
-        gLogger.error(fmtstr("Cannot open library: %s", dlerror()).c_str());
+        LOG_ERROR(fmtstr("Cannot open library: %s", dlerror()));
         return false;
     }
 
     // Create the builder
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
     if (!builder) {
-        gLogger.error("Failed to create builder.");
+        LOG_ERROR("Failed to create builder.");
         return false;
     }
 
@@ -143,27 +155,27 @@ int main(int argc, char** argv){
     const auto stronglyTyped = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
     auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(stronglyTyped));
     if (!network) {
-        gLogger.error("Failed to create network.");
+        LOG_ERROR("Failed to create network.");
         return false;
     }
 
     // Create the ONNX parser
     auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, gLogger));
     if (!parser) {
-        gLogger.error("Failed to create parser.");
+        LOG_ERROR("Failed to create parser.");
         return false;
     }
 
     // Parse the ONNX model
     if (!parser->parseFromFile(args.onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
-        gLogger.error("Failed to parse ONNX file.");
+        LOG_ERROR(fmtstr("Failed to parse ONNX file: %s", args.onnxPath));
         return false;
     }
 
     // Build the engine
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config) {
-        gLogger.error("Failed to create builder config.");
+        LOG_ERROR("Failed to create builder config.");
         return false;
     }
 
@@ -197,18 +209,18 @@ int main(int argc, char** argv){
     auto engine = builder->buildSerializedNetwork(*network, *config);
 
     if (!engine) {
-        std::cerr << "Failed to build engine." << std::endl;
+        LOG_ERROR("Failed to build engine.");
         return false;
     }
 
     std::ofstream ofs(args.enginePath, std::ios::out | std::ios::binary);
     if (!ofs) {
-        std::cerr << "Failed to open file for writing: " << args.enginePath << std::endl;
+        LOG_ERROR(fmtstr("Failed to open file for writing: %s", args.enginePath.c_str()));
         return false;
     }
     ofs.write(static_cast<char*>(engine->data()), engine->size());
     ofs.close();
-    std::cout << "Engine saved to " << args.enginePath << std::endl;
+    LOG_INFO(fmtstr("Engine saved to %s", args.enginePath.c_str()));
     dlclose(handle);
     return true;
 }

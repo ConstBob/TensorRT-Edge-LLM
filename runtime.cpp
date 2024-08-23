@@ -19,6 +19,7 @@ struct RuntimeArgs{
     std::string enginePath;
     std::string tokenizerPath;
     int maxLength{40};
+    bool debug;
 };
 
 void printUsage(const char* programName) {
@@ -29,6 +30,7 @@ void printUsage(const char* programName) {
     std::cerr << "  --enginePath     Provide the input TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --tokenizerPath  Provide the path to HF tokenizer. Required. " << std::endl;
     std::cerr << "  --maxLength      Provide the maximum output length for the generation session (including the input). Default = 40" << std::endl;
+    std::cerr << "  --debug          Use debug mode, which outputs tensors." << std::endl;
 };
 
 
@@ -39,6 +41,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[]){
         {"enginePath", required_argument, 0, 'e'},
         {"tokenizerPath", required_argument, 0, 't'},
         {"maxLength", required_argument,0, 's'},
+        {"debug", no_argument, 0, 'd'},
         {0, 0, 0, 0}
     };
 
@@ -82,8 +85,10 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[]){
                     args.maxLength = std::stoi(optarg);
                 }
                 break;
+            case 'd':
+                args.debug = true;
+                break;
             default:
-                printUsage(argv[0]);
                 return false;
         }
     }
@@ -102,7 +107,14 @@ int main(int argc, char* argv[])
         return true;
     }
 
-    void* handle = dlopen("/home/luxiaoz/drive-llm/plugins/build/libLLamaPlugin.so", RTLD_LAZY);
+    if (args.debug){
+        gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
+    }
+    else{
+        gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
+    }
+
+    void* handle = dlopen("../plugins/build/libLLamaPlugin.so", RTLD_LAZY);
 
     Tokenizer* tokenizer = new LlamaV3Tokenizer();
     tokenizer->loadFromHF(args.tokenizerPath);
@@ -125,7 +137,7 @@ int main(int argc, char* argv[])
         outputIdsInt32.push_back(static_cast<int32_t>(outputIds[i]));
     }
     std::string output = tokenizer->decode(outputIdsInt32);
-    std::cout << "Output is" << output << std::endl;
+    LOG_INFO(fmtstr("Output is %s", output.c_str()));
     dlclose(handle);
 
     return true;

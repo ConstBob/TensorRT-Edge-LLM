@@ -21,8 +21,6 @@
 #include "tokenizerUtils.h"
 #include "unicodeData.h"
 
-Logger gLogger{};
-
 BPERanksToToken reverseEncoder(const BPETokenToRanks& encoder)
 {
     BPERanksToToken decoder;
@@ -36,23 +34,23 @@ BPERanksToToken reverseEncoder(const BPETokenToRanks& encoder)
 }
 
 int decodeChar(const char& c) {
-    if (c >= 'A' && c <= 'Z') 
+    if (c >= 'A' && c <= 'Z')
     {
         return c - 'A';
     }
-    else if (c >= 'a' && c <= 'z') 
+    else if (c >= 'a' && c <= 'z')
     {
         return c - 'a' + 26;
     }
-    else if (c >= '0' && c <= '9') 
+    else if (c >= '0' && c <= '9')
     {
         return c - '0' + 52;
     }
-    else if (c == '+') 
+    else if (c == '+')
     {
-        return 62; 
+        return 62;
     }
-    else if (c == '/') 
+    else if (c == '/')
     {
         return 63;
     }
@@ -364,7 +362,7 @@ bool unicodeCollapseRegex(const std::string& expr, std::regex& regex)
 
         } catch (std::regex_error & e)
         {
-            gLogger.error(fmtstr("Failed to process regex: %s", expr).c_str());
+            LOG_ERROR(fmtstr("Failed to process regex: %s", expr));
             throw std::runtime_error("Failed to process regex");
         }
     }
@@ -399,11 +397,11 @@ std::string unicodeCollapseText(const std::vector<uint32_t>& cpts)
             //NOTE: C++ std::regex \s does not mach 0x85, Rust and Python regex does.
             //textCollapsed[i] = (char) 0x85;  // <Next Line> as whitespace fallback
             textCollapsed[i] = (char) 0x0B;    // <vertical tab> as whitespace fallback
-        } 
+        }
         else if (kUcatCpt.find(flags.categoryFlag()) != kUcatCpt.end())
         {
             textCollapsed[i] = kUcatCpt.at(flags.categoryFlag());
-        } 
+        }
         else
         {
             textCollapsed[i] = (char) 0xD0; // fallback

@@ -53,7 +53,7 @@ bool BPE::specialTokenPartition(const std::string& text, std::forward_list<textP
                     while (true)
                     {
                         auto match = rawText.find(specialToken, baseOffset);
-                        if ((match == std::string::npos) || (match + specialToken.length() > baseOffset + baseLength)) 
+                        if ((match == std::string::npos) || (match + specialToken.length() > baseOffset + baseLength))
                         {
                             break;
                         }
@@ -75,7 +75,7 @@ bool BPE::specialTokenPartition(const std::string& text, std::forward_list<textP
                         if (basePos == 0)
                         {
                             partitions.erase_after(partitions.before_begin());
-                        } 
+                        }
                         else
                         {
                             partitions.erase_after(std::next(partitions.begin(), (basePos - 1)));
@@ -105,7 +105,7 @@ bool BPE::specialTokenPartition(const std::string& text, std::forward_list<textP
     }
     catch(const std::exception& e)
     {
-        gLogger.error(fmtstr("BPE::specialTokenPartition failed on text: %s ", text).c_str());
+        LOG_ERROR(fmtstr("BPE::specialTokenPartition failed on text: %s", text.c_str()));
         return false;
     }
 }
@@ -132,10 +132,10 @@ bool BPE::tokenize(const std::string& piece, std::vector<Rank>& output) const no
     }
     catch(const std::exception& e)
     {
-        gLogger.error(fmtstr("BPE::tokenize failed on piece: %s", piece).c_str());
+        LOG_ERROR(fmtstr("BPE::tokenize failed on piece: %s", piece.c_str()));
         return false;
     }
-    
+
 }
 
 std::vector<std::string> BPE::regexSplitText(const std::string& text) const
@@ -152,7 +152,7 @@ std::vector<std::string> BPE::regexSplitText(const std::string& text) const
     {
         textCollapsed = text;
     }
-    
+
     auto bpeOffsets = unicodeRegexSplit(textCollapsed, mRegex);
 
     std::vector<std::string> bpeWords;
@@ -208,14 +208,14 @@ void BPE::bytePairEncode(const std::string& piece, std::vector<Rank>& output) co
         {
             const auto it = mEncoder.find(std::string
                 (
-                    piece.begin() + parts[i].first, 
+                    piece.begin() + parts[i].first,
                     piece.begin() + parts[i + 3].first
                 )
             );
             if (it != mEncoder.end())
             {
                 rank = it->second;
-            }            
+            }
         }
         return rank;
     };
@@ -278,13 +278,13 @@ bool BPE::detokenize(const std::vector<Rank>& tokens, std::string& output) const
     }
     catch(const std::exception& e)
     {
-        gLogger.error("BPE::detokenize failed.");
+        LOG_ERROR("BPE::detokenize failed.");
         return false;
     }
-    
+
 }
 
-// Tokenizer 
+// Tokenizer
 Tokenizer::Tokenizer()
     : mNumVocab{0}, mBosId{-1}, mEosId{-1}, mPadId{-1}
 {}
@@ -362,7 +362,7 @@ void Tokenizer::appendBos(std::vector<Rank>& output) const noexcept
     }
     else
     {
-        gLogger.warning("BOS ID is not set. Not appending BOS token.");
+        LOG_WARNING("BOS ID is not set. Not appending BOS token.");
     }
 }
 
@@ -374,7 +374,7 @@ void Tokenizer::appendEos(std::vector<Rank>& output) const noexcept
     }
     else
     {
-        gLogger.warning("EOS ID is not set. Not appending EOS token.");
+        LOG_WARNING("EOS ID is not set. Not appending EOS token.");
     }
 }
 
@@ -428,7 +428,7 @@ bool Tokenizer::loadTikTokenVocab(std::filesystem::path const& tiktokenFile, BPE
     }
     catch(const std::exception& e)
     {
-        gLogger.error(fmtstr("Failed to load Tokenizer from Tiktoken: %s", tiktokenFile).c_str());
+        LOG_ERROR(fmtstr("Failed to load Tokenizer from Tiktoken: %s", tiktokenFile.c_str()));
         return false;
     }
 }
@@ -506,7 +506,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
                     specialTokens[specialContent] = specialId;
                 }
             }
-        }    
+        }
 
         data.close();
 
@@ -516,7 +516,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
         {
             std::ifstream config(tokenizerConfig);
             std::string line;
-            
+
             while (std::getline(config, line))
             {
                 if (line.find("\"bos_token\"") != std::string::npos)
@@ -534,7 +534,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
                     eosId = specialTokens[token];
                 }
             }
-            
+
             config.close();
         }
 
@@ -542,7 +542,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
     }
     catch(const std::exception& e)
     {
-        gLogger.error(fmtstr("Failed to load Tokenizer from HF: %s", modelDir).c_str());
+        LOG_ERROR(fmtstr("Failed to load Tokenizer from HF: %s ", modelDir.c_str()));
         return false;
     }
 }
@@ -551,7 +551,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
 void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
 {
     BPETokenToRanks mergeableRanks;
-    
+
     assert(loadTikTokenVocab(modelPath, mergeableRanks));
 
     // add special tokens
@@ -598,8 +598,7 @@ void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
         specialTokens["<|end_of_text|>"],
         specialTokens["<|eot_id|>"]
     };
-
-    gLogger.info(fmtstr("Loaded LlamaV3Tokenizer from %s", modelPath.c_str()).c_str());
+    LOG_INFO(fmtstr("Loaded LlamaV3Tokenizer from %s", modelPath.c_str()));
 }
 
 void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
@@ -628,6 +627,5 @@ void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
         specialTokens["<|eot_id|>"]
     };
 
-    gLogger.info(fmtstr("Loaded LlamaV3Tokenizer from %s", modelDir.c_str()).c_str());
+   LOG_INFO(fmtstr("Loaded LlamaV3Tokenizer from %s", modelDir.c_str()));
 }
-

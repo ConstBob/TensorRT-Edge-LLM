@@ -11,7 +11,7 @@ using namespace std;
 bool Decoder::setup(std::filesystem::path& fp, cudaStream_t& stream){
     try{
         mStream = stream;
-        mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(*mLogger));
+        mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
         StreamReader* _sr = new StreamReader(fp);
         mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(*_sr));
         mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
@@ -26,7 +26,7 @@ bool Decoder::setup(std::filesystem::path& fp, cudaStream_t& stream){
     catch (std::exception const& e)
     {
         isSetup = false;
-        mLogger->error(e.what());
+        LOG_ERROR(e.what());
         return false;
     }
     return true;
@@ -146,6 +146,12 @@ void Decoder::allocateBuffer(){
     }
 }
 
+// This is a helper function to dump kv cache information
+void Decoder::printKVCache(int64_t contextLength){
+
+}
+
+
 void Decoder::generate(const std::vector<int64_t>& inputIds, std::vector<int64_t>& outputIds, GenerationConfig generationConfig){
     // We assume bs = 1 for this `generate` function for now. Copy input_ids and context_length
     assert(outputIds.size() == 0);
@@ -158,7 +164,7 @@ void Decoder::generate(const std::vector<int64_t>& inputIds, std::vector<int64_t
     while ((contextLength < generationConfig.maxLength)){
         const std::vector<int64_t>& generatedToken = mSampler->greedySample(reinterpret_cast<half*>(mDeviceBuffer["logits"]));
         outputIds.push_back(generatedToken[0]);
-        std::cout << "Generated token is " << generatedToken[0] << std::endl;
+        LOG_DEBUG(fmtstr("Generated token is %ld ", generatedToken[0]));
         ++contextLength;
         // Reaches eos token and reaches minLength.
         if ((generatedToken[0] == 128001) && (contextLength > generationConfig.minLength)){

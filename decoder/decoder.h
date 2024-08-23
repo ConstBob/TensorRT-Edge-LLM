@@ -38,7 +38,6 @@ class Decoder
 
 public:
     Decoder():
-        mLogger{std::make_shared<Logger>()},
         mStream{nullptr},
         mEngine{nullptr},
         mContextExecutionContext{nullptr},
@@ -63,7 +62,6 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    std::shared_ptr<Logger> mLogger;
     cudaStream_t mStream;
     bool isSetup;
     ModelConfig mConfig;
@@ -72,6 +70,7 @@ private:
     bool checkStaticShape(std::string& name);
     void allocateBuffer();
     Sampler<half>* mSampler;
+    void printKVCache(int64_t contextLength);
 };
 
 #endif
