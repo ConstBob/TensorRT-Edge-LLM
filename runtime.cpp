@@ -9,17 +9,18 @@
 #include <getopt.h>
 #include <vector>
 #include <dlfcn.h>
+#include <sstream>
 
 using namespace std;
 using namespace nvinfer1;
 
 struct RuntimeArgs{
-    bool help;
+    bool help{false};
     std::string inputString;
     std::string enginePath;
     std::string tokenizerPath;
     int maxLength{40};
-    bool debug;
+    bool debug{false};
 };
 
 void printUsage(const char* programName) {
@@ -120,19 +121,35 @@ int main(int argc, char* argv[])
     tokenizer->loadFromHF(args.tokenizerPath);
     std::vector<int32_t> inputIdsInt32 = tokenizer->encode(args.inputString, true);
     std::vector<int64_t> inputIds;
-    for (int i = 0; i< inputIdsInt32.size(); ++i){
-        inputIds.push_back(static_cast<int64_t>(inputIdsInt32[i]));
+    std::ostringstream oss;
+    if (args.debug){
+        oss << "input_ids size is: " << inputIdsInt32.size() << ". Content is: [";
     }
+    for (int i = 0; i < inputIdsInt32.size() - 1; ++i){
+        inputIds.push_back(static_cast<int64_t>(inputIdsInt32[i]));
+        if (args.debug){
+            oss << inputIds[i] << ",";
+        }
+    }
+    if (args.debug){
+        oss << "]";
+        LOG_DEBUG(oss.str());
+    }
+
     Decoder* decoder = new Decoder();
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     std::filesystem::path _enginePath(args.enginePath);
     decoder->setup(_enginePath, stream);
-    GenerationConfig generationConfig{40, 20, 1, 0};
+    GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
     std::vector<int64_t> outputIds;
     outputIds.reserve(args.maxLength);
     decoder->generate(inputIds, outputIds, generationConfig);
     std::vector<int32_t> outputIdsInt32;
+    if (args.debug){
+        LOG_DEBUG(fmtstr("Output length is %d", outputIds.size()));
+    }
+
     for (int i = 0; i< outputIds.size(); ++i){
         outputIdsInt32.push_back(static_cast<int32_t>(outputIds[i]));
     }

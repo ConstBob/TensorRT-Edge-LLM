@@ -63,8 +63,6 @@ inline void _checkCuda(cudaError_t result, char const* const func, char const* c
     } while (0)
 
 
-// int constexpr VOID_PTR_SZ = 2 + sizeof(void *) * 2;
-
 // StreamReader ported from TRT-LLM to read from engine file.
 class StreamReader final : public nvinfer1::IStreamReader
 {

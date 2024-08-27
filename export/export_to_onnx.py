@@ -45,7 +45,20 @@ def surgeon_graph(graph):
         graph.inputs.remove(i)
 
     context_length = gs.Variable("context_length", np.int64, [1])
+
+    # For context phase, last_token_ids should be context_length - 1; for generation phase, last_token_ids should be 0
+    last_token_ids = gs.Variable("last_token_ids", np.int64, [1])
+    one_constant = gs.Constant(name="/lm_head/Slice/one_constant", values=np.array([1], dtype=np.int64))
+    slice_end = gs.Variable(name="/lm_head/Slice/end", dtype=np.int64, shape=[1])
+    graph.layer(
+        name="/lm_head/Slice/Add",
+        op="Add",
+        inputs=[last_token_ids, one_constant],
+        outputs=[slice_end]
+    )
+
     graph.inputs.append(context_length)
+    graph.inputs.append(last_token_ids)
 
     # Look for kv cache outputs
     kv_outputs = {}
@@ -55,9 +68,9 @@ def surgeon_graph(graph):
             kv_outputs[output.name] = clear_inputs(output)
         if "logits" in output.name:
             logits = output
-    
+
     assert logits, "There should be logits output"
-    
+
     # Remove kv outputs
     for name in kv_outputs:
         graph.outputs.remove(kv_outputs[name])
@@ -137,10 +150,10 @@ def surgeon_graph(graph):
         graph.layer(
             name=f"Attention-{i}",
             op="AttentionPlugin",
-            inputs=[qkv,kv_input, context_length],
+            inputs=[qkv, kv_input, context_length],
             outputs=[attn_output, kv_output],
         )
-    
+
     # Insert Slice node for lm_head's input.
     lm_head_matmul = clear_outputs(logits.inputs[0].inputs[0].inputs[0])
     assert lm_head_matmul.name == "/lm_head/MatMul", f"You did not reach lm_head, but you reached {lm_head.name}"
@@ -150,13 +163,11 @@ def surgeon_graph(graph):
 
     # Insert a Slice node for lm_head_input
     slice_output = gs.Variable("/lm_head/Slice_Output")
-    starts = gs.Constant(name="/lm_head/Slice/starts", values=np.array([0, -1, 0], dtype=np.int32))
-    ends = gs.Constant(name="/lm_head/Slice/ends", values=np.array([np.iinfo(np.int32).max, np.iinfo(np.int32).max, np.iinfo(np.int32).max], dtype=np.int32))
-
+    slice_axis = gs.Constant(name="/lm_head/Slice/axes", values = np.array([1], dtype=np.int32))
     graph.layer(
         name="/lm_head/Slice",
         op="Slice",
-        inputs = [lm_head_input, starts, ends],
+        inputs = [lm_head_input, last_token_ids, slice_end,slice_axis],
         outputs = [slice_output],
     )
 
@@ -195,19 +206,19 @@ def main():
         )
     else:
         print(f"ONNX path given. Importing ONNX from {args.onnx_path}")
-    
+
     input_onnx_name = f"{args.output_dir}/model.onnx" if args.torch_dir else args.onnx_path
     graph = gs.import_onnx(onnx.load(input_onnx_name))
     t1 = time.time()
     print(f"ONNX export and load takes {t1 - t0}s. Using onnx_graphsurgeon to insert plugin.")
 
     graph = surgeon_graph(graph)
-    print("Start to export model to onnx")
-    model = gs.export_onnx(graph)
-    print("Finish exporting to onnx")
 
     t2 = time.time()
-    print(f"ONNX Graphsurgeon takes {t2 - t1}s.")
+    print(f"onnx_graphsurgeon takes {t2 - t1}s. Export back to onnx model")
+    model = gs.export_onnx(graph)
+    t3 = time.time()
+    print(f"gs.export(graph) takes {t3 - t2}s.")
 
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -222,7 +233,7 @@ def main():
 
         except Exception as e:
             print('Failed to delete %s. Reason: %s' % (file_path, e))
-    
+
     output_onnx_name = f"{args.output_dir}/model.onnx"
     onnx.save_model(
         model,
@@ -233,9 +244,9 @@ def main():
         convert_attribute=True
     )
 
-    t3 = time.time()
-    print(f"ONNX save takes {t3 - t2} seconds.")
-    print(f"Model ONNX saved to {args.output_dir} with {args.dtype} precision in {t3 - t0}s.")
+    t4 = time.time()
+    print(f"ONNX save takes {t4 - t3} seconds.")
+    print(f"Model ONNX saved to {args.output_dir} with {args.dtype} precision in {t4 - t0}s.")
 
 if __name__ == '__main__':
     main()

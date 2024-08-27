@@ -70,7 +70,9 @@ private:
     bool checkStaticShape(std::string& name);
     void allocateBuffer();
     Sampler<half>* mSampler;
-    void printKVCache(int64_t contextLength);
+    // These are used as debugging functions
+    std::string printKVCache(int64_t contextLength);
+    std::string printLogits();
 };
 
 #endif

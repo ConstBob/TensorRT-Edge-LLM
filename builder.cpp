@@ -13,13 +13,13 @@ using namespace std;
 using namespace nvinfer1;
 
 struct BuilderArgs{
-    bool help;
+    bool help{false};
     std::string onnxPath;
     std::string enginePath;
-    int batchSize{1};
-    int maxInputLen{128};
-    int maxSeqLen{256};
-    bool debug;
+    int64_t batchSize{1};
+    int64_t maxInputLen{128};
+    int64_t maxSeqLen{256};
+    bool debug{false};
 };
 
 void printUsage(const char* programName) {
@@ -123,11 +123,13 @@ Dims createDims(const std::vector<int64_t>& shape){
 int main(int argc, char** argv){
     BuilderArgs args;
     if ((argc < 2) || (!parseBuilderArgs(args, argc, argv))){
+        std::cerr << "Unable to parse builder args" << std::endl;
         printUsage(argv[0]);
         return false;
     }
     if (args.help){
         printUsage(argv[0]);
+        std::cout << "find help mode is True" << std::endl;
         return true;
     }
 
@@ -186,8 +188,8 @@ int main(int argc, char** argv){
     auto* contextProfile = builder->createOptimizationProfile();
     auto* generationProfile = builder->createOptimizationProfile();
 
-    // Location 2 is guaranteed to be one of the KV Cache inputs
-    Dims kvDims = network->getInput(2)->getDimensions();
+    // Location 3 is guaranteed to be one of the KV Cache inputs
+    Dims kvDims = network->getInput(3)->getDimensions();
     int64_t numKVHeads = kvDims.d[2];
     int64_t hiddenSizePerHead = kvDims.d[4];
 
@@ -196,10 +198,26 @@ int main(int argc, char** argv){
     Dims inputIdsGenerationShape = createDims({args.batchSize, 1});
     Dims kvCacheGenerationShape = createDims({args.batchSize, 2, numKVHeads, args.maxSeqLen, hiddenSizePerHead});
 
+    std::vector<int32_t> const minContextShape = {0};
+    std::vector<int32_t> const optContextShape = {args.maxInputLen / 2 - 1};
+    std::vector<int32_t> const maxContextShape = {args.maxInputLen - 1};
+    // Generation Phase has to be in s = 1
+    std::vector<int32_t> const minGenerationShape = {0};
+    std::vector<int32_t> const optGenerationShape = {0};
+    std::vector<int32_t> const maxGenerationShape = {0};
+    contextProfile->setShapeValues("last_token_ids", OptProfileSelector::kMIN, minContextShape.data(), 1);
+    contextProfile->setShapeValues("last_token_ids", OptProfileSelector::kOPT, optContextShape.data(), 1);
+    contextProfile->setShapeValues("last_token_ids", OptProfileSelector::kMAX, maxContextShape.data(), 1);
+    generationProfile->setShapeValues("last_token_ids", OptProfileSelector::kMIN, minGenerationShape.data(), 1);
+    generationProfile->setShapeValues("last_token_ids", OptProfileSelector::kOPT, optGenerationShape.data(), 1);
+    generationProfile->setShapeValues("last_token_ids", OptProfileSelector::kMAX, maxGenerationShape.data(), 1);
+
     setStaticProfile(contextProfile, "input_ids", inputIdsContextShape);
     setStaticProfile(generationProfile, "input_ids", inputIdsGenerationShape);
+
     for (int i = 0; i< nbLayers; ++i){
         setStaticProfile(contextProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheContextShape);
+        // std::cout << kvCacheContextShape.d[0] << "," << kvCacheContextShape.d[1] << ", " << kvCacheContextShape.d[2] << std::endl;
         setStaticProfile(generationProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheGenerationShape);
     }
 

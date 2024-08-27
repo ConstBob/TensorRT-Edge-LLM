@@ -35,6 +35,8 @@ constexpr float kROPE_SCALE = 1.0f;
 
 // Hugging-face rope implementation use roate-half method.
 constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_HALF;
+constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kLLAMA3;
+
 
 constexpr int32_t kDEVICE_ALIGNMENT{128};       // Make sure all device pointers are aligned by 128.
 
@@ -237,7 +239,7 @@ bool AttentionPlugin::supportsFormatCombination(
 }
 
 int32_t AttentionPlugin::getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs, nvinfer1::DimsExprs const* shapeInputs,
-        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs, nvinfer1::IExprBuilder& exprBuilder) noexcept 
+        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -343,8 +345,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nv
         // At Context phase. Do 1. Apply rope and write KVCache. 2. Dispatch FMHA runner.
         invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr,
             mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, kROPE_TYPE, kROPE_BASE_FREQUENCY,
-                kROPE_SCALE, mInputContextLen, stream);
-        
+                kROPE_SCALE, kROPE_INIT_TYPE, mInputContextLen, stream);
+
         // Prepare FMHA_v2 params to launch FMHA kernel
         Fused_multihead_attention_params_v2 params{};
         params.clear();
@@ -352,7 +354,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nv
 
         // Compute the prefix sum of sequence length.
         getSeqLenPrefixLength(reinterpret_cast<int32_t*>(alignedWorkspacePtr), seqLengthDevicePtr, mBatchSize);
-        
+
         // Set device ptr for FMHA kernel.
         params.qkv_ptr = qkvDevicePtr;
         params.cu_seqlens = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
@@ -366,8 +368,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nv
         // Generation phase we first prepare Q vector and update KVCache.
         half* qVecDevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
         invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
-            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, 
-                kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, 1, stream);
+            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen,
+                kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, 1, stream);
 
         // Prepare GQA runner parameter to dispatch kernel
         XQALaunchParams params = mGQARunner.initXQAParams();
@@ -413,4 +415,4 @@ nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(char const* name, nvin
 {
     AttentionPlugin* plugin = new AttentionPlugin(std::string(name));
     return plugin;
-}  
+}
