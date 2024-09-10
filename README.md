@@ -43,14 +43,14 @@ You will find 2 binaries: `build` and `runtime` in the `build` folder. Those wil
 In standard Linux system, you will first need to export the model from PyTorch to ONNX. We also use `onnx_graphsurgeon` to convert the Attention module into a TensorRT Plugin in the same script. An example command is:
 
 ```
-python3 export_to_onnx.py --model_dir llama-v3-8b-instruct-hf/ --output_dir llama_v3_onnx --dtype fp16
+python3 export_to_onnx.py --torch_dir llama-v3-8b-instruct-hf/ --output_dir llama_v3_onnx --dtype fp16
 ```
 
 ### Build the engine
 
 You will use `builder` binary to build the TensorRT engine. Example command:
 ```
-./builder --onnxPath=llama_v3_onnx/model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=50 --maxSeqLen=100
+./builder --onnxPath=llama_v3_onnx/model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=128 --maxSeqLen=256
 ```
 
 **Notes:** `--maxSeqLen` includes `--maxInputLen`, so it must be greater than `--maxInputLen`. The maximum new token would equal to `maxSeqLen - maxInputLen`. 
@@ -60,6 +60,6 @@ You will use `builder` binary to build the TensorRT engine. Example command:
 You will use `runtime` binary to infer the built TensorRT engine. Example command:
 
 ```
-./runtime --tokenizerPath=llama-v3-8b-instruct-hf/ --enginePath=llama.engine --maxLength=100
+./runtime --tokenizerPath=llama-v3-8b-instruct-hf/ --enginePath=llama.engine --maxLength=256
 ```
 
