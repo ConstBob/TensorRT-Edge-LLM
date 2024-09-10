@@ -10,16 +10,17 @@
  * its affiliates is strictly prohibited.
  */
 
-#include <gtest/gtest.h>
-#include "refAttention.h"
 #include "../contextFMHARunner.h"
+#include "refAttention.h"
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cuda.h>
 #include <fstream>
 #include <iostream>
 
-inline void check(bool condition, std::string errorMsg) {
+inline void check(bool condition, std::string errorMsg)
+{
     if (!condition)
     {
         throw std::runtime_error(errorMsg);
@@ -30,25 +31,38 @@ template <typename T>
 class ManagedMemBuf
 {
 public:
-    ManagedMemBuf(size_t nbElems): mSize {nbElems} {
-        if (nbElems != 0) {
+    ManagedMemBuf(size_t nbElems)
+        : mSize{nbElems}
+    {
+        if (nbElems != 0)
+        {
             void* p;
             checkCuda(cudaMallocManaged(&p, sizeof(T) * nbElems));
             mData.reset(reinterpret_cast<T*>(p));
         }
     }
-    T* get() const {return mData.get();}
-    size_t size() const {return mSize;}
-    void prefetch(int dstDevice, cudaStream_t stream = nullptr) const {
+    T* get() const
+    {
+        return mData.get();
+    }
+    size_t size() const
+    {
+        return mSize;
+    }
+    void prefetch(int dstDevice, cudaStream_t stream = nullptr) const
+    {
         checkCuda(cudaMemPrefetchAsync(get(), sizeof(T) * size(), dstDevice, stream));
     }
-    T& operator[](size_t i) const {
+    T& operator[](size_t i) const
+    {
         return mData[i];
     };
+
 private:
     struct CudaDeleter
     {
-        void operator()(void *p) const {
+        void operator()(void* p) const
+        {
             cudaFree(p);
         }
     };
@@ -87,7 +101,7 @@ void loadDataFromFile(std::string name, std::vector<half>& dataVec, int32_t nbDa
     {
         float value;
         file.read(reinterpret_cast<char*>(&value), sizeof(float));
-        dataVec[i] =  __float2half_rn(value);
+        dataVec[i] = __float2half_rn(value);
     }
     file.close();
 }
@@ -114,7 +128,7 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
     auto outdata = ManagedMemBuf<IOHead[MAX_SEQ_LEN][nbQHeads]>(batchSize);
     auto const seqLenList = ManagedMemBuf<int32_t>(batchSize + 1);
     size_t const totalQKVElems = validElemsPerHead * (nbKHeads + nbVHeads + nbQHeads) * MAX_SEQ_LEN * batchSize;
-    size_t const totalVElems = validElemsPerHead * (nbKHeads) * MAX_SEQ_LEN * batchSize;
+    size_t const totalVElems = validElemsPerHead * (nbKHeads) *MAX_SEQ_LEN * batchSize;
     size_t const totalOutElems = validElemsPerHead * nbQHeads * MAX_SEQ_LEN * batchSize;
 
     printf("Total QKV:%ld, and total out: %ld elements.\n", totalQKVElems, totalOutElems);
@@ -128,7 +142,7 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
     seqLenList[1] = seqLen;
 
     loadDataFromFile("../tests/fmha-io/qkv128_128.bin", qkvData[0][0][0].data, totalQKVElems);
-    
+
     cudaStream_t const stream = nullptr;
     auto prefetchToDevice = [&](int dev) {
         qkvData.prefetch(dev, stream);
@@ -138,7 +152,8 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
     prefetchToDevice(device);
     checkCuda(cudaStreamSynchronize(stream));
 
-    drivellm::ContextFMHARunner runner(nvinfer1::DataType::kHALF, batchSize, MAX_SEQ_LEN, nbQHeads, nbKHeads, validElemsPerHead, 86);
+    drivellm::ContextFMHARunner runner(
+        nvinfer1::DataType::kHALF, batchSize, MAX_SEQ_LEN, nbQHeads, nbKHeads, validElemsPerHead, 86);
     Fused_multihead_attention_params_v2 params;
     params.clear();
     runner.setupParams(params);
@@ -163,12 +178,17 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
         loadDataFromFile("../tests/fmha-io/out128_128.bin", refDataVec, totalOutElems);
         bool pass{true};
 
-        for (int32_t req = 0; req < batchSize; req++) {
-            for (int32_t s = 0; s < MAX_SEQ_LEN; s++) {
-                for (int32_t q = 0; q < nbQHeads; q++) {
-                    for (int32_t i = 0; i < validElemsPerHead; i++) {
+        for (int32_t req = 0; req < batchSize; req++)
+        {
+            for (int32_t s = 0; s < MAX_SEQ_LEN; s++)
+            {
+                for (int32_t q = 0; q < nbQHeads; q++)
+                {
+                    for (int32_t i = 0; i < validElemsPerHead; i++)
+                    {
                         float data = float(outdata[req][s][q][i]);
-                        int32_t refIdx = req * (MAX_SEQ_LEN * nbQHeads * validElemsPerHead) + s * (nbQHeads * validElemsPerHead) + q * validElemsPerHead + i;
+                        int32_t refIdx = req * (MAX_SEQ_LEN * nbQHeads * validElemsPerHead)
+                            + s * (nbQHeads * validElemsPerHead) + q * validElemsPerHead + i;
                         float refData = refDataVec[refIdx];
                         if (std::abs(data - refData) > 1e-3)
                         {

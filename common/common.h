@@ -3,18 +3,19 @@
 #define COMMON_H
 
 #include <NvInferRuntime.h>
-#include <filesystem>
-#include <iostream>
-#include <fstream>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdlib>
-#include <sstream>
-#include <cerrno>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 
 using namespace std;
 
-inline void check(bool condition, std::string errorMsg) {
+inline void check(bool condition, std::string errorMsg)
+{
     if (!condition)
     {
         throw std::runtime_error(errorMsg);
@@ -37,14 +38,14 @@ inline std::string vformat(char const* fmt, va_list args)
     return stringBuf;
 }
 
-inline std::string fmtstr(char const* format, ...){
+inline std::string fmtstr(char const* format, ...)
+{
     va_list args;
     va_start(args, format);
     std::string result = vformat(format, args);
     va_end(args);
     return result;
 };
-
 
 inline void _checkCuda(cudaError_t result, char const* const func, char const* const file, int const line)
 {
@@ -56,12 +57,11 @@ inline void _checkCuda(cudaError_t result, char const* const func, char const* c
 /*
  * Macros compliant with TensorRT coding conventions
  */
-#define CUDA_CHECK(stat)                                                                                          \
+#define CUDA_CHECK(stat)                                                                                               \
     do                                                                                                                 \
     {                                                                                                                  \
-        _checkCuda((stat), #stat, __FILE__, __LINE__);                                                \
+        _checkCuda((stat), #stat, __FILE__, __LINE__);                                                                 \
     } while (0)
-
 
 // StreamReader ported from TRT-LLM to read from engine file.
 class StreamReader final : public nvinfer1::IStreamReader
@@ -70,7 +70,8 @@ public:
     StreamReader(std::filesystem::path fp)
     {
         mFile.open(fp.string(), std::ios::binary | std::ios::in);
-        if (!mFile.good()){
+        if (!mFile.good())
+        {
             throw std::string("Error opening engine file: " + fp.string());
         };
     }
@@ -104,89 +105,103 @@ public:
     void log(nvinfer1::ILogger::Severity severity, char const* msg) noexcept override
     {
         std::string strMsg(msg);
-        switch(severity){
-            case nvinfer1::ILogger::Severity::kVERBOSE: {
-                debug(msg);
-                break;
-            }
-            case nvinfer1::ILogger::Severity::kERROR: {
-                error(msg);
-                break;
-            }
-            case nvinfer1::ILogger::Severity::kWARNING:
-            {
-                warning(msg);
-                break;
-            }
-            case nvinfer1::ILogger::Severity::kINFO:
-            {
-                info(msg);
-                break;
-            }
-            default:
-            {
-                error(msg);
-                break;
-            }
+        switch (severity)
+        {
+        case nvinfer1::ILogger::Severity::kVERBOSE:
+        {
+            debug(msg);
+            break;
+        }
+        case nvinfer1::ILogger::Severity::kERROR:
+        {
+            error(msg);
+            break;
+        }
+        case nvinfer1::ILogger::Severity::kWARNING:
+        {
+            warning(msg);
+            break;
+        }
+        case nvinfer1::ILogger::Severity::kINFO:
+        {
+            info(msg);
+            break;
+        }
+        default:
+        {
+            error(msg);
+            break;
+        }
         }
     }
 
-    void debug(const std::string& msg)
+    void debug(std::string const& msg)
     {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kVERBOSE){
+        if (_minSeverity >= nvinfer1::ILogger::Severity::kVERBOSE)
+        {
             std::cout << "[DEBUG]: " << msg << std::endl;
         }
     }
 
-    void warning(const std::string& msg)
+    void warning(std::string const& msg)
     {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kWARNING){
+        if (_minSeverity >= nvinfer1::ILogger::Severity::kWARNING)
+        {
             std::cerr << "[WARNING]: " << msg << std::endl;
         }
     }
 
-    void error(const std::string& msg)
+    void error(std::string const& msg)
     {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kERROR){
+        if (_minSeverity >= nvinfer1::ILogger::Severity::kERROR)
+        {
             std::cerr << "[ERROR]: " << msg << std::endl;
         }
     }
 
-    void info(const std::string& msg)
+    void info(std::string const& msg)
     {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kINFO){
+        if (_minSeverity >= nvinfer1::ILogger::Severity::kINFO)
+        {
             std::cout << "[INFO]: " << msg << std::endl;
         }
     }
 
-    void setLevel(nvinfer1::ILogger::Severity minSeverity){
+    void setLevel(nvinfer1::ILogger::Severity minSeverity)
+    {
         _minSeverity = minSeverity;
     }
 
-    nvinfer1::ILogger::Severity getLevel(){
+    nvinfer1::ILogger::Severity getLevel()
+    {
         return _minSeverity;
     }
+
 private:
     nvinfer1::ILogger::Severity _minSeverity = nvinfer1::ILogger::Severity::kVERBOSE;
 };
 
 inline Logger gLogger{};
 
-#define LOG_DEBUG(message) \
-    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kVERBOSE){ \
-        gLogger.debug(message); \
+#define LOG_DEBUG(message)                                                                                             \
+    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kVERBOSE)                                                   \
+    {                                                                                                                  \
+        gLogger.debug(message);                                                                                        \
     }
-#define LOG_INFO(message) \
-    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kINFO){ \
-        gLogger.info(message); \
+#define LOG_INFO(message)                                                                                              \
+    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kINFO)                                                      \
+    {                                                                                                                  \
+        gLogger.info(message);                                                                                         \
     }
-#define LOG_ERROR(message) \
-    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kERROR){ \
-        gLogger.error(message); \
+#define LOG_ERROR(message)                                                                                             \
+    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kERROR)                                                     \
+    {                                                                                                                  \
+        gLogger.error(message);                                                                                        \
     }
-#define LOG_WARNING(message) \
-    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kWARNING){ \
-        gLogger.warning(message); \
+#define LOG_WARNING(message)                                                                                           \
+    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kWARNING)                                                   \
+    {                                                                                                                  \
+        gLogger.warning(message);                                                                                      \
     }
 
 #endif

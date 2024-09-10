@@ -15,16 +15,18 @@
  * limitations under the License.
  */
 
-#include <limits>
-#include <fstream>
 #include <cassert>
+#include <fstream>
+#include <limits>
 
 #include "tokenizer.h"
 #include "tokenizerUtils.h"
 
 // BPE
-BPE::BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, const std::string& patStr)
-    : mEncoder{encoder}, mSpecialTokensEncoder{specialTokensEncoder}, mNeedRegexCollapse{false}
+BPE::BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, std::string const& patStr)
+    : mEncoder{encoder}
+    , mSpecialTokensEncoder{specialTokensEncoder}
+    , mNeedRegexCollapse{false}
 {
     mNeedRegexCollapse = unicodeCollapseRegex(patStr, mRegex);
 
@@ -32,11 +34,11 @@ BPE::BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, const 
     mSpecialTokensDecoder = reverseEncoder(mSpecialTokensEncoder);
 }
 
-bool BPE::specialTokenPartition(const std::string& text, std::forward_list<textPartition>& partitions) const noexcept
+bool BPE::specialTokenPartition(std::string const& text, std::forward_list<textPartition>& partitions) const noexcept
 {
     try
     {
-        for (const auto& [specialToken, specialId] : mSpecialTokensEncoder)
+        for (auto const& [specialToken, specialId] : mSpecialTokensEncoder)
         {
             for (auto it = partitions.begin(); it != partitions.end(); ++it)
             {
@@ -103,20 +105,20 @@ bool BPE::specialTokenPartition(const std::string& text, std::forward_list<textP
 
         return true;
     }
-    catch(const std::exception& e)
+    catch (std::exception const& e)
     {
         LOG_ERROR(fmtstr("BPE::specialTokenPartition failed on text: %s", text.c_str()));
         return false;
     }
 }
 
-bool BPE::tokenize(const std::string& piece, std::vector<Rank>& output) const noexcept
+bool BPE::tokenize(std::string const& piece, std::vector<Rank>& output) const noexcept
 {
     try
     {
         auto words = regexSplitText(piece);
 
-        for (const auto& word : words)
+        for (auto const& word : words)
         {
             auto it = mEncoder.find(word);
             if (it != mEncoder.end())
@@ -130,17 +132,16 @@ bool BPE::tokenize(const std::string& piece, std::vector<Rank>& output) const no
         }
         return true;
     }
-    catch(const std::exception& e)
+    catch (std::exception const& e)
     {
         LOG_ERROR(fmtstr("BPE::tokenize failed on piece: %s", piece.c_str()));
         return false;
     }
-
 }
 
-std::vector<std::string> BPE::regexSplitText(const std::string& text) const
+std::vector<std::string> BPE::regexSplitText(std::string const& text) const
 {
-    const auto cpts = unicodeCptsFromUtf8(text);
+    auto const cpts = unicodeCptsFromUtf8(text);
 
     // collapse for unicode regex match
     std::string textCollapsed;
@@ -159,9 +160,11 @@ std::vector<std::string> BPE::regexSplitText(const std::string& text) const
     bpeWords.reserve(bpeOffsets.size());
 
     int wordStart = 0;
-    for (const auto& offset : bpeOffsets) {
+    for (auto const& offset : bpeOffsets)
+    {
         bpeWords.emplace_back();
-        for (int i = wordStart; i < wordStart + offset; ++i) {
+        for (int i = wordStart; i < wordStart + offset; ++i)
+        {
             bpeWords.back() += unicodeCptToUtf8(cpts[i]);
         }
         wordStart += offset;
@@ -170,7 +173,7 @@ std::vector<std::string> BPE::regexSplitText(const std::string& text) const
     return bpeWords;
 }
 
-void BPE::bytePairEncode(const std::string& piece, std::vector<Rank>& output) const
+void BPE::bytePairEncode(std::string const& piece, std::vector<Rank>& output) const
 {
     // init parts, which is a vector of (start, rank).
     std::vector<std::pair<int, Rank>> parts;
@@ -183,7 +186,7 @@ void BPE::bytePairEncode(const std::string& piece, std::vector<Rank>& output) co
     for (int i = 0; i < piece.size() - 1; ++i)
     {
         Rank rank = MAX_RANK;
-        const auto it = mEncoder.find({piece.begin() + i, piece.begin() + i + 2});
+        auto const it = mEncoder.find({piece.begin() + i, piece.begin() + i + 2});
         if (it != mEncoder.end())
         {
             rank = it->second;
@@ -201,17 +204,12 @@ void BPE::bytePairEncode(const std::string& piece, std::vector<Rank>& output) co
     parts.emplace_back(std::make_pair(piece.size(), MAX_RANK));
 
     // helper function
-    auto getMergedRank = [&](const int i) -> Rank
-    {
+    auto getMergedRank = [&](int const i) -> Rank {
         Rank rank = MAX_RANK;
         if (i + 3 < parts.size())
         {
-            const auto it = mEncoder.find(std::string
-                (
-                    piece.begin() + parts[i].first,
-                    piece.begin() + parts[i + 3].first
-                )
-            );
+            const auto it
+                = mEncoder.find(std::string(piece.begin() + parts[i].first, piece.begin() + parts[i + 3].first));
             if (it != mEncoder.end())
             {
                 rank = it->second;
@@ -237,7 +235,8 @@ void BPE::bytePairEncode(const std::string& piece, std::vector<Rank>& output) co
         for (int i = 0; i < parts.size() - 1; ++i)
         {
             auto rank = parts[i].second;
-            if (rank < minRank.second) {
+            if (rank < minRank.second)
+            {
                 minRank = std::make_pair(i, rank);
             }
         }
@@ -246,19 +245,17 @@ void BPE::bytePairEncode(const std::string& piece, std::vector<Rank>& output) co
     // collect tokens from parts
     for (int i = 0; i < parts.size() - 1; ++i)
     {
-        const auto it = mEncoder.find({
-            piece.begin() + parts[i].first, piece.begin() + parts[i + 1].first
-        });
+        auto const it = mEncoder.find({piece.begin() + parts[i].first, piece.begin() + parts[i + 1].first});
         assert(it != mEncoder.end());
         output.emplace_back(it->second);
     }
 }
 
-bool BPE::detokenize(const std::vector<Rank>& tokens, std::string& output) const noexcept
+bool BPE::detokenize(std::vector<Rank> const& tokens, std::string& output) const noexcept
 {
     try
     {
-        for (const Rank& tok : tokens)
+        for (Rank const& tok : tokens)
         {
             std::string bytes;
             auto it = mDecoder.find(tok);
@@ -276,25 +273,30 @@ bool BPE::detokenize(const std::vector<Rank>& tokens, std::string& output) const
         }
         return true;
     }
-    catch(const std::exception& e)
+    catch (std::exception const& e)
     {
         LOG_ERROR("BPE::detokenize failed.");
         return false;
     }
-
 }
 
 // Tokenizer
 Tokenizer::Tokenizer()
-    : mNumVocab{0}, mBosId{-1}, mEosId{-1}, mPadId{-1}
-{}
-
-Tokenizer::Tokenizer(const std::string& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
-    const Rank& bosId, const Rank& eosId, const Rank& padId, const std::unordered_set<Rank>& stopTokens)
-    : mBosId{bosId}, mEosId{eosId}, mPadId{padId}, mStopTokens{stopTokens}
+    : mNumVocab{0}
+    , mBosId{-1}
+    , mEosId{-1}
+    , mPadId{-1}
 {
-    auto comp = [](const std::pair<std::string, Rank>& p1, const std::pair<std::string, Rank>& p2)
-    {
+}
+
+Tokenizer::Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
+    Rank const& bosId, Rank const& eosId, Rank const& padId, std::unordered_set<Rank> const& stopTokens)
+    : mBosId{bosId}
+    , mEosId{eosId}
+    , mPadId{padId}
+    , mStopTokens{stopTokens}
+{
+    auto comp = [](std::pair<std::string, Rank> const& p1, std::pair<std::string, Rank> const& p2) {
         return p1.second < p2.second;
     };
     auto maxId = std::max_element(mergeableRanks.begin(), mergeableRanks.end(), comp)->second;
@@ -304,7 +306,7 @@ Tokenizer::Tokenizer(const std::string& patStr, BPETokenToRanks& mergeableRanks,
     mBpe = std::make_unique<BPE>(mergeableRanks, specialTokens, patStr);
 }
 
-std::vector<Rank> Tokenizer::encode(const std::string& text, bool addSpecialTokens) const
+std::vector<Rank> Tokenizer::encode(std::string const& text, bool addSpecialTokens) const
 {
     std::vector<Rank> output;
     output.reserve(text.size() + 2 * addSpecialTokens);
@@ -321,7 +323,7 @@ std::vector<Rank> Tokenizer::encode(const std::string& text, bool addSpecialToke
         appendBos(output);
     }
 
-    for (const auto& part : partitions)
+    for (auto const& part : partitions)
     {
         if (part.type == TEXT_PART_RAW_TEXT)
         {
@@ -343,7 +345,7 @@ std::vector<Rank> Tokenizer::encode(const std::string& text, bool addSpecialToke
     return output;
 }
 
-std::string Tokenizer::decode(const std::vector<Rank>& tokens) const
+std::string Tokenizer::decode(std::vector<Rank> const& tokens) const
 {
     std::string output;
     output.reserve(tokens.size() * 2);
@@ -398,7 +400,7 @@ Rank Tokenizer::getPadId() const noexcept
     return mPadId;
 }
 
-const std::unordered_set<Rank>& Tokenizer::getStopTokens() const noexcept
+std::unordered_set<Rank> const& Tokenizer::getStopTokens() const noexcept
 {
     return mStopTokens;
 }
@@ -426,7 +428,7 @@ bool Tokenizer::loadTikTokenVocab(std::filesystem::path const& tiktokenFile, BPE
         file.close();
         return true;
     }
-    catch(const std::exception& e)
+    catch (std::exception const& e)
     {
         LOG_ERROR(fmtstr("Failed to load Tokenizer from Tiktoken: %s", tiktokenFile.c_str()));
         return false;
@@ -464,7 +466,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
             }
             else if (parseVocab)
             {
-                auto start = indent + 3;  // indent + 2 + "
+                auto start = indent + 3; // indent + 2 + "
                 auto mid = line.find("\": ", start);
                 auto end = line.find(",", mid);
 
@@ -540,7 +542,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
 
         return true;
     }
-    catch(const std::exception& e)
+    catch (std::exception const& e)
     {
         LOG_ERROR(fmtstr("Failed to load Tokenizer from HF: %s ", modelDir.c_str()));
         return false;
@@ -558,16 +560,10 @@ void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
     int numBaseTokens = mergeableRanks.size();
 
     std::vector<std::string> specialTokensList{
-        "<|begin_of_text|>",
-        "<|end_of_text|>",
-        "<|reserved_special_token_0|>",
-        "<|reserved_special_token_1|>",
-        "<|reserved_special_token_2|>",
-        "<|reserved_special_token_3|>",
-        "<|start_header_id|>",
-        "<|end_header_id|>",
+        "<|begin_of_text|>", "<|end_of_text|>", "<|reserved_special_token_0|>", "<|reserved_special_token_1|>",
+        "<|reserved_special_token_2|>", "<|reserved_special_token_3|>", "<|start_header_id|>", "<|end_header_id|>",
         "<|reserved_special_token_4|>",
-        "<|eot_id|>",  // end of turn
+        "<|eot_id|>", // end of turn
     };
 
     int numReservedSpecialTokens = 256;
@@ -582,8 +578,7 @@ void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
         specialTokens[specialTokensList[i]] = numBaseTokens + i;
     }
 
-    auto comp = [](const std::pair<std::string, Rank>& p1, const std::pair<std::string, Rank>& p2)
-    {
+    auto comp = [](std::pair<std::string, Rank> const& p1, std::pair<std::string, Rank> const& p2) {
         return p1.second < p2.second;
     };
     auto maxId = std::max_element(mergeableRanks.begin(), mergeableRanks.end(), comp)->second;
@@ -594,10 +589,7 @@ void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
     this->mBosId = specialTokens["<|begin_of_text|>"];
     this->mEosId = specialTokens["<|end_of_text|>"];
     this->mPadId = -1;
-    this->mStopTokens = {
-        specialTokens["<|end_of_text|>"],
-        specialTokens["<|eot_id|>"]
-    };
+    this->mStopTokens = {specialTokens["<|end_of_text|>"], specialTokens["<|eot_id|>"]};
     LOG_INFO(fmtstr("Loaded LlamaV3Tokenizer from %s", modelPath.c_str()));
 }
 
@@ -610,8 +602,7 @@ void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
 
     assert(loadHFVocab(modelDir, mergeableRanks, specialTokens, bosId, eosId));
 
-    auto comp = [](const std::pair<std::string, Rank>& p1, const std::pair<std::string, Rank>& p2)
-    {
+    auto comp = [](std::pair<std::string, Rank> const& p1, std::pair<std::string, Rank> const& p2) {
         return p1.second < p2.second;
     };
     auto maxId = std::max_element(mergeableRanks.begin(), mergeableRanks.end(), comp)->second;
@@ -622,10 +613,7 @@ void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
     this->mBosId = bosId;
     this->mEosId = eosId;
     this->mPadId = -1;
-    this->mStopTokens = {
-        specialTokens["<|end_of_text|>"],
-        specialTokens["<|eot_id|>"]
-    };
+    this->mStopTokens = {specialTokens["<|end_of_text|>"], specialTokens["<|eot_id|>"]};
 
-   LOG_INFO(fmtstr("Loaded LlamaV3Tokenizer from %s", modelDir.c_str()));
+    LOG_INFO(fmtstr("Loaded LlamaV3Tokenizer from %s", modelDir.c_str()));
 }

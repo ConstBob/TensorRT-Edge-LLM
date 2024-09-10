@@ -36,7 +36,7 @@ macro(set_ifndef var val)
 endmacro()
 
 # TRT dependencies
-set_ifndef(CUDA_VERSION 12.5)
+set_ifndef(CUDA_VERSION 12.6)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
 set_ifndef(TRT_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)

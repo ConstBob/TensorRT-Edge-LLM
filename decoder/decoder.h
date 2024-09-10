@@ -1,16 +1,15 @@
 #pragma once
 #ifndef DECODER_H
 #define DECODER_H
-#include <NvInferRuntime.h>
-#include <vector>
-#include <string>
-#include <map>
-#include <memory>
-#include <cfloat>
-#include <cuda_runtime_api.h>
 #include "common.h"
 #include "sampler.h"
-
+#include <NvInferRuntime.h>
+#include <cfloat>
+#include <cuda_runtime_api.h>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
 
 struct ModelConfig
 // This is the model config inferred from optimization profiles
@@ -24,7 +23,6 @@ struct ModelConfig
     int64_t vocabSize;
 };
 
-
 struct GenerationConfig
 {
     int64_t maxLength; // Equivalent to maxNewTokens + Length of input
@@ -37,20 +35,24 @@ class Decoder
 {
 
 public:
-    Decoder():
-        mStream{nullptr},
-        mEngine{nullptr},
-        mContextExecutionContext{nullptr},
-        mGenerationExecutionContext{nullptr},
-        isSetup{false},
-        mConfig{0,0,0,0,0,0,0},
-        mDeviceBuffer{},
-        mSampler{nullptr}
-    {}
+    Decoder()
+        : mStream{nullptr}
+        , mEngine{nullptr}
+        , mContextExecutionContext{nullptr}
+        , mGenerationExecutionContext{nullptr}
+        , isSetup{false}
+        , mConfig{0, 0, 0, 0, 0, 0, 0}
+        , mDeviceBuffer{}
+        , mSampler{nullptr}
+    {
+    }
     bool setup(std::filesystem::path& fp, cudaStream_t& stream);
-    void generate(const std::vector<int64_t>& inputIds, std::vector<int64_t>& outputIds, GenerationConfig generationConfig);
-    ~Decoder(){
-        for (auto deviceMem: mDeviceBuffer){
+    void generate(
+        std::vector<int64_t> const& inputIds, std::vector<int64_t>& outputIds, GenerationConfig generationConfig);
+    ~Decoder()
+    {
+        for (auto deviceMem : mDeviceBuffer)
+        {
             cudaFree(deviceMem.second);
         }
         mDeviceBuffer.clear();

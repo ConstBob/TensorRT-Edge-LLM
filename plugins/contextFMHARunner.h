@@ -39,7 +39,7 @@ public:
     void setupParams(Fused_multihead_attention_params_v2& params);
 
     // Dispatch XQA kernel and compute the attention result.
-    void dispatchFMHAKernel(Fused_multihead_attention_params_v2 & params, cudaStream_t const& stream);
+    void dispatchFMHAKernel(Fused_multihead_attention_params_v2& params, cudaStream_t const& stream);
 
     // The call load and prepare kernel to dispatch. After the call, the CUmodule will be loaded to device
     // and kernel functions are prepared to launch.
@@ -57,4 +57,4 @@ private:
     int32_t mSmVersion;
 };
 
-}
+} // namespace drivellm

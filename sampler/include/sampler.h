@@ -5,21 +5,23 @@
 #include <memory>
 #include <vector>
 
-template <typename T> class Sampler {
+template <typename T>
+class Sampler
+{
 public:
-  Sampler(int64_t batchSize, int64_t vocabSize);
-  ~Sampler();
+    Sampler(int64_t batchSize, int64_t vocabSize);
+    ~Sampler();
 
-  const std::vector<int64_t> &greedySample(const T *logits);
+    std::vector<int64_t> const& greedySample(T const* logits);
 
-  Sampler(Sampler const &) = delete;
-  Sampler &operator=(Sampler const &) = delete;
+    Sampler(Sampler const&) = delete;
+    Sampler& operator=(Sampler const&) = delete;
 
 private:
-  std::unique_ptr<BaseLayer> mLayer;
-  void *mWorkspace;
-  curandState *mDevStates;
-  DecoderDomain mDecoderDomain;
-  std::vector<int64_t> mOutputIds;
-  int64_t *mOutputIdsDevice;
+    std::unique_ptr<BaseLayer> mLayer;
+    void* mWorkspace;
+    curandState* mDevStates;
+    DecoderDomain mDecoderDomain;
+    std::vector<int64_t> mOutputIds;
+    int64_t* mOutputIdsDevice;
 };

@@ -19,14 +19,14 @@
 #ifndef TOKENIZER_H
 #define TOKENIZER_H
 
-#include <string>
-#include <vector>
+#include <cassert>
+#include <filesystem>
 #include <forward_list>
+#include <regex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <regex>
-#include <filesystem>
-#include <cassert>
+#include <vector>
 
 using Rank = std::int32_t;
 using BPETokenToRanks = std::unordered_map<std::string, Rank>;
@@ -40,20 +40,21 @@ typedef enum TEXT_PART_TYPE
 
 struct textPartition
 {
-    textPartition(Rank _token):
-        type(TEXT_PART_SPECIAL_TOKEN),
-        token(_token),
-        rawText(_dummy),
-        offset(0),
-        length(0)
-    {}
+    textPartition(Rank _token)
+        : type(TEXT_PART_SPECIAL_TOKEN)
+        , token(_token)
+        , rawText(_dummy)
+        , offset(0)
+        , length(0)
+    {
+    }
 
-    textPartition(const std::string& _rawText, int _offset, int _length):
-        type(TEXT_PART_RAW_TEXT),
-        token(-1),
-        rawText(_rawText),
-        offset(_offset),
-        length(_length)
+    textPartition(std::string const& _rawText, int _offset, int _length)
+        : type(TEXT_PART_RAW_TEXT)
+        , token(-1)
+        , rawText(_rawText)
+        , offset(_offset)
+        , length(_length)
     {
         assert(offset >= 0);
         assert(length >= 1);
@@ -63,31 +64,31 @@ struct textPartition
     const TEXT_PART_TYPE type;
     const Rank token;
     const std::string _dummy;
-    const std::string& rawText;
-    const int offset;
-    const int length;
+    std::string const& rawText;
+    int const offset;
+    int const length;
 };
 
 // BPE
 class BPE
 {
 public:
-    BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, const std::string& patStr);
+    BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, std::string const& patStr);
 
     ~BPE() = default;
 
-    bool tokenize(const std::string& text, std::vector<Rank>& output) const noexcept;
+    bool tokenize(std::string const& text, std::vector<Rank>& output) const noexcept;
 
-    bool detokenize(const std::vector<Rank>& tokens, std::string& bytes) const noexcept;
+    bool detokenize(std::vector<Rank> const& tokens, std::string& bytes) const noexcept;
 
-    bool specialTokenPartition(const std::string& text, std::forward_list<textPartition>& partitions) const noexcept;
+    bool specialTokenPartition(std::string const& text, std::forward_list<textPartition>& partitions) const noexcept;
 
 private:
-    void initRegex(const std::string* patStr);
+    void initRegex(std::string const* patStr);
 
-    void bytePairEncode(const std::string& piece, std::vector<Rank>& output) const;
+    void bytePairEncode(std::string const& piece, std::vector<Rank>& output) const;
 
-    std::vector<std::string> regexSplitText(const std::string& text) const;
+    std::vector<std::string> regexSplitText(std::string const& text) const;
 
     BPETokenToRanks mEncoder;
     BPERanksToToken mDecoder;
@@ -105,15 +106,15 @@ class Tokenizer
 public:
     Tokenizer();
 
-    Tokenizer(const std::string& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
-        const Rank& bosId = -1, const Rank& eosId = -1, const Rank& padId = -1, 
-        const std::unordered_set<Rank>& stopTokens = {});
+    Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
+        Rank const& bosId = -1, Rank const& eosId = -1, Rank const& padId = -1,
+        std::unordered_set<Rank> const& stopTokens = {});
 
     virtual ~Tokenizer() = default;
 
-    virtual std::vector<Rank> encode(const std::string& text, bool addSpecialTokens = false) const;
+    virtual std::vector<Rank> encode(std::string const& text, bool addSpecialTokens = false) const;
 
-    virtual std::string decode(const std::vector<Rank>& tokens) const;
+    virtual std::string decode(std::vector<Rank> const& tokens) const;
 
     virtual void loadFromTiktoken(std::filesystem::path const& modelPath) = 0;
 
@@ -127,14 +128,14 @@ public:
 
     Rank getPadId() const noexcept;
 
-    const std::unordered_set<Rank>& getStopTokens() const noexcept;
+    std::unordered_set<Rank> const& getStopTokens() const noexcept;
 
 protected:
     bool loadTikTokenVocab(std::filesystem::path const& tiktokenFile, BPETokenToRanks& vocab) const noexcept;
 
     // manually parse vocab and special tokens tokenizer.json file without using 3rdparty libraries
-    bool loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab,
-        BPETokenToRanks& specialTokens, Rank& bosId, Rank& eosId) const noexcept;
+    bool loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab, BPETokenToRanks& specialTokens,
+        Rank& bosId, Rank& eosId) const noexcept;
 
     void appendEos(std::vector<Rank>& output) const noexcept;
 
@@ -159,9 +160,12 @@ public:
 
 private:
     // original regex from tokenizer.json
-    // "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
-    // adapted: https://github.com/ggerganov/llama.cpp/pull/6920#issuecomment-2080233989
-    static constexpr char mRegexExpr[] = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    // "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}|
+    // ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" adapted:
+    // https://github.com/ggerganov/llama.cpp/pull/6920#issuecomment-2080233989
+    static constexpr char mRegexExpr[]
+        = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| "
+          "?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 };
 
 #endif // TOKENIZER_H

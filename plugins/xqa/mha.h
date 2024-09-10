@@ -14,8 +14,8 @@
 #ifndef __CUDACC__
 #include <cuda_runtime_api.h>
 #endif
-#include "utils.h"
 #include "defines.h"
+#include "utils.h"
 
 using CacheElem = ElemType<CACHE_ELEM_ENUM>;
 constexpr uint32_t validElemsPerHead = HEAD_ELEMS;
@@ -50,39 +50,25 @@ using KVCachePageIndex = int32_t; // shape: KVCacheHead[nbKHeads][tokensPerPage]
 
 struct BeamSearchParams
 {
-    uint32_t const* __restrict__ indices; // shape: [batchSize][beamWidth][capacity]
+    uint32_t const* __restrict__ indices;    // shape: [batchSize][beamWidth][capacity]
     uint32_t capacity;
-    uint32_t const* __restrict__ ctxLenList; // shape: [batchSize][beamWidth]. Should be [batchSize] but we have to match trt-llm API.
+    uint32_t const* __restrict__ ctxLenList; // shape: [batchSize][beamWidth]. Should be [batchSize] but we have to
+                                             // match trt-llm API.
 };
 
-void launchMHA(
-    cudaDeviceProp const& prop,
-    uint32_t nbKHeads,
-    IOHead* output,
-    IOHead const* q, // @fixme: we ignore input KV heads for now.
-    GMemKVCacheHead* kvCacheData,
-    uint32_t maxSeqLen,
-    uint32_t const* seqLen,
-    uint32_t batchSize,
-    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for int8/fp8 KV cache.
-    uint32_t* semaphores,
-    void* scratch,
-    cudaStream_t stream);
+void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads, IOHead* output,
+    IOHead const* q,                        // @fixme: we ignore input KV heads for now.
+    GMemKVCacheHead* kvCacheData, uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
+    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
+                                            // int8/fp8 KV cache.
+    uint32_t* semaphores, void* scratch, cudaStream_t stream);
 
-void launchHopperF8MHA(
-    cudaDeviceProp const& prop,
-    uint32_t nbKHeads,
-    IOHead* output,
-    IOHead const* q, // @fixme: we ignore input KV heads for now.
-    GMemKVCacheHead* kvCacheData,
-    uint32_t maxSeqLen,
-    uint32_t const* seqLen,
-    uint32_t batchSize,
-    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for int8/fp8 KV cache.
-    uint32_t* semaphores,
-    void* scratch,
-    cudaStream_t stream);
-
+void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads, IOHead* output,
+    IOHead const* q,                        // @fixme: we ignore input KV heads for now.
+    GMemKVCacheHead* kvCacheData, uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
+    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
+                                            // int8/fp8 KV cache.
+    uint32_t* semaphores, void* scratch, cudaStream_t stream);
 
 #if STATIC_NB_K_HEADS
 constexpr uint32_t nbKHeads = NB_K_HEADS;
@@ -107,7 +93,6 @@ enum class XQAKernelType : int32_t
     kAMPERE_WARP_SPECIALIZED = 0,
     kHOPPER_WARP_SPECIALIZED = 1
 };
-
 
 #ifdef GENERATE_CUBIN
 #define CUBIN_EXPORT extern "C"
