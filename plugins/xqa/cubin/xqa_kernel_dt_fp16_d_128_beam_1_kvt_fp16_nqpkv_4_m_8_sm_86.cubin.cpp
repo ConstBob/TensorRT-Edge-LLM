@@ -2273,4 +2273,4 @@ unsigned int xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_4_m_8_sm_86_cubin_le
 
 // clang-format on
 } // namespace kernels
-} // namespace tensorrt_llm
+} // namespace xqa

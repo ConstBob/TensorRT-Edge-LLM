@@ -10,10 +10,8 @@ enum class ContextAttentionMaskType
     SLIDING_WINDOW_CAUSAL
 };
 
-struct AlibiParams
-{
-    constexpr static int round_down_to_power_two(int x)
-    {
+struct AlibiParams {
+    constexpr static int round_down_to_power_two(int x) {
         x = x | (x >> 1);
         x = x | (x >> 2);
         x = x | (x >> 4);
@@ -23,22 +21,21 @@ struct AlibiParams
     }
 
     AlibiParams() = default;
-
-    AlibiParams(int h)
-    {
+    AlibiParams(int h, float scale_after_alibi = 1.f)
+        : scale_after_alibi(scale_after_alibi) {
         h_pow_2 = round_down_to_power_two(h);
         alibi_neg4_div_h = -4.0f / h_pow_2;
     }
-
-    AlibiParams(int h, int s, int tp_size, int rank)
-        : AlibiParams(h * tp_size)
-    {
+    AlibiParams(int h, int s, int tp_size, int rank,
+        float scale_after_alibi = 1.f)
+        : AlibiParams(h * tp_size, scale_after_alibi){
         head_idx_offset = h * rank;
         sequence_pos_offset = s * rank;
     }
 
     int h_pow_2{};
     float alibi_neg4_div_h{};
+    float scale_after_alibi{};
     // Could be simplified to `int rank` derive the others as `num_heads * rank, s * rank` at
     // runtime, but this makes assumptions about the layout downstream
     // (e.g. downstream may only split across the head dimension, so s would be the full sequence)
@@ -46,69 +43,57 @@ struct AlibiParams
     int sequence_pos_offset = 0;
 };
 
-typedef struct alignas(64)
-{
-    uint64_t data[8];
-} cudaTmaDesc;
-
 struct Fused_multihead_attention_params_v2
 {
     // The QKV matrices.
-    const void* qkv_ptr;
+    void* qkv_ptr;
+    // The separate Q matrice.
+    void* q_ptr;
+    // The separate KV matrice.
+    void* kv_ptr;
     // The mask to implement drop-out.
-    const void* packed_mask_ptr;
+    void* packed_mask_ptr;
     // The O matrix (output).
     void* o_ptr;
 
     // The stride between rows of the Q, K and V matrices.
     int64_t qkv_stride_in_bytes;
+    // The stride between rows of the separate Q matrice. (Used by non-packed Q input)
+    int64_t q_stride_in_bytes;
+    // The stride between rows of the separate KV matrice. (Used by Seperate KV input)
+    int64_t kv_stride_in_bytes;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;
     // The stride between rows of O.
     int64_t o_stride_in_bytes;
 
     // The dimensions. In ordinary multi-head attention (MHA), there are equal number of QKV heads
-    int b, h, s, d;
+    int b, h, h_kv, h_q_per_kv, s, d;
+    // Sliding Window Attention
+    // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
+    int sliding_window_size = INT_MAX;
     // The scaling factors for the kernel.
-    uint32_t scale_bmm1, scale_softmax, scale_bmm2;
+    uint32_t scale_bmm1, tanh_scale_bmm1, scale_softmax, scale_bmm2;
 
-    // Do we use trick to avoid I2F/F2I in the INT8 kernel.
-    bool enable_i2f_trick;
+    // The scaling factors in the device memory (required by TRT-LLM + FP8 FMHA).
+    uint32_t* scale_bmm1_d;
+    uint32_t* scale_bmm2_d;
 
-    // array of length b+1 holding prefix sum of actual sequence lengths
-    const int* cu_seqlens;
-
-    // use C/32 Format.
-    bool interleaved = false;
-    bool use_int8_scale_max = false;
+    bool enable_i2f_trick = false;
+    // array of length b+1 holding prefix sum of actual q sequence lengths.
+    int *cu_q_seqlens;
+    // array of length b+1 holding prefix sum of actual kv sequence lengths.
+    int *cu_kv_seqlens;
+    // array of length b+1 holding prefix sum of actual mask sequence lengths.
+    // it might not be the same as cu_q_seqlens as the mask seqlens will be padded.
+    int *cu_mask_rows;
 
     // If the kernel is using alibi or not
     bool has_alibi = false;
     AlibiParams alibi_params{};
 
-    // The number of heads computed by one iteration of the wave.
-    int heads_per_wave;
-    // Buffers to perform a global sync and a critical section.
-    int *counters, *max_barriers, *sum_barriers, *locks;
-    // Scratch buffers to finalize softmax.
-    float *max_scratch_ptr, *sum_scratch_ptr;
-    // Scratch buffer to finalize the output (not needed for FP16).
-    int* o_scratch_ptr;
-
-    // In multi-query or grouped-query attention (MQA/GQA), several Q heads are associated with one KV head
-    int h_kv;
-
-    // Sliding Window Attention
-    // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
-    int sliding_window_size = INT_MAX;
-
     // is input/output padded
     bool is_s_padded = false;
-
-    // tma descriptors
-    cudaTmaDesc tma_desc_q{};
-    cudaTmaDesc tma_desc_k{};
-    cudaTmaDesc tma_desc_v{};
 
     void clear()
     {
@@ -116,13 +101,8 @@ struct Fused_multihead_attention_params_v2
         packed_mask_ptr = nullptr;
         o_ptr = nullptr;
 
-        counters = nullptr;
-        max_barriers = nullptr;
-        sum_barriers = nullptr;
-        locks = nullptr;
-        max_scratch_ptr = nullptr;
-        sum_scratch_ptr = nullptr;
-        o_scratch_ptr = nullptr;
+        q_ptr = nullptr;
+        kv_ptr = nullptr;
 
         qkv_stride_in_bytes = 0;
         packed_mask_stride_in_bytes = 0;
@@ -130,20 +110,21 @@ struct Fused_multihead_attention_params_v2
 
         b = 0;
         h = 0;
+        h_kv = 0;
+        h_q_per_kv = 0;
         s = 0;
         d = 0;
         // The scaling factors for the kernel.
         scale_bmm1 = 0;
+        tanh_scale_bmm1 = 0;
         scale_softmax = 0;
         scale_bmm2 = 0;
 
         enable_i2f_trick = false;
 
-        cu_seqlens = nullptr;
-        interleaved = false;
-        use_int8_scale_max = false;
+        cu_q_seqlens = nullptr;
+        cu_kv_seqlens = nullptr;
 
-        h_kv = 0;
         sliding_window_size = INT_MAX;
         is_s_padded = false;
 

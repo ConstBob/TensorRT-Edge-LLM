@@ -147,7 +147,7 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
 
     params.qkv_ptr = &(qkvData[0][0][0]);
     params.o_ptr = &(outdata[0][0][0]);
-    params.cu_seqlens = &(seqLenList[0]);
+    params.cu_q_seqlens = &(seqLenList[0]);
 
     for (int i = 0; i < 1; ++i)
     {
@@ -174,6 +174,7 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
                         {
                             printf("At %d %d %d %d, data: %f refdata: %f. \n", req, s, q, i, data, refData);
                             pass = false;
+                            check(pass, "Expect output match with saved data.");
                         }
                     }
                 }
