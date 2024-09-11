@@ -349,26 +349,24 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
 {
     float const invSqrtScale = (1.f / sqrtf(mHeadSize));
 
-    // The kernel picked up by the project use the LOG2 optimization. At softmax(Qk^T), the kernel use 
-    // LOG2 instead of LOGE for computation. The optimization is removed for TRT-LLM for precision issue.
-    // TODO: Check precision and switch to another FMHA kernel branch for the project.
-    float const scale_bmm1 = invSqrtScale * float(M_LOG2E);
+    float const scale_bmm1 = invSqrtScale;
     float const scale_softmax = 1.f; // Seems to be only required for int8
     float const scale_bmm2 = 1.f;
 
     Data_type scale_type = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
-    set_alpha(params.scale_bmm1, scale_bmm1, fmha_v2::DATA_TYPE_FP32);
+    set_alpha(params.scale_bmm1, scale_bmm1, scale_type);
     set_alpha(params.scale_softmax, scale_softmax, scale_type);
     set_alpha(params.scale_bmm2, scale_bmm2, scale_type);
 
     params.b = mBatchSize;
     params.h = mNumHeads;
+    params.h_kv = mNumKVHeads;
+    params.h_q_per_kv = mNumHeads / mNumKVHeads;
     params.s = mSequenceLen;    // max sequence length
     params.d = mHeadSize;
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
     params.qkv_stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
-    params.h_kv = mNumKVHeads;
 
     // Always use padded sequence length now.
     params.is_s_padded = true;
@@ -389,7 +387,7 @@ bool ContextFMHARunner::prepareToRun()
 
 void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2 & params, cudaStream_t const& stream)
 {
-    check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_seqlens != nullptr,
+    check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr,
         "Device pointers are supposed to be valid");
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention, attentionMaskTypeToInt(mLaunchParams.attention_mask_type),

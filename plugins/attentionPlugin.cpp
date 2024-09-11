@@ -357,7 +357,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nv
 
         // Set device ptr for FMHA kernel.
         params.qkv_ptr = qkvDevicePtr;
-        params.cu_seqlens = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
+        params.cu_q_seqlens = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
         params.o_ptr = attentionResultDevicePtr;
 
         // Dispatch FMHA kernel

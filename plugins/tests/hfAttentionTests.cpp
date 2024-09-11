@@ -182,7 +182,7 @@ void test_fmha()
 
 
     params.qkv_ptr = qkv_device_ptr;
-    params.cu_seqlens = seqlen_device_ptr;
+    params.cu_q_seqlens = seqlen_device_ptr;
     params.o_ptr = attention_ptr;
 
     cudaStream_t const stream = nullptr;
