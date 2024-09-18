@@ -33,13 +33,12 @@ enum class RopeInitType : int8_t
     kLLAMA3 = 2,
 };
 
-void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
-    const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
+void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, int const* seq_lens,
+    int const head_num, int const kv_head_num, int const size_per_head, int const kv_cache_capacity,
     PositionEmbeddingType positionEmbedType, float rotary_embedding_freq, float rotary_embedding_scale,
-    RopeInitType rope_init_type, const int token_to_process, cudaStream_t stream);
+    RopeInitType rope_init_type, int const token_to_process, cudaStream_t stream);
 
-void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, const int* seq_lens,
-    const int head_num, const int kv_head_num, const int size_per_head, const int kv_cache_capacity,
+void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, int const* seq_lens,
+    int const head_num, int const kv_head_num, int const size_per_head, int const kv_cache_capacity,
     PositionEmbeddingType positionEmbedType, float rotary_embedding_freq, float rotary_embedding_scale,
-    RopeInitType rope_init_type, const int token_to_process, cudaStream_t stream);
-
+    RopeInitType rope_init_type, int const token_to_process, cudaStream_t stream);

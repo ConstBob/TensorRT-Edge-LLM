@@ -30,7 +30,7 @@ struct XQALaunchParams
         int32_t const* sequence_lengths = nullptr;
         uint32_t capacity = 0;
     };
-    
+
     void* output = nullptr;
     void const* qInputPtr = nullptr;
     KVCache kvCache;
@@ -51,11 +51,11 @@ struct XQALaunchParams
 class DecoderXQARunner
 {
 public:
-    DecoderXQARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t numQHeads,
-        int32_t numKvHeads, int32_t headSize, int32_t smVersion);
+    DecoderXQARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t numQHeads, int32_t numKvHeads,
+        int32_t headSize, int32_t smVersion);
 
     DecoderXQARunner() = default;
-    
+
     ~DecoderXQARunner() = default;
 
     size_t getWorkspaceSize(int max_num_tokens);
@@ -65,7 +65,7 @@ public:
     int32_t prepareToRun();
 
     // Dispatch XQA kernel and compute the attention result.
-    void dispatchXQAKernel(XQALaunchParams & params, cudaStream_t const& stream);
+    void dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream);
 
     // Initialize a XQA parameter with MHA and hardware configuration to query. The XQA parameter can be used by
     // prepareToRun() to query kernel to dispatch. Device pointer shall be setup by caller to dispatch XQA kernel.
@@ -82,4 +82,3 @@ private:
 };
 
 } // namespace drivellm
-

@@ -10,8 +10,10 @@ enum class ContextAttentionMaskType
     SLIDING_WINDOW_CAUSAL
 };
 
-struct AlibiParams {
-    constexpr static int round_down_to_power_two(int x) {
+struct AlibiParams
+{
+    constexpr static int round_down_to_power_two(int x)
+    {
         x = x | (x >> 1);
         x = x | (x >> 2);
         x = x | (x >> 4);
@@ -22,13 +24,14 @@ struct AlibiParams {
 
     AlibiParams() = default;
     AlibiParams(int h, float scale_after_alibi = 1.f)
-        : scale_after_alibi(scale_after_alibi) {
+        : scale_after_alibi(scale_after_alibi)
+    {
         h_pow_2 = round_down_to_power_two(h);
         alibi_neg4_div_h = -4.0f / h_pow_2;
     }
-    AlibiParams(int h, int s, int tp_size, int rank,
-        float scale_after_alibi = 1.f)
-        : AlibiParams(h * tp_size, scale_after_alibi){
+    AlibiParams(int h, int s, int tp_size, int rank, float scale_after_alibi = 1.f)
+        : AlibiParams(h * tp_size, scale_after_alibi)
+    {
         head_idx_offset = h * rank;
         sequence_pos_offset = s * rank;
     }
@@ -81,12 +84,12 @@ struct Fused_multihead_attention_params_v2
 
     bool enable_i2f_trick = false;
     // array of length b+1 holding prefix sum of actual q sequence lengths.
-    int *cu_q_seqlens;
+    int* cu_q_seqlens;
     // array of length b+1 holding prefix sum of actual kv sequence lengths.
-    int *cu_kv_seqlens;
+    int* cu_kv_seqlens;
     // array of length b+1 holding prefix sum of actual mask sequence lengths.
     // it might not be the same as cu_q_seqlens as the mask seqlens will be padded.
-    int *cu_mask_rows;
+    int* cu_mask_rows;
 
     // If the kernel is using alibi or not
     bool has_alibi = false;

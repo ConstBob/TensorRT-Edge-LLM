@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
+#include "../contextFMHARunner.h"
 #include "../pluginUtils.h"
 #include "../utilKernels.h"
-#include "../contextFMHARunner.h"
 
 #include <fstream>
 
@@ -51,7 +51,8 @@ void loadDataFromFile(std::string name, std::vector<half>& dataVec, int32_t nbDa
 }
 
 // Concat seperate QKV tensor of shape [1, S, H_{q, k, v}, D] into [1, S, Hq+Hk+Hv, D]
-std::vector<half> concatQKVData(std::vector<half> const& qTensor, std::vector<half> const& kTensor, std::vector<half> const& vTensor)
+std::vector<half> concatQKVData(
+    std::vector<half> const& qTensor, std::vector<half> const& kTensor, std::vector<half> const& vTensor)
 {
     std::vector<half> concatData;
     auto appendSequenceOfData = [&](std::vector<half> const& source, int32_t baseIdx, int32_t nbHeads) {
@@ -71,7 +72,7 @@ std::vector<half> concatQKVData(std::vector<half> const& qTensor, std::vector<ha
 
     return concatData;
 }
-}
+} // namespace
 
 void testRope()
 {
@@ -103,9 +104,9 @@ void testRope()
     checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * 1, cudaMemcpyHostToDevice));
 
     cudaStream_t const stream = nullptr;
-    invokeContextApplyRopeUpdateKVFP16(qkv_device_ptr, nullptr, kvcache_ptr, seqlen_device_ptr,
-        kNUM_Q_HEADS, kNUM_K_HEADS, kDIM_HEAD, kKV_CACHE_CAPACITY, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
-        kROPE_INIT_TYPE, kINPUT_LENGTH_PADDED, stream);
+    invokeContextApplyRopeUpdateKVFP16(qkv_device_ptr, nullptr, kvcache_ptr, seqlen_device_ptr, kNUM_Q_HEADS,
+        kNUM_K_HEADS, kDIM_HEAD, kKV_CACHE_CAPACITY, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE,
+        kINPUT_LENGTH_PADDED, stream);
     checkCuda(cudaStreamSynchronize(stream));
     checkCuda(cudaGetLastError());
 
@@ -173,13 +174,12 @@ void test_fmha()
     std::vector<int32_t> temp{0, kSEQUENCE_LENGTH};
     checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * 2, cudaMemcpyHostToDevice));
 
-    drivellm::ContextFMHARunner runner(nvinfer1::DataType::kHALF, kBATCH_SIZE, kINPUT_LENGTH_PADDED, kNUM_Q_HEADS,
-        kNUM_K_HEADS, kDIM_HEAD, 86);
+    drivellm::ContextFMHARunner runner(
+        nvinfer1::DataType::kHALF, kBATCH_SIZE, kINPUT_LENGTH_PADDED, kNUM_Q_HEADS, kNUM_K_HEADS, kDIM_HEAD, 86);
 
     Fused_multihead_attention_params_v2 params{};
     params.clear();
     runner.setupParams(params);
-
 
     params.qkv_ptr = qkv_device_ptr;
     params.cu_q_seqlens = seqlen_device_ptr;

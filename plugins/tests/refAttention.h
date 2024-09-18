@@ -12,18 +12,23 @@
 
 #pragma once
 
-#include <Eigen/Dense>
 #include "xqa/mha.h"
+#include <Eigen/Dense>
 
 struct CacheSeq
 {
-    GMemCacheHead const& operator[](uint32_t i) const {return data[i];}
+    GMemCacheHead const& operator[](uint32_t i) const
+    {
+        return data[i];
+    }
 
     GMemCacheHead const* data;
 };
 
 template <typename MathElem, uint32_t tileSize>
-Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(IOHead const* q, CacheSeq const& k, CacheSeq const& v, uint32_t seqLen, float kvScale, float xScale);
+Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(
+    IOHead const* q, CacheSeq const& k, CacheSeq const& v, uint32_t seqLen, float kvScale, float xScale);
 
 template <typename MathElem>
-Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q, CacheSeq const& k, CacheSeq const& v, uint32_t seqLen, float kvScale, float xScale);
+Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(
+    IOHead const* q, CacheSeq const& k, CacheSeq const& v, uint32_t seqLen, float kvScale, float xScale);

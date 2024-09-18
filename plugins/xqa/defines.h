@@ -100,4 +100,5 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 template <int32_t elemTypeEnum>
-using ElemType = mha::conditional_t<elemTypeEnum == 0, INPUT_ELEM, mha::conditional_t<elemTypeEnum == 1, int8_t, mha::conditional_t<elemTypeEnum == 2, __nv_fp8_e4m3, void>>>;
+using ElemType = mha::conditional_t<elemTypeEnum == 0, INPUT_ELEM,
+    mha::conditional_t<elemTypeEnum == 1, int8_t, mha::conditional_t<elemTypeEnum == 2, __nv_fp8_e4m3, void>>>;

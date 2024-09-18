@@ -20,11 +20,12 @@
 #define UNICODE_DATA_H
 
 #include <cstdint>
-#include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
-struct rangeNfd {
+struct rangeNfd
+{
     uint32_t first;
     uint32_t last;
     uint32_t nfd;

@@ -37,9 +37,7 @@ constexpr float kROPE_SCALE = 1.0f;
 constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_HALF;
 constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kLLAMA3;
 
-
-constexpr int32_t kDEVICE_ALIGNMENT{128};       // Make sure all device pointers are aligned by 128.
-
+constexpr int32_t kDEVICE_ALIGNMENT{128}; // Make sure all device pointers are aligned by 128.
 
 // TODO: Use a CUDA kernel to do the predix sum.
 void getSeqLenPrefixLength(int32_t* device_ptr_predix_sum, int32_t const* device_ptr_seqlen, int32_t nbSeq)
@@ -49,12 +47,14 @@ void getSeqLenPrefixLength(int32_t* device_ptr_predix_sum, int32_t const* device
     std::vector<int32_t> prefixSumVec(nbSeq + 1, 0);
     for (int32_t i = 0; i < nbSeq; ++i)
     {
-        prefixSumVec[i+1] = seqlenVec[i] + prefixSumVec[i];
+        prefixSumVec[i + 1] = seqlenVec[i] + prefixSumVec[i];
     }
-    checkCuda(cudaMemcpy(device_ptr_predix_sum, prefixSumVec.data(), sizeof(int32_t) * (nbSeq + 1), cudaMemcpyHostToDevice));
+    checkCuda(
+        cudaMemcpy(device_ptr_predix_sum, prefixSumVec.data(), sizeof(int32_t) * (nbSeq + 1), cudaMemcpyHostToDevice));
 }
 
-void* alignDevicePtr(void* ptr) {
+void* alignDevicePtr(void* ptr)
+{
     // Convert the pointer to an integer
     uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
     uintptr_t aligned_addr = (addr + kDEVICE_ALIGNMENT) & ~static_cast<uintptr_t>(kDEVICE_ALIGNMENT);
@@ -75,10 +75,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name)
     checkCuda(cudaGetDeviceProperties(&prop, device));
     int32_t smVersion = prop.major * 10 + prop.minor;
 
-    mFMHARunner = ContextFMHARunner(mDataType, mBatchSize, mInputContextLen,
-        mNumHeadQ, mNumHeadK, mNumElemPerHead, smVersion);
-    mGQARunner = DecoderXQARunner(mDataType, mBatchSize, mNumHeadQ,
-        mNumHeadK, mNumElemPerHead, smVersion);
+    mFMHARunner
+        = ContextFMHARunner(mDataType, mBatchSize, mInputContextLen, mNumHeadQ, mNumHeadK, mNumElemPerHead, smVersion);
+    mGQARunner = DecoderXQARunner(mDataType, mBatchSize, mNumHeadQ, mNumHeadK, mNumElemPerHead, smVersion);
 }
 
 AttentionPlugin::~AttentionPlugin()
@@ -102,7 +101,9 @@ nvinfer1::IPluginCapability* AttentionPlugin::getCapabilityInterface(nvinfer1::P
         assert(type == PluginCapabilityType::kCORE);
         return static_cast<IPluginV3OneCore*>(this);
     }
-    catch (std::exception const& e) {}
+    catch (std::exception const& e)
+    {
+    }
     return nullptr;
 }
 
@@ -140,12 +141,12 @@ int32_t AttentionPlugin::getNbOutputs() const noexcept
 }
 
 bool AttentionPlugin::supportsFormatCombination(
-        int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+    int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     // Support context/generation phase inputs:
     //      GEMM-QKV tensor (FP16) with shape [B, S, Hq+Hk+Hv,D]
-    //      KV-cache tensor (FP16) with shape [B, 2, Hkv, Smax, D], here Smax is the max capacity of the linear kvcache buffer.
-    //      Real context length: [B] (a vector of scalars) with type int32_t, the tensor should reside on host.
+    //      KV-cache tensor (FP16) with shape [B, 2, Hkv, Smax, D], here Smax is the max capacity of the linear kvcache
+    //      buffer. Real context length: [B] (a vector of scalars) with type int32_t, the tensor should reside on host.
     // Support context/generation phase outputs:
     //      attention result (FP16) with shape [B, S. Hq, D]
     //      KV-cache tensor, same as the above.
@@ -177,14 +178,13 @@ bool AttentionPlugin::supportsFormatCombination(
         {
             auto const tensorDim = tensorDesc.dims;
             status &= tensorDim.d[0] == mBatchSize;
-            status &= tensorDim.d[1] == 2;      // Specify K and V
+            status &= tensorDim.d[1] == 2; // Specify K and V
             status &= tensorDim.d[2] == mNumHeadK;
             status &= tensorDim.d[3] == mTotalContextLen || tensorDim.d[3] == 0;
             status &= tensorDim.d[4] == mNumElemPerHead;
         }
         return status;
     };
-
 
     auto checkSequenceLen = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
         bool status{true};
@@ -195,7 +195,7 @@ bool AttentionPlugin::supportsFormatCombination(
         if (status)
         {
             auto const tensorDim = tensorDesc.dims;
-            status &= tensorDim.d[0] == mBatchSize;  // single scalar
+            status &= tensorDim.d[0] == mBatchSize; // single scalar
         }
         return status;
     };
@@ -229,17 +229,19 @@ bool AttentionPlugin::supportsFormatCombination(
         case 2: result = checkSequenceLen(inOut[2]); break;
         case 3: result = checkAttentionOutput(inOut[3]); break;
         case 4: result = checkKVCache(inOut[4]); break;
-        default:
-            break;
+        default: break;
         }
         return result;
     }
-    catch (std::exception const& e) {}
+    catch (std::exception const& e)
+    {
+    }
     return false;
 }
 
-int32_t AttentionPlugin::getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs, nvinfer1::DimsExprs const* shapeInputs,
-        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+int32_t AttentionPlugin::getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
+    nvinfer1::DimsExprs const* shapeInputs, int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
+    nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -258,19 +260,21 @@ int32_t AttentionPlugin::getOutputShapes(nvinfer1::DimsExprs const* inputs, int3
         outputs[1] = inputs[1];
         return 0;
     }
-    catch (std::exception const& e) {}
+    catch (std::exception const& e)
+    {
+    }
     return 1;
 }
 
-int32_t AttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs, nvinfer1::DynamicPluginTensorDesc const* out,
-        int32_t nbOutputs) noexcept
+int32_t AttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
+    nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
     // Here we may want to switch different MHA runner.
     return 0;
 }
 
 size_t AttentionPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
-        nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
+    nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
     // We may want to reserve workspace here, need to determine more details after implementing the runners.
     // For FMHA kernel we need a buffer to store prefix sum of context lengths.
@@ -282,8 +286,8 @@ size_t AttentionPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const
     return nbBytesQTensor + kDEVICE_ALIGNMENT;
 }
 
-int32_t AttentionPlugin::getOutputDataTypes(
-        nvinfer1::DataType* outputTypes, int32_t nbOutputs, nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept
+int32_t AttentionPlugin::getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs,
+    nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
     try
     {
@@ -293,14 +297,16 @@ int32_t AttentionPlugin::getOutputDataTypes(
         outputTypes[1] = DataType::kHALF;
         return 0;
     }
-    catch(const std::exception& e) {}
+    catch (std::exception const& e)
+    {
+    }
 
     // non-zero return value treated as error code.
     return 1;
 }
 
-int32_t AttentionPlugin::onShapeChange(
-        nvinfer1::PluginTensorDesc const* in, int32_t nbInputs, nvinfer1::PluginTensorDesc const* out, int32_t nbOutputs) noexcept
+int32_t AttentionPlugin::onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs,
+    nvinfer1::PluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
     // We may need switch MHA runner, but it seems not necessary since we will receive shapes in enqueue as well.
     return 0;
@@ -318,8 +324,9 @@ PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
     return nullptr;
 }
 
-int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
+    cudaStream_t stream) noexcept
 {
     constexpr int32_t kQKV_INPUT_IDX{0};
     constexpr int32_t kKV_CACHE_INPUT_OUTPUT_IDX{1};
@@ -343,9 +350,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nv
     if (isContextPhase)
     {
         // At Context phase. Do 1. Apply rope and write KVCache. 2. Dispatch FMHA runner.
-        invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr,
-            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, kROPE_TYPE, kROPE_BASE_FREQUENCY,
-                kROPE_SCALE, kROPE_INIT_TYPE, mInputContextLen, stream);
+        invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ,
+            mNumHeadK, mNumElemPerHead, mTotalContextLen, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
+            kROPE_INIT_TYPE, mInputContextLen, stream);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
         Fused_multihead_attention_params_v2 params{};
@@ -368,8 +375,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nv
         // Generation phase we first prepare Q vector and update KVCache.
         half* qVecDevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
         invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
-            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen,
-                kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, 1, stream);
+            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
+            kROPE_INIT_TYPE, 1, stream);
 
         // Prepare GQA runner parameter to dispatch kernel
         XQALaunchParams params = mGQARunner.initXQAParams();
@@ -411,7 +418,8 @@ char const* AttentionPluginCreator::getPluginVersion() const noexcept
     return kATTENTION_PLUGIN_VERSION;
 }
 
-nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
+nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(
+    char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
 {
     AttentionPlugin* plugin = new AttentionPlugin(std::string(name));
     return plugin;

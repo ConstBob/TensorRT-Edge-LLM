@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-#include <iostream>
 #include <fstream>
+#include <iostream>
 
 #include <tokenizer.h>
 #include <tokenizerUtils.h>
 
-void testEncodeDecode(Tokenizer* tokenizer, const std::string& input, const std::vector<Rank> expected = {}, 
+void testEncodeDecode(Tokenizer* tokenizer, std::string const& input, const std::vector<Rank> expected = {},
     bool addSpecialTokens = false)
 {
     auto token = tokenizer->encode(input, addSpecialTokens);
@@ -30,7 +30,7 @@ void testEncodeDecode(Tokenizer* tokenizer, const std::string& input, const std:
     gLogger.info("Input: " + input);
 
     std::stringstream ss;
-    for (const auto& t : token)
+    for (auto const& t : token)
     {
         ss << t << ", ";
     }
@@ -39,7 +39,7 @@ void testEncodeDecode(Tokenizer* tokenizer, const std::string& input, const std:
     if (!expected.empty())
     {
         ss.str("");
-        for (const auto& t : expected)
+        for (auto const& t : expected)
         {
             ss << t << ", ";
         }
@@ -60,7 +60,7 @@ void testEncodeDecode(Tokenizer* tokenizer, const std::string& input, const std:
     gLogger.info("Passed");
 }
 
-std::vector<Rank> getGolden(const std::string& modelPath, const std::string& input, bool addSpecialTokens)
+std::vector<Rank> getGolden(std::string const& modelPath, std::string const& input, bool addSpecialTokens)
 {
     if (modelPath.compare(modelPath.size() - 15, 15, "tokenizer.model") != 0)
     {
@@ -80,7 +80,8 @@ std::vector<Rank> getGolden(const std::string& modelPath, const std::string& inp
 
         assert(pipe);
 
-        while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
+        while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr)
+        {
             result += buffer.data();
         }
         // remove []
@@ -92,7 +93,8 @@ std::vector<Rank> getGolden(const std::string& modelPath, const std::string& inp
         while (true)
         {
             int idx = result.find(", ", start);
-            if (idx == std::string::npos) {
+            if (idx == std::string::npos)
+            {
                 break;
             }
 
@@ -103,9 +105,9 @@ std::vector<Rank> getGolden(const std::string& modelPath, const std::string& inp
 
         golden.emplace_back(std::stoi(result.substr(start)));
 
-        return golden;       
+        return golden;
     }
-    catch(const std::exception& e)
+    catch (std::exception const& e)
     {
         return {};
     }
@@ -143,9 +145,8 @@ int main(int argc, char* argv[])
             "Usage:\n"
             "argv[1]: tokenizer path\n"
             "argv[2]: (optional) input_text\n"
-            "argv[3]: (optional) add_special [0,1]"
-        );
+            "argv[3]: (optional) add_special [0,1]");
     }
-    
+
     return 0;
 }

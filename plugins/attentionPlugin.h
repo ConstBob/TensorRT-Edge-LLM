@@ -25,9 +25,9 @@
 namespace drivellm
 {
 class AttentionPlugin : public nvinfer1::IPluginV3,
-                             public nvinfer1::IPluginV3OneCore,
-                             public nvinfer1::IPluginV3OneBuild,
-                             public nvinfer1::IPluginV3OneRuntime
+                        public nvinfer1::IPluginV3OneCore,
+                        public nvinfer1::IPluginV3OneBuild,
+                        public nvinfer1::IPluginV3OneRuntime
 {
 public:
     AttentionPlugin(std::string const& name);
@@ -36,7 +36,7 @@ public:
     AttentionPlugin() = delete;
 
     AttentionPlugin(AttentionPlugin const&) = delete;
-    
+
     ~AttentionPlugin() override;
 
     // IPluginV3 Methods
@@ -56,27 +56,28 @@ public:
     // end of IPluginV3OneCore Methods
 
     // IPluginV3Build Methods
-    bool supportsFormatCombination(
-        int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept override;
+    bool supportsFormatCombination(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
+        int32_t nbOutputs) noexcept override;
 
     int32_t getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs, nvinfer1::DimsExprs const* shapeInputs,
-        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs, nvinfer1::IExprBuilder& exprBuilder) noexcept override;
+        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
+        nvinfer1::IExprBuilder& exprBuilder) noexcept override;
 
-    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs, nvinfer1::DynamicPluginTensorDesc const* out,
-        int32_t nbOutputs) noexcept override;
+    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
+        nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
 
     size_t getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
         nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
 
-    int32_t getOutputDataTypes(
-        nvinfer1::DataType* outputTypes, int32_t nbOutputs, nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept override;
+    int32_t getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs, nvinfer1::DataType const* inputTypes,
+        int32_t nbInputs) const noexcept override;
 
     int32_t getNbOutputs() const noexcept override;
     // end IPluginV3Build Methods
 
     // IPluginV3Runtime Methods
-    int32_t onShapeChange(
-        nvinfer1::PluginTensorDesc const* in, int32_t nbInputs, nvinfer1::PluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
+    int32_t onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs, nvinfer1::PluginTensorDesc const* out,
+        int32_t nbOutputs) noexcept override;
 
     nvinfer1::IPluginV3* attachToContext(nvinfer1::IPluginResourceContext* context) noexcept override;
 
@@ -97,7 +98,7 @@ protected:
     int32_t const mNumHeadK{8};
     int32_t const mNumHeadV{8};
     int32_t const mNumElemPerHead{128};
-    
+
     // temporary variable for input context length. We should later expand it as a list
     // or let it become a user-configurable field.
     int32_t const mInputContextLen{128};
@@ -132,10 +133,10 @@ public:
 
     char const* getPluginVersion() const noexcept override;
 
-    nvinfer1::IPluginV3* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
+    nvinfer1::IPluginV3* createPlugin(
+        char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
 
 private:
-
     nvinfer1::PluginFieldCollection mFieldCollection;
 };
 

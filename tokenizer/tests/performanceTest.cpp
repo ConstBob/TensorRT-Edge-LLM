@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-#include <iostream>
-#include <fstream>
 #include <chrono>
+#include <fstream>
+#include <iostream>
 
 #include <tokenizer.h>
 #include <tokenizerUtils.h>
@@ -33,7 +33,7 @@ std::string strip(std::string& str)
     return "";
 }
 
-void testPerformance(const std::string& modelPath, const std::string& dataPath)
+void testPerformance(std::string const& modelPath, std::string const& dataPath)
 {
     std::ifstream data(dataPath);
     std::string line;
@@ -72,7 +72,7 @@ void testPerformance(const std::string& modelPath, const std::string& dataPath)
     std::chrono::duration<float> encodeTimer;
     std::chrono::duration<float> decodeTimer;
 
-    for (const auto& text : documents)
+    for (auto const& text : documents)
     {
         auto start = std::chrono::steady_clock::now();
         auto token = enc->encode(text);
@@ -89,13 +89,13 @@ void testPerformance(const std::string& modelPath, const std::string& dataPath)
     auto decodeDuration = std::chrono::duration_cast<std::chrono::microseconds>(decodeTimer).count();
 
     ss.str("");
-    ss << "Encode latency: " << (encodeDuration / nBytes) << " μs / Byte" 
-        << ", throughput: " << (nBytes / 1024 / 1024 / encodeDuration) * 1e6 << " MB / s";
+    ss << "Encode latency: " << (encodeDuration / nBytes) << " μs / Byte"
+       << ", throughput: " << (nBytes / 1024 / 1024 / encodeDuration) * 1e6 << " MB / s";
     gLogger.info(ss.str());
 
     ss.str("");
-    ss << "Decode latency: " << (decodeDuration / nBytes) << " μs / Byte" 
-        << ", throughput: " << (nBytes / 1024 / 1024 / decodeDuration) * 1e6 << " MB / s";
+    ss << "Decode latency: " << (decodeDuration / nBytes) << " μs / Byte"
+       << ", throughput: " << (nBytes / 1024 / 1024 / decodeDuration) * 1e6 << " MB / s";
     gLogger.info(ss.str());
 }
 
@@ -110,9 +110,8 @@ int main(int argc, char* argv[])
         gLogger.error(
             "Usage:\n"
             "argv[1]: tokenizer path\n"
-            "argv[2]: wiki.tokens path"
-        );
+            "argv[2]: wiki.tokens path");
     }
-    
+
     return 0;
 }
