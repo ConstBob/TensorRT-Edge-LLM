@@ -136,7 +136,7 @@ void Decoder::allocateBuffer()
 {
     // Allocate buffers for inputs and logits, and set the shape
     void* contextLengthDevice;
-    CUDA_CHECK(cudaMalloc(&contextLengthDevice, sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&contextLengthDevice, sizeof(int32_t)));
     mContextExecutionContext->setTensorAddress("context_length", contextLengthDevice);
     mGenerationExecutionContext->setTensorAddress("context_length", contextLengthDevice);
     mDeviceBuffer["context_length"] = contextLengthDevice;
@@ -243,9 +243,9 @@ void Decoder::generate(
 {
     // We assume bs = 1 for this `generate` function for now. Copy input_ids and context_length
     assert(outputIds.size() == 0);
-    int64_t contextLength = inputIds.size();
+    int32_t contextLength = inputIds.size();
     CUDA_CHECK(cudaMemcpyAsync(
-        mDeviceBuffer["context_length"], &contextLength, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+        mDeviceBuffer["context_length"], &contextLength, sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(
         mDeviceBuffer["input_ids"], inputIds.data(), contextLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
     int64_t lastTokenIds = contextLength - 1;
@@ -267,7 +267,7 @@ void Decoder::generate(
             break;
         }
         CUDA_CHECK(cudaMemcpyAsync(
-            mDeviceBuffer["context_length"], &contextLength, sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+            mDeviceBuffer["context_length"], &contextLength, sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
         CUDA_CHECK(cudaMemcpyAsync(
             mDeviceBuffer["last_token_ids"], &lastTokenIds, sizeof(int64_t), cudaMemcpyHostToHost, mStream));
         CUDA_CHECK(cudaMemcpyAsync(

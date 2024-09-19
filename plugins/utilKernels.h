@@ -42,3 +42,5 @@ void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuff
     int const head_num, int const kv_head_num, int const size_per_head, int const kv_cache_capacity,
     PositionEmbeddingType positionEmbedType, float rotary_embedding_freq, float rotary_embedding_scale,
     RopeInitType rope_init_type, int const token_to_process, cudaStream_t stream);
+
+void invokePrefixSum(int32_t const* in_d, int32_t* out_d, int32_t numSeq, cudaStream_t stream);

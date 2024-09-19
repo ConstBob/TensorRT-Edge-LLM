@@ -39,28 +39,14 @@ constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kLLAMA3;
 
 constexpr int32_t kDEVICE_ALIGNMENT{128}; // Make sure all device pointers are aligned by 128.
 
-// TODO: Use a CUDA kernel to do the predix sum.
-void getSeqLenPrefixLength(int32_t* device_ptr_predix_sum, int32_t const* device_ptr_seqlen, int32_t nbSeq)
-{
-    std::vector<int32_t> seqlenVec(nbSeq);
-    checkCuda(cudaMemcpy(seqlenVec.data(), device_ptr_seqlen, sizeof(int32_t) * nbSeq, cudaMemcpyDeviceToHost));
-    std::vector<int32_t> prefixSumVec(nbSeq + 1, 0);
-    for (int32_t i = 0; i < nbSeq; ++i)
-    {
-        prefixSumVec[i + 1] = seqlenVec[i] + prefixSumVec[i];
-    }
-    checkCuda(
-        cudaMemcpy(device_ptr_predix_sum, prefixSumVec.data(), sizeof(int32_t) * (nbSeq + 1), cudaMemcpyHostToDevice));
-}
-
-void* alignDevicePtr(void* ptr)
+int8_t* alignDevicePtr(void* ptr)
 {
     // Convert the pointer to an integer
     uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
     uintptr_t aligned_addr = (addr + kDEVICE_ALIGNMENT) & ~static_cast<uintptr_t>(kDEVICE_ALIGNMENT);
 
     // Convert the aligned address back to a pointer
-    return reinterpret_cast<void*>(aligned_addr);
+    return reinterpret_cast<int8_t*>(aligned_addr);
 }
 
 } // namespace
@@ -273,6 +259,7 @@ int32_t AttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const
     return 0;
 }
 
+// TODO: extend the worksapce calculation to a more generalized form.
 size_t AttentionPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
     nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
@@ -345,7 +332,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     half* kvCacheDevicePtr = reinterpret_cast<half*>(outputs[kKV_CACHE_INPUT_OUTPUT_IDX]);
 
     // Align workspace to be minimal aligned.
-    void* alignedWorkspacePtr = alignDevicePtr(workspace);
+    int8_t* alignedWorkspacePtr = alignDevicePtr(workspace);
 
     if (isContextPhase)
     {
@@ -360,11 +347,12 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         mFMHARunner.setupParams(params);
 
         // Compute the prefix sum of sequence length.
-        getSeqLenPrefixLength(reinterpret_cast<int32_t*>(alignedWorkspacePtr), seqLengthDevicePtr, mBatchSize);
+        int32_t* prefixSumDevicePtr = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
+        invokePrefixSum(seqLengthDevicePtr, prefixSumDevicePtr, mBatchSize, stream);
 
         // Set device ptr for FMHA kernel.
         params.qkv_ptr = qkvDevicePtr;
-        params.cu_q_seqlens = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
+        params.cu_q_seqlens = prefixSumDevicePtr;
         params.o_ptr = attentionResultDevicePtr;
 
         // Dispatch FMHA kernel

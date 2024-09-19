@@ -17,6 +17,13 @@
 
 #include "pluginUtils.h"
 #include "utilKernels.h"
+
+#include <thrust/copy.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/fill.h>
+#include <thrust/scan.h>
+
 namespace
 {
 
@@ -372,4 +379,16 @@ void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuff
     dispatchApplyRopeUpdateKV<half, true>(QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head,
         kv_cache_capacity, positionEmbedType, rotary_embedding_freq, rotary_embedding_scale, ropeInitType,
         token_to_process, stream);
+}
+
+void invokePrefixSum(int32_t const* in_d, int32_t* out_d, int32_t numSeq, cudaStream_t stream)
+{
+    thrust::device_ptr<const int32_t> thrust_in_ptr = thrust::device_pointer_cast(in_d);
+    thrust::device_ptr<int32_t> thrust_out_ptr(out_d);
+
+    // Fill out_d with zeros and then copy ctxLen contents to &thrust_out_ptr[1] (left leading zero).
+    thrust::fill(thrust::cuda::par.on(stream), thrust_out_ptr, thrust_out_ptr + numSeq + 1, 0);
+    thrust::copy(thrust::cuda::par.on(stream), thrust_in_ptr, thrust_in_ptr + numSeq, thrust_out_ptr + 1);
+    // Apply in-place inclusive scan to compute the result.
+    thrust::inclusive_scan(thrust::cuda::par.on(stream), thrust_out_ptr, thrust_out_ptr + numSeq + 1, thrust_out_ptr);
 }
