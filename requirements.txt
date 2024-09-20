@@ -3,3 +3,4 @@ transformers
 onnx
 onnx_graphsurgeon
 numpy
+onnx_runtime

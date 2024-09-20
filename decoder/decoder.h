@@ -1,6 +1,7 @@
 #pragma once
 #ifndef DECODER_H
 #define DECODER_H
+#include "benchmarkProfiler.h"
 #include "common.h"
 #include "sampler.h"
 #include <NvInferRuntime.h>
@@ -46,9 +47,11 @@ public:
         , mSampler{nullptr}
     {
     }
-    bool setup(std::filesystem::path& fp, cudaStream_t& stream);
-    void generate(
-        std::vector<int64_t> const& inputIds, std::vector<int64_t>& outputIds, GenerationConfig generationConfig);
+    bool setup(std::filesystem::path const& fp, cudaStream_t& stream);
+    void generate(std::vector<int64_t> const& inputIds, std::vector<int64_t>& outputIds,
+        GenerationConfig generationConfig, int64_t endIds = -1,
+        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
+    size_t getDeviceMemorySize() const noexcept;
     ~Decoder()
     {
         for (auto deviceMem : mDeviceBuffer)

@@ -10,7 +10,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 
 using namespace std;
 
@@ -183,25 +182,36 @@ private:
 
 inline Logger gLogger{};
 
-#define LOG_DEBUG(message)                                                                                             \
-    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kVERBOSE)                                                   \
+#define LOG_DEBUG(...)                                                                                                 \
+    do                                                                                                                 \
     {                                                                                                                  \
-        gLogger.debug(message);                                                                                        \
-    }
-#define LOG_INFO(message)                                                                                              \
-    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kINFO)                                                      \
+        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kVERBOSE)                                               \
+        {                                                                                                              \
+            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
+        }                                                                                                              \
+    } while (0)
+#define LOG_INFO(...)                                                                                                  \
+    do                                                                                                                 \
     {                                                                                                                  \
-        gLogger.info(message);                                                                                         \
-    }
-#define LOG_ERROR(message)                                                                                             \
-    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kERROR)                                                     \
+        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kINFO)                                                  \
+        {                                                                                                              \
+            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
+        }                                                                                                              \
+    } while (0)
+#define LOG_ERROR(...)                                                                                                 \
+    do                                                                                                                 \
     {                                                                                                                  \
-        gLogger.error(message);                                                                                        \
-    }
-#define LOG_WARNING(message)                                                                                           \
-    if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kWARNING)                                                   \
+        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kERROR)                                                 \
+        {                                                                                                              \
+            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
+        }                                                                                                              \
+    } while (0)
+#define LOG_WARNING(...)                                                                                               \
+    do                                                                                                                 \
     {                                                                                                                  \
-        gLogger.warning(message);                                                                                      \
-    }
-
+        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kWARNING)                                               \
+        {                                                                                                              \
+            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
+        }                                                                                                              \
+    } while (0)
 #endif

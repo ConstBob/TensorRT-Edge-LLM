@@ -12,7 +12,7 @@
 using namespace nvinfer1;
 using namespace std;
 
-bool Decoder::setup(std::filesystem::path& fp, cudaStream_t& stream)
+bool Decoder::setup(std::filesystem::path const& fp, cudaStream_t& stream)
 {
     try
     {
@@ -87,7 +87,7 @@ bool Decoder::validateAndFillConfig()
     int64_t numLayers = (nbIOs - 3) / 2;
     // Check input_ids
     std::string inputIdsName = "input_ids";
-    check(checkStaticShape(inputIdsName), fmtstr("%s should be static", inputIdsName));
+    check(checkStaticShape(inputIdsName), fmtstr("%s should be static", inputIdsName.c_str()));
     Dims inputIdsShapeContext = mEngine->getProfileShape(inputIdsName.c_str(), 0, OptProfileSelector::kMIN);
     batchSize = inputIdsShapeContext.d[0];
     maxInputLength = inputIdsShapeContext.d[1];
@@ -97,7 +97,7 @@ bool Decoder::validateAndFillConfig()
     for (int32_t i = 0; i < numLayers; ++i)
     {
         std::string kvName = fmtstr("past_key_values.%d", i);
-        check(checkStaticShape(kvName), fmtstr("%s should be static", kvName));
+        check(checkStaticShape(kvName), fmtstr("%s should be static", kvName.c_str()));
         Dims kvShapeContext = mEngine->getProfileShape(kvName.c_str(), 0, OptProfileSelector::kMIN);
         Dims kvShapeGeneration = mEngine->getProfileShape(kvName.c_str(), 1, OptProfileSelector::kMIN);
         assert(
@@ -238,8 +238,8 @@ std::string Decoder::printLogits()
     return formatFloat16Vector(logits);
 }
 
-void Decoder::generate(
-    std::vector<int64_t> const& inputIds, std::vector<int64_t>& outputIds, GenerationConfig generationConfig)
+void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int64_t>& outputIds,
+    GenerationConfig generationConfig, int64_t endIds, std::shared_ptr<BenchmarkProfiler> const profiler)
 {
     // We assume bs = 1 for this `generate` function for now. Copy input_ids and context_length
     assert(outputIds.size() == 0);
@@ -254,15 +254,23 @@ void Decoder::generate(
     // Context Phase
     mContextExecutionContext->enqueueV3(mStream);
 
+    bool contextStep = true;
+
     while ((contextLength < generationConfig.maxLength))
     {
         std::vector<int64_t> const& generatedToken
             = mSampler->greedySample(reinterpret_cast<half*>(mDeviceBuffer["logits"]));
         outputIds.push_back(generatedToken[0]);
+        if (contextStep && profiler)
+        {
+            profiler->recordHostEnd("first token latency");
+            profiler->recordDeviceStart("generation");
+            contextStep = false;
+        }
         ++contextLength;
         lastTokenIds = 0;
         // Reaches eos token and reaches minLength.
-        if ((generatedToken[0] == 128001) && (contextLength > generationConfig.minLength))
+        if (generatedToken[0] == endIds && (contextLength > generationConfig.minLength))
         {
             break;
         }
@@ -274,4 +282,14 @@ void Decoder::generate(
             mDeviceBuffer["input_ids"], generatedToken.data(), 1 * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
         mGenerationExecutionContext->enqueueV3(mStream);
     }
+
+    if (profiler)
+    {
+        profiler->recordDeviceEnd("generation");
+    }
+}
+
+size_t Decoder::getDeviceMemorySize() const noexcept
+{
+    return mEngine->getDeviceMemorySizeV2();
 }

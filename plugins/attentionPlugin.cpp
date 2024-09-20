@@ -134,7 +134,7 @@ bool AttentionPlugin::supportsFormatCombination(
     //      KV-cache tensor (FP16) with shape [B, 2, Hkv, Smax, D], here Smax is the max capacity of the linear kvcache
     //      buffer. Real context length: [B] (a vector of scalars) with type int32_t, the tensor should reside on host.
     // Support context/generation phase outputs:
-    //      attention result (FP16) with shape [B, S. Hq, D]
+    //      attention result (FP16) with shape [B, S, Hq, D]
     //      KV-cache tensor, same as the above.
     // In above context, S can be 1 (generation) or supported input context length.
     auto checkGemmQKV = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {

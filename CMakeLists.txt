@@ -65,7 +65,7 @@ include_directories(${CMAKE_SOURCE_DIR}/common)
 link_libraries(${NVINFER_LIB} ${CUDART_LIB})
 
 # Add executable with sources
-# add_subdirectory(plugins)
+add_subdirectory(plugins)
 add_subdirectory(tokenizer)
 add_subdirectory(sampler)
 add_subdirectory(decoder)
