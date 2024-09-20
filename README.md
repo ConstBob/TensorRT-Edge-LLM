@@ -59,7 +59,14 @@ You will use `builder` binary to build the TensorRT engine. Example command:
 
 You will use `runtime` binary to infer the built TensorRT engine. Example command:
 
+1. Inference with prompt
+
 ```
-./runtime --tokenizerPath=llama-v3-8b-instruct-hf/ --enginePath=llama.engine --maxLength=256
+./runtime --tokenizerPath=llama-v3-8b-instruct-hf/ --enginePath=llama.engine --maxLength=256 --inputString="What is the result of 1+1?"
 ```
 
+2. Benchmark the engine
+
+```
+ ./runtime --tokenizerPath=llama-v3-8b-instruct-hf/  --enginePath=llama.engine --maxLength=256 --inputLength=24 --mode benchmark
+```

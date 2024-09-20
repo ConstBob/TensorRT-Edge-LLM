@@ -107,7 +107,7 @@ bool BPE::specialTokenPartition(std::string const& text, std::forward_list<textP
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR(fmtstr("BPE::specialTokenPartition failed on text: %s", text.c_str()));
+        LOG_ERROR("BPE::specialTokenPartition failed on text: %s", text.c_str());
         return false;
     }
 }
@@ -134,7 +134,7 @@ bool BPE::tokenize(std::string const& piece, std::vector<Rank>& output) const no
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR(fmtstr("BPE::tokenize failed on piece: %s", piece.c_str()));
+        LOG_ERROR("BPE::tokenize failed on piece: %s", piece.c_str());
         return false;
     }
 }
@@ -430,7 +430,7 @@ bool Tokenizer::loadTikTokenVocab(std::filesystem::path const& tiktokenFile, BPE
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR(fmtstr("Failed to load Tokenizer from Tiktoken: %s", tiktokenFile.c_str()));
+        LOG_ERROR("Failed to load Tokenizer from Tiktoken: %s", tiktokenFile.c_str());
         return false;
     }
 }
@@ -544,7 +544,7 @@ bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR(fmtstr("Failed to load Tokenizer from HF: %s ", modelDir.c_str()));
+        LOG_ERROR("Failed to load Tokenizer from HF: %s ", modelDir.c_str());
         return false;
     }
 }
@@ -590,7 +590,7 @@ void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
     this->mEosId = specialTokens["<|end_of_text|>"];
     this->mPadId = -1;
     this->mStopTokens = {specialTokens["<|end_of_text|>"], specialTokens["<|eot_id|>"]};
-    LOG_INFO(fmtstr("Loaded LlamaV3Tokenizer from %s", modelPath.c_str()));
+    LOG_INFO("Loaded LlamaV3Tokenizer from %s", modelPath.c_str());
 }
 
 void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
@@ -615,5 +615,5 @@ void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
     this->mPadId = -1;
     this->mStopTokens = {specialTokens["<|end_of_text|>"], specialTokens["<|eot_id|>"]};
 
-    LOG_INFO(fmtstr("Loaded LlamaV3Tokenizer from %s", modelDir.c_str()));
+    LOG_INFO("Loaded LlamaV3Tokenizer from %s", modelDir.c_str());
 }

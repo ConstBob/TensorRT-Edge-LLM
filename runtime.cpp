@@ -1,18 +1,32 @@
 
+#include "common/common.h"
 #include "decoder.h"
 #include "tokenizer.h"
 #include <NvInferRuntime.h>
+#include <algorithm>
+#include <bits/getopt_core.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cuda_profiler_api.h>
 #include <dlfcn.h>
 #include <filesystem>
-#include <fstream>
 #include <getopt.h>
+#include <iomanip>
 #include <iostream>
+#include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
 using namespace std;
 using namespace nvinfer1;
+
+enum class MODE
+{
+    kInference,
+    kBenchmark
+};
 
 struct RuntimeArgs
 {
@@ -21,6 +35,10 @@ struct RuntimeArgs
     std::string enginePath;
     std::string tokenizerPath;
     int maxLength{40};
+    int inputLength;
+    MODE mode{MODE::kInference};
+    int64_t numRuns{10};
+    int64_t warmUp{2};
     bool debug{false};
 };
 
@@ -33,11 +51,15 @@ void printUsage(char const* programName)
     std::cerr << "Options:" << std::endl;
     std::cerr << "  -h               Display this help message" << std::endl;
     std::cerr << "  --inputString    Provide the input string to the runtime. Required. " << std::endl;
+    std::cerr << "  --inputLength    Provide the input string to the runtime. Required. " << std::endl;
     std::cerr << "  --enginePath     Provide the input TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --tokenizerPath  Provide the path to HF tokenizer. Required. " << std::endl;
     std::cerr << "  --maxLength      Provide the maximum output length for the generation session (including the "
                  "input). Default = 40"
               << std::endl;
+    std::cerr << "  --mode           Provide the mode. " << std::endl;
+    std::cerr << "  --warm_up        [Benchmark] Provide warm up iterations before benchmark starts." << std::endl;
+    std::cerr << "  --num_runs       [Benchmark] Minimal number of iterations to run during benchmarking." << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs tensors." << std::endl;
 };
 
@@ -45,7 +67,9 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 {
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"inputString", required_argument, 0, 'i'},
         {"enginePath", required_argument, 0, 'e'}, {"tokenizerPath", required_argument, 0, 't'},
-        {"maxLength", required_argument, 0, 's'}, {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
+        {"maxLength", required_argument, 0, 's'}, {"inputLength", required_argument, 0, 'c'},
+        {"mode", required_argument, 0, 'm'}, {"warm_up", required_argument, 0, 'w'},
+        {"num_runs", required_argument, 0, 'r'}, {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -94,11 +118,203 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                 args.maxLength = std::stoi(optarg);
             }
             break;
+        case 'c':
+            if (optarg)
+            {
+                args.inputLength = std::stoi(optarg);
+            }
+            break;
+        case 'm':
+            if (optarg)
+            {
+                if (strcmp(optarg, "benchmark") == 0)
+                {
+                    args.mode = MODE::kBenchmark;
+                }
+                else
+                {
+                    args.mode = MODE::kInference;
+                }
+            }
+            break;
+        case 'w':
+            if (optarg)
+            {
+                args.warmUp = std::stoi(optarg);
+            }
+            break;
+        case 'r':
+            if (optarg)
+            {
+                args.numRuns = std::stoi(optarg);
+            }
+            break;
         case 'd': args.debug = true; break;
         default: return false;
         }
     }
     return true;
+}
+
+std::string decode(std::filesystem::path const& enginePath, std::string const inputString, Tokenizer* tokenizer,
+    GenerationConfig const& generationConfig, bool debug = false)
+{
+    std::vector<int32_t> inputIdsInt32 = tokenizer->encode(inputString, true);
+    std::vector<int64_t> inputIds;
+    std::ostringstream oss;
+    if (debug)
+    {
+        oss << "input_ids size is: " << inputIdsInt32.size() << ". Content is: [";
+    }
+    for (int i = 0; i < inputIdsInt32.size() - 1; ++i)
+    {
+        inputIds.push_back(static_cast<int64_t>(inputIdsInt32[i]));
+        if (debug)
+        {
+            oss << inputIds[i] << ",";
+        }
+    }
+    if (debug)
+    {
+        oss << "]";
+        LOG_DEBUG(oss.str().c_str());
+    }
+
+    Decoder* decoder = new Decoder();
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    decoder->setup(enginePath, stream);
+    std::vector<int64_t> outputIds;
+    outputIds.reserve(generationConfig.maxLength);
+    decoder->generate(inputIds, outputIds, generationConfig, tokenizer->getEosId());
+    std::vector<int32_t> outputIdsInt32;
+    if (debug)
+    {
+        LOG_DEBUG("Output length is %d", outputIds.size());
+    }
+
+    for (int i = 0; i < outputIds.size(); ++i)
+    {
+        outputIdsInt32.push_back(static_cast<int32_t>(outputIds[i]));
+    }
+    std::string output = tokenizer->decode(outputIdsInt32);
+    return output;
+}
+
+void benchmark(std::filesystem::path const& enginePath, std::vector<int64_t> const& inputIds, int64_t warmUp,
+    int64_t numRuns, GenerationConfig const& generationConfig)
+{
+    auto profiler = std::make_shared<BenchmarkProfiler>();
+    profiler->startTiming();
+    profiler->recordDeviceMemStart();
+    profiler->recordHostMemStart();
+    Decoder* decoder = new Decoder();
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    profiler->recordHostStart("decoder setup");
+    decoder->setup(enginePath, stream);
+    profiler->recordHostEnd("decoder setup");
+    std::vector<int64_t> outputIds;
+    outputIds.reserve(generationConfig.maxLength);
+
+    profiler->stopTiming();
+    for (int64_t i = 0; i < warmUp; i++)
+    {
+        // Warmup for profiler
+        profiler->recordHostStart("seq latency");
+        decoder->generate(inputIds, outputIds, generationConfig, -1, profiler);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        profiler->recordHostEnd("seq latency");
+        outputIds.resize(0);
+    }
+    cudaDeviceSynchronize();
+
+    profiler->startTiming();
+    cudaProfilerStart();
+    for (int64_t i = 0; i < numRuns; i++)
+    {
+        profiler->recordHostStart("seq latency");
+        profiler->recordHostStart("first token latency");
+        decoder->generate(inputIds, outputIds, generationConfig, -1, profiler);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        profiler->recordHostEnd("seq latency");
+        outputIds.resize(0);
+    }
+    cudaProfilerStop();
+    profiler->stopTiming();
+    auto peakDeviceMem = profiler->recordDeviceMemEnd();
+    auto peakHostMem = profiler->recordHostMemEnd();
+
+    auto maxNewTokens = generationConfig.maxLength - inputIds.size();
+    auto [averageSeqLatency, duration, seqLatencies] = profiler->getHostElapsedTimeMs("seq latency");
+    auto [averageFirstTokenLatency, totalFirstTokenLatency, firstTokenLatencies]
+        = profiler->getHostElapsedTimeMs("first token latency");
+    auto [averageGenerationTime, totalGenerationTime, generationTimes] = profiler->getDeviceElapsedTimeMs("generation");
+    auto decoderSetupLatency = std::get<1>(profiler->getHostElapsedTimeMs("decoder setup"));
+    auto tokensPerSec = maxNewTokens / (averageSeqLatency / 1000);
+    auto generationTokensPerSec = maxNewTokens / (averageGenerationTime / 1000);
+
+    LOG_INFO("========================================================");
+    LOG_INFO("Benchmarking done. Decoder setup: %.2fs, Iteration: %d, GPU Time: %.2fs.", decoderSetupLatency / 1000,
+        seqLatencies.size(), duration / 1000);
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+    oss << "Sequence Latencies(ms): [";
+    constexpr int maxPrintedLatencies{20};
+    for (int i = 0; i < seqLatencies.size(); ++i)
+    {
+        oss << seqLatencies[i];
+        if (i == seqLatencies.size() - 1)
+        {
+            oss << "]";
+        }
+        else if (seqLatencies.size() > maxPrintedLatencies && i == (maxPrintedLatencies / 2 - 1))
+        {
+            oss << " ... ";
+            i = seqLatencies.size() - maxPrintedLatencies / 2;
+        }
+        else
+        {
+            oss << ", ";
+        }
+    }
+
+    LOG_INFO(oss.str().c_str());
+
+    oss.str("");
+    oss.clear();
+    oss << "First Token Latencies(ms): [";
+    for (int i = 0; i < firstTokenLatencies.size(); ++i)
+    {
+        oss << firstTokenLatencies[i];
+        if (i == firstTokenLatencies.size() - 1)
+        {
+            oss << "]";
+        }
+        else if (firstTokenLatencies.size() > maxPrintedLatencies && i == (maxPrintedLatencies / 2 - 1))
+        {
+            oss << " ... ";
+            i = firstTokenLatencies.size() - maxPrintedLatencies / 2;
+        }
+        else
+        {
+            oss << ", ";
+        }
+    }
+    LOG_INFO(oss.str().c_str());
+    LOG_INFO("batch_size: %d", 1);
+    LOG_INFO("input_length: %d", inputIds.size());
+    LOG_INFO("output_length: %d", maxNewTokens);
+    LOG_INFO("seq_latency(ms): %.2f", averageSeqLatency);
+    LOG_INFO("first_token_latency(ms): %.2f", averageFirstTokenLatency);
+    LOG_INFO("tokens_per_sec: %.2f", tokensPerSec);
+    LOG_INFO("generation_time(ms): %.2f", averageGenerationTime);
+    LOG_INFO("generation_tokens_per_sec: %.2f", generationTokensPerSec);
+    LOG_INFO("cpu_peak_mem(GiB): %.2f", peakHostMem / 1048576.0);
+    LOG_INFO("gpu_peak_mem(GiB): %.2f", peakDeviceMem / 1073741824.0);
+    LOG_INFO("execution_context_mem(GiB): %.2f", decoder->getDeviceMemorySize() / 1073741824.0);
+    LOG_INFO("========================================================");
 }
 
 int main(int argc, char* argv[])
@@ -107,12 +323,12 @@ int main(int argc, char* argv[])
     if ((argc < 2) || (!parseRuntimeArgs(args, argc, argv)))
     {
         printUsage(argv[0]);
-        return false;
+        return EXIT_FAILURE;
     }
     if (args.help)
     {
         printUsage(argv[0]);
-        return true;
+        return EXIT_SUCCESS;
     }
 
     if (args.debug)
@@ -125,52 +341,42 @@ int main(int argc, char* argv[])
     }
 
     void* handle = dlopen("../plugins/build/libLLamaPlugin.so", RTLD_LAZY);
-
-    Tokenizer* tokenizer = new LlamaV3Tokenizer();
-    tokenizer->loadFromHF(args.tokenizerPath);
-    std::vector<int32_t> inputIdsInt32 = tokenizer->encode(args.inputString, true);
-    std::vector<int64_t> inputIds;
-    std::ostringstream oss;
-    if (args.debug)
+    if (!handle)
     {
-        oss << "input_ids size is: " << inputIdsInt32.size() << ". Content is: [";
-    }
-    for (int i = 0; i < inputIdsInt32.size() - 1; ++i)
-    {
-        inputIds.push_back(static_cast<int64_t>(inputIdsInt32[i]));
-        if (args.debug)
-        {
-            oss << inputIds[i] << ",";
-        }
-    }
-    if (args.debug)
-    {
-        oss << "]";
-        LOG_DEBUG(oss.str());
+        LOG_ERROR("Cannot open library: %s", dlerror());
+        return EXIT_FAILURE;
     }
 
-    Decoder* decoder = new Decoder();
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-    std::filesystem::path _enginePath(args.enginePath);
-    decoder->setup(_enginePath, stream);
     GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
-    std::vector<int64_t> outputIds;
-    outputIds.reserve(args.maxLength);
-    decoder->generate(inputIds, outputIds, generationConfig);
-    std::vector<int32_t> outputIdsInt32;
-    if (args.debug)
+
+    switch (args.mode)
     {
-        LOG_DEBUG(fmtstr("Output length is %d", outputIds.size()));
+    case MODE::kBenchmark:
+    {
+        if (args.inputLength < 1)
+        {
+            LOG_ERROR("Please specify the input length");
+            return EXIT_FAILURE;
+        }
+        std::vector<int64_t> input(args.inputLength);
+        std::random_device dev;
+        std::mt19937 rng(dev());
+        std::uniform_int_distribution<std::mt19937::result_type> dist(0, 1000);
+        std::generate(input.begin(), input.end(), [&rng, &dist]() { return dist(rng); });
+        benchmark(args.enginePath, input, args.warmUp, args.numRuns, generationConfig);
+        break;
+    }
+    case MODE::kInference:
+    {
+        Tokenizer* tokenizer = new LlamaV3Tokenizer();
+        tokenizer->loadFromHF(args.tokenizerPath);
+        auto output = decode(args.enginePath, args.inputString, tokenizer, generationConfig, args.debug);
+        LOG_INFO("Output is %s", output.c_str());
+        break;
+    }
     }
 
-    for (int i = 0; i < outputIds.size(); ++i)
-    {
-        outputIdsInt32.push_back(static_cast<int32_t>(outputIds[i]));
-    }
-    std::string output = tokenizer->decode(outputIdsInt32);
-    LOG_INFO(fmtstr("Output is %s", output.c_str()));
     dlclose(handle);
 
-    return true;
+    return EXIT_SUCCESS;
 };

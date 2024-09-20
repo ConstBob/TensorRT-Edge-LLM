@@ -2,6 +2,7 @@
 #include "NvOnnxParser.h"
 #include "common.h"
 #include <NvInfer.h>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
@@ -38,8 +39,11 @@ void printUsage(char const* programName)
     std::cerr
         << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 256"
         << std::endl;
+    std::cerr
+        << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 256"
+        << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more logs." << std::endl;
-};
+}
 
 bool parseBuilderArgs(BuilderArgs& args, int argc, char* argv[])
 {
@@ -111,6 +115,9 @@ bool setStaticProfile(IOptimizationProfile* profile, char const* inputName, Dims
     return profile->setDimensions(inputName, OptProfileSelector::kMIN, dims)
         && profile->setDimensions(inputName, OptProfileSelector::kOPT, dims)
         && profile->setDimensions(inputName, OptProfileSelector::kMAX, dims);
+    return profile->setDimensions(inputName, OptProfileSelector::kMIN, dims)
+        && profile->setDimensions(inputName, OptProfileSelector::kOPT, dims)
+        && profile->setDimensions(inputName, OptProfileSelector::kMAX, dims);
 }
 
 Dims createDims(std::vector<int64_t> const& shape)
@@ -131,13 +138,13 @@ int main(int argc, char** argv)
     {
         std::cerr << "Unable to parse builder args" << std::endl;
         printUsage(argv[0]);
-        return false;
+        return EXIT_FAILURE;
     }
     if (args.help)
     {
         printUsage(argv[0]);
         std::cout << "find help mode is True" << std::endl;
-        return true;
+        return EXIT_SUCCESS;
     }
 
     if (args.debug)
@@ -152,8 +159,8 @@ int main(int argc, char** argv)
     void* handle = dlopen("../plugins/build/libLLamaPlugin.so", RTLD_LAZY);
     if (!handle)
     {
-        LOG_ERROR(fmtstr("Cannot open library: %s", dlerror()));
-        return false;
+        LOG_ERROR("Cannot open library: %s", dlerror());
+        return EXIT_FAILURE;
     }
 
     // Create the builder
@@ -161,7 +168,7 @@ int main(int argc, char** argv)
     if (!builder)
     {
         LOG_ERROR("Failed to create builder.");
-        return false;
+        return EXIT_FAILURE;
     }
 
     // Create the network definition
@@ -170,7 +177,7 @@ int main(int argc, char** argv)
     if (!network)
     {
         LOG_ERROR("Failed to create network.");
-        return false;
+        return EXIT_FAILURE;
     }
 
     // Create the ONNX parser
@@ -178,14 +185,14 @@ int main(int argc, char** argv)
     if (!parser)
     {
         LOG_ERROR("Failed to create parser.");
-        return false;
+        return EXIT_FAILURE;
     }
 
     // Parse the ONNX model
     if (!parser->parseFromFile(args.onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
     {
-        LOG_ERROR(fmtstr("Failed to parse ONNX file: %s", args.onnxPath));
-        return false;
+        LOG_ERROR("Failed to parse ONNX file: %s", args.onnxPath.c_str());
+        return EXIT_FAILURE;
     }
 
     // Build the engine
@@ -193,7 +200,7 @@ int main(int argc, char** argv)
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");
-        return false;
+        return EXIT_FAILURE;
     }
 
     int32_t nbInputs = network->getNbInputs();
@@ -214,8 +221,8 @@ int main(int argc, char** argv)
     Dims kvCacheGenerationShape = createDims({args.batchSize, 2, numKVHeads, args.maxSeqLen, hiddenSizePerHead});
 
     std::vector<int32_t> const minContextShape = {0};
-    std::vector<int32_t> const optContextShape = {args.maxInputLen / 2 - 1};
-    std::vector<int32_t> const maxContextShape = {args.maxInputLen - 1};
+    std::vector<int32_t> const optContextShape = {static_cast<int>(args.maxInputLen / 2 - 1)};
+    std::vector<int32_t> const maxContextShape = {static_cast<int>(args.maxInputLen - 1)};
     // Generation Phase has to be in s = 1
     std::vector<int32_t> const minGenerationShape = {0};
     std::vector<int32_t> const optGenerationShape = {0};
@@ -246,18 +253,18 @@ int main(int argc, char** argv)
     if (!engine)
     {
         LOG_ERROR("Failed to build engine.");
-        return false;
+        return EXIT_FAILURE;
     }
 
     std::ofstream ofs(args.enginePath, std::ios::out | std::ios::binary);
     if (!ofs)
     {
-        LOG_ERROR(fmtstr("Failed to open file for writing: %s", args.enginePath.c_str()));
-        return false;
+        LOG_ERROR("Failed to open file for writing: %s", args.enginePath.c_str());
+        return EXIT_FAILURE;
     }
     ofs.write(static_cast<char*>(engine->data()), engine->size());
     ofs.close();
-    LOG_INFO(fmtstr("Engine saved to %s", args.enginePath.c_str()));
+    LOG_INFO("Engine saved to %s", args.enginePath.c_str());
     dlclose(handle);
-    return true;
+    return EXIT_SUCCESS;
 }

@@ -66,19 +66,22 @@ inline bool isCudaLaunchBlocking()
     return result;
 }
 
-inline void syncAndCheck(char const* const file, int const line)
+/// Get the memory info
+/// \return The free and total amount of memory in bytes
+inline std::tuple<size_t, size_t> getDeviceMemoryInfo()
 {
-#ifndef NDEBUG
-    bool const checkError = true;
-#else
-    bool const checkError = isCudaLaunchBlocking();
-#endif
-
-    if (checkError)
-    {
-        cudaError_t result = cudaDeviceSynchronize();
-        CUDA_CHECK(result);
-    }
+    size_t free, total;
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    return {free, total};
 }
 
-#define sync_check_cuda_error() syncAndCheck(__FILE__, __LINE__)
+#ifdef NDEBUG
+#define sync_check_cuda_error()                                                                                        \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cudaError_t result = cudaDeviceSynchronize();                                                                  \
+        CUDA_CHECK(result);                                                                                            \
+    } while (0)
+#else
+#define sync_check_cuda_error()
+#endif

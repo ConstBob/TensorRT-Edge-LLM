@@ -373,7 +373,7 @@ bool unicodeCollapseRegex(std::string const& expr, std::regex& regex)
         }
         catch (std::regex_error& e)
         {
-            LOG_ERROR(fmtstr("Failed to process regex: %s", expr));
+            LOG_ERROR("Failed to process regex: %s", expr.c_str());
             throw std::runtime_error("Failed to process regex");
         }
     }
