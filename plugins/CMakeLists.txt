@@ -4,7 +4,6 @@ project(llama_plugin LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_TEST "Build tests which require GTest and Eigen" OFF)
@@ -16,25 +15,27 @@ macro(set_ifndef var val)
     message(STATUS "Configurable variable ${var} set to ${${var}}")
 endmacro()
 
-set_ifndef(TRT_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+set_ifndef(CMAKE_CUDA_ARCHITECTURES 80;86;89)
 
-find_path(_TRT_INCLUDE_DIR NvInfer.h HINTS ${TRT_INCLUDE_DIR} PATH_SUFFIXES include ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-set_ifndef(TRT_INCLUDE_DIR ${_TRT_INCLUDE_DIR})
 
-find_library(_NVINFER_LIB nvinfer HINTS ${TRT_LIB_DIR} PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
-set_ifndef(NVINFER_LIB ${_NVINFER_LIB})
+# Set TensorRT header includes and library dependencies.
+if(NOT DEFINED TRT_PACKAGE_DIR)
+    message(FATAL_ERROR "Please specify the -DTRT_PACKAGE_DIR when invoking CMake.")
+endif()
+
+find_path(TRT_INCLUDE_DIR NvInfer.h HINTS ${TRT_PACKAGE_DIR} PATH_SUFFIXES include)
+find_library(NVINFER_LIB nvinfer HINTS ${TRT_PACKAGE_DIR} PATH_SUFFIXES lib)
 
 include_directories(
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
 link_directories(
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib64
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib/stubs
 )
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=haswell -Wfatal-errors -Wreturn-type -Wall -Wextra -Wno-unknown-pragmas -Wno-deprecated -Wno-deprecated-declarations")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler --expt-relaxed-constexpr -t 0") # -res-usage
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wfatal-errors -Wreturn-type -Wall -Wextra -Wno-unknown-pragmas -Wno-deprecated -Wno-deprecated-declarations")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -t 0") # -res-usage
 set(CUDA_PTXAS_FLAGS "-warn-lmem-usage -warn-double-usage -warn-spills") # -Werror -v
 set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo -res-usage -keep --use_fast_math -Xptxas='${CUDA_PTXAS_FLAGS}'")
 set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -O0 -G")

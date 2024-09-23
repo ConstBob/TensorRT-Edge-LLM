@@ -156,9 +156,8 @@ int main(int argc, char** argv)
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    void* handle = dlopen("../plugins/build/libLLamaPlugin.so", RTLD_LAZY);
-    if (!handle)
-    {
+    void* handle = dlopen("drive-llm/build/plugins/libLLamaPlugin.so", RTLD_LAZY);
+    if (!handle) {
         LOG_ERROR("Cannot open library: %s", dlerror());
         return EXIT_FAILURE;
     }
