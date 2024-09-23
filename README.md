@@ -22,7 +22,7 @@ Currently only LLaMa3-8B-instruct with fp16 is supported.
 cd drive-llm/plugins
 mkdir build
 cd build
-cmake ..
+cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path}
 make
 ```
 You will see libLLaMaPlugin.so in your `plugins/build` folder. This will be used in the builder and runtime.
@@ -32,8 +32,14 @@ You will see libLLaMaPlugin.so in your `plugins/build` folder. This will be used
 cd drive-llm
 mkdir build
 cd build
-cmake ..
+cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path}
 make
+```
+
+3. Cross Compilation for aarch64 platform.  
+Add toolchain flag to the above CMake command
+```
+cmake .. -DTRT_PACKAGE_DIR=/path/to/TRT/package -DCMAKE_TOOLCHAIN_FILE={drive-llm-path}/cmake/aarch64_cross_toolchain.cmake
 ```
 
 You will find 2 binaries: `build` and `runtime` in the `build` folder. Those will be used later. 

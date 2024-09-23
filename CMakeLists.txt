@@ -19,50 +19,53 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 project(drive_llm VERSION 1.0 LANGUAGES CXX CUDA)
 
-# Specify the C++ standard
+# Specify the C++ standard and flags
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 
-set(ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations")
 
 macro(set_ifndef var val)
-    if(NOT ${var})
+    if(NOT DEFINED ${var})
         set(${var} ${val})
     endif()
     message(STATUS "Configurable variable ${var} set to ${${var}}")
 endmacro()
 
-# TRT dependencies
+# CUDA flags and dependencies.
+message(STATUS "CUDA_DIR is configured to ${CUDA_DIR}")
+message(STATUS "CUDA_LIBRARIES is configured to ${CUDA_LIBRARIES}")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+set_ifndef(CMAKE_CUDA_ARCHITECTURES 80;86;89)
+
 set_ifndef(CUDA_VERSION 12.6)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
-set_ifndef(TRT_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
 
-find_path(_CUDA_INCLUDE_DIR cuda_runtime_api.h HINTS ${CUDA_DIR} PATH_SUFFIXES include)
-set_ifndef(CUDA_INCLUDE_DIR ${_CUDA_INCLUDE_DIR})
+find_path(CUDA_INCLUDE_DIR cuda_runtime_api.h HINTS ${CUDA_DIR} PATH_SUFFIXES include)
+find_library(CUDART_LIB cudart HINTS ${CUDA_DIR} PATH_SUFFIXES lib lib64)
 
-set_ifndef(ONNX_PARSER_INCLUDE_DIR /home/scratch.luxiaoz_sw/trt/parsers/onnxOpenSource)
+set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
 
-find_library(_CUDART_LIB cudart HINTS ${CUDA_DIR} PATH_SUFFIXES lib lib64)
-set_ifndef(CUDART_LIB ${_CUDART_LIB})
+# Set TensorRT header includes and library dependencies.
+if(NOT DEFINED TRT_PACKAGE_DIR)
+    message(FATAL_ERROR "Please specify the -DTRT_PACKAGE_DIR when invoking CMake.")
+endif()
 
-find_path(_TRT_INCLUDE_DIR NvInfer.h HINTS ${TRT_INCLUDE_DIR} PATH_SUFFIXES include ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-set_ifndef(TRT_INCLUDE_DIR ${_TRT_INCLUDE_DIR})
+find_path(TRT_INCLUDE_DIR NvInfer.h HINTS ${TRT_PACKAGE_DIR} PATH_SUFFIXES include ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+find_path(ONNX_PARSER_INCLUDE_DIR NvOnnxParser.h HINTS ${TRT_INCLUDE_DIR})
+if(NOT ONNX_PARSER_INCLUDE_DIR)
+    message(FATAL_ERROR "NvOnnxParser.h not found in TensorRT headers, please specify the -DONNX_PARSER_INCLUDE_DIR when invoking CMake")
+endif()
 
-find_library(_NVINFER_LIB nvinfer HINTS ${TRT_LIB_DIR} PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
-find_library(_NV_ONNX_PARSER_LIB nvonnxparser HINTS ${TRT_LIB_DIR} PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
-set_ifndef(NVINFER_LIB ${_NVINFER_LIB})
-set_ifndef(NV_ONNX_PARSER_LIB ${_NV_ONNX_PARSER_LIB})
+find_library(NVINFER_LIB nvinfer HINTS ${TRT_PACKAGE_DIR} PATH_SUFFIXES lib lib64 ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
+find_library(NV_ONNX_PARSER_LIB nvonnxparser HINTS ${TRT_PACKAGE_DIR} PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
 
 # Include directories
 include_directories(${TRT_INCLUDE_DIR})
 include_directories(${CUDA_INCLUDE_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/common)
-
-link_libraries(${NVINFER_LIB} ${CUDART_LIB})
 
 # Add executable with sources
 add_subdirectory(plugins)
@@ -73,10 +76,18 @@ add_subdirectory(decoder)
 target_include_directories(sampler PUBLIC ${CMAKE_SOURCE_DIR}/sampler/include)
 target_link_libraries(decoder PUBLIC sampler)
 
-add_executable(runtime runtime.cpp)
-target_link_libraries(runtime PUBLIC tokenizer decoder ${CMAKE_DL_LIBS})
-target_include_directories(runtime PUBLIC ${CMAKE_SOURCE_DIR}/tokenizer ${CMAKE_SOURCE_DIR}/decoder)
-
 add_executable(builder builder.cpp)
-target_link_libraries(builder PUBLIC ${NV_ONNX_PARSER_LIB} ${CMAKE_DL_LIBS})
+target_link_libraries(builder PRIVATE ${NV_ONNX_PARSER_LIB} ${NVINFER_LIB} ${CUDART_LIB} ${CMAKE_DL_LIBS})
+# Workaround for aarch64 cross compilation where libvninfer.so links to libnvdla_compilers.
+# The libnvinfer dependencies shall be resolved at execution time on an embedded board.
+target_link_options(builder PRIVATE "-Wl,--unresolved-symbols=ignore-in-shared-libs")       
 target_include_directories(builder PUBLIC ${ONNX_PARSER_INCLUDE_DIR})
+
+add_executable(runtime runtime.cpp)
+target_link_libraries(runtime PRIVATE decoder tokenizer ${NVINFER_LIB} ${CUDART_LIB} ${CMAKE_DL_LIBS})
+# There are two workarounds for aarch64 cross compilation. It needs to override the libcudla symbols
+# and also need to points to the aarch64 version of libcudart_static lib.
+# TODO: Adjust CMake system to avoid introducing -lcudadevrt -lcudart_static -lrt -lpthread -ldl to the linker.
+#       From local experiment, the additional cuda libraries are brought by decoder static library.
+target_link_options(runtime PRIVATE "-Wl,--unresolved-symbols=ignore-in-shared-libs" "-L${CUDA_DIR}/lib")   
+target_include_directories(runtime PUBLIC ${CMAKE_SOURCE_DIR}/tokenizer ${CMAKE_SOURCE_DIR}/decoder $(CMAKE_SOURCE_DIR)/sampler)

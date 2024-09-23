@@ -21,4 +21,4 @@
 
 file(GLOB RUNTIME_SRCS *.cpp)
 
-add_library(decoder ${RUNTIME_SRCS})
+add_library(decoder STATIC ${RUNTIME_SRCS})

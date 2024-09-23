@@ -309,7 +309,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
 
     bool const isSm90 = (smVersion == fmha_v2::kSM_90);
-    bool const isSm8x = (smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_89);
+    bool const isSm8x = (smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87 || smVersion == fmha_v2::kSM_89);
     bool const isSm80 = (smVersion == fmha_v2::kSM_80);
 
     // We handle sm80/sm86 at first.

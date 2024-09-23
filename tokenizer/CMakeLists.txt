@@ -16,5 +16,5 @@
 # 
 
 file(GLOB TOKENIZER_SRCS *.cpp)
-add_library(tokenizer ${TOKENIZER_SRCS})
+add_library(tokenizer STATIC ${TOKENIZER_SRCS})
 
