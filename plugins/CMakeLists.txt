@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(BUILD_TEST "Build tests which require GTest and Eigen" OFF)
+option(BUILD_TEST "Build tests which require GTest and Eigen" ON)
 
 macro(set_ifndef var val)
     if(NOT ${var})
@@ -51,10 +51,9 @@ if(BUILD_TEST)
     find_package(GTest REQUIRED)
     find_package (Eigen3 REQUIRED NO_MODULE)
 
-    set(TRT_PATH "TensorRT-10.3")
     add_executable(unitTests tests/xqaTest.cpp tests/fmhaTest.cpp tests/ropeTest.cpp tests/hfAttentionTests.cpp utilKernels.cu contextFMHARunner.cpp
         decoderXQARunner.cpp tests/refAttention.cpp ${XQA_CUBIN_SRCS} ${FMHA_CUBIN_SRCS})
-    target_include_directories (unitTests PUBLIC ${EIGEN3_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${TRT_PATH}/include)
+    target_include_directories (unitTests PUBLIC ${EIGEN3_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${TRT_INCLUDE_DIR})
     target_link_libraries(unitTests PUBLIC GTest::gtest GTest::gtest_main cuda cudart Eigen3::Eigen)
 endif()
 

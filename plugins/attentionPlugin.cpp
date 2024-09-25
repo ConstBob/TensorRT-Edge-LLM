@@ -337,9 +337,13 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     if (isContextPhase)
     {
         // At Context phase. Do 1. Apply rope and write KVCache. 2. Dispatch FMHA runner.
+        // RoPE kernel now only handle padded input sequence, we treat all "tokens" in the
+        // padded input as processing targets.
+        // TODO: Explore non-padded input format.
+        int32_t const totalProcessToken = mInputContextLen * mBatchSize;
         invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ,
-            mNumHeadK, mNumElemPerHead, mTotalContextLen, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
-            kROPE_INIT_TYPE, mInputContextLen, stream);
+            mNumHeadK, mNumElemPerHead, mTotalContextLen, mInputContextLen, kROPE_TYPE, kROPE_BASE_FREQUENCY,
+            kROPE_SCALE, kROPE_INIT_TYPE, totalProcessToken, stream);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
         Fused_multihead_attention_params_v2 params{};
@@ -361,10 +365,12 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     else
     {
         // Generation phase we first prepare Q vector and update KVCache.
+        // Currently we only supports generating one token per sequence.
         half* qVecDevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
+        int32_t const totalProcessToken = mBatchSize;
         invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
-            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
-            kROPE_INIT_TYPE, 1, stream);
+            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, mInputContextLen, kROPE_TYPE,
+            kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, totalProcessToken, stream);
 
         // Prepare GQA runner parameter to dispatch kernel
         XQALaunchParams params = mGQARunner.initXQAParams();
