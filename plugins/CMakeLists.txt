@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(BUILD_TEST "Build tests which require GTest and Eigen" ON)
+option(BUILD_TEST "Build tests which require GTest and Eigen" OFF)
 
 macro(set_ifndef var val)
     if(NOT ${var})
