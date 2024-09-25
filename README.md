@@ -2,12 +2,12 @@
 
 ## Introduction
 
-This project showcases TensorRT's performance in Auto Platform, and therefore is a C++ project to run LLM Inference. It uses ONNX with customized TensorRT Attention Plugin to build the TensorRT engine. It also contains implementation of C++ tokenizers, C++ builder and C++/CUDA generation logics to run e2e LLM inference. The main challenge for the sample is that TensorRT Safety does not support dynamic shapes. 
+This project showcases TensorRT's capability and performance in Auto Platform, and therefore is a C++ project to run LLM Inference. It uses ONNX with customized TensorRT Attention Plugin to build the TensorRT engine. It also contains implementation of C++ tokenizers, C++ builder and C++/CUDA generation logics to run e2e LLM inference.
 
 
 ## Prerequisite
 
-You need a standard host to export the model into ONNX format. This host should have `requirements.txt` installed. Once you have the ONNX model ready for inference, the only dependency is TensorRT C++. This demo does not have any external dependency due to safety constraints.   
+You need a standard host to export the model into ONNX format. This host should have `requirements.txt` installed. Once you have the ONNX model ready for inference, the only dependency is TensorRT C++. This demo does not have any external dependency.   
 
 ## Supported models and precisions
 
@@ -15,19 +15,9 @@ Currently only LLaMa3-8B-instruct with fp16 is supported.
 
 ## Getting started
 
-### Build the C++ Sample
+### Build the C++ project
 
-1. Build the Attention Plugin
-```
-cd drive-llm/plugins
-mkdir build
-cd build
-cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path}
-make
-```
-You will see libLLaMaPlugin.so in your `plugins/build` folder. This will be used in the builder and runtime.
-
-2. Build the sample
+1. Build the project
 ```
 cd drive-llm
 mkdir build
@@ -35,14 +25,20 @@ cd build
 cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path}
 make
 ```
+You will find 2 binaries: `builder`, `runtime` in the `build` folder. Those will be used later.
+You will also see libLLaMaPlugin.so in your `build/plugins` folder. This will be used in the builder and runtime.
 
-3. Cross Compilation for aarch64 platform.  
+2. Cross Compilation for aarch64 platform.  
 Add toolchain flag to the above CMake command
 ```
-cmake .. -DTRT_PACKAGE_DIR=/path/to/TRT/package -DCMAKE_TOOLCHAIN_FILE={drive-llm-path}/cmake/aarch64_cross_toolchain.cmake
+cd drive-llm
+mkdir build
+cd build
+cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE={drive-llm-path}/cmake/aarch64_cross_toolchain.cmake
+make
 ```
-
-You will find 2 binaries: `build` and `runtime` in the `build` folder. Those will be used later. 
+The build commands will generate the same set of executables and shared library. These can be used on Orin aarch64 board.
+The engine generation and inference process on Orin is the same as on x86 machine.
 
 ### Export
 
