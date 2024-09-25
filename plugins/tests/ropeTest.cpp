@@ -49,8 +49,6 @@ void runRopeTestContext(int32_t batchSize, int32_t sequenceLen)
     cudaDeviceProp prop;
     checkCuda(cudaGetDeviceProperties(&prop, device));
 
-    check(batchSize == 1, "The test logic only supports 1 for now");
-
     size_t const totalQKVElems = sizePerHead * (nbKHeads + nbVHeads + nbQHeads) * MAX_SEQ_LEN * batchSize;
     size_t const totalKVCacheElems = sizePerHead * (nbKHeads + nbVHeads) * kvcacheCapacity * batchSize;
 
@@ -83,16 +81,16 @@ void runRopeTestContext(int32_t batchSize, int32_t sequenceLen)
 
     // Prepare sequence length buffer
     int32_t* seqlen_device_ptr = nullptr;
-    checkCuda(cudaMalloc(reinterpret_cast<void**>(&seqlen_device_ptr), sizeof(int32_t) * 2));
-    checkCuda(cudaMemset(seqlen_device_ptr, 0, sizeof(int32_t) * 2));
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&seqlen_device_ptr), sizeof(int32_t) * batchSize));
+    checkCuda(cudaMemset(seqlen_device_ptr, 0, sizeof(int32_t) * batchSize));
     {
-        std::vector<int32_t> temp{sequenceLen};
-        checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * 1, cudaMemcpyHostToDevice));
+        std::vector<int32_t> temp(batchSize, sequenceLen);
+        checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * batchSize, cudaMemcpyHostToDevice));
     }
 
     cudaStream_t const stream = nullptr;
     invokeContextApplyRopeUpdateKVFP16(qkv_device_ptr, nullptr, kvcache_ptr, seqlen_device_ptr, nbQHeads, nbKHeads,
-        sizePerHead, kvcacheCapacity, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, sequenceLen,
+        sizePerHead, kvcacheCapacity, MAX_SEQ_LEN, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, MAX_SEQ_LEN * batchSize,
         stream);
 
     checkCuda(cudaStreamSynchronize(stream));
@@ -221,8 +219,6 @@ void runRopeTestGeneration(int32_t batchSize, int32_t sequenceLen)
     cudaDeviceProp prop;
     checkCuda(cudaGetDeviceProperties(&prop, device));
 
-    check(batchSize == 1, "The test logic only supports 1 for now");
-
     size_t const totalQKVElems = sizePerHead * (nbKHeads + nbVHeads + nbQHeads) * 1 * batchSize;
     size_t const totalKVCacheElems = sizePerHead * (nbKHeads + nbVHeads) * kvcacheCapacity * batchSize;
     size_t const totalQElems = sizePerHead * (nbQHeads) *1 * batchSize;
@@ -284,16 +280,16 @@ void runRopeTestGeneration(int32_t batchSize, int32_t sequenceLen)
 
     // Prepare sequence length buffer
     int32_t* seqlen_device_ptr = nullptr;
-    checkCuda(cudaMalloc(reinterpret_cast<void**>(&seqlen_device_ptr), sizeof(int32_t) * 2));
-    checkCuda(cudaMemset(seqlen_device_ptr, 0, sizeof(int32_t) * 2));
+    checkCuda(cudaMalloc(reinterpret_cast<void**>(&seqlen_device_ptr), sizeof(int32_t) * batchSize));
+    checkCuda(cudaMemset(seqlen_device_ptr, 0, sizeof(int32_t) * batchSize));
     {
-        std::vector<int32_t> temp{sequenceLen};
-        checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * 1, cudaMemcpyHostToDevice));
+        std::vector<int32_t> temp(batchSize, sequenceLen);
+        checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * batchSize, cudaMemcpyHostToDevice));
     }
 
     cudaStream_t const stream = nullptr;
     invokeGenerationApplyRopeUpdateKVFP16(qkv_device_ptr, q_ptr, kvcache_ptr, seqlen_device_ptr, nbQHeads, nbKHeads,
-        sizePerHead, kvcacheCapacity, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, 1, stream);
+        sizePerHead, kvcacheCapacity, MAX_SEQ_LEN, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, batchSize, stream);
 
     // Check output data contents, based on the nature of rope, we will compare the data pair by pair.
     std::vector<float> kvCacheHost(totalKVCacheElems);
@@ -319,8 +315,9 @@ void runRopeTestGeneration(int32_t batchSize, int32_t sequenceLen)
             for (int i = 0; i < sizePerHead / 2; ++i)
             {
                 int srcOffsetQ = b * (nbQHeads + nbKHeads + nbVHeads) * sizePerHead + h * sizePerHead + i * 2;
+                int dstOffsetQ = b * nbQHeads * sizePerHead + h * sizePerHead + i * 2;
                 float2 qSrcPair{inputQKVData[srcOffsetQ], inputQKVData[srcOffsetQ + 1]};
-                float2 qDstPair{qUpdatedData[srcOffsetQ], qUpdatedData[srcOffsetQ + 1]};
+                float2 qDstPair{qUpdatedData[dstOffsetQ], qUpdatedData[dstOffsetQ + 1]};
                 float2 qRopePair = applyRopeTransformation(qSrcPair, sequenceLen - 1, i, sizePerHead);
                 bool status = checkDataPair(qDstPair, qRopePair, 5e-3);
                 if (!status)
@@ -384,8 +381,20 @@ TEST(sanity, rope_kv_context)
     runRopeTestContext<8, 128>(1, 64);
 }
 
+TEST(sanity, rope_kv_context_multi_batch)
+{
+    // Check 128 max len with 64 context len under batch 2
+    runRopeTestContext<8, 128>(2, 64);
+}
+
 TEST(sanity, rope_kv_generation)
 {
-    // Check 128 max len with 64 context len
+    // Check 128 max input-len with 200 context len
     runRopeTestGeneration<8, 128>(1, 200);
+}
+
+TEST(sanity, rope_kv_generation_multi_batch)
+{
+    // Check 128 max input-len with 200 context len under batch 2
+    runRopeTestGeneration<8, 128>(2, 200);
 }

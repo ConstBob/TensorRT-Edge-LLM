@@ -105,8 +105,8 @@ void testRope()
 
     cudaStream_t const stream = nullptr;
     invokeContextApplyRopeUpdateKVFP16(qkv_device_ptr, nullptr, kvcache_ptr, seqlen_device_ptr, kNUM_Q_HEADS,
-        kNUM_K_HEADS, kDIM_HEAD, kKV_CACHE_CAPACITY, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE,
-        kINPUT_LENGTH_PADDED, stream);
+        kNUM_K_HEADS, kDIM_HEAD, kKV_CACHE_CAPACITY, kINPUT_LENGTH_PADDED, kROPE_TYPE, kROPE_BASE_FREQUENCY, 
+        kROPE_SCALE, kROPE_INIT_TYPE, kINPUT_LENGTH_PADDED, stream);
     checkCuda(cudaStreamSynchronize(stream));
     checkCuda(cudaGetLastError());
 
