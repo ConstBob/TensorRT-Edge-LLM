@@ -4,15 +4,12 @@
 #include <NvInfer.h>
 #include <cstdlib>
 #include <dlfcn.h>
-#include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <string>
 
-using namespace std;
 using namespace nvinfer1;
-
 
 struct BuilderArgs
 {
@@ -224,7 +221,8 @@ int main(int argc, char** argv)
     Dims kvCacheContextShape = createDims({args.batchSize, 2, numKVHeads, 0, hiddenSizePerHead});
     Dims kvCacheGenerationShape = createDims({args.batchSize, 2, numKVHeads, args.maxSeqLen, hiddenSizePerHead});
 
-    for (int i = 0; i < nbKVCacheInputs; ++i){
+    for (int i = 0; i < nbKVCacheInputs; ++i)
+    {
         setStaticProfile(contextProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheContextShape);
         setStaticProfile(generationProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheGenerationShape);
     }
@@ -249,6 +247,6 @@ int main(int argc, char** argv)
     ofs.write(static_cast<char*>(engine->data()), engine->size());
     ofs.close();
     LOG_INFO("Engine saved to %s", args.enginePath.c_str());
-    // dlclose(handle);
+    dlclose(handle);
     return EXIT_SUCCESS;
 }

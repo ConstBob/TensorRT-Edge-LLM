@@ -51,7 +51,7 @@ bool BPE::specialTokenPartition(std::string const& text, std::forward_list<textP
                     auto baseOffset = part.offset;
                     auto baseLength = part.length;
 
-                    // find occurences of specialToken in rawText
+                    // find occurrences of specialToken in rawText
                     while (true)
                     {
                         auto match = rawText.find(specialToken, baseOffset);

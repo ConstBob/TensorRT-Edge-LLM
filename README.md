@@ -86,3 +86,30 @@ You will use `runtime` binary to infer the built TensorRT engine. Example comman
 
 ./runtime --enginePath=llama.bs2.engine --maxLength=256 --inputLength=24 --mode=benchmark
 ```
+
+4. Evaluate with MMLU
+
+First download and extract the dataset.
+
+```
+wget https://people.eecs.berkeley.edu/~hendrycks/data.tar
+tar -xf data.tar
+```
+
+Build engine
+
+```
+./builder --onnxPath=../export/llama_v3_onnx/model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=2048 --maxSeqLen=2050
+```
+
+Run engine
+
+```
+./runtime --tokenizerPath=/home/scratch.trt_llm_data/llm-models/llama-models-v3/llama-v3-8b-instruct-hf/  --enginePath=llama.engine --mode evaluate --datasetPath ../data --debug
+```
+
+Python reference 
+
+```
+python mmlu.py
+```

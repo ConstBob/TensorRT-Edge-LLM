@@ -394,7 +394,7 @@ void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuff
 
 void invokePrefixSum(int32_t const* in_d, int32_t* out_d, int32_t numSeq, cudaStream_t stream)
 {
-    thrust::device_ptr<const int32_t> thrust_in_ptr = thrust::device_pointer_cast(in_d);
+    thrust::device_ptr<int32_t const> thrust_in_ptr = thrust::device_pointer_cast(in_d);
     thrust::device_ptr<int32_t> thrust_out_ptr(out_d);
 
     // Fill out_d with zeros and then copy ctxLen contents to &thrust_out_ptr[1] (left leading zero).

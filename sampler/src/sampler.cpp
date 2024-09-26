@@ -24,9 +24,9 @@ Sampler<T>::Sampler(int64_t batchSize, int64_t vocabSize)
     mLayer->setup(batchSize, 1, nullptr, setupParams);
     mOutputIds.resize(batchSize);
     auto workspaceSize = mLayer->getWorkspaceSize();
-    cudaMalloc(&mWorkspace, sizeof(int8_t) * workspaceSize);
-    cudaMalloc(&mDevStates, sizeof(curandState) * batchSize);
-    cudaMalloc(&mOutputIdsDevice, sizeof(int64_t) * batchSize);
+    CUDA_CHECK(cudaMalloc(&mWorkspace, sizeof(int8_t) * workspaceSize));
+    CUDA_CHECK(cudaMalloc(&mDevStates, sizeof(curandState) * batchSize));
+    CUDA_CHECK(cudaMalloc(&mOutputIdsDevice, sizeof(int64_t) * batchSize));
 }
 
 template <typename T>

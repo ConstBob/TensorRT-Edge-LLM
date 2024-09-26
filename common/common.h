@@ -187,7 +187,7 @@ inline Logger gLogger{};
     {                                                                                                                  \
         if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kVERBOSE)                                               \
         {                                                                                                              \
-            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
+            gLogger.debug(fmtstr(__VA_ARGS__));                                                                        \
         }                                                                                                              \
     } while (0)
 #define LOG_INFO(...)                                                                                                  \
@@ -203,7 +203,7 @@ inline Logger gLogger{};
     {                                                                                                                  \
         if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kERROR)                                                 \
         {                                                                                                              \
-            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
+            gLogger.error(fmtstr(__VA_ARGS__));                                                                        \
         }                                                                                                              \
     } while (0)
 #define LOG_WARNING(...)                                                                                               \
@@ -211,7 +211,7 @@ inline Logger gLogger{};
     {                                                                                                                  \
         if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kWARNING)                                               \
         {                                                                                                              \
-            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
+            gLogger.warning(fmtstr(__VA_ARGS__));                                                                      \
         }                                                                                                              \
     } while (0)
 #endif

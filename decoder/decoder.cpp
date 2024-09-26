@@ -6,13 +6,15 @@
 #include <chrono>
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <memory>
 #include <ostream>
 #include <sstream>
 #include <utility>
 using namespace nvinfer1;
 using namespace std;
 
-bool Decoder::setup(std::filesystem::path const& fp, cudaStream_t& stream)
+template <typename T>
+bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream)
 {
     try
     {
@@ -56,7 +58,8 @@ bool checkDimsEqual(Dims& A, Dims& B)
 }
 
 // Helper function to check a certain input tensor has static shape
-bool Decoder::checkStaticShape(std::string& name)
+template <typename T>
+bool Decoder<T>::checkStaticShape(std::string& name)
 {
     for (int32_t i = 0; i < mEngine->getNbOptimizationProfiles(); ++i)
     {
@@ -75,7 +78,8 @@ bool Decoder::checkStaticShape(std::string& name)
     return true;
 }
 
-bool Decoder::validateAndFillConfig()
+template <typename T>
+bool Decoder<T>::validateAndFillConfig()
 {
     int64_t batchSize;
     int64_t numHead;
@@ -127,12 +131,13 @@ bool Decoder::validateAndFillConfig()
     int64_t vocabSize = logitsShape.d[1];
 
     mConfig = {batchSize, numHead, hiddenSizePerHead, maxInputLength, maxLength, numLayers, vocabSize};
-    mSampler = new Sampler<half>(batchSize, vocabSize);
+    mSampler = new Sampler<T>(batchSize, vocabSize);
 
     return 0;
 }
 
-void Decoder::allocateBuffer()
+template <typename T>
+void Decoder<T>::allocateBuffer()
 {
     // Allocate buffers for inputs and logits, and set the shape
     void* contextLengthDevice;
@@ -145,6 +150,7 @@ void Decoder::allocateBuffer()
     mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
     mGenerationExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
     mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
+    mHostBuffer["last_token_ids"] = malloc(mConfig.batchSize * sizeof(int64_t));
     void* inputIdsDevice;
     CUDA_CHECK(cudaMalloc(&inputIdsDevice, (mConfig.batchSize * mConfig.maxLength) * sizeof(int64_t)));
     mDeviceBuffer["input_ids"] = inputIdsDevice;
@@ -158,6 +164,7 @@ void Decoder::allocateBuffer()
     mDeviceBuffer["logits"] = logitsDevice;
     mContextExecutionContext->setTensorAddress("logits", logitsDevice);
     mGenerationExecutionContext->setTensorAddress("logits", logitsDevice);
+    mHostBuffer["finished_states"] = malloc(mConfig.batchSize * sizeof(bool));
     // Allocate buffers for kv cache and set the shape
     for (int32_t i = 0; i < mConfig.numLayers; ++i)
     {
@@ -194,11 +201,8 @@ std::string formatFloat16Vector(std::vector<half> const& vec, int64_t batchSize)
         auto minElementIter = std::min_element(beginIter, endIter);
 
         // Calculate the average
-        float sum = std::accumulate(beginIter, endIter, 0.0f, [](float sum, half val)
-            {
-                return sum + static_cast<float>(val);
-            }
-        );
+        float sum = std::accumulate(
+            beginIter, endIter, 0.0f, [](float sum, half val) { return sum + static_cast<float>(val); });
         float average = sum / batchVecSize;
 
         oss << "Maximum: " << static_cast<float>(*maxElementIter) << " at " << std::distance(beginIter, maxElementIter)
@@ -222,89 +226,105 @@ std::string formatFloat16Vector(std::vector<half> const& vec, int64_t batchSize)
 }
 
 // This is a helper function to dump kv cache information
-std::string Decoder::printKVCache(int64_t contextLength)
+template <typename T>
+std::string Decoder<T>::printKVCache(int64_t contextLength)
 {
     ostringstream oss;
     size_t totalKVSize = mConfig.batchSize * 2 * mConfig.hiddenSizePerHead * mConfig.numHead * contextLength;
-    std::vector<half> kvCache(totalKVSize, 0.0);
+    std::vector<T> kvCache(totalKVSize, 0.0);
     oss << "Context Length is: " << contextLength << std::endl;
     for (int i = 0; i < mConfig.numLayers; ++i)
     {
         oss << "Layer = " << i << "\n";
         CUDA_CHECK(cudaMemcpyAsync(kvCache.data(), mDeviceBuffer[fmtstr("past_key_values.%d", i)],
-            totalKVSize * sizeof(half), cudaMemcpyDeviceToHost));
+            totalKVSize * sizeof(T), cudaMemcpyDeviceToHost));
         oss << formatFloat16Vector(kvCache, mConfig.batchSize);
     }
     return oss.str();
 }
 
 // This is a helper function to print logits
-std::string Decoder::printLogits()
+template <typename T>
+std::string Decoder<T>::printLogits()
 {
     size_t totalLogitSize = mConfig.batchSize * 1 * mConfig.vocabSize;
-    std::vector<half> logits(totalLogitSize, 0.0);
+    std::vector<T> logits(totalLogitSize, 0.0);
     CUDA_CHECK(
-        cudaMemcpyAsync(logits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(half), cudaMemcpyDeviceToHost));
+        cudaMemcpyAsync(logits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(T), cudaMemcpyDeviceToHost));
     return formatFloat16Vector(logits, mConfig.batchSize);
 }
 
-void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths, std::vector<int64_t> lastTokenIds,
-    std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int32_t maxContextLength, int64_t endIds, 
+template <typename T>
+void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
+    std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
     std::shared_ptr<BenchmarkProfiler> const profiler)
 {
-    assert(contextLengths.size() == mConfig.batchSize), "Input batch size does not match engine batch size.";
-    CUDA_CHECK(cudaMemcpyAsync(
-        mDeviceBuffer["context_lengths"], contextLengths.data(), mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        mDeviceBuffer["last_token_ids"], lastTokenIds.data(), mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        mDeviceBuffer["input_ids"], inputIds.data(), mConfig.batchSize * maxContextLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    auto lastTokenIds = reinterpret_cast<int64_t*>(mHostBuffer["last_token_ids"]);
+    // The generation step stop at longest sequence reach the maxLength.
+    int32_t generationIter = *std::max_element(contextLengths.begin(), contextLengths.end());
+    memset(mHostBuffer["finished_states"], 0, sizeof(bool) * mConfig.batchSize);
+    auto finishedStates = reinterpret_cast<bool*>(mHostBuffer["finished_states"]);
+    int64_t unfinishedBatchNum = mConfig.batchSize;
+
+    for (int i = 0; i < mConfig.batchSize; i++)
+    {
+        assert(mConfig.maxInputLength >= contextLengths[i]);
+        lastTokenIds[i] = contextLengths[i] - 1;
+    }
+
+    assert(outputIds.size() == mConfig.batchSize);
+    assert(mConfig.maxLength >= generationConfig.maxLength);
+    assert(generationConfig.maxLength >= generationConfig.minLength);
+
+    auto sampleToken = [this, &outputIds, &generationIter, endIds, &generationConfig, &finishedStates, &contextLengths,
+                           &unfinishedBatchNum]() {
+        std::vector<int64_t> generatedToken = mSampler->greedySample(reinterpret_cast<T*>(mDeviceBuffer["logits"]));
+        ++generationIter;
+        for (int i = 0; i < mConfig.batchSize; i++)
+        {
+            if (!finishedStates[i])
+            {
+                outputIds[i].push_back(generatedToken[i]);
+                ++contextLengths[i];
+                // Reaches eos token and reaches minLength.
+                finishedStates[i] = generatedToken[i] == endIds && generationIter > generationConfig.minLength;
+                if (finishedStates[i])
+                {
+                    unfinishedBatchNum--;
+                }
+            }
+        }
+        return generatedToken;
+    };
+    assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
+        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], lastTokenIds, mConfig.batchSize * sizeof(int64_t),
+        cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
+        mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 
     // Context Phase
     mContextExecutionContext->enqueueV3(mStream);
+    auto generatedToken = sampleToken();
     LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
+    CUDA_CHECK(cudaMemset(mDeviceBuffer["last_token_ids"], 0, mConfig.batchSize * sizeof(int64_t)));
 
-    bool contextStep = true;
-
-    // The generation step stop at longest sequence reach the maxLength.
-    int32_t generationInter = *std::max_element(contextLengths.begin(), contextLengths.end());
-    while ((generationInter < generationConfig.maxLength))
+    if (profiler)
     {
-        std::vector<int64_t> const& generatedToken
-            = mSampler->greedySample(reinterpret_cast<half*>(mDeviceBuffer["logits"]));
-        for (int i = 0; i < mConfig.batchSize; ++i)
-        {
-            outputIds[i].push_back(generatedToken[i]);
-            ++contextLengths[i];
-            lastTokenIds[i] = 0;
-        }
-        if (contextStep && profiler)
-        {
-            profiler->recordHostEnd("first token latency");
-            profiler->recordDeviceStart("generation");
-            contextStep = false;
-        }
-        ++generationInter;
-        // Reaches eos token and reaches minLength.
-        for (int i = 0; i < mConfig.batchSize; ++i)
-        {
-            if (generatedToken[i] == endIds && (contextLengths[i] > generationConfig.minLength))
-            {
-                if (profiler)
-                {
-                    profiler->recordDeviceEnd("generation");
-                }
-                return;
-            }
-        }
-        CUDA_CHECK(cudaMemcpyAsync(
-            mDeviceBuffer["context_lengths"], contextLengths.data(), mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-        CUDA_CHECK(cudaMemcpyAsync(
-            mDeviceBuffer["last_token_ids"], lastTokenIds.data(), mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToHost, mStream));
-        CUDA_CHECK(cudaMemcpyAsync(
-            mDeviceBuffer["input_ids"], generatedToken.data(), mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+        profiler->recordHostEnd("first token latency");
+        profiler->recordDeviceStart("generation");
+    }
+
+    while (generationIter < generationConfig.maxLength && unfinishedBatchNum != 0)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
+            mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], generatedToken.data(),
+            mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 
         mGenerationExecutionContext->enqueueV3(mStream);
+        generatedToken = sampleToken();
         LOG_DEBUG("Generation phase logits:\n%s", printLogits().c_str());
     }
 
@@ -314,12 +334,32 @@ void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t
     }
 }
 
-size_t Decoder::getDeviceMemorySize() const noexcept
+template <typename T>
+std::vector<T> const& Decoder<T>::getLastHostLogits()
+{
+    size_t totalLogitSize = mConfig.batchSize * 1 * mConfig.vocabSize;
+    static std::vector<T> hostLogits(totalLogitSize);
+    CUDA_CHECK(
+        cudaMemcpy(hostLogits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(T), cudaMemcpyDeviceToHost));
+    return hostLogits;
+}
+
+template <typename T>
+size_t Decoder<T>::getDeviceMemorySize() const noexcept
 {
     return mEngine->getDeviceMemorySizeV2();
 }
 
-int64_t Decoder::getModelBatchSize() const noexcept
+template <typename T>
+int64_t Decoder<T>::getModelBatchSize() const noexcept
 {
     return mConfig.batchSize;
 }
+
+template <typename T>
+int64_t Decoder<T>::getMaxContextLength() const noexcept
+{
+    return mConfig.maxInputLength;
+}
+
+template class Decoder<half>;
