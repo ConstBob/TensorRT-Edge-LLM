@@ -22,6 +22,8 @@
 
 #include <NvInferRuntime.h>
 #include <string>
+#include <vector>
+
 namespace drivellm
 {
 class AttentionPlugin : public nvinfer1::IPluginV3,
@@ -30,7 +32,7 @@ class AttentionPlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    AttentionPlugin(std::string const& name);
+    AttentionPlugin(std::string const& name, const int32_t batchSize);
 
     // Force to distinguish different instances of the plugin.
     AttentionPlugin() = delete;
@@ -87,13 +89,15 @@ public:
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
     // end IPluginV3Runtime Methods
 
+    void setCustomConfiguration(const int32_t batchSize, const int32_t maxInputLen, const int32_t maxSeqLen);
+
 protected:
     std::string mLayerName;
     std::string mNamespace;
 
     nvinfer1::DataType mDataType{nvinfer1::DataType::kHALF};
     // Fields to specify Multihead attention configuration
-    int32_t const mBatchSize{1};
+    int32_t mBatchSize;
     int32_t const mNumHeadQ{32};
     int32_t const mNumHeadK{8};
     int32_t const mNumHeadV{8};
@@ -114,6 +118,10 @@ protected:
     // Requires FMHA runner, GQA runner, pre-processing runners for context/generation phase
     ContextFMHARunner mFMHARunner;
     DecoderXQARunner mGQARunner;
+
+private:
+    nvinfer1::PluginFieldCollection mFieldCollection;
+    std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
 class AttentionPluginCreator : public nvinfer1::IPluginCreatorV3One
@@ -138,6 +146,7 @@ public:
 
 private:
     nvinfer1::PluginFieldCollection mFieldCollection;
+    std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
 } // namespace drivellm

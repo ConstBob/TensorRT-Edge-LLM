@@ -64,4 +64,4 @@ set_target_properties(LLamaPlugin PROPERTIES
     SOVERSION 1
 )
 target_include_directories(LLamaPlugin PRIVATE ${TRT_INCLUDE_DIR})
-target_link_libraries(LLamaPlugin ${NVINFER_LIB} cuda cudart)
+target_link_libraries(LLamaPlugin ${NVINFER_LIB} cuda ${CUDART_LIB})

@@ -53,7 +53,8 @@ int8_t* alignDevicePtr(void* ptr)
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(std::string const& name)
+AttentionPlugin::AttentionPlugin(std::string const& name, const int32_t batchSize)
+    : mBatchSize{batchSize}
 {
     int device;
     checkCuda(cudaGetDevice(&device));
@@ -95,7 +96,7 @@ nvinfer1::IPluginCapability* AttentionPlugin::getCapabilityInterface(nvinfer1::P
 
 IPluginV3* AttentionPlugin::clone() noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mBatchSize);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -175,7 +176,7 @@ bool AttentionPlugin::supportsFormatCombination(
     auto checkSequenceLen = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
         bool status{true};
         auto const& tensorDesc = dynamicDesc.desc;
-        status &= tensorDesc.type == DataType::kINT64;
+        status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 1;
         if (status)
@@ -301,14 +302,18 @@ int32_t AttentionPlugin::onShapeChange(nvinfer1::PluginTensorDesc const* in, int
 
 nvinfer1::IPluginV3* AttentionPlugin::attachToContext(nvinfer1::IPluginResourceContext* context) noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mBatchSize);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
 
 PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
 {
-    return nullptr;
+    mPluginAttributes.clear();
+    mPluginAttributes.emplace_back(PluginField("mBatchSize", &mBatchSize, PluginFieldType::kINT32, 1));
+    mFieldCollection.nbFields = mPluginAttributes.size();
+    mFieldCollection.fields = mPluginAttributes.data();
+    return &mFieldCollection;
 }
 
 int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
@@ -386,10 +391,31 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     return 0;
 }
 
+void AttentionPlugin::setCustomConfiguration(const int32_t batchSize, const int32_t maxInputLen, const int32_t maxSeqLen)
+{
+    this->mBatchSize = batchSize;
+    // this->mInputContextLen = maxInputLen;  // uncomment when we support custom configuration
+    // this->mTotalContextLen = maxSeqLen;
+
+    // Reset mFMHARunner, mGQARunner
+    int device;
+    checkCuda(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    checkCuda(cudaGetDeviceProperties(&prop, device));
+    int32_t smVersion = prop.major * 10 + prop.minor;
+
+    mFMHARunner = ContextFMHARunner(mDataType, mBatchSize, mInputContextLen,
+        mNumHeadQ, mNumHeadK, mNumElemPerHead, smVersion);
+    mGQARunner = DecoderXQARunner(mDataType, mBatchSize, mNumHeadQ,
+        mNumHeadK, mNumElemPerHead, smVersion);
+}
+
 AttentionPluginCreator::AttentionPluginCreator()
 {
-    mFieldCollection.nbFields = 0;
-    mFieldCollection.fields = nullptr;
+    mPluginAttributes.clear();
+    mPluginAttributes.emplace_back(PluginField("mBatchSize", nullptr, PluginFieldType::kINT32, 1));
+    mFieldCollection.nbFields = mPluginAttributes.size();
+    mFieldCollection.fields = mPluginAttributes.data();
 }
 
 char const* AttentionPluginCreator::getPluginName() const noexcept
@@ -415,6 +441,18 @@ char const* AttentionPluginCreator::getPluginVersion() const noexcept
 nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(std::string(name));
+    PluginField const* fields = fc->fields;
+    int32_t batchSize{1};
+    // Read configurations from each fields
+    for (int i = 0; i < fc->nbFields; ++i)
+    {
+        char const* attrName = fields[i].name;
+        if (!strcmp(attrName, "mBatchSize"))
+        {
+            assert(fields[i].type == PluginFieldType::kINT32);
+            batchSize = static_cast<int32_t>(*(static_cast<int const*>(fields[i].data)));
+        }
+    }
+    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), batchSize);
     return plugin;
 }

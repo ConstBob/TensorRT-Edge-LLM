@@ -48,10 +48,12 @@ public:
     {
     }
     bool setup(std::filesystem::path const& fp, cudaStream_t& stream);
-    void generate(std::vector<int64_t> const& inputIds, std::vector<int64_t>& outputIds,
-        GenerationConfig generationConfig, int64_t endIds = -1,
+    void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths, std::vector<int64_t> lastTokenIds,
+        std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int32_t maxContextLength, int64_t endIds = -1,
         std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
+
     size_t getDeviceMemorySize() const noexcept;
+    int64_t getModelBatchSize() const noexcept;
     ~Decoder()
     {
         for (auto deviceMem : mDeviceBuffer)
