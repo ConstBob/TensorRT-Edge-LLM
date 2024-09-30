@@ -28,7 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
-using Rank = std::int32_t;
+using Rank = std::int64_t;
 using BPETokenToRanks = std::unordered_map<std::string, Rank>;
 using BPERanksToToken = std::unordered_map<Rank, std::string>;
 
@@ -112,7 +112,7 @@ public:
 
     virtual ~Tokenizer() = default;
 
-    virtual std::vector<Rank> encode(std::string const& text, bool addSpecialTokens = false) const;
+    virtual std::vector<Rank> encode(std::string const& text, bool addBos = false, bool addEos = false) const;
 
     virtual std::string decode(std::vector<Rank> const& tokens) const;
 

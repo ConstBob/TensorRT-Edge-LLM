@@ -43,21 +43,12 @@ def surgeon_graph(graph):
     # Should not remove while iterating, so remove them separately
     for i in removed_inputs:
         graph.inputs.remove(i)
-
-    context_length = gs.Variable("context_length", np.int64, [1])
+        
+    context_lengths = gs.Variable("context_lengths", np.int32, ['batch_size'])
 
     # For context phase, last_token_ids should be context_length - 1; for generation phase, last_token_ids should be 0
-    last_token_ids = gs.Variable("last_token_ids", np.int64, [1])
-    one_constant = gs.Constant(name="/lm_head/Slice/one_constant", values=np.array([1], dtype=np.int64))
-    slice_end = gs.Variable(name="/lm_head/Slice/end", dtype=np.int64, shape=[1])
-    graph.layer(
-        name="/lm_head/Slice/Add",
-        op="Add",
-        inputs=[last_token_ids, one_constant],
-        outputs=[slice_end]
-    )
-
-    graph.inputs.append(context_length)
+    last_token_ids = gs.Variable("last_token_ids", np.int64, ['batch_size', 1])
+    graph.inputs.append(context_lengths)
     graph.inputs.append(last_token_ids)
 
     # Look for kv cache outputs
@@ -150,29 +141,32 @@ def surgeon_graph(graph):
         graph.layer(
             name=f"Attention-{i}",
             op="AttentionPlugin",
-            inputs=[qkv, kv_input, context_length],
+            inputs=[qkv, kv_input, context_lengths],
             outputs=[attn_output, kv_output],
         )
 
-    # Insert Slice node for lm_head's input.
+    # Insert Gather node for lm_head's input.
     lm_head_matmul = clear_outputs(logits.inputs[0].inputs[0].inputs[0])
-    assert lm_head_matmul.name == "/lm_head/MatMul", f"You did not reach lm_head, but you reached {lm_head.name}"
+    assert lm_head_matmul.name == "/lm_head/MatMul", f"You did not reach lm_head, but you reached {lm_head_matmul.name}"
     lm_head_weight = lm_head_matmul.inputs[1]
     lm_head_weight.name = "/lm_head/MatMul/weight"
     lm_head_input = lm_head_matmul.inputs[0]
 
-    # Insert a Slice node for lm_head_input
-    slice_output = gs.Variable("/lm_head/Slice_Output")
-    slice_axis = gs.Constant(name="/lm_head/Slice/axes", values = np.array([1], dtype=np.int32))
+    gather_output = gs.Variable("/lm_head/Gather_Output")
+    
+    # lm_head_input shape: [batch_size, len, 4096]
+    # last_token_ids shape: [batch_size, 1]
+    # gather_output shape: [batch_size, 4096]
     graph.layer(
-        name="/lm_head/Slice",
-        op="Slice",
-        inputs = [lm_head_input, last_token_ids, slice_end,slice_axis],
-        outputs = [slice_output],
+        name="/lm_head/GatherND",
+        op="GatherND",
+        inputs = [lm_head_input, last_token_ids],
+        outputs = [gather_output],
+        attrs = {"batch_dims": 1}
     )
 
-    slice_output.outputs = [lm_head_matmul]
-    lm_head_matmul.inputs = [slice_output, lm_head_weight]
+    gather_output.outputs = [lm_head_matmul]
+    lm_head_matmul.inputs = [gather_output, lm_head_weight]
 
     # Remove the last cast layer so logits are in fp16 instead of fp32
     logits = clear_inputs(logits)
@@ -180,7 +174,7 @@ def surgeon_graph(graph):
     logits.inputs = [lm_head_matmul]
     logits.dtype = np.float16
     # Force logits shape to be 1 for both context phase and generation phase
-    logits.shape = [logits.shape[0], 1, logits.shape[2]]
+    logits.shape = [logits.shape[0], logits.shape[2]]
     graph.cleanup().toposort().fold_constants().cleanup().toposort()
 
     return graph

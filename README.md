@@ -70,5 +70,14 @@ You will use `runtime` binary to infer the built TensorRT engine. Example comman
 2. Benchmark the engine
 
 ```
- ./runtime --tokenizerPath=llama-v3-8b-instruct-hf/  --enginePath=llama.engine --maxLength=256 --inputLength=24 --mode benchmark
+./runtime --enginePath=llama.engine --maxLength=256 --inputLength=24 --mode=benchmark
+```
+
+3. Static multi-batch
+```
+./builder --onnxPath=llama_v3_onnx/model.onnx --enginePath=llama.bs2.engine --batchSize=2
+
+./runtime --tokenizerPath=llama-v3-8b-instruct-hf/ --enginePath=llama.bs2.engine --maxLength=256 --inputString="What is the result of 1+1?" --inputString="Where is Iceland?"
+
+./runtime --enginePath=llama.bs2.engine --maxLength=256 --inputLength=24 --mode=benchmark
 ```

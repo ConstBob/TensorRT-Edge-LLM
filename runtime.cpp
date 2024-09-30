@@ -31,7 +31,7 @@ enum class MODE
 struct RuntimeArgs
 {
     bool help{false};
-    std::string inputString;
+    std::vector<std::string> inputString;
     std::string enginePath;
     std::string tokenizerPath;
     int maxLength{40};
@@ -82,7 +82,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
         case 'i':
             if (optarg)
             {
-                args.inputString = optarg;
+                args.inputString.emplace_back(optarg);
             }
             else
             {
@@ -156,27 +156,51 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
     return true;
 }
 
-std::string decode(std::filesystem::path const& enginePath, std::string const inputString, Tokenizer* tokenizer,
+void prepareBatchInputIds(std::vector<std::string> const& inputString, Tokenizer* tokenizer, std::vector<int64_t>& inputIds, 
+    std::vector<int32_t>& contextLengths, std::vector<int64_t>& lastTokenIds, int& maxContextLength)
+{
+    std::vector<std::vector<int64_t>> batchInputIds;
+    int batchSize = inputString.size();
+    for (int i = 0; i < batchSize; ++i)
+    {
+        auto ids = tokenizer->encode(inputString[i], true);
+        batchInputIds.emplace_back(ids);
+        contextLengths[i] = ids.size();
+        lastTokenIds[i] = static_cast<int64_t>(ids.size() - 1);
+    }
+
+    // right padding
+    int64_t padId = tokenizer->getPadId();
+    inputIds.resize(batchSize * maxContextLength, padId);
+    for (int i = 0; i < batchSize; ++i)
+    {
+        std::copy(batchInputIds[i].begin(), batchInputIds[i].end(), inputIds.begin() + i * maxContextLength);
+    }
+}
+
+std::vector<std::string> decode(std::filesystem::path const& enginePath, std::vector<std::string> const& inputString, Tokenizer* tokenizer,
     GenerationConfig const& generationConfig, bool debug = false)
 {
-    std::vector<int32_t> inputIdsInt32 = tokenizer->encode(inputString, true);
-    std::vector<int64_t> inputIds;
-    std::ostringstream oss;
+    int batchSize = inputString.size();
+
+    std::vector<int64_t> inputIds;  //flattened
+    std::vector<int32_t> contextLengths(batchSize);
+    std::vector<int64_t> lastTokenIds(batchSize);
+    int32_t maxContextLength{128};
+    prepareBatchInputIds(inputString, tokenizer, inputIds, contextLengths, lastTokenIds, maxContextLength);
+
     if (debug)
     {
-        oss << "input_ids size is: " << inputIdsInt32.size() << ". Content is: [";
-    }
-    for (int i = 0; i < inputIdsInt32.size() - 1; ++i)
-    {
-        inputIds.push_back(static_cast<int64_t>(inputIdsInt32[i]));
-        if (debug)
+        std::ostringstream oss;
+        for (int i = 0; i < batchSize; ++i)
         {
-            oss << inputIds[i] << ",";
+            oss << "contextLengths[" << i << "] is " << contextLengths[i] << ". inputIds[" << i << "] is: [";
+            for (int j = 0; j < maxContextLength; ++j)
+            {
+                oss << inputIds[i * maxContextLength + j] << ",";
+            }
+            oss << "]\n";
         }
-    }
-    if (debug)
-    {
-        oss << "]";
         LOG_DEBUG(oss.str().c_str());
     }
 
@@ -184,24 +208,28 @@ std::string decode(std::filesystem::path const& enginePath, std::string const in
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     decoder->setup(enginePath, stream);
-    std::vector<int64_t> outputIds;
-    outputIds.reserve(generationConfig.maxLength);
-    decoder->generate(inputIds, outputIds, generationConfig, tokenizer->getEosId());
-    std::vector<int32_t> outputIdsInt32;
-    if (debug)
+    std::vector<std::vector<int64_t>> outputIds(batchSize);
+    for (int i = 0; i < batchSize; ++i)
     {
-        LOG_DEBUG("Output length is %d", outputIds.size());
+        outputIds[i].reserve(generationConfig.maxLength);
     }
+    decoder->generate(inputIds, contextLengths, lastTokenIds, outputIds, generationConfig, maxContextLength, tokenizer->getEosId());
 
-    for (int i = 0; i < outputIds.size(); ++i)
+    std::vector<std::string> output(batchSize);
+    for (int i = 0; i < batchSize; ++i)
     {
-        outputIdsInt32.push_back(static_cast<int32_t>(outputIds[i]));
+        if (debug)
+        {
+            LOG_DEBUG("Output%d length is %d", i, outputIds[i].size());
+        }
+        output[i] = tokenizer->decode(outputIds[i]);
+        LOG_INFO("Input%d is: %s", i, inputString[i].c_str());
+        LOG_INFO("Output%d is: %s", i, output[i].c_str());
     }
-    std::string output = tokenizer->decode(outputIdsInt32);
     return output;
 }
 
-void benchmark(std::filesystem::path const& enginePath, std::vector<int64_t> const& inputIds, int64_t warmUp,
+void benchmark(std::filesystem::path const& enginePath, int const& inputLength, int64_t warmUp,
     int64_t numRuns, GenerationConfig const& generationConfig)
 {
     auto profiler = std::make_shared<BenchmarkProfiler>();
@@ -214,18 +242,36 @@ void benchmark(std::filesystem::path const& enginePath, std::vector<int64_t> con
     profiler->recordHostStart("decoder setup");
     decoder->setup(enginePath, stream);
     profiler->recordHostEnd("decoder setup");
-    std::vector<int64_t> outputIds;
-    outputIds.reserve(generationConfig.maxLength);
-
     profiler->stopTiming();
+
+    int64_t batchSize = decoder->getModelBatchSize();
+    int32_t maxContextLength{128};
+    std::vector<int64_t> inputIds(batchSize * maxContextLength, -1);
+    std::vector<int32_t> contextLengths(batchSize, inputLength);
+    std::vector<int64_t> lastTokenIds(batchSize, inputLength - 1);
+    std::vector<std::vector<int64_t>> outputIds(batchSize);
+
+    std::random_device dev;
+    std::mt19937 rng(dev());
+    std::uniform_int_distribution<std::mt19937::result_type> dist(0, 1000);
+    for (int i = 0; i < batchSize; ++i)
+    {
+        auto beginIter = inputIds.begin() + i * maxContextLength;
+        std::generate(beginIter, beginIter + inputLength, [&rng, &dist]() { return dist(rng); });
+        outputIds[i].reserve(generationConfig.maxLength);
+    }
+
     for (int64_t i = 0; i < warmUp; i++)
     {
         // Warmup for profiler
         profiler->recordHostStart("seq latency");
-        decoder->generate(inputIds, outputIds, generationConfig, -1, profiler);
+        decoder->generate(inputIds, contextLengths, lastTokenIds, outputIds, generationConfig, maxContextLength, -1, profiler);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("seq latency");
-        outputIds.resize(0);
+        for (int i = 0; i < batchSize; ++i)
+        {
+            outputIds[i].resize(0);
+        }
     }
     cudaDeviceSynchronize();
 
@@ -235,17 +281,20 @@ void benchmark(std::filesystem::path const& enginePath, std::vector<int64_t> con
     {
         profiler->recordHostStart("seq latency");
         profiler->recordHostStart("first token latency");
-        decoder->generate(inputIds, outputIds, generationConfig, -1, profiler);
+        decoder->generate(inputIds, contextLengths, lastTokenIds, outputIds, generationConfig, maxContextLength, -1, profiler);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("seq latency");
-        outputIds.resize(0);
+        for (int i = 0; i < batchSize; ++i)
+        {
+            outputIds[i].resize(0);
+        }
     }
     cudaProfilerStop();
     profiler->stopTiming();
     auto peakDeviceMem = profiler->recordDeviceMemEnd();
     auto peakHostMem = profiler->recordHostMemEnd();
 
-    auto maxNewTokens = generationConfig.maxLength - inputIds.size();
+    auto maxNewTokens = batchSize * generationConfig.maxLength;
     auto [averageSeqLatency, duration, seqLatencies] = profiler->getHostElapsedTimeMs("seq latency");
     auto [averageFirstTokenLatency, totalFirstTokenLatency, firstTokenLatencies]
         = profiler->getHostElapsedTimeMs("first token latency");
@@ -303,9 +352,9 @@ void benchmark(std::filesystem::path const& enginePath, std::vector<int64_t> con
         }
     }
     LOG_INFO(oss.str().c_str());
-    LOG_INFO("batch_size: %d", 1);
-    LOG_INFO("input_length: %d", inputIds.size());
-    LOG_INFO("output_length: %d", maxNewTokens);
+    LOG_INFO("batch_size: %d", batchSize);
+    LOG_INFO("input_length per batch: %d", inputLength);
+    LOG_INFO("output_length per batch: %d", maxNewTokens);
     LOG_INFO("seq_latency(ms): %.2f", averageSeqLatency);
     LOG_INFO("first_token_latency(ms): %.2f", averageFirstTokenLatency);
     LOG_INFO("tokens_per_sec: %.2f", tokensPerSec);
@@ -340,7 +389,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    void* handle = dlopen("drive-llm/build/plugins/libLLamaPlugin.so", RTLD_LAZY);
+    void* handle = dlopen("plugins/libLLamaPlugin.so", RTLD_LAZY);
     if (!handle)
     {
         LOG_ERROR("Cannot open library: %s", dlerror());
@@ -358,12 +407,7 @@ int main(int argc, char* argv[])
             LOG_ERROR("Please specify the input length");
             return EXIT_FAILURE;
         }
-        std::vector<int64_t> input(args.inputLength);
-        std::random_device dev;
-        std::mt19937 rng(dev());
-        std::uniform_int_distribution<std::mt19937::result_type> dist(0, 1000);
-        std::generate(input.begin(), input.end(), [&rng, &dist]() { return dist(rng); });
-        benchmark(args.enginePath, input, args.warmUp, args.numRuns, generationConfig);
+        benchmark(args.enginePath, args.inputLength, args.warmUp, args.numRuns, generationConfig);
         break;
     }
     case MODE::kInference:
@@ -371,7 +415,6 @@ int main(int argc, char* argv[])
         Tokenizer* tokenizer = new LlamaV3Tokenizer();
         tokenizer->loadFromHF(args.tokenizerPath);
         auto output = decode(args.enginePath, args.inputString, tokenizer, generationConfig, args.debug);
-        LOG_INFO("Output is %s", output.c_str());
         break;
     }
     }

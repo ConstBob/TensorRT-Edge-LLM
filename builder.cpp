@@ -1,4 +1,5 @@
 
+#include "plugins/attentionPlugin.h"
 #include "NvOnnxParser.h"
 #include "common.h"
 #include <NvInfer.h>
@@ -12,6 +13,8 @@
 
 using namespace std;
 using namespace nvinfer1;
+using namespace drivellm;
+
 
 struct BuilderArgs
 {
@@ -156,11 +159,12 @@ int main(int argc, char** argv)
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    void* handle = dlopen("drive-llm/build/plugins/libLLamaPlugin.so", RTLD_LAZY);
-    if (!handle) {
-        LOG_ERROR("Cannot open library: %s", dlerror());
-        return EXIT_FAILURE;
-    }
+    // void* handle = dlopen("../plugins/build/libLLamaPlugin.so", RTLD_LAZY);
+    // if (!handle)
+    // {
+    //     LOG_ERROR("Cannot open library: %s", dlerror());
+    //     return EXIT_FAILURE;
+    // }
 
     // Create the builder
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
@@ -194,6 +198,22 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    // Modify attention plugin attributes
+    for (int i = 0; i < network->getNbLayers(); ++i)
+    {
+        nvinfer1::ILayer* layer = network->getLayer(i);
+        std::string layerName = layer->getName();
+
+        if (layerName.substr(0, 9) == "Attention" && layer->getType() == nvinfer1::LayerType::kPLUGIN_V3)
+        {
+            nvinfer1::IPluginV3Layer* attnLayer = dynamic_cast<nvinfer1::IPluginV3Layer*>(layer);
+            drivellm::AttentionPlugin* attnPlugin = dynamic_cast<drivellm::AttentionPlugin*>(&attnLayer->getPlugin());
+
+            // NOTE: maxInputLen and maxSeqLen does not take effect. Only support maxInputLen=128 and maxSeqLen=256 for now.
+            attnPlugin->setCustomConfiguration(args.batchSize, args.maxInputLen, args.maxSeqLen);
+        }
+    }
+
     // Build the engine
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config)
@@ -203,8 +223,8 @@ int main(int argc, char** argv)
     }
 
     int32_t nbInputs = network->getNbInputs();
-    // Excluding input_ids and context length
-    int32_t nbLayers = nbInputs - 2;
+    // Excluding input_ids, context_lengths and last_token_ids
+    int32_t nbLayers = nbInputs - 3;
 
     auto* contextProfile = builder->createOptimizationProfile();
     auto* generationProfile = builder->createOptimizationProfile();
@@ -214,30 +234,18 @@ int main(int argc, char** argv)
     int64_t numKVHeads = kvDims.d[2];
     int64_t hiddenSizePerHead = kvDims.d[4];
 
-    Dims inputIdsContextShape = createDims({args.batchSize, args.maxInputLen});
+    // set dimensions for input tensors
+    setStaticProfile(contextProfile, "input_ids", createDims({args.batchSize, args.maxInputLen}));
+    setStaticProfile(contextProfile, "context_lengths", createDims({args.batchSize}));
+    setStaticProfile(contextProfile, "last_token_ids", createDims({args.batchSize, 1}));
+    setStaticProfile(generationProfile, "input_ids", createDims({args.batchSize, 1}));
+    setStaticProfile(generationProfile, "context_lengths", createDims({args.batchSize}));
+    setStaticProfile(generationProfile, "last_token_ids", createDims({args.batchSize, 1}));
+
     Dims kvCacheContextShape = createDims({args.batchSize, 2, numKVHeads, 0, hiddenSizePerHead});
-    Dims inputIdsGenerationShape = createDims({args.batchSize, 1});
     Dims kvCacheGenerationShape = createDims({args.batchSize, 2, numKVHeads, args.maxSeqLen, hiddenSizePerHead});
 
-    std::vector<int32_t> const minContextShape = {0};
-    std::vector<int32_t> const optContextShape = {static_cast<int>(args.maxInputLen / 2 - 1)};
-    std::vector<int32_t> const maxContextShape = {static_cast<int>(args.maxInputLen - 1)};
-    // Generation Phase has to be in s = 1
-    std::vector<int32_t> const minGenerationShape = {0};
-    std::vector<int32_t> const optGenerationShape = {0};
-    std::vector<int32_t> const maxGenerationShape = {0};
-    contextProfile->setShapeValues("last_token_ids", OptProfileSelector::kMIN, minContextShape.data(), 1);
-    contextProfile->setShapeValues("last_token_ids", OptProfileSelector::kOPT, optContextShape.data(), 1);
-    contextProfile->setShapeValues("last_token_ids", OptProfileSelector::kMAX, maxContextShape.data(), 1);
-    generationProfile->setShapeValues("last_token_ids", OptProfileSelector::kMIN, minGenerationShape.data(), 1);
-    generationProfile->setShapeValues("last_token_ids", OptProfileSelector::kOPT, optGenerationShape.data(), 1);
-    generationProfile->setShapeValues("last_token_ids", OptProfileSelector::kMAX, maxGenerationShape.data(), 1);
-
-    setStaticProfile(contextProfile, "input_ids", inputIdsContextShape);
-    setStaticProfile(generationProfile, "input_ids", inputIdsGenerationShape);
-
-    for (int i = 0; i < nbLayers; ++i)
-    {
+    for (int i = 0; i < nbLayers; ++i){
         setStaticProfile(contextProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheContextShape);
         // std::cout << kvCacheContextShape.d[0] << "," << kvCacheContextShape.d[1] << ", " << kvCacheContextShape.d[2]
         // << std::endl;
@@ -264,6 +272,6 @@ int main(int argc, char** argv)
     ofs.write(static_cast<char*>(engine->data()), engine->size());
     ofs.close();
     LOG_INFO("Engine saved to %s", args.enginePath.c_str());
-    dlclose(handle);
+    // dlclose(handle);
     return EXIT_SUCCESS;
 }

@@ -306,10 +306,10 @@ Tokenizer::Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks,
     mBpe = std::make_unique<BPE>(mergeableRanks, specialTokens, patStr);
 }
 
-std::vector<Rank> Tokenizer::encode(std::string const& text, bool addSpecialTokens) const
+std::vector<Rank> Tokenizer::encode(std::string const& text, bool addBos, bool addEos) const
 {
     std::vector<Rank> output;
-    output.reserve(text.size() + 2 * addSpecialTokens);
+    output.reserve(text.size() + addBos + addEos);
     std::forward_list<textPartition> partitions;
 
     if (!text.empty())
@@ -318,7 +318,7 @@ std::vector<Rank> Tokenizer::encode(std::string const& text, bool addSpecialToke
         mBpe->specialTokenPartition(text, partitions);
     }
 
-    if (addSpecialTokens)
+    if (addBos)
     {
         appendBos(output);
     }
@@ -337,7 +337,7 @@ std::vector<Rank> Tokenizer::encode(std::string const& text, bool addSpecialToke
         }
     }
 
-    if (addSpecialTokens)
+    if (addEos)
     {
         appendEos(output);
     }
@@ -397,7 +397,7 @@ Rank Tokenizer::getEosId() const noexcept
 
 Rank Tokenizer::getPadId() const noexcept
 {
-    return mPadId;
+    return mPadId == -1 ? mEosId : mPadId;
 }
 
 std::unordered_set<Rank> const& Tokenizer::getStopTokens() const noexcept
