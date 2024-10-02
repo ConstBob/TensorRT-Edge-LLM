@@ -32,7 +32,7 @@ class AttentionPlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    AttentionPlugin(std::string const& name, const int32_t batchSize);
+    AttentionPlugin(std::string const& name);
 
     // Force to distinguish different instances of the plugin.
     AttentionPlugin() = delete;
@@ -89,39 +89,26 @@ public:
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
     // end IPluginV3Runtime Methods
 
-    void setCustomConfiguration(const int32_t batchSize, const int32_t maxInputLen, const int32_t maxSeqLen);
-
 protected:
     std::string mLayerName;
     std::string mNamespace;
+    int32_t mSMVersion;
 
     nvinfer1::DataType mDataType{nvinfer1::DataType::kHALF};
-    // Fields to specify Multihead attention configuration
-    int32_t mBatchSize;
+
+    // Number of heads and head dimension are specified by model and are runtime constant.
+    // TODO: Make number of heads become plugin attribute.
+    // TODO: The attention kernel
     int32_t const mNumHeadQ{32};
     int32_t const mNumHeadK{8};
     int32_t const mNumHeadV{8};
     int32_t const mNumElemPerHead{128};
 
-    // temporary variable for input context length. We should later expand it as a list
-    // or let it become a user-configurable field.
-    int32_t const mInputContextLen{128};
+    // Temporary variable we hardcode for now which should be later expanded as user
+    // configurable field.
+    // TODO: Generalize the plugin usage and mark them as plugin attribute.
+    int32_t const mMaxBatchSize{16};
     int32_t const mTotalContextLen{256};
-
-    // Need fields to keep meta parameter to specify the kernels to run.
-
-    // Reserve fields for cudaModule, cudaFunction, kernel metas.
-    // Since we are using padded static shape, we only gonna support a group of context length.
-    //     We will load a group of MHA kernels upon plugin initialization time.
-    //     At execution time, onShapeChange will be invoked when optimization profile is switched,
-    //     and we will know the exact set of kernels to dispatch.
-    // Requires FMHA runner, GQA runner, pre-processing runners for context/generation phase
-    ContextFMHARunner mFMHARunner;
-    DecoderXQARunner mGQARunner;
-
-private:
-    nvinfer1::PluginFieldCollection mFieldCollection;
-    std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
 class AttentionPluginCreator : public nvinfer1::IPluginCreatorV3One

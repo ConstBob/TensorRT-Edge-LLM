@@ -295,14 +295,14 @@ inline FMHAKernelList const* getFMHAKernels(Data_type type, int32_t sm)
 
 }; // namespace
 
-ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t seqLen,
+ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t paddedSeqLen,
     int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion)
-    : mBatchSize(batchSize)
-    , mSequenceLen(seqLen)
+    : mDataType(dataType)
+    , mBatchSize(batchSize)
+    , mPaddedSequenceLen(paddedSeqLen)
     , mNumHeads(numQHeads)
     , mNumKVHeads(numKvHeads)
     , mHeadSize(headSize)
-    , mDataType(dataType)
     , mSmVersion(smVersion)
 {
     mLaunchParams.set_default_kernel_selection_params();
@@ -322,7 +322,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
         mLaunchParams.force_unroll = true;
 
         // Use same code as TRT-LLM for kernel selection
-        if (mLaunchParams.flash_attention && mSequenceLen <= 64)
+        if (mLaunchParams.flash_attention && mPaddedSequenceLen <= 64)
         {
             // flash attention tiled kernels allows larger free dim tile size (M, N) with flexibility
             // in unroll dimension tile size (K). for short sequence length (s<=128), tiled kernels
@@ -365,7 +365,7 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
     params.h = mNumHeads;
     params.h_kv = mNumKVHeads;
     params.h_q_per_kv = mNumHeads / mNumKVHeads;
-    params.s = mSequenceLen; // max sequence length
+    params.s = mPaddedSequenceLen; // max sequence length of a batch of input queries.
     params.d = mHeadSize;
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
@@ -378,7 +378,7 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
 bool ContextFMHARunner::prepareToRun()
 {
     FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
-    FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mSequenceLen, mHeadSize, mLaunchParams.force_unroll,
+    FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
         attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.granular_tiling};
     FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
@@ -392,7 +392,7 @@ void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2& 
 {
     check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr,
         "Device pointers are supposed to be valid");
-    FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mSequenceLen, mHeadSize, mLaunchParams.force_unroll,
+    FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
         attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.granular_tiling};
     FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
