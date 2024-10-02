@@ -129,7 +129,7 @@ char const* AttentionPlugin::getPluginVersion() const noexcept
 
 int32_t AttentionPlugin::getNbOutputs() const noexcept
 {
-    // At both context and generation phase, output atention result and kv-cache.
+    // At both context and generation phase, output attention result and kv-cache.
     return 2;
 }
 
@@ -155,7 +155,6 @@ bool AttentionPlugin::supportsFormatCombination(
         {
             status &= tensorDim.d[2] == (mNumHeadQ + mNumHeadK + mNumHeadV) * mNumElemPerHead;
         }
-        // std::cout << "Dims: " <<tensorDim.d[0] << " "<< tensorDim.d[1] << " " << tensorDim.d[2] << std::endl;
         return status;
     };
 

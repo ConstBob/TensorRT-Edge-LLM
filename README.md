@@ -11,7 +11,7 @@ You need a standard host to export the model into ONNX format. This host should 
 
 ## Supported models and precisions
 
-Currently only LLaMa3-8B-instruct with fp16 is supported. 
+Currently only LLaMa3-8B-instruct with fp16 and fp8 are supported.
 
 ## Getting started
 
@@ -42,20 +42,25 @@ The engine generation and inference process on Orin is the same as on x86 machin
 
 ### Export
 
-In standard Linux system, you will first need to export the model from PyTorch to ONNX. We also use `onnx_graphsurgeon` to convert the Attention module into a TensorRT Plugin in the same script. An example command is:
+In standard Linux system, you will first need to export the model from PyTorch to ONNX. We also use `onnx_graphsurgeon` to convert the Attention module into a TensorRT Plugin in the same script. To export fp16 model:
 
 ```
-python3 export_to_onnx.py --torch_dir llama-v3-8b-instruct-hf/ --output_dir llama_v3_onnx --dtype fp16
+python3 export_to_onnx.py --torch_dir llama-v3-8b-instruct-hf/ --output_dir llama_v3_fp16_onnx --dtype fp16
+```
+
+To export fp8 model:
+```
+python3 quantize.py --torch_dir llama-v3-8b-instruct-hf/ --output_dir llama_v3_fp8_onnx
 ```
 
 ### Build the engine
 
-You will use `builder` binary to build the TensorRT engine. Example command:
+You will use `builder` binary to build the TensorRT engine. For fp8 and fp16, it is the same for now since we are not using fp8 kv cache. Example command:
 ```
-./builder --onnxPath=llama_v3_onnx/model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=128 --maxSeqLen=256
+./builder --onnxPath=llama_v3_fp8_onnx/quantized_model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=128 --maxSeqLen=256
 ```
 
-**Notes:** `--maxSeqLen` includes `--maxInputLen`, so it must be greater than `--maxInputLen`. The maximum new token would equal to `maxSeqLen - maxInputLen`. 
+**Notes:** `--maxSeqLen` includes `--maxInputLen`, so it must be greater than `--maxInputLen`. The maximum new token would equal to `maxSeqLen - maxInputLen`.
 
 ### Infer the engine
 

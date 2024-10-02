@@ -1,4 +1,16 @@
 repos:
+-   repo: https://github.com/pycqa/isort
+    rev: 5.12.0
+    hooks:
+    -   id: isort
+-   repo: https://github.com/Lucas-C/pre-commit-hooks.git
+    rev: v1.1.13
+    hooks:
+    -   id: remove-crlf
+-   repo: https://github.com/pre-commit/mirrors-yapf
+    rev: v0.32.0
+    hooks:
+    -   id: yapf
 -   repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v16.0.0
     hooks:
@@ -6,3 +18,13 @@ repos:
         types_or: [c++, c, cuda]
         exclude: |
             (?x)^(.*cubin.cpp$ | .*_cubin.h)$
+-   repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: v0.6.10
+    hooks:
+    -   id: cmake-format
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.2.4
+    hooks:
+    -   id: codespell
+        args:
+        - --ignore-words-list=rouge,inout,atleast,strat,nd,subtile,thrid
