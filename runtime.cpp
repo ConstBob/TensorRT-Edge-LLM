@@ -229,7 +229,7 @@ std::vector<std::string> decode(std::filesystem::path const& enginePath, std::ve
     return output;
 }
 
-void benchmark(std::filesystem::path const& enginePath, int const& inputLength, int64_t warmUp,
+void benchmark(std::filesystem::path const& enginePath, int const inputLength, int64_t warmUp,
     int64_t numRuns, GenerationConfig const& generationConfig)
 {
     auto profiler = std::make_shared<BenchmarkProfiler>();
@@ -294,7 +294,7 @@ void benchmark(std::filesystem::path const& enginePath, int const& inputLength, 
     auto peakDeviceMem = profiler->recordDeviceMemEnd();
     auto peakHostMem = profiler->recordHostMemEnd();
 
-    auto maxNewTokens = batchSize * generationConfig.maxLength;
+    auto maxNewTokens = batchSize * (generationConfig.maxLength - inputLength);
     auto [averageSeqLatency, duration, seqLatencies] = profiler->getHostElapsedTimeMs("seq latency");
     auto [averageFirstTokenLatency, totalFirstTokenLatency, firstTokenLatencies]
         = profiler->getHostElapsedTimeMs("first token latency");
@@ -389,7 +389,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    void* handle = dlopen("plugins/libLLamaPlugin.so", RTLD_LAZY);
+    void* handle = dlopen("build/plugins/libLLamaPlugin.so", RTLD_LAZY);
     if (!handle)
     {
         LOG_ERROR("Cannot open library: %s", dlerror());

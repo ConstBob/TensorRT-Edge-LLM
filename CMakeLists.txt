@@ -78,7 +78,7 @@ target_link_libraries(decoder PUBLIC sampler)
 
 add_executable(builder builder.cpp)
 # find_library(LLAMA_PLUGIN_LIB LLamaPlugin ${CMAKE_SOURCE_DIR}/build/plugins)
-target_link_libraries(builder PRIVATE LLamaPlugin ${NV_ONNX_PARSER_LIB} ${NVINFER_LIB} ${CUDART_LIB} ${CMAKE_DL_LIBS})
+target_link_libraries(builder PRIVATE ${NV_ONNX_PARSER_LIB} ${NVINFER_LIB} ${CUDART_LIB} ${CMAKE_DL_LIBS})
 # Workaround for aarch64 cross compilation where libvninfer.so links to libnvdla_compilers.
 # The libnvinfer dependencies shall be resolved at execution time on an embedded board.
 target_link_options(builder PRIVATE "-Wl,--unresolved-symbols=ignore-in-shared-libs")       

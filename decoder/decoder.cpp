@@ -265,8 +265,10 @@ void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t
     LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
 
     bool contextStep = true;
-    int contextIter = 0;
-    while ((contextIter < generationConfig.maxLength))
+
+    // The generation step stop at longest sequence reach the maxLength.
+    int32_t generationInter = *std::max_element(contextLengths.begin(), contextLengths.end());
+    while ((generationInter < generationConfig.maxLength))
     {
         std::vector<int64_t> const& generatedToken
             = mSampler->greedySample(reinterpret_cast<half*>(mDeviceBuffer["logits"]));
@@ -282,7 +284,7 @@ void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t
             profiler->recordDeviceStart("generation");
             contextStep = false;
         }
-        ++contextIter;
+        ++generationInter;
         // Reaches eos token and reaches minLength.
         for (int i = 0; i < mConfig.batchSize; ++i)
         {

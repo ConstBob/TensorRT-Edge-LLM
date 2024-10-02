@@ -53,18 +53,24 @@ int8_t* alignDevicePtr(void* ptr)
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(std::string const& name, const int32_t batchSize)
-    : mBatchSize{batchSize}
+AttentionPlugin::AttentionPlugin(std::string const& name)
 {
     int device;
     checkCuda(cudaGetDevice(&device));
     cudaDeviceProp prop;
     checkCuda(cudaGetDeviceProperties(&prop, device));
-    int32_t smVersion = prop.major * 10 + prop.minor;
+    mSMVersion = prop.major * 10 + prop.minor;
 
-    mFMHARunner
-        = ContextFMHARunner(mDataType, mBatchSize, mInputContextLen, mNumHeadQ, mNumHeadK, mNumElemPerHead, smVersion);
-    mGQARunner = DecoderXQARunner(mDataType, mBatchSize, mNumHeadQ, mNumHeadK, mNumElemPerHead, smVersion);
+    // Initialize the attention kernel runner and load the cubinModule / kernel function.
+    // We will constrct new runner at enqueue time with execution time batch / SequenceLen.
+    constexpr int32_t kDEFAULT_BATCH{1};
+    constexpr int32_t kDEFAULT_CONTEXT{128};
+    auto fmhaRunner = ContextFMHARunner(mDataType, kDEFAULT_BATCH, kDEFAULT_CONTEXT,
+        mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+    auto xqaRunner = DecoderXQARunner(mDataType, kDEFAULT_BATCH, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+
+    fmhaRunner.prepareToRun();
+    xqaRunner.prepareToRun();
 }
 
 AttentionPlugin::~AttentionPlugin()
@@ -96,7 +102,7 @@ nvinfer1::IPluginCapability* AttentionPlugin::getCapabilityInterface(nvinfer1::P
 
 IPluginV3* AttentionPlugin::clone() noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mBatchSize);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -147,8 +153,6 @@ bool AttentionPlugin::supportsFormatCombination(
         auto const tensorDim = tensorDesc.dims;
         if (status)
         {
-            status &= tensorDim.d[0] == mBatchSize;
-            status &= tensorDim.d[1] == 1 || tensorDim.d[1] == mInputContextLen;
             status &= tensorDim.d[2] == (mNumHeadQ + mNumHeadK + mNumHeadV) * mNumElemPerHead;
         }
         // std::cout << "Dims: " <<tensorDim.d[0] << " "<< tensorDim.d[1] << " " << tensorDim.d[2] << std::endl;
@@ -164,7 +168,6 @@ bool AttentionPlugin::supportsFormatCombination(
         if (status)
         {
             auto const tensorDim = tensorDesc.dims;
-            status &= tensorDim.d[0] == mBatchSize;
             status &= tensorDim.d[1] == 2; // Specify K and V
             status &= tensorDim.d[2] == mNumHeadK;
             status &= tensorDim.d[3] == mTotalContextLen || tensorDim.d[3] == 0;
@@ -179,11 +182,6 @@ bool AttentionPlugin::supportsFormatCombination(
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 1;
-        if (status)
-        {
-            auto const tensorDim = tensorDesc.dims;
-            status &= tensorDim.d[0] == mBatchSize; // single scalar
-        }
         return status;
     };
 
@@ -196,8 +194,6 @@ bool AttentionPlugin::supportsFormatCombination(
         if (status)
         {
             auto const tensorDim = tensorDesc.dims;
-            status &= tensorDim.d[0] == mBatchSize;
-            status &= tensorDim.d[1] == 1 || tensorDim.d[1] == mInputContextLen;
             status &= tensorDim.d[2] == mNumHeadQ;
             status &= tensorDim.d[3] == mNumElemPerHead;
         }
@@ -268,7 +264,7 @@ size_t AttentionPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const
     // For FMHA kernel we need a buffer to store prefix sum of context lengths.
     // For GQA kernel we need to reserve a buffer space to store the Q tensor after rope transformation.
     constexpr int32_t nbBytesPerData{2};
-    int32_t const nbBytesQTensor = nbBytesPerData * mBatchSize * mNumHeadQ * mNumElemPerHead;
+    int32_t const nbBytesQTensor = nbBytesPerData * mMaxBatchSize * mNumHeadQ * mNumElemPerHead;
 
     // Add alignment to ensure we have enough device space at worst scenrio.
     return nbBytesQTensor + kDEVICE_ALIGNMENT;
@@ -302,18 +298,14 @@ int32_t AttentionPlugin::onShapeChange(nvinfer1::PluginTensorDesc const* in, int
 
 nvinfer1::IPluginV3* AttentionPlugin::attachToContext(nvinfer1::IPluginResourceContext* context) noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mBatchSize);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
 
 PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
 {
-    mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("mBatchSize", &mBatchSize, PluginFieldType::kINT32, 1));
-    mFieldCollection.nbFields = mPluginAttributes.size();
-    mFieldCollection.fields = mPluginAttributes.data();
-    return &mFieldCollection;
+    return nullptr;
 }
 
 int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
@@ -323,10 +315,22 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     constexpr int32_t kQKV_INPUT_IDX{0};
     constexpr int32_t kKV_CACHE_INPUT_OUTPUT_IDX{1};
     constexpr int32_t kINPUT_LENGTH_INPUT_IDX{2};
-    constexpr int32_t kINPUT_CACHE_SEQUENCE_DIM_IDX{3};
     constexpr int32_t kATTENTION_OUTPUT_IDX{0};
 
+    // Obtain execution time batch size and input context length
+    constexpr int32_t kQKV_INPUT_BATCH_DIM_IDX{0};
+    constexpr int32_t kQKV_INPUT_SEQLEN_DIM_IDX{1};
+    PluginTensorDesc const& qkvInputDesc = inputDesc[kQKV_INPUT_IDX];
+    int32_t const runtimeBatchSize = static_cast<int32_t>(qkvInputDesc.dims.d[kQKV_INPUT_BATCH_DIM_IDX]);
+    int32_t const  runtimeSeqLen = static_cast<int32_t>(qkvInputDesc.dims.d[kQKV_INPUT_SEQLEN_DIM_IDX]);
+
+    check(runtimeBatchSize < mMaxBatchSize,
+        "Runtime batchsize exceed max batch size. This will overflow device data buffer");
+    check(runtimeSeqLen < mTotalContextLen,
+        "Runtime sequence length exceed max total context lengths. This will overflow KVCache buffer");
+
     // Check whether the plugin is running context or generation. Determine by whether input kvCache has zero length.
+    constexpr int32_t kINPUT_CACHE_SEQUENCE_DIM_IDX{3};
     PluginTensorDesc const& kvInputDesc = inputDesc[kKV_CACHE_INPUT_OUTPUT_IDX];
     bool const isContextPhase = kvInputDesc.dims.d[kINPUT_CACHE_SEQUENCE_DIM_IDX] == 0;
 
@@ -345,19 +349,21 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         // RoPE kernel now only handle padded input sequence, we treat all "tokens" in the
         // padded input as processing targets.
         // TODO: Explore non-padded input format.
-        int32_t const totalProcessToken = mInputContextLen * mBatchSize;
+        int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
         invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ,
-            mNumHeadK, mNumElemPerHead, mTotalContextLen, mInputContextLen, kROPE_TYPE, kROPE_BASE_FREQUENCY,
+            mNumHeadK, mNumElemPerHead, mTotalContextLen, runtimeSeqLen, kROPE_TYPE, kROPE_BASE_FREQUENCY,
             kROPE_SCALE, kROPE_INIT_TYPE, totalProcessToken, stream);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
+        auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen,
+            mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
         Fused_multihead_attention_params_v2 params{};
         params.clear();
-        mFMHARunner.setupParams(params);
+        fmhaRunner.setupParams(params);
 
         // Compute the prefix sum of sequence length.
         int32_t* prefixSumDevicePtr = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
-        invokePrefixSum(seqLengthDevicePtr, prefixSumDevicePtr, mBatchSize, stream);
+        invokePrefixSum(seqLengthDevicePtr, prefixSumDevicePtr, runtimeBatchSize, stream);
 
         // Set device ptr for FMHA kernel.
         params.qkv_ptr = qkvDevicePtr;
@@ -365,20 +371,21 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         params.o_ptr = attentionResultDevicePtr;
 
         // Dispatch FMHA kernel
-        mFMHARunner.dispatchFMHAKernel(params, stream);
+        fmhaRunner.dispatchFMHAKernel(params, stream);
     }
     else
     {
         // Generation phase we first prepare Q vector and update KVCache.
         // Currently we only supports generating one token per sequence.
         half* qVecDevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
-        int32_t const totalProcessToken = mBatchSize;
+        int32_t const totalProcessToken = runtimeBatchSize;
         invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
-            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, mInputContextLen, kROPE_TYPE,
+            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, runtimeSeqLen, kROPE_TYPE,
             kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, totalProcessToken, stream);
 
         // Prepare GQA runner parameter to dispatch kernel
-        XQALaunchParams params = mGQARunner.initXQAParams();
+        auto xqaRunner = DecoderXQARunner(mDataType, runtimeBatchSize, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+        XQALaunchParams params = xqaRunner.initXQAParams();
         params.output = attentionResultDevicePtr;
         params.qInputPtr = qVecDevicePtr;
         params.kvCache.data = kvCacheDevicePtr;
@@ -386,36 +393,13 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         params.kvCache.capacity = mTotalContextLen;
 
         // dispatch GQA runner.
-        mGQARunner.dispatchXQAKernel(params, stream);
+        xqaRunner.dispatchXQAKernel(params, stream);
     }
     return 0;
 }
 
-void AttentionPlugin::setCustomConfiguration(const int32_t batchSize, const int32_t maxInputLen, const int32_t maxSeqLen)
-{
-    this->mBatchSize = batchSize;
-    // this->mInputContextLen = maxInputLen;  // uncomment when we support custom configuration
-    // this->mTotalContextLen = maxSeqLen;
-
-    // Reset mFMHARunner, mGQARunner
-    int device;
-    checkCuda(cudaGetDevice(&device));
-    cudaDeviceProp prop;
-    checkCuda(cudaGetDeviceProperties(&prop, device));
-    int32_t smVersion = prop.major * 10 + prop.minor;
-
-    mFMHARunner = ContextFMHARunner(mDataType, mBatchSize, mInputContextLen,
-        mNumHeadQ, mNumHeadK, mNumElemPerHead, smVersion);
-    mGQARunner = DecoderXQARunner(mDataType, mBatchSize, mNumHeadQ,
-        mNumHeadK, mNumElemPerHead, smVersion);
-}
-
 AttentionPluginCreator::AttentionPluginCreator()
 {
-    mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("mBatchSize", nullptr, PluginFieldType::kINT32, 1));
-    mFieldCollection.nbFields = mPluginAttributes.size();
-    mFieldCollection.fields = mPluginAttributes.data();
 }
 
 char const* AttentionPluginCreator::getPluginName() const noexcept
@@ -441,18 +425,6 @@ char const* AttentionPluginCreator::getPluginVersion() const noexcept
 nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
 {
-    PluginField const* fields = fc->fields;
-    int32_t batchSize{1};
-    // Read configurations from each fields
-    for (int i = 0; i < fc->nbFields; ++i)
-    {
-        char const* attrName = fields[i].name;
-        if (!strcmp(attrName, "mBatchSize"))
-        {
-            assert(fields[i].type == PluginFieldType::kINT32);
-            batchSize = static_cast<int32_t>(*(static_cast<int const*>(fields[i].data)));
-        }
-    }
-    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), batchSize);
+    AttentionPlugin* plugin = new AttentionPlugin(std::string(name));
     return plugin;
 }

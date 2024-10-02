@@ -1,5 +1,4 @@
 
-#include "plugins/attentionPlugin.h"
 #include "NvOnnxParser.h"
 #include "common.h"
 #include <NvInfer.h>
@@ -13,7 +12,6 @@
 
 using namespace std;
 using namespace nvinfer1;
-using namespace drivellm;
 
 
 struct BuilderArgs
@@ -118,9 +116,6 @@ bool setStaticProfile(IOptimizationProfile* profile, char const* inputName, Dims
     return profile->setDimensions(inputName, OptProfileSelector::kMIN, dims)
         && profile->setDimensions(inputName, OptProfileSelector::kOPT, dims)
         && profile->setDimensions(inputName, OptProfileSelector::kMAX, dims);
-    return profile->setDimensions(inputName, OptProfileSelector::kMIN, dims)
-        && profile->setDimensions(inputName, OptProfileSelector::kOPT, dims)
-        && profile->setDimensions(inputName, OptProfileSelector::kMAX, dims);
 }
 
 Dims createDims(std::vector<int64_t> const& shape)
@@ -159,12 +154,12 @@ int main(int argc, char** argv)
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    // void* handle = dlopen("../plugins/build/libLLamaPlugin.so", RTLD_LAZY);
-    // if (!handle)
-    // {
-    //     LOG_ERROR("Cannot open library: %s", dlerror());
-    //     return EXIT_FAILURE;
-    // }
+    void* handle = dlopen("build/plugins/libLLamaPlugin.so", RTLD_LAZY);
+    if (!handle)
+    {
+        LOG_ERROR("Cannot open library: %s", dlerror());
+        return EXIT_FAILURE;
+    }
 
     // Create the builder
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
@@ -198,22 +193,6 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    // Modify attention plugin attributes
-    for (int i = 0; i < network->getNbLayers(); ++i)
-    {
-        nvinfer1::ILayer* layer = network->getLayer(i);
-        std::string layerName = layer->getName();
-
-        if (layerName.substr(0, 9) == "Attention" && layer->getType() == nvinfer1::LayerType::kPLUGIN_V3)
-        {
-            nvinfer1::IPluginV3Layer* attnLayer = dynamic_cast<nvinfer1::IPluginV3Layer*>(layer);
-            drivellm::AttentionPlugin* attnPlugin = dynamic_cast<drivellm::AttentionPlugin*>(&attnLayer->getPlugin());
-
-            // NOTE: maxInputLen and maxSeqLen does not take effect. Only support maxInputLen=128 and maxSeqLen=256 for now.
-            attnPlugin->setCustomConfiguration(args.batchSize, args.maxInputLen, args.maxSeqLen);
-        }
-    }
-
     // Build the engine
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config)
@@ -222,9 +201,9 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    int32_t nbInputs = network->getNbInputs();
+    int32_t const nbInputs = network->getNbInputs();
     // Excluding input_ids, context_lengths and last_token_ids
-    int32_t nbLayers = nbInputs - 3;
+    int32_t const nbKVCacheInputs = nbInputs - 3;
 
     auto* contextProfile = builder->createOptimizationProfile();
     auto* generationProfile = builder->createOptimizationProfile();
@@ -245,10 +224,8 @@ int main(int argc, char** argv)
     Dims kvCacheContextShape = createDims({args.batchSize, 2, numKVHeads, 0, hiddenSizePerHead});
     Dims kvCacheGenerationShape = createDims({args.batchSize, 2, numKVHeads, args.maxSeqLen, hiddenSizePerHead});
 
-    for (int i = 0; i < nbLayers; ++i){
+    for (int i = 0; i < nbKVCacheInputs; ++i){
         setStaticProfile(contextProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheContextShape);
-        // std::cout << kvCacheContextShape.d[0] << "," << kvCacheContextShape.d[1] << ", " << kvCacheContextShape.d[2]
-        // << std::endl;
         setStaticProfile(generationProfile, fmtstr("past_key_values.%d", i).c_str(), kvCacheGenerationShape);
     }
 
