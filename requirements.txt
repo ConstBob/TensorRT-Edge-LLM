@@ -4,3 +4,5 @@ onnx
 onnx_graphsurgeon
 numpy
 onnxruntime
+nvidia-modelopt
+torch

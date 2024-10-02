@@ -1,19 +1,34 @@
 import argparse
-from optimum.exporters.onnx import main_export
-import onnx_graphsurgeon as gs
-import onnx
-import numpy as np
 import os
 import time
 
+import numpy as np
+import onnx
+import onnx_graphsurgeon as gs
+from optimum.exporters.onnx import main_export
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--torch_dir', type=str, help="The name or path of HF PyTorch model ckpt", required=False)
-    parser.add_argument('--onnx_path', type=str, help="The path of original ONNX model", required=False)
-    parser.add_argument('--output_dir', type=str, help="The directory to store the generated ONNX model", required=True)
-    parser.add_argument('--dtype', type=str, default="fp16", help="The floating point precision to use for export")
+    parser.add_argument('--torch_dir',
+                        type=str,
+                        help="The name or path of HF PyTorch model ckpt",
+                        required=False)
+    parser.add_argument('--onnx_path',
+                        type=str,
+                        help="The path of original ONNX model",
+                        required=False)
+    parser.add_argument('--output_dir',
+                        type=str,
+                        help="The directory to store the generated ONNX model",
+                        required=True)
+    parser.add_argument('--dtype',
+                        type=str,
+                        default="fp16",
+                        help="The floating point precision to use for export")
     args = parser.parse_args()
     return args
+
 
 def clear_inputs(node):
     for i in node.inputs:
@@ -21,11 +36,13 @@ def clear_inputs(node):
     node.inputs.clear()
     return node
 
+
 def clear_outputs(node):
     for o in node.outputs:
         o.inputs.clear()
     node.outputs.clear()
     return node
+
 
 def surgeon_graph(graph):
     # Look for kv cache inputs
@@ -73,26 +90,41 @@ def surgeon_graph(graph):
     attention_outputs = {}
     for node in graph.nodes:
         if "q_proj/MatMul" in node.name and node.op == "MatMul":
-            assert len(node.outputs) == 1, "You did not reach the proper q_proj MatMul tensor!"
+            assert len(
+                node.outputs
+            ) == 1, "You did not reach the proper q_proj MatMul tensor!"
             q_output = node.outputs[0]
             q_outputs[q_output.name] = clear_outputs(q_output)
         if "k_proj/MatMul" in node.name and node.op == "MatMul":
-            assert len(node.outputs) == 1, "You did not reach the proper k_proj MatMul tensor!"
+            assert len(
+                node.outputs
+            ) == 1, "You did not reach the proper k_proj MatMul tensor!"
             k_output = node.outputs[0]
             k_outputs[k_output.name] = clear_outputs(k_output)
         if "v_proj/MatMul" in node.name and node.op == "MatMul":
-            assert len(node.outputs) == 1, "You did not reach the proper v_proj MatMul tensor!"
+            assert len(
+                node.outputs
+            ) == 1, "You did not reach the proper v_proj MatMul tensor!"
             v_output = node.outputs[0]
             v_outputs[v_output.name] = clear_outputs(v_output)
         if "self_attn/Transpose_4" in node.name and node.op == "Transpose":
-            assert len(node.outputs) == 1, "You did not reach the proper self_attn Transpose tensor!"
+            assert len(
+                node.outputs
+            ) == 1, "You did not reach the proper self_attn Transpose tensor!"
             attention_output = node.outputs[0]
-            attention_outputs[attention_output.name] = clear_inputs(attention_output)
+            attention_outputs[attention_output.name] = clear_inputs(
+                attention_output)
 
     assert len(kv_inputs) % 2 == 0, "kv inputs should be multiples of 2"
     assert len(kv_outputs) % 2 == 0, "kv outputs should be multiples of 2"
     num_layers = len(kv_inputs) // 2
-    num_layers_check_list = [len(kv_outputs) // 2, len(q_outputs), len(k_outputs), len(v_outputs), len(attention_outputs)]
+    num_layers_check_list = [
+        len(kv_outputs) // 2,
+        len(q_outputs),
+        len(k_outputs),
+        len(v_outputs),
+        len(attention_outputs)
+    ]
     for i in num_layers_check_list:
         assert i == num_layers, f"Uneven number of I/O nodes detected: {num_layers_check_list}"
 
@@ -110,32 +142,37 @@ def surgeon_graph(graph):
         v_weight = clear_outputs(v.inputs[0].inputs[1])
 
         qkv_weight = gs.Constant(
-            name = f"/model/layers.{i}/qkv_proj/weight",
-            values=np.concatenate((q_weight.values, k_weight.values, v_weight.values), axis = 1)
-        )
+            name=f"/model/layers.{i}/qkv_proj/weight",
+            values=np.concatenate(
+                (q_weight.values, k_weight.values, v_weight.values), axis=1))
 
-        qkv = gs.Variable(
-            name = f"/model/layers.{i}/qkv_proj/MatMul_output",
-            dtype = q.dtype
-        )
+        qkv = gs.Variable(name=f"/model/layers.{i}/qkv_proj/MatMul_output",
+                          dtype=q.dtype)
 
         graph.layer(
             name=f"/model/layers.{i}/self_attn/qkv_proj",
             op="MatMul",
             inputs=[hidden_state, qkv_weight],
-            outputs = [qkv],
+            outputs=[qkv],
         )
 
         k_cache = kv_inputs[f"past_key_values.{i}.key"]
-        kv_input_shape = (k_cache.shape[0], 2, k_cache.shape[1], k_cache.shape[2], k_cache.shape[3])
-        kv_input = gs.Variable(f"past_key_values.{i}", dtype=k_cache.dtype, shape=kv_input_shape)
+        kv_input_shape = (k_cache.shape[0], 2, k_cache.shape[1],
+                          k_cache.shape[2], k_cache.shape[3])
+        kv_input = gs.Variable(f"past_key_values.{i}",
+                               dtype=k_cache.dtype,
+                               shape=kv_input_shape)
         graph.inputs.append(kv_input)
 
-        attn_output = attention_outputs[f"/model/layers.{i}/self_attn/Transpose_4_output_0"]
+        attn_output = attention_outputs[
+            f"/model/layers.{i}/self_attn/Transpose_4_output_0"]
         attn_output.name = f"/model/layers.{i}/self_attn/attention_output"
         k_cache_output = kv_outputs[f"present.{i}.key"]
-        kv_output_shape = (k_cache_output.shape[0], 2, k_cache_output.shape[1], k_cache_output.shape[2], k_cache_output.shape[3])
-        kv_output = gs.Variable(f"present_key_values.{i}", dtype=k_cache_output.dtype, shape=kv_output_shape)
+        kv_output_shape = (k_cache_output.shape[0], 2, k_cache_output.shape[1],
+                           k_cache_output.shape[2], k_cache_output.shape[3])
+        kv_output = gs.Variable(f"present_key_values.{i}",
+                                dtype=k_cache_output.dtype,
+                                shape=kv_output_shape)
         graph.outputs.append(kv_output)
 
         graph.layer(
@@ -204,7 +241,9 @@ def main():
     input_onnx_name = f"{args.output_dir}/model.onnx" if args.torch_dir else args.onnx_path
     graph = gs.import_onnx(onnx.load(input_onnx_name))
     t1 = time.time()
-    print(f"ONNX export and load takes {t1 - t0}s. Using onnx_graphsurgeon to insert plugin.")
+    print(
+        f"ONNX export and load takes {t1 - t0}s. Using onnx_graphsurgeon to insert plugin."
+    )
 
     graph = surgeon_graph(graph)
 
@@ -217,7 +256,9 @@ def main():
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"Saving ONNX files in {output_dir}. All existing ONNX in the folder will be overwritten.")
+    print(
+        f"Saving ONNX files in {output_dir}. All existing ONNX in the folder will be overwritten."
+    )
     for filename in os.listdir(output_dir):
         file_path = os.path.join(output_dir, filename)
         try:
@@ -229,18 +270,19 @@ def main():
             print('Failed to delete %s. Reason: %s' % (file_path, e))
 
     output_onnx_name = f"{args.output_dir}/model.onnx"
-    onnx.save_model(
-        model,
-        output_onnx_name,
-        save_as_external_data=True,
-        all_tensors_to_one_file = True,
-        location=f"onnx_model.data",
-        convert_attribute=True
-    )
+    onnx.save_model(model,
+                    output_onnx_name,
+                    save_as_external_data=True,
+                    all_tensors_to_one_file=True,
+                    location=f"onnx_model.data",
+                    convert_attribute=True)
 
     t4 = time.time()
     print(f"ONNX save takes {t4 - t3} seconds.")
-    print(f"Model ONNX saved to {args.output_dir} with {args.dtype} precision in {t4 - t0}s.")
+    print(
+        f"Model ONNX saved to {args.output_dir} with {args.dtype} precision in {t4 - t0}s."
+    )
+
 
 if __name__ == '__main__':
     main()
