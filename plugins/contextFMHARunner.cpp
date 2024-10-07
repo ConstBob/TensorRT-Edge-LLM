@@ -311,9 +311,10 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     bool const isSm90 = (smVersion == fmha_v2::kSM_90);
     bool const isSm8x = (smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87 || smVersion == fmha_v2::kSM_89);
     bool const isSm80 = (smVersion == fmha_v2::kSM_80);
+    bool const isSm101 = (smVersion == fmha_v2::kSM_101);
 
-    // We handle sm80/sm86 at first.
-    if (isSm80 || isSm8x)
+    // Handle kernel selection under different context.
+    if (isSm80 || isSm8x || isSm101)
     {
         // always use flash attention kernels for Ampere/Ada
         mLaunchParams.flash_attention = true;
