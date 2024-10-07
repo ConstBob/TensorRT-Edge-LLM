@@ -9,10 +9,9 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
-
+#include "testWrapper.h"
 #include "../contextFMHARunner.h"
 #include "refAttention.h"
-#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cuda.h>
@@ -205,7 +204,7 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
     }
 }
 
-TEST(sanity, fmha_llama_V3_8b_128)
+TEST_CASE(sanity, fmha_llama_V3_8b_128)
 {
     runFMHATest<8, 128>(1, 128, true, true);
 }

@@ -1,5 +1,5 @@
-#include <gtest/gtest.h>
 
+#include "testWrapper.h"
 #include "../pluginUtils.h"
 #include "../utilKernels.h"
 
@@ -375,25 +375,25 @@ void runRopeTestGeneration(int32_t batchSize, int32_t sequenceLen)
     }
 }
 
-TEST(sanity, rope_kv_context)
+TEST_CASE(sanity, rope_kv_context)
 {
     // Check 128 max len with 64 context len
     runRopeTestContext<8, 128>(1, 64);
 }
 
-TEST(sanity, rope_kv_context_multi_batch)
+TEST_CASE(sanity, rope_kv_context_multi_batch)
 {
     // Check 128 max len with 64 context len under batch 2
     runRopeTestContext<8, 128>(2, 64);
 }
 
-TEST(sanity, rope_kv_generation)
+TEST_CASE(sanity, rope_kv_generation)
 {
     // Check 128 max input-len with 200 context len
     runRopeTestGeneration<8, 128>(1, 200);
 }
 
-TEST(sanity, rope_kv_generation_multi_batch)
+TEST_CASE(sanity, rope_kv_generation_multi_batch)
 {
     // Check 128 max input-len with 200 context len under batch 2
     runRopeTestGeneration<8, 128>(2, 200);

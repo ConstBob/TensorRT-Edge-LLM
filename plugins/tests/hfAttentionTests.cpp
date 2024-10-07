@@ -1,4 +1,4 @@
-#include <gtest/gtest.h>
+#include "testWrapper.h"
 
 #include "../contextFMHARunner.h"
 #include "../pluginUtils.h"
@@ -175,7 +175,7 @@ void test_fmha()
     checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * 2, cudaMemcpyHostToDevice));
 
     drivellm::ContextFMHARunner runner(
-        nvinfer1::DataType::kHALF, kBATCH_SIZE, kINPUT_LENGTH_PADDED, kNUM_Q_HEADS, kNUM_K_HEADS, kDIM_HEAD, 86);
+        nvinfer1::DataType::kHALF, kBATCH_SIZE, kINPUT_LENGTH_PADDED, kNUM_Q_HEADS, kNUM_K_HEADS, kDIM_HEAD, 101);
 
     Fused_multihead_attention_params_v2 params{};
     params.clear();
@@ -216,12 +216,12 @@ void test_fmha()
     printf("Average difference of attention result data is %f .\n", avgDiff);
 }
 
-TEST(hf_test, rope_kv_context)
+TEST_CASE(hf_test, rope_kv_context)
 {
     testRope();
 }
 
-TEST(hf_test, fmha_context)
+TEST_CASE(hf_test, fmha_context)
 {
     test_fmha();
 }

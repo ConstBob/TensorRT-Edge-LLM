@@ -11,7 +11,7 @@ set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
 
 
 # Point CUDA to aarch cross targets.
-set(CUDA_VERSION 12.4)
+set(CUDA_VERSION 12.7)
 set(CUDA_DIR /usr/local/cuda/targets/aarch64-linux CACHE STRING "CUDA ROOT dir")
 
 # Use host nvcc
@@ -21,8 +21,7 @@ set(CMAKE_CUDA_COMPILER_FORCED TRUE)
 set(CMAKE_CUDA_FLAGS " -Xcompiler=\"-fPIC \"" CACHE STRING "" FORCE)
 
 # Specify the architecture for CUDA
-set(CMAKE_CUDA_ARCHITECTURES 87)  # 87 is for Jetson Orin (Ampere GPU with compute capability 8.7)
-
+set(CMAKE_CUDA_ARCHITECTURES 87 101)  # 87 is for Orin, 101 for Thor
 # Tell CMake how to search for the libraries and programs
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
