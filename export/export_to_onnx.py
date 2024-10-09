@@ -60,7 +60,7 @@ def surgeon_graph(graph):
     # Should not remove while iterating, so remove them separately
     for i in removed_inputs:
         graph.inputs.remove(i)
-        
+
     context_lengths = gs.Variable("context_lengths", np.int32, ['batch_size'])
 
     # For context phase, last_token_ids should be context_length - 1; for generation phase, last_token_ids should be 0
@@ -190,17 +190,15 @@ def surgeon_graph(graph):
     lm_head_input = lm_head_matmul.inputs[0]
 
     gather_output = gs.Variable("/lm_head/Gather_Output")
-    
+
     # lm_head_input shape: [batch_size, len, 4096]
     # last_token_ids shape: [batch_size, 1]
     # gather_output shape: [batch_size, 4096]
-    graph.layer(
-        name="/lm_head/GatherND",
-        op="GatherND",
-        inputs = [lm_head_input, last_token_ids],
-        outputs = [gather_output],
-        attrs = {"batch_dims": 1}
-    )
+    graph.layer(name="/lm_head/GatherND",
+                op="GatherND",
+                inputs=[lm_head_input, last_token_ids],
+                outputs=[gather_output],
+                attrs={"batch_dims": 1})
 
     gather_output.outputs = [lm_head_matmul]
     lm_head_matmul.inputs = [gather_output, lm_head_weight]
@@ -213,6 +211,54 @@ def surgeon_graph(graph):
     # Force logits shape to be 1 for both context phase and generation phase
     logits.shape = [logits.shape[0], logits.shape[2]]
     graph.cleanup().toposort().fold_constants().cleanup().toposort()
+
+    matmul_nodes = []
+    for node in graph.nodes:
+        if node.op == "MatMul":
+            a, b = node.inputs
+            if a.dtype in [np.float16, None] and b.dtype in [np.float16, None]:
+                matmul_nodes.append(node)
+
+    fp32_tensors = {}
+
+    for node in matmul_nodes:
+        a, b = node.inputs
+        c = node.outputs[0]
+
+        def get_fp32_tensor(tensor, to_fp32=True):
+            if tensor.name in fp32_tensors:
+                return fp32_tensors[tensor.name]
+            else:
+                fp32_tensors[tensor.name] = gs.Variable(name=tensor.name +
+                                                        "_FP32",
+                                                        dtype=np.float32)
+                if to_fp32:
+                    graph.layer(inputs=[tensor],
+                                outputs=[fp32_tensors[tensor.name]],
+                                op='Cast',
+                                attrs={"to": np.float32})
+                else:
+                    graph.layer(inputs=[fp32_tensors[tensor.name]],
+                                outputs=[tensor],
+                                op='Cast',
+                                attrs={"to": np.float16})
+                return fp32_tensors[tensor.name]
+
+        a_fp32 = get_fp32_tensor(a)
+        b_fp32 = get_fp32_tensor(b)
+        c_fp32 = get_fp32_tensor(c, False)
+
+        graph.layer(
+            name=node.name,
+            op="MatMul",
+            inputs=[a_fp32, b_fp32],
+            outputs=[c_fp32],
+        )
+
+        node.inputs.clear()
+        node.outputs.clear()
+
+    graph.cleanup().toposort()
 
     return graph
 

@@ -1,6 +1,7 @@
 """
 Adapted from https://github.com/hendrycks/test/blob/master/evaluate.py
 """
+
 import argparse
 import os
 
@@ -76,7 +77,9 @@ def eval(args, subject, model, tokenizer, dev_df, test_df):
         label = test_df.iloc[i, test_df.shape[1] - 1]
 
         with torch.no_grad():
-            outputs = model(input_ids, output_hidden_states=True)
+            outputs = model(input_ids,
+                            output_hidden_states=True,
+                            output_attentions=True)
             logits = outputs.logits
 
         last_token_logits: torch.Tensor = logits[0, -1, :]
@@ -120,8 +123,7 @@ def eval(args, subject, model, tokenizer, dev_df, test_df):
 
 def main(args):
     model = args.model
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.float16).cuda()
+    model = AutoModelForCausalLM.from_pretrained(args.model).cuda()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     subjects = sorted([
         f.split("_test.csv")[0]

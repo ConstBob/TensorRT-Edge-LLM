@@ -107,7 +107,7 @@ protected:
     // Temporary variable we hardcode for now which should be later expanded as user
     // configurable field.
     // TODO: Generalize the plugin usage and mark them as plugin attribute.
-    int32_t const mMaxBatchSize{2048};
+    int32_t const mMaxBatchSize{16};
     int32_t const mTotalContextLen{2050};
 };
 

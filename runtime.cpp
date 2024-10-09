@@ -583,11 +583,6 @@ void evaluate(fs::path const& enginePath, fs::path const& datasetPath, Tokenizer
         auto const& testData = testSubject2Data[subject];
         auto const& devData = devSubject2Data[subject];
         subjectTotal = testData.size();
-        std::ofstream out;
-        if (debug)
-        {
-            out.open("cpp/" + subjectFmt + ".txt");
-        }
 
         for (auto const& data : testData)
         {
@@ -628,39 +623,24 @@ void evaluate(fs::path const& enginePath, fs::path const& datasetPath, Tokenizer
                     val = hostLogits[choices[i]];
                 }
             }
-            if (debug)
+            if (debug && printFirstThree)
             {
-                if (printFirstThree)
-                {
-                    LOG_DEBUG("Model's answer: %c, expected answer: %c", bestIdx + 'A', data.ans[0]);
-                    printFirstThree--;
-                }
-                out << prompt << std::endl;
-                out << "Size: " << inputIds.size() << std::endl;
-                for (auto i : inputIds)
-                {
-                    out << i << " ";
-                }
-                out << std::endl;
-                for (int i = 0; i < 4; i++)
-                {
-                    out << float(hostLogits[choices[i]]) << " ";
-                }
-                out << std::endl;
-                out << fmtstr("Model's answer: %c, expected answer: %c", bestIdx + 'A', data.ans[0]) << std::endl;
+                LOG_DEBUG("Model's answer: %c, expected answer: %c", bestIdx + 'A', data.ans[0]);
+                printFirstThree--;
             }
             if (bestIdx + 'A' == data.ans[0])
             {
                 subjectCorrect++;
             }
         }
-        LOG_INFO("Subject %s evaluation done. Average accuracy: %.2f", subjectFmt.c_str(),
+
+        LOG_INFO("Subject %s evaluation done. Average accuracy: %.3f", subjectFmt.c_str(),
             float(subjectCorrect) / subjectTotal);
         correct += subjectCorrect;
         total += subjectTotal;
     }
 
-    LOG_INFO("MMLU: %.2f", float(correct) / total);
+    LOG_INFO("MMLU: %.3f", float(correct) / total);
 }
 
 int main(int argc, char* argv[])
@@ -711,7 +691,6 @@ int main(int argc, char* argv[])
     {
         auto tokenizer = new LlamaV3Tokenizer();
         tokenizer->loadFromHF(args.tokenizerPath);
-        generationConfig.maxLength = 1;
         evaluate(args.enginePath, args.datasetPath, tokenizer, generationConfig, args.debug);
         break;
     }
