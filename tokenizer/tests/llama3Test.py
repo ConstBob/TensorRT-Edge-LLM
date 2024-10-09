@@ -1,40 +1,31 @@
-# 
+#
 # SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 # http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# 
+#
+
+import argparse
+import os
+from pathlib import Path
+from typing import (AbstractSet, Any, Collection, Dict, Iterator, List,
+                    Literal, Sequence, TypedDict, Union, cast)
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
-from typing import (
-    AbstractSet,
-    cast,
-    Collection,
-    Dict,
-    Iterator,
-    List,
-    Literal,
-    Sequence,
-    TypedDict,
-    Union,
-)
-import os
-from pathlib import Path
-from typing import Any, cast
-import argparse
 
-# Offical Llama3 tokenizer:
+
+# Official Llama3 tokenizer:
 # https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py
 class Tokenizer:
     """
@@ -74,7 +65,8 @@ class Tokenizer:
             for i in range(5, self.num_reserved_special_tokens - 5)
         ]
         self.special_tokens = {
-            token: num_base_tokens + i for i, token in enumerate(special_tokens)
+            token: num_base_tokens + i
+            for i, token in enumerate(special_tokens)
         }
         self.model = tiktoken.Encoding(
             name=Path(model_path).name,
@@ -138,13 +130,10 @@ class Tokenizer:
         # of max consecutive non-whitespace or whitespace characters.
         MAX_NO_WHITESPACES_CHARS = 25_000
 
-        substrs = (
-            substr
-            for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
-            for substr in self._split_whitespaces_or_nonwhitespaces(
-                s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
-            )
-        )
+        substrs = (substr for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
+                   for substr in self._split_whitespaces_or_nonwhitespaces(
+                       s[i:i +
+                         TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS))
         t: List[int] = []
         for substr in substrs:
             t.extend(
@@ -152,8 +141,7 @@ class Tokenizer:
                     substr,
                     allowed_special=allowed_special,
                     disallowed_special=disallowed_special,
-                )
-            )
+                ))
         if bos:
             t.insert(0, self.bos_id)
         if eos:
@@ -175,8 +163,7 @@ class Tokenizer:
 
     @staticmethod
     def _split_whitespaces_or_nonwhitespaces(
-        s: str, max_consecutive_slice_len: int
-    ) -> Iterator[str]:
+            s: str, max_consecutive_slice_len: int) -> Iterator[str]:
         """
         Splits the string `s` so that each substring contains no more than `max_consecutive_slice_len`
         consecutive whitespaces or consecutive non-whitespaces.
@@ -201,20 +188,25 @@ class Tokenizer:
 
 
 if __name__ == "__main__":
-    
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, help="Path to tokenizer.model file")
+    parser.add_argument("--model_path",
+                        type=str,
+                        help="Path to tokenizer.model file")
     parser.add_argument("--input", type=str, help="Input text to encode")
-    parser.add_argument("--add_special", type=int, default=0, help="Whether to add bos and eos")
+    parser.add_argument("--add_special",
+                        type=int,
+                        default=0,
+                        help="Whether to add bos and eos")
     args = parser.parse_args()
-    
+
     enc = Tokenizer(args.model_path)
-    
+
     bos = False
     eos = False
     if args.add_special:
         bos = True
         eos = True
-        
+
     token = enc.encode(args.input, bos=bos, eos=eos, allowed_special="all")
     print(token)

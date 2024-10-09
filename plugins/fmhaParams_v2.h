@@ -63,7 +63,7 @@ struct Fused_multihead_attention_params_v2
     int64_t qkv_stride_in_bytes;
     // The stride between rows of the separate Q matrice. (Used by non-packed Q input)
     int64_t q_stride_in_bytes;
-    // The stride between rows of the separate KV matrice. (Used by Seperate KV input)
+    // The stride between rows of the separate KV matrice. (Used by Separate KV input)
     int64_t kv_stride_in_bytes;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;

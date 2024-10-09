@@ -35,7 +35,7 @@ public:
 
     size_t getWorkspaceSize();
 
-    // The function will setup an ampty FMHA_v2 parameter. Device pointers shall be setup via caller.
+    // The function will setup an empty FMHA_v2 parameter. Device pointers shall be setup via caller.
     void setupParams(Fused_multihead_attention_params_v2& params);
 
     // Dispatch XQA kernel and compute the attention result.
