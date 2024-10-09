@@ -1,8 +1,13 @@
 build/
 *_engine/
+*.engine
 *_onnx/
 __pycache__/
 .vscode
 *.json
 .nvcode/
 .cache
+data/
+data.tar
+*.txt
+*.csv

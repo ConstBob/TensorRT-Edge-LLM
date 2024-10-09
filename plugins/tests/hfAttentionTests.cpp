@@ -50,7 +50,7 @@ void loadDataFromFile(std::string name, std::vector<half>& dataVec, int32_t nbDa
     file.close();
 }
 
-// Concat seperate QKV tensor of shape [1, S, H_{q, k, v}, D] into [1, S, Hq+Hk+Hv, D]
+// Concat separate QKV tensor of shape [1, S, H_{q, k, v}, D] into [1, S, Hq+Hk+Hv, D]
 std::vector<half> concatQKVData(
     std::vector<half> const& qTensor, std::vector<half> const& kTensor, std::vector<half> const& vTensor)
 {
@@ -105,7 +105,7 @@ void testRope()
 
     cudaStream_t const stream = nullptr;
     invokeContextApplyRopeUpdateKVFP16(qkv_device_ptr, nullptr, kvcache_ptr, seqlen_device_ptr, kNUM_Q_HEADS,
-        kNUM_K_HEADS, kDIM_HEAD, kKV_CACHE_CAPACITY, kINPUT_LENGTH_PADDED, kROPE_TYPE, kROPE_BASE_FREQUENCY, 
+        kNUM_K_HEADS, kDIM_HEAD, kKV_CACHE_CAPACITY, kINPUT_LENGTH_PADDED, kROPE_TYPE, kROPE_BASE_FREQUENCY,
         kROPE_SCALE, kROPE_INIT_TYPE, kINPUT_LENGTH_PADDED, stream);
     checkCuda(cudaStreamSynchronize(stream));
     checkCuda(cudaGetLastError());
@@ -121,7 +121,7 @@ void testRope()
     loadDataFromFile("../tests/hf-tensor/post-rope-qtensor.bin", refQData, nbQdata);
     loadDataFromFile("../tests/hf-tensor/post-rope-ktensor.bin", refKData, nbKData);
 
-    // V data should be unchaned.
+    // V data should be unchanged.
     std::vector<half> refQKV = concatQKVData(refQData, refKData, inputVData);
     double totalDiff = 0;
     for (int32_t i = 0; i < nbQKVData; ++i)

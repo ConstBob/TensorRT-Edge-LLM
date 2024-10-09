@@ -62,11 +62,11 @@ AttentionPlugin::AttentionPlugin(std::string const& name)
     mSMVersion = prop.major * 10 + prop.minor;
 
     // Initialize the attention kernel runner and load the cubinModule / kernel function.
-    // We will constrct new runner at enqueue time with execution time batch / SequenceLen.
+    // We will construct new runner at enqueue time with execution time batch / SequenceLen.
     constexpr int32_t kDEFAULT_BATCH{1};
     constexpr int32_t kDEFAULT_CONTEXT{128};
-    auto fmhaRunner = ContextFMHARunner(mDataType, kDEFAULT_BATCH, kDEFAULT_CONTEXT,
-        mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+    auto fmhaRunner = ContextFMHARunner(
+        mDataType, kDEFAULT_BATCH, kDEFAULT_CONTEXT, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
     auto xqaRunner = DecoderXQARunner(mDataType, kDEFAULT_BATCH, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
 
     fmhaRunner.prepareToRun();
@@ -321,7 +321,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     constexpr int32_t kQKV_INPUT_SEQLEN_DIM_IDX{1};
     PluginTensorDesc const& qkvInputDesc = inputDesc[kQKV_INPUT_IDX];
     int32_t const runtimeBatchSize = static_cast<int32_t>(qkvInputDesc.dims.d[kQKV_INPUT_BATCH_DIM_IDX]);
-    int32_t const  runtimeSeqLen = static_cast<int32_t>(qkvInputDesc.dims.d[kQKV_INPUT_SEQLEN_DIM_IDX]);
+    int32_t const runtimeSeqLen = static_cast<int32_t>(qkvInputDesc.dims.d[kQKV_INPUT_SEQLEN_DIM_IDX]);
 
     check(runtimeBatchSize < mMaxBatchSize,
         "Runtime batchsize exceed max batch size. This will overflow device data buffer");
@@ -350,12 +350,12 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         // TODO: Explore non-padded input format.
         int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
         invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ,
-            mNumHeadK, mNumElemPerHead, mTotalContextLen, runtimeSeqLen, kROPE_TYPE, kROPE_BASE_FREQUENCY,
-            kROPE_SCALE, kROPE_INIT_TYPE, totalProcessToken, stream);
+            mNumHeadK, mNumElemPerHead, mTotalContextLen, runtimeSeqLen, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
+            kROPE_INIT_TYPE, totalProcessToken, stream);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
-        auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen,
-            mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+        auto fmhaRunner = ContextFMHARunner(
+            mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
         Fused_multihead_attention_params_v2 params{};
         params.clear();
         fmhaRunner.setupParams(params);
@@ -379,11 +379,12 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         half* qVecDevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
         int32_t const totalProcessToken = runtimeBatchSize;
         invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
-            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, runtimeSeqLen, kROPE_TYPE,
-            kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, totalProcessToken, stream);
+            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, runtimeSeqLen, kROPE_TYPE, kROPE_BASE_FREQUENCY,
+            kROPE_SCALE, kROPE_INIT_TYPE, totalProcessToken, stream);
 
         // Prepare GQA runner parameter to dispatch kernel
-        auto xqaRunner = DecoderXQARunner(mDataType, runtimeBatchSize, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+        auto xqaRunner
+            = DecoderXQARunner(mDataType, runtimeBatchSize, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
         XQALaunchParams params = xqaRunner.initXQAParams();
         params.output = attentionResultDevicePtr;
         params.qInputPtr = qVecDevicePtr;
@@ -397,9 +398,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     return 0;
 }
 
-AttentionPluginCreator::AttentionPluginCreator()
-{
-}
+AttentionPluginCreator::AttentionPluginCreator() {}
 
 char const* AttentionPluginCreator::getPluginName() const noexcept
 {

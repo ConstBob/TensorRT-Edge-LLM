@@ -9,9 +9,9 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
-#include "testWrapper.h"
 #include "../contextFMHARunner.h"
 #include "refAttention.h"
+#include "testWrapper.h"
 
 #include <algorithm>
 #include <cuda.h>

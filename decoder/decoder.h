@@ -32,9 +32,9 @@ struct GenerationConfig
     int64_t topK;
 };
 
+template <typename T>
 class Decoder
 {
-
 public:
     Decoder()
         : mStream{nullptr}
@@ -48,17 +48,23 @@ public:
     {
     }
     bool setup(std::filesystem::path const& fp, cudaStream_t& stream);
-    void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths, std::vector<int64_t> lastTokenIds,
-        std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int32_t maxContextLength, int64_t endIds = -1,
+    void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
+        std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
         std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
 
+    std::vector<T> const& getLastHostLogits();
     size_t getDeviceMemorySize() const noexcept;
     int64_t getModelBatchSize() const noexcept;
+    int64_t getMaxContextLength() const noexcept;
     ~Decoder()
     {
         for (auto deviceMem : mDeviceBuffer)
         {
             cudaFree(deviceMem.second);
+        }
+        for (auto hostMem : mHostBuffer)
+        {
+            free(hostMem.second);
         }
         mDeviceBuffer.clear();
         isSetup = false;
@@ -73,6 +79,7 @@ private:
     bool isSetup;
     ModelConfig mConfig;
     std::map<std::string, void*> mDeviceBuffer;
+    std::map<std::string, void*> mHostBuffer;
     bool validateAndFillConfig();
     bool checkStaticShape(std::string& name);
     void allocateBuffer();

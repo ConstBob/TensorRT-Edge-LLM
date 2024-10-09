@@ -134,7 +134,7 @@ public:
             {
                 continue;
             }
-            // Filter out kernel that irrelavent to this project.
+            // Filter out kernel that irrelevant to this project.
             if (kernelMeta.mPagedKVCache == true || kernelMeta.mMultiQueryTokens == true || kernelMeta.mBeamWidth != 1
                 || kernelMeta.mDataType != kernelMeta.mKVDataType)
             {

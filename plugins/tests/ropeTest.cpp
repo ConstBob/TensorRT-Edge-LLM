@@ -1,7 +1,7 @@
 
-#include "testWrapper.h"
 #include "../pluginUtils.h"
 #include "../utilKernels.h"
+#include "testWrapper.h"
 
 #include <algorithm>
 #include <cmath>
@@ -90,8 +90,8 @@ void runRopeTestContext(int32_t batchSize, int32_t sequenceLen)
 
     cudaStream_t const stream = nullptr;
     invokeContextApplyRopeUpdateKVFP16(qkv_device_ptr, nullptr, kvcache_ptr, seqlen_device_ptr, nbQHeads, nbKHeads,
-        sizePerHead, kvcacheCapacity, MAX_SEQ_LEN, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, MAX_SEQ_LEN * batchSize,
-        stream);
+        sizePerHead, kvcacheCapacity, MAX_SEQ_LEN, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE,
+        MAX_SEQ_LEN * batchSize, stream);
 
     checkCuda(cudaStreamSynchronize(stream));
     checkCuda(cudaGetLastError());
@@ -289,7 +289,8 @@ void runRopeTestGeneration(int32_t batchSize, int32_t sequenceLen)
 
     cudaStream_t const stream = nullptr;
     invokeGenerationApplyRopeUpdateKVFP16(qkv_device_ptr, q_ptr, kvcache_ptr, seqlen_device_ptr, nbQHeads, nbKHeads,
-        sizePerHead, kvcacheCapacity, MAX_SEQ_LEN, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE, batchSize, stream);
+        sizePerHead, kvcacheCapacity, MAX_SEQ_LEN, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE, kROPE_INIT_TYPE,
+        batchSize, stream);
 
     // Check output data contents, based on the nature of rope, we will compare the data pair by pair.
     std::vector<float> kvCacheHost(totalKVCacheElems);

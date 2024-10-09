@@ -19,14 +19,14 @@ Sampler<T>::Sampler(int64_t batchSize, int64_t vocabSize)
 
     mLayer = std::make_unique<TopKSamplingLayer<T>>(mDecoderDomain);
 
-    // If we need to support top k, top p in the future, we need a seperate setup
+    // If we need to support top k, top p in the future, we need a separate setup
     // function to adjust top k, top p value between different request.
     mLayer->setup(batchSize, 1, nullptr, setupParams);
     mOutputIds.resize(batchSize);
     auto workspaceSize = mLayer->getWorkspaceSize();
-    cudaMalloc(&mWorkspace, sizeof(int8_t) * workspaceSize);
-    cudaMalloc(&mDevStates, sizeof(curandState) * batchSize);
-    cudaMalloc(&mOutputIdsDevice, sizeof(int64_t) * batchSize);
+    CUDA_CHECK(cudaMalloc(&mWorkspace, sizeof(int8_t) * workspaceSize));
+    CUDA_CHECK(cudaMalloc(&mDevStates, sizeof(curandState) * batchSize));
+    CUDA_CHECK(cudaMalloc(&mOutputIdsDevice, sizeof(int64_t) * batchSize));
 }
 
 template <typename T>

@@ -108,7 +108,7 @@ protected:
     // configurable field.
     // TODO: Generalize the plugin usage and mark them as plugin attribute.
     int32_t const mMaxBatchSize{16};
-    int32_t const mTotalContextLen{256};
+    int32_t const mTotalContextLen{2050};
 };
 
 class AttentionPluginCreator : public nvinfer1::IPluginCreatorV3One

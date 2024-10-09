@@ -10,9 +10,9 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "testWrapper.h"
 #include "../decoderXQARunner.h"
 #include "refAttention.h"
+#include "testWrapper.h"
 #include "xqa/cubin/xqa_kernel_cubin.h"
 
 #include <algorithm>
@@ -263,7 +263,8 @@ void runTest(
     checkCuda(cudaStreamSynchronize(stream));
 
     auto const scratch = reinterpret_cast<void*>(roundUp<uintptr_t>(reinterpret_cast<uintptr_t>(scratchBuf.get()),
-        (useQGMMA ? ioHeadBytes : paddedInputHeadBytes) * headGrpSize * beamWidth)); // 8 is sufficent for qgmma kernel.
+        (useQGMMA ? ioHeadBytes : paddedInputHeadBytes) * headGrpSize
+            * beamWidth)); // 8 is sufficient for qgmma kernel.
 
     // CUmodule cuModule;
     // CUfunction kernelFunction;

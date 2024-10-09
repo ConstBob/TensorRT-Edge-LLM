@@ -27,4 +27,4 @@ repos:
     hooks:
     -   id: codespell
         args:
-        - --ignore-words-list=rouge,inout,atleast,strat,nd,subtile,thrid
+        - --ignore-words-list=rouge,inout,atleast,strat,nd,subtile,thrid,ans,datas
