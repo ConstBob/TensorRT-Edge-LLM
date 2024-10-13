@@ -208,57 +208,9 @@ def surgeon_graph(graph):
     lm_head_matmul.outputs = [logits]
     logits.inputs = [lm_head_matmul]
     logits.dtype = np.float16
-    # Force logits shape to be 1 for both context phase and generation phase
+    # Force logits to have shape of [batch_size, vocab_size].
     logits.shape = [logits.shape[0], logits.shape[2]]
     graph.cleanup().toposort().fold_constants().cleanup().toposort()
-
-    matmul_nodes = []
-    for node in graph.nodes:
-        if node.op == "MatMul":
-            a, b = node.inputs
-            if a.dtype in [np.float16, None] and b.dtype in [np.float16, None]:
-                matmul_nodes.append(node)
-
-    fp32_tensors = {}
-
-    for node in matmul_nodes:
-        a, b = node.inputs
-        c = node.outputs[0]
-
-        def get_fp32_tensor(tensor, to_fp32=True):
-            if tensor.name in fp32_tensors:
-                return fp32_tensors[tensor.name]
-            else:
-                fp32_tensors[tensor.name] = gs.Variable(name=tensor.name +
-                                                        "_FP32",
-                                                        dtype=np.float32)
-                if to_fp32:
-                    graph.layer(inputs=[tensor],
-                                outputs=[fp32_tensors[tensor.name]],
-                                op='Cast',
-                                attrs={"to": np.float32})
-                else:
-                    graph.layer(inputs=[fp32_tensors[tensor.name]],
-                                outputs=[tensor],
-                                op='Cast',
-                                attrs={"to": np.float16})
-                return fp32_tensors[tensor.name]
-
-        a_fp32 = get_fp32_tensor(a)
-        b_fp32 = get_fp32_tensor(b)
-        c_fp32 = get_fp32_tensor(c, False)
-
-        graph.layer(
-            name=node.name,
-            op="MatMul",
-            inputs=[a_fp32, b_fp32],
-            outputs=[c_fp32],
-        )
-
-        node.inputs.clear()
-        node.outputs.clear()
-
-    graph.cleanup().toposort()
 
     return graph
 

@@ -30,12 +30,12 @@ namespace
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
 
+// Align with Meta's implementation for rotary embedding.
+// Use a different set of configuration could harm MMLU score noticably.
 constexpr float kROPE_BASE_FREQUENCY = 500000.f;
 constexpr float kROPE_SCALE = 1.0f;
-
-// Hugging-face rope implementation use roate-half method.
 constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_HALF;
-constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kLLAMA3;
+constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kDEFAULT;
 
 constexpr int32_t kDEVICE_ALIGNMENT{128}; // Make sure all device pointers are aligned by 128.
 
