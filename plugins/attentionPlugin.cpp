@@ -31,7 +31,7 @@ constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
 
 // Align with Meta's implementation for rotary embedding.
-// Use a different set of configuration could harm MMLU score noticably.
+// Use a different set of configuration could harm MMLU score noticeably.
 constexpr float kROPE_BASE_FREQUENCY = 500000.f;
 constexpr float kROPE_SCALE = 1.0f;
 constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_HALF;
@@ -55,11 +55,7 @@ REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
 AttentionPlugin::AttentionPlugin(std::string const& name)
 {
-    int device;
-    checkCuda(cudaGetDevice(&device));
-    cudaDeviceProp prop;
-    checkCuda(cudaGetDeviceProperties(&prop, device));
-    mSMVersion = prop.major * 10 + prop.minor;
+    mSMVersion = getSMVersion();
 
     // Initialize the attention kernel runner and load the cubinModule / kernel function.
     // We will construct new runner at enqueue time with execution time batch / SequenceLen.

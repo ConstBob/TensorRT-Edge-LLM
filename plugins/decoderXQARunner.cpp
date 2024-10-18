@@ -259,7 +259,7 @@ size_t DecoderXQARunner::getWorkspaceSize(int max_num_tokens)
     return 0;
 }
 
-int32_t DecoderXQARunner::prepareToRun()
+bool DecoderXQARunner::prepareToRun()
 {
     // Load CUmodules to device and collect device functions.
     XQAKernelList const* xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion);
@@ -267,7 +267,7 @@ int32_t DecoderXQARunner::prepareToRun()
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
 
     // check if there is a valid kernel corresponding to the requested config.
-    int32_t status = kernelInfo.mSharedMemBytes != 0;
+    bool status = kernelInfo.mSharedMemBytes != 0;
     return status;
 }
 

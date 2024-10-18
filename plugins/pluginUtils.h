@@ -50,3 +50,14 @@ inline void check(bool condition, std::string errorMsg)
         throw std::runtime_error(errorMsg);
     }
 }
+
+inline int getSMVersion()
+{
+    int device{-1};
+    checkCuda(cudaGetDevice(&device));
+    int sm_major = 0;
+    int sm_minor = 0;
+    checkCuda(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
+    checkCuda(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
+    return sm_major * 10 + sm_minor;
+}

@@ -156,7 +156,7 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
     Fused_multihead_attention_params_v2 params;
     params.clear();
     runner.setupParams(params);
-    int status = runner.prepareToRun();
+    bool status = runner.prepareToRun();
     check(status != 0, "Error in fetch kernel list.");
 
     params.qkv_ptr = &(qkvData[0][0][0]);

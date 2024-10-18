@@ -75,6 +75,19 @@ inline std::tuple<size_t, size_t> getDeviceMemoryInfo()
     return {free, total};
 }
 
+/// Get the SM version of GPU
+/// \return The SM version of current GPU
+inline int getSMVersion()
+{
+    int device{-1};
+    CUDA_CHECK(cudaGetDevice(&device));
+    int sm_major = 0;
+    int sm_minor = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
+    return sm_major * 10 + sm_minor;
+}
+
 #ifdef NDEBUG
 #define sync_check_cuda_error()                                                                                        \
     do                                                                                                                 \

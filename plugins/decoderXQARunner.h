@@ -62,7 +62,7 @@ public:
 
     // The call load and prepare kernel to dispatch. After the call, the CUmodule will be loaded to device
     // and kernel functions are prepared to launch.
-    int32_t prepareToRun();
+    bool prepareToRun();
 
     // Dispatch XQA kernel and compute the attention result.
     void dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream);
