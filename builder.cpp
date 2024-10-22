@@ -37,9 +37,6 @@ void printUsage(char const* programName)
     std::cerr
         << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 256"
         << std::endl;
-    std::cerr
-        << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 256"
-        << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more logs." << std::endl;
 }
 

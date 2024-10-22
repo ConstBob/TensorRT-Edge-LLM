@@ -312,7 +312,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     bool const isSm8x = (smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87 || smVersion == fmha_v2::kSM_89);
     bool const isSm80 = (smVersion == fmha_v2::kSM_80);
     bool const isSm101 = (smVersion == fmha_v2::kSM_101);
-
+    check(!isSm90, "SM90 is not supported for contextFMHA");
     // Handle kernel selection under different context.
     if (isSm80 || isSm8x || isSm101)
     {
