@@ -84,43 +84,53 @@ find_library(
   HINTS ${TRT_PACKAGE_DIR}
   PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
 
-# Include directories
-include_directories(${TRT_INCLUDE_DIR})
-include_directories(${CUDA_INCLUDE_DIR})
-include_directories(${CMAKE_SOURCE_DIR}/common)
+add_library(include_common INTERFACE)
+target_include_directories(
+  include_common INTERFACE ${TRT_INCLUDE_DIR} ${CUDA_INCLUDE_DIR}
+                           ${CMAKE_SOURCE_DIR}/common)
+
+add_library(common_settings INTERFACE)
+target_link_libraries(common_settings INTERFACE ${NVINFER_LIB} ${CUDART_LIB}
+                                                ${CMAKE_DL_LIBS} include_common)
+# Workaround for aarch64 cross compilation where libvninfer.so links to
+# libnvdla_compilers. The libnvinfer dependencies shall be resolved at execution
+# time on an embedded board.
+target_link_options(common_settings INTERFACE
+                    "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
 # Add executable with sources
 add_subdirectory(plugins)
 add_subdirectory(tokenizer)
 add_subdirectory(sampler)
 add_subdirectory(decoder)
+add_subdirectory(examples)
 
 target_include_directories(sampler PUBLIC ${CMAKE_SOURCE_DIR}/sampler/include)
+target_link_libraries(tokenizer PUBLIC include_common)
+target_link_libraries(sampler PUBLIC include_common)
 target_link_libraries(decoder PUBLIC sampler)
 
 add_executable(builder builder.cpp)
-# find_library(LLAMA_PLUGIN_LIB LLamaPlugin ${CMAKE_SOURCE_DIR}/build/plugins)
-target_link_libraries(builder PRIVATE ${NV_ONNX_PARSER_LIB} ${NVINFER_LIB}
-                                      ${CUDART_LIB} ${CMAKE_DL_LIBS})
-# Workaround for aarch64 cross compilation where libvninfer.so links to
-# libnvdla_compilers. The libnvinfer dependencies shall be resolved at execution
-# time on an embedded board.
-target_link_options(builder PRIVATE
-                    "-Wl,--unresolved-symbols=ignore-in-shared-libs")
+target_link_libraries(builder PRIVATE ${NV_ONNX_PARSER_LIB} common_settings)
 target_include_directories(builder PUBLIC ${ONNX_PARSER_INCLUDE_DIR})
 
+add_library(runtime_common INTERFACE)
+target_link_libraries(runtime_common INTERFACE decoder tokenizer ${NVINFER_LIB}
+                                               ${CUDART_LIB} ${CMAKE_DL_LIBS})
+target_include_directories(
+  runtime_common
+  INTERFACE ${CMAKE_SOURCE_DIR}/tokenizer ${CMAKE_SOURCE_DIR}/decoder
+            $(CMAKE_SOURCE_DIR)/sampler)
+
 add_executable(runtime runtime.cpp)
-target_link_libraries(runtime PRIVATE decoder tokenizer ${NVINFER_LIB}
-                                      ${CUDART_LIB} ${CMAKE_DL_LIBS})
+target_link_libraries(runtime PRIVATE runtime_common common_settings)
 # There are two workarounds for aarch64 cross compilation. It needs to override
 # the libcudla symbols and also need to points to the aarch64 version of
 # libcudart_static lib. TODO: Adjust CMake system to avoid introducing
 # -lcudadevrt -lcudart_static -lrt -lpthread -ldl to the linker. From local
 # experiment, the additional cuda libraries are brought by decoder static
 # library.
-target_link_options(
-  runtime PRIVATE "-Wl,--unresolved-symbols=ignore-in-shared-libs"
-  "-L${CUDA_DIR}/lib")
-target_include_directories(
-  runtime PUBLIC ${CMAKE_SOURCE_DIR}/tokenizer ${CMAKE_SOURCE_DIR}/decoder
-                 $(CMAKE_SOURCE_DIR)/sampler)
+target_link_options(runtime PRIVATE "-L${CUDA_DIR}/lib")
+
+target_link_libraries(chat PRIVATE runtime_common common_settings)
+target_link_options(chat PRIVATE "-L${CUDA_DIR}/lib")

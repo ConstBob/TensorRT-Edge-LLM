@@ -7,7 +7,6 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <memory>
-#include <ostream>
 #include <sstream>
 #include <utility>
 using namespace nvinfer1;
