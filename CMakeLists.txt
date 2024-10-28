@@ -103,7 +103,6 @@ add_subdirectory(plugins)
 add_subdirectory(tokenizer)
 add_subdirectory(sampler)
 add_subdirectory(decoder)
-add_subdirectory(examples)
 
 target_include_directories(sampler PUBLIC ${CMAKE_SOURCE_DIR}/sampler/include)
 target_link_libraries(tokenizer PUBLIC include_common)
@@ -132,5 +131,6 @@ target_link_libraries(runtime PRIVATE runtime_common common_settings)
 # library.
 target_link_options(runtime PRIVATE "-L${CUDA_DIR}/lib")
 
+add_executable(chat examples/chat.cpp)
 target_link_libraries(chat PRIVATE runtime_common common_settings)
 target_link_options(chat PRIVATE "-L${CUDA_DIR}/lib")
