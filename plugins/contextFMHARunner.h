@@ -29,21 +29,22 @@ public:
     ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t paddedSeqLen, int32_t numQHeads,
         int32_t numKvHeads, int32_t headSize, int32_t smVersion);
 
-    ContextFMHARunner() = default;
+    ContextFMHARunner() = delete;
 
     ~ContextFMHARunner() = default;
 
     size_t getWorkspaceSize();
 
-    // The function will setup an empty FMHA_v2 parameter. Device pointers shall be setup via caller.
+    // The function will setup kernel parameters except device pointers.
+    // Device pointers shall be set by caller of FMHA runner.
     void setupParams(Fused_multihead_attention_params_v2& params);
 
-    // Dispatch XQA kernel and compute the attention result.
+    // Dispatch FMHA kernel.
     void dispatchFMHAKernel(Fused_multihead_attention_params_v2& params, cudaStream_t const& stream);
 
-    // The call load and prepare kernel to dispatch. After the call, the CUmodule will be loaded to device
-    // and kernel functions are prepared to launch.
-    bool prepareToRun();
+    // Static methods to check kernel availability and load cubins into device.
+    static bool canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType);
+    static bool loadContextFMHAKernels(int32_t sm, nvinfer1::DataType dataType);
 
 private:
     nvinfer1::DataType mDataType;

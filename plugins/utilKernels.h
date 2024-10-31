@@ -19,13 +19,16 @@
 
 #include <cuda_fp16.h>
 
-enum class PositionEmbeddingType : int8_t
+enum class PositionEmbeddingType : int32_t
 {
-    kROPE_ORIGINAL = 1,
-    kROPE_ROTATE_HALF = 2,
+    kNone = 0,
+    kROPE_ROTATE_GPTJ = 1,
+    kROPE_ROTATE_NEOX = 2,
 };
 
-enum class RopeInitType : int8_t
+constexpr int32_t k_MAX_POSITION_EMBED_TYPE_VAL{2};
+
+enum class RopeInitType : int32_t
 {
     // Theta = 1 / (pow(rotary_embedding_freq, 2 * zid / headSize))
     kDEFAULT = 1,

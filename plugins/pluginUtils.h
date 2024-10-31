@@ -18,7 +18,11 @@
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <set>
 #include <stdexcept>
+#include <string>
+
+#include <NvInferRuntime.h>
 
 inline void checkCuda(cudaError_t err)
 {

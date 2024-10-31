@@ -343,12 +343,6 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     }
 }
 
-size_t ContextFMHARunner::getWorkspaceSize()
-{
-    // TODO: Find the workspace requirements for FMHA runner.
-    return 0;
-}
-
 void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
 {
     float const invSqrtScale = (1.f / sqrtf(mHeadSize));
@@ -376,17 +370,18 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
     params.is_s_padded = true;
 }
 
-bool ContextFMHARunner::prepareToRun()
+bool ContextFMHARunner::canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType)
 {
-    FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
-    FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
-        mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
-        attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.granular_tiling};
-    FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
+    bool const checkType = dataType == DataType::kHALF;
+    bool const checkHeadSize = headSize == 128;
 
-    // Validate there is a kernel function to implement the MHA
-    int32_t status = kernelInfo.mSharedMemBytes != 0;
-    return status;
+    return checkType && checkHeadSize;
+}
+
+bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::DataType dataType)
+{
+    FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), smVersion);
+    return fmhaKernelList != nullptr;
 }
 
 void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2& params, cudaStream_t const& stream)

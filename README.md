@@ -55,12 +55,14 @@ python3 quantize.py --torch_dir llama-v3-8b-instruct-hf/ --output_dir llama_v3_f
 
 ### Build the engine
 
-You will use `builder` binary to build the TensorRT engine. For fp8 and fp16, it is the same for now since we are not using fp8 kv cache. Example command:
+You will use `builder` binary to build the TensorRT engine. For fp8 and fp16, it is the same for now since we are not using fp8 kv cache. 
+Example command:
 ```
-./builder --onnxPath=llama_v3_fp8_onnx/quantized_model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=128 --maxSeqLen=256
+./builder --onnxPath=llama_v3_fp8_onnx/quantized_model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=128 --maxSeqLen=4096
 ```
 
 **Notes:** `--maxSeqLen` includes `--maxInputLen`, so it must be greater than `--maxInputLen`. The maximum new token would equal to `maxSeqLen - maxInputLen`.
+Please notice that the maxSeqLen here be identical to kvCache capacity of the attention plugin.
 
 ### Infer the engine
 
@@ -99,7 +101,7 @@ tar -xf data.tar
 Build engine
 
 ```
-./builder --onnxPath=../export/llama_v3_onnx/model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=2048 --maxSeqLen=2050
+./builder --onnxPath=../export/llama_v3_onnx/model.onnx --enginePath=llama.engine --batchSize=1 --maxInputLen=2048
 ```
 
 Run engine

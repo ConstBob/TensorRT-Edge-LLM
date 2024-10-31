@@ -16,10 +16,13 @@
  */
 
 #include "attentionPlugin.h"
+#include "contextFMHARunner.h"
+#include "decoderXQARunner.h"
 #include "pluginUtils.h"
-#include "utilKernels.h"
 
 #include <cassert>
+#include <mutex>
+#include <optional>
 #include <vector>
 
 using namespace nvinfer1;
@@ -30,11 +33,7 @@ namespace
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
 
-// Align with Meta's implementation for rotary embedding.
-// Use a different set of configuration could harm MMLU score noticeably.
-constexpr float kROPE_BASE_FREQUENCY = 500000.f;
-constexpr float kROPE_SCALE = 1.0f;
-constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_HALF;
+// TODO: Remove this type for long-context optimization since we don't need it now.
 constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kDEFAULT;
 
 constexpr int32_t kDEVICE_ALIGNMENT{128}; // Make sure all device pointers are aligned by 128.
@@ -49,30 +48,77 @@ int8_t* alignDevicePtr(void* ptr)
     return reinterpret_cast<int8_t*>(aligned_addr);
 }
 
+template <typename T>
+nvinfer1::PluginFieldType toFieldType();
+#define SPECIALIZE_TO_FIELD_TYPE(T, type)                                                                              \
+    template <>                                                                                                        \
+    nvinfer1::PluginFieldType toFieldType<T>()                                                                         \
+    {                                                                                                                  \
+        return nvinfer1::PluginFieldType::type;                                                                        \
+    }
+SPECIALIZE_TO_FIELD_TYPE(float, kFLOAT32)
+SPECIALIZE_TO_FIELD_TYPE(int32_t, kINT32)
+#undef SPECIALIZE_TO_FIELD_TYPE
+
+template <typename T>
+std::optional<T> parsePluginScalarField(std::string const& fieldName, nvinfer1::PluginFieldCollection const* fc)
+{
+    for (int32_t i = 0; i < fc->nbFields; ++i)
+    {
+        PluginField const& pluginField = fc->fields[i]; 
+        if (fieldName.compare(pluginField.name) == 0)
+        {
+            check(toFieldType<T>() == pluginField.type, "Mismatch datatype of plugin field");
+            check(pluginField.length == 1 && pluginField.data != nullptr, "Invalid plugin field");
+            return std::optional{*static_cast<T const*>(pluginField.data)};
+        }
+    }
+
+    return std::nullopt;
+}
+
 } // namespace
+
+// Static class fields initialization
+PluginFieldCollection AttentionPluginCreator::mFieldCollection{};
+std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(std::string const& name)
+AttentionPlugin::AttentionPlugin(std::string const& name, TensorRTPhase phase, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType)
+    : mLayerName(name)
+    , mUsagePhase(phase)
+    , mNumHeadQ(numQHeads)
+    , mNumHeadKV(numKVHeads)
+    , mNumElemPerHead(headSize)
+    , mMaxBatchSize(maxBatchSize)
+    , mKVCacheCapacity(kvCacheCapacity)
+    , mPosEmbedType(posEmbedType)
 {
     mSMVersion = getSMVersion();
 
-    // Initialize the attention kernel runner and load the cubinModule / kernel function.
-    // We will construct new runner at enqueue time with execution time batch / SequenceLen.
-    constexpr int32_t kDEFAULT_BATCH{1};
-    constexpr int32_t kDEFAULT_CONTEXT{128};
-    auto fmhaRunner = ContextFMHARunner(
-        mDataType, kDEFAULT_BATCH, kDEFAULT_CONTEXT, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
-    auto xqaRunner = DecoderXQARunner(mDataType, kDEFAULT_BATCH, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+    bool canImplement = ContextFMHARunner::canImplement(mNumElemPerHead, mSMVersion, mDataType)
+        && DecoderXQARunner::canImplement(mNumHeadQ, mNumHeadKV, mSMVersion, mDataType);
+    if (!canImplement)
+    {
+        throw std::runtime_error("Cannot implement the AttentionPlugin configuration.");
+    }
 
-    fmhaRunner.prepareToRun();
-    xqaRunner.prepareToRun();
+    // Load FMHA and XQA kernels to device. The kernel code will only be loaded once if
+    // multiple AttentionPlugin instances exist in the model.
+    ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
+    DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType);
 }
 
 AttentionPlugin::~AttentionPlugin()
 {
-    // Do nothing now, The plugin class only contains basic data structures and CUDA modules are
-    // are not managed by the plugin itself.
+}
+
+void AttentionPlugin::setRotaryConfig(float ropeScale, float ropeBaseFrequency)
+{
+    mRotaryScale = ropeScale;
+    mRotaryBaseFrequency = ropeBaseFrequency;
 }
 
 nvinfer1::IPluginCapability* AttentionPlugin::getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept
@@ -98,7 +144,9 @@ nvinfer1::IPluginCapability* AttentionPlugin::getCapabilityInterface(nvinfer1::P
 
 IPluginV3* AttentionPlugin::clone() noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mUsagePhase, mNumHeadQ, mNumHeadKV,
+        mNumElemPerHead, mMaxBatchSize, mKVCacheCapacity, mPosEmbedType);
+    plugin->setRotaryConfig(mRotaryScale, mRotaryBaseFrequency);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -133,13 +181,12 @@ bool AttentionPlugin::supportsFormatCombination(
     int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     // Support context/generation phase inputs:
-    //      GEMM-QKV tensor (FP16) with shape [B, S, Hq+Hk+Hv,D]
-    //      KV-cache tensor (FP16) with shape [B, 2, Hkv, Smax, D], here Smax is the max capacity of the linear kvcache
-    //      buffer. Real context length: [B] (a vector of scalars) with type int32_t, the tensor should reside on host.
+    //      GEMM-QKV tensor (linear FP16) with shape [B, S, Hq+Hk+Hv, D]
+    //      KV-cache tensor (linear FP16) with shape [B, 2, Hkv, Smax, D], here Smax is the kvcache capacity
+    //      buffer. Real context length: [B] (a vector of scalars) with type int32_t.
     // Support context/generation phase outputs:
-    //      attention result (FP16) with shape [B, S, Hq, D]
+    //      attention result (linear FP16) with shape [B, S, Hq, D]
     //      KV-cache tensor, same as the above.
-    // In above context, S can be 1 (generation) or supported input context length.
     auto checkGemmQKV = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
         bool status{true};
         auto const& tensorDesc = dynamicDesc.desc;
@@ -149,7 +196,7 @@ bool AttentionPlugin::supportsFormatCombination(
         auto const tensorDim = tensorDesc.dims;
         if (status)
         {
-            status &= tensorDim.d[2] == (mNumHeadQ + mNumHeadK + mNumHeadV) * mNumElemPerHead;
+            status &= tensorDim.d[2] == (mNumHeadQ + mNumHeadKV + mNumHeadKV) * mNumElemPerHead;
         }
         return status;
     };
@@ -164,8 +211,8 @@ bool AttentionPlugin::supportsFormatCombination(
         {
             auto const tensorDim = tensorDesc.dims;
             status &= tensorDim.d[1] == 2; // Specify K and V
-            status &= tensorDim.d[2] == mNumHeadK;
-            status &= tensorDim.d[3] == mTotalContextLen || tensorDim.d[3] == 0;
+            status &= tensorDim.d[2] == mNumHeadKV;
+            status &= tensorDim.d[3] == 0 || tensorDim.d[3] == mKVCacheCapacity;
             status &= tensorDim.d[4] == mNumElemPerHead;
         }
         return status;
@@ -293,45 +340,64 @@ int32_t AttentionPlugin::onShapeChange(nvinfer1::PluginTensorDesc const* in, int
 
 nvinfer1::IPluginV3* AttentionPlugin::attachToContext(nvinfer1::IPluginResourceContext* context) noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName);
-    plugin->setPluginNamespace(mNamespace.c_str());
-    return plugin;
+    return clone();
 }
 
 PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
 {
-    return nullptr;
+    mDataToSerialize.clear();
+
+    mDataToSerialize.emplace_back(PluginField("max_batch_size", &mMaxBatchSize, PluginFieldType::kINT32, 1));
+    mDataToSerialize.emplace_back(PluginField("kv_cache_capacity", &mKVCacheCapacity, PluginFieldType::kINT32, 1));
+    mDataToSerialize.emplace_back(PluginField("num_q_heads", &mNumHeadQ, PluginFieldType::kINT32, 1));
+    mDataToSerialize.emplace_back(PluginField("num_kv_heads", &mNumHeadKV, PluginFieldType::kINT32, 1));
+    mDataToSerialize.emplace_back(PluginField("head_size", &mNumElemPerHead, PluginFieldType::kINT32, 1));
+    mDataToSerialize.emplace_back(PluginField("position_embedding_type", &mPosEmbedType, PluginFieldType::kINT32, 1));
+    mDataToSerialize.emplace_back(PluginField("rotary_scaling", &mRotaryScale, PluginFieldType::kFLOAT32, 1));
+    mDataToSerialize.emplace_back(PluginField("rotary_base_frequency", &mRotaryBaseFrequency, PluginFieldType::kFLOAT32, 1));
+
+    mFCToSerialize.nbFields = mDataToSerialize.size();
+    mFCToSerialize.fields = mDataToSerialize.data();
+    return &mFCToSerialize;
 }
 
 int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
+    // Disable enqueue during engine generation phase.
+    if (mUsagePhase == TensorRTPhase::kBUILD)
+    {
+        return 0;
+    }
     constexpr int32_t kQKV_INPUT_IDX{0};
     constexpr int32_t kKV_CACHE_INPUT_OUTPUT_IDX{1};
     constexpr int32_t kINPUT_LENGTH_INPUT_IDX{2};
     constexpr int32_t kATTENTION_OUTPUT_IDX{0};
 
-    // Obtain execution time batch size and input context length
+    // Obtain execution time batch size, input context length, and KV-cache capacity per sequence.
     constexpr int32_t kQKV_INPUT_BATCH_DIM_IDX{0};
     constexpr int32_t kQKV_INPUT_SEQLEN_DIM_IDX{1};
     PluginTensorDesc const& qkvInputDesc = inputDesc[kQKV_INPUT_IDX];
     int32_t const runtimeBatchSize = static_cast<int32_t>(qkvInputDesc.dims.d[kQKV_INPUT_BATCH_DIM_IDX]);
     int32_t const runtimeSeqLen = static_cast<int32_t>(qkvInputDesc.dims.d[kQKV_INPUT_SEQLEN_DIM_IDX]);
 
+    constexpr int32_t kKV_CACHE_SEQUENCE_LENGTH_DIM_IDX{3};
+    PluginTensorDesc const& kvCacheInputDesc = inputDesc[kKV_CACHE_INPUT_OUTPUT_IDX];
+
+    // The input kv-cache length is zero at context phase. We use it to distinguish context
+    // and decoding phase.
+    int32_t const kvCacheInputLength = kvCacheInputDesc.dims.d[kKV_CACHE_SEQUENCE_LENGTH_DIM_IDX];
+    bool const isContextPhase = kvCacheInputLength == 0;
+
+    // Check the runtime batch size and input context length are valid for execution.
     check(runtimeBatchSize < mMaxBatchSize,
         "Runtime batchsize exceed max batch size. This will overflow device data buffer");
-    check(runtimeSeqLen < mTotalContextLen,
+    check(runtimeSeqLen < mKVCacheCapacity,
         "Runtime sequence length exceed max total context lengths. This will overflow KVCache buffer");
-
-    // Check whether the plugin is running context or generation. Determine by whether input kvCache has zero length.
-    constexpr int32_t kINPUT_CACHE_SEQUENCE_DIM_IDX{3};
-    PluginTensorDesc const& kvInputDesc = inputDesc[kKV_CACHE_INPUT_OUTPUT_IDX];
-    bool const isContextPhase = kvInputDesc.dims.d[kINPUT_CACHE_SEQUENCE_DIM_IDX] == 0;
 
     half* qkvDevicePtr = reinterpret_cast<half*>(const_cast<void*>(inputs[kQKV_INPUT_IDX]));
     int32_t const* seqLengthDevicePtr = reinterpret_cast<int32_t const*>(inputs[kINPUT_LENGTH_INPUT_IDX]);
-
     half* attentionResultDevicePtr = reinterpret_cast<half*>(outputs[kATTENTION_OUTPUT_IDX]);
     half* kvCacheDevicePtr = reinterpret_cast<half*>(outputs[kKV_CACHE_INPUT_OUTPUT_IDX]);
 
@@ -346,12 +412,12 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         // TODO: Explore non-padded input format.
         int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
         invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ,
-            mNumHeadK, mNumElemPerHead, mTotalContextLen, runtimeSeqLen, kROPE_TYPE, kROPE_BASE_FREQUENCY, kROPE_SCALE,
-            kROPE_INIT_TYPE, totalProcessToken, stream);
+            mNumHeadKV, mNumElemPerHead, mKVCacheCapacity, runtimeSeqLen, mPosEmbedType, mRotaryBaseFrequency,
+            mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, stream);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
         auto fmhaRunner = ContextFMHARunner(
-            mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+            mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mSMVersion);
         Fused_multihead_attention_params_v2 params{};
         params.clear();
         fmhaRunner.setupParams(params);
@@ -375,18 +441,18 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         half* qVecDevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
         int32_t const totalProcessToken = runtimeBatchSize;
         invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
-            mNumHeadQ, mNumHeadK, mNumElemPerHead, mTotalContextLen, runtimeSeqLen, kROPE_TYPE, kROPE_BASE_FREQUENCY,
-            kROPE_SCALE, kROPE_INIT_TYPE, totalProcessToken, stream);
+            mNumHeadQ, mNumHeadKV, mNumElemPerHead, mKVCacheCapacity, runtimeSeqLen, mPosEmbedType,
+            mRotaryBaseFrequency, mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, stream);
 
         // Prepare GQA runner parameter to dispatch kernel
         auto xqaRunner
-            = DecoderXQARunner(mDataType, runtimeBatchSize, mNumHeadQ, mNumHeadK, mNumElemPerHead, mSMVersion);
+            = DecoderXQARunner(mDataType, runtimeBatchSize, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mSMVersion);
         XQALaunchParams params = xqaRunner.initXQAParams();
         params.output = attentionResultDevicePtr;
         params.qInputPtr = qVecDevicePtr;
         params.kvCache.data = kvCacheDevicePtr;
         params.kvCache.sequence_lengths = seqLengthDevicePtr;
-        params.kvCache.capacity = mTotalContextLen;
+        params.kvCache.capacity = mKVCacheCapacity;
 
         // dispatch GQA runner.
         xqaRunner.dispatchXQAKernel(params, stream);
@@ -394,7 +460,24 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     return 0;
 }
 
-AttentionPluginCreator::AttentionPluginCreator() {}
+AttentionPluginCreator::AttentionPluginCreator()
+{
+    static std::mutex sMutex;
+    std::lock_guard<std::mutex> lock(sMutex);
+
+    mPluginAttributes.clear();
+    mPluginAttributes.emplace_back(PluginField("max_batch_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("kv_cache_capacity", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("num_q_heads", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("rotary_scaling", nullptr, PluginFieldType::kFLOAT32, 1));
+    mPluginAttributes.emplace_back(PluginField("rotary_base_frequency", nullptr, PluginFieldType::kFLOAT32, 1));
+
+    mFieldCollection.nbFields = mPluginAttributes.size();
+    mFieldCollection.fields = mPluginAttributes.data();
+}
 
 char const* AttentionPluginCreator::getPluginName() const noexcept
 {
@@ -416,9 +499,83 @@ char const* AttentionPluginCreator::getPluginVersion() const noexcept
     return kATTENTION_PLUGIN_VERSION;
 }
 
+AttentionPlugin* createDefaultAttentionPlugin(char const* name, nvinfer1::TensorRTPhase phase)
+{
+    constexpr int32_t numQHeads{32};
+    constexpr int32_t numKVHeads{8};
+    constexpr int32_t headSize{128};
+    constexpr int32_t maxBatchSize{16};
+    constexpr int32_t kvCacheCapacity{4096};
+    constexpr PositionEmbeddingType posEmbedType{PositionEmbeddingType::kROPE_ROTATE_NEOX};
+
+    // Align with Meta's implementation for rotary embedding.
+    constexpr float rotaryScale{1.0F};
+    constexpr float rotaryFrequency{500000.f};
+
+    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), phase, numQHeads,
+        numKVHeads, headSize, maxBatchSize, kvCacheCapacity, posEmbedType);
+    plugin->setRotaryConfig(rotaryScale, rotaryFrequency);
+    return plugin;
+}
+
 nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(std::string(name));
-    return plugin;
+    try
+    {   
+        // If no plugin attribute is available, construct an AttentionPlugin used by llama3-8B model by
+        // default. Otherwise, all plugin attributes shall be specified.
+        if (fc->nbFields == 0)
+        {
+            return createDefaultAttentionPlugin(name, phase);
+        }
+
+        std::optional<int32_t> maxBatchSize = parsePluginScalarField<int32_t>("max_batch_size", fc);
+        std::optional<int32_t> kvCacheCapacity = parsePluginScalarField<int32_t>("kv_cache_capacity", fc);
+        std::optional<int32_t> numQHeads = parsePluginScalarField<int32_t>("num_q_heads", fc);
+        std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
+        std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
+        std::optional<int32_t> posEmbedVal = parsePluginScalarField<int32_t>("position_embedding_type", fc);
+
+        bool checkRequiredFields = maxBatchSize.has_value() && kvCacheCapacity.has_value() && numQHeads.has_value()
+            && headSize.has_value() && numKVHeads.has_value() && posEmbedVal.has_value();
+        if (!checkRequiredFields)
+        {
+            return nullptr;
+        }
+        if (posEmbedVal.value() > k_MAX_POSITION_EMBED_TYPE_VAL)
+        {
+            return nullptr;
+        }
+
+        PositionEmbeddingType const posEmbedType = static_cast<PositionEmbeddingType>(posEmbedVal.value());
+        bool const useRotaryEmbed = posEmbedType == PositionEmbeddingType::kROPE_ROTATE_GPTJ
+            || posEmbedType == PositionEmbeddingType::kROPE_ROTATE_NEOX;
+        
+        std::optional<float> rotaryScale{std::nullopt};
+        std::optional<float> rotaryFrequency{std::nullopt};
+        if (useRotaryEmbed)
+        {
+            rotaryScale = parsePluginScalarField<float>("rotary_scaling", fc);
+            rotaryFrequency = parsePluginScalarField<float>("rotary_base_frequency", fc);
+            bool checkRotaryFields = rotaryScale.has_value() && rotaryFrequency.has_value();
+            if (!checkRotaryFields)
+            {
+                return nullptr;
+            }
+        }
+
+        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), phase, numQHeads.value(),
+            numKVHeads.value(), headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType);
+        if (useRotaryEmbed)
+        {
+            plugin->setRotaryConfig(rotaryScale.value(), rotaryFrequency.value());
+        }
+
+        return plugin;
+    }
+    catch(std::exception const& e)
+    {
+    }
+    return nullptr;
 }

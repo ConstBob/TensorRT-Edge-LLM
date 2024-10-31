@@ -268,16 +268,16 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, int c
 
     switch (positionEmbedType)
     {
-    case PositionEmbeddingType::kROPE_ORIGINAL:
+    case PositionEmbeddingType::kROPE_ROTATE_GPTJ:
     {
         // Original rotary position encoding will apply transformation to adjacent pair of data.
         apply_rotary_embedding(
             q, k, tidx, size_per_head, rotary_embedding_freq, rotary_embedding_scale, token_idx_in_seq, ropeInitType);
         break;
     }
-    case PositionEmbeddingType::kROPE_ROTATE_HALF:
+    case PositionEmbeddingType::kROPE_ROTATE_NEOX:
     {
-        // With Rotate Half RoPE position embedding, the transformation will apply to pair of data
+        // With GPT-NEOX style RoPE position embedding, the transformation will apply to pair of data
         // with D dimension [tIDX, tIDX + size_per_head / 2]. We first store the adjacent q/k data pair
         // into shared memory and read the two data from tIDX and tIDX + size_per_head / 2
         T* q_smem = reinterpret_cast<T*>(smem_);
@@ -362,7 +362,7 @@ void dispatchApplyRopeUpdateKV(T* QKV, T* Q, T* kvCacheBuffer, int const* seq_le
 
     // Determine required shared memory size by type of rope.
     size_t smem_size{0};
-    if (positionEmbedType == PositionEmbeddingType::kROPE_ROTATE_HALF)
+    if (positionEmbedType == PositionEmbeddingType::kROPE_ROTATE_NEOX)
     {
         // The shared memory should be large enough to contain the data of single head q + k vector.
         smem_size = 2 * size_per_head * sizeof(T);
