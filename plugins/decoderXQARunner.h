@@ -58,18 +58,15 @@ public:
 
     ~DecoderXQARunner() = default;
 
-    size_t getWorkspaceSize(int max_num_tokens);
-
-    // The call load and prepare kernel to dispatch. After the call, the CUmodule will be loaded to device
-    // and kernel functions are prepared to launch.
-    bool prepareToRun();
-
     // Dispatch XQA kernel and compute the attention result.
     void dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream);
 
     // Initialize a XQA parameter with MHA and hardware configuration to query. The XQA parameter can be used by
     // prepareToRun() to query kernel to dispatch. Device pointer shall be setup by caller to dispatch XQA kernel.
     XQALaunchParams initXQAParams();
+
+    static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, nvinfer1::DataType dataType);
+    static bool loadDecodeXQAKernels(int32_t smVersion, nvinfer1::DataType dataType);
 
 private:
     nvinfer1::DataType mDataType;

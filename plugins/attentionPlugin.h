@@ -17,12 +17,11 @@
 
 #pragma once
 
-#include "contextFMHARunner.h"
-#include "decoderXQARunner.h"
-
 #include <NvInferRuntime.h>
 #include <string>
 #include <vector>
+
+#include "utilKernels.h"
 
 namespace drivellm
 {
@@ -32,7 +31,9 @@ class AttentionPlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    AttentionPlugin(std::string const& name);
+    // Plugin constructor and attention specific utility methods
+    AttentionPlugin(std::string const& name, nvinfer1::TensorRTPhase phase, int32_t numQHeads, int32_t numKVHeads,
+        int32_t headSize, int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType);
 
     // Force to distinguish different instances of the plugin.
     AttentionPlugin() = delete;
@@ -41,11 +42,14 @@ public:
 
     ~AttentionPlugin() override;
 
+    // Set rotary configuration when positional embedding has type kROPE_ROTATE_GPTJ or kROPE_ROTATE_NEOX
+    void setRotaryConfig(float ropeScale, float ropeBaseFrequency);
+
     // IPluginV3 Methods
     nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
 
     IPluginV3* clone() noexcept override;
-    //
+    // end if IPluginV3 methods
 
     // IPluginV3OneCore Methods
     char const* getPluginName() const noexcept override;
@@ -92,23 +96,32 @@ public:
 protected:
     std::string mLayerName;
     std::string mNamespace;
-    int32_t mSMVersion;
 
-    nvinfer1::DataType mDataType{nvinfer1::DataType::kHALF};
+    // The plugin will skip enqueue in build phase to avoid execution error from random context lengths.
+    nvinfer1::TensorRTPhase mUsagePhase;
 
     // Number of heads and head dimension are specified by model and are runtime constant.
-    // TODO: Make number of heads become plugin attribute.
-    // TODO: The attention kernel
-    int32_t const mNumHeadQ{32};
-    int32_t const mNumHeadK{8};
-    int32_t const mNumHeadV{8};
-    int32_t const mNumElemPerHead{128};
+    int32_t mNumHeadQ{};
+    int32_t mNumHeadKV{};
+    int32_t mNumElemPerHead{};
 
-    // Temporary variable we hardcode for now which should be later expanded as user
-    // configurable field.
-    // TODO: Generalize the plugin usage and mark them as plugin attribute.
-    int32_t const mMaxBatchSize{16};
-    int32_t const mTotalContextLen{2050};
+    // Runtime configuration of the plugin to specify max batchSize and kv-cache capacity.
+    // Here the kvcache capacity refers to max number of tokens per input context.
+    int32_t mMaxBatchSize{};
+    int32_t mKVCacheCapacity{};
+
+    // Positional embedding configuration.
+    PositionEmbeddingType mPosEmbedType{};
+    float mRotaryScale{1.0F};
+    float mRotaryBaseFrequency{};
+
+    // Datatype of QKV and kvCache. Only supports FP16 as of now.
+    nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
+    int32_t mSMVersion;
+
+    // IPluginV3 serialization related
+    std::vector<nvinfer1::PluginField> mDataToSerialize;
+    nvinfer1::PluginFieldCollection mFCToSerialize;
 };
 
 class AttentionPluginCreator : public nvinfer1::IPluginCreatorV3One
@@ -116,7 +129,7 @@ class AttentionPluginCreator : public nvinfer1::IPluginCreatorV3One
 public:
     AttentionPluginCreator();
 
-    ~AttentionPluginCreator() = default;
+    ~AttentionPluginCreator() override = default;
 
     char const* getPluginName() const noexcept override;
 
@@ -132,8 +145,8 @@ public:
         char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
 
 private:
-    nvinfer1::PluginFieldCollection mFieldCollection;
-    std::vector<nvinfer1::PluginField> mPluginAttributes;
+    static nvinfer1::PluginFieldCollection mFieldCollection;
+    static std::vector<nvinfer1::PluginField> mPluginAttributes;
 };
 
 } // namespace drivellm

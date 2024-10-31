@@ -253,24 +253,6 @@ DecoderXQARunner::DecoderXQARunner(nvinfer1::DataType const dataType, int32_t ba
 {
 }
 
-size_t DecoderXQARunner::getWorkspaceSize(int max_num_tokens)
-{
-    // Right now we don't enable multiple block launch for XQA kernel, so it doesn't need additional
-    return 0;
-}
-
-bool DecoderXQARunner::prepareToRun()
-{
-    // Load CUmodules to device and collect device functions.
-    XQAKernelList const* xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion);
-    XQAKernelRuntimeHashKey hashKey{trtToXqaDataType(mDataType), mHeadSize, mNumHeads / mNumKVHeads, 1};
-    XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
-
-    // check if there is a valid kernel corresponding to the requested config.
-    bool status = kernelInfo.mSharedMemBytes != 0;
-    return status;
-}
-
 XQALaunchParams DecoderXQARunner::initXQAParams()
 {
     XQALaunchParams params{};
@@ -281,6 +263,21 @@ XQALaunchParams DecoderXQARunner::initXQAParams()
     params.dataType = mDataType;
 
     return params;
+}
+
+bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, DataType dataType)
+{
+    bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
+    bool const checkType = dataType == DataType::kHALF;
+    bool const checkQHeadPerKV = (numQHeads / numKVHeads == 4);
+
+    return checkHeadNumbers && checkType && checkQHeadPerKV;
+}
+
+bool DecoderXQARunner::loadDecodeXQAKernels(int32_t smVersion, DataType dataType)
+{
+    XQAKernelList const* xqaKernelList = getXQAKernels(trtToXqaDataType(dataType), smVersion);
+    return xqaKernelList != nullptr;
 }
 
 void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)

@@ -18,7 +18,7 @@ struct BuilderArgs
     std::string enginePath;
     int64_t batchSize{1};
     int64_t maxInputLen{128};
-    int64_t maxSeqLen{256};
+    int64_t maxSeqLen{4096};
     bool debug{false};
 };
 
