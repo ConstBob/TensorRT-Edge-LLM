@@ -422,13 +422,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         params.clear();
         fmhaRunner.setupParams(params);
 
-        // Compute the prefix sum of sequence length.
-        int32_t* prefixSumDevicePtr = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
-        invokePrefixSum(seqLengthDevicePtr, prefixSumDevicePtr, runtimeBatchSize, stream);
-
         // Set device ptr for FMHA kernel.
         params.qkv_ptr = qkvDevicePtr;
-        params.cu_q_seqlens = prefixSumDevicePtr;
+        params.cu_q_seqlens = seqLengthDevicePtr;
         params.o_ptr = attentionResultDevicePtr;
 
         // Dispatch FMHA kernel

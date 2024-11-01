@@ -303,7 +303,6 @@ void runTest(
 
     drivellm::DecoderXQARunner runner(nvinfer1::DataType::kHALF, batchSize, nbQHeads, nbVHeads, 128, 101);
     drivellm::XQALaunchParams params = runner.initXQAParams();
-    runner.prepareToRun();
 
     params.output = &(output[0][0][0]);
     params.qInputPtr = &(qHeads[0][0][0]);
@@ -313,6 +312,7 @@ void runTest(
 
     auto runKernel = [&]() {
         runner.dispatchXQAKernel(params, stream);
+        checkCuda(cudaStreamSynchronize(stream));
         checkCuda(cudaGetLastError());
     };
 
@@ -456,5 +456,5 @@ void runTest(
 
 TEST_CASE(sanity, gqa_llama_V3_8b_128)
 {
-    runTest<8>(1, 960, true, true, true);
+    runTest<8>(1, 960, false, true, true);
 }

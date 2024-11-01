@@ -53,8 +53,6 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 file(GLOB XQA_CUBIN_SRCS "xqa/cubin/*.cpp")
 file(GLOB FMHA_CUBIN_SRCS "fmha-v2/cubin/*.cpp")
 
-message(STATUS "FMHA_CUBIN_SRCS = ${FMHA_CUBIN_SRCS}")
-
 if(BUILD_TEST)
   message(STATUS "Build tests. Looking for Eigen3")
   find_package(Eigen3 REQUIRED NO_MODULE)

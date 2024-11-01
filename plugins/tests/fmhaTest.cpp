@@ -136,9 +136,7 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
     std::fill_n(qkvData[0][0][0].data, totalQKVElems, qkvFillVal);
     std::fill_n(outdata[0][0][0].data, totalOutElems, outFillVal);
 
-    // fmha kernel requires to provide the prefix-sum of batch of sequence length
-    seqLenList[0] = 0;
-    seqLenList[1] = seqLen;
+    seqLenList[0] = seqLen;
 
     loadDataFromFile("../tests/fmha-io/qkv128_128.bin", qkvData[0][0][0].data, totalQKVElems);
 
@@ -152,12 +150,10 @@ void runFMHATest(int32_t batchSize, int32_t seqLen, bool testPerf, bool refCheck
     checkCuda(cudaStreamSynchronize(stream));
 
     drivellm::ContextFMHARunner runner(
-        nvinfer1::DataType::kHALF, batchSize, MAX_SEQ_LEN, nbQHeads, nbKHeads, validElemsPerHead, 86);
+        nvinfer1::DataType::kHALF, batchSize, MAX_SEQ_LEN, nbQHeads, nbKHeads, validElemsPerHead, 101);
     Fused_multihead_attention_params_v2 params;
     params.clear();
     runner.setupParams(params);
-    bool status = runner.prepareToRun();
-    check(status != 0, "Error in fetch kernel list.");
 
     params.qkv_ptr = &(qkvData[0][0][0]);
     params.o_ptr = &(outdata[0][0][0]);
