@@ -365,9 +365,6 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
     params.qkv_stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
-
-    // Always use padded sequence length now.
-    params.is_s_padded = true;
 }
 
 bool ContextFMHARunner::canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType)

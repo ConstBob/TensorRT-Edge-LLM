@@ -11,7 +11,7 @@
 // This value is configurable
 constexpr float kROPE_BASE_FREQUENCY = 10000.f;
 constexpr float kROPE_SCALE = 1.0f;
-constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ORIGINAL;
+constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_GPTJ;
 constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kDEFAULT;
 
 float2 applyRopeTransformation(float2 src, int32_t seqIdx, int32_t tIdx, int32_t embed_dim)

@@ -83,20 +83,12 @@ struct Fused_multihead_attention_params_v2
     uint32_t* scale_bmm2_d;
 
     bool enable_i2f_trick = false;
-    // array of length b+1 holding prefix sum of actual q sequence lengths.
-    int* cu_q_seqlens;
-    // array of length b+1 holding prefix sum of actual kv sequence lengths.
-    int* cu_kv_seqlens;
-    // array of length b+1 holding prefix sum of actual mask sequence lengths.
-    // it might not be the same as cu_q_seqlens as the mask seqlens will be padded.
-    int* cu_mask_rows;
+    // array of length b actual q sequence lengths of this batch.
+    int const* cu_q_seqlens;
 
     // If the kernel is using alibi or not
     bool has_alibi = false;
     AlibiParams alibi_params{};
-
-    // is input/output padded
-    bool is_s_padded = false;
 
     void clear()
     {
@@ -126,10 +118,8 @@ struct Fused_multihead_attention_params_v2
         enable_i2f_trick = false;
 
         cu_q_seqlens = nullptr;
-        cu_kv_seqlens = nullptr;
 
         sliding_window_size = INT_MAX;
-        is_s_padded = false;
 
         has_alibi = false;
         alibi_params = AlibiParams{};

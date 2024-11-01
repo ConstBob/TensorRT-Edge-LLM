@@ -10,7 +10,7 @@ set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
 
 # Point CUDA to aarch cross targets.
-set(CUDA_VERSION 12.7)
+set(CUDA_VERSION 12.8)
 set(CUDA_DIR
     /usr/local/cuda/targets/aarch64-linux
     CACHE STRING "CUDA ROOT dir")

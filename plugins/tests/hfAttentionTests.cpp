@@ -34,7 +34,7 @@ constexpr float kROPE_BASE_FREQUENCY = 500000.f;
 constexpr float kROPE_SCALE = 1.0f;
 
 // Huggingface use rotate-half rope which is different from original Meta implementation.
-constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_HALF;
+constexpr PositionEmbeddingType kROPE_TYPE = PositionEmbeddingType::kROPE_ROTATE_GPTJ;
 constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kLLAMA3;
 
 void loadDataFromFile(std::string name, std::vector<half>& dataVec, int32_t nbData)
@@ -171,8 +171,8 @@ void test_fmha()
     check(concatQKV.size() == nbQKVData, "Check number of QKV data is consistent");
     checkCuda(cudaMemcpy(qkv_device_ptr, concatQKV.data(), sizeof(half) * nbQKVData, cudaMemcpyHostToDevice));
 
-    std::vector<int32_t> temp{0, kSEQUENCE_LENGTH};
-    checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * 2, cudaMemcpyHostToDevice));
+    std::vector<int32_t> temp{kSEQUENCE_LENGTH};
+    checkCuda(cudaMemcpy(seqlen_device_ptr, temp.data(), sizeof(int32_t) * 1, cudaMemcpyHostToDevice));
 
     drivellm::ContextFMHARunner runner(
         nvinfer1::DataType::kHALF, kBATCH_SIZE, kINPUT_LENGTH_PADDED, kNUM_Q_HEADS, kNUM_K_HEADS, kDIM_HEAD, 101);
