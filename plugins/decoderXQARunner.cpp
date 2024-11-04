@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 using namespace nvinfer1;
 using namespace drivellm;
@@ -269,7 +270,9 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
 {
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;
-    bool const checkQHeadPerKV = (numQHeads / numKVHeads == 4);
+    std::vector<int> allowedHeadRatio{1, 3, 4, 6, 7};
+    bool const checkQHeadPerKV = 
+        std::find(allowedHeadRatio.begin(), allowedHeadRatio.end(), int(numQHeads / numKVHeads)) != allowedHeadRatio.end();
 
     return checkHeadNumbers && checkType && checkQHeadPerKV;
 }
