@@ -113,7 +113,7 @@ int main(int argc, char* argv[])
         LOG_ERROR("Cannot open library: %s", dlerror());
         return EXIT_FAILURE;
     }
-    Tokenizer* tokenizer = new LlamaV3Tokenizer();
+    Tokenizer* tokenizer = new Tokenizer();
     tokenizer->loadFromHF(args.tokenizerPath);
     auto decoder = new Decoder<half>();
     cudaStream_t stream;

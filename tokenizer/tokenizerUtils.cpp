@@ -198,6 +198,52 @@ std::string decodeHFTokenToNormal(std::string const& hfToken)
     return decoded;
 }
 
+std::string normalizeRegex(std::string const& expr)
+{
+    std::string normalizedExpr;
+
+    for (int i = 0; i < expr.size(); )
+    {
+        // case 1: (?i) case-insentive modifier
+        // e.g. (?i:'s|'t|'re|'ve|'m|'ll|'d) => (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+        if (expr.find("(?i:", i) != std::string::npos)
+        {
+            normalizedExpr += "(?:";
+
+            size_t next = expr.find("(?i:", i) + 4;
+            size_t end = expr.find(")", next);
+            auto part = expr.substr(next, end - next);
+
+            for (int j = next; j < end; ++j)
+            {
+                char c = expr[j];
+                if (isalpha(c))
+                {
+                    normalizedExpr += '[';
+                    normalizedExpr += tolower(c);
+                    normalizedExpr += toupper(c);
+                    normalizedExpr += ']';
+                }
+                else
+                {
+                    normalizedExpr += c;
+                }
+            }
+
+            normalizedExpr += ")";
+            i = end + 1;
+        }
+        else 
+        {
+            normalizedExpr += expr[i];
+            ++i;
+        }
+
+    }
+
+    return normalizedExpr;
+}
+
 /**
  * Unicode Utils
  */

@@ -39,9 +39,11 @@ BPERanksToToken reverseEncoder(BPETokenToRanks const& encoder);
 // decode hf format token str to normal utf-8
 std::string decodeHFTokenToNormal(std::string const& hfToken);
 
+// deal with regex expressions that c++ regex don't support
+std::string normalizeRegex(std::string const& expr);
+
 /**
  * Unicode Utils
- * Reference: https://github.com/ggerganov/llama.cpp/src/unicode.cpp
  */
 struct codepointFlags
 {
@@ -110,11 +112,8 @@ static const std::map<int, std::string> kUcatMap = {
         "\x21-\x23\x25-\x2A\x2C-\x2F\x3A-\x3B\x3F-\x40\\\x5B-\\\x5D\x5F\\\x7B\\\x7D"}, // !-#%-*,-/:-;?-@\[-\]_\{\}
 };
 
-// generate a "collapsed" representation of regex to handle unicode categories
 bool unicodeCollapseRegex(std::string const& expr, std::regex& regex);
 
-// generate a "collapsed" representation of the text, where all codepoints are replaced by a single byte
-// ref: https://github.com/ggerganov/llama.cpp/pull/6920#issuecomment-2081479935
 std::string unicodeCollapseText(std::vector<uint32_t> const& cpts);
 
 std::vector<size_t> unicodeRegexSplit(std::string const& text, std::regex const& regex);

@@ -107,8 +107,7 @@ public:
     Tokenizer();
 
     Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
-        Rank const& bosId = -1, Rank const& eosId = -1, Rank const& padId = -1,
-        std::unordered_set<Rank> const& stopTokens = {});
+        Rank const& bosId = -1, Rank const& eosId = -1, Rank const& padId = -1);
 
     virtual ~Tokenizer() = default;
 
@@ -116,9 +115,7 @@ public:
 
     virtual std::string decode(std::vector<Rank> const& tokens) const;
 
-    virtual void loadFromTiktoken(std::filesystem::path const& modelPath) = 0;
-
-    virtual void loadFromHF(std::filesystem::path const& modelDir) = 0;
+    virtual void loadFromHF(std::filesystem::path const& modelDir);
 
     int getNumVocab() const noexcept;
 
@@ -128,14 +125,11 @@ public:
 
     Rank getPadId() const noexcept;
 
-    std::unordered_set<Rank> const& getStopTokens() const noexcept;
-
 protected:
-    bool loadTikTokenVocab(std::filesystem::path const& tiktokenFile, BPETokenToRanks& vocab) const noexcept;
+    // manually parse tokenizer.json and tokenizer_config.json without using 3rdparty libraries
+    void loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab, BPETokenToRanks& specialTokens) noexcept;
 
-    // manually parse vocab and special tokens tokenizer.json file without using 3rdparty libraries
-    bool loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab, BPETokenToRanks& specialTokens,
-        Rank& bosId, Rank& eosId) const noexcept;
+    void loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens) noexcept;
 
     void appendEos(std::vector<Rank>& output) const noexcept;
 
@@ -143,29 +137,11 @@ protected:
 
     int mNumVocab;
     std::unique_ptr<BPE> mBpe;
-
     Rank mBosId;
     Rank mEosId;
     Rank mPadId;
-    std::unordered_set<Rank> mStopTokens;
-};
+    std::string mRegexExpr;
 
-// Llamav3 tokenizer
-class LlamaV3Tokenizer : public Tokenizer
-{
-public:
-    void loadFromTiktoken(std::filesystem::path const& modelPath) override;
-
-    void loadFromHF(std::filesystem::path const& modelDir) override;
-
-private:
-    // original regex from tokenizer.json
-    // "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}|
-    // ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" adapted:
-    // https://github.com/ggerganov/llama.cpp/pull/6920#issuecomment-2080233989
-    static constexpr char mRegexExpr[]
-        = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| "
-          "?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 };
 
 #endif // TOKENIZER_H
