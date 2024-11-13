@@ -5,4 +5,4 @@ onnx_graphsurgeon
 numpy
 onnxruntime
 nvidia-modelopt
-torch
+torch~=2.4.0

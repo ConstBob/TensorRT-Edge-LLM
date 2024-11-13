@@ -6,6 +6,7 @@ import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 from optimum.exporters.onnx import main_export
+from transformers import AutoConfig
 
 
 def parse_arguments():
@@ -44,7 +45,7 @@ def clear_outputs(node):
     return node
 
 
-def surgeon_graph(graph):
+def surgeon_graph(graph, attention_attrs={}):
     # Look for kv cache inputs
     kv_inputs = {}
     removed_inputs = []
@@ -94,19 +95,19 @@ def surgeon_graph(graph):
                 node.outputs
             ) == 1, "You did not reach the proper q_proj MatMul tensor!"
             q_output = node.outputs[0]
-            q_outputs[q_output.name] = clear_outputs(q_output)
+            q_outputs[q_output.name] = q_output
         if "k_proj/MatMul" in node.name and node.op == "MatMul":
             assert len(
                 node.outputs
             ) == 1, "You did not reach the proper k_proj MatMul tensor!"
             k_output = node.outputs[0]
-            k_outputs[k_output.name] = clear_outputs(k_output)
+            k_outputs[k_output.name] = k_output
         if "v_proj/MatMul" in node.name and node.op == "MatMul":
             assert len(
                 node.outputs
             ) == 1, "You did not reach the proper v_proj MatMul tensor!"
             v_output = node.outputs[0]
-            v_outputs[v_output.name] = clear_outputs(v_output)
+            v_outputs[v_output.name] = v_output
         if "self_attn/Transpose_4" in node.name and node.op == "Transpose":
             assert len(
                 node.outputs
@@ -155,6 +156,28 @@ def surgeon_graph(graph):
             inputs=[hidden_state, qkv_weight],
             outputs=[qkv],
         )
+        
+        # Merge bias add to a single Add Op
+        if "q_proj/Add" in q.outputs[0].name and q.outputs[0].op == "Add":
+            q_bias = clear_outputs(q.outputs[0].inputs[0])
+            k_bias = clear_outputs(k.outputs[0].inputs[0])
+            v_bias = clear_outputs(v.outputs[0].inputs[0])
+            qkv_bias = gs.Constant(
+                name=f"/model/layers.{i}/qkv_proj/bias", 
+                values=np.concatenate(
+                    (q_bias.values, k_bias.values, v_bias.values), axis=0))
+            
+            add_output = gs.Variable(name=f"/model/layers.{i}/qkv_proj/Add_output",
+                            dtype=q.dtype)
+
+            graph.layer(
+                name=f"/model/layers.{i}/self_attn/qkv_proj/Add",
+                op="Add",
+                inputs=[qkv, qkv_bias],
+                outputs=[add_output],
+            )
+            
+            qkv = add_output
 
         k_cache = kv_inputs[f"past_key_values.{i}.key"]
         kv_input_shape = (k_cache.shape[0], 2, k_cache.shape[1],
@@ -180,6 +203,7 @@ def surgeon_graph(graph):
             op="AttentionPlugin",
             inputs=[qkv, kv_input, context_lengths],
             outputs=[attn_output, kv_output],
+            attrs=attention_attrs
         )
 
     # Insert Gather node for lm_head's input.
@@ -243,7 +267,28 @@ def main():
         f"ONNX export and load takes {t1 - t0}s. Using onnx_graphsurgeon to insert plugin."
     )
 
-    graph = surgeon_graph(graph)
+    # parse attention attributes from config
+    input_onnx_dir = os.path.dirname(input_onnx_name)
+    config = AutoConfig.from_pretrained(
+        f"{input_onnx_dir}/config.json",
+        trust_remote_code=True,
+    ).to_dict()
+    
+    rotary_scaling = config.get("rope_scaling", 1.0)
+    if rotary_scaling is None:
+        rotary_scaling = 1.0
+        
+    attention_attrs = {
+        "num_q_heads": config.get("num_attention_heads", 32),
+        "num_kv_heads": config.get("num_key_value_heads", 32),
+        "head_size": config.get("hidden_size", 4096) // config.get("num_attention_heads", 32),
+        "rotary_scaling": rotary_scaling,
+        "rotary_base_frequency": config.get("rope_theta", 500000.0),
+        "position_embedding_type": 2,
+        "max_batch_size": 16,
+        "kv_cache_capacity": 4096,
+    }
+    graph = surgeon_graph(graph, attention_attrs)
 
     t2 = time.time()
     print(f"onnx_graphsurgeon takes {t2 - t1}s. Export back to onnx model")

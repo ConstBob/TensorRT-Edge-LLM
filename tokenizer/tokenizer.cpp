@@ -290,11 +290,10 @@ Tokenizer::Tokenizer()
 }
 
 Tokenizer::Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
-    Rank const& bosId, Rank const& eosId, Rank const& padId, std::unordered_set<Rank> const& stopTokens)
+    Rank const& bosId, Rank const& eosId, Rank const& padId)
     : mBosId{bosId}
     , mEosId{eosId}
     , mPadId{padId}
-    , mStopTokens{stopTokens}
 {
     auto comp = [](std::pair<std::string, Rank> const& p1, std::pair<std::string, Rank> const& p2) {
         return p1.second < p2.second;
@@ -400,183 +399,146 @@ Rank Tokenizer::getPadId() const noexcept
     return mPadId == -1 ? mEosId : mPadId;
 }
 
-std::unordered_set<Rank> const& Tokenizer::getStopTokens() const noexcept
+void Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab,
+    BPETokenToRanks& specialTokens) noexcept
 {
-    return mStopTokens;
-}
+    std::filesystem::path tokenizerFile = modelDir / "tokenizer.json";
+    assert(std::filesystem::exists(tokenizerFile));
+    std::ifstream data(tokenizerFile);
 
-bool Tokenizer::loadTikTokenVocab(std::filesystem::path const& tiktokenFile, BPETokenToRanks& vocab) const noexcept
-{
-    try
+    std::string line;
+    int indent = 0;
+    bool parseVocab = false;
+    bool parseSpecial = false;
+
+    std::string specialContent;
+    Rank specialId;
+
+    while (std::getline(data, line))
     {
-        assert(std::filesystem::exists(tiktokenFile));
-
-        std::ifstream file(tiktokenFile);
-
-        std::string line;
-        while (std::getline(file, line))
+        // parse model.vocab
+        if (!parseVocab && line.find("\"vocab\": {") != std::string::npos)
         {
-            auto it = line.find(" ");
-            if (it != std::string::npos)
+            parseVocab = true;
+            indent = line.find("\"");
+        }
+        else if (parseVocab && line.substr(indent) == "},")
+        {
+            parseVocab = false;
+        }
+        else if (parseVocab)
+        {
+            auto start = indent + 3; // indent + 2 + "
+            auto mid = line.find("\": ", start);
+            auto end = line.find(",", mid);
+
+            auto hfToken = line.substr(start, mid - start);
+            Rank rank = std::stoi(line.substr(mid + 3, end - mid - 3));
+
+            // remove "escape" character in json pattern: "\"", "\\"
+            hfToken = std::regex_replace(hfToken, std::regex(R"(\\([\\\"]))"), "$1");
+            auto token = decodeHFTokenToNormal(hfToken);
+            vocab[token] = rank;
+        }
+
+        // parse added_tokens
+        else if (!parseSpecial && line.find("\"added_tokens\": [") != std::string::npos)
+        {
+            parseSpecial = true;
+            indent = line.find("\"");
+        }
+        else if (parseSpecial && line.substr(indent) == "],")
+        {
+            parseSpecial = false;
+        }
+        else if (parseSpecial)
+        {
+            // Only parse id and content for now
+            if (line.find("\"id\": ") != std::string::npos)
             {
-                std::string token = base64Decode(line.substr(0, it));
-                Rank rank = std::stoi(line.substr(it + 1));
-                vocab[token] = rank;
+                auto start = line.find(": ");
+                auto end = line.size() - 1;
+                specialId = std::stoi(line.substr(start + 2, end - start - 2));
+            }
+            else if (line.find("\"content\"") != std::string::npos)
+            {
+                auto start = line.find(": ");
+                auto end = line.size() - 2;
+                specialContent = line.substr(start + 3, end - start - 3);
+                specialTokens[specialContent] = specialId;
             }
         }
 
-        file.close();
-        return true;
+        // parse regex
+        else if (line.find("\"Regex\": \"") != std::string::npos)
+        {
+            auto start = line.find(": ");
+            auto end = line.size() - 1;
+            std::string rawRegex = line.substr(start + 3, end - start - 3);
+
+            // remove "escape" character in json pattern: "\"", "\\"
+            rawRegex = std::regex_replace(rawRegex, std::regex(R"(\\([\\\"]))"), "$1");
+            this->mRegexExpr = normalizeRegex(rawRegex);
+        }
     }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to load Tokenizer from Tiktoken: %s", tiktokenFile.c_str());
-        return false;
-    }
+
+    data.close();
 }
 
-bool Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab,
-    BPETokenToRanks& specialTokens, Rank& bosId, Rank& eosId) const noexcept
+void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens) noexcept
 {
-    try
+    std::filesystem::path tokenizerConfig = modelDir / "tokenizer_config.json";
+
+    auto parseSpecialToken = [&specialTokens](std::string line) -> Rank
     {
-        std::filesystem::path tokenizerFile = modelDir / "tokenizer.json";
-        assert(std::filesystem::exists(tokenizerFile));
-        std::ifstream data(tokenizerFile);
-
-        std::string line;
-        int indent = 0;
-        bool parseVocab = false;
-        bool parseSpecial = false;
-
-        std::string specialContent;
-        Rank specialId;
-
-        while (std::getline(data, line))
+        auto start = line.find(": ");
+        auto end = line.size() - 1;
+        std::string token = line.substr(start + 2, end - start - 2);
+        if (token == "null")
         {
-            // parse model.vocab
-            if (!parseVocab && line.find("\"vocab\": {") != std::string::npos)
-            {
-                parseVocab = true;
-                indent = line.find("\"");
-            }
-            else if (parseVocab && line.substr(indent) == "},")
-            {
-                parseVocab = false;
-            }
-            else if (parseVocab)
-            {
-                auto start = indent + 3; // indent + 2 + "
-                auto mid = line.find("\": ", start);
-                auto end = line.find(",", mid);
-
-                auto hfToken = line.substr(start, mid - start);
-                Rank rank = std::stoi(line.substr(mid + 3, end - mid - 3));
-
-                // remove "escape" character in json pattern: "\"", "\\"
-                hfToken = std::regex_replace(hfToken, std::regex(R"(\\([\\\"]))"), "$1");
-                auto token = decodeHFTokenToNormal(hfToken);
-
-                vocab[token] = rank;
-            }
-
-            // parse added_tokens
-            else if (!parseSpecial && line.find("\"added_tokens\": [") != std::string::npos)
-            {
-                parseSpecial = true;
-                indent = line.find("\"");
-            }
-            else if (parseSpecial && line.substr(indent) == "],")
-            {
-                parseSpecial = false;
-            }
-            else if (parseSpecial)
-            {
-                // Only parse id and content for now
-                if (line.find("\"id\": ") != std::string::npos)
-                {
-                    auto start = line.find(": ");
-                    auto end = line.size() - 1;
-                    specialId = std::stoi(line.substr(start + 2, end - start - 2));
-                }
-                else if (line.find("\"content\"") != std::string::npos)
-                {
-                    auto start = line.find(": ");
-                    auto end = line.size() - 2;
-                    specialContent = line.substr(start + 3, end - start - 3);
-
-                    specialTokens[specialContent] = specialId;
-                }
-            }
+            return -1;
         }
 
-        data.close();
-
-        // parse bos and eos token from config
-        std::filesystem::path tokenizerConfig = modelDir / "tokenizer_config.json";
-        if (std::filesystem::exists(tokenizerConfig))
-        {
-            std::ifstream config(tokenizerConfig);
-            std::string line;
-
-            while (std::getline(config, line))
-            {
-                if (line.find("\"bos_token\"") != std::string::npos)
-                {
-                    auto start = line.find(": ");
-                    auto end = line.size() - 2;
-                    std::string token = line.substr(start + 3, end - start - 3);
-                    bosId = specialTokens[token];
-                }
-                else if (line.find("\"eos_token\"") != std::string::npos)
-                {
-                    auto start = line.find(": ");
-                    auto end = line.size() - 2;
-                    std::string token = line.substr(start + 3, end - start - 3);
-                    eosId = specialTokens[token];
-                }
-            }
-
-            config.close();
-        }
-
-        return true;
-    }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to load Tokenizer from HF: %s ", modelDir.c_str());
-        return false;
-    }
-}
-
-// LlamaV3Tokenizer
-void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
-{
-    BPETokenToRanks mergeableRanks;
-
-    assert(loadTikTokenVocab(modelPath, mergeableRanks));
-
-    // add special tokens
-    int numBaseTokens = mergeableRanks.size();
-
-    std::vector<std::string> specialTokensList{
-        "<|begin_of_text|>", "<|end_of_text|>", "<|reserved_special_token_0|>", "<|reserved_special_token_1|>",
-        "<|reserved_special_token_2|>", "<|reserved_special_token_3|>", "<|start_header_id|>", "<|end_header_id|>",
-        "<|reserved_special_token_4|>",
-        "<|eot_id|>", // end of turn
+        assert(token[0] == '\"' && token[token.size() - 1] == '\"');
+        token = token.substr(1, token.size() - 2);
+        return specialTokens[token];
     };
 
-    int numReservedSpecialTokens = 256;
-    for (int i = 5; i < numReservedSpecialTokens - 5; ++i)
+    if (std::filesystem::exists(tokenizerConfig))
     {
-        specialTokensList.emplace_back("<|reserved_special_token_" + std::to_string(i) + "|>");
-    }
+        std::ifstream config(tokenizerConfig);
+        std::string line;
 
-    BPETokenToRanks specialTokens;
-    for (int i = 0; i < specialTokensList.size(); ++i)
-    {
-        specialTokens[specialTokensList[i]] = numBaseTokens + i;
+        while (std::getline(config, line))
+        {
+            if (line.find("\"bos_token\"") != std::string::npos)
+            {
+                this->mBosId = parseSpecialToken(line);
+            }
+            else if (line.find("\"eos_token\"") != std::string::npos)
+            {
+                this->mEosId = parseSpecialToken(line);
+            }
+            else if (line.find("\"pad_token\"") != std::string::npos)
+            {
+                this->mPadId = parseSpecialToken(line);
+            }
+        }
+
+        config.close();
     }
+    else
+    {
+        LOG_WARNING("Cannot find tokenizer_config.json. Use default config.");
+    }
+}
+
+void Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
+{
+    BPETokenToRanks mergeableRanks;
+    BPETokenToRanks specialTokens;
+    loadHFVocab(modelDir, mergeableRanks, specialTokens);
+    loadHFConfig(modelDir, specialTokens);
 
     auto comp = [](std::pair<std::string, Rank> const& p1, std::pair<std::string, Rank> const& p2) {
         return p1.second < p2.second;
@@ -586,34 +548,6 @@ void LlamaV3Tokenizer::loadFromTiktoken(std::filesystem::path const& modelPath)
 
     this->mNumVocab = std::max(maxId, maxSpecialId) + 1;
     this->mBpe = std::make_unique<BPE>(mergeableRanks, specialTokens, mRegexExpr);
-    this->mBosId = specialTokens["<|begin_of_text|>"];
-    this->mEosId = specialTokens["<|end_of_text|>"];
-    this->mPadId = -1;
-    this->mStopTokens = {specialTokens["<|end_of_text|>"], specialTokens["<|eot_id|>"]};
-    LOG_INFO("Loaded LlamaV3Tokenizer from %s", modelPath.c_str());
-}
 
-void LlamaV3Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
-{
-    BPETokenToRanks mergeableRanks;
-    BPETokenToRanks specialTokens;
-    Rank bosId = -1;
-    Rank eosId = -1;
-
-    assert(loadHFVocab(modelDir, mergeableRanks, specialTokens, bosId, eosId));
-
-    auto comp = [](std::pair<std::string, Rank> const& p1, std::pair<std::string, Rank> const& p2) {
-        return p1.second < p2.second;
-    };
-    auto maxId = std::max_element(mergeableRanks.begin(), mergeableRanks.end(), comp)->second;
-    auto maxSpecialId = std::max_element(specialTokens.begin(), specialTokens.end(), comp)->second;
-
-    this->mNumVocab = std::max(maxId, maxSpecialId) + 1;
-    this->mBpe = std::make_unique<BPE>(mergeableRanks, specialTokens, mRegexExpr);
-    this->mBosId = bosId;
-    this->mEosId = eosId;
-    this->mPadId = -1;
-    this->mStopTokens = {specialTokens["<|end_of_text|>"], specialTokens["<|eot_id|>"]};
-
-    LOG_INFO("Loaded LlamaV3Tokenizer from %s", modelDir.c_str());
+    LOG_INFO("Loaded tokenizer from %s", modelDir.c_str());
 }

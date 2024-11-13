@@ -689,14 +689,14 @@ int main(int argc, char* argv[])
     }
     case MODE::kEvaluate:
     {
-        auto tokenizer = new LlamaV3Tokenizer();
+        auto tokenizer = new Tokenizer();
         tokenizer->loadFromHF(args.tokenizerPath);
         evaluate(args.enginePath, args.datasetPath, tokenizer, generationConfig, args.debug);
         break;
     }
     case MODE::kInference:
     {
-        auto tokenizer = new LlamaV3Tokenizer();
+        auto tokenizer = new Tokenizer();
         tokenizer->loadFromHF(args.tokenizerPath);
         auto output = decode(args.enginePath, args.inputString, tokenizer, generationConfig, args.debug);
         break;

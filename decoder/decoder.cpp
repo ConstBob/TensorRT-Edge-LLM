@@ -86,8 +86,8 @@ bool Decoder<T>::validateAndFillConfig()
     int64_t maxInputLength;
     int64_t maxLength;
     int64_t nbIOs = static_cast<int64_t>(mEngine->getNbIOTensors());
-    // input_ids, context_length and logits
-    int64_t numLayers = (nbIOs - 3) / 2;
+    // input_ids, context_length, last_token_ids and logits
+    int64_t numLayers = (nbIOs - 4) / 2;
     // Check input_ids
     std::string inputIdsName = "input_ids";
     check(checkStaticShape(inputIdsName), fmtstr("%s should be static", inputIdsName.c_str()));

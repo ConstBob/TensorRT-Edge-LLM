@@ -18,13 +18,12 @@
 #include <fstream>
 #include <iostream>
 
-#include <tokenizer.h>
-#include <tokenizerUtils.h>
+#include "../tokenizer.h"
+#include "../tokenizerUtils.h"
 
-void testEncodeDecode(Tokenizer* tokenizer, std::string const& input, const std::vector<Rank> expected = {},
-    bool addSpecialTokens = false)
+void testEncodeDecode(Tokenizer* tokenizer, std::string const& input, const std::vector<Rank> expected = {})
 {
-    auto token = tokenizer->encode(input, addSpecialTokens);
+    auto token = tokenizer->encode(input);
     std::string output = tokenizer->decode(token);
 
     gLogger.info("Input: " + input);
@@ -48,31 +47,17 @@ void testEncodeDecode(Tokenizer* tokenizer, std::string const& input, const std:
         assert(token == expected);
     }
 
-    if (addSpecialTokens)
-    {
-        assert(output == "<|begin_of_text|>" + input + "<|end_of_text|>");
-    }
-    else
-    {
-        assert(output == input);
-    }
-
+    assert(output == input);
     gLogger.info("Passed");
 }
 
-std::vector<Rank> getGolden(std::string const& modelPath, std::string const& input, bool addSpecialTokens)
+std::vector<Rank> getGolden(std::string const& modelPath, std::string const& input)
 {
-    if (modelPath.compare(modelPath.size() - 15, 15, "tokenizer.model") != 0)
-    {
-        return {};
-    }
-
     try
     {
-        std::string cmd = "python3 ../tests/llama3Test.py"
+        std::string cmd = "python3 ./tokenizer/tests/tokenizerTest.py"
             " --model_path=\"" + modelPath + "\""
-            " --input=\"" + input + "\""
-            " --add_special=" + std::to_string(addSpecialTokens);
+            " --input=\"" + input + "\"";
 
         std::array<char, 128> buffer;
         std::string result;
@@ -118,34 +103,24 @@ int main(int argc, char* argv[])
     if (argc >= 2)
     {
         // load tokenizer
-        Tokenizer* enc = new LlamaV3Tokenizer;
-
         auto modelPath = std::string(argv[1]);
-        if (modelPath.compare(modelPath.size() - 15, 15, "tokenizer.model") == 0)
-        {
-            enc->loadFromTiktoken(modelPath);
-        }
-        else
-        {
-            enc->loadFromHF(modelPath);
-        }
+        Tokenizer* enc = new Tokenizer();
+        enc->loadFromHF(modelPath);
 
         // get input
-        std::string input = (argc >= 3) ? argv[2] : "<|begin_of_text|>hello¢ nvidia，你好！👍<|end_of_text|>";
-        bool addSpecial = (argc >= 4) ? std::stoi(argv[3]) : false;
+        std::string input = (argc >= 3) ? argv[2] : "hello¢ nvidia，你好！👍";
 
         // get golden from python script
-        auto expected = getGolden(modelPath, input, addSpecial);
+        auto expected = getGolden(modelPath, input);
 
-        testEncodeDecode(enc, input, expected, addSpecial);
+        testEncodeDecode(enc, input, expected);
     }
     else
     {
         gLogger.error(
             "Usage:\n"
             "argv[1]: tokenizer path\n"
-            "argv[2]: (optional) input_text\n"
-            "argv[3]: (optional) add_special [0,1]");
+            "argv[2]: (optional) input_text\n");
     }
 
     return 0;

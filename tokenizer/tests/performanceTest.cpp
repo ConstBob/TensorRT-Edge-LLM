@@ -19,8 +19,8 @@
 #include <fstream>
 #include <iostream>
 
-#include <tokenizer.h>
-#include <tokenizerUtils.h>
+#include "../tokenizer.h"
+#include "../tokenizerUtils.h"
 
 std::string strip(std::string& str)
 {
@@ -55,15 +55,8 @@ void testPerformance(std::string const& modelPath, std::string const& dataPath)
     ss << std::fixed << std::setprecision(2) << "Num_bytes: " << (nBytes / 1024 / 1024) << " MB";
     gLogger.info(ss.str());
 
-    Tokenizer* enc = new LlamaV3Tokenizer;
-    if (modelPath.compare(modelPath.size() - 15, 15, "tokenizer.model") == 0)
-    {
-        enc->loadFromTiktoken(modelPath);
-    }
-    else
-    {
-        enc->loadFromHF(modelPath);
-    }
+    Tokenizer* enc = new Tokenizer();
+    enc->loadFromHF(modelPath);
 
     enc->decode(enc->encode("warmup"));
 
