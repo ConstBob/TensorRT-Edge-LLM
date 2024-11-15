@@ -71,7 +71,7 @@ public:
         mFile.open(fp.string(), std::ios::binary | std::ios::in);
         if (!mFile.good())
         {
-            throw std::string("Error opening engine file: " + fp.string());
+            throw std::runtime_error(fmtstr("Cannot open engine file: %s", fp.string()));
         };
     }
 

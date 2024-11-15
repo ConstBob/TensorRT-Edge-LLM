@@ -9,5 +9,4 @@ __pycache__/
 .cache
 data/
 data.tar
-*.txt
 *.csv
