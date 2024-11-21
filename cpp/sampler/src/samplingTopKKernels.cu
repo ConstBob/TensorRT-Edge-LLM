@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
-#include "decodingParams.h"
-#include "reduceKernelUtils.h"
-#include "samplingTopKKernels.h"
-#include "topKSamplingLayer.h"
+#include "sampler/include/decodingParams.h"
+#include "sampler/include/reduceKernelUtils.h"
+#include "sampler/include/samplingTopKKernels.h"
+#include "sampler/include/topKSamplingLayer.h"
 #include <cstdint>
 #include <cub/cub.cuh>
 #include <stdexcept>

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "baseLayer.h"
-#include "cudaUtils.h"
+#include "common/cudaUtils.h"
 #include <cstdint>
 
 //! \brief Layer to randomly sample tokens from TopK logits.

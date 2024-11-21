@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#include "samplingTopKKernels.h"
-#include "topKSamplingLayer.h"
+#include "sampler/include/samplingTopKKernels.h"
+#include "sampler/include/topKSamplingLayer.h"
 
 #include <algorithm>
 #include <cstdint>

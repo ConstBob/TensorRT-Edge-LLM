@@ -19,7 +19,7 @@
 #ifndef TOKENIZER_UTILS_H
 #define TOKENIZER_UTILS_H
 
-#include "common.h"
+#include "common/common.h"
 #include "tokenizer.h"
 #include <cassert>
 #include <iostream>

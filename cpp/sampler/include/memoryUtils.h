@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common.h"
+#include "common/common.h"
 #include <NvInferRuntime.h>
 #include <cassert>
 #include <cstdint>

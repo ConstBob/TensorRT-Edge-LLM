@@ -16,9 +16,10 @@
  */
 
 #include "decoderXQARunner.h"
-#include "pluginUtils.h"
-#include "xqa/cubin/xqa_kernel_cubin.h"
+#include "attentionPlugin/pluginUtils.h"
+#include "attentionPlugin/xqa/cubin/xqa_kernel_cubin.h"
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <unordered_map>

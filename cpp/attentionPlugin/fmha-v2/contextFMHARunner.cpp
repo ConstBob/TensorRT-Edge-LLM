@@ -16,8 +16,8 @@
  */
 
 #include "contextFMHARunner.h"
-#include "fmha-v2/cubin/fmha_cubin.h"
-#include "pluginUtils.h"
+#include "attentionPlugin/fmha-v2/cubin/fmha_cubin.h"
+#include "attentionPlugin/pluginUtils.h"
 
 #include <cuda_fp16.h>
 #include <math.h>
