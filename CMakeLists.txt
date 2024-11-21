@@ -18,8 +18,8 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 project(
-  drive_llm
-  VERSION 1.0
+  driveos_llm_sdk
+  VERSION 7.0.1.0
   LANGUAGES CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -29,6 +29,7 @@ set(CMAKE_CUDA_STANDARD 17)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 
 macro(set_ifndef var val)
   if(NOT DEFINED ${var})
@@ -38,11 +39,9 @@ macro(set_ifndef var val)
 endmacro()
 
 # CUDA flags and dependencies.
-message(STATUS "CUDA_DIR is configured to ${CUDA_DIR}")
-message(STATUS "CUDA_LIBRARIES is configured to ${CUDA_LIBRARIES}")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
-set_ifndef(CMAKE_CUDA_ARCHITECTURES 80;86;89)
-
+if (NOT DEFINED AARCH64_CROSS_BUILD)
+  set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
+endif()
 set_ifndef(CUDA_VERSION 12.6)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
 
@@ -84,53 +83,36 @@ find_library(
   HINTS ${TRT_PACKAGE_DIR}
   PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
 
-add_library(include_common INTERFACE)
-target_include_directories(
-  include_common INTERFACE ${TRT_INCLUDE_DIR} ${CUDA_INCLUDE_DIR}
-                           ${CMAKE_SOURCE_DIR}/common)
+set(COMMON_INCLUDE_DIRS ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/cpp)
 
-add_library(common_settings INTERFACE)
-target_link_libraries(common_settings INTERFACE ${NVINFER_LIB} ${CUDART_LIB}
-                                                ${CMAKE_DL_LIBS} include_common)
+add_library(commonLibraryExt INTERFACE)
+target_link_libraries(commonLibraryExt INTERFACE ${NVINFER_LIB} ${CUDART_LIB})
 # Workaround for aarch64 cross compilation where libvninfer.so links to
 # libnvdla_compilers. The libnvinfer dependencies shall be resolved at execution
 # time on an embedded board.
-target_link_options(common_settings INTERFACE
+target_link_options(commonLibraryExt INTERFACE
                     "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
-# Add executable with sources
-add_subdirectory(plugins)
-add_subdirectory(tokenizer)
-add_subdirectory(sampler)
-add_subdirectory(decoder)
+# Build Core libraries of the project. attentionPlugin shared library 
+# and llmSdkCore/tokenizer static library will be generated.
+add_subdirectory(cpp)
 
-target_include_directories(sampler PUBLIC ${CMAKE_SOURCE_DIR}/sampler/include)
-target_link_libraries(tokenizer PUBLIC include_common)
-target_link_libraries(sampler PUBLIC include_common)
-target_link_libraries(decoder PUBLIC sampler)
-
+# Build executable for engine generation.
 add_executable(builder builder.cpp)
-target_link_libraries(builder PRIVATE ${NV_ONNX_PARSER_LIB} common_settings)
-target_include_directories(builder PUBLIC ${ONNX_PARSER_INCLUDE_DIR})
-
-add_library(runtime_common INTERFACE)
-target_link_libraries(runtime_common INTERFACE decoder tokenizer ${NVINFER_LIB}
-                                               ${CUDART_LIB} ${CMAKE_DL_LIBS})
-target_include_directories(
-  runtime_common
-  INTERFACE ${CMAKE_SOURCE_DIR}/tokenizer ${CMAKE_SOURCE_DIR}/decoder
-            $(CMAKE_SOURCE_DIR)/sampler)
+target_link_libraries(builder PRIVATE ${NV_ONNX_PARSER_LIB} commonLibraryExt)
+target_include_directories(builder PRIVATE ${ONNX_PARSER_INCLUDE_DIR} ${COMMON_INCLUDE_DIRS})
 
 add_executable(runtime runtime.cpp)
-target_link_libraries(runtime PRIVATE runtime_common common_settings)
-# There are two workarounds for aarch64 cross compilation. It needs to override
-# the libcudla symbols and also need to points to the aarch64 version of
-# libcudart_static lib. TODO: Adjust CMake system to avoid introducing
-# -lcudadevrt -lcudart_static -lrt -lpthread -ldl to the linker. From local
-# experiment, the additional cuda libraries are brought by decoder static
-# library.
-target_link_options(runtime PRIVATE "-L${CUDA_DIR}/lib")
+target_link_libraries(runtime PRIVATE llmSdkCore tokenizer commonLibraryExt)
+target_include_directories(runtime PRIVATE ${COMMON_INCLUDE_DIRS})
 
 add_executable(chat examples/chat.cpp)
-target_link_libraries(chat PRIVATE runtime_common common_settings)
-target_link_options(chat PRIVATE "-L${CUDA_DIR}/lib")
+target_link_libraries(chat PRIVATE llmSdkCore tokenizer commonLibraryExt)
+target_include_directories(chat PRIVATE ${COMMON_INCLUDE_DIRS})
+
+# Resolve linker error for AArch64 cross build. cudadevrt and cudart_static
+# are introduced into the linking of executables
+if (DEFINED AARCH64_CROSS_BUILD)
+  target_link_options(chat PRIVATE "-L${CUDA_DIR}/lib")
+  target_link_options(runtime PRIVATE "-L${CUDA_DIR}/lib")
+endif()

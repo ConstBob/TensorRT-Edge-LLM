@@ -1,5 +1,5 @@
-#include "decoder.h"
-#include "tokenizer.h"
+#include "decoder/decoder.h"
+#include "tokenizer/tokenizer.h"
 #include <NvInferRuntime.h>
 #include <dlfcn.h>
 #include <getopt.h>
@@ -107,7 +107,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    void* handle = dlopen("build/plugins/libLLamaPlugin.so", RTLD_LAZY);
+    void* handle = dlopen("build/libAttentionPlugin.so", RTLD_LAZY);
     if (!handle)
     {
         LOG_ERROR("Cannot open library: %s", dlerror());

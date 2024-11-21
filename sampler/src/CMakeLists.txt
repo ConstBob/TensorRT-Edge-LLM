@@ -1,3 +1,0 @@
-file(GLOB SAMPLING_CU_SRCS "*.cu")
-file(GLOB SAMPLING_CPP_SRCS "*.cpp")
-add_library(sampler STATIC ${SAMPLING_CU_SRCS} ${SAMPLING_CPP_SRCS})

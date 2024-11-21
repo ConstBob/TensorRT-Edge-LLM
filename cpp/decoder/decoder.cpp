@@ -1,5 +1,5 @@
 #include "decoder.h"
-#include "common.h"
+#include "common/common.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
 #include <cassert>

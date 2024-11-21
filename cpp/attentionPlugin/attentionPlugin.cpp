@@ -16,8 +16,8 @@
  */
 
 #include "attentionPlugin.h"
-#include "contextFMHARunner.h"
-#include "decoderXQARunner.h"
+#include "attentionPlugin/fmha-v2/contextFMHARunner.h"
+#include "attentionPlugin/xqa/decoderXQARunner.h"
 #include "pluginUtils.h"
 
 #include <cassert>

@@ -1,6 +1,6 @@
 
 #include "NvOnnxParser.h"
-#include "common.h"
+#include "common/common.h"
 #include <NvInfer.h>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -148,7 +148,7 @@ int main(int argc, char** argv)
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    void* handle = dlopen("build/plugins/libLLamaPlugin.so", RTLD_LAZY);
+    void* handle = dlopen("build/libAttentionPlugin.so", RTLD_LAZY);
     if (!handle)
     {
         LOG_ERROR("Cannot open library: %s", dlerror());

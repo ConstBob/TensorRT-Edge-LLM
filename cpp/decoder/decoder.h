@@ -1,9 +1,9 @@
 #pragma once
 #ifndef DECODER_H
 #define DECODER_H
-#include "benchmarkProfiler.h"
-#include "common.h"
-#include "sampler.h"
+#include "common/benchmarkProfiler.h"
+#include "common/common.h"
+#include "sampler/include/sampler.h"
 #include <NvInferRuntime.h>
 #include <cfloat>
 #include <cuda_runtime_api.h>

@@ -1,5 +1,5 @@
-#include "sampler.h"
-#include "topKSamplingLayer.h"
+#include "sampler/include/sampler.h"
+#include "sampler/include/topKSamplingLayer.h"
 #include <cstdint>
 #include <memory>
 

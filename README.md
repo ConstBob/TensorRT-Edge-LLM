@@ -34,7 +34,7 @@ Add toolchain flag to the above CMake command
 cd drive-llm
 mkdir build
 cd build
-cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE={drive-llm-path}/cmake/aarch64_cross_toolchain.cmake
+cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_cross_toolchain.cmake
 make
 ```
 The build commands will generate the same set of executables and shared library. These can be used on Orin aarch64 board.
