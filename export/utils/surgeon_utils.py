@@ -401,6 +401,7 @@ def insert_int4_dq(graph: gs.Graph, state_dict: dict):
     assert len(int4_weight_dict) == len(
         weight_scale_dict
     ), f"{len(int4_weight_dict)} should be the same as {len(weight_scale_dict)}"
+    # TODO: Make block_size dynamic
     dq_node_attributes = {"axis": 0, "block_size": 128}
     qdq.insert_dq_nodes(graph,
                         scales=weight_scale_dict,
