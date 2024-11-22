@@ -1,8 +1,0 @@
-optimum==1.22.0
-transformers==4.44.2
-onnx
-onnx_graphsurgeon
-numpy
-onnxruntime
-nvidia-modelopt
-torch~=2.4.0

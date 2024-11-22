@@ -1,4 +1,5 @@
 build/
+build*/
 *_engine/
 *.engine
 *_onnx/
@@ -9,5 +10,4 @@ __pycache__/
 .cache
 data/
 data.tar
-*.txt
 *.csv
