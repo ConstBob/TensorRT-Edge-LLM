@@ -156,13 +156,14 @@ def insert_attention_plugin(graph: gs.Graph, config: dict):
         Warns the user that particular field is not included in the dict, but is required for AttentionPlugin
         """
         if key not in config or config.get(key, value) is None:
-            print(f"{key} does not exist. Set to {value}")
+            print(f"{key} does not exist. Set to {value}.")
             return value
         return config.get(key)
 
     start_time = time.time()
-    print("Inserting AttentionPlugin...")
-    rotary_scaling = set_with_warning("rope_scaling", 1.0)
+    print("Replacing MHA Pattern with AttentionPlugin...")
+    # We do not have any optimization on long context and therefore rotary_scaling is always 1.0
+    rotary_scaling = 1.0
     num_q_heads = set_with_warning("num_attention_heads", 32)
     num_kv_heads = set_with_warning("num_key_value_heads", 32)
     head_size = set_with_warning("hidden_size", 4096) // num_q_heads
