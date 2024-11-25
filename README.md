@@ -112,3 +112,14 @@ Python reference
 ```
 python scripts/mmlu.py
 ```
+
+## Performance
+Attached is the performance of all supported models collected on Thor with clock fixed at 756MHz with FP16 precision.
+
+Model | Precision | Batch Size | Input/Output | First Token Latency(ms) | Generation Tokens/sec | Total Latency
+--- | --- | --- | --- | --- | --- | ---
+LLaMa3-8b-instruct | FP16 | 1 | 512+128 | 263.26 | 15.55 | 8492.5
+LLaMa3.1-8B | FP16 | 1 | 512+128 | 263.21 | 15.91 | 8308.82
+LLaMa3.2-3B | FP16 | 1 | 512+128 | 119.32 | 33.87 | 3899.13
+QWen2.5-7B-instruct | FP16 | 1 | 512+128 | 256.90 | 16.29 | 7858.04
+QWen2-7B-instruct | FP16 | 1 | 512+128 | 256.75 | 15.61 | 8455.55
