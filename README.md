@@ -4,7 +4,7 @@
 
 DriveOS LLM SDK is a light-weighted C++ software toolkit to showcase TensorRT's capability and performance to deploy Large Language Model(LLM) targeted Auto Platform. With DriveOS LLM SDK, users can:
 1. Quantize and export PyTorch model to ONNX on Linux x86 system.
-1. Build TensorRT Engine and run e2e LLM inference, including tokenization and sampling on Auto Platforms.
+1. Build TensorRT Engine and run e2e LLM inference, including tokenization and sampling on Auto Platform.
 
 
 ## Prerequisite
@@ -14,15 +14,21 @@ A Linux X86 host with GPU is required to export the model into ONNX format. Once
 ## Supported platforms, models and precisions
 
 ### DriveOS 7.0.1 Release for Thor
-DriveOS 7.0.1 is shipped with TensorRT 10.4 and CUDA 12.8 to support **Thor** platform. The following models and precisions are currently supported with good precision to run e2e inference by DriveOS LLM SDK.
+DriveOS 7.0.1 is shipped with TensorRT 10.4 and CUDA 12.8 to support **Thor** platform.
+
+The following LLM models under [./examples/llm](./examples/llm/) with corresponding precisions are supported by DriveOS LLM SDK with good accuracy:
 
 Model | FP16 | INT4 | FP8
 --- | --- | --- | ---
-[LLaMa3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | No
-[LLaMa3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | No
-[LLaMa3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | No
-[QWen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | No
-[QWen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | No
+[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | No
+[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | No
+[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | No
+[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | No
+[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | No
+
+The following VLM models under [./examples/vlm](./examples/vlm/) with corresponding precisions are supported by DriveOS LLM SDK with good accuracy:
+
+**TBA**
 
 #### Precisions explained and notes:
 1. **FP16**: All the weights and compute are in FP16.
@@ -30,7 +36,7 @@ Model | FP16 | INT4 | FP8
 1. **INT4(W4A16)**: All the weights are quantized in INT4 using awq recipe, but all the compute are in FP16 precision. INT4 can reduce memory footprint significantly, but in TensorRT 10.4 the latency is worse than FP16 due to unfused INT4 GEMM kernels.
 
 #### Customized Models
-1. Decoder-only LLaMa series and QWen series are likely to be supported if it fits in Thor memory, but they are not fully tested.
+1. Decoder-only Llama series and Qwen series are likely to be supported if it fits in Thor memory, but they are not fully tested.
 1. Other model series will likely not be supported due to the Tokenizer implementation and model architecture difference.
 
 ### Other Platforms
@@ -52,74 +58,12 @@ cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch
 make
 ```
 
-To build and run DriveOS LLM SDK in x86 machine, the `-DCMAKE_TOOCHAIN_FILE` is not needed. The binaries `builder`, `runtime` and `chat` generated to be used later. The AttentionPlugin library will also be there in `libAttentionPlugin.so`
+To build and run DriveOS LLM SDK in x86 machine, the `-DCMAKE_TOOCHAIN_FILE` is not needed. The binaries are generated in `examples` folder to be used later. The AttentionPlugin library will also be there in `libAttentionPlugin.so`.
 
 ### 2. Export ONNX from PyTorch checkpoint
 
-First, it is needed to export the PyTorch model to ONNX on a x86 Linux host with GPU. If quantization is needed, it is recommended (or even required) to use a Data Center GPU like H100. Please see [README.MD](./export/README.md) for the detailed model export process. Once the ONNX model is available, no Python will be needed.
+First, it is needed to export the PyTorch model to ONNX on a x86 Linux host with GPU. If quantization is needed, it is recommended (or even required) to use a Data Center GPU like H100. Please see [export/README.md](./export/README.md) for the detailed model export process. Once the ONNX model is available, no Python will be needed.
 
-### 3. Build engine
+### 3. Build engine and run E2E LLM inference on C++
 
-The `builder` binary is used to build the TensorRT engine. All the ONNX have the same IO name and data type, so the building process is agnostic for all ONNX independent of model and precision.
-
-Example command:
-```
-./build/builder --onnxPath=llama3_fp16/model.onnx --enginePath=llama3_fp16.engine --batchSize=1 --maxInputLen=128 --maxSeqLen=4096
-```
-
-**Notes:**
-1. `--maxSeqLen` includes `--maxInputLen`, so it must be greater than `--maxInputLen`. The maximum new token would equal to `maxSeqLen - maxInputLen`.
-1. Please notice that `maxSeqLen` must be identical to `kv_cache_capacity` field of the ONNX `AttentionPlugin` node.
-1. We can support static multi-batch `batchSize < max_batch_size` field of ONNX `AttentionPlugin` node.
-
-### 4. Infer engine
-
-The `runtime` or `chat` binaries are examples to show E2E C++ LLM inference using greedy decoding. Example usages:
-
-#### Interactive Chat
-```
-./build/chat --tokenizerPath=llama-v3-8b-instruct-hf/ --enginePath=llama3_fp16.engine --maxLength=64
-```
-**Note**:
-1. Chat will prompt for each batch until it has input prompt for all batches.
-
-#### Inference with prompt
-
-```
-./build/runtime --tokenizerPath=llama-v3-8b-instruct-hf/ --enginePath=llama.engine --maxLength=256 --inputString="What is the result of 1+1?" [--inputString="Where is Iceland?"]
-```
-**Note**:
-1. To run inference with prompt for multi-batch engine, there should be exact n times `--inputString` inputs.
-
-#### Benchmark Performance
-
-```
-./build/runtime --enginePath=llama.engine --maxLength=256 --inputLength=24 --mode=benchmark
-```
-
-#### Evaluate with MMLU
-
-To run MMLU accuracy evaluation, it is first required to download the dataset.
-
-```
-wget https://people.eecs.berkeley.edu/~hendrycks/data.tar
-tar -xf data.tar
-./runtime --tokenizerPath=/home/scratch.trt_llm_data/llm-models/llama-models-v3/llama-v3-8b-instruct-hf/  --enginePath=llama.engine --mode evaluate --datasetPath ../data --debug
-```
-
-Python reference
-
-```
-python scripts/mmlu.py
-```
-
-## Performance
-Attached is the performance of all supported models collected on Thor with clock fixed at 756MHz with FP16 precision.
-
-Model | Precision | Batch Size | Input/Output | First Token Latency(ms) | Generation Tokens/sec | Total Latency
---- | --- | --- | --- | --- | --- | ---
-LLaMa3-8b-instruct | FP16 | 1 | 512+128 | 263.26 | 15.55 | 8492.5
-LLaMa3.1-8B | FP16 | 1 | 512+128 | 263.21 | 15.91 | 8308.82
-LLaMa3.2-3B | FP16 | 1 | 512+128 | 119.32 | 33.87 | 3899.13
-QWen2.5-7B-instruct | FP16 | 1 | 512+128 | 256.90 | 16.29 | 7858.04
-QWen2-7B-instruct | FP16 | 1 | 512+128 | 256.75 | 15.61 | 8455.55
+Once the model is exported, you can follow the examples to build and run E2E LLM inference with C++. Please follow [examples/llm/README.md](./examples/llm/README.md) for decoder-only LLMs. The cpp files under [examples](./examples/) folder show the usage of the DriveOS LLM SDK runtime.

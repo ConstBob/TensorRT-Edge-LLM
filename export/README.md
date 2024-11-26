@@ -6,7 +6,7 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 
 1. Since ONNX export is platform agnostic, it is strongly recommended to run the script in Linux x86 platform with Ampere or above GPUs.
 1. To run FP8 quantization, it is required to run on SM>=89.
-1. To avoid OOM, it is recommended to run the quantization on H100 80GB GPU to avoid OOM.
+1. To avoid OOM during quantization and ONNX export, it is recommended to run the quantization on H100 80GB GPU to avoid OOM.
 
 ## Usage
 
@@ -15,7 +15,7 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 1. `pip3 install -r requirements.txt`
 1. Call export script
 ```
-python3 onnx_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4] --output_dir $ONNX_DIR
+python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4] --output_dir $ONNX_DIR
 ```
 
 The ONNX with desired data type will be exported in `$ONNX_DIR`.
@@ -31,15 +31,15 @@ The export script can export the following PyTorch models into ONNX.
 
 Model | FP16 | INT4 | FP8
 --- | --- | --- | ---
-[LLaMa3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes
-[LLaMa3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes
-[LLaMa3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes
-[QWen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes
-[QWen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes
+[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes
+[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes
+[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes
+[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes
+[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes
 
 ## Limitations
 
-1. QWen export requires torch<2.5.0. With torch>=2.5.0, you will encounter this issue:
+1. Qwen export requires torch<2.5.0. With torch>=2.5.0, you will encounter this issue:
 ```
     _C._jit_pass_onnx_graph_shape_type_inference(
 RuntimeError: The serialized model is larger than the 2GiB limit imposed by the protobuf library. Therefore the output file must be a file path, so that the ONNX external data can be written to the same directory. Please specify the output file name.

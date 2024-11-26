@@ -39,7 +39,7 @@ macro(set_ifndef var val)
 endmacro()
 
 # CUDA flags and dependencies.
-if (NOT DEFINED AARCH64_CROSS_BUILD)
+if(NOT DEFINED AARCH64_CROSS_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
 endif()
 set_ifndef(CUDA_VERSION 12.6)
@@ -83,7 +83,8 @@ find_library(
   HINTS ${TRT_PACKAGE_DIR}
   PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
 
-set(COMMON_INCLUDE_DIRS ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/cpp)
+set(COMMON_INCLUDE_DIRS ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR}
+                        ${CMAKE_SOURCE_DIR}/cpp)
 
 add_library(commonLibraryExt INTERFACE)
 target_link_libraries(commonLibraryExt INTERFACE ${NVINFER_LIB} ${CUDART_LIB})
@@ -93,26 +94,9 @@ target_link_libraries(commonLibraryExt INTERFACE ${NVINFER_LIB} ${CUDART_LIB})
 target_link_options(commonLibraryExt INTERFACE
                     "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
-# Build Core libraries of the project. attentionPlugin shared library 
-# and llmSdkCore/tokenizer static library will be generated.
+# Build Core libraries of the project. attentionPlugin shared library and
+# llmSdkCore/tokenizer static library will be generated.
 add_subdirectory(cpp)
 
-# Build executable for engine generation.
-add_executable(builder builder.cpp)
-target_link_libraries(builder PRIVATE ${NV_ONNX_PARSER_LIB} commonLibraryExt)
-target_include_directories(builder PRIVATE ${ONNX_PARSER_INCLUDE_DIR} ${COMMON_INCLUDE_DIRS})
-
-add_executable(runtime runtime.cpp)
-target_link_libraries(runtime PRIVATE llmSdkCore tokenizer commonLibraryExt)
-target_include_directories(runtime PRIVATE ${COMMON_INCLUDE_DIRS})
-
-add_executable(chat examples/chat.cpp)
-target_link_libraries(chat PRIVATE llmSdkCore tokenizer commonLibraryExt)
-target_include_directories(chat PRIVATE ${COMMON_INCLUDE_DIRS})
-
-# Resolve linker error for AArch64 cross build. cudadevrt and cudart_static
-# are introduced into the linking of executables
-if (DEFINED AARCH64_CROSS_BUILD)
-  target_link_options(chat PRIVATE "-L${CUDA_DIR}/lib")
-  target_link_options(runtime PRIVATE "-L${CUDA_DIR}/lib")
-endif()
+# Build C++ examples to showcase the usage
+add_subdirectory(examples)

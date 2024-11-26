@@ -1,1 +1,1 @@
-add_executable(chat chat.cpp)
+add_subdirectory(llm)
