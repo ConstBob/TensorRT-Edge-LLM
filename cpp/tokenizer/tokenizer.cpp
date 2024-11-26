@@ -363,7 +363,7 @@ void Tokenizer::appendBos(std::vector<Rank>& output) const noexcept
     }
     else
     {
-        LOG_WARNING("BOS ID is not set. Not appending BOS token.");
+        LOG_DEBUG("BOS ID is not set. Not appending BOS token.");
     }
 }
 
@@ -375,7 +375,7 @@ void Tokenizer::appendEos(std::vector<Rank>& output) const noexcept
     }
     else
     {
-        LOG_WARNING("EOS ID is not set. Not appending EOS token.");
+        LOG_DEBUG("EOS ID is not set. Not appending EOS token.");
     }
 }
 
@@ -399,8 +399,8 @@ Rank Tokenizer::getPadId() const noexcept
     return mPadId == -1 ? mEosId : mPadId;
 }
 
-void Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab,
-    BPETokenToRanks& specialTokens) noexcept
+void Tokenizer::loadHFVocab(
+    std::filesystem::path const& modelDir, BPETokenToRanks& vocab, BPETokenToRanks& specialTokens) noexcept
 {
     std::filesystem::path tokenizerFile = modelDir / "tokenizer.json";
     assert(std::filesystem::exists(tokenizerFile));
@@ -489,8 +489,7 @@ void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRa
 {
     std::filesystem::path tokenizerConfig = modelDir / "tokenizer_config.json";
 
-    auto parseSpecialToken = [&specialTokens](std::string line) -> Rank
-    {
+    auto parseSpecialToken = [&specialTokens](std::string line) -> Rank {
         auto start = line.find(": ");
         auto end = line.size() - 1;
         std::string token = line.substr(start + 2, end - start - 2);

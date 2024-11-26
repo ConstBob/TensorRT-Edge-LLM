@@ -1,13 +1,13 @@
 #include "decoder/decoder.h"
 #include "tokenizer/tokenizer.h"
 #include <NvInferRuntime.h>
+#include <algorithm>
 #include <dlfcn.h>
 #include <getopt.h>
 #include <iostream>
 #include <string>
 #include <vector>
 
-using namespace std;
 using namespace nvinfer1;
 
 struct RuntimeArgs
@@ -29,9 +29,10 @@ void printUsage(char const* programName)
     std::cerr << "  -h               Display this help message" << std::endl;
     std::cerr << "  --enginePath     Provide the input TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --tokenizerPath  Provide the path to HF tokenizer. Required. " << std::endl;
-    std::cerr << "  --maxLength      Provide the maximum output length for the generation session (including the "
-                 "input). Default = 256"
-              << std::endl;
+    std::cerr
+        << "  --maxLength      [Chat] Provide the maximum output length for the generation session (including the "
+           "input). Default = 256"
+        << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more information." << std::endl;
 };
 
@@ -107,12 +108,20 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    void* handle = dlopen("build/libAttentionPlugin.so", RTLD_LAZY);
-    if (!handle)
+    char const* pluginPath = std::getenv("PLUGIN_PATH");
+
+    if (pluginPath != nullptr)
     {
-        LOG_ERROR("Cannot open library: %s", dlerror());
-        return EXIT_FAILURE;
+        LOG_INFO("PLUGIN_PATH: %s", pluginPath);
     }
+    else
+    {
+        LOG_INFO("PLUGIN_PATH variable is not set. Default to build/libAttentionPlugin.so");
+        pluginPath = "build/libAttentionPlugin.so";
+    }
+
+    void* handle = dlopen(pluginPath, RTLD_LAZY);
+
     Tokenizer* tokenizer = new Tokenizer();
     tokenizer->loadFromHF(args.tokenizerPath);
     auto decoder = new Decoder<half>();
@@ -138,6 +147,7 @@ int main(int argc, char* argv[])
             std::getline(std::cin, inputString);
             if (inputString == quitString)
             {
+                dlclose(handle);
                 std::cout << "Exit. Thanks for using DriveOS LLM SDK!" << std::endl;
                 return EXIT_SUCCESS;
             }

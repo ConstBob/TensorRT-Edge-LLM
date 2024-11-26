@@ -172,8 +172,7 @@ if __name__ == "__main__":
         "--model",
         "-m",
         type=str,
-        default=
-        "/home/scratch.trt_llm_data/llm-models/llama-models-v3/llama-v3-8b-instruct-hf/",
+        required=True,
     )
     args = parser.parse_args()
     main(args)
