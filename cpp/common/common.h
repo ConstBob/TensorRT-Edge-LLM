@@ -94,6 +94,16 @@ public:
     }
     std::ifstream mFile;
 };
+struct TensorInfo
+{
+    void* data;
+    nvinfer1::Dims dims;
+    TensorInfo(void* data, const nvinfer1::Dims dims)
+        : data(data)
+        , dims(dims)
+    {
+    }
+};
 
 // Logger for TensorRT info/warning/errors
 class Logger : public nvinfer1::ILogger

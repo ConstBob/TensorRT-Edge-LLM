@@ -30,6 +30,8 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g")
 
 macro(set_ifndef var val)
   if(NOT DEFINED ${var})
@@ -83,8 +85,9 @@ find_library(
   HINTS ${TRT_PACKAGE_DIR}
   PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
 
-set(COMMON_INCLUDE_DIRS ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR}
-                        ${CMAKE_SOURCE_DIR}/cpp)
+set(COMMON_INCLUDE_DIRS
+    ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/cpp
+    ${CMAKE_SOURCE_DIR}/examples/multimodal)
 
 add_library(commonLibraryExt INTERFACE)
 target_link_libraries(commonLibraryExt INTERFACE ${NVINFER_LIB} ${CUDART_LIB})

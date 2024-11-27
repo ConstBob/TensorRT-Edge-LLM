@@ -1,7 +1,7 @@
-import os
 import re
 import time
 from typing import Union
+from enum import Enum
 
 import modelopt.onnx.quantization.qdq_utils as qdq
 import numpy as np
@@ -10,9 +10,15 @@ import onnx_graphsurgeon as gs
 import torch
 from modelopt.onnx.quantization.gs_patching import patch_gs_modules
 from onnx_graphsurgeon.ir.tensor import LazyValues
-from transformers import AutoConfig, DynamicCache
 
 
+class RopeType(Enum):
+    kNone = 0
+    kROPE_ROTATE_GPTJ = 1
+    kROPE_ROTATE_NEOX = 2
+    kMOPRE = 3
+    
+    
 def clear_inputs(node: Union[gs.Node, gs.Tensor]):
     """
     Clear all inputs for a node or tensor in ONNX
@@ -81,7 +87,7 @@ def insert_gather_last_token(graph: gs.Graph):
             break
     assert logits, "Cannot find logits output in the graph!"
 
-    lm_head_matmul = logits
+    lm_head_matmul = logits.inputs[0]
     for i in range(5):
         if "/lm_head/MatMul" in lm_head_matmul.name:
             lm_head_matmul = clear_outputs(lm_head_matmul)
@@ -92,7 +98,8 @@ def insert_gather_last_token(graph: gs.Graph):
                 f"Gather is already in the graph. No gather operation will be inserted. Function completed in {end_time - start_time}s."
             )
             return graph
-        lm_head_matmul = lm_head_matmul.inputs[0]
+        lm_head_matmul = lm_head_matmul.inputs[0].inputs[0]
+
     assert "/lm_head/MatMul" in lm_head_matmul.name and lm_head_matmul.op == "MatMul", f"You did not reach lm_head, but you reached {lm_head_matmul.name}"
     lm_head_weight = lm_head_matmul.inputs[1]
     lm_head_weight.name = "/lm_head/MatMul/weight"
@@ -128,7 +135,7 @@ def insert_gather_last_token(graph: gs.Graph):
     return graph
 
 
-def insert_attention_plugin(graph: gs.Graph, config: dict):
+def insert_attention_plugin(graph: gs.Graph, config: dict, rope_type: RopeType, extra_inputs: list):
     """
     Insert AttentionPlugin for the graph. AttentionPlugin takes the following inputs and outputs:
 
@@ -136,6 +143,7 @@ def insert_attention_plugin(graph: gs.Graph, config: dict):
         qkv: [bs, seq_len, d_q+d_k+d_v]. Therefore qkv from q_proj, k_proj and v_proj will be concatenated
         kv_input: [bs, 2, num_head, max_kv_capacity, d_kv]
         context_lengths: [bs]
+        extra_inputs
 
     Outputs:
         attention_outputs: [bs, seq_len, h_q, d_q]
@@ -146,6 +154,8 @@ def insert_attention_plugin(graph: gs.Graph, config: dict):
     Parameters:
         graph: gs.Graph
         config: dict. Converted from transformers.AutoConfig
+        rope_type: RopeType.
+        extra_inputs: list
 
     Returns:
         The graph after inserted AttentionPlugin
@@ -168,6 +178,11 @@ def insert_attention_plugin(graph: gs.Graph, config: dict):
     num_kv_heads = set_with_warning("num_key_value_heads", 32)
     head_size = set_with_warning("hidden_size", 4096) // num_q_heads
     rotary_base_frequency = set_with_warning("rope_theta", 500000.0)
+    half_rotary_dim = set_with_warning("hidden_size",
+                                       4096) // set_with_warning(
+                                           "num_attention_heads", 32) // 2
+    rotary_embedding_max_positions = set_with_warning(
+        "max_position_embeddings", 32768)
 
     attention_attrs = {
         "num_q_heads": num_q_heads,
@@ -175,9 +190,11 @@ def insert_attention_plugin(graph: gs.Graph, config: dict):
         "head_size": head_size,
         "rotary_scaling": rotary_scaling,
         "rotary_base_frequency": rotary_base_frequency,
-        "position_embedding_type": 2,
+        "position_embedding_type": rope_type.value,
         "max_batch_size": 16,
         "kv_cache_capacity": 4096,
+        "half_rotary_dim": half_rotary_dim,
+        "rotary_embedding_max_positions": rotary_embedding_max_positions,
     }
 
     removed_inputs = []
@@ -203,6 +220,9 @@ def insert_attention_plugin(graph: gs.Graph, config: dict):
     context_lengths = gs.Variable("context_lengths", np.int32, ['batch_size'])
 
     graph.inputs.append(context_lengths)
+
+    for input in extra_inputs:
+        graph.inputs.append(input)
 
     num_layers = (len(graph.outputs) - 1) // 2
     # Look for kv cache outputs and remove them from graph
@@ -297,7 +317,7 @@ def insert_attention_plugin(graph: gs.Graph, config: dict):
 
         graph.layer(name=f"Attention-{i}",
                     op="AttentionPlugin",
-                    inputs=[qkv, kv_input, context_lengths],
+                    inputs=[qkv, kv_input, context_lengths] + extra_inputs,
                     outputs=[attn_output, kv_output],
                     attrs=attention_attrs)
     end_time = time.time()
@@ -356,7 +376,6 @@ def insert_int4_dq(graph: gs.Graph, state_dict: dict):
     for node in graph.nodes:
         if node.op == "MatMul" and "_proj" in node.name:
             # Need to insert DQ and pre_quant_scale
-            layer_id = extract_layer_id(node.name)
             hf_name = '.'.join(node.name.split("/")[1:-1])
             hf_weight_name = hf_name + ".weight"
             hf_pre_quant_scale_name = hf_name + ".input_quantizer._pre_quant_scale"

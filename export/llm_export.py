@@ -8,13 +8,13 @@ import onnx_graphsurgeon as gs
 import torch
 from modelopt.torch.export.unified_export_hf import export_hf_checkpoint
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from utils.export_utils import WrapperModelForCausalLM, torch_to_onnx
+from utils.export_utils import WrapperModelForCausalLM, llm_to_onnx
 from utils.quantization_utils import quantize
 from utils.surgeon_utils import (fold_fp8_qdq_to_dq, insert_attention_plugin,
-                                 insert_gather_last_token, insert_int4_dq)
+                                 insert_gather_last_token, insert_int4_dq, RopeType)
 
 
-def parse_arguments():
+def llm_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--torch_dir',
                         type=str,
@@ -62,8 +62,7 @@ def parse_arguments():
         help=
         "The path of config.json, in case it is not with the PyTorch or ONNX file",
         default=None)
-    args = parser.parse_args()
-    return args
+    return parser
 
 
 def get_config_path(args):
@@ -87,67 +86,71 @@ def get_config_path(args):
     return None
 
 
-def main():
-    start_time = time.time()
-    args = parse_arguments()
-    os.makedirs(args.output_dir, exist_ok=True)
-    assert args.torch_dir or args.onnx_path, "You need to provide either --torch_dir or --onnx_path to process the export script"
+def export_raw_llm(model, output_dir, dtype, config_path, torch_dir, dataset_dir="",
+                   extra_inputs={}, extra_dyn_axes={}):
+    """
+    Export raw llm model to ONNX and do quantize.
+
+    Args:
+        model: torch.nn.module
+        output_dir: str
+        dtype: str
+        config_path: str
+        torch_dir: str, Used for loading tokenizer for quantization
+        dataset_dir: str, Used for quantization
+    """
     state_dict = None
-    config_path = get_config_path(args)
+    os.makedirs(output_dir, exist_ok=True)
 
-    if args.torch_dir:
-        # Exporting ONNX from PyTorch model
-        torch_dir = args.torch_dir
-        model = AutoModelForCausalLM.from_pretrained(
-            torch_dir, torch_dtype=torch.float16).cuda()
-
-        if args.save_original:
-            onnx_dir = args.output_dir + "_raw"
+    if dtype == "fp16" or dtype == "int4":
+        if dtype == "int4":
+            print(
+                "int4 native onnx.export does not support. Need to surgeon from fp16 ONNX..."
+            )
         else:
-            onnx_dir = args.output_dir
+            print("Loading fp16 ONNX model...")
+        llm_to_onnx(model, output_dir, extra_inputs=extra_inputs, extra_dyn_axes=extra_dyn_axes)
+        shutil.copy(config_path, os.path.join(output_dir, "config.json"))
+        
+    # Need to quantize model to fp8 or int4
+    if dtype == "fp8" or dtype == "int4":
+        tokenizer = AutoTokenizer.from_pretrained(torch_dir)
+        model = quantize(model, tokenizer, dtype, dataset_dir)
 
-        os.makedirs(onnx_dir, exist_ok=True)
+        if dtype == "fp8":
+            print(
+                "Exporting fp8 ONNX model from quantized PyTorch model...")
+            llm_to_onnx(model, output_dir, extra_inputs=extra_inputs, extra_dyn_axes=extra_dyn_axes)
+            shutil.copy(config_path, os.path.join(output_dir, "config.json"))
 
-        if args.dtype == "fp16" or args.dtype == "int4":
-            if args.dtype == "int4":
-                print(
-                    "int4 native onnx.export does not support. Need to surgeon from fp16 ONNX..."
-                )
-            else:
-                print("Loading fp16 ONNX model...")
-            torch_to_onnx(WrapperModelForCausalLM(model), onnx_dir)
-            shutil.copy(os.path.join(torch_dir, "config.json"),
-                        os.path.join(onnx_dir, "config.json"))
+        # Compress weights
+        quantized_model_dir = f"{output_dir}_{dtype}_quantized"
+        os.makedirs(quantized_model_dir, exist_ok=True)
+        export_hf_checkpoint(model, dtype=torch.float16)
+        state_dict = model.state_dict()
+        torch.save(state_dict,
+                    os.path.join(quantized_model_dir, "model.pth"))
+        
+    return state_dict
 
-        # Need to quantize model to fp8 or int4
-        if args.dtype == "fp8" or args.dtype == "int4":
-            tokenizer = AutoTokenizer.from_pretrained(torch_dir)
-            model = quantize(model, tokenizer, args.dtype, args.dataset_dir)
 
-            if args.dtype == "fp8":
-                print(
-                    "Exporting fp8 ONNX model from quantized PyTorch model...")
-                torch_to_onnx(WrapperModelForCausalLM(model), onnx_dir)
-                shutil.copy(config_path, os.path.join(onnx_dir, "config.json"))
-
-            # Compress weights
-            quantized_model_dir = f"{args.output_dir}_{args.dtype}_quantized"
-            os.makedirs(quantized_model_dir, exist_ok=True)
-            export_hf_checkpoint(model, dtype=torch.float16)
-            state_dict = model.state_dict()
-            torch.save(state_dict,
-                       os.path.join(quantized_model_dir, "model.pth"))
-    else:
-        print(f"ONNX path given. Importing ONNX from {args.onnx_path}")
-        # Int4 requires knowledge of the int4 weights and scales.
-        if args.dtype == "int4":
-            assert args.state_dict_path, "You need to pass state_dict for int4 ONNX export"
-            state_dict = torch.load(args.state_dict_path)
-
-    # Surgeon graph based on precision and mode
-    raw_onnx_path = f"{onnx_dir}/model.onnx" if args.torch_dir else args.onnx_path
-
-    if args.mode == "plugin":
+def surgeon_llm(raw_onnx_path, output_dir, dtype, mode, config_path, state_dict,
+                rope_type=RopeType.kROPE_ROTATE_NEOX, extra_plugin_inputs=[]):
+    """
+    Surgeon raw llm onnx to fit TRT.
+    For example, insert attention plugin, insert quantization q/dq nodes.
+    
+    Args:
+        raw_onnx_path: str
+        output_dir: str
+        dtype: str
+        mode: str
+        config_path: str
+        state_dict: None or OrderedDict 
+        rope_type: RopeType.
+        extra_plugin_inputs: list
+    """
+    if mode == "plugin":
         # AttentionPlugin requires knowledge of the model. Assume config file is in onnx_dir
         assert os.path.exists(
             config_path), "No config.json is found. Cannot run plugin mode."
@@ -166,20 +169,20 @@ def main():
     t1 = time.time()
     print(f"Importing ONNX graph takes {t1 - t0}s.")
 
-    if args.mode == "plugin":
-        graph = insert_attention_plugin(graph, config)
+    if mode == "plugin":
+        graph = insert_attention_plugin(graph, config, rope_type, extra_plugin_inputs)
 
-    if args.dtype == "fp8":
+    if dtype == "fp8":
         graph = fold_fp8_qdq_to_dq(graph)
 
-    elif args.dtype == "int4":
+    elif dtype == "int4":
         graph = insert_int4_dq(graph, state_dict)
 
     graph = insert_gather_last_token(graph)
 
     graph.cleanup().toposort().fold_constants().cleanup().toposort()
 
-    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
     t2 = time.time()
     print(
         f"Saving ONNX files in {output_dir}. All existing ONNX in the folder will be overwritten."
@@ -206,13 +209,61 @@ def main():
 
     if os.path.exists(config_path):
         shutil.copy(config_path, os.path.join(output_dir, "config.json"))
+        
     t3 = time.time()
-    print(f"ONNX export and save takes {t3 - t2}s.")
+    print(f"Surgeon LLM completed in {t3 - t2}s.")
+
+
+def main(args):
+    assert args.torch_dir or args.onnx_path, "You need to provide either --torch_dir or --onnx_path to process the export script"
+    start_time = time.time()
+    state_dict = None
+
+    if args.torch_dir:
+        # Exporting ONNX from PyTorch model
+        torch_dir = args.torch_dir
+        model = AutoModelForCausalLM.from_pretrained(
+            torch_dir, torch_dtype=torch.float16).cuda()
+
+        if args.save_original:
+            onnx_dir = args.output_dir + "_raw"
+        else:
+            onnx_dir = args.output_dir
+            
+        state_dict = export_raw_llm(
+            WrapperModelForCausalLM(model), 
+            onnx_dir, 
+            args.dtype, 
+            args.config_path, 
+            args.torch_dir, 
+            args.dataset_dir
+        )
+    else:
+        print(f"ONNX path given. Importing ONNX from {args.onnx_path}")
+        # Int4 requires knowledge of the int4 weights and scales.
+        if args.dtype == "int4":
+            assert args.state_dict_path, "You need to pass state_dict for int4 ONNX export"
+            state_dict = torch.load(args.state_dict_path)
+
+    # Surgeon graph based on precision and mode
+    raw_onnx_path = f"{onnx_dir}/model.onnx" if args.torch_dir else args.onnx_path
+    surgeon_llm(
+        raw_onnx_path, 
+        args.output_dir, 
+        args.dtype, 
+        args.mode, 
+        args.config_path, 
+        state_dict
+    )
+    
     end_time = time.time()
     print(
-        f"Model ONNX saved to {output_dir} with {args.dtype} precision in {end_time - start_time}s."
+        f"LLM ONNX saved to {args.output_dir} with {args.dtype} precision in {end_time - start_time}s."
     )
 
 
 if __name__ == '__main__':
-    main()
+    parser = llm_arguments()
+    args = parser.parse_args()
+    args.config_path = get_config_path(args)
+    main(args)

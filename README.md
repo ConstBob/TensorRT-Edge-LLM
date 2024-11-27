@@ -52,6 +52,7 @@ The C++ project can be built in Linux x86 host with cross build.
 
 ```
 cd drive-llm
+git submodule update --init --recursive
 mkdir build
 cd build
 cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_cross_toolchain.cmake

@@ -107,7 +107,7 @@ public:
     Tokenizer();
 
     Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
-        Rank const& bosId = -1, Rank const& eosId = -1, Rank const& padId = -1);
+        Rank const& bosId = -1, Rank const& eosId = -1, Rank const& padId = -1, Rank const& unkId = -1);
 
     virtual ~Tokenizer() = default;
 
@@ -125,11 +125,15 @@ public:
 
     Rank getPadId() const noexcept;
 
+    Rank getUnkId() const noexcept;
+
 protected:
     // manually parse tokenizer.json and tokenizer_config.json without using 3rdparty libraries
-    void loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab, BPETokenToRanks& specialTokens) noexcept;
+    void loadHFSpecialTokens(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens);
 
-    void loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens) noexcept;
+    void loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab);
+
+    void loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens);
 
     void appendEos(std::vector<Rank>& output) const noexcept;
 
@@ -140,8 +144,8 @@ protected:
     Rank mBosId;
     Rank mEosId;
     Rank mPadId;
+    Rank mUnkId;
     std::string mRegexExpr;
-
 };
 
 #endif // TOKENIZER_H

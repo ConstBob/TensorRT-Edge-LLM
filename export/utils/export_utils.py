@@ -25,13 +25,38 @@ class WrapperModelForCausalLM(torch.nn.Module):
         return logits, past_key_values
 
 
-def torch_to_onnx(model, output_dir):
+def export_onnx(model,
+                inputs,
+                onnx_dir,
+                onnx_name='model.onnx',
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes={'input': {
+                    0: 'batch'
+                }}):
+    os.makedirs(onnx_dir, exist_ok=True)
+
+    torch.onnx.export(
+        model,
+        inputs,
+        f'{onnx_dir}/{onnx_name}',
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        opset_version=19,
+        do_constant_folding=True,
+    )
+
+
+def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
     """
     Export the WrapperModelForCausalLM to ONNX with fixed I/O names and shape definitions and save to `output_dir`
 
     Parameters:
         model: torch.Module
         output_dir: str, the output_dir of the original ONNX.
+        extra_inputs: dict, append additional inputs after kv_cache
+        extra_dyn_axes: dict
     """
     start_time = time.time()
     config = model.config
@@ -68,20 +93,19 @@ def torch_to_onnx(model, output_dir):
     cache = DynamicCache.from_legacy_cache(dummy_kv_cache)
     legacy_format_cache = cache.to_legacy_cache()
 
-    torch.onnx.export(
+    export_onnx(
         model,
         (dummy_input_ids, {
-            "past_key_values": legacy_format_cache
+            "past_key_values": legacy_format_cache,
+            **extra_inputs
         }),
-        os.path.join(output_dir, "model.onnx"),
-        input_names=input_names,
+        output_dir,
+        input_names=input_names + list(extra_inputs.keys()),
         output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        opset_version=19,
-        do_constant_folding=True,
+        dynamic_axes=dynamic_axes | extra_dyn_axes,
     )
 
     end_time = time.time()
     print(
-        f"Native ONNX Export from torch completed in {end_time - start_time}s."
+        f"Native ONNX Export from torch completed in {end_time - start_time}s. ONNX file is saved to {output_dir}."
     )
