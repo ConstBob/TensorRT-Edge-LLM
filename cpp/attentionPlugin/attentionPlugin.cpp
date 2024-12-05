@@ -77,6 +77,40 @@ std::optional<T> parsePluginScalarField(std::string const& fieldName, nvinfer1::
     return std::nullopt;
 }
 
+template <typename T, class Enable = void>
+struct Serializer
+{
+};
+
+template <typename T>
+struct Serializer<T, typename std::enable_if_t<std::is_arithmetic_v<T> || std::is_enum_v<T>>>
+{
+    static void serialize(void** buffer, T const& value)
+    {
+        ::memcpy(*buffer, &value, sizeof(T));
+        reinterpret_cast<char*&>(*buffer) += sizeof(T);
+    }
+    static void deserialize(void const** buffer, size_t* buffer_size, T* value)
+    {
+        assert(*buffer_size >= sizeof(T));
+        ::memcpy(value, *buffer, sizeof(T));
+        reinterpret_cast<char const*&>(*buffer) += sizeof(T);
+        *buffer_size -= sizeof(T);
+    }
+};
+
+template <typename T>
+inline void serializeValue(void** buffer, T const& value)
+{
+    return Serializer<T>::serialize(buffer, value);
+}
+
+template <typename T>
+inline void deserializeValue(void const** buffer, size_t* buffer_size, T* value)
+{
+    return Serializer<T>::deserialize(buffer, buffer_size, value);
+}
+
 } // namespace
 
 // Static class fields initialization
@@ -85,10 +119,9 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(std::string const& name, TensorRTPhase phase, int32_t numQHeads, int32_t numKVHeads,
+AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads,
     int32_t headSize, int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType)
     : mLayerName(name)
-    , mUsagePhase(phase)
     , mNumHeadQ(numQHeads)
     , mNumHeadKV(numKVHeads)
     , mNumElemPerHead(headSize)
@@ -111,6 +144,24 @@ AttentionPlugin::AttentionPlugin(std::string const& name, TensorRTPhase phase, i
     DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType);
 }
 
+AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size_t length)
+    : mLayerName(name)
+{
+    deserializeValue(&data, &length, &mMaxBatchSize);
+    deserializeValue(&data, &length, &mKVCacheCapacity);
+    deserializeValue(&data, &length, &mNumHeadQ);
+    deserializeValue(&data, &length, &mNumHeadKV);
+    deserializeValue(&data, &length, &mNumElemPerHead);
+    deserializeValue(&data, &length, &mPosEmbedType);
+    deserializeValue(&data, &length, &mRotaryScale);
+    deserializeValue(&data, &length, &mRotaryBaseFrequency);
+
+    mSMVersion = getSMVersion();
+    ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
+    DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType);
+}
+
+
 AttentionPlugin::~AttentionPlugin()
 {
 }
@@ -121,37 +172,16 @@ void AttentionPlugin::setRotaryConfig(float ropeScale, float ropeBaseFrequency)
     mRotaryBaseFrequency = ropeBaseFrequency;
 }
 
-nvinfer1::IPluginCapability* AttentionPlugin::getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept
+IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    try
-    {
-        if (type == PluginCapabilityType::kBUILD)
-        {
-            return static_cast<IPluginV3OneBuild*>(this);
-        }
-        if (type == PluginCapabilityType::kRUNTIME)
-        {
-            return static_cast<IPluginV3OneRuntime*>(this);
-        }
-        assert(type == PluginCapabilityType::kCORE);
-        return static_cast<IPluginV3OneCore*>(this);
-    }
-    catch (std::exception const& e)
-    {
-    }
-    return nullptr;
-}
-
-IPluginV3* AttentionPlugin::clone() noexcept
-{
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mUsagePhase, mNumHeadQ, mNumHeadKV,
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV,
         mNumElemPerHead, mMaxBatchSize, mKVCacheCapacity, mPosEmbedType);
     plugin->setRotaryConfig(mRotaryScale, mRotaryBaseFrequency);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
 
-char const* AttentionPlugin::getPluginName() const noexcept
+char const* AttentionPlugin::getPluginType() const noexcept
 {
     return kATTENTION_PLUGIN_NAME;
 }
@@ -178,7 +208,7 @@ int32_t AttentionPlugin::getNbOutputs() const noexcept
 }
 
 bool AttentionPlugin::supportsFormatCombination(
-    int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+    int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     // Support context/generation phase inputs:
     //      GEMM-QKV tensor (linear FP16) with shape [B, S, Hq+Hk+Hv, D]
@@ -187,9 +217,8 @@ bool AttentionPlugin::supportsFormatCombination(
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [B, S, Hq, D]
     //      KV-cache tensor, same as the above.
-    auto checkGemmQKV = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
+    auto checkGemmQKV = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        auto const& tensorDesc = dynamicDesc.desc;
         status &= tensorDesc.type == DataType::kHALF;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
@@ -201,9 +230,8 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkKVCache = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
+    auto checkKVCache = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        auto const& tensorDesc = dynamicDesc.desc;
         status &= tensorDesc.type == DataType::kHALF;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 5;
@@ -218,18 +246,16 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkSequenceLen = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
+    auto checkSequenceLen = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        auto const& tensorDesc = dynamicDesc.desc;
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 1;
         return status;
     };
 
-    auto checkAttentionOutput = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
+    auto checkAttentionOutput = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        auto const& tensorDesc = dynamicDesc.desc;
         status &= tensorDesc.type == DataType::kHALF;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 4;
@@ -264,43 +290,43 @@ bool AttentionPlugin::supportsFormatCombination(
     return false;
 }
 
-int32_t AttentionPlugin::getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
-    nvinfer1::DimsExprs const* shapeInputs, int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
-    nvinfer1::IExprBuilder& exprBuilder) noexcept
+// IPluginV2Ext Methods
+DataType AttentionPlugin::getOutputDataType(
+    int32_t index, nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
-    try
-    {
-        assert(inputs != nullptr);
-        assert(nbInputs == 3);
-        assert(nbOutputs == getNbOutputs());
-
-        // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
-        outputs[0].nbDims = 4;
-        outputs[0].d[0] = inputs[0].d[0];
-        outputs[0].d[1] = inputs[0].d[1];
-        outputs[0].d[2] = exprBuilder.constant(mNumHeadQ);
-        outputs[0].d[3] = exprBuilder.constant(mNumElemPerHead);
-
-        // Output[1] is KVCache, identical input[1]
-        outputs[1] = inputs[1];
-        return 0;
-    }
-    catch (std::exception const& e)
-    {
-    }
-    return 1;
+    return DataType::kHALF;
 }
 
-int32_t AttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
+
+DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
+    int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+{
+    // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
+    DimsExprs output;
+    if (outputIndex == 0)
+    {
+        output.nbDims = 4;
+        output.d[0] = inputs[0].d[0];
+        output.d[1] = inputs[0].d[1];
+        output.d[2] = exprBuilder.constant(mNumHeadQ);
+        output.d[3] = exprBuilder.constant(mNumElemPerHead);
+    }
+    else
+    {
+        // Output[1] is KVCache, identical input[1]
+        output = inputs[1];
+    }
+    return output;
+}
+
+void AttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
     nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
-    // Here we may want to switch different MHA runner.
-    return 0;
 }
 
 // TODO: extend the worksapce calculation to a more generalized form.
-size_t AttentionPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
-    nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
+size_t AttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int32_t nbInputs,
+    nvinfer1::PluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
     // We may want to reserve workspace here, need to determine more details after implementing the runners.
     // For FMHA kernel we need a buffer to store prefix sum of context lengths.
@@ -312,64 +338,10 @@ size_t AttentionPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const
     return nbBytesQTensor + kDEVICE_ALIGNMENT;
 }
 
-int32_t AttentionPlugin::getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs,
-    nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept
-{
-    try
-    {
-        assert(nbOutputs == getNbOutputs());
-        assert(nbInputs == 3);
-        outputTypes[0] = DataType::kHALF;
-        outputTypes[1] = DataType::kHALF;
-        return 0;
-    }
-    catch (std::exception const& e)
-    {
-    }
-
-    // non-zero return value treated as error code.
-    return 1;
-}
-
-int32_t AttentionPlugin::onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs,
-    nvinfer1::PluginTensorDesc const* out, int32_t nbOutputs) noexcept
-{
-    // We may need switch MHA runner, but it seems not necessary since we will receive shapes in enqueue as well.
-    return 0;
-}
-
-nvinfer1::IPluginV3* AttentionPlugin::attachToContext(nvinfer1::IPluginResourceContext* context) noexcept
-{
-    return clone();
-}
-
-PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
-{
-    mDataToSerialize.clear();
-
-    mDataToSerialize.emplace_back(PluginField("max_batch_size", &mMaxBatchSize, PluginFieldType::kINT32, 1));
-    mDataToSerialize.emplace_back(PluginField("kv_cache_capacity", &mKVCacheCapacity, PluginFieldType::kINT32, 1));
-    mDataToSerialize.emplace_back(PluginField("num_q_heads", &mNumHeadQ, PluginFieldType::kINT32, 1));
-    mDataToSerialize.emplace_back(PluginField("num_kv_heads", &mNumHeadKV, PluginFieldType::kINT32, 1));
-    mDataToSerialize.emplace_back(PluginField("head_size", &mNumElemPerHead, PluginFieldType::kINT32, 1));
-    mDataToSerialize.emplace_back(PluginField("position_embedding_type", &mPosEmbedType, PluginFieldType::kINT32, 1));
-    mDataToSerialize.emplace_back(PluginField("rotary_scaling", &mRotaryScale, PluginFieldType::kFLOAT32, 1));
-    mDataToSerialize.emplace_back(PluginField("rotary_base_frequency", &mRotaryBaseFrequency, PluginFieldType::kFLOAT32, 1));
-
-    mFCToSerialize.nbFields = mDataToSerialize.size();
-    mFCToSerialize.fields = mDataToSerialize.data();
-    return &mFCToSerialize;
-}
-
 int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
-    // Disable enqueue during engine generation phase.
-    if (mUsagePhase == TensorRTPhase::kBUILD)
-    {
-        return 0;
-    }
     constexpr int32_t kQKV_INPUT_IDX{0};
     constexpr int32_t kKV_CACHE_INPUT_OUTPUT_IDX{1};
     constexpr int32_t kINPUT_LENGTH_INPUT_IDX{2};
@@ -456,6 +428,37 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     return 0;
 }
 
+size_t AttentionPlugin::getSerializationSize() const noexcept
+{
+    return sizeof(mMaxBatchSize) + sizeof(mKVCacheCapacity) + sizeof(mNumHeadQ) + sizeof(mNumHeadKV)
+        + sizeof(mNumElemPerHead) + sizeof(mPosEmbedType) + sizeof(mRotaryScale) + sizeof(mRotaryBaseFrequency);
+}
+
+void AttentionPlugin::serialize(void* buffer) const noexcept
+{
+    serializeValue(&buffer, mMaxBatchSize);
+    serializeValue(&buffer, mKVCacheCapacity);
+    serializeValue(&buffer, mNumHeadQ);
+    serializeValue(&buffer, mNumHeadKV);
+    serializeValue(&buffer, mNumElemPerHead);
+    serializeValue(&buffer, mPosEmbedType);
+    serializeValue(&buffer, mRotaryScale);
+    serializeValue(&buffer, mRotaryBaseFrequency);
+}
+
+int32_t AttentionPlugin::initialize() noexcept
+{
+    return 0;
+}
+
+void AttentionPlugin::terminate() noexcept {}
+
+void AttentionPlugin::destroy() noexcept
+{
+    delete this;
+}
+
+
 AttentionPluginCreator::AttentionPluginCreator()
 {
     static std::mutex sMutex;
@@ -485,9 +488,14 @@ nvinfer1::PluginFieldCollection const* AttentionPluginCreator::getFieldNames() n
     return &mFieldCollection;
 }
 
+void AttentionPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
+{
+    mNamespace = libNamespace;
+}
+
 char const* AttentionPluginCreator::getPluginNamespace() const noexcept
 {
-    return "";
+    return mNamespace.c_str();
 }
 
 char const* AttentionPluginCreator::getPluginVersion() const noexcept
@@ -495,7 +503,7 @@ char const* AttentionPluginCreator::getPluginVersion() const noexcept
     return kATTENTION_PLUGIN_VERSION;
 }
 
-AttentionPlugin* createDefaultAttentionPlugin(char const* name, nvinfer1::TensorRTPhase phase)
+AttentionPlugin* createDefaultAttentionPlugin(char const* name)
 {
     constexpr int32_t numQHeads{32};
     constexpr int32_t numKVHeads{8};
@@ -508,14 +516,14 @@ AttentionPlugin* createDefaultAttentionPlugin(char const* name, nvinfer1::Tensor
     constexpr float rotaryScale{1.0F};
     constexpr float rotaryFrequency{500000.f};
 
-    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), phase, numQHeads,
+    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads,
         numKVHeads, headSize, maxBatchSize, kvCacheCapacity, posEmbedType);
     plugin->setRotaryConfig(rotaryScale, rotaryFrequency);
     return plugin;
 }
 
-nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(
-    char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
+nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
+    char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
 {
     try
     {   
@@ -523,7 +531,7 @@ nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(
         // default. Otherwise, all plugin attributes shall be specified.
         if (fc->nbFields == 0)
         {
-            return createDefaultAttentionPlugin(name, phase);
+            return createDefaultAttentionPlugin(name);
         }
 
         std::optional<int32_t> maxBatchSize = parsePluginScalarField<int32_t>("max_batch_size", fc);
@@ -561,7 +569,7 @@ nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(
             }
         }
 
-        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), phase, numQHeads.value(),
+        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(),
             numKVHeads.value(), headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType);
         if (useRotaryEmbed)
         {
@@ -571,6 +579,19 @@ nvinfer1::IPluginV3* AttentionPluginCreator::createPlugin(
         return plugin;
     }
     catch(std::exception const& e)
+    {
+    }
+    return nullptr;
+}
+
+nvinfer1::IPluginV2* AttentionPluginCreator::deserializePlugin(
+    char const* name, void const* serialData, size_t serialLength) noexcept
+{
+    try
+    {
+        return new AttentionPlugin(name, serialData, serialLength);
+    }
+    catch (std::exception const& e)
     {
     }
     return nullptr;
