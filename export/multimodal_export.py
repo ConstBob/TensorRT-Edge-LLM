@@ -6,9 +6,10 @@ import numpy as np
 import onnx_graphsurgeon as gs
 import torch
 import torch.nn as nn
+from llm_export import (RopeType, export_raw_llm, get_config_path,
+                        llm_arguments, surgeon_llm)
 from transformers.cache_utils import DynamicCache
-from llm_export import export_raw_llm, surgeon_llm, get_config_path, llm_arguments, RopeType
-from utils.export_utils import export_onnx, WrapperModelForCausalLM
+from utils.export_utils import WrapperModelForCausalLM, export_onnx
 
 
 def multimodal_arguments():
@@ -31,7 +32,7 @@ class Qwen2VLWrapper(WrapperModelForCausalLM):
     def __init__(self, model):
         super().__init__(model)
 
-    def forward( self, input_ids, past_key_values, image_embeds):
+    def forward(self, input_ids, past_key_values, image_embeds):
         # Handles combination of text tokens with virtual tokens
         image_mask = input_ids > (self.config.vocab_size - 1)
 
@@ -61,7 +62,7 @@ class Qwen2VLWrapper(WrapperModelForCausalLM):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        
+
         # Convert kv cache back to list for onnx export
         past_key_values = outputs.past_key_values.to_legacy_cache()
         return logits, past_key_values
@@ -69,8 +70,8 @@ class Qwen2VLWrapper(WrapperModelForCausalLM):
 
 def export_qwen2_vl_visual(hf_model, output_dir):
     from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-        Qwen2VisionTransformerPretrainedModel, Qwen2VLVisionBlock, VisionAttention,
-        apply_rotary_pos_emb_vision)
+        Qwen2VisionTransformerPretrainedModel, Qwen2VLVisionBlock,
+        VisionAttention, apply_rotary_pos_emb_vision)
 
     class VisionAttentionOpt(VisionAttention):
 
@@ -181,7 +182,7 @@ def export_qwen2_vl_visual(hf_model, output_dir):
     export_onnx(
         model,
         (input, rotary_pos_emb, attention_mask),
-        output_dir, 
+        output_dir,
         input_names=["input", "rotary_pos_emb", "attention_mask"],
         output_names=["output"],
         dynamic_axes=dynamic_axes,
@@ -195,56 +196,52 @@ def export_qwen2_vl_visual(hf_model, output_dir):
 
 def export_qwen2_vl(args):
     from transformers import Qwen2VLForConditionalGeneration
-    
+
     hf_model = Qwen2VLForConditionalGeneration.from_pretrained(
         args.torch_dir,
         torch_dtype=torch.float16,
     ).cuda()
 
     # 1. export visual encoder
-    export_qwen2_vl_visual(hf_model.visual, os.path.join(args.output_dir, "visual_enc_onnx"))
-    
+    export_qwen2_vl_visual(hf_model.visual,
+                           os.path.join(args.output_dir, "visual_enc_onnx"))
+
     # 2. export raw llm
     llm_output_dir = os.path.join(args.output_dir, "llm_onnx")
     if args.save_original:
         raw_onnx_dir = llm_output_dir + "_raw"
     else:
         raw_onnx_dir = llm_output_dir
-        
+
     dummy_len = 10
-    image_embeds = torch.randn((dummy_len, hf_model.config.hidden_size), 
-                                dtype=torch.float16).cuda()
-    state_dict = export_raw_llm(
-        Qwen2VLWrapper(hf_model), 
-        raw_onnx_dir, 
-        args.dtype, 
-        os.path.join(args.torch_dir, "config.json"), 
-        args.torch_dir,
-        extra_inputs={
-            "image_embeds": image_embeds
-        },
-        extra_dyn_axes={
-            "image_embeds": {
-                0: "image_token_length"
-            },
-        }
-    )
-    
+    image_embeds = torch.randn((dummy_len, hf_model.config.hidden_size),
+                               dtype=torch.float16).cuda()
+    state_dict = export_raw_llm(Qwen2VLWrapper(hf_model),
+                                raw_onnx_dir,
+                                args.dtype,
+                                os.path.join(args.torch_dir, "config.json"),
+                                args.torch_dir,
+                                extra_inputs={"image_embeds": image_embeds},
+                                extra_dyn_axes={
+                                    "image_embeds": {
+                                        0: "image_token_length"
+                                    },
+                                })
+
     # 3. surgeon llm
     mrope_rotary_sin_cos = gs.Variable("mrope_rotary_sin_cos", np.float32,
                                        ['batch_size', 4194304])
     mrope_position_deltas = gs.Variable("mrope_position_deltas", np.int64,
                                         ['batch_size', 1])
     surgeon_llm(
-        f"{raw_onnx_dir}/model.onnx", 
-        llm_output_dir, 
-        args.dtype, 
-        args.mode, 
-        args.config_path, 
+        f"{raw_onnx_dir}/model.onnx",
+        llm_output_dir,
+        args.dtype,
+        args.mode,
+        args.config_path,
         state_dict,
-        rope_type=RopeType.kMOPRE,
-        extra_plugin_inputs=[mrope_rotary_sin_cos, mrope_position_deltas]
-    )
+        rope_type=RopeType.kMROPE,
+        extra_plugin_inputs=[mrope_rotary_sin_cos, mrope_position_deltas])
 
 
 if __name__ == '__main__':
@@ -256,4 +253,3 @@ if __name__ == '__main__':
         export_qwen2_vl(args)
     else:
         raise RuntimeError(f"Invalid model type {args.model_type}")
-

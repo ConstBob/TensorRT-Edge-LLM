@@ -24,7 +24,7 @@ enum class PositionEmbeddingType : int32_t
     kNone = 0,
     kROPE_ROTATE_GPTJ = 1,
     kROPE_ROTATE_NEOX = 2,
-    kMOPRE = 3,
+    kMROPE = 3,
 };
 
 constexpr int32_t k_MAX_POSITION_EMBED_TYPE_VAL{3};

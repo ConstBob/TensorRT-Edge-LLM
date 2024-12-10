@@ -1,7 +1,7 @@
 import re
 import time
-from typing import Union
 from enum import Enum
+from typing import Union
 
 import modelopt.onnx.quantization.qdq_utils as qdq
 import numpy as np
@@ -16,9 +16,9 @@ class RopeType(Enum):
     kNone = 0
     kROPE_ROTATE_GPTJ = 1
     kROPE_ROTATE_NEOX = 2
-    kMOPRE = 3
-    
-    
+    kMROPE = 3
+
+
 def clear_inputs(node: Union[gs.Node, gs.Tensor]):
     """
     Clear all inputs for a node or tensor in ONNX
@@ -135,7 +135,8 @@ def insert_gather_last_token(graph: gs.Graph):
     return graph
 
 
-def insert_attention_plugin(graph: gs.Graph, config: dict, rope_type: RopeType, extra_inputs: list):
+def insert_attention_plugin(graph: gs.Graph, config: dict, rope_type: RopeType,
+                            extra_inputs: list):
     """
     Insert AttentionPlugin for the graph. AttentionPlugin takes the following inputs and outputs:
 

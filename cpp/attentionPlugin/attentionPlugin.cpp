@@ -119,8 +119,9 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType,int32_t halfRotaryDim, int32_t rotaryEmbeddingMaxPositions)
+AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType, int32_t halfRotaryDim,
+    int32_t rotaryEmbeddingMaxPositions)
     : mLayerName(name)
     , mNumHeadQ(numQHeads)
     , mNumHeadKV(numKVHeads)
@@ -163,10 +164,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType);
 }
 
-
-AttentionPlugin::~AttentionPlugin()
-{
-}
+AttentionPlugin::~AttentionPlugin() {}
 
 void AttentionPlugin::setRotaryConfig(float ropeScale, float ropeBaseFrequency)
 {
@@ -176,8 +174,8 @@ void AttentionPlugin::setRotaryConfig(float ropeScale, float ropeBaseFrequency)
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV,
-        mNumElemPerHead, mMaxBatchSize, mKVCacheCapacity, mPosEmbedType, mHalfRotaryDim, mRotaryEmbeddingMaxPositions);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize,
+        mKVCacheCapacity, mPosEmbedType, mHalfRotaryDim, mRotaryEmbeddingMaxPositions);
     plugin->setRotaryConfig(mRotaryScale, mRotaryBaseFrequency);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
@@ -270,18 +268,16 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkMropeRotaryCosSin = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
+    auto checkMropeRotaryCosSin = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        auto const& tensorDesc = dynamicDesc.desc;
         status &= tensorDesc.type == DataType::kFLOAT;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 2;
         return status;
     };
 
-    auto checkMropePositionDeltas = [this](nvinfer1::DynamicPluginTensorDesc const& dynamicDesc) {
+    auto checkMropePositionDeltas = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
-        auto const& tensorDesc = dynamicDesc.desc;
         status &= tensorDesc.type == DataType::kINT64;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 2;
@@ -290,7 +286,7 @@ bool AttentionPlugin::supportsFormatCombination(
 
     try
     {
-        if (mPosEmbedType == PositionEmbeddingType::kMOPRE)
+        if (mPosEmbedType == PositionEmbeddingType::kMROPE)
         {
             assert(nbInputs == 5 && nbOutputs == 2);
         }
@@ -306,7 +302,7 @@ bool AttentionPlugin::supportsFormatCombination(
         case 1: result = checkKVCache(inOut[1]); break;
         case 2: result = checkSequenceLen(inOut[2]); break;
         case 3:
-            if (mPosEmbedType == PositionEmbeddingType::kMOPRE)
+            if (mPosEmbedType == PositionEmbeddingType::kMROPE)
             {
                 result = checkMropeRotaryCosSin(inOut[3]);
             }
@@ -317,7 +313,7 @@ bool AttentionPlugin::supportsFormatCombination(
             break;
 
         case 4:
-            if (mPosEmbedType == PositionEmbeddingType::kMOPRE)
+            if (mPosEmbedType == PositionEmbeddingType::kMROPE)
             {
                 result = checkMropePositionDeltas(inOut[4]);
             }
@@ -327,13 +323,13 @@ bool AttentionPlugin::supportsFormatCombination(
             }
             break;
         case 5:
-            if (mPosEmbedType == PositionEmbeddingType::kMOPRE)
+            if (mPosEmbedType == PositionEmbeddingType::kMROPE)
             {
                 result = checkAttentionOutput(inOut[5]);
             }
             break;
         case 6:
-            if (mPosEmbedType == PositionEmbeddingType::kMOPRE)
+            if (mPosEmbedType == PositionEmbeddingType::kMROPE)
             {
                 result = checkKVCache(inOut[6]);
             }
@@ -355,9 +351,8 @@ DataType AttentionPlugin::getOutputDataType(
     return DataType::kHALF;
 }
 
-
-DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
-    int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
+    nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
     DimsExprs output;
@@ -432,10 +427,10 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t const* seqLengthDevicePtr = reinterpret_cast<int32_t const*>(inputs[kINPUT_LENGTH_INPUT_IDX]);
     half* attentionResultDevicePtr = reinterpret_cast<half*>(outputs[kATTENTION_OUTPUT_IDX]);
     half* kvCacheDevicePtr = reinterpret_cast<half*>(outputs[kKV_CACHE_INPUT_OUTPUT_IDX]);
-    float2 const* mrope_rotary_cos_sin = (mPosEmbedType == PositionEmbeddingType::kMOPRE)
+    float2 const* mrope_rotary_cos_sin = (mPosEmbedType == PositionEmbeddingType::kMROPE)
         ? reinterpret_cast<float2 const*>(inputs[kMrope_Rotary_Cos_Sin_IDX])
         : nullptr;
-    int64_t const* mrope_position_deltas = (mPosEmbedType == PositionEmbeddingType::kMOPRE)
+    int64_t const* mrope_position_deltas = (mPosEmbedType == PositionEmbeddingType::kMROPE)
         ? reinterpret_cast<int64_t const*>(inputs[kMrope_Position_Deltas_IDX])
         : nullptr;
 
@@ -526,7 +521,6 @@ void AttentionPlugin::destroy() noexcept
     delete this;
 }
 
-
 AttentionPluginCreator::AttentionPluginCreator()
 {
     static std::mutex sMutex;
@@ -588,8 +582,8 @@ AttentionPlugin* createDefaultAttentionPlugin(char const* name)
     constexpr float rotaryScale{1.0F};
     constexpr float rotaryFrequency{500000.f};
 
-    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads,
-        numKVHeads, headSize, maxBatchSize, kvCacheCapacity, posEmbedType, halfRotaryDim, rotaryEmbeddingMaxPositions);
+    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads, numKVHeads, headSize, maxBatchSize,
+        kvCacheCapacity, posEmbedType, halfRotaryDim, rotaryEmbeddingMaxPositions);
     plugin->setRotaryConfig(rotaryScale, rotaryFrequency);
     return plugin;
 }
@@ -630,7 +624,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         PositionEmbeddingType const posEmbedType = static_cast<PositionEmbeddingType>(posEmbedVal.value());
         bool const useRotaryEmbed = posEmbedType == PositionEmbeddingType::kROPE_ROTATE_GPTJ
             || posEmbedType == PositionEmbeddingType::kROPE_ROTATE_NEOX
-            || posEmbedType == PositionEmbeddingType::kMOPRE;
+            || posEmbedType == PositionEmbeddingType::kMROPE;
 
         std::optional<float> rotaryScale{std::nullopt};
         std::optional<float> rotaryFrequency{std::nullopt};
@@ -645,8 +639,8 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
             }
         }
 
-        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(),
-            numKVHeads.value(), headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType,halfRotaryDim.value(),
+        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
+            headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType, halfRotaryDim.value(),
             rotaryEmbeddingMaxPositions.value());
         if (useRotaryEmbed)
         {
