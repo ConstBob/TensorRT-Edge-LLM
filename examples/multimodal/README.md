@@ -3,7 +3,7 @@
 ### Download Qwen2-VL
 ```bash
 git lfs install
-export MODEL_NAME="Qwen2-VL-7B-Instruct" # or Qwen2-VL-7B-Instruct
+export MODEL_NAME="Qwen2-VL-7B-Instruct" # or Qwen2-VL-2B-Instruct
 git clone https://huggingface.co/Qwen/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
 ```
 
@@ -38,17 +38,16 @@ trtexec \
 ```
 
 ### Build language model engine
-You will use `builder` binary to build the TensorRT engine. 
+You will use `llm_build` binary to build the TensorRT engine. 
 ```
 cd ../../
 ./build/examples/llm/llm_build --onnxPath=examples/multimodal/tmp/onnx/${MODEL_NAME}/llm_onnx/model.onnx \
 --enginePath=examples/multimodal/tmp/trt_engines/${MODEL_NAME}/llm_model/model.engine \
 --maxInputLen=2048 --maxImageTokens=5184 --minImageTokens=128 --maxSeqLen=4096 \
 --modelType="qwen2_vl" \
---batchSize=2 \
---imageTokens=1122
+--batchSize=1 \
+--imageTokens=888
 ```
-
 
 **Notes:** `--maxSeqLen` includes `--maxInputLen`, so it must be greater than `--maxInputLen`. The maximum new token would equal to `maxSeqLen - maxInputLen`.
 
@@ -63,8 +62,9 @@ cd ../../
 --modelType="qwen2_vl" \
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/qwen2vl/pics/demo.jpeg" \
+--debug
+```
+
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/qwen2vl/pics/image1.jpeg" \
 --maxLength=4096
-```
-

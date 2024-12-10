@@ -262,6 +262,91 @@ std::string Decoder<T>::printLogits()
 }
 
 template <typename T>
+void printAbsMean(T const* buf, uint64_t size, cudaStream_t stream, std::string name = "")
+{
+    if (buf == nullptr)
+    {
+        printf("%s is an nullptr, skip!", name.c_str());
+        return;
+    }
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    T* h_tmp = new T[size];
+    CUDA_CHECK(cudaMemcpyAsync(h_tmp, buf, sizeof(T) * size, cudaMemcpyDeviceToHost, stream));
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    double sum = 0.0f;
+    uint64_t zero_count = 0;
+    float max_val = -1e10;
+    bool find_inf = false;
+    // printf("First 20 else:\n");
+    // for(uint64_t i = 0; i < 20; i++){
+    //     printf("=== %f \n",static_cast<float>(h_tmp[i]));
+    // }
+    // printf("Last 20 else:\n");
+    // for(uint64_t i = 20; i > 0 ; i--){
+    //     printf("=== %f \n",static_cast<float>(h_tmp[size - i]));
+    // }
+    for (uint64_t i = 0; i < size; i++)
+    {
+        if (std::isinf((float) (h_tmp[i])))
+        {
+            find_inf = true;
+            continue;
+        }
+        sum += abs((double) h_tmp[i]);
+        if ((float) h_tmp[i] == 0.0f)
+        {
+            zero_count++;
+        }
+        max_val = max_val > abs(float(h_tmp[i])) ? max_val : abs(float(h_tmp[i]));
+    }
+    printf("%20s size: %u, abs mean: %f, abs sum: %f, abs max: %f, find inf: %s \n", name.c_str(), size, sum / size,
+        sum, max_val, find_inf ? "true" : "false");
+
+    std::string dir_name = "dump_res";
+
+    std::string file_name = dir_name + "/" + name + ".bin";
+    std::ofstream file(file_name, std::ios::out | std::ios::binary);
+    if (file.is_open())
+    {
+
+        file.write((char*) h_tmp, size * sizeof(T));
+        file.close();
+
+        std::cout << "Vector data saved to" << file_name << std::endl;
+    }
+    else
+    {
+        std::cerr << "Error opening file for writing" << std::endl;
+    }
+
+    delete[] h_tmp;
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+void loadDataFromFile(std::filesystem::path const& dataPath, std::vector<T>& data)
+{
+    std::ifstream file(dataPath, std::ios::binary);
+    if (!file.is_open())
+    {
+        std::cerr << "Error opening file" << dataPath << std::endl;
+        return;
+    }
+    file.seekg(0, std::ios::end);
+    std::streampos fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    data.resize(fileSize / sizeof(T));
+
+    file.read(reinterpret_cast<char*>(data.data()), fileSize);
+
+    file.close();
+}
+
+template <typename T>
 void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
     std::shared_ptr<BenchmarkProfiler> const profiler, std::optional<TensorInfo> const& image_embeds,
@@ -311,31 +396,88 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
         mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-
-    if (image_embeds.has_value())
-    {
-        mDeviceBuffer["image_embeds"] = image_embeds.value().data;
-        mContextExecutionContext->setTensorAddress("image_embeds", image_embeds.value().data);
-        mGenerationExecutionContext->setTensorAddress("image_embeds", image_embeds.value().data);
-        mContextExecutionContext->setInputShape("image_embeds", image_embeds.value().dims);
-        mGenerationExecutionContext->setInputShape("image_embeds", image_embeds.value().dims);
-    }
-
-    if (mropeRotaryCosSin.has_value())
+    if (true)
     {
 
-        mDeviceBuffer["mrope_rotary_sin_cos"] = mropeRotaryCosSin.value().data;
-        mContextExecutionContext->setTensorAddress("mrope_rotary_sin_cos", mropeRotaryCosSin.value().data);
-        mGenerationExecutionContext->setTensorAddress("mrope_rotary_sin_cos", mropeRotaryCosSin.value().data);
-        mContextExecutionContext->setInputShape("mrope_rotary_sin_cos", mropeRotaryCosSin.value().dims);
-        mGenerationExecutionContext->setInputShape("mrope_rotary_sin_cos", mropeRotaryCosSin.value().dims);
+        void* attnMropeRotaryCosSinDevice;
+        CUDA_CHECK(cudaMalloc(&attnMropeRotaryCosSinDevice, (4194304) * sizeof(float)));
+        void* attnMropePositionDeltasDevice;
+        CUDA_CHECK(cudaMalloc(&attnMropePositionDeltasDevice, (mConfig.batchSize) * sizeof(int64_t)));
 
-        mDeviceBuffer["mrope_position_deltas"] = mropePositionDeltas.value().data;
-        mContextExecutionContext->setTensorAddress("mrope_position_deltas", mropePositionDeltas.value().data);
-        mGenerationExecutionContext->setTensorAddress("mrope_position_deltas", mropePositionDeltas.value().data);
-        mContextExecutionContext->setInputShape("mrope_position_deltas", mropePositionDeltas.value().dims);
-        mGenerationExecutionContext->setInputShape("mrope_position_deltas", mropePositionDeltas.value().dims);
+        mDeviceBuffer["mrope_rotary_sin_cos"] = attnMropeRotaryCosSinDevice;
+        mContextExecutionContext->setTensorAddress("mrope_rotary_sin_cos", attnMropeRotaryCosSinDevice);
+        mGenerationExecutionContext->setTensorAddress("mrope_rotary_sin_cos", attnMropeRotaryCosSinDevice);
+        mContextExecutionContext->setInputShape("mrope_rotary_sin_cos", {2, {mConfig.batchSize, 4194304}});
+        mGenerationExecutionContext->setInputShape("mrope_rotary_sin_cos", {2, {mConfig.batchSize, 4194304}});
+
+        mDeviceBuffer["mrope_position_deltas"] = attnMropePositionDeltasDevice;
+        mContextExecutionContext->setTensorAddress("mrope_position_deltas", attnMropePositionDeltasDevice);
+        mGenerationExecutionContext->setTensorAddress("mrope_position_deltas", attnMropePositionDeltasDevice);
+        mContextExecutionContext->setInputShape("mrope_position_deltas", {2, {mConfig.batchSize, 1}});
+        mGenerationExecutionContext->setInputShape("mrope_position_deltas", {2, {mConfig.batchSize, 1}});
+        // read from cpu
+        //  int32_t sizeOfHalf =  1;
+        const int32_t imageTokenNums = 888;
+        void* imageEmbeddingDevice;
+        CUDA_CHECK(cudaMalloc(&imageEmbeddingDevice, (imageTokenNums * 3584) * sizeof(half)));
+        mDeviceBuffer["image_embeds"] = imageEmbeddingDevice;
+        mContextExecutionContext->setTensorAddress("image_embeds", imageEmbeddingDevice);
+        mGenerationExecutionContext->setTensorAddress("image_embeds", imageEmbeddingDevice);
+        mContextExecutionContext->setInputShape("image_embeds", {2, {imageTokenNums, 3584}});
+        mGenerationExecutionContext->setInputShape("image_embeds", {2, {imageTokenNums, 3584}});
+
+        std::vector<half> image_embeddings_data;
+        image_embeddings_data.resize(888 * 3584);
+        std::vector<float> mropeRotaryCosSin_data;
+        mropeRotaryCosSin_data.resize(4194304);
+        std::vector<int64_t> mropePositionDeltas_data;
+        mropePositionDeltas_data.resize(1);
+        loadDataFromFile("trtllm_input/inputs_embeds_trtllm.bin", image_embeddings_data);
+        loadDataFromFile("trtllm_input/mrope_rotary_sin_cos_trtllm.bin", mropeRotaryCosSin_data);
+        loadDataFromFile("trtllm_input/mrope_position_deltas_trtllm.bin", mropePositionDeltas_data);
+        printf("mropePositionDeltas_data[0] is %d \n", mropePositionDeltas_data);
+
+        assert(image_embeddings_data.data() != nullptr && "image_embeddings_data is nullptr.");
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["image_embeds"], image_embeddings_data.data(),
+            imageTokenNums * 3584 * sizeof(half), cudaMemcpyHostToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mrope_rotary_sin_cos"], mropeRotaryCosSin_data.data(),
+            mConfig.batchSize * 4194304 * sizeof(float), cudaMemcpyHostToDevice, mStream));
+        CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mrope_position_deltas"], mropePositionDeltas_data.data(),
+            mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+
+        printAbsMean(static_cast<__half*>(mDeviceBuffer["image_embeds"]), 888 * 3584, mStream, "input_embedding");
+        printAbsMean(static_cast<float*>(mDeviceBuffer["mrope_rotary_sin_cos"]), 4194304, mStream), "mropeRotaryCosSin";
+        printAbsMean(
+            static_cast<int64_t*>(mDeviceBuffer["mrope_position_deltas"]), 1, mStream, "mrope_position_deltas");
     }
+
+    // if (image_embeds.has_value())
+    // {
+    //     mDeviceBuffer["image_embeds"] = image_embeds.value().data;
+    //     mContextExecutionContext->setTensorAddress("image_embeds", image_embeds.value().data);
+    //     mGenerationExecutionContext->setTensorAddress("image_embeds", image_embeds.value().data);
+    //     mContextExecutionContext->setInputShape("image_embeds", image_embeds.value().dims);
+    //     mGenerationExecutionContext->setInputShape("image_embeds", image_embeds.value().dims);
+    //     printAbsMean(static_cast<__half*>(image_embeds.value().data),888*3584,mStream,"input_embedding");
+    // }
+
+    // if (mropeRotaryCosSin.has_value())
+    // {
+
+    //     mDeviceBuffer["mrope_rotary_sin_cos"] = mropeRotaryCosSin.value().data;
+    //     mContextExecutionContext->setTensorAddress("mrope_rotary_sin_cos", mropeRotaryCosSin.value().data);
+    //     mGenerationExecutionContext->setTensorAddress("mrope_rotary_sin_cos", mropeRotaryCosSin.value().data);
+    //     mContextExecutionContext->setInputShape("mrope_rotary_sin_cos", mropeRotaryCosSin.value().dims);
+    //     mGenerationExecutionContext->setInputShape("mrope_rotary_sin_cos", mropeRotaryCosSin.value().dims);
+    //     printAbsMean(static_cast<float*>(mropeRotaryCosSin.value().data),4194304,mStream),"mropeRotaryCosSin";
+
+    //     mDeviceBuffer["mrope_position_deltas"] = mropePositionDeltas.value().data;
+    //     mContextExecutionContext->setTensorAddress("mrope_position_deltas", mropePositionDeltas.value().data);
+    //     mGenerationExecutionContext->setTensorAddress("mrope_position_deltas", mropePositionDeltas.value().data);
+    //     mContextExecutionContext->setInputShape("mrope_position_deltas", mropePositionDeltas.value().dims);
+    //     mGenerationExecutionContext->setInputShape("mrope_position_deltas", mropePositionDeltas.value().dims);
+    //     printAbsMean(static_cast<int64_t*>(mropePositionDeltas.value().data),1,mStream,"mrope_position_deltas");
+    // }
 
     // Context Phase
     mContextExecutionContext->enqueueV3(mStream);

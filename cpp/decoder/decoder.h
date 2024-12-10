@@ -23,8 +23,6 @@ struct ModelConfig
     int64_t maxLength; // Equivalent to maxOutputLength;
     int64_t numLayers;
     int64_t vocabSize;
-    int32_t max_position_embeddings = 32768;
-    int32_t qwen2vl_hiddendims = 3584;
 };
 
 struct GenerationConfig

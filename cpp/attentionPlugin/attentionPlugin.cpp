@@ -157,7 +157,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mNumElemPerHead);
     deserializeValue(&data, &length, &mPosEmbedType);
     deserializeValue(&data, &length, &mRotaryScale);
-    deserializeValue(&data, &length, &mRotaryBaseFrequency);
+    deserializeValue(&data, &length, &mHalfRotaryDim);
+    deserializeValue(&data, &length, &mRotaryEmbeddingMaxPositions);
 
     mSMVersion = getSMVersion();
     ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
@@ -494,7 +495,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mMaxBatchSize) + sizeof(mKVCacheCapacity) + sizeof(mNumHeadQ) + sizeof(mNumHeadKV)
-        + sizeof(mNumElemPerHead) + sizeof(mPosEmbedType) + sizeof(mRotaryScale) + sizeof(mRotaryBaseFrequency);
+        + sizeof(mNumElemPerHead) + sizeof(mPosEmbedType) + sizeof(mRotaryScale) + sizeof(mRotaryBaseFrequency)
+        + sizeof(mHalfRotaryDim) + sizeof(mRotaryEmbeddingMaxPositions);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
