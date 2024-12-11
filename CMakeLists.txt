@@ -83,8 +83,9 @@ find_library(
   HINTS ${TRT_PACKAGE_DIR}
   PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
 
-set(COMMON_INCLUDE_DIRS ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR}
-                        ${CMAKE_SOURCE_DIR}/cpp)
+set(COMMON_INCLUDE_DIRS
+    ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/cpp
+    ${CMAKE_SOURCE_DIR}/examples/multimodal)
 
 add_library(commonLibraryExt INTERFACE)
 target_link_libraries(commonLibraryExt INTERFACE ${NVINFER_LIB} ${CUDART_LIB})

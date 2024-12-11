@@ -9,6 +9,7 @@
 #include <cuda_runtime_api.h>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,7 +51,10 @@ public:
     bool setup(std::filesystem::path const& fp, cudaStream_t& stream);
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
         std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
-        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
+        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
+        std::optional<TensorInfo> const& image_embeds = std::nullopt,
+        std::optional<TensorInfo> const& mropeRotaryCosSin = std::nullopt,
+        std::optional<TensorInfo> const& mropePositionDeltas = std::nullopt);
 
     std::vector<T> const& getLastHostLogits();
     size_t getDeviceMemorySize() const noexcept;

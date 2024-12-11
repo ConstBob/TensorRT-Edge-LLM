@@ -286,14 +286,16 @@ Tokenizer::Tokenizer()
     , mBosId{-1}
     , mEosId{-1}
     , mPadId{-1}
+    , mUnkId{-1}
 {
 }
 
 Tokenizer::Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
-    Rank const& bosId, Rank const& eosId, Rank const& padId)
+    Rank const& bosId, Rank const& eosId, Rank const& padId, Rank const& unkId)
     : mBosId{bosId}
     , mEosId{eosId}
     , mPadId{padId}
+    , mUnkId{unkId}
 {
     auto comp = [](std::pair<std::string, Rank> const& p1, std::pair<std::string, Rank> const& p2) {
         return p1.second < p2.second;
@@ -399,8 +401,100 @@ Rank Tokenizer::getPadId() const noexcept
     return mPadId == -1 ? mEosId : mPadId;
 }
 
-void Tokenizer::loadHFVocab(
-    std::filesystem::path const& modelDir, BPETokenToRanks& vocab, BPETokenToRanks& specialTokens) noexcept
+Rank Tokenizer::getUnkId() const noexcept
+{
+    return mUnkId;
+}
+
+void Tokenizer::loadHFSpecialTokens(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens)
+{
+    std::string line;
+    int indent = 0;
+    bool parseSpecial = false;
+    std::string specialContent;
+    Rank specialId;
+
+    // Load 'added_tokens_decoder' from tokenizer_config.json
+    std::filesystem::path tokenizerConfig = modelDir / "tokenizer_config.json";
+    if (std::filesystem::exists(tokenizerConfig))
+    {
+        std::ifstream config(tokenizerConfig);
+
+        while (std::getline(config, line))
+        {
+            if (!parseSpecial && line.find("\"added_tokens_decoder\": {") != std::string::npos)
+            {
+                parseSpecial = true;
+                indent = line.find("\"");
+            }
+            else if (parseSpecial && line.substr(indent) == "},")
+            {
+                break;
+            }
+            else if (parseSpecial)
+            {
+                // Only parse id and content for now
+                if (line.find("\": {") != std::string::npos)
+                {
+                    auto start = line.find("\"") + 1;
+                    auto end = line.find("\": {");
+                    specialId = std::stoi(line.substr(start, end - start));
+                }
+                else if (line.find("\"content\"") != std::string::npos)
+                {
+                    auto start = line.find(": ") + 3;
+                    auto end = line.size() - 2;
+                    specialContent = line.substr(start, end - start);
+                    specialTokens[specialContent] = specialId;
+                }
+            }
+        }
+
+        config.close();
+    }
+
+    if (!parseSpecial)
+    {
+        // Load 'added_tokens' from tokenizer.json
+        std::filesystem::path tokenizerFile = modelDir / "tokenizer.json";
+        assert(std::filesystem::exists(tokenizerFile));
+        std::ifstream data(tokenizerFile);
+
+        while (std::getline(data, line))
+        {
+            if (!parseSpecial && line.find("\"added_tokens\": [") != std::string::npos)
+            {
+                parseSpecial = true;
+                indent = line.find("\"");
+            }
+            else if (parseSpecial && line.substr(indent) == "],")
+            {
+                break;
+            }
+            else if (parseSpecial)
+            {
+                // Only parse id and content for now
+                if (line.find("\"id\": ") != std::string::npos)
+                {
+                    auto start = line.find(": ");
+                    auto end = line.size() - 1;
+                    specialId = std::stoi(line.substr(start + 2, end - start - 2));
+                }
+                else if (line.find("\"content\"") != std::string::npos)
+                {
+                    auto start = line.find(": ");
+                    auto end = line.size() - 2;
+                    specialContent = line.substr(start + 3, end - start - 3);
+                    specialTokens[specialContent] = specialId;
+                }
+            }
+        }
+
+        data.close();
+    }
+}
+
+void Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab)
 {
     std::filesystem::path tokenizerFile = modelDir / "tokenizer.json";
     assert(std::filesystem::exists(tokenizerFile));
@@ -409,10 +503,6 @@ void Tokenizer::loadHFVocab(
     std::string line;
     int indent = 0;
     bool parseVocab = false;
-    bool parseSpecial = false;
-
-    std::string specialContent;
-    Rank specialId;
 
     while (std::getline(data, line))
     {
@@ -441,34 +531,6 @@ void Tokenizer::loadHFVocab(
             vocab[token] = rank;
         }
 
-        // parse added_tokens
-        else if (!parseSpecial && line.find("\"added_tokens\": [") != std::string::npos)
-        {
-            parseSpecial = true;
-            indent = line.find("\"");
-        }
-        else if (parseSpecial && line.substr(indent) == "],")
-        {
-            parseSpecial = false;
-        }
-        else if (parseSpecial)
-        {
-            // Only parse id and content for now
-            if (line.find("\"id\": ") != std::string::npos)
-            {
-                auto start = line.find(": ");
-                auto end = line.size() - 1;
-                specialId = std::stoi(line.substr(start + 2, end - start - 2));
-            }
-            else if (line.find("\"content\"") != std::string::npos)
-            {
-                auto start = line.find(": ");
-                auto end = line.size() - 2;
-                specialContent = line.substr(start + 3, end - start - 3);
-                specialTokens[specialContent] = specialId;
-            }
-        }
-
         // parse regex
         else if (line.find("\"Regex\": \"") != std::string::npos)
         {
@@ -485,13 +547,13 @@ void Tokenizer::loadHFVocab(
     data.close();
 }
 
-void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens) noexcept
+void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens)
 {
     std::filesystem::path tokenizerConfig = modelDir / "tokenizer_config.json";
 
     auto parseSpecialToken = [&specialTokens](std::string line) -> Rank {
         auto start = line.find(": ");
-        auto end = line.size() - 1;
+        auto end = line.find(",");
         std::string token = line.substr(start + 2, end - start - 2);
         if (token == "null")
         {
@@ -522,6 +584,10 @@ void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRa
             {
                 this->mPadId = parseSpecialToken(line);
             }
+            else if (line.find("\"unk_token\"") != std::string::npos)
+            {
+                this->mUnkId = parseSpecialToken(line);
+            }
         }
 
         config.close();
@@ -536,7 +602,9 @@ void Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
 {
     BPETokenToRanks mergeableRanks;
     BPETokenToRanks specialTokens;
-    loadHFVocab(modelDir, mergeableRanks, specialTokens);
+
+    loadHFSpecialTokens(modelDir, specialTokens);
+    loadHFVocab(modelDir, mergeableRanks);
     loadHFConfig(modelDir, specialTokens);
 
     auto comp = [](std::pair<std::string, Rank> const& p1, std::pair<std::string, Rank> const& p2) {

@@ -86,9 +86,16 @@ bool Decoder<T>::validateAndFillConfig()
     int64_t maxInputLength;
     int64_t maxLength;
     int64_t nbIOs = static_cast<int64_t>(mEngine->getNbIOTensors());
-    // input_ids, context_length, last_token_ids and logits
-    int64_t numLayers = (nbIOs - 4) / 2;
-    // Check input_ids
+    int64_t numLayers = 0;
+    for (int32_t i = 0; i < nbIOs; ++i)
+    {
+        char const* name = mEngine->getIOTensorName(i);
+        if (mEngine->getTensorShape(name).nbDims == 5)
+        {
+            numLayers++;
+        }
+    }
+    numLayers = numLayers / 2;
     std::string inputIdsName = "input_ids";
     check(checkStaticShape(inputIdsName), fmtstr("%s should be static", inputIdsName.c_str()));
     Dims inputIdsShapeContext = mEngine->getProfileShape(inputIdsName.c_str(), 0, OptProfileSelector::kMIN);
@@ -256,7 +263,8 @@ std::string Decoder<T>::printLogits()
 template <typename T>
 void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
-    std::shared_ptr<BenchmarkProfiler> const profiler)
+    std::shared_ptr<BenchmarkProfiler> const profiler, std::optional<TensorInfo> const& image_embeds,
+    std::optional<TensorInfo> const& mropeRotaryCosSin, std::optional<TensorInfo> const& mropePositionDeltas)
 {
     auto lastTokenIds = reinterpret_cast<int64_t*>(mHostBuffer["last_token_ids"]);
     // The generation step stop at longest sequence reach the maxLength.
@@ -302,6 +310,30 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
         mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+
+    if (image_embeds.has_value())
+    {
+        mDeviceBuffer["image_embeds"] = image_embeds.value().data;
+        mContextExecutionContext->setTensorAddress("image_embeds", image_embeds.value().data);
+        mGenerationExecutionContext->setTensorAddress("image_embeds", image_embeds.value().data);
+        mContextExecutionContext->setInputShape("image_embeds", image_embeds.value().dims);
+        mGenerationExecutionContext->setInputShape("image_embeds", image_embeds.value().dims);
+    }
+
+    if (mropeRotaryCosSin.has_value())
+    {
+        mDeviceBuffer["mrope_rotary_cos_sin"] = mropeRotaryCosSin.value().data;
+        mContextExecutionContext->setTensorAddress("mrope_rotary_cos_sin", mropeRotaryCosSin.value().data);
+        mGenerationExecutionContext->setTensorAddress("mrope_rotary_cos_sin", mropeRotaryCosSin.value().data);
+        mContextExecutionContext->setInputShape("mrope_rotary_cos_sin", mropeRotaryCosSin.value().dims);
+        mGenerationExecutionContext->setInputShape("mrope_rotary_cos_sin", mropeRotaryCosSin.value().dims);
+
+        mDeviceBuffer["mrope_position_deltas"] = mropePositionDeltas.value().data;
+        mContextExecutionContext->setTensorAddress("mrope_position_deltas", mropePositionDeltas.value().data);
+        mGenerationExecutionContext->setTensorAddress("mrope_position_deltas", mropePositionDeltas.value().data);
+        mContextExecutionContext->setInputShape("mrope_position_deltas", mropePositionDeltas.value().dims);
+        mGenerationExecutionContext->setInputShape("mrope_position_deltas", mropePositionDeltas.value().dims);
+    }
 
     // Context Phase
     mContextExecutionContext->enqueueV3(mStream);

@@ -65,7 +65,7 @@ std::optional<T> parsePluginScalarField(std::string const& fieldName, nvinfer1::
 {
     for (int32_t i = 0; i < fc->nbFields; ++i)
     {
-        PluginField const& pluginField = fc->fields[i]; 
+        PluginField const& pluginField = fc->fields[i];
         if (fieldName.compare(pluginField.name) == 0)
         {
             check(toFieldType<T>() == pluginField.type, "Mismatch datatype of plugin field");
@@ -119,8 +119,9 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType)
+AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType, int32_t halfRotaryDim,
+    int32_t rotaryEmbeddingMaxPositions)
     : mLayerName(name)
     , mNumHeadQ(numQHeads)
     , mNumHeadKV(numKVHeads)
@@ -128,6 +129,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mMaxBatchSize(maxBatchSize)
     , mKVCacheCapacity(kvCacheCapacity)
     , mPosEmbedType(posEmbedType)
+    , mHalfRotaryDim(halfRotaryDim)
+    , mRotaryEmbeddingMaxPositions(rotaryEmbeddingMaxPositions)
 {
     mSMVersion = getSMVersion();
 
@@ -155,16 +158,15 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mPosEmbedType);
     deserializeValue(&data, &length, &mRotaryScale);
     deserializeValue(&data, &length, &mRotaryBaseFrequency);
+    deserializeValue(&data, &length, &mHalfRotaryDim);
+    deserializeValue(&data, &length, &mRotaryEmbeddingMaxPositions);
 
     mSMVersion = getSMVersion();
     ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
     DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType);
 }
 
-
-AttentionPlugin::~AttentionPlugin()
-{
-}
+AttentionPlugin::~AttentionPlugin() {}
 
 void AttentionPlugin::setRotaryConfig(float ropeScale, float ropeBaseFrequency)
 {
@@ -174,8 +176,8 @@ void AttentionPlugin::setRotaryConfig(float ropeScale, float ropeBaseFrequency)
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV,
-        mNumElemPerHead, mMaxBatchSize, mKVCacheCapacity, mPosEmbedType);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize,
+        mKVCacheCapacity, mPosEmbedType, mHalfRotaryDim, mRotaryEmbeddingMaxPositions);
     plugin->setRotaryConfig(mRotaryScale, mRotaryBaseFrequency);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
@@ -268,9 +270,32 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
+    auto checkMropeRotaryCosSin = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+        bool status{true};
+        status &= tensorDesc.type == DataType::kFLOAT;
+        status &= tensorDesc.format == TensorFormat::kLINEAR;
+        status &= tensorDesc.dims.nbDims == 2;
+        return status;
+    };
+
+    auto checkMropePositionDeltas = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+        bool status{true};
+        status &= tensorDesc.type == DataType::kINT64;
+        status &= tensorDesc.format == TensorFormat::kLINEAR;
+        status &= tensorDesc.dims.nbDims == 2;
+        return status;
+    };
+
     try
     {
-        assert(nbInputs == 3 && nbOutputs == 2);
+        if (mPosEmbedType == PositionEmbeddingType::kMROPE)
+        {
+            assert(nbInputs == 5 && nbOutputs == 2);
+        }
+        else
+        {
+            assert(nbInputs == 3 && nbOutputs == 2);
+        }
         assert(pos < (nbInputs + nbOutputs));
         bool result{false};
         switch (pos)
@@ -278,8 +303,39 @@ bool AttentionPlugin::supportsFormatCombination(
         case 0: result = checkGemmQKV(inOut[0]); break;
         case 1: result = checkKVCache(inOut[1]); break;
         case 2: result = checkSequenceLen(inOut[2]); break;
-        case 3: result = checkAttentionOutput(inOut[3]); break;
-        case 4: result = checkKVCache(inOut[4]); break;
+        case 3:
+            if (mPosEmbedType == PositionEmbeddingType::kMROPE)
+            {
+                result = checkMropeRotaryCosSin(inOut[3]);
+            }
+            else
+            {
+                result = checkAttentionOutput(inOut[3]);
+            }
+            break;
+
+        case 4:
+            if (mPosEmbedType == PositionEmbeddingType::kMROPE)
+            {
+                result = checkMropePositionDeltas(inOut[4]);
+            }
+            else
+            {
+                result = checkKVCache(inOut[4]);
+            }
+            break;
+        case 5:
+            if (mPosEmbedType == PositionEmbeddingType::kMROPE)
+            {
+                result = checkAttentionOutput(inOut[5]);
+            }
+            break;
+        case 6:
+            if (mPosEmbedType == PositionEmbeddingType::kMROPE)
+            {
+                result = checkKVCache(inOut[6]);
+            }
+            break;
         default: break;
         }
         return result;
@@ -297,9 +353,8 @@ DataType AttentionPlugin::getOutputDataType(
     return DataType::kHALF;
 }
 
-
-DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
-    int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
+    nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
     DimsExprs output;
@@ -346,6 +401,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     constexpr int32_t kKV_CACHE_INPUT_OUTPUT_IDX{1};
     constexpr int32_t kINPUT_LENGTH_INPUT_IDX{2};
     constexpr int32_t kATTENTION_OUTPUT_IDX{0};
+    constexpr int32_t kMROPE_ROTARY_COS_SIN_IDX{3};
+    constexpr int32_t kMROPE_POSITION_DELTAS_IDX{4};
 
     // Obtain execution time batch size, input context length, and KV-cache capacity per sequence.
     constexpr int32_t kQKV_INPUT_BATCH_DIM_IDX{0};
@@ -372,6 +429,12 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t const* seqLengthDevicePtr = reinterpret_cast<int32_t const*>(inputs[kINPUT_LENGTH_INPUT_IDX]);
     half* attentionResultDevicePtr = reinterpret_cast<half*>(outputs[kATTENTION_OUTPUT_IDX]);
     half* kvCacheDevicePtr = reinterpret_cast<half*>(outputs[kKV_CACHE_INPUT_OUTPUT_IDX]);
+    float2 const* mrope_rotary_cos_sin = (mPosEmbedType == PositionEmbeddingType::kMROPE)
+        ? reinterpret_cast<float2 const*>(inputs[kMROPE_ROTARY_COS_SIN_IDX])
+        : nullptr;
+    int64_t const* mrope_position_deltas = (mPosEmbedType == PositionEmbeddingType::kMROPE)
+        ? reinterpret_cast<int64_t const*>(inputs[kMROPE_POSITION_DELTAS_IDX])
+        : nullptr;
 
     // Align workspace to be minimal aligned.
     int8_t* alignedWorkspacePtr = alignDevicePtr(workspace);
@@ -385,7 +448,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
         invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ,
             mNumHeadKV, mNumElemPerHead, mKVCacheCapacity, runtimeSeqLen, mPosEmbedType, mRotaryBaseFrequency,
-            mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, stream);
+            mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, mHalfRotaryDim, mRotaryEmbeddingMaxPositions,
+            mrope_rotary_cos_sin, stream);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
         auto fmhaRunner = ContextFMHARunner(
@@ -410,7 +474,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         int32_t const totalProcessToken = runtimeBatchSize;
         invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
             mNumHeadQ, mNumHeadKV, mNumElemPerHead, mKVCacheCapacity, runtimeSeqLen, mPosEmbedType,
-            mRotaryBaseFrequency, mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, stream);
+            mRotaryBaseFrequency, mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, mHalfRotaryDim,
+            mRotaryEmbeddingMaxPositions, mrope_position_deltas, stream);
 
         // Prepare GQA runner parameter to dispatch kernel
         auto xqaRunner
@@ -431,7 +496,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mMaxBatchSize) + sizeof(mKVCacheCapacity) + sizeof(mNumHeadQ) + sizeof(mNumHeadKV)
-        + sizeof(mNumElemPerHead) + sizeof(mPosEmbedType) + sizeof(mRotaryScale) + sizeof(mRotaryBaseFrequency);
+        + sizeof(mNumElemPerHead) + sizeof(mPosEmbedType) + sizeof(mRotaryScale) + sizeof(mRotaryBaseFrequency)
+        + sizeof(mHalfRotaryDim) + sizeof(mRotaryEmbeddingMaxPositions);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
@@ -444,6 +510,8 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&buffer, mPosEmbedType);
     serializeValue(&buffer, mRotaryScale);
     serializeValue(&buffer, mRotaryBaseFrequency);
+    serializeValue(&buffer, mHalfRotaryDim);
+    serializeValue(&buffer, mRotaryEmbeddingMaxPositions);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -457,7 +525,6 @@ void AttentionPlugin::destroy() noexcept
 {
     delete this;
 }
-
 
 AttentionPluginCreator::AttentionPluginCreator()
 {
@@ -473,6 +540,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("rotary_scaling", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("rotary_base_frequency", nullptr, PluginFieldType::kFLOAT32, 1));
+    mPluginAttributes.emplace_back(PluginField("half_rotary_dim", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_max_positions", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
@@ -511,13 +580,15 @@ AttentionPlugin* createDefaultAttentionPlugin(char const* name)
     constexpr int32_t maxBatchSize{16};
     constexpr int32_t kvCacheCapacity{4096};
     constexpr PositionEmbeddingType posEmbedType{PositionEmbeddingType::kROPE_ROTATE_NEOX};
+    constexpr int32_t halfRotaryDim{64};
+    constexpr int32_t rotaryEmbeddingMaxPositions{32768};
 
     // Align with Meta's implementation for rotary embedding.
     constexpr float rotaryScale{1.0F};
     constexpr float rotaryFrequency{500000.f};
 
-    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads,
-        numKVHeads, headSize, maxBatchSize, kvCacheCapacity, posEmbedType);
+    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads, numKVHeads, headSize, maxBatchSize,
+        kvCacheCapacity, posEmbedType, halfRotaryDim, rotaryEmbeddingMaxPositions);
     plugin->setRotaryConfig(rotaryScale, rotaryFrequency);
     return plugin;
 }
@@ -526,7 +597,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
 {
     try
-    {   
+    {
         // If no plugin attribute is available, construct an AttentionPlugin used by llama3-8B model by
         // default. Otherwise, all plugin attributes shall be specified.
         if (fc->nbFields == 0)
@@ -540,9 +611,13 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
         std::optional<int32_t> posEmbedVal = parsePluginScalarField<int32_t>("position_embedding_type", fc);
+        std::optional<int32_t> halfRotaryDim = parsePluginScalarField<int32_t>("half_rotary_dim", fc);
+        std::optional<int32_t> rotaryEmbeddingMaxPositions
+            = parsePluginScalarField<int32_t>("rotary_embedding_max_positions", fc);
 
         bool checkRequiredFields = maxBatchSize.has_value() && kvCacheCapacity.has_value() && numQHeads.has_value()
-            && headSize.has_value() && numKVHeads.has_value() && posEmbedVal.has_value();
+            && headSize.has_value() && numKVHeads.has_value() && posEmbedVal.has_value() && halfRotaryDim.has_value()
+            && rotaryEmbeddingMaxPositions.has_value();
         if (!checkRequiredFields)
         {
             return nullptr;
@@ -554,8 +629,9 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
 
         PositionEmbeddingType const posEmbedType = static_cast<PositionEmbeddingType>(posEmbedVal.value());
         bool const useRotaryEmbed = posEmbedType == PositionEmbeddingType::kROPE_ROTATE_GPTJ
-            || posEmbedType == PositionEmbeddingType::kROPE_ROTATE_NEOX;
-        
+            || posEmbedType == PositionEmbeddingType::kROPE_ROTATE_NEOX
+            || posEmbedType == PositionEmbeddingType::kMROPE;
+
         std::optional<float> rotaryScale{std::nullopt};
         std::optional<float> rotaryFrequency{std::nullopt};
         if (useRotaryEmbed)
@@ -569,8 +645,9 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
             }
         }
 
-        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(),
-            numKVHeads.value(), headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType);
+        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
+            headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType, halfRotaryDim.value(),
+            rotaryEmbeddingMaxPositions.value());
         if (useRotaryEmbed)
         {
             plugin->setRotaryConfig(rotaryScale.value(), rotaryFrequency.value());
@@ -578,7 +655,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
 
         return plugin;
     }
-    catch(std::exception const& e)
+    catch (std::exception const& e)
     {
     }
     return nullptr;
