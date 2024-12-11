@@ -24,7 +24,6 @@ You will use trtexec to build the engine. Assign desired optimization profile fo
 - multi_size_opt = max(multi_size_min, int(multi_size_max / 2)) = 10368
 
 ```
-
 export MIN=128 OPT=10368 MAX=20736
 mkdir -p tmp/trt_engines/${MODEL_NAME}/vision_encoder
 trtexec \
@@ -45,15 +44,13 @@ cd ../../
 --enginePath=examples/multimodal/tmp/trt_engines/${MODEL_NAME}/llm_model/model.engine \
 --maxInputLen=2048 --maxImageTokens=5184 --minImageTokens=128 --maxSeqLen=4096 \
 --modelType="qwen2_vl" \
---batchSize=1 \
---imageTokens=888
+--batchSize=2 \
+--imageTokens=1122
 ```
 
 **Notes:** `--maxSeqLen` includes `--maxInputLen`, so it must be greater than `--maxInputLen`. The maximum new token would equal to `maxSeqLen - maxInputLen`.
 
 ### Infer the engine
-1. Inference with prompt
-
 ```
 ./build/examples/multimodal/multimodal_runner \
 --tokenizerPath=examples/multimodal/tmp/hf_models/${MODEL_NAME} \
@@ -62,9 +59,7 @@ cd ../../
 --modelType="qwen2_vl" \
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/qwen2vl/pics/demo.jpeg" \
---debug
-```
-
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/qwen2vl/pics/image1.jpeg" \
 --maxLength=4096
+```

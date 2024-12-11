@@ -156,7 +156,9 @@ def insert_attention_plugin(graph: gs.Graph, config: dict, rope_type: RopeType,
         graph: gs.Graph
         config: dict. Converted from transformers.AutoConfig
         rope_type: RopeType.
-        extra_inputs: list
+        extra_inputs: list. Extra inputs is for VLM like QWen2-VL which will contains mrope_rotary_cos_sin and mrope_position_deltas, the mrope_rotary_cos_sin is the rotary cos/sin cache and mrope_position_deltas is the position deltas which are needed by Mrope.
+
+
 
     Returns:
         The graph after inserted AttentionPlugin

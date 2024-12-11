@@ -229,7 +229,7 @@ def export_qwen2_vl(args):
                                 })
 
     # 3. surgeon llm
-    mrope_rotary_sin_cos = gs.Variable("mrope_rotary_sin_cos", np.float32,
+    mrope_rotary_cos_sin = gs.Variable("mrope_rotary_cos_sin", np.float32,
                                        ['batch_size', 4194304])
     mrope_position_deltas = gs.Variable("mrope_position_deltas", np.int64,
                                         ['batch_size', 1])
@@ -241,7 +241,7 @@ def export_qwen2_vl(args):
         args.config_path,
         state_dict,
         rope_type=RopeType.kMROPE,
-        extra_plugin_inputs=[mrope_rotary_sin_cos, mrope_position_deltas])
+        extra_plugin_inputs=[mrope_rotary_cos_sin, mrope_position_deltas])
 
 
 if __name__ == '__main__':

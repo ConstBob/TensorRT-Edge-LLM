@@ -157,6 +157,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mNumElemPerHead);
     deserializeValue(&data, &length, &mPosEmbedType);
     deserializeValue(&data, &length, &mRotaryScale);
+    deserializeValue(&data, &length, &mRotaryBaseFrequency);
     deserializeValue(&data, &length, &mHalfRotaryDim);
     deserializeValue(&data, &length, &mRotaryEmbeddingMaxPositions);
 
@@ -400,8 +401,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     constexpr int32_t kKV_CACHE_INPUT_OUTPUT_IDX{1};
     constexpr int32_t kINPUT_LENGTH_INPUT_IDX{2};
     constexpr int32_t kATTENTION_OUTPUT_IDX{0};
-    constexpr int32_t kMrope_Rotary_Cos_Sin_IDX{3};
-    constexpr int32_t kMrope_Position_Deltas_IDX{4};
+    constexpr int32_t kMROPE_ROTARY_COS_SIN_IDX{3};
+    constexpr int32_t kMROPE_POSITION_DELTAS_IDX{4};
 
     // Obtain execution time batch size, input context length, and KV-cache capacity per sequence.
     constexpr int32_t kQKV_INPUT_BATCH_DIM_IDX{0};
@@ -429,10 +430,10 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     half* attentionResultDevicePtr = reinterpret_cast<half*>(outputs[kATTENTION_OUTPUT_IDX]);
     half* kvCacheDevicePtr = reinterpret_cast<half*>(outputs[kKV_CACHE_INPUT_OUTPUT_IDX]);
     float2 const* mrope_rotary_cos_sin = (mPosEmbedType == PositionEmbeddingType::kMROPE)
-        ? reinterpret_cast<float2 const*>(inputs[kMrope_Rotary_Cos_Sin_IDX])
+        ? reinterpret_cast<float2 const*>(inputs[kMROPE_ROTARY_COS_SIN_IDX])
         : nullptr;
     int64_t const* mrope_position_deltas = (mPosEmbedType == PositionEmbeddingType::kMROPE)
-        ? reinterpret_cast<int64_t const*>(inputs[kMrope_Position_Deltas_IDX])
+        ? reinterpret_cast<int64_t const*>(inputs[kMROPE_POSITION_DELTAS_IDX])
         : nullptr;
 
     // Align workspace to be minimal aligned.
@@ -509,6 +510,8 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&buffer, mPosEmbedType);
     serializeValue(&buffer, mRotaryScale);
     serializeValue(&buffer, mRotaryBaseFrequency);
+    serializeValue(&buffer, mHalfRotaryDim);
+    serializeValue(&buffer, mRotaryEmbeddingMaxPositions);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -613,7 +616,8 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
             = parsePluginScalarField<int32_t>("rotary_embedding_max_positions", fc);
 
         bool checkRequiredFields = maxBatchSize.has_value() && kvCacheCapacity.has_value() && numQHeads.has_value()
-            && headSize.has_value() && numKVHeads.has_value() && posEmbedVal.has_value();
+            && headSize.has_value() && numKVHeads.has_value() && posEmbedVal.has_value() && halfRotaryDim.has_value()
+            && rotaryEmbeddingMaxPositions.has_value();
         if (!checkRequiredFields)
         {
             return nullptr;

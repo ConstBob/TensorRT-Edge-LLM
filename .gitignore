@@ -21,3 +21,4 @@ examples/multimodal/buils.sh
 *.onnx_data
 *.pth
 examples/multimodal/tmp/hf_models/Qwen2-VL-7B-Instruct
+examples/multimodal/tmp/hf_models/Qwen2-VL-2B-Instruct

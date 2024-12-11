@@ -255,7 +255,7 @@ std::vector<std::string> decode(std::filesystem::path const& lmEnginePath,
     else
     {
 
-        throw std::runtime_error("Only support Qwen2-VL model for Multimodal model.");
+        throw std::runtime_error("Only support Qwen2-VL model for Multimodal models.");
     }
 
     std::vector<std::string> output(batchSize);

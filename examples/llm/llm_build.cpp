@@ -382,31 +382,51 @@ int main(int argc, char** argv)
     }
     if (args.modelType == "qwen2_vl")
     {
+        int hidden_size = 0;
+        int mrope_rotary_cos_sin_dim = 0;
+        for (int idx = 0; idx < nbInputs; idx++)
+        {
+
+            if (strcmp(network->getInput(idx)->getName(), "image_embeds") == 0)
+            {
+                hidden_size = network->getInput(idx)->getDimensions().d[1];
+            }
+            else if (strcmp(network->getInput(idx)->getName(), "mrope_rotary_cos_sin") == 0)
+            {
+                mrope_rotary_cos_sin_dim = network->getInput(idx)->getDimensions().d[1];
+            }
+        }
+        if (hidden_size == 0 || mrope_rotary_cos_sin_dim == 0)
+        {
+            LOG_ERROR("Please add image_embeds and mrope_rotary_sin_cos as inputs for Qwen2-VL.");
+        }
 
         if (args.dynamicShape)
         {
 
             result &= setOptimizationProfile(contextProfile, "image_embeds", nullptr,
-                createDims({args.minImageTokens, 3584}),
-                createDims({(args.minImageTokens + args.maxImageTokens) / 2, 3584}),
-                createDims({args.maxImageTokens, 3584}));
+                createDims({args.minImageTokens, hidden_size}),
+                createDims({(args.minImageTokens + args.maxImageTokens) / 2, hidden_size}),
+                createDims({args.maxImageTokens, hidden_size}));
             result &= setOptimizationProfile(generationProfile, "image_embeds", nullptr,
-                createDims({args.minImageTokens, 3584}),
-                createDims({(args.minImageTokens + args.maxImageTokens) / 2, 3584}),
-                createDims({args.maxImageTokens, 3584}));
+                createDims({args.minImageTokens, hidden_size}),
+                createDims({(args.minImageTokens + args.maxImageTokens) / 2, hidden_size}),
+                createDims({args.maxImageTokens, hidden_size}));
         }
         else
         {
 
-            result &= setOptimizationProfile(contextProfile, "image_embeds", createDims({args.imageTokens, 3584}));
-            result &= setOptimizationProfile(generationProfile, "image_embeds", createDims({args.imageTokens, 3584}));
+            result
+                &= setOptimizationProfile(contextProfile, "image_embeds", createDims({args.imageTokens, hidden_size}));
+            result &= setOptimizationProfile(
+                generationProfile, "image_embeds", createDims({args.imageTokens, hidden_size}));
         }
         result &= setOptimizationProfile(
-            contextProfile, "mrope_rotary_sin_cos", createDims({args.batchSize, 4194304})); // 32768*128
+            contextProfile, "mrope_rotary_cos_sin", createDims({args.batchSize, mrope_rotary_cos_sin_dim}));
         result &= setOptimizationProfile(contextProfile, "mrope_position_deltas", createDims({args.batchSize, 1}));
 
-        result
-            &= setOptimizationProfile(generationProfile, "mrope_rotary_sin_cos", createDims({args.batchSize, 4194304}));
+        result &= setOptimizationProfile(
+            generationProfile, "mrope_rotary_cos_sin", createDims({args.batchSize, mrope_rotary_cos_sin_dim}));
         result &= setOptimizationProfile(generationProfile, "mrope_position_deltas", createDims({args.batchSize, 1}));
     }
 
