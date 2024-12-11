@@ -11,14 +11,3 @@ __pycache__/
 data/
 data.tar
 *.csv
-*.onnx
-*.data
-build.sh
-compile.sh
-*.log
-examples/multimodal/buils.sh
-*.bin
-*.onnx_data
-*.pth
-examples/multimodal/tmp/hf_models/Qwen2-VL-7B-Instruct
-examples/multimodal/tmp/hf_models/Qwen2-VL-2B-Instruct

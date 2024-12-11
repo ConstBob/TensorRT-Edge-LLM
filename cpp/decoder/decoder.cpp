@@ -6,7 +6,6 @@
 #include <chrono>
 #include <cuda_runtime.h>
 #include <filesystem>
-#include <iostream>
 #include <memory>
 #include <sstream>
 #include <utility>
