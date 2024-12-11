@@ -216,11 +216,12 @@ def export_qwen2_vl(args):
     dummy_len = 10
     image_embeds = torch.randn((dummy_len, hf_model.config.hidden_size),
                                dtype=torch.float16).cuda()
-    state_dict = export_raw_llm(Qwen2VLWrapper(hf_model),
+    state_dict = export_raw_llm(hf_model,
                                 raw_onnx_dir,
                                 args.dtype,
                                 os.path.join(args.torch_dir, "config.json"),
                                 args.torch_dir,
+                                wrapper_cls=Qwen2VLWrapper,
                                 extra_inputs={"image_embeds": image_embeds},
                                 extra_dyn_axes={
                                     "image_embeds": {

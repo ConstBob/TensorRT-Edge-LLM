@@ -87,7 +87,7 @@ def get_config_path(args):
 
 
 def export_raw_llm(model, output_dir, dtype, config_path, torch_dir, dataset_dir="",
-                   extra_inputs={}, extra_dyn_axes={}):
+                   wrapper_cls=WrapperModelForCausalLM, extra_inputs={}, extra_dyn_axes={}):
     """
     Export raw llm model to ONNX and do quantize.
 
@@ -109,7 +109,7 @@ def export_raw_llm(model, output_dir, dtype, config_path, torch_dir, dataset_dir
             )
         else:
             print("Loading fp16 ONNX model...")
-        llm_to_onnx(model, output_dir, extra_inputs=extra_inputs, extra_dyn_axes=extra_dyn_axes)
+        llm_to_onnx(wrapper_cls(model), output_dir, extra_inputs=extra_inputs, extra_dyn_axes=extra_dyn_axes)
         shutil.copy(config_path, os.path.join(output_dir, "config.json"))
         
     # Need to quantize model to fp8 or int4
@@ -231,7 +231,7 @@ def main(args):
             onnx_dir = args.output_dir
             
         state_dict = export_raw_llm(
-            WrapperModelForCausalLM(model), 
+            model, 
             onnx_dir, 
             args.dtype, 
             args.config_path, 
