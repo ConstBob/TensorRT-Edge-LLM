@@ -120,7 +120,7 @@ def export_raw_llm(model, output_dir, dtype, config_path, torch_dir, dataset_dir
         if dtype == "fp8":
             print(
                 "Exporting fp8 ONNX model from quantized PyTorch model...")
-            llm_to_onnx(model, output_dir, extra_inputs=extra_inputs, extra_dyn_axes=extra_dyn_axes)
+            llm_to_onnx(wrapper_cls(model), output_dir, extra_inputs=extra_inputs, extra_dyn_axes=extra_dyn_axes)
             shutil.copy(config_path, os.path.join(output_dir, "config.json"))
 
         # Compress weights
