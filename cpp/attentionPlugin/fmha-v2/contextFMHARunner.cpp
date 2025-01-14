@@ -370,7 +370,7 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
 bool ContextFMHARunner::canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType)
 {
     bool const checkType = dataType == DataType::kHALF;
-    bool const checkHeadSize = headSize == 128;
+    bool const checkHeadSize = headSize == 128 || headSize == 64;
 
     return checkType && checkHeadSize;
 }
