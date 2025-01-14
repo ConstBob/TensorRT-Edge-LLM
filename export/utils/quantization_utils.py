@@ -43,16 +43,61 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
     return calib_dataloader
 
 
-def get_quant_config(precision):
+def get_quant_config(precision, lm_head_precision="fp16"):
 
     if precision == "fp8":
         quant_cfg = mtq.FP8_DEFAULT_CFG
     elif precision == "int4":
         quant_cfg = mtq.INT4_AWQ_CFG
+
+    elif precision == "nvfp4":
+        quant_cfg = mtq.NVFP4_DEFAULT_CFG
+
+    if lm_head_precision == "fp8":
+        quant_cfg["quant_cfg"]["*lm_head.input_quantizer"] = {
+            "num_bits": (4, 3),
+            "axis": None
+        }
+        quant_cfg["quant_cfg"]["*lm_head.weight_quantizer"] = {
+            "num_bits": (4, 3),
+            "axis": None
+        }
+    elif lm_head_precision == "int4":
+        quant_cfg["quant_cfg"]["*lm_head.weight_quantizer"] = {
+            "num_bits": 4,
+            "block_sizes": {
+                -1: 128
+            },
+            "enable": True
+        }
+    elif lm_head_precision == "nvfp4":
+        quant_cfg["quant_cfg"]["*lm_head.input_quantizer"] = {
+            "num_bits": (2, 1),
+            "block_sizes": {
+                -1: 16,
+                "type": "dynamic",
+                "scale_bits": (4, 3)
+            },
+            "axis": None,
+            "enable": True,
+        }
+        quant_cfg["quant_cfg"]["*lm_head.weight_quantizer"] = {
+            "num_bits": (2, 1),
+            "block_sizes": {
+                -1: 16,
+                "type": "dynamic",
+                "scale_bits": (4, 3)
+            },
+            "axis": None,
+            "enable": True,
+        }
     return quant_cfg
 
 
-def _quantize_model(model, precision, calib_dataloader=None):
+def _quantize_model(model,
+                    precision,
+                    calib_dataloader=None,
+                    lm_head_precision="fp16"):
     """
     The calibration loop for the model can be setup using the modelopt API.
 
@@ -76,7 +121,7 @@ def _quantize_model(model, precision, calib_dataloader=None):
     print("Starting quantization...")
     start_time = time.time()
     mtq.quantize(model,
-                 get_quant_config(precision),
+                 get_quant_config(precision, lm_head_precision),
                  forward_loop=calibrate_loop)
     end_time = time.time()
     print(f"Quantization finishes in {end_time - start_time}s.")
@@ -84,13 +129,22 @@ def _quantize_model(model, precision, calib_dataloader=None):
     return model
 
 
-def quantize(model, tokenizer, precision, dataset_dir=None):
+def quantize(model,
+             tokenizer,
+             precision,
+             lm_head_precision="fp16",
+             dataset_dir=None):
     """
     Quantize the PyTorch model to fp8 or int4_awq
     """
     assert precision in [
-        "fp8", "int4"
-    ], f"Only fp8(W8A8) and int4(W4A16) is supported. You passed an unsupported precision: {precision}."
+        "fp8", "int4", "nvfp4"
+    ], f"Only fp8(W8A8), int4(W4A16) and nvfp4(W4A4) is supported. You passed an unsupported precision: {precision}."
+
+    assert lm_head_precision in [
+        "fp16", "fp8", "int4", "nvfp4"
+    ], f"Only fp16(unquantized), fp8(W8A8), int4(W4A16) and nvfp4(W4A4) is supported for lm_head. You passed an unsupported precision: {lm_head_precision}."
+
     if tokenizer.pad_token != "<unk>":
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token is None:
@@ -105,6 +159,7 @@ def quantize(model, tokenizer, precision, dataset_dir=None):
     data_loader = get_calib_dataloader(dataset_name_or_dir=dataset_dir,
                                        tokenizer=tokenizer,
                                        batch_size=batch_size)
-    quantized_model = _quantize_model(model, precision, data_loader)
+    quantized_model = _quantize_model(model, precision, data_loader,
+                                      lm_head_precision)
     mtq.print_quant_summary(quantized_model)
     return quantized_model

@@ -135,7 +135,9 @@ def insert_gather_last_token(graph: gs.Graph):
     return graph
 
 
-def insert_attention_plugin(graph: gs.Graph, config: dict, rope_type: RopeType,
+def insert_attention_plugin(graph: gs.Graph,
+                            config: dict,
+                            rope_type: RopeType,
                             extra_inputs: list = None):
     """
     Insert AttentionPlugin for the graph. AttentionPlugin takes the following inputs and outputs:
