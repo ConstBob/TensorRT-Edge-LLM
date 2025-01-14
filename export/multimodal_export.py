@@ -6,17 +6,18 @@ import numpy as np
 import onnx_graphsurgeon as gs
 import torch
 import torch.nn as nn
-from llm_export import (RopeType, export_raw_llm, get_config_path,
-                        llm_arguments, surgeon_llm)
+from llm_export import (export_raw_llm, get_config_path, llm_arguments,
+                        surgeon_llm)
 from transformers.cache_utils import DynamicCache
-from utils.export_utils import WrapperModelForCausalLM, export_onnx
+from utils.export_utils import WrapperModelForCausalLM, torch_to_onnx
+from utils.surgeon_utils import RopeType
 
 
 def multimodal_arguments():
     parser = llm_arguments()
     parser.add_argument('--model_type',
                         type=str,
-                        default=None,
+                        default='qwen2_vl',
                         choices=['qwen2_vl'],
                         help="Model type")
     return parser
@@ -179,10 +180,11 @@ def export_qwen2_vl_visual(hf_model, output_dir):
     }
 
     start_time = time.time()
-    export_onnx(
+    torch_to_onnx(
         model,
         (input, rotary_pos_emb, attention_mask),
         output_dir,
+        "model.onnx",
         input_names=["input", "rotary_pos_emb", "attention_mask"],
         output_names=["output"],
         dynamic_axes=dynamic_axes,
@@ -221,6 +223,7 @@ def export_qwen2_vl(args):
                                 args.dtype,
                                 os.path.join(args.torch_dir, "config.json"),
                                 args.torch_dir,
+                                lm_head_precision=args.lm_head,
                                 wrapper_cls=Qwen2VLWrapper,
                                 extra_inputs={"image_embeds": image_embeds},
                                 extra_dyn_axes={

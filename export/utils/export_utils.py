@@ -25,15 +25,8 @@ class WrapperModelForCausalLM(torch.nn.Module):
         return logits, past_key_values
 
 
-def export_onnx(model,
-                inputs,
-                onnx_dir,
-                onnx_name='model.onnx',
-                input_names=['input'],
-                output_names=['output'],
-                dynamic_axes={'input': {
-                    0: 'batch'
-                }}):
+def torch_to_onnx(model, inputs, onnx_dir, onnx_name, input_names,
+                  output_names, dynamic_axes):
     os.makedirs(onnx_dir, exist_ok=True)
 
     torch.onnx.export(
@@ -55,8 +48,8 @@ def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
     Parameters:
         model: torch.Module
         output_dir: str, the output_dir of the original ONNX.
-        extra_inputs: dict, append additional inputs after kv_cache
-        extra_dyn_axes: dict
+        extra_inputs: dict, append additional inputs after kv_cache. Usually for VL models
+        extra_dyn_axes: dict. Usually for VL models
     """
     start_time = time.time()
     config = model.config
@@ -93,13 +86,14 @@ def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
     cache = DynamicCache.from_legacy_cache(dummy_kv_cache)
     legacy_format_cache = cache.to_legacy_cache()
 
-    export_onnx(
+    torch_to_onnx(
         model,
         (dummy_input_ids, {
             "past_key_values": legacy_format_cache,
             **extra_inputs
         }),
         output_dir,
+        "model.onnx",
         input_names=input_names + list(extra_inputs.keys()),
         output_names=output_names,
         dynamic_axes=dynamic_axes | extra_dyn_axes,
