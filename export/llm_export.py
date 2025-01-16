@@ -164,7 +164,7 @@ def export_raw_llm(model,
                              dtype=torch.float16,
                              export_dir=quantized_model_dir)
 
-    return state_dict
+    return model.state_dict()
 
 
 def surgeon_llm(raw_onnx_path,
@@ -283,7 +283,7 @@ def main(args):
     else:
         print(f"ONNX path given. Importing ONNX from {args.onnx_path}")
         # Int4 requires knowledge of the int4 weights and scales.
-        if dtype == "int4":
+        if args.dtype == "int4":
             assert args.state_dict_path, "You need to pass state_dict for int4 ONNX export"
             state_dict = torch.load(args.state_dict_path)
 
