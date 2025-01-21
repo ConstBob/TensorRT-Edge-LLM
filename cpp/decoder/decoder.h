@@ -1,8 +1,8 @@
 #pragma once
-#ifndef DECODER_H
-#define DECODER_H
+
 #include "common/benchmarkProfiler.h"
 #include "common/common.h"
+#include "common/trtUtils.h"
 #include "sampler/include/sampler.h"
 #include <NvInferRuntime.h>
 #include <cfloat>
@@ -48,7 +48,7 @@ public:
         , mSampler{nullptr}
     {
     }
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream);
+    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int64_t batchSize = 1);
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
         std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
         std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
@@ -84,7 +84,7 @@ private:
     ModelConfig mConfig;
     std::map<std::string, void*> mDeviceBuffer;
     std::map<std::string, void*> mHostBuffer;
-    bool validateAndFillConfig();
+    bool validateAndFillConfig(int64_t batchSize = 1);
     bool checkStaticShape(std::string& name);
     void allocateBuffer();
     Sampler<half>* mSampler;
@@ -92,5 +92,3 @@ private:
     std::string printKVCache(int64_t contextLength);
     std::string printLogits();
 };
-
-#endif

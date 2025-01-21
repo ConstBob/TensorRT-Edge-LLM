@@ -16,10 +16,8 @@
  */
 
 #pragma once
-#ifndef TOKENIZER_UTILS_H
-#define TOKENIZER_UTILS_H
 
-#include "common/common.h"
+#include "common/logger.h"
 #include "tokenizer.h"
 #include <cassert>
 #include <iostream>
@@ -125,5 +123,3 @@ uint32_t unicodeCptFromUtf8(std::string const& utf8, size_t& offset);
 std::string unicodeCptToUtf8(uint32_t cp);
 
 codepointFlags unicodeCptFlags(const uint32_t cp);
-
-#endif // TOKENIZER_UTILS_H

@@ -16,9 +16,6 @@
  */
 
 #pragma once
-#ifndef TOKENIZER_H
-#define TOKENIZER_H
-
 #include <cassert>
 #include <filesystem>
 #include <forward_list>
@@ -147,5 +144,3 @@ protected:
     Rank mUnkId;
     std::string mRegexExpr;
 };
-
-#endif // TOKENIZER_H

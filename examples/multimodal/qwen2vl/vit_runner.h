@@ -1,8 +1,7 @@
 #pragma once
-#ifndef VITRT_H
-#define VITRT_H
 
 #include "common/common.h"
+#include "common/trtUtils.h"
 #include "tokenizer/tokenizer.h"
 #include <cuda_fp16.h>
 #include <filesystem>
@@ -10,6 +9,7 @@
 #include <map>
 #include <string>
 #include <vector>
+
 struct VisualPreprocessorConfig
 {
     // TODO: parse config from json or user-defined from args
@@ -107,5 +107,3 @@ private:
 
     VisualPreprocessorConfig mConfig;
 };
-
-#endif

@@ -202,9 +202,9 @@ std::string normalizeRegex(std::string const& expr)
 {
     std::string normalizedExpr;
 
-    for (int i = 0; i < expr.size(); )
+    for (int i = 0; i < expr.size();)
     {
-        // case 1: (?i) case-insentive modifier
+        // case 1: (?i) case-insensitive modifier
         // e.g. (?i:'s|'t|'re|'ve|'m|'ll|'d) => (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
         if (expr.find("(?i:", i) != std::string::npos)
         {
@@ -214,7 +214,7 @@ std::string normalizeRegex(std::string const& expr)
             size_t end = expr.find(")", next);
             auto part = expr.substr(next, end - next);
 
-            for (int j = next; j < end; ++j)
+            for (size_t j = next; j < end; ++j)
             {
                 char c = expr[j];
                 if (isalpha(c))
@@ -233,12 +233,11 @@ std::string normalizeRegex(std::string const& expr)
             normalizedExpr += ")";
             i = end + 1;
         }
-        else 
+        else
         {
             normalizedExpr += expr[i];
             ++i;
         }
-
     }
 
     return normalizedExpr;

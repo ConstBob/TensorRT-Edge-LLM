@@ -16,8 +16,6 @@
  */
 
 #pragma once
-#ifndef UNICODE_DATA_H
-#define UNICODE_DATA_H
 
 #include <cstdint>
 #include <unordered_map>
@@ -38,5 +36,3 @@ extern const std::unordered_set<uint32_t> unicodeSetWhitespace;
 extern const std::unordered_map<uint32_t, uint32_t> unicodeMapLowercase;
 extern const std::unordered_map<uint32_t, uint32_t> unicodeMapUppercase;
 extern const std::vector<rangeNfd> unicodeRangesNfd;
-
-#endif // UNICODE_DATA_H

@@ -246,7 +246,7 @@ std::vector<std::string> decode(std::filesystem::path const& lmEnginePath,
         vitrunner->visualPreprocess(imagePaths, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
         vitrunner->allocateBuffer();
         vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
-        decoder->setup(lmEnginePath, stream);
+        decoder->setup(lmEnginePath, stream, batchSize);
         vitrunner->textPreprocess(inputStrings, imagePaths, visualGridTHWs, tokenizer, inputIds, contextLengths,
             decoder->getMaxContextLength());
         decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), nullptr,
@@ -295,7 +295,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    void* handle = dlopen("build/libAttentionPlugin.so", RTLD_LAZY);
+    auto handle = loadPlugin();
     if (!handle)
     {
         LOG_ERROR("Cannot open library: %s", dlerror());
@@ -307,8 +307,6 @@ int main(int argc, char* argv[])
     tokenizer->loadFromHF(args.tokenizerPath);
     auto output = decode(args.lmEnginePath, args.visualEnginePath, args.inputStrings, args.imagePaths, tokenizer,
         generationConfig, args.debug, args.modelType);
-
-    dlclose(handle);
 
     return EXIT_SUCCESS;
 };

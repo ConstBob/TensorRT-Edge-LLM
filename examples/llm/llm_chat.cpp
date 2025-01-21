@@ -1,3 +1,4 @@
+// #include "common/trtUtils.h"
 #include "decoder/decoder.h"
 #include "tokenizer/tokenizer.h"
 #include <NvInferRuntime.h>
@@ -8,9 +9,7 @@
 #include <string>
 #include <vector>
 
-using namespace nvinfer1;
-
-struct RuntimeArgs
+struct LLMChatArgs
 {
     bool help{false};
     std::string enginePath;
@@ -29,14 +28,13 @@ void printUsage(char const* programName)
     std::cerr << "  -h               Display this help message" << std::endl;
     std::cerr << "  --enginePath     Provide the input TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --tokenizerPath  Provide the path to HF tokenizer. Required. " << std::endl;
-    std::cerr
-        << "  --maxLength      [Chat] Provide the maximum output length for the generation session (including the "
-           "input). Default = 256"
-        << std::endl;
+    std::cerr << "  --maxLength            Provide the maximum output length for the generation session (including the "
+                 "input). Default = 256"
+              << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more information." << std::endl;
 };
 
-bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
+bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
 {
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"enginePath", required_argument, 0, 'e'},
         {"tokenizerPath", required_argument, 0, 't'}, {"maxLength", required_argument, 0, 's'},
@@ -87,8 +85,8 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 
 int main(int argc, char* argv[])
 {
-    RuntimeArgs args;
-    if ((argc < 2) || (!parseRuntimeArgs(args, argc, argv)))
+    LLMChatArgs args;
+    if ((argc < 2) || (!parseLLMChatArgs(args, argc, argv)))
     {
         printUsage(argv[0]);
         return EXIT_FAILURE;
@@ -108,19 +106,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    char const* pluginPath = std::getenv("PLUGIN_PATH");
-
-    if (pluginPath != nullptr)
-    {
-        LOG_INFO("PLUGIN_PATH: %s", pluginPath);
-    }
-    else
-    {
-        LOG_INFO("PLUGIN_PATH variable is not set. Default to build/libAttentionPlugin.so");
-        pluginPath = "build/libAttentionPlugin.so";
-    }
-
-    void* handle = dlopen(pluginPath, RTLD_LAZY);
+    auto handle = loadPlugin();
 
     Tokenizer* tokenizer = new Tokenizer();
     tokenizer->loadFromHF(args.tokenizerPath);
@@ -135,19 +121,18 @@ int main(int argc, char* argv[])
     std::vector<int64_t> inputIds(batchSize * maxContextLength, padId);
     std::vector<int32_t> contextLengths(batchSize, 0);
     GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
-    string quitString = "quit";
+    std::string quitString = "quit";
     std::cout << "Welcome to NVIDIA DriveOS LLM SDK! Please enter your prompts. Enter quit to exit the program."
               << std::endl;
     while (true)
     {
         for (int64_t i = 0; i < batchSize; ++i)
         {
-            string inputString;
+            std::string inputString;
             std::cout << "Prompt for batch " << i << ": ";
             std::getline(std::cin, inputString);
             if (inputString == quitString)
             {
-                dlclose(handle);
                 std::cout << "Exit. Thanks for using DriveOS LLM SDK!" << std::endl;
                 return EXIT_SUCCESS;
             }
@@ -176,6 +161,5 @@ int main(int argc, char* argv[])
         std::fill(inputIds.begin(), inputIds.end(), padId);
         std::fill(contextLengths.begin(), contextLengths.end(), 0);
     }
-
     return EXIT_FAILURE;
 };

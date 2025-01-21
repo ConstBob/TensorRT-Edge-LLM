@@ -183,9 +183,7 @@ def insert_attention_plugin(graph: gs.Graph,
     num_kv_heads = set_with_warning("num_key_value_heads", 32)
     head_size = set_with_warning("hidden_size", 4096) // num_q_heads
     rotary_base_frequency = set_with_warning("rope_theta", 500000.0)
-    half_rotary_dim = set_with_warning("hidden_size",
-                                       4096) // set_with_warning(
-                                           "num_attention_heads", 32) // 2
+    half_rotary_dim = head_size // 2
     rotary_embedding_max_positions = set_with_warning(
         "max_position_embeddings", 32768)
 

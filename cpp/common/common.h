@@ -1,6 +1,4 @@
 #pragma once
-#ifndef COMMON_H
-#define COMMON_H
 
 #include <NvInferRuntime.h>
 #include <cerrno>
@@ -10,8 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-
-using namespace std;
+#include <string>
 
 inline void check(bool condition, std::string errorMsg)
 {
@@ -62,166 +59,12 @@ inline void _checkCuda(cudaError_t result, char const* const func, char const* c
         _checkCuda((stat), #stat, __FILE__, __LINE__);                                                                 \
     } while (0)
 
-// StreamReader ported from TRT-LLM to read from engine file.
-class StreamReader final : public nvinfer1::IStreamReader
+inline std::string extractFolderName(std::string const& path)
 {
-public:
-    StreamReader(std::filesystem::path fp)
+    size_t found = path.find_last_of("/\\");
+    if (found != std::string::npos)
     {
-        mFile.open(fp.string(), std::ios::binary | std::ios::in);
-        if (!mFile.good())
-        {
-            throw std::runtime_error(fmtstr("Cannot open engine file: %s", fp.string()));
-        };
+        return path.substr(0, found);
     }
-
-    virtual ~StreamReader()
-    {
-        if (mFile.is_open())
-        {
-            mFile.close();
-        }
-    }
-
-    int64_t read(void* destination, int64_t nbBytes) final
-    {
-        if (!mFile.good())
-        {
-            return -1;
-        }
-        mFile.read(static_cast<char*>(destination), nbBytes);
-        return mFile.gcount();
-    }
-    std::ifstream mFile;
-};
-struct TensorInfo
-{
-    void* data;
-    nvinfer1::Dims dims;
-    TensorInfo(void* data, const nvinfer1::Dims dims)
-        : data(data)
-        , dims(dims)
-    {
-    }
-};
-
-// Logger for TensorRT info/warning/errors
-class Logger : public nvinfer1::ILogger
-{
-public:
-    Logger(){};
-    ~Logger(){};
-    void log(nvinfer1::ILogger::Severity severity, char const* msg) noexcept override
-    {
-        std::string strMsg(msg);
-        switch (severity)
-        {
-        case nvinfer1::ILogger::Severity::kVERBOSE:
-        {
-            debug(msg);
-            break;
-        }
-        case nvinfer1::ILogger::Severity::kERROR:
-        {
-            error(msg);
-            break;
-        }
-        case nvinfer1::ILogger::Severity::kWARNING:
-        {
-            warning(msg);
-            break;
-        }
-        case nvinfer1::ILogger::Severity::kINFO:
-        {
-            info(msg);
-            break;
-        }
-        default:
-        {
-            error(msg);
-            break;
-        }
-        }
-    }
-
-    void debug(std::string const& msg)
-    {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kVERBOSE)
-        {
-            std::cout << "[DEBUG]: " << msg << std::endl;
-        }
-    }
-
-    void warning(std::string const& msg)
-    {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kWARNING)
-        {
-            std::cerr << "[WARNING]: " << msg << std::endl;
-        }
-    }
-
-    void error(std::string const& msg)
-    {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kERROR)
-        {
-            std::cerr << "[ERROR]: " << msg << std::endl;
-        }
-    }
-
-    void info(std::string const& msg)
-    {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kINFO)
-        {
-            std::cout << "[INFO]: " << msg << std::endl;
-        }
-    }
-
-    void setLevel(nvinfer1::ILogger::Severity minSeverity)
-    {
-        _minSeverity = minSeverity;
-    }
-
-    nvinfer1::ILogger::Severity getLevel()
-    {
-        return _minSeverity;
-    }
-
-private:
-    nvinfer1::ILogger::Severity _minSeverity = nvinfer1::ILogger::Severity::kVERBOSE;
-};
-
-inline Logger gLogger{};
-
-#define LOG_DEBUG(...)                                                                                                 \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kVERBOSE)                                               \
-        {                                                                                                              \
-            gLogger.debug(fmtstr(__VA_ARGS__));                                                                        \
-        }                                                                                                              \
-    } while (0)
-#define LOG_INFO(...)                                                                                                  \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kINFO)                                                  \
-        {                                                                                                              \
-            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
-        }                                                                                                              \
-    } while (0)
-#define LOG_ERROR(...)                                                                                                 \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kERROR)                                                 \
-        {                                                                                                              \
-            gLogger.error(fmtstr(__VA_ARGS__));                                                                        \
-        }                                                                                                              \
-    } while (0)
-#define LOG_WARNING(...)                                                                                               \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kWARNING)                                               \
-        {                                                                                                              \
-            gLogger.warning(fmtstr(__VA_ARGS__));                                                                      \
-        }                                                                                                              \
-    } while (0)
-#endif
+    return "";
+}

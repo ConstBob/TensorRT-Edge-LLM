@@ -3,6 +3,7 @@
 #include "common.h"
 #include "cudaEvent.h"
 #include "cudaUtils.h"
+#include "logger.h"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
