@@ -1,5 +1,6 @@
 
 #include "common/common.h"
+#include "common/trtUtils.h"
 #include "decoder/decoder.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
@@ -13,8 +14,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
-using namespace nvinfer1;
 
 struct LLMBenchmarkArgs
 {
@@ -262,21 +261,9 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    char const* pluginPath = std::getenv("PLUGIN_PATH");
+    auto handle = loadPlugin();
 
-    if (pluginPath != nullptr)
-    {
-        LOG_INFO("PLUGIN_PATH: %s", pluginPath);
-    }
-    else
-    {
-        LOG_INFO("PLUGIN_PATH variable is not set. Default to build/libAttentionPlugin.so");
-        pluginPath = "build/libAttentionPlugin.so";
-    }
-
-    void* handle = dlopen(pluginPath, RTLD_LAZY);
-
-    GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
+    GenerationConfig generationConfig{args.maxLength, args.maxLength, 1, 0};
 
     if ((args.inputLength < 1) || (args.maxLength < 1))
     {
@@ -284,6 +271,5 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
     benchmark(args.enginePath, args.inputLength, args.warmUp, args.numRuns, generationConfig);
-    dlclose(handle);
     return EXIT_SUCCESS;
 };

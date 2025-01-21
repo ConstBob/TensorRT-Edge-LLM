@@ -176,7 +176,7 @@ void Qwen2ViTRunner::computeRotaryPosEmb(
     int64_t maxGridSize{0};
     for (auto const& grid : grids)
     {
-        maxGridSize = max(maxGridSize, max(grid[1], grid[2]));
+        maxGridSize = std::max(maxGridSize, std::max(grid[1], grid[2]));
     }
 
     int dim = mConfig.embedDim / mConfig.numHeads / 2;
@@ -337,7 +337,7 @@ void Qwen2ViTRunner::getRopeIdx(std::vector<std::vector<int64_t>> const& batchIn
             }
 
             start = it + 1 + T * H * W;
-            startIdx += max(T, max(H, W)) + textLen;
+            startIdx += std::max(T, std::max(H, W)) + textLen;
         }
 
         // Remaining text part
@@ -433,7 +433,7 @@ std::string Qwen2ViTRunner::applyChatTemplate(std::string const& inputString,
     {
         if (addVisionId)
         {
-            prompt += "Picture " + to_string(i) + ": ";
+            prompt += "Picture " + std::to_string(i) + ": ";
         }
 
         auto grid = visualGridTHWs[totalImageIdx++];

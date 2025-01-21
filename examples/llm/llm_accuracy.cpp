@@ -1,5 +1,6 @@
 
 #include "common/common.h"
+#include "common/trtUtils.h"
 #include "decoder/decoder.h"
 #include "tokenizer/tokenizer.h"
 #include <NvInferRuntime.h>
@@ -16,8 +17,6 @@
 #include <unordered_map>
 #include <vector>
 namespace fs = std::filesystem;
-
-using namespace nvinfer1;
 
 struct LLMAccuracyArgs
 {
@@ -369,19 +368,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    char const* pluginPath = std::getenv("PLUGIN_PATH");
-
-    if (pluginPath != nullptr)
-    {
-        LOG_INFO("PLUGIN_PATH: %s", pluginPath);
-    }
-    else
-    {
-        LOG_INFO("PLUGIN_PATH variable is not set. Default to build/libAttentionPlugin.so");
-        pluginPath = "build/libAttentionPlugin.so";
-    }
-
-    void* handle = dlopen(pluginPath, RTLD_LAZY);
+    auto handle = loadPlugin();
 
     // The generationConfig will change
     GenerationConfig generationConfig{0, 0, 1, 0};
@@ -389,8 +376,5 @@ int main(int argc, char* argv[])
     auto tokenizer = new Tokenizer();
     tokenizer->loadFromHF(args.tokenizerPath);
     mmluAccuracy(args.enginePath, args.datasetPath, tokenizer, generationConfig, args.debug);
-
-    dlclose(handle);
-
     return EXIT_SUCCESS;
 };

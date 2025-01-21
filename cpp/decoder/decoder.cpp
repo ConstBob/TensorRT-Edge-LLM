@@ -1,5 +1,4 @@
 #include "decoder.h"
-#include "common/common.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
 #include <cassert>
@@ -9,11 +8,9 @@
 #include <memory>
 #include <sstream>
 #include <utility>
-using namespace nvinfer1;
-using namespace std;
 
 template <typename T>
-bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream)
+bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, int64_t batchSize)
 {
     try
     {
@@ -26,7 +23,7 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream)
         assert(mEngine->getNbOptimizationProfiles() == 2 && "The engine requires 2 optimization profiles");
         mContextExecutionContext->setOptimizationProfileAsync(0, mStream);
         mGenerationExecutionContext->setOptimizationProfileAsync(1, mStream);
-        validateAndFillConfig();
+        validateAndFillConfig(batchSize);
         allocateBuffer();
         isSetup = true;
     }
@@ -40,7 +37,7 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream)
 }
 
 // Helper function to check 2 dims are equal.
-bool checkDimsEqual(Dims& A, Dims& B)
+bool checkDimsEqual(nvinfer1::Dims& A, nvinfer1::Dims& B)
 {
     if (A.nbDims != B.nbDims)
     {
@@ -62,9 +59,9 @@ bool Decoder<T>::checkStaticShape(std::string& name)
 {
     for (int32_t i = 0; i < mEngine->getNbOptimizationProfiles(); ++i)
     {
-        Dims minShape = mEngine->getProfileShape(name.c_str(), i, OptProfileSelector::kMIN);
-        Dims optShape = mEngine->getProfileShape(name.c_str(), i, OptProfileSelector::kOPT);
-        Dims maxShape = mEngine->getProfileShape(name.c_str(), i, OptProfileSelector::kMAX);
+        nvinfer1::Dims minShape = mEngine->getProfileShape(name.c_str(), i, nvinfer1::OptProfileSelector::kMIN);
+        nvinfer1::Dims optShape = mEngine->getProfileShape(name.c_str(), i, nvinfer1::OptProfileSelector::kOPT);
+        nvinfer1::Dims maxShape = mEngine->getProfileShape(name.c_str(), i, nvinfer1::OptProfileSelector::kMAX);
         if (!checkDimsEqual(minShape, optShape))
         {
             return false;
@@ -78,9 +75,8 @@ bool Decoder<T>::checkStaticShape(std::string& name)
 }
 
 template <typename T>
-bool Decoder<T>::validateAndFillConfig()
+bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
 {
-    int64_t batchSize;
     int64_t numHead;
     int64_t hiddenSizePerHead;
     int64_t maxInputLength;
@@ -97,24 +93,37 @@ bool Decoder<T>::validateAndFillConfig()
     }
     numLayers = numLayers / 2;
     std::string inputIdsName = "input_ids";
-    check(checkStaticShape(inputIdsName), fmtstr("%s should be static", inputIdsName.c_str()));
-    Dims inputIdsShapeContext = mEngine->getProfileShape(inputIdsName.c_str(), 0, OptProfileSelector::kMIN);
-    batchSize = inputIdsShapeContext.d[0];
+    nvinfer1::Dims inputIdsShapeContext
+        = mEngine->getProfileShape(inputIdsName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+    nvinfer1::Dims inputIdsShapeContextMin
+        = mEngine->getProfileShape(inputIdsName.c_str(), 0, nvinfer1::OptProfileSelector::kMIN);
+    int64_t minBatchSize = inputIdsShapeContextMin.d[0];
+    int64_t maxBatchSize = inputIdsShapeContext.d[0];
+    // If min = max, this is a static shape engine.
+    if (minBatchSize == maxBatchSize)
+    {
+        batchSize = minBatchSize;
+    }
+    else
+    {
+        // This is a dynamic batch engine, but we need to check if the provided batchSize is between min and max
+        assert(batchSize >= minBatchSize && batchSize <= maxBatchSize);
+    }
     maxInputLength = inputIdsShapeContext.d[1];
-    Dims inputIdsShapeGeneration = mEngine->getProfileShape(inputIdsName.c_str(), 1, OptProfileSelector::kMIN);
-    assert(inputIdsShapeGeneration.d[0] == batchSize && inputIdsShapeGeneration.d[1] == 1);
+    nvinfer1::Dims inputIdsShapeGeneration
+        = mEngine->getProfileShape(inputIdsName.c_str(), 1, nvinfer1::OptProfileSelector::kMAX);
+    assert(inputIdsShapeGeneration.d[1] == 1);
 
     for (int32_t i = 0; i < numLayers; ++i)
     {
         std::string kvName = fmtstr("past_key_values.%d", i);
-        check(checkStaticShape(kvName), fmtstr("%s should be static", kvName.c_str()));
-        Dims kvShapeContext = mEngine->getProfileShape(kvName.c_str(), 0, OptProfileSelector::kMIN);
-        Dims kvShapeGeneration = mEngine->getProfileShape(kvName.c_str(), 1, OptProfileSelector::kMIN);
+        nvinfer1::Dims kvShapeContext = mEngine->getProfileShape(kvName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+        nvinfer1::Dims kvShapeGeneration
+            = mEngine->getProfileShape(kvName.c_str(), 1, nvinfer1::OptProfileSelector::kMAX);
         assert(
             kvShapeContext.nbDims == 5 && kvShapeGeneration.nbDims == 5 && "KV Cache should have [b, 2, h, s, d_kv]");
         if (i == 0)
         {
-            assert(kvShapeContext.d[0] == batchSize);
             assert(kvShapeContext.d[1] == 2);
             numHead = kvShapeContext.d[2];
             assert(kvShapeContext.d[3] == 0);
@@ -123,16 +132,14 @@ bool Decoder<T>::validateAndFillConfig()
         }
         else
         {
-            assert((kvShapeContext.d[0] == batchSize) && (kvShapeContext.d[1] == 2) && (kvShapeContext.d[2] == numHead)
-                && (kvShapeContext.d[3] == 0) && (kvShapeContext.d[4] == hiddenSizePerHead));
+            assert((kvShapeContext.d[1] == 2) && (kvShapeContext.d[2] == numHead) && (kvShapeContext.d[3] == 0)
+                && (kvShapeContext.d[4] == hiddenSizePerHead));
         }
-        assert((kvShapeGeneration.d[0] == batchSize) && (kvShapeGeneration.d[1] == 2)
-            && (kvShapeGeneration.d[2] == numHead) && (kvShapeGeneration.d[3] == (maxLength))
-            && (kvShapeGeneration.d[4] == hiddenSizePerHead));
+        assert((kvShapeGeneration.d[1] == 2) && (kvShapeGeneration.d[2] == numHead)
+            && (kvShapeGeneration.d[3] == (maxLength)) && (kvShapeGeneration.d[4] == hiddenSizePerHead));
     }
 
-    char const* logitsName = "logits";
-    Dims logitsShape = mEngine->getTensorShape("logits");
+    nvinfer1::Dims logitsShape = mEngine->getTensorShape("logits");
     // Needs the vocab size
     int64_t vocabSize = logitsShape.d[1];
 
@@ -149,12 +156,16 @@ void Decoder<T>::allocateBuffer()
     void* contextLengthDevice;
     CUDA_CHECK(cudaMalloc(&contextLengthDevice, mConfig.batchSize * sizeof(int32_t)));
     mContextExecutionContext->setTensorAddress("context_lengths", contextLengthDevice);
+    mContextExecutionContext->setInputShape("context_lengths", {1, {mConfig.batchSize}});
     mGenerationExecutionContext->setTensorAddress("context_lengths", contextLengthDevice);
+    mGenerationExecutionContext->setInputShape("context_lengths", {1, {mConfig.batchSize}});
     mDeviceBuffer["context_lengths"] = contextLengthDevice;
     void* lastTokenIdsDevice;
     CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * 1 * sizeof(int64_t)));
     mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+    mContextExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
     mGenerationExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+    mGenerationExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
     mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
     mHostBuffer["last_token_ids"] = malloc(mConfig.batchSize * sizeof(int64_t));
     void* inputIdsDevice;
@@ -226,7 +237,7 @@ std::string formatFloat16Vector(std::vector<half> const& vec, int64_t batchSize)
                 oss << ",";
             }
         }
-        oss << "]" << endl;
+        oss << "]" << std::endl;
     }
     return oss.str();
 }
@@ -235,7 +246,7 @@ std::string formatFloat16Vector(std::vector<half> const& vec, int64_t batchSize)
 template <typename T>
 std::string Decoder<T>::printKVCache(int64_t contextLength)
 {
-    ostringstream oss;
+    std::ostringstream oss;
     size_t totalKVSize = mConfig.batchSize * 2 * mConfig.hiddenSizePerHead * mConfig.numHead * contextLength;
     std::vector<T> kvCache(totalKVSize, 0.0);
     oss << "Context Length is: " << contextLength << std::endl;
