@@ -51,17 +51,20 @@ inline size_t monitorHostMemory(std::atomic_bool& done)
             {
                 if (line.find("MemAvailable:") == 0)
                 {
-                    availableMemory = strtoul(line.c_str() + 13, nullptr, 10);
-
-                    if (totalMemory - availableMemory > peakMem)
+                    if (totalMemory == 0)
                     {
-                        peakMem = totalMemory - availableMemory;
+                        totalMemory = strtoul(line.c_str() + 13, nullptr, 10);
+                    }
+                    else
+                    {
+                        availableMemory = strtoul(line.c_str() + 13, nullptr, 10);
+
+                        if (totalMemory - availableMemory > peakMem)
+                        {
+                            peakMem = totalMemory - availableMemory;
+                        }
                     }
                     break;
-                }
-                else if (totalMemory == 0 && line.find("MemTotal:") == 0)
-                {
-                    totalMemory = strtoul(line.c_str() + 9, nullptr, 10);
                 }
             }
             meminfo.close();
