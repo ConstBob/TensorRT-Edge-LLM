@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -19,7 +19,7 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 project(
   driveos_llm_sdk
-  VERSION 7.0.1.0
+  VERSION 7.0.2.0
   LANGUAGES CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -39,20 +39,30 @@ macro(set_ifndef var val)
 endmacro()
 
 # CUDA flags and dependencies.
-if(NOT DEFINED AARCH64_CROSS_BUILD)
+if(NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
 endif()
-set_ifndef(CUDA_VERSION 12.6)
+
+set_ifndef(CUDA_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_VERSION})
 
 find_path(
-  CUDA_INCLUDE_DIR cuda_runtime_api.h
+  CUDA_RUNTIME_API_INCLUDE_DIR cuda_runtime_api.h
   HINTS ${CUDA_DIR}
   PATH_SUFFIXES include)
+
 find_library(
   CUDART_LIB cudart
-  HINTS ${CUDA_DIR}
+  HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
   PATH_SUFFIXES lib lib64)
+
+find_path(
+  CURAND_KERNEL_INCLUDE_DIR
+  NAMES curand_kernel.h
+  HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
+  PATH_SUFFIXES include)
+
+set(CUDA_INCLUDE_DIR ${CUDA_RUNTIME_API_INCLUDE_DIR} ${CURAND_KERNEL_INCLUDE_DIR})
 
 set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
 
@@ -101,3 +111,4 @@ add_subdirectory(cpp)
 
 # Build C++ examples to showcase the usage
 add_subdirectory(examples)
+

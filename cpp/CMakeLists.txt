@@ -38,7 +38,7 @@ set_target_properties(AttentionPlugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAK
 target_include_directories(AttentionPlugin PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(AttentionPlugin commonLibraryExt cuda)
 # avoid linker error from aarch64 cross build
-if (DEFINED AARCH64_CROSS_BUILD)
+if (DEFINED AARCH64_BUILD)
   target_link_options(AttentionPlugin PRIVATE "-L${CUDA_DIR}/lib")
   target_link_options(AttentionPlugin PRIVATE "-L${CUDA_DIR}/lib/stubs")
 endif()

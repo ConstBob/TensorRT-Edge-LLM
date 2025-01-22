@@ -1,4 +1,20 @@
-# aarch64_toolchain.cmake
+#
+# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
 
@@ -15,6 +31,9 @@ find_program(CMAKE_CXX_COMPILER
     NO_DEFAULT_PATH
 )
 
+set(CMAKE_C_COMPILER /usr/bin/aarch64-linux-gnu-gcc)
+set(CMAKE_CXX_COMPILER /usr/bin/aarch64-linux-gnu-g++)
+
 set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
 
@@ -23,6 +42,7 @@ set(CUDA_VERSION 12.8)
 set(CUDA_DIR
     /usr/local/cuda/targets/aarch64-linux
     CACHE STRING "CUDA ROOT dir")
+
 set(CUDA_TARGET_DIR /usr/local/cuda/${AUTO_TARGET}/targets/aarch64-linux)
 
 # Use host nvcc
@@ -50,4 +70,3 @@ set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 
 # Set variable to indicate CMake is running aarch64 build
 set(AARCH64_BUILD TRUE)
-
