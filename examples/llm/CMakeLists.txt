@@ -20,7 +20,7 @@ target_include_directories(llm_accuracy PRIVATE ${COMMON_INCLUDE_DIRS})
 
 # Resolve linker error for AArch64 cross build. cudadevrt and cudart_static are
 # introduced into the linking of executables
-if(DEFINED AARCH64_CROSS_BUILD)
+if(DEFINED AARCH64_BUILD)
   target_link_options(llm_chat PRIVATE "-L${CUDA_DIR}/lib")
   target_link_options(llm_benchmark PRIVATE "-L${CUDA_DIR}/lib")
   target_link_options(llm_accuracy PRIVATE "-L${CUDA_DIR}/lib")

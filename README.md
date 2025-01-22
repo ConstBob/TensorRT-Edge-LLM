@@ -55,7 +55,14 @@ cd drive-llm
 git submodule update --init --recursive
 mkdir build
 cd build
-cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_cross_toolchain.cmake
+cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_cross_toolchain.cmake -DAUTO_TARGET=thor
+make
+```
+
+Built in Linux aarch64 with native build
+```
+cd build
+cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_native_toolchain.cmake -DAUTO_TARGET=thor
 make
 ```
 

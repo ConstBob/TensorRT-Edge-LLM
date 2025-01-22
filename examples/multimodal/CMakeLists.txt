@@ -11,6 +11,6 @@ add_executable(vlm_chat vlm_chat.cpp ${QWEN2VL_CPP_SRCS})
 target_link_libraries(vlm_chat PRIVATE llmSdkCore tokenizer commonLibraryExt)
 target_include_directories(vlm_chat PRIVATE ${COMMON_INCLUDE_DIRS}
                                             ../../dependencies/stb)
-if(DEFINED AARCH64_CROSS_BUILD)
+if(DEFINED AARCH64_BUILD)
   target_link_options(vlm_chat PRIVATE "-L${CUDA_DIR}/lib")
 endif()
