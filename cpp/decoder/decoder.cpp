@@ -16,8 +16,8 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, in
     {
         mStream = stream;
         mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-        StreamReader* _sr = new StreamReader(fp);
-        mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(*_sr));
+        StreamReader _sr(fp);
+        mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
         mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
         mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
         assert(mEngine->getNbOptimizationProfiles() == 2 && "The engine requires 2 optimization profiles");
@@ -144,7 +144,7 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
     int64_t vocabSize = logitsShape.d[1];
 
     mConfig = {batchSize, numHead, hiddenSizePerHead, maxInputLength, maxLength, numLayers, vocabSize};
-    mSampler = new Sampler<T>(batchSize, vocabSize);
+    mSampler = std::make_unique<Sampler<T>>(batchSize, vocabSize);
 
     return 0;
 }

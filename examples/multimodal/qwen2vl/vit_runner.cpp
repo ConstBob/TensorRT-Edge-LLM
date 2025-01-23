@@ -14,8 +14,8 @@ bool Qwen2ViTRunner::setup(std::filesystem::path const& fp, cudaStream_t& stream
     {
         mStream = stream;
         mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-        StreamReader* _sr = new StreamReader(fp);
-        mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(*_sr));
+        StreamReader _sr(fp);
+        mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
         mContext = std::unique_ptr<nvinfer1::IExecutionContext>(mVisualEngine->createExecutionContext());
         mContext->setOptimizationProfileAsync(0, mStream);
         mBatchSize = batchSize;
@@ -461,8 +461,8 @@ std::string Qwen2ViTRunner::applyChatTemplate(std::string const& inputString,
 
 void Qwen2ViTRunner::textPreprocess(std::vector<std::string> const& inputStrings,
     std::vector<std::vector<std::string>> const& imagePaths, std::vector<std::vector<int64_t>> const& visualGridTHWs,
-    Tokenizer* tokenizer, std::vector<int64_t>& inputIds, std::vector<int32_t>& contextLengths, int maxContextLength,
-    int vocabSize)
+    std::unique_ptr<Tokenizer>& tokenizer, std::vector<int64_t>& inputIds, std::vector<int32_t>& contextLengths,
+    int maxContextLength, int vocabSize)
 {
     std::vector<std::vector<int64_t>> batchInputIds;
     int totalImageIdx = 0;

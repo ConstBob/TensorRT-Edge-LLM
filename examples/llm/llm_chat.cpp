@@ -108,9 +108,9 @@ int main(int argc, char* argv[])
 
     auto handle = loadPlugin();
 
-    Tokenizer* tokenizer = new Tokenizer();
+    auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
-    auto decoder = new Decoder<half>();
+    auto decoder = std::make_unique<Decoder<half>>();
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     decoder->setup(args.enginePath, stream);

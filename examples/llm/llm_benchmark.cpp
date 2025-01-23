@@ -109,7 +109,7 @@ void benchmark(std::string& enginePath, int const inputLength, int64_t warmUp, i
     profiler->startTiming();
     profiler->recordDeviceMemStart();
     profiler->recordHostMemStart();
-    auto decoder = new Decoder<half>();
+    auto decoder = std::make_unique<Decoder<half>>();
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     profiler->recordHostStart("decoder setup");

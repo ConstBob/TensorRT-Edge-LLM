@@ -202,7 +202,7 @@ std::string normalizeRegex(std::string const& expr)
 {
     std::string normalizedExpr;
 
-    for (int i = 0; i < expr.size();)
+    for (size_t i = 0; i < expr.size();)
     {
         // case 1: (?i) case-insensitive modifier
         // e.g. (?i:'s|'t|'re|'ve|'m|'ll|'d) => (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])

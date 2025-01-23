@@ -207,7 +207,7 @@ std::vector<TestData> parseCSVFile(fs::path const& csvPath, int maxRecordNum = -
     return res;
 }
 
-void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Tokenizer* tokenizer,
+void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, std::unique_ptr<Tokenizer>& tokenizer,
     GenerationConfig generationConfig, bool debug)
 {
     std::unordered_map<std::string, std::vector<TestData>> testSubject2Data, devSubject2Data;
@@ -256,7 +256,7 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
         return;
     }
 
-    auto decoder = new Decoder<half>();
+    auto decoder = std::make_unique<Decoder<half>>();
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     decoder->setup(enginePath, stream);
@@ -373,7 +373,7 @@ int main(int argc, char* argv[])
     // The generationConfig will change
     GenerationConfig generationConfig{0, 0, 1, 0};
 
-    auto tokenizer = new Tokenizer();
+    auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
     mmluAccuracy(args.enginePath, args.datasetPath, tokenizer, generationConfig, args.debug);
     return EXIT_SUCCESS;
