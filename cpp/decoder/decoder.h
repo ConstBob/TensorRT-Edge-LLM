@@ -87,7 +87,7 @@ private:
     bool validateAndFillConfig(int64_t batchSize = 1);
     bool checkStaticShape(std::string& name);
     void allocateBuffer();
-    Sampler<half>* mSampler;
+    std::unique_ptr<Sampler<T>> mSampler;
     // These are used as debugging functions
     std::string printKVCache(int64_t contextLength);
     std::string printLogits();

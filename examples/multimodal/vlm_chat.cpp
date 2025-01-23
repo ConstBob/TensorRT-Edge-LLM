@@ -213,7 +213,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 
 std::vector<std::string> decode(std::filesystem::path const& lmEnginePath,
     std::filesystem::path const& visualEnginePath, std::vector<std::string>& inputStrings,
-    std::vector<std::vector<std::string>> const& imagePaths, Tokenizer* tokenizer,
+    std::vector<std::vector<std::string>> const& imagePaths, std::unique_ptr<Tokenizer>& tokenizer,
     GenerationConfig const& generationConfig, bool debug = false, std::string modelType = "qwen2_vl")
 {
     // Set default input string if not given
@@ -222,7 +222,7 @@ std::vector<std::string> decode(std::filesystem::path const& lmEnginePath,
         inputStrings.emplace_back("Describe this image.");
     }
     int32_t batchSize = imagePaths.size();
-    auto decoder = new Decoder<half>();
+    auto decoder = std::make_unique<Decoder<half>>();
 
     std::vector<std::vector<int64_t>> outputIds(batchSize);
     for (int i = 0; i < batchSize; ++i)
@@ -231,7 +231,7 @@ std::vector<std::string> decode(std::filesystem::path const& lmEnginePath,
     }
     if (modelType == "qwen2_vl")
     {
-        auto vitrunner = new Qwen2ViTRunner();
+        auto vitrunner = std::make_unique<Qwen2ViTRunner>();
         cudaStream_t stream;
         CUDA_CHECK(cudaStreamCreate(&stream));
         vitrunner->setup(visualEnginePath, stream, batchSize);
@@ -303,7 +303,7 @@ int main(int argc, char* argv[])
     }
 
     GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
-    Tokenizer* tokenizer = new Tokenizer();
+    auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
     auto output = decode(args.lmEnginePath, args.visualEnginePath, args.inputStrings, args.imagePaths, tokenizer,
         generationConfig, args.debug, args.modelType);

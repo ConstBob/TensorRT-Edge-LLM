@@ -253,7 +253,7 @@ class FMHAKernelLoader
 {
 
 public:
-    FMHAKernelList const* getFMHAKernelList(Data_type type, int32_t sm)
+    std::unique_ptr<FMHAKernelList> const& getFMHAKernelList(Data_type type, int32_t sm)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
@@ -263,12 +263,12 @@ public:
         auto const findIter = mKernels.find(hash_key);
         if (findIter == mKernels.end())
         {
-            FMHAKernelList* newKernel = new FMHAKernelList{type, sm};
+            std::unique_ptr<FMHAKernelList> newKernel = std::make_unique<FMHAKernelList>(type, sm);
             newKernel->loadFMHAKernels();
-            mKernels.insert(std::make_pair(hash_key, std::unique_ptr<FMHAKernelList>(newKernel)));
+            mKernels.insert(std::make_pair(hash_key, std::move(newKernel)));
             return newKernel;
         }
-        return findIter->second.get();
+        return findIter->second;
     }
 
     static FMHAKernelLoader& Get()
@@ -288,7 +288,7 @@ private:
     std::unordered_map<FMHAKernelLoadHashKey, const std::unique_ptr<FMHAKernelList>, FMHAKernelLoadHasher> mKernels;
 };
 
-inline FMHAKernelList const* getFMHAKernels(Data_type type, int32_t sm)
+inline std::unique_ptr<FMHAKernelList> const& getFMHAKernels(Data_type type, int32_t sm)
 {
     return FMHAKernelLoader::Get().getFMHAKernelList(type, sm);
 }
@@ -377,7 +377,7 @@ bool ContextFMHARunner::canImplement(int32_t headSize, int32_t sm, nvinfer1::Dat
 
 bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::DataType dataType)
 {
-    FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), smVersion);
+    std::unique_ptr<FMHAKernelList> const& fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), smVersion);
     return fmhaKernelList != nullptr;
 }
 
@@ -388,7 +388,7 @@ void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2& 
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
         attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.granular_tiling};
-    FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
+    std::unique_ptr<FMHAKernelList> const& fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
     FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
     check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
 

@@ -45,8 +45,9 @@ public:
 
     void textPreprocess(std::vector<std::string> const& inputStrings,
         std::vector<std::vector<std::string>> const& imagePaths,
-        std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
-        std::vector<int32_t>& contextLengths, int maxContextLength, int vocabSize = 152064);
+        std::vector<std::vector<int64_t>> const& visualGridTHWs, std::unique_ptr<Tokenizer>& tokenizer,
+        std::vector<int64_t>& inputIds, std::vector<int32_t>& contextLengths, int maxContextLength,
+        int vocabSize = 152064);
 
     void visualInfer(
         std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb);

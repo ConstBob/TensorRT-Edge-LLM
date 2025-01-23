@@ -5,7 +5,7 @@
 
 int main()
 {
-    Tokenizer* tokenizer = new Tokenizer();
+    auto tokenizer = std::make_unique<Tokenizer>();
 
     tokenizer->loadFromHF("./Meta-Llama-3-8B-Instruct");
 
