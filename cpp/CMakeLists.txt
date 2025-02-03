@@ -43,6 +43,21 @@ if (DEFINED AARCH64_BUILD)
   target_link_options(AttentionPlugin PRIVATE "-L${CUDA_DIR}/lib/stubs")
 endif()
 
+# Generate optional int4GroupwiseGemm plugin shared library
+file(GLOB_RECURSE INT4_GEMM_PLUGIN_CPP_SRCS "int4GroupwiseGemmPlugin/*.cpp")
+file(GLOB_RECURSE INT4_GEMM_PLUGIN_CU_SRCS "int4GroupwiseGemmPlugin/*.cu")
+
+add_library(Int4GemmPlugin SHARED ${INT4_GEMM_PLUGIN_CPP_SRCS} ${INT4_GEMM_PLUGIN_CU_SRCS})
+set_target_properties(Int4GemmPlugin PROPERTIES VERSION 1.0 SOVERSION 1)
+set_target_properties(Int4GemmPlugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_include_directories(Int4GemmPlugin PRIVATE ${COMMON_INCLUDE_DIRS})
+target_link_libraries(Int4GemmPlugin commonLibraryExt cuda)
+# avoid linker error from aarch64 cross build
+if (DEFINED AARCH64_CROSS_BUILD)
+  target_link_options(Int4GemmPlugin PRIVATE "-L${CUDA_DIR}/lib")
+  target_link_options(Int4GemmPlugin PRIVATE "-L${CUDA_DIR}/lib/stubs")
+endif()
+
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
