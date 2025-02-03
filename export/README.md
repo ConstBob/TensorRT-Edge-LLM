@@ -13,29 +13,38 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 1. Download HF checkpoint from transformers and save it locally
 1. `cd export`
 1. `pip3 install -r requirements.txt`
-1. Call export script
+1. Call export script. If you are working with multimodal model, use `multimodal_export.py`
 ```
-python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4] --output_dir $ONNX_DIR
+python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4] --output_dir $ONNX_DIR
+python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4] --output_dir $ONNX_DIR
+
 ```
 
 The ONNX with desired data type will be exported in `$ONNX_DIR`.
 
 **Notes:**
-1. Even though FP8 is supported for ONNX export, Orin does not support FP8. Thor FP8 is also not ready for DriveOS 7.0.1 release with TensorRT 10.4, but we are actively working on it.
-1. Pass in `--keep_original` to save the original exported ONNX in `$ONNX_DIR_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 this will be FP8 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
+1. Even though FP8 or NVFP4 is supported for ONNX export, Orin does not support FP8 or NVFP4.
+1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 this will be FP8 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
 
 ## Supported models and precisions
 
-The export script can export the following PyTorch models into ONNX.
+The `llm_export.py` script can export the following LLM models into ONNX. There is a potential that other LLMs can be supported.
 
-Model | FP16 | INT4 | FP8
+Model | FP16 | INT4 | FP8 | NVFP4
 --- | --- | --- | ---
-[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes
-[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes
-[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes
-[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes
-[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes
+[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes
+[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes
+[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes
+[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes | Yes
+[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes | Yes
+
+The `multimodal_export.py` script can export the following multimodal models into ONNX. Currently it only supports Qwen2-VL.
+
+Model | FP16 | INT4 | FP8 | NVFP4
+--- | --- | --- | ---
+[Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes
+[Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes
 
 ## Limitations
 

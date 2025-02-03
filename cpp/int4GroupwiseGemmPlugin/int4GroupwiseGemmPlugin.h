@@ -30,7 +30,7 @@ public:
     Int4GroupwsieGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize);
 
     Int4GroupwsieGemmPlugin(std::string const& name, void const* data, size_t length);
-    
+
     // Force to distinguish different instances of the plugin.
     Int4GroupwsieGemmPlugin() = delete;
 
@@ -49,12 +49,12 @@ public:
     nvinfer1::DimsExprs getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
         nvinfer1::IExprBuilder& exprBuilder) noexcept override;
 
-    bool supportsFormatCombination(int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs,
-        int32_t nbOutputs) noexcept override;
-    
+    bool supportsFormatCombination(
+        int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept override;
+
     void configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
         nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
-    
+
     size_t getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int32_t nbInputs,
         nvinfer1::PluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
 
@@ -76,11 +76,10 @@ public:
 protected:
     std::string mLayerName;
     std::string mNamespace;
-    
-    int32_t mGemmN;
-    int32_t mGemmK;
-    int32_t mGroupSize;
-    int32_t mSMVersion;
+
+    int32_t mGemmN{};
+    int32_t mGemmK{};
+    int32_t mGroupSize{};
 };
 
 class Int4GroupwsieGemmPluginCreator : public nvinfer1::IPluginCreator
@@ -100,9 +99,8 @@ public:
 
     char const* getPluginVersion() const noexcept override;
 
-    nvinfer1::IPluginV2* createPlugin(
-        char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
-    
+    nvinfer1::IPluginV2* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
+
     nvinfer1::IPluginV2* deserializePlugin(
         char const* name, void const* serialData, size_t serialLength) noexcept override;
 

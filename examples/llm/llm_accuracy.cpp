@@ -207,7 +207,7 @@ std::vector<TestData> parseCSVFile(fs::path const& csvPath, int maxRecordNum = -
     return res;
 }
 
-void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, std::unique_ptr<Tokenizer>& tokenizer,
+void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Tokenizer* tokenizer,
     GenerationConfig generationConfig, bool debug)
 {
     std::unordered_map<std::string, std::vector<TestData>> testSubject2Data, devSubject2Data;
@@ -375,6 +375,6 @@ int main(int argc, char* argv[])
 
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
-    mmluAccuracy(args.enginePath, args.datasetPath, tokenizer, generationConfig, args.debug);
+    mmluAccuracy(args.enginePath, args.datasetPath, tokenizer.get(), generationConfig, args.debug);
     return EXIT_SUCCESS;
 };

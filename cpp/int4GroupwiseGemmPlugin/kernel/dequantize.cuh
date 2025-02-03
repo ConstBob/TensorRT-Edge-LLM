@@ -1,14 +1,14 @@
 #pragma once
 
-#include <stdint.h>
 #include <cuda_fp16.h>
+#include <stdint.h>
 
-__inline__ __device__ void dequantize_s4_to_fp16x2(half2 const &source, uint4 *result)
+__inline__ __device__ void dequantize_s4_to_fp16x2(half2 const& source, uint4* result)
 {
     // uint4 result;
 
-    uint32_t *h = reinterpret_cast<uint32_t *>(result);
-    uint32_t const i4s = reinterpret_cast<uint32_t const &>(source);
+    uint32_t* h = reinterpret_cast<uint32_t*>(result);
+    uint32_t const i4s = reinterpret_cast<uint32_t const&>(source);
 
     // First, we extract the i4s and construct an intermediate fp16 number.
     static constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;

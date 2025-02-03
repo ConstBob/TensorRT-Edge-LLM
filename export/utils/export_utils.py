@@ -28,17 +28,17 @@ class WrapperModelForCausalLM(torch.nn.Module):
 def torch_to_onnx(model, inputs, onnx_dir, onnx_name, input_names,
                   output_names, dynamic_axes):
     os.makedirs(onnx_dir, exist_ok=True)
-
-    torch.onnx.export(
-        model,
-        inputs,
-        f'{onnx_dir}/{onnx_name}',
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        opset_version=19,
-        do_constant_folding=True,
-    )
+    with torch.inference_mode():
+        torch.onnx.export(
+            model,
+            inputs,
+            f'{onnx_dir}/{onnx_name}',
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=19,
+            do_constant_folding=True,
+        )
 
 
 def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):

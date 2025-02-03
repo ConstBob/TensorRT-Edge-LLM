@@ -28,27 +28,27 @@
 using namespace nvinfer1;
 using namespace drivellm;
 
-using Data_type = xqa::kernels::Data_type;
+using XQADataType = xqa::kernels::Data_type;
 
 namespace
 {
 
-Data_type trtToXqaDataType(nvinfer1::DataType type)
+XQADataType trtToXqaDataType(nvinfer1::DataType type)
 {
-    Data_type xqaType{Data_type::DATA_TYPE_FP16};
+    XQADataType xqaType{XQADataType::DATA_TYPE_FP16};
     switch (type)
     {
-    case nvinfer1::DataType::kFLOAT: xqaType = Data_type::DATA_TYPE_FP32; break;
-    case nvinfer1::DataType::kHALF: xqaType = Data_type::DATA_TYPE_FP16; break;
-    case nvinfer1::DataType::kBF16: xqaType = Data_type::DATA_TYPE_BF16; break;
-    case nvinfer1::DataType::kFP8: xqaType = Data_type::DATA_TYPE_E4M3; break;
+    case nvinfer1::DataType::kFLOAT: xqaType = XQADataType::DATA_TYPE_FP32; break;
+    case nvinfer1::DataType::kHALF: xqaType = XQADataType::DATA_TYPE_FP16; break;
+    case nvinfer1::DataType::kBF16: xqaType = XQADataType::DATA_TYPE_BF16; break;
+    case nvinfer1::DataType::kFP8: xqaType = XQADataType::DATA_TYPE_E4M3; break;
     default: throw std::runtime_error("Unsupported datatype for XQA.");
     }
     return xqaType;
 }
 struct XQAKernelLoadHashKey
 {
-    Data_type data_type;
+    XQADataType data_type;
     int32_t sm;
 
     bool operator==(XQAKernelLoadHashKey const& other) const
@@ -70,7 +70,7 @@ struct XQAKernelLoadHasher
 
 struct XQAKernelRuntimeHashKey
 {
-    Data_type kv_data_type;
+    XQADataType kv_data_type;
     int32_t head_size;
     int32_t num_q_heads_per_kv;
     int32_t beam_size;
@@ -115,7 +115,7 @@ class XQAKernelList
     using TKernelMetaInfo = xqa::kernels::XQAKernelMetaInfo;
 
 public:
-    XQAKernelList(Data_type type, int32_t sm)
+    XQAKernelList(XQADataType type, int32_t sm)
         : mDataType(type)
         , mSMVersion(sm)
     {
@@ -192,7 +192,7 @@ protected:
     TKernelMetaInfo const* mKernelMeta;
     int32_t mKernelMetaCount;
     int32_t mSMVersion;
-    Data_type mDataType;
+    XQADataType mDataType;
     std::unordered_map<unsigned long long const*, CUmodule> mModules;
 
     std::unordered_map<XQAKernelRuntimeHashKey, XQAKernelFuncInfo, XQAKernelRuntimeHasher> mFunctions;
@@ -202,22 +202,22 @@ class XQAKernelLoader
 {
 
 public:
-    std::unique_ptr<XQAKernelList> const& getXQAKernelList(Data_type type, int32_t sm)
+    XQAKernelList* getXQAKernelList(XQADataType type, int32_t sm)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
         XQAKernelLoadHashKey hash_key{type, sm};
 
-        auto const findIter = mKernels.find(hash_key);
+        auto findIter = mKernels.find(hash_key);
         if (findIter == mKernels.end())
         {
             std::unique_ptr<XQAKernelList> newKernel = std::make_unique<XQAKernelList>(type, sm);
             newKernel->loadXQAKernels();
             mKernels.insert(std::make_pair(hash_key, std::move(newKernel)));
-            return newKernel;
+            findIter = mKernels.find(hash_key);
         }
-        return findIter->second;
+        return findIter->second.get();
     }
 
     static XQAKernelLoader& Get()
@@ -237,7 +237,7 @@ private:
     std::unordered_map<XQAKernelLoadHashKey, const std::unique_ptr<XQAKernelList>, XQAKernelLoadHasher> mKernels;
 };
 
-inline std::unique_ptr<XQAKernelList> const& getXQAKernels(Data_type type, int32_t sm)
+inline XQAKernelList* getXQAKernels(XQADataType type, int32_t sm)
 {
     return XQAKernelLoader::Get().getXQAKernelList(type, sm);
 }
@@ -281,7 +281,7 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
 
 bool DecoderXQARunner::loadDecodeXQAKernels(int32_t smVersion, DataType dataType)
 {
-    std::unique_ptr<XQAKernelList> const& xqaKernelList = getXQAKernels(trtToXqaDataType(dataType), smVersion);
+    XQAKernelList* xqaKernelList = getXQAKernels(trtToXqaDataType(dataType), smVersion);
     return xqaKernelList != nullptr;
 }
 
@@ -293,7 +293,7 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
         "Invalid device pointer passed to kernel dispatch function");
 
     auto hashKey = getRuntimeHashKeyFromXQAParams(params);
-    std::unique_ptr<XQAKernelList> const& xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion);
+    XQAKernelList* xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion);
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
     check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the GQA");
 

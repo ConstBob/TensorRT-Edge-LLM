@@ -461,8 +461,8 @@ std::string Qwen2ViTRunner::applyChatTemplate(std::string const& inputString,
 
 void Qwen2ViTRunner::textPreprocess(std::vector<std::string> const& inputStrings,
     std::vector<std::vector<std::string>> const& imagePaths, std::vector<std::vector<int64_t>> const& visualGridTHWs,
-    std::unique_ptr<Tokenizer>& tokenizer, std::vector<int64_t>& inputIds, std::vector<int32_t>& contextLengths,
-    int maxContextLength, int vocabSize)
+    Tokenizer* tokenizer, std::vector<int64_t>& inputIds, std::vector<int32_t>& contextLengths, int maxContextLength,
+    int vocabSize)
 {
     std::vector<std::vector<int64_t>> batchInputIds;
     int totalImageIdx = 0;
