@@ -142,16 +142,17 @@ std::string generateTRTExecCommand(
     int64_t maxLength = args.maxSeqLen;
 
     std::string trtExecCommand = fmtstr(
-        "Equivalent trtexec command: trtexec --onnx=%s --saveEngine=%s --staticPlugins=${PLUGIN_PATH} --stronglyTyped "
+        "Equivalent trtexec command: trtexec --onnx=%s --saveEngine=%s --staticPlugins=${ATTENTION_PLUGIN_PATH} "
+        "--stronglyTyped "
         "--verbose "
-        "--profile 0 "
-        "--minShape=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ld*1,past_key_values.*:%ldx2x%ldx0x%ld "
-        "--optShape=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ld*1,past_key_values.*:%ldx2x%ldx0x%ld "
-        "--maxShape=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ld*1,past_key_values.*:%ldx2x%ldx0x%ld "
-        "--profile 1 "
-        "--minShape=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ld*1,past_key_values.*:%ldx2x%ldx%ldx%ld "
-        "--optShape=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ld*1,past_key_values.*:%ldx2x%ldx%ldx%ld "
-        "--maxShape=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ld*1,past_key_values.*:%ldx2x%ldx%ldx%ld",
+        "--profile=0 "
+        "--minShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld "
+        "--optShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld "
+        "--maxShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld "
+        "--profile=1 "
+        "--minShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx%ldx%ld "
+        "--optShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx%ldx%ld "
+        "--maxShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx%ldx%ld",
         args.onnxPath.c_str(), args.enginePath.c_str(), minBatchSize, minInputLen, minBatchSize, minBatchSize,
         minBatchSize, numKVHeads, hiddenSizePerHead, optBatchSize, optInputLen, optBatchSize, optBatchSize,
         optBatchSize, numKVHeads, hiddenSizePerHead, maxBatchSize, maxInputLen, maxBatchSize, maxBatchSize,

@@ -213,7 +213,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 
 std::vector<std::string> decode(std::filesystem::path const& lmEnginePath,
     std::filesystem::path const& visualEnginePath, std::vector<std::string>& inputStrings,
-    std::vector<std::vector<std::string>> const& imagePaths, std::unique_ptr<Tokenizer>& tokenizer,
+    std::vector<std::vector<std::string>> const& imagePaths, Tokenizer* tokenizer,
     GenerationConfig const& generationConfig, bool debug = false, std::string modelType = "qwen2_vl")
 {
     // Set default input string if not given
@@ -305,7 +305,7 @@ int main(int argc, char* argv[])
     GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
-    auto output = decode(args.lmEnginePath, args.visualEnginePath, args.inputStrings, args.imagePaths, tokenizer,
+    auto output = decode(args.lmEnginePath, args.visualEnginePath, args.inputStrings, args.imagePaths, tokenizer.get(),
         generationConfig, args.debug, args.modelType);
 
     return EXIT_SUCCESS;

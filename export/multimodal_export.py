@@ -245,7 +245,8 @@ def export_qwen2_vl(args):
         args.config_path,
         state_dict,
         rope_type=RopeType.kMROPE,
-        extra_plugin_inputs=[mrope_rotary_cos_sin, mrope_position_deltas])
+        extra_plugin_inputs=[mrope_rotary_cos_sin, mrope_position_deltas],
+        lm_head_precision=args.lm_head)
 
 
 if __name__ == '__main__':

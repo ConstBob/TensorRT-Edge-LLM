@@ -28,7 +28,7 @@
 using namespace nvinfer1;
 using namespace drivellm;
 
-using Data_type = fmha_v2::Data_type;
+using FMHADataType = fmha_v2::Data_type;
 
 namespace
 {
@@ -44,27 +44,27 @@ union __float_uint32_t_union
     uint32_t u32;
 };
 
-static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
+static inline void set_alpha(uint32_t& alpha, float norm, FMHADataType dtype)
 {
-    if (dtype == Data_type::DATA_TYPE_FP16)
+    if (dtype == FMHADataType::DATA_TYPE_FP16)
     {
         // Convert the float value into two fp16 value and pack into the uint32_t buffer.
         __half2_uint32_t_union temp;
         temp.fp162 = __float2half2_rn(norm);
         alpha = temp.u32;
     }
-    else if (dtype == Data_type::DATA_TYPE_FP32)
+    else if (dtype == FMHADataType::DATA_TYPE_FP32)
     {
         __float_uint32_t_union temp;
         temp.fp32 = norm;
         alpha = temp.u32;
     }
-    else if (dtype == Data_type::DATA_TYPE_INT32)
+    else if (dtype == FMHADataType::DATA_TYPE_INT32)
     {
         int32_t inorm = static_cast<int32_t>(norm);
         alpha = reinterpret_cast<uint32_t const&>(inorm);
     }
-    else if (dtype == Data_type::DATA_TYPE_BF16)
+    else if (dtype == FMHADataType::DATA_TYPE_BF16)
     {
         // TODO HACK!! BF16 Outputs are computed in FP32 for FP8.
         // This is because cublas does not allow current FP32 output.
@@ -76,15 +76,15 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
     }
 }
 
-Data_type trtToFMHADataType(nvinfer1::DataType type)
+FMHADataType trtToFMHADataType(nvinfer1::DataType type)
 {
-    Data_type fmhaType{Data_type::DATA_TYPE_FP16};
+    FMHADataType fmhaType{FMHADataType::DATA_TYPE_FP16};
     switch (type)
     {
-    case nvinfer1::DataType::kFLOAT: fmhaType = Data_type::DATA_TYPE_FP32; break;
-    case nvinfer1::DataType::kHALF: fmhaType = Data_type::DATA_TYPE_FP16; break;
-    case nvinfer1::DataType::kBF16: fmhaType = Data_type::DATA_TYPE_BF16; break;
-    case nvinfer1::DataType::kFP8: fmhaType = Data_type::DATA_TYPE_E4M3; break;
+    case nvinfer1::DataType::kFLOAT: fmhaType = FMHADataType::DATA_TYPE_FP32; break;
+    case nvinfer1::DataType::kHALF: fmhaType = FMHADataType::DATA_TYPE_FP16; break;
+    case nvinfer1::DataType::kBF16: fmhaType = FMHADataType::DATA_TYPE_BF16; break;
+    case nvinfer1::DataType::kFP8: fmhaType = FMHADataType::DATA_TYPE_E4M3; break;
     default: throw std::runtime_error("Unsupported datatype for FMHA_v2.");
     }
     return fmhaType;
@@ -104,7 +104,7 @@ int32_t attentionMaskTypeToInt(ContextAttentionMaskType type)
 
 struct FMHAKernelLoadHashKey
 {
-    Data_type data_type;
+    FMHADataType data_type;
     int32_t sm;
 
     bool operator==(FMHAKernelLoadHashKey const& other) const
@@ -126,7 +126,7 @@ struct FMHAKernelLoadHasher
 
 struct FMHAKernelHashKey
 {
-    Data_type data_type;
+    FMHADataType data_type;
     int32_t sequenceLen;
     int32_t headSize;
     bool unroll;
@@ -173,7 +173,7 @@ class FMHAKernelList
     using TKernelMetaInfo = fmha_v2::FusedMultiHeadAttentionKernelMetaInfoV2;
 
 public:
-    FMHAKernelList(Data_type type, int32_t sm)
+    FMHAKernelList(FMHADataType type, int32_t sm)
         : mDataType(type)
         , mSMVersion(sm)
     {
@@ -242,7 +242,7 @@ public:
 protected:
     TKernelMetaInfo const* mKernelMeta;
     int32_t mKernelMetaCount;
-    Data_type mDataType;
+    FMHADataType mDataType;
     int32_t mSMVersion;
     std::unordered_map<unsigned char const*, CUmodule> mModules;
 
@@ -253,22 +253,22 @@ class FMHAKernelLoader
 {
 
 public:
-    std::unique_ptr<FMHAKernelList> const& getFMHAKernelList(Data_type type, int32_t sm)
+    FMHAKernelList* getFMHAKernelList(FMHADataType type, int32_t sm)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
         FMHAKernelLoadHashKey hash_key{type, sm};
 
-        auto const findIter = mKernels.find(hash_key);
+        auto findIter = mKernels.find(hash_key);
         if (findIter == mKernels.end())
         {
             std::unique_ptr<FMHAKernelList> newKernel = std::make_unique<FMHAKernelList>(type, sm);
             newKernel->loadFMHAKernels();
             mKernels.insert(std::make_pair(hash_key, std::move(newKernel)));
-            return newKernel;
+            findIter = mKernels.find(hash_key);
         }
-        return findIter->second;
+        return findIter->second.get();
     }
 
     static FMHAKernelLoader& Get()
@@ -288,7 +288,7 @@ private:
     std::unordered_map<FMHAKernelLoadHashKey, const std::unique_ptr<FMHAKernelList>, FMHAKernelLoadHasher> mKernels;
 };
 
-inline std::unique_ptr<FMHAKernelList> const& getFMHAKernels(Data_type type, int32_t sm)
+inline FMHAKernelList* getFMHAKernels(FMHADataType type, int32_t sm)
 {
     return FMHAKernelLoader::Get().getFMHAKernelList(type, sm);
 }
@@ -351,7 +351,7 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
     float const scale_softmax = 1.f; // Seems to be only required for int8
     float const scale_bmm2 = 1.f;
 
-    Data_type scale_type = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
+    FMHADataType scale_type = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
     set_alpha(params.scale_bmm1, scale_bmm1, scale_type);
     set_alpha(params.scale_softmax, scale_softmax, scale_type);
     set_alpha(params.scale_bmm2, scale_bmm2, scale_type);
@@ -377,7 +377,7 @@ bool ContextFMHARunner::canImplement(int32_t headSize, int32_t sm, nvinfer1::Dat
 
 bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::DataType dataType)
 {
-    std::unique_ptr<FMHAKernelList> const& fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), smVersion);
+    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), smVersion);
     return fmhaKernelList != nullptr;
 }
 
@@ -388,7 +388,7 @@ void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2& 
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
         attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.granular_tiling};
-    std::unique_ptr<FMHAKernelList> const& fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
+    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
     FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
     check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
 

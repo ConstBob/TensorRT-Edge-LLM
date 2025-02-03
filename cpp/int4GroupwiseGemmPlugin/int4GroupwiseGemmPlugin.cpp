@@ -21,8 +21,8 @@
 #include <cassert>
 #include <cstring>
 #include <cuda_fp16.h>
-#include <optional>
 #include <mutex>
+#include <optional>
 
 #include <iostream>
 
@@ -53,7 +53,7 @@ std::optional<T> parsePluginScalarField(std::string const& fieldName, nvinfer1::
 {
     for (int32_t i = 0; i < fc->nbFields; ++i)
     {
-        PluginField const& pluginField = fc->fields[i]; 
+        PluginField const& pluginField = fc->fields[i];
         if (fieldName.compare(pluginField.name) == 0)
         {
             assert(toFieldType<T>() == pluginField.type);
@@ -123,10 +123,7 @@ Int4GroupwsieGemmPlugin::Int4GroupwsieGemmPlugin(std::string const& name, void c
     deserializeValue(&data, &length, &mGroupSize);
 }
 
-
-Int4GroupwsieGemmPlugin::~Int4GroupwsieGemmPlugin()
-{
-}
+Int4GroupwsieGemmPlugin::~Int4GroupwsieGemmPlugin() {}
 
 IPluginV2DynamicExt* Int4GroupwsieGemmPlugin::clone() const noexcept
 {
@@ -228,13 +225,12 @@ DataType Int4GroupwsieGemmPlugin::getOutputDataType(
     return DataType::kHALF;
 }
 
-
 DimsExprs Int4GroupwsieGemmPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
     int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
     DimsExprs output;
-    
+
     output.nbDims = 3;
     output.d[0] = inputs[0].d[0];
     output.d[1] = inputs[0].d[1];
@@ -265,16 +261,16 @@ int32_t Int4GroupwsieGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     int8_t* weightsInPtr = reinterpret_cast<int8_t*>(const_cast<void*>(inputs[1]));
     half* ScaleInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[2]));
     half* gemmOutDevicePtr = reinterpret_cast<half*>(outputs[0]);
-    
+
     if (M <= 6)
     {
-        gemv_forward_cuda_new(gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr,
-            M, mGemmN, mGemmK, mGroupSize, stream);
+        gemv_forward_cuda_new(
+            gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
     }
     else
     {
-        gemm_forward_cuda_new(gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr,
-            M, mGemmN, mGemmK, mGroupSize, stream);
+        gemm_forward_cuda_new(
+            gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
     }
     return 0;
 }
@@ -302,7 +298,6 @@ void Int4GroupwsieGemmPlugin::destroy() noexcept
 {
     delete this;
 }
-
 
 Int4GroupwsieGemmPluginCreator::Int4GroupwsieGemmPluginCreator()
 {
@@ -347,7 +342,7 @@ nvinfer1::IPluginV2* Int4GroupwsieGemmPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
 {
     try
-    {   
+    {
         // Read N, K attributes for the plugin.
         std::optional<int32_t> gemmN = parsePluginScalarField<int32_t>("gemm_n", fc);
         std::optional<int32_t> gemmK = parsePluginScalarField<int32_t>("gemm_k", fc);
@@ -359,11 +354,11 @@ nvinfer1::IPluginV2* Int4GroupwsieGemmPluginCreator::createPlugin(
             return nullptr;
         }
 
-        Int4GroupwsieGemmPlugin* plugin = new Int4GroupwsieGemmPlugin(std::string(name),
-            gemmN.value(), gemmK.value(), groupSize.value());
+        Int4GroupwsieGemmPlugin* plugin
+            = new Int4GroupwsieGemmPlugin(std::string(name), gemmN.value(), gemmK.value(), groupSize.value());
         return plugin;
     }
-    catch(std::exception const& e)
+    catch (std::exception const& e)
     {
     }
     return nullptr;
