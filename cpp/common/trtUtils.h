@@ -18,6 +18,19 @@ inline nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
     return dims;
 }
 
+struct EngineInputDesc
+{
+    std::string name;
+    void* data;
+    nvinfer1::Dims dims;
+    EngineInputDesc(const std::string name, void* data, const nvinfer1::Dims dims)
+        : name(name)
+        , data(data)
+        , dims(dims)
+    {
+    }
+};
+
 inline bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const* inputName,
     nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims)
 {

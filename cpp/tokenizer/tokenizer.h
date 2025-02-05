@@ -76,7 +76,7 @@ public:
 
     bool tokenize(std::string const& text, std::vector<Rank>& output) const noexcept;
 
-    bool detokenize(std::vector<Rank> const& tokens, std::string& bytes) const noexcept;
+    bool detokenize(std::vector<Rank> const& tokens, std::string& bytes, bool skipSpecialTokens = false) const noexcept;
 
     bool specialTokenPartition(std::string const& text, std::forward_list<textPartition>& partitions) const noexcept;
 
@@ -110,7 +110,7 @@ public:
 
     virtual std::vector<Rank> encode(std::string const& text, bool addBos = false, bool addEos = false) const;
 
-    virtual std::string decode(std::vector<Rank> const& tokens) const;
+    virtual std::string decode(std::vector<Rank> const& tokens, bool skipSpecialTokens = false) const;
 
     virtual void loadFromHF(std::filesystem::path const& modelDir);
 
