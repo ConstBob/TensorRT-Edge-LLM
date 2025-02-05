@@ -180,8 +180,9 @@ bool Int4GroupwsieGemmPlugin::supportsFormatCombination(
         }
         case 1:
         {
-            // The Int4 weights are packed and swizzled into a special layout.
-            // Since TensorRT doesn't have Int16 datatype, we use Int8 datatype to store the weights.
+            // The int4 weights are packed and swizzled into a special layout with int16 [N/4, K].
+            // Since TensorRT doesn't have Int16 datatype, we use int8 datatype to store the weights.
+            // Therefore the type should be [N/2, K] in int8.
             status &= tensorDesc.type == DataType::kINT8;
             status &= tensorDesc.format == TensorFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 2;
@@ -191,8 +192,7 @@ bool Int4GroupwsieGemmPlugin::supportsFormatCombination(
         }
         case 2:
         {
-            // The FP16 weights scales are transposed into "[k,N]"" layout which correspond
-            // to the kernel implementation.
+            // The accepted scale for the kernel should be fp16 with [K/group_size,N]
             status &= tensorDesc.type == DataType::kHALF;
             status &= tensorDesc.format == TensorFormat::kLINEAR;
             status &= tensorDesc.dims.nbDims == 2;

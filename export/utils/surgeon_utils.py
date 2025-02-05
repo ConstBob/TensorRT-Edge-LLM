@@ -130,6 +130,7 @@ def insert_gather_last_token(graph: gs.Graph):
     # Force logits to have shape of [batch_size, vocab_size].
     logits.shape = [logits.shape[0], logits.shape[2]]
 
+    graph.cleanup().toposort()
     end_time = time.time()
     print(f"GatherND inserted in {end_time - start_time}s.")
     return graph
@@ -323,10 +324,31 @@ def insert_attention_plugin(graph: gs.Graph,
                     inputs=[qkv, kv_input, context_lengths] + extra_inputs,
                     outputs=[attn_output, kv_output],
                     attrs=attention_attrs)
+    graph.cleanup().toposort()
     end_time = time.time()
     print(f"AttentionPlugin inserted in {end_time - start_time}s. ")
 
     return graph
+
+
+def unpack_int4_weights(awq_weights: np.array, dtype: np.dtype):
+    """
+    The awq_weights have shape [N/2, K]. Reshape to a [K, N] matrix with expanded weights
+    """
+    awq_weights = awq_weights.T
+    int4_weights = np.zeros((awq_weights.shape[0], awq_weights.shape[1], 2),
+                            dtype=dtype)
+    int4_weights[..., 0] = awq_weights & 0x0F
+    int4_weights[..., 1] = (awq_weights >> 4) & 0x0F
+
+    def toint(x):
+        sign = x & 0x08
+        value = ~((~x) & 0x07)
+        return np.where(sign.astype(bool), sign | value, x)
+
+    int4_weights = toint(int4_weights)
+    int4_weights = int4_weights.reshape([int4_weights.shape[0], -1])
+    return int4_weights
 
 
 def insert_int4_dq(graph: gs.Graph, state_dict: dict):
@@ -347,28 +369,8 @@ def insert_int4_dq(graph: gs.Graph, state_dict: dict):
 
     """
 
-    def unpack_int4_weights(awq_weights: np.array):
-        """
-        int4 weights are packed as int8 weights. Suppose the int4 weights have dimension [m,n], the int8 representation have dimension [m, n/2].
-        Therefore the weights need to be unpacked to its normal shape in order to be processed by modelopt to insert DQ nodes.
-        """
-        awq_weights = awq_weights.T
-        int4_weights = np.zeros(
-            (awq_weights.shape[0], awq_weights.shape[1], 2), dtype=np.int8)
-        int4_weights[..., 0] = awq_weights & 0x0F
-        int4_weights[..., 1] = (awq_weights >> 4) & 0x0F
-
-        def toint8(x):
-            sign = x & 0x08
-            value = ~((~x) & 0x07)
-            return np.where(sign.astype(bool), sign | value, x)
-
-        int4_weights = toint8(int4_weights)
-        int4_weights = int4_weights.reshape([int4_weights.shape[0], -1])
-        return int4_weights
-
     start_time = time.time()
-    print("Replacing all fp16 weights with int4 DequantizeLinear...")
+    print("Replacing all fp16 GEMM with int4 DequantizeLinear...")
     patch_gs_modules()
     state_keys = state_dict.keys()
     int4_weight_dict = {}
@@ -384,15 +386,15 @@ def insert_int4_dq(graph: gs.Graph, state_dict: dict):
             hf_pre_quant_scale_name = hf_name + ".input_quantizer._pre_quant_scale"
             hf_weight_scale_name = hf_name + ".weight_quantizer._amax"
             assert hf_weight_name in state_keys, f"{hf_weight_name} not in state_keys!"
-            # assert hf_pre_quant_scale_name in state_keys, f"{hf_pre_quant_scale_name} not in state_keys!"
             assert hf_weight_scale_name in state_keys, f"{hf_weight_scale_name} not in state_keys!"
 
             # Extract the tensors from HF state_dict
             hf_weight = state_dict[hf_weight_name].cpu().numpy()
             assert hf_weight.dtype == np.int8, f"Weight should be np.int8 type. You have {hf_weight.dtype}."
-            int4_weight = unpack_int4_weights(hf_weight)
-            # For quantizing X[m,n] with block_size, TensorRT uses scale with shape [m / block_size, n].
-            # However, HF weights is amax (7*scale) with shape [n, m / block_size]. Therefore a transpose is needed.
+            # The weights from modelopt is a packed tensor with shape [N/2, K]. Need to unpack to shape [K, N]
+            int4_weight = unpack_int4_weights(hf_weight, np.int8)
+            # The scale factor has a shape [N, K/group_size]. Need to reshape to [K/group_size, N]
+            # In addition, _amax is 7x the scale.
             hf_weight_scale = state_dict[hf_weight_scale_name].cpu().numpy(
             ).transpose(1, 0) / 7
             # Force weight scale in fp16 can help TensorRT GEMM fusion.
@@ -413,7 +415,6 @@ def insert_int4_dq(graph: gs.Graph, state_dict: dict):
             ), f"Provide quantized {hf_weight_name} weight shape {int4_weight.shape} is not same as original {weight.shape}"
             int4_weight_dict[onnx_weight_name] = int4_weight
             weight_scale_dict[onnx_weight_name] = hf_weight_scale
-
             if hf_pre_quant_scale_name in state_keys:
                 input = node.inputs[1 - weight_id]
                 hf_pre_quant_scale = state_dict[hf_pre_quant_scale_name].cpu(
@@ -434,8 +435,178 @@ def insert_int4_dq(graph: gs.Graph, state_dict: dict):
         qdq.insert_pre_quant_scale_nodes(graph,
                                          input_tensors=input_tensors_dict,
                                          pre_quant_scale=pre_quant_scale_dict)
+    graph.cleanup().toposort()
     end_time = time.time()
     print(f"Int4 DQ inserted in {end_time - start_time}s.")
+    return graph
+
+
+def interleave_int4_weights(naively_packed_weights, interleave=4, kstride=64):
+    """
+    Adapted from https://github.com/mit-han-lab/llm-awq/blob/main/awq/quantize/qmodule.py#L26
+    """
+
+    # naively packed weights: int4 weights naively packed as int8 type with shape [N/2, K].
+    naively_packed_weights = naively_packed_weights.cpu().numpy()
+    # Convert from naively packed weights to unsigned int4 weights represented as int16.
+    # Unpacked_qweight is int16 with shape [K, N]. The +8 is required to match the implementation of awq gemm kernels requirement.
+    # In the plugin kernel, a -8 will be performed to convert back to original weights.
+    unpacked_qweight = unpack_int4_weights(naively_packed_weights,
+                                           np.int16) + 8
+    # Transposed back to [N, K] with int16 weights representation
+    unpacked_qweight = unpacked_qweight.transpose(1, 0)
+
+    # unpacked_qwight: int16 [N, K]
+    N = unpacked_qweight.shape[0]
+    K = unpacked_qweight.shape[1]
+
+    packed_kernel = unpacked_qweight.reshape(N, K // 32, 32)
+    # np.arange(32).reshape(4, 4, 2).transpose(1, 0, 2) => [0, 1, 8, 9, 16, 17, 24, 25, ...]
+    packed_kernel = packed_kernel.reshape(N, K // 32, 4, 4,
+                                          2).transpose(0, 1, 3, 2, 4)
+    packed_kernel = packed_kernel.reshape(N, K // 32, 32)
+
+    # reorder each 8 weights for fast dequantization
+    # [0, 1, 2, 3, 4, 5, 6, 7] => [0, 2, 4, 6, 1, 3, 5, 7]
+    packed_kernel = packed_kernel.reshape(N, K // 32, 4, 8)
+    packed_kernel = packed_kernel.reshape(N, K // 32, 4, 4,
+                                          2).transpose(0, 1, 2, 4, 3)
+    packed_kernel = packed_kernel.reshape(N, K)
+
+    # interleaving every four rows
+    packed_kernel = packed_kernel.reshape(N // interleave, interleave,
+                                          K // kstride, kstride)
+    # N // 4, K // 64, 4, 64
+    packed_kernel = packed_kernel.transpose(0, 2, 1, 3)
+    packed_kernel = packed_kernel.reshape(N // interleave, K // kstride,
+                                          kstride, interleave)
+    # Packing -> (N // 4, K // 64, 64)
+    packed_kernel = (packed_kernel[..., 0]
+                     | (packed_kernel[..., 1] << 4)
+                     | (packed_kernel[..., 2] << 8)
+                     | (packed_kernel[..., 3] << 12))
+    # reshape to (N // 4, K), FP16 format
+    packed_kernel = packed_kernel.reshape(N // interleave, K)
+
+    # reshape to (N // 2, K), int8 format
+    qweight_int8 = packed_kernel.view(np.int8).reshape(N // 2, K)
+    return qweight_int8
+
+
+def insert_int4_gemm_plugin(graph: gs.Graph, state_dict: dict):
+    """
+    This function starts with pure fp16 ONNX graph and replaces all the weights with Int4GemmPlugin for int4 weights.
+
+    Parameters:
+        graph: gs.Graph
+            The original fp16 ONNX graph
+
+        state_dict: dict[str, np.array]
+            The state_dict of the int4_awq quantized PyTorch model.
+
+    Returns:
+        Graph with all fp16 weights replaced by Int4GemmPlugin layer.
+
+    """
+
+    start_time = time.time()
+    print("Replacing all fp16 weights with Int4GemmPlugin...")
+    patch_gs_modules()
+    state_keys = state_dict.keys()
+
+    gemm_nodes = []
+    for node in graph.nodes:
+        if node.op == "MatMul" and "_proj" in node.name:
+            gemm_nodes.append(node)
+
+    for node in gemm_nodes:
+        # MatMul in proj must be input and weights
+        assert len(
+            node.inputs
+        ) == 2, f"You have more than 2 inputs for MatMul node {node.name}"
+        weight_id = 0 if isinstance(node.inputs[0], gs.Constant) else 1
+        assert isinstance(
+            node.inputs[weight_id],
+            gs.Constant), f"Both inputs for node {node.name} are not Constant!"
+        gemm_name = node.name
+        weight = node.inputs[weight_id]
+        onnx_weight_name = weight.name
+
+        # Should not clear outputs because qkv shares the same input
+        input = node.inputs[1 - weight_id]
+        input.outputs.remove(node)
+        weight.outputs.remove(node)
+        assert len(node.outputs) == 1, "Gemm should only have 1 output!"
+        output = node.outputs[0]
+        output.inputs.remove(node)
+        graph.nodes.remove(node)
+
+        # Need to insert DQ and pre_quant_scale
+        hf_name = '.'.join(node.name.split("/")[1:-1])
+        hf_weight_name = hf_name + ".weight"
+        hf_pre_quant_scale_name = hf_name + ".input_quantizer._pre_quant_scale"
+        hf_weight_scale_name = hf_name + ".weight_quantizer._amax"
+        assert hf_weight_name in state_keys, f"{hf_weight_name} not in state_keys!"
+        assert hf_weight_scale_name in state_keys, f"{hf_weight_scale_name} not in state_keys!"
+
+        # Extract the tensors from HF state_dict
+        hf_weight = state_dict[hf_weight_name]
+
+        # The shape of packed int4 weight is [N/2, K] in numpy format
+        hf_weight = interleave_int4_weights(hf_weight)
+
+        assert hf_weight.dtype == np.int8, f"Weight should be np.int8 type. You have {hf_weight.dtype}."
+
+        # The shape of weight scale is [N, K/group_size]
+        hf_weight_scale = state_dict[hf_weight_scale_name].cpu().numpy(
+        ).transpose(1, 0) / 7
+        # Force weight scale in fp16
+        hf_weight_scale = np.float16(hf_weight_scale)
+
+        onnx_weights_int4 = gs.Constant(gemm_name + "/int8_packed_weights",
+                                        hf_weight)
+        onnx_scale = gs.Constant(gemm_name + "/fp16_scale", hf_weight_scale)
+        gemm_n = hf_weight.shape[0] * 2
+        assert gemm_n == hf_weight_scale.shape[
+            1], f"Weights should have shape [N/2, K]. Scale should have shape [K/group_size, N]. You have weight shape {hf_weight.shape} and scale shape {hf_weight_scale.shape}."
+        gemm_k = hf_weight.shape[1]
+        group_size = gemm_k // hf_weight_scale.shape[0]
+        gemm_attrs = {
+            "gemm_n": gemm_n,
+            "gemm_k": gemm_k,
+            "group_size": group_size,
+        }
+
+        if hf_pre_quant_scale_name in state_keys:
+            hf_pre_quant_scale = state_dict[hf_pre_quant_scale_name].cpu(
+            ).numpy()
+            smoothed_input = gs.Variable(name=f"{gemm_name}/smoothed_input",
+                                         dtype=input.dtype,
+                                         shape=input.shape)
+            pre_quant_scale_weight = gs.Constant(
+                gemm_name + "/pre_quant_scale",
+                hf_pre_quant_scale,
+            )
+
+            graph.layer(
+                name=f"{gemm_name}/SmoothMul",
+                op="Mul",
+                inputs=[input, pre_quant_scale_weight],
+                outputs=[smoothed_input],
+            )
+        else:
+            smoothed_input = input
+
+        graph.layer(name=f"{gemm_name}Plugin",
+                    op="Int4GroupwiseGemmPlugin",
+                    inputs=[smoothed_input, onnx_weights_int4, onnx_scale],
+                    outputs=[output],
+                    attrs=gemm_attrs)
+
+    graph.cleanup()
+    # TODO: There is a bug in toposort()
+    end_time = time.time()
+    print(f"Int4 Gemm Plugin inserted in {end_time - start_time}s.")
     return graph
 
 
@@ -490,6 +661,8 @@ def fold_fp8_qdq_to_dq(graph: gs.Graph):
             dq_op.inputs = [onnx_weights_fp8, onnx_scale]
             dq_op.op = "DequantizeLinear"
             dq_op.outputs[0].dtype = np.float16
+
+    graph.cleanup().toposort()
     end_time = time.time()
     print(
         f"fp8 qdq replaced with only dq completed in {end_time - start_time}s."

@@ -261,7 +261,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    auto handle = loadPlugin();
+    auto pluginHandles = loadPlugins();
 
     GenerationConfig generationConfig{args.maxLength, args.maxLength, 1, 0};
 

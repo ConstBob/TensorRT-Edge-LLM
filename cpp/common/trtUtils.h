@@ -26,17 +26,17 @@ inline bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char
         && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
 }
 
-inline std::unique_ptr<void, decltype(&dlclose)> loadPlugin(void)
+inline std::unique_ptr<void, decltype(&dlclose)> loadAttentionPlugin(void)
 {
-    char const* pluginPath = std::getenv("PLUGIN_PATH");
+    char const* pluginPath = std::getenv("ATTENTION_PLUGIN_PATH");
 
     if (pluginPath != nullptr)
     {
-        LOG_INFO("PLUGIN_PATH: %s", pluginPath);
+        LOG_INFO("ATTENTION_PLUGIN_PATH: %s", pluginPath);
     }
     else
     {
-        LOG_INFO("PLUGIN_PATH variable is not set. Default to build/libAttentionPlugin.so");
+        LOG_INFO("ATTENTION_PLUGIN_PATH variable is not set. Default to build/libAttentionPlugin.so");
         pluginPath = "build/libAttentionPlugin.so";
     }
 
@@ -47,6 +47,40 @@ inline std::unique_ptr<void, decltype(&dlclose)> loadPlugin(void)
         return std::unique_ptr<void, decltype(&dlclose)>(nullptr, &dlclose);
     }
     return handle;
+}
+
+inline std::unique_ptr<void, decltype(&dlclose)> loadInt4GemmPlugin(void)
+{
+    char const* pluginPath = std::getenv("INT4_GEMM_PLUGIN_PATH");
+
+    if (pluginPath != nullptr)
+    {
+        LOG_INFO("INT4_GEMM_PLUGIN_PATH: %s", pluginPath);
+    }
+    else
+    {
+        LOG_INFO("INT4_GEMM_PLUGIN_PATH variable is not set. Default to build/libInt4GemmPlugin.so");
+        pluginPath = "build/libInt4GemmPlugin.so";
+    }
+
+    auto handle = std::unique_ptr<void, decltype(&dlclose)>(dlopen(pluginPath, RTLD_LAZY), &dlclose);
+    if (!handle)
+    {
+        LOG_WARNING("Cannot open plugin library: %s", dlerror());
+        return std::unique_ptr<void, decltype(&dlclose)>(nullptr, &dlclose);
+    }
+    return handle;
+}
+
+inline std::vector<std::unique_ptr<void, decltype(&dlclose)>> loadPlugins(bool int4GemmPlugin = true)
+{
+    std::vector<std::unique_ptr<void, decltype(&dlclose)>> handles;
+    handles.push_back(loadAttentionPlugin());
+    if (int4GemmPlugin)
+    {
+        handles.push_back(loadInt4GemmPlugin());
+    }
+    return handles;
 }
 
 // StreamReader ported from TRT-LLM to read from engine file.

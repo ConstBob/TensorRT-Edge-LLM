@@ -648,11 +648,7 @@ int main(int argc, char** argv)
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    auto handle = loadPlugin();
-    if (!handle)
-    {
-        return EXIT_FAILURE;
-    }
+    auto pluginHandles = loadPlugins();
 
     if (args.modelType != "qwen2_vl")
     {

@@ -295,12 +295,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    auto handle = loadPlugin();
-    if (!handle)
-    {
-        LOG_ERROR("Cannot open library: %s", dlerror());
-        return EXIT_FAILURE;
-    }
+    auto pluginHandles = loadPlugins();
 
     GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
     auto tokenizer = std::make_unique<Tokenizer>();
