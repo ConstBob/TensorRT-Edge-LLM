@@ -187,11 +187,7 @@ int main(int argc, char** argv)
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    auto handle = loadPlugin();
-    if (!handle)
-    {
-        return EXIT_FAILURE;
-    }
+    auto pluginHandles = loadPlugins();
 
     // Create the builder
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
@@ -322,6 +318,7 @@ int main(int argc, char** argv)
 
     config->addOptimizationProfile(contextProfile);
     config->addOptimizationProfile(generationProfile);
+    config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
     auto engine = builder->buildSerializedNetwork(*network, *config);
 
     if (!engine)
