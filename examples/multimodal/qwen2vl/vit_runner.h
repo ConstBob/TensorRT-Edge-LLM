@@ -10,13 +10,11 @@
 #include <string>
 #include <vector>
 
+
 struct VisualPreprocessorConfig
 {
-    // TODO: parse config from json or user-defined from args
-    std::vector<double> imageMean{0.48145466, 0.4578275, 0.40821073};
-    std::vector<double> imageStd{0.26862954, 0.26130258, 0.27577711};
-    int64_t minPixels{3136};
-    int64_t maxPixels{12845056};
+    int64_t minPixels{4 * 28 * 28};
+    int64_t maxPixels{16384 * 28 * 28};
     int64_t patchSize{14};
     int64_t temporalPatchSize{2};
     int64_t mergeSize{2};
@@ -25,6 +23,8 @@ struct VisualPreprocessorConfig
     int64_t maxPositionEmbeddings{32768};
     int rotaryEmbedDim{128};
     float theta = 1000000.0f;
+    std::vector<double> imageMean{0.48145466, 0.4578275, 0.40821073};
+    std::vector<double> imageStd{0.26862954, 0.26130258, 0.27577711};
 };
 
 class Qwen2ViTRunner
@@ -34,44 +34,42 @@ public:
         : mStream{nullptr}
         , mVisualEngine{nullptr}
         , mDeviceBuffer{}
-        , mHostBuffer{}
         , isSetup{false}
     {
     }
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize);
+    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize = 1,
+        int minPixels = 4 * 28 * 28, int maxPixels = 16384 * 28 * 28);
 
-    void visualPreprocess(std::vector<std::vector<std::string>> const& imagePaths, std::vector<half>& patches,
-        std::vector<half>& attentionMask, std::vector<float>& rotaryPosEmb, std::vector<std::vector<int64_t>>& grids);
+    void visualPreprocess(std::vector<unsigned char*> const& imageBuffers,
+        std::vector<std::vector<int>> const& imageSizes, std::vector<half>& patches, 
+        std::vector<half>& attentionMask, std::vector<float>& rotaryPosEmb,
+        std::vector<std::vector<int64_t>>& grids);
 
     void textPreprocess(std::vector<std::string> const& inputStrings,
-        std::vector<std::vector<std::string>> const& imagePaths,
-        std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
-        std::vector<int32_t>& contextLengths, int maxContextLength, int vocabSize = 152064);
+        std::vector<int> const& numImages, std::vector<std::vector<int64_t>> const& visualGridTHWs, 
+        std::unique_ptr<Tokenizer>& tokenizer, std::vector<int64_t>& inputIds, 
+        std::vector<int32_t>& contextLengths, int const maxContextLength, int const vocabSize = 152064);
 
     void visualInfer(
         std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb);
-    TensorInfo getImageEmbeds();
-    TensorInfo getMropeRotaryCosSin();
-    TensorInfo getMropePositionDeltas();
+    std::vector<EngineInputDesc> getExtraLLMInputs();
+
+    void initRandomInputs(std::vector<half>& visualInput, 
+    std::vector<half>& visualAttentionMask, std::vector<float>& visualRotaryPosEmb, 
+    std::vector<int64_t>& inputIds, int const textTokenLength, int const imageTokenLength,
+    int const maxContextLength, int const vocabSize = 152064);
+
     void allocateBuffer();
+    void freeBuffer();
 
     ~Qwen2ViTRunner()
     {
-        for (auto deviceMem : mDeviceBuffer)
-        {
-            cudaFree(deviceMem.second);
-        }
-        for (auto hostMem : mHostBuffer)
-        {
-            free(hostMem.second);
-        }
-        mDeviceBuffer.clear();
+        freeBuffer();
         isSetup = false;
     }
 
 private:
     std::map<std::string, void*> mDeviceBuffer;
-    std::map<std::string, void*> mHostBuffer;
     std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
@@ -81,19 +79,20 @@ private:
     int64_t mHW;
 
     std::tuple<int, int> smartResize(
-        int const height, int const width, int const factor, int const minPixels, int const maxPixels);
+        int const height, int const width, int const maxRatio = 200);
     void initRotaryEmbedding(
         int numPos, int dim, float theta, std::vector<std::vector<float>>& sinusoidInp, float scale = 1.0f);
     /**
      * Apply chat template according to chat_template.json
      * As an example, we assume putting images first and then texts, and combining into a single prompt message.
      */
-    std::string applyChatTemplate(std::string const& inputString, std::vector<std::string> const& imagePaths,
-        std::vector<std::vector<int64_t>> const& visualGridTHWs, int& totalImageIdx, int64_t imageMergeSize = 2,
-        bool addVisionId = false, bool addGenerationPrompt = true);
+    std::string applyChatTemplate(std::string const& inputString,
+        int const& numImages, std::vector<std::vector<int64_t>> const& visualGridTHWs,
+        int& totalImageIdx, int64_t imageMergeSize = 2, bool addGenerationPrompt = true);
 
-    void preprocessImage(std::string const& imagePath, std::vector<half>& patches,
-        std::vector<std::vector<int64_t>>& grids, int64_t& totalSeqLength);
+    void preprocessImage(unsigned char* image, int const& width, int const& height, 
+        int const& channels, std::vector<half>& patches, std::vector<std::vector<int64_t>>& grids, 
+        int64_t& totalSeqLength);
     void computeRotaryPosEmb(std::vector<std::vector<int64_t>> const& grids, std::vector<float>& rotaryPosEmb);
     /**
      * Calculate the 3D rope index based on image and video's temporal, height and width in LLM.

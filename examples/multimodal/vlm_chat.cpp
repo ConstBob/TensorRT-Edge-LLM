@@ -6,27 +6,18 @@
 #include <dlfcn.h>
 #include <getopt.h>
 
-enum class MODE
-{
-    kInference,
-    kBenchmark,
-    kEvaluate
-};
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 struct RuntimeArgs
 {
     bool help{false};
     std::vector<std::string> inputStrings;
     std::vector<std::vector<std::string>> imagePaths;
-    std::string lmEnginePath;
+    std::string llmEnginePath;
     std::string visualEnginePath;
     std::string tokenizerPath;
-    std::string datasetPath;
-    int maxLength{40};
-    int inputLength;
-    MODE mode{MODE::kInference};
-    int64_t numRuns{10};
-    int64_t warmUp{2};
+    int maxLength{1024};
     bool debug{false};
     std::string modelType{"qwen2_vl"};
 };
@@ -34,21 +25,21 @@ struct RuntimeArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] [-i or --inputString=<input>] [-e or --enginePath=<path to TensorRT engine>] [-s or "
-                 "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>]"
+              << " [-h] [-e or --llmEnginePath=<path to LLM engine>] [-v or --visualEnginePath=<path to visual engine>]"
+                 " [-s or --maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>]"
+                 " [--inputString=<input string for one batch>] [--imagePaths=<image paths for one batch>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  -h                  Display this help message" << std::endl;
     std::cerr << "  --inputString       Provide the input string to the runtime. Required. " << std::endl;
     std::cerr << "  --imagePaths        Provide the input image paths to the runtime. Required. " << std::endl;
-    std::cerr << "  --lmEnginePath      Provide the Qwen TensorRT engine file path. Required. " << std::endl;
+    std::cerr << "  --llmEnginePath     Provide the Qwen TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --visualEnginePath  Provide the visual TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --tokenizerPath     Provide the path to HF tokenizer. Required. " << std::endl;
     std::cerr << "  --maxLength         Provide the maximum output length for the generation session (including the "
-                 "input). Default = 40"
+                 "input). Default = 1024."
               << std::endl;
-    std::cerr << "  --mode              Provide the mode. " << std::endl;
-    std::cerr << "  --modelType         Provide the model type, choose from llama,qwen,qwen_vl,qwen2_vl.Required."
+    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl."
               << std::endl;
     std::cerr << "  --debug             Use debug mode, which outputs tensors." << std::endl;
 };
@@ -56,12 +47,10 @@ void printUsage(char const* programName)
 bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 {
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"inputString", required_argument, 0, 'i'},
-        {"imagePaths", required_argument, 0, 'p'}, {"lmEnginePath", required_argument, 0, 'e'},
+        {"imagePaths", required_argument, 0, 'p'}, {"llmEnginePath", required_argument, 0, 'e'},
         {"visualEnginePath", required_argument, 0, 'v'}, {"tokenizerPath", required_argument, 0, 't'},
-        {"maxLength", required_argument, 0, 's'}, {"inputLength", required_argument, 0, 'c'},
-        {"mode", required_argument, 0, 'm'}, {"warmUp", required_argument, 0, 'w'},
-        {"numRuns", required_argument, 0, 'r'}, {"datasetPath", required_argument, 0, 'D'},
-        {"debug", no_argument, 0, 'd'}, {"modelType", required_argument, 0, 0}, {0, 0, 0, 0}};
+        {"maxLength", required_argument, 0, 's'}, {"debug", no_argument, 0, 'd'}, 
+        {"modelType", required_argument, 0, 0}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -91,6 +80,8 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                 std::string path;
                 while (std::getline(ss, path, ','))
                 {
+                    // Trim spaces 
+                    path = regex_replace(path, std::regex("(^[ ]+)|([ ]+$)"),"");
                     paths.push_back(path);
                 }
                 args.imagePaths.emplace_back(paths);
@@ -104,11 +95,11 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
         case 'e':
             if (optarg)
             {
-                args.lmEnginePath = optarg;
+                args.llmEnginePath = optarg;
             }
             else
             {
-                std::cerr << "ERROR: --lmEnginePath requires option argument" << std::endl;
+                std::cerr << "ERROR: --llmEnginePath requires option argument" << std::endl;
                 return false;
             }
             break;
@@ -140,53 +131,6 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                 args.maxLength = std::stoi(optarg);
             }
             break;
-        case 'c':
-            if (optarg)
-            {
-                args.inputLength = std::stoi(optarg);
-            }
-            break;
-        case 'm':
-            if (optarg)
-            {
-                if (strcmp(optarg, "benchmark") == 0)
-                {
-                    args.mode = MODE::kBenchmark;
-                }
-                else if (strcmp(optarg, "evaluate") == 0)
-                {
-                    args.mode = MODE::kEvaluate;
-                }
-                if (strcmp(optarg, "inference") == 0)
-                {
-                    args.mode = MODE::kInference;
-                }
-                else
-                {
-                    std::cerr << "ERROR: invalid argument for --mode. Get " << optarg
-                              << ", valid options: benchmark, evaluate, inference." << std::endl;
-                    return false;
-                }
-            }
-            break;
-        case 'D':
-            if (optarg)
-            {
-                args.datasetPath = optarg;
-            }
-            break;
-        case 'w':
-            if (optarg)
-            {
-                args.warmUp = std::stoi(optarg);
-            }
-            break;
-        case 'r':
-            if (optarg)
-            {
-                args.numRuns = std::stoi(optarg);
-            }
-            break;
         case 'd': args.debug = true; break;
         case 0:
             if (strcmp(long_options[option_index].name, "modelType") == 0)
@@ -211,61 +155,103 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
     return true;
 }
 
-std::vector<std::string> decode(std::filesystem::path const& lmEnginePath,
+void decodeQwen2VL(std::filesystem::path const& llmEnginePath,
     std::filesystem::path const& visualEnginePath, std::vector<std::string>& inputStrings,
-    std::vector<std::vector<std::string>> const& imagePaths, Tokenizer* tokenizer,
-    GenerationConfig const& generationConfig, bool debug = false, std::string modelType = "qwen2_vl")
+    std::vector<std::vector<std::string>> const& imagePaths, std::unique_ptr<Tokenizer>& tokenizer,
+    GenerationConfig const& generationConfig, int32_t const batchSize, std::vector<std::vector<int64_t>>& outputIds)
 {
-    // Set default input string if not given
-    for (int i = inputStrings.size(); i < imagePaths.size(); ++i)
+    // Setup
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    auto vitrunner = new Qwen2ViTRunner();
+    vitrunner->setup(visualEnginePath, stream, batchSize);
+    auto decoder = new Decoder<half>();
+    decoder->setup(llmEnginePath, stream, batchSize);
+
+    // Preprocess
+    std::vector<half> visualInput;
+    std::vector<half> visualAttentionMask;
+    std::vector<float> visualRotaryPosEmb;
+    std::vector<std::vector<int64_t>> visualGridTHWs;
+    std::vector<int64_t> inputIds;
+    std::vector<int32_t> contextLengths;
+
+    // Load images
+    std::vector<unsigned char*> imageBuffers;
+    std::vector<std::vector<int>> imageSizes;
+    std::vector<int> numImages;
+    for (int b = 0; b < imagePaths.size(); ++b)
+    {
+        numImages.emplace_back(imagePaths[b].size());
+        for (int i = 0; i < imagePaths[b].size(); ++i)
+        {
+            int width{0}, height{0}, channels{0};
+            int desiredChannels = 3;
+            // Loaded pixels in hwc, rgb order
+            unsigned char* image = stbi_load(imagePaths[b][i].c_str(),
+                &width, &height, &channels, desiredChannels);
+            if (image == nullptr)
+            {
+                LOG_ERROR("Failed to load image: %s", stbi_failure_reason());
+                return ;
+            }
+
+            imageBuffers.emplace_back(image);
+            imageSizes.emplace_back(std::vector<int>{width, height, desiredChannels});
+        }
+    }
+
+    vitrunner->visualPreprocess(imageBuffers, imageSizes, visualInput, visualAttentionMask, 
+        visualRotaryPosEmb, visualGridTHWs);
+    vitrunner->allocateBuffer();
+    vitrunner->textPreprocess(inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths,
+        decoder->getMaxContextLength());
+
+    // Infer
+    vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+    decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), nullptr,
+        vitrunner->getExtraLLMInputs());
+}
+
+std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
+    std::filesystem::path const& visualEnginePath, std::vector<std::string>& inputStrings,
+    std::vector<std::vector<std::string>>& imagePaths, std::unique_ptr<Tokenizer>& tokenizer,
+    GenerationConfig const& generationConfig, std::string modelType)
+{
+    int32_t batchSize = std::max(inputStrings.size(), imagePaths.size());
+    
+    // Set default inputString and imagePaths to batchSize
+    for (int i = inputStrings.size(); i < batchSize; ++i)
     {
         inputStrings.emplace_back("Describe this image.");
     }
-    int32_t batchSize = imagePaths.size();
-    auto decoder = std::make_unique<Decoder<half>>();
+    for (int i = imagePaths.size(); i < batchSize; ++i)
+    {
+        imagePaths.emplace_back(std::vector<std::string>{});
+    }
 
     std::vector<std::vector<int64_t>> outputIds(batchSize);
     for (int i = 0; i < batchSize; ++i)
     {
         outputIds[i].reserve(generationConfig.maxLength);
     }
+
     if (modelType == "qwen2_vl")
     {
-        auto vitrunner = std::make_unique<Qwen2ViTRunner>();
-        cudaStream_t stream;
-        CUDA_CHECK(cudaStreamCreate(&stream));
-        vitrunner->setup(visualEnginePath, stream, batchSize);
-        // Preprocess
-        std::vector<half> visualInput;
-        std::vector<half> visualAttentionMask;
-        std::vector<float> visualRotaryPosEmb;
-        std::vector<std::vector<int64_t>> visualGridTHWs;
-        std::vector<int64_t> inputIds;
-        std::vector<int32_t> contextLengths;
-
-        vitrunner->visualPreprocess(imagePaths, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
-        vitrunner->allocateBuffer();
-        vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
-        decoder->setup(lmEnginePath, stream, batchSize);
-        vitrunner->textPreprocess(inputStrings, imagePaths, visualGridTHWs, tokenizer, inputIds, contextLengths,
-            decoder->getMaxContextLength());
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), nullptr,
-            vitrunner->getImageEmbeds(), vitrunner->getMropeRotaryCosSin(), vitrunner->getMropePositionDeltas());
+        decodeQwen2VL(llmEnginePath, visualEnginePath, inputStrings, imagePaths, tokenizer, generationConfig,
+            batchSize, outputIds);
     }
     else
     {
-
         throw std::runtime_error("Only support Qwen2-VL model for Multimodal models.");
     }
 
     std::vector<std::string> output(batchSize);
     for (int i = 0; i < batchSize; ++i)
     {
-        if (debug)
-        {
-            LOG_DEBUG("Output%d length is %d", i, outputIds[i].size());
-        }
-        output[i] = tokenizer->decode(outputIds[i]);
+        LOG_DEBUG("Output%d length is %d", i, outputIds[i].size());
+        output[i] = tokenizer->decode(outputIds[i], true);
         LOG_INFO("Input%d is: %s", i, inputStrings[i].c_str());
         LOG_INFO("Output%d is: %s", i, output[i].c_str());
     }
@@ -300,8 +286,8 @@ int main(int argc, char* argv[])
     GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
-    auto output = decode(args.lmEnginePath, args.visualEnginePath, args.inputStrings, args.imagePaths, tokenizer.get(),
-        generationConfig, args.debug, args.modelType);
+    auto output = decode(args.llmEnginePath, args.visualEnginePath, args.inputStrings, 
+        args.imagePaths, tokenizer, generationConfig, args.modelType);
 
     return EXIT_SUCCESS;
 };

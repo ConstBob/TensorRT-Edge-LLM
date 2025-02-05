@@ -53,7 +53,7 @@ set_target_properties(Int4GemmPlugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE
 target_include_directories(Int4GemmPlugin PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(Int4GemmPlugin commonLibraryExt cuda)
 # avoid linker error from aarch64 cross build
-if (DEFINED AARCH64_CROSS_BUILD)
+if (DEFINED AARCH64_BUILD)
   target_link_options(Int4GemmPlugin PRIVATE "-L${CUDA_DIR}/lib")
   target_link_options(Int4GemmPlugin PRIVATE "-L${CUDA_DIR}/lib/stubs")
 endif()

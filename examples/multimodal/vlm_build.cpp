@@ -20,16 +20,16 @@ struct VLMBuildArgs
     std::string visualOnnxPath;
     std::string llmEnginePath;
     std::string visualEnginePath;
-    int64_t batchSize{1};
-    int64_t maxInputLen{128};
-    int64_t maxSeqLen{4096};
-    bool dynamicShape{false};
-    bool debug{false};
     std::string modelType{"qwen2_vl"};
+    int64_t maxInputLen{1024};
+    int64_t maxSeqLen{4096};
+    int64_t batchSize{1};
+    int64_t imageTokens{512};
+    bool dynamicShape{false};
     int64_t maxBatchSize{4};
-    int64_t imageTokens{888};
-    int64_t minImageTokens{128};
-    int64_t maxImageTokens{5184};
+    int64_t minImageTokens{4};
+    int64_t maxImageTokens{1024};
+    bool debug{false};
     bool visualOnly{false};
     bool llmOnly{false};
 };
@@ -490,13 +490,9 @@ std::string generateViTTRTExecCommand(VLMBuildArgs const& args, int64_t const& p
 
 int buildViT(VLMBuildArgs const& args)
 {
-    int64_t optBatchSize = args.batchSize;
-    int64_t minBatchSize, maxBatchSize;
     int64_t minHW, optHW, maxHW;
     if (args.dynamicShape)
     {
-        minBatchSize = 1;
-        maxBatchSize = args.maxBatchSize;
         // In Qwen2-VL, HW is always 4ximageTokens because it equals to spatial_merge_size ** 2.
         minHW = args.minImageTokens * 4;
         maxHW = args.maxImageTokens * 4;
@@ -504,8 +500,6 @@ int buildViT(VLMBuildArgs const& args)
     }
     else
     {
-        minBatchSize = args.batchSize;
-        maxBatchSize = args.batchSize;
         minHW = args.imageTokens * 4;
         optHW = minHW;
         maxHW = minHW;

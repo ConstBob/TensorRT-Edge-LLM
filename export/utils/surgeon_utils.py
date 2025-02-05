@@ -139,6 +139,7 @@ def insert_gather_last_token(graph: gs.Graph):
 def insert_attention_plugin(graph: gs.Graph,
                             config: dict,
                             rope_type: RopeType,
+                            max_seq_length: int,
                             extra_inputs: list = None):
     """
     Insert AttentionPlugin for the graph. AttentionPlugin takes the following inputs and outputs:
@@ -196,7 +197,7 @@ def insert_attention_plugin(graph: gs.Graph,
         "rotary_base_frequency": rotary_base_frequency,
         "position_embedding_type": rope_type.value,
         "max_batch_size": 16,
-        "kv_cache_capacity": 4096,
+        "kv_cache_capacity": max_seq_length,
         "half_rotary_dim": half_rotary_dim,
         "rotary_embedding_max_positions": rotary_embedding_max_positions,
     }

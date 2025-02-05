@@ -251,7 +251,7 @@ void BPE::bytePairEncode(std::string const& piece, std::vector<Rank>& output) co
     }
 }
 
-bool BPE::detokenize(std::vector<Rank> const& tokens, std::string& output) const noexcept
+bool BPE::detokenize(std::vector<Rank> const& tokens, std::string& output, bool skipSpecialTokens) const noexcept
 {
     try
     {
@@ -263,7 +263,7 @@ bool BPE::detokenize(std::vector<Rank> const& tokens, std::string& output) const
             {
                 bytes = it->second;
             }
-            else
+            else if (!skipSpecialTokens)
             {
                 it = mSpecialTokensDecoder.find(tok);
                 assert(it != mSpecialTokensDecoder.end());
@@ -346,12 +346,12 @@ std::vector<Rank> Tokenizer::encode(std::string const& text, bool addBos, bool a
     return output;
 }
 
-std::string Tokenizer::decode(std::vector<Rank> const& tokens) const
+std::string Tokenizer::decode(std::vector<Rank> const& tokens, bool skipSpecialTokens) const
 {
     std::string output;
     output.reserve(tokens.size() * 2);
 
-    bool success = mBpe->detokenize(tokens, output);
+    bool success = mBpe->detokenize(tokens, output, skipSpecialTokens);
     assert(success);
 
     return output;

@@ -28,9 +28,6 @@
 // Replace special chars to support std::regex
 static const std::regex specialChars{R"([[\^$.|?*+(){}])"};
 
-// base64 decode to bytes
-std::string base64Decode(std::string const& encoded);
-
 // reverse map<token, id> to map<id, token>
 BPERanksToToken reverseEncoder(BPETokenToRanks const& encoder);
 

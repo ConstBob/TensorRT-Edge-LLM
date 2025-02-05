@@ -221,7 +221,7 @@ def export_qwen2_vl(args):
     state_dict = export_raw_llm(hf_model,
                                 raw_onnx_dir,
                                 args.dtype,
-                                os.path.join(args.torch_dir, "config.json"),
+                                args.config_path,
                                 args.torch_dir,
                                 lm_head_precision=args.lm_head,
                                 wrapper_cls=Qwen2VLWrapper,
@@ -244,6 +244,7 @@ def export_qwen2_vl(args):
         args.mode,
         args.config_path,
         state_dict,
+        args.max_seq_length,
         rope_type=RopeType.kMROPE,
         extra_plugin_inputs=[mrope_rotary_cos_sin, mrope_position_deltas],
         lm_head_precision=args.lm_head)

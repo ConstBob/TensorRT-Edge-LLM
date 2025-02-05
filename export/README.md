@@ -26,6 +26,7 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 1. Even though FP8 or NVFP4 is supported for ONNX export, Orin does not support FP8 or NVFP4.
 1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 this will be FP8 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
+1. Default `--max_seq_length=4096`. Please change this field if longer sequence length is required.
 
 ## Supported models and precisions
 
