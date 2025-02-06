@@ -33,7 +33,7 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 The `llm_export.py` script can export the following LLM models into ONNX. There is a potential that other LLMs can be supported.
 
 Model | FP16 | INT4 | FP8 | NVFP4
---- | --- | --- | ---
+--- | --- | --- | --- | ---
 [Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes
 [Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes
 [Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes
@@ -43,7 +43,7 @@ Model | FP16 | INT4 | FP8 | NVFP4
 The `multimodal_export.py` script can export the following multimodal models into ONNX. Currently it only supports Qwen2-VL.
 
 Model | FP16 | INT4 | FP8 | NVFP4
---- | --- | --- | ---
+--- | --- | --- | --- | ---
 [Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes
 [Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes
 
