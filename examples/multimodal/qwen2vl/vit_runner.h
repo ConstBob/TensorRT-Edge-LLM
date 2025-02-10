@@ -10,7 +10,6 @@
 #include <string>
 #include <vector>
 
-
 struct VisualPreprocessorConfig
 {
     int64_t minPixels{4 * 28 * 28};
@@ -37,27 +36,24 @@ public:
         , isSetup{false}
     {
     }
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize = 1,
-        int minPixels = 4 * 28 * 28, int maxPixels = 16384 * 28 * 28);
+    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize = 1, int minPixels = 4 * 28 * 28,
+        int maxPixels = 16384 * 28 * 28);
 
     void visualPreprocess(std::vector<unsigned char*> const& imageBuffers,
-        std::vector<std::vector<int>> const& imageSizes, std::vector<half>& patches, 
-        std::vector<half>& attentionMask, std::vector<float>& rotaryPosEmb,
-        std::vector<std::vector<int64_t>>& grids);
+        std::vector<std::vector<int>> const& imageSizes, std::vector<half>& patches, std::vector<half>& attentionMask,
+        std::vector<float>& rotaryPosEmb, std::vector<std::vector<int64_t>>& grids);
 
-    void textPreprocess(std::vector<std::string> const& inputStrings,
-        std::vector<int> const& numImages, std::vector<std::vector<int64_t>> const& visualGridTHWs, 
-        std::unique_ptr<Tokenizer>& tokenizer, std::vector<int64_t>& inputIds, 
+    void textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
+        std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
         std::vector<int32_t>& contextLengths, int const maxContextLength, int const vocabSize = 152064);
 
     void visualInfer(
         std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb);
     std::vector<EngineInputDesc> getExtraLLMInputs();
 
-    void initRandomInputs(std::vector<half>& visualInput, 
-    std::vector<half>& visualAttentionMask, std::vector<float>& visualRotaryPosEmb, 
-    std::vector<int64_t>& inputIds, int const textTokenLength, int const imageTokenLength,
-    int const maxContextLength, int const vocabSize = 152064);
+    void initRandomInputs(std::vector<half>& visualInput, std::vector<half>& visualAttentionMask,
+        std::vector<float>& visualRotaryPosEmb, std::vector<int64_t>& inputIds, int const textTokenLength,
+        int const imageTokenLength, int const maxContextLength, int const vocabSize = 152064);
 
     void allocateBuffer();
     void freeBuffer();
@@ -78,21 +74,19 @@ private:
     bool isSetup;
     int64_t mHW;
 
-    std::tuple<int, int> smartResize(
-        int const height, int const width, int const maxRatio = 200);
+    std::tuple<int, int> smartResize(int const height, int const width, int const maxRatio = 200);
     void initRotaryEmbedding(
         int numPos, int dim, float theta, std::vector<std::vector<float>>& sinusoidInp, float scale = 1.0f);
     /**
      * Apply chat template according to chat_template.json
      * As an example, we assume putting images first and then texts, and combining into a single prompt message.
      */
-    std::string applyChatTemplate(std::string const& inputString,
-        int const& numImages, std::vector<std::vector<int64_t>> const& visualGridTHWs,
-        int& totalImageIdx, int64_t imageMergeSize = 2, bool addGenerationPrompt = true);
+    std::string applyChatTemplate(std::string const& inputString, int const& numImages,
+        std::vector<std::vector<int64_t>> const& visualGridTHWs, int& totalImageIdx, int64_t imageMergeSize = 2,
+        bool addGenerationPrompt = true);
 
-    void preprocessImage(unsigned char* image, int const& width, int const& height, 
-        int const& channels, std::vector<half>& patches, std::vector<std::vector<int64_t>>& grids, 
-        int64_t& totalSeqLength);
+    void preprocessImage(unsigned char* image, int const& width, int const& height, int const& channels,
+        std::vector<half>& patches, std::vector<std::vector<int64_t>>& grids, int64_t& totalSeqLength);
     void computeRotaryPosEmb(std::vector<std::vector<int64_t>> const& grids, std::vector<float>& rotaryPosEmb);
     /**
      * Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
