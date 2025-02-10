@@ -15,16 +15,17 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 1. `pip3 install -r requirements.txt`
 1. Call export script. If you are working with multimodal model, use `multimodal_export.py`
 ```
-python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4] --output_dir $ONNX_DIR
-python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4] --output_dir $ONNX_DIR
+python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
+python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
 
 ```
 
 The ONNX with desired data type will be exported in `$ONNX_DIR`.
 
 **Notes:**
+1. TensorRT Out-of-the-box(OOTB) has a known performance issue with INT4 GEMV. Even though the accuracy is good, the performance is not as desired. Therefore a Int4GroupwiseGemmPlugin is written and the dq+gemms are replaced by the plugin as a temporary solution for now for int4 by default. If you do not want to use this plugin, you can pass in int4_ootb as the datatype for export script.
 1. Even though FP8 or NVFP4 is supported for ONNX export, Orin does not support FP8 or NVFP4.
-1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 this will be FP8 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
+1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 or NVFP4 this will be FP8 or NVFP4 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
 1. Default `--max_seq_length=4096`. Please change this field if longer sequence length is required.
 

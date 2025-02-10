@@ -2,38 +2,40 @@
 
 ## Introduction
 
-DriveOS LLM SDK is a light-weighted C++ software toolkit to showcase TensorRT's capability and performance to deploy Large Language Model(LLM) targeted Auto Platform. With DriveOS LLM SDK, users can:
-1. Quantize and export PyTorch model to ONNX on Linux x86 system.
-1. Build TensorRT Engine and run e2e LLM inference, including tokenization and sampling on Auto Platform.
+DriveOS LLM SDK is a light-weighted C++ software toolkit to showcase TensorRT's capability and performance to deploy Large Language Models(LLMs) and Vision Language Models(VLMs) targeted Auto Platform. With DriveOS LLM SDK, users can:
+1. Quantize and export PyTorch model to [ONNX Format](https://onnx.ai/) on Linux x86 system.
+1. Build TensorRT Engine and run e2e LLM inference, including tokenization and sampling, on Auto Platform.
 
 
 ## Prerequisite
 
-A Linux X86 host with GPU is required to export the model into ONNX format. Once the ONNX model is exported, the only dependency is TensorRT C++ library and CUDA runtime. DriveOS LLM SDK does not have any external C++ dependency.
+A Linux X86 host with GPU is required to export the model into ONNX format. Once the ONNX model is exported, the only dependency is TensorRT C++ library and CUDA runtime. DriveOS LLM SDK does not have any external C++ dependencies.
 
 ## Supported platforms, models and precisions
 
-### DriveOS 7.0.1 Release for Thor
-DriveOS 7.0.1 is shipped with TensorRT 10.4 and CUDA 12.8 to support **Thor** platform.
+The following LLM models under [./examples/llm](./examples/llm/) with corresponding precisions are supported by DriveOS LLM SDK:
 
-The following LLM models under [./examples/llm](./examples/llm/) with corresponding precisions are supported by DriveOS LLM SDK with good accuracy:
+Model | FP16 | INT4 | FP8 | NVFP4
+--- | --- | --- | --- | ---
+[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes
+[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes
+[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes
+[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes | Yes
+[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes | Yes
 
-Model | FP16 | INT4 | FP8
---- | --- | --- | ---
-[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | No
-[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | No
-[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | No
-[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | No
-[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | No
+The following VLM models under [./examples/vlm](./examples/vlm/) with corresponding precisions are supported by DriveOS LLM SDK with good accuracy. Note that the ViT will always be in FP16 precision.
 
-The following VLM models under [./examples/vlm](./examples/vlm/) with corresponding precisions are supported by DriveOS LLM SDK with good accuracy:
+Model | FP16 | INT4 | FP8 | NVFP4
+--- | --- | --- | --- | ---
+[Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes
+[Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes
 
-**TBA**
 
 #### Precisions explained and notes:
 1. **FP16**: All the weights and compute are in FP16.
-1. **FP8(W8A8)**: All the weights and GEMM are in FP8, but KV Cache, LayerNorm, Attention and lm_head are in FP16 precision. FP8 can both reduce memory footprint and kernel performance. FP8 GEMM is not supported by TensorRT 10.4 but it will be available in a later release.
-1. **INT4(W4A16)**: All the weights are quantized in INT4 using awq recipe, but all the compute are in FP16 precision. INT4 can reduce memory footprint significantly, but in TensorRT 10.4 the latency is worse than FP16 due to unfused INT4 GEMM kernels.
+1. **FP8(W8A8)**: All the weights and GEMMs are in FP8, but KV Cache, LayerNorm, Attention and lm_head are in FP16 precision. FP8 can both reduce memory footprint and improve inference latency.
+1. **INT4(W4A16)**: All the weights are quantized in INT4 using awq recipe, but all the compute are in FP16 precision. INT4 can reduce memory footprint and improve significantly by reducing weights loading by 4x compared to FP16. Note that because TensorRT native(Or out-of-the-box or ootb) INT4 kernels have some performance issues, a [Int4GroupwiseGemmPlugin](./cpp/int4GroupwiseGemmPlugin/) is provided as the default option for INT4.
+1. **NVFP4(W4A4)**: Similar to FP8, all the weights and GEMMs are in NVFP4 while the other parts are in FP16 precision. NVFP4 can significantly reduce memory footprint and improve inference latency, especially context phase. Current generation phase performance of NVFP4 GEMM is good but has room for improvements. The improvements will be shipped in the next few releases.
 
 #### Customized Models
 1. Decoder-only Llama series and Qwen series are likely to be supported if it fits in Thor memory, but they are not fully tested.
@@ -74,4 +76,4 @@ First, it is needed to export the PyTorch model to ONNX on a x86 Linux host with
 
 ### 3. Build engine and run E2E LLM inference on C++
 
-Once the model is exported, you can follow the examples to build and run E2E LLM inference with C++. Please follow [examples/llm/README.md](./examples/llm/README.md) for decoder-only LLMs. The cpp files under [examples](./examples/) folder show the usage of the DriveOS LLM SDK runtime.
+Once the model is exported, you can follow the examples to build and run E2E LLM inference with C++. Please follow [examples/llm/README.md](./examples/llm/README.md) for decoder-only LLMs and [examples/multimodal/README.md](./examples/multimodal/README.md) for VLMs. The cpp files under [examples](./examples/) folder showcase the usage of the DriveOS LLM SDK runtime.

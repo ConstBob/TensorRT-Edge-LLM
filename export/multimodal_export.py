@@ -16,8 +16,8 @@ import numpy as np
 import onnx_graphsurgeon as gs
 import torch
 import torch.nn as nn
-from llm_export import (export_raw_llm, get_config_path, llm_arguments,
-                        surgeon_llm)
+from llm_export import (check_dtype_support, export_raw_llm, get_config_path,
+                        llm_arguments, surgeon_llm)
 from transformers.cache_utils import DynamicCache
 from utils.export_utils import WrapperModelForCausalLM, torch_to_onnx
 from utils.surgeon_utils import RopeType
@@ -115,7 +115,7 @@ def export_qwen2_vl_visual(hf_model, output_dir):
             attn_weights = nn.functional.softmax(attn_weights,
                                                  dim=-1,
                                                  dtype=torch.float32).to(
-                                                    v.dtype)
+                                                     v.dtype)
             attn_output = torch.matmul(attn_weights, v)
             attn_output = attn_output.transpose(0, 1)
             attn_output = attn_output.reshape(seq_length, -1)
@@ -209,6 +209,8 @@ def export_qwen2_vl_visual(hf_model, output_dir):
 
 
 def export_qwen2_vl(args):
+    if not check_dtype_support():
+        return
     from transformers import Qwen2VLForConditionalGeneration
 
     hf_model = Qwen2VLForConditionalGeneration.from_pretrained(
