@@ -1,6 +1,6 @@
 # DriveOS LLM SDK Example: Multimodal Models
 
-This document shows how to run multimodal pipelines with DrivsOS-LLM, e.g. from image+text input modalities to text output.
+This document shows how to run multimodal pipelines with DrivsOS LLM SDK, e.g. from image+text input modalities to text output.
 
 Multimodal models' LLM part and multimodal part are separated to two TensorRT engines. While LLM part is similar to LLM-only models, multimodal part is model-specific. Multimodal runner combines the two parts together. The multimodal features of shape `[batch_size, num_multimodal_features, multimodal_hidden_dim]` is flattened as `[batch_size * num_multimodal_features, multimodal_hidden_dim]` and passed like a prompt embedding table together with other model specific inputs.
 
@@ -30,7 +30,7 @@ We describes how to run supported models in the below section.
     ```
 
 ### Build engine
-The `vlm_build` binary is used to build TensorRT engines. Coresponding to ONNX, we build visual engine and LLM engine respectively.
+The `vlm_build` binary is used to build TensorRT engines. Corresponding to ONNX, we build visual engine and LLM engine respectively.
 1. Static shape. Specify `--batchSize` and `--imageTokens`.
     ```
     ./build/examples/multimoal/vlm_build \
@@ -76,7 +76,7 @@ The `vlm_chat` and `vlm_accuracy` binaries are examples to show E2E C++ VLM infe
 ```
 **Note**:
 1. `--inputString` takes input prompt for one batch. `--imagePaths` takes image paths for one batch. Multiple image paths in one batch should be separated with comma `','`.
-1. One `--inputString` and one `--imagePaths` are paired as inputs for one batch. `batchSize` equals to the maximum of number of `--inputString` and number of `--imagePaths`. 
+1. One `--inputString` and one `--imagePaths` are paired as inputs for one batch. `batchSize` equals to the maximum of number of `--inputString` and number of `--imagePaths`.
 1. For any batch that contains `--imagePaths` only, `--inputString` is set to default prompt `Describe this image.`. For any batch that contains `--inputString` only, `--imagePaths` is set to empty, which is equivalent to pure LLM inference.
 
 #### Benchmark Performance
@@ -112,7 +112,7 @@ To match MMMU evaluation [config](https://github.com/open-compass/VLMEvalKit/blo
     --model_type qwen2_vl \
     --max_seq_length 8192
     ```
-2. Build engine 
+2. Build engine
     ```
     ./build/examples/multimoal/vlm_build \
     --llmOnnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx/model.onnx \

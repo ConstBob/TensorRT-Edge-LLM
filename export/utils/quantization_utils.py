@@ -57,7 +57,7 @@ def get_quant_config(precision, lm_head_precision="fp16"):
 
     if precision == "fp8":
         quant_cfg = mtq.FP8_DEFAULT_CFG
-    # Include int4_plugin as a temporary solution
+    # Include both int4 plugin and ootb solution
     elif "int4" in precision:
         quant_cfg = mtq.INT4_AWQ_CFG
 
@@ -150,12 +150,12 @@ def quantize(model,
     Quantize the PyTorch model to fp8 or int4_awq
     """
     assert precision in [
-        "fp8", "int4", "nvfp4", "int4_plugin"
+        "fp8", "int4", "nvfp4", "int4_ootb"
     ], f"Only fp8(W8A8), int4(W4A16) and nvfp4(W4A4) is supported. You passed an unsupported precision: {precision}."
 
     assert lm_head_precision in [
-        "fp16", "fp8", "int4", "nvfp4", "int4_plugin"
-    ], f"Only fp16(unquantized), fp8(W8A8), int4(W4A16) and nvfp4(W4A4) is supported for lm_head. You passed an unsupported precision: {lm_head_precision}."
+        "fp16"
+    ], f"Only fp16(unquantized) is supported for lm_head. You passed an unsupported precision: {lm_head_precision}."
 
     if tokenizer.pad_token != "<unk>":
         tokenizer.pad_token = tokenizer.eos_token

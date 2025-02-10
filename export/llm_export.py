@@ -35,19 +35,20 @@ def llm_arguments():
                         type=str,
                         help="The folder of HF PyTorch model ckpt",
                         required=False)
-    parser.add_argument(
-        '--dtype',
-        type=str,
-        default="fp16",
-        choices=["fp16", "fp8", "int4", "nvfp4", "int4_plugin"],
-        help="The precision of onnx export")
+    parser.add_argument('--dtype',
+                        type=str,
+                        default="fp16",
+                        choices=["fp16", "fp8", "int4", "nvfp4", "int4_ootb"],
+                        help="The precision of onnx export")
 
     parser.add_argument(
         '--lm_head',
         type=str,
         default="fp16",
-        choices=["fp16", "fp8", "int4", "nvfp4", "int4_plugin"],
-        help="The precision of lm_head")
+        choices=["fp16"],
+        help=
+        "The precision of lm_head. Currently only fp16 is tested and supported"
+    )
     parser.add_argument('--output_dir',
                         type=str,
                         help="The directory to store the generated ONNX model",
@@ -59,11 +60,14 @@ def llm_arguments():
         help="Pass this option when you have existing onnx to surgeon",
         required=False)
 
-    parser.add_argument('--mode',
-                        type=str,
-                        default="plugin",
-                        choices=["plugin", "ootb"],
-                        help="Whether to insert AttentionPlugin to ONNX")
+    parser.add_argument(
+        '--mode',
+        type=str,
+        default="plugin",
+        choices=["plugin"],
+        help=
+        "Whether to insert AttentionPlugin to ONNX. In the future there might be other options to use native TensorRT Attention"
+    )
     parser.add_argument(
         '--save_original',
         action='store_true',
@@ -81,10 +85,12 @@ def llm_arguments():
         help=
         "The path of config.json, in case it is not with the PyTorch or ONNX file",
         default=None)
-    parser.add_argument('--max_seq_length',
-                        type=int,
-                        help="The path of state dict path only for int4",
-                        default=4096)
+    parser.add_argument(
+        '--max_seq_length',
+        type=int,
+        help=
+        "Maximum sequence length as an attribute to AttentionPlugin. Change this when you need to run long context inference",
+        default=4096)
     return parser
 
 
@@ -150,7 +156,7 @@ def export_raw_llm(model,
         shutil.copy(config_path, os.path.join(output_dir, "config.json"))
 
     # Need to quantize model to fp8, int4 or nvfp4
-    if dtype in ["fp8", "int4", "nvfp4", "int4_plugin"]:
+    if dtype in ["fp8", "int4", "nvfp4", "int4_ootb"]:
         tokenizer = AutoTokenizer.from_pretrained(torch_dir,
                                                   trust_remote_code=True)
         modelopt_state = os.path.join(torch_dir, "modelopt_state.pth")
@@ -224,7 +230,7 @@ def surgeon_llm(raw_onnx_path,
         ).to_dict()
     else:
         print(
-            "Warning: DriveOS LLM SDK currently does not support OOTB TensorRT so far."
+            "Warning: DriveOS LLM SDK currently does not support OOTB(Out-of-the-box) TensorRT so far."
         )
 
     t0 = time.time()
@@ -239,10 +245,10 @@ def surgeon_llm(raw_onnx_path,
     graph = insert_gather_last_token(graph)
     graph.fold_constants().cleanup().toposort()
 
-    if dtype == "int4":
+    if dtype == "int4_ootb":
         graph = insert_int4_dq(graph, state_dict)
 
-    elif dtype == "int4_plugin":
+    elif dtype == "int4":
         graph = insert_int4_gemm_plugin(graph, state_dict)
 
     elif dtype == "fp8" or lm_head_precision == "fp8":
@@ -287,12 +293,38 @@ def surgeon_llm(raw_onnx_path,
     print(f"Surgeon LLM completed in {t3 - t2}s.")
 
 
-def get_modelopt_version():
-    try:
-        import modelopt
-        return Version(modelopt.__version__)
-    except Exception as e:
-        print(f"Modelopt version cannot be parsed. Reason: {str(e)}")
+def check_dtype_support(args):
+    """
+    Check whether the dtype is supported by DriveOS LLM SDK. Returns False if it is not supported because of:
+    1. Modelopt < 0.23.0 does not support nvfp4
+    2. Modelopt > 0.19.0 has accuracy issues for int4
+    """
+
+    def get_modelopt_version():
+        try:
+            import modelopt
+            return Version(modelopt.__version__)
+        except Exception as e:
+            print(f"Modelopt version cannot be parsed. Reason: {str(e)}")
+
+    if (args.dtype == "nvfp4") and get_modelopt_version() < Version("0.23.0"):
+        print(
+            "nvfp4 is not supported by installed modelopt version. Please upgrade to 0.23.0 or above for nvfp4 export. Exit."
+        )
+        return False
+
+    if ("int4" in args.dtype) and get_modelopt_version() > Version("0.19.0"):
+        print(
+            "int4 have accuracy issues with modelopt version > 0.19.0. Please use modelopt==0.19.0. Exit."
+        )
+        return False
+
+    if args.dtype == "int4_ootb":
+        print(
+            "int4 ootb has performance issues. If you want to run int4_awq, it is recommended to export by default as plugin"
+        )
+
+    return True
 
 
 def main(args):
@@ -300,16 +332,7 @@ def main(args):
     start_time = time.time()
     state_dict = None
 
-    if (args.dtype == "nvfp4") and get_modelopt_version() < Version("0.23.0"):
-        print(
-            "nvfp4 is not supported by installed modelopt version. Please upgrade to 0.23.0 or above for nvfp4 export."
-        )
-        return
-
-    if ("int4" in args.dtype) and get_modelopt_version() > Version("0.19.0"):
-        print(
-            "Int4 have accuracy issues with modelopt version > 0.19.0. Please use modelOpt==0.19.0"
-        )
+    if not check_dtype_support():
         return
 
     if args.torch_dir:
