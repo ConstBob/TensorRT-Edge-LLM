@@ -480,9 +480,9 @@ std::string generateViTTRTExecCommand(VLMBuildArgs const& args, int64_t const& p
 {
     std::string trtExecCommand = fmtstr(
         "Equivalent ViT trtexec command: trtexec --onnx=%s --saveEngine=%s --stronglyTyped --verbose "
-        "--minShape=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ld*%ld "
-        "--optShape=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ld*%ld "
-        "--maxShape=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ld*%ld ",
+        "--minShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld "
+        "--optShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld "
+        "--maxShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld ",
         args.visualOnnxPath.c_str(), args.visualEnginePath.c_str(), minHW, patchSize, minHW, ropeEmbdSize, minHW, minHW,
         optHW, patchSize, optHW, ropeEmbdSize, optHW, optHW, maxHW, patchSize, maxHW, ropeEmbdSize, maxHW, maxHW);
     return trtExecCommand;
