@@ -3,9 +3,9 @@
 #include "decoder/decoder.h"
 #include "qwen2vl/vit_runner.h"
 #include "tokenizer/tokenizer.h"
+#include <cuda_profiler_api.h>
 #include <dlfcn.h>
 #include <getopt.h>
-#include <cuda_profiler_api.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
@@ -22,6 +22,7 @@ struct RuntimeArgs
     std::string modelType{"qwen2_vl"};
     int numRuns{10};
     int warmUp{2};
+    bool noCudaGraph{false};
     bool debug{false};
 };
 
@@ -41,10 +42,11 @@ void printUsage(char const* programName)
     std::cerr << "  --outputLength      Provide the output token length for the generation session (NOT including the "
                  "input). Required."
               << std::endl;
-    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl."
-              << std::endl;
+    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl." << std::endl;
     std::cerr << "  --warmUp            Provide warm up iterations before benchmark starts. Default = 2." << std::endl;
     std::cerr << "  --numRuns           Minimal number of iterations to run during benchmarking. Default = 10."
+              << std::endl;
+    std::cerr << "  --noCudaGraph       Cuda graph is default enabled. Use this flag to disable cuda graph."
               << std::endl;
     std::cerr << "  --debug             Use debug mode, which outputs tensors." << std::endl;
 };
@@ -53,10 +55,10 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 {
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"llmEnginePath", required_argument, 0, 'e'},
         {"visualEnginePath", required_argument, 0, 'v'}, {"textTokenLength", required_argument, 0, 't'},
-        {"imageTokenLength", required_argument, 0, 'i'}, {"outputLength", required_argument, 0, 'o'}, 
-        {"modelType", required_argument, 0, 0}, {"warmUp", required_argument, 0, 'w'}, {"batchSize", required_argument, 0, 'b'}, 
-        {"numRuns", required_argument, 0, 'r'}, {"debug", no_argument, 0, 'd'},
-        {0, 0, 0, 0}};
+        {"imageTokenLength", required_argument, 0, 'i'}, {"outputLength", required_argument, 0, 'o'},
+        {"modelType", required_argument, 0, 0}, {"warmUp", required_argument, 0, 'w'},
+        {"batchSize", required_argument, 0, 'b'}, {"numRuns", required_argument, 0, 'r'},
+        {"noCudaGraph", no_argument, 0, 'g'}, {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -101,13 +103,13 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                 args.outputLength = std::stoi(optarg);
             }
             break;
-         case 't':
+        case 't':
             if (optarg)
             {
                 args.textTokenLength = std::stoi(optarg);
             }
             break;
-         case 'i':
+        case 'i':
             if (optarg)
             {
                 args.imageTokenLength = std::stoi(optarg);
@@ -125,6 +127,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                 args.numRuns = std::stoi(optarg);
             }
             break;
+        case 'g': args.noCudaGraph = true; break;
         case 'd': args.debug = true; break;
         case 0:
             if (strcmp(long_options[option_index].name, "modelType") == 0)
@@ -150,8 +153,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 }
 
 void printBenchmarkResult(std::shared_ptr<BenchmarkProfiler> const profiler, int const batchSize,
-    int const textTokenLength, int const imageTokenLength, int const outputLength, 
-    size_t const deviceMemorySize)
+    int const textTokenLength, int const imageTokenLength, int const outputLength, size_t const deviceMemorySize)
 {
     profiler->stopTiming();
     auto peakDeviceMem = profiler->recordDeviceMemEnd();
@@ -212,11 +214,10 @@ void printBenchmarkResult(std::shared_ptr<BenchmarkProfiler> const profiler, int
     LOG_INFO("========================================================");
 }
 
-size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath,
-    std::filesystem::path const& visualEnginePath, GenerationConfig const& generationConfig, 
-    int const batchSize, int const textTokenLength, int const imageTokenLength, 
-    std::vector<std::vector<int64_t>>& outputIds, std::shared_ptr<BenchmarkProfiler> const profiler, 
-    int const warmUp, int const numRuns)
+size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
+    GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
+    int const imageTokenLength, std::vector<std::vector<int64_t>>& outputIds,
+    std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph)
 {
     // Setup
     cudaStream_t stream;
@@ -230,7 +231,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath,
     profiler->recordHostMemStart();
     profiler->recordHostStart("decoder setup");
     vitrunner->setup(visualEnginePath, stream, batchSize);
-    decoder->setup(llmEnginePath, stream, batchSize);
+    decoder->setup(llmEnginePath, stream, useCudaGraph, batchSize);
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
 
@@ -241,16 +242,16 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath,
     std::vector<int64_t> inputIds(batchSize * decoder->getMaxContextLength(), -1);
     std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
 
-    vitrunner->initRandomInputs(visualInput, visualAttentionMask, visualRotaryPosEmb,
-        inputIds, textTokenLength, imageTokenLength, decoder->getMaxContextLength());
+    vitrunner->initRandomInputs(visualInput, visualAttentionMask, visualRotaryPosEmb, inputIds, textTokenLength,
+        imageTokenLength, decoder->getMaxContextLength());
+    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     for (int i = 0; i < warmUp; i++)
     {
         // Warmup for profiler
         profiler->recordHostStart("pipeline latency");
         vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler,
-            vitrunner->getExtraLLMInputs());
+        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("pipeline latency");
     }
@@ -268,8 +269,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath,
 
         profiler->recordHostStart("seq latency");
         profiler->recordHostStart("first token latency");
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler,
-            vitrunner->getExtraLLMInputs());
+        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("seq latency");
         profiler->recordHostEnd("pipeline latency");
@@ -280,9 +280,9 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath,
     return decoder->getDeviceMemorySize();
 }
 
-void benchmark(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
-    int const batchSize, int const textTokenLength, int const imageTokenLength, int const outputLength, 
-    std::string modelType, int const warmUp, int const numRuns)
+void benchmarkVLM(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
+    int const batchSize, int const textTokenLength, int const imageTokenLength, int const outputLength,
+    std::string modelType, int const warmUp, int const numRuns, bool useCudaGraph)
 {
     int totalSeqLength = textTokenLength + imageTokenLength + outputLength;
     GenerationConfig generationConfig{totalSeqLength, totalSeqLength, 1, 0};
@@ -298,17 +298,15 @@ void benchmark(std::filesystem::path const& llmEnginePath, std::filesystem::path
 
     if (modelType == "qwen2_vl")
     {
-        deviceMemorySize = benchmarkQwen2VL(llmEnginePath, visualEnginePath, 
-            generationConfig, batchSize, textTokenLength, imageTokenLength, outputIds, 
-            profiler, warmUp, numRuns);
+        deviceMemorySize = benchmarkQwen2VL(llmEnginePath, visualEnginePath, generationConfig, batchSize,
+            textTokenLength, imageTokenLength, outputIds, profiler, warmUp, numRuns, useCudaGraph);
     }
     else
     {
         throw std::runtime_error("Only support Qwen2-VL model for Multimodal models.");
     }
 
-    printBenchmarkResult(profiler, batchSize, textTokenLength, imageTokenLength, outputLength,
-        deviceMemorySize);
+    printBenchmarkResult(profiler, batchSize, textTokenLength, imageTokenLength, outputLength, deviceMemorySize);
 }
 
 int main(int argc, char* argv[])
@@ -341,8 +339,8 @@ int main(int argc, char* argv[])
         LOG_ERROR("Please specify --textTokenLength, --imageTokenLength and --outputLength for benchmark.");
         return EXIT_FAILURE;
     }
-    benchmark(args.llmEnginePath, args.visualEnginePath, args.batchSize, args.textTokenLength, 
-        args.imageTokenLength, args.outputLength, args.modelType, args.warmUp, args.numRuns);
+    benchmarkVLM(args.llmEnginePath, args.visualEnginePath, args.batchSize, args.textTokenLength, args.imageTokenLength,
+        args.outputLength, args.modelType, args.warmUp, args.numRuns, !args.noCudaGraph);
 
     return EXIT_SUCCESS;
 };

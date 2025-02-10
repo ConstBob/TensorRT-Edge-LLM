@@ -21,12 +21,15 @@ inline nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
 struct EngineInputDesc
 {
     std::string name;
-    void* data;
-    nvinfer1::Dims dims;
-    EngineInputDesc(const std::string name, void* data, const nvinfer1::Dims dims)
+    void* deviceBuffer;
+    nvinfer1::Dims contextDims;
+    nvinfer1::Dims generationDims;
+    EngineInputDesc(const std::string name, void* deviceBuffer, const nvinfer1::Dims contextDims, 
+        const nvinfer1::Dims generationDims)
         : name(name)
-        , data(data)
-        , dims(dims)
+        , deviceBuffer(deviceBuffer)
+        , contextDims(contextDims)
+        , generationDims(generationDims)
     {
     }
 };

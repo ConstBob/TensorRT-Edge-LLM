@@ -25,6 +25,14 @@ struct ModelConfig
     int64_t vocabSize;
 };
 
+struct Qwen2VLConfig
+// This is the model config specifically for QWen2-VL
+{
+    int64_t imageHiddenSize;
+    int64_t mropeDim;
+    int64_t maxImageTokens;
+};
+
 struct GenerationConfig
 {
     int64_t maxLength; // Equivalent to maxNewTokens + Length of input
@@ -37,22 +45,26 @@ template <typename T>
 class Decoder
 {
 public:
-    Decoder()
+    Decoder(bool useCudaGraph = true)
         : mStream{nullptr}
         , mEngine{nullptr}
         , mContextExecutionContext{nullptr}
         , mGenerationExecutionContext{nullptr}
         , isSetup{false}
         , mConfig{0, 0, 0, 0, 0, 0, 0}
+        , mQwen2VLConfig{0, 0, 0}
+        , isQwen2VLSetup{false}
         , mDeviceBuffer{}
         , mSampler{nullptr}
+        , mUseCudaGraph{true}
+        , mCudaGraphCaptured{false}
     {
     }
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int64_t batchSize = 1);
+    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph = false, int64_t batchSize = 1);
+    bool setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
         std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
-        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
-        std::optional<std::vector<EngineInputDesc>> const& extraInputs = std::nullopt);
+        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
 
     std::vector<T> const& getLastHostLogits();
     size_t getDeviceMemorySize() const noexcept;
@@ -80,6 +92,8 @@ private:
     cudaStream_t mStream;
     bool isSetup;
     ModelConfig mConfig;
+    Qwen2VLConfig mQwen2VLConfig;
+    bool isQwen2VLSetup{false};
     std::map<std::string, void*> mDeviceBuffer;
     std::map<std::string, void*> mHostBuffer;
     bool validateAndFillConfig(int64_t batchSize = 1);
@@ -89,4 +103,9 @@ private:
     // These are used as debugging functions
     std::string printKVCache(int64_t contextLength);
     std::string printLogits();
+
+    bool mUseCudaGraph{true};
+    bool mCudaGraphCaptured{false};
+    cudaGraph_t mGenerationGraph;
+    cudaGraphExec_t mGenerationGraphExec;
 };

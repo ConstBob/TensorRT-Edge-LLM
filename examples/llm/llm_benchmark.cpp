@@ -24,6 +24,7 @@ struct LLMBenchmarkArgs
     int64_t numRuns{10};
     int64_t warmUp{2};
     bool debug{false};
+    bool noCudaGraph{false};
 };
 
 void printUsage(char const* programName)
@@ -42,14 +43,15 @@ void printUsage(char const* programName)
     std::cerr << "  --numRuns        Minimal number of iterations to run during benchmarking. Default = 10."
               << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs tensors." << std::endl;
+    std::cerr << "  --noCudaGraph    Cuda graph is default enabled. Use this flag to disable cuda graph." << std::endl;
 };
 
 bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
 {
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"enginePath", required_argument, 0, 'e'},
         {"maxLength", required_argument, 0, 's'}, {"inputLength", required_argument, 0, 'c'},
-        {"warmUp", required_argument, 0, 'w'}, {"numRuns", required_argument, 0, 'r'}, {"debug", no_argument, 0, 'd'},
-        {0, 0, 0, 0}};
+        {"warmUp", required_argument, 0, 'w'}, {"numRuns", required_argument, 0, 'r'},
+        {"noCudaGraph", no_argument, 0, 'g'}, {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -95,6 +97,7 @@ bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
                 args.numRuns = std::stoi(optarg);
             }
             break;
+        case 'g': args.noCudaGraph = true; break;
         case 'd': args.debug = true; break;
         default: return false;
         }
@@ -102,8 +105,8 @@ bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
     return true;
 }
 
-void benchmark(std::string& enginePath, int const inputLength, int64_t warmUp, int64_t numRuns,
-    GenerationConfig const& generationConfig)
+void benchmarkLLM(std::string& enginePath, int const inputLength, int64_t warmUp, int64_t numRuns,
+    GenerationConfig const& generationConfig, bool useCudaGraph)
 {
     auto profiler = std::make_shared<BenchmarkProfiler>();
     profiler->startTiming();
@@ -113,7 +116,7 @@ void benchmark(std::string& enginePath, int const inputLength, int64_t warmUp, i
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     profiler->recordHostStart("decoder setup");
-    decoder->setup(enginePath, stream);
+    decoder->setup(enginePath, stream, useCudaGraph);
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
 
@@ -270,6 +273,6 @@ int main(int argc, char* argv[])
         LOG_ERROR("Please specify --inputLength and --maxLength for benchmark.");
         return EXIT_FAILURE;
     }
-    benchmark(args.enginePath, args.inputLength, args.warmUp, args.numRuns, generationConfig);
+    benchmarkLLM(args.enginePath, args.inputLength, args.warmUp, args.numRuns, generationConfig, !args.noCudaGraph);
     return EXIT_SUCCESS;
 };

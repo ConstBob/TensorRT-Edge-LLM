@@ -39,8 +39,7 @@ void printUsage(char const* programName)
     std::cerr << "  --maxLength         Provide the maximum output length for the generation session (including the "
                  "input). Default = 1024."
               << std::endl;
-    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl."
-              << std::endl;
+    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl." << std::endl;
     std::cerr << "  --debug             Use debug mode, which outputs tensors." << std::endl;
 };
 
@@ -49,7 +48,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"inputString", required_argument, 0, 'i'},
         {"imagePaths", required_argument, 0, 'p'}, {"llmEnginePath", required_argument, 0, 'e'},
         {"visualEnginePath", required_argument, 0, 'v'}, {"tokenizerPath", required_argument, 0, 't'},
-        {"maxLength", required_argument, 0, 's'}, {"debug", no_argument, 0, 'd'}, 
+        {"maxLength", required_argument, 0, 's'}, {"debug", no_argument, 0, 'd'},
         {"modelType", required_argument, 0, 0}, {0, 0, 0, 0}};
 
     int opt;
@@ -80,8 +79,8 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                 std::string path;
                 while (std::getline(ss, path, ','))
                 {
-                    // Trim spaces 
-                    path = regex_replace(path, std::regex("(^[ ]+)|([ ]+$)"),"");
+                    // Trim spaces
+                    path = regex_replace(path, std::regex("(^[ ]+)|([ ]+$)"), "");
                     paths.push_back(path);
                 }
                 args.imagePaths.emplace_back(paths);
@@ -155,10 +154,10 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
     return true;
 }
 
-void decodeQwen2VL(std::filesystem::path const& llmEnginePath,
-    std::filesystem::path const& visualEnginePath, std::vector<std::string>& inputStrings,
-    std::vector<std::vector<std::string>> const& imagePaths, std::unique_ptr<Tokenizer>& tokenizer,
-    GenerationConfig const& generationConfig, int32_t const batchSize, std::vector<std::vector<int64_t>>& outputIds)
+void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
+    std::vector<std::string>& inputStrings, std::vector<std::vector<std::string>> const& imagePaths,
+    Tokenizer* tokenizer, GenerationConfig const& generationConfig, int32_t const batchSize,
+    std::vector<std::vector<int64_t>>& outputIds)
 {
     // Setup
     cudaStream_t stream;
@@ -167,7 +166,7 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath,
     auto vitrunner = new Qwen2ViTRunner();
     vitrunner->setup(visualEnginePath, stream, batchSize);
     auto decoder = new Decoder<half>();
-    decoder->setup(llmEnginePath, stream, batchSize);
+    decoder->setup(llmEnginePath, stream, true, batchSize);
 
     // Preprocess
     std::vector<half> visualInput;
@@ -189,12 +188,11 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath,
             int width{0}, height{0}, channels{0};
             int desiredChannels = 3;
             // Loaded pixels in hwc, rgb order
-            unsigned char* image = stbi_load(imagePaths[b][i].c_str(),
-                &width, &height, &channels, desiredChannels);
+            unsigned char* image = stbi_load(imagePaths[b][i].c_str(), &width, &height, &channels, desiredChannels);
             if (image == nullptr)
             {
                 LOG_ERROR("Failed to load image: %s", stbi_failure_reason());
-                return ;
+                return;
             }
 
             imageBuffers.emplace_back(image);
@@ -202,25 +200,28 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath,
         }
     }
 
-    vitrunner->visualPreprocess(imageBuffers, imageSizes, visualInput, visualAttentionMask, 
-        visualRotaryPosEmb, visualGridTHWs);
+    vitrunner->visualPreprocess(
+        imageBuffers, imageSizes, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
     vitrunner->allocateBuffer();
-    vitrunner->textPreprocess(inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths,
-        decoder->getMaxContextLength());
+    vitrunner->textPreprocess(
+        inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths, decoder->getMaxContextLength());
 
     // Infer
     vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
-    decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), nullptr,
-        vitrunner->getExtraLLMInputs());
+
+    // Reuse the same device buffer for VIT output and LLM "image_embeds" input to avoid H2D/D2H copy
+    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+    
+    decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), nullptr);
 }
 
 std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
     std::filesystem::path const& visualEnginePath, std::vector<std::string>& inputStrings,
-    std::vector<std::vector<std::string>>& imagePaths, std::unique_ptr<Tokenizer>& tokenizer,
-    GenerationConfig const& generationConfig, std::string modelType)
+    std::vector<std::vector<std::string>>& imagePaths, Tokenizer* tokenizer, GenerationConfig const& generationConfig,
+    std::string modelType)
 {
     int32_t batchSize = std::max(inputStrings.size(), imagePaths.size());
-    
+
     // Set default inputString and imagePaths to batchSize
     for (int i = inputStrings.size(); i < batchSize; ++i)
     {
@@ -239,8 +240,8 @@ std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
 
     if (modelType == "qwen2_vl")
     {
-        decodeQwen2VL(llmEnginePath, visualEnginePath, inputStrings, imagePaths, tokenizer, generationConfig,
-            batchSize, outputIds);
+        decodeQwen2VL(llmEnginePath, visualEnginePath, inputStrings, imagePaths, tokenizer, generationConfig, batchSize,
+            outputIds);
     }
     else
     {
@@ -286,8 +287,8 @@ int main(int argc, char* argv[])
     GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
-    auto output = decode(args.llmEnginePath, args.visualEnginePath, args.inputStrings, 
-        args.imagePaths, tokenizer, generationConfig, args.modelType);
+    auto output = decode(args.llmEnginePath, args.visualEnginePath, args.inputStrings, args.imagePaths, tokenizer.get(),
+        generationConfig, args.modelType);
 
     return EXIT_SUCCESS;
 };

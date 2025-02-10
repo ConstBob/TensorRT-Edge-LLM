@@ -185,7 +185,7 @@ def surgeon_llm(raw_onnx_path,
                 mode,
                 config_path,
                 state_dict,
-                max_seq_length, 
+                max_seq_length=4096,
                 rope_type=RopeType.kROPE_ROTATE_NEOX,
                 extra_plugin_inputs=[],
                 lm_head_precision="fp16"):
@@ -335,15 +335,15 @@ def main(args):
 
             # Surgeon graph based on precision and mode
             raw_onnx_path = f"{onnx_dir}/model.onnx" if args.torch_dir else args.onnx_path
-    surgeon_llm(raw_onnx_path, 
-                args.output_dir, 
-                args.dtype, 
-                args.mode, 
-                args.config_path, 
+    surgeon_llm(raw_onnx_path,
+                args.output_dir,
+                args.dtype,
+                args.mode,
+                args.config_path,
                 state_dict,
                 args.max_seq_length,
                 lm_head_precision=args.lm_head)
-    
+
     end_time = time.time()
     print(
         f"LLM ONNX saved to {args.output_dir} with {args.dtype} precision in {end_time - start_time}s."

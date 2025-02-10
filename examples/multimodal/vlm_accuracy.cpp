@@ -3,9 +3,9 @@
 #include "decoder/decoder.h"
 #include "qwen2vl/vit_runner.h"
 #include "tokenizer/tokenizer.h"
+#include <cuda_profiler_api.h>
 #include <dlfcn.h>
 #include <getopt.h>
-#include <cuda_profiler_api.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
@@ -38,7 +38,7 @@ struct MMMUTestData
     std::string format() const
     {
         std::string prompt = question;
-        
+
         if (questionType == "multiple-choice")
         {
             for (int i = 0; i < options.size(); ++i)
@@ -48,7 +48,8 @@ struct MMMUTestData
             }
             prompt += "\n\nAnswer with the option's letter from the given choices directly.";
         }
-        else{
+        else
+        {
             prompt += "\n\nAnswer the question using a single word or phrase.";
         }
 
@@ -170,10 +171,10 @@ bool parseMultimodalAccuracyArgs(MultimodalAccuracyArgs& args, int argc, char* a
 
 std::vector<unsigned char> base64Decode(std::string const& encoded)
 {
-    static const std::string BASE64_CHARS =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "0123456789+/";
+    static const std::string BASE64_CHARS
+        = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          "abcdefghijklmnopqrstuvwxyz"
+          "0123456789+/";
 
     std::vector<unsigned char> decoded;
     if (encoded.empty())
@@ -200,7 +201,8 @@ std::vector<unsigned char> base64Decode(std::string const& encoded)
             {
                 bits <<= 6;
                 nBits += 6;
-                bits |= BASE64_CHARS.find(c);;
+                bits |= BASE64_CHARS.find(c);
+                ;
             }
             else if (j == 2)
             {
@@ -244,8 +246,7 @@ std::vector<MMMUTestData*> parseTSVFile(std::filesystem::path const& csvPath)
     {
         auto data = new MMMUTestData{};
 
-        auto getItem = [&file, &csvPath](char const delim = '\t') -> std::string
-        {
+        auto getItem = [&file, &csvPath](char const delim = '\t') -> std::string {
             // Handling this according to http://super-csv.github.io/super-csv/csv_specification.html
             std::string item;
             auto c = file.get();
@@ -294,16 +295,16 @@ std::vector<MMMUTestData*> parseTSVFile(std::filesystem::path const& csvPath)
             return item;
         };
 
-        auto parseImgBytes = [](std::vector<std::vector<unsigned char>>& images, std::string const& imgStr)
-        {
+        auto parseImgBytes = [](std::vector<std::vector<unsigned char>>& images, std::string const& imgStr) {
             if (imgStr.size() < 2)
             {
-                return ;
+                return;
             }
-            
+
             size_t start = 1;
             size_t end = imgStr.find(", ");
-            while (end != std::string::npos) {
+            while (end != std::string::npos)
+            {
                 // remove quotes
                 std::string base64Str = imgStr.substr(start + 1, end - start - 2);
                 images.emplace_back(base64Decode(base64Str));
@@ -320,16 +321,16 @@ std::vector<MMMUTestData*> parseTSVFile(std::filesystem::path const& csvPath)
         };
 
         // Each record items has the order of:
-        //     id, index, question, split, A, B, C, D, answer, topic_difficulty, subfield, 
+        //     id, index, question, split, A, B, C, D, answer, topic_difficulty, subfield,
         //     image_type, question_type, explanation, image, image_path, E, F, G, H, I, category, l2-category"
-        
+
         std::string id = getItem();
         if (id.empty())
         {
             break;
         }
         data->id = id;
-        getItem();  // index
+        getItem(); // index
         data->question = getItem();
         data->split = getItem();
 
@@ -344,15 +345,15 @@ std::vector<MMMUTestData*> parseTSVFile(std::filesystem::path const& csvPath)
         }
 
         data->answer = getItem();
-        getItem();  // difficulty
-        getItem();  // subfield
-        getItem();  // imgType
+        getItem();                      // difficulty
+        getItem();                      // subfield
+        getItem();                      // imgType
         data->questionType = getItem();
-        getItem();  // imgType
+        getItem();                      // imgType
 
-        std::string imgStr = getItem();  // image str
+        std::string imgStr = getItem(); // image str
         parseImgBytes(data->images, imgStr);
-        getItem();  // image_path
+        getItem();                      // image_path
 
         // E, F, G, H, I,
         for (int i = 0; i < 5; ++i)
@@ -364,15 +365,14 @@ std::vector<MMMUTestData*> parseTSVFile(std::filesystem::path const& csvPath)
             }
         }
 
-        getItem();  // category
-        getItem('\n');  // l2-category
+        getItem();     // category
+        getItem('\n'); // l2-category
         res.emplace_back(data);
     }
 
     file.close();
     return res;
 }
-
 
 void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestData*> const& dataset)
 {
@@ -384,7 +384,7 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
             << "\"A\",\"B\",\"C\",\"D\",\"E\",\"F\",\"G\",\"H\",\"I\"\n";
 
     // Escape double quotes and enclose fields in quotes
-    auto escapeAndQuote = [](const std::string& field) {
+    auto escapeAndQuote = [](std::string const& field) {
         std::string escapedField = "\"";
         for (char c : field)
         {
@@ -424,7 +424,7 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
         // Store options in list of strings
         // outFile << "\"[";
         for (int i = 0; i < 9; ++i)
-        {   
+        {
             if (i < data->options.size())
             {
                 auto opt = data->options[i];
@@ -441,9 +441,8 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
     outFile.close();
 }
 
-void evalQwen2VL(std::filesystem::path const& llmEnginePath,
-    std::filesystem::path const& visualEnginePath, std::vector<MMMUTestData*> const& dataset, 
-    std::unique_ptr<Tokenizer>& tokenizer)
+void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
+    std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer)
 {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -468,7 +467,7 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath,
             continue;
         }
         LOG_INFO(data->id.c_str());
-        
+
         std::vector<half> visualInput;
         std::vector<half> visualAttentionMask;
         std::vector<float> visualRotaryPosEmb;
@@ -480,29 +479,29 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath,
         // Preprocess
         std::vector<unsigned char*> imageBuffers;
         std::vector<std::vector<int>> imageSizes;
-        for (auto & buffer : data->images)
+        for (auto& buffer : data->images)
         {
             int width{0}, height{0}, channels{0};
             int desiredChannels = 3;
-            unsigned char* image = stbi_load_from_memory(
-                buffer.data(), buffer.size(), &width, &height, &channels, desiredChannels);
+            unsigned char* image
+                = stbi_load_from_memory(buffer.data(), buffer.size(), &width, &height, &channels, desiredChannels);
             assert(image != NULL && "Failed to load image.");
             imageBuffers.emplace_back(image);
             imageSizes.emplace_back(std::vector<int>{width, height, desiredChannels});
         }
 
-        vitrunner->visualPreprocess(imageBuffers, imageSizes, visualInput, visualAttentionMask, 
-            visualRotaryPosEmb, visualGridTHWs);
+        vitrunner->visualPreprocess(
+            imageBuffers, imageSizes, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
         vitrunner->allocateBuffer();
 
         std::string prompt = data->format();
         int numImage = data->images.size();
-        vitrunner->textPreprocess({prompt}, {numImage}, visualGridTHWs, tokenizer, inputIds, contextLengths,
-            maxInputLength);
+        vitrunner->textPreprocess(
+            {prompt}, {numImage}, visualGridTHWs, tokenizer, inputIds, contextLengths, maxInputLength);
 
         vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), nullptr,
-            vitrunner->getExtraLLMInputs());
+        decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
 
         std::string pred = tokenizer->decode(outputIds[0], true);
         data->pred = pred;
@@ -515,8 +514,8 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath,
 }
 
 void mmmuAccuracy(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
-    std::filesystem::path const& datasetPath, std::filesystem::path const& outputPath,
-    std::unique_ptr<Tokenizer>& tokenizer, std::string modelType)
+    std::filesystem::path const& datasetPath, std::filesystem::path const& outputPath, Tokenizer* tokenizer,
+    std::string modelType)
 {
     std::vector<MMMUTestData*> dataset;
     try
@@ -525,12 +524,12 @@ void mmmuAccuracy(std::filesystem::path const& llmEnginePath, std::filesystem::p
         dataset = parseTSVFile(datasetPath);
         LOG_DEBUG("Loaded dataset size: %d", dataset.size());
     }
-    catch(const std::exception& e)
+    catch (std::exception const& e)
     {
         LOG_ERROR("Failed to load dataset: %s", e.what());
         return;
     }
-    
+
     if (modelType == "qwen2_vl")
     {
         evalQwen2VL(llmEnginePath, visualEnginePath, dataset, tokenizer);
@@ -570,8 +569,8 @@ int main(int argc, char* argv[])
 
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
-    mmmuAccuracy(args.llmEnginePath, args.visualEnginePath, args.datasetPath, args.outputPath,
-        tokenizer, args.modelType);
+    mmmuAccuracy(
+        args.llmEnginePath, args.visualEnginePath, args.datasetPath, args.outputPath, tokenizer.get(), args.modelType);
 
     return EXIT_SUCCESS;
 };

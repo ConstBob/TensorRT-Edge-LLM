@@ -418,8 +418,8 @@ int buildLLM(VLMBuildArgs const& args)
 
     result &= setOptimizationProfile(contextProfile, "image_embeds", createDims({minImageTokens, imageHiddenSize}),
         createDims({optImageTokens, imageHiddenSize}), createDims({maxImageTokens, imageHiddenSize}));
-    result &= setOptimizationProfile(generationProfile, "image_embeds", createDims({minImageTokens, imageHiddenSize}),
-        createDims({optImageTokens, imageHiddenSize}), createDims({maxImageTokens, imageHiddenSize}));
+    result &= setOptimizationProfile(generationProfile, "image_embeds", createDims({1, imageHiddenSize}),
+        createDims({1, imageHiddenSize}), createDims({1, imageHiddenSize}));
 
     result &= setOptimizationProfile(contextProfile, "mrope_rotary_cos_sin", createDims({minBatchSize, mropeDim}),
         createDims({optBatchSize, mropeDim}), createDims({maxBatchSize, mropeDim}));

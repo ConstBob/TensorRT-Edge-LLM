@@ -10,7 +10,7 @@
 #include <utility>
 
 template <typename T>
-bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, int64_t batchSize)
+bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph, int64_t batchSize)
 {
     try
     {
@@ -25,6 +25,8 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, in
         mGenerationExecutionContext->setOptimizationProfileAsync(1, mStream);
         validateAndFillConfig(batchSize);
         allocateBuffer();
+        mUseCudaGraph = useCudaGraph;
+        mCudaGraphCaptured = false;
         isSetup = true;
     }
     catch (std::exception const& e)
@@ -34,6 +36,28 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, in
         return false;
     }
     return true;
+}
+
+template <typename T>
+bool Decoder<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
+{
+    for (int i = 0; i < extraInputs.size(); ++i)
+    {
+        char const* inputName = extraInputs[i].name.c_str();
+        void* inputDevice = extraInputs[i].deviceBuffer;
+        nvinfer1::Dims contextDims = extraInputs[i].contextDims;
+        nvinfer1::Dims generationDims = extraInputs[i].generationDims;
+
+        mContextExecutionContext->setTensorAddress(inputName, inputDevice);
+        mGenerationExecutionContext->setTensorAddress(inputName, inputDevice);
+        mContextExecutionContext->setInputShape(inputName, contextDims);
+        mGenerationExecutionContext->setInputShape(inputName, generationDims);
+    }
+    // Need to reset cudaGraph because the setInputShape and setTensorAddress requires cudaGraph to be recaptured
+    if (mUseCudaGraph)
+    {
+        mCudaGraphCaptured = false;
+    }
 }
 
 // Helper function to check 2 dims are equal.
@@ -278,7 +302,7 @@ std::string Decoder<T>::printLogits()
 template <typename T>
 void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
-    std::shared_ptr<BenchmarkProfiler> const profiler, std::optional<std::vector<EngineInputDesc>> const& extraInputs)
+    std::shared_ptr<BenchmarkProfiler> const profiler)
 {
     auto lastTokenIds = reinterpret_cast<int64_t*>(mHostBuffer["last_token_ids"]);
     // The generation step stop at longest sequence reach the maxLength.
@@ -319,6 +343,9 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         return generatedToken;
     };
     assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
+
+    // Setup "input_ids",  "context_lengths", "last_token_ids"
+    // Extra model inputs should be set with `setupExtraInputs` before this function
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
         mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], lastTokenIds, mConfig.batchSize * sizeof(int64_t),
@@ -326,20 +353,22 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
         mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 
-    // Setup model-specific inputs
-    if (extraInputs.has_value())
+    // Capture cuda graph only on the first run. This cuda graph will be cached and reused for all the other runs.
+    if (mUseCudaGraph && !mCudaGraphCaptured)
     {
-        for (int i = 0; i < extraInputs.value().size(); ++i)
+        try
         {
-            const char* inputName = extraInputs.value()[i].name.c_str();
-            void* inputData = extraInputs.value()[i].data;
-            nvinfer1::Dims inputDims = extraInputs.value()[i].dims;
-            
-            mDeviceBuffer[inputName] = inputData;
-            mContextExecutionContext->setTensorAddress(inputName, inputData);
-            mGenerationExecutionContext->setTensorAddress(inputName, inputData);
-            mContextExecutionContext->setInputShape(inputName, inputDims);
-            mGenerationExecutionContext->setInputShape(inputName, inputDims);
+            CUDA_CHECK(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeGlobal));
+            mGenerationExecutionContext->enqueueV3(mStream);
+            CUDA_CHECK(cudaStreamEndCapture(mStream, &mGenerationGraph));
+            CUDA_CHECK(cudaGraphInstantiate(&mGenerationGraphExec, mGenerationGraph, 0));
+            mCudaGraphCaptured = true;
+        }
+        catch (std::exception const& e)
+        {
+            LOG_WARNING("Cuda graph cannot be captured due to %s. Fall back to non cuda graph.", e.what());
+            mUseCudaGraph = false;
+            mCudaGraphCaptured = false;
         }
     }
 
@@ -362,7 +391,16 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], generatedToken.data(),
             mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 
-        mGenerationExecutionContext->enqueueV3(mStream);
+        if (mUseCudaGraph && mCudaGraphCaptured)
+        {
+            CUDA_CHECK(cudaGraphLaunch(mGenerationGraphExec, mStream));
+            CUDA_CHECK(cudaStreamSynchronize(mStream));
+        }
+        else
+        {
+            mGenerationExecutionContext->enqueueV3(mStream);
+        }
+
         generatedToken = sampleToken();
         LOG_DEBUG("Generation phase logits:\n%s", printLogits().c_str());
     }
