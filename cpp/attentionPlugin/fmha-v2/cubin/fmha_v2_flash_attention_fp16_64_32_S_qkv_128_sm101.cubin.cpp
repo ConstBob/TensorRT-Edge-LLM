@@ -1,3 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+ 
 unsigned char cubin_fmha_v2_flash_attention_fp16_64_32_S_qkv_128_sm101_cu_cubin[] = {
   0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x41, 0x08, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0xbe, 0x00, 0x01, 0x00, 0x00, 0x00,
