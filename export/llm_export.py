@@ -332,7 +332,7 @@ def main(args):
     start_time = time.time()
     state_dict = None
 
-    if not check_dtype_support():
+    if not check_dtype_support(args):
         return
 
     if args.torch_dir:

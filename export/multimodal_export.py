@@ -209,7 +209,7 @@ def export_qwen2_vl_visual(hf_model, output_dir):
 
 
 def export_qwen2_vl(args):
-    if not check_dtype_support():
+    if not check_dtype_support(args):
         return
     from transformers import Qwen2VLForConditionalGeneration
 
