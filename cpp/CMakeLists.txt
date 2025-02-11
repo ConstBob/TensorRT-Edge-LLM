@@ -20,7 +20,7 @@ set(CUDA_PTXAS_FLAGS "-warn-lmem-usage -warn-double-usage -warn-spills"
 set(CMAKE_CUDA_FLAGS_RELEASE
     "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo -res-usage -keep --use_fast_math -Xptxas='${CUDA_PTXAS_FLAGS}'"
 )
-set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -O0 -G")
+set(CMAKE_CUDA_FLAGS_DEBUG "")
 
 # Generate attention plugin shared library
 file(GLOB_RECURSE PLUGIN_CPP_SRCS "attentionPlugin/*.cpp")
