@@ -9,7 +9,7 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #include "common/common.h"
 #include "decoder/decoder.h"
 #include "qwen2vl/vit_runner.h"

@@ -9,7 +9,7 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #include "common/common.h"
 #include "decoder/decoder.h"
 #include "qwen2vl/vit_runner.h"
@@ -222,7 +222,7 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
 
     // Reuse the same device buffer for VIT output and LLM "image_embeds" input to avoid H2D/D2H copy
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
-    
+
     decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), nullptr);
 }
 

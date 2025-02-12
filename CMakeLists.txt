@@ -1,12 +1,12 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# property and proprietary rights in and to this material, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this material and related documentation without an express
+# license agreement from NVIDIA CORPORATION or its affiliates is strictly
+# prohibited.
 
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
@@ -55,7 +55,8 @@ find_path(
   HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
   PATH_SUFFIXES include)
 
-set(CUDA_INCLUDE_DIR ${CUDA_RUNTIME_API_INCLUDE_DIR} ${CURAND_KERNEL_INCLUDE_DIR})
+set(CUDA_INCLUDE_DIR ${CUDA_RUNTIME_API_INCLUDE_DIR}
+                     ${CURAND_KERNEL_INCLUDE_DIR})
 
 set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
 

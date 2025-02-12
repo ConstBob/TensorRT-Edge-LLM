@@ -9,7 +9,7 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #pragma once
 
 #include <NvInferRuntime.h>
@@ -24,11 +24,12 @@ class AttentionPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
     // Plugin constructor and attention specific utility methods
-    AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads,
-        int32_t headSize, int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType,int32_t halfRotaryDim, int32_t rotaryEmbeddingMaxPositions);
+    AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+        int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType, int32_t halfRotaryDim,
+        int32_t rotaryEmbeddingMaxPositions);
 
     AttentionPlugin(std::string const& name, void const* data, size_t length);
-    
+
     // Force to distinguish different instances of the plugin.
     AttentionPlugin() = delete;
 
@@ -50,12 +51,12 @@ public:
     nvinfer1::DimsExprs getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
         nvinfer1::IExprBuilder& exprBuilder) noexcept override;
 
-    bool supportsFormatCombination(int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs,
-        int32_t nbOutputs) noexcept override;
-    
+    bool supportsFormatCombination(
+        int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept override;
+
     void configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
         nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
-    
+
     size_t getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int32_t nbInputs,
         nvinfer1::PluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
 
@@ -117,9 +118,8 @@ public:
 
     char const* getPluginVersion() const noexcept override;
 
-    nvinfer1::IPluginV2* createPlugin(
-        char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
-    
+    nvinfer1::IPluginV2* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
+
     nvinfer1::IPluginV2* deserializePlugin(
         char const* name, void const* serialData, size_t serialLength) noexcept override;
 

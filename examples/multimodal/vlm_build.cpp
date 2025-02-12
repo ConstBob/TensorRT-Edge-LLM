@@ -9,7 +9,7 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #include "NvOnnxParser.h"
 #include "common/common.h"
 #include "common/logger.h"
