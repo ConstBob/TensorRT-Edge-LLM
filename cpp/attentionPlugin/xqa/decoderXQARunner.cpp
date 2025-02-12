@@ -9,7 +9,7 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #include "decoderXQARunner.h"
 #include "attentionPlugin/pluginUtils.h"
 #include "attentionPlugin/xqa/cubin/xqa_kernel_cubin.h"

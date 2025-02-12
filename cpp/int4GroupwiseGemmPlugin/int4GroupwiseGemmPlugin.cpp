@@ -9,7 +9,7 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #include "int4GroupwiseGemmPlugin.h"
 #include "int4GroupwiseGemmPlugin/kernel/int4GroupwiseGemm.h"
 

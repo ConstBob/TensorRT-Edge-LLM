@@ -9,21 +9,20 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #pragma once
 
 #include "common.h"
 #include "logger.h"
 #include <NvInfer.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <memory>
 #include <stdexcept>
-#include <vector>
-#include <sys/stat.h>
 #include <sys/mman.h>
-#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
-
+#include <vector>
 
 inline nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
 {
@@ -41,7 +40,7 @@ struct EngineInputDesc
     void* deviceBuffer;
     nvinfer1::Dims contextDims;
     nvinfer1::Dims generationDims;
-    EngineInputDesc(const std::string name, void* deviceBuffer, const nvinfer1::Dims contextDims, 
+    EngineInputDesc(const std::string name, void* deviceBuffer, const nvinfer1::Dims contextDims,
         const nvinfer1::Dims generationDims)
         : name(name)
         , deviceBuffer(deviceBuffer)

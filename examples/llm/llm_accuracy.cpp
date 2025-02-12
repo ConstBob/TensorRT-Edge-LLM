@@ -9,7 +9,7 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #include "common/common.h"
 #include "common/trtUtils.h"
 #include "decoder/decoder.h"

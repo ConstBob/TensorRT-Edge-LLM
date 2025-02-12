@@ -1,28 +1,27 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved. SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# property and proprietary rights in and to this material, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this material and related documentation without an express
+# license agreement from NVIDIA CORPORATION or its affiliates is strictly
+# prohibited.
 
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
 
 # Specify the cross-compiler
-find_program(CMAKE_C_COMPILER 
-    NAMES aarch64-linux-gnu-gcc
-    PATHS /usr/local/bin /usr/bin
-    NO_DEFAULT_PATH
-)
+find_program(
+  CMAKE_C_COMPILER
+  NAMES aarch64-linux-gnu-gcc
+  PATHS /usr/local/bin /usr/bin
+  NO_DEFAULT_PATH)
 
-find_program(CMAKE_CXX_COMPILER 
-    NAMES aarch64-linux-gnu-g++
-    PATHS /usr/local/bin /usr/bin
-    NO_DEFAULT_PATH
-)
+find_program(
+  CMAKE_CXX_COMPILER
+  NAMES aarch64-linux-gnu-g++
+  PATHS /usr/local/bin /usr/bin NO_DEFAULT_PATH)
 
 set(CMAKE_C_COMPILER /usr/bin/aarch64-linux-gnu-gcc)
 set(CMAKE_CXX_COMPILER /usr/bin/aarch64-linux-gnu-g++)
