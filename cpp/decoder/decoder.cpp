@@ -9,12 +9,13 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #include "decoder.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <memory>
@@ -28,8 +29,19 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, bo
     {
         mStream = stream;
         mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-        StreamReader _sr(fp);
-        mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
+        char const* disableMmapLoad = std::getenv("DISABLE_MMAP_LOAD");
+        if (disableMmapLoad != nullptr)
+        {
+            StreamReader _sr(fp);
+            mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
+        }
+        else
+        {
+            auto mmapReader = std::make_unique<MmapReader>(fp);
+            mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+                mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+        }
+
         mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
         mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
         assert(mEngine->getNbOptimizationProfiles() == 2 && "The engine requires 2 optimization profiles");

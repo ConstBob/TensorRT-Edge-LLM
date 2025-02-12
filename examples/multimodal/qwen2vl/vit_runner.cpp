@@ -9,7 +9,7 @@
  * without an express license agreement from NVIDIA CORPORATION or
  * its affiliates is strictly prohibited.
  */
- 
+
 #include "vit_runner.h"
 #include <cmath>
 #include <random>
@@ -25,8 +25,19 @@ bool Qwen2ViTRunner::setup(
     {
         mStream = stream;
         mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-        StreamReader _sr(fp);
-        mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
+        char const* disableMmapLoad = std::getenv("DISABLE_MMAP_LOAD");
+        if (disableMmapLoad != nullptr)
+        {
+            StreamReader _sr(fp);
+            mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
+        }
+        else
+        {
+            auto mmapReader = std::make_unique<MmapReader>(fp);
+            mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+                mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+        }
+
         mContext = std::unique_ptr<nvinfer1::IExecutionContext>(mVisualEngine->createExecutionContext());
         mContext->setOptimizationProfileAsync(0, mStream);
         mBatchSize = batchSize;
@@ -519,16 +530,16 @@ std::vector<EngineInputDesc> Qwen2ViTRunner::getExtraLLMInputs()
     std::vector<EngineInputDesc> extraInputs;
     nvinfer1::Dims imageEmbedsDims = mContext->getTensorShape("output");
     int64_t imageHiddenSize = imageEmbedsDims.d[1];
-    extraInputs.emplace_back(EngineInputDesc{
-        "image_embeds", mDeviceBuffer["output"], imageEmbedsDims, {2, {1, imageHiddenSize}}});
+    extraInputs.emplace_back(
+        EngineInputDesc{"image_embeds", mDeviceBuffer["output"], imageEmbedsDims, {2, {1, imageHiddenSize}}});
 
     nvinfer1::Dims cosSinDims = {2, {mBatchSize, mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim}};
-    extraInputs.emplace_back(EngineInputDesc{
-        "mrope_rotary_cos_sin", mDeviceBuffer["mropeRotaryCosSin"], cosSinDims, cosSinDims});
+    extraInputs.emplace_back(
+        EngineInputDesc{"mrope_rotary_cos_sin", mDeviceBuffer["mropeRotaryCosSin"], cosSinDims, cosSinDims});
 
     nvinfer1::Dims deltasDim = {2, {mBatchSize, 1}};
-    extraInputs.emplace_back(EngineInputDesc{
-        "mrope_position_deltas", mDeviceBuffer["mropePositionDeltas"], deltasDim, deltasDim});
+    extraInputs.emplace_back(
+        EngineInputDesc{"mrope_position_deltas", mDeviceBuffer["mropePositionDeltas"], deltasDim, deltasDim});
 
     return extraInputs;
 }
