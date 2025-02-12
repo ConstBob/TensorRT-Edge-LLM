@@ -1,4 +1,4 @@
-# DriveOS LLM SDK: TensorRT's Large Language Model Inference Sample for Auto Platform
+# DriveOS LLM SDK: TensorRT's Large Language Model Inference Framework for Auto Platforms
 
 ## Introduction
 
@@ -22,8 +22,9 @@ Model | FP16 | INT4 | FP8 | NVFP4
 [Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes
 [Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes | Yes
 [Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes | Yes
+[Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) | Yes | Yes | Yes | Yes
 
-The following VLM models under [./examples/vlm](./examples/vlm/) with corresponding precisions are supported by DriveOS LLM SDK with good accuracy. Note that the ViT will always be in FP16 precision.
+The following VLM models under [./examples/vlm](./examples/vlm/) with corresponding precisions are supported by DriveOS LLM SDK. Note that the ViT will always be in FP16 precision.
 
 Model | FP16 | INT4 | FP8 | NVFP4
 --- | --- | --- | --- | ---
@@ -35,10 +36,10 @@ Model | FP16 | INT4 | FP8 | NVFP4
 1. **FP16**: All the weights and compute are in FP16.
 1. **FP8(W8A8)**: All the weights and GEMMs are in FP8, but KV Cache, LayerNorm, Attention and lm_head are in FP16 precision. FP8 can both reduce memory footprint and improve inference latency.
 1. **INT4(W4A16)**: All the weights are quantized in INT4 using awq recipe, but all the compute are in FP16 precision. INT4 can reduce memory footprint and improve significantly by reducing weights loading by 4x compared to FP16. Note that because TensorRT native(Or out-of-the-box or ootb) INT4 kernels have some performance issues, a [Int4GroupwiseGemmPlugin](./cpp/int4GroupwiseGemmPlugin/) is provided as the default option for INT4.
-1. **NVFP4(W4A4)**: Similar to FP8, all the weights and GEMMs are in NVFP4 while the other parts are in FP16 precision. NVFP4 can significantly reduce memory footprint and improve inference latency, especially context phase. Current generation phase performance of NVFP4 GEMM is good but has room for improvements. The improvements will be shipped in the next few releases.
+1. **NVFP4(W4A4)**: Similar to FP8, all the weights and GEMMs are in NVFP4 while the other parts are in FP16 precision. NVFP4 can significantly reduce memory footprint and improve inference latency, especially context phase. Current generation phase(mainly GEMV) performance of NVFP4 is good but has room for improvements. The improvements will be shipped in the next few releases.
 
 #### Customized Models
-1. Decoder-only Llama series and Qwen series are likely to be supported if it fits in Thor memory, but they are not fully tested.
+1. Decoder-only Llama series and Qwen series are likely to be supported if it fits in Thor memory, but they are not fully tested. For VLM, only Qwen2-VL is likely to be supported.
 1. Other model series will likely not be supported due to the Tokenizer implementation and model architecture difference.
 
 ### Other Platforms
@@ -54,7 +55,6 @@ The C++ project can be built in Linux x86 host with cross build.
 
 ```
 cd drive-llm
-git submodule update --init --recursive
 mkdir build
 cd build
 cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_cross_toolchain.cmake -DAUTO_TARGET=thor
@@ -68,7 +68,7 @@ cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch
 make
 ```
 
-To build and run DriveOS LLM SDK in x86 machine, the `-DCMAKE_TOOCHAIN_FILE` is not needed. The binaries are generated in `examples` folder to be used later. The AttentionPlugin library will also be there in `libAttentionPlugin.so`.
+To build and run DriveOS LLM SDK in x86 machine for rapid development, the `-DCMAKE_TOOCHAIN_FILE` and `-DAUTO_TARGET` is not needed. The binaries are generated in `examples` folder to be used later. The AttentionPlugin library will also be there in `libAttentionPlugin.so`.
 
 ### 2. Export ONNX from PyTorch checkpoint
 
@@ -77,3 +77,37 @@ First, it is needed to export the PyTorch model to ONNX on a x86 Linux host with
 ### 3. Build engine and run E2E LLM inference on C++
 
 Once the model is exported, you can follow the examples to build and run E2E LLM inference with C++. Please follow [examples/llm/README.md](./examples/llm/README.md) for decoder-only LLMs and [examples/multimodal/README.md](./examples/multimodal/README.md) for VLMs. The cpp files under [examples](./examples/) folder showcase the usage of the DriveOS LLM SDK runtime.
+
+## Limitations and Known Issues
+
+**Python Export**:
+1. Qwen export requires `torch<2.5.0`. With `torch>=2.5.0`, you will encounter the below issue. Therefore the `torch` version is fixed at `torch==2.4.1`.
+```
+    _C._jit_pass_onnx_graph_shape_type_inference(
+RuntimeError: The serialized model is larger than the 2GiB limit imposed by the protobuf library. Therefore the output file must be a file path, so that the ONNX external data can be written to the same directory. Please specify the output file name.
+```
+2. `nvidia-modelopt>0.19.0` has accuracy issues for INT4 recipe, so for the mainstream it is fixed at 0.19.0.
+
+**NVFP4 export:**
+3. NVFP4 ONNX has not been matured, due to onnx==1.18.0 has not been released. If you want to run NVFP4, you first need to unintall onnx and modelopt using `pip3 uninstall onnx` and `pip3 install nvidia-modelopt`, and then in export folder, `pip3 install -r requirements_nvfp4.txt`, which installs preview `onnx-weekly` and `modelopt==0.23.0`. You will likely encounter this issue below. You need to manually change `split_complex_to_pairs` to `_split_complex_to_pairs` in the file as a WAR because the function name has been changed by a recent ONNX commit. The issue should be fixed once `onnx==1.18.0` is formally released.
+```
+  File "/usr/local/lib/python3.10/dist-packages/onnxmltools/proto/__init__.py", line 14, in <module>
+    from onnx.helper import split_complex_to_pairs
+ImportError: cannot import name 'split_complex_to_pairs' from 'onnx.helper' (/usr/local/lib/python3.10/dist-packages/onnx/helper.py)
+```
+4. You may encounter the below issue for nvfp4 export. This issue comes from modelopt. You need to manually add ` get_quantization_format(module[0]) != QUANTIZATION_NONE` as the first condition. Modelopt team will fix it in the next release.
+```
+  File "/home/.local/lib/python3.10/site-packages/modelopt/torch/export/unified_export_hf.py", line 109, in requantize_resmooth_fused_llm_layers
+    if tensor in output_to_layernorm.keys() and "awq" in get_quantization_format(modules[0]):
+TypeError: argument of type 'NoneType' is not iterable
+```
+
+**Engine build**:
+5. Since Qwen and Llama's vocab size is large (~100000), using `--dynamicShape` with `--maxBatchSize` > 1 is not supported and will run into engine build crash. TensorRT team is aware of this issue and will fix it in the later version.
+
+**Inference**:
+7. There is a known issue on DriveOS 7.0.2 that `cudaMallocAsync` will fail when allocated memory size is large (>~5G). If you build an engine that is larger than 5GB, it will fail to load the engine. Please use this as a WAR to prevent this issue. DriveOS team is aware of this issue and will fix it in the next release.
+```
+echo 24576 | sudo tee /proc/sys/vm/nr_hugepages
+```
+8. If you encounter issue with mmap while loading the engine, you can use `export DISABLE_MMAP_LOAD=1` to use the default IStreamReader to load engine.
