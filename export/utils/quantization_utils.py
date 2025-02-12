@@ -165,7 +165,7 @@ def quantize(model,
         dataset_dir = "cnn_dailymail"
 
     if "int4" in precision:
-        batch_size = 32
+        batch_size = 16
     else:
         batch_size = 1
     data_loader = get_calib_dataloader(dataset_name_or_dir=dataset_dir,
