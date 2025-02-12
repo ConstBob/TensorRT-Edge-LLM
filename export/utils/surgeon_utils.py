@@ -454,9 +454,10 @@ def insert_int4_dq(graph: gs.Graph, state_dict: dict):
 
 def interleave_int4_weights(naively_packed_weights, interleave=4, kstride=64):
     """
-    Adapted from https://github.com/mit-han-lab/llm-awq/blob/main/awq/quantize/qmodule.py#L26
+    This function is adapted from
+    https://github.com/mit-han-lab/llm-awq/blob/main/awq/quantize/qmodule.py#L26
+    to prepare the packed int4 weights for int4 plugin to use.
     """
-
     # naively packed weights: int4 weights naively packed as int8 type with shape [N/2, K].
     naively_packed_weights = naively_packed_weights.cpu().numpy()
     # Convert from naively packed weights to unsigned int4 weights represented as int16.
