@@ -176,7 +176,8 @@ def export_raw_llm(model,
 
             if dtype == "fp8" or dtype == "nvfp4":
                 print(
-                    "Exporting fp8 ONNX model from quantized PyTorch model...")
+                    f"Exporting {dtype} ONNX model from quantized PyTorch model..."
+                )
                 llm_to_onnx(wrapper_cls(model),
                             output_dir,
                             extra_inputs=extra_inputs,

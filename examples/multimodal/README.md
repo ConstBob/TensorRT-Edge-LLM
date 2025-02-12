@@ -25,7 +25,7 @@ We describes how to run supported models in the below section.
     python3 ../../export/multimodal_export.py \
     --torch_dir tmp/hf_models/${MODEL_NAME} \
     --output_dir tmp/onnx/${MODEL_NAME} \
-    --dtype [fp16|fp8|int4] \
+    --dtype [fp16|fp8|int4|nvfp4] \
     --model_type qwen2_vl
     ```
 

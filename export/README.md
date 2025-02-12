@@ -4,9 +4,8 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 
 ## Prerequisite
 
-1. Since ONNX export is platform agnostic, it is strongly recommended to run the script in Linux x86 platform with Ampere or above GPUs.
-1. To run FP8 quantization, it is required to run on SM>=89.
-1. To avoid OOM during quantization and ONNX export, it is recommended to run the quantization on H100 80GB GPU to avoid OOM.
+1. Since ONNX export is platform agnostic, it is strongly recommended to run the script in Linux x86 platform with Ampere or above GPUs. Even though FP8 deployment only works with Ada and above, and NVFP4 deployment only works with Blackwell and above, the simulated quantization script can be run on any GPU.
+1. To avoid OOM during quantization and ONNX export, it is recommended to run the quantization on GPUs with 80GB memory to avoid OOM.
 
 ## Usage
 
@@ -27,7 +26,7 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 1. Even though FP8 or NVFP4 is supported for ONNX export, Orin does not support FP8 or NVFP4.
 1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 or NVFP4 this will be FP8 or NVFP4 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
-1. Default `--max_seq_length=4096`. Please change this field if longer sequence length is required.
+1. Default `--max_seq_length=4096`. Please change this field if other sequence length is required.
 
 ## Supported models and precisions
 
@@ -47,11 +46,3 @@ Model | FP16 | INT4 | FP8 | NVFP4
 --- | --- | --- | --- | ---
 [Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes
 [Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes
-
-## Limitations
-
-1. Qwen export requires torch<2.5.0. With torch>=2.5.0, you will encounter this issue:
-```
-    _C._jit_pass_onnx_graph_shape_type_inference(
-RuntimeError: The serialized model is larger than the 2GiB limit imposed by the protobuf library. Therefore the output file must be a file path, so that the ONNX external data can be written to the same directory. Please specify the output file name.
-```

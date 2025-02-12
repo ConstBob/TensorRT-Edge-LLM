@@ -16,7 +16,7 @@ Example command:
 
 **Notes:**
 1. `--maxSeqLen` includes `--maxInputLen`, so it must be greater than `--maxInputLen`. The maximum new token would equal to `maxSeqLen - maxInputLen`.
-1. Please notice that `maxSeqLen` must be identical to `kv_cache_capacity` field of the ONNX `AttentionPlugin` node.
+1. Please notice that `maxSeqLen` must be identical to `kv_cache_capacity` field of the ONNX `AttentionPlugin` node. This field can be adjusted using `--max_seq_len` during ONNX export.
 1. We can support static multi-batch `batchSize < max_batch_size` field of ONNX `AttentionPlugin` node.
 
 ## Infer engine
