@@ -6,7 +6,7 @@ TMP_DIR="driveos_llm_sdk"
 mkdir -p $TMP_DIR
 
 # List the directories to include (space-separated)
-INCLUDE_DIRS="3rdParty cmake cpp examples export scripts CMakeLists.txt README.md"
+INCLUDE_DIRS="3rdParty cmake cpp examples export scripts CMakeLists.txt README.md performance.md LICENSE release-note.md"
 cp -r $INCLUDE_DIRS $TMP_DIR
 
 # Create the tar.gz archive
