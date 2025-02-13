@@ -104,13 +104,12 @@ def export_qwen2_vl_visual(hf_model, output_dir):
             k = apply_rotary_pos_emb_vision(k.unsqueeze(0),
                                             rotary_pos_emb).squeeze(0)
 
-            q = q.transpose(0, 1).to(torch.float32)
-            k = k.transpose(0, 1).to(torch.float32)
+            q = q.transpose(0, 1)
+            k = k.transpose(0, 1)
             v = v.transpose(0, 1)
             attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
                 self.head_dim)
             attn_weights = attn_weights + attention_mask
-            attn_weights = attn_weights.to(torch.float16)
 
             attn_weights = nn.functional.softmax(attn_weights,
                                                  dim=-1,
