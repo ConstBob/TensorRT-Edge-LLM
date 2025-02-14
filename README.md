@@ -81,6 +81,7 @@ Once the model is exported, you can follow the examples to build and run E2E LLM
 ## Limitations and Known Issues
 
 **Python Export**:
+
 1. Qwen export requires `torch<2.5.0`. With `torch>=2.5.0`, you will encounter the below issue. Therefore the `torch` version is fixed at `torch==2.4.1`.
 ```
     _C._jit_pass_onnx_graph_shape_type_inference(
@@ -89,7 +90,8 @@ RuntimeError: The serialized model is larger than the 2GiB limit imposed by the 
 2. `nvidia-modelopt>0.19.0` has accuracy issues for INT4 recipe, so for the mainstream it is fixed at 0.19.0.
 
 **NVFP4 export:**
-3. NVFP4 ONNX has not been matured, due to onnx==1.18.0 has not been released. If you want to run NVFP4, you first need to unintall onnx and modelopt using `pip3 uninstall onnx` and `pip3 install nvidia-modelopt`, and then in export folder, `pip3 install -r requirements_nvfp4.txt`, which installs preview `onnx-weekly` and `modelopt==0.23.0`. You will likely encounter this issue below. You need to manually change `split_complex_to_pairs` to `_split_complex_to_pairs` in the file as a WAR because the function name has been changed by a recent ONNX commit. The issue should be fixed once `onnx==1.18.0` is formally released.
+
+3. NVFP4 ONNX has not been matured, due to onnx==1.18.0 has not been released. If you want to export NVFP4 ONNX, you first need to do `pip3 install -r requirements.txt`, then unintall onnx and modelopt using `pip3 uninstall onnx` and `pip3 uninstall nvidia-modelopt`, and then in export folder, `pip3 install -r requirements_nvfp4.txt`, which installs preview `onnx-weekly` and `nvidia-modelopt==0.23.0`. You will likely encounter this issue below. You need to manually change `split_complex_to_pairs` to `_split_complex_to_pairs` in the file as a WAR because the function name has been changed by a recent ONNX commit. The issue should be fixed once `onnx==1.18.0` is formally released.
 ```
   File "/usr/local/lib/python3.10/dist-packages/onnxmltools/proto/__init__.py", line 14, in <module>
     from onnx.helper import split_complex_to_pairs
@@ -103,11 +105,17 @@ TypeError: argument of type 'NoneType' is not iterable
 ```
 
 **Engine build**:
+
 5. Since Qwen and Llama's vocab size is large (~100000), using `--dynamicShape` with `--maxBatchSize` > 1 is not supported and will run into engine build crash. TensorRT team is aware of this issue and will fix it in the later version.
 
 **Inference**:
-7. There is a known issue on DriveOS 7.0.2 that `cudaMallocAsync` will fail when allocated memory size is large (>~5G). If you build an engine that is larger than 5GB, it will fail to load the engine. Please use this as a WAR to prevent this issue. DriveOS team is aware of this issue and will fix it in the next release.
+
+6. There is a known issue on DriveOS 7.0.2 that `cudaMallocAsync` will fail when allocated memory size is large (>~5G). If you build an engine that is larger than 5GB, it will fail to load the engine. Please use this as a WAR to prevent this issue. DriveOS team is aware of this issue and will fix it in the next release.
 ```
 echo 24576 | sudo tee /proc/sys/vm/nr_hugepages
 ```
-8. If you encounter issue with mmap while loading the engine, you can use `export DISABLE_MMAP_LOAD=1` to use the default IStreamReader to load engine.
+7. If you encounter issue with mmap while loading the engine, you can use `export DISABLE_MMAP_LOAD=1` to use the default IStreamReader to load engine.
+
+**Accuracy**:
+8. nvFP4 accuracy drops for v0.0.2 Early Drop version. We will try to fix in v0.0.2 official release.
+
