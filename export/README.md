@@ -12,7 +12,8 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 1. Download HF checkpoint from transformers and save it locally
 1. `cd export`
 1. `pip3 install -r requirements.txt`
-1. Call export script. If you are working with multimodal model, use `multimodal_export.py`
+1. If you are working with NVFP4, you need to unintall `onnx` and `nvidia-modelopt` using `pip3 uninstall onnx` and `pip3 uninstall nvidia-modelopt`, and then install `pip3 install -r requirements_nvfp4.txt`. Please refer to the instruction in [../README.md](../README.md#limitations-and-known-issues) to properly configure the environment.
+1. Call export script.
 ```
 python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
 python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
