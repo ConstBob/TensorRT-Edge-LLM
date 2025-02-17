@@ -63,7 +63,7 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, bo
 }
 
 template <typename T>
-bool Decoder<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
+void Decoder<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
 {
     for (int i = 0; i < extraInputs.size(); ++i)
     {
