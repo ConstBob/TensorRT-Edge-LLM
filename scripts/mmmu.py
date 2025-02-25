@@ -374,7 +374,7 @@ def evaluate_mmmu(args):
     """
     Adapted from https://github.com/MMMU-Benchmark/MMMU/blob/main/mmmu/main_eval_only.py
     """
-    df = pd.read_csv(args.csv_path)
+    df = pd.read_csv(args.csv_path, encoding= 'unicode_escape')
 
     # group by category
     output_dict_w_cat = {}
