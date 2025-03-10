@@ -302,15 +302,14 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
 {
     mLaunchParams.set_default_kernel_selection_params();
     mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
-    
-    // The context FMHA-v2 kernels taken by the project only support ampere/ada for 
-    // reference on x86 machine, Orin/Thor for production on auto platforms.
-    bool const isSm8x = (smVersion == fmha_v2::kSM_80 || smVersion == fmha_v2::kSM_86
-        || smVersion == fmha_v2::kSM_87 || smVersion == fmha_v2::kSM_89);
+
+    bool const isSm90 = (smVersion == fmha_v2::kSM_90);
+    bool const isSm8x = (smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87 || smVersion == fmha_v2::kSM_89);
+    bool const isSm80 = (smVersion == fmha_v2::kSM_80);
     bool const isSm101 = (smVersion == fmha_v2::kSM_101);
-    check(!(isSm8x || isSm101), "Other SMs are not supported by context FMHA-v2 kernels");
+    check(!isSm90, "SM90 is not supported for contextFMHA");
     // Handle kernel selection under different context.
-    if (isSm8x || isSm101)
+    if (isSm80 || isSm8x || isSm101)
     {
         // always use flash attention kernels for Ampere/Ada
         mLaunchParams.flash_attention = true;
@@ -318,17 +317,22 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
         mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
 
-        if (mPaddedSequenceLen <= 64 || mHeadSize < 256)
+        // Use same code as TRT-LLM for kernel selection
+        if (mLaunchParams.flash_attention && mPaddedSequenceLen <= 64)
         {
             // flash attention tiled kernels allows larger free dim tile size (M, N) with flexibility
             // in unroll dimension tile size (K). for short sequence length (s<=128), tiled kernels
-            // can suffer from tile quantization loss.
-            // Also flash attention tiled kernel is generally faster when head_size>=256
+            // can suffer from tile quantization loss therefore use flash attention non-tiled instead
             mLaunchParams.granular_tiling = false;
         }
-        else
+        else if (isSm8x && mHeadSize < 256)
         {
-            // otherwise, choose tiled FMHA-v2 flash-attention kernel.
+            // flash attention tiled kernel is faster on Ada and Ampere derivatives when head_size>=256
+            mLaunchParams.granular_tiling = false;
+        }
+        else if (isSm80 || isSm8x)
+        {
+            // otherwise, choose tiled kernel for Ampere/Ada
             mLaunchParams.granular_tiling = true;
         }
     }
