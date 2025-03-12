@@ -218,19 +218,19 @@ void gemv_forward_cuda_new(half* in_feats, int8_t* weights_device, half* scaling
         break;
     case 3:
         gemv_kernel<N_PER_BLOCK, 3, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 4:
         gemv_kernel<N_PER_BLOCK, 4, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 5:
         gemv_kernel<N_PER_BLOCK, 5, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     case 6:
         gemv_kernel<N_PER_BLOCK, 6, BLOCK_SIZE, 128>
-            <<<num_blocks, num_threads>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+            <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
         break;
     default: throw std::runtime_error("Unsupported batch size for gemv kernel.\n");
     }
