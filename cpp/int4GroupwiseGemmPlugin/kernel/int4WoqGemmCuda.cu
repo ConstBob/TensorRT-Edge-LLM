@@ -483,6 +483,6 @@ void gemm_forward_cuda_new(half* in_feats, int8_t* weights_device, half* scaling
     dim3 threads_per_block(WARP_SIZE, NUM_WARPS);
     auto kernel_func = gemm_w4a16_T2<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;
     cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);
-    kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(
+    kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(
         in_feats, kernel, scaling_factors, out_feats, m, n, k);
 }
