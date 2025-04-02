@@ -105,3 +105,14 @@ add_subdirectory(cpp)
 
 # Build C++ examples to showcase the usage
 add_subdirectory(examples)
+
+option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
+
+if(BUILD_UNIT_TESTS)
+  set(BUILD_GMOCK OFF CACHE BOOL "Disable Google Mock")
+  add_subdirectory(${CMAKE_SOURCE_DIR}/3rdParty/googletest)
+  file(GLOB_RECURSE UNIT_TESTS_SRCS ${CMAKE_SOURCE_DIR}/unittests/*.cpp)
+  add_executable(unitTest ${UNIT_TESTS_SRCS})
+  target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS})
+  target_link_libraries(unitTest PRIVATE gtest gtest_main ${CUDART_LIB})
+endif()
