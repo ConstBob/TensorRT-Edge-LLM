@@ -24,10 +24,13 @@ import random
 import re
 from argparse import ArgumentParser
 from typing import Dict
+import logging
 
+logger = logging.getLogger(__name__)
 random.seed(42)
 import numpy as np
 import pandas as pd
+import chardet
 
 # https://github.com/MMMU-Benchmark/MMMU/blob/main/mmmu/utils/data_utils.py
 DOMAIN_CAT2SUB_CAT = {
@@ -369,12 +372,32 @@ def get_multi_choice_info(result):
 
     return index2ans, all_choices
 
+def read_csv_safely(file_path):
+    # Detect encoding
+    with open(file_path, 'rb') as f:
+        raw_data = f.read(10000)
+    result = chardet.detect(raw_data)
+    encoding = result['encoding']
+    confidence = result['confidence']
+
+    # Fallback to latin-1 if confidence is low or encoding is None
+    if not encoding or confidence < 0.5:
+        encoding = 'latin-1'
+
+    # Try reading with detected encoding + fallbacks
+    try:
+        return pd.read_csv(file_path, encoding=encoding)
+    except UnicodeDecodeError:
+        try:
+            return pd.read_csv(file_path, encoding='latin-1')
+        except Exception as e:
+            raise ValueError(f"Failed to read file: {e}")
 
 def evaluate_mmmu(args):
     """
     Adapted from https://github.com/MMMU-Benchmark/MMMU/blob/main/mmmu/main_eval_only.py
     """
-    df = pd.read_csv(args.csv_path, encoding= 'unicode_escape')
+    df = read_csv_safely(args.csv_path)
 
     # group by category
     output_dict_w_cat = {}
