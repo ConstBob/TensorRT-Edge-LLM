@@ -15,7 +15,10 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 1. If you are working with NVFP4, you need to unintall `onnx` and `nvidia-modelopt` using `pip3 uninstall onnx` and `pip3 uninstall nvidia-modelopt`, and then install `pip3 install -r requirements_nvfp4.txt`. Please refer to the instruction in [../README.md](../README.md#limitations-and-known-issues) to properly configure the environment.
 1. Call export script.
 ```
+# LLM model
 python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
+
+# VLM model
 python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
 
 ```
@@ -27,7 +30,7 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 1. Even though FP8 or NVFP4 is supported for ONNX export, Orin does not support FP8 or NVFP4.
 1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 or NVFP4 this will be FP8 or NVFP4 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
-1. Default `--max_seq_length=4096`. Please change this field if other sequence length is required.
+1. Default `--max_seq_length=4096`, which corresponds to `kv_cache_capacity` field in AttentionPlugin. Please change this field if other sequence length is required. [prepare_mmmu_onnx.py](../../scripts/prepare_mmmu_onnx.py) provides a script to change `kv_cache_capacity` in existing LLM ONNX to avoid exporting again.
 
 ## Supported models and precisions
 
@@ -53,3 +56,5 @@ Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 --- | --- | --- | --- | --- | ---
 [Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes | [link](https://nvidia.box.com/shared/static/a81q1cv9mwl7f36u0fprd1jm3mpzej4s)
 [Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [link](https://nvidia.box.com/shared/static/5b8sqae7sbdjso5058o97qo307nr1ds9)
+[Qwen2.5-VL-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Yes | Yes | Yes | Yes |
+[Qwen2.5-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | Yes | Yes | Yes | Yes |

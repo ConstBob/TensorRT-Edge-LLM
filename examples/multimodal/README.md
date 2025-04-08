@@ -6,139 +6,154 @@ Multimodal models' LLM part and multimodal part are separated to two TensorRT en
 
 We describes how to run supported models in the below section.
 
-- [Qwen2-VL](#qwen2-vl)
+- [Qwen2-VL and Qwen2.5-VL](#qwen2-vl-and-qwen2_5-vl)
 
-
-## Qwen2-VL
+## Qwen2-VL and Qwen2_5-VL
 ### Prerequisite
 1. Downdload Huggingface weights
+
+    Supported models:
+    - [Qwen2-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct)
+    - [Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct)
+    - [Qwen2.5-vl-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
+    - [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)
+
     ```bash
     git lfs install
-    export MODEL_NAME="Qwen2-VL-7B-Instruct" # or Qwen2-VL-2B-Instruct
+    export MODEL_NAME="Qwen2-VL-7B-Instruct"
     git clone https://huggingface.co/Qwen/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+
+    export MODEL_TYPE="qwen2_vl"
+    # or
+    export MODEL_TYPE="qwen2_5_vl"
     ```
 
 2. Export to ONNX.
 
-    An ONNX that complies with the DriveOS LLM SDK runtime should be ready following [ONNX export](../../export/README.md). To run inference with real data, a tokenizer file is also required. Visual and LLM part is exported to two separate ONNX files.
+    Visual and LLM part is exported to two separate ONNX files. For details, please refer to [export README](../../export/README.md). 
     ```
-    python3 ../../export/multimodal_export.py \
+    cd drive-llm
+    
+    python3 ./export/multimodal_export.py \
     --torch_dir tmp/hf_models/${MODEL_NAME} \
     --output_dir tmp/onnx/${MODEL_NAME} \
-    --dtype [fp16|fp8|int4|nvfp4] \
-    --model_type qwen2_vl
+    --dtype [fp16|fp8|int4|nvfp4]
     ```
+
+### Image Preprocess and Number of Image Tokens
+1. Image preprocess methods is located in `Qwen2ViTRunner`, which is aligned to huggingface Qwen2-VL/Qwen2.5-VL official image preprocesser.
+1. As a sample, `Qwen2ViTRunner` uses third-party header-only library `stb_image` to read and resize jpeg images. Users should customize image preprocess methods according to their needs, e.g. support other image format, use other libraries.
+1. User should set appropriate `imageTokens` in `vlm_build` and appropriate `minPixels, maxPixels` in `vitrunner->setup()`. For Qwen2-VL/Qwen2.5-VL, `N*28*28` pixels will generate `N` image tokens. Total number of image tokens = `N` tokens/image * `M` images/batch. `N*M` should match `vlm_build` config so that:
+    1. `N*M` should be equal to `--imageTokens` for static shape LLM engine, or 
+    1. `N*M` should be within the range `[--minImageTokens, --maxImageTokens]` for dynamic shape LLM engine.
+1. In `vlm_chat`, we set default `minPixels = 128*28*28, maxPixels = 512*28*28`. Under this preprocess config, `qwen2vl/pics/demo.jpeg` becomes input shape [1944, 1176] for VIT and generate 486 image tokens.
+1. In `vlm_accuracy`, we set default `minPixels = 1280*28*28, maxPixels = 6620*28*28`.
 
 ### Build engine
 The `vlm_build` binary is used to build TensorRT engines. Corresponding to ONNX, we build visual engine and LLM engine respectively.
-1. Static shape. Specify `--batchSize` and `--imageTokens`.
+1. Static shape.
+
+    Specify `--batchSize` and `--imageTokens`. For production, use static shape for better performance unless dynamic shape is necessary.
     ```
     ./build/examples/multimoal/vlm_build \
     --llmOnnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx/model.onnx \
     --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
     --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx/model.onnx \
     --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
-    --modelType="qwen2_vl" \
+    --modelType=${MODEL_TYPE} \
     --maxInputLen=1024 --maxSeqLen=4096 \
-    --batchSize=1 --imageTokens=512
+    --batchSize=1 --imageTokens=486
     ```
-2. Dynamic shape. Specify `--maxBatchSize`, `--minImageTokens` and `--minImageTokens`.
+2. Dynamic shape.
+
+    Add `--dynamicShape` and specify `--maxBatchSize`, `--minImageTokens` and `--minImageTokens`.
     ```
     ./build/examples/multimoal/vlm_build \
     --llmOnnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx/model.onnx \
     --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
     --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx/model.onnx \
     --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
-    --modelType="qwen2_vl" \
+    --modelType=${MODEL_TYPE} \
     --maxInputLen=1024 --maxSeqLen=4096 \
     --dynamicShape \
-    --maxBatchSize=2 --minImageTokens=4 --maxImageTokens=1024
+    --maxBatchSize=1 --minImageTokens=128 --maxImageTokens=512
     ```
 
-### Infer engine
-
-The `vlm_chat` and `vlm_accuracy` binaries are examples to show E2E C++ VLM inference using greedy decoding. Example usages:
-
-#### VLM Chat
-
+### VLM Chat
 ```
-# BS=2
 ./build/examples/multimodal/vlm_chat \
 --tokenizerPath=tmp/hf_models/${MODEL_NAME} \
 --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
---visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_encoder_fp16.engine \
---modelType="qwen2_vl" \
---maxLength=1024 \
+--visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
+--modelType=${MODEL_TYPE} \
 --inputString="Describe the picture." \
---imagePaths="examples/multimodal/qwen2vl/pics/demo.jpeg" \
---inputString="Identify the similarities between these images." \
---imagePaths="examples/multimodal/qwen2vl/pics/image1.jpeg,examples/multimodal/qwen2vl/pics/image2.jpeg"
+--imagePaths="examples/multimodal/qwen2vl/pics/demo.jpeg"
 ```
 **Note**:
-1. `--inputString` takes input prompt for one batch. `--imagePaths` takes image paths for one batch. Multiple image paths in one batch should be separated with comma `','`.
-1. One `--inputString` and one `--imagePaths` are paired as inputs for one batch. `batchSize` equals to the maximum of number of `--inputString` and number of `--imagePaths`.
-1. For any batch that contains `--imagePaths` only, `--inputString` is set to default prompt `Describe this image.`. For any batch that contains `--inputString` only, `--imagePaths` is set to empty, which is equivalent to pure LLM inference.
+1. `vlm_chat` default `minPixels = 128*28*28, maxPixels = 512*28*28`. The above example command uses `--imageTokens=486` to match "qwen2vl/pics/demo.jpeg" size. Users should modify `--imageTokens` or `minPixels`, `maxPixels` according to their needs. For more details, please reference [Image Preprocess](#Image-Preprocess).
 
-#### Benchmark Performance
-
-1. Benchmark the E2E pipeline performance on certain input size
-
+1. `vlm_chat` uses command line arguments to pass prompts and images.
+    1. `--inputString` takes input prompt for one batch. `--imagePaths` takes image paths for one batch. Multiple image paths in one batch should be separated with comma `','`, for example,
     ```
-    ./build/examples/multimodal/vlm_benchmark \
-    --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_encoder_fp16.engine \
-    --modelType="qwen2_vl" \
-    --textTokenLength=512 --imageTokenLength=512 --outputLength=256
-    [--warmUp=2 --numRuns=10]
+    --inputString="Identify the similarities between these images." \
+    --imagePaths="image1.jpeg,image2.jpeg"
     ```
-2. Benchmark visual encoder and LLM separately
-
-    - Use Qwen2 model as an approximation for Qwen2-VL LLM part performance.
-        - Build [Qwen2 engine](../llm/README.md) of the same size and precision.
-        - Use `../llm/llm_benchmark` binary to benchmark.
-    - Use `trtexec` to benchmark visual encoder engine.
-    - E2E latency = visual encoder latency + LLM latency
+    1. One `--inputString` and one `--imagePaths` are paired as inputs for one batch. `batchSize` equals to the maximum of number of `--inputString` and number of `--imagePaths`.
+    1. For any batch that contains `--imagePaths` only, `--inputString` is set to default prompt `Describe this image.`. For any batch that contains `--inputString` only, `--imagePaths` is set to empty, which is equivalent to pure LLM inference.
+    1. Users may modify input passing according to their needs.
 
 
-#### Evaluate accuracy with MMMU
+### Benchmark Performance
 
-To match MMMU evaluation [config](https://github.com/open-compass/VLMEvalKit/blob/9ca28fd06bac52d0c42845dac8891dd9e6354611/vlmeval/config.py#L253-L264) and MMMU images size, we need to generate ONNX and TensorRT engines with the following config: `--minImageTokens=1280`, `--maxImageTokens=6620`, `--maxInputLen=7168`, `--maxSeqLen=8192`.
-1. Export ONNX
+```
+./build/examples/multimodal/vlm_benchmark \
+--llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
+--visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
+--modelType=${MODEL_TYPE} \
+--textTokenLength=512 --imageTokenLength=486 --outputLength=256 \
+[--warmUp=2 --numRuns=10]
+```
+**Note**:
+1. `--imageTokenLength` should be equal to `--imageTokens` for static shape LLM engine, or should be within the range `[--minImageTokens, --maxImageTokens]` for dynamic shape LLM engine.
+
+
+### Evaluate accuracy with MMMU
+
+To match MMMU evaluation [config](https://github.com/open-compass/VLMEvalKit/blob/9ca28fd06bac52d0c42845dac8891dd9e6354611/vlmeval/config.py#L253-L264) and TensorRT shape requirement, we need to generate ONNX and TensorRT engines with the following config: `--minImageTokens=1280`, `--maxImageTokens=6620`, `--maxInputLen=7168`, `--maxSeqLen=8192`.
+
+1. Use [prepare_mmmu_onnx.py](../../scripts/prepare_mmmu_onnx.py) to set `kv_cache_capacity=8192` in LLM ONNX.
     ```
-    python3 ../../export/multimodal_export.py \
-    --torch_dir tmp/hf_models/${MODEL_NAME} \
-    --output_dir tmp/onnx/${MODEL_NAME} \
-    --dtype [fp16|fp8|int4] \
-    --model_type qwen2_vl \
-    --max_seq_length 8192
+    python3 ./scripts/prepare_mmmu_onnx.py \
+    --input_path tmp/onnx/${MODEL_NAME}/llm_onnx/model.onnx \
+    --output_path tmp/onnx/${MODEL_NAME}/llm_onnx_mmmu/model.onnx
     ```
 2. Build engine
     ```
     ./build/examples/multimoal/vlm_build \
-    --llmOnnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx/model.onnx \
-    --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
+    --llmOnnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx_mmmu/model.onnx \
+    --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.mmmu.engine \
     --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx/model.onnx \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
-    --modelType="qwen2_vl" \
+    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.mmmu.engine \
+    --modelType=${MODEL_TYPE} \
     --maxInputLen=7168 --maxSeqLen=8192 \
     --dynamicShape \
     --maxBatchSize=1 --minImageTokens=1280 --maxImageTokens=6620
     ```
 3. Collect inference results on MMMU-val dataset.
-
     ```
     wget https://opencompass.openxlab.space/utils/VLMEval/MMMU_DEV_VAL.tsv
 
     ./build/examples/multimodal/vlm_accuracy \
     --tokenizerPath=tmp/hf_models/${MODEL_NAME} \
-    --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_encoder_fp16.engine \
+    --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.mmmu.engine \
+    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_encoder_fp16.mmmu.engine \
     --modelType=qwen2_vl \
     --datasetPath=./MMMU_DEV_VAL.tsv \
-    --outputPath=./mmmu-qwen2vl.csv \
+    --outputPath=./mmmu-results.csv \
     ```
 4. Evaluate results with python script.
-
     ```
-    python scripts/mmmu.py --csv_path=./mmmu-qwen2vl.tsv --output_path=./mmmu-qwen2vl-eval.json
+    python ./scripts/mmmu.py --csv_path=./mmmu-results.tsv --output_path=./mmmu-results-eval.json
     ```
+**Note**:
+Drive-LLM MMMU score is different from Qwen official. Drive-LLM MMMU implementation follows [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU), while Qwen-VL uses [VLMEvalkit](https://github.com/open-compass/VLMEvalKit). VLMEvalkit provides higher MMMU scores due to different prompt setup and evaluation method. It also requires higher memory that is not suitable for edge devices. Drive-LLM MMMU scores are aligned with official MMMU-Benchmark results with HuggingFace implementation, providing confidence in VLM accuracy. For details, please refer to [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU) or [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) for getting HuggingFace model accuracy scores.

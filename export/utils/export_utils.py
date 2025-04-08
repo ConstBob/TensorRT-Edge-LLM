@@ -27,10 +27,11 @@ class WrapperModelForCausalLM(torch.nn.Module):
         self.config = model.config
 
     def forward(self, input_ids, past_key_values):
+        past_key_values = DynamicCache.from_legacy_cache(past_key_values)
         outputs = self.model(input_ids=input_ids,
                              past_key_values=past_key_values)
         hidden_states = outputs[0]
-        past_key_values = outputs.past_key_values
+        past_key_values = outputs.past_key_values.to_legacy_cache()
         logits = self.lm_head(hidden_states)
         return logits, past_key_values
 
@@ -93,13 +94,10 @@ def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
         dynamic_axes[f"past_key_values.{i}.key"] = input_dynamic_axes
         dynamic_axes[f"past_key_values.{i}.value"] = input_dynamic_axes
 
-    cache = DynamicCache.from_legacy_cache(dummy_kv_cache)
-    legacy_format_cache = cache.to_legacy_cache()
-
     torch_to_onnx(
         model,
         (dummy_input_ids, {
-            "past_key_values": legacy_format_cache,
+            "past_key_values": dummy_kv_cache,
             **extra_inputs
         }),
         output_dir,
