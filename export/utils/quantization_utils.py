@@ -62,8 +62,8 @@ def get_quant_config(precision, lm_head_precision="fp16"):
         quant_cfg = mtq.INT4_AWQ_CFG
 
     elif precision == "nvfp4":
-        if hasattr(mtq, "NVFP4_DEFAULT_CFG"):
-            quant_cfg = mtq.NVFP4_DEFAULT_CFG
+        if hasattr(mtq, "NVFP4_AWQ_FULL_CFG"):
+            quant_cfg = mtq.NVFP4_AWQ_FULL_CFG
 
     if lm_head_precision == "fp8":
         quant_cfg["quant_cfg"]["*lm_head.input_quantizer"] = {
