@@ -1,5 +1,5 @@
-transformers~=4.45.1
-torch~=2.4.1
+transformers~=4.49.0
+torch~=2.6.0
 nvidia-modelopt[torch]~=0.19.0
 nvidia-modelopt[onnx]~=0.19.0
 onnx~=1.17.0

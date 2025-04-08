@@ -24,6 +24,17 @@
 
 struct VisualPreprocessorConfig
 {
+    VisualPreprocessorConfig(std::string modelType)
+        : modelType{modelType}
+    {
+        if (modelType == "qwen2_5_vl")
+        {
+            maxPositionEmbeddings = 128000;
+        }
+    }
+
+    std::string modelType;
+    int64_t batchSize;
     int64_t minPixels{4 * 28 * 28};
     int64_t maxPixels{16384 * 28 * 28};
     int64_t patchSize{14};
@@ -36,18 +47,21 @@ struct VisualPreprocessorConfig
     float theta = 1000000.0f;
     std::vector<double> imageMean{0.48145466, 0.4578275, 0.40821073};
     std::vector<double> imageStd{0.26862954, 0.26130258, 0.27577711};
+    int64_t windowSize{112};  // window attention size used by Qwen2.5-VL
 };
 
 class Qwen2ViTRunner
 {
 public:
-    Qwen2ViTRunner()
+    Qwen2ViTRunner(std::string modelType)
         : mStream{nullptr}
         , mVisualEngine{nullptr}
         , mDeviceBuffer{}
         , isSetup{false}
+        , mConfig{modelType}
     {
     }
+
     bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize = 1, int minPixels = 4 * 28 * 28,
         int maxPixels = 16384 * 28 * 28);
 
@@ -59,12 +73,22 @@ public:
         std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
         std::vector<int32_t>& contextLengths, int const maxContextLength, int const vocabSize = 152064);
 
-    void visualInfer(
+    void getWindowIndex(std::vector<std::vector<int64_t>> const& grids, std::vector<half>& windowAttentionMask, 
+        std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex);
+    
+    void qwen2ViTInfer(
         std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb);
+
+    void qwen2_5ViTInfer(
+        std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb, 
+        std::vector<half> const& windowAttentionMask, std::vector<int64_t> const& windowIndex,
+        std::vector<int64_t> const& reverseWindowIndex);
+
     std::vector<EngineInputDesc> getExtraLLMInputs();
 
     void initRandomInputs(std::vector<half>& visualInput, std::vector<half>& visualAttentionMask,
-        std::vector<float>& visualRotaryPosEmb, std::vector<int64_t>& inputIds, int const textTokenLength,
+        std::vector<float>& visualRotaryPosEmb, std::vector<half>& windowAttentionMask, std::vector<int64_t>& windowIndex,
+        std::vector<int64_t>& reverseWindowIndex, std::vector<int64_t>& inputIds, int const textTokenLength,
         int const imageTokenLength, int const maxContextLength, int const vocabSize = 152064);
 
     void allocateBuffer();
@@ -82,7 +106,6 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     cudaStream_t mStream;
-    int mBatchSize;
     bool isSetup;
     int64_t mHW;
 

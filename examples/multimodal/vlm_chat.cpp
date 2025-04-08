@@ -1,14 +1,14 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
- */
+* SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+* SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+*
+* NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+* property and proprietary rights in and to this material, related
+* documentation and any modifications thereto. Any use, reproduction,
+* disclosure or distribution of this material and related documentation
+* without an express license agreement from NVIDIA CORPORATION or
+* its affiliates is strictly prohibited.
+*/
 
 #include "common/common.h"
 #include "decoder/decoder.h"
@@ -36,10 +36,10 @@ struct RuntimeArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] [-e or --llmEnginePath=<path to LLM engine>] [-v or --visualEnginePath=<path to visual engine>]"
-                 " [-s or --maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>]"
-                 " [--inputString=<input string for one batch>] [--imagePaths=<image paths for one batch>]"
-              << std::endl;
+            << " [-h] [-e or --llmEnginePath=<path to LLM engine>] [-v or --visualEnginePath=<path to visual engine>]"
+                " [-s or --maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>]"
+                " [--inputString=<input string for one batch>] [--imagePaths=<image paths for one batch>]"
+            << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  -h                  Display this help message" << std::endl;
     std::cerr << "  --inputString       Provide the input string to the runtime. Required. " << std::endl;
@@ -48,8 +48,8 @@ void printUsage(char const* programName)
     std::cerr << "  --visualEnginePath  Provide the visual TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --tokenizerPath     Provide the path to HF tokenizer. Required. " << std::endl;
     std::cerr << "  --maxLength         Provide the maximum output length for the generation session (including the "
-                 "input). Default = 1024."
-              << std::endl;
+                "input). Default = 1024."
+            << std::endl;
     std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl." << std::endl;
     std::cerr << "  --debug             Use debug mode, which outputs tensors." << std::endl;
 };
@@ -153,7 +153,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                     else
                     {
                         std::cerr << "ERROR: model type requires option argument,support only qwen2_vl currently"
-                                  << std::endl;
+                                << std::endl;
                         return false;
                     }
                 }
@@ -168,14 +168,14 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     std::vector<std::string>& inputStrings, std::vector<std::vector<std::string>> const& imagePaths,
     Tokenizer* tokenizer, GenerationConfig const& generationConfig, int32_t const batchSize,
-    std::vector<std::vector<int64_t>>& outputIds)
+    std::vector<std::vector<int64_t>>& outputIds, std::string modelType)
 {
     // Setup
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    auto vitrunner = new Qwen2ViTRunner();
-    vitrunner->setup(visualEnginePath, stream, batchSize);
+    auto vitrunner = new Qwen2ViTRunner(modelType);
+    vitrunner->setup(visualEnginePath, stream, batchSize, 128*28*28, 512*28*28);
     auto decoder = new Decoder<half>();
     decoder->setup(llmEnginePath, stream, true, batchSize);
 
@@ -218,12 +218,23 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
         inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths, decoder->getMaxContextLength());
 
     // Infer
-    vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+    if (modelType == "qwen2_vl")
+    {
+        vitrunner->qwen2ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+    }
+    else
+    {
+        std::vector<half> visualWindowAttentionMask;
+        std::vector<int64_t> visualWindowIndex;
+        std::vector<int64_t> reverseWindowIndex;
+        vitrunner->getWindowIndex(visualGridTHWs, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
+        vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
+    }
 
     // Reuse the same device buffer for VIT output and LLM "image_embeds" input to avoid H2D/D2H copy
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
-    decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), nullptr);
+    decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
 }
 
 std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
@@ -249,10 +260,10 @@ std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
         outputIds[i].reserve(generationConfig.maxLength);
     }
 
-    if (modelType == "qwen2_vl")
+    if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
     {
         decodeQwen2VL(llmEnginePath, visualEnginePath, inputStrings, imagePaths, tokenizer, generationConfig, batchSize,
-            outputIds);
+            outputIds, modelType);
     }
     else
     {

@@ -52,7 +52,7 @@ struct MMMUTestData
 
         if (questionType == "multiple-choice")
         {
-            for (int i = 0; i < options.size(); ++i)
+            for (size_t i = 0; i < options.size(); ++i)
             {
                 char letter = 'A' + i;
                 prompt += "\n" + std::string(1, letter) + ". " + options[i];
@@ -434,7 +434,7 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
 
         // Store options in list of strings
         // outFile << "\"[";
-        for (int i = 0; i < 9; ++i)
+        for (size_t i = 0; i < 9; ++i)
         {
             if (i < data->options.size())
             {
@@ -453,14 +453,13 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
 }
 
 void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
-    std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer)
+    std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer, std::string const& modelType)
 {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    auto vitrunner = new Qwen2ViTRunner();
-    // Set minPixels according to: https://github.com/open-compass/VLMEvalKit/blob/main/vlmeval/config.py
-    vitrunner->setup(visualEnginePath, stream, 1, 1280 * 28 * 28);
+    auto vitrunner = new Qwen2ViTRunner(modelType);
+    vitrunner->setup(visualEnginePath, stream, 1, 1280 * 28 * 28, 6620*28*28);
 
     auto decoder = new Decoder<half>();
     decoder->setup(llmEnginePath, stream);
@@ -510,7 +509,19 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
         vitrunner->textPreprocess(
             {prompt}, {numImage}, visualGridTHWs, tokenizer, inputIds, contextLengths, maxInputLength);
 
-        vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+        // Infer
+        if (modelType == "qwen2_vl")
+        {
+            vitrunner->qwen2ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+        }
+        else
+        {
+            std::vector<half> visualWindowAttentionMask;
+            std::vector<int64_t> visualWindowIndex;
+            std::vector<int64_t> reverseWindowIndex;
+            vitrunner->getWindowIndex(visualGridTHWs, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
+            vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
+        }
         decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
         decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
 
@@ -541,9 +552,9 @@ void mmmuAccuracy(std::filesystem::path const& llmEnginePath, std::filesystem::p
         return;
     }
 
-    if (modelType == "qwen2_vl")
+    if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
     {
-        evalQwen2VL(llmEnginePath, visualEnginePath, dataset, tokenizer);
+        evalQwen2VL(llmEnginePath, visualEnginePath, dataset, tokenizer, modelType);
     }
     else
     {

@@ -40,10 +40,9 @@ bool Qwen2ViTRunner::setup(
 
         mContext = std::unique_ptr<nvinfer1::IExecutionContext>(mVisualEngine->createExecutionContext());
         mContext->setOptimizationProfileAsync(0, mStream);
-        mBatchSize = batchSize;
+        mConfig.batchSize = batchSize;
         mConfig.minPixels = minPixels;
         mConfig.maxPixels = maxPixels;
-
         isSetup = true;
     }
     catch (std::exception const& e)
@@ -78,22 +77,42 @@ void Qwen2ViTRunner::allocateBuffer()
     mContext->setTensorAddress("rotary_pos_emb", rotaryPosEmbDevice);
     mContext->setInputShape("rotary_pos_emb", {2, {mHW, posEmbDim}});
 
-    nvinfer1::Dims outputShape = mContext->getTensorShape("output");
-    nvinfer1::DataType outType = mVisualEngine->getTensorDataType("output");
-    int64_t nToken = outputShape.d[0];
+    nvinfer1::Dims outputShape = mVisualEngine->getTensorShape("output");
     int64_t hiddenDim = outputShape.d[1];
     void* outputDevice;
-    CUDA_CHECK(cudaMalloc(&outputDevice, (nToken * hiddenDim) * sizeof(half)));
+    // In Qwen2-VL, mHW is always 4ximageTokens because it equals to spatial_merge_size ** 2.
+    CUDA_CHECK(cudaMalloc(&outputDevice, (mHW / 4 * hiddenDim) * sizeof(half)));
     mDeviceBuffer["output"] = outputDevice;
     mContext->setTensorAddress("output", outputDevice);
 
     void* mropeRotaryCosSinDevice;
-    int64_t mropeRotaryCosSinSize = mBatchSize * mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim * sizeof(float);
+    int64_t mropeRotaryCosSinSize = mConfig.batchSize * mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim * sizeof(float);
     CUDA_CHECK(cudaMalloc(&mropeRotaryCosSinDevice, mropeRotaryCosSinSize));
     mDeviceBuffer["mropeRotaryCosSin"] = mropeRotaryCosSinDevice;
     void* mropePositionDeltasDevice;
-    CUDA_CHECK(cudaMalloc(&mropePositionDeltasDevice, mBatchSize * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&mropePositionDeltasDevice, mConfig.batchSize * sizeof(int64_t)));
     mDeviceBuffer["mropePositionDeltas"] = mropePositionDeltasDevice;
+
+    if (mConfig.modelType == "qwen2_5_vl")
+    {
+        void* windowAttentionMaskDevice;
+        CUDA_CHECK(cudaMalloc(&windowAttentionMaskDevice, (mHW * mHW) * sizeof(half)));
+        mDeviceBuffer["window_attention_mask"] = windowAttentionMaskDevice;
+        mContext->setTensorAddress("window_attention_mask", windowAttentionMaskDevice);
+        mContext->setInputShape("window_attention_mask", {3, {1, mHW, mHW}});
+    
+        void* windowIndexDevice;
+        CUDA_CHECK(cudaMalloc(&windowIndexDevice, (mHW / 4) * sizeof(int64_t)));
+        mDeviceBuffer["window_index"] = windowIndexDevice;
+        mContext->setTensorAddress("window_index", windowIndexDevice);
+        mContext->setInputShape("window_index", {1, {mHW / 4}});
+    
+        void* reverseIndexDevice;
+        CUDA_CHECK(cudaMalloc(&reverseIndexDevice, (mHW / 4) * sizeof(int64_t)));
+        mDeviceBuffer["reverse_window_index"] = reverseIndexDevice;
+        mContext->setTensorAddress("reverse_window_index", reverseIndexDevice);
+        mContext->setInputShape("reverse_window_index", {1, {mHW / 4}});
+    }
 }
 
 void Qwen2ViTRunner::freeBuffer()
@@ -130,7 +149,7 @@ void Qwen2ViTRunner::preprocessImage(unsigned char* image, int const& width, int
     std::vector<half>& patches, std::vector<std::vector<int64_t>>& grids, int64_t& totalSeqLength)
 {
     // resize
-    auto [resizedHeight, resizedWidth] = smartResize(height / 2, width / 2, mConfig.patchSize * mConfig.mergeSize);
+    auto [resizedHeight, resizedWidth] = smartResize(height, width, mConfig.patchSize * mConfig.mergeSize);
     unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * channels);
     stbir_resize_uint8_linear(
         image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
@@ -240,7 +259,7 @@ void Qwen2ViTRunner::computeRotaryPosEmb(
     }
 
     rotaryPosEmb.resize(posIds.size() * (dim / 2));
-    for (int i = 0; i < posIds.size(); ++i)
+    for (size_t i = 0; i < posIds.size(); ++i)
     {
         auto emb = rotaryPosEmbFull[posIds[i]];
         std::copy(emb.begin(), emb.end(), rotaryPosEmb.begin() + i * (dim / 2));
@@ -288,7 +307,7 @@ void Qwen2ViTRunner::visualPreprocess(std::vector<unsigned char*> const& imageBu
     std::vector<float>& rotaryPosEmb, std::vector<std::vector<int64_t>>& grids)
 {
     int64_t totalSeqLength = 0;
-    for (int i = 0; i < imageBuffers.size(); ++i)
+    for (size_t i = 0; i < imageBuffers.size(); ++i)
     {
         preprocessImage(
             imageBuffers[i], imageSizes[i][0], imageSizes[i][1], imageSizes[i][2], patches, grids, totalSeqLength);
@@ -296,7 +315,7 @@ void Qwen2ViTRunner::visualPreprocess(std::vector<unsigned char*> const& imageBu
 
     attentionMask.resize(totalSeqLength * totalSeqLength, -CUDART_MAX_NORMAL_FP16);
     int start = 0;
-    for (auto const grid : grids)
+    for (auto const& grid : grids)
     {
         int64_t len = grid[1] * grid[2];
         for (int t = 0; t < grid[0]; ++t)
@@ -422,10 +441,10 @@ void Qwen2ViTRunner::generateMropeParams(
     }
 
     std::vector<int> mRopeSections{0, 16, 40, 64}; // cumsum of {16, 24, 24}
-    int64_t mropeRotaryCosSinSize = mBatchSize * mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim;
+    int64_t mropeRotaryCosSinSize = mConfig.batchSize * mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim;
     mropeRotaryCosSin.resize(mropeRotaryCosSinSize);
 
-    for (int b = 0; b < mBatchSize; ++b)
+    for (int b = 0; b < mConfig.batchSize; ++b)
     {
         for (int sec = 0; sec < 3; ++sec)
         {
@@ -447,7 +466,7 @@ void Qwen2ViTRunner::generateMropeParams(
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropeRotaryCosSin"], mropeRotaryCosSin.data(),
         mropeRotaryCosSinSize * sizeof(float), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropePositionDeltas"], mropePositionDeltas.data(),
-        mBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+        mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 }
 
 std::string Qwen2ViTRunner::applyChatTemplate(std::string const& inputString, int const& numImage,
@@ -490,29 +509,29 @@ void Qwen2ViTRunner::textPreprocess(std::vector<std::string> const& inputStrings
     std::vector<std::vector<int64_t>> batchInputIds;
     int totalImageIdx = 0;
     int value = vocabSize;
-    for (int i = 0; i < inputStrings.size(); ++i)
+    for (size_t i = 0; i < inputStrings.size(); ++i)
     {
         std::string prompt = applyChatTemplate(inputStrings[i], numImages[i], visualGridTHWs, totalImageIdx);
-        std::vector<int64_t> inputIds = tokenizer->encode(prompt);
+        std::vector<int64_t> ids = tokenizer->encode(prompt);
         // replace vis tokens
-        for (int j = 0; j < inputIds.size(); ++j)
+        for (size_t j = 0; j < ids.size(); ++j)
         {
             // <|vision_pad|>, <|image_pad|>, <|video_pad|>
-            if (inputIds[j] == 151654 || inputIds[j] == 151655 || inputIds[j] == 151656)
+            if (ids[j] == 151654 || ids[j] == 151655 || ids[j] == 151656)
             {
-                inputIds[j] = value;
+                ids[j] = value;
                 ++value;
             }
         }
 
-        batchInputIds.emplace_back(inputIds);
+        batchInputIds.emplace_back(ids);
     }
 
     generateMropeParams(batchInputIds, visualGridTHWs);
 
     // Pad to maxContextLength
     int64_t padId = tokenizer->getPadId();
-    for (int i = 0; i < batchInputIds.size(); ++i)
+    for (size_t i = 0; i < batchInputIds.size(); ++i)
     {
         int32_t inputSize = static_cast<int32_t>(batchInputIds[i].size());
         if (inputSize > maxContextLength)
@@ -533,18 +552,18 @@ std::vector<EngineInputDesc> Qwen2ViTRunner::getExtraLLMInputs()
     extraInputs.emplace_back(
         EngineInputDesc{"image_embeds", mDeviceBuffer["output"], imageEmbedsDims, {2, {1, imageHiddenSize}}});
 
-    nvinfer1::Dims cosSinDims = {2, {mBatchSize, mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim}};
+    nvinfer1::Dims cosSinDims = {2, {mConfig.batchSize, mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim}};
     extraInputs.emplace_back(
         EngineInputDesc{"mrope_rotary_cos_sin", mDeviceBuffer["mropeRotaryCosSin"], cosSinDims, cosSinDims});
 
-    nvinfer1::Dims deltasDim = {2, {mBatchSize, 1}};
+    nvinfer1::Dims deltasDim = {2, {mConfig.batchSize, 1}};
     extraInputs.emplace_back(
         EngineInputDesc{"mrope_position_deltas", mDeviceBuffer["mropePositionDeltas"], deltasDim, deltasDim});
 
     return extraInputs;
 }
 
-void Qwen2ViTRunner::visualInfer(
+void Qwen2ViTRunner::qwen2ViTInfer(
     std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb)
 {
     int64_t inputDim = mContext->getTensorShape("input").d[1];
@@ -562,8 +581,101 @@ void Qwen2ViTRunner::visualInfer(
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 }
 
-void Qwen2ViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vector<half>& visualAttentionMask,
-    std::vector<float>& visualRotaryPosEmb, std::vector<int64_t>& inputIds, int const textTokenLength,
+
+void Qwen2ViTRunner::getWindowIndex(std::vector<std::vector<int64_t>> const& grids, 
+    std::vector<half>& windowAttentionMask, std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex)
+{
+    // Init windowIndex and cuWindowSeqlens
+    std::vector<int64_t> cuWindowSeqlens{0};
+    int windowIndexId = 0;
+    int vitMergerWindowSize = mConfig.windowSize / mConfig.mergeSize / mConfig.patchSize;
+
+    for (const auto& grid : grids)
+    {
+        int64_t T = grid[0], H = grid[1], W = grid[2];
+        int64_t llmGridH = H / mConfig.mergeSize;
+        int64_t llmGridW = W / mConfig.mergeSize;
+        int numWindowsH = (llmGridH + vitMergerWindowSize - 1) / vitMergerWindowSize;
+        int numWindowsW = (llmGridW + vitMergerWindowSize - 1) / vitMergerWindowSize;
+
+        for (int i = 0; i < numWindowsH; ++i)
+        {
+            for (int j = 0; j < numWindowsW; ++j)
+            {
+                int cnt{0};
+                for (int m = 0; m < vitMergerWindowSize; ++m)
+                {
+                    for (int n = 0; n < vitMergerWindowSize; ++n)
+                    {
+                        int64_t idxH = i * vitMergerWindowSize + m;
+                        int64_t idxW = j * vitMergerWindowSize + n;
+                        if (idxH < llmGridH && idxW < llmGridW)
+                        {
+                            windowIndex.emplace_back(idxH * llmGridW + idxW + windowIndexId);
+                            ++cnt;
+                        }
+                    }
+                }
+
+                cuWindowSeqlens.emplace_back(cnt * mConfig.mergeSize * mConfig.mergeSize +
+                    cuWindowSeqlens.back());
+            }
+        }
+
+        windowIndexId += T * llmGridH * llmGridW;
+    }
+
+    reverseWindowIndex.resize(windowIndex.size());
+    std::iota(reverseWindowIndex.begin(), reverseWindowIndex.end(), 0);
+    std::sort(reverseWindowIndex.begin(), reverseWindowIndex.end(),
+              [&windowIndex](size_t left, size_t right)
+              {
+                  return windowIndex[left] < windowIndex[right];
+              });
+
+    windowAttentionMask.resize(mHW * mHW, -CUDART_MAX_NORMAL_FP16);
+    for (size_t s = 1; s < cuWindowSeqlens.size(); ++s)
+    {
+        for (int i = cuWindowSeqlens[s - 1]; i < cuWindowSeqlens[s]; ++i)
+        {
+            for (int j = cuWindowSeqlens[s - 1]; j < cuWindowSeqlens[s]; ++j)
+            {
+                windowAttentionMask[i * mHW + j] = CUDART_ZERO_FP16;
+            }
+        }
+    }
+}
+
+void Qwen2ViTRunner::qwen2_5ViTInfer(
+    std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb,
+    std::vector<half> const& windowAttentionMask, std::vector<int64_t> const& windowIndex,
+    std::vector<int64_t> const& reverseWindowIndex)
+{
+    int64_t inputDim = mContext->getTensorShape("input").d[1];
+    int64_t posEmbDim = mContext->getTensorShape("rotary_pos_emb").d[1];
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        mDeviceBuffer["input"], input.data(), (mHW * inputDim) * sizeof(half), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["attention_mask"], attentionMask.data(), (mHW * mHW) * sizeof(half),
+        cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["rotary_pos_emb"], rotaryPosEmb.data(), (mHW * posEmbDim) * sizeof(float),
+        cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["window_attention_mask"], windowAttentionMask.data(), (mHW * mHW) * sizeof(half),
+        cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["window_index"], windowIndex.data(), (mHW / 4) * sizeof(int64_t),
+        cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["reverse_window_index"], reverseWindowIndex.data(), (mHW / 4) * sizeof(int64_t),
+        cudaMemcpyHostToDevice, mStream));
+
+    mContext->enqueueV3(mStream);
+
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+}
+
+void Qwen2ViTRunner::initRandomInputs(
+    std::vector<half>& visualInput, std::vector<half>& visualAttentionMask,
+    std::vector<float>& visualRotaryPosEmb, std::vector<half>& windowAttentionMask, std::vector<int64_t>& windowIndex,
+    std::vector<int64_t>& reverseWindowIndex, std::vector<int64_t>& inputIds, int const textTokenLength,
     int const imageTokenLength, int const maxContextLength, int const vocabSize)
 {
     std::random_device dev;
@@ -586,10 +698,17 @@ void Qwen2ViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vecto
 
     allocateBuffer();
 
+    if (mConfig.modelType == "qwen2_5_vl")
+    {
+        // Assume grid (T,H,W) = (1, 4, imageTokenLength) for simplicity
+        std::vector<std::vector<int64_t>> grids = {{1, 4, imageTokenLength}};
+        getWindowIndex(grids, windowAttentionMask, windowIndex, reverseWindowIndex);
+    }
+
     // Init input ids
     std::uniform_int_distribution<std::mt19937::result_type> intDist(0, 10000);
     int value = vocabSize;
-    for (int i = 0; i < mBatchSize; ++i)
+    for (int i = 0; i < mConfig.batchSize; ++i)
     {
         auto beginIter = inputIds.begin() + i * maxContextLength;
         std::generate(
@@ -603,13 +722,13 @@ void Qwen2ViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vecto
     }
 
     // Init mrope params
-    int64_t mropeRotaryCosSinSize = mBatchSize * mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim;
+    int64_t mropeRotaryCosSinSize = mConfig.batchSize * mConfig.maxPositionEmbeddings * mConfig.rotaryEmbedDim;
     std::vector<float> mropeRotaryCosSin(mropeRotaryCosSinSize);
     std::generate(mropeRotaryCosSin.begin(), mropeRotaryCosSin.end(), [&rng, &dist]() { return dist(rng); });
-    std::vector<int64_t> mropePositionDeltas(mBatchSize, 0);
+    std::vector<int64_t> mropePositionDeltas(mConfig.batchSize, 0);
 
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropeRotaryCosSin"], mropeRotaryCosSin.data(),
         mropeRotaryCosSinSize * sizeof(float), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropePositionDeltas"], mropePositionDeltas.data(),
-        mBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+        mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 }

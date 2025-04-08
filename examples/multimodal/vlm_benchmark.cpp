@@ -189,7 +189,7 @@ void printBenchmarkResult(std::shared_ptr<BenchmarkProfiler> const profiler, int
     oss << std::fixed << std::setprecision(2);
     oss << "Sequence Latencies(ms): [";
     constexpr int maxPrintedLatencies{20};
-    for (int i = 0; i < pipeLatencies.size(); ++i)
+    for (size_t i = 0; i < pipeLatencies.size(); ++i)
     {
         oss << pipeLatencies[i];
         if (i == pipeLatencies.size() - 1)
@@ -228,20 +228,21 @@ void printBenchmarkResult(std::shared_ptr<BenchmarkProfiler> const profiler, int
 size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
     int const imageTokenLength, std::vector<std::vector<int64_t>>& outputIds,
-    std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph)
+    std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph,
+    std::string const& modelType)
 {
     // Setup
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    auto vitrunner = new Qwen2ViTRunner();
+    auto vitrunner = new Qwen2ViTRunner(modelType);
     auto decoder = new Decoder<half>();
 
     profiler->startTiming();
     profiler->recordDeviceMemStart();
     profiler->recordHostMemStart();
     profiler->recordHostStart("decoder setup");
-    vitrunner->setup(visualEnginePath, stream, batchSize);
+    vitrunner->setup(visualEnginePath, stream, batchSize, imageTokenLength*28*28, imageTokenLength*28*28);
     decoder->setup(llmEnginePath, stream, useCudaGraph, batchSize);
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
@@ -252,16 +253,28 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     std::vector<float> visualRotaryPosEmb;
     std::vector<int64_t> inputIds(batchSize * decoder->getMaxContextLength(), -1);
     std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
+    // Only initialized for qwen2_5_vl
+    std::vector<half> visualWindowAttentionMask;
+    std::vector<int64_t> visualWindowIndex;
+    std::vector<int64_t> reverseWindowIndex;
 
-    vitrunner->initRandomInputs(visualInput, visualAttentionMask, visualRotaryPosEmb, inputIds, textTokenLength,
-        imageTokenLength, decoder->getMaxContextLength());
+    vitrunner->initRandomInputs(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
+        visualWindowIndex, reverseWindowIndex, inputIds, textTokenLength, imageTokenLength, decoder->getMaxContextLength());
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     for (int i = 0; i < warmUp; i++)
     {
         // Warmup for profiler
         profiler->recordHostStart("pipeline latency");
-        vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+        if (modelType == "qwen2_vl")
+        {
+            vitrunner->qwen2ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+        }
+        else
+        {
+            vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
+                visualWindowIndex, reverseWindowIndex);
+        }
         decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("pipeline latency");
@@ -274,8 +287,16 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     {
         profiler->recordHostStart("pipeline latency");
         profiler->recordHostStart("visual encoder latency");
-        vitrunner->visualInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (modelType == "qwen2_vl")
+        {
+            vitrunner->qwen2ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+        }
+        else
+        {
+            vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
+                visualWindowIndex, reverseWindowIndex);
+        }
+         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("visual encoder latency");
 
         profiler->recordHostStart("seq latency");
@@ -293,7 +314,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
 
 void benchmarkVLM(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     int const batchSize, int const textTokenLength, int const imageTokenLength, int const outputLength,
-    std::string modelType, int const warmUp, int const numRuns, bool useCudaGraph)
+    std::string const& modelType, int const warmUp, int const numRuns, bool useCudaGraph)
 {
     int totalSeqLength = textTokenLength + imageTokenLength + outputLength;
     GenerationConfig generationConfig{totalSeqLength, totalSeqLength, 1, 0};
@@ -307,10 +328,10 @@ void benchmarkVLM(std::filesystem::path const& llmEnginePath, std::filesystem::p
     auto profiler = std::make_shared<BenchmarkProfiler>();
     size_t deviceMemorySize;
 
-    if (modelType == "qwen2_vl")
+    if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
     {
         deviceMemorySize = benchmarkQwen2VL(llmEnginePath, visualEnginePath, generationConfig, batchSize,
-            textTokenLength, imageTokenLength, outputIds, profiler, warmUp, numRuns, useCudaGraph);
+            textTokenLength, imageTokenLength, outputIds, profiler, warmUp, numRuns, useCudaGraph, modelType);
     }
     else
     {
