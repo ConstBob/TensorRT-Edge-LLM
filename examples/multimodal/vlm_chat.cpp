@@ -175,7 +175,8 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     auto vitrunner = new Qwen2ViTRunner(modelType);
-    vitrunner->setup(visualEnginePath, stream, batchSize, 128*28*28, 512*28*28);
+    vitrunner->setup(visualEnginePath, stream, batchSize, 128, 512, 1024);
+    vitrunner->allocateBuffer();
     auto decoder = new Decoder<half>();
     decoder->setup(llmEnginePath, stream, true, batchSize);
 
@@ -213,7 +214,6 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
 
     vitrunner->visualPreprocess(
         imageBuffers, imageSizes, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
-    vitrunner->allocateBuffer();
     vitrunner->textPreprocess(
         inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths, decoder->getMaxContextLength());
 

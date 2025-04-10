@@ -459,7 +459,7 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     auto vitrunner = new Qwen2ViTRunner(modelType);
-    vitrunner->setup(visualEnginePath, stream, 1, 1280 * 28 * 28, 6620*28*28);
+    vitrunner->setup(visualEnginePath, stream, 1, 1280, 6620, 6620);
 
     auto decoder = new Decoder<half>();
     decoder->setup(llmEnginePath, stream);
