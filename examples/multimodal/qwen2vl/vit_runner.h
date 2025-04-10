@@ -35,8 +35,8 @@ struct VisualPreprocessorConfig
 
     std::string modelType;
     int64_t batchSize;
-    int64_t minPixels{4 * 28 * 28};
-    int64_t maxPixels{16384 * 28 * 28};
+    int64_t minTokens{4};       // The minimum number of tokens in a single image
+    int64_t maxTokens{16384};   // The maximum number of tokens in a single image
     int64_t patchSize{14};
     int64_t temporalPatchSize{2};
     int64_t mergeSize{2};
@@ -62,8 +62,19 @@ public:
     {
     }
 
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize = 1, int minPixels = 4 * 28 * 28,
-        int maxPixels = 16384 * 28 * 28);
+    /**
+     * @brief Sets up the Qwen2ViTRunner with the necessary configurations and resources.
+     *
+     * @param fp The file path to visual TensorRT engine file.
+     * @param stream The CUDA stream to be used for GPU operations.
+     * @param batchSize The batch size for processing.
+     * @param minTokes The minimum number of tokens in a single image.
+     * @param maxTokens The maximum number of tokens in a single image.
+     * @param totalMaxTokens The total maximum number of tokens for all images.
+     *
+     * @return True if the setup is successful, false otherwise.
+     */
+    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize, int minTokes, int maxTokens, int totalMaxTokens);
 
     void visualPreprocess(std::vector<unsigned char*> const& imageBuffers,
         std::vector<std::vector<int>> const& imageSizes, std::vector<half>& patches, std::vector<half>& attentionMask,

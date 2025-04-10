@@ -18,8 +18,8 @@
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include <stb_image_resize2.h>
 
-bool Qwen2ViTRunner::setup(
-    std::filesystem::path const& fp, cudaStream_t& stream, int batchSize, int minPixels, int maxPixels)
+bool Qwen2ViTRunner::setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize, int minTokes,
+    int maxTokens, int totalMaxTokens)
 {
     try
     {
@@ -41,8 +41,10 @@ bool Qwen2ViTRunner::setup(
         mContext = std::unique_ptr<nvinfer1::IExecutionContext>(mVisualEngine->createExecutionContext());
         mContext->setOptimizationProfileAsync(0, mStream);
         mConfig.batchSize = batchSize;
-        mConfig.minPixels = minPixels;
-        mConfig.maxPixels = maxPixels;
+        mConfig.minTokens = minTokes;
+        mConfig.maxTokens = maxTokens;
+        mHW = totalMaxTokens * 4;
+
         isSetup = true;
     }
     catch (std::exception const& e)
@@ -286,15 +288,17 @@ std::tuple<int, int> Qwen2ViTRunner::smartResize(int const height, int const wid
     int hBar = std::max(factor, roundByFactor(height, factor));
     int wBar = std::max(factor, roundByFactor(width, factor));
 
-    if (hBar * wBar > mConfig.maxPixels)
+    int maxPixels = mConfig.maxTokens * 28 * 28;
+    int minPixels = mConfig.minTokens * 28 * 28;
+    if (hBar * wBar > maxPixels)
     {
-        double beta = std::sqrt(static_cast<double>(height * width) / mConfig.maxPixels);
+        double beta = std::sqrt(static_cast<double>(height * width) / maxPixels);
         hBar = floorByFactor(static_cast<int>(height / beta), factor);
         wBar = floorByFactor(static_cast<int>(width / beta), factor);
     }
-    else if (hBar * wBar < mConfig.minPixels)
+    else if (hBar * wBar < minPixels)
     {
-        double beta = std::sqrt(static_cast<double>(mConfig.minPixels) / (height * width));
+        double beta = std::sqrt(static_cast<double>(minPixels) / (height * width));
         hBar = ceilByFactor(static_cast<int>(height * beta), factor);
         wBar = ceilByFactor(static_cast<int>(width * beta), factor);
     }
@@ -311,6 +315,11 @@ void Qwen2ViTRunner::visualPreprocess(std::vector<unsigned char*> const& imageBu
     {
         preprocessImage(
             imageBuffers[i], imageSizes[i][0], imageSizes[i][1], imageSizes[i][2], patches, grids, totalSeqLength);
+    }
+
+    if (totalSeqLength > mHW)
+    {
+        throw std::runtime_error("Image tokens number exceeds the maximum limitation.");
     }
 
     attentionMask.resize(totalSeqLength * totalSeqLength, -CUDART_MAX_NORMAL_FP16);
@@ -332,8 +341,6 @@ void Qwen2ViTRunner::visualPreprocess(std::vector<unsigned char*> const& imageBu
     }
 
     computeRotaryPosEmb(grids, rotaryPosEmb);
-
-    mHW = totalSeqLength;
     return;
 }
 
@@ -569,12 +576,25 @@ void Qwen2ViTRunner::qwen2ViTInfer(
     int64_t inputDim = mContext->getTensorShape("input").d[1];
     int64_t posEmbDim = mContext->getTensorShape("rotary_pos_emb").d[1];
 
+    if (input.size() > mHW * inputDim)
+    {
+        throw std::runtime_error("Input size exceeds the maximum size.");
+    }
+    if (attentionMask.size() > mHW * mHW)
+    {
+        throw std::runtime_error("Attention mask size exceeds the maximum size.");
+    }
+    if (rotaryPosEmb.size() > mHW * posEmbDim)
+    {
+        throw std::runtime_error("Rotary position embedding size exceeds the maximum size.");
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(
-        mDeviceBuffer["input"], input.data(), (mHW * inputDim) * sizeof(half), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["attention_mask"], attentionMask.data(), (mHW * mHW) * sizeof(half),
-        cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["rotary_pos_emb"], rotaryPosEmb.data(), (mHW * posEmbDim) * sizeof(float),
-        cudaMemcpyHostToDevice, mStream));
+        mDeviceBuffer["input"], input.data(), input.size() * sizeof(half), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["attention_mask"], attentionMask.data(),
+        attentionMask.size() * sizeof(half), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["rotary_pos_emb"], rotaryPosEmb.data(),
+        rotaryPosEmb.size() * sizeof(float), cudaMemcpyHostToDevice, mStream));
 
     mContext->enqueueV3(mStream);
 
@@ -654,18 +674,43 @@ void Qwen2ViTRunner::qwen2_5ViTInfer(
     int64_t inputDim = mContext->getTensorShape("input").d[1];
     int64_t posEmbDim = mContext->getTensorShape("rotary_pos_emb").d[1];
 
+    if (input.size() > mHW * inputDim)
+    {
+        throw std::runtime_error("Input size exceeds the maximum size.");
+    }
+    if (attentionMask.size() > mHW * mHW)
+    {
+        throw std::runtime_error("Attention mask size exceeds the maximum size.");
+    }
+    if (rotaryPosEmb.size() > mHW * posEmbDim)
+    {
+        throw std::runtime_error("Rotary position embedding size exceeds the maximum size.");
+    }
+    if (windowAttentionMask.size() > mHW * mHW)
+    {
+        throw std::runtime_error("Window attention mask size exceeds the maximum size.");
+    }
+    if (windowIndex.size() > mHW / 4)
+    {
+        throw std::runtime_error("Window index size exceeds the maximum size.");
+    }
+    if (reverseWindowIndex.size() > mHW / 4)
+    {
+        throw std::runtime_error("Reverse window index size exceeds the maximum size.");
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(
-        mDeviceBuffer["input"], input.data(), (mHW * inputDim) * sizeof(half), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["attention_mask"], attentionMask.data(), (mHW * mHW) * sizeof(half),
+        mDeviceBuffer["input"], input.data(), input.size() * sizeof(half), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["attention_mask"], attentionMask.data(),
+        attentionMask.size() * sizeof(half), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["rotary_pos_emb"], rotaryPosEmb.data(),
+        rotaryPosEmb.size() * sizeof(float), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["window_attention_mask"], windowAttentionMask.data(),
+        windowAttentionMask.size() * sizeof(half), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["window_index"], windowIndex.data(), windowIndex.size() * sizeof(int64_t),
         cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["rotary_pos_emb"], rotaryPosEmb.data(), (mHW * posEmbDim) * sizeof(float),
-        cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["window_attention_mask"], windowAttentionMask.data(), (mHW * mHW) * sizeof(half),
-        cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["window_index"], windowIndex.data(), (mHW / 4) * sizeof(int64_t),
-        cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["reverse_window_index"], reverseWindowIndex.data(), (mHW / 4) * sizeof(int64_t),
-        cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["reverse_window_index"], reverseWindowIndex.data(),
+        reverseWindowIndex.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 
     mContext->enqueueV3(mStream);
 

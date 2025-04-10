@@ -242,7 +242,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     profiler->recordDeviceMemStart();
     profiler->recordHostMemStart();
     profiler->recordHostStart("decoder setup");
-    vitrunner->setup(visualEnginePath, stream, batchSize, imageTokenLength*28*28, imageTokenLength*28*28);
+    vitrunner->setup(visualEnginePath, stream, batchSize, imageTokenLength, imageTokenLength, imageTokenLength);
     decoder->setup(llmEnginePath, stream, useCudaGraph, batchSize);
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
