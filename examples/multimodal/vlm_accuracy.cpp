@@ -19,7 +19,9 @@
 #include <getopt.h>
 
 #define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include <stb_image.h>
+#include <stb_image_resize2.h>
 
 using namespace nvinfer1;
 
@@ -496,8 +498,17 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
             unsigned char* image
                 = stbi_load_from_memory(buffer.data(), buffer.size(), &width, &height, &channels, desiredChannels);
             assert(image != NULL && "Failed to load image.");
-            imageBuffers.emplace_back(image);
-            imageSizes.emplace_back(std::vector<int>{width, height, desiredChannels});
+
+            // Adjust image size
+            auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height / 2, width / 2);
+            unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
+            stbir_resize_uint8_linear(
+                image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
+
+            imageBuffers.emplace_back(resizedImage);
+            imageSizes.emplace_back(std::vector<int>{resizedWidth, resizedHeight, desiredChannels});
+
+            stbi_image_free(image);
         }
 
         vitrunner->visualPreprocess(
@@ -530,6 +541,10 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
 
         ++i;
         vitrunner->freeBuffer();
+        for (auto& buffer : imageBuffers)
+        {
+            free(buffer);
+        }
     }
 
     LOG_INFO("Collected results on %d questions.", i);

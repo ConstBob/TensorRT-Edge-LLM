@@ -18,7 +18,9 @@
 #include <getopt.h>
 
 #define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include <stb_image.h>
+#include <stb_image_resize2.h>
 
 struct RuntimeArgs
 {
@@ -207,8 +209,17 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
                 return;
             }
 
-            imageBuffers.emplace_back(image);
-            imageSizes.emplace_back(std::vector<int>{width, height, desiredChannels});
+            // Resize
+            auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height / 2, width / 2);
+            unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
+
+            stbir_resize_uint8_linear(
+                image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
+
+            imageBuffers.emplace_back(resizedImage);
+            imageSizes.emplace_back(std::vector<int>{resizedWidth, resizedHeight, desiredChannels});
+
+            stbi_image_free(image);
         }
     }
 
@@ -235,6 +246,11 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
+
+    for (auto& buffer : imageBuffers)
+    {
+        free(buffer);
+    }
 }
 
 std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,

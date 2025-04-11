@@ -105,6 +105,8 @@ public:
     void allocateBuffer();
     void freeBuffer();
 
+    std::tuple<int, int> adjustImageSize(int const height, int const width);
+
     ~Qwen2ViTRunner()
     {
         freeBuffer();
@@ -120,7 +122,6 @@ private:
     bool isSetup;
     int64_t mHW;
 
-    std::tuple<int, int> smartResize(int const height, int const width, int const maxRatio = 200);
     void initRotaryEmbedding(
         int numPos, int dim, float theta, std::vector<std::vector<float>>& sinusoidInp, float scale = 1.0f);
     /**
