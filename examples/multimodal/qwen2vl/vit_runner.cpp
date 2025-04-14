@@ -15,9 +15,6 @@
 #include <random>
 #include <tuple>
 
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include <stb_image_resize2.h>
-
 bool Qwen2ViTRunner::setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize, int minTokes,
     int maxTokens, int totalMaxTokens)
 {
@@ -150,17 +147,11 @@ void Qwen2ViTRunner::initRotaryEmbedding(
 void Qwen2ViTRunner::preprocessImage(unsigned char* image, int const& width, int const& height, int const& channels,
     std::vector<half>& patches, std::vector<std::vector<int64_t>>& grids, int64_t& totalSeqLength)
 {
-    // resize
-    auto [resizedHeight, resizedWidth] = smartResize(height, width, mConfig.patchSize * mConfig.mergeSize);
-    unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * channels);
-    stbir_resize_uint8_linear(
-        image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
-
-    std::vector<int64_t> curGrid{1, (resizedHeight / mConfig.patchSize), (resizedWidth / mConfig.patchSize)};
+    std::vector<int64_t> curGrid{1, (height / mConfig.patchSize), (width / mConfig.patchSize)};
     grids.emplace_back(curGrid);
-    totalSeqLength += (resizedHeight / mConfig.patchSize) * (resizedWidth / mConfig.patchSize);
+    totalSeqLength += (height / mConfig.patchSize) * (width / mConfig.patchSize);
 
-    int curSize = mConfig.temporalPatchSize * resizedHeight * resizedWidth * channels;
+    int curSize = mConfig.temporalPatchSize * height * width * channels;
     std::vector<half> curPatch(curSize);
 
     // Normalize and store to patches. Reorder dimensions according to:
@@ -186,8 +177,7 @@ void Qwen2ViTRunner::preprocessImage(unsigned char* image, int const& width, int
                                     + mergeH * mConfig.patchSize + patchH;
                                 int originalW = gridW * mConfig.mergeSize * mConfig.patchSize
                                     + mergeW * mConfig.patchSize + patchW;
-                                unsigned char value
-                                    = resizedImage[originalH * resizedWidth * channels + originalW * channels + c];
+                                unsigned char value = image[originalH * width * channels + originalW * channels + c];
                                 half normalized
                                     = __double2half((value / 255.0 - mConfig.imageMean[c]) / mConfig.imageStd[c]);
 
@@ -268,7 +258,7 @@ void Qwen2ViTRunner::computeRotaryPosEmb(
     }
 }
 
-std::tuple<int, int> Qwen2ViTRunner::smartResize(int const height, int const width, int const maxRatio)
+std::tuple<int, int> Qwen2ViTRunner::adjustImageSize(int const height, int const width)
 {
     // According to https://github.com/QwenLM/Qwen2-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py
     auto roundByFactor
@@ -278,13 +268,13 @@ std::tuple<int, int> Qwen2ViTRunner::smartResize(int const height, int const wid
     auto ceilByFactor
         = [](int value, int factor) -> int { return std::ceil(static_cast<double>(value) / factor) * factor; };
 
-    if (std::max(height, width) / std::min(height, width) > maxRatio)
+    int factor = mConfig.patchSize * mConfig.mergeSize;
+    if (std::max(height, width) / std::min(height, width) > factor)
     {
-        throw std::invalid_argument("absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
+        throw std::invalid_argument("absolute aspect ratio must be smaller than " + std::to_string(factor) + ", got "
             + std::to_string(std::max(height, width) / std::min(height, width)));
     }
 
-    int factor = mConfig.patchSize * mConfig.mergeSize;
     int hBar = std::max(factor, roundByFactor(height, factor));
     int wBar = std::max(factor, roundByFactor(width, factor));
 
