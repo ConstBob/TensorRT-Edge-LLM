@@ -53,6 +53,10 @@ if(DEFINED AARCH64_BUILD)
   target_link_options(Int4GemmPlugin PRIVATE "-L${CUDA_DIR}/lib/stubs")
 endif()
 
+# Generate static library for plugin components for unit tests purposes.
+add_library(llmSdkPlugin STATIC ${PLUGIN_CPP_SRCS} ${PLUGIN_CU_SRCS})
+target_include_directories(llmSdkPlugin PRIVATE ${COMMON_INCLUDE_DIRS})
+
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")

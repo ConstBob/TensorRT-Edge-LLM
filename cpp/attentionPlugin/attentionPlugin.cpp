@@ -138,8 +138,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 
     // Load FMHA and XQA kernels to device. The kernel code will only be loaded once if
     // multiple AttentionPlugin instances exist in the model.
+    // TODO: Fix me too pass spec-deocde support through plugin attributes.
+    bool const useSpecDecode = false;
     ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
-    DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType);
+    DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType, useSpecDecode);
 }
 
 AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size_t length)
@@ -158,7 +160,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
 
     mSMVersion = getSMVersion();
     ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
-    DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType);
+    // TODO: Fix me too pass spec-deocde support through plugin attributes.
+    bool const useSpecDecode = false;
+    DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType, useSpecDecode);
 }
 
 AttentionPlugin::~AttentionPlugin() {}
