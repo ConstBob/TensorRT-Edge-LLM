@@ -26,6 +26,7 @@ struct XQALaunchParams
         uint32_t capacity = 0;
     };
 
+    // Device memory pointers to launch XQA kernel.
     void* output = nullptr;
     void const* qInputPtr = nullptr;
     KVCache kvCache;
@@ -33,11 +34,20 @@ struct XQALaunchParams
     int32_t* semaphores = nullptr;
     void* scratch = nullptr;
 
+    // Unique device memory pointer for spec-decode tree attention.
+    void* treeAttnMask = nullptr;
+    int32_t* qCuSeqLen = nullptr;
+
     // MHA parameter to locate a kernel to launch.
     int32_t numQheads = 0;
     int32_t numKVheads = 0;
     int32_t headSize = 0;
     int32_t batchSize = 0;
+
+    // Parameters for spec-decode tree attention
+    int32_t qSeqLen = 0;
+    float qScale = 1.0F;
+    int32_t headGroupSize = 0;
 
     // I/O type of the kernel
     nvinfer1::DataType dataType;
@@ -55,13 +65,14 @@ public:
 
     // Dispatch XQA kernel and compute the attention result.
     void dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream);
+    void dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cudaStream_t const& stream);
 
     // Initialize a XQA parameter with MHA and hardware configuration to query. The XQA parameter can be used by
     // prepareToRun() to query kernel to dispatch. Device pointer shall be setup by caller to dispatch XQA kernel.
     XQALaunchParams initXQAParams();
 
     static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, nvinfer1::DataType dataType);
-    static bool loadDecodeXQAKernels(int32_t smVersion, nvinfer1::DataType dataType);
+    static bool loadDecodeXQAKernels(int32_t smVersion, nvinfer1::DataType dataType, bool useSpecDecodeKernels);
 
 private:
     nvinfer1::DataType mDataType;

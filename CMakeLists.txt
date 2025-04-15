@@ -49,6 +49,11 @@ find_library(
   HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
   PATH_SUFFIXES lib lib64)
 
+find_library(
+  CUDA_LIB cuda
+  HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
+  PATH_SUFFIXES lib lib64)
+
 find_path(
   CURAND_KERNEL_INCLUDE_DIR
   NAMES curand_kernel.h
@@ -111,8 +116,8 @@ option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
 if(BUILD_UNIT_TESTS)
   set(BUILD_GMOCK OFF CACHE BOOL "Disable Google Mock")
   add_subdirectory(${CMAKE_SOURCE_DIR}/3rdParty/googletest)
-  file(GLOB_RECURSE UNIT_TESTS_SRCS ${CMAKE_SOURCE_DIR}/unittests/*.cpp)
+  file(GLOB_RECURSE UNIT_TESTS_SRCS ${CMAKE_SOURCE_DIR}/unittests/*.cpp ${CMAKE_SOURCE_DIR}/unittests/*.cu)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
   target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS})
-  target_link_libraries(unitTest PRIVATE gtest gtest_main ${CUDART_LIB})
+  target_link_libraries(unitTest PRIVATE gtest gtest_main llmSdkPlugin ${CUDART_LIB} ${CUDA_LIB})
 endif()
