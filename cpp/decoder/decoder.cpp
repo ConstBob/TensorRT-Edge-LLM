@@ -382,6 +382,17 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
     {
         try
         {
+            // Destroy the existing graph and execution context if they exist
+            if (mGenerationGraph)
+            {
+                CUDA_CHECK(cudaGraphDestroy(mGenerationGraph));
+                mGenerationGraph = nullptr;
+            }
+            if (mGenerationGraphExec)
+            {
+                CUDA_CHECK(cudaGraphExecDestroy(mGenerationGraphExec));
+                mGenerationGraphExec = nullptr;
+            }
             CUDA_CHECK(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeGlobal));
             mGenerationExecutionContext->enqueueV3(mStream);
             CUDA_CHECK(cudaStreamEndCapture(mStream, &mGenerationGraph));
