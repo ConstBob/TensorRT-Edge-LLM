@@ -60,6 +60,8 @@ public:
         , mSampler{nullptr}
         , mUseCudaGraph{true}
         , mCudaGraphCaptured{false}
+        , mGenerationGraph{nullptr}
+        , mGenerationGraphExec{nullptr}
     {
     }
     bool setup(std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph = false, int64_t batchSize = 1);
