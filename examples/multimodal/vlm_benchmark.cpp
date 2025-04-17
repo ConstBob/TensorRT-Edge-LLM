@@ -309,7 +309,13 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     cudaProfilerStop();
     profiler->stopTiming();
 
-    return decoder->getDeviceMemorySize();
+    size_t deviceMemorySize = decoder->getDeviceMemorySize();
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    delete vitrunner;
+    delete decoder;
+
+    return deviceMemorySize;
 }
 
 void benchmarkVLM(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
