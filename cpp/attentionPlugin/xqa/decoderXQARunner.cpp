@@ -45,10 +45,11 @@ struct XQAKernelLoadHashKey
 {
     XQADataType data_type;
     int32_t sm;
+    bool specDecode;
 
     bool operator==(XQAKernelLoadHashKey const& other) const
     {
-        return data_type == other.data_type && sm == other.sm;
+        return data_type == other.data_type && sm == other.sm && specDecode == other.specDecode;
     }
 };
 
@@ -59,6 +60,8 @@ struct XQAKernelLoadHasher
         size_t key = s.data_type;
         key <<= 16;
         key ^= s.sm;
+        key <<= 4;
+        key ^= s.specDecode;
         return key;
     }
 };
@@ -219,7 +222,7 @@ public:
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
-        XQAKernelLoadHashKey hash_key{type, sm};
+        XQAKernelLoadHashKey hash_key{type, sm, specDecode};
 
         auto findIter = mKernels.find(hash_key);
         if (findIter == mKernels.end())

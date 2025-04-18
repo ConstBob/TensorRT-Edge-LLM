@@ -112,8 +112,9 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     }
     float passRate1E_3 = static_cast<float>(numErrorWithin1E_3) / (batchSize * qSequenceLength * numQHeads * headSize);
 
-    std::cout << "XQA Tree Attention Decoding test." << " num_Q_heads: " << numQHeads
+    std::cout << "XQA Tree Attention Decoding test. batch_size: " << batchSize << " num_Q_heads: " << numQHeads
         << " num_KV_heads: "  << numKVHeads << " head_size: " << headSize
+        << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
         << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);

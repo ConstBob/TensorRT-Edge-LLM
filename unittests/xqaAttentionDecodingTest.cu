@@ -100,9 +100,9 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     }
     float passRate1E_3 = static_cast<float>(numErrorWithin1E_3) / (batchSize * numQHeads * headSize);
 
-    std::cout << "XQA Attention Decoding test." << " num_Q_heads: " << numQHeads
+    std::cout << "XQA Attention Decoding test. batch_size: " << batchSize << " num_Q_heads: " << numQHeads
         << " num_KV_heads: "  << numKVHeads << " head_size: " << headSize
-        << "kvcache lengths: " << kvCacheLengths << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+        << " kvcache lengths: " << kvCacheLengths << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);
 }
