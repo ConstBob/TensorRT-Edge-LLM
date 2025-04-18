@@ -32,14 +32,23 @@ enum class RopeInitType : int32_t
     kLLAMA3 = 2,
 };
 
-void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, int const* seq_lens,
+void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* kvCacheBuffer, int const* seq_lens,
     int const head_num, int const kv_head_num, int const size_per_head, int const kv_cache_capacity,
     int const padded_seq_len, PositionEmbeddingType positionEmbedType, float rotary_embedding_freq,
-    float rotary_embedding_scale, RopeInitType rope_init_type, int const token_to_process, int const half_rotary_dim,
-    int const rotary_embedding_max_position, float2 const* mrope_rotary_cos_sin, cudaStream_t stream);
+    float rotary_embedding_scale, RopeInitType rope_init_type, int const token_to_process,
+    int const rotary_embedding_max_position, float2 const* mrope_rotary_cos_sin,
+    cudaStream_t stream);
 
 void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, int const* seq_lens,
     int const head_num, int const kv_head_num, int const size_per_head, int const kv_cache_capacity,
     int const padded_seq_len, PositionEmbeddingType positionEmbedType, float rotary_embedding_freq,
-    float rotary_embedding_scale, RopeInitType rope_init_type, int const token_to_process, int const half_rotary_dim,
-    int const rotary_embedding_max_position, int64_t const* mrope_position_deltas, cudaStream_t stream);
+    float rotary_embedding_scale, RopeInitType rope_init_type, int const token_to_process,
+    int const rotary_embedding_max_position, int64_t const* mrope_position_deltas,
+    cudaStream_t stream);
+
+void invokeSpecDecodeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, int const* seq_lens,
+    int const* custom_seq_index, int const head_num, int const kv_head_num, int const size_per_head,
+    int const kv_cache_capacity, int const padded_seqlen, PositionEmbeddingType positionEmbedType,
+    float rotary_embedding_freq, float rotary_embedding_scale, RopeInitType ropeInitType, int const token_to_process,
+    int const rotary_embedding_max_position, int64_t const* mrope_position_deltas,
+    cudaStream_t stream);

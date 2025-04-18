@@ -192,10 +192,10 @@ struct Vec_t<half>
 } // namespace
 
 template <typename T, bool IsGenerate>
-__global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, int const* seq_lens, int const head_num,
-    int const kv_head_num, int const size_per_head, int const kv_cache_capacity, int padded_seqlen,
+__global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, int const* full_seq_lens, int const* custom_seq_index,
+    int const head_num,int const kv_head_num, int const size_per_head, int const kv_cache_capacity, int padded_q_len,
     PositionEmbeddingType positionEmbedType, float rotary_embedding_freq, float rotary_embedding_scale,
-    RopeInitType ropeInitType, int const half_rotary_dim, int const rotary_embedding_max_position,
+    RopeInitType ropeInitType, int const rotary_embedding_max_position,
     float2 const* mrope_rotary_cos_sin, int64_t const* mrope_position_deltas)
 {
     // The kernel take QKV tensor, apply rotary embedding, and
@@ -208,9 +208,11 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, int c
     //   Q dst shape: (batch_size, head_num, seq_len, size_per_head)
     //   KV dst shape: (batch_size, kv_head_num, seq_len, size_per_head)
 
-    // We currently only handle case with batch size = 1.
-    // TODO: Need a proper way to deal with un-equal batch of sequences.
-
+    //  When handle kv-cache write for Tree attention, the token index among a sequence is
+    //       not the same as the index in the kv-cache. We supply the corresponding sequence
+    //       index from the custom_seq_index array.
+    //  full_seq_len: For a batch of sequences, this represents the lengths of tokens in the sequence
+    //                which include the commited kv-cache length plus the newly added q_len in this round of generation
     extern __shared__ __align__(sizeof(float2)) char smem_[];
 
     constexpr int vec_size = Vec_t<T>::size;
@@ -220,19 +222,30 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, int c
     int const padded_token_idx = blockIdx.x;
     int batch_index;
     int token_idx_in_seq;
+    int token_idx_in_kvcache;
+    int const half_rotary_dim = size_per_head / 2;
 
     if (IsGenerate)
     {
-        // In generate phase, we support exactly one token to generate per sequence.
-        // Therefore the padded_token_idx also indicates the batch index.
-        batch_index = padded_token_idx;
-        token_idx_in_seq = seq_lens[batch_index] - 1;
+        // In generate phase, we can handle a sequence of tokens.
+        // In each batch there are padded_q_len tokens to handle.
+        batch_index = padded_token_idx / padded_q_len;
+        int32_t const seq_q_index = padded_token_idx % padded_q_len;
+        token_idx_in_kvcache = full_seq_lens[batch_index] - padded_q_len + seq_q_index;
+        if (custom_seq_index == nullptr)
+        {
+            token_idx_in_seq = token_idx_in_kvcache;
+        }
+        else
+        {
+            token_idx_in_seq = custom_seq_index[padded_token_idx];
+        }
     }
     else
     {
         // In context phase, we support the padded sequence length.
-        batch_index = padded_token_idx / padded_seqlen;
-        token_idx_in_seq = padded_token_idx % padded_seqlen;
+        batch_index = padded_token_idx / padded_q_len;
+        token_idx_in_seq = padded_token_idx % padded_q_len;
     }
 
     // We only use the same tensor data and kv-cache type now.
@@ -334,14 +347,14 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, int c
         = kv_head_num * kv_cache_capacity * size_per_head;         // max bytes of K or V per (total) sequence
     int const offset_sequence = batch_index * (2 * bytes_per_seq); // offset of the current sequence in linear buffer.
     int const offset_local_kv
-        = kv_head_idx * kv_cache_capacity * size_per_head + token_idx_in_seq * size_per_head + tidx * vec_size;
+        = kv_head_idx * kv_cache_capacity * size_per_head + token_idx_in_kvcache * size_per_head + tidx * vec_size;
 
     int const cache_offset_k = offset_sequence + offset_local_kv;
     int const cache_offset_v = offset_sequence + bytes_per_seq + offset_local_kv;
 
     if constexpr (IsGenerate)
     {
-        int const offset_q = batch_index * head_num * size_per_head + hidden_idx;
+        int const offset_q = padded_token_idx * head_num * size_per_head + hidden_idx;
         *reinterpret_cast<Vec_t*>(&Q[offset_q]) = q;
     }
     else
@@ -364,12 +377,11 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, int c
 }
 
 template <typename T, bool IsGenerate>
-void dispatchApplyRopeUpdateKV(T* QKV, T* Q, T* kvCacheBuffer, int const* seq_lens, int const head_num,
+void dispatchApplyRopeUpdateKV(T* QKV, T* Q, T* kvCacheBuffer, int const* seq_lens, int const* custom_seq_index, int const head_num,
     int const kv_head_num, int const size_per_head, int const kv_cache_capacity, int const padded_seqlen,
     PositionEmbeddingType positionEmbedType, float rotary_embedding_freq, float rotary_embedding_scale,
-    RopeInitType ropeInitType, int const token_to_process, int const half_rotary_dim,
-    int const rotary_embedding_max_position, float2 const* mrope_rotary_cos_sin, int64_t const* mrope_position_deltas,
-    cudaStream_t stream)
+    RopeInitType ropeInitType, int const token_to_process, int const rotary_embedding_max_position,
+    float2 const* mrope_rotary_cos_sin, int64_t const* mrope_position_deltas, cudaStream_t stream)
 {
     check(QKV != nullptr && kvCacheBuffer != nullptr && seq_lens != nullptr,
         "Data pointers of qkv, kvcache, and sequence length shall be valid");
@@ -391,32 +403,47 @@ void dispatchApplyRopeUpdateKV(T* QKV, T* Q, T* kvCacheBuffer, int const* seq_le
         // The shared memory should be large enough to contain the data of single head q + k vector.
         smem_size = 2 * size_per_head * sizeof(T);
     }
-    applyBiasRopeUpdateKVCache<T, IsGenerate><<<grid, block, smem_size, stream>>>(QKV, Q, kvCacheBuffer, seq_lens,
+    applyBiasRopeUpdateKVCache<T, IsGenerate><<<grid, block, smem_size, stream>>>(QKV, Q, kvCacheBuffer, seq_lens, custom_seq_index,
         head_num, kv_head_num, size_per_head, kv_cache_capacity, padded_seqlen, positionEmbedType,
-        rotary_embedding_freq, rotary_embedding_scale, ropeInitType, half_rotary_dim, rotary_embedding_max_position,
+        rotary_embedding_freq, rotary_embedding_scale, ropeInitType, rotary_embedding_max_position,
         mrope_rotary_cos_sin, mrope_position_deltas);
 }
 
-void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, int const* seq_lens,
+void invokeContextApplyRopeUpdateKVFP16(half* QKV, half* kvCacheBuffer, int const* seq_lens,
     int const head_num, int const kv_head_num, int const size_per_head, int const kv_cache_capacity,
     int const padded_seqlen, PositionEmbeddingType positionEmbedType, float rotary_embedding_freq,
-    float rotary_embedding_scale, RopeInitType ropeInitType, int const token_to_process, int const half_rotary_dim,
+    float rotary_embedding_scale, RopeInitType ropeInitType, int const token_to_process,
     int const rotary_embedding_max_position, float2 const* mrope_rotary_cos_sin, cudaStream_t stream)
 {
-    dispatchApplyRopeUpdateKV<half, false>(QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head,
+    // The custom_seq_index is not used in context phase positional encoding.
+    // Q buffer is not used in context phase positional encoding.
+    half* Q = nullptr;
+    int const* custom_seq_index = nullptr;
+    dispatchApplyRopeUpdateKV<half, false>(QKV, Q, kvCacheBuffer, seq_lens, custom_seq_index, head_num, kv_head_num, size_per_head,
         kv_cache_capacity, padded_seqlen, positionEmbedType, rotary_embedding_freq, rotary_embedding_scale,
-        ropeInitType, token_to_process, half_rotary_dim, rotary_embedding_max_position, mrope_rotary_cos_sin, nullptr,
-        stream);
+        ropeInitType, token_to_process, rotary_embedding_max_position, mrope_rotary_cos_sin, nullptr, stream);
 }
 
 void invokeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, int const* seq_lens,
     int const head_num, int const kv_head_num, int const size_per_head, int const kv_cache_capacity,
     int const padded_seqlen, PositionEmbeddingType positionEmbedType, float rotary_embedding_freq,
-    float rotary_embedding_scale, RopeInitType ropeInitType, int const token_to_process, int const half_rotary_dim,
+    float rotary_embedding_scale, RopeInitType ropeInitType, int const token_to_process,
     int const rotary_embedding_max_position, int64_t const* mrope_position_deltas, cudaStream_t stream)
 {
-    dispatchApplyRopeUpdateKV<half, true>(QKV, Q, kvCacheBuffer, seq_lens, head_num, kv_head_num, size_per_head,
+    // The custom_seq_index is not used in vanilla generation phase positional encoding.
+    int const* custom_seq_index = nullptr;
+    dispatchApplyRopeUpdateKV<half, true>(QKV, Q, kvCacheBuffer, seq_lens, custom_seq_index, head_num, kv_head_num, size_per_head,
         kv_cache_capacity, padded_seqlen, positionEmbedType, rotary_embedding_freq, rotary_embedding_scale,
-        ropeInitType, token_to_process, half_rotary_dim, rotary_embedding_max_position, nullptr, mrope_position_deltas,
-        stream);
+        ropeInitType, token_to_process, rotary_embedding_max_position, nullptr, mrope_position_deltas, stream);
+}
+
+void invokeSpecDecodeGenerationApplyRopeUpdateKVFP16(half* QKV, half* Q, half* kvCacheBuffer, int const* seq_lens, int const* custom_seq_index,
+    int const head_num, int const kv_head_num, int const size_per_head, int const kv_cache_capacity,
+    int const padded_seqlen, PositionEmbeddingType positionEmbedType, float rotary_embedding_freq,
+    float rotary_embedding_scale, RopeInitType ropeInitType, int const token_to_process,
+    int const rotary_embedding_max_position, int64_t const* mrope_position_deltas, cudaStream_t stream)
+{
+    dispatchApplyRopeUpdateKV<half, true>(QKV, Q, kvCacheBuffer, seq_lens, custom_seq_index, head_num, kv_head_num, size_per_head,
+        kv_cache_capacity, padded_seqlen, positionEmbedType, rotary_embedding_freq, rotary_embedding_scale,
+        ropeInitType, token_to_process, rotary_embedding_max_position, nullptr, mrope_position_deltas, stream);
 }

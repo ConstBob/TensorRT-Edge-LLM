@@ -25,7 +25,7 @@ class AttentionPlugin : public nvinfer1::IPluginV2DynamicExt
 public:
     // Plugin constructor and attention specific utility methods
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType, int32_t halfRotaryDim,
+        int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType,
         int32_t rotaryEmbeddingMaxPositions);
 
     AttentionPlugin(std::string const& name, void const* data, size_t length);
@@ -93,7 +93,6 @@ protected:
     PositionEmbeddingType mPosEmbedType{PositionEmbeddingType::kNone};
     float mRotaryScale{1.0F};
     float mRotaryBaseFrequency{};
-    int mHalfRotaryDim{0};
     int mRotaryEmbeddingMaxPositions{0};
 
     // Datatype of QKV and kvCache. Only supports FP16 as of now.

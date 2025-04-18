@@ -115,7 +115,7 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType, int32_t halfRotaryDim,
+    int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType,
     int32_t rotaryEmbeddingMaxPositions)
     : mLayerName(name)
     , mNumHeadQ(numQHeads)
@@ -124,7 +124,6 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mMaxBatchSize(maxBatchSize)
     , mKVCacheCapacity(kvCacheCapacity)
     , mPosEmbedType(posEmbedType)
-    , mHalfRotaryDim(halfRotaryDim)
     , mRotaryEmbeddingMaxPositions(rotaryEmbeddingMaxPositions)
 {
     mSMVersion = getSMVersion();
@@ -155,7 +154,6 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mPosEmbedType);
     deserializeValue(&data, &length, &mRotaryScale);
     deserializeValue(&data, &length, &mRotaryBaseFrequency);
-    deserializeValue(&data, &length, &mHalfRotaryDim);
     deserializeValue(&data, &length, &mRotaryEmbeddingMaxPositions);
 
     mSMVersion = getSMVersion();
@@ -176,7 +174,7 @@ void AttentionPlugin::setRotaryConfig(float ropeScale, float ropeBaseFrequency)
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
     AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize,
-        mKVCacheCapacity, mPosEmbedType, mHalfRotaryDim, mRotaryEmbeddingMaxPositions);
+        mKVCacheCapacity, mPosEmbedType, mRotaryEmbeddingMaxPositions);
     plugin->setRotaryConfig(mRotaryScale, mRotaryBaseFrequency);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
@@ -445,9 +443,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         // padded input as processing targets.
         // TODO: Explore non-padded input format.
         int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
-        invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, nullptr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ,
+        invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ,
             mNumHeadKV, mNumElemPerHead, mKVCacheCapacity, runtimeSeqLen, mPosEmbedType, mRotaryBaseFrequency,
-            mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, mHalfRotaryDim, mRotaryEmbeddingMaxPositions,
+            mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, mRotaryEmbeddingMaxPositions,
             mrope_rotary_cos_sin, stream);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
@@ -473,7 +471,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         int32_t const totalProcessToken = runtimeBatchSize;
         invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
             mNumHeadQ, mNumHeadKV, mNumElemPerHead, mKVCacheCapacity, runtimeSeqLen, mPosEmbedType,
-            mRotaryBaseFrequency, mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, mHalfRotaryDim,
+            mRotaryBaseFrequency, mRotaryScale, kROPE_INIT_TYPE, totalProcessToken,
             mRotaryEmbeddingMaxPositions, mrope_position_deltas, stream);
 
         // Prepare GQA runner parameter to dispatch kernel
@@ -496,7 +494,7 @@ size_t AttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mMaxBatchSize) + sizeof(mKVCacheCapacity) + sizeof(mNumHeadQ) + sizeof(mNumHeadKV)
         + sizeof(mNumElemPerHead) + sizeof(mPosEmbedType) + sizeof(mRotaryScale) + sizeof(mRotaryBaseFrequency)
-        + sizeof(mHalfRotaryDim) + sizeof(mRotaryEmbeddingMaxPositions);
+        + sizeof(mRotaryEmbeddingMaxPositions);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
@@ -509,7 +507,6 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&buffer, mPosEmbedType);
     serializeValue(&buffer, mRotaryScale);
     serializeValue(&buffer, mRotaryBaseFrequency);
-    serializeValue(&buffer, mHalfRotaryDim);
     serializeValue(&buffer, mRotaryEmbeddingMaxPositions);
 }
 
@@ -539,7 +536,6 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("rotary_scaling", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("rotary_base_frequency", nullptr, PluginFieldType::kFLOAT32, 1));
-    mPluginAttributes.emplace_back(PluginField("half_rotary_dim", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_max_positions", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
@@ -579,7 +575,6 @@ AttentionPlugin* createDefaultAttentionPlugin(char const* name)
     constexpr int32_t maxBatchSize{16};
     constexpr int32_t kvCacheCapacity{4096};
     constexpr PositionEmbeddingType posEmbedType{PositionEmbeddingType::kROPE_ROTATE_NEOX};
-    constexpr int32_t halfRotaryDim{64};
     constexpr int32_t rotaryEmbeddingMaxPositions{32768};
 
     // Align with Meta's implementation for rotary embedding.
@@ -587,7 +582,7 @@ AttentionPlugin* createDefaultAttentionPlugin(char const* name)
     constexpr float rotaryFrequency{500000.f};
 
     AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads, numKVHeads, headSize, maxBatchSize,
-        kvCacheCapacity, posEmbedType, halfRotaryDim, rotaryEmbeddingMaxPositions);
+        kvCacheCapacity, posEmbedType, rotaryEmbeddingMaxPositions);
     plugin->setRotaryConfig(rotaryScale, rotaryFrequency);
     return plugin;
 }
@@ -610,12 +605,11 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
         std::optional<int32_t> posEmbedVal = parsePluginScalarField<int32_t>("position_embedding_type", fc);
-        std::optional<int32_t> halfRotaryDim = parsePluginScalarField<int32_t>("half_rotary_dim", fc);
         std::optional<int32_t> rotaryEmbeddingMaxPositions
             = parsePluginScalarField<int32_t>("rotary_embedding_max_positions", fc);
 
         bool checkRequiredFields = maxBatchSize.has_value() && kvCacheCapacity.has_value() && numQHeads.has_value()
-            && headSize.has_value() && numKVHeads.has_value() && posEmbedVal.has_value() && halfRotaryDim.has_value()
+            && headSize.has_value() && numKVHeads.has_value() && posEmbedVal.has_value()
             && rotaryEmbeddingMaxPositions.has_value();
         if (!checkRequiredFields)
         {
@@ -645,7 +639,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         }
 
         AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
-            headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType, halfRotaryDim.value(),
+            headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType,
             rotaryEmbeddingMaxPositions.value());
         if (useRotaryEmbed)
         {
