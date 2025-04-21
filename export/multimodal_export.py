@@ -404,6 +404,8 @@ def export_multimodal(args):
         ).cuda()
 
         # 1. export visual encoder
+        # Qwen2.5-VL 3B VIT has FP16 overflow issue on certain inputs.
+        # Apply ../scripts/upcast_fp32_gemm_war.py after exporting ONNX as work-around.
         export_qwen2_5_vl_visual(hf_model.visual,
                                  os.path.join(args.output_dir, "visual_enc_onnx"))
 
@@ -434,7 +436,6 @@ def export_multimodal(args):
     # 3. surgeon llm
     mrope_rotary_cos_sin = gs.Variable("mrope_rotary_cos_sin", np.float32,
         ['batch_size', hf_model.config.max_position_embeddings * 128])  # head_size = 128
-        # ['batch_size', args.max_seq_length * 128])  # head_size = 128
     mrope_position_deltas = gs.Variable("mrope_position_deltas", np.int64,
         ['batch_size', 1])
     surgeon_llm(
