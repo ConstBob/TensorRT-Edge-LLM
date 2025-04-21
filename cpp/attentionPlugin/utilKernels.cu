@@ -244,8 +244,10 @@ __global__ void applyBiasRopeUpdateKVCache(T* QKV, T* Q, T* kvCacheBuffer, int c
     else
     {
         // In context phase, we support the padded sequence length.
+        // The index of the token in the kv-cache is always the same as the index in the kvcache buffer
         batch_index = padded_token_idx / padded_q_len;
         token_idx_in_seq = padded_token_idx % padded_q_len;
+        token_idx_in_kvcache = token_idx_in_seq;
     }
 
     // We only use the same tensor data and kv-cache type now.

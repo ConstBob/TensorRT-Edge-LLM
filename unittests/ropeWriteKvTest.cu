@@ -16,6 +16,38 @@ struct RopeParams
     float rotaryEmbeddingScale;
 };
 
+class KvCacheIndexer
+{
+public:
+    KvCacheIndexer(int32_t const batchSize, int32_t const kvHeadNum, int32_t const kvCacheCapacity, int32_t const headSize)
+    {
+        mBatchSize = batchSize;
+        mKvHeadNum = kvHeadNum;
+        mKvCacheCapacity = kvCacheCapacity;
+        mHeadSize = headSize;
+    }
+    
+    int32_t indexK(int32_t const b, int32_t const hk, int32_t const cacheIdx, int32_t const d)
+    {
+        // Linear KVCache has layout of [B, 2, Hkv, S_capacity, D].
+        return b * 2 * mKvHeadNum * mKvCacheCapacity * mHeadSize + 
+            hk * mKvCacheCapacity * mHeadSize + cacheIdx * mHeadSize + d;
+    }
+
+    int32_t indexV(int32_t const b, int32_t const hv, int32_t const cacheIdx, int32_t const d)
+    {
+        // Linear KVCache has layout of [B, 2, Hkv, S_capacity, D].
+        // V cache need to offset the whole kCache buffer for the sequence.
+        return b * 2 * mKvHeadNum * mKvCacheCapacity * mHeadSize + 
+            (mKvHeadNum + hv) * mKvCacheCapacity * mHeadSize + cacheIdx * mHeadSize + d;
+    }
+private:
+    int32_t mBatchSize;
+    int32_t mKvHeadNum;
+    int32_t mKvCacheCapacity;
+    int32_t mHeadSize;
+};
+
 void TestRopeWriteKvPrefill(int32_t const batchSize, int32_t const qHeadNum, int32_t const kvHeadNum, int32_t const headSize,
     int32_t const kvCacheCapacity, int32_t const paddedSeqlen, RopeParams const& ropeParams)
 {
@@ -78,6 +110,7 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, int32_t const qHeadNum, int
     thrust::copy(qkvDevice.begin(), qkvDevice.end(), qkvOut.begin());
     thrust::copy(kvCacheDevice.begin(), kvCacheDevice.end(), kvCacheOut.begin());
 
+    KvCacheIndexer kvIndexer(batchSize, kvHeadNum, kvCacheCapacity, headSize);
     for (int32_t i = 0; i < batchSize; ++i)
     {
         int32_t const batchOffset = i * paddedSeqlen * (qHeadNum + 2 * kvHeadNum) * headSize;
@@ -102,11 +135,15 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, int32_t const qHeadNum, int
                 for (int32_t d = 0; d < headSize; ++d)
                 {
                     half const kVal = qkvOut[kOffset + d];
+                    half const kCacheVal = kvCacheOut[kvIndexer.indexK(i, hkv, j, d)];
                     half const kRefVal = qkvReference[kOffset + d];
                     half const vVal = qkvOut[vOffset + d];
+                    half const vCacheVal = kvCacheOut[kvIndexer.indexV(i, hkv, j, d)];
                     half const vRefVal = qkvReference[vOffset + d];
                     EXPECT_TRUE(isclose(kVal, kRefVal, 1e-3, 1e-3));
                     EXPECT_TRUE(isclose(vVal, vRefVal, 1e-3, 1e-3));
+                    EXPECT_TRUE(isclose(kCacheVal, kVal, 1e-5, 1e-5));
+                    EXPECT_TRUE(isclose(vCacheVal, vVal, 1e-5, 1e-5));
                 }
             }
         }
@@ -224,34 +261,23 @@ void TestRopeWriteKvDecode(int32_t const batchSize, int32_t const qHeadNum, int3
         EXPECT_TRUE(isclose(qOut[i], qreference[i], 1e-3, 4e-3));
     }
 
-    // Compare against KV result in Cache buffer
-    auto kCacheIndexer = [&](int32_t const b, int32_t const hk, int32_t const cacheIdx, int32_t const d)
-    {
-        return b * 2 * kvHeadNum * kvCacheCapacity * headSize + hk * kvCacheCapacity * headSize
-            + cacheIdx * headSize + d;
-    };
-    auto vCacheIndexer = [&](int32_t const b, int32_t const hv, int32_t const cacheIdx, int32_t const d)
-    {
-        // The vCache need to offset the whole kCache buffer for the sequence.
-        return b * 2 * kvHeadNum * kvCacheCapacity * headSize + (kvHeadNum + hv) * kvCacheCapacity * headSize
-            + cacheIdx * headSize + d;
-    };
+    KvCacheIndexer kvIndexer(batchSize, kvHeadNum, kvCacheCapacity, headSize);
 
     for (int32_t b = 0; b < batchSize; ++b)
     {
         int32_t const qStartIdx = fullSeqLens[b] - qLen;
         for (int32_t s = 0; s < qLen; ++s)
         {
-            int32_t const seqIdx = qStartIdx + s;
+            int32_t const inCacheIdx = qStartIdx + s;
             for (int32_t hkv = 0; hkv < kvHeadNum; ++hkv)
             {
                 int32_t const kvRefOffset = b * qLen * kvHeadNum * headSize + s * kvHeadNum * headSize + hkv * headSize;
                 for (int32_t d = 0; d < headSize; ++d)
                 {
-                    half const kVal = kvCacheOut[kCacheIndexer(b, hkv, seqIdx, d)];
+                    half const kVal = kvCacheOut[kvIndexer.indexK(b, hkv, inCacheIdx, d)];
                     half const kRefVal = kreference[kvRefOffset + d];
                     EXPECT_TRUE(isclose(kVal, kRefVal, 1e-3, 4e-3));
-                    half const vVal = kvCacheOut[vCacheIndexer(b, hkv, seqIdx, d)];
+                    half const vVal = kvCacheOut[kvIndexer.indexV(b, hkv, inCacheIdx, d)];
                     half const vRefVal = vreference[kvRefOffset + d];
                     EXPECT_TRUE(isclose(vVal, vRefVal, 1e-3, 4e-3));
                 }
