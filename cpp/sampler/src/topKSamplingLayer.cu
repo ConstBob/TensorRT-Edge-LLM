@@ -103,7 +103,7 @@ void TopKSamplingLayer<T>::deallocateBuffer(std::int32_t const batchSize)
     cudaFree(mRuntimeTopKDevice.data());
     cudaFree(mRuntimeTopPDevice.data());
     cudaFree(mSkipDecodeDevice.data());
-    delete static_cast<bool*>(mSkipDecodeHost.data());
+    delete[] static_cast<bool*>(mSkipDecodeHost.data());
 }
 
 template <typename T>
