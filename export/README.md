@@ -31,7 +31,7 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 or NVFP4 this will be FP8 or NVFP4 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
 1. Default `--max_seq_length=4096`, which corresponds to `kv_cache_capacity` field in AttentionPlugin. Please change this field if other sequence length is required. [prepare_mmmu_onnx.py](../../scripts/prepare_mmmu_onnx.py) provides a script to change `kv_cache_capacity` in existing LLM ONNX to avoid exporting again.
-1. Qwen2.5-VL 3B VIT has FP16 overflow issue. Apply (upcast_fp32_gemm_war.py)[../scripts/upcast_fp32_gemm_war.py] after exporting VIT ONNX as work-around.
+1. Qwen2.5-VL 3B VIT has FP16 overflow issue. Apply [upcast_fp32_gemm_war.py](../scripts/upcast_fp32_gemm_war.py) after exporting VIT ONNX as work-around.
 
 ## Supported models and precisions
 
@@ -44,18 +44,19 @@ Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 [Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes | 
 [Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes | 
 [Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes |
-[Qwen2-0.5B-instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) | Yes | Yes | Yes | Yes |
-[Qwen2-1.5B-instruct](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct) | Yes | Yes | Yes | Yes | [link](https://nvidia.box.com/shared/static/43p52d6077mo8r15lnp2zt4cl2wzgap4)
-[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes | Yes | [link](https://nvidia.box.com/shared/static/fqhpm2hqopi0nockbgyen1wy1zy4isgb)
-[Qwen2.5-0.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | Yes | Yes | Yes | Yes | [link](https://nvidia.box.com/shared/static/n0z2kvd3layzvbhs4y6ksmzz1o92tg46)
-[Qwen2.5-1.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Yes | Yes | Yes | Yes |
-[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes | Yes |
+[Qwen2-0.5B-instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_0.5b.tgz]()
+[Qwen2-1.5B-instruct](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_1.5b.tgz]()
+[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_7b.tgz]()
+[Qwen2.5-0.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_0.5b.tgz]()
+[Qwen2.5-1.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_1.5b.tgz]()
+[Qwen2.5-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_3b.tgz]()
+[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_7b.tgz]()
 
 The `multimodal_export.py` script can export the following multimodal models into ONNX. Currently it only supports Qwen2-VL.
 
 Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 --- | --- | --- | --- | --- | ---
-[Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes | [link](https://nvidia.box.com/shared/static/a81q1cv9mwl7f36u0fprd1jm3mpzej4s)
-[Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [link](https://nvidia.box.com/shared/static/5b8sqae7sbdjso5058o97qo307nr1ds9)
-[Qwen2.5-VL-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Yes | Yes | Yes | Yes |
-[Qwen2.5-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | Yes | Yes | Yes | Yes |
+[Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_vl_2b.tgz](https://nvidia.box.com/shared/static/p1r5fv10qwuq5nvj2ffwpv0ndfbvzgv0)
+[Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_vl_7b.tgz](https://nvidia.box.com/shared/static/zzkstqg4cojfknm1azsb1qfk1in7if51)
+[Qwen2.5-VL-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_vl_3b.tgz](https://nvidia.box.com/shared/static/531he8t7k5r59qedzfrch4cj13wl5hfe)
+[Qwen2.5-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_vl_2b.tgz](https://nvidia.box.com/shared/static/cgqo6ngxp3dw5ussgpct290ud2kd34kk)

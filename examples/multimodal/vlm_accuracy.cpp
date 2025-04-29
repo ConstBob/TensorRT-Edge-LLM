@@ -461,10 +461,11 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     auto vitrunner = new Qwen2ViTRunner(modelType);
-    vitrunner->setup(visualEnginePath, stream, 1, 1280, 6620, 6620);
+    vitrunner->setup(visualEnginePath, stream, 1);
 
     auto decoder = new Decoder<half>();
     decoder->setup(llmEnginePath, stream);
+    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     int maxInputLength = decoder->getMaxContextLength();
     GenerationConfig generationConfig{maxInputLength + 256, 0, 1, 0};
@@ -497,10 +498,15 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
             int desiredChannels = 3;
             unsigned char* image
                 = stbi_load_from_memory(buffer.data(), buffer.size(), &width, &height, &channels, desiredChannels);
-            assert(image != NULL && "Failed to load image.");
+            if (image == nullptr)
+            {
+                LOG_ERROR("Failed to load image: %s", stbi_failure_reason());
+                continue;
+            }
 
-            // Adjust image size
-            auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height / 2, width / 2);
+            // Diviving by 2 to deal with a few images with large size.
+            // Otherwise, it requires larger dynamic shape range, which is not supported by TensorRT.
+            auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height / 2, width / 2, 1280*28*28, 6620*28*28);
             unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
             stbir_resize_uint8_linear(
                 image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
@@ -513,7 +519,6 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
 
         vitrunner->visualPreprocess(
             imageBuffers, imageSizes, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
-        vitrunner->allocateBuffer();
 
         std::string prompt = data->format();
         int numImage = data->images.size();
@@ -533,14 +538,12 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
             vitrunner->getWindowIndex(visualGridTHWs, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
             vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
         }
-        decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
         decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
 
         std::string pred = tokenizer->decode(outputIds[0], true);
         data->pred = pred;
 
         ++i;
-        vitrunner->freeBuffer();
         for (auto& buffer : imageBuffers)
         {
             free(buffer);
