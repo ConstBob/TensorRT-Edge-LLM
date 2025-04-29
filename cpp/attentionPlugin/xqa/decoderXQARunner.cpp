@@ -287,12 +287,15 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
 {
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;
-    std::vector<int> allowedHeadRatio{1, 3, 4, 6, 7, 8};
-    bool const checkQHeadPerKV
-        = std::find(allowedHeadRatio.begin(), allowedHeadRatio.end(), int(numQHeads / numKVHeads))
-        != allowedHeadRatio.end();
+    std::vector<int32_t> allowedSMVersions{80, 86, 87, 89, 101};
+    bool const checkSMVersion = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion)
+        != allowedSMVersions.end();
 
-    return checkHeadNumbers && checkType && checkQHeadPerKV;
+    // Current kernel list supports head ratio from 1 to 8.
+    int32_t const headRatio = numQHeads / numKVHeads;
+    bool const checkQHeadPerKV = headRatio >= 1 && headRatio <= 8;
+
+    return checkHeadNumbers && checkType && checkSMVersion && checkQHeadPerKV;
 }
 
 bool DecoderXQARunner::loadDecodeXQAKernels(int32_t smVersion, DataType dataType, bool useSpecDecodeKernels)
