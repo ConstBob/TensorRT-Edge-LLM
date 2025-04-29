@@ -177,10 +177,10 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     auto vitrunner = new Qwen2ViTRunner(modelType);
-    vitrunner->setup(visualEnginePath, stream, batchSize, 128, 512, 1024);
-    vitrunner->allocateBuffer();
+    vitrunner->setup(visualEnginePath, stream, batchSize);
     auto decoder = new Decoder<half>();
     decoder->setup(llmEnginePath, stream, true, batchSize);
+    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     // Preprocess
     std::vector<half> visualInput;
@@ -209,8 +209,10 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
                 return;
             }
 
-            // Resize
-            auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height / 2, width / 2);
+            // Adjust image size to limit number of tokens generated in desired range
+            // User should set appropriate minPixels and maxPixels according to their use case and match engine build config.
+            // For details please refer to README.md#image-preprocess-and-number-of-image-tokens
+            auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height, width, 128*28*28, 512*28*28);
             unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
 
             stbir_resize_uint8_linear(
@@ -241,9 +243,6 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
         vitrunner->getWindowIndex(visualGridTHWs, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
         vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
     }
-
-    // Reuse the same device buffer for VIT output and LLM "image_embeds" input to avoid H2D/D2H copy
-    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
 

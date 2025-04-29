@@ -30,24 +30,29 @@ struct VisualPreprocessorConfig
         if (modelType == "qwen2_5_vl")
         {
             maxPositionEmbeddings = 128000;
+            vocabSize = 151936;
         }
     }
 
     std::string modelType;
-    int64_t batchSize;
-    int64_t minTokens{4};       // The minimum number of tokens in a single image
-    int64_t maxTokens{16384};   // The maximum number of tokens in a single image
+    int64_t llmBatchSize;
+    int64_t curHW;
+    int64_t maxHW;
+    int64_t inputDim;
+    int64_t vitPosEmbDim;
+    int64_t hiddenDim;
     int64_t patchSize{14};
     int64_t temporalPatchSize{2};
     int64_t mergeSize{2};
-    int64_t embedDim{1280};
     int64_t numHeads{16};
     int64_t maxPositionEmbeddings{32768};
-    int rotaryEmbedDim{128};
+    int64_t mropeEmbDim{128};
     float theta = 1000000.0f;
     std::vector<double> imageMean{0.48145466, 0.4578275, 0.40821073};
     std::vector<double> imageStd{0.26862954, 0.26130258, 0.27577711};
     int64_t windowSize{112};  // window attention size used by Qwen2.5-VL
+    int64_t vocabSize = 152064;
+    int64_t visionStartTokenId = 151652;
 };
 
 class Qwen2ViTRunner
@@ -67,14 +72,11 @@ public:
      *
      * @param fp The file path to visual TensorRT engine file.
      * @param stream The CUDA stream to be used for GPU operations.
-     * @param batchSize The batch size for processing.
-     * @param minTokes The minimum number of tokens in a single image.
-     * @param maxTokens The maximum number of tokens in a single image.
-     * @param totalMaxTokens The total maximum number of tokens for all images.
+     * @param llmBatchSize The batch size of LLM.
      *
      * @return True if the setup is successful, false otherwise.
      */
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int batchSize, int minTokes, int maxTokens, int totalMaxTokens);
+    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int llmBatchSize);
 
     void visualPreprocess(std::vector<unsigned char*> const& imageBuffers,
         std::vector<std::vector<int>> const& imageSizes, std::vector<half>& patches, std::vector<half>& attentionMask,
@@ -82,7 +84,7 @@ public:
 
     void textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
         std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
-        std::vector<int32_t>& contextLengths, int const maxContextLength, int const vocabSize = 152064);
+        std::vector<int32_t>& contextLengths, int const maxContextLength);
 
     void getWindowIndex(std::vector<std::vector<int64_t>> const& grids, std::vector<half>& windowAttentionMask, 
         std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex);
@@ -100,16 +102,19 @@ public:
     void initRandomInputs(std::vector<half>& visualInput, std::vector<half>& visualAttentionMask,
         std::vector<float>& visualRotaryPosEmb, std::vector<half>& windowAttentionMask, std::vector<int64_t>& windowIndex,
         std::vector<int64_t>& reverseWindowIndex, std::vector<int64_t>& inputIds, int const textTokenLength,
-        int const imageTokenLength, int const maxContextLength, int const vocabSize = 152064);
+        int const imageTokenLength, int const maxContextLength);
 
     void allocateBuffer();
-    void freeBuffer();
 
-    std::tuple<int, int> adjustImageSize(int const height, int const width);
+    std::tuple<int, int> adjustImageSize(int const height, int const width, int const minPixels, int const maxPixels);
 
     ~Qwen2ViTRunner()
     {
-        freeBuffer();
+        for (auto deviceMem : mDeviceBuffer)
+        {
+            cudaFree(deviceMem.second);
+        }
+        mDeviceBuffer.clear();
         isSetup = false;
     }
 
@@ -120,7 +125,10 @@ private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     cudaStream_t mStream;
     bool isSetup;
-    int64_t mHW;
+
+    void validateAndFillConfig(int batchSize);
+
+    int setInputShape();
 
     void initRotaryEmbedding(
         int numPos, int dim, float theta, std::vector<std::vector<float>>& sinusoidInp, float scale = 1.0f);
@@ -129,8 +137,7 @@ private:
      * As an example, we assume putting images first and then texts, and combining into a single prompt message.
      */
     std::string applyChatTemplate(std::string const& inputString, int const& numImages,
-        std::vector<std::vector<int64_t>> const& visualGridTHWs, int& totalImageIdx, int64_t imageMergeSize = 2,
-        bool addGenerationPrompt = true);
+        std::vector<std::vector<int64_t>> const& visualGridTHWs, int& totalImageIdx, bool addGenerationPrompt = true);
 
     void preprocessImage(unsigned char* image, int const& width, int const& height, int const& channels,
         std::vector<half>& patches, std::vector<std::vector<int64_t>>& grids, int64_t& totalSeqLength);
@@ -140,8 +147,7 @@ private:
      */
     void getRopeIdx(std::vector<std::vector<int64_t>> const& batchInputIds,
         std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<int64_t>& mropePositionIds,
-        std::vector<int64_t>& mropePositionDeltas, int64_t maxPositionEmbeddings, int64_t visionStartTokenId = 151652,
-        int64_t spacialMergeSize = 2);
+        std::vector<int64_t>& mropePositionDeltas);
     void generateMropeParams(std::vector<std::vector<int64_t>> const& batchInputIds,
         std::vector<std::vector<int64_t>> const& visualGridTHWs);
 

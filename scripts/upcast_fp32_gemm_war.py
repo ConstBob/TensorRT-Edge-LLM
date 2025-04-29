@@ -1,6 +1,7 @@
 import onnx
 import onnx_graphsurgeon as gs
 from argparse import ArgumentParser
+import os
 
 
 # Helper function to create a Cast node
@@ -64,6 +65,9 @@ def upcast_fp32_gemm(input_path, output_path):
     # Cleanup and export modified ONNX
     graph.cleanup().toposort()
     onnx_model = gs.export_onnx(graph)
+
+    output_dir = os.path.dirname(output_path)
+    os.makedirs(output_dir, exist_ok=True)
     onnx.save_model(onnx_model,
                     output_path,
                     save_as_external_data=True,
