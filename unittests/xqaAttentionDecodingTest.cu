@@ -66,6 +66,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     thrust::device_vector<half> outDevice(outReference.size(), 0.0F);
     thrust::device_vector<int32_t> kvCacheLengthDevice(kvCacheLengths);
 
+    EXPECT_TRUE(drivellm::DecoderXQARunner::canImplement(numQHeads, numKVHeads, smVersion, DataType::kHALF));
     drivellm::DecoderXQARunner runner(DataType::kHALF, batchSize, numQHeads, numKVHeads, headSize, smVersion);
     auto params = runner.initXQAParams();
     params.qInputPtr = thrust::raw_pointer_cast(qInputDevice.data());
@@ -121,6 +122,13 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio4)
     TestXQAAttentionDecodingAccuracy(4, 32, 8, 128, 256);
     TestXQAAttentionDecodingAccuracy(1, 32, 8, 64, 2048);
     TestXQAAttentionDecodingAccuracy(4, 16, 4, 64, 512);
+}
+
+TEST(XQAAttentionDecodingTest, accuracyKVRatio5)
+{
+    TestXQAAttentionDecodingAccuracy(1, 40, 8, 128, 1024);
+    TestXQAAttentionDecodingAccuracy(2, 40, 8, 128, 512);
+    TestXQAAttentionDecodingAccuracy(4, 40, 8, 128, 512);
 }
 
 TEST(XQAAttentionDecodingTest, accuracyKVRatio7)
