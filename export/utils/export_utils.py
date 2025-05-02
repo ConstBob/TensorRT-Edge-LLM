@@ -12,7 +12,43 @@ import os
 import time
 
 import torch
+from peft import PeftConfig, PeftModel, load_peft_weights
 from transformers import DynamicCache
+
+
+def load_model_with_lora(base_model, lora_dir, lora_mode):
+    """
+    Load and handle LoRA weights for a model.
+
+    Args:
+        base_model: The base model loaded from HuggingFace
+        lora_dir: Directory containing LoRA weights
+        lora_mode: LoRA mode to use ("merged" or "static")
+
+    Returns:
+        The model with LoRA weights applied (merged for merged mode)
+    """
+    if not lora_dir:
+        return base_model
+
+    if lora_mode == "merged":
+        print(f"Loading LoRA weights from {lora_dir} in merged mode...")
+        model = PeftModel.from_pretrained(base_model, lora_dir)
+        print("Merging LoRA weights into base model...")
+        model = model.merge_and_unload()
+        return model
+    elif lora_mode == "static":
+        print(f"Loading LoRA config from {lora_dir} in static mode...")
+
+        # Load LoRA config
+        config = PeftConfig.from_pretrained(lora_dir)
+
+        # Load LoRA weights
+        weights = load_peft_weights(lora_dir)
+
+        return base_model, config, weights
+
+    return base_model
 
 
 class WrapperModelForCausalLM(torch.nn.Module):

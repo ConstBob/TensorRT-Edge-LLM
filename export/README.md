@@ -20,7 +20,11 @@ python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_o
 
 # VLM model
 python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
+```
 
+For models with LoRA weights, you can use the following command:
+```
+python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $LORA_DIR --lora_mode merged --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
 ```
 
 The ONNX with desired data type will be exported in `$ONNX_DIR`.
@@ -32,17 +36,20 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
 1. Default `--max_seq_length=4096`, which corresponds to `kv_cache_capacity` field in AttentionPlugin. Please change this field if other sequence length is required. [prepare_mmmu_onnx.py](../../scripts/prepare_mmmu_onnx.py) provides a script to change `kv_cache_capacity` in existing LLM ONNX to avoid exporting again.
 1. Qwen2.5-VL 3B VIT has FP16 overflow issue. Apply [upcast_fp32_gemm_war.py](../scripts/upcast_fp32_gemm_war.py) after exporting VIT ONNX as work-around.
+1. For LoRA support, two modes are available:
+   - `merged`: LoRA weights are merged into the base model before export (recommended for most use cases)
+   - `static`: LoRA weights are kept separate and applied during inference using static LoRA patterns
 
 ## Supported models and precisions
 
-The `llm_export.py` script can export the following LLM models into ONNX. There is a potential that other LLMs can be supported. 
+The `llm_export.py` script can export the following LLM models into ONNX. There is a potential that other LLMs can be supported.
 
 We also provide ONNX files for some of the models so you can download them directly.
 
 Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 --- | --- | --- | --- | --- | ---
-[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes | 
-[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes | 
+[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes |
+[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes |
 [Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes |
 [Qwen2-0.5B-instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_0.5b.tgz]()
 [Qwen2-1.5B-instruct](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_1.5b.tgz]()

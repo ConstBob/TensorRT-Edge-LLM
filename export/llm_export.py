@@ -13,20 +13,15 @@ import os
 import shutil
 import time
 
-import modelopt.torch.opt as mto
 import onnx
 import onnx_graphsurgeon as gs
 import torch
-from modelopt.torch.export import export_hf_checkpoint
-from modelopt.torch.quantization.utils import is_quantized_linear
 from packaging.version import Version
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from utils.export_utils import WrapperModelForCausalLM, llm_to_onnx
-from utils.quantization_utils import quantize
-from utils.surgeon_utils import (RopeType, fold_fp8_qdq_to_dq,
-                                 insert_attention_plugin,
-                                 insert_gather_last_token, insert_int4_dq,
-                                 insert_int4_gemm_plugin)
+from utils.export_utils import (WrapperModelForCausalLM, llm_to_onnx,
+                                load_model_with_lora)
+from utils.surgeon_utils import (RopeType, insert_attention_plugin,
+                                 insert_gather_last_token)
 
 
 def llm_arguments():
@@ -91,6 +86,18 @@ def llm_arguments():
         help=
         "Maximum sequence length as an attribute to AttentionPlugin. Change this when you need to run long context inference",
         default=4096)
+    parser.add_argument('--lora_dir',
+                        type=str,
+                        help="The directory containing LoRA weights",
+                        required=False)
+    parser.add_argument(
+        '--lora_mode',
+        type=str,
+        default="none",
+        choices=["merged", "none", "static"],
+        help=
+        "LoRA mode. Currently merged mode (weights merged into base model) and static mode (weights not merged) are supported",
+        required=False)
     return parser
 
 
@@ -157,6 +164,10 @@ def export_raw_llm(model,
 
     # Need to quantize model to fp8, int4 or nvfp4
     if dtype in ["fp8", "int4", "nvfp4", "int4_ootb"]:
+        # Avoid import modelopt when no quantization is needed
+        from modelopt.torch.export import export_hf_checkpoint
+        from modelopt.torch.quantization.utils import is_quantized_linear
+        from utils.quantization_utils import quantize
         tokenizer = AutoTokenizer.from_pretrained(torch_dir,
                                                   trust_remote_code=True)
         modelopt_state = os.path.join(torch_dir, "modelopt_state.pth")
@@ -205,7 +216,9 @@ def surgeon_llm(raw_onnx_path,
                 max_seq_length=4096,
                 rope_type=RopeType.kROPE_ROTATE_NEOX,
                 extra_plugin_inputs=[],
-                lm_head_precision="fp16"):
+                lm_head_precision="fp16",
+                lora_config=None,
+                lora_weights=None):
     """
     Surgeon raw llm onnx to fit TRT.
     For example, insert attention plugin, insert quantization q/dq nodes.
@@ -219,6 +232,10 @@ def surgeon_llm(raw_onnx_path,
         state_dict: None or OrderedDict
         rope_type: RopeType.
         extra_plugin_inputs: list
+        lora_config: PeftConfig, optional
+            The LoRA adapter configuration for dynamic mode
+        lora_weights: dict, optional
+            The LoRA adapter weights for dynamic mode
     """
     if mode == "plugin":
         # AttentionPlugin requires knowledge of the model. Assume config file is in onnx_dir
@@ -247,16 +264,37 @@ def surgeon_llm(raw_onnx_path,
     graph.fold_constants().cleanup().toposort()
 
     if dtype == "int4_ootb":
+        from utils.surgeon_utils import insert_int4_dq
         graph = insert_int4_dq(graph, state_dict)
 
     elif dtype == "int4":
+        from utils.surgeon_utils import insert_int4_gemm_plugin
         graph = insert_int4_gemm_plugin(graph, state_dict)
 
     elif dtype == "fp8" or lm_head_precision == "fp8":
+        from utils.surgeon_utils import fold_fp8_qdq_to_dq
         graph = fold_fp8_qdq_to_dq(graph)
 
     os.makedirs(output_dir, exist_ok=True)
     t2 = time.time()
+
+    onnx_model = gs.export_onnx(graph)
+
+    if dtype == "nvfp4":
+        t4 = time.time()
+        from modelopt.onnx.quantization.qdq_utils import fp4qdq_to_2dq
+        onnx_model = fp4qdq_to_2dq(onnx_model)
+        t5 = time.time()
+        print(f"nvfp4 qdq to 2 dqs inserted in {t5 - t4}.")
+
+    # Insert static LoRA as the last step
+    if lora_config is not None and lora_weights is not None:
+        graph = gs.import_onnx(onnx_model)
+        from utils.surgeon_utils import insert_static_lora
+        graph = insert_static_lora(graph, lora_config, lora_weights, dtype)
+        onnx_model = gs.export_onnx(graph)
+
+    output_onnx_name = f"{output_dir}/model.onnx"
     print(
         f"Saving ONNX files in {output_dir}. All existing ONNX in the folder will be overwritten."
     )
@@ -269,16 +307,6 @@ def surgeon_llm(raw_onnx_path,
 
         except Exception as e:
             print('Failed to delete %s. Reason: %s' % (file_path, e))
-
-    output_onnx_name = f"{output_dir}/model.onnx"
-    onnx_model = gs.export_onnx(graph)
-
-    if dtype == "nvfp4":
-        t4 = time.time()
-        from modelopt.onnx.quantization.qdq_utils import fp4qdq_to_2dq
-        onnx_model = fp4qdq_to_2dq(onnx_model)
-        t5 = time.time()
-        print(f"nvfp4 qdq to 2 dqs inserted in {t5 - t4}.")
 
     onnx.save_model(onnx_model,
                     output_onnx_name,
@@ -332,9 +360,14 @@ def main(args):
     assert args.torch_dir or args.onnx_path, "You need to provide either --torch_dir or --onnx_path to process the export script"
     start_time = time.time()
     state_dict = None
+    lora_config = None
+    lora_weights = None
 
     if not check_dtype_support(args):
         return
+
+    if args.onnx_path:
+        raw_onnx_path = args.onnx_path
 
     if args.torch_dir:
         # Exporting ONNX from PyTorch model
@@ -358,6 +391,14 @@ def main(args):
                 torch_dir, torch_dtype=torch.float16,
                 trust_remote_code=True).cuda()
 
+            # Handle LoRA weights if provided
+            if args.lora_mode == "static":
+                model, lora_config, lora_weights = load_model_with_lora(
+                    model, args.lora_dir, args.lora_mode)
+            elif args.lora_mode == "merged":
+                model = load_model_with_lora(model, args.lora_dir,
+                                             args.lora_mode)
+
             if args.save_original:
                 onnx_dir = args.output_dir + "_raw"
             else:
@@ -368,7 +409,9 @@ def main(args):
                                         args.lm_head, args.dataset_dir)
 
             # Surgeon graph based on precision and mode
-            raw_onnx_path = f"{onnx_dir}/model.onnx" if args.torch_dir else args.onnx_path
+            raw_onnx_path = f"{onnx_dir}/model.onnx"
+
+    # Apply surgical operations
     surgeon_llm(raw_onnx_path,
                 args.output_dir,
                 args.dtype,
@@ -376,7 +419,9 @@ def main(args):
                 args.config_path,
                 state_dict,
                 args.max_seq_length,
-                lm_head_precision=args.lm_head)
+                lm_head_precision=args.lm_head,
+                lora_config=lora_config,
+                lora_weights=lora_weights)
 
     end_time = time.time()
     print(
