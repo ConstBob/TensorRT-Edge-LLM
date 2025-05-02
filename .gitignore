@@ -11,3 +11,5 @@ __pycache__/
 data/
 data.tar
 *.csv
+*.tar.gz
+internal/
