@@ -58,12 +58,13 @@ add_library(llmSdkPlugin STATIC ${PLUGIN_CPP_SRCS} ${PLUGIN_CU_SRCS})
 target_include_directories(llmSdkPlugin PRIVATE ${COMMON_INCLUDE_DIRS})
 
 # Generate Core C++ static library for LLM-SDK
+file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE SAMPLER_CPP_SRCS "sampler/*.cpp")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE DECODER_CPP_SRCS "decoder/*.cpp")
 
 add_library(llmSdkCore STATIC ${SAMPLER_CPP_SRCS} ${SAMPLER_CU_SRCS}
-                              ${DECODER_CPP_SRCS})
+                              ${DECODER_CPP_SRCS} ${COMMON_CPP_SRCS})
 target_include_directories(llmSdkCore PRIVATE ${COMMON_INCLUDE_DIRS})
 
 # Generate tokenizer C++ static library
