@@ -1,13 +1,18 @@
+## v0.0.3
+- DriveOS 7.0.3.0
+- TensorRT 10.10
+Similar performance compared to v0.0.2 is expected, so performance number is not recollected.
+
 ## v0.0.2
-### Environment and Intructions
+### Environment and Instructions
 - Platform: Thor-U with clock fixed at 1520MHz.
 - DriveOS: 7.0.2.0
 - TensorRT: 10.8
-- Performance Intruction: Follow `examples/llm/README.md#llm_benchmark` and `examples/multimodal/README.md#vlm_benchmark`.
-- DDR Bandwidth Intruction: `sudo emc_log -client readtally -client writetally`.
+- Performance Instruction: Follow `examples/llm/README.md#llm_benchmark` and `examples/multimodal/README.md#vlm_benchmark`.
+- DDR Bandwidth Instruction: `sudo emc_log -client readtally -client writetally`.
 
 ### LLM
-| Model        | BS-InSeq-OutSeq | Precision | Overall<br>Latency(ms) | Overall<br>Token/s | Prefill Latency(ms) | Decode Latency(ms) | Decode token/s | Inference CPU(GB) | Inference GPU(GB) | Context GPU(GB) | DDR Bnadiwdth (GB/s) |
+| Model        | BS-InSeq-OutSeq | Precision | Overall Latency(ms) | Overall Token/s | Prefill Latency(ms) | Decode Latency(ms) | Decode token/s | Inference CPU(GB) | Inference GPU(GB) | Context GPU(GB) | DDR Bandwidth (GB/s) |
 | ------------ | --------------- | --------- | ---------------------- | ------------------ | ------------------- | ------------------ | -------------- | ----------------- | ----------------- | --------------- | ----------- |
 | Qwen2.5-0.5B | 1-512-64        | FP8       | 278.3                  | 229.97             | 9.55                | 268.73             | 238.16         | 0.15              | 1.03              | 0.02            |             |
 | Qwen2.5-0.5B | 1-512-64        | nvFP4     | 263.96                 | 242.46             | 9.03                | 254.91             | 251.07         | 0.17              | 0.91              | 0.02            | 113.44      |

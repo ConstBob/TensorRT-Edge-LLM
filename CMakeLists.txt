@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 project(
   driveos_llm_sdk
-  VERSION 7.0.2.0
+  VERSION 0.0.3.3
   LANGUAGES CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -114,10 +114,14 @@ add_subdirectory(examples)
 option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
 
 if(BUILD_UNIT_TESTS)
-  set(BUILD_GMOCK OFF CACHE BOOL "Disable Google Mock")
+  set(BUILD_GMOCK
+      OFF
+      CACHE BOOL "Disable Google Mock")
   add_subdirectory(${CMAKE_SOURCE_DIR}/3rdParty/googletest)
-  file(GLOB_RECURSE UNIT_TESTS_SRCS ${CMAKE_SOURCE_DIR}/unittests/*.cpp ${CMAKE_SOURCE_DIR}/unittests/*.cu)
+  file(GLOB_RECURSE UNIT_TESTS_SRCS ${CMAKE_SOURCE_DIR}/unittests/*.cpp
+       ${CMAKE_SOURCE_DIR}/unittests/*.cu)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
   target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS})
-  target_link_libraries(unitTest PRIVATE gtest gtest_main llmSdkPlugin llmSdkCore ${CUDART_LIB} ${CUDA_LIB})
+  target_link_libraries(unitTest PRIVATE gtest gtest_main llmSdkPlugin
+                                         llmSdkCore ${CUDART_LIB} ${CUDA_LIB})
 endif()
