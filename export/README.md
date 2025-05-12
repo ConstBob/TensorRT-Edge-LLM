@@ -10,9 +10,9 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 ## Usage
 
 1. Download HF checkpoint from transformers and save it locally
-1. `cd export`
+1. `cd export` at the top-level of LLM SDK repository
 1. `pip3 install -r requirements.txt`
-1. If you are working with NVFP4, you need to unintall `onnx` and `nvidia-modelopt` using `pip3 uninstall onnx` and `pip3 uninstall nvidia-modelopt`, and then install `pip3 install -r requirements_nvfp4.txt`. Please refer to the instruction in [../README.md](../README.md#limitations-and-known-issues) to properly configure the environment.
+1. If you are working with NVFP4, you need to uninstall `onnx` and `nvidia-modelopt` using `pip3 uninstall onnx` and `pip3 uninstall nvidia-modelopt`, and then install `pip3 install -r requirements_nvfp4.txt`. Please refer to the instruction in [../README.md](../README.md#limitations-and-known-issues) to properly configure the environment.
 1. Call export script.
 ```
 # LLM model
