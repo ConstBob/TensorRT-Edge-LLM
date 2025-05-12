@@ -1,4 +1,8 @@
 # Release Notes
+## 0.0.3
+- Fixed CUDA Graph capture errors
+- Fixed NVFP4 accuracy issue by changing quantization recipe
+
 ## 0.0.2
 - Added VLM support with Qwen2-VL-2B, Qwen2-VL-7B examples
 - Added Qwen2-0.5B and Llama3-1B support by extending `AttentionPlugin`
