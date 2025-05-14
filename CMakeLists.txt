@@ -31,6 +31,13 @@ macro(set_ifndef var val)
   message(STATUS "Configurable variable ${var} set to ${${var}}")
 endmacro()
 
+macro(add_cross_build_link_options target)
+  if(DEFINED AARCH64_BUILD)
+    target_link_options(${target} PRIVATE "-L${CUDA_DIR}/lib")
+    target_link_options(${target} PRIVATE "-L${CUDA_DIR}/lib/stubs")
+  endif()
+endmacro(add_cross_build_link_options)
+
 # CUDA flags and dependencies.
 if(NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
@@ -50,9 +57,9 @@ find_library(
   PATH_SUFFIXES lib lib64)
 
 find_library(
-  CUDA_LIB cuda
+  CUDA_DRIVER_LIB cuda
   HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
-  PATH_SUFFIXES lib lib64)
+  PATH_SUFFIXES lib lib64 lib/stubs)
 
 find_path(
   CURAND_KERNEL_INCLUDE_DIR
@@ -123,5 +130,6 @@ if(BUILD_UNIT_TESTS)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
   target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS})
   target_link_libraries(unitTest PRIVATE gtest gtest_main llmSdkPlugin
-                                         llmSdkCore ${CUDART_LIB} ${CUDA_LIB})
+                                         llmSdkCore ${CUDART_LIB} ${CUDA_DRIVER_LIB})
+  add_cross_build_link_options(unitTest)
 endif()
