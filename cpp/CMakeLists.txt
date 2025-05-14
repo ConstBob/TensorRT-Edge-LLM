@@ -29,12 +29,8 @@ set_target_properties(AttentionPlugin PROPERTIES VERSION 1.0 SOVERSION 1)
 set_target_properties(AttentionPlugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                  ${CMAKE_BINARY_DIR})
 target_include_directories(AttentionPlugin PRIVATE ${COMMON_INCLUDE_DIRS})
-target_link_libraries(AttentionPlugin commonLibraryExt cuda)
-# avoid linker error from aarch64 cross build
-if(DEFINED AARCH64_BUILD)
-  target_link_options(AttentionPlugin PRIVATE "-L${CUDA_DIR}/lib")
-  target_link_options(AttentionPlugin PRIVATE "-L${CUDA_DIR}/lib/stubs")
-endif()
+target_link_libraries(AttentionPlugin commonLibraryExt ${CUDA_DRIVER_LIB})
+add_cross_build_link_options(AttentionPlugin)
 
 # Generate optional int4GroupwiseGemm plugin shared library
 file(GLOB_RECURSE INT4_GEMM_PLUGIN_CPP_SRCS "int4GroupwiseGemmPlugin/*.cpp")
@@ -46,12 +42,8 @@ set_target_properties(Int4GemmPlugin PROPERTIES VERSION 1.0 SOVERSION 1)
 set_target_properties(Int4GemmPlugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                 ${CMAKE_BINARY_DIR})
 target_include_directories(Int4GemmPlugin PRIVATE ${COMMON_INCLUDE_DIRS})
-target_link_libraries(Int4GemmPlugin commonLibraryExt cuda)
-# avoid linker error from aarch64 cross build
-if(DEFINED AARCH64_BUILD)
-  target_link_options(Int4GemmPlugin PRIVATE "-L${CUDA_DIR}/lib")
-  target_link_options(Int4GemmPlugin PRIVATE "-L${CUDA_DIR}/lib/stubs")
-endif()
+target_link_libraries(Int4GemmPlugin commonLibraryExt ${CUDA_DRIVER_LIB})
+add_cross_build_link_options(Int4GemmPlugin)
 
 # Generate static library for plugin components for unit tests purposes.
 add_library(llmSdkPlugin STATIC ${PLUGIN_CPP_SRCS} ${PLUGIN_CU_SRCS})
