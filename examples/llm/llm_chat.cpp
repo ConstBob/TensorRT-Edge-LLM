@@ -24,6 +24,8 @@
 struct LLMChatArgs
 {
     bool help{false};
+    bool interactive{false};
+    std::vector<std::string> inputStrings;
     std::string enginePath;
     std::string tokenizerPath;
     int maxLength{256};
@@ -33,14 +35,17 @@ struct LLMChatArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] [-e or --enginePath=<path to TensorRT engine>] [-s or "
-                 "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>]"
+              << " [-h] [-i or --interactive] [-e or --enginePath=<path to TensorRT engine>] [-s or "
+                 "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>] [--inputString=<input string for "
+                 "one batch>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  -h               Display this help message" << std::endl;
+    std::cerr << "  --interactive    Interactive chat mode. " << std::endl;
+    std::cerr << "  --inputString    Provide the input string to the runtime. Required. " << std::endl;
     std::cerr << "  --enginePath     Provide the input TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --tokenizerPath  Provide the path to HF tokenizer. Required. " << std::endl;
-    std::cerr << "  --maxLength            Provide the maximum output length for the generation session (including the "
+    std::cerr << "  --maxLength      Provide the maximum output length for the generation session (including the "
                  "input). Default = 256"
               << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more information." << std::endl;
@@ -48,18 +53,31 @@ void printUsage(char const* programName)
 
 bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
 {
-    static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"enginePath", required_argument, 0, 'e'},
+    static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"interactive", no_argument, 0, 'i'},
+        {"inputString", required_argument, 0, 'c'}, {"enginePath", required_argument, 0, 'e'},
         {"tokenizerPath", required_argument, 0, 't'}, {"maxLength", required_argument, 0, 's'},
         {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
 
     int opt;
 
     // Loop to process each option
-    while ((opt = getopt_long(argc, argv, "he:t:s:d", long_options, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "he:t:s:di", long_options, nullptr)) != -1)
     {
         switch (opt)
         {
         case 'h': args.help = true; return true;
+        case 'i': args.interactive = true; break;
+        case 'c':
+            if (optarg)
+            {
+                args.inputStrings.emplace_back(optarg);
+            }
+            else
+            {
+                std::cerr << "ERROR: --inputString requires option argument" << std::endl;
+                return false;
+            }
+            break;
         case 'e':
             if (optarg)
             {
@@ -136,18 +154,62 @@ int main(int argc, char* argv[])
     std::string quitString = "quit";
     std::cout << "Welcome to NVIDIA DriveOS LLM SDK! Please enter your prompts. Enter quit to exit the program."
               << std::endl;
-    while (true)
+
+    if (args.interactive)
+    { // interactive mode
+        while (true)
+        {
+            for (int64_t i = 0; i < batchSize; ++i)
+            {
+                std::string inputString;
+                std::cout << "Prompt for batch " << i << ": ";
+                std::getline(std::cin, inputString);
+                if (inputString == quitString)
+                {
+                    std::cout << "Exit. Thanks for using DriveOS LLM SDK!" << std::endl;
+                    return EXIT_SUCCESS;
+                }
+                std::vector<int64_t> batchInputIds = tokenizer->encode(inputString, true);
+                int32_t inputSize = static_cast<int32_t>(batchInputIds.size());
+                if (inputSize > maxContextLength)
+                {
+                    std::cout << "Warning: input length > max context length. The last tokens will be truncated."
+                              << std::endl;
+                }
+                contextLengths[i] = std::min(inputSize, maxContextLength);
+                batchInputIds.resize(maxContextLength, padId);
+                std::copy(batchInputIds.begin(), batchInputIds.end(), inputIds.begin() + i * maxContextLength);
+            }
+            std::vector<std::vector<int64_t>> outputIds(batchSize);
+            for (int i = 0; i < batchSize; ++i)
+            {
+                outputIds[i].reserve(generationConfig.maxLength);
+            }
+            decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
+            for (int i = 0; i < batchSize; ++i)
+            {
+                std::cout << "Output for batch " << i << ": " << tokenizer->decode(outputIds[i]) << std::endl;
+            }
+            // Reset the values
+            std::fill(inputIds.begin(), inputIds.end(), padId);
+            std::fill(contextLengths.begin(), contextLengths.end(), 0);
+        }
+    }
+    else
     {
+        // non-interactive mode
+        if (args.inputStrings.size() != batchSize) {
+            std::cerr << "Error: Number of input strings (" << args.inputStrings.size() 
+                      << ") must match the model's batch size (by --batchSize)" << batchSize 
+                      << "). Please provide exactly " << batchSize << " input string(s) using --inputString flag." << std::endl;
+        }
+        assert(args.inputStrings.size() == batchSize);
+
         for (int64_t i = 0; i < batchSize; ++i)
         {
-            std::string inputString;
-            std::cout << "Prompt for batch " << i << ": ";
-            std::getline(std::cin, inputString);
-            if (inputString == quitString)
-            {
-                std::cout << "Exit. Thanks for using DriveOS LLM SDK!" << std::endl;
-                return EXIT_SUCCESS;
-            }
+            std::string inputString = args.inputStrings[i];
+            std::cout << "Input string for batch: " << i << ": " << inputString << std::endl;
+
             std::vector<int64_t> batchInputIds = tokenizer->encode(inputString, true);
             int32_t inputSize = static_cast<int32_t>(batchInputIds.size());
             if (inputSize > maxContextLength)
