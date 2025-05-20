@@ -55,7 +55,7 @@ inline std::string fmtstr(char const* format, ...)
     return result;
 };
 
-inline void _checkCuda(cudaError_t result, char const* const func, char const* const file, int const line)
+inline void _checkCuda(cudaError_t result, char const* const func, [[maybe_unused]] char const* const file, [[maybe_unused]] int const line)
 {
     if (result)
     {

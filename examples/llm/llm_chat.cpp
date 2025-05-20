@@ -146,7 +146,7 @@ int main(int argc, char* argv[])
     decoder->setup(args.enginePath, stream);
     int32_t maxContextLength = static_cast<int32_t>(decoder->getMaxContextLength());
     int64_t batchSize = decoder->getModelBatchSize();
-    int64_t batchCount = 0;
+    // int64_t batchCount = 0; UNUSED
     int64_t padId = tokenizer->getPadId();
     std::vector<int64_t> inputIds(batchSize * maxContextLength, padId);
     std::vector<int32_t> contextLengths(batchSize, 0);

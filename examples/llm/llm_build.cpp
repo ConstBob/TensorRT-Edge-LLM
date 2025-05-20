@@ -249,7 +249,7 @@ int main(int argc, char** argv)
     int64_t nbKVCacheInputs = 0;
     nvinfer1::Dims kvDims;
     bool getKvDims = false;
-    for (size_t i = 0; i < network->getNbInputs(); ++i)
+    for (int32_t i = 0; i < nbInputs; ++i)
     {
         if (network->getInput(i)->getDimensions().nbDims == 5)
         {

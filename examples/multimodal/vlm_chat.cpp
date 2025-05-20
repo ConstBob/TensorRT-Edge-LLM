@@ -194,10 +194,10 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
     std::vector<unsigned char*> imageBuffers;
     std::vector<std::vector<int>> imageSizes;
     std::vector<int> numImages;
-    for (int b = 0; b < imagePaths.size(); ++b)
+    for (size_t b = 0; b < imagePaths.size(); ++b)
     {
         numImages.emplace_back(imagePaths[b].size());
-        for (int i = 0; i < imagePaths[b].size(); ++i)
+        for (size_t i = 0; i < imagePaths[b].size(); ++i)
         {
             int width{0}, height{0}, channels{0};
             int desiredChannels = 3;

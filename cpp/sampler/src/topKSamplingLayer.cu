@@ -144,8 +144,6 @@ void TopKSamplingLayer<T>::setup(std::int32_t batchSize, std::int32_t beamWidth,
     auto const topP = (runtimeTopPSize == 0) ? DefaultDecodingParams::getTopP() : runtimeTopP.front();
 
     auto batchSlotsPtr = batchSlots ? static_cast<std::int32_t const*>(batchSlots) : nullptr;
-    auto setupWorkspaceDevicePtr = tensorCastOrNull<std::int32_t>(mSetupWorkspaceDevice);
-    auto setupWorkspaceDeviceAsFloatPtr = reinterpret_cast<float const*>(setupWorkspaceDevicePtr);
     auto runtimeTopKDevicePtr = tensorCastOrNull<std::int32_t>(mRuntimeTopKDevice);
     auto runtimeTopPDevicePtr = tensorCastOrNull<float>(mRuntimeTopPDevice);
     if (runtimeTopKSize > 1)

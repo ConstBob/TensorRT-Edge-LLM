@@ -49,7 +49,7 @@ template <typename T>
 class Decoder
 {
 public:
-    Decoder(bool useCudaGraph = true)
+    Decoder()
         : mStream{nullptr}
         , mEngine{nullptr}
         , mContextExecutionContext{nullptr}
@@ -58,7 +58,7 @@ public:
         , mConfig{0, 0, 0, 0, 0, 0, 0}
         , mDeviceBuffer{}
         , mSampler{nullptr}
-        , mUseCudaGraph{true}
+        , mUseCudaGraph{false}
         , mCudaGraphCaptured{false}
         , mGenerationGraph{nullptr}
         , mGenerationGraphExec{nullptr}
@@ -89,11 +89,11 @@ public:
     };
 
 private:
+    cudaStream_t mStream;
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    cudaStream_t mStream;
     bool isSetup;
     ModelConfig mConfig;
     std::map<std::string, void*> mDeviceBuffer;

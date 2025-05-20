@@ -636,7 +636,7 @@ void Qwen2ViTRunner::getWindowIndex(std::vector<std::vector<int64_t>> const& gri
         windowIndexId += T * llmGridH * llmGridW;
     }
 
-    if (windowIndex.size() * 4 != mConfig.curHW)
+    if (windowIndex.size() * 4 != static_cast<size_t>(mConfig.curHW))
     {
         LOG_ERROR("windowIndex size does not match mConfig.curHW.");
         return;

@@ -78,7 +78,6 @@ __global__ void gemv_kernel(
     int const kThreadsNumPerTile = kStride / kElemsPerThread;
     // assert(MEM_ACCESS_SIZE == 128);
 
-    static constexpr int kShuffleSize = 32;
     static constexpr int kShuffleBasicTile = 2;
     static constexpr int kShuffleContinous = 4;
     static constexpr int kShuffleStrided = 4;

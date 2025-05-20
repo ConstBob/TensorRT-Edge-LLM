@@ -76,10 +76,10 @@ public:
 
 private:
     nvinfer1::DataType mDataType;
-    int32_t mBatchSize;
-    int32_t mNumHeads;
-    int32_t mNumKVHeads;
-    int32_t mHeadSize;
+    uint32_t mBatchSize;
+    uint32_t mNumHeads;
+    uint32_t mNumKVHeads;
+    uint32_t mHeadSize;
 
     int32_t mSmVersion;
 };

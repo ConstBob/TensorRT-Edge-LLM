@@ -65,7 +65,7 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, bo
 template <typename T>
 void Decoder<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
 {
-    for (int i = 0; i < extraInputs.size(); ++i)
+    for (size_t i = 0; i < extraInputs.size(); ++i)
     {
         char const* inputName = extraInputs[i].name.c_str();
         void* inputDevice = extraInputs[i].deviceBuffer;
@@ -342,7 +342,7 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         outputIds[i].clear();
     }
 
-    assert(outputIds.size() == mConfig.batchSize);
+    assert(outputIds.size() == static_cast<size_t>(mConfig.batchSize));
     assert(mConfig.maxLength >= generationConfig.maxLength);
     assert(generationConfig.maxLength >= generationConfig.minLength);
 
@@ -366,7 +366,7 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         }
         return generatedToken;
     };
-    assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
+    assert(contextLengths.size() == static_cast<size_t>(mConfig.batchSize) && "Input batch size does not match engine batch size.");
 
     // Setup "input_ids",  "context_lengths", "last_token_ids"
     // Extra model inputs should be set with `setupExtraInputs` before this function

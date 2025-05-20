@@ -122,8 +122,10 @@ class XQAKernelList
 
 public:
     XQAKernelList(XQADataType type, int32_t sm, bool specDecode)
-        : mDataType(type)
+        : mKernelMeta(nullptr)
+        , mKernelMetaCount(0)
         , mSMVersion(sm)
+        , mDataType(type)
     {
         if (specDecode)
         {

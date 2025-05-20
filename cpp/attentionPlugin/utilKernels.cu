@@ -180,6 +180,7 @@ struct Vec_t<float>
 {
     using Type = float2;
     static constexpr int size = 2;
+    static_assert(size == 2, "Size must be 2 for float");
 };
 
 template <>
@@ -187,6 +188,7 @@ struct Vec_t<half>
 {
     using Type = uint32_t;
     static constexpr int size = 2;
+    static_assert(size == 2, "Size must be 2 for float");
 };
 
 } // namespace
