@@ -132,7 +132,7 @@ std::vector<TestData> parseCSVFile(fs::path const& csvPath, int maxRecordNum = -
     {
         LOG_DEBUG(csvPath.c_str());
     }
-    while (!file.eof() && (maxRecordNum == -1 || res.size() < maxRecordNum))
+    while (!file.eof() && (maxRecordNum == -1 || static_cast<int>(res.size()) < maxRecordNum))
     {
         TestData data;
         data.options.resize(4);
@@ -246,13 +246,13 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
             auto devFile = datasetPath / "dev" / (subject + "_dev.csv");
             assert(fs::exists(testFile));
             assert(fs::exists(devFile));
-            int printFirstThreeLine = debug ? 3 : 0;
+            [[maybe_unused]] int printFirstThreeLine = debug ? 3 : 0;
 
             auto testData = parseCSVFile(testFile, -1, debug);
             auto devData = parseCSVFile(devFile, 5, debug);
 
-            auto formatExample = []() { std::string prompt; };
-            auto genPrompt = [&subject]() {
+            [[maybe_unused]] auto formatExample = []() { std::string prompt; };
+            [[maybe_unused]] auto genPrompt = [&subject]() {
                 std::string prompt
                     = "The following are multiple choice questions (with answers) about " + subject + ".\n\n";
             };
@@ -277,10 +277,10 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
     std::vector<int32_t> contextLengths(1);
     int64_t total = 0, correct = 0;
 
-    auto genDevPrompt = [](int n, std::vector<TestData> const& datas, std::string const& subjectFmt) {
+    auto genDevPrompt = [](uint16_t n, std::vector<TestData> const& datas, std::string const& subjectFmt) {
         std::string devPrompt
             = "The following are multiple choice questions (with answers) about " + subjectFmt + ".\n\n";
-        for (int i = 0; i < n && i < datas.size(); i++)
+        for (size_t i = 0; i < n && i < datas.size(); i++)
         {
             devPrompt += datas[i].format();
         }
@@ -302,7 +302,7 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
             std::string prompt;
             std::vector<int64_t> inputIds;
 
-            int devPromptNum = 5;
+            uint16_t devPromptNum = 5;
             do
             {
                 prompt = genDevPrompt(devPromptNum, devData, subjectFmt) + data.format(false);

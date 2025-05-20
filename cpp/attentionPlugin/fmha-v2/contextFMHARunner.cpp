@@ -215,7 +215,7 @@ public:
                 checkCu(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     funcInfo.mSharedMemBytes));
             }
-            FMHAKernelHashKey hashKey{kernelMeta.mDataType, kernelMeta.mS, kernelMeta.mD, kernelMeta.mUnrollStep != 0,
+            FMHAKernelHashKey hashKey{kernelMeta.mDataType, static_cast<int32_t>(kernelMeta.mS), static_cast<int32_t>(kernelMeta.mD), kernelMeta.mUnrollStep != 0,
                 kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType,
                 kernelMeta.mTiled};
             mFunctions.insert(std::make_pair(hashKey, funcInfo));
@@ -238,7 +238,7 @@ protected:
     TKernelMetaInfo const* mKernelMeta;
     int32_t mKernelMetaCount;
     FMHADataType mDataType;
-    int32_t mSMVersion;
+    uint32_t mSMVersion;
     std::unordered_map<unsigned char const*, CUmodule> mModules;
 
     std::unordered_map<FMHAKernelHashKey, FMHAKernelFuncInfo, FMHAKernelHasher> mFunctions;
@@ -358,7 +358,7 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
     params.qkv_stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
 }
 
-bool ContextFMHARunner::canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType)
+bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType)
 {
     bool const checkType = dataType == DataType::kHALF;
     bool const checkHeadSize = headSize == 128 || headSize == 64;

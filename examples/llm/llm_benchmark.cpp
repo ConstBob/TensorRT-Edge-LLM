@@ -197,7 +197,7 @@ void benchmarkLLM(std::string& enginePath, int const inputLength, int64_t warmUp
     oss << std::fixed << std::setprecision(2);
     oss << "Sequence Latencies(ms): [";
     constexpr int maxPrintedLatencies{20};
-    for (int i = 0; i < seqLatencies.size(); ++i)
+    for (size_t i = 0; i < seqLatencies.size(); ++i)
     {
         oss << seqLatencies[i];
         if (i == seqLatencies.size() - 1)
@@ -220,7 +220,7 @@ void benchmarkLLM(std::string& enginePath, int const inputLength, int64_t warmUp
     oss.str("");
     oss.clear();
     oss << "First Token Latencies(ms): [";
-    for (int i = 0; i < firstTokenLatencies.size(); ++i)
+    for (size_t i = 0; i < firstTokenLatencies.size(); ++i)
     {
         oss << firstTokenLatencies[i];
         if (i == firstTokenLatencies.size() - 1)

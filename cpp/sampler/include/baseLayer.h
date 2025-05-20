@@ -83,7 +83,8 @@ public:
     //! \param inputs shared pointer to params inherited from BaseForwardParams
     // clang-format on
     virtual void forwardSync(
-        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& inputs)
+        [[maybe_unused]] std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        [[maybe_unused]] std::shared_ptr<BaseDecodingInputs> const& inputs)
     {
     }
 

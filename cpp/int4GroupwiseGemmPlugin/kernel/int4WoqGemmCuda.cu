@@ -188,9 +188,7 @@ __device__ __inline__ void global_to_share_one_stage_scales_T2(half* src, half* 
 {
     constexpr int threads_needed = CTA_N / PACK_SIZE / 1;
     constexpr int threads_used = threads_needed < CTA_SIZE ? threads_needed : CTA_SIZE;
-    constexpr int total_global_iters = CTA_N / PACK_SIZE / threads_used;
     constexpr int threads_per_row = CTA_N / PACK_SIZE;
-    constexpr int kSmemCol = CTA_N;
     bool local_mask = mask & (threadIdx.y * WARP_SIZE + threadIdx.x < threads_used);
     int g_idx = global_iter_k * CTA_K / G;
 
@@ -277,9 +275,7 @@ __global__ void gemm_w4a16_T2(
     constexpr int CTA_SIZE = NUM_WARPS * WARP_SIZE;
     int num_blocks_n = (N + CTA_N - 1) / CTA_N;
     int num_blocks_m = (M + CTA_M - 1) / CTA_M;
-    int blockIdx_x = 0;
     int blockIdx_y = blockIdx.x % (num_blocks_m * num_blocks_n);
-    int blockIdx_z = blockIdx.x / (num_blocks_m * num_blocks_n);
     int const log_tile = get_log_tile<1>((N + CTA_N - 1) / CTA_N);
     int blockIdx_m = blockIdx_y / (num_blocks_n >> log_tile);
     int blockIdx_n = blockIdx_y % (num_blocks_n >> log_tile);
@@ -294,7 +290,6 @@ __global__ void gemm_w4a16_T2(
     constexpr int kSmemSizeBPerStage = CTA_N / kInterleave * kSmemPadKB;
     constexpr int kSmemSizeA = kSmemSizeAPerStage * STAGES;
     constexpr int kSmemSizeB = kSmemSizeBPerStage * STAGES;
-    constexpr int kSmemSizeScales = CTA_N * STAGES / 2;
     constexpr int scales_load_interval = G / CTA_K;
     extern __shared__ half mem_shared[];
     half* A_shared = mem_shared;

@@ -46,22 +46,22 @@ BPERanksToToken reverseEncoder(BPETokenToRanks const& encoder)
     return decoder;
 }
 
-static std::unordered_map<uint32_t, uint8_t> unicodeCptToByteMap()
+[[maybe_unused]] static std::unordered_map<uint32_t, uint8_t> unicodeCptToByteMap()
 {
     std::unordered_map<uint32_t, uint8_t> map;
     for (uint32_t ch = 0x21; ch <= 0x7E; ++ch)
     { // u'!' to u'~'
-        assert(0 <= ch && ch < 256);
+        assert(ch < 256);
         map[ch] = ch;
     }
     for (uint32_t ch = 0xA1; ch <= 0xAC; ++ch)
     { // u'¡' to u'¬'
-        assert(0 <= ch && ch < 256);
+        assert(ch < 256);
         map[ch] = ch;
     }
     for (uint32_t ch = 0xAE; ch <= 0xFF; ++ch)
     { // u'®' to u'ÿ'
-        assert(0 <= ch && ch < 256);
+        assert(ch < 256);
         map[ch] = ch;
     }
 

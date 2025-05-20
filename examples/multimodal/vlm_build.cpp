@@ -348,7 +348,7 @@ int buildLLM(VLMBuildArgs const& args)
     int64_t nbKVCacheInputs = 0;
     nvinfer1::Dims kvDims;
     bool getKvDims = false;
-    for (size_t i = 0; i < network->getNbInputs(); ++i)
+    for (int32_t i = 0; i < nbInputs; ++i)
     {
         if (network->getInput(i)->getDimensions().nbDims == 5)
         {
@@ -578,7 +578,7 @@ int buildViT(VLMBuildArgs const& args)
     auto* visualProfile = builder->createOptimizationProfile();
     int64_t patchSize = 0;
     int64_t ropeEmbdSize = 0;
-    for (size_t i = 0; i < network->getNbInputs(); ++i)
+    for (int32_t i = 0; i < nbInputs; ++i)
     {
         if (strcmp(network->getInput(i)->getName(), "input") == 0)
         {

@@ -119,12 +119,13 @@ public:
     }
 
 private:
-    std::map<std::string, void*> mDeviceBuffer;
+    cudaStream_t mStream;
     std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;
+    std::map<std::string, void*> mDeviceBuffer;
+    bool isSetup;
+    VisualPreprocessorConfig mConfig;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    cudaStream_t mStream;
-    bool isSetup;
 
     void validateAndFillConfig(int batchSize);
 
@@ -150,6 +151,4 @@ private:
         std::vector<int64_t>& mropePositionDeltas);
     void generateMropeParams(std::vector<std::vector<int64_t>> const& batchInputIds,
         std::vector<std::vector<int64_t>> const& visualGridTHWs);
-
-    VisualPreprocessorConfig mConfig;
 };

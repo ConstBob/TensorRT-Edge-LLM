@@ -50,7 +50,7 @@ bool BPE::specialTokenPartition(std::string const& text, std::forward_list<textP
                     while (true)
                     {
                         auto match = rawText.find(specialToken, baseOffset);
-                        if ((match == std::string::npos) || (match + specialToken.length() > baseOffset + baseLength))
+                        if ((match == std::string::npos) || (static_cast<int>(match + specialToken.length()) > (baseOffset + baseLength)))
                         {
                             break;
                         }
@@ -58,7 +58,7 @@ bool BPE::specialTokenPartition(std::string const& text, std::forward_list<textP
                         auto basePos = std::distance(partitions.begin(), it);
 
                         // insert left part
-                        if (match > baseOffset)
+                        if (match > static_cast<size_t>(baseOffset))
                         {
                             partitions.emplace_after(it, rawText, baseOffset, match - baseOffset);
                             ++it;
@@ -79,7 +79,7 @@ bool BPE::specialTokenPartition(std::string const& text, std::forward_list<textP
                         }
 
                         // insert right part and continue loop
-                        if (match + specialToken.length() < baseOffset + baseLength)
+                        if (match + specialToken.length() < static_cast<size_t>(baseOffset + baseLength))
                         {
                             int rightOffset = match + specialToken.length();
                             int rightLength = baseLength + baseOffset - (match + specialToken.length());
@@ -154,11 +154,11 @@ std::vector<std::string> BPE::regexSplitText(std::string const& text) const
     std::vector<std::string> bpeWords;
     bpeWords.reserve(bpeOffsets.size());
 
-    int wordStart = 0;
+    size_t wordStart = 0;
     for (auto const& offset : bpeOffsets)
     {
         bpeWords.emplace_back();
-        for (int i = wordStart; i < wordStart + offset; ++i)
+        for (size_t i = wordStart; i < wordStart + offset; ++i)
         {
             bpeWords.back() += unicodeCptToUtf8(cpts[i]);
         }
@@ -178,7 +178,7 @@ void BPE::bytePairEncode(std::string const& piece, std::vector<Rank>& output) co
     auto MAX_RANK = std::numeric_limits<Rank>::max();
     std::pair<int, Rank> minRank{MAX_INT, MAX_RANK};
 
-    for (int i = 0; i < piece.size() - 1; ++i)
+    for (size_t i = 0; i < piece.size() - 1; ++i)
     {
         Rank rank = MAX_RANK;
         auto const it = mEncoder.find({piece.begin() + i, piece.begin() + i + 2});
@@ -199,7 +199,7 @@ void BPE::bytePairEncode(std::string const& piece, std::vector<Rank>& output) co
     parts.emplace_back(std::make_pair(piece.size(), MAX_RANK));
 
     // helper function
-    auto getMergedRank = [&](int const i) -> Rank {
+    auto getMergedRank = [&](size_t const i) -> Rank {
         Rank rank = MAX_RANK;
         if (i + 3 < parts.size())
         {
@@ -227,7 +227,7 @@ void BPE::bytePairEncode(std::string const& piece, std::vector<Rank>& output) co
 
         // update minRank
         minRank = std::make_pair(MAX_INT, MAX_RANK);
-        for (int i = 0; i < parts.size() - 1; ++i)
+        for (size_t i = 0; i < parts.size() - 1; ++i)
         {
             auto rank = parts[i].second;
             if (rank < minRank.second)
@@ -238,7 +238,7 @@ void BPE::bytePairEncode(std::string const& piece, std::vector<Rank>& output) co
     }
 
     // collect tokens from parts
-    for (int i = 0; i < parts.size() - 1; ++i)
+    for (size_t i = 0; i < parts.size() - 1; ++i)
     {
         auto const it = mEncoder.find({piece.begin() + parts[i].first, piece.begin() + parts[i + 1].first});
         assert(it != mEncoder.end());

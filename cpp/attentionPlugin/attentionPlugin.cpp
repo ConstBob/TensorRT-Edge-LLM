@@ -345,12 +345,12 @@ bool AttentionPlugin::supportsFormatCombination(
 
 // IPluginV2Ext Methods
 DataType AttentionPlugin::getOutputDataType(
-    int32_t index, nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept
+    [[maybe_unused]] int32_t index, [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
     return DataType::kHALF;
 }
 
-DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
+DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
     nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
@@ -371,14 +371,14 @@ DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::Di
     return output;
 }
 
-void AttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
-    nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in, [[maybe_unused]] int32_t nbInputs,
+    [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
 }
 
 // TODO: extend the worksapce calculation to a more generalized form.
-size_t AttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int32_t nbInputs,
-    nvinfer1::PluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
+size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs, [[maybe_unused]] int32_t nbInputs,
+    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
     // We may want to reserve workspace here, need to determine more details after implementing the runners.
     // For FMHA kernel we need a buffer to store prefix sum of context lengths.
@@ -391,7 +391,7 @@ size_t AttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* input
 }
 
 int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
-    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
+    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     constexpr int32_t kQKV_INPUT_IDX{0};

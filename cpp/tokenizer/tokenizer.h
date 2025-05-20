@@ -50,7 +50,7 @@ struct textPartition
     {
         assert(offset >= 0);
         assert(length >= 1);
-        assert(offset + length <= rawText.length());
+        assert(offset + length <= static_cast<int>(rawText.length()));
     }
 
     const TEXT_PART_TYPE type;

@@ -27,7 +27,7 @@
 inline nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
 {
     nvinfer1::Dims dims{static_cast<int32_t>(shape.size()), {}};
-    for (int i = 0; i < shape.size(); ++i)
+    for (size_t i = 0; i < shape.size(); ++i)
     {
         dims.d[i] = shape[i];
     }
@@ -58,7 +58,16 @@ inline bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char
         && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
 }
 
-inline std::unique_ptr<void, decltype(&dlclose)> loadAttentionPlugin(void)
+// Define a custom deleter type to handle the noexcept attribute
+struct DlDeleter {
+    void operator()(void* handle) const noexcept {
+        if (handle) {
+            dlclose(handle);
+        }
+    }
+};
+
+inline std::unique_ptr<void, DlDeleter> loadAttentionPlugin(void)
 {
     char const* pluginPath = std::getenv("ATTENTION_PLUGIN_PATH");
 
@@ -72,16 +81,16 @@ inline std::unique_ptr<void, decltype(&dlclose)> loadAttentionPlugin(void)
         pluginPath = "build/libAttentionPlugin.so";
     }
 
-    auto handle = std::unique_ptr<void, decltype(&dlclose)>(dlopen(pluginPath, RTLD_LAZY), &dlclose);
+    auto handle = std::unique_ptr<void, DlDeleter>(dlopen(pluginPath, RTLD_LAZY));
     if (!handle)
     {
         LOG_ERROR("Cannot open plugin library: %s", dlerror());
-        return std::unique_ptr<void, decltype(&dlclose)>(nullptr, &dlclose);
+        return std::unique_ptr<void, DlDeleter>(nullptr);
     }
     return handle;
 }
 
-inline std::unique_ptr<void, decltype(&dlclose)> loadInt4GemmPlugin(void)
+inline std::unique_ptr<void, DlDeleter> loadInt4GemmPlugin(void)
 {
     char const* pluginPath = std::getenv("INT4_GEMM_PLUGIN_PATH");
 
@@ -95,18 +104,18 @@ inline std::unique_ptr<void, decltype(&dlclose)> loadInt4GemmPlugin(void)
         pluginPath = "build/libInt4GemmPlugin.so";
     }
 
-    auto handle = std::unique_ptr<void, decltype(&dlclose)>(dlopen(pluginPath, RTLD_LAZY), &dlclose);
+    auto handle = std::unique_ptr<void, DlDeleter>(dlopen(pluginPath, RTLD_LAZY));
     if (!handle)
     {
         LOG_WARNING("Cannot open plugin library: %s", dlerror());
-        return std::unique_ptr<void, decltype(&dlclose)>(nullptr, &dlclose);
+        return std::unique_ptr<void, DlDeleter>(nullptr);
     }
     return handle;
 }
 
-inline std::vector<std::unique_ptr<void, decltype(&dlclose)>> loadPlugins(bool int4GemmPlugin = true)
+inline std::vector<std::unique_ptr<void, DlDeleter>> loadPlugins(bool int4GemmPlugin = true)
 {
-    std::vector<std::unique_ptr<void, decltype(&dlclose)>> handles;
+    std::vector<std::unique_ptr<void, DlDeleter>> handles;
     handles.push_back(loadAttentionPlugin());
     if (int4GemmPlugin)
     {
@@ -203,7 +212,7 @@ public:
     {
         return mData;
     }
-    const size_t getSize() const
+    size_t getSize() const
     {
         return mBytes;
     }
