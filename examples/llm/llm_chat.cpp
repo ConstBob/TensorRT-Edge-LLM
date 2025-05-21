@@ -194,46 +194,44 @@ int main(int argc, char* argv[])
             std::fill(inputIds.begin(), inputIds.end(), padId);
             std::fill(contextLengths.begin(), contextLengths.end(), 0);
         }
+        return EXIT_FAILURE;
     }
-    else
+    // non-interactive mode
+    if (args.inputStrings.size() != static_cast<size_t>(batchSize))
     {
-        // non-interactive mode
-        if (args.inputStrings.size() != batchSize) {
-            std::cerr << "Error: Number of input strings (" << args.inputStrings.size() 
-                      << ") must match the model's batch size (by --batchSize)" << batchSize 
-                      << "). Please provide exactly " << batchSize << " input string(s) using --inputString flag." << std::endl;
-        }
-        assert(args.inputStrings.size() == batchSize);
-
-        for (int64_t i = 0; i < batchSize; ++i)
-        {
-            std::string inputString = args.inputStrings[i];
-            std::cout << "Input string for batch: " << i << ": " << inputString << std::endl;
-
-            std::vector<int64_t> batchInputIds = tokenizer->encode(inputString, true);
-            int32_t inputSize = static_cast<int32_t>(batchInputIds.size());
-            if (inputSize > maxContextLength)
-            {
-                std::cout << "Warning: input length > max context length. The last tokens will be truncated."
-                          << std::endl;
-            }
-            contextLengths[i] = std::min(inputSize, maxContextLength);
-            batchInputIds.resize(maxContextLength, padId);
-            std::copy(batchInputIds.begin(), batchInputIds.end(), inputIds.begin() + i * maxContextLength);
-        }
-        std::vector<std::vector<int64_t>> outputIds(batchSize);
-        for (int i = 0; i < batchSize; ++i)
-        {
-            outputIds[i].reserve(generationConfig.maxLength);
-        }
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
-        for (int i = 0; i < batchSize; ++i)
-        {
-            std::cout << "Output for batch " << i << ": " << tokenizer->decode(outputIds[i]) << std::endl;
-        }
-        // Reset the values
-        std::fill(inputIds.begin(), inputIds.end(), padId);
-        std::fill(contextLengths.begin(), contextLengths.end(), 0);
+        std::cerr << "Error: Number of input strings (" << args.inputStrings.size()
+                  << ") must match the model's batch size (by --batchSize)" << batchSize << "). Please provide exactly "
+                  << batchSize << " input string(s) using --inputString flag." << std::endl;
+        return EXIT_FAILURE;
     }
-    return EXIT_FAILURE;
+
+    for (int64_t i = 0; i < batchSize; ++i)
+    {
+        std::string inputString = args.inputStrings[i];
+        std::cout << "Input string for batch: " << i << ": " << inputString << std::endl;
+
+        std::vector<int64_t> batchInputIds = tokenizer->encode(inputString, true);
+        int32_t inputSize = static_cast<int32_t>(batchInputIds.size());
+        if (inputSize > maxContextLength)
+        {
+            std::cout << "Warning: input length > max context length. The last tokens will be truncated." << std::endl;
+        }
+        contextLengths[i] = std::min(inputSize, maxContextLength);
+        batchInputIds.resize(maxContextLength, padId);
+        std::copy(batchInputIds.begin(), batchInputIds.end(), inputIds.begin() + i * maxContextLength);
+    }
+    std::vector<std::vector<int64_t>> outputIds(batchSize);
+    for (int i = 0; i < batchSize; ++i)
+    {
+        outputIds[i].reserve(generationConfig.maxLength);
+    }
+    decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
+    for (int i = 0; i < batchSize; ++i)
+    {
+        std::cout << "Output for batch " << i << ": " << tokenizer->decode(outputIds[i]) << std::endl;
+    }
+    // Reset the values
+    std::fill(inputIds.begin(), inputIds.end(), padId);
+    std::fill(contextLengths.begin(), contextLengths.end(), 0);
+    return EXIT_SUCCESS;
 };
