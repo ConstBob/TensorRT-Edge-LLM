@@ -12,6 +12,9 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+
 namespace drivellm
 {
 
@@ -39,12 +42,12 @@ public:
     // Number of children if the node is an object or an array.
     [[nodiscard]] size_t size() const;
     // Whether the object has a member
-    [[nodiscard]] bool hasMember(const std::string& name) const;
+    [[nodiscard]] bool hasMember(std::string const& name) const;
     // Access a child via its name. For object only.
-    JsonNode operator[](const std::string& name);
+    JsonNode operator[](std::string const& name);
     // Access a child via its index.
     JsonNode operator[](size_t index);
-    
+
     // Whether the node is a boolean.
     [[nodiscard]] bool isBool() const;
     // Get the boolean value.
@@ -89,7 +92,4 @@ private:
     JsonRootImpl* mImpl{nullptr};
 };
 
-}
-
-
-
+} // namespace drivellm
