@@ -57,6 +57,11 @@ void Qwen2ViTRunner::validateAndFillConfig(int llmBatchSize)
     mConfig.inputDim = mContext->getTensorShape("input").d[1];
     mConfig.vitPosEmbDim = mContext->getTensorShape("rotary_pos_emb").d[1];
     mConfig.hiddenDim = mVisualEngine->getTensorShape("output").d[1];
+    if (mConfig.hiddenDim != 3584)
+    {
+        // Set vocabSize for 2B and 3B model
+        mConfig.vocabSize = 151936;
+    }
 }
 
 void Qwen2ViTRunner::allocateBuffer()
