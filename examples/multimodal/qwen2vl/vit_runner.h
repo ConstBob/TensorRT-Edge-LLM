@@ -30,7 +30,6 @@ struct VisualPreprocessorConfig
         if (modelType == "qwen2_5_vl")
         {
             maxPositionEmbeddings = 128000;
-            vocabSize = 151936;
         }
     }
 
