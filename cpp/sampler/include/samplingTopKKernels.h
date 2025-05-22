@@ -133,11 +133,14 @@ struct TopKSamplingKernelParams
         }
 
         assert(workspace);
-        assert(curandState);
 
         if (cumLogProbs != nullptr || outputLogProbs != nullptr)
         {
-            assert(maxTokensPerStep == 1 && !returnAllTopK);
+            assert(maxTokensPerStep == 1);
+            if(cumLogProbs != nullptr)
+            {
+                assert(!returnAllTopK);
+            }
         }
 
         assert(0 < maxTopP && maxTopP <= 1.f);

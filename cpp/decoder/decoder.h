@@ -62,13 +62,37 @@ public:
         , mCudaGraphCaptured{false}
         , mGenerationGraph{nullptr}
         , mGenerationGraphExec{nullptr}
+        , mIsEagle{false}
     {
     }
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph = false, int64_t batchSize = 1);
+    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph = false, int64_t batchSize = 1,
+        bool isEagle = false);
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
         std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
         std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
+
+    void generateForContext(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
+        GenerationConfig generationConfig, std::vector<int64_t> const& last_token_ids, int64_t endIds = -1,
+        void* attentionMask = nullptr, void* attentionPosId = nullptr, const nvinfer1::Dims inputDims = {},
+        const nvinfer1::Dims attentionMaskDims = {}, const nvinfer1::Dims attentionPosIdDims = {},
+        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
+
+    void generateForDecode(void* inputIds, std::vector<int32_t> contextLengths, std::vector<int64_t>& last_token_ids,
+        int32_t maxDecodingTokens, void* attentionMask, void* attentionPosId);
+    void addNewBuffer(std::string const& name, const nvinfer1::Dims dimsContext, int sizeOfByte);
+    void generateForDraftContext(void* inputIds, void* hiddenStates, void* attentionMask, void* attentionPosId,
+        std::vector<int32_t> contextLengths, std::vector<int64_t>& last_token_ids, bool isEagle3 = false,
+        void* hiddenStatesFromDraftZero = nullptr, const nvinfer1::Dims inputDims = {},
+        const nvinfer1::Dims hiddenStatesDims = {}, const nvinfer1::Dims attentionMaskDims = {},
+        const nvinfer1::Dims attentionPosIdDims = {});
+    void generateForDraftDecode(void* inputIds, void* hiddenStates, void* attention_mask, void* attention_pos_id,
+        std::vector<int32_t> contextLengths, std::vector<int64_t>& last_token_ids, const nvinfer1::Dims inputDims,
+        const nvinfer1::Dims hiddenStatesDims, const nvinfer1::Dims attentionMaskDims,
+        const nvinfer1::Dims attentionPosIdDims, const nvinfer1::Dims lastTokenIdsDims, int layerIdx,
+        bool isEagle3 = false, void* hiddenStatesFromDraftZero = nullptr, void* hiddenStatesFromTargetZero = nullptr);
+    void* getDeviceBuffer(std::string const& name);
+    const ModelConfig getModelConfig() const noexcept;
 
     std::vector<T> const& getLastHostLogits();
     size_t getDeviceMemorySize() const noexcept;
@@ -103,11 +127,14 @@ private:
     void allocateBuffer();
     std::unique_ptr<Sampler<T>> mSampler;
     // These are used as debugging functions
-    std::string printKVCache(int64_t contextLength);
+    std::string printKVCache();
     std::string printLogits();
+    std::string mEnginePath;
 
     bool mUseCudaGraph{true};
     bool mCudaGraphCaptured{false};
     cudaGraph_t mGenerationGraph;
     cudaGraphExec_t mGenerationGraphExec;
+    // Flag indicating Eagle pattern mode(target + draft models)
+    bool mIsEagle;
 };

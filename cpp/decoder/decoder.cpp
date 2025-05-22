@@ -23,7 +23,8 @@
 #include <utility>
 
 template <typename T>
-bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph, int64_t batchSize)
+bool Decoder<T>::setup(
+    std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph, int64_t batchSize, bool isEagle)
 {
     try
     {
@@ -47,6 +48,9 @@ bool Decoder<T>::setup(std::filesystem::path const& fp, cudaStream_t& stream, bo
         assert(mEngine->getNbOptimizationProfiles() == 2 && "The engine requires 2 optimization profiles");
         mContextExecutionContext->setOptimizationProfileAsync(0, mStream);
         mGenerationExecutionContext->setOptimizationProfileAsync(1, mStream);
+        // before allocateBuffer()
+        mIsEagle = isEagle;
+        mEnginePath = fp;
         validateAndFillConfig(batchSize);
         allocateBuffer();
         mUseCudaGraph = useCudaGraph;
@@ -158,9 +162,12 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
         assert(batchSize >= minBatchSize && batchSize <= maxBatchSize);
     }
     maxInputLength = inputIdsShapeContext.d[1];
-    nvinfer1::Dims inputIdsShapeGeneration
-        = mEngine->getProfileShape(inputIdsName.c_str(), 1, nvinfer1::OptProfileSelector::kMAX);
-    assert(inputIdsShapeGeneration.d[1] == 1);
+    if (!mIsEagle)
+    {
+        nvinfer1::Dims inputIdsShapeGeneration
+            = mEngine->getProfileShape(inputIdsName.c_str(), 1, nvinfer1::OptProfileSelector::kMAX);
+        assert(inputIdsShapeGeneration.d[1] == 1);
+    }
 
     for (int32_t i = 0; i < numLayers; ++i)
     {
@@ -210,48 +217,105 @@ void Decoder<T>::allocateBuffer()
     mDeviceBuffer["context_lengths"] = contextLengthDevice;
 
     void* lastTokenIdsDevice;
-    CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * 1 * sizeof(int64_t)));
-    mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
-    mContextExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
-    mGenerationExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
-    mGenerationExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
-    mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
-    mHostBuffer["last_token_ids"] = malloc(mConfig.batchSize * sizeof(int64_t));
+    int32_t sizeOfHalf = 2;
+    if (mIsEagle)
+    {
+        CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t)));
+        mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+        mContextExecutionContext->setInputShape("last_token_ids", {1, {1}});
+        mGenerationExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+        mContextExecutionContext->setInputShape("last_token_ids", {1, {1}});
+        mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
+        mHostBuffer["last_token_ids"] = malloc(mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t));
+    }
+    else
+    {
+        CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * 1 * sizeof(int64_t)));
+        mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+        mContextExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
+        mGenerationExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+        mGenerationExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
+        mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
+        mHostBuffer["last_token_ids"] = malloc(mConfig.batchSize * sizeof(int64_t));
 
-    void* inputIdsDevice;
-    CUDA_CHECK(cudaMalloc(&inputIdsDevice, (mConfig.batchSize * mConfig.maxLength) * sizeof(int64_t)));
-    mDeviceBuffer["input_ids"] = inputIdsDevice;
-    mContextExecutionContext->setTensorAddress("input_ids", inputIdsDevice);
-    mGenerationExecutionContext->setTensorAddress("input_ids", inputIdsDevice);
-    mContextExecutionContext->setInputShape("input_ids", {2, {mConfig.batchSize, mConfig.maxInputLength}});
-    mGenerationExecutionContext->setInputShape("input_ids", {2, {mConfig.batchSize, 1}});
+        void* inputIdsDevice;
+        CUDA_CHECK(cudaMalloc(&inputIdsDevice, (mConfig.batchSize * mConfig.maxLength) * sizeof(int64_t)));
+        mDeviceBuffer["input_ids"] = inputIdsDevice;
+        mContextExecutionContext->setTensorAddress("input_ids", inputIdsDevice);
+        mGenerationExecutionContext->setTensorAddress("input_ids", inputIdsDevice);
+        mContextExecutionContext->setInputShape("input_ids", {2, {mConfig.batchSize, mConfig.maxInputLength}});
+        mGenerationExecutionContext->setInputShape("input_ids", {2, {mConfig.batchSize, 1}});
 
-    void* logitsDevice;
-    int32_t sizeOfFloat = 2;
-    CUDA_CHECK(cudaMalloc(&logitsDevice, (mConfig.batchSize * mConfig.vocabSize) * sizeOfFloat));
-    mDeviceBuffer["logits"] = logitsDevice;
-    mContextExecutionContext->setTensorAddress("logits", logitsDevice);
-    mGenerationExecutionContext->setTensorAddress("logits", logitsDevice);
+        void* logitsDevice;
+        CUDA_CHECK(cudaMalloc(&logitsDevice, (mConfig.batchSize * mConfig.vocabSize) * sizeOfHalf));
+        mDeviceBuffer["logits"] = logitsDevice;
+        mContextExecutionContext->setTensorAddress("logits", logitsDevice);
+        mGenerationExecutionContext->setTensorAddress("logits", logitsDevice);
+    }
+
     mHostBuffer["finished_states"] = malloc(mConfig.batchSize * sizeof(bool));
 
     // Allocate buffers for kv cache and set the shape
+    void* kvCacheDevice;
+    CUDA_CHECK(cudaMalloc(&kvCacheDevice,
+        (mConfig.batchSize * 2 * mConfig.numHead * mConfig.maxLength * mConfig.hiddenSizePerHead * mConfig.numLayers
+            * sizeOfHalf)));
+    CUDA_CHECK(cudaMemsetAsync(kvCacheDevice, 0,
+        (mConfig.batchSize * 2 * mConfig.numHead * mConfig.maxLength * mConfig.hiddenSizePerHead * mConfig.numLayers
+            * sizeOfHalf)));
+    const size_t bytesPerLayer
+        = mConfig.batchSize * 2 * mConfig.numHead * mConfig.maxLength * mConfig.hiddenSizePerHead * sizeOfHalf;
+    mDeviceBuffer["kv_cache"] = kvCacheDevice;
     for (int32_t i = 0; i < mConfig.numLayers; ++i)
     {
-        void* kvCacheDevice;
-        CUDA_CHECK(cudaMalloc(&kvCacheDevice,
-            (mConfig.batchSize * 2 * mConfig.numHead * mConfig.maxLength * mConfig.hiddenSizePerHead) * sizeOfFloat));
+
         std::string pastKeyValuesName = fmtstr("past_key_values.%d", i);
         std::string presentKeyValuesName = fmtstr("present_key_values.%d", i);
-        mDeviceBuffer[pastKeyValuesName] = kvCacheDevice;
-        mContextExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheDevice);
-        mContextExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheDevice);
-        mGenerationExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheDevice);
-        mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheDevice);
+        void* curLayerKVCacheAddr = static_cast<uint8_t*>(kvCacheDevice) + bytesPerLayer * i;
+        mContextExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), curLayerKVCacheAddr);
+        mContextExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), curLayerKVCacheAddr);
+        mGenerationExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), curLayerKVCacheAddr);
+        mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), curLayerKVCacheAddr);
         mContextExecutionContext->setInputShape(
             pastKeyValuesName.c_str(), {5, {mConfig.batchSize, 2, mConfig.numHead, 0, mConfig.hiddenSizePerHead}});
         mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(),
             {5, {mConfig.batchSize, 2, mConfig.numHead, mConfig.maxLength, mConfig.hiddenSizePerHead}});
     }
+}
+
+template <typename T>
+void Decoder<T>::addNewBuffer(std::string const& name, const nvinfer1::Dims dimsContext, int sizeOfByte)
+{
+
+    void* devicePtr;
+    if (name == "input_ids")
+    {
+        // allocate 1 more for eagle
+        CUDA_CHECK(cudaMalloc(&devicePtr, (mConfig.maxLength + 1) * mConfig.batchSize * sizeOfByte));
+    }
+    else
+    {
+        CUDA_CHECK(cudaMalloc(&devicePtr, volume(dimsContext) * sizeOfByte));
+    }
+    mDeviceBuffer[name] = devicePtr;
+    mContextExecutionContext->setTensorAddress(name.c_str(), devicePtr);
+    mGenerationExecutionContext->setTensorAddress(name.c_str(), devicePtr);
+    return;
+}
+
+template <typename T>
+void* Decoder<T>::getDeviceBuffer(std::string const& name)
+{
+    auto it = mDeviceBuffer.find(name);
+    if (it != mDeviceBuffer.end())
+    {
+        return it->second;
+    }
+    else
+    {
+        assert(false && "The tensor name provided for device buffer doesn't find.");
+    }
+    return nullptr;
 }
 
 std::string formatFloat16Vector(std::vector<half> const& vec, int64_t batchSize)
@@ -296,17 +360,25 @@ std::string formatFloat16Vector(std::vector<half> const& vec, int64_t batchSize)
 
 // This is a helper function to dump kv cache information
 template <typename T>
-std::string Decoder<T>::printKVCache(int64_t contextLength)
+std::string Decoder<T>::printKVCache()
 {
     std::ostringstream oss;
-    size_t totalKVSize = mConfig.batchSize * 2 * mConfig.hiddenSizePerHead * mConfig.numHead * contextLength;
+    size_t totalKVSize = mConfig.batchSize * 2 * mConfig.hiddenSizePerHead * mConfig.numHead * mConfig.maxLength;
+    printf(
+        "totalKVSize: %d and mConfig.batchSize: %d, mConfig.numLayers: %d, mConfig.maxLength: %d, "
+        "mConfig.hiddenSizePerHead: %d, mConfig.numHead: %d\n",
+        totalKVSize, mConfig.batchSize, mConfig.numLayers, mConfig.maxLength, mConfig.hiddenSizePerHead,
+        mConfig.numHead);
     std::vector<T> kvCache(totalKVSize, 0.0);
-    oss << "Context Length is: " << contextLength << std::endl;
+    oss << "Context Length is: " << mConfig.maxLength << std::endl;
+    auto const sizeOfHalf = 2;
+    const size_t bytesPerLayer = totalKVSize * sizeOfHalf;
     for (int i = 0; i < mConfig.numLayers; ++i)
     {
         oss << "Layer = " << i << "\n";
-        CUDA_CHECK(cudaMemcpyAsync(kvCache.data(), mDeviceBuffer[fmtstr("past_key_values.%d", i)],
-            totalKVSize * sizeof(T), cudaMemcpyDeviceToHost));
+        auto curLayerKVCacheAddr = static_cast<uint8_t*>(mDeviceBuffer["kv_cache"]) + bytesPerLayer * i;
+        CUDA_CHECK(cudaMemcpyAsync(kvCache.data(), curLayerKVCacheAddr, bytesPerLayer, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaDeviceSynchronize());
         oss << formatFloat16Vector(kvCache, mConfig.batchSize);
     }
     return oss.str();
@@ -447,6 +519,155 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
 }
 
 template <typename T>
+void Decoder<T>::generateForContext(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
+    GenerationConfig generationConfig, std::vector<int64_t> const& last_token_ids, int64_t endIds, void* attentionMask,
+    void* attentionPosId, const nvinfer1::Dims inputDims, const nvinfer1::Dims attentionMaskDims,
+    const nvinfer1::Dims attentionPosIdDims, std::shared_ptr<BenchmarkProfiler> const profiler)
+{
+    assert(mConfig.maxLength >= generationConfig.maxLength);
+    assert(generationConfig.maxLength >= generationConfig.minLength);
+    assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
+        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
+        mConfig.batchSize * contextLengths[0] * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], last_token_ids.data(),
+        last_token_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    mContextExecutionContext->setInputShape("input_ids", inputDims);
+    mContextExecutionContext->setTensorAddress("attention_mask", attentionMask);
+    mContextExecutionContext->setInputShape("attention_mask", attentionMaskDims);
+    mContextExecutionContext->setTensorAddress("attention_pos_id", attentionPosId);
+    mContextExecutionContext->setInputShape("attention_pos_id", attentionPosIdDims);
+    mContextExecutionContext->enqueueV3(mStream);
+    LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
+}
+
+template <typename T>
+void Decoder<T>::generateForDecode(void* inputIds, std::vector<int32_t> ContextLengths,
+    std::vector<int64_t>& last_token_ids, int32_t maxDecodingTokens, void* attentionMask, void* attentionPosId)
+{
+
+    mGenerationExecutionContext->setTensorAddress("input_ids", inputIds);
+    const nvinfer1::Dims inputDims = {2, {mConfig.batchSize, maxDecodingTokens}};
+    mGenerationExecutionContext->setInputShape("input_ids", inputDims);
+    std::vector<int32_t> tempContextLengths = ContextLengths;
+    for (size_t i = 0; i < tempContextLengths.size(); ++i)
+    {
+        tempContextLengths[i] += 1;
+        ContextLengths[i] += maxDecodingTokens;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], ContextLengths.data(),
+        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], last_token_ids.data(),
+        last_token_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+
+    mGenerationExecutionContext->setTensorAddress("attention_mask", attentionMask);
+    const nvinfer1::Dims attentionMaskDims = {3, {mConfig.batchSize, maxDecodingTokens, divUp(maxDecodingTokens, 32)}};
+    mGenerationExecutionContext->setInputShape("attention_mask", attentionMaskDims);
+
+    mGenerationExecutionContext->setTensorAddress("attention_pos_id", attentionPosId);
+    const nvinfer1::Dims attentionPosIdDims = {2, {mConfig.batchSize, maxDecodingTokens}};
+    mGenerationExecutionContext->setInputShape("attention_pos_id", attentionPosIdDims);
+
+    mGenerationExecutionContext->setTensorAddress("last_token_ids", mDeviceBuffer["last_token_ids"]);
+    const nvinfer1::Dims lastTokenIdsDims = {1, {maxDecodingTokens}};
+    mGenerationExecutionContext->setInputShape("last_token_ids", lastTokenIdsDims);
+    mGenerationExecutionContext->enqueueV3(mStream);
+    // reset the context_lengths
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], tempContextLengths.data(),
+        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+}
+
+template <typename T>
+void Decoder<T>::generateForDraftContext(void* inputIds, void* hiddenStates, void* attentionMask, void* attentionPosId,
+    std::vector<int32_t> contextLengths, std::vector<int64_t>& last_token_ids, bool isEagle3,
+    void* hiddenStatesFromDraftZero, const nvinfer1::Dims inputDims, const nvinfer1::Dims hiddenStatesDims,
+    const nvinfer1::Dims attentionMaskDims, const nvinfer1::Dims attentionPosIdDims)
+{
+
+    mContextExecutionContext->setTensorAddress("input_ids", inputIds);
+    mContextExecutionContext->setInputShape("input_ids", inputDims);
+    mContextExecutionContext->setTensorAddress("hidden_states_input", hiddenStates);
+    mContextExecutionContext->setInputShape("hidden_states_input", hiddenStatesDims);
+    if (isEagle3)
+    {
+        nvinfer1::Dims hsDimsFromDraft = hiddenStatesDims;
+        hsDimsFromDraft.d[2] = hiddenStatesDims.d[2] / 3;
+        mContextExecutionContext->setTensorAddress("hidden_states_from_draft", hiddenStatesFromDraftZero);
+        mContextExecutionContext->setInputShape("hidden_states_from_draft", hsDimsFromDraft); // set 0
+    }
+
+    assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
+        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], reinterpret_cast<void*>(last_token_ids.data()),
+        last_token_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    // no need for context phase
+    mContextExecutionContext->setTensorAddress("attention_mask", attentionMask);
+    mContextExecutionContext->setInputShape("attention_mask", attentionMaskDims);
+    mContextExecutionContext->setTensorAddress("attention_pos_id", attentionPosId);
+    mContextExecutionContext->setInputShape("attention_pos_id", attentionPosIdDims);
+    mContextExecutionContext->enqueueV3(mStream);
+
+    auto logits_last_token_draft = getDeviceBuffer("logits");
+    LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
+    LOG_DEBUG("Context phase kv cache:\n%s", printKVCache().c_str());
+}
+
+template <typename T>
+void Decoder<T>::generateForDraftDecode(void* inputIds, void* hiddenStates, void* attention_mask,
+    void* attention_pos_id, std::vector<int32_t> contextLengths, std::vector<int64_t>& last_token_ids,
+    const nvinfer1::Dims inputDims, const nvinfer1::Dims hiddenStatesDims, const nvinfer1::Dims attentionMaskDims,
+    const nvinfer1::Dims attentionPosIdDims, const nvinfer1::Dims lastTokenIdsDims, int layerIdx, bool isEagle3,
+    void* hiddenStatesFromDraftZero, void* hiddenStatesFromTargetZero)
+{
+
+    nvinfer1::Dims hsDimsFromTarget = hiddenStatesDims;
+    hsDimsFromTarget.d[2] = hiddenStatesDims.d[2] * 3;
+    if (isEagle3)
+    {
+
+        if (layerIdx == 0)
+        {
+
+            mGenerationExecutionContext->setTensorAddress("hidden_states_input", hiddenStates);
+            mGenerationExecutionContext->setInputShape("hidden_states_input", hsDimsFromTarget);
+            mGenerationExecutionContext->setTensorAddress("hidden_states_from_draft", hiddenStatesFromDraftZero);
+            mGenerationExecutionContext->setInputShape("hidden_states_from_draft", hiddenStatesDims);
+        }
+        else
+        {
+            mGenerationExecutionContext->setTensorAddress("hidden_states_input", hiddenStatesFromTargetZero);
+            mGenerationExecutionContext->setInputShape("hidden_states_input", hsDimsFromTarget);
+            mGenerationExecutionContext->setTensorAddress("hidden_states_from_draft", hiddenStates);
+            mGenerationExecutionContext->setInputShape("hidden_states_from_draft", hiddenStatesDims);
+        }
+    }
+    else
+    {
+        mGenerationExecutionContext->setTensorAddress("hidden_states_input", hiddenStates);
+        mGenerationExecutionContext->setInputShape("hidden_states_input", hiddenStatesDims);
+    }
+
+    mGenerationExecutionContext->setTensorAddress("input_ids", inputIds);
+    mGenerationExecutionContext->setInputShape("input_ids", inputDims);
+
+    mGenerationExecutionContext->setTensorAddress("attention_mask", attention_mask);
+    mGenerationExecutionContext->setInputShape("attention_mask", attentionMaskDims);
+    mGenerationExecutionContext->setTensorAddress("attention_pos_id", attention_pos_id);
+    mGenerationExecutionContext->setInputShape("attention_pos_id", attentionPosIdDims);
+
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
+        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], reinterpret_cast<void*>(last_token_ids.data()),
+        last_token_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+
+    mGenerationExecutionContext->setInputShape("last_token_ids", lastTokenIdsDims);
+    mGenerationExecutionContext->enqueueV3(mStream);
+}
+
+template <typename T>
 std::vector<T> const& Decoder<T>::getLastHostLogits()
 {
     size_t totalLogitSize = mConfig.batchSize * 1 * mConfig.vocabSize;
@@ -472,6 +693,12 @@ template <typename T>
 int64_t Decoder<T>::getMaxContextLength() const noexcept
 {
     return mConfig.maxInputLength;
+}
+
+template <typename T>
+const ModelConfig Decoder<T>::getModelConfig() const noexcept
+{
+    return mConfig;
 }
 
 template class Decoder<half>;
