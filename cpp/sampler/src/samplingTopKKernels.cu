@@ -136,6 +136,7 @@ __global__ void topKStage2Sampling(std::int32_t const* __restrict topKTmpIdBuf, 
     auto const probThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
     auto const size = k * BLOCKS_PER_BEAM_;
     auto const stride = maxTopK * BLOCKS_PER_BEAM_;
+    bool const sampleTokenInSelected = returnAllTopK && curandState;
 
     typedef cub::BlockReduce<TopK_2<float>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -194,7 +195,10 @@ __global__ void topKStage2Sampling(std::int32_t const* __restrict topKTmpIdBuf, 
 
     if (tid == 0)
     {
-        auto randNum = static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
+        // if we want to return all top k indices, we should not do random sampling for probThreshold
+        auto randNum = (returnAllTopK || curandState == nullptr)
+            ? static_cast<float>(probThreshold * sSum)
+            : static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
         auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
         for (std::int32_t ki = 0; ki < k; ki++)
         {
@@ -208,11 +212,26 @@ __global__ void topKStage2Sampling(std::int32_t const* __restrict topKTmpIdBuf, 
                 auto outputId = idx != -1
                     ? topKTmpIdBuf[(batchIdx * maxTokensPerStep + tokenIdx) * stride + idx] % vocabSize
                     : vocabSize - 1;
+                outputId = outputId == -1 ? vocabSize - 1 : outputId;
                 auto const curSeqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
                 auto const outIdx = returnAllTopK ? tokenIdx * maxTopK + ki : curSeqLen + tokenIdx;
                 outputIdsRequestPtr[outIdx] = outputId;
                 // cum log prob is not supported with returnAllTopK
-                if (!returnAllTopK)
+                if (returnAllTopK)
+                {
+                    // 'outputLogProbs' is the probability induced by the top-k sampling:
+                    // NOT normalized (same way as OpenAI does):
+                    // log_prob = log P(i | i is in vocab) = log(expLogit)
+                    // normalized:
+                    // log_prob = log P(i | i is in top-k) = log(expLogit / sum)
+                    if (outputLogProbs != nullptr)
+                    {
+                        auto logProb = logf(expLogit);
+                        auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                        outputLogProbs[batchSlot * maxTopK + ki] = normalizedProb;
+                    }
+                }
+                else
                 {
                     if (cumLogProbs != nullptr || outputLogProbs != nullptr)
                     {
@@ -223,12 +242,8 @@ __global__ void topKStage2Sampling(std::int32_t const* __restrict topKTmpIdBuf, 
                         }
                         if (outputLogProbs != nullptr)
                         {
-                            // 'outputLogProbs' is the probability induced by the top-k
-                            // sampling: NOT normalized (same way as OpenAI does): log_prob =
-                            // log P(i | i is in vocab) = log(expLogit) normalized: log_prob =
-                            // log P(i | i is in top-k) = log(expLogit / sum)
-                            outputLogProbs[curSeqLen * maxBatchSize + batchSlot]
-                                = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                            auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                            outputLogProbs[curSeqLen * maxBatchSize + batchSlot] = normalizedProb;
                         }
                     }
                     break;

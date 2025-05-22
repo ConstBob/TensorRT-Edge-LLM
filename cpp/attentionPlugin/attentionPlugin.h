@@ -26,7 +26,7 @@ public:
     // Plugin constructor and attention specific utility methods
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
         int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType,
-        int32_t rotaryEmbeddingMaxPositions);
+        int32_t rotaryEmbeddingMaxPositions, int32_t isEagleMode);
 
     AttentionPlugin(std::string const& name, void const* data, size_t length);
 
@@ -83,7 +83,8 @@ protected:
     int32_t mNumHeadQ{};
     int32_t mNumHeadKV{};
     int32_t mNumElemPerHead{};
-
+    // Eagle uses tree attention
+    int32_t mEnableTreeAttention{0};
     // Runtime configuration of the plugin to specify max batchSize and kv-cache capacity.
     // Here the kvcache capacity refers to max number of tokens per input context.
     int32_t mMaxBatchSize{};
@@ -94,6 +95,7 @@ protected:
     float mRotaryScale{1.0F};
     float mRotaryBaseFrequency{};
     int mRotaryEmbeddingMaxPositions{0};
+    bool mIsMrope{false};
 
     // Datatype of QKV and kvCache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

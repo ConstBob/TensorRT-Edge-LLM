@@ -15,6 +15,7 @@
 #include "common.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <numeric>
 
 static char const* _cudaGetErrorEnum(cublasStatus_t error)
 {
@@ -76,6 +77,15 @@ inline bool isCudaLaunchBlocking()
     }
 
     return result;
+}
+
+static std::int64_t volume(nvinfer1::Dims const& dims)
+{
+    
+    return dims.nbDims < 0 ? -1
+        : dims.nbDims == 0 ? 0
+                            : std::accumulate(dims.d, dims.d + dims.nbDims, std::int64_t{1}, std::multiplies<>{});
+    
 }
 
 /// Get the memory info
