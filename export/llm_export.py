@@ -333,7 +333,7 @@ def surgeon_llm(raw_onnx_path,
     if dtype == "nvfp4":
         t4 = time.time()
         from modelopt.onnx.quantization.qdq_utils import fp4qdq_to_2dq
-        onnx_model = fp4qdq_to_2dq(onnx_model)
+        onnx_model = fp4qdq_to_2dq(onnx_model, verbose=True)
         t5 = time.time()
         print(f"nvfp4 qdq to 2 dqs inserted in {t5 - t4}.")
 

@@ -76,7 +76,6 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 or NVFP4 this will be FP8 or NVFP4 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
 1. Default `--max_seq_length=4096`, which corresponds to `kv_cache_capacity` field in AttentionPlugin. Please change this field if other sequence length is required. [prepare_mmmu_onnx.py](../../scripts/prepare_mmmu_onnx.py) provides a script to change `kv_cache_capacity` in existing LLM ONNX to avoid exporting again.
-1. Qwen2.5-VL 3B VIT has FP16 overflow issue. Apply [upcast_fp32_gemm_war.py](../scripts/upcast_fp32_gemm_war.py) after exporting VIT ONNX as work-around.
 1. For LoRA support, two modes are available:
    - `merged`: LoRA weights are merged into the base model before export (recommended for most use cases)
    - `static`: LoRA weights are kept separate and applied during inference using static LoRA patterns
