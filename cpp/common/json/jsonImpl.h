@@ -99,6 +99,7 @@ public:
     JsonRootImpl& operator=(JsonRootImpl&&) & = delete;
 
     bool parse(std::string const& text);
+    bool parseFromPath(std::string const& filePath);
 
 private:
 

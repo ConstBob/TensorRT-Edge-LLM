@@ -50,9 +50,35 @@ struct EngineInputDesc
     }
 };
 
+inline bool checkOptimizationProfileDims(
+    nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims)
+{
+    if (minDims.nbDims != optDims.nbDims || optDims.nbDims != maxDims.nbDims)
+    {
+        LOG_ERROR("Dimension count mismatch: minDims.nbDims=%d, optDims.nbDims=%d, maxDims.nbDims=%d", minDims.nbDims,
+            optDims.nbDims, maxDims.nbDims);
+        return false;
+    }
+    for (int i = 0; i < minDims.nbDims; ++i)
+    {
+        if (minDims.d[i] > optDims.d[i] || optDims.d[i] > maxDims.d[i])
+        {
+            LOG_ERROR("Dimension value mismatch at index %d: min=%d, opt=%d, max=%d", i, minDims.d[i], optDims.d[i],
+                maxDims.d[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const* inputName,
     nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims)
 {
+    if (!checkOptimizationProfileDims(minDims, optDims, maxDims))
+    {
+        LOG_INFO("setOptimizationProfile: %s is not valid", inputName);
+        return false;
+    }
     return profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, minDims)
         && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, optDims)
         && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);

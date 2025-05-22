@@ -21,7 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
-
+#include <vector>
 inline void check(bool condition, std::string errorMsg)
 {
     if (!condition)
@@ -79,4 +79,33 @@ inline std::string extractFolderName(std::string const& path)
         return path.substr(0, found);
     }
     return "";
+}
+
+inline int copyFile(std::string const& srcPath, std::string const& dstPath)
+{
+    if (srcPath == dstPath)
+    {
+        printf("Source and target file path are same, skip copying.");
+    }
+    else
+    {
+        std::ifstream source(srcPath, std::ios::in | std::ios::binary);
+        if (!source)
+        {
+            printf("Failed to open file for reading: %s", srcPath.c_str());
+            return EXIT_FAILURE;
+        }
+
+        std::ofstream dest(dstPath, std::ios::out | std::ios::binary);
+        if (dest)
+        {
+            dest << source.rdbuf();
+            printf("Successfully copied file to %s", dstPath.c_str());
+        }
+        else
+        {
+            printf("Failed to copy file to %s", dstPath.c_str());
+            return EXIT_FAILURE;
+        }
+    }
 }
