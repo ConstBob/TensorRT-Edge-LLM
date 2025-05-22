@@ -10,10 +10,13 @@
 
 import os
 import time
+import math
 
 import torch
 from peft import PeftConfig, PeftModel, load_peft_weights
 from transformers import DynamicCache
+from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+    VisionAttention, apply_rotary_pos_emb_vision)
 
 
 def load_model_with_lora(base_model, lora_dir, lora_mode):
@@ -238,3 +241,31 @@ def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
     print(
         f"Native ONNX Export from torch completed in {end_time - start_time}s. ONNX file is saved to {output_dir}."
     )
+
+
+class QwenVisionAttention(VisionAttention):
+
+    def __init__(self, dim: int, num_heads: int = 16):
+        super().__init__(dim, num_heads)
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                attention_mask: torch.Tensor,
+                position_embeddings: torch.Tensor) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
+        attn_weights = attn_weights + attention_mask
+
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(0, 1)
+        attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = self.proj(attn_output)
+        return attn_output

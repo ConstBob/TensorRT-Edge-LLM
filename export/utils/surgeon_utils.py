@@ -808,14 +808,11 @@ def fold_fp8_qdq_to_dq(graph: gs.Graph):
             onnx_weights_fp8 = gs.Constant(quantizer_name + "/fp8_weights",
                                            values)
 
-            numpy_scale = torch_scale.to(torch.float16).numpy()
-            onnx_scale = gs.Constant(quantizer_name + "/fp16_scale",
-                                     numpy_scale)
             node.outputs.clear()
             # DQ Op is separated out
-            dq_op.inputs = [onnx_weights_fp8, onnx_scale]
+            dq_op.inputs[0] = onnx_weights_fp8
             dq_op.op = "DequantizeLinear"
-            dq_op.outputs[0].dtype = np.float16
+            dq_op.outputs[0].dtype = dq_op.inputs[1].dtype
 
     graph.cleanup().toposort()
     end_time = time.time()

@@ -88,7 +88,6 @@ Once the model is exported, you can follow the examples to build and run E2E LLM
 RuntimeError: The serialized model is larger than the 2GiB limit imposed by the protobuf library. Therefore the output file must be a file path, so that the ONNX external data can be written to the same directory. Please specify the output file name.
 ```
 2. `nvidia-modelopt>0.19.0` has accuracy issues for INT4 recipe, so for the mainstream it is fixed at 0.19.0.
-3. Qwen2.5-VL 3B VIT with FP16 precision has occasional overflow issue from the last transformer block and we observed the same issue with HuggingFace using Pytorch backend. Apply [upcast_fp32_gemm_war.py](scripts/upcast_fp32_gemm_war.py) after exporting VIT ONNX as work-around.
 
 **NVFP4 export:**
 
