@@ -430,9 +430,50 @@ bool JsonRoot::parse(std::string const& text)
     return mImpl->parse(text);
 }
 
+bool JsonRoot::parseFromPath(std::string const& filePath)
+{
+    // Open the file in binary mode to prevent CRLF translation issues on Windows
+    // and ensure tellg() reports the correct byte size.
+    if (!std::filesystem::exists(filePath))
+    {
+        throw std::runtime_error("Could not find file: " + filePath);
+    }
+    std::ifstream inputFileStream(filePath, std::ios::binary | std::ios::ate);
+
+    if (!inputFileStream.is_open()) {
+        throw std::runtime_error("Could not open file: " + filePath);
+    }
+
+    std::streamsize fileSize = inputFileStream.tellg();
+    inputFileStream.seekg(0, std::ios::beg);
+
+    if (fileSize == -1) {
+        inputFileStream.close();
+        throw std::runtime_error("Could not determine file size: " + filePath);
+    }
+
+    std::string content;
+    if (fileSize > 0) {
+        content.resize(static_cast<std::string::size_type>(fileSize)); 
+                                                                    
+        if (!inputFileStream.read(&content[0], fileSize)) {
+            inputFileStream.close();
+            throw std::runtime_error("Could not read file into string: " + filePath);
+        }
+    }
+
+    inputFileStream.close();
+    return parse(content);
+}
+
 JsonNode JsonRoot::getRoot() const
 {
-    return JsonNode(mImpl);
+    auto rootNode = JsonNode(mImpl);
+    if (!rootNode.isObject())
+    {
+        throw std::runtime_error("Root node is not an object");
+    }
+    return rootNode;
 }
 
 } // namespace drivellm

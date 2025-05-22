@@ -83,6 +83,8 @@ public:
 
     // Parse JSON in a string.
     bool parse(std::string const& text);
+    // Parse JSON in a file.
+    bool parseFromPath(std::string const& filePath);
     // Get the root node of the JSON structure.
     [[nodiscard]] JsonNode getRoot() const;
 

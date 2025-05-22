@@ -9,4 +9,5 @@
 # prohibited.
 
 add_subdirectory(llm)
+add_subdirectory(eagle)
 add_subdirectory(multimodal)
