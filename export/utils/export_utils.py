@@ -71,6 +71,94 @@ class WrapperModelForCausalLM(torch.nn.Module):
         logits = self.lm_head(hidden_states)
         return logits, past_key_values
 
+class WrapperEagleBaseModelForCausalLM(torch.nn.Module):
+    """
+    Wrapper Model to ensure all models have the same I/O
+    """
+
+    def __init__(self, model, eagle3=False):
+        super().__init__()
+        self.model = model.model
+        self.lm_head = model.lm_head
+        self.config = model.config
+        self.eagle3 = eagle3
+
+    def forward(self, input_ids, past_key_values):
+        past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        outputs = self.model(input_ids=input_ids,
+                             past_key_values=past_key_values,
+                             output_hidden_states=True)
+
+        last_hidden_states = outputs[0]
+        all_hidden_states = outputs['hidden_states']
+        if self.eagle3:
+            idx = [
+                2, ((len(all_hidden_states) - 1) // 2),
+                len(all_hidden_states) - 4
+            ]
+            hidden_states_0 = all_hidden_states[idx[0]]
+            hidden_states_1 = all_hidden_states[idx[1]]
+            hidden_states_2 = all_hidden_states[idx[2]]
+            hidden_states = torch.cat(
+                [hidden_states_0, hidden_states_1, hidden_states_2], dim=-1)
+
+        past_key_values = outputs.past_key_values
+        hidden_states_reshape = last_hidden_states.reshape(
+            -1, last_hidden_states.size(2))
+        logits = self.lm_head(hidden_states_reshape)
+        if self.eagle3:
+            return logits, past_key_values, hidden_states
+        else:
+            return logits, past_key_values, last_hidden_states
+
+
+class WrapperEagleDraftModelForCausalLM(torch.nn.Module):
+    """
+    Wrapper Model to ensure all models have the same I/O
+    """
+
+    def __init__(self, model, eagle3=False):
+        super().__init__()
+        self.model = model
+        self.lm_head = model.lm_head
+        self.model.lm_head = torch.nn.Identity()
+        self.config = model.config
+        self.logsoftmax = model.logsoftmax
+        self.model.logsoftmax = torch.nn.Identity()
+        self.eagle3 = eagle3
+
+    def forward(self,
+                input_ids,
+                past_key_values,
+                hidden_states_input,
+                hidden_states_from_draft=None):
+        past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        if self.eagle3:
+            #hidden_states_input: go through the fc layer
+            outputs = self.model(
+                hidden_states=hidden_states_input,
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                hidden_states_from_draft=hidden_states_from_draft,
+                use_cache=True)
+            hidden_states = outputs[0]
+            hidden_states_reshape = hidden_states.reshape(
+                -1, hidden_states.size(2))
+            hidden_states_reshape = self.model.norm(hidden_states_reshape)
+        else:
+            outputs = self.model(hidden_states=hidden_states_input,
+                                 input_ids=input_ids,
+                                 past_key_values=past_key_values,
+                                 use_cache=True)
+            hidden_states = outputs[0]
+            hidden_states_reshape = hidden_states.reshape(
+                -1, hidden_states.size(2))
+
+        past_key_values = outputs[1]
+
+        logits = self.lm_head(hidden_states_reshape)
+        #hidden_states will added as output in insert_gather_last_token_eagle
+        return logits, past_key_values  
 
 def torch_to_onnx(model, inputs, onnx_dir, onnx_name, input_names,
                   output_names, dynamic_axes):
@@ -129,6 +217,9 @@ def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
         input_dynamic_axes = {0: "batch_size", 2: "past_len"}
         dynamic_axes[f"past_key_values.{i}.key"] = input_dynamic_axes
         dynamic_axes[f"past_key_values.{i}.value"] = input_dynamic_axes
+    
+    if isinstance(model, WrapperEagleBaseModelForCausalLM):
+        output_names.extend(['hidden_states'])
 
     torch_to_onnx(
         model,
