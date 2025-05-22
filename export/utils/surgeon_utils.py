@@ -68,6 +68,140 @@ def no_none_elements(l):
     return all(i is not None for i in l)
 
 
+def find_last_reshape_node(graph: gs.Graph):
+
+    reshape_nodes = []
+    for node in graph.nodes:
+        if node.op == "Reshape":
+            reshape_nodes.append(node)
+    sorted_nodes = list(graph.toposort().nodes)
+    reshape_nodes = [node for node in sorted_nodes if node.op == "Reshape"]
+    last_reshape = None
+    if reshape_nodes:
+        last_reshape = reshape_nodes[-1]
+        print(f"Last Reshape node in topological order:")
+        print(f"  Name: {last_reshape.name}")
+        print(f"  Inputs: {[inp.name for inp in last_reshape.inputs]}")
+        print(f"  Outputs: {[out.name for out in last_reshape.outputs]}")
+    else:
+        print("No reshape node found in the graph.")
+    return last_reshape
+
+
+def insert_gather_last_token_eagle(graph: gs.Graph,
+                                   eagle_draft: bool = True,
+                                   eagle3: bool = False):
+    """
+    Inserts GatherND for lm_head to only gather the last token.
+
+    For regular ONNX, it outputs the logits for the entire model. However, in context phase, we only need logits
+    for the last token in input_ids. Computing all logits will be not desirable. Therefore, we add a GatherND node
+    before lm_head to ensure that only the hidden_states of the last token is passed to lm_head. An extra last_token_ids
+    input is added to the ONNX. If Gather is already there, return the original graph.
+
+    Parameters:
+        graph: gs.Graph. The original ONNX graph for the LLM
+
+    Returns:
+        The graph after adding GatherND node.
+
+    """
+    start_time = time.time()
+    print("Inserting GatherND to only compute logits for last token...")
+
+    logits = None
+    for output in graph.outputs:
+        if "logits" in output.name:
+            logits = output
+            break
+    assert logits, "Cannot find logits output in the graph!"
+
+    lm_head_matmul = logits.inputs[0]
+    for i in range(5):
+        if "/lm_head/MatMul" in lm_head_matmul.name:
+            lm_head_matmul = clear_outputs(lm_head_matmul)
+            break
+        if "Gather" in lm_head_matmul.name:
+            end_time = time.time()
+            print(
+                f"Gather is already in the graph. No gather operation will be inserted. Function completed in {end_time - start_time}s."
+            )
+            return graph
+        lm_head_matmul = lm_head_matmul.inputs[0].inputs[0]
+
+    assert "/lm_head/MatMul" in lm_head_matmul.name and lm_head_matmul.op == "MatMul", f"You did not reach lm_head, but you reached {lm_head_matmul.name}"
+    if eagle_draft:
+        gather_output = gs.Variable("hidden_states", np.float16,
+                                    ['indices_len', 'hidden_size'])
+    else:
+        gather_output = gs.Variable("/lm_head/Gather_Output")
+
+    last_token_ids = gs.Variable("last_token_ids", np.int64, ['indices_len'])
+    graph.inputs.append(last_token_ids)
+
+    if eagle_draft:
+        graph.outputs.append(gather_output)
+
+    if eagle3:
+        #reshape+gather+norm+lm_head
+        last_reshape = find_last_reshape_node(graph)
+        reshape_output = last_reshape.outputs[0]
+        graph.layer(
+            name="/lm_head/Gather",
+            op="Gather",
+            inputs=[reshape_output, last_token_ids],  # 使用 reshape 的输出作为输入
+            outputs=[gather_output],
+            attrs={"batch_dims": 1})
+        for node in graph.nodes:
+            if reshape_output in node.inputs and node.op != "Gather":
+                node.inputs = [
+                    gather_output if x == reshape_output else x
+                    for x in node.inputs
+                ]
+                print(
+                    f"Updated node {node.name} to use gather output instead of reshape output"
+                )
+
+    else:
+        lm_head_weight = lm_head_matmul.inputs[1]
+        lm_head_weight.name = "/lm_head/MatMul/weight"
+        lm_head_input = lm_head_matmul.inputs[0]
+        # lm_head_input shape: [batch_size*len, 4096]
+        # last_token_ids shape: [indices_len]
+        # gather_output shape: [batch_size*indices_len, 4096]
+        graph.layer(name="/lm_head/Gather",
+                    op="Gather",
+                    inputs=[lm_head_input, last_token_ids],
+                    outputs=[gather_output],
+                    attrs={"batch_dims": 1})
+
+        gather_output.outputs = [lm_head_matmul]
+        lm_head_matmul.inputs = [gather_output, lm_head_weight]
+
+    if eagle_draft:
+        logits = clear_inputs(logits)
+        softmax_input = gs.Variable("/lm_head/Softmax_Input", np.float16)
+        softmax_output = logits
+        lm_head_matmul.outputs = [softmax_input]
+        graph.layer(name="/lm_head/Softmax",
+                    op="Softmax",
+                    inputs=[softmax_input],
+                    outputs=[softmax_output],
+                    attrs={"axis": -1})
+    else:
+        # Remove the last cast layer so logits are in fp16 instead of fp32
+        logits = clear_inputs(logits)
+        lm_head_matmul.outputs = [logits]
+        logits.inputs = [lm_head_matmul]
+    logits.dtype = np.float16
+    # Force logits to have shape of [batch_size, vocab_size].
+    logits.shape = [logits.shape[0], logits.shape[1]]
+    graph.cleanup().toposort()
+
+    end_time = time.time()
+    print(f"Gather inserted in {end_time - start_time}s.")
+    return graph
+
 def insert_gather_last_token(graph: gs.Graph):
     """
     Inserts GatherND for lm_head to only gather the last token.
@@ -148,7 +282,8 @@ def insert_attention_plugin(graph: gs.Graph,
                             config: dict,
                             rope_type: RopeType,
                             max_seq_length: int,
-                            extra_inputs: list = None):
+                            extra_inputs: list = None,
+                            extra_plugin_attributes: dict = None):
     """
     Insert AttentionPlugin for the graph. AttentionPlugin takes the following inputs and outputs:
 
@@ -176,25 +311,34 @@ def insert_attention_plugin(graph: gs.Graph,
         The graph after inserted AttentionPlugin
     """
 
-    def set_with_warning(key, value):
+    def require_config_key(key):
         """
-        Warns the user that particular field is not included in the dict, but is required for AttentionPlugin
+        Validates that a required configuration key exists in the config dictionary.
+        If the key does not exist or its value is None, the function will assert and terminate the program.
+        
+        Args:
+            key: The configuration key to check
+            
+        Returns:
+            The value of the key if it exists
+            
+        Raises:
+            AssertionError: If the key does not exist or its value is None
         """
-        if key not in config or config.get(key, value) is None:
-            print(f"{key} does not exist. Set to {value}.")
-            return value
-        return config.get(key)
+        if key not in config:
+            assert False, f"{key} does not exist and is required for AttentionPlugin. Please check your config file."
+        return config.get(key) 
 
     start_time = time.time()
     print("Replacing MHA Pattern with AttentionPlugin...")
     # We do not have any optimization on long context and therefore rotary_scaling is always 1.0
     rotary_scaling = 1.0
-    num_q_heads = set_with_warning("num_attention_heads", 32)
-    num_kv_heads = set_with_warning("num_key_value_heads", 32)
-    head_size = set_with_warning("hidden_size", 4096) // num_q_heads
-    rotary_base_frequency = set_with_warning("rope_theta", 500000.0)
-    rotary_embedding_max_positions = set_with_warning(
-        "max_position_embeddings", 32768)
+    num_q_heads = require_config_key("num_attention_heads")
+    num_kv_heads = require_config_key("num_key_value_heads")
+    head_size = require_config_key("hidden_size") // num_q_heads
+    rotary_base_frequency = require_config_key("rope_theta")
+    rotary_embedding_max_positions = require_config_key("max_position_embeddings")
+    
 
     attention_attrs = {
         "num_q_heads": num_q_heads,
@@ -206,6 +350,7 @@ def insert_attention_plugin(graph: gs.Graph,
         "max_batch_size": 16,
         "kv_cache_capacity": max_seq_length,
         "rotary_embedding_max_positions": rotary_embedding_max_positions,
+        **extra_plugin_attributes,
     }
 
     removed_inputs = []
