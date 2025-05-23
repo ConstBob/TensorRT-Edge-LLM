@@ -136,7 +136,6 @@ __global__ void topKStage2Sampling(std::int32_t const* __restrict topKTmpIdBuf, 
     auto const probThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
     auto const size = k * BLOCKS_PER_BEAM_;
     auto const stride = maxTopK * BLOCKS_PER_BEAM_;
-    bool const sampleTokenInSelected = returnAllTopK && curandState;
 
     typedef cub::BlockReduce<TopK_2<float>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;

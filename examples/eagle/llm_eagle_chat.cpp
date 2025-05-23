@@ -166,6 +166,10 @@ void inference(std::vector<int64_t>& inputIds, Eagle<half>* eagle, std::vector<i
     }
     eagle->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), isEagle3, nullptr,
         newTokensNumbers, iterNumbers);
+    for (int i = 0; i < batchSize; ++i)
+    {
+        std::cout << "Output for batch " << i << ": " << tokenizer->decode(outputIds[i]) << std::endl;
+    }
     // Reset the values
     std::fill(inputIds.begin(), inputIds.end(), 0);
     std::fill(contextLengths.begin(), contextLengths.end(), 0);
@@ -238,11 +242,6 @@ int main(int argc, char* argv[])
             }
             inputIds = tokenizer->encode(inputString, true);
             int32_t inputSize = static_cast<int32_t>(inputIds.size());
-            for (int i = 0; i < inputSize; i++)
-            {
-                std::cout << inputIds[i] << " ";
-            }
-            std::cout << std::endl;
             if (inputSize > maxContextLength)
             {
                 std::cout << "Warning: input length > max context length. The last tokens will be truncated."
@@ -257,11 +256,6 @@ int main(int argc, char* argv[])
     {
         inputIds = tokenizer->encode(args.inputString, true);
         int32_t inputSize = static_cast<int32_t>(inputIds.size());
-        for (int i = 0; i < inputSize; i++)
-        {
-            std::cout << inputIds[i] << " ";
-        }
-        std::cout << std::endl;
         if (inputSize > maxContextLength)
         {
             std::cout << "Warning: input length > max context length. The last tokens will be truncated." << std::endl;

@@ -263,7 +263,6 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    int32_t const nbInputs = network->getNbInputs();
     auto* contextProfile = builder->createOptimizationProfile();
     auto* generationProfile = builder->createOptimizationProfile();
 

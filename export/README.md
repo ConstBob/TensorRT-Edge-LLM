@@ -31,8 +31,8 @@ Eagle decoding: we only verify LLAMA-based model with FP16 precision now.
 Eagle3: for Eagle3, we use the model from HuggingFace [yuhuili/EAGLE3-LLaMA3.1-Instruct-8B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B), which is a LLAMA-based model.
 
 ```
-export TORCH_DIR="Meta-Llama-3.1-8B-Instruct"
-export EAGLE3_TORCH_DIR="EAGLE3-LLaMA3.1-Instruct-8B"
+export TORCH_DIR="../Meta-Llama-3.1-8B-Instruct"
+export EAGLE3_TORCH_DIR="../EAGLE3-LLaMA3.1-Instruct-8B"
 git lfs install
 git clone https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct $TORCH_DIR
 git clone https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B $EAGLE3_TORCH_DIR
@@ -41,31 +41,31 @@ git clone https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B $EAGLE3_TOR
 
 Export ONNX for base model:
 ```
-export EAGLE3_ONNX_BASE_DIR="Meta-Llama-3.1-8B-Instruct-Eagle3-Base"
-python3 export/llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE3_ONNX_BASE_DIR --eagle_base True --eagle3 True
+export EAGLE3_ONNX_BASE_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle3-Base"
+python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE3_ONNX_BASE_DIR --eagle_base True --eagle3 True
 ```
 Export ONNX for draft model:
 ```
-export EAGLE3_ONNX_DRAFT_DIR="Meta-Llama-3.1-8B-Instruct-Eagle3-Draft"
-python3 export/llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE3_ONNX_DRAFT_DIR --eagle_torch_dir $EAGLE3_TORCH_DIR --eagle_draft True --eagle3 True
+export EAGLE3_ONNX_DRAFT_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle3-Draft"
+python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE3_ONNX_DRAFT_DIR --eagle_torch_dir $EAGLE3_TORCH_DIR --eagle_draft True --eagle3 True
 ```
 For Eagle2:
 ```
-export TORCH_DIR="Meta-Llama-3.1-8B-Instruct"
-export EAGLE2_TORCH_DIR="EAGLE-LLaMA3.1-Instruct-8B"
+export TORCH_DIR="../Meta-Llama-3.1-8B-Instruct"
+export EAGLE2_TORCH_DIR="../EAGLE-LLaMA3.1-Instruct-8B"
 git lfs install
 git clone https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct $TORCH_DIR
 git clone git clone https://huggingface.co/yuhuili/EAGLE-LLaMA3.1-Instruct-8B $EAGLE2_TORCH_DIR
 ```
 Export ONNX for base model:
 ```
-export EAGLE2_ONNX_BASE_DIR="Meta-Llama-3.1-8B-Instruct-Eagle-Base"
-python3 export/llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE2_ONNX_BASE_DIR --eagle_base True
+export EAGLE2_ONNX_BASE_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle-Base"
+python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE2_ONNX_BASE_DIR --eagle_base True
 ```
 Export ONNX for draft model:
 ```
-export EAGLE2_ONNX_DRAFT_DIR="Meta-Llama-3.1-8B-Instruct-Eagle-Draft"
-python3 export/llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE2_ONNX_DRAFT_DIR --eagle_torch_dir $EAGLE2_TORCH_DIR --eagle_draft True
+export EAGLE2_ONNX_DRAFT_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle-Draft"
+python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE2_ONNX_DRAFT_DIR --eagle_torch_dir $EAGLE2_TORCH_DIR --eagle_draft True
 ```
 
 The ONNX with desired data type will be exported in `$ONNX_DIR`.
