@@ -265,7 +265,6 @@ void benchmarkLLM(std::string& enginePath, std::string& eagleEnginePath, std::st
     draftDecoder->setup(eagleEnginePath, stream, useCudaGraph, 1, true);
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
-    int32_t maxContextLength = static_cast<int32_t>(baseDecoder->getMaxContextLength()) + 1; // for eagle
     int64_t batchSize = baseDecoder->getModelBatchSize();
     if (batchSize != 1)
     {

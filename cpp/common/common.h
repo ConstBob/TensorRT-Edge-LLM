@@ -108,4 +108,5 @@ inline int copyFile(std::string const& srcPath, std::string const& dstPath)
             return EXIT_FAILURE;
         }
     }
+    return EXIT_SUCCESS;
 }

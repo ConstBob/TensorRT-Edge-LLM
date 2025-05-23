@@ -91,27 +91,27 @@ export EAGLE2_DRAFT_ENGINE_DIR="Meta-Llama-3.1-8B-Instruct-Eagle-Draft-Engine"
 ### Infer engine
 ```
 export TORCH_DIR="Meta-Llama-3.1-8B-Instruct"
-export EAGLE2_BASE_ENGINE_DIR=$EAGLE_BASE_ENGINE_DIR/model_fp16_base_eagle.engine
-export EAGLE2_DRAFT_ENGINE_DIR=$EAGLE_DRAFT_ENGINE_DIR/model_fp16_draft_eagle.engine
+export EAGLE2_BASE_ENGINE_PATH=$EAGLE2_BASE_ENGINE_DIR/model_fp16_base_eagle.engine
+export EAGLE2_DRAFT_ENGINE_PATH=$EAGLE2_DRAFT_ENGINE_DIR/model_fp16_draft_eagle.engine
 ```
 #### Interactive Chat
 ```
 ./build/examples/eagle/llm_eagle_chat --tokenizerPath=$TORCH_DIR \
---enginePath=$EAGLE2_BASE_ENGINE_DIR --eagleEnginePath=$EAGLE2_DRAFT_ENGINE_DIR \
+--enginePath=$EAGLE2_BASE_ENGINE_PATH --eagleEnginePath=$EAGLE2_DRAFT_ENGINE_PATH \
 --maxLength=1024
 ```
 
 #### Chat with a specific input string
 ```
 ./build/examples/eagle/llm_eagle_chat --tokenizerPath=$TORCH_DIR \
---enginePath=$EAGLE2_BASE_ENGINE_DIR --eagleEnginePath=$EAGLE2_DRAFT_ENGINE_DIR \
+--enginePath=$EAGLE2_BASE_ENGINE_PATH --eagleEnginePath=$EAGLE2_DRAFT_ENGINE_PATH \
 --maxLength=1024 --inputString "<|begin_of_text|>A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Hello ASSISTANT:"
 ```
 #### Benchmark Performance
 
 ```
 ./build/examples/eagle/llm_eagle_benchmark \
---enginePath=$EAGLE2_BASE_ENGINE_DIR --eagleEnginePath=$EAGLE2_DRAFT_ENGINE_DIR \
+--enginePath=$EAGLE2_BASE_ENGINE_PATH --eagleEnginePath=$EAGLE2_DRAFT_ENGINE_PATH \
 --tokenizerPath=$TORCH_DIR \
 --maxLength=256 [--warmUp 2 --numRuns 10] 
 ```

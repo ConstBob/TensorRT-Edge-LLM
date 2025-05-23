@@ -190,8 +190,7 @@ def export_raw_llm(model,
         else:
             print("Loading fp16 ONNX model...")
         
-        if wrapper_cls != WrapperModelForCausalLM:
-            # For WrapperEagleDraftModelForCausalLM and WrapperEagleBaseModelForCausalLM
+        if wrapper_cls in (WrapperEagleDraftModelForCausalLM, WrapperEagleBaseModelForCausalLM):
             llm_to_onnx(wrapper_cls(model, eagle3=eagle3),
                         output_dir,
                         extra_inputs=extra_inputs,
@@ -257,7 +256,7 @@ def surgeon_llm(raw_onnx_path,
                 max_seq_length=4096,
                 rope_type=RopeType.kROPE_ROTATE_NEOX,
                 extra_plugin_inputs=[],
-                extra_plugin_attributes=[],
+                extra_plugin_attributes={},
                 lm_head_precision="fp16",
                 lora_config=None,
                 lora_weights=None,

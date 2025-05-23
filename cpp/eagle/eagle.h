@@ -70,6 +70,8 @@ public:
         std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
         bool isEagle3 = false, std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
         std::vector<int32_t>* newTokens = nullptr, std::vector<int32_t>* iterNumbers = nullptr);
+    size_t getDeviceMemorySize() const noexcept;
+    std::vector<T> const& getLastHostLogits();
 
     ~Eagle()
     {
@@ -99,8 +101,7 @@ private:
         int32_t& generationIter, int64_t& unfinishedBatchNum, std::vector<int32_t>& contextLengths);
     void allocateEagleBuffer();
     void invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
-    size_t getDeviceMemorySize() const noexcept;
-    std::vector<T> const& getLastHostLogits();
+    
     void eagleCommonParamsInit();
     void initDraftVoc();
     std::unique_ptr<Decoder<T>> mBaseModel;

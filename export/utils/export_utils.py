@@ -105,7 +105,7 @@ class WrapperEagleBaseModelForCausalLM(torch.nn.Module):
             hidden_states = torch.cat(
                 [hidden_states_0, hidden_states_1, hidden_states_2], dim=-1)
 
-        past_key_values = outputs.past_key_values
+        past_key_values = outputs.past_key_values.to_legacy_cache()
         hidden_states_reshape = last_hidden_states.reshape(
             -1, last_hidden_states.size(2))
         logits = self.lm_head(hidden_states_reshape)
