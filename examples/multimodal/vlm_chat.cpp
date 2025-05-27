@@ -33,6 +33,7 @@ struct RuntimeArgs
     int maxLength{1024};
     bool debug{false};
     std::string modelType{"qwen2_vl"};
+    std::pair<std::string, std::string> loraWeights; // name:path format
 };
 
 void printUsage(char const* programName)
@@ -62,7 +63,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
         {"imagePaths", required_argument, 0, 'p'}, {"llmEnginePath", required_argument, 0, 'e'},
         {"visualEnginePath", required_argument, 0, 'v'}, {"tokenizerPath", required_argument, 0, 't'},
         {"maxLength", required_argument, 0, 's'}, {"debug", no_argument, 0, 'd'},
-        {"modelType", required_argument, 0, 0}, {0, 0, 0, 0}};
+        {"modelType", required_argument, 0, 0}, {"loraWeights", required_argument, 0, 0}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -147,17 +148,33 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
         case 0:
             if (strcmp(long_options[option_index].name, "modelType") == 0)
             {
+                if (optarg)
                 {
-                    if (optarg)
+                    args.modelType = optarg;
+                }
+                else
+                {
+                    std::cerr << "ERROR: model type requires option argument" << std::endl;
+                    return false;
+                }
+            }
+            else if (strcmp(long_options[option_index].name, "loraWeights") == 0)
+            {
+                if (optarg)
+                {
+                    std::string loraArg = optarg;
+                    size_t colonPos = loraArg.find(':');
+                    if (colonPos == std::string::npos)
                     {
-                        args.modelType = optarg;
-                    }
-                    else
-                    {
-                        std::cerr << "ERROR: model type requires option argument,support only qwen2_vl currently"
-                                  << std::endl;
+                        std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
                         return false;
                     }
+                    args.loraWeights = std::make_pair(loraArg.substr(0, colonPos), loraArg.substr(colonPos + 1));
+                }
+                else
+                {
+                    std::cerr << "ERROR: --loraWeights requires option argument" << std::endl;
+                    return false;
                 }
             }
             break;
@@ -170,7 +187,8 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
 void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     std::vector<std::string>& inputStrings, std::vector<std::vector<std::string>> const& imagePaths,
     Tokenizer* tokenizer, GenerationConfig const& generationConfig, int32_t const batchSize,
-    std::vector<std::vector<int64_t>>& outputIds, std::string modelType)
+    std::vector<std::vector<int64_t>>& outputIds, std::string modelType,
+    std::pair<std::string, std::string> const& loraWeights)
 {
     // Setup
     cudaStream_t stream;
@@ -181,6 +199,21 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
     auto decoder = new Decoder<half>();
     decoder->setup(llmEnginePath, stream, false, batchSize);
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+
+    // Load and switch to LoRA weights if provided
+    if (!loraWeights.first.empty() && !loraWeights.second.empty())
+    {
+        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        {
+            LOG_ERROR("Failed to load LoRA weights: %s", loraWeights.second.c_str());
+            return;
+        }
+        if (!decoder->switchLora(loraWeights.first))
+        {
+            LOG_ERROR("Failed to switch to LoRA weights: %s", loraWeights.first.c_str());
+            return;
+        }
+    }
 
     // Preprocess
     std::vector<half> visualInput;
@@ -257,7 +290,7 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
 std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
     std::filesystem::path const& visualEnginePath, std::vector<std::string>& inputStrings,
     std::vector<std::vector<std::string>>& imagePaths, Tokenizer* tokenizer, GenerationConfig const& generationConfig,
-    std::string modelType)
+    std::string modelType, std::pair<std::string, std::string> const& loraWeights)
 {
     int32_t batchSize = std::max(inputStrings.size(), imagePaths.size());
 
@@ -280,7 +313,7 @@ std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
     if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
     {
         decodeQwen2VL(llmEnginePath, visualEnginePath, inputStrings, imagePaths, tokenizer, generationConfig, batchSize,
-            outputIds, modelType);
+            outputIds, modelType, loraWeights);
     }
     else
     {
@@ -327,7 +360,7 @@ int main(int argc, char* argv[])
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
     auto output = decode(args.llmEnginePath, args.visualEnginePath, args.inputStrings, args.imagePaths, tokenizer.get(),
-        generationConfig, args.modelType);
+        generationConfig, args.modelType, args.loraWeights);
 
     return EXIT_SUCCESS;
 };

@@ -36,6 +36,7 @@ struct LLMBenchmarkArgs
     int64_t warmUp{2};
     bool debug{false};
     bool noCudaGraph{false};
+    std::pair<std::string, std::string> loraWeights; // name:path pair
 };
 
 void printUsage(char const* programName)
@@ -55,6 +56,7 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs tensors." << std::endl;
     std::cerr << "  --noCudaGraph    Cuda graph is default enabled. Use this flag to disable cuda graph." << std::endl;
+    std::cerr << "  --loraWeights    Provide LoRA weights in format name:path." << std::endl;
 };
 
 bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
@@ -62,7 +64,8 @@ bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"enginePath", required_argument, 0, 'e'},
         {"maxLength", required_argument, 0, 's'}, {"inputLength", required_argument, 0, 'c'},
         {"warmUp", required_argument, 0, 'w'}, {"numRuns", required_argument, 0, 'r'},
-        {"noCudaGraph", no_argument, 0, 'g'}, {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
+        {"noCudaGraph", no_argument, 0, 'g'}, {"debug", no_argument, 0, 'd'},
+        {"loraWeights", required_argument, 0, 'l'}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -110,6 +113,21 @@ bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
             break;
         case 'g': args.noCudaGraph = true; break;
         case 'd': args.debug = true; break;
+        case 'l':
+            if (optarg)
+            {
+                std::string loraArg = optarg;
+                size_t colonPos = loraArg.find(':');
+                if (colonPos == std::string::npos)
+                {
+                    std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
+                    return false;
+                }
+                std::string name = loraArg.substr(0, colonPos);
+                std::string path = loraArg.substr(colonPos + 1);
+                args.loraWeights = std::make_pair(name, path);
+            }
+            break;
         default: return false;
         }
     }
@@ -117,7 +135,8 @@ bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
 }
 
 void benchmarkLLM(std::string& enginePath, int const inputLength, int64_t warmUp, int64_t numRuns,
-    GenerationConfig const& generationConfig, bool useCudaGraph)
+    GenerationConfig const& generationConfig, bool useCudaGraph,
+    std::pair<std::string, std::string> const& loraWeights = std::make_pair("", ""))
 {
     auto profiler = std::make_shared<BenchmarkProfiler>();
     profiler->startTiming();
@@ -130,6 +149,21 @@ void benchmarkLLM(std::string& enginePath, int const inputLength, int64_t warmUp
     decoder->setup(enginePath, stream, useCudaGraph);
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
+
+    // Load and switch to LoRA weights if provided
+    if (!loraWeights.first.empty())
+    {
+        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        {
+            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraWeights.first.c_str(), loraWeights.second.c_str());
+            return;
+        }
+        if (!decoder->switchLora(loraWeights.first))
+        {
+            LOG_ERROR("Failed to switch to LoRA: %s", loraWeights.first.c_str());
+            return;
+        }
+    }
 
     int64_t batchSize = decoder->getModelBatchSize();
     std::vector<int64_t> inputIds(batchSize * decoder->getMaxContextLength(), -1);
@@ -284,6 +318,7 @@ int main(int argc, char* argv[])
         LOG_ERROR("Please specify --inputLength and --maxLength for benchmark.");
         return EXIT_FAILURE;
     }
-    benchmarkLLM(args.enginePath, args.inputLength, args.warmUp, args.numRuns, generationConfig, !args.noCudaGraph);
+    benchmarkLLM(args.enginePath, args.inputLength, args.warmUp, args.numRuns, generationConfig, !args.noCudaGraph,
+        args.loraWeights);
     return EXIT_SUCCESS;
 };

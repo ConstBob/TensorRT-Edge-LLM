@@ -30,6 +30,7 @@ struct LLMChatArgs
     std::string tokenizerPath;
     int maxLength{256};
     bool debug{false};
+    std::vector<std::pair<std::string, std::string>> loraWeights; // name:path pairs
 };
 
 void printUsage(char const* programName)
@@ -37,18 +38,23 @@ void printUsage(char const* programName)
     std::cerr << "Usage: " << programName
               << " [-h] [-i or --interactive] [-e or --enginePath=<path to TensorRT engine>] [-s or "
                  "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>] [--inputString=<input string for "
-                 "one batch>]"
+                 "one batch>] [--loraWeights=<name:path>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  -h               Display this help message" << std::endl;
     std::cerr << "  --interactive    Interactive chat mode. " << std::endl;
-    std::cerr << "  --inputString    Provide the input string to the runtime. Required. " << std::endl;
+    std::cerr << "  --inputString    Provide the input string to the runtime. Required in non-interactive mode. "
+              << std::endl;
     std::cerr << "  --enginePath     Provide the input TensorRT engine file path. Required. " << std::endl;
     std::cerr << "  --tokenizerPath  Provide the path to HF tokenizer. Required. " << std::endl;
     std::cerr << "  --maxLength      Provide the maximum output length for the generation session (including the "
                  "input). Default = 256"
               << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more information." << std::endl;
+    std::cerr << "  --loraWeights    Provide LoRA weights in format name:path. Can be specified multiple times in "
+                 "interactive mode."
+              << std::endl;
+    std::cerr << "                   In non-interactive mode, only one LoRA weight is allowed." << std::endl;
 };
 
 bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
@@ -56,12 +62,12 @@ bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"interactive", no_argument, 0, 'i'},
         {"inputString", required_argument, 0, 'c'}, {"enginePath", required_argument, 0, 'e'},
         {"tokenizerPath", required_argument, 0, 't'}, {"maxLength", required_argument, 0, 's'},
-        {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
+        {"debug", no_argument, 0, 'd'}, {"loraWeights", required_argument, 0, 'l'}, {0, 0, 0, 0}};
 
     int opt;
 
     // Loop to process each option
-    while ((opt = getopt_long(argc, argv, "he:t:s:di", long_options, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "he:t:s:di:l:c", long_options, nullptr)) != -1)
     {
         switch (opt)
         {
@@ -107,9 +113,32 @@ bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
             }
             break;
         case 'd': args.debug = true; break;
+        case 'l':
+            if (optarg)
+            {
+                std::string loraArg = optarg;
+                size_t colonPos = loraArg.find(':');
+                if (colonPos == std::string::npos)
+                {
+                    std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
+                    return false;
+                }
+                std::string name = loraArg.substr(0, colonPos);
+                std::string path = loraArg.substr(colonPos + 1);
+                args.loraWeights.emplace_back(name, path);
+            }
+            break;
         default: return false;
         }
     }
+
+    // Validate LoRA weights in non-interactive mode
+    if (!args.interactive && args.loraWeights.size() > 1)
+    {
+        std::cerr << "ERROR: Only one LoRA weight is allowed in non-interactive mode" << std::endl;
+        return false;
+    }
+
     return true;
 }
 
@@ -144,6 +173,30 @@ int main(int argc, char* argv[])
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     decoder->setup(args.enginePath, stream);
+
+    // Load LoRA weights
+    for (auto const& [name, path] : args.loraWeights)
+    {
+        if (!decoder->addLora(name, path))
+        {
+            std::cerr << "Failed to load LoRA weights: " << name << " from " << path << std::endl;
+            if (!args.interactive)
+            {
+                return EXIT_FAILURE;
+            }
+        }
+    }
+
+    // In non-interactive mode, switch to the specified LoRA if provided
+    if (!args.interactive && !args.loraWeights.empty())
+    {
+        if (!decoder->switchLora(args.loraWeights[0].first))
+        {
+            std::cerr << "Failed to switch to LoRA: " << args.loraWeights[0].first << std::endl;
+            return EXIT_FAILURE;
+        }
+    }
+
     int32_t maxContextLength = static_cast<int32_t>(decoder->getMaxContextLength());
     int64_t batchSize = decoder->getModelBatchSize();
     // int64_t batchCount = 0; UNUSED
@@ -159,6 +212,46 @@ int main(int argc, char* argv[])
     { // interactive mode
         while (true)
         {
+            // Check if we should switch LoRA weights
+            if (decoder->getLoraNames().size() > 1)
+            {
+                std::cout << "\nAvailable LoRA weights:" << std::endl;
+                for (auto const& name : decoder->getLoraNames())
+                {
+                    std::cout << "- " << name << std::endl;
+                }
+                std::cout << "Do you want to switch LoRA weights? (yes/no): ";
+                std::string answer;
+                std::getline(std::cin, answer);
+                if (answer == "yes")
+                {
+                    bool validChoice = false;
+                    while (!validChoice)
+                    {
+                        std::cout << "Enter LoRA name to switch to: ";
+                        std::string loraName;
+                        std::getline(std::cin, loraName);
+                        if (std::find(decoder->getLoraNames().begin(), decoder->getLoraNames().end(), loraName)
+                            != decoder->getLoraNames().end())
+                        {
+                            if (decoder->switchLora(loraName))
+                            {
+                                std::cout << "Switched to LoRA: " << loraName << std::endl;
+                                validChoice = true;
+                            }
+                            else
+                            {
+                                std::cout << "Failed to switch to LoRA: " << loraName << std::endl;
+                            }
+                        }
+                        else
+                        {
+                            std::cout << "Invalid LoRA name. Please choose from the available options." << std::endl;
+                        }
+                    }
+                }
+            }
+
             for (int64_t i = 0; i < batchSize; ++i)
             {
                 std::string inputString;

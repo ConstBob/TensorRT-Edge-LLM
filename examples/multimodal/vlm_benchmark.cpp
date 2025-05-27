@@ -35,6 +35,7 @@ struct RuntimeArgs
     int warmUp{2};
     bool noCudaGraph{false};
     bool debug{false};
+    std::pair<std::string, std::string> loraWeights; // name:path format
 };
 
 void printUsage(char const* programName)
@@ -60,6 +61,7 @@ void printUsage(char const* programName)
     std::cerr << "  --noCudaGraph       Cuda graph is default enabled. Use this flag to disable cuda graph."
               << std::endl;
     std::cerr << "  --debug             Use debug mode, which outputs tensors." << std::endl;
+    std::cerr << "  --loraWeights       Provide the LoRA weights in format name:path" << std::endl;
 };
 
 bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
@@ -69,7 +71,8 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
         {"imageTokenLength", required_argument, 0, 'i'}, {"outputLength", required_argument, 0, 'o'},
         {"modelType", required_argument, 0, 0}, {"warmUp", required_argument, 0, 'w'},
         {"batchSize", required_argument, 0, 'b'}, {"numRuns", required_argument, 0, 'r'},
-        {"noCudaGraph", no_argument, 0, 'g'}, {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
+        {"noCudaGraph", no_argument, 0, 'g'}, {"debug", no_argument, 0, 'd'}, {"loraWeights", required_argument, 0, 0},
+        {0, 0, 0, 0}};
 
     int opt;
 
@@ -143,17 +146,33 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
         case 0:
             if (strcmp(long_options[option_index].name, "modelType") == 0)
             {
+                if (optarg)
                 {
-                    if (optarg)
+                    args.modelType = optarg;
+                }
+                else
+                {
+                    std::cerr << "ERROR: model type requires option argument" << std::endl;
+                    return false;
+                }
+            }
+            else if (strcmp(long_options[option_index].name, "loraWeights") == 0)
+            {
+                if (optarg)
+                {
+                    std::string loraArg = optarg;
+                    size_t colonPos = loraArg.find(':');
+                    if (colonPos == std::string::npos)
                     {
-                        args.modelType = optarg;
-                    }
-                    else
-                    {
-                        std::cerr << "ERROR: model type requires option argument,support only qwen2_vl currently"
-                                  << std::endl;
+                        std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
                         return false;
                     }
+                    args.loraWeights = std::make_pair(loraArg.substr(0, colonPos), loraArg.substr(colonPos + 1));
+                }
+                else
+                {
+                    std::cerr << "ERROR: --loraWeights requires option argument" << std::endl;
+                    return false;
                 }
             }
             break;
@@ -229,7 +248,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
     int const imageTokenLength, std::vector<std::vector<int64_t>>& outputIds,
     std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph,
-    std::string const& modelType)
+    std::string const& modelType, std::pair<std::string, std::string> const& loraWeights)
 {
     // Setup
     cudaStream_t stream;
@@ -245,6 +264,22 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     vitrunner->setup(visualEnginePath, stream, batchSize);
     decoder->setup(llmEnginePath, stream, useCudaGraph, batchSize);
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+
+    // Load and switch to LoRA weights if provided
+    if (!loraWeights.first.empty() && !loraWeights.second.empty())
+    {
+        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        {
+            LOG_ERROR("Failed to load LoRA weights: %s", loraWeights.second.c_str());
+            return 0;
+        }
+        if (!decoder->switchLora(loraWeights.first))
+        {
+            LOG_ERROR("Failed to switch to LoRA weights: %s", loraWeights.first.c_str());
+            return 0;
+        }
+    }
+
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
 
@@ -260,7 +295,8 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     std::vector<int64_t> reverseWindowIndex;
 
     vitrunner->initRandomInputs(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
-        visualWindowIndex, reverseWindowIndex, inputIds, textTokenLength, imageTokenLength, decoder->getMaxContextLength());
+        visualWindowIndex, reverseWindowIndex, inputIds, textTokenLength, imageTokenLength,
+        decoder->getMaxContextLength());
 
     for (int i = 0; i < warmUp; i++)
     {
@@ -320,7 +356,8 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
 
 void benchmarkVLM(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     int const batchSize, int const textTokenLength, int const imageTokenLength, int const outputLength,
-    std::string const& modelType, int const warmUp, int const numRuns, bool useCudaGraph)
+    std::string const& modelType, int const warmUp, int const numRuns, bool useCudaGraph,
+    std::pair<std::string, std::string> const& loraWeights)
 {
     int totalSeqLength = textTokenLength + imageTokenLength + outputLength;
     GenerationConfig generationConfig{totalSeqLength, totalSeqLength, 1, 0};
@@ -336,8 +373,9 @@ void benchmarkVLM(std::filesystem::path const& llmEnginePath, std::filesystem::p
 
     if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
     {
-        deviceMemorySize = benchmarkQwen2VL(llmEnginePath, visualEnginePath, generationConfig, batchSize,
-            textTokenLength, imageTokenLength, outputIds, profiler, warmUp, numRuns, useCudaGraph, modelType);
+        deviceMemorySize
+            = benchmarkQwen2VL(llmEnginePath, visualEnginePath, generationConfig, batchSize, textTokenLength,
+                imageTokenLength, outputIds, profiler, warmUp, numRuns, useCudaGraph, modelType, loraWeights);
     }
     else
     {
@@ -378,7 +416,7 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
     benchmarkVLM(args.llmEnginePath, args.visualEnginePath, args.batchSize, args.textTokenLength, args.imageTokenLength,
-        args.outputLength, args.modelType, args.warmUp, args.numRuns, !args.noCudaGraph);
+        args.outputLength, args.modelType, args.warmUp, args.numRuns, !args.noCudaGraph, args.loraWeights);
 
     return EXIT_SUCCESS;
 };

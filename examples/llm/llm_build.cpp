@@ -35,6 +35,7 @@ struct LLMBuildArgs
     bool dynamicShape{false};
     bool debug{false};
     int64_t maxBatchSize{4};
+    int64_t maxLoraRank{0}; // Default to 0 means no LoRA
 };
 
 void printUsage(char const* programName)
@@ -42,7 +43,7 @@ void printUsage(char const* programName)
     std::cerr << "Usage: " << programName
               << " [-h] <--onnxPath str> <--enginePath str> [-b or "
                  "--batchSize int] [-c or --maxInputLen int] [-s or --maxSeqLen int] [--dynamicShape] [--maxBatchSize "
-                 "int] [--debug]"
+                 "int] [--debug] [--maxLoraRank int]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  -h               Display this help message" << std::endl;
@@ -56,6 +57,7 @@ void printUsage(char const* programName)
         << std::endl;
     std::cerr << "  --dynamicShape   Use dynamic shape profiles." << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more logs." << std::endl;
+    std::cerr << "  --maxLoraRank    Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)" << std::endl;
 }
 
 bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
@@ -64,9 +66,9 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"enginePath", required_argument, 0, 'o'}, {"batchSize", required_argument, 0, 'b'},
         {"maxInputLen", required_argument, 0, 'c'}, {"maxSeqLen", required_argument, 0, 's'},
         {"debug", no_argument, 0, 'd'}, {"dynamicShape", no_argument, 0, 'y'},
-        {"maxBatchSize", required_argument, 0, 'B'}, {"imageTokens", required_argument, 0, 0},
-        {"minImageTokens", required_argument, 0, 0}, {"maxImageTokens", required_argument, 0, 0},
-        {"modelType", required_argument, 0, 0}, {0, 0, 0, 0}};
+        {"maxBatchSize", required_argument, 0, 'B'}, {"maxLoraRank", required_argument, 0, 'L'},
+        {"imageTokens", required_argument, 0, 0}, {"minImageTokens", required_argument, 0, 0},
+        {"maxImageTokens", required_argument, 0, 0}, {"modelType", required_argument, 0, 0}, {0, 0, 0, 0}};
 
     int opt;
     // Loop to process each option
@@ -124,6 +126,12 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
             break;
         case 'd': args.debug = true; break;
         case 'y': args.dynamicShape = true; break;
+        case 'L':
+            if (optarg)
+            {
+                args.maxLoraRank = std::stoi(optarg);
+            }
+            break;
         default: LOG_ERROR("Invalid Argument %c is %s.", opt, optarg); return false;
         }
     }
@@ -326,6 +334,51 @@ int main(int argc, char** argv)
     {
         LOG_ERROR("Issues setting up optimization profile");
         return EXIT_FAILURE;
+    }
+
+    // Add LoRA optimization profiles if maxLoraRank > 0
+    if (args.maxLoraRank > 0)
+    {
+        for (int i = 0; i < network->getNbInputs(); ++i)
+        {
+            auto* input = network->getInput(i);
+            std::string inputName = input->getName();
+
+            if (inputName.find("lora_A") != std::string::npos)
+            {
+                // For lora_A, the shape is [gemm_k, lora_rank]
+                auto dims = input->getDimensions();
+                if (dims.nbDims == 2)
+                {
+                    int64_t gemm_k = dims.d[0];
+                    result &= setOptimizationProfile(contextProfile, inputName.c_str(),
+                        createDims({gemm_k, 0}),                    // min shape
+                        createDims({gemm_k, args.maxLoraRank / 2}), // opt shape
+                        createDims({gemm_k, args.maxLoraRank}));    // max shape
+                    result &= setOptimizationProfile(generationProfile, inputName.c_str(),
+                        createDims({gemm_k, 0}),                    // min shape
+                        createDims({gemm_k, args.maxLoraRank / 2}), // opt shape
+                        createDims({gemm_k, args.maxLoraRank}));    // max shape
+                }
+            }
+            else if (inputName.find("lora_B") != std::string::npos)
+            {
+                // For lora_B, the shape is [lora_rank, gemm_n]
+                auto dims = input->getDimensions();
+                if (dims.nbDims == 2)
+                {
+                    int64_t gemm_n = dims.d[1];
+                    result &= setOptimizationProfile(contextProfile, inputName.c_str(),
+                        createDims({0, gemm_n}),                    // min shape
+                        createDims({args.maxLoraRank / 2, gemm_n}), // opt shape
+                        createDims({args.maxLoraRank, gemm_n}));    // max shape
+                    result &= setOptimizationProfile(generationProfile, inputName.c_str(),
+                        createDims({0, gemm_n}),                    // min shape
+                        createDims({args.maxLoraRank / 2, gemm_n}), // opt shape
+                        createDims({args.maxLoraRank, gemm_n}));    // max shape
+                }
+            }
+        }
     }
 
     config->addOptimizationProfile(contextProfile);

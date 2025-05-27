@@ -35,6 +35,7 @@ struct MultimodalAccuracyArgs
     std::string outputPath;
     std::string modelType{"qwen2_vl"};
     bool debug{false};
+    std::pair<std::string, std::string> loraWeights; // name:path format
 };
 
 struct MMMUTestData
@@ -85,6 +86,7 @@ void printUsage(char const* programName)
     std::cerr << "  --outputPath        Provide the path to save output." << std::endl;
     std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl." << std::endl;
     std::cerr << "  --debug             Use debug mode, which outputs tensors." << std::endl;
+    std::cerr << "  --loraWeights       Provide the LoRA weights in format name:path" << std::endl;
 };
 
 bool parseMultimodalAccuracyArgs(MultimodalAccuracyArgs& args, int argc, char* argv[])
@@ -92,7 +94,8 @@ bool parseMultimodalAccuracyArgs(MultimodalAccuracyArgs& args, int argc, char* a
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"llmEnginePath", required_argument, 0, 'e'},
         {"visualEnginePath", required_argument, 0, 'v'}, {"tokenizerPath", required_argument, 0, 't'},
         {"datasetPath", required_argument, 0, 'D'}, {"outputPath", required_argument, 0, 'o'},
-        {"modelType", required_argument, 0, 0}, {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
+        {"modelType", required_argument, 0, 0}, {"debug", no_argument, 0, 'd'},
+        {"loraWeights", required_argument, 0, 0}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -162,17 +165,33 @@ bool parseMultimodalAccuracyArgs(MultimodalAccuracyArgs& args, int argc, char* a
         case 0:
             if (strcmp(long_options[option_index].name, "modelType") == 0)
             {
+                if (optarg)
                 {
-                    if (optarg)
+                    args.modelType = optarg;
+                }
+                else
+                {
+                    std::cerr << "ERROR: model type requires option argument" << std::endl;
+                    return false;
+                }
+            }
+            else if (strcmp(long_options[option_index].name, "loraWeights") == 0)
+            {
+                if (optarg)
+                {
+                    std::string loraArg = optarg;
+                    size_t colonPos = loraArg.find(':');
+                    if (colonPos == std::string::npos)
                     {
-                        args.modelType = optarg;
-                    }
-                    else
-                    {
-                        std::cerr << "ERROR: model type requires option argument,support only qwen2_vl currently"
-                                  << std::endl;
+                        std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
                         return false;
                     }
+                    args.loraWeights = std::make_pair(loraArg.substr(0, colonPos), loraArg.substr(colonPos + 1));
+                }
+                else
+                {
+                    std::cerr << "ERROR: --loraWeights requires option argument" << std::endl;
+                    return false;
                 }
             }
             break;
@@ -455,7 +474,8 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
 }
 
 void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
-    std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer, std::string const& modelType)
+    std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer, std::string const& modelType,
+    std::pair<std::string, std::string> const& loraWeights)
 {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -466,6 +486,21 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
     auto decoder = new Decoder<half>();
     decoder->setup(llmEnginePath, stream);
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+
+    // Load and switch to LoRA weights if provided
+    if (!loraWeights.first.empty() && !loraWeights.second.empty())
+    {
+        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        {
+            LOG_ERROR("Failed to load LoRA weights: %s", loraWeights.second.c_str());
+            return;
+        }
+        if (!decoder->switchLora(loraWeights.first))
+        {
+            LOG_ERROR("Failed to switch to LoRA weights: %s", loraWeights.first.c_str());
+            return;
+        }
+    }
 
     int maxInputLength = decoder->getMaxContextLength();
     GenerationConfig generationConfig{maxInputLength + 256, 0, 1, 0};
@@ -506,7 +541,8 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
 
             // Diviving by 2 to deal with a few images with large size.
             // Otherwise, it requires larger dynamic shape range, which is not supported by TensorRT.
-            auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height / 2, width / 2, 1280*28*28, 6620*28*28);
+            auto [resizedHeight, resizedWidth]
+                = vitrunner->adjustImageSize(height / 2, width / 2, 1280 * 28 * 28, 6620 * 28 * 28);
             unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
             stbir_resize_uint8_linear(
                 image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
@@ -536,7 +572,8 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
             std::vector<int64_t> visualWindowIndex;
             std::vector<int64_t> reverseWindowIndex;
             vitrunner->getWindowIndex(visualGridTHWs, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
-            vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
+            vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
+                visualWindowIndex, reverseWindowIndex);
         }
         decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
 
@@ -555,7 +592,7 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
 
 void mmmuAccuracy(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     std::filesystem::path const& datasetPath, std::filesystem::path const& outputPath, Tokenizer* tokenizer,
-    std::string modelType)
+    std::string modelType, std::pair<std::string, std::string> const& loraWeights)
 {
     std::vector<MMMUTestData*> dataset;
     try
@@ -572,7 +609,7 @@ void mmmuAccuracy(std::filesystem::path const& llmEnginePath, std::filesystem::p
 
     if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
     {
-        evalQwen2VL(llmEnginePath, visualEnginePath, dataset, tokenizer, modelType);
+        evalQwen2VL(llmEnginePath, visualEnginePath, dataset, tokenizer, modelType, loraWeights);
     }
     else
     {
@@ -609,8 +646,8 @@ int main(int argc, char* argv[])
 
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
-    mmmuAccuracy(
-        args.llmEnginePath, args.visualEnginePath, args.datasetPath, args.outputPath, tokenizer.get(), args.modelType);
+    mmmuAccuracy(args.llmEnginePath, args.visualEnginePath, args.datasetPath, args.outputPath, tokenizer.get(),
+        args.modelType, args.loraWeights);
 
     return EXIT_SUCCESS;
 };
