@@ -36,6 +36,7 @@ struct LLMAccuracyArgs
     std::string tokenizerPath;
     std::string datasetPath;
     bool debug{false};
+    std::pair<std::string, std::string> loraWeights; // name:path pair
 };
 
 struct TestData
@@ -72,13 +73,14 @@ void printUsage(char const* programName)
     std::cerr << "  --tokenizerPath  Provide the path to HF tokenizer. Required. " << std::endl;
     std::cerr << "  --datasetPath    Provide the dataset path for evaluation." << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs tensors." << std::endl;
+    std::cerr << "  --loraWeights    Provide LoRA weights in format name:path." << std::endl;
 };
 
 bool parseLLMAccuracyArgs(LLMAccuracyArgs& args, int argc, char* argv[])
 {
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"enginePath", required_argument, 0, 'e'},
         {"tokenizerPath", required_argument, 0, 't'}, {"datasetPath", required_argument, 0, 'D'},
-        {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
+        {"debug", no_argument, 0, 'd'}, {"loraWeights", required_argument, 0, 'l'}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -117,6 +119,21 @@ bool parseLLMAccuracyArgs(LLMAccuracyArgs& args, int argc, char* argv[])
             }
             break;
         case 'd': args.debug = true; break;
+        case 'l':
+            if (optarg)
+            {
+                std::string loraArg = optarg;
+                size_t colonPos = loraArg.find(':');
+                if (colonPos == std::string::npos)
+                {
+                    std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
+                    return false;
+                }
+                std::string name = loraArg.substr(0, colonPos);
+                std::string path = loraArg.substr(colonPos + 1);
+                args.loraWeights = std::make_pair(name, path);
+            }
+            break;
         default: return false;
         }
     }
@@ -219,7 +236,8 @@ std::vector<TestData> parseCSVFile(fs::path const& csvPath, int maxRecordNum = -
 }
 
 void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Tokenizer* tokenizer,
-    GenerationConfig generationConfig, bool debug)
+    GenerationConfig generationConfig, bool debug,
+    std::pair<std::string, std::string> const& loraWeights = std::make_pair("", ""))
 {
     std::unordered_map<std::string, std::vector<TestData>> testSubject2Data, devSubject2Data;
     std::vector<std::string> subjects;
@@ -271,6 +289,22 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     decoder->setup(enginePath, stream);
+
+    // Load and switch to LoRA weights if provided
+    if (!loraWeights.first.empty())
+    {
+        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        {
+            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraWeights.first.c_str(), loraWeights.second.c_str());
+            return;
+        }
+        if (!decoder->switchLora(loraWeights.first))
+        {
+            LOG_ERROR("Failed to switch to LoRA: %s", loraWeights.first.c_str());
+            return;
+        }
+    }
+
     std::vector<int64_t> choices
         = {tokenizer->encode("A")[0], tokenizer->encode("B")[0], tokenizer->encode("C")[0], tokenizer->encode("D")[0]},
         lastTokenIds(1);
@@ -386,6 +420,6 @@ int main(int argc, char* argv[])
 
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.tokenizerPath);
-    mmluAccuracy(args.enginePath, args.datasetPath, tokenizer.get(), generationConfig, args.debug);
+    mmluAccuracy(args.enginePath, args.datasetPath, tokenizer.get(), generationConfig, args.debug, args.loraWeights);
     return EXIT_SUCCESS;
 };

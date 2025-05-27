@@ -76,9 +76,6 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 1. Pass in `--keep_original` to save the original exported ONNX in `${ONNX_DIR}_raw` folder. For FP16 and INT4, this is FP16 onnx, while for FP8 or NVFP4 this will be FP8 or NVFP4 onnx with FP32 weight storage. This ONNX can be reused by passing in `--onnx_path` to save ONNX export time.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
 1. Default `--max_seq_length=4096`, which corresponds to `kv_cache_capacity` field in AttentionPlugin. Please change this field if other sequence length is required. [prepare_mmmu_onnx.py](../../scripts/prepare_mmmu_onnx.py) provides a script to change `kv_cache_capacity` in existing LLM ONNX to avoid exporting again.
-1. For LoRA support, two modes are available:
-   - `merged`: LoRA weights are merged into the base model before export (recommended for most use cases)
-   - `static`: LoRA weights are kept separate and applied during inference using static LoRA patterns
 
 ## Supported models and precisions
 
@@ -107,3 +104,44 @@ Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 [Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_vl_7b.tgz](https://nvidia.box.com/shared/static/zzkstqg4cojfknm1azsb1qfk1in7if51)
 [Qwen2.5-VL-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_vl_3b.tgz](https://nvidia.box.com/shared/static/531he8t7k5r59qedzfrch4cj13wl5hfe)
 [Qwen2.5-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_vl_2b.tgz](https://nvidia.box.com/shared/static/cgqo6ngxp3dw5ussgpct290ud2kd34kk)
+
+## LoRA Support
+
+The exporter supports three modes of LoRA (Low-Rank Adaptation) integration for all precisions:
+
+1. **Merged Mode** (`--lora_mode merged`):
+   - LoRA weights are merged into the base model before export
+   - Merged weights will be quantized together with the base model
+   - No runtime LoRA switching capability
+   - Usage:
+   ```
+   python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $LORA_DIR --lora_mode merged --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
+   ```
+
+2. **Static Mode** (`--lora_mode static`):
+   - LoRA weights are kept separate and applied during inference using static LoRA patterns
+   - LoRA GEMMs will be in FP16 precision
+   - No runtime LoRA switching capability
+   - Usage:
+   ```
+   python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $LORA_DIR --lora_mode static --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
+   ```
+
+3. **Dynamic Mode** (`--lora_mode dynamic`):
+   - LoRA weights are provided as inputs during inference
+   - LoRA GEMMs will be in FP16 precision
+   - Enables runtime LoRA switching capability
+   - Requires preprocessing of LoRA weights using `process_lora_weights.py`
+   - Usage:
+   ```
+   # Need to process LoRA weights to be runtime compatible.
+   python3 process_lora_weights.py --input_dir $LORA_DIR --output_dir $PROCESSED_LORA_DIR
+   
+   # Then export the model
+   python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $PROCESSED_LORA_DIR --lora_mode dynamic --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
+   ```
+
+**Important Notes:**
+- Only dynamic mode supports runtime LoRA switching
+- For dynamic mode, the LoRA weights must be preprocessed using `process_lora_weights.py` to ensure compatibility
+- The preprocessing step converts weights to FP16, applies proper scaling, and ensures correct tensor shapes

@@ -41,7 +41,7 @@ We describes how to run supported models in the below section.
     ```
 
 ### Image Preprocess and Number of Image Tokens
-1. Image preprocess methods is located in `Qwen2ViTRunner`, which is aligned to huggingface Qwen2-VL/Qwen2.5-VL official image preprocesser.
+1. Image preprocess methods is located in `Qwen2ViTRunner`, which is aligned to huggingface Qwen2-VL/Qwen2.5-VL official image preprocessor.
 1. As a sample, `Qwen2ViTRunner` uses third-party header-only library `stb_image` to read and resize jpeg images. Users should customize image preprocess methods according to their needs, e.g. support other image format, use other libraries.
 1. User should set appropriate `imageTokens` in `vlm_build` and resize input images to appropriate shapes to match engine build config.
     1. For Qwen2-VL/Qwen2.5-VL, an image with height * width = `N*28*28` pixels will generate `N` image tokens.
@@ -64,6 +64,12 @@ The `vlm_build` binary is used to build TensorRT engines. Corresponding to ONNX,
     --maxInputLen=1024 --maxSeqLen=4096 \
     --batchSize=1 --imageTokens=486
     ```
+
+    For dynamic LoRA support, add the following flags:
+    ```
+    --maxLoraRank=<max_rank> --loraWeights=<path_to_lora_weights_safetensors>
+    ```
+
 2. Dynamic shape.
 
     Add `--dynamicShape` and specify `--maxBatchSize`, `--minImageTokens` and `--minImageTokens`.
@@ -77,6 +83,11 @@ The `vlm_build` binary is used to build TensorRT engines. Corresponding to ONNX,
     --maxInputLen=1024 --maxSeqLen=4096 \
     --dynamicShape \
     --maxBatchSize=1 --minImageTokens=128 --maxImageTokens=512
+    ```
+
+    For dynamic LoRA support, add the following flags:
+    ```
+    --maxLoraRank=<max_rank>
     ```
 
 ### VLM Chat
@@ -157,3 +168,65 @@ To match MMMU evaluation [config](https://github.com/open-compass/VLMEvalKit/blo
     ```
 **Note**:
 Drive-LLM MMMU score is different from Qwen official. Drive-LLM MMMU implementation follows [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU), while Qwen-VL uses [VLMEvalkit](https://github.com/open-compass/VLMEvalKit). VLMEvalkit provides higher MMMU scores due to different prompt setup and evaluation method. It also requires higher memory that is not suitable for edge devices. Drive-LLM MMMU scores are aligned with official MMMU-Benchmark results with HuggingFace implementation, providing confidence in VLM accuracy. For details, please refer to [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU) or [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) for getting HuggingFace model accuracy scores.
+
+## LoRA Support
+
+DriveOS LLM SDK supports dynamic LoRA (Low-Rank Adaptation) for efficient model adaptation.
+
+- **Build-time:** Use `--maxLoraRank=<max_rank>` in `vlm_build` to enable dynamic LoRA support. Omit for static/merged LoRA.
+- **Runtime:** Use `--loraWeights=name:path_to_lora_weights.safetensors` in `vlm_chat`, `vlm_benchmark`, or `vlm_accuracy` to load LoRA weights. Omit for static/merged LoRA.
+
+> **Warning:**
+> - You must process LoRA weights using `export/process_lora_weights.py` before use.
+> - You are responsible for ensuring the LoRA weights are valid and compatible.
+> - For static/merged LoRA, do **not** use these flags.
+
+### Example: Build Engine
+
+**Without LoRA:**
+```
+./build/examples/multimodal/vlm_build \
+  --llmOnnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx/model.onnx \
+  --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
+  --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx/model.onnx \
+  --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
+  --modelType=${MODEL_TYPE} \
+  --maxInputLen=1024 --maxSeqLen=4096 \
+  --batchSize=1 --imageTokens=486
+```
+**With dynamic LoRA:**
+```
+./build/examples/multimodal/vlm_build \
+  --llmOnnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx/model.onnx \
+  --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
+  --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx/model.onnx \
+  --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
+  --modelType=${MODEL_TYPE} \
+  --maxInputLen=1024 --maxSeqLen=4096 \
+  --batchSize=1 --imageTokens=486 \
+  --maxLoraRank=16
+```
+
+### Example: Runtime Inference
+
+**Without LoRA:**
+```
+./build/examples/multimodal/vlm_chat \
+  --tokenizerPath=tmp/hf_models/${MODEL_NAME} \
+  --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
+  --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
+  --modelType=${MODEL_TYPE} \
+  --inputString="Describe the picture." \
+  --imagePaths="examples/multimodal/qwen2vl/pics/demo.jpeg"
+```
+**With dynamic LoRA:**
+```
+./build/examples/multimodal/vlm_chat \
+  --tokenizerPath=tmp/hf_models/${MODEL_NAME} \
+  --llmEnginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
+  --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_fp16.engine \
+  --modelType=${MODEL_TYPE} \
+  --inputString="Describe the picture." \
+  --imagePaths="examples/multimodal/qwen2vl/pics/demo.jpeg" \
+  --loraWeights=my_lora:processed_lora_weights.safetensors
+```

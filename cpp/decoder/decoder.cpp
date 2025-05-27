@@ -55,6 +55,8 @@ bool Decoder<T>::setup(
         allocateBuffer();
         mUseCudaGraph = useCudaGraph;
         mCudaGraphCaptured = false;
+        // Set all LoRA weights to rank 0, if any
+        switchLora("None");
         isSetup = true;
     }
     catch (std::exception const& e)
@@ -281,6 +283,11 @@ void Decoder<T>::allocateBuffer()
         mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(),
             {5, {mConfig.batchSize, 2, mConfig.numHead, mConfig.maxLength, mConfig.hiddenSizePerHead}});
     }
+
+    // Initialize dummy LoRA buffer
+    void* dummyLoraBuffer;
+    CUDA_CHECK(cudaMalloc(&dummyLoraBuffer, sizeof(T)));
+    mDeviceBuffer["dummy_lora"] = dummyLoraBuffer;
 }
 
 template <typename T>
@@ -438,7 +445,8 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         }
         return generatedToken;
     };
-    assert(contextLengths.size() == static_cast<size_t>(mConfig.batchSize) && "Input batch size does not match engine batch size.");
+    assert(contextLengths.size() == static_cast<size_t>(mConfig.batchSize)
+        && "Input batch size does not match engine batch size.");
 
     // Setup "input_ids",  "context_lengths", "last_token_ids"
     // Extra model inputs should be set with `setupExtraInputs` before this function
@@ -699,6 +707,143 @@ template <typename T>
 const ModelConfig Decoder<T>::getModelConfig() const noexcept
 {
     return mConfig;
+}
+
+template <typename T>
+bool Decoder<T>::addLora(std::string const& name, std::string const& filePath)
+{
+    if (name == "None")
+    {
+        LOG_WARNING("'None' is reserved for no LoRA weights.");
+        return false;
+    }
+
+    try
+    {
+        auto loader = std::make_unique<drivellm::SafeTensorsLoader>(filePath);
+
+        // Load all tensors to GPU
+        if (!loader->loadFromFileToGPU())
+        {
+            LOG_WARNING("Failed to load LoRA weights to GPU from: %s", filePath.c_str());
+            return false;
+        }
+
+        // Store the loader in our map
+        mLoraWeights[name] = std::move(loader);
+        return true;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_WARNING("Failed to add LoRA weights: %s", e.what());
+        return false;
+    }
+}
+
+template <typename T>
+bool Decoder<T>::switchLora(std::string const& name)
+{
+    // Get the number of bindings in the engine
+    int32_t numBindings = mEngine->getNbIOTensors();
+
+    // If name is "None", set all LoRA weights to rank 0
+    if (name == "None")
+    {
+        for (int32_t i = 0; i < numBindings; ++i)
+        {
+            char const* bindingName = mEngine->getIOTensorName(i);
+            std::string bindingNameStr(bindingName);
+            if (bindingNameStr.find("lora_") != std::string::npos)
+            {
+                // Get the shape from profile
+                nvinfer1::Dims shape = mEngine->getProfileShape(bindingName, 0, nvinfer1::OptProfileSelector::kMAX);
+                // Set rank dimension to 0 (second dim for A, first dim for B)
+                if (bindingNameStr.find("lora_A") != std::string::npos)
+                {
+                    shape.d[1] = 0; // [gemm_k, rank]
+                }
+                else if (bindingNameStr.find("lora_B") != std::string::npos)
+                {
+                    shape.d[0] = 0; // [rank, gemm_n]
+                }
+
+                // Set shape and address for both contexts
+                mContextExecutionContext->setInputShape(bindingName, shape);
+                mGenerationExecutionContext->setInputShape(bindingName, shape);
+                mContextExecutionContext->setTensorAddress(bindingName, mDeviceBuffer["dummy_lora"]);
+                mGenerationExecutionContext->setTensorAddress(bindingName, mDeviceBuffer["dummy_lora"]);
+            }
+        }
+        return true;
+    }
+
+    // Check if the requested LoRA exists
+    auto it = mLoraWeights.find(name);
+    if (it == mLoraWeights.end())
+    {
+        LOG_WARNING("LoRA weights with name '%s' not found", name.c_str());
+        return false;
+    }
+
+    auto& loraLoader = it->second;
+    auto const& tensorInfo = loraLoader->getSafeTensorsInfo();
+
+    // Iterate through all bindings
+    for (int32_t i = 0; i < numBindings; ++i)
+    {
+        char const* bindingName = mEngine->getIOTensorName(i);
+        std::string bindingNameStr(bindingName);
+        if (bindingNameStr.find("lora_") != std::string::npos)
+        {
+            // Get the shape from profile
+            nvinfer1::Dims shape = mEngine->getProfileShape(bindingName, 0, nvinfer1::OptProfileSelector::kMAX);
+
+            // Try to find the tensor in the LoRA weights
+            auto tensorIt = tensorInfo.find(bindingName);
+            if (tensorIt != tensorInfo.end() && tensorIt->second.gpuPtr != nullptr)
+            {
+                // Found matching tensor, use its data
+                mContextExecutionContext->setInputShape(bindingName, shape);
+                mGenerationExecutionContext->setInputShape(bindingName, shape);
+                mContextExecutionContext->setTensorAddress(bindingName, tensorIt->second.gpuPtr);
+                mGenerationExecutionContext->setTensorAddress(bindingName, tensorIt->second.gpuPtr);
+            }
+            else
+            {
+                // No matching tensor found, set rank to 0
+                if (bindingNameStr.find("lora_A") != std::string::npos)
+                {
+                    shape.d[1] = 0; // [gemm_k, rank]
+                }
+                else if (bindingNameStr.find("lora_B") != std::string::npos)
+                {
+                    shape.d[0] = 0; // [rank, gemm_n]
+                }
+                mContextExecutionContext->setInputShape(bindingName, shape);
+                mGenerationExecutionContext->setInputShape(bindingName, shape);
+                mContextExecutionContext->setTensorAddress(bindingName, mDeviceBuffer["dummy_lora"]);
+                mGenerationExecutionContext->setTensorAddress(bindingName, mDeviceBuffer["dummy_lora"]);
+            }
+        }
+    }
+
+    // Need to reset cudaGraph because the setInputShape and setTensorAddress requires cudaGraph to be recaptured
+    if (mUseCudaGraph)
+    {
+        mCudaGraphCaptured = false;
+    }
+    return true;
+}
+
+template <typename T>
+std::vector<std::string> Decoder<T>::getLoraNames() const
+{
+    std::vector<std::string> names = {"None"};
+    for (auto const& [name, _] : mLoraWeights)
+    {
+        names.push_back(name);
+    }
+    return names;
 }
 
 template class Decoder<half>;

@@ -13,15 +13,17 @@ import os
 import shutil
 import time
 
+import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 import torch
-import numpy as np
 from packaging.version import Version
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from utils.export_utils import (WrapperModelForCausalLM, llm_to_onnx,
-                                load_model_with_lora,WrapperEagleBaseModelForCausalLM,
-                                WrapperEagleDraftModelForCausalLM)
+from utils.export_utils import (WrapperEagleBaseModelForCausalLM,
+                                WrapperEagleDraftModelForCausalLM,
+                                WrapperModelForCausalLM, llm_to_onnx,
+                                load_model_with_lora)
+from utils.lora import insert_dynamic_lora, insert_static_lora
 from utils.surgeon_utils import (RopeType, insert_attention_plugin,
                                  insert_gather_last_token,
                                  insert_gather_last_token_eagle)
@@ -102,9 +104,9 @@ def llm_arguments():
         '--lora_mode',
         type=str,
         default="none",
-        choices=["merged", "none", "static"],
+        choices=["merged", "none", "static", "dynamic"],
         help=
-        "LoRA mode. Currently merged mode (weights merged into base model) and static mode (weights not merged) are supported",
+        "LoRA mode. Currently merged mode (weights merged into base model), static mode (weights not merged) and dynamic mode (weights as inputs) are supported",
         required=False)
     parser.add_argument(
         '--eagle_base',
@@ -189,8 +191,9 @@ def export_raw_llm(model,
             )
         else:
             print("Loading fp16 ONNX model...")
-        
-        if wrapper_cls in (WrapperEagleDraftModelForCausalLM, WrapperEagleBaseModelForCausalLM):
+
+        if wrapper_cls in (WrapperEagleDraftModelForCausalLM,
+                           WrapperEagleBaseModelForCausalLM):
             llm_to_onnx(wrapper_cls(model, eagle3=eagle3),
                         output_dir,
                         extra_inputs=extra_inputs,
@@ -258,6 +261,7 @@ def surgeon_llm(raw_onnx_path,
                 extra_plugin_inputs=[],
                 extra_plugin_attributes={},
                 lm_head_precision="fp16",
+                lora_mode="none",
                 lora_config=None,
                 lora_weights=None,
                 eagle_base=False,
@@ -337,10 +341,13 @@ def surgeon_llm(raw_onnx_path,
         print(f"nvfp4 qdq to 2 dqs inserted in {t5 - t4}.")
 
     # Insert static LoRA as the last step
-    if lora_config is not None and lora_weights is not None:
+    if lora_mode == "static" and lora_config is not None and lora_weights is not None:
         graph = gs.import_onnx(onnx_model)
-        from utils.surgeon_utils import insert_static_lora
         graph = insert_static_lora(graph, lora_config, lora_weights, dtype)
+        onnx_model = gs.export_onnx(graph)
+    elif lora_mode == "dynamic":
+        graph = gs.import_onnx(onnx_model)
+        graph = insert_dynamic_lora(graph, dtype)
         onnx_model = gs.export_onnx(graph)
 
     output_onnx_name = f"{output_dir}/model.onnx"
@@ -549,15 +556,14 @@ def main(args):
     extra_plugin_attributes = {}
     extra_plugin_inputs = []
     if args.eagle_base or args.eagle_draft:
-        attention_mask = gs.Variable(
-            "attention_mask", np.int32,
-            ['batch_size', 'q_len', 'q_len_aligned'])
+        attention_mask = gs.Variable("attention_mask", np.int32,
+                                     ['batch_size', 'q_len', 'q_len_aligned'])
         attention_pos_id = gs.Variable("attention_pos_id", np.int32,
-                                        ['batch_size', 'q_len'])
+                                       ['batch_size', 'q_len'])
         extra_plugin_inputs.append(attention_mask)
         extra_plugin_inputs.append(attention_pos_id)
         extra_plugin_attributes["enable_tree_attention"] = 1
-        
+
     surgeon_llm(raw_onnx_path,
                 args.output_dir,
                 args.dtype,
@@ -568,6 +574,7 @@ def main(args):
                 lm_head_precision=args.lm_head,
                 extra_plugin_inputs=extra_plugin_inputs,
                 extra_plugin_attributes=extra_plugin_attributes,
+                lora_mode=args.lora_mode,
                 lora_config=lora_config,
                 lora_weights=lora_weights,
                 eagle_base=args.eagle_base,

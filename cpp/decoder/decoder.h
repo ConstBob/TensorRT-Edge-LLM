@@ -14,6 +14,7 @@
 
 #include "common/benchmarkProfiler.h"
 #include "common/common.h"
+#include "common/safetensors_loader/safetensorsLoader.h"
 #include "common/trtUtils.h"
 #include "sampler/include/sampler.h"
 #include <NvInferRuntime.h>
@@ -23,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ModelConfig
@@ -111,6 +113,9 @@ public:
         mDeviceBuffer.clear();
         isSetup = false;
     };
+    bool addLora(std::string const& name, std::string const& filePath);
+    bool switchLora(std::string const& name);
+    std::vector<std::string> getLoraNames() const;
 
 private:
     cudaStream_t mStream;
@@ -137,4 +142,5 @@ private:
     cudaGraphExec_t mGenerationGraphExec;
     // Flag indicating Eagle pattern mode(target + draft models)
     bool mIsEagle;
+    std::unordered_map<std::string, std::unique_ptr<drivellm::SafeTensorsLoader>> mLoraWeights;
 };
