@@ -441,6 +441,7 @@ void Eagle<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_
     int32_t generationIter = 0;
     int64_t unfinishedBatchNum = mBaseModel->getModelConfig().batchSize;
     updateGenerationStatus(generationIter, unfinishedBatchNum, contextLengths);
+    std::for_each(contextLengths.begin(), contextLengths.end(), [this](int32_t& val) { val -= 1; });
     if(generationIter < generationConfig.maxLength && unfinishedBatchNum != 0){
     
         auto const hiddenStates = mBaseModel->getDeviceBuffer("hidden_states");
@@ -461,9 +462,7 @@ void Eagle<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_
             mEagleDeviceBuffer["positionIdsVerification"]);
         invokeSamplingAndAccept(static_cast<int64_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
         invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
-        for(int i = 0; i < mBatchSize; i++){
-            contextLengthForDraft[i] = contextLengths[i] -1;
-        }
+        contextLengthForDraft = contextLengths;
         updateGenerationStatus(generationIter, unfinishedBatchNum, contextLengths);
         // decode
         while (generationIter < generationConfig.maxLength && unfinishedBatchNum != 0)
