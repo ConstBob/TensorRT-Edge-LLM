@@ -166,6 +166,14 @@ struct InitCausalAttentionMaskParams
     int32_t* packedMask{nullptr};
 };
 
+struct GetLastLogitsOffsetParams
+{
+    int32_t* paths{nullptr};
+    int32_t* bestPathIds{nullptr};
+    int64_t* acceptedLengths{nullptr};
+    int64_t* lastLogitsOffset{nullptr};
+};
+
 void dispatchUpdateCumScoresAndParentsIds(UpdateCumScoresAndParentsIdsParams const& params,EagleCommonParams const& commonParams);
 
 void dispatchAssembleDraftIdsAndPathAndMaskAndPositionIds(
@@ -181,3 +189,5 @@ template <typename T>
 void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds(UpdateKVCacheParams<T> const& params, EagleCommonParams const& commonParams);
 
 void dispatchInitializeAttentionMaskCausal(InitCausalAttentionMaskParams const& params, EagleCommonParams const& commonParams);
+
+void dispatchGetLastLogitsOffset(GetLastLogitsOffsetParams const& params, EagleCommonParams const& commonParams);

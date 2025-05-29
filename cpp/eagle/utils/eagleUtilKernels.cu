@@ -899,3 +899,32 @@ void dispatchInitializeAttentionMaskCausal(InitCausalAttentionMaskParams const& 
     initCausalAttentionMask<<<gridSize, blockSize, 0, commonParams.stream>>>(
         params.mask, commonParams.batchSize, commonParams.maxDecodingTokens, params.packedMask);
 }
+
+__global__ void getLastLogitsOffsetKernel(
+    int64_t* lastLogitsOffset,          
+    const int32_t* paths,               
+    const int32_t* bestPathIds, 
+    const int64_t* acceptedLengths,
+    int32_t batchSize,
+    int32_t maxPathLen,
+    int32_t maxDecodingTokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batchSize) return;
+
+    int bestPath = bestPathIds[idx];
+    int64_t acceptedLen = acceptedLengths[idx];
+    int pathOffset = idx * maxDecodingTokens * (maxPathLen + 1) + bestPath * (maxPathLen + 1);
+    
+    lastLogitsOffset[idx] = paths[pathOffset + acceptedLen - 1];
+}
+
+void dispatchGetLastLogitsOffset(GetLastLogitsOffsetParams const& params, EagleCommonParams const& commonParams)
+{
+    int const blockSize = 128;
+    int const gridSize = (commonParams.batchSize + blockSize - 1) / blockSize;
+
+    getLastLogitsOffsetKernel<<<gridSize, blockSize, 0, commonParams.stream>>>(params.lastLogitsOffset,
+        params.paths, params.bestPathIds, params.acceptedLengths, commonParams.batchSize, commonParams.maxPathLen,
+        commonParams.maxDecodingTokens);
+}

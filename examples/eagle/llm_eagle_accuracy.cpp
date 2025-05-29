@@ -315,7 +315,7 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& eagleEnginePath, f
     auto baseDecoder = std::make_unique<Decoder<half>>();
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    baseDecoder->setup(enginePath, stream);
+    baseDecoder->setup(enginePath, stream, true, 1, true);
     auto draftDecoder = std::make_unique<Decoder<half>>();
     draftDecoder->setup(eagleEnginePath, stream, true, 1, true);
     std::vector<int64_t> choices

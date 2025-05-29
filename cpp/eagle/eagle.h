@@ -112,6 +112,7 @@ private:
     EagleCommonParams mEagleCommonParams;
     std::string mEagleEnginePath;
     std::vector<int64_t> acceptedLengthsHost{mBatchSize};
+    std::vector<int64_t> lastLogitsOffsetHost{mBatchSize};
 
     int64_t mBatchSize;
     int32_t mMaxSeqLen;
