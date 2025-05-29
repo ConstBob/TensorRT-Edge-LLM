@@ -367,6 +367,10 @@ void Eagle<T>::allocateEagleBuffer()
     {
         initDraftVoc();
     }
+
+    void* lastLogitsOffsetDevice;
+    CUDA_CHECK(cudaMalloc(&lastLogitsOffsetDevice, mBatchSize * sizeof(int64_t)));
+    mEagleDeviceBuffer["lastLogitsOffset"] = lastLogitsOffsetDevice;
 }
 template <typename T>
 void Eagle<T>::addNewBufferForModelIO()
@@ -390,10 +394,23 @@ size_t Eagle<T>::getDeviceMemorySize() const noexcept
 template <typename T>
 std::vector<T> const& Eagle<T>::getLastHostLogits()
 {
-    size_t totalLogitSize = mBatchSize * 1 * mVocabSize;
-    static std::vector<T> hostLogits(totalLogitSize);
-    CUDA_CHECK(cudaMemcpy(
-        hostLogits.data(), mBaseModel->getDeviceBuffer("logits"), totalLogitSize * sizeof(T), cudaMemcpyDeviceToHost));
+    size_t totalLogitSize = mBatchSize * mVocabSize;
+    static std::vector<T> hostLogits(totalLogitSize, 0);
+    GetLastLogitsOffsetParams params;
+    params.paths = static_cast<int32_t*>(mEagleDeviceBuffer["paths"]);
+    params.bestPathIds = static_cast<int32_t*>(mEagleDeviceBuffer["bestPathIds"]);
+    params.acceptedLengths = static_cast<int64_t*>(mEagleDeviceBuffer["acceptedLengths"]);
+    params.lastLogitsOffset = static_cast<int64_t*>(mEagleDeviceBuffer["lastLogitsOffset"]);
+    dispatchGetLastLogitsOffset(params, mEagleCommonParams);
+    CUDA_CHECK(cudaMemcpyAsync(lastLogitsOffsetHost.data(), mEagleDeviceBuffer["lastLogitsOffset"],
+        mBatchSize * sizeof(int64_t), cudaMemcpyDeviceToHost, mStream));
+    for (int i = 0; i < mBatchSize; i++)
+    {
+        auto const offset = i * mMaxDecodingTokens * mVocabSize + lastLogitsOffsetHost[i] * mVocabSize;
+        CUDA_CHECK(cudaMemcpy(
+        hostLogits.data() + i * mVocabSize, static_cast<T*>(mBaseModel->getDeviceBuffer("logits")) + offset, mVocabSize * sizeof(T), cudaMemcpyDeviceToHost));
+    }
+    
     return hostLogits;
 }
 
@@ -418,78 +435,82 @@ void Eagle<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_
         profiler->recordHostEnd("first token latency");
         profiler->recordDeviceStart("generation");
     }
-
     invokeSamplingAndAccept(nullptr, 1, endIds);
-    auto iterNum = 1;
     std::vector<int32_t> contextLengthForDraft = contextLengths;
-    auto const hiddenStates = mBaseModel->getDeviceBuffer("hidden_states");
-    // only for bs=1
-    mDraftModel->generateForDraftContext(
-        static_cast<void*>(static_cast<int64_t*>(mBaseModel->getDeviceBuffer("input_ids")) + 1), hiddenStates,
-        mEagleDeviceBuffer["packedAttentionMaskCausal"], mEagleDeviceBuffer["treePositionIds"], contextLengthForDraft,
-        last_token_ids, isEagle3, mEagleDeviceBuffer["hiddenStatesFromDraftZero"], {2, {mBatchSize, contextLengths[0]}},
-        {3, {mBatchSize, contextLengths[0], mTargetOutputHiddenDim}}, {3, {mBatchSize, 1, 1}},
-        {2, {mBatchSize, 1}});
-
-    draftModelDecodeInfer(contextLengthForDraft);
-    std::vector<int64_t> lastTokenIdsForVerification(mMaxDecodingTokens);
-    std::iota(lastTokenIdsForVerification.begin(), lastTokenIdsForVerification.end(), 0);
-
-    // tree verification
-    mBaseModel->generateForDecode(mEagleDeviceBuffer["draftIds"], contextLengths, lastTokenIdsForVerification,
-        mMaxDecodingTokens, mEagleDeviceBuffer["packedTreeMaskVerification"],
-        mEagleDeviceBuffer["positionIdsVerification"]);
-    invokeSamplingAndAccept(static_cast<int64_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
-    invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
+    auto iterNum = 1;
     int32_t generationIter = 0;
     int64_t unfinishedBatchNum = mBaseModel->getModelConfig().batchSize;
-    contextLengthForDraft = contextLengths;
     updateGenerationStatus(generationIter, unfinishedBatchNum, contextLengths);
-    // decode
-    while (generationIter < generationConfig.maxLength && unfinishedBatchNum != 0)
-    {
-        iterNum++;
-        std::vector<int64_t> lastTokenIdsForEagle0;
-        for (int i = 0; i < mBatchSize; i++)
-        {
-            lastTokenIdsForEagle0.push_back(acceptedLengthsHost[i] - 1);
-        }
-
-        nvinfer1::Dims inputDims = {2, {mBatchSize, mMaxDecodingTokens}};
-
-        nvinfer1::Dims hiddenStatesDims = {3, {mBatchSize, mMaxDecodingTokens, mHiddenDim}};
-        nvinfer1::Dims attentionMaskDims = {3, {mBatchSize, mMaxDecodingTokens, divUp(mMaxDecodingTokens, 32)}};
-        nvinfer1::Dims attentionPosIdDims = {2, {mBatchSize, mMaxDecodingTokens}};
-        nvinfer1::Dims lastTokenIdsDims = {1, {mBatchSize}};
-
-        std::for_each(contextLengthForDraft.begin(), contextLengthForDraft.end(),
-            [this](int32_t& val) { val += mMaxDecodingTokens; });
-
-        mDraftModel->generateForDraftDecode(mEagleDeviceBuffer["selectedOutputIdsDraft"],
-            mEagleDeviceBuffer["hiddenStatesDraftDecode"], mEagleDeviceBuffer["packedAttentionMaskCausal"],
-            mEagleDeviceBuffer["treePositionIds"], contextLengthForDraft, lastTokenIdsForEagle0, inputDims,
-            hiddenStatesDims, attentionMaskDims, attentionPosIdDims, lastTokenIdsDims, 0, isEagle3,
-            mEagleDeviceBuffer["hiddenStatesFromDraftZero"], nullptr);
-
-        for (int i = 0; i < mBatchSize; i++)
-        {
-            contextLengthForDraft[i] += acceptedLengthsHost[i] - mMaxDecodingTokens;
-        }
-
+    if(generationIter < generationConfig.maxLength && unfinishedBatchNum != 0){
+    
+        auto const hiddenStates = mBaseModel->getDeviceBuffer("hidden_states");
+        // only for bs=1
+        mDraftModel->generateForDraftContext(
+            static_cast<void*>(static_cast<int64_t*>(mBaseModel->getDeviceBuffer("input_ids")) + 1), hiddenStates,
+            mEagleDeviceBuffer["packedAttentionMaskCausal"], mEagleDeviceBuffer["treePositionIds"], contextLengthForDraft,
+            last_token_ids, isEagle3, mEagleDeviceBuffer["hiddenStatesFromDraftZero"], {2, {mBatchSize, contextLengths[0]}},
+            {3, {mBatchSize, contextLengths[0], mTargetOutputHiddenDim}}, {3, {mBatchSize, 1, 1}},
+            {2, {mBatchSize, 1}});
         draftModelDecodeInfer(contextLengthForDraft);
-        // contextLengths[i] contains the new sample token, so we need to minus 1
-        std::for_each(contextLengths.begin(), contextLengths.end(), [this](int32_t& val) { val -= 1; });
+        std::vector<int64_t> lastTokenIdsForVerification(mMaxDecodingTokens);
+        std::iota(lastTokenIdsForVerification.begin(), lastTokenIdsForVerification.end(), 0);
 
+        // tree verification
         mBaseModel->generateForDecode(mEagleDeviceBuffer["draftIds"], contextLengths, lastTokenIdsForVerification,
             mMaxDecodingTokens, mEagleDeviceBuffer["packedTreeMaskVerification"],
             mEagleDeviceBuffer["positionIdsVerification"]);
-        invokeSamplingAndAccept(
-            static_cast<int64_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
+        invokeSamplingAndAccept(static_cast<int64_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
         invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
-        contextLengthForDraft = contextLengths;
+        for(int i = 0; i < mBatchSize; i++){
+            contextLengthForDraft[i] = contextLengths[i] -1;
+        }
         updateGenerationStatus(generationIter, unfinishedBatchNum, contextLengths);
-        auto const current_context_length = contextLengths[0];
+        // decode
+        while (generationIter < generationConfig.maxLength && unfinishedBatchNum != 0)
+        {
+            iterNum++;
+            std::vector<int64_t> lastTokenIdsForEagle0;
+            for (int i = 0; i < mBatchSize; i++)
+            {
+                lastTokenIdsForEagle0.push_back(acceptedLengthsHost[i] - 1);
+            }
+
+            nvinfer1::Dims inputDims = {2, {mBatchSize, mMaxDecodingTokens}};
+
+            nvinfer1::Dims hiddenStatesDims = {3, {mBatchSize, mMaxDecodingTokens, mHiddenDim}};
+            nvinfer1::Dims attentionMaskDims = {3, {mBatchSize, mMaxDecodingTokens, divUp(mMaxDecodingTokens, 32)}};
+            nvinfer1::Dims attentionPosIdDims = {2, {mBatchSize, mMaxDecodingTokens}};
+            nvinfer1::Dims lastTokenIdsDims = {1, {mBatchSize}};
+
+            std::for_each(contextLengthForDraft.begin(), contextLengthForDraft.end(),
+                [this](int32_t& val) { val += mMaxDecodingTokens; });
+
+            mDraftModel->generateForDraftDecode(mEagleDeviceBuffer["selectedOutputIdsDraft"],
+                mEagleDeviceBuffer["hiddenStatesDraftDecode"], mEagleDeviceBuffer["packedAttentionMaskCausal"],
+                mEagleDeviceBuffer["treePositionIds"], contextLengthForDraft, lastTokenIdsForEagle0, inputDims,
+                hiddenStatesDims, attentionMaskDims, attentionPosIdDims, lastTokenIdsDims, 0, isEagle3,
+                mEagleDeviceBuffer["hiddenStatesFromDraftZero"], nullptr);
+
+            for (int i = 0; i < mBatchSize; i++)
+            {
+                contextLengthForDraft[i] += acceptedLengthsHost[i] - mMaxDecodingTokens;
+            }
+
+            draftModelDecodeInfer(contextLengthForDraft);
+            // contextLengths[i] contains the new sample token, so we need to minus 1
+            std::for_each(contextLengths.begin(), contextLengths.end(), [this](int32_t& val) { val -= 1; });
+
+            mBaseModel->generateForDecode(mEagleDeviceBuffer["draftIds"], contextLengths, lastTokenIdsForVerification,
+                mMaxDecodingTokens, mEagleDeviceBuffer["packedTreeMaskVerification"],
+                mEagleDeviceBuffer["positionIdsVerification"]);
+            invokeSamplingAndAccept(static_cast<int64_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
+            invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
+            contextLengthForDraft = contextLengths;
+            updateGenerationStatus(generationIter, unfinishedBatchNum, contextLengths);
+        }
+
     }
+
     if (profiler)
     {
         profiler->recordDeviceEnd("generation");
@@ -500,7 +521,7 @@ void Eagle<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_
         auto const newLen = contextLengths[i] - initContextLengths[i];
         outputIds[i].resize(newLen);
         auto const acception_rate = (float) newLen / iterNum;
-        LOG_INFO("Acception_rate: %f newLen: %d iterNum: %d\n", acception_rate, newLen, iterNum);
+        LOG_DEBUG("Acception_rate: %f newLen: %d iterNum: %d\n", acception_rate, newLen, iterNum);
         if (newTokensNumbers)
         {
             newTokensNumbers->push_back(newLen);
@@ -514,6 +535,7 @@ void Eagle<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_
             newLen * sizeof(int64_t), cudaMemcpyDeviceToHost, mStream));
     }
     CUDA_CHECK(cudaStreamSynchronize(mStream));
+    
     return;
 }
 template <typename T>
