@@ -1,3 +1,0 @@
-nvidia-modelopt[torch]==0.23.0
-nvidia-modelopt[onnx]==0.23.0
-onnx-weekly

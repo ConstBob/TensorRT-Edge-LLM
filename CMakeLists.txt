@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 project(
   driveos_llm_sdk
-  VERSION 0.0.3.3
+  VERSION 0.1.0.0
   LANGUAGES CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -129,7 +129,8 @@ if(BUILD_UNIT_TESTS)
        ${CMAKE_SOURCE_DIR}/unittests/*.cu)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
   target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS})
-  target_link_libraries(unitTest PRIVATE gtest gtest_main llmSdkPlugin
-                                         llmSdkCore ${CUDART_LIB} ${CUDA_DRIVER_LIB})
+  target_link_libraries(
+    unitTest PRIVATE gtest gtest_main llmSdkPlugin llmSdkCore ${CUDART_LIB}
+                     ${CUDA_DRIVER_LIB})
   add_cross_build_link_options(unitTest)
 endif()

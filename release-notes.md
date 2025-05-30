@@ -1,4 +1,14 @@
 # Release Notes
+## 0.1.0
+- Initial bring up of EAGLE2 & EAGLE3 with tree attention kernels
+- Initial bring up of static and dynamic LoRA
+- Added model support for Qwen2.5 3B, Qwen2.5-VL 3B, Qwen2.5-VL 7B
+- Added FP8 VIT recipe for VLM
+- Add JSON parser implementation
+- Improved NVFP4 and FP8 performance with TensorRT10.10
+- Improved unit tests and coding style
+- Fixed C++ memory leak
+
 ## 0.0.3
 - Fixed CUDA Graph capture errors
 - Fixed NVFP4 accuracy issue by changing quantization recipe

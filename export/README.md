@@ -12,63 +12,22 @@ This folder contains script to export ONNX model from PyTorch model. The exporte
 1. Download HF checkpoint from transformers and save it locally
 1. `cd export` at the top-level of LLM SDK repository
 1. `pip3 install -r requirements.txt`
-1. If you are working with NVFP4, you need to uninstall `onnx` and `nvidia-modelopt` using `pip3 uninstall onnx` and `pip3 uninstall nvidia-modelopt`, and then install `pip3 install -r requirements_nvfp4.txt`. Please refer to the instruction in [../README.md](../README.md#limitations-and-known-issues) to properly configure the environment.
+   1. If you are working with INT4, you need to downgrade `nvidia-modelopt` to 0.19.0.
+   ```
+   pip3 uninstall -y nvidia-modelopt
+   pip3 install -r requirements_int4.txt
+   ```
+   1. Please refer to the instruction in [../README.md](../README.md#limitations-and-known-issues) to properly configure the environment.
 1. Call export script.
-```
-# LLM model
-python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
+   ```
+   # LLM model
+   python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
 
-# VLM model
-python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
-```
+   # VLM model
+   python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR --visualType [fp16|fp8]
+   ```
 
-For models with LoRA weights, you can use the following command:
-```
-python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $LORA_DIR --lora_mode merged --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
-```
-Eagle decoding: we only verify LLAMA-based model with FP16 precision now.
-
-Eagle3: for Eagle3, we use the model from HuggingFace [yuhuili/EAGLE3-LLaMA3.1-Instruct-8B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B), which is a LLAMA-based model.
-
-```
-export TORCH_DIR="../Meta-Llama-3.1-8B-Instruct"
-export EAGLE3_TORCH_DIR="../EAGLE3-LLaMA3.1-Instruct-8B"
-git lfs install
-git clone https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct $TORCH_DIR
-git clone https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B $EAGLE3_TORCH_DIR
-
-```
-
-Export ONNX for base model:
-```
-export EAGLE3_ONNX_BASE_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle3-Base"
-python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE3_ONNX_BASE_DIR --eagle_base True --eagle3 True
-```
-Export ONNX for draft model:
-```
-export EAGLE3_ONNX_DRAFT_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle3-Draft"
-python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE3_ONNX_DRAFT_DIR --eagle_torch_dir $EAGLE3_TORCH_DIR --eagle_draft True --eagle3 True
-```
-For Eagle2:
-```
-export TORCH_DIR="../Meta-Llama-3.1-8B-Instruct"
-export EAGLE2_TORCH_DIR="../EAGLE-LLaMA3.1-Instruct-8B"
-git lfs install
-git clone https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct $TORCH_DIR
-git clone git clone https://huggingface.co/yuhuili/EAGLE-LLaMA3.1-Instruct-8B $EAGLE2_TORCH_DIR
-```
-Export ONNX for base model:
-```
-export EAGLE2_ONNX_BASE_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle-Base"
-python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE2_ONNX_BASE_DIR --eagle_base True
-```
-Export ONNX for draft model:
-```
-export EAGLE2_ONNX_DRAFT_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle-Draft"
-python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE2_ONNX_DRAFT_DIR --eagle_torch_dir $EAGLE2_TORCH_DIR --eagle_draft True
-```
-
-The ONNX with desired data type will be exported in `$ONNX_DIR`.
+1. The ONNX with desired data type will be exported in `$ONNX_DIR`.
 
 **Notes:**
 1. TensorRT Out-of-the-box(OOTB) has a known performance issue with INT4 GEMV. Even though the accuracy is good, the performance is not as desired. Therefore a Int4GroupwiseGemmPlugin is written and the dq+gemms are replaced by the plugin as a temporary solution for now for int4 by default. If you do not want to use this plugin, you can pass in int4_ootb as the datatype for export script.
@@ -77,71 +36,87 @@ The ONNX with desired data type will be exported in `$ONNX_DIR`.
 1. Pass `--dataset_dir` to skip downloading quantization calibration dataset
 1. Default `--max_seq_length=4096`, which corresponds to `kv_cache_capacity` field in AttentionPlugin. Please change this field if other sequence length is required. [prepare_mmmu_onnx.py](../../scripts/prepare_mmmu_onnx.py) provides a script to change `kv_cache_capacity` in existing LLM ONNX to avoid exporting again.
 
+## LoRA
+For models with LoRA weights, you can use the following command:
+```
+python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $LORA_DIR --lora_mode merged --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
+```
+For LoRA support, two modes are available:
+   - `merged`: LoRA weights are merged into the base model before export (recommended for most use cases)
+   - `static`: LoRA weights are kept separate and applied during inference using static LoRA patterns
+
+## Eagle Deocding
+For Eagle decoding, we only verify LLAMA-based model with FP16 precision now.
+
+### Eagle3
+1. For Eagle3, we use the model from HuggingFace [yuhuili/EAGLE3-LLaMA3.1-Instruct-8B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B), which is a LLAMA-based model.
+
+   ```
+   export TORCH_DIR="../Meta-Llama-3.1-8B-Instruct"
+   export EAGLE3_TORCH_DIR="../EAGLE3-LLaMA3.1-Instruct-8B"
+   git lfs install
+   git clone https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct $TORCH_DIR
+   git clone https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B $EAGLE3_TORCH_DIR
+   ```
+
+1. Export ONNX for base model:
+   ```
+   export EAGLE3_ONNX_BASE_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle3-Base"
+   python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE3_ONNX_BASE_DIR --eagle_base True --eagle3 True
+   ```
+1. Export ONNX for draft model:
+   ```
+   export EAGLE3_ONNX_DRAFT_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle3-Draft"
+   python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE3_ONNX_DRAFT_DIR --eagle_torch_dir $EAGLE3_TORCH_DIR --eagle_draft True --eagle3 True
+   ```
+### Eagle2
+1. Download model
+   ```
+   export TORCH_DIR="../Meta-Llama-3.1-8B-Instruct"
+   export EAGLE2_TORCH_DIR="../EAGLE-LLaMA3.1-Instruct-8B"
+   git lfs install
+   git clone https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct $TORCH_DIR
+   git clone git clone https://huggingface.co/yuhuili/EAGLE-LLaMA3.1-Instruct-8B $EAGLE2_TORCH_DIR
+   ```
+1. Export ONNX for base model:
+   ```
+   export EAGLE2_ONNX_BASE_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle-Base"
+   python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE2_ONNX_BASE_DIR --eagle_base True
+   ```
+1. Export ONNX for draft model:
+   ```
+   export EAGLE2_ONNX_DRAFT_DIR="../Meta-Llama-3.1-8B-Instruct-Eagle-Draft"
+   python3 llm_export.py --torch_dir $TORCH_DIR --dtype fp16 --output_dir $EAGLE2_ONNX_DRAFT_DIR --eagle_torch_dir $EAGLE2_TORCH_DIR --eagle_draft True
+   ```
+
 ## Supported models and precisions
 
 The `llm_export.py` script can export the following LLM models into ONNX. There is a potential that other LLMs can be supported.
 
-We also provide ONNX files for some of the models so you can download them directly.
+We also provide ONNX files for some of the models with open-source license so you can download them directly.
 
 Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 --- | --- | --- | --- | --- | ---
-[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes |
-[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes |
-[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes |
-[Qwen2-0.5B-instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_0.5b.tgz]()
-[Qwen2-1.5B-instruct](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_1.5b.tgz]()
-[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_7b.tgz]()
-[Qwen2.5-0.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_0.5b.tgz]()
-[Qwen2.5-1.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_1.5b.tgz]()
-[Qwen2.5-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_3b.tgz]()
-[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_7b.tgz]()
+[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes | [llama3_8b.tgz](https://nvidia.box.com/shared/static/2r5xez6bg3sodpg3xjy7v9kiuw270c8h)
+[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes | [llama3.1_8b.tgz](https://nvidia.box.com/shared/static/2my40zw33m7a3s23hv8a2iowd2oy4ykz)
+[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes | [llama3.2_3b.tgz](https://nvidia.box.com/shared/static/cz794nwsb5y4vn8sm3b5x9g3xax2m0dj)
+[Qwen2-0.5B-instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_0.5b.tgz](https://nvidia.box.com/shared/static/9buz5igx2unkerl1o23k4cpbvo2hvigf)
+[Qwen2-1.5B-instruct](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_1.5b.tgz](https://nvidia.box.com/shared/static/0t4ucre0kc5nuuqqjlgj2ed6tzkkvjw1)
+[Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_7b.tgz](https://nvidia.box.com/shared/static/bfowygk8lj0vt55jxfl1cizenur6pjo4)
+[Qwen2.5-0.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_0.5b.tgz](https://nvidia.box.com/shared/static/5rvd43zi8b3ha4x3wm1vjfryb9az1xht)
+[Qwen2.5-1.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_1.5b.tgz](https://nvidia.box.com/shared/static/0kg77vm50jw3nheci628mrse5sj1j4yn)
+[Qwen2.5-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) | Yes | Yes | Yes | Yes | /
+[Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_7b.tgz](https://nvidia.box.com/shared/static/tjqxajzqz2ko25b3tuft7vsl3ffp56jm)
+[Llama3.1-8B-Eagle2-Base](https://huggingface.co/meta-llama/Llama-3.1-8B)  | Yes | No | No | No | [llama3.1_8b_eagle2_base.tgz](https://nvidia.box.com/shared/static/7j4tgbr1hxaj6a2ngv0ynrkyq6rghvq0)
+[Llama3.1-8B-Eagle2-Draft](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B) | Yes | No | No | No | [llama3.1_8b_eagle2_draft.tgz](https://nvidia.box.com/shared/static/apv5wtpd3twl8y4glz171t6eterht78q)
+[Llama3.1-8B-Eagle3-Base](https://huggingface.co/meta-llama/Llama-3.1-8B)  | Yes | No | No | No | [llama3.1_8b_eagle3_base.tgz](https://nvidia.box.com/shared/static/7d5diet4ze770tv93yzev3gf9eemclbi)
+[Llama3.1-8B-Eagle3-Draft](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B) | Yes | No | No | No | [llama3.1_8b_eagle3_draft.tgz](https://nvidia.box.com/shared/static/wvqyb348j800l6yfks7icmlrog4oiil1)
 
-The `multimodal_export.py` script can export the following multimodal models into ONNX. Currently it only supports Qwen2-VL.
+The `multimodal_export.py` script can export the following multimodal models into ONNX.
 
 Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 --- | --- | --- | --- | --- | ---
-[Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_vl_2b.tgz](https://nvidia.box.com/shared/static/p1r5fv10qwuq5nvj2ffwpv0ndfbvzgv0)
-[Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_vl_7b.tgz](https://nvidia.box.com/shared/static/zzkstqg4cojfknm1azsb1qfk1in7if51)
-[Qwen2.5-VL-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_vl_3b.tgz](https://nvidia.box.com/shared/static/531he8t7k5r59qedzfrch4cj13wl5hfe)
-[Qwen2.5-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_vl_2b.tgz](https://nvidia.box.com/shared/static/cgqo6ngxp3dw5ussgpct290ud2kd34kk)
-
-## LoRA Support
-
-The exporter supports three modes of LoRA (Low-Rank Adaptation) integration for all precisions:
-
-1. **Merged Mode** (`--lora_mode merged`):
-   - LoRA weights are merged into the base model before export
-   - Merged weights will be quantized together with the base model
-   - No runtime LoRA switching capability
-   - Usage:
-   ```
-   python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $LORA_DIR --lora_mode merged --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
-   ```
-
-2. **Static Mode** (`--lora_mode static`):
-   - LoRA weights are kept separate and applied during inference using static LoRA patterns
-   - LoRA GEMMs will be in FP16 precision
-   - No runtime LoRA switching capability
-   - Usage:
-   ```
-   python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $LORA_DIR --lora_mode static --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
-   ```
-
-3. **Dynamic Mode** (`--lora_mode dynamic`):
-   - LoRA weights are provided as inputs during inference
-   - LoRA GEMMs will be in FP16 precision
-   - Enables runtime LoRA switching capability
-   - Requires preprocessing of LoRA weights using `process_lora_weights.py`
-   - Usage:
-   ```
-   # Need to process LoRA weights to be runtime compatible.
-   python3 process_lora_weights.py --input_dir $LORA_DIR --output_dir $PROCESSED_LORA_DIR
-   
-   # Then export the model
-   python3 llm_export.py --torch_dir $TORCH_DIR --lora_dir $PROCESSED_LORA_DIR --lora_mode dynamic --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
-   ```
-
-**Important Notes:**
-- Only dynamic mode supports runtime LoRA switching
-- For dynamic mode, the LoRA weights must be preprocessed using `process_lora_weights.py` to ensure compatibility
-- The preprocessing step converts weights to FP16, applies proper scaling, and ensures correct tensor shapes
+[Qwen2-VL-2B-instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_vl_2b.tgz](https://nvidia.box.com/shared/static/wt0c4ydbkwlqy33hc5u65c7hbqzydas4)
+[Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_vl_7b.tgz](https://nvidia.box.com/shared/static/818242meioy5ms3g0hgpb74uqw9pxhxl)
+[Qwen2.5-VL-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Yes | Yes | Yes | Yes | /
+[Qwen2.5-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_vl_7b.tgz](https://nvidia.box.com/shared/static/kwcqornn39km3ujzaor1erjflb9vlajs)
