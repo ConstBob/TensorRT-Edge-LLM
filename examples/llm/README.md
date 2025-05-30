@@ -34,12 +34,17 @@ Example command:
 
 The `llm_benchmark`, `llm_accuracy` and `llm_chat` binaries are examples to show E2E C++ LLM inference using greedy decoding. Example usages:
 
-### Interactive Chat
-```
-./build/examples/llm/llm_chat --tokenizerPath=<path_to_tokenizer> --enginePath=<engine_path> --maxLength=64
-```
-**Note**:
-1. Chat will prompt for each batch until it has input prompt for all batches.
+### Chat
+1. Interactive mode
+    
+    Chat will prompt for each batch until it has input prompt for all batches.
+    ```
+    ./build/examples/llm/llm_chat --tokenizerPath=$TORCH_DIR --enginePath=llama3_fp16.engine --maxLength=64 --interactivte
+    ```
+2. Chat with input string
+    ```
+    ./build/examples/llm/llm_chat --tokenizerPath=$TORCH_DIR --enginePath=llama3_fp16.engine --maxLength=64 --inputString="What is deep learning?"
+    ```
 
 #### Example: Runtime Inference
 

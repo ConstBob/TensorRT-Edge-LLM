@@ -1,0 +1,2 @@
+nvidia-modelopt[torch]==0.19.0
+nvidia-modelopt[onnx]==0.19.0
