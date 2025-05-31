@@ -40,7 +40,6 @@ struct AcceptDraftTokensByIdsWithPathsParams
     int64_t endIds{0};
 
     int32_t curTokensPerStep{1};
-
 };
 
 template <typename T>
@@ -174,20 +173,25 @@ struct GetLastLogitsOffsetParams
     int64_t* lastLogitsOffset{nullptr};
 };
 
-void dispatchUpdateCumScoresAndParentsIds(UpdateCumScoresAndParentsIdsParams const& params,EagleCommonParams const& commonParams);
+void dispatchUpdateCumScoresAndParentsIds(
+    UpdateCumScoresAndParentsIdsParams const& params, EagleCommonParams const& commonParams);
 
 void dispatchAssembleDraftIdsAndPathAndMaskAndPositionIds(
     AssembleDraftIdsAndPathAndMaskAndPositionIdsParams const& params, EagleCommonParams const& commonParams);
 
 template <typename T>
 void dispatchUpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScores(
-    UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<T> const& params, EagleCommonParams const& commonParams);
+    UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<T> const& params,
+    EagleCommonParams const& commonParams);
 
-void dispatchAcceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams const& params, EagleCommonParams const& commonParams);
+void dispatchAcceptDraftTokensByIdsWithPaths(
+    AcceptDraftTokensByIdsWithPathsParams const& params, EagleCommonParams const& commonParams);
 
 template <typename T>
-void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds(UpdateKVCacheParams<T> const& params, EagleCommonParams const& commonParams);
+void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds(
+    UpdateKVCacheParams<T> const& params, EagleCommonParams const& commonParams);
 
-void dispatchInitializeAttentionMaskCausal(InitCausalAttentionMaskParams const& params, EagleCommonParams const& commonParams);
+void dispatchInitializeAttentionMaskCausal(
+    InitCausalAttentionMaskParams const& params, EagleCommonParams const& commonParams);
 
 void dispatchGetLastLogitsOffset(GetLastLogitsOffsetParams const& params, EagleCommonParams const& commonParams);

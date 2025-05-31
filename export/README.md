@@ -45,7 +45,7 @@ For LoRA support, two modes are available:
    - `merged`: LoRA weights are merged into the base model before export (recommended for most use cases)
    - `static`: LoRA weights are kept separate and applied during inference using static LoRA patterns
 
-## Eagle Deocding
+## Eagle Decoding
 For Eagle decoding, we only verify LLAMA-based model with FP16 precision now.
 
 ### Eagle3

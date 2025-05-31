@@ -19,10 +19,12 @@
 #include <NvInferRuntime.h>
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 #include <cuda_profiler_api.h>
 #include <dlfcn.h>
 #include <filesystem>
+#include <fstream>
 #include <getopt.h>
 #include <iomanip>
 #include <iostream>
@@ -31,9 +33,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <fstream>
-#include <cstdio>
-
 
 struct LLMEagleBenchmarkArgs
 {
@@ -71,10 +70,15 @@ void printUsage(char const* programName)
     std::cerr << "  --debug          Use debug mode, which outputs tensors." << std::endl;
     std::cerr << "  --noCudaGraph    Cuda graph is default enabled. Use this flag to disable cuda graph." << std::endl;
     std::cerr << "  --isEagle3       Use Eagle3 mode. Default is Eagle2." << std::endl;
-    std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model, the number provided must be aligned with building phase. Default = 60"
+    std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model, the number provided must "
+                 "be aligned with building phase. Default = 60"
               << std::endl;
-    std::cerr << "  --topK           Provide the topK for draft model to select the topK candidates. the number provided must be aligned with building phase. Default is 10." << std::endl;
-    std::cerr << "  --maxPathLen     Provide the max stack layers for draft model to constrcut the max tree path length. the number provided must be aligned with building phase. Default is 6." << std::endl;
+    std::cerr << "  --topK           Provide the topK for draft model to select the topK candidates. the number "
+                 "provided must be aligned with building phase. Default is 10."
+              << std::endl;
+    std::cerr << "  --maxPathLen     Provide the max stack layers for draft model to construct the max tree path "
+                 "length. the number provided must be aligned with building phase. Default is 6."
+              << std::endl;
 };
 
 bool parseLLMEagleBenchmarkArgs(LLMEagleBenchmarkArgs& args, int argc, char* argv[])
@@ -84,8 +88,8 @@ bool parseLLMEagleBenchmarkArgs(LLMEagleBenchmarkArgs& args, int argc, char* arg
         {"warmUp", required_argument, 0, 'w'}, {"numRuns", required_argument, 0, 'r'},
         {"eagleEnginePath", required_argument, 0, 'l'}, {"tokenizerPath", required_argument, 0, 't'},
         {"noCudaGraph", no_argument, 0, 'g'}, {"debug", no_argument, 0, 'd'}, {"isEagle3", no_argument, 0, 'i'},
-        {"maxDecodingTokens", required_argument, 0, 'm'}, {"topK", required_argument, 0, 'k'}, {"maxPathLen", required_argument, 0, 'p'},
-        {0, 0, 0, 0}};
+        {"maxDecodingTokens", required_argument, 0, 'm'}, {"topK", required_argument, 0, 'k'},
+        {"maxPathLen", required_argument, 0, 'p'}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -169,43 +173,54 @@ bool parseLLMEagleBenchmarkArgs(LLMEagleBenchmarkArgs& args, int argc, char* arg
     return true;
 }
 
-void replace_all_substrings_inplace(std::string& subject, const std::string& search, const std::string& replace) {
+void replace_all_substrings_inplace(std::string& subject, std::string const& search, std::string const& replace)
+{
     size_t pos = 0;
-    if (search.empty()) {
+    if (search.empty())
+    {
         return;
     }
-    while ((pos = subject.find(search, pos)) != std::string::npos) {
+    while ((pos = subject.find(search, pos)) != std::string::npos)
+    {
         subject.replace(pos, search.length(), replace);
         // Advance past the replaced segment to avoid issues if 'replace' contains 'search'
         pos += replace.length();
     }
 }
 
-std::vector<std::string> extract_question_contents_with_json_parser(const std::string& filename) {
+std::vector<std::string> extract_question_contents_with_json_parser(std::string const& filename)
+{
     std::vector<std::string> all_question_contents;
     std::ifstream file(filename);
 
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
         fprintf(stderr, "Error: Could not open file %s\n", filename.c_str());
         exit(EXIT_FAILURE);
     }
 
     std::string line;
-    while (std::getline(file, line)) {
+    while (std::getline(file, line))
+    {
         drivellm::JsonRoot json_root;
-        if (!json_root.parse(line)) {
+        if (!json_root.parse(line))
+        {
             fprintf(stderr, "Error: Failed to parse JSON line: %s\n", line.c_str());
             continue;
         }
 
         drivellm::JsonNode root_node = json_root.getRoot();
-        if (root_node.isObject() && root_node.hasMember("question")) {
+        if (root_node.isObject() && root_node.hasMember("question"))
+        {
             drivellm::JsonNode question_node = root_node["question"];
-            if (question_node.isArray()) {
+            if (question_node.isArray())
+            {
                 std::string combined_content;
-                for (size_t i = 0; i < question_node.size(); ++i) {
+                for (size_t i = 0; i < question_node.size(); ++i)
+                {
                     drivellm::JsonNode element_node = question_node[i];
-                    if (element_node.isString()) {
+                    if (element_node.isString())
+                    {
                         std::string segment = element_node.getString();
                         // Apply JSON unescaping
                         // Order matters: \\ must be replaced first, then specific escapes like \", \/
@@ -213,25 +228,28 @@ std::vector<std::string> extract_question_contents_with_json_parser(const std::s
                         replace_all_substrings_inplace(segment, "\\\\", "\\"); // Unescape \\ to \
                         replace_all_substrings_inplace(segment, "\\\"", "\""); // Unescape \" to "
                         replace_all_substrings_inplace(segment, "\\/", "/");   // Unescape \/ to /
-                        replace_all_substrings_inplace(segment, "\\n", "\n");   // Unescape \n to newline
-                        replace_all_substrings_inplace(segment, "\\r", "\r");   // Unescape \r to carriage return
-                        replace_all_substrings_inplace(segment, "\\t", "\t");   // Unescape \t to tab
-                        replace_all_substrings_inplace(segment, "\\b", "\b");   // Unescape \b to backspace
-                        replace_all_substrings_inplace(segment, "\\f", "\f");   // Unescape \f to form feed
+                        replace_all_substrings_inplace(segment, "\\n", "\n");  // Unescape \n to newline
+                        replace_all_substrings_inplace(segment, "\\r", "\r");  // Unescape \r to carriage return
+                        replace_all_substrings_inplace(segment, "\\t", "\t");  // Unescape \t to tab
+                        replace_all_substrings_inplace(segment, "\\b", "\b");  // Unescape \b to backspace
+                        replace_all_substrings_inplace(segment, "\\f", "\f");  // Unescape \f to form feed
                         // Note: Unicode escapes \uXXXX are not handled by this simple replacement.
                         combined_content += segment;
-                    } else {
-                        
+                    }
+                    else
+                    {
+
                         printf("Warning: Non-string element found in 'question' array on line: %s\n", line.c_str());
                     }
                 }
                 all_question_contents.push_back(combined_content);
             }
-        } else {
-        
+        }
+        else
+        {
+
             printf("Warning: 'question' field not found or root is not an object on line: %s\n", line.c_str());
         }
-        
     }
 
     file.close();
@@ -247,7 +265,8 @@ float calculateAverage(std::vector<T> const& vec)
 }
 
 void benchmarkLLM(std::string& enginePath, std::string& eagleEnginePath, std::string& tokenizerPath, int64_t warmUp,
-    int64_t numRuns, GenerationConfig const& generationConfig, bool useCudaGraph, bool isEagle3, int32_t maxDecodingTokens, int32_t topK, int32_t maxPathLen)
+    int64_t numRuns, GenerationConfig const& generationConfig, bool useCudaGraph, bool isEagle3,
+    int32_t maxDecodingTokens, int32_t topK, int32_t maxPathLen)
 {
     auto profiler = std::make_shared<BenchmarkProfiler>();
     profiler->startTiming();
@@ -271,9 +290,9 @@ void benchmarkLLM(std::string& enginePath, std::string& eagleEnginePath, std::st
         printf("Eagle only supports batch size 1 currently!\n");
         assert(false);
     }
-    
-    auto eagle = new Eagle<half>(std::move(baseDecoder), std::move(draftDecoder), stream, eagleEnginePath, maxPathLen, topK, isEagle3,
-        maxDecodingTokens);
+
+    auto eagle = new Eagle<half>(std::move(baseDecoder), std::move(draftDecoder), stream, eagleEnginePath, maxPathLen,
+        topK, isEagle3, maxDecodingTokens);
     std::vector<int64_t> inputIds(batchSize);
     std::vector<int32_t> contextLengths(batchSize, 0);
 
@@ -288,7 +307,7 @@ void benchmarkLLM(std::string& enginePath, std::string& eagleEnginePath, std::st
     inputIds = tokenizer->encode(questions[0], false);
     contextLengths[0] = inputIds.size();
     outputIds[0].reserve(generationConfig.maxLength);
-    
+
     for (int64_t i = 0; i < warmUp; i++)
     {
         // Warmup for profiler
@@ -318,7 +337,7 @@ void benchmarkLLM(std::string& enginePath, std::string& eagleEnginePath, std::st
 
     for (size_t sampleIdx = 0; sampleIdx < questions.size(); ++sampleIdx)
     {
-        
+
         std::vector<int32_t> newTokensNumbers;
         std::vector<int32_t> iterNumbers;
         inputIds = tokenizer->encode(questions[sampleIdx], false);

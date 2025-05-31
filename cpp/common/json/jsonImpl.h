@@ -16,8 +16,8 @@
 
 #include <memory>
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 namespace drivellm
 {
@@ -51,8 +51,8 @@ public:
 
 protected:
     std::string mName;                                    // The name of the node
-    Jsmntok* mToken{nullptr};                            // The handler in rapidjson
-    char const* mJson{nullptr};                     // The original JSON string
+    Jsmntok* mToken{nullptr};                             // The handler in rapidjson
+    char const* mJson{nullptr};                           // The original JSON string
     std::vector<std::unique_ptr<JsonNodeImpl>> mChildren; // The list of children nodes
 };
 
@@ -102,7 +102,6 @@ public:
     bool parseFromPath(std::string const& filePath);
 
 private:
-
     // Create our JSON nodes via walking through the third-party JSON tree. Thus
     // we will not allocate JSON nodes during the later usage.
     // Return the total nodes (tokens) of the tree.

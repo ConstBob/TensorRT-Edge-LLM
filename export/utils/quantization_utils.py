@@ -8,19 +8,20 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import math
 import os
 import time
-import math
 
 import modelopt.torch.quantization as mtq
-from modelopt.torch.quantization.nn import TensorQuantizer
-from datasets import load_dataset
 import torch
-from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
-from transformers import AutoProcessor
+from datasets import load_dataset
+from modelopt.torch.quantization.nn import TensorQuantizer
 from PIL import Image
-from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_rotary_pos_emb_vision
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoProcessor
+from transformers.models.qwen2_vl.modeling_qwen2_vl import \
+    apply_rotary_pos_emb_vision
 from utils.export_utils import QwenVisionAttention
 
 
@@ -113,9 +114,7 @@ def get_quant_config(precision, lm_head_precision="fp16"):
     return quant_cfg
 
 
-def _quantize_model(model,
-                    quant_config,
-                    calib_dataloader=None):
+def _quantize_model(model, quant_config, calib_dataloader=None):
     """
     The calibration loop for the model can be setup using the modelopt API.
 
@@ -189,22 +188,25 @@ class QuantQwenVisionAttention(QwenVisionAttention):
     """
     Quantized MHA version of QwenVisionAttention.
     """
+
     def __init__(self, dim: int, num_heads: int = 16):
         super().__init__(dim, num_heads)
         self._setup()
-    
+
     def _setup(self):
         self.q_bmm_quantizer = TensorQuantizer()
         self.k_bmm_quantizer = TensorQuantizer()
         self.v_bmm_quantizer = TensorQuantizer()
         self.softmax_quantizer = TensorQuantizer()
 
-    def forward(self,
-                hidden_states: torch.Tensor,
+    def forward(self, hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor,
                 position_embeddings: torch.Tensor) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3,
+                                                  self.num_heads,
+                                                  -1).permute(1, 0, 2,
+                                                              3).unbind(0)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
@@ -213,10 +215,12 @@ class QuantQwenVisionAttention(QwenVisionAttention):
         v = v.transpose(0, 1)
         q = self.q_bmm_quantizer(q)
         k = self.k_bmm_quantizer(k)
-        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
+            self.head_dim)
         attn_weights = attn_weights + attention_mask
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
+        attn_weights = F.softmax(attn_weights, dim=-1,
+                                 dtype=torch.float32).to(v.dtype)
         attn_weights = self.softmax_quantizer(attn_weights)
         v = self.v_bmm_quantizer(v)
         attn_output = torch.matmul(attn_weights, v)
@@ -225,7 +229,9 @@ class QuantQwenVisionAttention(QwenVisionAttention):
         attn_output = self.proj(attn_output)
         return attn_output
 
-mtq.register(original_cls=QwenVisionAttention, quantized_cls=QuantQwenVisionAttention)
+
+mtq.register(original_cls=QwenVisionAttention,
+             quantized_cls=QuantQwenVisionAttention)
 
 
 def get_vit_calib_dataloader(
@@ -237,23 +243,31 @@ def get_vit_calib_dataloader(
     # Default use MMMU_DEV. It's recommended to use your own dataset for calibration.
     if dataset_name_or_dir == "MMMU":
         dataset = load_dataset("lmms-lab/MMMU", split="dev")
-        
+
         def _preprocess(data, processor):
             image_inputs = []
             for (key, value) in data.items():
                 if "image" in key and isinstance(value, Image.Image):
                     image_inputs.append(value.convert("RGB"))
-            inputs = processor(text="", images=image_inputs, padding=True, return_tensors="pt",)
+            inputs = processor(
+                text="",
+                images=image_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
             return {
                 "hidden_states": inputs["pixel_values"],
                 "grid_thw": inputs["image_grid_thw"],
             }
 
         # Limit pixels to reasonable size. Too large images will cause OOM.
-        processor = AutoProcessor.from_pretrained(torch_dir, min_pixels=128*28*28, max_pixels=2048*28*28)
-        dataset = dataset.map(
-            _preprocess, batched=False, fn_kwargs={"processor": processor}, remove_columns=dataset.column_names
-        )
+        processor = AutoProcessor.from_pretrained(torch_dir,
+                                                  min_pixels=128 * 28 * 28,
+                                                  max_pixels=2048 * 28 * 28)
+        dataset = dataset.map(_preprocess,
+                              batched=False,
+                              fn_kwargs={"processor": processor},
+                              remove_columns=dataset.column_names)
         dataset.set_format(type="torch", columns=dataset.column_names)
     else:
         raise NotImplementedError(
@@ -261,53 +275,64 @@ def get_vit_calib_dataloader(
         )
 
     if model_type in ["qwen2_vl", "qwen2_5_vl"]:
-        # Initialize additonal inputs for model
+        # Initialize additional inputs for model
         class QwenViTDataset(Dataset):
+
             def __init__(self, data, model):
                 self.data = data
                 self.model = model
 
             def __len__(self):
                 return len(self.data)
-            
+
             def get_attention_mask(self, cu_seqlens, seq_length):
-                attention_mask = torch.full(
-                    [1, seq_length, seq_length], torch.finfo(self.model.dtype).min, dtype=self.model.dtype
-                )
+                attention_mask = torch.full([1, seq_length, seq_length],
+                                            torch.finfo(self.model.dtype).min,
+                                            dtype=self.model.dtype)
                 for i in range(1, len(cu_seqlens)):
-                    attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
+                    attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i],
+                                   cu_seqlens[i - 1]:cu_seqlens[i]] = 0
                 return attention_mask
-            
+
             def __getitem__(self, idx):
                 raw_data = self.data[idx]
                 hidden_states = raw_data["hidden_states"].to(self.model.dtype)
                 grid_thw = raw_data["grid_thw"]
                 rotary_pos_emb = self.model.rot_pos_emb(grid_thw)
-                cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-                    dim=0, dtype=torch.int32,
-                )
+                cu_seqlens = torch.repeat_interleave(
+                    grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+                        dim=0,
+                        dtype=torch.int32,
+                    )
                 cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
                 seq_length = hidden_states.shape[0]
-                attention_mask = self.get_attention_mask(cu_seqlens, seq_length)
-                inputs =  {
+                attention_mask = self.get_attention_mask(
+                    cu_seqlens, seq_length)
+                inputs = {
                     "hidden_states": hidden_states,
                     "rotary_pos_emb": rotary_pos_emb,
                     "attention_mask": attention_mask,
                 }
 
                 if model_type == "qwen2_5_vl":
-                    window_index, cu_window_seqlens = self.model.get_window_index(grid_thw)
-                    cu_window_seqlens = torch.tensor(cu_window_seqlens, dtype=torch.int32,)
-                    cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
-                    window_attention_mask = self.get_attention_mask(cu_window_seqlens, seq_length)
+                    window_index, cu_window_seqlens = self.model.get_window_index(
+                        grid_thw)
+                    cu_window_seqlens = torch.tensor(
+                        cu_window_seqlens,
+                        dtype=torch.int32,
+                    )
+                    cu_window_seqlens = torch.unique_consecutive(
+                        cu_window_seqlens)
+                    window_attention_mask = self.get_attention_mask(
+                        cu_window_seqlens, seq_length)
                     reverse_window_index = torch.argsort(window_index)
                     inputs["window_attention_mask"] = window_attention_mask
                     inputs["window_index"] = window_index
                     inputs["reverse_window_index"] = reverse_window_index
-                
-                return inputs   
-            
-        dataset = QwenViTDataset(dataset, model)   
+
+                return inputs
+
+        dataset = QwenViTDataset(dataset, model)
     else:
         raise NotImplementedError(f"Invalid model type {model_type}")
 
@@ -318,14 +343,22 @@ def quantize_visual(model, precision, model_type, torch_dir):
     assert precision in [
         "fp8"
     ], f"Only fp8(W8A8) is recommended for vit. You passed an unsupported precision: {precision}."
-    
+
     # Set quantization config, enable FP8 MHA and FP8 GEMM
     quant_config = mtq.FP8_DEFAULT_CFG
     quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
-    quant_config["quant_cfg"]["*[qkv]_bmm_quantizer"] = {"num_bits": (4, 3), "axis": None}
-    quant_config["quant_cfg"]["*softmax_quantizer"] = {"num_bits": (4, 3), "axis": None}
+    quant_config["quant_cfg"]["*[qkv]_bmm_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None
+    }
+    quant_config["quant_cfg"]["*softmax_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None
+    }
 
-    data_loader = get_vit_calib_dataloader(model, model_type, torch_dir=torch_dir)
+    data_loader = get_vit_calib_dataloader(model,
+                                           model_type,
+                                           torch_dir=torch_dir)
     quantized_model = _quantize_model(model, quant_config, data_loader)
     mtq.print_quant_summary(quantized_model)
     return quantized_model

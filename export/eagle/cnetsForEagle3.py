@@ -10,20 +10,22 @@
 """ PyTorch LLaMA model."""
 from typing import List, Optional
 
-
 import torch.utils.checkpoint
 from torch import nn
 
-from .layers import LlamaDecoderLayeremb,load_weight_from_safetensors,LlamaRMSNorm
+from .layers import (LlamaDecoderLayeremb, LlamaRMSNorm,
+                     load_weight_from_safetensors)
+
 
 class Eagle3(nn.Module):
 
-    def __init__(self,
-                 config,
-                 load_emb=False,
-                 path=None,
-                 bias=False,
-                 ):
+    def __init__(
+        self,
+        config,
+        load_emb=False,
+        path=None,
+        bias=False,
+    ):
         super().__init__()
         self.config = config
         self.gradient_checkpointing = True
@@ -38,7 +40,8 @@ class Eagle3(nn.Module):
                                  self.draft_vocab_size,
                                  bias=False)
         if load_emb and not hasattr(config, "target_hidden_size"):
-            self.embed_tokens.weight.data = load_weight_from_safetensors(path,"model.embed_tokens.weight")
+            self.embed_tokens.weight.data = load_weight_from_safetensors(
+                path, "model.embed_tokens.weight")
         self.hidden_size = config.hidden_size
         self.layers = nn.ModuleList([
             LlamaDecoderLayeremb(config, index, eagle3=True)
@@ -60,19 +63,19 @@ class Eagle3(nn.Module):
         self.register_buffer("d2t", d2t)
         self.register_buffer("t2d", t2d)
 
-
-    def forward(self,
-                hidden_states,
-                input_ids,
-                hidden_states_from_draft,
-                attention_mask: Optional[torch.Tensor] = None,
-                position_ids: Optional[torch.LongTensor] = None,
-                past_key_values: Optional[List[torch.FloatTensor]] = None,
-                inputs_embeds: Optional[torch.FloatTensor] = None,
-                use_cache: Optional[bool] = None,
-                output_attentions: Optional[bool] = None,
-                output_hidden_states: Optional[bool] = None,
-                ):
+    def forward(
+        self,
+        hidden_states,
+        input_ids,
+        hidden_states_from_draft,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ):
 
         with torch.no_grad():
             inputs_embeds = self.embed_tokens(input_ids)
@@ -80,7 +83,7 @@ class Eagle3(nn.Module):
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
         hidden_states = self.fc(hidden_states)
         hidden_states = hidden_states_from_draft + hidden_states
-        
+
         next_decoder_cache = () if use_cache else None
 
         past_key_value = past_key_values[

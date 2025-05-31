@@ -15,16 +15,18 @@ import torch.utils.checkpoint
 from torch import nn
 from transformers.activations import ACT2FN
 
-from .layers import LlamaDecoderLayer,load_weight_from_safetensors
+from .layers import LlamaDecoderLayer, load_weight_from_safetensors
+
 
 class Eagle2(nn.Module):
 
-    def __init__(self,
-                 config,
-                 load_emb=False,
-                 path=None,
-                 bias=False,
-                 ):
+    def __init__(
+        self,
+        config,
+        load_emb=False,
+        path=None,
+        bias=False,
+    ):
         super().__init__()
 
         self.padding_idx = config.pad_token_id
@@ -38,9 +40,11 @@ class Eagle2(nn.Module):
                                  self.draft_vocab_size,
                                  bias=False)
         if load_emb:
-            self.embed_tokens.weight.data = load_weight_from_safetensors(path,"model.embed_tokens.weight")
-            self.lm_head.weight.data = load_weight_from_safetensors(path,"lm_head.weight")
-       
+            self.embed_tokens.weight.data = load_weight_from_safetensors(
+                path, "model.embed_tokens.weight")
+            self.lm_head.weight.data = load_weight_from_safetensors(
+                path, "lm_head.weight")
+
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(config, index)
             for index in range(config.num_hidden_layers)
@@ -51,21 +55,21 @@ class Eagle2(nn.Module):
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
-    def forward(self,
-                hidden_states,
-                input_ids,
-                attention_mask: Optional[torch.Tensor] = None,
-                position_ids: Optional[torch.LongTensor] = None,
-                past_key_values: Optional[List[torch.FloatTensor]] = None,
-                inputs_embeds: Optional[torch.FloatTensor] = None,
-                use_cache: Optional[bool] = None,
-                output_attentions: Optional[bool] = None,
-                output_hidden_states: Optional[bool] = None,
-                ):
+    def forward(
+        self,
+        hidden_states,
+        input_ids,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ):
 
         with torch.no_grad():
             inputs_embeds = self.embed_tokens(input_ids)
-
 
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
         hidden_states = self.fc(
@@ -81,7 +85,6 @@ class Eagle2(nn.Module):
             past_key_value = past_key_values[
                 idx] if past_key_values is not None else None
 
-            
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -101,5 +104,3 @@ class Eagle2(nn.Module):
             return hidden_states, next_decoder_cache
 
         return hidden_states
-
-

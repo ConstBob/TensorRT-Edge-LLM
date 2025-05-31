@@ -49,7 +49,7 @@ struct VisualPreprocessorConfig
     float theta = 1000000.0f;
     std::vector<double> imageMean{0.48145466, 0.4578275, 0.40821073};
     std::vector<double> imageStd{0.26862954, 0.26130258, 0.27577711};
-    int64_t windowSize{112};  // window attention size used by Qwen2.5-VL
+    int64_t windowSize{112}; // window attention size used by Qwen2.5-VL
     int64_t vocabSize = 152064;
     int64_t visionStartTokenId = 151652;
 };
@@ -85,23 +85,22 @@ public:
         std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
         std::vector<int32_t>& contextLengths, int const maxContextLength);
 
-    void getWindowIndex(std::vector<std::vector<int64_t>> const& grids, std::vector<half>& windowAttentionMask, 
+    void getWindowIndex(std::vector<std::vector<int64_t>> const& grids, std::vector<half>& windowAttentionMask,
         std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex);
-    
+
     void qwen2ViTInfer(
         std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb);
 
-    void qwen2_5ViTInfer(
-        std::vector<half> const& input, std::vector<half> const& attentionMask, std::vector<float> const& rotaryPosEmb, 
-        std::vector<half> const& windowAttentionMask, std::vector<int64_t> const& windowIndex,
-        std::vector<int64_t> const& reverseWindowIndex);
+    void qwen2_5ViTInfer(std::vector<half> const& input, std::vector<half> const& attentionMask,
+        std::vector<float> const& rotaryPosEmb, std::vector<half> const& windowAttentionMask,
+        std::vector<int64_t> const& windowIndex, std::vector<int64_t> const& reverseWindowIndex);
 
     std::vector<EngineInputDesc> getExtraLLMInputs();
 
     void initRandomInputs(std::vector<half>& visualInput, std::vector<half>& visualAttentionMask,
-        std::vector<float>& visualRotaryPosEmb, std::vector<half>& windowAttentionMask, std::vector<int64_t>& windowIndex,
-        std::vector<int64_t>& reverseWindowIndex, std::vector<int64_t>& inputIds, int const textTokenLength,
-        int const imageTokenLength, int const maxContextLength);
+        std::vector<float>& visualRotaryPosEmb, std::vector<half>& windowAttentionMask,
+        std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex, std::vector<int64_t>& inputIds,
+        int const textTokenLength, int const imageTokenLength, int const maxContextLength);
 
     void allocateBuffer();
 

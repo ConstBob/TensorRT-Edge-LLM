@@ -81,11 +81,10 @@ inline bool isCudaLaunchBlocking()
 
 static std::int64_t volume(nvinfer1::Dims const& dims)
 {
-    
+
     return dims.nbDims < 0 ? -1
         : dims.nbDims == 0 ? 0
-                            : std::accumulate(dims.d, dims.d + dims.nbDims, std::int64_t{1}, std::multiplies<>{});
-    
+                           : std::accumulate(dims.d, dims.d + dims.nbDims, std::int64_t{1}, std::multiplies<>{});
 }
 
 /// Get the memory info

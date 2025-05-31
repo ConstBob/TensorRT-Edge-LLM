@@ -1,12 +1,11 @@
 #pragma once
 
-#include <vector>
 #include <cuda_fp16.h>
+#include <vector>
 
-
-inline std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<half> const& k, std::vector<half> const& v,
-                                            int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-                                            std::optional<std::vector<int32_t>> const& treeAttnMask = std::nullopt)
+inline std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<half> const& k,
+    std::vector<half> const& v, int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, std::optional<std::vector<int32_t>> const& treeAttnMask = std::nullopt)
 {
     assert(qlen <= kvlen);
     int32_t const numQheadPerKV = numQHeads / numKVHeads;
@@ -20,7 +19,7 @@ inline std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vec
         // KV Tensor has layout of [KVhead, kv_sequence, featureVal]
         return kvHeadIdx * kvlen * headSize + kvSequenceIdx * headSize + valIdx;
     };
-    
+
     std::vector<half> result(numQHeads * headSize * qlen);
     for (int32_t tokenIdx = 0; tokenIdx < qlen; ++tokenIdx)
     {
@@ -77,13 +76,13 @@ inline std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vec
                 }
                 result[qoIndexer(tokenIdx, qHeadIdx, valIdx)] = __float2half(outVal);
             }
-        }   
+        }
     }
 
     return result;
 }
 
-inline std::vector<half> ropeRef(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize, 
+inline std::vector<half> ropeRef(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,
     int32_t const seqIdx, float const ropeScale, float const ropeTheta, bool const permute)
 {
     std::vector<half> result;

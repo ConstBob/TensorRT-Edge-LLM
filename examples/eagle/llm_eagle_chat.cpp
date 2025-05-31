@@ -46,8 +46,7 @@ void printUsage(char const* programName)
               << " [-h] [-e or --enginePath=<path to TensorRT engine>] [-g or --eagleEnginePath=<path to Eagle "
                  "TensorRT engine>] [-s or "
                  "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>]"
-              << " [-i or --inputString=<input string>]"
-              << std::endl;
+              << " [-i or --inputString=<input string>]" << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  -h               Display this help message" << std::endl;
     std::cerr << "  --enginePath     Provide the input TensorRT engine file path. Required. " << std::endl;
@@ -61,10 +60,15 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more information." << std::endl;
     std::cerr << "  --isEagle3       Use Eagle3 algorithm. Default is Eagle2." << std::endl;
-    std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model, the number provided must be aligned with building phase. Default = 60"
+    std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model, the number provided must "
+                 "be aligned with building phase. Default = 60"
               << std::endl;
-    std::cerr << "  --topK           Provide the topK for draft model to select the topK candidates. the number provided must be aligned with building phase. Default is 10." << std::endl;
-    std::cerr << "  --maxPathLen     Provide the max stack layers for draft model to constrcut the max tree path length. the number provided must be aligned with building phase. Default is 6." << std::endl;
+    std::cerr << "  --topK           Provide the topK for draft model to select the topK candidates. the number "
+                 "provided must be aligned with building phase. Default is 10."
+              << std::endl;
+    std::cerr << "  --maxPathLen     Provide the max stack layers for draft model to construct the max tree path "
+                 "length. the number provided must be aligned with building phase. Default is 6."
+              << std::endl;
 };
 
 bool parseLLMEagleChatArgs(LLMEagleChatArgs& args, int argc, char* argv[])
@@ -218,8 +222,8 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    auto eagle = new Eagle<half>(std::move(baseDecoder), std::move(draftDecoder), stream, args.eagleEnginePath, args.maxPathLen, args.topK,
-        args.isEagle3, args.maxDecodingTokens);
+    auto eagle = new Eagle<half>(std::move(baseDecoder), std::move(draftDecoder), stream, args.eagleEnginePath,
+        args.maxPathLen, args.topK, args.isEagle3, args.maxDecodingTokens);
 
     std::vector<int64_t> inputIds(batchSize);
     std::vector<int32_t> contextLengths(batchSize, 0);

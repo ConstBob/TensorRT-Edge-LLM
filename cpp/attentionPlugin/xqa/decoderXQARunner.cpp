@@ -90,10 +90,9 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQALaunchParams const& xq
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams const& xqaParams)
 {
     constexpr int32_t kBEAM_SIZE{1};
-    constexpr int32_t kQHEAD_PER_KV = 0;    // Tree attention kernel supports any ratio of Q/KV heads.
+    constexpr int32_t kQHEAD_PER_KV = 0; // Tree attention kernel supports any ratio of Q/KV heads.
     return {trtToXqaDataType(xqaParams.dataType), xqaParams.headSize, kQHEAD_PER_KV, kBEAM_SIZE};
 }
-
 
 struct XQAKernelRuntimeHasher
 {
@@ -290,8 +289,8 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;
     std::vector<int32_t> allowedSMVersions{80, 86, 87, 89, 101};
-    bool const checkSMVersion = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion)
-        != allowedSMVersions.end();
+    bool const checkSMVersion
+        = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion) != allowedSMVersions.end();
 
     // Current kernel list supports head ratio from 1 to 8.
     int32_t const headRatio = numQHeads / numKVHeads;

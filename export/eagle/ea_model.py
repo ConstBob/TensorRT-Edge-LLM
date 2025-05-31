@@ -7,15 +7,17 @@
 # disclosure or distribution of this material and related documentation
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
+import json
 import os
+
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
 
-from .cnetsForEagle3 import Eagle3
 from .cnetsForEagle2 import Eagle2
-import json
+from .cnetsForEagle3 import Eagle3
+
 
 class EagleModel(nn.Module):
 
@@ -38,12 +40,12 @@ class EagleModel(nn.Module):
             bias = con["bias"]
         except:
             bias = True
-      
+
         if use_eagle3:
             self.ea_layer = Eagle3(self.config,
-                                  bias=bias,
-                                  path=base_model_name_or_path,
-                                  load_emb=True)
+                                   bias=bias,
+                                   path=base_model_name_or_path,
+                                   load_emb=True)
         else:
             self.ea_layer = Eagle2(self.config,
                                    bias=bias,
@@ -94,6 +96,7 @@ class EagleModel(nn.Module):
                     new_state_dict[key] = value
             ea_layer_state_dict = new_state_dict
 
-        model = cls(use_eagle3, base_model_path, configpath, ea_layer_state_dict)
+        model = cls(use_eagle3, base_model_path, configpath,
+                    ea_layer_state_dict)
 
         return model
