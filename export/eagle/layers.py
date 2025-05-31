@@ -7,15 +7,16 @@
 # disclosure or distribution of this material and related documentation
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
-import torch
-import math
-import torch.nn as nn
-from typing import Optional, Tuple
 import json
+import math
 import os
-from transformers.activations import ACT2FN
-from transformers.models.llama.modeling_llama import LlamaRMSNorm,repeat_kv
+from typing import Optional, Tuple
+
+import torch
+import torch.nn as nn
 from safetensors import safe_open
+from transformers.activations import ACT2FN
+from transformers.models.llama.modeling_llama import LlamaRMSNorm, repeat_kv
 
 
 # The attention layer is simplified cause we will use attention plugin to replace it
@@ -65,7 +66,6 @@ class LlamaAttention(nn.Module):
                Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -76,8 +76,7 @@ class LlamaAttention(nn.Module):
                                      self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
                                          self.head_dim).transpose(1, 2)
-        
-        
+
         if past_key_value is not None:
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -127,18 +126,19 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-       
+
         down_proj = self.down_proj(
             self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return down_proj
+
 
 class LlamaDecoderLayeremb(nn.Module):
 
     def __init__(self, config, last=True, eagle3=False):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config,eagle3=eagle3)
+        self.self_attn = LlamaAttention(config=config, eagle3=eagle3)
         self.mlp = LlamaMLP(config)
         self.last = last
         self.hidden_norm = LlamaRMSNorm(config.hidden_size,
@@ -230,6 +230,7 @@ class LlamaDecoderLayer(nn.Module):
                                                 eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size,
                                                      eps=config.rms_norm_eps)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -275,7 +276,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        
+
         outputs = (hidden_states, )
         if output_attentions:
             outputs += (self_attn_weights, )
@@ -286,28 +287,24 @@ class LlamaDecoderLayer(nn.Module):
         return outputs
 
 
+def load_weight_from_safetensors(path, key="model.embed_tokens.weight"):
 
-def load_weight_from_safetensors(path,key="model.embed_tokens.weight"):
-    
     try:
         with open(os.path.join(path, "model.safetensors.index.json"),
-                    "r") as f:
+                  "r") as f:
             index_json = json.loads(f.read())
-            emb_path = index_json["weight_map"][
-                key]
+            emb_path = index_json["weight_map"][key]
         with safe_open(os.path.join(path, emb_path),
-                        framework="pt",
-                        device="cpu") as f:
+                       framework="pt",
+                       device="cpu") as f:
             tensor_slice = f.get_slice(key)
             vocab_size, hidden_dim = tensor_slice.get_shape()
             tensor = tensor_slice[:, :hidden_dim].float()
     except:
         with open(os.path.join(path, "pytorch_model.bin.index.json"),
-                    "r") as f:
+                  "r") as f:
             index_json = json.loads(f.read())
-            emb_path = index_json["weight_map"][
-                key]
+            emb_path = index_json["weight_map"][key]
         weights = torch.load(os.path.join(path, emb_path))
         tensor = weights[key].float()
     return tensor
-

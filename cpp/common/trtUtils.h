@@ -85,9 +85,12 @@ inline bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char
 }
 
 // Define a custom deleter type to handle the noexcept attribute
-struct DlDeleter {
-    void operator()(void* handle) const noexcept {
-        if (handle) {
+struct DlDeleter
+{
+    void operator()(void* handle) const noexcept
+    {
+        if (handle)
+        {
             dlclose(handle);
         }
     }

@@ -11,8 +11,8 @@
  */
 
 #include "jsonImpl.h"
-#include "common/logger.h"
 #include "common/json.h"
+#include "common/logger.h"
 
 #include <algorithm>
 #include <cctype>
@@ -229,7 +229,7 @@ bool JsonRootImpl::parse(std::string const& text)
     mJson = mSource.c_str();
     jsmn_init(&mParser);
 
-    const int INITIAL_TOKEN_NUM = 65536;
+    int const INITIAL_TOKEN_NUM = 65536;
     mTokens.resize(INITIAL_TOKEN_NUM);
     while (true)
     {
@@ -440,23 +440,27 @@ bool JsonRoot::parseFromPath(std::string const& filePath)
     }
     std::ifstream inputFileStream(filePath, std::ios::binary | std::ios::ate);
 
-    if (!inputFileStream.is_open()) {
+    if (!inputFileStream.is_open())
+    {
         throw std::runtime_error("Could not open file: " + filePath);
     }
 
     std::streamsize fileSize = inputFileStream.tellg();
     inputFileStream.seekg(0, std::ios::beg);
 
-    if (fileSize == -1) {
+    if (fileSize == -1)
+    {
         inputFileStream.close();
         throw std::runtime_error("Could not determine file size: " + filePath);
     }
 
     std::string content;
-    if (fileSize > 0) {
-        content.resize(static_cast<std::string::size_type>(fileSize)); 
-                                                                    
-        if (!inputFileStream.read(&content[0], fileSize)) {
+    if (fileSize > 0)
+    {
+        content.resize(static_cast<std::string::size_type>(fileSize));
+
+        if (!inputFileStream.read(&content[0], fileSize))
+        {
             inputFileStream.close();
             throw std::runtime_error("Could not read file into string: " + filePath);
         }

@@ -1,6 +1,6 @@
-#include <gtest/gtest.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <gtest/gtest.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
@@ -22,7 +22,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     std::vector<half> kvInput;
     std::vector<half> outReference;
     std::vector<int32_t> packedTreeMaskInput;
-    
+
     for (int32_t i = 0; i < batchSize; i++)
     {
         std::vector<half> qi(numQHeads * headSize * qSequenceLength);
@@ -35,7 +35,8 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         uniformFloatinitialization(vi);
         uniformIntInitialization(treeMaski, 0, 1);
 
-        auto ref = casualAttentionRef(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads, headSize, std::make_optional(treeMaski));
+        auto ref = casualAttentionRef(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads, headSize,
+            std::make_optional(treeMaski));
 
         // Add data from batch to input Tensors
         qInput.insert(qInput.end(), qi.begin(), qi.end());
@@ -66,7 +67,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
                     mask |= maskFlag << k;
                 }
                 packedMaski[i * numPackedMasksPerToken + j] = mask;
-            }   
+            }
         }
         packedTreeMaskInput.insert(packedTreeMaskInput.end(), packedMaski.begin(), packedMaski.end());
     }
@@ -98,7 +99,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
 
     bool NanValueDetected = false;
     int32_t numErrorWithin1E_3 = 0;
-    for (int32_t i = 0; i < batchSize * qSequenceLength * numQHeads * headSize; ++i) 
+    for (int32_t i = 0; i < batchSize * qSequenceLength * numQHeads * headSize; ++i)
     {
         EXPECT_TRUE(isclose(outHost[i], outReference[i], 1e-2, 1e-2));
         if (isclose(outHost[i], outReference[i], 1e-3, 1e-3))
@@ -113,9 +114,9 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     float passRate1E_3 = static_cast<float>(numErrorWithin1E_3) / (batchSize * qSequenceLength * numQHeads * headSize);
 
     std::cout << "XQA Tree Attention Decoding test. batch_size: " << batchSize << " num_Q_heads: " << numQHeads
-        << " num_KV_heads: "  << numKVHeads << " head_size: " << headSize
-        << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
-        << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+              << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
+              << " kvcache seq_len: " << kvSequenceLength << " q_seq_len: " << qSequenceLength
+              << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);
 }

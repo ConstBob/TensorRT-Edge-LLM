@@ -22,8 +22,8 @@ template <typename T>
 class Eagle
 {
 public:
-    Eagle(std::unique_ptr<Decoder<T>> baseModel, std::unique_ptr<Decoder<T>> draftModel, cudaStream_t stream,std::string eagleEnginePath,
-        int32_t maxPathLen = 6, int32_t topK = 10, bool isEagle3 = false,
+    Eagle(std::unique_ptr<Decoder<T>> baseModel, std::unique_ptr<Decoder<T>> draftModel, cudaStream_t stream,
+        std::string eagleEnginePath, int32_t maxPathLen = 6, int32_t topK = 10, bool isEagle3 = false,
         int32_t maxDecodingTokens = 60)
         : mBaseModel(std::move(baseModel))
         , mDraftModel(std::move(draftModel))
@@ -32,7 +32,7 @@ public:
 
         auto modelConfig = mBaseModel->getModelConfig();
         mBatchSize = modelConfig.batchSize;
-        // for eagle plus 1 
+        // for eagle plus 1
         mMaxSeqLen = modelConfig.maxLength + 1;
         mVocabSize = modelConfig.vocabSize;
         mMaxInputLength = modelConfig.maxInputLength;
@@ -43,7 +43,7 @@ public:
         mTopK = topK;
         mIsEagle3 = isEagle3;
         mEagleEnginePath = eagleEnginePath;
-        
+
         drivellm::JsonRoot root;
         std::string folderPath = extractFolderName(mEagleEnginePath);
         std::string configPath = folderPath + "/config.json";
@@ -60,7 +60,6 @@ public:
             mDraftVocabSize = rootNode["vocab_size"].getInteger();
         }
 
-        
         eagleCommonParamsInit();
         allocateEagleBuffer();
         addNewBufferForModelIO();
@@ -89,8 +88,7 @@ public:
 
 private:
     void addNewBufferForModelIO();
-    void invokeSamplingAndAccept(
-        int64_t* draftIds, const int32_t curTokensPerStep, int64_t endIds);
+    void invokeSamplingAndAccept(int64_t* draftIds, const int32_t curTokensPerStep, int64_t endIds);
     void invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t layerIdx, T* hs_draft);
     void invokeUpdateCumScoresAndParentsIds(int32_t layerIdx);
     void invokeAssembleDraftIdsAndPathAndMaskAndPositionIds();
@@ -101,7 +99,7 @@ private:
         int32_t& generationIter, int64_t& unfinishedBatchNum, std::vector<int32_t>& contextLengths);
     void allocateEagleBuffer();
     void invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
-    
+
     void eagleCommonParamsInit();
     void initDraftVoc();
     std::unique_ptr<Decoder<T>> mBaseModel;
@@ -123,11 +121,11 @@ private:
     int32_t mMaxDraftTokens;
     int32_t mMaxDecodingTokens;
     // depth+1
-    int32_t mMaxPathLen; 
+    int32_t mMaxPathLen;
     int32_t mTopK;
     int32_t mDraftVocabSize;
     bool mIsEagle3;
-    
+
     cudaStream_t mStream;
 };
 

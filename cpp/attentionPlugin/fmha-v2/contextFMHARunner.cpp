@@ -215,9 +215,9 @@ public:
                 checkCu(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     funcInfo.mSharedMemBytes));
             }
-            FMHAKernelHashKey hashKey{kernelMeta.mDataType, static_cast<int32_t>(kernelMeta.mS), static_cast<int32_t>(kernelMeta.mD), kernelMeta.mUnrollStep != 0,
-                kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType,
-                kernelMeta.mTiled};
+            FMHAKernelHashKey hashKey{kernelMeta.mDataType, static_cast<int32_t>(kernelMeta.mS),
+                static_cast<int32_t>(kernelMeta.mD), kernelMeta.mUnrollStep != 0, kernelMeta.mFP32Accumulation,
+                kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType, kernelMeta.mTiled};
             mFunctions.insert(std::make_pair(hashKey, funcInfo));
         }
     }
@@ -302,11 +302,11 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
 {
     mLaunchParams.set_default_kernel_selection_params();
     mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
-    
-    // The context FMHA-v2 kernels taken by the project only support ampere/ada for 
+
+    // The context FMHA-v2 kernels taken by the project only support ampere/ada for
     // reference on x86 machine, Orin/Thor for production on auto platforms.
-    bool const isSm8x = (smVersion == fmha_v2::kSM_80 || smVersion == fmha_v2::kSM_86
-        || smVersion == fmha_v2::kSM_87 || smVersion == fmha_v2::kSM_89);
+    bool const isSm8x = (smVersion == fmha_v2::kSM_80 || smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87
+        || smVersion == fmha_v2::kSM_89);
     bool const isSm101 = (smVersion == fmha_v2::kSM_101);
     check((isSm8x || isSm101), "Other SMs are not supported by context FMHA-v2 kernels");
     // Handle kernel selection under different context.

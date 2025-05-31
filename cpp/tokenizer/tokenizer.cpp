@@ -50,7 +50,8 @@ bool BPE::specialTokenPartition(std::string const& text, std::forward_list<textP
                     while (true)
                     {
                         auto match = rawText.find(specialToken, baseOffset);
-                        if ((match == std::string::npos) || (static_cast<int>(match + specialToken.length()) > (baseOffset + baseLength)))
+                        if ((match == std::string::npos)
+                            || (static_cast<int>(match + specialToken.length()) > (baseOffset + baseLength)))
                         {
                             break;
                         }

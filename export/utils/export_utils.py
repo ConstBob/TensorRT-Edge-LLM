@@ -8,9 +8,9 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import math
 import os
 import time
-import math
 
 import torch
 from peft import PeftConfig, PeftModel, load_peft_weights
@@ -73,6 +73,7 @@ class WrapperModelForCausalLM(torch.nn.Module):
         past_key_values = outputs.past_key_values.to_legacy_cache()
         logits = self.lm_head(hidden_states)
         return logits, past_key_values
+
 
 class WrapperEagleBaseModelForCausalLM(torch.nn.Module):
     """
@@ -161,7 +162,8 @@ class WrapperEagleDraftModelForCausalLM(torch.nn.Module):
 
         logits = self.lm_head(hidden_states_reshape)
         #hidden_states will added as output in insert_gather_last_token_eagle
-        return logits, past_key_values  
+        return logits, past_key_values
+
 
 def torch_to_onnx(model, inputs, onnx_dir, onnx_name, input_names,
                   output_names, dynamic_axes):
@@ -220,7 +222,7 @@ def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
         input_dynamic_axes = {0: "batch_size", 2: "past_len"}
         dynamic_axes[f"past_key_values.{i}.key"] = input_dynamic_axes
         dynamic_axes[f"past_key_values.{i}.value"] = input_dynamic_axes
-    
+
     if isinstance(model, WrapperEagleBaseModelForCausalLM):
         output_names.extend(['hidden_states'])
 
@@ -248,22 +250,28 @@ class QwenVisionAttention(VisionAttention):
     def __init__(self, dim: int, num_heads: int = 16):
         super().__init__(dim, num_heads)
 
-    def forward(self,
-                hidden_states: torch.Tensor,
+    def forward(self, hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor,
                 position_embeddings: torch.Tensor) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3,
+                                                  self.num_heads,
+                                                  -1).permute(1, 0, 2,
+                                                              3).unbind(0)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
         v = v.transpose(0, 1)
-        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
+            self.head_dim)
         attn_weights = attn_weights + attention_mask
 
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
+        attn_weights = torch.nn.functional.softmax(attn_weights,
+                                                   dim=-1,
+                                                   dtype=torch.float32).to(
+                                                       v.dtype)
         attn_output = torch.matmul(attn_weights, v)
         attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.reshape(seq_length, -1)

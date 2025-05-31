@@ -35,7 +35,7 @@ template <typename T>
 nvinfer1::PluginFieldType toFieldType();
 #define SPECIALIZE_TO_FIELD_TYPE(T, type)                                                                              \
     template <>                                                                                                        \
-    [[maybe_unused]] nvinfer1::PluginFieldType toFieldType<T>()                                                                         \
+    [[maybe_unused]] nvinfer1::PluginFieldType toFieldType<T>()                                                        \
     {                                                                                                                  \
         return nvinfer1::PluginFieldType::type;                                                                        \
     }
@@ -214,14 +214,14 @@ bool Int4GroupwsieGemmPlugin::supportsFormatCombination(
 }
 
 // IPluginV2Ext Methods
-DataType Int4GroupwsieGemmPlugin::getOutputDataType(
-    [[maybe_unused]] int32_t index, [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
+DataType Int4GroupwsieGemmPlugin::getOutputDataType([[maybe_unused]] int32_t index,
+    [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
     return DataType::kHALF;
 }
 
-DimsExprs Int4GroupwsieGemmPlugin::getOutputDimensions([[maybe_unused]] int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
-    [[maybe_unused]] int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
+DimsExprs Int4GroupwsieGemmPlugin::getOutputDimensions([[maybe_unused]] int32_t outputIndex,
+    nvinfer1::DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
     DimsExprs output;
@@ -233,14 +233,16 @@ DimsExprs Int4GroupwsieGemmPlugin::getOutputDimensions([[maybe_unused]] int32_t 
     return output;
 }
 
-void Int4GroupwsieGemmPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in, [[maybe_unused]] int32_t nbInputs,
-    [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
+void Int4GroupwsieGemmPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
+    [[maybe_unused]] int32_t nbOutputs) noexcept
 {
 }
 
 // TODO: extend the worksapce calculation to a more generalized form.
-size_t Int4GroupwsieGemmPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs, [[maybe_unused]] int32_t nbInputs,
-    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
+size_t Int4GroupwsieGemmPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
+    [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
     return 0;
 }

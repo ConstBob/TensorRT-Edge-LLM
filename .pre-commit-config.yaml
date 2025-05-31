@@ -1,5 +1,7 @@
 # Global exclude pattern
-exclude: '^3rdParty/'
+exclude: |
+    ^3rdParty/|
+    ^cpp/common/json/jsmn\.h$
 
 repos:
 -   repo: https://github.com/pycqa/isort
@@ -35,3 +37,4 @@ repos:
     -   id: codespell
         args:
         - --ignore-words-list=rouge,inout,atleast,strat,nd,subtile,thrid,ans,datas
+        exclude: '.*\.json$'

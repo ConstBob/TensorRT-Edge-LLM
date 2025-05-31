@@ -60,7 +60,8 @@ void printUsage(char const* programName)
     std::cerr
         << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 4096"
         << std::endl;
-    std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model. Default = 60" << std::endl;
+    std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model. Default = 60"
+              << std::endl;
     std::cerr << "  --dynamicShape   Use dynamic shape profiles." << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more logs." << std::endl;
 }
@@ -429,7 +430,7 @@ int main(int argc, char** argv)
     // Copy config.json to engine path
     auto configPath = extractFolderName(args.onnxPath) + "/config.json";
     std::string targetConfigPath = extractFolderName(args.enginePath) + "/config.json";
-    copyFile(configPath,targetConfigPath);
+    copyFile(configPath, targetConfigPath);
 
     if (args.isEagle3 && args.isEagleDraft)
     {

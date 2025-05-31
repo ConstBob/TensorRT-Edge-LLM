@@ -19,18 +19,18 @@
 # limitations under the License.
 
 import json
+import logging
 import math
 import random
 import re
 from argparse import ArgumentParser
 from typing import Dict
-import logging
 
 logger = logging.getLogger(__name__)
 random.seed(42)
+import chardet
 import numpy as np
 import pandas as pd
-import chardet
 
 # https://github.com/MMMU-Benchmark/MMMU/blob/main/mmmu/utils/data_utils.py
 DOMAIN_CAT2SUB_CAT = {
@@ -372,6 +372,7 @@ def get_multi_choice_info(result):
 
     return index2ans, all_choices
 
+
 def read_csv_safely(file_path):
     # Detect encoding
     with open(file_path, 'rb') as f:
@@ -392,6 +393,7 @@ def read_csv_safely(file_path):
             return pd.read_csv(file_path, encoding='latin-1')
         except Exception as e:
             raise ValueError(f"Failed to read file: {e}")
+
 
 def evaluate_mmmu(args):
     """

@@ -1,6 +1,6 @@
-#include <gtest/gtest.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <gtest/gtest.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
@@ -12,8 +12,8 @@
 
 using namespace nvinfer1;
 
-void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, int32_t kvCacheCapacity)
+void TestXQAAttentionDecodingAccuracy(
+    int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t kvCacheCapacity)
 {
     int32_t const smVersion = getSMVersion();
     // Decoding attention length always set qSequenceLength to 1
@@ -26,7 +26,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     // Initialize KVCahce buffer to full capacity.
     std::vector<half> kvInput(batchSize * 2 * numKVHeads * kvCacheCapacity * headSize, 0.F);
     std::vector<half> outReference;
-    
+
     for (int32_t i = 0; i < batchSize; i++)
     {
         int32_t kvLength = kvCacheLengths[i];
@@ -51,10 +51,10 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
             {
                 for (int32_t d = 0; d < headSize; d++)
                 {
-                    kvInput[batchOffset + hkv * kvCacheCapacity * headSize + skv * headSize + d] =
-                        ki[hkv * kvLength * headSize + skv * headSize + d];
-                    kvInput[batchOffset + vOffset + hkv * kvCacheCapacity * headSize + skv * headSize + d] =
-                        vi[hkv * kvLength * headSize + skv * headSize + d];
+                    kvInput[batchOffset + hkv * kvCacheCapacity * headSize + skv * headSize + d]
+                        = ki[hkv * kvLength * headSize + skv * headSize + d];
+                    kvInput[batchOffset + vOffset + hkv * kvCacheCapacity * headSize + skv * headSize + d]
+                        = vi[hkv * kvLength * headSize + skv * headSize + d];
                 }
             }
         }
@@ -87,7 +87,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
 
     bool NanValueDetected = false;
     int32_t numErrorWithin1E_3 = 0;
-    for (int32_t i = 0; i < batchSize * numQHeads * headSize; ++i) 
+    for (int32_t i = 0; i < batchSize * numQHeads * headSize; ++i)
     {
         EXPECT_TRUE(isclose(outHost[i], outReference[i], 1e-2, 1e-2));
         if (isclose(outHost[i], outReference[i], 1e-3, 1e-3))
@@ -102,8 +102,8 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     float passRate1E_3 = static_cast<float>(numErrorWithin1E_3) / (batchSize * numQHeads * headSize);
 
     std::cout << "XQA Attention Decoding test. batch_size: " << batchSize << " num_Q_heads: " << numQHeads
-        << " num_KV_heads: "  << numKVHeads << " head_size: " << headSize
-        << " kvcache lengths: " << kvCacheLengths << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+              << " num_KV_heads: " << numKVHeads << " head_size: " << headSize << " kvcache lengths: " << kvCacheLengths
+              << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);
 }

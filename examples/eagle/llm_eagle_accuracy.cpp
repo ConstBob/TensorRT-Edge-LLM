@@ -80,10 +80,15 @@ void printUsage(char const* programName)
     std::cerr << "  --datasetPath    Provide the dataset path for evaluation." << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs tensors." << std::endl;
     std::cerr << "  --isEagle3       Use Eagle3 mode." << std::endl;
-    std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model, the number provided must be aligned with building phase. Default = 60"
+    std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model, the number provided must "
+                 "be aligned with building phase. Default = 60"
               << std::endl;
-    std::cerr << "  --topK           Provide the topK for draft model to select the topK candidates. the number provided must be aligned with building phase. Default is 10." << std::endl;
-    std::cerr << "  --maxPathLen     Provide the max stack layers for draft model to constrcut the max tree path length. the number provided must be aligned with building phase. Default is 6." << std::endl;
+    std::cerr << "  --topK           Provide the topK for draft model to select the topK candidates. the number "
+                 "provided must be aligned with building phase. Default is 10."
+              << std::endl;
+    std::cerr << "  --maxPathLen     Provide the max stack layers for draft model to construct the max tree path "
+                 "length. the number provided must be aligned with building phase. Default is 6."
+              << std::endl;
 };
 
 bool parseLLMEagleAccuracyArgs(LLMEagleAccuracyArgs& args, int argc, char* argv[])
@@ -91,8 +96,8 @@ bool parseLLMEagleAccuracyArgs(LLMEagleAccuracyArgs& args, int argc, char* argv[
     static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"enginePath", required_argument, 0, 'e'},
         {"eagleEnginePath", required_argument, 0, 'E'}, {"tokenizerPath", required_argument, 0, 't'},
         {"datasetPath", required_argument, 0, 'D'}, {"debug", no_argument, 0, 'd'}, {"isEagle3", no_argument, 0, 'i'},
-        {"maxDecodingTokens", required_argument, 0, 'm'}, {"topK", required_argument, 0, 'k'}, {"maxPathLen", required_argument, 0, 'p'},
-        {0, 0, 0, 0}};
+        {"maxDecodingTokens", required_argument, 0, 'm'}, {"topK", required_argument, 0, 'k'},
+        {"maxPathLen", required_argument, 0, 'p'}, {0, 0, 0, 0}};
 
     int opt;
 
@@ -160,7 +165,7 @@ bool parseLLMEagleAccuracyArgs(LLMEagleAccuracyArgs& args, int argc, char* argv[
                 args.maxPathLen = std::stoi(optarg);
             }
             break;
-            
+
         case 'd': args.debug = true; break;
         default: return false;
         }
@@ -264,7 +269,8 @@ std::vector<TestData> parseCSVFile(fs::path const& csvPath, int maxRecordNum = -
 }
 
 void mmluAccuracy(fs::path const& enginePath, fs::path const& eagleEnginePath, fs::path const& datasetPath,
-    Tokenizer* tokenizer, GenerationConfig generationConfig, bool debug, bool isEagle3, int32_t maxDecodingTokens, int32_t topK, int32_t maxPathLen)
+    Tokenizer* tokenizer, GenerationConfig generationConfig, bool debug, bool isEagle3, int32_t maxDecodingTokens,
+    int32_t topK, int32_t maxPathLen)
 {
     std::unordered_map<std::string, std::vector<TestData>> testSubject2Data, devSubject2Data;
     std::vector<std::string> subjects;
@@ -334,8 +340,8 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& eagleEnginePath, f
         return devPrompt;
     };
 
-    auto eagle = new Eagle<half>(std::move(baseDecoder), std::move(draftDecoder), stream, eagleEnginePath, maxPathLen, topK, isEagle3,
-        maxDecodingTokens);
+    auto eagle = new Eagle<half>(std::move(baseDecoder), std::move(draftDecoder), stream, eagleEnginePath, maxPathLen,
+        topK, isEagle3, maxDecodingTokens);
 
     for (auto const& subject : subjects)
     {

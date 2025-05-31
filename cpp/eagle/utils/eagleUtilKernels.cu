@@ -1,11 +1,11 @@
+#include "eagleUtilKernels.h"
+#include "memoryUtils.h"
+#include <cub/cub.cuh>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <cub/cub.cuh>
-#include "eagleUtilKernels.h"
-#include "memoryUtils.h"
 
 __inline__ __device__ int32_t packMaskBits(bool* mask, int32_t startIdx, int32_t maxLength)
 {
@@ -160,7 +160,8 @@ __global__ void acceptDraftTokensByIdsWithPaths(int64_t* outputIds, int64_t* inp
     }
 }
 
-void dispatchAcceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams const& params, EagleCommonParams const& commonParams)
+void dispatchAcceptDraftTokensByIdsWithPaths(
+    AcceptDraftTokensByIdsWithPathsParams const& params, EagleCommonParams const& commonParams)
 {
     int32_t constexpr BLOCK_SIZE = 256;
     dim3 block(BLOCK_SIZE);
@@ -364,23 +365,26 @@ void dispatchUpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInter
             params.treeIndices, params.treeMaskInput, params.treeMaskInit, params.treeMaskUpdate,
             params.treeMaskUpdateforAttention, params.packedTreeMaskUpdateforAttention, params.treePositionIds,
             params.curContextLengths, params.packedTreeMaskUpdateforAttentionNoPadding, params.intermediateScores,
-            params.cumScoresForThirdTopk, params.outputIdsForThirdTopk, params.allTokens, params.draftVoc, commonParams.topK,
-            params.layerIdx, params.maxLength, commonParams.batchSize, commonParams.maxPathLen);
+            params.cumScoresForThirdTopk, params.outputIdsForThirdTopk, params.allTokens, params.draftVoc,
+            commonParams.topK, params.layerIdx, params.maxLength, commonParams.batchSize, commonParams.maxPathLen);
 
     CUDA_CHECK(cudaMemcpyAsync(params.treeMaskInput, params.treeMaskUpdate,
-        commonParams.batchSize * commonParams.topK * params.maxLength * sizeof(bool), cudaMemcpyDeviceToDevice, commonParams.stream));
+        commonParams.batchSize * commonParams.topK * params.maxLength * sizeof(bool), cudaMemcpyDeviceToDevice,
+        commonParams.stream));
     CUDA_CHECK(cudaMemsetAsync(params.treeMaskUpdateforAttention, 0,
         commonParams.batchSize * params.maxLength * params.maxLength * sizeof(bool), commonParams.stream));
 
     gridSize = (commonParams.batchSize * commonParams.topK * commonParams.hiddenDim + BLOCK_SIZE - 1) / BLOCK_SIZE;
     updateHiddenStates<T><<<gridSize, BLOCK_SIZE, 0, commonParams.stream>>>(params.inputHiddenStatesDraft,
-        params.outputHiddenStatesDraft, params.treeIndices, commonParams.batchSize, commonParams.topK, commonParams.hiddenDim,
-        params.layerIdx, commonParams.maxPathLen);
+        params.outputHiddenStatesDraft, params.treeIndices, commonParams.batchSize, commonParams.topK,
+        commonParams.hiddenDim, params.layerIdx, commonParams.maxPathLen);
 }
 template void dispatchUpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScores<float>(
-    UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<float> const& params, EagleCommonParams const& commonParams);
+    UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<float> const& params,
+    EagleCommonParams const& commonParams);
 template void dispatchUpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScores<half>(
-    UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<half> const& params, EagleCommonParams const& commonParams);
+    UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<half> const& params,
+    EagleCommonParams const& commonParams);
 
 inline __device__ void insertionSortOutputIds(int64_t* outputIds, int32_t n)
 {
@@ -535,7 +539,7 @@ __global__ void assembleDraftIdsAndTreeMaskAndPositionIdsAndPredecessors(int64_t
         __syncthreads();
         // one thread compute one token's packedTreeMaskVerification
         int32_t const numPackedMasksPerToken = (maxDecodingTokens + 31) / 32;
-        for(int i = 0; i < numPackedMasksPerToken; i++)
+        for (int i = 0; i < numPackedMasksPerToken; i++)
         {
             int32_t const packedIdx = flat_index3(batchIdx, tokenIdx, i, maxDecodingTokens, numPackedMasksPerToken);
             int32_t remainingBits = maxDecodingTokens - i * 32;
@@ -626,14 +630,14 @@ void dispatchAssembleDraftIdsAndPathAndMaskAndPositionIds(
 
     auto gridSize = (commonParams.maxDecodingTokens * commonParams.batchSize + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    size_t smemSize
-        = (BLOCK_SIZE * commonParams.maxDecodingTokens * sizeof(bool) + commonParams.maxDecodingTokens * sizeof(int64_t) + 15)
+    size_t smemSize = (BLOCK_SIZE * commonParams.maxDecodingTokens * sizeof(bool)
+                          + commonParams.maxDecodingTokens * sizeof(int64_t) + 15)
         & ~15;
     assembleDraftIdsAndTreeMaskAndPositionIdsAndPredecessors<<<gridSize, BLOCK_SIZE, smemSize, commonParams.stream>>>(
         params.fourthTopKIds, params.allDraftIds, params.allDraftIdsAncestors, params.modelInputIds,
         params.contextLengths, params.treeMask, params.positionIds, params.draftIds, params.draftIdsAncestors,
-        params.packedTreeMaskVerification, commonParams.batchSize, commonParams.maxDraftTokens, commonParams.maxDecodingTokens,
-        commonParams.topK, commonParams.maxSeqLen);
+        params.packedTreeMaskVerification, commonParams.batchSize, commonParams.maxDraftTokens,
+        commonParams.maxDecodingTokens, commonParams.topK, commonParams.maxSeqLen);
 
     gridSize = commonParams.batchSize;
     auto const blockSize = commonParams.maxDecodingTokens;
@@ -687,7 +691,8 @@ __global__ void updateCumScoresAndParentsIds(float* outputLogProbsAllDraft, floa
     }
 }
 
-void dispatchUpdateCumScoresAndParentsIds(UpdateCumScoresAndParentsIdsParams const& params, EagleCommonParams const& commonParams)
+void dispatchUpdateCumScoresAndParentsIds(
+    UpdateCumScoresAndParentsIdsParams const& params, EagleCommonParams const& commonParams)
 {
     constexpr int32_t BLOCK_SIZE = 128;
     int64_t gridSize = (commonParams.batchSize * commonParams.topK * commonParams.topK + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -835,16 +840,18 @@ __global__ void updateHiddenStatesInputs(T* hiddenStatesInputs, T* hiddenStates,
 }
 
 template <typename T>
-void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds(UpdateKVCacheParams<T> const& params, EagleCommonParams const& commonParams)
+void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds(
+    UpdateKVCacheParams<T> const& params, EagleCommonParams const& commonParams)
 {
     dim3 blockSize(16, 8);
     constexpr int vec_size = std::is_same<T, half>::value ? 2 : 1;
     dim3 gridSize(((commonParams.hiddenSizePerHead / vec_size) + blockSize.x - 1) / blockSize.x,
         (commonParams.numHead + blockSize.y - 1) / blockSize.y, commonParams.numLayers);
 
-    updateKVCache<T><<<gridSize, blockSize, 0, commonParams.stream>>>(params.KVCache, params.paths, params.acceptedLengths,
-        params.bestPathIds, params.contextLengths, commonParams.maxPathLen, commonParams.batchSize, commonParams.numHead,
-        commonParams.hiddenSizePerHead, commonParams.maxDecodingTokens, commonParams.kvCacheSeqLen, commonParams.numLayers);
+    updateKVCache<T><<<gridSize, blockSize, 0, commonParams.stream>>>(params.KVCache, params.paths,
+        params.acceptedLengths, params.bestPathIds, params.contextLengths, commonParams.maxPathLen,
+        commonParams.batchSize, commonParams.numHead, commonParams.hiddenSizePerHead, commonParams.maxDecodingTokens,
+        commonParams.kvCacheSeqLen, commonParams.numLayers);
 
     int threadsPerBlock = 256;
 
@@ -855,12 +862,15 @@ void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds(UpdateKVCacheParams<
         commonParams.batchSize, commonParams.maxDecodingTokens, commonParams.targetHiddenDim);
 
     blocksPerGrid = (commonParams.batchSize + threadsPerBlock - 1) / threadsPerBlock;
-    updateContextLengthsAndTreePositionIds<<<blocksPerGrid, threadsPerBlock, 0, commonParams.stream>>>(params.contextLengths,
-        params.acceptedLengths, params.treePositionIds, commonParams.batchSize, commonParams.maxDecodingTokens);
+    updateContextLengthsAndTreePositionIds<<<blocksPerGrid, threadsPerBlock, 0, commonParams.stream>>>(
+        params.contextLengths, params.acceptedLengths, params.treePositionIds, commonParams.batchSize,
+        commonParams.maxDecodingTokens);
 }
 
-template void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds<float>(UpdateKVCacheParams<float> const& params, EagleCommonParams const& commonParams);
-template void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds<half>(UpdateKVCacheParams<half> const& params, EagleCommonParams const& commonParams);
+template void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds<float>(
+    UpdateKVCacheParams<float> const& params, EagleCommonParams const& commonParams);
+template void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds<half>(
+    UpdateKVCacheParams<half> const& params, EagleCommonParams const& commonParams);
 
 __global__ void initCausalAttentionMask(bool* mask, int batchSize, int maxPathLen, int32_t* packedMask)
 {
@@ -890,7 +900,8 @@ __global__ void initCausalAttentionMask(bool* mask, int batchSize, int maxPathLe
     }
 }
 
-void dispatchInitializeAttentionMaskCausal(InitCausalAttentionMaskParams const& params, EagleCommonParams const& commonParams)
+void dispatchInitializeAttentionMaskCausal(
+    InitCausalAttentionMaskParams const& params, EagleCommonParams const& commonParams)
 {
     int const blockSize = 256;
     int const total = commonParams.batchSize * commonParams.maxDecodingTokens * commonParams.maxDecodingTokens;
@@ -900,22 +911,17 @@ void dispatchInitializeAttentionMaskCausal(InitCausalAttentionMaskParams const& 
         params.mask, commonParams.batchSize, commonParams.maxDecodingTokens, params.packedMask);
 }
 
-__global__ void getLastLogitsOffsetKernel(
-    int64_t* lastLogitsOffset,          
-    const int32_t* paths,               
-    const int32_t* bestPathIds, 
-    const int64_t* acceptedLengths,
-    int32_t batchSize,
-    int32_t maxPathLen,
-    int32_t maxDecodingTokens
-) {
+__global__ void getLastLogitsOffsetKernel(int64_t* lastLogitsOffset, int32_t const* paths, int32_t const* bestPathIds,
+    int64_t const* acceptedLengths, int32_t batchSize, int32_t maxPathLen, int32_t maxDecodingTokens)
+{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batchSize) return;
+    if (idx >= batchSize)
+        return;
 
     int bestPath = bestPathIds[idx];
     int64_t acceptedLen = acceptedLengths[idx];
     int pathOffset = idx * maxDecodingTokens * (maxPathLen + 1) + bestPath * (maxPathLen + 1);
-    
+
     lastLogitsOffset[idx] = paths[pathOffset + acceptedLen - 1];
 }
 
@@ -924,7 +930,7 @@ void dispatchGetLastLogitsOffset(GetLastLogitsOffsetParams const& params, EagleC
     int const blockSize = 128;
     int const gridSize = (commonParams.batchSize + blockSize - 1) / blockSize;
 
-    getLastLogitsOffsetKernel<<<gridSize, blockSize, 0, commonParams.stream>>>(params.lastLogitsOffset,
-        params.paths, params.bestPathIds, params.acceptedLengths, commonParams.batchSize, commonParams.maxPathLen,
+    getLastLogitsOffsetKernel<<<gridSize, blockSize, 0, commonParams.stream>>>(params.lastLogitsOffset, params.paths,
+        params.bestPathIds, params.acceptedLengths, commonParams.batchSize, commonParams.maxPathLen,
         commonParams.maxDecodingTokens);
 }

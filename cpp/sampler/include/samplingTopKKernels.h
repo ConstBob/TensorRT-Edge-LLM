@@ -137,7 +137,7 @@ struct TopKSamplingKernelParams
         if (cumLogProbs != nullptr || outputLogProbs != nullptr)
         {
             assert(maxTokensPerStep == 1);
-            if(cumLogProbs != nullptr)
+            if (cumLogProbs != nullptr)
             {
                 assert(!returnAllTopK);
             }

@@ -2,7 +2,6 @@
 
 #include "common/json.h"
 
-
 // Simplest test with one level of Json object.
 TEST(JsonParsingTest, basicOneLayer)
 {
@@ -207,7 +206,7 @@ TEST(JsonParsingTest, SafeTensorHeader)
         auto dtypeNode = weightNode1["dtype"];
         EXPECT_TRUE(dtypeNode.isString());
         EXPECT_EQ(dtypeNode.getString(), "F16");
-        
+
         auto shapeNode = weightNode1["shape"];
         EXPECT_TRUE(shapeNode.isArray());
         EXPECT_EQ(shapeNode.size(), 2);
@@ -220,7 +219,7 @@ TEST(JsonParsingTest, SafeTensorHeader)
         EXPECT_EQ(dataOffsetsNode[0].getInteger(), 0);
         EXPECT_EQ(dataOffsetsNode[1].getInteger(), 262144000);
     }
-    
+
     auto weightNode4 = rootNode[4];
     EXPECT_TRUE(weightNode4.isObject());
     {
@@ -232,7 +231,7 @@ TEST(JsonParsingTest, SafeTensorHeader)
         EXPECT_TRUE(shapeNode.isArray());
         EXPECT_EQ(shapeNode.size(), 2);
         EXPECT_EQ(shapeNode[0].getInteger(), 11008);
-        EXPECT_EQ(shapeNode[1].getInteger(), 4096); 
+        EXPECT_EQ(shapeNode[1].getInteger(), 4096);
 
         auto dataOffsetsNode = weightNode4["data_offsets"];
         EXPECT_TRUE(dataOffsetsNode.isArray());

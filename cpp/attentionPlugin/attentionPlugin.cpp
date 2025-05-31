@@ -305,11 +305,13 @@ bool AttentionPlugin::supportsFormatCombination(
 
     try
     {
-       
+
         if (mIsMrope && mEnableTreeAttention)
         {
             assert(nbInputs == 7 && nbOutputs == 2);
-        }else if(mIsMrope || mEnableTreeAttention){
+        }
+        else if (mIsMrope || mEnableTreeAttention)
+        {
 
             assert(nbInputs == 5 && nbOutputs == 2);
         }
@@ -354,16 +356,22 @@ bool AttentionPlugin::supportsFormatCombination(
             }
             break;
         case 5:
-            if (mEnableTreeAttention && mIsMrope){
+            if (mEnableTreeAttention && mIsMrope)
+            {
                 result = checkAttentionMask(inOut[5]);
-            }else if(mEnableTreeAttention || mIsMrope){
+            }
+            else if (mEnableTreeAttention || mIsMrope)
+            {
                 result = checkAttentionOutput(inOut[5]);
             }
             break;
         case 6:
-            if(mEnableTreeAttention && mIsMrope){
+            if (mEnableTreeAttention && mIsMrope)
+            {
                 result = checkAttentionPosId(inOut[6]);
-            }else if(mEnableTreeAttention || mIsMrope){
+            }
+            else if (mEnableTreeAttention || mIsMrope)
+            {
                 result = checkKVCache(inOut[6]);
             }
             break;
@@ -374,8 +382,9 @@ bool AttentionPlugin::supportsFormatCombination(
             }
             break;
         case 8:
-            if(mEnableTreeAttention && mIsMrope){
-               result = checkAttentionOutput(inOut[8]);
+            if (mEnableTreeAttention && mIsMrope)
+            {
+                result = checkAttentionOutput(inOut[8]);
             }
             break;
         default: break;
@@ -389,14 +398,14 @@ bool AttentionPlugin::supportsFormatCombination(
 }
 
 // IPluginV2Ext Methods
-DataType AttentionPlugin::getOutputDataType(
-    [[maybe_unused]] int32_t index, [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
+DataType AttentionPlugin::getOutputDataType([[maybe_unused]] int32_t index,
+    [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
     return DataType::kHALF;
 }
 
-DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
-    nvinfer1::IExprBuilder& exprBuilder) noexcept
+DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
+    [[maybe_unused]] int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
     DimsExprs output;
@@ -416,14 +425,16 @@ DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::Di
     return output;
 }
 
-void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in, [[maybe_unused]] int32_t nbInputs,
-    [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
+void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
+    [[maybe_unused]] int32_t nbOutputs) noexcept
 {
 }
 
 // TODO: extend the worksapce calculation to a more generalized form.
-size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs, [[maybe_unused]] int32_t nbInputs,
-    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
+size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
+    [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
     // We may want to reserve workspace here, need to determine more details after implementing the runners.
     // For FMHA kernel we need a buffer to store prefix sum of context lengths.
@@ -439,8 +450,8 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
 }
 
 int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
-    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
-    cudaStream_t stream) noexcept
+    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
+    void* workspace, cudaStream_t stream) noexcept
 {
     constexpr int32_t kQKV_INPUT_IDX{0};
     constexpr int32_t kKV_CACHE_INPUT_OUTPUT_IDX{1};
@@ -448,7 +459,6 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     constexpr int32_t kATTENTION_OUTPUT_IDX{0};
     constexpr int32_t kMROPE_ROTARY_COS_SIN_IDX{3};
     constexpr int32_t kMROPE_POSITION_DELTAS_IDX{4};
-    
 
     // Obtain execution time batch size, input context length, and KV-cache capacity per sequence.
     constexpr int32_t kQKV_INPUT_BATCH_DIM_IDX{0};

@@ -1,7 +1,8 @@
-import onnx
 import os
 import shutil
 from argparse import ArgumentParser
+
+import onnx
 
 
 def modify_onnx_model(input_path, output_path):
@@ -34,20 +35,16 @@ def modify_onnx_model(input_path, output_path):
 
 
 if __name__ == "__main__":
-    
+
     parser = ArgumentParser()
-    parser.add_argument(
-        "--input_path", 
-        type=str, 
-        required=True,
-        help="The path to input onnx file."
-    )
-    parser.add_argument(
-        "--output_path", 
-        type=str, 
-        required=True,
-        help="The path to output onnx file."
-    )
+    parser.add_argument("--input_path",
+                        type=str,
+                        required=True,
+                        help="The path to input onnx file.")
+    parser.add_argument("--output_path",
+                        type=str,
+                        required=True,
+                        help="The path to output onnx file.")
     args = parser.parse_args()
 
     modify_onnx_model(args.input_path, args.output_path)

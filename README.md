@@ -101,4 +101,5 @@ pip3 install -r requirements_int4.txt
 echo 24576 | sudo tee /proc/sys/vm/nr_hugepages
 ```
 4. If you encounter issue with mmap while loading the engine, you can use `export DISABLE_MMAP_LOAD=1` to use the default IStreamReader to load engine.
+5. FP8 ViT has minor accuracy loss and has significant memory footprint issue. It is recommended to use FP16 ViT to avoid the issues.
 
