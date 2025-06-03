@@ -184,56 +184,6 @@ def quantize(model,
     return quantized_model
 
 
-class QuantQwenVisionAttention(QwenVisionAttention):
-    """
-    Quantized MHA version of QwenVisionAttention.
-    """
-
-    def __init__(self, dim: int, num_heads: int = 16):
-        super().__init__(dim, num_heads)
-        self._setup()
-
-    def _setup(self):
-        self.q_bmm_quantizer = TensorQuantizer()
-        self.k_bmm_quantizer = TensorQuantizer()
-        self.v_bmm_quantizer = TensorQuantizer()
-        self.softmax_quantizer = TensorQuantizer()
-
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                position_embeddings: torch.Tensor) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
-        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3,
-                                                  self.num_heads,
-                                                  -1).permute(1, 0, 2,
-                                                              3).unbind(0)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        q = self.q_bmm_quantizer(q)
-        k = self.k_bmm_quantizer(k)
-        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
-            self.head_dim)
-        attn_weights = attn_weights + attention_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1,
-                                 dtype=torch.float32).to(v.dtype)
-        attn_weights = self.softmax_quantizer(attn_weights)
-        v = self.v_bmm_quantizer(v)
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.reshape(seq_length, -1)
-        attn_output = self.proj(attn_output)
-        return attn_output
-
-
-mtq.register(original_cls=QwenVisionAttention,
-             quantized_cls=QuantQwenVisionAttention)
-
-
 def get_vit_calib_dataloader(
     model,
     model_type,
@@ -344,17 +294,9 @@ def quantize_visual(model, precision, model_type, torch_dir):
         "fp8"
     ], f"Only fp8(W8A8) is recommended for vit. You passed an unsupported precision: {precision}."
 
-    # Set quantization config, enable FP8 MHA and FP8 GEMM
+    # Set quantization config, enable FP8 GEMM
     quant_config = mtq.FP8_DEFAULT_CFG
     quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
-    quant_config["quant_cfg"]["*[qkv]_bmm_quantizer"] = {
-        "num_bits": (4, 3),
-        "axis": None
-    }
-    quant_config["quant_cfg"]["*softmax_quantizer"] = {
-        "num_bits": (4, 3),
-        "axis": None
-    }
 
     data_loader = get_vit_calib_dataloader(model,
                                            model_type,
