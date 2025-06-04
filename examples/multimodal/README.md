@@ -42,6 +42,7 @@ We describes how to run supported models in the below section.
     ```
 **Note**:
 1. We support FP8 VIT quantization. A NVIDIA research has shown that FP8 VIT can preserves VLM accuracy while inscreases VIT performance. For defails you can refer to this [paper](https://arxiv.org/pdf/2412.04468).
+1. In TensorRT10.10, user need to disable `attn.proj` layers to get best FP8 VIT performance.
 1. Qwen2.5-VL 3B VIT with FP16 precision has occasional overflow issue from the last transformer block and we observed the same issue with HuggingFace using Pytorch backend. We applied a work-around to cast the last down_proj to FP32 in [multimodal_export.py](../../export/multimodal_export.py).
 
 ### Image Preprocess and Number of Image Tokens
