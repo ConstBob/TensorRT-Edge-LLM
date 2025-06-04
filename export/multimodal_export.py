@@ -446,7 +446,6 @@ def export_llm(hf_model, args):
          ])  # head_size = 128
     mrope_position_deltas = gs.Variable("mrope_position_deltas", np.int64,
                                         ['batch_size', 1])
-    state_dict = None
     surgeon_llm(
         f"{raw_onnx_dir}/model.onnx",
         llm_output_dir,
