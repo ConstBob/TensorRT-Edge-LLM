@@ -97,9 +97,9 @@ We also provide ONNX files for some of the models with open-source license so yo
 
 Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 --- | --- | --- | --- | --- | ---
-[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes | [llama3_8b.tgz](https://nvidia.box.com/shared/static/2r5xez6bg3sodpg3xjy7v9kiuw270c8h)
-[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes | [llama3.1_8b.tgz](https://nvidia.box.com/shared/static/2my40zw33m7a3s23hv8a2iowd2oy4ykz)
-[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes | [llama3.2_3b.tgz](https://nvidia.box.com/shared/static/cz794nwsb5y4vn8sm3b5x9g3xax2m0dj)
+[Llama3-8b-instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Yes | Yes | Yes | Yes | /
+[Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | Yes | Yes | Yes | Yes | /
+[Llama3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | Yes | Yes | Yes | Yes | /
 [Qwen2-0.5B-instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_0.5b.tgz](https://nvidia.box.com/shared/static/9buz5igx2unkerl1o23k4cpbvo2hvigf)
 [Qwen2-1.5B-instruct](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_1.5b.tgz](https://nvidia.box.com/shared/static/0t4ucre0kc5nuuqqjlgj2ed6tzkkvjw1)
 [Qwen2-7B-instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_7b.tgz](https://nvidia.box.com/shared/static/bfowygk8lj0vt55jxfl1cizenur6pjo4)
@@ -107,9 +107,9 @@ Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 [Qwen2.5-1.5B-instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_1.5b.tgz](https://nvidia.box.com/shared/static/0kg77vm50jw3nheci628mrse5sj1j4yn)
 [Qwen2.5-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) | Yes | Yes | Yes | Yes | /
 [Qwen2.5-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_7b.tgz](https://nvidia.box.com/shared/static/tjqxajzqz2ko25b3tuft7vsl3ffp56jm)
-[Llama3.1-8B-Eagle2-Base](https://huggingface.co/meta-llama/Llama-3.1-8B)  | Yes | No | No | No | [llama3.1_8b_eagle2_base.tgz](https://nvidia.box.com/shared/static/7j4tgbr1hxaj6a2ngv0ynrkyq6rghvq0)
+[Llama3.1-8B-Eagle2-Base](https://huggingface.co/meta-llama/Llama-3.1-8B)  | Yes | No | No | No | /
 [Llama3.1-8B-Eagle2-Draft](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B) | Yes | No | No | No | [llama3.1_8b_eagle2_draft.tgz](https://nvidia.box.com/shared/static/apv5wtpd3twl8y4glz171t6eterht78q)
-[Llama3.1-8B-Eagle3-Base](https://huggingface.co/meta-llama/Llama-3.1-8B)  | Yes | No | No | No | [llama3.1_8b_eagle3_base.tgz](https://nvidia.box.com/shared/static/7d5diet4ze770tv93yzev3gf9eemclbi)
+[Llama3.1-8B-Eagle3-Base](https://huggingface.co/meta-llama/Llama-3.1-8B)  | Yes | No | No | No | /
 [Llama3.1-8B-Eagle3-Draft](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B) | Yes | No | No | No | [llama3.1_8b_eagle3_draft.tgz](https://nvidia.box.com/shared/static/wvqyb348j800l6yfks7icmlrog4oiil1)
 
 The `multimodal_export.py` script can export the following multimodal models into ONNX.
