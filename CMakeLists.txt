@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 project(
   driveos_llm_sdk
-  VERSION 0.1.0.0
+  VERSION 0.1.0.1
   LANGUAGES CXX CUDA)
 
 # Specify the C++ standard and flags
