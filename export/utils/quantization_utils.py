@@ -298,7 +298,7 @@ def quantize_visual(model, precision, model_type, torch_dir):
     # Also disable Conv3d to avoid accuracy degradation.
     quant_config = mtq.FP8_DEFAULT_CFG
     quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
-    
+
     # With TensorRT10.10, disable `attn.proj` layers to avoid performance degradation.
     quant_config["quant_cfg"]["*attn.proj*"] = {"enable": False}
 

@@ -41,6 +41,7 @@ struct LLMEagleBuildArgs
     bool isEagleDraft{false};
     bool isEagle3{false};
     int32_t maxDecodingTokens{60};
+    int32_t mMaxDraftTokensPerStep{60};
 };
 
 void printUsage(char const* programName)
@@ -48,7 +49,8 @@ void printUsage(char const* programName)
     std::cerr << "Usage: " << programName
               << " [-h] <--onnxPath str> <--enginePath str> [-b or "
                  "--batchSize int] [-c or --maxInputLen int] [-s or --maxSeqLen int] [--dynamicShape] [--maxBatchSize "
-                 "int] [--debug] [-e or --eagleBase] [-g or --eagleDraft] [-a or --eagle3] [-m or --mMaxDecodingTokens]"
+                 "int] [--debug] [-e or --eagleBase] [-g or --eagleDraft] [-a or --eagle3] [-m or "
+                 "--mMaxDecodingTokens] [-p or --mMaxDraftTokensPerStep]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  -h               Display this help message" << std::endl;
@@ -61,6 +63,9 @@ void printUsage(char const* programName)
         << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 4096"
         << std::endl;
     std::cerr << "  --maxDecodingTokens Provide the maximum decoding tokens for target model. Default = 60"
+              << std::endl;
+    std::cerr << "  --mMaxDraftTokensPerStep Provide the maximum decoding tokens for draft model which is equal to "
+                 "maxPathLen * topK. Default = 60"
               << std::endl;
     std::cerr << "  --dynamicShape   Use dynamic shape profiles." << std::endl;
     std::cerr << "  --debug          Use debug mode, which outputs more logs." << std::endl;
@@ -75,7 +80,8 @@ bool parseLLMEagleBuildArgs(LLMEagleBuildArgs& args, int argc, char* argv[])
         {"eagle3", no_argument, 0, 'a'}, {"dynamicShape", no_argument, 0, 'y'},
         {"maxBatchSize", required_argument, 0, 'B'}, {"imageTokens", required_argument, 0, 0},
         {"minImageTokens", required_argument, 0, 0}, {"maxImageTokens", required_argument, 0, 0},
-        {"modelType", required_argument, 0, 0}, {"maxDecodingTokens", required_argument, 0, 0}, {0, 0, 0, 0}};
+        {"modelType", required_argument, 0, 0}, {"maxDecodingTokens", required_argument, 0, 0},
+        {"mMaxDraftTokensPerStep", required_argument, 0, 0}, {0, 0, 0, 0}};
 
     int opt;
     // Loop to process each option
@@ -135,6 +141,12 @@ bool parseLLMEagleBuildArgs(LLMEagleBuildArgs& args, int argc, char* argv[])
             if (optarg)
             {
                 args.maxDecodingTokens = std::stoi(optarg);
+            }
+            break;
+        case 'p':
+            if (optarg)
+            {
+                args.mMaxDraftTokensPerStep = std::stoi(optarg);
             }
             break;
         case 'g': args.isEagleDraft = true; break;
@@ -293,13 +305,15 @@ int main(int argc, char** argv)
     }
 
     int const mMaxDecodingTokens = args.maxDecodingTokens;
+    int const mMaxDraftTokensPerStep = args.mMaxDraftTokensPerStep;
+    int const mMaxTokens = args.isEagleDraft ? mMaxDraftTokensPerStep : mMaxDecodingTokens;
     if (args.isEagleDraft or args.isEagleBase)
     {
         result &= setOptimizationProfile(contextProfile, "input_ids", createDims({minBatchSize, 1}),
             createDims({optBatchSize, args.maxInputLen / 2}), createDims({maxBatchSize, args.maxInputLen}));
 
         result &= setOptimizationProfile(generationProfile, "input_ids", createDims({minBatchSize, 1}),
-            createDims({optBatchSize, mMaxDecodingTokens / 2}), createDims({maxBatchSize, mMaxDecodingTokens}));
+            createDims({optBatchSize, mMaxTokens / 2}), createDims({maxBatchSize, mMaxTokens}));
     }
 
     result &= setOptimizationProfile(contextProfile, "context_lengths", createDims({minBatchSize}),
@@ -310,66 +324,49 @@ int main(int argc, char** argv)
 
     if (args.isEagleDraft)
     {
-        if (args.isEagle3)
-        {
-            result &= setOptimizationProfile(contextProfile, "hidden_states_from_draft",
-                createDims({minBatchSize, 1, hiddenSizeDim}),
-                createDims({optBatchSize, args.maxInputLen / 2, hiddenSizeDim}),
-                createDims({maxBatchSize, args.maxInputLen, hiddenSizeDim}));
-            result &= setOptimizationProfile(generationProfile, "hidden_states_from_draft",
-                createDims({minBatchSize, 1, hiddenSizeDim}),
-                createDims({optBatchSize, mMaxDecodingTokens / 2, hiddenSizeDim}),
-                createDims({maxBatchSize, mMaxDecodingTokens, hiddenSizeDim}));
 
-            result &= setOptimizationProfile(contextProfile, "hidden_states_input",
-                createDims({minBatchSize, 1, targetModelOutputHiddenDim}),
-                createDims({optBatchSize, args.maxInputLen / 2, targetModelOutputHiddenDim}),
-                createDims({maxBatchSize, args.maxInputLen, targetModelOutputHiddenDim}));
-            result &= setOptimizationProfile(generationProfile, "hidden_states_input",
-                createDims({minBatchSize, 1, targetModelOutputHiddenDim}),
-                createDims({optBatchSize, mMaxDecodingTokens / 2, targetModelOutputHiddenDim}),
-                createDims({maxBatchSize, mMaxDecodingTokens, targetModelOutputHiddenDim}));
-        }
-        else
-        {
+        result &= setOptimizationProfile(contextProfile, "hidden_states_from_draft",
+            createDims({minBatchSize, 1, hiddenSizeDim}),
+            createDims({optBatchSize, args.maxInputLen / 2, hiddenSizeDim}),
+            createDims({maxBatchSize, args.maxInputLen, hiddenSizeDim}));
+        result &= setOptimizationProfile(generationProfile, "hidden_states_from_draft",
+            createDims({minBatchSize, 1, hiddenSizeDim}), createDims({optBatchSize, mMaxTokens / 2, hiddenSizeDim}),
+            createDims({maxBatchSize, mMaxTokens, hiddenSizeDim}));
 
-            result &= setOptimizationProfile(contextProfile, "hidden_states_input",
-                createDims({minBatchSize, 1, hiddenSizeDim}),
-                createDims({optBatchSize, args.maxInputLen / 2, hiddenSizeDim}),
-                createDims({maxBatchSize, args.maxInputLen, hiddenSizeDim}));
-            result &= setOptimizationProfile(generationProfile, "hidden_states_input",
-                createDims({minBatchSize, 1, hiddenSizeDim}),
-                createDims({optBatchSize, mMaxDecodingTokens / 2, hiddenSizeDim}),
-                createDims({maxBatchSize, mMaxDecodingTokens, hiddenSizeDim}));
-        }
+        result &= setOptimizationProfile(contextProfile, "hidden_states_input",
+            createDims({minBatchSize, 1, targetModelOutputHiddenDim}),
+            createDims({optBatchSize, args.maxInputLen / 2, targetModelOutputHiddenDim}),
+            createDims({maxBatchSize, args.maxInputLen, targetModelOutputHiddenDim}));
+        result &= setOptimizationProfile(generationProfile, "hidden_states_input",
+            createDims({minBatchSize, 1, targetModelOutputHiddenDim}),
+            createDims({optBatchSize, mMaxTokens / 2, targetModelOutputHiddenDim}),
+            createDims({maxBatchSize, mMaxTokens, targetModelOutputHiddenDim}));
 
         result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1}),
             createDims({args.maxInputLen / 2}), createDims({args.maxInputLen}));
         result &= setOptimizationProfile(generationProfile, "last_token_ids", createDims({1}),
-            createDims({mMaxDecodingTokens / 2}), createDims({mMaxDecodingTokens}));
+            createDims({mMaxTokens / 2}), createDims({mMaxTokens}));
     }
     else if (args.isEagleBase)
     {
         result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1}),
             createDims({args.maxInputLen / 2}), createDims({args.maxInputLen}));
         result &= setOptimizationProfile(generationProfile, "last_token_ids", createDims({1}),
-            createDims({mMaxDecodingTokens / 2}), createDims({mMaxDecodingTokens}));
+            createDims({mMaxTokens / 2}), createDims({mMaxTokens}));
     }
 
     if (args.isEagleDraft or args.isEagleBase)
     {
-        const int32_t attn_mask_align_size = 32;
+        const int32_t attnMaskAlignSize = 32;
         result &= setOptimizationProfile(contextProfile, "attention_mask", createDims({minBatchSize, 1, 1}),
             createDims({optBatchSize, 1, 1}), createDims({maxBatchSize, 1, 1}));
         result &= setOptimizationProfile(generationProfile, "attention_mask", createDims({minBatchSize, 1, 1}),
-            createDims({optBatchSize, mMaxDecodingTokens / 2,
-                divUp(mMaxDecodingTokens / 2, attn_mask_align_size) * attn_mask_align_size}),
-            createDims({maxBatchSize, mMaxDecodingTokens,
-                divUp(mMaxDecodingTokens, attn_mask_align_size) * attn_mask_align_size}));
+            createDims({optBatchSize, mMaxTokens / 2, divUp(mMaxTokens / 2, attnMaskAlignSize) * attnMaskAlignSize}),
+            createDims({maxBatchSize, mMaxTokens, divUp(mMaxTokens, attnMaskAlignSize) * attnMaskAlignSize}));
         result &= setOptimizationProfile(contextProfile, "attention_pos_id", createDims({minBatchSize, 1}),
             createDims({optBatchSize, 1}), createDims({maxBatchSize, 1}));
         result &= setOptimizationProfile(generationProfile, "attention_pos_id", createDims({minBatchSize, 1}),
-            createDims({optBatchSize, mMaxDecodingTokens / 2}), createDims({maxBatchSize, mMaxDecodingTokens}));
+            createDims({optBatchSize, mMaxTokens / 2}), createDims({maxBatchSize, mMaxTokens}));
     }
 
     nvinfer1::Dims minKVContextShape = createDims({minBatchSize, 2, numKVHeads, 0, hiddenSizePerHead});
