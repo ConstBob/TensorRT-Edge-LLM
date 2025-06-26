@@ -131,11 +131,8 @@ class WrapperEagleDraftModelForCausalLM(torch.nn.Module):
         self.model.logsoftmax = torch.nn.Identity()
         self.eagle3 = eagle3
 
-    def forward(self,
-                input_ids,
-                past_key_values,
-                hidden_states_input,
-                hidden_states_from_draft=None):
+    def forward(self, input_ids, past_key_values, hidden_states_input,
+                hidden_states_from_draft):
         past_key_values = DynamicCache.from_legacy_cache(past_key_values)
         if self.eagle3:
             #hidden_states_input: go through the fc layer
@@ -150,10 +147,12 @@ class WrapperEagleDraftModelForCausalLM(torch.nn.Module):
                 -1, hidden_states.size(2))
             hidden_states_reshape = self.model.norm(hidden_states_reshape)
         else:
-            outputs = self.model(hidden_states=hidden_states_input,
-                                 input_ids=input_ids,
-                                 past_key_values=past_key_values,
-                                 use_cache=True)
+            outputs = self.model(
+                hidden_states=hidden_states_input,
+                hidden_states_from_draft=hidden_states_from_draft,
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                use_cache=True)
             hidden_states = outputs[0]
             hidden_states_reshape = hidden_states.reshape(
                 -1, hidden_states.size(2))

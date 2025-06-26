@@ -559,16 +559,16 @@ std::vector<EngineInputDesc> Qwen2ViTRunner::getExtraLLMInputs()
 {
     std::vector<EngineInputDesc> extraInputs;
 
-    extraInputs.emplace_back(EngineInputDesc{"image_embeds", mDeviceBuffer["output"],
+    extraInputs.emplace_back(EngineInputDesc{"image_embeds", mDeviceBuffer["output"], mDeviceBuffer["output"],
         {2, {mConfig.maxHW / 4, mConfig.hiddenDim}}, {2, {1, mConfig.hiddenDim}}});
 
     nvinfer1::Dims cosSinDims = {2, {mConfig.llmBatchSize, mConfig.maxPositionEmbeddings * mConfig.mropeEmbDim}};
-    extraInputs.emplace_back(
-        EngineInputDesc{"mrope_rotary_cos_sin", mDeviceBuffer["mropeRotaryCosSin"], cosSinDims, cosSinDims});
+    extraInputs.emplace_back(EngineInputDesc{"mrope_rotary_cos_sin", mDeviceBuffer["mropeRotaryCosSin"],
+        mDeviceBuffer["mropeRotaryCosSin"], cosSinDims, cosSinDims});
 
     nvinfer1::Dims deltasDim = {2, {mConfig.llmBatchSize, 1}};
-    extraInputs.emplace_back(
-        EngineInputDesc{"mrope_position_deltas", mDeviceBuffer["mropePositionDeltas"], deltasDim, deltasDim});
+    extraInputs.emplace_back(EngineInputDesc{"mrope_position_deltas", mDeviceBuffer["mropePositionDeltas"],
+        mDeviceBuffer["mropePositionDeltas"], deltasDim, deltasDim});
 
     return extraInputs;
 }

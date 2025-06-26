@@ -471,9 +471,19 @@ def main(args):
             hidden_states_input = torch.randn(
                 (dummy_bs, dummy_len_input_hidden, model.config.hidden_size),
                 dtype=torch.float16).cuda()
-            extra_inputs = {"hidden_states_input": hidden_states_input}
+            hidden_states_from_draft = torch.randn(
+                (dummy_bs, dummy_len_input_hidden, model.config.hidden_size),
+                dtype=torch.float16).cuda()
+            extra_inputs = {
+                "hidden_states_input": hidden_states_input,
+                "hidden_states_from_draft": hidden_states_from_draft
+            }
             extra_dyn_axes = {
                 "hidden_states_input": {
+                    0: "batch_size",
+                    1: "seq_len"
+                },
+                "hidden_states_from_draft": {
                     0: "batch_size",
                     1: "seq_len"
                 }

@@ -59,6 +59,7 @@ class Eagle2(nn.Module):
         self,
         hidden_states,
         input_ids,
+        hidden_states_from_draft=torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -72,6 +73,7 @@ class Eagle2(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+        hidden_states = hidden_states + hidden_states_from_draft
         hidden_states = self.fc(
             torch.cat((inputs_embeds, hidden_states), dim=-1))
 

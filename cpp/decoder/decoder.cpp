@@ -67,26 +67,32 @@ bool Decoder<T>::setup(
     }
     return true;
 }
-
 template <typename T>
 void Decoder<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
 {
     for (size_t i = 0; i < extraInputs.size(); ++i)
     {
         char const* inputName = extraInputs[i].name.c_str();
-        void* inputDevice = extraInputs[i].deviceBuffer;
+        void* inputDeviceForContext = extraInputs[i].deviceBufferForContext;
+        void* inputDeviceForDecode = extraInputs[i].deviceBufferForDecode;
         nvinfer1::Dims contextDims = extraInputs[i].contextDims;
         nvinfer1::Dims generationDims = extraInputs[i].generationDims;
-
-        mContextExecutionContext->setTensorAddress(inputName, inputDevice);
-        mGenerationExecutionContext->setTensorAddress(inputName, inputDevice);
-        mContextExecutionContext->setInputShape(inputName, contextDims);
-        mGenerationExecutionContext->setInputShape(inputName, generationDims);
-    }
-    // Need to reset cudaGraph because the setInputShape and setTensorAddress requires cudaGraph to be recaptured
-    if (mUseCudaGraph)
-    {
-        mCudaGraphCaptured = false;
+        if (inputDeviceForContext != nullptr)
+        {
+            mContextExecutionContext->setTensorAddress(inputName, inputDeviceForContext);
+            mContextExecutionContext->setInputShape(inputName, contextDims);
+        }
+        if (inputDeviceForDecode != nullptr)
+        {
+            mGenerationExecutionContext->setTensorAddress(inputName, inputDeviceForDecode);
+            mGenerationExecutionContext->setInputShape(inputName, generationDims);
+            // Need to reset cudaGraph because the setInputShape and setTensorAddress requires cudaGraph to be
+            // recaptured
+            if (mUseCudaGraph)
+            {
+                mCudaGraphCaptured = false;
+            }
+        }
     }
 }
 
@@ -205,58 +211,10 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
 
     return 0;
 }
-
 template <typename T>
-void Decoder<T>::allocateBuffer()
+void Decoder<T>::allocateBufferForKVCache()
 {
-    // Allocate buffers for inputs and logits, and set the shape
-    void* contextLengthDevice;
-    CUDA_CHECK(cudaMalloc(&contextLengthDevice, mConfig.batchSize * sizeof(int32_t)));
-    mContextExecutionContext->setTensorAddress("context_lengths", contextLengthDevice);
-    mContextExecutionContext->setInputShape("context_lengths", {1, {mConfig.batchSize}});
-    mGenerationExecutionContext->setTensorAddress("context_lengths", contextLengthDevice);
-    mGenerationExecutionContext->setInputShape("context_lengths", {1, {mConfig.batchSize}});
-    mDeviceBuffer["context_lengths"] = contextLengthDevice;
-
-    void* lastTokenIdsDevice;
     int32_t sizeOfHalf = 2;
-    if (mIsEagle)
-    {
-        CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t)));
-        mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
-        mContextExecutionContext->setInputShape("last_token_ids", {1, {1}});
-        mGenerationExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
-        mContextExecutionContext->setInputShape("last_token_ids", {1, {1}});
-        mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
-        mHostBuffer["last_token_ids"] = malloc(mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t));
-    }
-    else
-    {
-        CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * 1 * sizeof(int64_t)));
-        mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
-        mContextExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
-        mGenerationExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
-        mGenerationExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
-        mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
-        mHostBuffer["last_token_ids"] = malloc(mConfig.batchSize * sizeof(int64_t));
-
-        void* inputIdsDevice;
-        CUDA_CHECK(cudaMalloc(&inputIdsDevice, (mConfig.batchSize * mConfig.maxLength) * sizeof(int64_t)));
-        mDeviceBuffer["input_ids"] = inputIdsDevice;
-        mContextExecutionContext->setTensorAddress("input_ids", inputIdsDevice);
-        mGenerationExecutionContext->setTensorAddress("input_ids", inputIdsDevice);
-        mContextExecutionContext->setInputShape("input_ids", {2, {mConfig.batchSize, mConfig.maxInputLength}});
-        mGenerationExecutionContext->setInputShape("input_ids", {2, {mConfig.batchSize, 1}});
-
-        void* logitsDevice;
-        CUDA_CHECK(cudaMalloc(&logitsDevice, (mConfig.batchSize * mConfig.vocabSize) * sizeOfHalf));
-        mDeviceBuffer["logits"] = logitsDevice;
-        mContextExecutionContext->setTensorAddress("logits", logitsDevice);
-        mGenerationExecutionContext->setTensorAddress("logits", logitsDevice);
-    }
-
-    mHostBuffer["finished_states"] = malloc(mConfig.batchSize * sizeof(bool));
-
     // Allocate buffers for kv cache and set the shape
     void* kvCacheDevice;
     CUDA_CHECK(cudaMalloc(&kvCacheDevice,
@@ -270,7 +228,6 @@ void Decoder<T>::allocateBuffer()
     mDeviceBuffer["kv_cache"] = kvCacheDevice;
     for (int32_t i = 0; i < mConfig.numLayers; ++i)
     {
-
         std::string pastKeyValuesName = fmtstr("past_key_values.%d", i);
         std::string presentKeyValuesName = fmtstr("present_key_values.%d", i);
         void* curLayerKVCacheAddr = static_cast<uint8_t*>(kvCacheDevice) + bytesPerLayer * i;
@@ -283,11 +240,73 @@ void Decoder<T>::allocateBuffer()
         mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(),
             {5, {mConfig.batchSize, 2, mConfig.numHead, mConfig.maxLength, mConfig.hiddenSizePerHead}});
     }
+}
 
+template <typename T>
+void Decoder<T>::allocateCommonBuffers()
+{
+    allocateBufferForKVCache();
+    void* contextLengthDevice;
+    CUDA_CHECK(cudaMalloc(&contextLengthDevice, mConfig.batchSize * sizeof(int32_t)));
+    mContextExecutionContext->setTensorAddress("context_lengths", contextLengthDevice);
+    mContextExecutionContext->setInputShape("context_lengths", {1, {mConfig.batchSize}});
+    mGenerationExecutionContext->setTensorAddress("context_lengths", contextLengthDevice);
+    mGenerationExecutionContext->setInputShape("context_lengths", {1, {mConfig.batchSize}});
+    mDeviceBuffer["context_lengths"] = contextLengthDevice;
     // Initialize dummy LoRA buffer
     void* dummyLoraBuffer;
     CUDA_CHECK(cudaMalloc(&dummyLoraBuffer, sizeof(T)));
     mDeviceBuffer["dummy_lora"] = dummyLoraBuffer;
+}
+
+template <typename T>
+void Decoder<T>::allocateExtraBufferForEagle()
+{
+    void* lastTokenIdsDevice;
+    CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t)));
+    mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+    mContextExecutionContext->setInputShape("last_token_ids", {1, {1}});
+    mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
+}
+template <typename T>
+void Decoder<T>::allocateExtraBufferForVanilla()
+{
+    int32_t sizeOfHalf = 2;
+    void* lastTokenIdsDevice;
+    CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * 1 * sizeof(int64_t)));
+    mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+    mContextExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
+    mGenerationExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
+    mGenerationExecutionContext->setInputShape("last_token_ids", {2, {mConfig.batchSize, 1}});
+    mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
+
+    void* inputIdsDevice;
+    CUDA_CHECK(cudaMalloc(&inputIdsDevice, (mConfig.batchSize * mConfig.maxLength) * sizeof(int64_t)));
+    mDeviceBuffer["input_ids"] = inputIdsDevice;
+    mGenerationExecutionContext->setTensorAddress("input_ids", inputIdsDevice);
+    mGenerationExecutionContext->setInputShape("input_ids", {2, {mConfig.batchSize, 1}});
+
+    void* logitsDevice;
+    CUDA_CHECK(cudaMalloc(&logitsDevice, (mConfig.batchSize * mConfig.vocabSize) * sizeOfHalf));
+    mDeviceBuffer["logits"] = logitsDevice;
+    mContextExecutionContext->setTensorAddress("logits", logitsDevice);
+    mGenerationExecutionContext->setTensorAddress("logits", logitsDevice);
+
+    mHostBuffer["finished_states"] = malloc(mConfig.batchSize * sizeof(bool));
+}
+
+template <typename T>
+void Decoder<T>::allocateBuffer()
+{
+    allocateCommonBuffers();
+    if (mIsEagle)
+    {
+        allocateExtraBufferForEagle();
+    }
+    else
+    {
+        allocateExtraBufferForVanilla();
+    }
 }
 
 template <typename T>
@@ -397,9 +416,43 @@ std::string Decoder<T>::printLogits()
 {
     size_t totalLogitSize = mConfig.batchSize * 1 * mConfig.vocabSize;
     std::vector<T> logits(totalLogitSize, 0.0);
-    CUDA_CHECK(
-        cudaMemcpyAsync(logits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(T), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(
+        logits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(T), cudaMemcpyDeviceToHost, mStream));
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
     return formatFloat16Vector(logits, mConfig.batchSize);
+}
+template <typename T>
+void Decoder<T>::initCudaGraph()
+{
+    // Capture cuda graph only on the first run. This cuda graph will be cached and reused for all the other runs.
+    if (mUseCudaGraph && !mCudaGraphCaptured)
+    {
+        try
+        {
+            // Destroy the existing graph and execution context if they exist
+            if (mGenerationGraph)
+            {
+                CUDA_CHECK(cudaGraphDestroy(mGenerationGraph));
+                mGenerationGraph = nullptr;
+            }
+            if (mGenerationGraphExec)
+            {
+                CUDA_CHECK(cudaGraphExecDestroy(mGenerationGraphExec));
+                mGenerationGraphExec = nullptr;
+            }
+            CUDA_CHECK(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeGlobal));
+            mGenerationExecutionContext->enqueueV3(mStream);
+            CUDA_CHECK(cudaStreamEndCapture(mStream, &mGenerationGraph));
+            CUDA_CHECK(cudaGraphInstantiate(&mGenerationGraphExec, mGenerationGraph, 0));
+            mCudaGraphCaptured = true;
+        }
+        catch (std::exception const& e)
+        {
+            LOG_WARNING("Cuda graph cannot be captured due to %s. Fall back to non cuda graph.", e.what());
+            mUseCudaGraph = false;
+            mCudaGraphCaptured = false;
+        }
+    }
 }
 
 template <typename T>
@@ -407,13 +460,13 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
     std::shared_ptr<BenchmarkProfiler> const profiler)
 {
-    auto lastTokenIds = reinterpret_cast<int64_t*>(mHostBuffer["last_token_ids"]);
     // The generation step stop at longest sequence reach the maxLength.
     int32_t generationIter = *std::max_element(contextLengths.begin(), contextLengths.end());
     memset(mHostBuffer["finished_states"], 0, sizeof(bool) * mConfig.batchSize);
     auto finishedStates = reinterpret_cast<bool*>(mHostBuffer["finished_states"]);
     int64_t unfinishedBatchNum = mConfig.batchSize;
 
+    std::vector<int64_t> lastTokenIds(mConfig.batchSize);
     for (int i = 0; i < mConfig.batchSize; i++)
     {
         assert(mConfig.maxInputLength >= contextLengths[i]);
@@ -445,53 +498,14 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         }
         return generatedToken;
     };
-    assert(contextLengths.size() == static_cast<size_t>(mConfig.batchSize)
-        && "Input batch size does not match engine batch size.");
-
-    // Setup "input_ids",  "context_lengths", "last_token_ids"
     // Extra model inputs should be set with `setupExtraInputs` before this function
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
-        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], lastTokenIds, mConfig.batchSize * sizeof(int64_t),
-        cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
         mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    generateForContext(
+        mDeviceBuffer["input_ids"], contextLengths, lastTokenIds, {2, {mConfig.batchSize, mConfig.maxInputLength}});
 
-    // Capture cuda graph only on the first run. This cuda graph will be cached and reused for all the other runs.
-    if (mUseCudaGraph && !mCudaGraphCaptured)
-    {
-        try
-        {
-            // Destroy the existing graph and execution context if they exist
-            if (mGenerationGraph)
-            {
-                CUDA_CHECK(cudaGraphDestroy(mGenerationGraph));
-                mGenerationGraph = nullptr;
-            }
-            if (mGenerationGraphExec)
-            {
-                CUDA_CHECK(cudaGraphExecDestroy(mGenerationGraphExec));
-                mGenerationGraphExec = nullptr;
-            }
-            CUDA_CHECK(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeGlobal));
-            mGenerationExecutionContext->enqueueV3(mStream);
-            CUDA_CHECK(cudaStreamEndCapture(mStream, &mGenerationGraph));
-            CUDA_CHECK(cudaGraphInstantiate(&mGenerationGraphExec, mGenerationGraph, 0));
-            mCudaGraphCaptured = true;
-        }
-        catch (std::exception const& e)
-        {
-            LOG_WARNING("Cuda graph cannot be captured due to %s. Fall back to non cuda graph.", e.what());
-            mUseCudaGraph = false;
-            mCudaGraphCaptured = false;
-        }
-    }
-
-    // Context Phase
-    mContextExecutionContext->enqueueV3(mStream);
     auto generatedToken = sampleToken();
-    LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
-    CUDA_CHECK(cudaMemset(mDeviceBuffer["last_token_ids"], 0, mConfig.batchSize * sizeof(int64_t)));
+    std::fill(lastTokenIds.begin(), lastTokenIds.end(), 0);
 
     if (profiler)
     {
@@ -501,23 +515,13 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
 
     while (generationIter < generationConfig.maxLength && unfinishedBatchNum != 0)
     {
-        CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
-            mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+
         CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], generatedToken.data(),
             mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 
-        if (mUseCudaGraph && mCudaGraphCaptured)
-        {
-            CUDA_CHECK(cudaGraphLaunch(mGenerationGraphExec, mStream));
-            CUDA_CHECK(cudaStreamSynchronize(mStream));
-        }
-        else
-        {
-            mGenerationExecutionContext->enqueueV3(mStream);
-        }
+        generateForDecode(contextLengths, lastTokenIds);
 
         generatedToken = sampleToken();
-        LOG_DEBUG("Generation phase logits:\n%s", printLogits().c_str());
     }
 
     if (profiler)
@@ -527,152 +531,43 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
 }
 
 template <typename T>
-void Decoder<T>::generateForContext(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
-    GenerationConfig generationConfig, std::vector<int64_t> const& last_token_ids, int64_t endIds, void* attentionMask,
-    void* attentionPosId, const nvinfer1::Dims inputDims, const nvinfer1::Dims attentionMaskDims,
-    const nvinfer1::Dims attentionPosIdDims, std::shared_ptr<BenchmarkProfiler> const profiler)
+void Decoder<T>::generateForContext(void* inputIds, std::vector<int32_t>& contextLengths,
+    std::vector<int64_t> const& lastTokenIds, const nvinfer1::Dims inputDims)
 {
-    assert(mConfig.maxLength >= generationConfig.maxLength);
-    assert(generationConfig.maxLength >= generationConfig.minLength);
+    // check input batch size
     assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
         mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
-        mConfig.batchSize * contextLengths[0] * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], last_token_ids.data(),
-        last_token_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-    mContextExecutionContext->setInputShape("input_ids", inputDims);
-    mContextExecutionContext->setTensorAddress("attention_mask", attentionMask);
-    mContextExecutionContext->setInputShape("attention_mask", attentionMaskDims);
-    mContextExecutionContext->setTensorAddress("attention_pos_id", attentionPosId);
-    mContextExecutionContext->setInputShape("attention_pos_id", attentionPosIdDims);
-    mContextExecutionContext->enqueueV3(mStream);
-    LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
-}
-
-template <typename T>
-void Decoder<T>::generateForDecode(void* inputIds, std::vector<int32_t> ContextLengths,
-    std::vector<int64_t>& last_token_ids, int32_t maxDecodingTokens, void* attentionMask, void* attentionPosId)
-{
-
-    mGenerationExecutionContext->setTensorAddress("input_ids", inputIds);
-    const nvinfer1::Dims inputDims = {2, {mConfig.batchSize, maxDecodingTokens}};
-    mGenerationExecutionContext->setInputShape("input_ids", inputDims);
-    std::vector<int32_t> tempContextLengths = ContextLengths;
-    for (size_t i = 0; i < tempContextLengths.size(); ++i)
-    {
-        tempContextLengths[i] += 1;
-        ContextLengths[i] += maxDecodingTokens;
-    }
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], ContextLengths.data(),
-        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], last_token_ids.data(),
-        last_token_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-
-    mGenerationExecutionContext->setTensorAddress("attention_mask", attentionMask);
-    const nvinfer1::Dims attentionMaskDims = {3, {mConfig.batchSize, maxDecodingTokens, divUp(maxDecodingTokens, 32)}};
-    mGenerationExecutionContext->setInputShape("attention_mask", attentionMaskDims);
-
-    mGenerationExecutionContext->setTensorAddress("attention_pos_id", attentionPosId);
-    const nvinfer1::Dims attentionPosIdDims = {2, {mConfig.batchSize, maxDecodingTokens}};
-    mGenerationExecutionContext->setInputShape("attention_pos_id", attentionPosIdDims);
-
-    mGenerationExecutionContext->setTensorAddress("last_token_ids", mDeviceBuffer["last_token_ids"]);
-    const nvinfer1::Dims lastTokenIdsDims = {1, {maxDecodingTokens}};
-    mGenerationExecutionContext->setInputShape("last_token_ids", lastTokenIdsDims);
-    mGenerationExecutionContext->enqueueV3(mStream);
-    // reset the context_lengths
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], tempContextLengths.data(),
-        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-}
-
-template <typename T>
-void Decoder<T>::generateForDraftContext(void* inputIds, void* hiddenStates, void* attentionMask, void* attentionPosId,
-    std::vector<int32_t> contextLengths, std::vector<int64_t>& last_token_ids, bool isEagle3,
-    void* hiddenStatesFromDraftZero, const nvinfer1::Dims inputDims, const nvinfer1::Dims hiddenStatesDims,
-    const nvinfer1::Dims attentionMaskDims, const nvinfer1::Dims attentionPosIdDims)
-{
-
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], lastTokenIds.data(),
+        lastTokenIds.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
     mContextExecutionContext->setTensorAddress("input_ids", inputIds);
     mContextExecutionContext->setInputShape("input_ids", inputDims);
-    mContextExecutionContext->setTensorAddress("hidden_states_input", hiddenStates);
-    mContextExecutionContext->setInputShape("hidden_states_input", hiddenStatesDims);
-    if (isEagle3)
-    {
-        nvinfer1::Dims hsDimsFromDraft = hiddenStatesDims;
-        hsDimsFromDraft.d[2] = hiddenStatesDims.d[2] / 3;
-        mContextExecutionContext->setTensorAddress("hidden_states_from_draft", hiddenStatesFromDraftZero);
-        mContextExecutionContext->setInputShape("hidden_states_from_draft", hsDimsFromDraft); // set 0
-    }
 
-    assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
-        mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], reinterpret_cast<void*>(last_token_ids.data()),
-        last_token_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
-    // no need for context phase
-    mContextExecutionContext->setTensorAddress("attention_mask", attentionMask);
-    mContextExecutionContext->setInputShape("attention_mask", attentionMaskDims);
-    mContextExecutionContext->setTensorAddress("attention_pos_id", attentionPosId);
-    mContextExecutionContext->setInputShape("attention_pos_id", attentionPosIdDims);
     mContextExecutionContext->enqueueV3(mStream);
-
-    auto logits_last_token_draft = getDeviceBuffer("logits");
+    initCudaGraph();
     LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
     LOG_DEBUG("Context phase kv cache:\n%s", printKVCache().c_str());
 }
 
 template <typename T>
-void Decoder<T>::generateForDraftDecode(void* inputIds, void* hiddenStates, void* attention_mask,
-    void* attention_pos_id, std::vector<int32_t> contextLengths, std::vector<int64_t>& last_token_ids,
-    const nvinfer1::Dims inputDims, const nvinfer1::Dims hiddenStatesDims, const nvinfer1::Dims attentionMaskDims,
-    const nvinfer1::Dims attentionPosIdDims, const nvinfer1::Dims lastTokenIdsDims, int layerIdx, bool isEagle3,
-    void* hiddenStatesFromDraftZero, void* hiddenStatesFromTargetZero)
+void Decoder<T>::generateForDecode(std::vector<int32_t>& contextLengths, std::vector<int64_t>& lastTokenIds)
 {
-
-    nvinfer1::Dims hsDimsFromTarget = hiddenStatesDims;
-    hsDimsFromTarget.d[2] = hiddenStatesDims.d[2] * 3;
-    if (isEagle3)
-    {
-
-        if (layerIdx == 0)
-        {
-
-            mGenerationExecutionContext->setTensorAddress("hidden_states_input", hiddenStates);
-            mGenerationExecutionContext->setInputShape("hidden_states_input", hsDimsFromTarget);
-            mGenerationExecutionContext->setTensorAddress("hidden_states_from_draft", hiddenStatesFromDraftZero);
-            mGenerationExecutionContext->setInputShape("hidden_states_from_draft", hiddenStatesDims);
-        }
-        else
-        {
-            mGenerationExecutionContext->setTensorAddress("hidden_states_input", hiddenStatesFromTargetZero);
-            mGenerationExecutionContext->setInputShape("hidden_states_input", hsDimsFromTarget);
-            mGenerationExecutionContext->setTensorAddress("hidden_states_from_draft", hiddenStates);
-            mGenerationExecutionContext->setInputShape("hidden_states_from_draft", hiddenStatesDims);
-        }
-    }
-    else
-    {
-        mGenerationExecutionContext->setTensorAddress("hidden_states_input", hiddenStates);
-        mGenerationExecutionContext->setInputShape("hidden_states_input", hiddenStatesDims);
-    }
-
-    mGenerationExecutionContext->setTensorAddress("input_ids", inputIds);
-    mGenerationExecutionContext->setInputShape("input_ids", inputDims);
-
-    mGenerationExecutionContext->setTensorAddress("attention_mask", attention_mask);
-    mGenerationExecutionContext->setInputShape("attention_mask", attentionMaskDims);
-    mGenerationExecutionContext->setTensorAddress("attention_pos_id", attention_pos_id);
-    mGenerationExecutionContext->setInputShape("attention_pos_id", attentionPosIdDims);
 
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
         mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], reinterpret_cast<void*>(last_token_ids.data()),
-        last_token_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], lastTokenIds.data(),
+        lastTokenIds.size() * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 
-    mGenerationExecutionContext->setInputShape("last_token_ids", lastTokenIdsDims);
-    mGenerationExecutionContext->enqueueV3(mStream);
+    if (mUseCudaGraph && mCudaGraphCaptured)
+    {
+        CUDA_CHECK(cudaGraphLaunch(mGenerationGraphExec, mStream));
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+    }
+    else
+    {
+        mGenerationExecutionContext->enqueueV3(mStream);
+    }
+    LOG_DEBUG("Generation phase logits:\n%s", printLogits().c_str());
 }
 
 template <typename T>

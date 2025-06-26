@@ -43,6 +43,7 @@ public:
         mTopK = topK;
         mIsEagle3 = isEagle3;
         mEagleEnginePath = eagleEnginePath;
+        mMaxDraftTokensPerStep = mMaxPathLen * mTopK;
 
         drivellm::JsonRoot root;
         std::string folderPath = extractFolderName(mEagleEnginePath);
@@ -59,10 +60,10 @@ public:
         {
             mDraftVocabSize = rootNode["vocab_size"].getInteger();
         }
-
         eagleCommonParamsInit();
         allocateEagleBuffer();
         addNewBufferForModelIO();
+        setupExtraInputsForBaseModel();
     };
 
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
@@ -102,6 +103,8 @@ private:
 
     void eagleCommonParamsInit();
     void initDraftVoc();
+    void setupExtraInputsForBaseModel();
+    void setupExtraInputsForDraftModel(std::vector<int32_t> const& contextLengths);
     std::unique_ptr<Decoder<T>> mBaseModel;
     std::unique_ptr<Decoder<T>> mDraftModel;
 
@@ -118,6 +121,7 @@ private:
     int32_t mVocabSize;
     int32_t mMaxInputLength;
     int32_t mTargetOutputHiddenDim;
+    int32_t mMaxDraftTokensPerStep;
     int32_t mMaxDraftTokens;
     int32_t mMaxDecodingTokens;
     // depth+1
