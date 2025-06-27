@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define the output archive name
-VERSION="0.1.0.0"
+VERSION="0.1.0.1"
 OUTPUT_FILE="driveos_llm_sdk-${VERSION}.tar.gz"
 TMP_DIR="driveos_llm_sdk-${VERSION}"
 mkdir -p $TMP_DIR
