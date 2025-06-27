@@ -16,6 +16,7 @@
 
 #include "tokenizer.h"
 #include "tokenizerUtils.h"
+#include "common/json.h"
 
 // BPE
 BPE::BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, std::string const& patStr)
@@ -546,47 +547,73 @@ void Tokenizer::loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRan
 void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens)
 {
     std::filesystem::path tokenizerConfig = modelDir / "tokenizer_config.json";
-
-    auto parseSpecialToken = [&specialTokens](std::string line) -> Rank {
-        auto start = line.find(": ");
-        auto end = line.find(",");
-        std::string token = line.substr(start + 2, end - start - 2);
-        if (token == "null")
-        {
-            return -1;
-        }
-
-        assert(token[0] == '\"' && token[token.size() - 1] == '\"');
-        token = token.substr(1, token.size() - 2);
-        return specialTokens[token];
-    };
-
     if (std::filesystem::exists(tokenizerConfig))
     {
         std::ifstream config(tokenizerConfig);
-        std::string line;
+        std::string content((std::istreambuf_iterator<char>(config)),
+                           std::istreambuf_iterator<char>());
+        config.close();
 
-        while (std::getline(config, line))
+        drivellm::JsonRoot jsonRoot;
+        if (jsonRoot.parse(content))
         {
-            if (line.find("\"bos_token\"") != std::string::npos)
+            auto root = jsonRoot.getRoot();
+            if (root.isObject())
             {
-                this->mBosId = parseSpecialToken(line);
-            }
-            else if (line.find("\"eos_token\"") != std::string::npos)
-            {
-                this->mEosId = parseSpecialToken(line);
-            }
-            else if (line.find("\"pad_token\"") != std::string::npos)
-            {
-                this->mPadId = parseSpecialToken(line);
-            }
-            else if (line.find("\"unk_token\"") != std::string::npos)
-            {
-                this->mUnkId = parseSpecialToken(line);
+                if (root.hasMember("bos_token"))
+                {
+                    if (root["bos_token"].isString())
+                    {
+                        std::string token = root["bos_token"].getString();
+                        this->mBosId = token == "null" ? -1 : specialTokens[token];
+                    }
+                    else if (root["bos_token"].isObject())
+                    {
+                        std::string token = root["bos_token"]["content"].getString();
+                        this->mBosId = token == "null" ? -1 : specialTokens[token];
+                    }
+                }
+                if (root.hasMember("eos_token"))
+                {
+                    if (root["eos_token"].isString())
+                    {
+                        std::string token = root["eos_token"].getString();
+                        this->mEosId = token == "null" ? -1 : specialTokens[token];
+                    }
+                    else if (root["eos_token"].isObject())
+                    {
+                        std::string token = root["eos_token"]["content"].getString();
+                        this->mEosId = token == "null" ? -1 : specialTokens[token];
+                    }
+                }
+                if (root.hasMember("pad_token"))
+                {
+                    if (root["pad_token"].isString())
+                    {
+                        std::string token = root["pad_token"].getString();
+                        this->mPadId = token == "null" ? -1 : specialTokens[token];
+                    }
+                    else if (root["pad_token"].isObject())
+                    {
+                        std::string token = root["pad_token"]["content"].getString();
+                        this->mPadId = token == "null" ? -1 : specialTokens[token];
+                    }
+                }
+                if (root.hasMember("unk_token"))
+                {
+                    if (root["unk_token"].isString())
+                    {
+                        std::string token = root["unk_token"].getString();
+                        this->mUnkId = token == "null" ? -1 : specialTokens[token];
+                    }
+                    else if (root["unk_token"].isObject())
+                    {
+                        std::string token = root["unk_token"]["content"].getString();
+                        this->mUnkId = token == "null" ? -1 : specialTokens[token];
+                    }
+                }
             }
         }
-
-        config.close();
     }
     else
     {
