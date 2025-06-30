@@ -63,3 +63,37 @@ typename std::enable_if<std::is_arithmetic<T>::value, std::ostream&>::type opera
     os << "]";
     return os;
 }
+
+class KvCacheIndexer
+{
+public:
+    KvCacheIndexer(
+        int32_t const batchSize, int32_t const kvHeadNum, int32_t const kvCacheCapacity, int32_t const headSize)
+    {
+        mBatchSize = batchSize;
+        mKvHeadNum = kvHeadNum;
+        mKvCacheCapacity = kvCacheCapacity;
+        mHeadSize = headSize;
+    }
+
+    int32_t indexK(int32_t const b, int32_t const hk, int32_t const cacheIdx, int32_t const d)
+    {
+        // Linear KVCache has layout of [B, 2, Hkv, S_capacity, D].
+        return b * 2 * mKvHeadNum * mKvCacheCapacity * mHeadSize + hk * mKvCacheCapacity * mHeadSize
+            + cacheIdx * mHeadSize + d;
+    }
+
+    int32_t indexV(int32_t const b, int32_t const hv, int32_t const cacheIdx, int32_t const d)
+    {
+        // Linear KVCache has layout of [B, 2, Hkv, S_capacity, D].
+        // V cache need to offset the whole kCache buffer for the sequence.
+        return b * 2 * mKvHeadNum * mKvCacheCapacity * mHeadSize + (mKvHeadNum + hv) * mKvCacheCapacity * mHeadSize
+            + cacheIdx * mHeadSize + d;
+    }
+
+private:
+    int32_t mBatchSize;
+    int32_t mKvHeadNum;
+    int32_t mKvCacheCapacity;
+    int32_t mHeadSize;
+};
