@@ -15,21 +15,22 @@ target_include_directories(vlm_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
 add_cross_build_link_options(vlm_build)
 
 file(GLOB_RECURSE QWEN2VL_CPP_SRCS "qwen2vl/*.cpp")
+file(GLOB_RECURSE INTERNVL3_CPP_SRCS "internvl3/*.cpp")
 
-add_executable(vlm_chat vlm_chat.cpp ${QWEN2VL_CPP_SRCS})
+add_executable(vlm_chat vlm_chat.cpp ${QWEN2VL_CPP_SRCS} ${INTERNVL3_CPP_SRCS})
 target_link_libraries(vlm_chat PRIVATE llmSdkCore tokenizer commonLibraryExt)
 target_include_directories(vlm_chat PRIVATE ${COMMON_INCLUDE_DIRS}
                                             ${CMAKE_SOURCE_DIR}/3rdParty/stb)
 add_cross_build_link_options(vlm_chat)
 
-add_executable(vlm_benchmark vlm_benchmark.cpp ${QWEN2VL_CPP_SRCS})
+add_executable(vlm_benchmark vlm_benchmark.cpp ${QWEN2VL_CPP_SRCS} ${INTERNVL3_CPP_SRCS})
 target_link_libraries(vlm_benchmark PRIVATE llmSdkCore tokenizer
                                             commonLibraryExt)
 add_cross_build_link_options(vlm_benchmark)
 
 target_include_directories(
   vlm_benchmark PRIVATE ${COMMON_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/3rdParty/stb)
-add_executable(vlm_accuracy vlm_accuracy.cpp ${QWEN2VL_CPP_SRCS})
+add_executable(vlm_accuracy vlm_accuracy.cpp ${QWEN2VL_CPP_SRCS} ${INTERNVL3_CPP_SRCS})
 target_link_libraries(vlm_accuracy PRIVATE llmSdkCore tokenizer
                                            commonLibraryExt)
 target_include_directories(

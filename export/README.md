@@ -137,3 +137,7 @@ Model | FP16 | INT4 | FP8 | NVFP4 | ONNX
 [Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2_vl_7b.tgz](https://nvidia.box.com/shared/static/818242meioy5ms3g0hgpb74uqw9pxhxl)
 [Qwen2.5-VL-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Yes | Yes | Yes | Yes | /
 [Qwen2.5-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | Yes | Yes | Yes | Yes | [qwen2.5_vl_7b.tgz](https://nvidia.box.com/shared/static/kwcqornn39km3ujzaor1erjflb9vlajs)
+[InternVL3-1B](https://huggingface.co/OpenGVLab/InternVL3-1B) | Yes | Yes | Yes | Yes | /
+
+**Notes for InternVL3:**
+- Visual encoder currently only supports FP16.

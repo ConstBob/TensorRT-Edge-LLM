@@ -5,7 +5,7 @@ from argparse import ArgumentParser
 import onnx
 
 
-def modify_onnx_model(input_path, output_path):
+def modify_onnx_model(input_path, output_path, kv_cache_capacity=8192):
     # Load the ONNX model
     model = onnx.load(input_path)
     graph = model.graph
@@ -15,7 +15,7 @@ def modify_onnx_model(input_path, output_path):
         if node.op_type == "AttentionPlugin":
             for attr in node.attribute:
                 if attr.name == "kv_cache_capacity":
-                    attr.i = 8192  # Update the attribute value to 8192
+                    attr.i = kv_cache_capacity  # Update the attribute value to 8192
 
     # Save the modified model to a new file
     output_dir = os.path.dirname(output_path)
@@ -45,6 +45,10 @@ if __name__ == "__main__":
                         type=str,
                         required=True,
                         help="The path to output onnx file.")
+    parser.add_argument("-kv","--kv_cache_capacity",
+                        type=int,
+                        default=8192,
+                        help="The kv cache capacity for the attention plugin.")
     args = parser.parse_args()
 
-    modify_onnx_model(args.input_path, args.output_path)
+    modify_onnx_model(args.input_path, args.output_path, args.kv_cache_capacity)
