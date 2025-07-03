@@ -8,3 +8,5 @@ numpy
 onnxruntime
 datasets
 peft
+einops
+timm

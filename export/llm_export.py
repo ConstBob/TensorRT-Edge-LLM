@@ -305,7 +305,12 @@ def surgeon_llm(raw_onnx_path,
     print(f"Importing ONNX graph takes {t1 - t0}s.")
 
     if mode == "plugin":
-        graph = insert_attention_plugin(graph, config, rope_type,
+        if config['model_type'] == "internvl_chat":
+            graph = insert_attention_plugin(graph, config['llm_config'], rope_type,
+                                        max_seq_length, extra_plugin_inputs,
+                                        extra_plugin_attributes)
+        else:
+            graph = insert_attention_plugin(graph, config, rope_type,
                                         max_seq_length, extra_plugin_inputs,
                                         extra_plugin_attributes)
     if eagle_base:
@@ -372,7 +377,10 @@ def surgeon_llm(raw_onnx_path,
                     convert_attribute=True)
 
     if os.path.exists(config_path):
-        shutil.copy(config_path, os.path.join(output_dir, "config.json"))
+        if config_path.endswith("config.json"):
+            shutil.copy(config_path, os.path.join(output_dir, "config.json"))
+        else:
+            shutil.copy(os.path.join(config_path, "config.json"), os.path.join(output_dir, "config.json"))
 
     t3 = time.time()
     print(f"Surgeon LLM completed in {t3 - t2}s.")

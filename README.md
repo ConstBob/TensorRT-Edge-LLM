@@ -36,6 +36,7 @@ Model | FP16 | INT4 | FP8 | NVFP4
 [Qwen2-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | Yes | Yes | Yes | Yes
 [Qwen2.5-VL-3B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Yes | Yes | Yes | Yes
 [Qwen2.5-VL-7B-instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | Yes | Yes | Yes | Yes
+[InternVL3-1B](https://huggingface.co/OpenGVLab/InternVL3-1B) | Yes | Yes | Yes | Yes
 
 ### Precisions Explained
 

@@ -13,6 +13,7 @@
 #include "common/common.h"
 #include "decoder/decoder.h"
 #include "qwen2vl/vit_runner.h"
+#include "internvl3/vit_runner.h"
 #include "tokenizer/tokenizer.h"
 #include <cuda_profiler_api.h>
 #include <dlfcn.h>
@@ -590,6 +591,132 @@ void evalQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::pa
     LOG_INFO("Collected results on %d questions.", i);
 }
 
+void evalInternVL3(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
+    std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer, std::string const& modelType,
+    std::pair<std::string, std::string> const& loraWeights)
+{
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    auto vitrunner = new InternVLViTRunner(modelType);
+    vitrunner->setup(visualEnginePath, stream, 1);
+
+    auto decoder = new Decoder<half>();
+    decoder->setup(llmEnginePath, stream, false, 1);
+    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+
+    // Load and switch to LoRA weights if provided
+    if (!loraWeights.first.empty() && !loraWeights.second.empty())
+    {
+        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        {
+            LOG_ERROR("Failed to load LoRA weights: %s", loraWeights.second.c_str());
+            return;
+        }
+        if (!decoder->switchLora(loraWeights.first))
+        {
+            LOG_ERROR("Failed to switch to LoRA weights: %s", loraWeights.first.c_str());
+            return;
+        }
+    }
+
+    int maxInputLength = decoder->getMaxContextLength();
+    GenerationConfig generationConfig{maxInputLength + 256, 0, 1, 0};
+
+    int i = 0;
+    LOG_INFO("Starting running tests.");
+
+    for (auto data : dataset)
+    {
+        if (data->split != "validation")
+        {
+            continue;
+        }
+        LOG_INFO(data->id.c_str());
+
+        bool useThumbnail = true;
+        std::vector<half> visualInput;
+        std::vector<int64_t> inputIds;
+        std::vector<int64_t> imageTokenLengths;
+        std::vector<int32_t> contextLengths;
+        std::vector<std::vector<int64_t>> outputIds(1);
+
+        // Preprocess
+        std::vector<unsigned char*> imageBuffers;
+        std::vector<unsigned char*> thumbnailImageBuffers;
+        std::vector<std::vector<int>> imageSizes;
+        for (auto& buffer : data->images)
+        {
+            int width{0}, height{0}, channels{0};
+            int desiredChannels = 3;
+            unsigned char* image
+                = stbi_load_from_memory(buffer.data(), buffer.size(), &width, &height, &channels, desiredChannels);
+            if (image == nullptr)
+            {
+                LOG_ERROR("Failed to load image: %s", stbi_failure_reason());
+                continue;
+            }
+
+            // Restricting to max 4 448x448 blocks. Some questions have more than 4 images.
+            // Otherwise, it requires larger dynamic shape range, which is not supported by TensorRT.
+            std::vector<std::pair<int, int>> targetRatios
+                = {{1, 1}, {1, 2}, {2, 1}, {3, 1}, {1, 3}, {2, 2}, {4, 1}, {1, 4}, {5, 1}, {1, 5}, {1, 6}, {6, 1},
+                  {3, 2}, {2, 3}};
+                // {{1, 1}, {1, 2}, {2, 1}, {3, 1}, {1, 3}, {2, 2}, {4, 1}, {1, 4}};
+            auto [resizedHeight, resizedWidth]
+                = vitrunner->adjustImageSize(height, width, targetRatios);
+            unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
+            stbir_resize_uint8_linear(
+                image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
+
+            imageBuffers.emplace_back(resizedImage);
+            imageSizes.emplace_back(std::vector<int>{resizedWidth, resizedHeight, desiredChannels});
+
+            if (useThumbnail)
+            {
+                int thumbnailImageSize = 448;
+                unsigned char* thumbnailImage = (unsigned char*) malloc(thumbnailImageSize * thumbnailImageSize * desiredChannels);
+                stbir_resize_uint8_linear(
+                    image, width, height, 0, thumbnailImage, thumbnailImageSize, thumbnailImageSize, 0, stbir_pixel_layout::STBIR_RGB);
+                thumbnailImageBuffers.emplace_back(thumbnailImage);
+            }
+            else
+            {
+                thumbnailImageBuffers.emplace_back(nullptr);
+            }
+
+            stbi_image_free(image);
+        }
+
+        vitrunner->visualPreprocess(
+            imageBuffers, thumbnailImageBuffers, imageSizes, visualInput, imageTokenLengths, useThumbnail);
+
+        std::string prompt = data->format();
+        int numImage = data->images.size();
+        vitrunner->textPreprocess(
+            {prompt}, {numImage}, imageTokenLengths, tokenizer, inputIds, contextLengths, maxInputLength);
+
+        // Infer
+        vitrunner->internVLViTInfer(visualInput);
+        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
+
+        std::string pred = tokenizer->decode(outputIds[0], true);
+        data->pred = pred;
+
+        ++i;
+        for (auto& buffer : imageBuffers)
+        {
+            free(buffer);
+        }
+        for (auto& buffer : thumbnailImageBuffers)
+        {
+            free(buffer);
+        }
+    }
+
+    LOG_INFO("Collected results on %d questions.", i);
+}
+
 void mmmuAccuracy(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     std::filesystem::path const& datasetPath, std::filesystem::path const& outputPath, Tokenizer* tokenizer,
     std::string modelType, std::pair<std::string, std::string> const& loraWeights)
@@ -611,9 +738,13 @@ void mmmuAccuracy(std::filesystem::path const& llmEnginePath, std::filesystem::p
     {
         evalQwen2VL(llmEnginePath, visualEnginePath, dataset, tokenizer, modelType, loraWeights);
     }
+    else if (modelType == "internvl3")
+    {
+        evalInternVL3(llmEnginePath, visualEnginePath, dataset, tokenizer, modelType, loraWeights);
+    }
     else
     {
-        throw std::runtime_error("Only support Qwen2-VL model for Multimodal models.");
+        throw std::runtime_error("Only support Qwen2-VL and InternVL3 models for Multimodal models.");
     }
 
     saveResult(outputPath, dataset);
