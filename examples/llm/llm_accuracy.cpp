@@ -13,6 +13,8 @@
 #include "common/common.h"
 #include "common/trtUtils.h"
 #include "decoder/decoder.h"
+#include "engine/llm_engine.h"
+#include "llm_param.h"
 #include "tokenizer/tokenizer.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
@@ -31,12 +33,10 @@ namespace fs = std::filesystem;
 
 struct LLMAccuracyArgs
 {
-    bool help{false};
-    std::string enginePath;
-    std::string tokenizerPath;
     std::string datasetPath;
-    bool debug{false};
-    std::pair<std::string, std::string> loraWeights; // name:path pair
+    BaseParams baseParams;
+    EagleParams eagleParams;
+    LoraWeights loraWeights;
 };
 
 struct TestData
@@ -65,73 +65,63 @@ void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [-h] [-i or --inputString=<input>] [-e or --enginePath=<path to TensorRT engine>] [-s or "
-                 "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>]"
+                 "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>] "
               << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  -h               Display this help message" << std::endl;
-    std::cerr << "  --enginePath     Provide the input TensorRT engine file path. Required. " << std::endl;
-    std::cerr << "  --tokenizerPath  Provide the path to HF tokenizer. Required. " << std::endl;
     std::cerr << "  --datasetPath    Provide the dataset path for evaluation." << std::endl;
-    std::cerr << "  --debug          Use debug mode, which outputs tensors." << std::endl;
-    std::cerr << "  --loraWeights    Provide LoRA weights in format name:path." << std::endl;
+    CommonUsage::printBaseOptions();
+    CommonUsage::printEagleOptions();
+    CommonUsage::printLoraOptions();
 };
 
 bool parseLLMAccuracyArgs(LLMAccuracyArgs& args, int argc, char* argv[])
 {
-    static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"enginePath", required_argument, 0, 'e'},
-        {"tokenizerPath", required_argument, 0, 't'}, {"datasetPath", required_argument, 0, 'D'},
-        {"debug", no_argument, 0, 'd'}, {"loraWeights", required_argument, 0, 'l'}, {0, 0, 0, 0}};
+    static struct option accuracyOptions[]
+        = {{"datasetPath", required_argument, 0, 'D'}, {"loraWeights", required_argument, 0, 'l'}, {0, 0, 0, 0}};
+
+    struct option long_options[64];
+    int idx = 0;
+    for (int i = 0; CommonOptions::baseOptions[i].name != 0; ++i)
+        long_options[idx++] = CommonOptions::baseOptions[i];
+    for (int i = 0; CommonOptions::eagleOptions[i].name != 0; ++i)
+        long_options[idx++] = CommonOptions::eagleOptions[i];
+    for (int i = 0; accuracyOptions[i].name != 0; ++i)
+        long_options[idx++] = accuracyOptions[i];
+    long_options[idx] = {0, 0, 0, 0};
 
     int opt;
-
-    // Loop to process each option
-    while ((opt = getopt_long(argc, argv, "he:t:D:d", long_options, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "D:l:e:t:hdga:m:k:p:E:", long_options, nullptr)) != -1)
     {
+        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, true))
+        {
+            continue;
+        }
+
+        if (CommonOptions::parseEagleOptions(args.eagleParams, opt, optarg))
+        {
+            continue;
+        }
+
         switch (opt)
         {
-        case 'h': args.help = true; return true;
-        case 'e':
-            if (optarg)
-            {
-                args.enginePath = optarg;
-            }
-            else
-            {
-                std::cerr << "ERROR: --enginePath requires option argument" << std::endl;
-                return false;
-            }
-            break;
-        case 't':
-            if (optarg)
-            {
-                args.tokenizerPath = optarg;
-            }
-            else
-            {
-                std::cerr << "ERROR: --tokenizerPath requires option argument" << std::endl;
-                return false;
-            }
-            break;
         case 'D':
             if (optarg)
             {
                 args.datasetPath = optarg;
             }
             break;
-        case 'd': args.debug = true; break;
         case 'l':
             if (optarg)
             {
-                std::string loraArg = optarg;
-                size_t colonPos = loraArg.find(':');
-                if (colonPos == std::string::npos)
+                if (LoraWeights::validateFormat(optarg))
                 {
-                    std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
+                    auto loraPair = LoraWeights::parse(optarg);
+                    args.loraWeights.add(loraPair.first, loraPair.second);
+                }
+                else
+                {
                     return false;
                 }
-                std::string name = loraArg.substr(0, colonPos);
-                std::string path = loraArg.substr(colonPos + 1);
-                args.loraWeights = std::make_pair(name, path);
             }
             break;
         default: return false;
@@ -235,18 +225,15 @@ std::vector<TestData> parseCSVFile(fs::path const& csvPath, int maxRecordNum = -
     return res;
 }
 
-void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Tokenizer* tokenizer,
-    GenerationConfig generationConfig, bool debug,
-    std::pair<std::string, std::string> const& loraWeights = std::make_pair("", ""))
+void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer, GenerationConfig generationConfig)
 {
     std::unordered_map<std::string, std::vector<TestData>> testSubject2Data, devSubject2Data;
     std::vector<std::string> subjects;
     try
     {
-        assert(fs::exists(datasetPath / "test"));
-        assert(fs::exists(datasetPath / "dev"));
-
-        for (auto& filename : fs::directory_iterator(datasetPath / "test"))
+        assert(fs::exists(fs::path(args.datasetPath) / "test"));
+        assert(fs::exists(fs::path(args.datasetPath) / "dev"));
+        for (auto& filename : fs::directory_iterator(fs::path(args.datasetPath) / "test"))
         {
             auto filenameStr = filename.path().filename().string();
             auto idx = filenameStr.find("_test.csv");
@@ -257,17 +244,16 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
         }
 
         std::sort(subjects.begin(), subjects.end());
-
         for (auto& subject : subjects)
         {
-            auto testFile = datasetPath / "test" / (subject + "_test.csv");
-            auto devFile = datasetPath / "dev" / (subject + "_dev.csv");
+            auto testFile = fs::path(args.datasetPath) / "test" / (subject + "_test.csv");
+            auto devFile = fs::path(args.datasetPath) / "dev" / (subject + "_dev.csv");
             assert(fs::exists(testFile));
             assert(fs::exists(devFile));
-            [[maybe_unused]] int printFirstThreeLine = debug ? 3 : 0;
+            [[maybe_unused]] int printFirstThreeLine = args.baseParams.debug ? 3 : 0;
 
-            auto testData = parseCSVFile(testFile, -1, debug);
-            auto devData = parseCSVFile(devFile, 5, debug);
+            auto testData = parseCSVFile(testFile, -1, args.baseParams.debug);
+            auto devData = parseCSVFile(devFile, 5, args.baseParams.debug);
 
             [[maybe_unused]] auto formatExample = []() { std::string prompt; };
             [[maybe_unused]] auto genPrompt = [&subject]() {
@@ -285,22 +271,36 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
         return;
     }
 
-    auto decoder = std::make_unique<Decoder<half>>();
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    decoder->setup(enginePath, stream);
-
-    // Load and switch to LoRA weights if provided
-    if (!loraWeights.first.empty())
+    EngineConfig engineConfig;
+    if (args.eagleParams.eagleEnginePath.empty())
     {
-        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        LOG_INFO("Running in standard LLM mode.");
+        engineConfig = EngineConfig(args.baseParams.enginePath);
+    }
+    else
+    {
+        LOG_INFO("Running in Eagle mode.");
+        engineConfig = EngineConfig(args.baseParams.enginePath, args.eagleParams.eagleEnginePath,
+            args.eagleParams.maxPathLen, args.eagleParams.topK, args.eagleParams.isEagle3,
+            args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
+    }
+    auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
+    bool const eagleMode = llmEngine->isEagleModel();
+    // Load and switch to LoRA weights if provided
+    if (args.loraWeights.hasWeights() && !eagleMode)
+    {
+        auto& decoderPtr = llmEngine->getDecoder();
+        auto loraPair = args.loraWeights.getFirst();
+        if (!decoderPtr->addLora(loraPair.first, loraPair.second))
         {
-            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraWeights.first.c_str(), loraWeights.second.c_str());
+            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraPair.first.c_str(), loraPair.second.c_str());
             return;
         }
-        if (!decoder->switchLora(loraWeights.first))
+        if (!decoderPtr->switchLora(loraPair.first))
         {
-            LOG_ERROR("Failed to switch to LoRA: %s", loraWeights.first.c_str());
+            LOG_ERROR("Failed to switch to LoRA: %s", loraPair.first.c_str());
             return;
         }
     }
@@ -325,7 +325,7 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
     {
         int64_t subjectTotal, subjectCorrect = 0;
         std::string subjectFmt = subject;
-        int printFirstThree = debug ? 3 : 0;
+        int printFirstThree = args.baseParams.debug ? 3 : 0;
         std::replace(subjectFmt.begin(), subjectFmt.end(), '_', ' ');
         auto const& testData = testSubject2Data[subject];
         auto const& devData = devSubject2Data[subject];
@@ -344,7 +344,7 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
                 devPromptNum--;
             } while (inputIds.size() > 2048 && devPromptNum >= 0);
 
-            if (debug && printFirstThree)
+            if (args.baseParams.debug && printFirstThree)
             {
                 LOG_DEBUG("Prompt: %s", prompt.c_str());
             }
@@ -358,8 +358,12 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
                 continue;
             }
             contextLengths[0] = inputIds.size();
-            decoder->generate(inputIds, contextLengths, outputIds, generationConfig);
-            auto const& hostLogits = decoder->getLastHostLogits();
+            llmEngine->generate(
+                inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, nullptr, tokenizer);
+
+            std::vector<half> hostLogits;
+            llmEngine->getLastHostLogits(hostLogits);
+
             int bestIdx = 0;
             half val = hostLogits[choices[0]];
             for (int i = 1; i < 4; i++)
@@ -370,7 +374,7 @@ void mmluAccuracy(fs::path const& enginePath, fs::path const& datasetPath, Token
                     val = hostLogits[choices[i]];
                 }
             }
-            if (debug && printFirstThree)
+            if (args.baseParams.debug && printFirstThree)
             {
                 LOG_DEBUG("Model's answer: %c, expected answer: %c", bestIdx + 'A', data.ans[0]);
                 printFirstThree--;
@@ -398,13 +402,13 @@ int main(int argc, char* argv[])
         printUsage(argv[0]);
         return EXIT_FAILURE;
     }
-    if (args.help)
+    if (args.baseParams.help)
     {
         printUsage(argv[0]);
         return EXIT_SUCCESS;
     }
 
-    if (args.debug)
+    if (args.baseParams.debug)
     {
         gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
     }
@@ -415,11 +419,11 @@ int main(int argc, char* argv[])
 
     auto pluginHandles = loadPlugins();
 
-    // The generationConfig will change
     GenerationConfig generationConfig{0, 0, 1, 0};
 
     auto tokenizer = std::make_unique<Tokenizer>();
-    tokenizer->loadFromHF(args.tokenizerPath);
-    mmluAccuracy(args.enginePath, args.datasetPath, tokenizer.get(), generationConfig, args.debug, args.loraWeights);
+    tokenizer->loadFromHF(args.baseParams.tokenizerPath);
+
+    mmluAccuracy(args, tokenizer.get(), generationConfig);
     return EXIT_SUCCESS;
 };

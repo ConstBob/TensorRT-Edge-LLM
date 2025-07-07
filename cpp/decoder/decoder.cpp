@@ -571,13 +571,13 @@ void Decoder<T>::generateForDecode(std::vector<int32_t>& contextLengths, std::ve
 }
 
 template <typename T>
-std::vector<T> const& Decoder<T>::getLastHostLogits()
+void Decoder<T>::getLastHostLogits(std::vector<T>& hostLogits)
 {
     size_t totalLogitSize = mConfig.batchSize * 1 * mConfig.vocabSize;
-    static std::vector<T> hostLogits(totalLogitSize);
+    hostLogits.resize(totalLogitSize);
     CUDA_CHECK(
         cudaMemcpy(hostLogits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(T), cudaMemcpyDeviceToHost));
-    return hostLogits;
+    return;
 }
 
 template <typename T>
