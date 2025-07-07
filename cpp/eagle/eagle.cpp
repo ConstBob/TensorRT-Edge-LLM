@@ -366,6 +366,18 @@ void Eagle<T>::allocateEagleBuffer()
     CUDA_CHECK(cudaMalloc(&lastLogitsOffsetDevice, mBatchSize * sizeof(int64_t)));
     mEagleDeviceBuffer["lastLogitsOffset"] = lastLogitsOffsetDevice;
 }
+
+template <typename T>
+int64_t Eagle<T>::getModelBatchSize() const noexcept
+{
+    return mBatchSize;
+}
+template <typename T>
+int64_t Eagle<T>::getMaxContextLength() const noexcept
+{
+    return mBaseModel->getMaxContextLength();
+}
+
 template <typename T>
 void Eagle<T>::addNewBufferForModelIO()
 {
@@ -455,10 +467,10 @@ size_t Eagle<T>::getDeviceMemorySize() const noexcept
 }
 
 template <typename T>
-std::vector<T> const& Eagle<T>::getLastHostLogits()
+void Eagle<T>::getLastHostLogits(std::vector<T>& hostLogits)
 {
     size_t totalLogitSize = mBatchSize * mVocabSize;
-    static std::vector<T> hostLogits(totalLogitSize, 0);
+    hostLogits.resize(totalLogitSize);
     GetLastLogitsOffsetParams params;
     params.paths = static_cast<int32_t*>(mEagleDeviceBuffer["paths"]);
     params.bestPathIds = static_cast<int32_t*>(mEagleDeviceBuffer["bestPathIds"]);
@@ -474,8 +486,7 @@ std::vector<T> const& Eagle<T>::getLastHostLogits()
             static_cast<T*>(mBaseModel->getDeviceBuffer("logits")) + offset, mVocabSize * sizeof(T),
             cudaMemcpyDeviceToHost));
     }
-
-    return hostLogits;
+    return;
 }
 
 template <typename T>

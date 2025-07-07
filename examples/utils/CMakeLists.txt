@@ -7,6 +7,12 @@
 # distribution of this material and related documentation without an express
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
-add_subdirectory(utils)
-add_subdirectory(llm)
-add_subdirectory(multimodal)
+
+set(UTILS_SOURCES llm_param.cpp)
+
+set(UTILS_HEADERS llm_param.h)
+
+add_library(utils STATIC ${UTILS_SOURCES} ${UTILS_HEADERS})
+
+target_include_directories(utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                                        ${COMMON_INCLUDE_DIRS})

@@ -71,7 +71,9 @@ public:
         bool isEagle3 = false, std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
         std::vector<int32_t>* newTokens = nullptr, std::vector<int32_t>* iterNumbers = nullptr);
     size_t getDeviceMemorySize() const noexcept;
-    std::vector<T> const& getLastHostLogits();
+    void getLastHostLogits(std::vector<T>& hostLogits);
+    int64_t getModelBatchSize() const noexcept;
+    int64_t getMaxContextLength() const noexcept;
 
     ~Eagle()
     {

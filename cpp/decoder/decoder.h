@@ -84,7 +84,7 @@ public:
     void* getDeviceBuffer(std::string const& name);
     const ModelConfig getModelConfig() const noexcept;
 
-    std::vector<T> const& getLastHostLogits();
+    void getLastHostLogits(std::vector<T>& hostLogits);
     size_t getDeviceMemorySize() const noexcept;
     int64_t getModelBatchSize() const noexcept;
     int64_t getMaxContextLength() const noexcept;

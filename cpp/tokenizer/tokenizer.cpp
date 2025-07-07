@@ -14,9 +14,9 @@
 #include <fstream>
 #include <limits>
 
+#include "common/json.h"
 #include "tokenizer.h"
 #include "tokenizerUtils.h"
-#include "common/json.h"
 
 // BPE
 BPE::BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, std::string const& patStr)
@@ -550,8 +550,7 @@ void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRa
     if (std::filesystem::exists(tokenizerConfig))
     {
         std::ifstream config(tokenizerConfig);
-        std::string content((std::istreambuf_iterator<char>(config)),
-                           std::istreambuf_iterator<char>());
+        std::string content((std::istreambuf_iterator<char>(config)), std::istreambuf_iterator<char>());
         config.close();
 
         drivellm::JsonRoot jsonRoot;
