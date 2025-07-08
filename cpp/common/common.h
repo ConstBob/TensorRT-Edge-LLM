@@ -22,6 +22,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
 inline void check(bool condition, std::string errorMsg)
 {
     if (!condition)
