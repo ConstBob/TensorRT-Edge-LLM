@@ -12,8 +12,10 @@
 
 #include "common/common.h"
 #include "decoder/decoder.h"
-#include "qwen2vl/vit_runner.h"
+#include "engine/llm_engine.h"
 #include "internvl3/vit_runner.h"
+#include "llm_param.h"
+#include "qwen2vl/vit_runner.h"
 #include "tokenizer/tokenizer.h"
 #include <dlfcn.h>
 #include <getopt.h>
@@ -23,59 +25,75 @@
 #include <stb_image.h>
 #include <stb_image_resize2.h>
 
-struct RuntimeArgs
+struct VlmChatArgs
 {
-    bool help{false};
+    BaseParams baseParams;
+    EagleParams eagleParams;
+    VLMRunParams vlmRunParams;
+    LoraWeights loraWeights;
     std::vector<std::string> inputStrings;
     std::vector<std::vector<std::string>> imagePaths;
-    std::string llmEnginePath;
-    std::string visualEnginePath;
-    std::string tokenizerPath;
     int maxLength{1024};
-    bool debug{false};
-    std::string modelType{"qwen2_vl"};
-    std::pair<std::string, std::string> loraWeights; // name:path format
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] [-e or --llmEnginePath=<path to LLM engine>] [-v or --visualEnginePath=<path to visual engine>]"
-                 " [-s or --maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>]"
-                 " [--inputString=<input string for one batch>] [--imagePaths=<image paths for one batch>]"
+              << " [--help] [--enginePath=<path to LLM engine>] [--visualEnginePath=<path to visual engine>]"
+                 " [--tokenizerPath=<path to HF tokenizer>] [--inputString=<input string for one batch>]"
+                 " [--imagePaths=<image paths for one batch>] [--maxLength=<int>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  -h                  Display this help message" << std::endl;
     std::cerr << "  --inputString       Provide the input string to the runtime. Required. " << std::endl;
     std::cerr << "  --imagePaths        Provide the input image paths to the runtime. Required. " << std::endl;
-    std::cerr << "  --llmEnginePath     Provide the Qwen TensorRT engine file path. Required. " << std::endl;
-    std::cerr << "  --visualEnginePath  Provide the visual TensorRT engine file path. Required. " << std::endl;
-    std::cerr << "  --tokenizerPath     Provide the path to HF tokenizer. Required. " << std::endl;
     std::cerr << "  --maxLength         Provide the maximum output length for the generation session (including the "
                  "input). Default = 1024."
               << std::endl;
-    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl." << std::endl;
-    std::cerr << "  --debug             Use debug mode, which outputs tensors." << std::endl;
+    CommonUsage::printBaseOptions();
+    CommonUsage::printEagleOptions();
+    CommonUsage::printVLMRunOptions();
+    CommonUsage::printLoraOptions();
 };
 
-bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
+bool parseVlmChatArgs(VlmChatArgs& args, int argc, char* argv[])
 {
-    static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"inputString", required_argument, 0, 'i'},
-        {"imagePaths", required_argument, 0, 'p'}, {"llmEnginePath", required_argument, 0, 'e'},
-        {"visualEnginePath", required_argument, 0, 'v'}, {"tokenizerPath", required_argument, 0, 't'},
-        {"maxLength", required_argument, 0, 's'}, {"debug", no_argument, 0, 'd'},
-        {"modelType", required_argument, 0, 0}, {"loraWeights", required_argument, 0, 0}, {0, 0, 0, 0}};
+    static struct option chatOptions[]
+        = {{"inputString", required_argument, 0, 801}, {"imagePaths", required_argument, 0, 802},
+            {"maxLength", required_argument, 0, 803}, {"loraWeights", required_argument, 0, 804}, {0, 0, 0, 0}};
+
+    struct option long_options[64];
+    int idx = 0;
+    for (int i = 0; CommonOptions::baseOptions[i].name != 0; ++i)
+        long_options[idx++] = CommonOptions::baseOptions[i];
+    for (int i = 0; CommonOptions::eagleOptions[i].name != 0; ++i)
+        long_options[idx++] = CommonOptions::eagleOptions[i];
+    for (int i = 0; CommonOptions::vlmRunOptions[i].name != 0; ++i)
+        long_options[idx++] = CommonOptions::vlmRunOptions[i];
+    for (int i = 0; chatOptions[i].name != 0; ++i)
+        long_options[idx++] = chatOptions[i];
+    long_options[idx] = {0, 0, 0, 0};
 
     int opt;
-
-    // Loop to process each option
-    int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "h:iest", long_options, &option_index)) != -1)
+    while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
+        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, true))
+        {
+            continue;
+        }
+
+        if (CommonOptions::parseEagleOptions(args.eagleParams, opt, optarg))
+        {
+            continue;
+        }
+
+        if (CommonOptions::parseVLMRunOptions(args.vlmRunParams, opt, optarg))
+        {
+            continue;
+        }
+
         switch (opt)
         {
-        case 'h': args.help = true; return true;
-        case 'i':
+        case 801:
             if (optarg)
             {
                 args.inputStrings.emplace_back(optarg);
@@ -86,7 +104,7 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 'p':
+        case 802:
             if (optarg)
             {
                 std::vector<std::string> paths;
@@ -106,77 +124,34 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 'e':
-            if (optarg)
-            {
-                args.llmEnginePath = optarg;
-            }
-            else
-            {
-                std::cerr << "ERROR: --llmEnginePath requires option argument" << std::endl;
-                return false;
-            }
-            break;
-        case 'v':
-            if (optarg)
-            {
-                args.visualEnginePath = optarg;
-            }
-            else
-            {
-                std::cerr << "ERROR: --visualEnginePath requires option argument" << std::endl;
-                return false;
-            }
-            break;
-        case 't':
-            if (optarg)
-            {
-                args.tokenizerPath = optarg;
-            }
-            else
-            {
-                std::cerr << "ERROR: --tokenizerPath requires option argument" << std::endl;
-                return false;
-            }
-            break;
-        case 's':
+        case 803:
             if (optarg)
             {
                 args.maxLength = std::stoi(optarg);
             }
-            break;
-        case 'd': args.debug = true; break;
-        case 0:
-            if (strcmp(long_options[option_index].name, "modelType") == 0)
+            else
             {
-                if (optarg)
+                std::cerr << "ERROR: --maxLength requires option argument" << std::endl;
+                return false;
+            }
+            break;
+        case 804:
+            if (optarg)
+            {
+                if (LoraWeights::validateFormat(optarg))
                 {
-                    args.modelType = optarg;
+                    auto loraPair = LoraWeights::parse(optarg);
+                    args.loraWeights.add(loraPair.first, loraPair.second);
                 }
                 else
                 {
-                    std::cerr << "ERROR: model type requires option argument" << std::endl;
                     return false;
                 }
             }
-            else if (strcmp(long_options[option_index].name, "loraWeights") == 0)
+            else
             {
-                if (optarg)
-                {
-                    std::string loraArg = optarg;
-                    size_t colonPos = loraArg.find(':');
-                    if (colonPos == std::string::npos)
-                    {
-                        std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
-                        return false;
-                    }
-                    args.loraWeights = std::make_pair(loraArg.substr(0, colonPos), loraArg.substr(colonPos + 1));
-                }
-                else
-                {
-                    std::cerr << "ERROR: --loraWeights requires option argument" << std::endl;
-                    return false;
-                }
+                std::cerr << "ERROR: --loraWeights requires option argument" << std::endl;
+                return false;
             }
             break;
         default: return false;
@@ -185,36 +160,59 @@ bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
     return true;
 }
 
-void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
+template <typename ViTRunnerType>
+std::unique_ptr<LLMEngineHalf> getLLMEngine(BaseParams const& baseParams, EagleParams const& eagleParams,
+    LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
+{
+    EngineConfig engineConfig;
+    bool eagleMode = !eagleParams.eagleEnginePath.empty();
+    if (eagleMode)
+    {
+        LOG_INFO("Running in Eagle mode.");
+        engineConfig = EngineConfig(baseParams.enginePath, eagleParams.eagleEnginePath, eagleParams.maxPathLen,
+            eagleParams.topK, eagleParams.isEagle3, eagleParams.maxDecodingTokens, !baseParams.noCudaGraph);
+    }
+    else
+    {
+        LOG_INFO("Running in standard LLM mode.");
+        engineConfig = EngineConfig(baseParams.enginePath);
+    }
+    auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
+    llmEngine->setupExtraInputs(vitrunner->getExtraLLMInputs());
+
+    // Load and switch to LoRA weights if provided
+    if (loraWeights.hasWeights() && !eagleMode)
+    {
+        auto& decoderPtr = llmEngine->getDecoder();
+        auto loraPair = loraWeights.getFirst();
+        if (!decoderPtr->addLora(loraPair.first, loraPair.second))
+        {
+            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraPair.first.c_str(), loraPair.second.c_str());
+            return nullptr;
+        }
+        if (!decoderPtr->switchLora(loraPair.first))
+        {
+            LOG_ERROR("Failed to switch to LoRA: %s", loraPair.first.c_str());
+            return nullptr;
+        }
+    }
+
+    return llmEngine;
+}
+
+void decodeQwen2VL(BaseParams const& baseParams, EagleParams const& eagleParams, VLMRunParams const& vlmRunParams,
     std::vector<std::string>& inputStrings, std::vector<std::vector<std::string>> const& imagePaths,
     Tokenizer* tokenizer, GenerationConfig const& generationConfig, int32_t const batchSize,
-    std::vector<std::vector<int64_t>>& outputIds, std::string modelType,
-    std::pair<std::string, std::string> const& loraWeights)
+    std::vector<std::vector<int64_t>>& outputIds, LoraWeights const& loraWeights)
 {
     // Setup
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    auto vitrunner = new Qwen2ViTRunner(modelType);
-    vitrunner->setup(visualEnginePath, stream, batchSize);
-    auto decoder = new Decoder<half>();
-    decoder->setup(llmEnginePath, stream, false, batchSize);
-    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+    auto vitrunner = new Qwen2ViTRunner(vlmRunParams.modelType);
+    vitrunner->setup(vlmRunParams.visualEnginePath, stream, batchSize);
 
-    // Load and switch to LoRA weights if provided
-    if (!loraWeights.first.empty() && !loraWeights.second.empty())
-    {
-        if (!decoder->addLora(loraWeights.first, loraWeights.second))
-        {
-            LOG_ERROR("Failed to load LoRA weights: %s", loraWeights.second.c_str());
-            return;
-        }
-        if (!decoder->switchLora(loraWeights.first))
-        {
-            LOG_ERROR("Failed to switch to LoRA weights: %s", loraWeights.first.c_str());
-            return;
-        }
-    }
+    auto llmEngine = getLLMEngine<Qwen2ViTRunner>(baseParams, eagleParams, loraWeights, stream, vitrunner);
 
     // Preprocess
     std::vector<half> visualInput;
@@ -263,10 +261,10 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
     vitrunner->visualPreprocess(
         imageBuffers, imageSizes, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
     vitrunner->textPreprocess(
-        inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths, decoder->getMaxContextLength());
+        inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths, llmEngine->getMaxContextLength());
 
     // Infer
-    if (modelType == "qwen2_vl")
+    if (vlmRunParams.modelType == "qwen2_vl")
     {
         vitrunner->qwen2ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
     }
@@ -280,44 +278,30 @@ void decodeQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::
             visualWindowIndex, reverseWindowIndex);
     }
 
-    decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
+    llmEngine->generate(inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, nullptr, tokenizer);
 
     for (auto& buffer : imageBuffers)
     {
         free(buffer);
     }
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    delete vitrunner;
 }
 
-void decodeInternVL3(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
+void decodeInternVL3(BaseParams const& baseParams, EagleParams const& eagleParams, VLMRunParams const& vlmRunParams,
     std::vector<std::string>& inputStrings, std::vector<std::vector<std::string>> const& imagePaths,
     Tokenizer* tokenizer, GenerationConfig const& generationConfig, int32_t const batchSize,
-    std::vector<std::vector<int64_t>>& outputIds, std::string modelType,
-    std::pair<std::string, std::string> const& loraWeights, bool const useThumbnail)
+    std::vector<std::vector<int64_t>>& outputIds, LoraWeights const& loraWeights, bool const useThumbnail)
 {
     // Setup
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    auto vitrunner = new InternVLViTRunner(modelType);
-    vitrunner->setup(visualEnginePath, stream, batchSize);
-    auto decoder = new Decoder<half>();
-    decoder->setup(llmEnginePath, stream, false, batchSize);
-    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+    auto vitrunner = new InternVLViTRunner(vlmRunParams.modelType);
+    vitrunner->setup(vlmRunParams.visualEnginePath, stream, batchSize);
 
-    // Load and switch to LoRA weights if provided
-    if (!loraWeights.first.empty() && !loraWeights.second.empty())
-    {
-        if (!decoder->addLora(loraWeights.first, loraWeights.second))
-        {
-            LOG_ERROR("Failed to load LoRA weights: %s", loraWeights.second.c_str());
-            return;
-        }
-        if (!decoder->switchLora(loraWeights.first))
-        {
-            LOG_ERROR("Failed to switch to LoRA weights: %s", loraWeights.first.c_str());
-            return;
-        }
-    }
+    auto llmEngine = getLLMEngine<InternVLViTRunner>(baseParams, eagleParams, loraWeights, stream, vitrunner);
 
     // Preprocess
     std::vector<half> visualInput;
@@ -348,13 +332,12 @@ void decodeInternVL3(std::filesystem::path const& llmEnginePath, std::filesystem
             // Adjust image size to the nearest target ratio
             // User should set appropriate imageTokens value according to their use case and match engine build
             // config. For details please refer to README.md#image-preprocess-and-number-of-image-tokens
-            
+
             // Downsized to max 6 448x448 blocks. The preprocessing on hf allows for max 12 448x448 blocks.
-            // This was done to reduce the number of image tokens since engine build with a longer output sequence 
+            // This was done to reduce the number of image tokens since engine build with a longer output sequence
             // can be supported if configured during onnx export.
-            std::vector<std::pair<int, int>> targetRatios
-                = {{1, 1}, {1, 2}, {2, 1}, {3, 1}, {1, 3}, {2, 2}, {4, 1}, {1, 4}, {5, 1}, {1, 5}, {1, 6}, {6, 1},
-                    {3, 2}, {2, 3}};
+            std::vector<std::pair<int, int>> targetRatios = {{1, 1}, {1, 2}, {2, 1}, {3, 1}, {1, 3}, {2, 2}, {4, 1},
+                {1, 4}, {5, 1}, {1, 5}, {1, 6}, {6, 1}, {3, 2}, {2, 3}};
             auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height, width, targetRatios);
             unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
 
@@ -367,9 +350,10 @@ void decodeInternVL3(std::filesystem::path const& llmEnginePath, std::filesystem
             if (useThumbnail)
             {
                 int thumbnailImageSize = 448;
-                unsigned char* thumbnailImage = (unsigned char*) malloc(thumbnailImageSize * thumbnailImageSize * desiredChannels);
-                stbir_resize_uint8_linear(
-                    image, width, height, 0, thumbnailImage, thumbnailImageSize, thumbnailImageSize, 0, stbir_pixel_layout::STBIR_RGB);
+                unsigned char* thumbnailImage
+                    = (unsigned char*) malloc(thumbnailImageSize * thumbnailImageSize * desiredChannels);
+                stbir_resize_uint8_linear(image, width, height, 0, thumbnailImage, thumbnailImageSize,
+                    thumbnailImageSize, 0, stbir_pixel_layout::STBIR_RGB);
                 thumbnailImageBuffers.emplace_back(thumbnailImage);
             }
             else
@@ -382,12 +366,12 @@ void decodeInternVL3(std::filesystem::path const& llmEnginePath, std::filesystem
     }
     vitrunner->visualPreprocess(
         imageBuffers, thumbnailImageBuffers, imageSizes, visualInput, imageTokenLengths, useThumbnail);
-    vitrunner->textPreprocess(
-        inputStrings, numImages, imageTokenLengths, tokenizer, inputIds, contextLengths, decoder->getMaxContextLength());
+    vitrunner->textPreprocess(inputStrings, numImages, imageTokenLengths, tokenizer, inputIds, contextLengths,
+        llmEngine->getMaxContextLength());
 
     // Infer
     vitrunner->internVLViTInfer(visualInput);
-    decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
+    llmEngine->generate(inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, nullptr, tokenizer);
 
     for (auto& buffer : imageBuffers)
     {
@@ -402,10 +386,10 @@ void decodeInternVL3(std::filesystem::path const& llmEnginePath, std::filesystem
     }
 }
 
-std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
-    std::filesystem::path const& visualEnginePath, std::vector<std::string>& inputStrings,
+std::vector<std::string> decode(BaseParams const& baseParams, EagleParams const& eagleParams,
+    VLMRunParams const& vlmRunParams, std::vector<std::string>& inputStrings,
     std::vector<std::vector<std::string>>& imagePaths, Tokenizer* tokenizer, GenerationConfig const& generationConfig,
-    std::string modelType, std::pair<std::string, std::string> const& loraWeights)
+    LoraWeights const& loraWeights)
 {
     int32_t batchSize = std::max(inputStrings.size(), imagePaths.size());
 
@@ -425,15 +409,15 @@ std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
         outputIds[i].reserve(generationConfig.maxLength);
     }
 
-    if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
+    if (vlmRunParams.modelType == "qwen2_vl" || vlmRunParams.modelType == "qwen2_5_vl")
     {
-        decodeQwen2VL(llmEnginePath, visualEnginePath, inputStrings, imagePaths, tokenizer, generationConfig, batchSize,
-            outputIds, modelType, loraWeights);
+        decodeQwen2VL(baseParams, eagleParams, vlmRunParams, inputStrings, imagePaths, tokenizer, generationConfig,
+            batchSize, outputIds, loraWeights);
     }
-    else if (modelType == "internvl3")
+    else if (vlmRunParams.modelType == "internvl3")
     {
-        decodeInternVL3(llmEnginePath, visualEnginePath, inputStrings, imagePaths, tokenizer, generationConfig, batchSize,
-            outputIds, modelType, loraWeights, true);
+        decodeInternVL3(baseParams, eagleParams, vlmRunParams, inputStrings, imagePaths, tokenizer, generationConfig,
+            batchSize, outputIds, loraWeights, true);
     }
     else
     {
@@ -453,19 +437,19 @@ std::vector<std::string> decode(std::filesystem::path const& llmEnginePath,
 
 int main(int argc, char* argv[])
 {
-    RuntimeArgs args;
-    if ((argc < 2) || (!parseRuntimeArgs(args, argc, argv)))
+    VlmChatArgs args;
+    if ((argc < 2) || (!parseVlmChatArgs(args, argc, argv)))
     {
         printUsage(argv[0]);
         return EXIT_FAILURE;
     }
-    if (args.help)
+    if (args.baseParams.help)
     {
         printUsage(argv[0]);
         return EXIT_SUCCESS;
     }
 
-    if (args.debug)
+    if (args.baseParams.debug)
     {
         gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
     }
@@ -478,9 +462,9 @@ int main(int argc, char* argv[])
 
     GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
     auto tokenizer = std::make_unique<Tokenizer>();
-    tokenizer->loadFromHF(args.tokenizerPath);
-    auto output = decode(args.llmEnginePath, args.visualEnginePath, args.inputStrings, args.imagePaths, tokenizer.get(),
-        generationConfig, args.modelType, args.loraWeights);
+    tokenizer->loadFromHF(args.baseParams.tokenizerPath);
+    auto output = decode(args.baseParams, args.eagleParams, args.vlmRunParams, args.inputStrings, args.imagePaths,
+        tokenizer.get(), generationConfig, args.loraWeights);
 
     return EXIT_SUCCESS;
 };

@@ -12,3 +12,4 @@ data.tar
 *.csv
 *.tar.gz
 internal/
+*.log

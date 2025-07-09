@@ -378,13 +378,13 @@ bool AttentionPlugin::supportsFormatCombination(
         case 7:
             if (mIsMrope && mEnableTreeAttention)
             {
-                result = checkKVCache(inOut[7]);
+                result = checkAttentionOutput(inOut[7]);
             }
             break;
         case 8:
-            if (mEnableTreeAttention && mIsMrope)
+            if (mIsMrope && mEnableTreeAttention)
             {
-                result = checkAttentionOutput(inOut[8]);
+                result = checkKVCache(inOut[8]);
             }
             break;
         default: break;
@@ -495,8 +495,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t kATTENTION_POS_ID_INPUT_IDX;
     if (mIsMrope && mEnableTreeAttention)
     {
-        kATTENTION_MASK_INPUT_IDX = 4;
-        kATTENTION_POS_ID_INPUT_IDX = 5;
+        kATTENTION_MASK_INPUT_IDX = 5;
+        kATTENTION_POS_ID_INPUT_IDX = 6;
         attention_mask = reinterpret_cast<int32_t*>(const_cast<void*>(inputs[kATTENTION_MASK_INPUT_IDX]));
         custom_seq_index = reinterpret_cast<int32_t*>(const_cast<void*>(inputs[kATTENTION_POS_ID_INPUT_IDX]));
     }

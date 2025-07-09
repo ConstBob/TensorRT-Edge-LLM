@@ -24,7 +24,10 @@ This folder contains scripts to export ONNX models from PyTorch models. The expo
    python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR
 
    # VLM model
-   python3 multimodal_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR --visualType [fp16|fp8]
+   ## LLM part onnx export:
+      python3 llm_export.py --torch_dir $TORCH_DIR --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $ONNX_DIR --use_prompt_tuning True
+   ## Visual part onnx export:
+      python3 multimodal_export.py --torch_dir $TORCH_DIR --output_dir $ONNX_DIR --visualType [fp16|fp8]
    ```
 
 5. The ONNX with desired data type will be exported in `$ONNX_DIR`.

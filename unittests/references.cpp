@@ -4,9 +4,9 @@
 #include <cmath>
 #include <limits>
 
-std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<half> const& k,
-    std::vector<half> const& v, int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, std::optional<std::vector<int32_t>> const& treeAttnMask)
+std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<half> const& k, std::vector<half> const& v,
+    int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    std::optional<std::vector<int32_t>> const& treeAttnMask)
 {
     assert(qlen <= kvlen);
     int32_t const numQheadPerKV = numQHeads / numKVHeads;

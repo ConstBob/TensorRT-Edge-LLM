@@ -45,6 +45,22 @@ struct EagleBuildParams
     int32_t mMaxDraftTokensPerStep{60};
 };
 
+struct VLMBuildParams
+{
+
+    std::string modelType{"qwen2_vl"};
+    int64_t imageTokens{512};
+    int64_t minImageTokens{4};
+    int64_t maxImageTokens{1024};
+    bool usePromptTuning{true};
+};
+
+struct VLMRunParams
+{
+    std::string visualEnginePath{""};
+    std::string modelType{"qwen2_vl"};
+};
+
 struct LoraWeights
 {
     std::vector<std::pair<std::string, std::string>> weights;
@@ -95,9 +111,15 @@ namespace CommonOptions
 extern const struct option baseOptions[];
 extern const struct option eagleOptions[];
 extern const struct option eagleBuildOptions[];
+extern const struct option vlmBuildOptions[];
+extern const struct option vlmRunOptions[];
+
 bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg, bool requireTokenizer = false);
 bool parseEagleOptions(EagleParams& eagleParams, int opt, char const* optarg);
 bool parseEagleBuildOptions(EagleBuildParams& eagleBuildParams, int opt, char const* optarg);
+bool parseVLMBuildOptions(VLMBuildParams& vlmBuildParams, int opt, char const* optarg);
+bool parseVLMRunOptions(VLMRunParams& vlmRunParams, int opt, char const* optarg);
+
 } // namespace CommonOptions
 
 namespace CommonUsage
@@ -105,6 +127,8 @@ namespace CommonUsage
 void printBaseOptions();
 void printEagleOptions();
 void printEagleBuildOptions();
+void printVLMBuildOptions();
+void printVLMRunOptions();
 void printLoraOptions();
 void printBenchmarkOptions();
 } // namespace CommonUsage

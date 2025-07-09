@@ -40,6 +40,7 @@ struct LLMBuildArgs
     int64_t maxBatchSize{4};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
     EagleBuildParams eagleBuildParams;
+    VLMBuildParams vlmBuildParams;
 };
 
 class LLMEngineProfileBuilder
@@ -69,9 +70,12 @@ public:
         {
             setupVanillaProfiles();
         }
+        if (args.vlmBuildParams.usePromptTuning)
+        {
+            setupExtraProfilesForVLM();
+        }
         setupProfilesForLora();
         // TODO: add other profiles here
-        // setupProfilesForVLM();
     }
     std::string generateTRTExecCommand()
     {
@@ -146,6 +150,7 @@ private:
     int64_t numKVHeads;
     int64_t hiddenSizePerHead;
     int32_t nbKVCacheInputs;
+    // for eagle
     int32_t hiddenSizeDim;
     int32_t targetModelOutputHiddenDim;
 
@@ -161,6 +166,8 @@ private:
         {
             minBatchSize = args.batchSize;
             maxBatchSize = args.batchSize;
+            args.vlmBuildParams.maxImageTokens = args.vlmBuildParams.imageTokens;
+            args.vlmBuildParams.minImageTokens = args.vlmBuildParams.imageTokens;
         }
         if (args.eagleBuildParams.isEagleBase || args.eagleBuildParams.isEagleDraft)
         {
@@ -205,6 +212,73 @@ private:
         }
     }
 
+    void setupExtraProfilesForVLM()
+    {
+        setupExtraProfilesForVLMCommon();
+        if (args.vlmBuildParams.modelType == "qwen2_vl" || args.vlmBuildParams.modelType == "qwen2_5_vl")
+        {
+            setupExtraProfilesForQwen2VL();
+        }
+    }
+    void setupExtraProfilesForVLMCommon()
+    {
+        int32_t imageHiddenSize = 0;
+        for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
+        {
+            if (strcmp(network->getInput(idx)->getName(), "image_embeds") == 0)
+            {
+                imageHiddenSize = network->getInput(idx)->getDimensions().d[1];
+            }
+        }
+        if (imageHiddenSize == 0)
+        {
+            LOG_ERROR("Please add image_embeds as inputs for VLM.");
+        }
+        int64_t optImageTokens = (args.vlmBuildParams.maxImageTokens + args.vlmBuildParams.minImageTokens) / 2;
+
+        result &= setOptimizationProfile(contextProfile, "image_embeds",
+            createDims({args.vlmBuildParams.minImageTokens, imageHiddenSize}),
+            createDims({optImageTokens, imageHiddenSize}),
+            createDims({args.vlmBuildParams.maxImageTokens, imageHiddenSize}));
+        result &= setOptimizationProfile(generationProfile, "image_embeds", createDims({1, imageHiddenSize}),
+            createDims({1, imageHiddenSize}), createDims({1, imageHiddenSize}));
+
+        if (result == false)
+        {
+            LOG_ERROR("Failed to setup optimization profiles at setupExtraProfilesForVLMCommon().");
+        }
+    }
+    void setupExtraProfilesForQwen2VL()
+    {
+        int32_t mropeDim = 0;
+        for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
+        {
+            if (strcmp(network->getInput(idx)->getName(), "mrope_rotary_cos_sin") == 0)
+            {
+                mropeDim = network->getInput(idx)->getDimensions().d[1];
+            }
+        }
+        if (mropeDim == 0)
+        {
+            LOG_ERROR("Please add mrope_rotary_sin_cos as inputs for Qwen2-VL.");
+        }
+
+        result &= setOptimizationProfile(contextProfile, "mrope_rotary_cos_sin", createDims({minBatchSize, mropeDim}),
+            createDims({optBatchSize, mropeDim}), createDims({maxBatchSize, mropeDim}));
+        result &= setOptimizationProfile(contextProfile, "mrope_position_deltas", createDims({minBatchSize, 1}),
+            createDims({optBatchSize, 1}), createDims({maxBatchSize, 1}));
+
+        result
+            &= setOptimizationProfile(generationProfile, "mrope_rotary_cos_sin", createDims({minBatchSize, mropeDim}),
+                createDims({optBatchSize, mropeDim}), createDims({maxBatchSize, mropeDim}));
+        result &= setOptimizationProfile(generationProfile, "mrope_position_deltas", createDims({minBatchSize, 1}),
+            createDims({optBatchSize, 1}), createDims({maxBatchSize, 1}));
+        if (result == false)
+        {
+            LOG_ERROR("Failed to setup optimization profiles at setupExtraProfilesForQwen2VL.");
+        }
+    }
+
     void setupCommonProfiles()
     {
         result &= setOptimizationProfile(contextProfile, "context_lengths", createDims({minBatchSize}),
@@ -213,6 +287,11 @@ private:
             createDims({optBatchSize}), createDims({maxBatchSize}));
 
         setupKVCacheProfiles();
+
+        if (result == false)
+        {
+            LOG_ERROR("Failed to setup optimization profiles at setupCommonProfiles().");
+        }
     }
 
     void setupKVCacheProfiles()
@@ -234,6 +313,11 @@ private:
                 optKVContextShape, maxKVContextShape);
             result &= setOptimizationProfile(generationProfile, fmtstr("past_key_values.%d", i).c_str(),
                 minKVGenerationShape, optKVGenerationShape, maxKVGenerationShape);
+        }
+
+        if (result == false)
+        {
+            LOG_ERROR("Failed to setup optimization profiles at setupKVCacheProfiles().");
         }
     }
 
@@ -258,6 +342,11 @@ private:
             createDims({optBatchSize, 1}), createDims({maxBatchSize, 1}));
         result &= setOptimizationProfile(generationProfile, "last_token_ids", createDims({minBatchSize, 1}),
             createDims({optBatchSize, 1}), createDims({maxBatchSize, 1}));
+
+        if (result == false)
+        {
+            LOG_ERROR("Failed to setup optimization profiles at setupVanillaProfiles().");
+        }
     }
 
     void setupEagleProfiles()
@@ -322,6 +411,11 @@ private:
             result &= setOptimizationProfile(generationProfile, "attention_pos_id", createDims({minBatchSize, 1}),
                 createDims({optBatchSize, mMaxTokens / 2}), createDims({maxBatchSize, mMaxTokens}));
         }
+
+        if (result == false)
+        {
+            LOG_ERROR("Failed to setup optimization profiles at setupEagleProfiles().");
+        }
     }
     void setupProfilesForLora()
     {
@@ -369,64 +463,70 @@ private:
                 }
             }
         }
+
+        if (result == false)
+        {
+            LOG_ERROR("Failed to setup optimization profiles at setupProfilesForLora().");
+        }
     }
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] <--onnxPath str> <--enginePath str> [-b or "
-                 "--batchSize int] [-c or --maxInputLen int] [-s or --maxSeqLen int] [--dynamicShape] [--maxBatchSize "
-                 "int] [--debug] [--maxLoraRank int]"
+              << " [--help] --onnxPath <path> --enginePath <path> [--batchSize <int>] [--maxInputLen <int>] "
+                 "[--maxSeqLen <int>] [--dynamicShape] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  -h               Display this help message" << std::endl;
-    std::cerr << "  --onnxPath       Provide the input onnx file path. Required. " << std::endl;
-    std::cerr << "  --enginePath     Provide the output TensorRT engine file path. Required. " << std::endl;
-    std::cerr << "  --batchSize      Provide the desired batch_size for builder. Default = 1" << std::endl;
-    std::cerr << "  --maxBatchSize   Provide the maximum batch_size for builder. Default = 4" << std::endl;
-    std::cerr << "  --maxInputLen    Provide the maximum input length for the model. Default = 128" << std::endl;
+    std::cerr << "  --help               Display this help message" << std::endl;
+    std::cerr << "  --onnxPath           Provide the input onnx file path. Required. " << std::endl;
+    std::cerr << "  --enginePath         Provide the output TensorRT engine file path. Required. " << std::endl;
+    std::cerr << "  --batchSize          Provide the desired batch_size for builder. Default = 1" << std::endl;
+    std::cerr << "  --maxBatchSize       Provide the maximum batch_size for builder. Default = 4" << std::endl;
+    std::cerr << "  --maxInputLen        Provide the maximum input length for the model. Default = 128" << std::endl;
     std::cerr
-        << "  --maxSeqLen      Provide the maximum output length for the model (including the input). Default = 4096"
+        << "  --maxSeqLen         Provide the maximum output length for the model (including the input). Default = 4096"
         << std::endl;
-    std::cerr << "  --dynamicShape   Use dynamic shape profiles." << std::endl;
-    std::cerr << "  --debug          Use debug mode, which outputs more logs." << std::endl;
-    std::cerr << "  --maxLoraRank    Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)" << std::endl;
+    std::cerr << "  --dynamicShape      Use dynamic shape profiles." << std::endl;
+    std::cerr << "  --debug             Use debug mode, which outputs more logs." << std::endl;
+    std::cerr << "  --maxLoraRank       Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)"
+              << std::endl;
     CommonUsage::printEagleBuildOptions();
 }
 
 bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
 {
-    static struct option buildOptions[] = {{"help", no_argument, 0, 'h'}, {"onnxPath", required_argument, 0, 'i'},
-        {"enginePath", required_argument, 0, 'o'}, {"batchSize", required_argument, 0, 'b'},
-        {"maxInputLen", required_argument, 0, 'c'}, {"maxSeqLen", required_argument, 0, 's'},
-        {"debug", no_argument, 0, 'd'}, {"dynamicShape", no_argument, 0, 'y'},
-        {"maxBatchSize", required_argument, 0, 'B'}, {"maxLoraRank", required_argument, 0, 'L'},
-        {"imageTokens", required_argument, 0, 0}, {"minImageTokens", required_argument, 0, 0},
-        {"maxImageTokens", required_argument, 0, 0}, {"modelType", required_argument, 0, 0}, {0, 0, 0, 0}};
+    static struct option buildOptions[] = {{"help", no_argument, 0, 701}, {"onnxPath", required_argument, 0, 702},
+        {"enginePath", required_argument, 0, 703}, {"batchSize", required_argument, 0, 704},
+        {"maxInputLen", required_argument, 0, 705}, {"maxSeqLen", required_argument, 0, 706},
+        {"debug", no_argument, 0, 707}, {"dynamicShape", no_argument, 0, 708},
+        {"maxBatchSize", required_argument, 0, 709}, {"maxLoraRank", required_argument, 0, 710}, {0, 0, 0, 0}};
 
     struct option long_options[64];
     int idx = 0;
     for (int i = 0; CommonOptions::eagleBuildOptions[i].name != 0; ++i)
         long_options[idx++] = CommonOptions::eagleBuildOptions[i];
+    for (int i = 0; CommonOptions::vlmBuildOptions[i].name != 0; ++i)
+        long_options[idx++] = CommonOptions::vlmBuildOptions[i];
     for (int i = 0; buildOptions[i].name != 0; ++i)
         long_options[idx++] = buildOptions[i];
     long_options[idx] = {0, 0, 0, 0};
 
     int opt;
-    // Loop to process each option
-    int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "hi:o:b:c:s:dyB:L:ega:m:", long_options, &option_index)) != -1)
+    while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
         if (CommonOptions::parseEagleBuildOptions(args.eagleBuildParams, opt, optarg))
         {
             continue;
         }
-
+        if (CommonOptions::parseVLMBuildOptions(args.vlmBuildParams, opt, optarg))
+        {
+            continue;
+        }
         switch (opt)
         {
-        case 'h': args.help = true; return true;
-        case 'i':
+        case 701: args.help = true; return true;
+        case 702:
             if (optarg)
             {
                 args.onnxPath = optarg;
@@ -437,7 +537,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 'o':
+        case 703:
             if (optarg)
             {
                 args.enginePath = optarg;
@@ -448,33 +548,33 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 'b':
+        case 704:
             if (optarg)
             {
                 args.batchSize = std::stoi(optarg);
             }
             break;
-        case 'B':
-            if (optarg)
-            {
-                args.maxBatchSize = std::stoi(optarg);
-            }
-            break;
-        case 'c':
+        case 705:
             if (optarg)
             {
                 args.maxInputLen = std::stoi(optarg);
             }
             break;
-        case 's':
+        case 706:
             if (optarg)
             {
                 args.maxSeqLen = std::stoi(optarg);
             }
             break;
-        case 'd': args.debug = true; break;
-        case 'y': args.dynamicShape = true; break;
-        case 'L':
+        case 707: args.debug = true; break;
+        case 708: args.dynamicShape = true; break;
+        case 709:
+            if (optarg)
+            {
+                args.maxBatchSize = std::stoi(optarg);
+            }
+            break;
+        case 710:
             if (optarg)
             {
                 args.maxLoraRank = std::stoi(optarg);

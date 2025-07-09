@@ -38,8 +38,8 @@ struct LLMChatArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] [-i or --interactive] [-e or --enginePath=<path to TensorRT engine>] [-s or "
-                 "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>] [--inputString=<input string for "
+              << " [--help] [--interactive] [--enginePath=<path to TensorRT engine>] "
+                 "[--maxLength=<int>] [--tokenizerPath=<path to HF tokenizer>] [--inputString=<input string for "
                  "one batch>] [--loraWeights=<name:path>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
@@ -57,8 +57,8 @@ void printUsage(char const* programName)
 bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
 {
     static struct option chatOptions[]
-        = {{"interactive", no_argument, 0, 'i'}, {"inputString", required_argument, 0, 'c'},
-            {"maxLength", required_argument, 0, 's'}, {"loraWeights", required_argument, 0, 'l'}, {0, 0, 0, 0}};
+        = {{"interactive", no_argument, 0, 901}, {"inputString", required_argument, 0, 902},
+            {"maxLength", required_argument, 0, 903}, {"loraWeights", required_argument, 0, 904}, {0, 0, 0, 0}};
 
     struct option long_options[64];
     int idx = 0;
@@ -71,7 +71,7 @@ bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
     long_options[idx] = {0, 0, 0, 0};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:c:s:l:e:t:hdga:m:k:p:E:", long_options, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
         if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, true))
         {
@@ -85,8 +85,8 @@ bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
 
         switch (opt)
         {
-        case 'i': args.interactive = true; break;
-        case 'c':
+        case 901: args.interactive = true; break;
+        case 902:
             if (optarg)
             {
                 args.inputStrings.emplace_back(optarg);
@@ -97,13 +97,13 @@ bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 's':
+        case 903:
             if (optarg)
             {
                 args.maxLength = std::stoi(optarg);
             }
             break;
-        case 'l':
+        case 904:
             if (optarg)
             {
                 if (LoraWeights::validateFormat(optarg))

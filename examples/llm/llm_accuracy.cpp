@@ -64,8 +64,8 @@ struct TestData
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] [-i or --inputString=<input>] [-e or --enginePath=<path to TensorRT engine>] [-s or "
-                 "--maxLength=<int>] [-t or --tokenizerPath=<path to HF tokenizer>] "
+              << " [--help] [--inputString=<input>] [--enginePath=<path to TensorRT engine>] "
+                 "[--maxLength=<int>] [--tokenizerPath=<path to HF tokenizer>] "
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --datasetPath    Provide the dataset path for evaluation." << std::endl;
@@ -77,7 +77,7 @@ void printUsage(char const* programName)
 bool parseLLMAccuracyArgs(LLMAccuracyArgs& args, int argc, char* argv[])
 {
     static struct option accuracyOptions[]
-        = {{"datasetPath", required_argument, 0, 'D'}, {"loraWeights", required_argument, 0, 'l'}, {0, 0, 0, 0}};
+        = {{"datasetPath", required_argument, 0, 1101}, {"loraWeights", required_argument, 0, 1102}, {0, 0, 0, 0}};
 
     struct option long_options[64];
     int idx = 0;
@@ -90,7 +90,8 @@ bool parseLLMAccuracyArgs(LLMAccuracyArgs& args, int argc, char* argv[])
     long_options[idx] = {0, 0, 0, 0};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "D:l:e:t:hdga:m:k:p:E:", long_options, nullptr)) != -1)
+
+    while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
         if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, true))
         {
@@ -104,13 +105,13 @@ bool parseLLMAccuracyArgs(LLMAccuracyArgs& args, int argc, char* argv[])
 
         switch (opt)
         {
-        case 'D':
+        case 1101:
             if (optarg)
             {
                 args.datasetPath = optarg;
             }
             break;
-        case 'l':
+        case 1102:
             if (optarg)
             {
                 if (LoraWeights::validateFormat(optarg))

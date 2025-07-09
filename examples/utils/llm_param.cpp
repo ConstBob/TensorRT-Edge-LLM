@@ -15,22 +15,30 @@
 namespace CommonOptions
 {
 
-const struct option baseOptions[] = {{"enginePath", optional_argument, 0, 'e'},
-    {"tokenizerPath", optional_argument, 0, 't'}, {"help", no_argument, 0, 'h'}, {"debug", no_argument, 0, 'd'},
-    {"noCudaGraph", no_argument, 0, 'g'}, {0, 0, 0, 0}};
+const struct option baseOptions[]
+    = {{"enginePath", optional_argument, 0, 1}, {"tokenizerPath", optional_argument, 0, 2}, {"help", no_argument, 0, 3},
+        {"debug", no_argument, 0, 4}, {"noCudaGraph", no_argument, 0, 5}, {0, 0, 0, 0}};
 
-const struct option eagleBuildOptions[] = {{"isEagleBase", no_argument, 0, 'e'}, {"isEagleDraft", no_argument, 0, 'g'},
-    {"isEagle3", no_argument, 0, 'a'}, {"maxDecodingTokens", optional_argument, 0, 'm'},
-    {"mMaxDraftTokensPerStep", optional_argument, 0, 'p'}, {0, 0, 0, 0}};
-const struct option eagleOptions[] = {{"eagleEnginePath", optional_argument, 0, 'E'}, {"isEagle3", no_argument, 0, 'a'},
-    {"maxDecodingTokens", optional_argument, 0, 'm'}, {"topK", optional_argument, 0, 'k'},
-    {"maxPathLen", optional_argument, 0, 'p'}, {0, 0, 0, 0}};
+const struct option eagleBuildOptions[] = {{"isEagleBase", no_argument, 0, 101}, {"isEagleDraft", no_argument, 0, 102},
+    {"isEagle3", no_argument, 0, 103}, {"maxDecodingTokens", optional_argument, 0, 104},
+    {"mMaxDraftTokensPerStep", optional_argument, 0, 105}, {0, 0, 0, 0}};
+
+const struct option eagleOptions[] = {{"eagleEnginePath", optional_argument, 0, 201}, {"isEagle3", no_argument, 0, 202},
+    {"maxDecodingTokens", optional_argument, 0, 203}, {"topK", optional_argument, 0, 204},
+    {"maxPathLen", optional_argument, 0, 205}, {0, 0, 0, 0}};
+
+const struct option vlmBuildOptions[] = {{"modelType", optional_argument, 0, 301},
+    {"imageTokens", optional_argument, 0, 302}, {"minImageTokens", optional_argument, 0, 303},
+    {"maxImageTokens", optional_argument, 0, 304}, {"usePromptTuning", no_argument, 0, 305}, {0, 0, 0, 0}};
+
+const struct option vlmRunOptions[]
+    = {{"visualEnginePath", required_argument, 0, 401}, {"modelType", optional_argument, 0, 402}, {0, 0, 0, 0}};
 
 bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg, bool requireTokenizer)
 {
     switch (opt)
     {
-    case 'e': // enginePath
+    case 1: // enginePath
         if (optarg)
         {
             baseParams.enginePath = optarg;
@@ -41,7 +49,7 @@ bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg, bool 
             return false;
         }
         break;
-    case 't': // tokenizerPath
+    case 2: // tokenizerPath
         if (optarg)
         {
             baseParams.tokenizerPath = optarg;
@@ -55,13 +63,13 @@ bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg, bool 
             }
         }
         break;
-    case 'h': // help
+    case 3: // help
         baseParams.help = true;
         break;
-    case 'd': // debug
+    case 4: // debug
         baseParams.debug = true;
         break;
-    case 'g': // noCudaGraph
+    case 5: // noCudaGraph
         baseParams.noCudaGraph = true;
         break;
     default: return false;
@@ -73,26 +81,26 @@ bool parseEagleOptions(EagleParams& eagleParams, int opt, char const* optarg)
 {
     switch (opt)
     {
-    case 'E': // eagleEnginePath
+    case 201: // eagleEnginePath
         if (optarg)
             eagleParams.eagleEnginePath = optarg;
         break;
-    case 'a': // isEagle3
+    case 202: // isEagle3
         eagleParams.isEagle3 = true;
         break;
-    case 'm': // maxDecodingTokens
+    case 203: // maxDecodingTokens
         if (optarg)
         {
             eagleParams.maxDecodingTokens = std::stoi(optarg);
         }
         break;
-    case 'k': // topK
+    case 204: // topK
         if (optarg)
         {
             eagleParams.topK = std::stoi(optarg);
         }
         break;
-    case 'p': // maxPathLen
+    case 205: // maxPathLen
         if (optarg)
         {
             eagleParams.maxPathLen = std::stoi(optarg);
@@ -107,25 +115,85 @@ bool parseEagleBuildOptions(EagleBuildParams& eagleBuildParams, int opt, char co
 {
     switch (opt)
     {
-    case 'e': // isEagleBase
+    case 101: // isEagleBase
         eagleBuildParams.isEagleBase = true;
         break;
-    case 'g': // isEagleDraft
+    case 102: // isEagleDraft
         eagleBuildParams.isEagleDraft = true;
         break;
-    case 'a': // isEagle3
+    case 103: // isEagle3
         eagleBuildParams.isEagle3 = true;
         break;
-    case 'm': // maxDecodingTokens
+    case 104: // maxDecodingTokens
         if (optarg)
         {
             eagleBuildParams.maxDecodingTokens = std::stoi(optarg);
         }
         break;
-    case 'p': // mMaxDraftTokensPerStep
+    case 105: // mMaxDraftTokensPerStep
         if (optarg)
         {
             eagleBuildParams.mMaxDraftTokensPerStep = std::stoi(optarg);
+        }
+        break;
+    default: return false;
+    }
+    return true;
+}
+
+bool parseVLMBuildOptions(VLMBuildParams& vlmBuildParams, int opt, char const* optarg)
+{
+    switch (opt)
+    {
+    case 301:
+        if (optarg)
+        {
+            vlmBuildParams.modelType = optarg;
+        }
+        break;
+    case 302:
+        if (optarg)
+        {
+            vlmBuildParams.imageTokens = std::stoll(optarg);
+        }
+        break;
+    case 303:
+        if (optarg)
+        {
+            vlmBuildParams.minImageTokens = std::stoll(optarg);
+        }
+        break;
+    case 304:
+        if (optarg)
+        {
+            vlmBuildParams.maxImageTokens = std::stoll(optarg);
+        }
+        break;
+    case 305: vlmBuildParams.usePromptTuning = true; break;
+    default: return false;
+    }
+    return true;
+}
+
+bool parseVLMRunOptions(VLMRunParams& vlmRunParams, int opt, char const* optarg)
+{
+    switch (opt)
+    {
+    case 401:
+        if (optarg)
+        {
+            vlmRunParams.visualEnginePath = optarg;
+        }
+        else
+        {
+            std::cerr << "ERROR: --visualEnginePath requires option argument" << std::endl;
+            return false;
+        }
+        break;
+    case 402:
+        if (optarg)
+        {
+            vlmRunParams.modelType = optarg;
         }
         break;
     default: return false;
@@ -184,5 +252,20 @@ void printEagleBuildOptions()
         << "  --maxDecodingTokens   Provide the maximum decoding tokens for target model, the number provided must "
            "be aligned with running phase. Optional, default = 60"
         << std::endl;
+}
+
+void printVLMBuildOptions()
+{
+    std::cerr << "  --modelType         Model type for VLM build. Default = qwen2_vl." << std::endl;
+    std::cerr << "  --imageTokens       Number of image tokens. Default = 512." << std::endl;
+    std::cerr << "  --minImageTokens    Minimum number of image tokens. Default = 4." << std::endl;
+    std::cerr << "  --maxImageTokens    Maximum number of image tokens. Default = 1024." << std::endl;
+    std::cerr << "  --usePromptTuning  Enable prompt tuning for VLM build. Default = false." << std::endl;
+}
+
+void printVLMRunOptions()
+{
+    std::cerr << "  --visualEnginePath  Provide the visual TensorRT engine file path. Required." << std::endl;
+    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl." << std::endl;
 }
 } // namespace CommonUsage
