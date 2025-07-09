@@ -74,6 +74,7 @@ public:
     void getLastHostLogits(std::vector<T>& hostLogits);
     int64_t getModelBatchSize() const noexcept;
     int64_t getMaxContextLength() const noexcept;
+    void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
 
     ~Eagle()
     {

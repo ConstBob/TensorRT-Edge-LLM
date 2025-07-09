@@ -12,8 +12,10 @@
 
 #include "common/common.h"
 #include "decoder/decoder.h"
-#include "qwen2vl/vit_runner.h"
+#include "engine/llm_engine.h"
 #include "internvl3/vit_runner.h"
+#include "llm_param.h"
+#include "qwen2vl/vit_runner.h"
 #include "tokenizer/tokenizer.h"
 #include <cuda_profiler_api.h>
 #include <dlfcn.h>
@@ -22,159 +24,121 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
-struct RuntimeArgs
+struct VlmBenchmarkArgs
 {
-    bool help{false};
-    std::string llmEnginePath;
-    std::string visualEnginePath;
-    int batchSize{1};
+    BaseParams baseParams;
+    VLMRunParams vlmRunParams;
+    LoraWeights loraWeights;
     int textTokenLength{0};
     int imageTokenLength{0};
     int outputLength{0};
-    std::string modelType{"qwen2_vl"};
     int numRuns{10};
     int warmUp{2};
-    bool noCudaGraph{false};
-    bool debug{false};
-    std::pair<std::string, std::string> loraWeights; // name:path format
+    int batchSize{1};
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] [-e or --llmEnginePath=<path to LLM engine>] [-v or --visualEnginePath=<path to visual engine>]"
-                 " <--imageTokenLength int> <--textTokenLength int> <--outputLength int> [--warmUp int] [--numRuns int]"
+              << " [--help] [--enginePath=<path to LLM engine>] [--visualEnginePath=<path to visual engine>]"
+                 " <--imageTokenLength int> <--textTokenLength int> <--outputLength int> [--warmUp int] [--numRuns "
+                 "int] [--batchSize int]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  -h                  Display this help message" << std::endl;
-    std::cerr << "  --llmEnginePath     Provide the Qwen TensorRT engine file path. Required. " << std::endl;
-    std::cerr << "  --visualEnginePath  Provide the visual TensorRT engine file path. Required. " << std::endl;
-    std::cerr << "  --batchSize         Provide the batch size to benchmark. Default is 1. " << std::endl;
     std::cerr << "  --textTokenLength   Provide the number of text tokens to the runtime. Required. " << std::endl;
     std::cerr << "  --imageTokenLength  Provide the number of image tokens to the runtime. Required. " << std::endl;
     std::cerr << "  --outputLength      Provide the output token length for the generation session (NOT including the "
                  "input). Required."
               << std::endl;
-    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl." << std::endl;
     std::cerr << "  --warmUp            Provide warm up iterations before benchmark starts. Default = 2." << std::endl;
     std::cerr << "  --numRuns           Minimal number of iterations to run during benchmarking. Default = 10."
               << std::endl;
-    std::cerr << "  --noCudaGraph       Cuda graph is default enabled. Use this flag to disable cuda graph."
-              << std::endl;
-    std::cerr << "  --debug             Use debug mode, which outputs tensors." << std::endl;
-    std::cerr << "  --loraWeights       Provide the LoRA weights in format name:path" << std::endl;
+    std::cerr << "  --batchSize         Provide the batch size for benchmarking. Default = 1." << std::endl;
+    CommonUsage::printBaseOptions();
+    CommonUsage::printVLMRunOptions();
+    CommonUsage::printLoraOptions();
 };
 
-bool parseRuntimeArgs(RuntimeArgs& args, int argc, char* argv[])
+bool parseVlmBenchmarkArgs(VlmBenchmarkArgs& args, int argc, char* argv[])
 {
-    static struct option long_options[] = {{"help", no_argument, 0, 'h'}, {"llmEnginePath", required_argument, 0, 'e'},
-        {"visualEnginePath", required_argument, 0, 'v'}, {"textTokenLength", required_argument, 0, 't'},
-        {"imageTokenLength", required_argument, 0, 'i'}, {"outputLength", required_argument, 0, 'o'},
-        {"modelType", required_argument, 0, 0}, {"warmUp", required_argument, 0, 'w'},
-        {"batchSize", required_argument, 0, 'b'}, {"numRuns", required_argument, 0, 'r'},
-        {"noCudaGraph", no_argument, 0, 'g'}, {"debug", no_argument, 0, 'd'}, {"loraWeights", required_argument, 0, 0},
-        {0, 0, 0, 0}};
+    static struct option benchmarkOptions[] = {{"textTokenLength", required_argument, 0, 1201},
+        {"imageTokenLength", required_argument, 0, 1202}, {"outputLength", required_argument, 0, 1203},
+        {"warmUp", required_argument, 0, 1204}, {"numRuns", required_argument, 0, 1205},
+        {"loraWeights", required_argument, 0, 1206}, {"batchSize", required_argument, 0, 1207}, {0, 0, 0, 0}};
+
+    struct option long_options[64];
+    int idx = 0;
+    for (int i = 0; CommonOptions::baseOptions[i].name != 0; ++i)
+        long_options[idx++] = CommonOptions::baseOptions[i];
+    for (int i = 0; CommonOptions::vlmRunOptions[i].name != 0; ++i)
+        long_options[idx++] = CommonOptions::vlmRunOptions[i];
+    for (int i = 0; benchmarkOptions[i].name != 0; ++i)
+        long_options[idx++] = benchmarkOptions[i];
+    long_options[idx] = {0, 0, 0, 0};
 
     int opt;
-
-    // Loop to process each option
-    int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "he:v:t:i:o:w:r:d", long_options, &option_index)) != -1)
+    while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
+        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, false))
+        {
+            continue;
+        }
+
+        if (CommonOptions::parseVLMRunOptions(args.vlmRunParams, opt, optarg))
+        {
+            continue;
+        }
+
         switch (opt)
         {
-        case 'h': args.help = true; return true;
-        case 'e':
-            if (optarg)
-            {
-                args.llmEnginePath = optarg;
-            }
-            else
-            {
-                std::cerr << "ERROR: --llmEnginePath requires option argument" << std::endl;
-                return false;
-            }
-            break;
-        case 'v':
-            if (optarg)
-            {
-                args.visualEnginePath = optarg;
-            }
-            else
-            {
-                std::cerr << "ERROR: --visualEnginePath requires option argument" << std::endl;
-                return false;
-            }
-            break;
-        case 'b':
-            if (optarg)
-            {
-                args.batchSize = std::stoi(optarg);
-            }
-            break;
-        case 'o':
-            if (optarg)
-            {
-                args.outputLength = std::stoi(optarg);
-            }
-            break;
-        case 't':
+        case 1201:
             if (optarg)
             {
                 args.textTokenLength = std::stoi(optarg);
             }
             break;
-        case 'i':
+        case 1202:
             if (optarg)
             {
                 args.imageTokenLength = std::stoi(optarg);
             }
             break;
-        case 'w':
+        case 1203:
+            if (optarg)
+            {
+                args.outputLength = std::stoi(optarg);
+            }
+            break;
+        case 1204:
             if (optarg)
             {
                 args.warmUp = std::stoi(optarg);
             }
             break;
-        case 'r':
+        case 1205:
             if (optarg)
             {
                 args.numRuns = std::stoi(optarg);
             }
             break;
-        case 'g': args.noCudaGraph = true; break;
-        case 'd': args.debug = true; break;
-        case 0:
-            if (strcmp(long_options[option_index].name, "modelType") == 0)
+        case 1206:
+            if (optarg)
             {
-                if (optarg)
+                if (LoraWeights::validateFormat(optarg))
                 {
-                    args.modelType = optarg;
+                    auto loraPair = LoraWeights::parse(optarg);
+                    args.loraWeights.add(loraPair.first, loraPair.second);
                 }
                 else
                 {
-                    std::cerr << "ERROR: model type requires option argument" << std::endl;
                     return false;
                 }
             }
-            else if (strcmp(long_options[option_index].name, "loraWeights") == 0)
+            break;
+        case 1207:
+            if (optarg)
             {
-                if (optarg)
-                {
-                    std::string loraArg = optarg;
-                    size_t colonPos = loraArg.find(':');
-                    if (colonPos == std::string::npos)
-                    {
-                        std::cerr << "ERROR: --loraWeights must be in format name:path" << std::endl;
-                        return false;
-                    }
-                    args.loraWeights = std::make_pair(loraArg.substr(0, colonPos), loraArg.substr(colonPos + 1));
-                }
-                else
-                {
-                    std::cerr << "ERROR: --loraWeights requires option argument" << std::endl;
-                    return false;
-                }
+                args.batchSize = std::stoi(optarg);
             }
             break;
         default: return false;
@@ -249,7 +213,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
     int const imageTokenLength, std::vector<std::vector<int64_t>>& outputIds,
     std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph,
-    std::string const& modelType, std::pair<std::string, std::string> const& loraWeights)
+    std::string const& modelType, LoraWeights const& loraWeights)
 {
     // Setup
     cudaStream_t stream;
@@ -267,16 +231,17 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     // Load and switch to LoRA weights if provided
-    if (!loraWeights.first.empty() && !loraWeights.second.empty())
+    if (loraWeights.hasWeights())
     {
-        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        auto loraPair = loraWeights.getFirst();
+        if (!decoder->addLora(loraPair.first, loraPair.second))
         {
-            LOG_ERROR("Failed to load LoRA weights: %s", loraWeights.second.c_str());
+            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraPair.first.c_str(), loraPair.second.c_str());
             return 0;
         }
-        if (!decoder->switchLora(loraWeights.first))
+        if (!decoder->switchLora(loraPair.first))
         {
-            LOG_ERROR("Failed to switch to LoRA weights: %s", loraWeights.first.c_str());
+            LOG_ERROR("Failed to switch to LoRA: %s", loraPair.first.c_str());
             return 0;
         }
     }
@@ -359,7 +324,7 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
     GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
     int const imageTokenLength, std::vector<std::vector<int64_t>>& outputIds,
     std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph,
-    std::string const& modelType, std::pair<std::string, std::string> const& loraWeights)
+    std::string const& modelType, LoraWeights const& loraWeights)
 {
     // Setup
     cudaStream_t stream;
@@ -376,16 +341,17 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
     decoder->setup(llmEnginePath, stream, useCudaGraph, batchSize);
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
     // Load and switch to LoRA weights if provided
-    if (!loraWeights.first.empty() && !loraWeights.second.empty())
+    if (loraWeights.hasWeights())
     {
-        if (!decoder->addLora(loraWeights.first, loraWeights.second))
+        auto loraPair = loraWeights.getFirst();
+        if (!decoder->addLora(loraPair.first, loraPair.second))
         {
-            LOG_ERROR("Failed to load LoRA weights: %s", loraWeights.second.c_str());
+            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraPair.first.c_str(), loraPair.second.c_str());
             return 0;
         }
-        if (!decoder->switchLora(loraWeights.first))
+        if (!decoder->switchLora(loraPair.first))
         {
-            LOG_ERROR("Failed to switch to LoRA weights: %s", loraWeights.first.c_str());
+            LOG_ERROR("Failed to switch to LoRA: %s", loraPair.first.c_str());
             return 0;
         }
     }
@@ -398,8 +364,8 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
     std::vector<int64_t> inputIds(batchSize * decoder->getMaxContextLength(), -1);
     std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
 
-    vitrunner->initRandomInputs(visualInput, inputIds, textTokenLength, imageTokenLength,
-        decoder->getMaxContextLength());
+    vitrunner->initRandomInputs(
+        visualInput, inputIds, textTokenLength, imageTokenLength, decoder->getMaxContextLength());
     for (int i = 0; i < warmUp; i++)
     {
         // Warmup for profiler
@@ -440,58 +406,56 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
     return deviceMemorySize;
 }
 
-void benchmarkVLM(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
-    int const batchSize, int const textTokenLength, int const imageTokenLength, int const outputLength,
-    std::string const& modelType, int const warmUp, int const numRuns, bool useCudaGraph,
-    std::pair<std::string, std::string> const& loraWeights)
+void benchmarkVLM(VlmBenchmarkArgs const& args)
 {
-    int totalSeqLength = textTokenLength + imageTokenLength + outputLength;
+    int totalSeqLength = args.textTokenLength + args.imageTokenLength + args.outputLength;
     GenerationConfig generationConfig{totalSeqLength, totalSeqLength, 1, 0};
 
-    std::vector<std::vector<int64_t>> outputIds(batchSize);
-    for (int i = 0; i < batchSize; ++i)
+    std::vector<std::vector<int64_t>> outputIds(args.batchSize);
+    for (int i = 0; i < args.batchSize; ++i)
     {
-        outputIds[i].reserve(outputLength);
+        outputIds[i].reserve(args.outputLength);
     }
 
     auto profiler = std::make_shared<BenchmarkProfiler>();
     size_t deviceMemorySize;
 
-    if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
+    if (args.vlmRunParams.modelType == "qwen2_vl" || args.vlmRunParams.modelType == "qwen2_5_vl")
     {
-        deviceMemorySize
-            = benchmarkQwen2VL(llmEnginePath, visualEnginePath, generationConfig, batchSize, textTokenLength,
-                imageTokenLength, outputIds, profiler, warmUp, numRuns, useCudaGraph, modelType, loraWeights);
+        deviceMemorySize = benchmarkQwen2VL(args.baseParams.enginePath, args.vlmRunParams.visualEnginePath,
+            generationConfig, args.batchSize, args.textTokenLength, args.imageTokenLength, outputIds, profiler,
+            args.warmUp, args.numRuns, !args.baseParams.noCudaGraph, args.vlmRunParams.modelType, args.loraWeights);
     }
-    else if (modelType == "internvl3")
+    else if (args.vlmRunParams.modelType == "internvl3")
     {
-        deviceMemorySize
-            = benchmarkInternVL3(llmEnginePath, visualEnginePath, generationConfig, batchSize, textTokenLength,
-                imageTokenLength, outputIds, profiler, warmUp, numRuns, useCudaGraph, modelType, loraWeights);
+        deviceMemorySize = benchmarkInternVL3(args.baseParams.enginePath, args.vlmRunParams.visualEnginePath,
+            generationConfig, args.batchSize, args.textTokenLength, args.imageTokenLength, outputIds, profiler,
+            args.warmUp, args.numRuns, !args.baseParams.noCudaGraph, args.vlmRunParams.modelType, args.loraWeights);
     }
     else
     {
         throw std::runtime_error("Only support Qwen2-VL and InternVL3 models for Multimodal models.");
     }
 
-    printBenchmarkResult(profiler, batchSize, textTokenLength, imageTokenLength, outputLength, deviceMemorySize);
+    printBenchmarkResult(
+        profiler, args.batchSize, args.textTokenLength, args.imageTokenLength, args.outputLength, deviceMemorySize);
 }
 
 int main(int argc, char* argv[])
 {
-    RuntimeArgs args;
-    if ((argc < 2) || (!parseRuntimeArgs(args, argc, argv)))
+    VlmBenchmarkArgs args;
+    if ((argc < 2) || (!parseVlmBenchmarkArgs(args, argc, argv)))
     {
         printUsage(argv[0]);
         return EXIT_FAILURE;
     }
-    if (args.help)
+    if (args.baseParams.help)
     {
         printUsage(argv[0]);
         return EXIT_SUCCESS;
     }
 
-    if (args.debug)
+    if (args.baseParams.debug)
     {
         gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
     }
@@ -507,8 +471,7 @@ int main(int argc, char* argv[])
         LOG_ERROR("Please specify --textTokenLength, --imageTokenLength and --outputLength for benchmark.");
         return EXIT_FAILURE;
     }
-    benchmarkVLM(args.llmEnginePath, args.visualEnginePath, args.batchSize, args.textTokenLength, args.imageTokenLength,
-        args.outputLength, args.modelType, args.warmUp, args.numRuns, !args.noCudaGraph, args.loraWeights);
+    benchmarkVLM(args);
 
     return EXIT_SUCCESS;
 };

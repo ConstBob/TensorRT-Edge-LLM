@@ -43,7 +43,7 @@ struct LLMBenchmarkArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [-h] <--enginePath str> <--inputLength int> <--maxLength int> [--warmUp int] [--numRuns int]"
+              << " [--help] <--enginePath str> <--inputLength int> <--maxLength int> [--warmUp int] [--numRuns int]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     CommonUsage::printBaseOptions();
@@ -195,9 +195,9 @@ float calculateAverage(std::vector<T> const& vec)
 
 bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
 {
-    static struct option benchmarkOptions[] = {{"inputLength", required_argument, 0, 'c'},
-        {"maxLength", required_argument, 0, 's'}, {"warmUp", required_argument, 0, 'w'},
-        {"numRuns", required_argument, 0, 'r'}, {"loraWeights", required_argument, 0, 'o'}, {0, 0, 0, 0}};
+    static struct option benchmarkOptions[] = {{"inputLength", required_argument, 0, 1001},
+        {"maxLength", required_argument, 0, 1002}, {"warmUp", required_argument, 0, 1003},
+        {"numRuns", required_argument, 0, 1004}, {"loraWeights", required_argument, 0, 1005}, {0, 0, 0, 0}};
 
     struct option long_options[64];
     int idx = 0;
@@ -210,7 +210,7 @@ bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
     long_options[idx] = {0, 0, 0, 0};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "s:c:w:r:o:e:t:hdga:m:k:p:E:", long_options, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
         if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg))
         {
@@ -223,31 +223,31 @@ bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
         }
         switch (opt)
         {
-        case 's':
-            if (optarg)
-            {
-                args.maxLength = std::stoi(optarg);
-            }
-            break;
-        case 'c':
+        case 1001:
             if (optarg)
             {
                 args.inputLength = std::stoi(optarg);
             }
             break;
-        case 'w':
+        case 1002:
+            if (optarg)
+            {
+                args.maxLength = std::stoi(optarg);
+            }
+            break;
+        case 1003:
             if (optarg)
             {
                 args.warmUp = std::stoi(optarg);
             }
             break;
-        case 'r':
+        case 1004:
             if (optarg)
             {
                 args.numRuns = std::stoi(optarg);
             }
             break;
-        case 'o':
+        case 1005:
             if (optarg)
             {
                 if (LoraWeights::validateFormat(optarg))

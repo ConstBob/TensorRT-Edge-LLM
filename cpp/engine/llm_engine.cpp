@@ -103,6 +103,21 @@ int64_t LLMEngine<T>::getDeviceMemorySize()
 }
 
 template <typename T>
+void LLMEngine<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
+{
+    if (isEagleModel())
+    {
+        auto& eagle = getEagle();
+        eagle->setupExtraInputs(extraInputs);
+    }
+    else
+    {
+        auto& decoder = getDecoder();
+        decoder->setupExtraInputs(extraInputs);
+    }
+}
+
+template <typename T>
 void LLMEngine<T>::getLastHostLogits(std::vector<T>& hostLogits)
 {
     if (isEagleModel())
@@ -145,9 +160,14 @@ void LLMEngine<T>::generate(std::vector<int64_t> const& inputIds, std::vector<in
     else
     {
         auto& decoder = getDecoder();
+        int64_t eosId = -1;
+        if (tokenizer)
+        {
+            eosId = tokenizer->getEosId();
+        }
         if (autoDecode && tokenizer)
         {
-            decoder->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId());
+            decoder->generate(inputIds, contextLengths, outputIds, generationConfig, eosId);
             for (int i = 0; i < mBatchSize; ++i)
             {
                 std::cout << "Output for batch " << i << ": " << tokenizer->decode(outputIds[i]) << std::endl;
@@ -155,7 +175,7 @@ void LLMEngine<T>::generate(std::vector<int64_t> const& inputIds, std::vector<in
         }
         else
         {
-            decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler);
+            decoder->generate(inputIds, contextLengths, outputIds, generationConfig, eosId, profiler);
         }
     }
 }

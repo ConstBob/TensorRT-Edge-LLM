@@ -45,10 +45,12 @@ if __name__ == "__main__":
                         type=str,
                         required=True,
                         help="The path to output onnx file.")
-    parser.add_argument("-kv","--kv_cache_capacity",
+    parser.add_argument("-kv",
+                        "--kv_cache_capacity",
                         type=int,
                         default=8192,
                         help="The kv cache capacity for the attention plugin.")
     args = parser.parse_args()
 
-    modify_onnx_model(args.input_path, args.output_path, args.kv_cache_capacity)
+    modify_onnx_model(args.input_path, args.output_path,
+                      args.kv_cache_capacity)

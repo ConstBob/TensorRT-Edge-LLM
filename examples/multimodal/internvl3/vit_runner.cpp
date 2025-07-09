@@ -92,8 +92,8 @@ int InternVLViTRunner::setInputShape()
 }
 
 void InternVLViTRunner::preprocessImage(unsigned char* image, unsigned char* thumbnailImage, int const& width,
-    int const& height, int const& channels, std::vector<half>& patches, int64_t& totalSeqLength, 
-    bool useThumbnail, std::vector<int64_t>& imageTokenLengths)
+    int const& height, int const& channels, std::vector<half>& patches, int64_t& totalSeqLength, bool useThumbnail,
+    std::vector<int64_t>& imageTokenLengths)
 {
     int64_t curSeqLength = (height / mConfig.patchSize) * (width / mConfig.patchSize);
     int curSize = height * width * channels;
@@ -103,7 +103,7 @@ void InternVLViTRunner::preprocessImage(unsigned char* image, unsigned char* thu
         curSeqLength += 1024; // 448x448x3 size of thumbnail image has (448/patchSize)^2 = 1024 where patchSize=14
     }
 
-    imageTokenLengths.push_back(curSeqLength/4); // Image token length here is seq/4 because of the downsampling
+    imageTokenLengths.push_back(curSeqLength / 4); // Image token length here is seq/4 because of the downsampling
     totalSeqLength += curSeqLength;
 
     std::vector<half> curPatch(curSize);
@@ -127,10 +127,8 @@ void InternVLViTRunner::preprocessImage(unsigned char* image, unsigned char* thu
 
                                 // src dimensions: (H, W, C) => (gridH, blockSize, patchSize, gridW, blockSize,
                                 // patchSize, C)
-                                int originalH = gridH * mConfig.blockImageSize
-                                    + mergeH * mConfig.patchSize + patchH;
-                                int originalW = gridW * mConfig.blockImageSize
-                                    + mergeW * mConfig.patchSize + patchW;
+                                int originalH = gridH * mConfig.blockImageSize + mergeH * mConfig.patchSize + patchH;
+                                int originalW = gridW * mConfig.blockImageSize + mergeW * mConfig.patchSize + patchW;
 
                                 unsigned char value = image[originalH * width * channels + originalW * channels + c];
                                 half normalized
@@ -138,13 +136,9 @@ void InternVLViTRunner::preprocessImage(unsigned char* image, unsigned char* thu
 
                                 // dst dimensions: (gridH, gridW, channels) x (blockSize/patchSize, blockSize/patchSize,
                                 // patchSize, patchSize)
-                                int dstHW = gridH * (width/mConfig.blockImageSize) * channels
-                                    + gridW * channels
-                                    + c;
-                                int dstDim = mergeH * mConfig.blockImageSize * mConfig.patchSize 
-                                    + patchH * mConfig.blockImageSize
-                                    + mergeW * mConfig.patchSize
-                                    + patchW;
+                                int dstHW = gridH * (width / mConfig.blockImageSize) * channels + gridW * channels + c;
+                                int dstDim = mergeH * mConfig.blockImageSize * mConfig.patchSize
+                                    + patchH * mConfig.blockImageSize + mergeW * mConfig.patchSize + patchW;
                                 curPatch[dstHW * mConfig.blockImageSize * mConfig.blockImageSize + dstDim] = normalized;
                             }
                         }
@@ -168,18 +162,18 @@ void InternVLViTRunner::preprocessImage(unsigned char* image, unsigned char* thu
                         {
                             int originalH = mergeH * mConfig.patchSize + patchH;
                             int originalW = mergeW * mConfig.patchSize + patchW;
-                            unsigned char value = thumbnailImage[originalH * mConfig.blockImageSize * channels + originalW * channels + c];
+                            unsigned char value = thumbnailImage[originalH * mConfig.blockImageSize * channels
+                                + originalW * channels + c];
                             half normalized
                                 = __double2half((value / 255.0 - mConfig.imageMean[c]) / mConfig.imageStd[c]);
 
                             // dst dimensions: (1, channels) x (blockSize/patchSize, blockSize/patchSize,
                             // patchSize, patchSize)
                             int dstHW = c;
-                            int dstDim = mergeH * mConfig.blockImageSize * mConfig.patchSize 
-                                + patchH * mConfig.blockImageSize
-                                + mergeW * mConfig.patchSize
-                                + patchW;
-                            thumbnailPatch[dstHW * mConfig.blockImageSize * mConfig.blockImageSize + dstDim] = normalized;
+                            int dstDim = mergeH * mConfig.blockImageSize * mConfig.patchSize
+                                + patchH * mConfig.blockImageSize + mergeW * mConfig.patchSize + patchW;
+                            thumbnailPatch[dstHW * mConfig.blockImageSize * mConfig.blockImageSize + dstDim]
+                                = normalized;
                         }
                     }
                 }
@@ -197,17 +191,17 @@ std::tuple<int, int> InternVLViTRunner::adjustImageSize(
     int const height, int const width, std::vector<std::pair<int, int>> const& targetRatios)
 {
     int64_t imageSize = mConfig.blockImageSize;
-    
+
     double aspect_ratio = static_cast<double>(width) / height;
     double best_ratio_diff = HUGE_VAL;
     std::pair<int, int> best_ratio = {1, 1};
     int area = width * height;
-    
-    for (const auto& ratio : targetRatios)
+
+    for (auto const& ratio : targetRatios)
     {
         double target_aspect_ratio = static_cast<double>(ratio.first) / ratio.second;
         double ratio_diff = std::abs(aspect_ratio - target_aspect_ratio);
-        
+
         if (ratio_diff < best_ratio_diff)
         {
             best_ratio_diff = ratio_diff;
@@ -226,15 +220,13 @@ std::tuple<int, int> InternVLViTRunner::adjustImageSize(
 }
 
 void InternVLViTRunner::visualPreprocess(std::vector<unsigned char*> const& imageBuffers,
-    std::vector<unsigned char*> const& thumbnailImageBuffers,
-    std::vector<std::vector<int>> const& imageSizes, std::vector<half>& patches,
-    std::vector<int64_t>& imageTokenLengths, bool useThumbnail)
+    std::vector<unsigned char*> const& thumbnailImageBuffers, std::vector<std::vector<int>> const& imageSizes,
+    std::vector<half>& patches, std::vector<int64_t>& imageTokenLengths, bool useThumbnail)
 {
     int64_t totalSeqLength = 0;
     for (size_t i = 0; i < imageBuffers.size(); ++i)
     {
-        preprocessImage(
-            imageBuffers[i], thumbnailImageBuffers[i], imageSizes[i][0], imageSizes[i][1], imageSizes[i][2],
+        preprocessImage(imageBuffers[i], thumbnailImageBuffers[i], imageSizes[i][0], imageSizes[i][1], imageSizes[i][2],
             patches, totalSeqLength, useThumbnail, imageTokenLengths);
     }
 
@@ -252,7 +244,10 @@ std::string InternVLViTRunner::applyChatTemplate(std::string const& inputString,
     std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt)
 {
     // System prefix
-    std::string prompt = "<|im_start|>system\n你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。<|im_end|>\n<|im_start|>user\n";
+    std::string prompt
+        = "<|im_start|>"
+          "system\n你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语"
+          "言模型。<|im_end|>\n<|im_start|>user\n";
 
     // Images
     for (int i = 0; i < numImages; ++i)
@@ -322,7 +317,7 @@ std::vector<EngineInputDesc> InternVLViTRunner::getExtraLLMInputs()
     std::vector<EngineInputDesc> extraInputs;
 
     extraInputs.emplace_back(EngineInputDesc{"image_embeds", mDeviceBuffer["output"], mDeviceBuffer["output"],
-        {2, {mConfig.maxHW/4, mConfig.hiddenDim}}, {2, {1, mConfig.hiddenDim}}});
+        {2, {mConfig.maxHW / 4, mConfig.hiddenDim}}, {2, {1, mConfig.hiddenDim}}});
 
     return extraInputs;
 }
@@ -343,8 +338,8 @@ void InternVLViTRunner::internVLViTInfer(std::vector<half> const& input)
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 }
 
-void InternVLViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vector<int64_t>& inputIds, int const textTokenLength,
-    int const imageTokenLength, int const maxContextLength)
+void InternVLViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vector<int64_t>& inputIds,
+    int const textTokenLength, int const imageTokenLength, int const maxContextLength)
 {
     std::random_device dev;
     std::mt19937 rng(dev());

@@ -63,9 +63,9 @@ public:
      */
     bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int llmBatchSize);
 
-    void visualPreprocess(std::vector<unsigned char*> const& imageBuffers, std::vector<unsigned char*> const& thumbnailImageBuffers,
-        std::vector<std::vector<int>> const& imageSizes, std::vector<half>& patches,
-        std::vector<int64_t>& imageTokenLengths, bool useThumbnail);
+    void visualPreprocess(std::vector<unsigned char*> const& imageBuffers,
+        std::vector<unsigned char*> const& thumbnailImageBuffers, std::vector<std::vector<int>> const& imageSizes,
+        std::vector<half>& patches, std::vector<int64_t>& imageTokenLengths, bool useThumbnail);
 
     void textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
         std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
@@ -75,12 +75,13 @@ public:
 
     std::vector<EngineInputDesc> getExtraLLMInputs();
 
-    void initRandomInputs(std::vector<half>& visualInput, std::vector<int64_t>& inputIds,
-        int const textTokenLength, int const imageTokenLength, int const maxContextLength);
+    void initRandomInputs(std::vector<half>& visualInput, std::vector<int64_t>& inputIds, int const textTokenLength,
+        int const imageTokenLength, int const maxContextLength);
 
     void allocateBuffer();
 
-    std::tuple<int, int> adjustImageSize(int const height, int const width, std::vector<std::pair<int, int>> const& targetRatios);
+    std::tuple<int, int> adjustImageSize(
+        int const height, int const width, std::vector<std::pair<int, int>> const& targetRatios);
 
     ~InternVLViTRunner()
     {
@@ -111,6 +112,7 @@ private:
     std::string applyChatTemplate(std::string const& inputString, int const& numImages,
         std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true);
 
-    void preprocessImage(unsigned char* image, unsigned char* thumbnailImage, int const& width, int const& height, int const& channels,
-        std::vector<half>& patches, int64_t& totalSeqLength, bool useThumbnail, std::vector<int64_t>& imageTokenLengths);
-}; 
+    void preprocessImage(unsigned char* image, unsigned char* thumbnailImage, int const& width, int const& height,
+        int const& channels, std::vector<half>& patches, int64_t& totalSeqLength, bool useThumbnail,
+        std::vector<int64_t>& imageTokenLengths);
+};

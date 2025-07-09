@@ -76,8 +76,10 @@ class Eagle3(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
     ):
-
-        with torch.no_grad():
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds")
+        if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)

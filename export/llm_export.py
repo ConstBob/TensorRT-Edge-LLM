@@ -13,16 +13,14 @@ import os
 import shutil
 import time
 
-import numpy as np
 import onnx
 import onnx_graphsurgeon as gs
 import torch
 from packaging.version import Version
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from utils.export_utils import (WrapperEagleBaseModelForCausalLM,
+from utils.export_utils import (ModelLoader, WrapperEagleBaseModelForCausalLM,
                                 WrapperEagleDraftModelForCausalLM,
-                                WrapperModelForCausalLM, llm_to_onnx,
-                                load_model_with_lora)
+                                WrapperModelForCausalLM, llm_to_onnx)
 from utils.lora import insert_dynamic_lora, insert_static_lora
 from utils.surgeon_utils import (RopeType, insert_attention_plugin,
                                  insert_gather_last_token,
@@ -126,6 +124,12 @@ def llm_arguments():
         default=False,
         required=False,
     )
+    parser.add_argument(
+        '--use_prompt_tuning',
+        type=bool,
+        default=False,
+        required=False,
+    )
     return parser
 
 
@@ -170,7 +174,8 @@ def export_raw_llm(model,
                    wrapper_cls=WrapperModelForCausalLM,
                    extra_inputs={},
                    extra_dyn_axes={},
-                   eagle3=False):
+                   eagle3=False,
+                   use_prompt_tuning=False):
     """
     Export raw llm model to ONNX and perform quantization.
 
@@ -192,17 +197,12 @@ def export_raw_llm(model,
         else:
             print("Loading fp16 ONNX model...")
 
-        if wrapper_cls in (WrapperEagleDraftModelForCausalLM,
-                           WrapperEagleBaseModelForCausalLM):
-            llm_to_onnx(wrapper_cls(model, eagle3=eagle3),
-                        output_dir,
-                        extra_inputs=extra_inputs,
-                        extra_dyn_axes=extra_dyn_axes)
-        else:
-            llm_to_onnx(wrapper_cls(model),
-                        output_dir,
-                        extra_inputs=extra_inputs,
-                        extra_dyn_axes=extra_dyn_axes)
+        llm_to_onnx(wrapper_cls(model,
+                                eagle3=eagle3,
+                                use_prompt_tuning=use_prompt_tuning),
+                    output_dir,
+                    extra_inputs=extra_inputs,
+                    extra_dyn_axes=extra_dyn_axes)
         shutil.copy(config_path, os.path.join(output_dir, "config.json"))
 
     # Need to quantize model to fp8, int4 or nvfp4
@@ -232,7 +232,9 @@ def export_raw_llm(model,
                 print(
                     f"Exporting {dtype} ONNX model from quantized PyTorch model..."
                 )
-                llm_to_onnx(wrapper_cls(model),
+                llm_to_onnx(wrapper_cls(model,
+                                        eagle3=eagle3,
+                                        use_prompt_tuning=use_prompt_tuning),
                             output_dir,
                             extra_inputs=extra_inputs,
                             extra_dyn_axes=extra_dyn_axes)
@@ -306,13 +308,15 @@ def surgeon_llm(raw_onnx_path,
 
     if mode == "plugin":
         if config['model_type'] == "internvl_chat":
-            graph = insert_attention_plugin(graph, config['llm_config'], rope_type,
-                                        max_seq_length, extra_plugin_inputs,
-                                        extra_plugin_attributes)
+            graph = insert_attention_plugin(graph, config['llm_config'],
+                                            rope_type, max_seq_length,
+                                            extra_plugin_inputs,
+                                            extra_plugin_attributes)
         else:
             graph = insert_attention_plugin(graph, config, rope_type,
-                                        max_seq_length, extra_plugin_inputs,
-                                        extra_plugin_attributes)
+                                            max_seq_length,
+                                            extra_plugin_inputs,
+                                            extra_plugin_attributes)
     if eagle_base:
         graph = insert_gather_last_token_eagle(graph, False)
     elif eagle_draft:
@@ -380,7 +384,8 @@ def surgeon_llm(raw_onnx_path,
         if config_path.endswith("config.json"):
             shutil.copy(config_path, os.path.join(output_dir, "config.json"))
         else:
-            shutil.copy(os.path.join(config_path, "config.json"), os.path.join(output_dir, "config.json"))
+            shutil.copy(os.path.join(config_path, "config.json"),
+                        os.path.join(output_dir, "config.json"))
 
     t3 = time.time()
     print(f"Surgeon LLM completed in {t3 - t2}s.")
@@ -433,84 +438,11 @@ def main(args):
     if args.onnx_path:
         raw_onnx_path = args.onnx_path
 
-    if args.eagle_draft:
-        assert args.eagle_torch_dir, "You need to provide --eagle_torch_dir when you want to export eagle draft"
-        from eagle.ea_model import EagleModel
-        onnx_dir = args.output_dir
-        model = EagleModel.from_pretrained(
-            base_model_path=args.torch_dir,
-            ea_model_path=args.eagle_torch_dir,
-            use_eagle3=args.eagle3,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            device_map="cpu",
-            local_files_only=True,
-        )
+    model_loader = ModelLoader(args.torch_dir, args.config_path,
+                               args.eagle_torch_dir, args.eagle_base,
+                               args.eagle_draft, args.eagle3)
 
-        draft_model = model.ea_layer
-        draft_model.to(torch.float16).to('cuda')
-        dummy_len_input_hidden = 10
-        dummy_bs = 1
-        if args.eagle3:
-            hidden_states_input = torch.randn(
-                (dummy_bs, dummy_len_input_hidden,
-                 model.config.hidden_size * 3),
-                dtype=torch.float16).cuda()
-            hidden_states_from_draft = torch.randn(
-                (dummy_bs, dummy_len_input_hidden, model.config.hidden_size),
-                dtype=torch.float16).cuda()
-
-            extra_inputs = {
-                "hidden_states_input": hidden_states_input,
-                "hidden_states_from_draft": hidden_states_from_draft
-            }
-            extra_dyn_axes = {
-                "hidden_states_input": {
-                    0: "batch_size",
-                    1: "seq_len",
-                },
-                "hidden_states_from_draft": {
-                    0: "batch_size",
-                    1: "seq_len",
-                }
-            }
-
-        else:
-            hidden_states_input = torch.randn(
-                (dummy_bs, dummy_len_input_hidden, model.config.hidden_size),
-                dtype=torch.float16).cuda()
-            hidden_states_from_draft = torch.randn(
-                (dummy_bs, dummy_len_input_hidden, model.config.hidden_size),
-                dtype=torch.float16).cuda()
-            extra_inputs = {
-                "hidden_states_input": hidden_states_input,
-                "hidden_states_from_draft": hidden_states_from_draft
-            }
-            extra_dyn_axes = {
-                "hidden_states_input": {
-                    0: "batch_size",
-                    1: "seq_len"
-                },
-                "hidden_states_from_draft": {
-                    0: "batch_size",
-                    1: "seq_len"
-                }
-            }
-
-        state_dict = export_raw_llm(
-            draft_model,
-            onnx_dir,
-            args.dtype,
-            args.config_path,
-            args.torch_dir,
-            args.lm_head,
-            args.dataset_dir,
-            wrapper_cls=WrapperEagleDraftModelForCausalLM,
-            extra_inputs=extra_inputs,
-            extra_dyn_axes=extra_dyn_axes,
-            eagle3=args.eagle3)
-        raw_onnx_path = f"{onnx_dir}/model.onnx"
-    elif args.torch_dir:
+    if args.torch_dir:
         # Exporting ONNX from PyTorch model
         torch_dir = args.torch_dir
         # This can be useful for loading modelopt saved model
@@ -528,85 +460,62 @@ def main(args):
                             state_dict[key] = f.get_tensor(key)
             raw_onnx_path = args.onnx_path
         else:
-            model = AutoModelForCausalLM.from_pretrained(
-                torch_dir, torch_dtype=torch.float16,
-                trust_remote_code=True).cuda()
-
-            # Handle LoRA weights if provided
-            if args.lora_mode == "static":
-                model, lora_config, lora_weights = load_model_with_lora(
-                    model, args.lora_dir, args.lora_mode)
-            elif args.lora_mode == "merged":
-                model = load_model_with_lora(model, args.lora_dir,
-                                             args.lora_mode)
-
+            model = model_loader.load_model()
             if args.save_original:
                 onnx_dir = args.output_dir + "_raw"
             else:
                 onnx_dir = args.output_dir
-
-            if args.eagle_base:
-                state_dict = export_raw_llm(
-                    model,
-                    onnx_dir,
-                    args.dtype,
-                    args.config_path,
-                    args.torch_dir,
-                    args.lm_head,
-                    args.dataset_dir,
-                    wrapper_cls=WrapperEagleBaseModelForCausalLM,
-                    eagle3=args.eagle3)
-            else:
-                state_dict = export_raw_llm(
-                    model,
-                    onnx_dir,
-                    args.dtype,
-                    args.config_path,
-                    args.torch_dir,
-                    args.lm_head,
-                    args.dataset_dir,
-                    wrapper_cls=WrapperModelForCausalLM)
-
             # Surgeon graph based on precision and mode
             raw_onnx_path = f"{onnx_dir}/model.onnx"
-
-    # Apply surgical operations
-    extra_plugin_attributes = {}
-    extra_plugin_inputs = []
-    if args.eagle_base or args.eagle_draft:
-        attention_mask = gs.Variable("attention_mask", np.int32,
-                                     ['batch_size', 'q_len', 'q_len_aligned'])
-        attention_pos_id = gs.Variable("attention_pos_id", np.int32,
-                                       ['batch_size', 'q_len'])
-        extra_plugin_inputs.append(attention_mask)
-        extra_plugin_inputs.append(attention_pos_id)
-        extra_plugin_attributes["enable_tree_attention"] = 1
-
-    surgeon_llm(raw_onnx_path,
-                args.output_dir,
+            # Handle LoRA weights if provided
+            if args.lora_mode == "static":
+                model, lora_config, lora_weights = model_loader.load_model_with_lora(
+                    model, args.lora_dir, args.lora_mode)
+            elif args.lora_mode == "merged":
+                model = model_loader.load_model_with_lora(
+                    model, args.lora_dir, args.lora_mode)
+            extra_inputs, extra_dyn_axes = model_loader.prepare_extra_inputs()
+            state_dict = export_raw_llm(
+                model if model_loader.model_type != "internvl_chat" else
+                model.language_model,
+                onnx_dir,
                 args.dtype,
-                args.mode,
                 args.config_path,
-                state_dict,
-                args.max_seq_length,
-                lm_head_precision=args.lm_head,
-                extra_plugin_inputs=extra_plugin_inputs,
-                extra_plugin_attributes=extra_plugin_attributes,
-                lora_mode=args.lora_mode,
-                lora_config=lora_config,
-                lora_weights=lora_weights,
-                eagle_base=args.eagle_base,
-                eagle_draft=args.eagle_draft,
-                eagle3=args.eagle3)
+                args.torch_dir,
+                args.lm_head,
+                args.dataset_dir,
+                wrapper_cls=model_loader.get_wrapper_cls(),
+                extra_inputs=extra_inputs,
+                extra_dyn_axes=extra_dyn_axes,
+                eagle3=args.eagle3,
+                use_prompt_tuning=args.use_prompt_tuning)
+
+    extra_plugin_inputs, extra_plugin_attributes = model_loader.add_extra_plugin_inputs(
+    )
+    # Providing the config path to config.json results in a hf validation error for internvl_chat.
+    surgeon_llm(
+        raw_onnx_path,
+        args.output_dir,
+        args.dtype,
+        args.mode,
+        args.config_path
+        if model_loader.model_type != "internvl_chat" else args.torch_dir,
+        state_dict,
+        args.max_seq_length,
+        rope_type=model_loader.get_rope_type(),
+        lm_head_precision=args.lm_head,
+        extra_plugin_inputs=extra_plugin_inputs,
+        extra_plugin_attributes=extra_plugin_attributes,
+        lora_mode=args.lora_mode,
+        lora_config=lora_config if args.lora_mode == "static" else None,
+        lora_weights=lora_weights if args.lora_mode == "static" else None,
+        eagle_base=args.eagle_base,
+        eagle_draft=args.eagle_draft,
+        eagle3=args.eagle3)
+
     if args.eagle3 and args.eagle_draft:
-        load_model_path = os.path.join(args.eagle_torch_dir,
-                                       "pytorch_model.bin")
-        ea_layer_state_dict = torch.load(load_model_path, weights_only=True)
-        # When the  draft vocab size is not equal to the base vocab size, we need to map the token id from draft to base using d2t.bin
-        d2t_tensor = ea_layer_state_dict['d2t']
-        d2t_path = os.path.join(onnx_dir, "d2t.bin")
-        with open(d2t_path, 'wb') as f:
-            f.write(d2t_tensor.numpy().astype(np.int64).tobytes())
+        model_loader.save_d2t_for_eagle3_draft(args.output_dir)
+
     end_time = time.time()
     print(
         f"LLM ONNX saved to {args.output_dir} with {args.dtype} precision in {end_time - start_time}s."

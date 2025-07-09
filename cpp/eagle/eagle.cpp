@@ -461,6 +461,13 @@ void Eagle<T>::setupExtraInputsForDraftModel(std::vector<int32_t> const& context
 }
 
 template <typename T>
+void Eagle<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
+{
+    mBaseModel->setupExtraInputs(extraInputs);
+    mDraftModel->setupExtraInputs(extraInputs);
+}
+
+template <typename T>
 size_t Eagle<T>::getDeviceMemorySize() const noexcept
 {
     return mBaseModel->getDeviceMemorySize() + mDraftModel->getDeviceMemorySize();
