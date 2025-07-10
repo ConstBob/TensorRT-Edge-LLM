@@ -9,7 +9,7 @@
 # prohibited.
 
 set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -Wfatal-errors -Wreturn-type -Wall -Wextra -Wno-unknown-pragmas -Wno-deprecated"
+    "${CMAKE_CXX_FLAGS} -Wfatal-errors -Wall -Wextra -Wno-unknown-pragmas -Wno-deprecated"
 )
 
 # Define additional CUDA flags for kernel compilation.
