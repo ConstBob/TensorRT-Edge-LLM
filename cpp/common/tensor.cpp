@@ -237,6 +237,7 @@ bool Tensor::reshape(Coords shape) noexcept
 
     mShape = shape;
     mStrides = computeStrides(shape);
+    return true;
 }
 
 } // namespace rt
