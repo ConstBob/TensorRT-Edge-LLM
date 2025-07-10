@@ -26,19 +26,15 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 from utils.surgeon_utils import RopeType
 
 
-class PromptTuningEmbedding(Embedding):
+class PromptTuningEmbedding(torch.nn.Module):
 
     def __init__(
         self,
-        num_embeddings: int,
-        embedding_dim: int,
-        weight: Tensor,
-        padding_idx: Optional[int] = None,
+        embedding: Embedding,
     ):
-        super().__init__(num_embeddings, embedding_dim, padding_idx)
-
-        self.vocab_size = num_embeddings
-        self.weight = weight
+        super().__init__()
+        self.embedding = embedding
+        self.vocab_size = embedding.num_embeddings
 
     def forward(self, input_ids, image_embeds):
         # Handles combination of text tokens with visual tokens
@@ -46,8 +42,7 @@ class PromptTuningEmbedding(Embedding):
 
         # clip tokens in the [0, vocab_size) range
         normal_tokens = torch.where(image_mask, self.vocab_size - 1, input_ids)
-        normal_embeddings = torch.nn.functional.embedding(
-            normal_tokens, self.weight.data)
+        normal_embeddings = self.embedding(normal_tokens)
 
         # put virtual tokens in the [0, max_visual_vocab_size) range
         visual_tokens = torch.where(image_mask, input_ids - self.vocab_size, 0)
@@ -79,10 +74,8 @@ class WrapperModelForCausalLM(torch.nn.Module):
         if self.use_prompt_tuning:
             for name, module in self.model.named_modules():
                 if isinstance(module, torch.nn.Embedding):
-                    padding_idx = getattr(module, 'padding_idx', None)
                     self.prompt_tuning_embedding = PromptTuningEmbedding(
-                        module.num_embeddings, module.embedding_dim,
-                        module.weight, padding_idx)
+                        module)
                     break
 
     def forward(self,
