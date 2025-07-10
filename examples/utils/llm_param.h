@@ -52,7 +52,7 @@ struct VLMBuildParams
     int64_t imageTokens{512};
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
-    bool usePromptTuning{true};
+    bool usePromptTuning{false};
 };
 
 struct VLMRunParams
