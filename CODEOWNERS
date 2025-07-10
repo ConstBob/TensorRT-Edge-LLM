@@ -1,3 +1,5 @@
-cpp/* @fans
-export/* @luxiaoz
-examples/* @luxiaoz @sgai @amberl
+# Folder ownership to enforce code review rule.
+
+/cpp/* @fans
+/export/* @luxiaoz
+/examples/* @luxiaoz @sgai @amberl
