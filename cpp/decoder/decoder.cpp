@@ -11,6 +11,7 @@
  */
 
 #include "decoder.h"
+#include "sampler/sampling.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
 #include <cassert>
@@ -207,8 +208,6 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
     int64_t vocabSize = logitsShape.d[1];
 
     mConfig = {batchSize, numHead, hiddenSizePerHead, maxInputLength, maxLength, numLayers, vocabSize};
-    mSampler = std::make_unique<Sampler<T>>(batchSize, vocabSize);
-
     return 0;
 }
 template <typename T>
@@ -253,10 +252,23 @@ void Decoder<T>::allocateCommonBuffers()
     mGenerationExecutionContext->setTensorAddress("context_lengths", contextLengthDevice);
     mGenerationExecutionContext->setInputShape("context_lengths", {1, {mConfig.batchSize}});
     mDeviceBuffer["context_lengths"] = contextLengthDevice;
+
+    // Allocate buffer for selected indices (used by sampling kernels)
+    void* selectedIndicesDevice;
+    CUDA_CHECK(cudaMalloc(&selectedIndicesDevice, mConfig.batchSize * sizeof(int64_t)));
+    mDeviceBuffer["selected_indices"] = selectedIndicesDevice;
+
     // Initialize dummy LoRA buffer
     void* dummyLoraBuffer;
     CUDA_CHECK(cudaMalloc(&dummyLoraBuffer, sizeof(T)));
     mDeviceBuffer["dummy_lora"] = dummyLoraBuffer;
+
+    void* samplingWorkspaceBuffer;
+    drivellm::SamplingParams samplingParams(mConfig.batchSize, mConfig.vocabSize, 1.0f, 1);
+    size_t workspaceSize
+        = drivellm::getTopKtopPSamplingWorkspaceSize<T>(mConfig.batchSize, mConfig.vocabSize, samplingParams);
+    CUDA_CHECK(cudaMalloc(&samplingWorkspaceBuffer, workspaceSize));
+    mDeviceBuffer["samplingWorkspace"] = samplingWorkspaceBuffer;
 }
 
 template <typename T>
@@ -480,7 +492,29 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
 
     auto sampleToken = [this, &outputIds, &generationIter, endIds, &generationConfig, &finishedStates, &contextLengths,
                            &unfinishedBatchNum]() {
-        std::vector<int64_t> generatedToken = mSampler->greedySample(reinterpret_cast<T*>(mDeviceBuffer["logits"]));
+        // Get device memory for selected indices
+        int64_t* deviceSelectedIndices = reinterpret_cast<int64_t*>(mDeviceBuffer["selected_indices"]);
+
+        // Use greedy sampling (top_k=1, temperature=1.0f)
+        // TODO: add temperature, top_k and top_p sampling
+        drivellm::SamplingParams params(mConfig.batchSize, mConfig.vocabSize, 1.0f, 1, 1.0f);
+
+        drivellm::topKtopPSamplingFromLogits<T>(reinterpret_cast<T const*>(mDeviceBuffer["logits"]), // logits
+            deviceSelectedIndices,                                                                   // selected_indices
+            params,                                                                                  // params
+            mDeviceBuffer["samplingWorkspace"],                                                      // workspace
+            drivellm::getTopKtopPSamplingWorkspaceSize<T>(
+                mConfig.batchSize, mConfig.vocabSize, params),                                       // workspaceSize
+            mStream                                                                                  // stream
+        );
+
+        // Copy results back to host directly as int64_t
+        std::vector<int64_t> generatedToken(mConfig.batchSize);
+
+        CUDA_CHECK(cudaMemcpyAsync(generatedToken.data(), deviceSelectedIndices, mConfig.batchSize * sizeof(int64_t),
+            cudaMemcpyDeviceToHost, mStream));
+        CUDA_CHECK(cudaStreamSynchronize(mStream));
+
         ++generationIter;
         for (int i = 0; i < mConfig.batchSize; i++)
         {

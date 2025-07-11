@@ -16,7 +16,6 @@
 #include "common/common.h"
 #include "common/safetensors_loader/safetensorsLoader.h"
 #include "common/trtUtils.h"
-#include "sampler/include/sampler.h"
 #include <NvInferRuntime.h>
 #include <cfloat>
 #include <cuda_runtime_api.h>
@@ -59,7 +58,6 @@ public:
         , isSetup{false}
         , mConfig{0, 0, 0, 0, 0, 0, 0}
         , mDeviceBuffer{}
-        , mSampler{nullptr}
         , mUseCudaGraph{false}
         , mCudaGraphCaptured{false}
         , mGenerationGraph{nullptr}
@@ -124,7 +122,6 @@ private:
     void allocateExtraBufferForVanilla();
     void allocateCommonBuffers();
     void initCudaGraph();
-    std::unique_ptr<Sampler<T>> mSampler;
     // These are used as debugging functions
     std::string printKVCache();
     std::string printLogits();

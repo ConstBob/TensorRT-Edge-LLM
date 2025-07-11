@@ -1,7 +1,9 @@
 # Global exclude pattern
 exclude: |
-    ^3rdParty/|
-    ^cpp/common/json/jsmn\.h$
+    (?x)^(
+        3rdParty/.*|
+        cpp/common/json/jsmn\.h$|
+    )$
 
 repos:
 -   repo: https://github.com/pycqa/isort

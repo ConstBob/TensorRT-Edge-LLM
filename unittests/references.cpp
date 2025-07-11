@@ -1,5 +1,6 @@
 #include "references.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <limits>
@@ -145,5 +146,274 @@ std::vector<half> ropeRefCosSin(std::vector<half> const& input, int32_t const nu
         }
         result.insert(result.end(), y.begin(), y.end());
     }
+    return result;
+}
+
+std::vector<float> softmaxRef(std::vector<float> const& logits, float temperature)
+{
+    std::vector<float> scaledLogits(logits.size());
+    float invTemp = (temperature == 0.0f) ? 0.0f : 1.0f / temperature;
+
+    for (size_t i = 0; i < logits.size(); ++i)
+    {
+        scaledLogits[i] = logits[i] * invTemp;
+    }
+
+    // Find max for numerical stability
+    float maxLogit = *std::max_element(scaledLogits.begin(), scaledLogits.end());
+
+    // Compute softmax
+    std::vector<float> probs(logits.size());
+    float sumExp = 0.0f;
+    for (size_t i = 0; i < logits.size(); ++i)
+    {
+        probs[i] = std::exp(scaledLogits[i] - maxLogit);
+        sumExp += probs[i];
+    }
+
+    for (size_t i = 0; i < logits.size(); ++i)
+    {
+        probs[i] /= sumExp;
+    }
+
+    return probs;
+}
+
+std::set<int32_t> getTopKAllowedTokensRef(std::vector<float> const& logits, int32_t topK)
+{
+    std::vector<std::pair<float, int32_t>> logitPairs;
+    for (int32_t i = 0; i < static_cast<int32_t>(logits.size()); ++i)
+    {
+        logitPairs.emplace_back(logits[i], i);
+    }
+
+    // Sort by logits in descending order
+    int32_t kLimit = std::min(topK, static_cast<int32_t>(logits.size()));
+    std::partial_sort(logitPairs.begin(), logitPairs.begin() + kLimit, logitPairs.end(),
+        [](auto const& a, auto const& b) { return a.first > b.first; });
+
+    std::set<int32_t> allowedTokens;
+    for (int32_t i = 0; i < kLimit; ++i)
+    {
+        allowedTokens.insert(logitPairs[i].second);
+    }
+
+    return allowedTokens;
+}
+
+std::set<int32_t> getTopPAllowedTokensRef(std::vector<float> const& logits, float topP, float temperature)
+{
+    std::vector<std::pair<float, int32_t>> logitPairs;
+    for (int32_t i = 0; i < static_cast<int32_t>(logits.size()); ++i)
+    {
+        logitPairs.emplace_back(logits[i], i);
+    }
+
+    // Sort by logits in descending order
+    std::sort(logitPairs.begin(), logitPairs.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
+
+    // Extract all logits and compute probabilities
+    std::vector<float> allLogits(logits.size());
+    for (size_t i = 0; i < logits.size(); ++i)
+    {
+        allLogits[i] = logitPairs[i].first;
+    }
+    auto allProbs = softmaxRef(allLogits, temperature);
+
+    // Handle edge case: topP = 0.0 means only the highest probability token
+    if (topP <= 0.0f)
+    {
+        std::set<int32_t> allowedTokens;
+        allowedTokens.insert(logitPairs[0].second);
+        return allowedTokens;
+    }
+
+    // Find the cutoff point for top-p
+    float cumsum = 0.0f;
+    int32_t cutoff = 0;
+    for (size_t i = 0; i < allProbs.size(); ++i)
+    {
+        cumsum += allProbs[i];
+        cutoff = i + 1;
+        if (cumsum >= topP)
+        {
+            break;
+        }
+    }
+
+    std::set<int32_t> allowedTokens;
+    for (int32_t i = 0; i < cutoff; ++i)
+    {
+        allowedTokens.insert(logitPairs[i].second);
+    }
+
+    return allowedTokens;
+}
+
+std::set<int32_t> getCombinedAllowedTokensRef(
+    std::vector<float> const& logits, int32_t topK, float topP, float temperature)
+{
+    std::vector<std::pair<float, int32_t>> logitPairs;
+    for (int32_t i = 0; i < static_cast<int32_t>(logits.size()); ++i)
+    {
+        logitPairs.emplace_back(logits[i], i);
+    }
+
+    // Sort by logits in descending order
+    std::sort(logitPairs.begin(), logitPairs.end(), [](auto const& a, auto const& b) { return a.first > b.first; });
+
+    // Apply top-k constraint first
+    int32_t kLimit = std::min(topK, static_cast<int32_t>(logits.size()));
+
+    // Extract top-k logits and compute probabilities
+    std::vector<float> topKLogits(kLimit);
+    for (int32_t i = 0; i < kLimit; ++i)
+    {
+        topKLogits[i] = logitPairs[i].first;
+    }
+    auto topKProbs = softmaxRef(topKLogits, temperature);
+
+    // Apply top-p constraint to the top-k elements
+    float cumsum = 0.0f;
+    int32_t cutoff = kLimit - 1;
+
+    for (int32_t i = 0; i < kLimit; ++i)
+    {
+        cumsum += topKProbs[i];
+        if (cumsum >= topP)
+        {
+            cutoff = i;
+            break;
+        }
+    }
+
+    std::set<int32_t> allowedTokens;
+    for (int32_t i = 0; i <= cutoff; ++i)
+    {
+        allowedTokens.insert(logitPairs[i].second);
+    }
+
+    return allowedTokens;
+}
+
+std::vector<std::pair<float, int32_t>> getTopKElementsRef(std::vector<float> const& logits, int32_t topK)
+{
+    std::vector<std::pair<float, int32_t>> logitPairs;
+    for (int32_t i = 0; i < static_cast<int32_t>(logits.size()); ++i)
+    {
+        logitPairs.emplace_back(logits[i], i);
+    }
+
+    // Sort by logits in descending order
+    int32_t kLimit = std::min(topK, static_cast<int32_t>(logits.size()));
+    std::partial_sort(logitPairs.begin(), logitPairs.begin() + kLimit, logitPairs.end(),
+        [](auto const& a, auto const& b) { return a.first > b.first; });
+
+    logitPairs.resize(kLimit);
+    return logitPairs;
+}
+
+// Unified reference function that handles all cases
+std::vector<std::pair<float, int32_t>> returnAllTopKReference(
+    std::vector<float> const& input, int32_t topK, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs)
+{
+    // First get the top-k elements from the entire vocabulary
+    auto topKElements = getTopKElementsRef(input, topK);
+
+    std::vector<std::pair<float, int32_t>> result;
+
+    if (!returnLogProbs)
+    {
+        // Return raw values (either logits or probabilities)
+        for (auto const& element : topKElements)
+        {
+            int32_t idx = element.second;
+            float value = input[idx];
+            result.emplace_back(value, idx);
+        }
+        return result;
+    }
+
+    // Return log probabilities
+    if (inputHasProbs)
+    {
+        // Input is already probabilities
+        if (normalizeLogProbs)
+        {
+            // Normalize over top-k only
+            std::vector<float> topKProbs;
+            for (auto const& element : topKElements)
+            {
+                topKProbs.push_back(input[element.second]);
+            }
+
+            // Normalize the top-k probabilities
+            float sum = 0.0f;
+            for (float prob : topKProbs)
+            {
+                sum += prob;
+            }
+
+            for (size_t i = 0; i < topKElements.size(); ++i)
+            {
+                int32_t idx = topKElements[i].second;
+                float normalizedProb = topKProbs[i] / sum;
+                float logProb = std::log(normalizedProb);
+                result.emplace_back(logProb, idx);
+            }
+        }
+        else
+        {
+            // Just take log of original probabilities
+            for (auto const& element : topKElements)
+            {
+                int32_t idx = element.second;
+                float prob = input[idx];
+                float logProb = std::log(prob);
+                result.emplace_back(logProb, idx);
+            }
+        }
+    }
+    else
+    {
+        // Input is logits
+        // Find max logit among the top-k elements for numerical stability
+        float maxLogit = -std::numeric_limits<float>::infinity();
+        for (auto const& element : topKElements)
+        {
+            maxLogit = std::max(maxLogit, element.first);
+        }
+
+        if (normalizeLogProbs)
+        {
+            // Compute sum of exp(logit - maxLogit) for normalization
+            float sum = 0.0f;
+            for (auto const& element : topKElements)
+            {
+                sum += std::exp(element.first - maxLogit);
+            }
+
+            for (auto const& element : topKElements)
+            {
+                int32_t idx = element.second;
+                float logit = element.first;
+                float expLogit = std::exp(logit - maxLogit);
+                float logProb = std::log(expLogit) - std::log(sum);
+                result.emplace_back(logProb, idx);
+            }
+        }
+        else
+        {
+            // Just output log(exp(value - maxLogit)) = value - maxLogit
+            for (auto const& element : topKElements)
+            {
+                int32_t idx = element.second;
+                float logit = element.first;
+                float logProb = logit - maxLogit;
+                result.emplace_back(logProb, idx);
+            }
+        }
+    }
+
     return result;
 }
