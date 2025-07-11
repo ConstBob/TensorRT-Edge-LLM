@@ -118,12 +118,12 @@ public:
 
 private:
     cudaStream_t mStream;
-    std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;
     std::map<std::string, void*> mDeviceBuffer;
     bool isSetup;
     VisualPreprocessorConfig mConfig;
-    std::unique_ptr<nvinfer1::IExecutionContext> mContext;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
+    std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;
+    std::unique_ptr<nvinfer1::IExecutionContext> mContext;
 
     void validateAndFillConfig(int batchSize);
 
