@@ -107,10 +107,10 @@ public:
 
 private:
     cudaStream_t mStream;
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext;
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
 
     bool isSetup;
     ModelConfig mConfig;
