@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cmath>
+#include <iomanip>
+#include <iostream>
 #include <ostream>
 #include <random>
 #include <vector>
@@ -97,3 +99,53 @@ private:
     int32_t mKvCacheCapacity;
     int32_t mHeadSize;
 };
+
+template <typename T>
+static std::pair<float, float> getTolerance()
+{
+    if constexpr (std::is_same_v<T, float>)
+    {
+        return {1e-4f, 1e-6f}; // rtol, atol for FP32
+    }
+    else if constexpr (std::is_same_v<T, half>)
+    {
+        return {1e-2f, 1e-2f}; // rtol, atol for FP16
+    }
+    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
+    {
+        return {0.15f, 0.02f}; // rtol, atol for BF16
+    }
+    else
+    {
+        return {1e-4f, 1e-6f}; // Default
+    }
+}
+
+static bool checkBounds(int index, int size, std::string const& arrayName, int batch, int pos)
+{
+    if (index >= size)
+    {
+        std::cout << "Index out of bounds for " << arrayName << " at batch " << batch << " position " << pos
+                  << " (index " << index << ", size " << size << ")" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+template <typename T>
+static bool validateValue(
+    float gpuVal, float expectedVal, int32_t gpuIdx, int batch, int pos, std::string const& testName)
+{
+    auto [rtol, atol] = getTolerance<T>();
+    if (!isclose(gpuVal, expectedVal, rtol, atol))
+    {
+        float absError = std::abs(gpuVal - expectedVal);
+        float relError = std::abs(gpuVal - expectedVal) / std::abs(expectedVal);
+        std::cout << testName << " validation failed at batch " << batch << " position " << pos
+                  << ": GPU=" << std::fixed << std::setprecision(8) << gpuVal << ", Expected=" << std::fixed
+                  << std::setprecision(8) << expectedVal << " (abs_error=" << absError << ", rel_error=" << relError
+                  << ")" << std::endl;
+        return false;
+    }
+    return true;
+}

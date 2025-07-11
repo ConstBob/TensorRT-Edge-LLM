@@ -5,9 +5,6 @@
 #include "common/common.h"
 #include "common/json.h"
 #include "decoder/decoder.h"
-#include "sampler/include/sampler.h"
-#include "sampler/include/samplingTopKKernels.h"
-#include "sampler/include/topKSamplingLayer.h"
 #include "utils/eagleUtilKernels.h"
 #include <NvInferRuntime.h>
 #include <cfloat>
