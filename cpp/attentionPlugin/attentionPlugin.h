@@ -16,8 +16,6 @@
 #include <string>
 #include <vector>
 
-#include "utilKernels.h"
-
 namespace drivellm
 {
 class AttentionPlugin : public nvinfer1::IPluginV2DynamicExt
@@ -25,8 +23,7 @@ class AttentionPlugin : public nvinfer1::IPluginV2DynamicExt
 public:
     // Plugin constructor and attention specific utility methods
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType,
-        int32_t rotaryEmbeddingMaxPositions, int32_t isEagleMode);
+        int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t isEagleMode);
 
     AttentionPlugin(std::string const& name, void const* data, size_t length);
 
@@ -36,9 +33,6 @@ public:
     AttentionPlugin(AttentionPlugin const&) = delete;
 
     ~AttentionPlugin() override;
-
-    // Set rotary configuration when positional embedding has type kROPE_ROTATE_GPTJ or kROPE_ROTATE_NEOX
-    void setRotaryConfig(float ropeScale, float ropeBaseFrequency);
 
     // IPluginV2DynamicExt Methods
     nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
@@ -89,13 +83,6 @@ protected:
     // Here the kvcache capacity refers to max number of tokens per input context.
     int32_t mMaxBatchSize{};
     int32_t mKVCacheCapacity{};
-
-    // Positional embedding configuration.
-    PositionEmbeddingType mPosEmbedType{PositionEmbeddingType::kNone};
-    float mRotaryScale{1.0F};
-    float mRotaryBaseFrequency{};
-    int mRotaryEmbeddingMaxPositions{0};
-    bool mIsMrope{false};
 
     // Datatype of QKV and kvCache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

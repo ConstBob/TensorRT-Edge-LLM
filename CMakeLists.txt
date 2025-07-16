@@ -128,7 +128,7 @@ if(BUILD_UNIT_TESTS)
   file(GLOB_RECURSE UNIT_TESTS_SRCS ${CMAKE_SOURCE_DIR}/unittests/*.cpp
        ${CMAKE_SOURCE_DIR}/unittests/*.cu)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
-  target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS})
+  target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR})
   target_link_libraries(
     unitTest PRIVATE gtest gtest_main llmSdkPlugin llmSdkCore ${CUDART_LIB}
                      ${CUDA_DRIVER_LIB})

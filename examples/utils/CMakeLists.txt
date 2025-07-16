@@ -8,11 +8,10 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
-set(UTILS_SOURCES llm_param.cpp)
+file(GLOB_RECURSE EXAMPLE_UTILS_CPP_SOURCES "*.cpp")
+file(GLOB_RECURSE EXAMPLE_UTILS_CU_SOURCES "*.cu")
 
-set(UTILS_HEADERS llm_param.h)
+add_library(exampleUtils STATIC ${EXAMPLE_UTILS_CPP_SOURCES} ${EXAMPLE_UTILS_CU_SOURCES})
 
-add_library(utils STATIC ${UTILS_SOURCES} ${UTILS_HEADERS})
-
-target_include_directories(utils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+target_include_directories(exampleUtils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                         ${COMMON_INCLUDE_DIRS})

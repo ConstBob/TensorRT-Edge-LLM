@@ -289,6 +289,12 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer, GenerationC
     }
     auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
     bool const eagleMode = llmEngine->isEagleModel();
+
+    // Initialize rope_rotary_cos_sin
+    std::string baseFolderPath = extractFolderName(args.baseParams.enginePath);
+    std::string configPath = baseFolderPath + "/config.json";
+    llmEngine->setupRopeCosSin(configPath);
+
     // Load and switch to LoRA weights if provided
     if (args.loraWeights.hasWeights() && !eagleMode)
     {

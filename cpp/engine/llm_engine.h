@@ -61,6 +61,7 @@ public:
     int64_t getDeviceMemorySize();
     void getLastHostLogits(std::vector<T>& hostLogits);
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
+    void setupRopeCosSin(std::string const& configPath);
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> const& contextLengths,
         std::vector<std::vector<int64_t>>& outputIds, GenerationConfig const& generationConfig,
         std::vector<int32_t>* newTokensNumbers = nullptr, std::vector<int32_t>* iterNumbers = nullptr,

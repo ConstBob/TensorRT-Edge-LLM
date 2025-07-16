@@ -93,9 +93,6 @@ void Qwen2ViTRunner::allocateBuffer()
         = mConfig.llmBatchSize * mConfig.maxPositionEmbeddings * mConfig.mropeEmbDim * sizeof(float);
     CUDA_CHECK(cudaMalloc(&mropeRotaryCosSinDevice, mropeRotaryCosSinSize));
     mDeviceBuffer["mropeRotaryCosSin"] = mropeRotaryCosSinDevice;
-    void* mropePositionDeltasDevice;
-    CUDA_CHECK(cudaMalloc(&mropePositionDeltasDevice, mConfig.llmBatchSize * sizeof(int64_t)));
-    mDeviceBuffer["mropePositionDeltas"] = mropePositionDeltasDevice;
 
     if (mConfig.modelType == "qwen2_5_vl")
     {
@@ -353,8 +350,7 @@ void Qwen2ViTRunner::visualPreprocess(std::vector<unsigned char*> const& imageBu
 }
 
 void Qwen2ViTRunner::getRopeIdx(std::vector<std::vector<int64_t>> const& batchInputIds,
-    std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<int64_t>& mropePositionIds,
-    std::vector<int64_t>& mropePositionDeltas)
+    std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<int64_t>& mropePositionIds)
 {
     int totalImageIdx = 0;
 
@@ -402,29 +398,21 @@ void Qwen2ViTRunner::getRopeIdx(std::vector<std::vector<int64_t>> const& batchIn
             startIdx += std::max(T, std::max(H, W)) + textLen;
         }
 
-        // Remaining text part
-        if (start < end)
-        {
-            int textLen = end - start;
-            for (int i = 0; i < 3; ++i)
-            {
-                for (int j = 0; j < textLen; ++j)
-                {
-                    positionIds[i].emplace_back(j + startIdx);
-                }
-            }
-
-            startIdx += textLen;
-        }
-
-        // Pad to maxPositionEmbeddings
+        // Remaining text part till maxPositionEmbeddings. Treat all generated tokens as text tokens.
+        int textLen = mConfig.maxPositionEmbeddings - positionIds[0].size();
         for (int i = 0; i < 3; ++i)
         {
-            positionIds[i].resize(mConfig.maxPositionEmbeddings);
-            mropePositionIds.insert(mropePositionIds.end(), positionIds[i].begin(), positionIds[i].end());
+            for (int j = 0; j < textLen; ++j)
+            {
+                positionIds[i].emplace_back(j + startIdx);
+            }
         }
 
-        mropePositionDeltas.emplace_back(startIdx - inputIds.size());
+        for (int i = 0; i < 3; ++i)
+        {
+            assert(positionIds[i].size() == mConfig.maxPositionEmbeddings);
+            mropePositionIds.insert(mropePositionIds.end(), positionIds[i].begin(), positionIds[i].end());
+        }
     }
 }
 
@@ -432,10 +420,9 @@ void Qwen2ViTRunner::generateMropeParams(
     std::vector<std::vector<int64_t>> const& batchInputIds, std::vector<std::vector<int64_t>> const& visualGridTHWs)
 {
     std::vector<float> mropeRotaryCosSin;
-    std::vector<int64_t> mropePositionDeltas;
 
     std::vector<int64_t> mropePositionIds; // (bs, 3, maxPositionEmbeddings)
-    getRopeIdx(batchInputIds, visualGridTHWs, mropePositionIds, mropePositionDeltas);
+    getRopeIdx(batchInputIds, visualGridTHWs, mropePositionIds);
 
     std::vector<std::vector<float>> sinusoidInp(
         mConfig.maxPositionEmbeddings, std::vector<float>(mConfig.mropeEmbDim / 2));
@@ -466,10 +453,11 @@ void Qwen2ViTRunner::generateMropeParams(
                     = mropePositionIds[b * 3 * mConfig.maxPositionEmbeddings + sec * mConfig.maxPositionEmbeddings + i];
                 for (int j = mRopeSections[sec]; j < mRopeSections[sec + 1]; ++j)
                 {
-                    int dstIdx
-                        = b * mConfig.maxPositionEmbeddings * mConfig.mropeEmbDim + i * mConfig.mropeEmbDim + j * 2;
-                    mropeRotaryCosSin[dstIdx] = cosOri[pos][j];
-                    mropeRotaryCosSin[dstIdx + 1] = sinOri[pos][j];
+                    int cosDstIdx
+                        = b * mConfig.maxPositionEmbeddings * mConfig.mropeEmbDim + i * mConfig.mropeEmbDim + j;
+                    int32_t sinOffset = mConfig.mropeEmbDim / 2;
+                    mropeRotaryCosSin[cosDstIdx] = cosOri[pos][j];
+                    mropeRotaryCosSin[cosDstIdx + sinOffset] = sinOri[pos][j];
                 }
             }
         }
@@ -477,8 +465,6 @@ void Qwen2ViTRunner::generateMropeParams(
 
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropeRotaryCosSin"], mropeRotaryCosSin.data(),
         mropeRotaryCosSinSize * sizeof(float), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropePositionDeltas"], mropePositionDeltas.data(),
-        mConfig.llmBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
 }
 
 std::string Qwen2ViTRunner::applyChatTemplate(std::string const& inputString, int const& numImage,
@@ -562,13 +548,9 @@ std::vector<EngineInputDesc> Qwen2ViTRunner::getExtraLLMInputs()
     extraInputs.emplace_back(EngineInputDesc{"image_embeds", mDeviceBuffer["output"], mDeviceBuffer["output"],
         {2, {mConfig.maxHW / 4, mConfig.hiddenDim}}, {2, {1, mConfig.hiddenDim}}});
 
-    nvinfer1::Dims cosSinDims = {2, {mConfig.llmBatchSize, mConfig.maxPositionEmbeddings * mConfig.mropeEmbDim}};
-    extraInputs.emplace_back(EngineInputDesc{"mrope_rotary_cos_sin", mDeviceBuffer["mropeRotaryCosSin"],
+    nvinfer1::Dims cosSinDims = {3, {mConfig.llmBatchSize, mConfig.maxPositionEmbeddings, mConfig.mropeEmbDim}};
+    extraInputs.emplace_back(EngineInputDesc{"rope_rotary_cos_sin", mDeviceBuffer["mropeRotaryCosSin"],
         mDeviceBuffer["mropeRotaryCosSin"], cosSinDims, cosSinDims});
-
-    nvinfer1::Dims deltasDim = {2, {mConfig.llmBatchSize, 1}};
-    extraInputs.emplace_back(EngineInputDesc{"mrope_position_deltas", mDeviceBuffer["mropePositionDeltas"],
-        mDeviceBuffer["mropePositionDeltas"], deltasDim, deltasDim});
 
     return extraInputs;
 }
@@ -742,10 +724,7 @@ void Qwen2ViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vecto
     int64_t mropeRotaryCosSinSize = mConfig.llmBatchSize * mConfig.maxPositionEmbeddings * mConfig.mropeEmbDim;
     std::vector<float> mropeRotaryCosSin(mropeRotaryCosSinSize);
     std::generate(mropeRotaryCosSin.begin(), mropeRotaryCosSin.end(), [&rng, &dist]() { return dist(rng); });
-    std::vector<int64_t> mropePositionDeltas(mConfig.llmBatchSize, 0);
 
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropeRotaryCosSin"], mropeRotaryCosSin.data(),
-        mropeRotaryCosSinSize * sizeof(float), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropePositionDeltas"], mropePositionDeltas.data(),
-        mConfig.llmBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+        mropeRotaryCosSinSize * sizeof(float), cudaMemcpyHostToDevice, mStream));;
 }

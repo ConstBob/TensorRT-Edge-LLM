@@ -23,7 +23,6 @@ from torch.nn import Embedding
 from transformers import DynamicCache
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     VisionAttention, apply_rotary_pos_emb_vision)
-from utils.surgeon_utils import RopeType
 
 
 class PromptTuningEmbedding(torch.nn.Module):
@@ -253,7 +252,6 @@ class ModelLoader:
         self.eagle_base = eagle_base
         self.eagle_draft = eagle_draft
         self.eagle3 = eagle3
-        self.rope_type = RopeType.kROPE_ROTATE_NEOX
 
     def get_model_type(self):
         """Get model type from config file"""
@@ -335,8 +333,6 @@ class ModelLoader:
         print(
             f"Loading HF model from {self.torch_dir} with model type {self.model_type}"
         )
-        if self.model_type in ['qwen2_vl', 'qwen2_5_vl']:
-            self.rope_type = RopeType.kMROPE
         if self.eagle_draft:
             self.hf_model = self._get_eagle_draft_model()
         elif self.model_type == 'qwen2_vl':
@@ -366,9 +362,6 @@ class ModelLoader:
 
         return self.hf_model.eval().cuda()
 
-    def get_rope_type(self):
-        return self.rope_type
-
     def add_extra_plugin_inputs(self):
         """Add extra inputs based on model type and Eagle configuration"""
         extra_plugin_inputs = []
@@ -377,19 +370,6 @@ class ModelLoader:
         # Ensure model is loaded
         if self.hf_model is None:
             self.load_model()
-
-        # Add inputs for vision models
-        if self.model_type == 'qwen2_vl' or self.model_type == 'qwen2_5_vl':
-
-            mrope_rotary_cos_sin = gs.Variable(
-                "mrope_rotary_cos_sin", np.float32, [
-                    'batch_size',
-                    self.hf_model.config.max_position_embeddings * 128
-                ])  # head_size = 128
-            mrope_position_deltas = gs.Variable("mrope_position_deltas",
-                                                np.int64, ['batch_size', 1])
-            extra_plugin_inputs.append(mrope_rotary_cos_sin)
-            extra_plugin_inputs.append(mrope_position_deltas)
 
         # Add inputs for Eagle models
         if self.eagle_base or self.eagle_draft:
@@ -401,6 +381,8 @@ class ModelLoader:
             extra_plugin_inputs.append(attention_mask)
             extra_plugin_inputs.append(attention_pos_id)
             extra_plugin_attributes["enable_tree_attention"] = 1
+        else:
+            extra_plugin_attributes["enable_tree_attention"] = 0
 
         return extra_plugin_inputs, extra_plugin_attributes
 

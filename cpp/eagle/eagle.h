@@ -72,6 +72,7 @@ public:
     int64_t getModelBatchSize() const noexcept;
     int64_t getMaxContextLength() const noexcept;
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
+    void setupRopeCosSin(std::string const& configPath);
 
     ~Eagle()
     {

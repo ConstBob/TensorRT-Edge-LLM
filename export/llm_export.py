@@ -22,7 +22,7 @@ from utils.export_utils import (ModelLoader, WrapperEagleBaseModelForCausalLM,
                                 WrapperEagleDraftModelForCausalLM,
                                 WrapperModelForCausalLM, llm_to_onnx)
 from utils.lora import insert_dynamic_lora, insert_static_lora
-from utils.surgeon_utils import (RopeType, insert_attention_plugin,
+from utils.surgeon_utils import (insert_attention_plugin,
                                  insert_gather_last_token,
                                  insert_gather_last_token_eagle)
 
@@ -259,7 +259,6 @@ def surgeon_llm(raw_onnx_path,
                 config_path,
                 state_dict,
                 max_seq_length=4096,
-                rope_type=RopeType.kROPE_ROTATE_NEOX,
                 extra_plugin_inputs=[],
                 extra_plugin_attributes={},
                 lm_head_precision="fp16",
@@ -280,7 +279,6 @@ def surgeon_llm(raw_onnx_path,
         mode: str
         config_path: str
         state_dict: None or OrderedDict
-        rope_type: RopeType.
         extra_plugin_inputs: list
         lora_config: PeftConfig, optional
             The LoRA adapter configuration for dynamic mode
@@ -309,12 +307,11 @@ def surgeon_llm(raw_onnx_path,
     if mode == "plugin":
         if config['model_type'] == "internvl_chat":
             graph = insert_attention_plugin(graph, config['llm_config'],
-                                            rope_type, max_seq_length,
+                                            max_seq_length,
                                             extra_plugin_inputs,
                                             extra_plugin_attributes)
         else:
-            graph = insert_attention_plugin(graph, config, rope_type,
-                                            max_seq_length,
+            graph = insert_attention_plugin(graph, config, max_seq_length,
                                             extra_plugin_inputs,
                                             extra_plugin_attributes)
     if eagle_base:
@@ -502,7 +499,6 @@ def main(args):
         if model_loader.model_type != "internvl_chat" else args.torch_dir,
         state_dict,
         args.max_seq_length,
-        rope_type=model_loader.get_rope_type(),
         lm_head_precision=args.lm_head,
         extra_plugin_inputs=extra_plugin_inputs,
         extra_plugin_attributes=extra_plugin_attributes,

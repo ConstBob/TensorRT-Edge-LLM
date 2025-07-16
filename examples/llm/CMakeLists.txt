@@ -10,7 +10,7 @@
 
 add_executable(llm_build llm_build.cpp)
 target_link_libraries(llm_build PRIVATE ${NV_ONNX_PARSER_LIB} commonLibraryExt
-                                        utils llmSdkCore)
+                                        exampleUtils llmSdkCore)
 target_include_directories(
   llm_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR} ${COMMON_INCLUDE_DIRS}
                     ${CMAKE_SOURCE_DIR}/examples/utils)
@@ -18,14 +18,14 @@ add_cross_build_link_options(llm_build)
 
 # Build executables for chat, benchmark and accuracy mode
 add_executable(llm_chat llm_chat.cpp)
-target_link_libraries(llm_chat PRIVATE llmSdkCore tokenizer utils
+target_link_libraries(llm_chat PRIVATE llmSdkCore tokenizer exampleUtils
                                        commonLibraryExt)
 target_include_directories(llm_chat PRIVATE ${COMMON_INCLUDE_DIRS}
                                             ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_chat)
 
 add_executable(llm_benchmark llm_benchmark.cpp)
-target_link_libraries(llm_benchmark PRIVATE llmSdkCore tokenizer utils
+target_link_libraries(llm_benchmark PRIVATE llmSdkCore tokenizer exampleUtils
                                             commonLibraryExt)
 target_include_directories(
   llm_benchmark PRIVATE ${COMMON_INCLUDE_DIRS}
@@ -33,7 +33,7 @@ target_include_directories(
 add_cross_build_link_options(llm_benchmark)
 
 add_executable(llm_accuracy llm_accuracy.cpp)
-target_link_libraries(llm_accuracy PRIVATE llmSdkCore tokenizer utils
+target_link_libraries(llm_accuracy PRIVATE llmSdkCore tokenizer exampleUtils
                                            commonLibraryExt)
 target_include_directories(
   llm_accuracy PRIVATE ${COMMON_INCLUDE_DIRS}

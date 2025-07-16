@@ -236,6 +236,13 @@ int main(int argc, char* argv[])
     std::cout << "Welcome to NVIDIA DriveOS LLM SDK! Please enter your prompts. Enter quit to exit the program."
               << std::endl;
     inputIds.resize(batchSize * contextLength, padId);
+
+    // Initialize rope_rotary_cos_sin
+    std::string baseFolderPath = extractFolderName(args.baseParams.enginePath);
+    std::string configPath = baseFolderPath + "/config.json";
+    llmEngine->setupRopeCosSin(configPath);
+
+    // Load LoRA weights
     if (!eagleMode)
     {
         auto& decoderPtr = llmEngine->getDecoder();
@@ -299,6 +306,7 @@ int main(int argc, char* argv[])
         }
         return EXIT_FAILURE;
     }
+
     // non-interactive mode
     if (args.inputStrings.size() != static_cast<size_t>(batchSize))
     {
