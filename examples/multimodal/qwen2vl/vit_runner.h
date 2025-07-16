@@ -145,8 +145,7 @@ private:
      * Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
      */
     void getRopeIdx(std::vector<std::vector<int64_t>> const& batchInputIds,
-        std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<int64_t>& mropePositionIds,
-        std::vector<int64_t>& mropePositionDeltas);
+        std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<int64_t>& mropePositionIds);
     void generateMropeParams(std::vector<std::vector<int64_t>> const& batchInputIds,
         std::vector<std::vector<int64_t>> const& visualGridTHWs);
 };

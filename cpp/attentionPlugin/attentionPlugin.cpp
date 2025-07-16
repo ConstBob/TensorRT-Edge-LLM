@@ -14,6 +14,7 @@
 #include "attentionPlugin/fmha-v2/contextFMHARunner.h"
 #include "attentionPlugin/xqa/decoderXQARunner.h"
 #include "pluginUtils.h"
+#include "posEnc/applyRopeWriteKV.h"
 
 #include <cassert>
 #include <mutex>
@@ -27,9 +28,6 @@ namespace
 {
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
-
-// TODO: Remove this type for long-context optimization since we don't need it now.
-constexpr RopeInitType kROPE_INIT_TYPE = RopeInitType::kDEFAULT;
 
 constexpr int32_t kDEVICE_ALIGNMENT{128}; // Make sure all device pointers are aligned by 128.
 
@@ -115,23 +113,16 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t maxBatchSize, int32_t kvCacheCapacity, PositionEmbeddingType posEmbedType,
-    int32_t rotaryEmbeddingMaxPositions, int32_t enableTreeAttention)
+    int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t enableTreeAttention)
     : mLayerName(name)
     , mNumHeadQ(numQHeads)
     , mNumHeadKV(numKVHeads)
     , mNumElemPerHead(headSize)
     , mMaxBatchSize(maxBatchSize)
     , mKVCacheCapacity(kvCacheCapacity)
-    , mPosEmbedType(posEmbedType)
-    , mRotaryEmbeddingMaxPositions(rotaryEmbeddingMaxPositions)
     , mEnableTreeAttention(enableTreeAttention)
 {
     mSMVersion = getSMVersion();
-    if (mPosEmbedType == PositionEmbeddingType::kMROPE)
-    {
-        mIsMrope = true;
-    }
 
     bool canImplement = ContextFMHARunner::canImplement(mNumElemPerHead, mSMVersion, mDataType)
         && DecoderXQARunner::canImplement(mNumHeadQ, mNumHeadKV, mSMVersion, mDataType);
@@ -156,10 +147,6 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mNumHeadQ);
     deserializeValue(&data, &length, &mNumHeadKV);
     deserializeValue(&data, &length, &mNumElemPerHead);
-    deserializeValue(&data, &length, &mPosEmbedType);
-    deserializeValue(&data, &length, &mRotaryScale);
-    deserializeValue(&data, &length, &mRotaryBaseFrequency);
-    deserializeValue(&data, &length, &mRotaryEmbeddingMaxPositions);
     deserializeValue(&data, &length, &mEnableTreeAttention);
 
     mSMVersion = getSMVersion();
@@ -171,17 +158,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
 
 AttentionPlugin::~AttentionPlugin() {}
 
-void AttentionPlugin::setRotaryConfig(float ropeScale, float ropeBaseFrequency)
-{
-    mRotaryScale = ropeScale;
-    mRotaryBaseFrequency = ropeBaseFrequency;
-}
-
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
     AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize,
-        mKVCacheCapacity, mPosEmbedType, mRotaryEmbeddingMaxPositions, mEnableTreeAttention);
-    plugin->setRotaryConfig(mRotaryScale, mRotaryBaseFrequency);
+        mKVCacheCapacity, mEnableTreeAttention);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -218,7 +198,10 @@ bool AttentionPlugin::supportsFormatCombination(
     // Support context/generation phase inputs:
     //      GEMM-QKV tensor (linear FP16) with shape [B, S, Hq+Hk+Hv, D]
     //      KV-cache tensor (linear FP16) with shape [B, 2, Hkv, Smax, D], here Smax is the kvcache capacity
-    //      buffer. Real context length: [B] (a vector of scalars) with type int32_t.
+    //      buffer.
+    //      Real context length: [B] (a vector of scalars) with type int32_t.
+    //      RoPE cos/sin cache: [B or 1, Smax, D] (a tensor of scalars) with type float.
+    //            Rope CosSin can be ND vector depending on rope type.
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [B, S, Hq, D]
     //      KV-cache tensor, same as the above.
@@ -259,33 +242,12 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkAttentionOutput = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
-        bool status{true};
-        status &= tensorDesc.type == DataType::kHALF;
-        status &= tensorDesc.format == TensorFormat::kLINEAR;
-        status &= tensorDesc.dims.nbDims == 4;
-        if (status)
-        {
-            auto const tensorDim = tensorDesc.dims;
-            status &= tensorDim.d[2] == mNumHeadQ;
-            status &= tensorDim.d[3] == mNumElemPerHead;
-        }
-        return status;
-    };
-
-    auto checkMropeRotaryCosSin = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkPosEncodingCosSin = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kFLOAT;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
-        status &= tensorDesc.dims.nbDims == 2;
-        return status;
-    };
-
-    auto checkMropePositionDeltas = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
-        bool status{true};
-        status &= tensorDesc.type == DataType::kINT64;
-        status &= tensorDesc.format == TensorFormat::kLINEAR;
-        status &= tensorDesc.dims.nbDims == 2;
+        status &= tensorDesc.dims.nbDims == 3;
+        status &= tensorDesc.dims.d[2] == mNumElemPerHead;
         return status;
     };
     auto checkAttentionMask = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
@@ -303,92 +265,58 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
+    // Output tensor checks
+    auto checkAttentionOutput = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+        bool status{true};
+        status &= tensorDesc.type == DataType::kHALF;
+        status &= tensorDesc.format == TensorFormat::kLINEAR;
+        status &= tensorDesc.dims.nbDims == 4;
+        if (status)
+        {
+            auto const tensorDim = tensorDesc.dims;
+            status &= tensorDim.d[2] == mNumHeadQ;
+            status &= tensorDim.d[3] == mNumElemPerHead;
+        }
+        return status;
+    };
+
     try
     {
 
-        if (mIsMrope && mEnableTreeAttention)
+        if (mEnableTreeAttention)
         {
-            assert(nbInputs == 7 && nbOutputs == 2);
-        }
-        else if (mIsMrope || mEnableTreeAttention)
-        {
-
-            assert(nbInputs == 5 && nbOutputs == 2);
+            assert(nbInputs == 6 && nbOutputs == 2);
         }
         else
         {
-            assert(nbInputs == 3 && nbOutputs == 2);
+            assert(nbInputs == 4 && nbOutputs == 2);
         }
-        assert(pos < (nbInputs + nbOutputs));
-        bool result{false};
-        switch (pos)
-        {
-        case 0: result = checkGemmQKV(inOut[0]); break;
-        case 1: result = checkKVCache(inOut[1]); break;
-        case 2: result = checkSequenceLen(inOut[2]); break;
-        case 3:
-            if (mIsMrope)
-            {
-                result = checkMropeRotaryCosSin(inOut[3]);
-            }
-            else if (mEnableTreeAttention)
-            {
-                result = checkAttentionMask(inOut[3]);
-            }
-            else
-            {
-                result = checkAttentionOutput(inOut[3]);
-            }
-            break;
 
-        case 4:
-            if (mIsMrope)
+        bool result{true};
+        if (pos < nbInputs)
+        {
+            switch (pos)
             {
-                result = checkMropePositionDeltas(inOut[4]);
+                case 0: result = checkGemmQKV(inOut[0]); break;
+                case 1: result = checkKVCache(inOut[1]); break;
+                case 2: result = checkSequenceLen(inOut[2]); break;
+                case 3: result = checkPosEncodingCosSin(inOut[3]); break;
+                case 4: result = checkAttentionMask(inOut[4]); break;
+                case 5: result = checkAttentionPosId(inOut[5]); break;
+                default: break;
             }
-            else if (mEnableTreeAttention)
-            {
-                result = checkAttentionPosId(inOut[4]);
-            }
-            else
-            {
-                result = checkKVCache(inOut[4]);
-            }
-            break;
-        case 5:
-            if (mEnableTreeAttention && mIsMrope)
-            {
-                result = checkAttentionMask(inOut[5]);
-            }
-            else if (mEnableTreeAttention || mIsMrope)
-            {
-                result = checkAttentionOutput(inOut[5]);
-            }
-            break;
-        case 6:
-            if (mEnableTreeAttention && mIsMrope)
-            {
-                result = checkAttentionPosId(inOut[6]);
-            }
-            else if (mEnableTreeAttention || mIsMrope)
-            {
-                result = checkKVCache(inOut[6]);
-            }
-            break;
-        case 7:
-            if (mIsMrope && mEnableTreeAttention)
-            {
-                result = checkAttentionOutput(inOut[7]);
-            }
-            break;
-        case 8:
-            if (mIsMrope && mEnableTreeAttention)
-            {
-                result = checkKVCache(inOut[8]);
-            }
-            break;
-        default: break;
         }
+        else
+        {
+            int32_t outPos = pos - nbInputs;
+            switch (outPos)
+            {
+                case 0: result = checkAttentionOutput(inOut[pos]); break;
+                case 1: result = checkKVCache(inOut[pos]); break;
+                default: break;
+            }
+        }
+
         return result;
     }
     catch (std::exception const& e)
@@ -457,8 +385,11 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     constexpr int32_t kKV_CACHE_INPUT_OUTPUT_IDX{1};
     constexpr int32_t kINPUT_LENGTH_INPUT_IDX{2};
     constexpr int32_t kATTENTION_OUTPUT_IDX{0};
-    constexpr int32_t kMROPE_ROTARY_COS_SIN_IDX{3};
-    constexpr int32_t kMROPE_POSITION_DELTAS_IDX{4};
+    constexpr int32_t kPOS_ENCODING_COS_SIN_IDX{3};
+
+    // Optional Inputs that only used with spec decoding tree attention.
+    constexpr int32_t kATTENTION_MASK_INPUT_IDX{4};
+    constexpr int32_t kATTENTION_POS_ID_INPUT_IDX{5};
 
     // Obtain execution time batch size, input context length, and KV-cache capacity per sequence.
     constexpr int32_t kQKV_INPUT_BATCH_DIM_IDX{0};
@@ -485,27 +416,14 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t const* seqLengthDevicePtr = reinterpret_cast<int32_t const*>(inputs[kINPUT_LENGTH_INPUT_IDX]);
     half* attentionResultDevicePtr = reinterpret_cast<half*>(outputs[kATTENTION_OUTPUT_IDX]);
     half* kvCacheDevicePtr = reinterpret_cast<half*>(outputs[kKV_CACHE_INPUT_OUTPUT_IDX]);
-    float2 const* mrope_rotary_cos_sin
-        = mIsMrope ? reinterpret_cast<float2 const*>(inputs[kMROPE_ROTARY_COS_SIN_IDX]) : nullptr;
-    int64_t const* mrope_position_deltas
-        = mIsMrope ? reinterpret_cast<int64_t const*>(inputs[kMROPE_POSITION_DELTAS_IDX]) : nullptr;
+    float const* posEncodingCosSinDevicePtr = reinterpret_cast<float const*>(inputs[kPOS_ENCODING_COS_SIN_IDX]);
+
     int32_t* attention_mask = nullptr;
-    int32_t* custom_seq_index = nullptr;
-    int32_t kATTENTION_MASK_INPUT_IDX;
-    int32_t kATTENTION_POS_ID_INPUT_IDX;
-    if (mIsMrope && mEnableTreeAttention)
+    int32_t* customSeqIndex = nullptr;
+    if (mEnableTreeAttention)
     {
-        kATTENTION_MASK_INPUT_IDX = 5;
-        kATTENTION_POS_ID_INPUT_IDX = 6;
         attention_mask = reinterpret_cast<int32_t*>(const_cast<void*>(inputs[kATTENTION_MASK_INPUT_IDX]));
-        custom_seq_index = reinterpret_cast<int32_t*>(const_cast<void*>(inputs[kATTENTION_POS_ID_INPUT_IDX]));
-    }
-    else if (mEnableTreeAttention)
-    {
-        kATTENTION_MASK_INPUT_IDX = 3;
-        kATTENTION_POS_ID_INPUT_IDX = 4;
-        attention_mask = reinterpret_cast<int32_t*>(const_cast<void*>(inputs[kATTENTION_MASK_INPUT_IDX]));
-        custom_seq_index = reinterpret_cast<int32_t*>(const_cast<void*>(inputs[kATTENTION_POS_ID_INPUT_IDX]));
+        customSeqIndex = reinterpret_cast<int32_t*>(const_cast<void*>(inputs[kATTENTION_POS_ID_INPUT_IDX]));
     }
 
     // Align workspace to be minimal aligned.
@@ -519,9 +437,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         // TODO: Explore non-padded input format.
         int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
 
-        invokeContextApplyRopeUpdateKVFP16(qkvDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr, mNumHeadQ, mNumHeadKV,
-            mNumElemPerHead, mKVCacheCapacity, runtimeSeqLen, mPosEmbedType, mRotaryBaseFrequency, mRotaryScale,
-            kROPE_INIT_TYPE, totalProcessToken, mRotaryEmbeddingMaxPositions, mrope_rotary_cos_sin, stream);
+        drivellm::kernel::launchApplyRopeWriteKVContext(qkvDevicePtr, kvCacheDevicePtr, posEncodingCosSinDevicePtr,
+            runtimeSeqLen, totalProcessToken, mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, stream);
+
         // Prepare FMHA_v2 params to launch FMHA kernel
         auto fmhaRunner = ContextFMHARunner(
             mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mSMVersion);
@@ -546,17 +464,15 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         if (mEnableTreeAttention)
         {
 
-            invokeSpecDecodeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr,
-                seqLengthDevicePtr, custom_seq_index, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mKVCacheCapacity,
-                runtimeSeqLen, mPosEmbedType, mRotaryBaseFrequency, mRotaryScale, kROPE_INIT_TYPE, totalProcessToken,
-                mRotaryEmbeddingMaxPositions, mrope_position_deltas, stream);
+            drivellm::kernel::launchApplyRopeWriteKVTreeDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
+                posEncodingCosSinDevicePtr, seqLengthDevicePtr, customSeqIndex, runtimeSeqLen, totalProcessToken,
+                mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, stream);
         }
         else
         {
-            invokeGenerationApplyRopeUpdateKVFP16(qkvDevicePtr, qVecDevicePtr, kvCacheDevicePtr, seqLengthDevicePtr,
-                mNumHeadQ, mNumHeadKV, mNumElemPerHead, mKVCacheCapacity, runtimeSeqLen, mPosEmbedType,
-                mRotaryBaseFrequency, mRotaryScale, kROPE_INIT_TYPE, totalProcessToken, mRotaryEmbeddingMaxPositions,
-                mrope_position_deltas, stream);
+            drivellm::kernel::launchApplyRopeWriteKVDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
+                posEncodingCosSinDevicePtr, seqLengthDevicePtr, runtimeSeqLen, totalProcessToken, mKVCacheCapacity,
+                mNumHeadQ, mNumHeadKV, mNumElemPerHead, stream);
         }
         // Prepare GQA runner parameter to dispatch kernel
         auto xqaRunner
@@ -589,8 +505,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mMaxBatchSize) + sizeof(mKVCacheCapacity) + sizeof(mNumHeadQ) + sizeof(mNumHeadKV)
-        + sizeof(mNumElemPerHead) + sizeof(mPosEmbedType) + sizeof(mRotaryScale) + sizeof(mRotaryBaseFrequency)
-        + sizeof(mRotaryEmbeddingMaxPositions) + sizeof(mEnableTreeAttention);
+        + sizeof(mNumElemPerHead) + sizeof(mEnableTreeAttention);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
@@ -600,10 +515,6 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&buffer, mNumHeadQ);
     serializeValue(&buffer, mNumHeadKV);
     serializeValue(&buffer, mNumElemPerHead);
-    serializeValue(&buffer, mPosEmbedType);
-    serializeValue(&buffer, mRotaryScale);
-    serializeValue(&buffer, mRotaryBaseFrequency);
-    serializeValue(&buffer, mRotaryEmbeddingMaxPositions);
     serializeValue(&buffer, mEnableTreeAttention);
 }
 
@@ -630,10 +541,6 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("num_q_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("rotary_scaling", nullptr, PluginFieldType::kFLOAT32, 1));
-    mPluginAttributes.emplace_back(PluginField("rotary_base_frequency", nullptr, PluginFieldType::kFLOAT32, 1));
-    mPluginAttributes.emplace_back(PluginField("rotary_embedding_max_positions", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
@@ -664,88 +571,30 @@ char const* AttentionPluginCreator::getPluginVersion() const noexcept
     return kATTENTION_PLUGIN_VERSION;
 }
 
-AttentionPlugin* createDefaultAttentionPlugin(char const* name)
-{
-    constexpr int32_t numQHeads{32};
-    constexpr int32_t numKVHeads{8};
-    constexpr int32_t headSize{128};
-    constexpr int32_t maxBatchSize{16};
-    constexpr int32_t kvCacheCapacity{4096};
-    constexpr PositionEmbeddingType posEmbedType{PositionEmbeddingType::kROPE_ROTATE_NEOX};
-    constexpr int32_t rotaryEmbeddingMaxPositions{32768};
-    constexpr int32_t enableTreeAttention{0};
-
-    // Align with Meta's implementation for rotary embedding.
-    constexpr float rotaryScale{1.0F};
-    constexpr float rotaryFrequency{500000.f};
-
-    AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads, numKVHeads, headSize, maxBatchSize,
-        kvCacheCapacity, posEmbedType, rotaryEmbeddingMaxPositions, enableTreeAttention);
-    plugin->setRotaryConfig(rotaryScale, rotaryFrequency);
-    return plugin;
-}
-
 nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
 {
     try
     {
-        // If no plugin attribute is available, construct an AttentionPlugin used by llama3-8B model by
-        // default. Otherwise, all plugin attributes shall be specified.
-        if (fc->nbFields == 0)
-        {
-            return createDefaultAttentionPlugin(name);
-        }
-
         std::optional<int32_t> maxBatchSize = parsePluginScalarField<int32_t>("max_batch_size", fc);
         std::optional<int32_t> kvCacheCapacity = parsePluginScalarField<int32_t>("kv_cache_capacity", fc);
         std::optional<int32_t> numQHeads = parsePluginScalarField<int32_t>("num_q_heads", fc);
         std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
-        std::optional<int32_t> posEmbedVal = parsePluginScalarField<int32_t>("position_embedding_type", fc);
-        std::optional<int32_t> rotaryEmbeddingMaxPositions
-            = parsePluginScalarField<int32_t>("rotary_embedding_max_positions", fc);
         // Make enable_tree_attention optional with default value 0
         std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
         int32_t enableTreeAttentionValue = enableTreeAttention.value_or(0);
 
+        // Enforce Core parameters are specified.
         bool checkRequiredFields = maxBatchSize.has_value() && kvCacheCapacity.has_value() && numQHeads.has_value()
-            && headSize.has_value() && numKVHeads.has_value() && posEmbedVal.has_value()
-            && rotaryEmbeddingMaxPositions.has_value();
+            && headSize.has_value() && numKVHeads.has_value();
         if (!checkRequiredFields)
         {
             return nullptr;
         }
-        if (posEmbedVal.value() > k_MAX_POSITION_EMBED_TYPE_VAL)
-        {
-            return nullptr;
-        }
-
-        PositionEmbeddingType const posEmbedType = static_cast<PositionEmbeddingType>(posEmbedVal.value());
-        bool const useRotaryEmbed = posEmbedType == PositionEmbeddingType::kROPE_ROTATE_GPTJ
-            || posEmbedType == PositionEmbeddingType::kROPE_ROTATE_NEOX
-            || posEmbedType == PositionEmbeddingType::kMROPE;
-
-        std::optional<float> rotaryScale{std::nullopt};
-        std::optional<float> rotaryFrequency{std::nullopt};
-        if (useRotaryEmbed)
-        {
-            rotaryScale = parsePluginScalarField<float>("rotary_scaling", fc);
-            rotaryFrequency = parsePluginScalarField<float>("rotary_base_frequency", fc);
-            bool checkRotaryFields = rotaryScale.has_value() && rotaryFrequency.has_value();
-            if (!checkRotaryFields)
-            {
-                return nullptr;
-            }
-        }
 
         AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
-            headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), posEmbedType,
-            rotaryEmbeddingMaxPositions.value(), enableTreeAttentionValue);
-        if (useRotaryEmbed)
-        {
-            plugin->setRotaryConfig(rotaryScale.value(), rotaryFrequency.value());
-        }
+            headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), enableTreeAttentionValue);
 
         return plugin;
     }

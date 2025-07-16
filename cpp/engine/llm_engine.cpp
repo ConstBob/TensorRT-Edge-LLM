@@ -118,6 +118,21 @@ void LLMEngine<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInp
 }
 
 template <typename T>
+void LLMEngine<T>::setupRopeCosSin(std::string const& configPath)
+{
+    if (isEagleModel())
+    {
+        auto& eagle = getEagle();
+        eagle->setupRopeCosSin(configPath);
+    }
+    else
+    {
+        auto& decoder = getDecoder();
+        decoder->setupRopeCosSin(configPath);
+    }
+}
+
+template <typename T>
 void LLMEngine<T>::getLastHostLogits(std::vector<T>& hostLogits)
 {
     if (isEagleModel())

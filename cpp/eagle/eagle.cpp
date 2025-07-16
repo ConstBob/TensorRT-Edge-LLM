@@ -467,6 +467,13 @@ void Eagle<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
 }
 
 template <typename T>
+void Eagle<T>::setupRopeCosSin(std::string const& configPath)
+{
+    mBaseModel->setupRopeCosSin(configPath);
+    mDraftModel->setupRopeCosSin(configPath);
+}
+
+template <typename T>
 size_t Eagle<T>::getDeviceMemorySize() const noexcept
 {
     return mBaseModel->getDeviceMemorySize() + mDraftModel->getDeviceMemorySize();

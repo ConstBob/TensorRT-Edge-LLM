@@ -22,6 +22,8 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include "common/json.h"
+#include "common/posEncoding/initializeCosSinCache.h"
 
 template <typename T>
 bool Decoder<T>::setup(
@@ -97,6 +99,55 @@ void Decoder<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInput
     }
 }
 
+template <typename T>
+void Decoder<T>::setupRopeCosSin(std::string const& configPath)
+{
+    drivellm::JsonRoot root;
+    root.parseFromPath(configPath);
+    auto rootNode = root.getRoot();
+
+    std::string ropeType = "default";
+
+    float rotaryScale = 1.0f;
+    float rotaryTheta = rootNode["rope_theta"].getFloat();
+    int32_t maxPositionEmbeddings = rootNode["max_position_embeddings"].getInteger();
+
+    if (rootNode.hasMember("rope_scaling"))
+    {
+        if (rootNode["rope_scaling"].hasMember("type"))
+        {
+            ropeType = rootNode["rope_scaling"]["type"].getString();
+        }
+    }
+
+    void* ropeRotaryCosSinDevice;
+    CUDA_CHECK(cudaMalloc(&ropeRotaryCosSinDevice, mConfig.maxLength * mConfig.rotaryDim * sizeof(float)));
+    mContextExecutionContext->setTensorAddress("rope_rotary_cos_sin", ropeRotaryCosSinDevice);
+    mContextExecutionContext->setInputShape("rope_rotary_cos_sin", {3, {1, mConfig.maxLength, mConfig.rotaryDim}});
+    mGenerationExecutionContext->setTensorAddress("rope_rotary_cos_sin", ropeRotaryCosSinDevice);
+    mGenerationExecutionContext->setInputShape("rope_rotary_cos_sin", {3, {1, mConfig.maxLength, mConfig.rotaryDim}});
+
+    if (ropeType == "default")
+    {
+        drivellm::kernel::initializeNormalRopeCosSin(reinterpret_cast<float*>(ropeRotaryCosSinDevice),
+            rotaryTheta, rotaryScale, mConfig.rotaryDim, mConfig.maxLength, mStream);
+    }
+    else
+    {
+        LOG_ERROR("Unsupported rope type: %s", ropeType.c_str());
+        throw std::runtime_error(
+            "setupRopeCosSin(): Unsupported rope type when initializing rope cos sin: " + ropeType);
+    }
+
+    // Clear existing rope_rotary_cos_sin in device buffer.
+    // Add current rope_rotary_cos_sin to device buffer which can be released by object destruction.
+    if (mDeviceBuffer.find("rope_rotary_cos_sin") != mDeviceBuffer.end())
+    {
+        CUDA_CHECK(cudaFree(mDeviceBuffer["rope_rotary_cos_sin"]));
+    }
+    mDeviceBuffer["rope_rotary_cos_sin"] = ropeRotaryCosSinDevice;
+}
+
 // Helper function to check 2 dims are equal.
 bool checkDimsEqual(nvinfer1::Dims& A, nvinfer1::Dims& B)
 {
@@ -140,6 +191,7 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
 {
     int64_t numHead;
     int64_t hiddenSizePerHead;
+    int64_t rotaryDim;
     int64_t maxInputLength;
     int64_t maxLength;
     int64_t nbIOs = static_cast<int64_t>(mEngine->getNbIOTensors());
@@ -207,7 +259,11 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
     // Needs the vocab size
     int64_t vocabSize = logitsShape.d[1];
 
-    mConfig = {batchSize, numHead, hiddenSizePerHead, maxInputLength, maxLength, numLayers, vocabSize};
+    nvinfer1::Dims rotaryDimShape = mEngine->getTensorShape("rope_rotary_cos_sin");
+    rotaryDim = rotaryDimShape.d[2];
+
+    mConfig = {batchSize, numHead, hiddenSizePerHead, rotaryDim, maxInputLength, maxLength, numLayers, vocabSize};
+
     return 0;
 }
 template <typename T>

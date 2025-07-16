@@ -20,13 +20,6 @@ import torch
 from onnx_graphsurgeon.ir.tensor import LazyValues
 
 
-class RopeType(Enum):
-    kNone = 0
-    kROPE_ROTATE_GPTJ = 1
-    kROPE_ROTATE_NEOX = 2
-    kMROPE = 3
-
-
 def clear_inputs(node: Union[gs.Node, gs.Tensor]):
     """
     Clear all inputs for a node or tensor in ONNX
@@ -281,18 +274,19 @@ def insert_gather_last_token(graph: gs.Graph):
 
 def insert_attention_plugin(graph: gs.Graph,
                             config: dict,
-                            rope_type: RopeType,
                             max_seq_length: int,
                             extra_inputs: list = None,
                             extra_plugin_attributes: dict = None):
     """
     Insert AttentionPlugin for the graph. AttentionPlugin takes the following inputs and outputs:
 
-    Inputs:
-        qkv: [bs, seq_len, d_q+d_k+d_v]. Therefore qkv from q_proj, k_proj and v_proj will be concatenated
+    Core Inputs:
+        qkv: [bs, seq_len, (Hq + Hk + Hv) * head_size]. Therefore qkv from q_proj, k_proj and v_proj will be concatenated
         kv_input: [bs, 2, num_head, max_kv_capacity, d_kv]
         context_lengths: [bs]
-        extra_inputs:[]
+        rope_rotary_cos_sin: [rope_batch_size, rope_max_position_length, rotary_dim]
+    extra_inputs: Determined by usage type, for example, eagle decoding requires attention mask and token pos ids
+        from the draft tree structure.
 
     Outputs:
         attention_outputs: [bs, seq_len, h_q, d_q]
@@ -303,8 +297,7 @@ def insert_attention_plugin(graph: gs.Graph,
     Parameters:
         graph: gs.Graph
         config: dict. Converted from transformers.AutoConfig
-        rope_type: RopeType.
-        extra_inputs: list. Extra inputs is for VLM like QWen2-VL which will contains mrope_rotary_cos_sin and mrope_position_deltas, the mrope_rotary_cos_sin is the rotary cos/sin cache and mrope_position_deltas is the position deltas which are needed by Mrope.
+        extra_inputs: list. Inputs that specially required by the execution mode (ex. Eagle decoding)
 
 
 
@@ -332,25 +325,18 @@ def insert_attention_plugin(graph: gs.Graph,
 
     start_time = time.time()
     print("Replacing MHA Pattern with AttentionPlugin...")
-    # We do not have any optimization on long context and therefore rotary_scaling is always 1.0
-    rotary_scaling = 1.0
     num_q_heads = require_config_key("num_attention_heads")
     num_kv_heads = require_config_key("num_key_value_heads")
-    head_size = require_config_key("hidden_size") // num_q_heads
-    rotary_base_frequency = require_config_key("rope_theta")
-    rotary_embedding_max_positions = require_config_key(
-        "max_position_embeddings")
+    head_size = config.get("head_dim", None) or require_config_key("hidden_size") // num_q_heads
+    partial_rotary_factor = config.get("partial_rotary_factor", 1.0)
+    rotary_dim = int(head_size * partial_rotary_factor)
 
     attention_attrs = {
         "num_q_heads": num_q_heads,
         "num_kv_heads": num_kv_heads,
         "head_size": head_size,
-        "rotary_scaling": float(rotary_scaling),
-        "rotary_base_frequency": float(rotary_base_frequency),
-        "position_embedding_type": rope_type.value,
         "max_batch_size": 16,
         "kv_cache_capacity": max_seq_length,
-        "rotary_embedding_max_positions": rotary_embedding_max_positions,
         **extra_plugin_attributes,
     }
 
@@ -375,8 +361,11 @@ def insert_attention_plugin(graph: gs.Graph,
         graph.inputs.remove(clear_outputs(i))
 
     context_lengths = gs.Variable("context_lengths", np.int32, ['batch_size'])
+    rope_rotary_cos_sin = gs.Variable("rope_rotary_cos_sin", np.float32,
+                                      ['rope_batch_size', 'rope_max_position_length', rotary_dim])
 
     graph.inputs.append(context_lengths)
+    graph.inputs.append(rope_rotary_cos_sin)
 
     for input in extra_inputs:
         graph.inputs.append(input)
@@ -474,7 +463,7 @@ def insert_attention_plugin(graph: gs.Graph,
 
         graph.layer(name=f"Attention-{i}",
                     op="AttentionPlugin",
-                    inputs=[qkv, kv_input, context_lengths] + extra_inputs,
+                    inputs=[qkv, kv_input, context_lengths, rope_rotary_cos_sin] + extra_inputs,
                     outputs=[attn_output, kv_output],
                     attrs=attention_attrs)
     graph.cleanup().toposort()

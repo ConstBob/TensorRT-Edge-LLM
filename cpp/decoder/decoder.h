@@ -32,6 +32,7 @@ struct ModelConfig
     int64_t batchSize;
     int64_t numHead;
     int64_t hiddenSizePerHead;
+    int64_t rotaryDim;
     int64_t maxInputLength;
     int64_t maxLength; // Equivalent to maxOutputLength;
     int64_t numLayers;
@@ -56,7 +57,7 @@ public:
         , mContextExecutionContext{nullptr}
         , mGenerationExecutionContext{nullptr}
         , isSetup{false}
-        , mConfig{0, 0, 0, 0, 0, 0, 0}
+        , mConfig{0, 0, 0, 0, 0, 0, 0, 0}
         , mDeviceBuffer{}
         , mUseCudaGraph{false}
         , mCudaGraphCaptured{false}
@@ -68,6 +69,7 @@ public:
     bool setup(std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph = false, int64_t batchSize = 1,
         bool isEagle = false);
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
+    void setupRopeCosSin(std::string const& configPath);
 
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
         std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
