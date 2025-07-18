@@ -85,7 +85,7 @@ struct SamplingWorkspace
 
         // Add alignment function (same as in size calculation)
         auto alignSize = [](size_t size) -> size_t {
-            const size_t alignment = 256; // 256-byte alignment for optimal GPU memory access
+            size_t const alignment = 256; // 256-byte alignment for optimal GPU memory access
             return (size + alignment - 1) & ~(alignment - 1);
         };
 
@@ -166,7 +166,7 @@ struct SamplingWorkspace
 
         // Add alignment function (same as in size calculation)
         auto alignSize = [](size_t size) -> size_t {
-            const size_t alignment = 256; // 256-byte alignment for optimal GPU memory access
+            size_t const alignment = 256; // 256-byte alignment for optimal GPU memory access
             return (size + alignment - 1) & ~(alignment - 1);
         };
 
@@ -207,7 +207,7 @@ size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, Sa
 
     // Add alignment padding between buffers
     auto alignSize = [](size_t size) -> size_t {
-        const size_t alignment = 256; // 256-byte alignment for optimal GPU memory access
+        size_t const alignment = 256; // 256-byte alignment for optimal GPU memory access
         return (size + alignment - 1) & ~(alignment - 1);
     };
 
@@ -251,7 +251,7 @@ template <typename T>
 size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK)
 {
     auto alignSize = [](size_t size) -> size_t {
-        const size_t alignment = 256;
+        size_t const alignment = 256;
         return (size + alignment - 1) & ~(alignment - 1);
     };
 

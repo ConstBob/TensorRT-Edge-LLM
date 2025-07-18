@@ -54,8 +54,8 @@ struct textPartition
     }
 
     const TEXT_PART_TYPE type;
-    const Rank token;
-    const std::string _dummy;
+    Rank const token;
+    std::string const _dummy;
     std::string const& rawText;
     int const offset;
     int const length;

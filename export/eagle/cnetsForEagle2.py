@@ -10,7 +10,6 @@
 """ PyTorch LLaMA model."""
 from typing import List, Optional
 
-import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from transformers.activations import ACT2FN

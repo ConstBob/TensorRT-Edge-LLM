@@ -11,6 +11,8 @@
  */
 
 #include "decoder.h"
+#include "common/json.h"
+#include "common/posEncoding/initializeCosSinCache.h"
 #include "sampler/sampling.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
@@ -22,8 +24,6 @@
 #include <memory>
 #include <sstream>
 #include <utility>
-#include "common/json.h"
-#include "common/posEncoding/initializeCosSinCache.h"
 
 template <typename T>
 bool Decoder<T>::setup(
@@ -135,8 +135,8 @@ void Decoder<T>::setupRopeCosSin(std::string const& configPath)
         setupExtraInputs(extraInputs);
 
         // Initialize
-        drivellm::kernel::initializeNormalRopeCosSin(reinterpret_cast<float*>(ropeRotaryCosSinDevice),
-            rotaryTheta, rotaryScale, mConfig.rotaryDim, mConfig.maxLength, mStream);
+        drivellm::kernel::initializeNormalRopeCosSin(reinterpret_cast<float*>(ropeRotaryCosSinDevice), rotaryTheta,
+            rotaryScale, mConfig.rotaryDim, mConfig.maxLength, mStream);
     }
     else if (ropeType == "longrope")
     {
@@ -149,25 +149,26 @@ void Decoder<T>::setupRopeCosSin(std::string const& configPath)
         mDeviceBuffer["long_cos_sin"] = longCosSinDevice;
 
         // Note: Need to setupExtraInputs according to runtime context length before inference
-        //     For context lenghth > originalMaxPositionEmbeddings, use mDeviceBuffer["long_cos_sin"]
-        //     For context lenghth <= originalMaxPositionEmbeddings, use mDeviceBuffer["short_cos_sin"]
+        //     For context length > originalMaxPositionEmbeddings, use mDeviceBuffer["long_cos_sin"]
+        //     For context length <= originalMaxPositionEmbeddings, use mDeviceBuffer["short_cos_sin"]
 
         // Helper function to read factor data from json
         auto readFactorData = [&](std::string const& factorName) -> float* {
             auto factorNode = rootNode["rope_scaling"][factorName];
-            assert(factorNode.size() == mConfig.rotaryDim / 2 && (std::string(factorName) + " size should be equal to rotaryDim / 2").c_str());
-            
+            assert(factorNode.size() == mConfig.rotaryDim / 2
+                && (std::string(factorName) + " size should be equal to rotaryDim / 2").c_str());
+
             std::vector<float> factor;
             factor.reserve(factorNode.size());
             for (size_t i = 0; i < factorNode.size(); ++i)
             {
                 factor.emplace_back(factorNode[i].getFloat());
             }
-            
+
             float* factorDevice;
             CUDA_CHECK(cudaMalloc(&factorDevice, factor.size() * sizeof(float)));
             CUDA_CHECK(cudaMemcpy(factorDevice, factor.data(), factor.size() * sizeof(float), cudaMemcpyHostToDevice));
-            
+
             return factorDevice;
         };
 
@@ -322,7 +323,7 @@ void Decoder<T>::allocateBufferForKVCache()
     CUDA_CHECK(cudaMemsetAsync(kvCacheDevice, 0,
         (mConfig.batchSize * 2 * mConfig.numHead * mConfig.maxLength * mConfig.hiddenSizePerHead * mConfig.numLayers
             * sizeOfHalf)));
-    const size_t bytesPerLayer
+    size_t const bytesPerLayer
         = mConfig.batchSize * 2 * mConfig.numHead * mConfig.maxLength * mConfig.hiddenSizePerHead * sizeOfHalf;
     mDeviceBuffer["kv_cache"] = kvCacheDevice;
     for (int32_t i = 0; i < mConfig.numLayers; ++i)
@@ -422,7 +423,7 @@ void Decoder<T>::allocateBuffer()
 }
 
 template <typename T>
-void Decoder<T>::addNewBuffer(std::string const& name, const nvinfer1::Dims dimsContext, int sizeOfByte)
+void Decoder<T>::addNewBuffer(std::string const& name, nvinfer1::Dims const dimsContext, int sizeOfByte)
 {
 
     void* devicePtr;
@@ -510,7 +511,7 @@ std::string Decoder<T>::printKVCache()
     std::vector<T> kvCache(totalKVSize, 0.0);
     oss << "Context Length is: " << mConfig.maxLength << std::endl;
     auto const sizeOfHalf = 2;
-    const size_t bytesPerLayer = totalKVSize * sizeOfHalf;
+    size_t const bytesPerLayer = totalKVSize * sizeOfHalf;
     for (int i = 0; i < mConfig.numLayers; ++i)
     {
         oss << "Layer = " << i << "\n";
@@ -604,8 +605,8 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
             params,                                                                                  // params
             mDeviceBuffer["samplingWorkspace"],                                                      // workspace
             drivellm::getTopKtopPSamplingWorkspaceSize<T>(
-                mConfig.batchSize, mConfig.vocabSize, params),                                       // workspaceSize
-            mStream                                                                                  // stream
+                mConfig.batchSize, mConfig.vocabSize, params), // workspaceSize
+            mStream                                            // stream
         );
 
         // Copy results back to host directly as int64_t
@@ -666,7 +667,7 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
 
 template <typename T>
 void Decoder<T>::generateForContext(void* inputIds, std::vector<int32_t>& contextLengths,
-    std::vector<int64_t> const& lastTokenIds, const nvinfer1::Dims inputDims)
+    std::vector<int64_t> const& lastTokenIds, nvinfer1::Dims const inputDims)
 {
     // check input batch size
     assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
@@ -733,7 +734,7 @@ int64_t Decoder<T>::getMaxContextLength() const noexcept
 }
 
 template <typename T>
-const ModelConfig Decoder<T>::getModelConfig() const noexcept
+ModelConfig const Decoder<T>::getModelConfig() const noexcept
 {
     return mConfig;
 }

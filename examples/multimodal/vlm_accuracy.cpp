@@ -157,7 +157,7 @@ bool parseMultimodalAccuracyArgs(MultimodalAccuracyArgs& args, int argc, char* a
 
 std::vector<unsigned char> base64Decode(std::string const& encoded)
 {
-    static const std::string BASE64_CHARS
+    static std::string const BASE64_CHARS
         = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
           "abcdefghijklmnopqrstuvwxyz"
           "0123456789+/";
@@ -331,15 +331,15 @@ std::vector<MMMUTestData*> parseTSVFile(std::filesystem::path const& csvPath)
         }
 
         data->answer = getItem();
-        getItem();                      // difficulty
-        getItem();                      // subfield
-        getItem();                      // imgType
+        getItem(); // difficulty
+        getItem(); // subfield
+        getItem(); // imgType
         data->questionType = getItem();
-        getItem();                      // imgType
+        getItem(); // imgType
 
         std::string imgStr = getItem(); // image str
         parseImgBytes(data->images, imgStr);
-        getItem();                      // image_path
+        getItem(); // image_path
 
         // E, F, G, H, I,
         for (int i = 0; i < 5; ++i)

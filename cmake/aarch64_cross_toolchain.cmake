@@ -22,7 +22,8 @@ find_program(
 find_program(
   CMAKE_CXX_COMPILER
   NAMES aarch64-linux-gnu-g++
-  PATHS /usr/local/bin /usr/bin NO_DEFAULT_PATH)
+  PATHS /usr/local/bin /usr/bin
+  NO_DEFAULT_PATH)
 
 set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)

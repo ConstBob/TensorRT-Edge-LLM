@@ -726,5 +726,6 @@ void Qwen2ViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vecto
     std::generate(mropeRotaryCosSin.begin(), mropeRotaryCosSin.end(), [&rng, &dist]() { return dist(rng); });
 
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropeRotaryCosSin"], mropeRotaryCosSin.data(),
-        mropeRotaryCosSinSize * sizeof(float), cudaMemcpyHostToDevice, mStream));;
+        mropeRotaryCosSinSize * sizeof(float), cudaMemcpyHostToDevice, mStream));
+    ;
 }

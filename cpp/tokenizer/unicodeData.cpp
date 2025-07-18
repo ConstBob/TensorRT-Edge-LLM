@@ -29,7 +29,7 @@
 
 #include "unicodeData.h"
 
-const std::vector<std::pair<uint32_t, uint16_t>> unicodeRangesFlags = {
+std::vector<std::pair<uint32_t, uint16_t>> const unicodeRangesFlags = {
     // start, flags // last=next_start-1
     {0x000000, 0x0080},
     {0x000020, 0x0008},
@@ -2306,7 +2306,7 @@ const std::vector<std::pair<uint32_t, uint16_t>> unicodeRangesFlags = {
     {0x110000, 0x0000},
 };
 
-const std::unordered_set<uint32_t> unicodeSetWhitespace = {
+std::unordered_set<uint32_t> const unicodeSetWhitespace = {
     0x000009,
     0x00000A,
     0x00000B,
@@ -2334,7 +2334,7 @@ const std::unordered_set<uint32_t> unicodeSetWhitespace = {
     0x003000,
 };
 
-const std::unordered_map<uint32_t, uint32_t> unicodeMapLowercase = {
+std::unordered_map<uint32_t, uint32_t> const unicodeMapLowercase = {
     {0x000041, 0x000061},
     {0x000042, 0x000062},
     {0x000043, 0x000063},
@@ -3770,7 +3770,7 @@ const std::unordered_map<uint32_t, uint32_t> unicodeMapLowercase = {
     {0x01E921, 0x01E943},
 };
 
-const std::unordered_map<uint32_t, uint32_t> unicodeMapUppercase = {
+std::unordered_map<uint32_t, uint32_t> const unicodeMapUppercase = {
     {0x000061, 0x000041},
     {0x000062, 0x000042},
     {0x000063, 0x000043},
@@ -5223,7 +5223,7 @@ const std::unordered_map<uint32_t, uint32_t> unicodeMapUppercase = {
     {0x01E943, 0x01E921},
 };
 
-const std::vector<rangeNfd> unicodeRangesNfd = {
+std::vector<rangeNfd> const unicodeRangesNfd = {
     // start, last, nfd
     {0x000000, 0x000000, 0x000000},
     {0x0000C0, 0x0000C5, 0x000041},

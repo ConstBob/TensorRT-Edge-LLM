@@ -90,7 +90,7 @@ public:
 
 private:
     void addNewBufferForModelIO();
-    void invokeSamplingAndAccept(int64_t* draftIds, const int32_t curTokensPerStep, int64_t endIds);
+    void invokeSamplingAndAccept(int64_t* draftIds, int32_t const curTokensPerStep, int64_t endIds);
     void invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t layerIdx, T* hs_draft);
     void invokeUpdateCumScoresAndParentsIds(int32_t layerIdx);
     void invokeAssembleDraftIdsAndPathAndMaskAndPositionIds();

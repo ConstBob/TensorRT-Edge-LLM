@@ -280,7 +280,7 @@ public:
 private:
     FMHAKernelLoader() = default;
 
-    std::unordered_map<FMHAKernelLoadHashKey, const std::unique_ptr<FMHAKernelList>, FMHAKernelLoadHasher> mKernels;
+    std::unordered_map<FMHAKernelLoadHashKey, std::unique_ptr<FMHAKernelList> const, FMHAKernelLoadHasher> mKernels;
 };
 
 inline FMHAKernelList* getFMHAKernels(FMHADataType type, int32_t sm)

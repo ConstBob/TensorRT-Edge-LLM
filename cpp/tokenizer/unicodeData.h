@@ -36,10 +36,10 @@ struct rangeNfd
     uint32_t nfd;
 };
 
-static const uint32_t MAX_CODEPOINTS = 0x110000;
+static uint32_t const MAX_CODEPOINTS = 0x110000;
 
-extern const std::vector<std::pair<uint32_t, uint16_t>> unicodeRangesFlags;
-extern const std::unordered_set<uint32_t> unicodeSetWhitespace;
-extern const std::unordered_map<uint32_t, uint32_t> unicodeMapLowercase;
-extern const std::unordered_map<uint32_t, uint32_t> unicodeMapUppercase;
-extern const std::vector<rangeNfd> unicodeRangesNfd;
+extern std::vector<std::pair<uint32_t, uint16_t>> const unicodeRangesFlags;
+extern std::unordered_set<uint32_t> const unicodeSetWhitespace;
+extern std::unordered_map<uint32_t, uint32_t> const unicodeMapLowercase;
+extern std::unordered_map<uint32_t, uint32_t> const unicodeMapUppercase;
+extern std::vector<rangeNfd> const unicodeRangesNfd;

@@ -41,8 +41,8 @@ struct EngineInputDesc
     void* deviceBufferForDecode;
     nvinfer1::Dims contextDims;
     nvinfer1::Dims generationDims;
-    EngineInputDesc(const std::string name, void* deviceBufferForContext, void* deviceBufferForDecode,
-        const nvinfer1::Dims contextDims, const nvinfer1::Dims generationDims)
+    EngineInputDesc(std::string const name, void* deviceBufferForContext, void* deviceBufferForDecode,
+        nvinfer1::Dims const contextDims, nvinfer1::Dims const generationDims)
         : name(name)
         , deviceBufferForContext(deviceBufferForContext)
         , deviceBufferForDecode(deviceBufferForDecode)
@@ -257,7 +257,7 @@ struct TensorInfo
 {
     void* data;
     nvinfer1::Dims dims;
-    TensorInfo(void* data, const nvinfer1::Dims dims)
+    TensorInfo(void* data, nvinfer1::Dims const dims)
         : data(data)
         , dims(dims)
     {

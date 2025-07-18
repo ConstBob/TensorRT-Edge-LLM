@@ -33,6 +33,6 @@ std::vector<std::pair<float, int32_t>> returnAllTopKReference(
     std::vector<float> const& input, int32_t topK, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs);
 
 void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<float>& longCosSinCache,
-    std::vector<float> const& shortFactor, std::vector<float> const& longFactor,
-    float rotaryBaseFrequency, int32_t rotaryDim, int32_t kvCacheCapacity, int32_t rotaryEmbeddingMaxPositions,
+    std::vector<float> const& shortFactor, std::vector<float> const& longFactor, float rotaryBaseFrequency,
+    int32_t rotaryDim, int32_t kvCacheCapacity, int32_t rotaryEmbeddingMaxPositions,
     int32_t originalMaxPositionEmbeddings);

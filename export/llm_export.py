@@ -17,10 +17,9 @@ import onnx
 import onnx_graphsurgeon as gs
 import torch
 from packaging.version import Version
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from utils.export_utils import (ModelLoader, WrapperEagleBaseModelForCausalLM,
-                                WrapperEagleDraftModelForCausalLM,
-                                WrapperModelForCausalLM, llm_to_onnx)
+from transformers import AutoConfig, AutoTokenizer
+from utils.export_utils import (ModelLoader, WrapperModelForCausalLM,
+                                llm_to_onnx)
 from utils.lora import insert_dynamic_lora, insert_static_lora
 from utils.surgeon_utils import (insert_attention_plugin,
                                  insert_gather_last_token,

@@ -1,5 +1,5 @@
-#include "initializeCosSinCache.h"
 #include "common/common.h"
+#include "initializeCosSinCache.h"
 
 #include <cuda_runtime.h>
 
@@ -9,8 +9,8 @@ namespace kernel
 {
 
 template <int32_t RotaryDim>
-__global__ void initializeNormalRopeCosSinKernel(float* cosSinCache, float rotaryBaseFrequency, float rotaryScale,
-    int32_t rotaryEmbeddingMaxPositions)
+__global__ void initializeNormalRopeCosSinKernel(
+    float* cosSinCache, float rotaryBaseFrequency, float rotaryScale, int32_t rotaryEmbeddingMaxPositions)
 {
     // In this kernel, each warp compute one "position" of the cos/sin cache, and loop until max position.
     // Each CTA will be assigned 4 warps so it proceeds 4 positions in an iteration.
@@ -28,7 +28,7 @@ __global__ void initializeNormalRopeCosSinKernel(float* cosSinCache, float rotar
 
     float ropeConstants[RotaryDim / 64];
 
-    #pragma unroll
+#pragma unroll
     for (uint32_t i = 0; i < RotaryDim / 64; ++i)
     {
         uint32_t zid = tIdx + i * 32;
@@ -39,7 +39,7 @@ __global__ void initializeNormalRopeCosSinKernel(float* cosSinCache, float rotar
     {
         uint32_t cosSinOffset = posIdx * RotaryDim;
 
-        #pragma unroll
+#pragma unroll
         for (uint32_t i = 0; i < RotaryDim / 64; ++i)
         {
             float invFreq = posIdx * rotaryScale / ropeConstants[i];
@@ -66,14 +66,11 @@ void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, f
     void* kernelPtr{nullptr};
     switch (rotaryDim)
     {
-        case 64:
-            kernelPtr = (void*) initializeNormalRopeCosSinKernel<64>;
-            break;
-        case 128:
-            kernelPtr = (void*) initializeNormalRopeCosSinKernel<128>;
-            break;
-        default:
-            throw std::runtime_error("Un-implemented rotaryDim for initializeNormalRopeCosSin: " + std::to_string(rotaryDim));
+    case 64: kernelPtr = (void*) initializeNormalRopeCosSinKernel<64>; break;
+    case 128: kernelPtr = (void*) initializeNormalRopeCosSinKernel<128>; break;
+    default:
+        throw std::runtime_error(
+            "Un-implemented rotaryDim for initializeNormalRopeCosSin: " + std::to_string(rotaryDim));
     }
     int32_t maxBlockPerSM{};
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, kernelPtr, 128, 0));
@@ -81,12 +78,8 @@ void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, f
     int32_t const numBlocks = std::min(maxBlockPerSM * numSMs, rotaryEmbeddingMaxPositions / 4);
     dim3 grid(numBlocks);
 
-    void* kernelArgs[] = {
-        reinterpret_cast<void*>(&cosSinCache),
-        reinterpret_cast<void*>(&rotaryBaseFrequency),
-        reinterpret_cast<void*>(&rotaryScale),
-        reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)
-    };
+    void* kernelArgs[] = {reinterpret_cast<void*>(&cosSinCache), reinterpret_cast<void*>(&rotaryBaseFrequency),
+        reinterpret_cast<void*>(&rotaryScale), reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)};
     CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
 }
 
@@ -110,7 +103,7 @@ __global__ void initializeLongRopeCosSinKernel(float* cosSinCache, float* extFac
 
     float ropeConstants[RotaryDim / 32];
 
-    #pragma unroll
+#pragma unroll
     for (uint32_t i = 0; i < RotaryDim / 32; ++i)
     {
         uint32_t zid = tIdx + i * 16;
@@ -121,7 +114,7 @@ __global__ void initializeLongRopeCosSinKernel(float* cosSinCache, float* extFac
     {
         uint32_t cosSinOffset = posIdx * RotaryDim;
 
-        #pragma unroll
+#pragma unroll
         for (uint32_t i = 0; i < RotaryDim / 32; ++i)
         {
             uint32_t zid = tIdx + i * 16;
@@ -136,8 +129,8 @@ __global__ void initializeLongRopeCosSinKernel(float* cosSinCache, float* extFac
 }
 
 void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, float* shortFactor, float* longFactors,
-    float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, 
-    int32_t maxPositionEmbeddings, int32_t originalMaxPositionEmbeddings, cudaStream_t stream)
+    float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t maxPositionEmbeddings,
+    int32_t originalMaxPositionEmbeddings, cudaStream_t stream)
 {
     // rotaryEmbeddingMaxPositions: length of position embeddings
     //     CosSinCache shape: [rotaryEmbeddingMaxPositions, rotaryDim]
@@ -161,62 +154,46 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
     void* kernelPtr{nullptr};
     switch (rotaryDim)
     {
-        case 32:
-            kernelPtr = (void*) initializeLongRopeCosSinKernel<32>;
-            break;
-        case 64:
-            kernelPtr = (void*) initializeLongRopeCosSinKernel<64>;
-            break;
-        case 96:
-            kernelPtr = (void*) initializeLongRopeCosSinKernel<96>;
-            break;
-        case 128:
-            kernelPtr = (void*) initializeLongRopeCosSinKernel<128>;
-            break;
-        default:
-            throw std::runtime_error("Un-implemented rotaryDim for initializeLongRopeCosSin: " + std::to_string(rotaryDim));
+    case 32: kernelPtr = (void*) initializeLongRopeCosSinKernel<32>; break;
+    case 64: kernelPtr = (void*) initializeLongRopeCosSinKernel<64>; break;
+    case 96: kernelPtr = (void*) initializeLongRopeCosSinKernel<96>; break;
+    case 128: kernelPtr = (void*) initializeLongRopeCosSinKernel<128>; break;
+    default:
+        throw std::runtime_error("Un-implemented rotaryDim for initializeLongRopeCosSin: " + std::to_string(rotaryDim));
     }
 
     int32_t maxBlockPerSM{};
     int32_t numBlocks{};
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, kernelPtr, 128, 0));
 
-    // Initialized longCosSinCache for context lenghth > originalMaxPositionEmbeddings
+    // Initialized longCosSinCache for context length > originalMaxPositionEmbeddings
     // For all positions, use longFactors to compute cosSinCache
     numBlocks = std::min(maxBlockPerSM * numSMs, rotaryEmbeddingMaxPositions / 8);
     dim3 longGrid(numBlocks);
 
-    void* longKernelArgs[] = {
-        reinterpret_cast<void*>(&longCosSinCache),
-        reinterpret_cast<void*>(&longFactors),
-        reinterpret_cast<void*>(&rotaryBaseFrequency),
-        reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions),
-        reinterpret_cast<void*>(&scalingFactor)
-    };
+    void* longKernelArgs[] = {reinterpret_cast<void*>(&longCosSinCache), reinterpret_cast<void*>(&longFactors),
+        reinterpret_cast<void*>(&rotaryBaseFrequency), reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions),
+        reinterpret_cast<void*>(&scalingFactor)};
     CUDA_CHECK(cudaLaunchKernel(kernelPtr, longGrid, block, longKernelArgs, 0, stream));
 
-    // Initialized shortCosSinCache for context lenghth <= originalMaxPositionEmbeddings
+    // Initialized shortCosSinCache for context length <= originalMaxPositionEmbeddings
     // For positions <= originalMaxPositionEmbeddings, use shortFactor to compute cosSinCache
     // For positions > originalMaxPositionEmbeddings, use longFactors to compute cosSinCache. Copy from longCosSinCache.
     int32_t shortMaxPositions = std::min(originalMaxPositionEmbeddings, rotaryEmbeddingMaxPositions);
     numBlocks = std::min(maxBlockPerSM * numSMs, shortMaxPositions / 8);
     dim3 shortGrid(numBlocks);
 
-    void* shortKernelArgs[] = {
-        reinterpret_cast<void*>(&shortCosSinCache),
-        reinterpret_cast<void*>(&shortFactor),
-        reinterpret_cast<void*>(&rotaryBaseFrequency),
-        reinterpret_cast<void*>(&shortMaxPositions),
-        reinterpret_cast<void*>(&scalingFactor)
-    };
+    void* shortKernelArgs[] = {reinterpret_cast<void*>(&shortCosSinCache), reinterpret_cast<void*>(&shortFactor),
+        reinterpret_cast<void*>(&rotaryBaseFrequency), reinterpret_cast<void*>(&shortMaxPositions),
+        reinterpret_cast<void*>(&scalingFactor)};
     CUDA_CHECK(cudaLaunchKernel(kernelPtr, shortGrid, block, shortKernelArgs, 0, stream));
 
     if (rotaryEmbeddingMaxPositions > shortMaxPositions)
     {
-        CUDA_CHECK(cudaMemcpyAsync(
-            shortCosSinCache + shortMaxPositions * rotaryDim, longCosSinCache + shortMaxPositions * rotaryDim,
-            (rotaryEmbeddingMaxPositions - shortMaxPositions) * rotaryDim * sizeof(float),
-            cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(shortCosSinCache + shortMaxPositions * rotaryDim,
+            longCosSinCache + shortMaxPositions * rotaryDim,
+            (rotaryEmbeddingMaxPositions - shortMaxPositions) * rotaryDim * sizeof(float), cudaMemcpyDeviceToDevice,
+            stream));
     }
 }
 

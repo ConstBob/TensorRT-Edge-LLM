@@ -33,7 +33,7 @@ void Eagle<T>::eagleCommonParamsInit()
 }
 
 template <typename T>
-void Eagle<T>::invokeSamplingAndAccept(int64_t* draftIds, const int32_t curTokensPerStep, int64_t endIds)
+void Eagle<T>::invokeSamplingAndAccept(int64_t* draftIds, int32_t const curTokensPerStep, int64_t endIds)
 {
     auto const logits_last_token = mBaseModel->getDeviceBuffer("logits");
 
@@ -199,7 +199,7 @@ void Eagle<T>::allocateEagleBuffer()
     // [mBatchSize,mMaxPathLen,topk*topk] mMaxPathLen = depth+1
     void* allScoresDevice;
     CUDA_CHECK(cudaMalloc(&allScoresDevice, mBatchSize * mMaxPathLen * mTopK * mTopK * sizeof(float)));
-    const size_t totalElements = mBatchSize * mMaxPathLen * mTopK * mTopK;
+    size_t const totalElements = mBatchSize * mMaxPathLen * mTopK * mTopK;
     std::vector<float> hostScores(totalElements, -INFINITY);
     CUDA_CHECK(cudaMemcpyAsync(
         allScoresDevice, hostScores.data(), totalElements * sizeof(float), cudaMemcpyHostToDevice, mStream));
@@ -724,9 +724,9 @@ void Eagle<T>::draftDecodePostProcess(int32_t layerIdx)
         static_cast<float*>(mEagleDeviceBuffer["outputLogProbsAllDraftFloat"]), // top_k_values (float log probs)
         static_cast<int64_t*>(mEagleDeviceBuffer["outputIdsAllDraft"]),         // top_k_indices
         batchSize, mDraftVocabSize, mTopK, workspace, workspaceSize, mStream,
-        true,                                                                   // return_log_probs
-        false,                                                                  // normalize log probs
-        true);                                                                  // softmax is already computed
+        true,  // return_log_probs
+        false, // normalize log probs
+        true); // softmax is already computed
 
     auto const hiddenStatesDraft = mDraftModel->getDeviceBuffer("hidden_states");
 
@@ -756,9 +756,9 @@ void Eagle<T>::draftDecodePostProcess(int32_t layerIdx)
             mTopK * mTopK,                                                      // vocab_size
             mTopK,                                                              // top_k
             mEagleDeviceBuffer["topk3Workspace"], allocatedWorkspaceSize3, mStream,
-            false,                                                              // don't return log probs
-            false,                                                              // don't normalize
-            false                                                               // compute softmax
+            false, // don't return log probs
+            false, // don't normalize
+            false  // compute softmax
         );
     }
     // prepare for next layer
@@ -779,9 +779,9 @@ void Eagle<T>::invokeAssembleDraftIdsAndPathAndMaskAndPositionIds()
         mMaxPathLen * mTopK * mTopK,                                // vocab_size
         mMaxDraftTokens,                                            // top_k
         mEagleDeviceBuffer["topk4Workspace"], allocatedWorkspaceSize4, mStream,
-        false,                                                      // don't return log probs
-        false,                                                      // don't normalize
-        false                                                       // compute softmax
+        false, // don't return log probs
+        false, // don't normalize
+        false  // compute softmax
     );
 
     AssembleDraftIdsAndPathAndMaskAndPositionIdsParams assembleParams;

@@ -11,7 +11,8 @@
 file(GLOB_RECURSE EXAMPLE_UTILS_CPP_SOURCES "*.cpp")
 file(GLOB_RECURSE EXAMPLE_UTILS_CU_SOURCES "*.cu")
 
-add_library(exampleUtils STATIC ${EXAMPLE_UTILS_CPP_SOURCES} ${EXAMPLE_UTILS_CU_SOURCES})
+add_library(exampleUtils STATIC ${EXAMPLE_UTILS_CPP_SOURCES}
+                                ${EXAMPLE_UTILS_CU_SOURCES})
 
 target_include_directories(exampleUtils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-                                        ${COMMON_INCLUDE_DIRS})
+                                               ${COMMON_INCLUDE_DIRS})

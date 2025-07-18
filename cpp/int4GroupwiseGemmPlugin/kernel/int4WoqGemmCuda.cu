@@ -125,7 +125,7 @@ __device__ __inline__ void global_to_share_one_stage_A_T2(half* src, half* dst, 
     {
         int global_iter = shared_iter_k * partial_global_iters + _global_iter;
         int ld_row = global_iter * cta_step_m_or_n + threadIdx.y * warp_step_m_or_n + (threadIdx.x / threads_per_row);
-        int ld_col_swizzled = (ld_col ^ (ld_row) &7) * PACK_SIZE;
+        int ld_col_swizzled = (ld_col ^ (ld_row) & 7) * PACK_SIZE;
         void* dst_ptr = (void*) (dst + ld_row * kSmemCol + ld_col_swizzled);
         uint4* src_ptr = (uint4*) (src + (ld_row + cta_offset_m) * global_ncols + ld_col * PACK_SIZE
             + global_iter_k
@@ -219,7 +219,7 @@ __device__ __inline__ void share_to_reg_one_stage_A_T2(
 
         int ld_row = warp_offset_m + shared_iter * OP_M + (threadIdx.x % 16);
         int ld_col = k_0_1 * 16 + (threadIdx.x / 16) * 8;
-        int ld_col_swizzled = ((ld_col / PACK_SIZE) ^ (ld_row) &7) * PACK_SIZE;
+        int ld_col_swizzled = ((ld_col / PACK_SIZE) ^ (ld_row) & 7) * PACK_SIZE;
         void* addr_ptr = (void*) (src + ld_row * kSmemCol + ld_col_swizzled);
 
         uint32_t addr = cast_smem_ptr_to_uint(addr_ptr);
