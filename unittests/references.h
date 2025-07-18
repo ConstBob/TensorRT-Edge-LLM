@@ -11,10 +11,10 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<hal
     std::optional<std::vector<int32_t>> const& treeAttnMask = std::nullopt);
 
 std::vector<half> ropeRef(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,
-    int32_t const seqIdx, float const ropeScale, float const ropeTheta, bool const permute);
+    int32_t const rotaryDim, int32_t const seqIdx, float const ropeScale, float const ropeTheta, bool const permute);
 
 std::vector<half> ropeRefCosSin(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,
-    std::vector<float> const& cos, std::vector<float> const& sin, bool const permute);
+    int32_t const rotaryDim, std::vector<float> const& cos, std::vector<float> const& sin, bool const permute);
 
 // Sampling reference functions
 std::vector<float> softmaxRef(std::vector<float> const& logits, float temperature = 1.0f);
@@ -31,3 +31,8 @@ std::vector<std::pair<float, int32_t>> getTopKElementsRef(std::vector<float> con
 // Unified reference function that handles all cases
 std::vector<std::pair<float, int32_t>> returnAllTopKReference(
     std::vector<float> const& input, int32_t topK, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs);
+
+void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<float>& longCosSinCache,
+    std::vector<float> const& shortFactor, std::vector<float> const& longFactor,
+    float rotaryBaseFrequency, int32_t rotaryDim, int32_t kvCacheCapacity, int32_t rotaryEmbeddingMaxPositions,
+    int32_t originalMaxPositionEmbeddings);
