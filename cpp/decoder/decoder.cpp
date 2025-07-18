@@ -120,17 +120,69 @@ void Decoder<T>::setupRopeCosSin(std::string const& configPath)
         }
     }
 
-    void* ropeRotaryCosSinDevice;
-    CUDA_CHECK(cudaMalloc(&ropeRotaryCosSinDevice, mConfig.maxLength * mConfig.rotaryDim * sizeof(float)));
-    mContextExecutionContext->setTensorAddress("rope_rotary_cos_sin", ropeRotaryCosSinDevice);
-    mContextExecutionContext->setInputShape("rope_rotary_cos_sin", {3, {1, mConfig.maxLength, mConfig.rotaryDim}});
-    mGenerationExecutionContext->setTensorAddress("rope_rotary_cos_sin", ropeRotaryCosSinDevice);
-    mGenerationExecutionContext->setInputShape("rope_rotary_cos_sin", {3, {1, mConfig.maxLength, mConfig.rotaryDim}});
-
     if (ropeType == "default")
     {
+        // Allocate buffer
+        void* ropeRotaryCosSinDevice;
+        CUDA_CHECK(cudaMalloc(&ropeRotaryCosSinDevice, mConfig.maxLength * mConfig.rotaryDim * sizeof(float)));
+        mDeviceBuffer["rope_rotary_cos_sin"] = ropeRotaryCosSinDevice;
+
+        // Setup extra inputs
+        std::vector<EngineInputDesc> extraInputs;
+        extraInputs.emplace_back(EngineInputDesc{"rope_rotary_cos_sin", mDeviceBuffer["rope_rotary_cos_sin"],
+            mDeviceBuffer["rope_rotary_cos_sin"], {3, {1, mConfig.maxLength, mConfig.rotaryDim}},
+            {3, {1, mConfig.maxLength, mConfig.rotaryDim}}});
+        setupExtraInputs(extraInputs);
+
+        // Initialize
         drivellm::kernel::initializeNormalRopeCosSin(reinterpret_cast<float*>(ropeRotaryCosSinDevice),
             rotaryTheta, rotaryScale, mConfig.rotaryDim, mConfig.maxLength, mStream);
+    }
+    else if (ropeType == "longrope")
+    {
+        // Allocate device buffer for short and long cos sin
+        void* shortCosSinDevice;
+        CUDA_CHECK(cudaMalloc(&shortCosSinDevice, mConfig.maxLength * mConfig.rotaryDim * sizeof(float)));
+        mDeviceBuffer["short_cos_sin"] = shortCosSinDevice;
+        void* longCosSinDevice;
+        CUDA_CHECK(cudaMalloc(&longCosSinDevice, mConfig.maxLength * mConfig.rotaryDim * sizeof(float)));
+        mDeviceBuffer["long_cos_sin"] = longCosSinDevice;
+
+        // Note: Need to setupExtraInputs according to runtime context length before inference
+        //     For context lenghth > originalMaxPositionEmbeddings, use mDeviceBuffer["long_cos_sin"]
+        //     For context lenghth <= originalMaxPositionEmbeddings, use mDeviceBuffer["short_cos_sin"]
+
+        // Helper function to read factor data from json
+        auto readFactorData = [&](std::string const& factorName) -> float* {
+            auto factorNode = rootNode["rope_scaling"][factorName];
+            assert(factorNode.size() == mConfig.rotaryDim / 2 && (std::string(factorName) + " size should be equal to rotaryDim / 2").c_str());
+            
+            std::vector<float> factor;
+            factor.reserve(factorNode.size());
+            for (size_t i = 0; i < factorNode.size(); ++i)
+            {
+                factor.emplace_back(factorNode[i].getFloat());
+            }
+            
+            float* factorDevice;
+            CUDA_CHECK(cudaMalloc(&factorDevice, factor.size() * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(factorDevice, factor.data(), factor.size() * sizeof(float), cudaMemcpyHostToDevice));
+            
+            return factorDevice;
+        };
+
+        auto shortFactorDevice = readFactorData("short_factor");
+        auto longFactorDevice = readFactorData("long_factor");
+        int32_t maxPositionEmbeddings = rootNode["max_position_embeddings"].getInteger();
+        int32_t originalMaxPositionEmbeddings = rootNode["original_max_position_embeddings"].getInteger();
+
+        drivellm::kernel::initializeLongRopeCosSin(reinterpret_cast<float*>(shortCosSinDevice),
+            reinterpret_cast<float*>(longCosSinDevice), shortFactorDevice, longFactorDevice, rotaryTheta,
+            mConfig.rotaryDim, mConfig.maxLength, maxPositionEmbeddings, originalMaxPositionEmbeddings, mStream);
+
+        // Free shortFactorDevice and longFactorDevice
+        CUDA_CHECK(cudaFree(shortFactorDevice));
+        CUDA_CHECK(cudaFree(longFactorDevice));
     }
     else
     {
@@ -138,14 +190,6 @@ void Decoder<T>::setupRopeCosSin(std::string const& configPath)
         throw std::runtime_error(
             "setupRopeCosSin(): Unsupported rope type when initializing rope cos sin: " + ropeType);
     }
-
-    // Clear existing rope_rotary_cos_sin in device buffer.
-    // Add current rope_rotary_cos_sin to device buffer which can be released by object destruction.
-    if (mDeviceBuffer.find("rope_rotary_cos_sin") != mDeviceBuffer.end())
-    {
-        CUDA_CHECK(cudaFree(mDeviceBuffer["rope_rotary_cos_sin"]));
-    }
-    mDeviceBuffer["rope_rotary_cos_sin"] = ropeRotaryCosSinDevice;
 }
 
 // Helper function to check 2 dims are equal.

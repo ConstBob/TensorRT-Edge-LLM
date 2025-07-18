@@ -85,54 +85,57 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<hal
 }
 
 std::vector<half> ropeRef(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,
-    int32_t const seqIdx, float const ropeScale, float const ropeTheta, bool const permute)
+    int32_t const rotaryDim, int32_t const seqIdx, float const ropeScale, float const ropeTheta, bool const permute)
 {
     std::vector<half> result;
     for (int32_t i = 0; i < numHeads; i++)
     {
         std::vector<half> x(input.begin() + headSize * i, input.begin() + headSize * (i + 1));
         std::vector<half> y(headSize);
-        for (int32_t j = 0; j < headSize / 2; j++)
+        for (int32_t j = 0; j < rotaryDim / 2; j++)
         {
             int32_t leftIndex, rightIndex;
             // Determine whether to apply gpt-neox style rope to permute.
             if (permute)
             {
                 leftIndex = j;
-                rightIndex = headSize / 2 + j;
+                rightIndex = rotaryDim / 2 + j;
             }
             else
             {
                 leftIndex = j * 2;
                 rightIndex = j * 2 + 1;
             }
-            float invFreq = (seqIdx * ropeScale) / std::pow(ropeTheta, 2 * j / float(headSize));
+            float invFreq = (seqIdx * ropeScale) / std::pow(ropeTheta, 2 * j / float(rotaryDim));
             float cos = std::cos(invFreq);
             float sin = std::sin(invFreq);
             y[leftIndex] = __half2float(x[leftIndex]) * cos - __half2float(x[rightIndex]) * sin;
             y[rightIndex] = __half2float(x[leftIndex]) * sin + __half2float(x[rightIndex]) * cos;
         }
-        result.insert(result.end(), y.begin(), y.end());
+        // Insert RoPE part
+        result.insert(result.end(), y.begin(), y.begin() + rotaryDim);
+        // Copy the remaining part of the input vector
+        result.insert(result.end(), x.begin() + rotaryDim, x.end());
     }
     return result;
 }
 
 std::vector<half> ropeRefCosSin(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,
-    std::vector<float> const& cosCache, std::vector<float> const& sinCache, bool const permute)
+    int32_t const rotaryDim, std::vector<float> const& cosCache, std::vector<float> const& sinCache, bool const permute)
 {
     std::vector<half> result;
     for (int32_t i = 0; i < numHeads; i++)
     {
         std::vector<half> x(input.begin() + headSize * i, input.begin() + headSize * (i + 1));
         std::vector<half> y(headSize);
-        for (int32_t j = 0; j < headSize / 2; j++)
+        for (int32_t j = 0; j < rotaryDim / 2; j++)
         {
             int32_t leftIndex, rightIndex;
             // Determine whether to apply gpt-neox style rope to permute.
             if (permute)
             {
                 leftIndex = j;
-                rightIndex = headSize / 2 + j;
+                rightIndex = rotaryDim / 2 + j;
             }
             else
             {
@@ -144,7 +147,10 @@ std::vector<half> ropeRefCosSin(std::vector<half> const& input, int32_t const nu
             y[leftIndex] = __half2float(x[leftIndex]) * cos - __half2float(x[rightIndex]) * sin;
             y[rightIndex] = __half2float(x[leftIndex]) * sin + __half2float(x[rightIndex]) * cos;
         }
-        result.insert(result.end(), y.begin(), y.end());
+        // Insert RoPE part
+        result.insert(result.end(), y.begin(), y.begin() + rotaryDim);
+        // Copy the remaining part of the input vector
+        result.insert(result.end(), x.begin() + rotaryDim, x.end());
     }
     return result;
 }
@@ -416,4 +422,48 @@ std::vector<std::pair<float, int32_t>> returnAllTopKReference(
     }
 
     return result;
+}
+
+void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<float>& longCosSinCache,
+    std::vector<float> const& shortFactor, std::vector<float> const& longFactor,
+    float rotaryBaseFrequency, int32_t rotaryDim, int32_t kvCacheCapacity, int32_t rotaryEmbeddingMaxPositions,
+    int32_t originalMaxPositionEmbeddings)
+{
+    float scalingFactor = 1.0f;
+    float scale = static_cast<float>(rotaryEmbeddingMaxPositions) / static_cast<float>(originalMaxPositionEmbeddings);
+    if (scale > 1.0f)
+    {
+        scalingFactor = std::sqrt(1.0f + std::log(scale) / std::log(static_cast<float>(originalMaxPositionEmbeddings)));
+    }
+    
+    auto initCosSin = [&](std::vector<float> const& extFactors, std::vector<float>& cosSin, int32_t maxPositions) {
+        for (int32_t pos = 0; pos < maxPositions; ++pos)
+        {
+            for (int32_t i = 0; i < rotaryDim / 2; ++i)
+            {
+                float invFreq = pos / (extFactors[i] * std::pow(rotaryBaseFrequency, 2 * i / float(rotaryDim)));
+                float cos = std::cos(invFreq) * scalingFactor;
+                float sin = std::sin(invFreq) * scalingFactor;
+                cosSin[pos * rotaryDim + i] = cos;
+                cosSin[pos * rotaryDim + i + rotaryDim / 2] = sin;
+            }
+        }
+    };
+
+    // LongCosSinCache for context lenghth > originalMaxPositionEmbeddings
+    // For all positions, use longFactor to compute cosSinCache
+    initCosSin(longFactor, longCosSinCache, kvCacheCapacity);
+
+    // ShortCosSinCache for context lenghth <= originalMaxPositionEmbeddings
+    // For positions <= originalMaxPositionEmbeddings, use shortFactor to compute cosSinCache
+    // For positions > originalMaxPositionEmbeddings, use longFactor to compute cosSinCache. Copy from longCosSinCache.
+    int32_t shortMaxPositions = std::min(originalMaxPositionEmbeddings, kvCacheCapacity);
+    initCosSin(shortFactor, shortCosSinCache, shortMaxPositions);
+    if (shortMaxPositions < kvCacheCapacity)
+    {
+        std::copy(longCosSinCache.begin() + shortMaxPositions * rotaryDim, longCosSinCache.end(),
+            shortCosSinCache.begin() + shortMaxPositions * rotaryDim);
+    }
+
+    return ;
 }
