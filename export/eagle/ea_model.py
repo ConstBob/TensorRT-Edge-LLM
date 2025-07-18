@@ -65,7 +65,7 @@ class EagleModel(nn.Module):
         ea_model_path=None,
         **kwargs,
     ):
-        Type = AutoConfig.from_pretrained(base_model_path).architectures[0]
+        AutoConfig.from_pretrained(base_model_path).architectures[0]
         configpath = os.path.join(ea_model_path, "config.json")
         if not os.path.exists(configpath):
             configpath = hf_hub_download(ea_model_path, "config.json")

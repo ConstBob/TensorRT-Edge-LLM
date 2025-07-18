@@ -205,7 +205,7 @@ void BPE::bytePairEncode(std::string const& piece, std::vector<Rank>& output) co
         Rank rank = MAX_RANK;
         if (i + 3 < parts.size())
         {
-            const auto it
+            auto const it
                 = mEncoder.find(std::string(piece.begin() + parts[i].first, piece.begin() + parts[i + 3].first));
             if (it != mEncoder.end())
             {

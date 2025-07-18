@@ -250,7 +250,7 @@ public:
 private:
     XQAKernelLoader() = default;
 
-    std::unordered_map<XQAKernelLoadHashKey, const std::unique_ptr<XQAKernelList>, XQAKernelLoadHasher> mKernels;
+    std::unordered_map<XQAKernelLoadHashKey, std::unique_ptr<XQAKernelList> const, XQAKernelLoadHasher> mKernels;
 };
 
 inline XQAKernelList* getXQAKernels(XQADataType type, int32_t sm, bool specDecode)

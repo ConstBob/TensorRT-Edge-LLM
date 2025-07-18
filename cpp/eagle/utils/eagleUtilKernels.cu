@@ -16,7 +16,7 @@ __inline__ __device__ int32_t packMaskBits(bool* mask, int32_t startIdx, int32_t
     {
         if (k < maxLength)
         {
-            const int32_t maskFlag = mask[startIdx + k];
+            int32_t const maskFlag = mask[startIdx + k];
             packedMask |= maskFlag << k;
         }
     }
@@ -132,7 +132,7 @@ __global__ void acceptDraftTokensByIdsWithPaths(int64_t* outputIds, int64_t* inp
         auto const pathOffset = batchIdx * maxDecodingTokens * (maxPathLen + 1) + bestPathIdx * (maxPathLen + 1);
 
         for (auto ti = static_cast<int32_t>(threadIdx.x); ti < acceptedLength + 1;
-             ti += static_cast<int32_t>(blockDim.x))
+            ti += static_cast<int32_t>(blockDim.x))
         {
             auto tokenId = paths[pathOffset + ti];
             auto const targetSrcTokenIdx = batchIdx * maxDecodingTokens + tokenId;
@@ -212,7 +212,7 @@ __global__ void updateDraftInputIdsAndTreeMaskAndPositionIds(int64_t* outputIdsA
         {
 
             auto const indexPacked = flat_index3(bs, outId, lengthIdx / 32, topK, divUp(topK, 32));
-            const int32_t numPackedMasksPerToken = (topK + 31) / 32;
+            int32_t const numPackedMasksPerToken = (topK + 31) / 32;
 
             int const packedIdx = flat_index3(bs, outId, lengthIdx / 32, maxLength, numPackedMasksPerToken);
             int32_t remainingBits = topK - lengthIdx;
@@ -285,7 +285,7 @@ __global__ void updateDraftInputIdsAndTreeMaskAndPositionIds(int64_t* outputIdsA
         if (lengthIdx % 32 == 0 && outId == 0)
         {
             // Calculate the number of packed masks per token
-            const int32_t numPackedMasksPerToken = (maxLength + 31) / 32;
+            int32_t const numPackedMasksPerToken = (maxLength + 31) / 32;
             int32_t remainingBits = maxLength - lengthIdx;
             if (remainingBits > 32)
             {
@@ -424,8 +424,8 @@ inline __device__ int64_t findAncestorIndex(int64_t* draftIds, int32_t tokenIdx,
 __global__ void assembleDraftIdsAndTreeMaskAndPositionIdsAndPredecessors(int64_t const* thirdTopKIds,
     int64_t const* allDraftIds, int64_t const* allDraftIdsAncestors, int64_t const* modelInputIds,
     int32_t const* contextLengths, bool* treeMask, int32_t* positionIds, int64_t* draftIds, int64_t* draftIdsAncestors,
-    int32_t* packedTreeMaskVerification, const int32_t batchSize, const int32_t maxDraftTokens,
-    const int32_t maxDecodingTokens, const int32_t topK, const int64_t maxSeqLen)
+    int32_t* packedTreeMaskVerification, int32_t const batchSize, int32_t const maxDraftTokens,
+    int32_t const maxDecodingTokens, int32_t const topK, int64_t const maxSeqLen)
 {
 
     int const idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -554,12 +554,12 @@ __global__ void assembleDraftIdsAndTreeMaskAndPositionIdsAndPredecessors(int64_t
 }
 
 __global__ void reconstructPath(int64_t const* draftIdsAncestors, int32_t* depthIds, int32_t* path,
-    int32_t* validPathNum, int32_t const* contextLengths, const int32_t batchSize, const int32_t maxDraftTokens,
-    const int32_t maxPathLen, const int32_t maxDecodingTokens)
+    int32_t* validPathNum, int32_t const* contextLengths, int32_t const batchSize, int32_t const maxDraftTokens,
+    int32_t const maxPathLen, int32_t const maxDecodingTokens)
 {
 
-    const int32_t batchIdx = blockIdx.x;
-    const int32_t tokenIdx = threadIdx.x;
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tokenIdx = threadIdx.x;
     if (tokenIdx == 0)
     {
         validPathNum[batchIdx] = 0;
@@ -703,26 +703,26 @@ void dispatchUpdateCumScoresAndParentsIds(
 
 template <typename T>
 __global__ void updateKVCache(T* kvCache, int32_t const* paths, int64_t const* acceptedLengths,
-    int32_t const* bestPathIds, int32_t* contextLengths, const int32_t maxPathLen, const int32_t batchSize,
-    const int32_t numHead, const int32_t hiddenSizePerHead, const int32_t maxDecodingTokens, const int32_t maxSeqLen,
-    const int32_t numLayers)
+    int32_t const* bestPathIds, int32_t* contextLengths, int32_t const maxPathLen, int32_t const batchSize,
+    int32_t const numHead, int32_t const hiddenSizePerHead, int32_t const maxDecodingTokens, int32_t const maxSeqLen,
+    int32_t const numLayers)
 {
 
     constexpr int32_t vec_size = std::is_same<T, half>::value ? 2 : 1;
     assert(hiddenSizePerHead % vec_size == 0);
 
-    const int32_t layerIdx = blockIdx.z;
-    const int32_t headIdx = threadIdx.y + blockIdx.y * blockDim.y;
-    const int32_t hVecIdx = threadIdx.x + blockIdx.x * blockDim.x;
-    const int32_t hIdx = hVecIdx * vec_size;
+    int32_t const layerIdx = blockIdx.z;
+    int32_t const headIdx = threadIdx.y + blockIdx.y * blockDim.y;
+    int32_t const hVecIdx = threadIdx.x + blockIdx.x * blockDim.x;
+    int32_t const hIdx = hVecIdx * vec_size;
 
     if (layerIdx >= numLayers || headIdx >= numHead || hVecIdx >= hiddenSizePerHead / vec_size)
         return;
 
-    const int32_t headOffset = headIdx * maxSeqLen * hiddenSizePerHead;
-    const int32_t hiddenStride = hiddenSizePerHead;
+    int32_t const headOffset = headIdx * maxSeqLen * hiddenSizePerHead;
+    int32_t const hiddenStride = hiddenSizePerHead;
     // [B, 2, H, S, D]--->kv cache
-    const int32_t layerOffset = layerIdx * batchSize * 2 * numHead * maxSeqLen * hiddenSizePerHead;
+    int32_t const layerOffset = layerIdx * batchSize * 2 * numHead * maxSeqLen * hiddenSizePerHead;
 
     using vec_t = typename std::conditional<std::is_same<T, half>::value, half2, float>::type;
 
@@ -732,22 +732,22 @@ __global__ void updateKVCache(T* kvCache, int32_t const* paths, int64_t const* a
             continue;
 
         int32_t dstIdxBase = contextLengths[bs] - acceptedLengths[bs] - 1;
-        const int32_t bestPath = bestPathIds[bs];
-        const int32_t acceptedLen = acceptedLengths[bs];
+        int32_t const bestPath = bestPathIds[bs];
+        int32_t const acceptedLen = acceptedLengths[bs];
 
-        const int32_t pathOffset = bs * maxDecodingTokens * (maxPathLen + 1) + bestPath * (maxPathLen + 1);
-        const int32_t kvCacheOffset = layerOffset + bs * 2 * numHead * maxSeqLen * hiddenSizePerHead;
+        int32_t const pathOffset = bs * maxDecodingTokens * (maxPathLen + 1) + bestPath * (maxPathLen + 1);
+        int32_t const kvCacheOffset = layerOffset + bs * 2 * numHead * maxSeqLen * hiddenSizePerHead;
 
         for (int pathIdx = 0; pathIdx < acceptedLen; ++pathIdx)
         {
-            const int32_t validTokenIdx = paths[pathOffset + pathIdx];
+            int32_t const validTokenIdx = paths[pathOffset + pathIdx];
 
             if (validTokenIdx == -1)
                 break;
-            const int32_t srcPos = contextLengths[bs] + validTokenIdx - acceptedLengths[bs] - 1;
-            const int32_t keyDstOffset = kvCacheOffset + headOffset + dstIdxBase * hiddenStride + hIdx;
+            int32_t const srcPos = contextLengths[bs] + validTokenIdx - acceptedLengths[bs] - 1;
+            int32_t const keyDstOffset = kvCacheOffset + headOffset + dstIdxBase * hiddenStride + hIdx;
 
-            const int32_t keySrcOffset = kvCacheOffset + headOffset + srcPos * hiddenStride + hIdx;
+            int32_t const keySrcOffset = kvCacheOffset + headOffset + srcPos * hiddenStride + hIdx;
 
             if constexpr (std::is_same<T, half>::value)
             {
@@ -758,10 +758,10 @@ __global__ void updateKVCache(T* kvCache, int32_t const* paths, int64_t const* a
                 kvCache[keyDstOffset] = kvCache[keySrcOffset];
             }
 
-            const int32_t valueDstOffset = kvCacheOffset + 1 * numHead * maxSeqLen * hiddenSizePerHead + headOffset
+            int32_t const valueDstOffset = kvCacheOffset + 1 * numHead * maxSeqLen * hiddenSizePerHead + headOffset
                 + dstIdxBase * hiddenStride + hIdx;
 
-            const int32_t valueSrcOffset = kvCacheOffset + 1 * numHead * maxSeqLen * hiddenSizePerHead + headOffset
+            int32_t const valueSrcOffset = kvCacheOffset + 1 * numHead * maxSeqLen * hiddenSizePerHead + headOffset
                 + srcPos * hiddenStride + hIdx;
 
             if constexpr (std::is_same<T, half>::value)
@@ -782,7 +782,7 @@ __global__ void updateKVCache(T* kvCache, int32_t const* paths, int64_t const* a
 __global__ void updateContextLengthsAndTreePositionIds(int32_t* contextLengths, int64_t const* acceptedLengths,
     int32_t* treePositionIds, int32_t batchSize, int32_t maxDecodingTokens)
 {
-    const int32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int32_t const tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid >= batchSize)
         return;
 
@@ -800,9 +800,9 @@ __global__ void updateHiddenStatesInputs(T* hiddenStatesInputs, T* hiddenStates,
     constexpr int32_t vec_size = std::is_same<T, half>::value ? 2 : 1;
     assert(hiddenDim % vec_size == 0);
 
-    const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int32_t bs = tid / (hiddenDim / vec_size);
-    const int32_t hiddenIdx = (tid % (hiddenDim / vec_size)) * vec_size;
+    int32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const bs = tid / (hiddenDim / vec_size);
+    int32_t const hiddenIdx = (tid % (hiddenDim / vec_size)) * vec_size;
 
     if (bs >= batchSize || hiddenIdx >= hiddenDim)
         return;
@@ -812,19 +812,19 @@ __global__ void updateHiddenStatesInputs(T* hiddenStatesInputs, T* hiddenStates,
     if (acceptedLengths[bs] == 0)
         return;
 
-    const int32_t bestPath = bestPathIds[bs];
-    const int32_t acceptedLen = acceptedLengths[bs];
-    const int32_t pathOffset = bs * maxDecodingTokens * (maxPathLen + 1) + bestPath * (maxPathLen + 1);
+    int32_t const bestPath = bestPathIds[bs];
+    int32_t const acceptedLen = acceptedLengths[bs];
+    int32_t const pathOffset = bs * maxDecodingTokens * (maxPathLen + 1) + bestPath * (maxPathLen + 1);
 
     int32_t dstIdx = 0;
     for (int32_t pathIdx = 0; pathIdx < acceptedLen; ++pathIdx)
     {
-        const int32_t validTokenIdx = paths[pathOffset + pathIdx];
+        int32_t const validTokenIdx = paths[pathOffset + pathIdx];
         if (validTokenIdx == -1)
             break;
 
-        const int32_t srcOffset = flat_index3(bs, validTokenIdx, hiddenIdx, maxDecodingTokens, hiddenDim);
-        const int32_t dstOffset = flat_index3(bs, dstIdx, hiddenIdx, maxDecodingTokens, hiddenDim);
+        int32_t const srcOffset = flat_index3(bs, validTokenIdx, hiddenIdx, maxDecodingTokens, hiddenDim);
+        int32_t const dstOffset = flat_index3(bs, dstIdx, hiddenIdx, maxDecodingTokens, hiddenDim);
         if constexpr (std::is_same<T, half>::value)
         {
             *reinterpret_cast<vec_t*>(&hiddenStatesInputs[dstOffset])
@@ -855,7 +855,7 @@ void dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds(
 
     int threadsPerBlock = 256;
 
-    const int32_t totalThreads = commonParams.batchSize * (commonParams.targetHiddenDim / vec_size);
+    int32_t const totalThreads = commonParams.batchSize * (commonParams.targetHiddenDim / vec_size);
     int32_t blocksPerGrid = (totalThreads + threadsPerBlock - 1) / threadsPerBlock;
     updateHiddenStatesInputs<T><<<blocksPerGrid, threadsPerBlock, 0, commonParams.stream>>>(params.hiddenStatesInputs,
         params.hiddenStates, params.paths, params.bestPathIds, params.acceptedLengths, commonParams.maxPathLen,
@@ -887,7 +887,7 @@ __global__ void initCausalAttentionMask(bool* mask, int batchSize, int maxPathLe
     mask[idx] = (j <= i);
     __syncthreads();
 
-    const int32_t numPackedMasksPerToken = (maxPathLen + 31) / 32;
+    int32_t const numPackedMasksPerToken = (maxPathLen + 31) / 32;
     auto const packedIdx = flat_index3(b, i, j / 32, maxPathLen, numPackedMasksPerToken);
     if (j % 32 == 0 && j < maxPathLen)
     {

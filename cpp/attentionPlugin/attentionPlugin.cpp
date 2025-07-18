@@ -160,8 +160,8 @@ AttentionPlugin::~AttentionPlugin() {}
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize,
-        mKVCacheCapacity, mEnableTreeAttention);
+    AttentionPlugin* plugin = new AttentionPlugin(
+        mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize, mKVCacheCapacity, mEnableTreeAttention);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -297,13 +297,13 @@ bool AttentionPlugin::supportsFormatCombination(
         {
             switch (pos)
             {
-                case 0: result = checkGemmQKV(inOut[0]); break;
-                case 1: result = checkKVCache(inOut[1]); break;
-                case 2: result = checkSequenceLen(inOut[2]); break;
-                case 3: result = checkPosEncodingCosSin(inOut[3]); break;
-                case 4: result = checkAttentionMask(inOut[4]); break;
-                case 5: result = checkAttentionPosId(inOut[5]); break;
-                default: break;
+            case 0: result = checkGemmQKV(inOut[0]); break;
+            case 1: result = checkKVCache(inOut[1]); break;
+            case 2: result = checkSequenceLen(inOut[2]); break;
+            case 3: result = checkPosEncodingCosSin(inOut[3]); break;
+            case 4: result = checkAttentionMask(inOut[4]); break;
+            case 5: result = checkAttentionPosId(inOut[5]); break;
+            default: break;
             }
         }
         else
@@ -311,9 +311,9 @@ bool AttentionPlugin::supportsFormatCombination(
             int32_t outPos = pos - nbInputs;
             switch (outPos)
             {
-                case 0: result = checkAttentionOutput(inOut[pos]); break;
-                case 1: result = checkKVCache(inOut[pos]); break;
-                default: break;
+            case 0: result = checkAttentionOutput(inOut[pos]); break;
+            case 1: result = checkKVCache(inOut[pos]); break;
+            default: break;
             }
         }
 

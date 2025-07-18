@@ -20,8 +20,8 @@
 class Logger : public nvinfer1::ILogger
 {
 public:
-    Logger(){};
-    ~Logger(){};
+    Logger() {};
+    ~Logger() {};
     void log(nvinfer1::ILogger::Severity severity, char const* msg) noexcept override
     {
         std::string strMsg(msg);

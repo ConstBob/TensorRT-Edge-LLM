@@ -59,8 +59,14 @@ file(GLOB_RECURSE EAGLE_CPP_SRCS "eagle/*.cpp")
 file(GLOB_RECURSE ENGINE_CPP_SRCS "engine/*.cpp")
 
 add_library(
-  llmSdkCore STATIC ${SAMPLER_CU_SRCS} ${DECODER_CPP_SRCS} ${COMMON_CPP_SRCS}
-                    ${COMMON_CU_SRCS} ${EAGLE_CPP_SRCS} ${EAGLE_CU_SRCS} ${ENGINE_CPP_SRCS})
+  llmSdkCore STATIC
+  ${SAMPLER_CU_SRCS}
+  ${DECODER_CPP_SRCS}
+  ${COMMON_CPP_SRCS}
+  ${COMMON_CU_SRCS}
+  ${EAGLE_CPP_SRCS}
+  ${EAGLE_CU_SRCS}
+  ${ENGINE_CPP_SRCS})
 target_include_directories(llmSdkCore PRIVATE ${COMMON_INCLUDE_DIRS})
 
 # Generate tokenizer C++ static library

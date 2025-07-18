@@ -295,7 +295,6 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
     profiler->stopTiming();
     bool const eagleMode = llmEngine->isEagleModel();
 
-
     // Initialize rope_rotary_cos_sin
     std::string baseFolderPath = extractFolderName(args.baseParams.enginePath);
     std::string configPath = baseFolderPath + "/config.json";

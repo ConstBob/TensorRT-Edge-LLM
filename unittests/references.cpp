@@ -425,8 +425,8 @@ std::vector<std::pair<float, int32_t>> returnAllTopKReference(
 }
 
 void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<float>& longCosSinCache,
-    std::vector<float> const& shortFactor, std::vector<float> const& longFactor,
-    float rotaryBaseFrequency, int32_t rotaryDim, int32_t kvCacheCapacity, int32_t rotaryEmbeddingMaxPositions,
+    std::vector<float> const& shortFactor, std::vector<float> const& longFactor, float rotaryBaseFrequency,
+    int32_t rotaryDim, int32_t kvCacheCapacity, int32_t rotaryEmbeddingMaxPositions,
     int32_t originalMaxPositionEmbeddings)
 {
     float scalingFactor = 1.0f;
@@ -435,7 +435,7 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
     {
         scalingFactor = std::sqrt(1.0f + std::log(scale) / std::log(static_cast<float>(originalMaxPositionEmbeddings)));
     }
-    
+
     auto initCosSin = [&](std::vector<float> const& extFactors, std::vector<float>& cosSin, int32_t maxPositions) {
         for (int32_t pos = 0; pos < maxPositions; ++pos)
         {
@@ -450,11 +450,11 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
         }
     };
 
-    // LongCosSinCache for context lenghth > originalMaxPositionEmbeddings
+    // LongCosSinCache for context length > originalMaxPositionEmbeddings
     // For all positions, use longFactor to compute cosSinCache
     initCosSin(longFactor, longCosSinCache, kvCacheCapacity);
 
-    // ShortCosSinCache for context lenghth <= originalMaxPositionEmbeddings
+    // ShortCosSinCache for context length <= originalMaxPositionEmbeddings
     // For positions <= originalMaxPositionEmbeddings, use shortFactor to compute cosSinCache
     // For positions > originalMaxPositionEmbeddings, use longFactor to compute cosSinCache. Copy from longCosSinCache.
     int32_t shortMaxPositions = std::min(originalMaxPositionEmbeddings, kvCacheCapacity);
@@ -465,5 +465,5 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
             shortCosSinCache.begin() + shortMaxPositions * rotaryDim);
     }
 
-    return ;
+    return;
 }

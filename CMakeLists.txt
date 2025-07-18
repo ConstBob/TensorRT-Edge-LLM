@@ -20,7 +20,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_CUDA_STANDARD 17)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations -Wall -Werror=return-type")
+set(CMAKE_CXX_FLAGS
+    "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations -Wall -Werror=return-type")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 
@@ -128,7 +129,8 @@ if(BUILD_UNIT_TESTS)
   file(GLOB_RECURSE UNIT_TESTS_SRCS ${CMAKE_SOURCE_DIR}/unittests/*.cpp
        ${CMAKE_SOURCE_DIR}/unittests/*.cu)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
-  target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR})
+  target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS}
+                                              ${CMAKE_SOURCE_DIR})
   target_link_libraries(
     unitTest PRIVATE gtest gtest_main llmSdkPlugin llmSdkCore ${CUDART_LIB}
                      ${CUDA_DRIVER_LIB})

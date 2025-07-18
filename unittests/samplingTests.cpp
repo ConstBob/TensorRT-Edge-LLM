@@ -20,11 +20,11 @@
 using namespace drivellm;
 
 // Test configuration
-const int32_t ACCURACY_BATCH_SIZE = 4;
-const int32_t ACCURACY_VOCAB_SIZE = 20;
-const std::vector<int32_t> PERFORMANCE_BATCH_SIZES = {1, 4};
-const int32_t PERFORMANCE_VOCAB_SIZE = 100000;
-const uint64_t TEST_SEED = 42;
+int32_t const ACCURACY_BATCH_SIZE = 4;
+int32_t const ACCURACY_VOCAB_SIZE = 20;
+std::vector<int32_t> const PERFORMANCE_BATCH_SIZES = {1, 4};
+int32_t const PERFORMANCE_VOCAB_SIZE = 100000;
+uint64_t const TEST_SEED = 42;
 
 // Test fixture for sampling tests
 class SamplingTest : public ::testing::Test

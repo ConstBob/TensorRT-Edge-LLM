@@ -76,13 +76,13 @@ public:
         std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
 
     void generateForContext(void* inputIds, std::vector<int32_t>& contextLengths,
-        std::vector<int64_t> const& lastTokenIds, const nvinfer1::Dims inputDims = {});
+        std::vector<int64_t> const& lastTokenIds, nvinfer1::Dims const inputDims = {});
 
     void generateForDecode(std::vector<int32_t>& contextLengths, std::vector<int64_t>& lastTokenIds);
-    void addNewBuffer(std::string const& name, const nvinfer1::Dims dimsContext, int sizeOfByte);
+    void addNewBuffer(std::string const& name, nvinfer1::Dims const dimsContext, int sizeOfByte);
 
     void* getDeviceBuffer(std::string const& name);
-    const ModelConfig getModelConfig() const noexcept;
+    ModelConfig const getModelConfig() const noexcept;
 
     void getLastHostLogits(std::vector<T>& hostLogits);
     size_t getDeviceMemorySize() const noexcept;

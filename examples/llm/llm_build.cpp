@@ -104,20 +104,28 @@ public:
             "--stronglyTyped "
             "--verbose "
             "--profile=0 "
-            "--minShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--optShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--maxShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,rope_rotary_cos_sin:%ldx%ldx%ld "
+            "--minShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
+            "rope_rotary_cos_sin:%ldx%ldx%ld "
+            "--optShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
+            "rope_rotary_cos_sin:%ldx%ldx%ld "
+            "--maxShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
+            "rope_rotary_cos_sin:%ldx%ldx%ld "
             "--profile=1 "
-            "--minShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--optShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--maxShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,rope_rotary_cos_sin:%ldx%ldx%ld",
-            args.onnxPath.c_str(), args.enginePath.c_str(),
-            minBatchSize, minInputLen, minBatchSize, minBatchSize, minBatchSize, numKVHeads, headSize, minBatchSize, maxLength, rotaryDim,
-            optBatchSize, optInputLen, optBatchSize, optBatchSize, optBatchSize, numKVHeads, headSize, optBatchSize, maxLength, rotaryDim,
-            maxBatchSize, maxInputLen, maxBatchSize, maxBatchSize, maxBatchSize, numKVHeads, headSize, maxBatchSize, maxPositionEmbeddings, rotaryDim,
-            minBatchSize, minBatchSize, minBatchSize, minBatchSize, numKVHeads, maxLength, headSize, minBatchSize, maxLength, rotaryDim,
-            optBatchSize, optBatchSize, optBatchSize, optBatchSize, numKVHeads, maxLength, headSize, optBatchSize, maxLength, rotaryDim,
-            maxBatchSize, maxBatchSize, maxBatchSize, maxBatchSize, numKVHeads, maxLength, headSize, maxBatchSize, maxPositionEmbeddings, rotaryDim);
+            "--minShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
+            "rope_rotary_cos_sin:%ldx%ldx%ld "
+            "--optShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
+            "rope_rotary_cos_sin:%ldx%ldx%ld "
+            "--maxShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
+            "rope_rotary_cos_sin:%ldx%ldx%ld",
+            args.onnxPath.c_str(), args.enginePath.c_str(), minBatchSize, minInputLen, minBatchSize, minBatchSize,
+            minBatchSize, numKVHeads, headSize, minBatchSize, maxLength, rotaryDim, optBatchSize, optInputLen,
+            optBatchSize, optBatchSize, optBatchSize, numKVHeads, headSize, optBatchSize, maxLength, rotaryDim,
+            maxBatchSize, maxInputLen, maxBatchSize, maxBatchSize, maxBatchSize, numKVHeads, headSize, maxBatchSize,
+            maxPositionEmbeddings, rotaryDim, minBatchSize, minBatchSize, minBatchSize, minBatchSize, numKVHeads,
+            maxLength, headSize, minBatchSize, maxLength, rotaryDim, optBatchSize, optBatchSize, optBatchSize,
+            optBatchSize, numKVHeads, maxLength, headSize, optBatchSize, maxLength, rotaryDim, maxBatchSize,
+            maxBatchSize, maxBatchSize, maxBatchSize, numKVHeads, maxLength, headSize, maxBatchSize,
+            maxPositionEmbeddings, rotaryDim);
         return trtExecCommand;
     }
 
@@ -192,7 +200,7 @@ private:
         }
         if (rootNode.hasMember("partial_rotary_factor"))
         {
-            rotaryDim = (int64_t)(rootNode["partial_rotary_factor"].getFloat() * headSize);
+            rotaryDim = (int64_t) (rootNode["partial_rotary_factor"].getFloat() * headSize);
         }
         else
         {
@@ -238,10 +246,14 @@ private:
         result &= setOptimizationProfile(generationProfile, "context_lengths", createDims({minBatchSize}),
             createDims({optBatchSize}), createDims({maxBatchSize}));
 
-        result &= setOptimizationProfile(contextProfile, "rope_rotary_cos_sin", createDims({minBatchSize, args.maxSeqLen, rotaryDim}),
-            createDims({optBatchSize, args.maxSeqLen, rotaryDim}), createDims({maxBatchSize, maxPositionEmbeddings, rotaryDim}));
-        result &= setOptimizationProfile(generationProfile, "rope_rotary_cos_sin", createDims({minBatchSize, args.maxSeqLen, rotaryDim}),
-            createDims({optBatchSize, args.maxSeqLen, rotaryDim}), createDims({maxBatchSize, maxPositionEmbeddings, rotaryDim}));
+        result &= setOptimizationProfile(contextProfile, "rope_rotary_cos_sin",
+            createDims({minBatchSize, args.maxSeqLen, rotaryDim}),
+            createDims({optBatchSize, args.maxSeqLen, rotaryDim}),
+            createDims({maxBatchSize, maxPositionEmbeddings, rotaryDim}));
+        result &= setOptimizationProfile(generationProfile, "rope_rotary_cos_sin",
+            createDims({minBatchSize, args.maxSeqLen, rotaryDim}),
+            createDims({optBatchSize, args.maxSeqLen, rotaryDim}),
+            createDims({maxBatchSize, maxPositionEmbeddings, rotaryDim}));
 
         setupKVCacheProfiles();
 
@@ -257,12 +269,9 @@ private:
         nvinfer1::Dims minKVContextShape = createDims({minBatchSize, 2, numKVHeads, 0, headSize});
         nvinfer1::Dims optKVContextShape = createDims({optBatchSize, 2, numKVHeads, 0, headSize});
         nvinfer1::Dims maxKVContextShape = createDims({maxBatchSize, 2, numKVHeads, 0, headSize});
-        nvinfer1::Dims minKVGenerationShape
-            = createDims({minBatchSize, 2, numKVHeads, args.maxSeqLen, headSize});
-        nvinfer1::Dims optKVGenerationShape
-            = createDims({optBatchSize, 2, numKVHeads, args.maxSeqLen, headSize});
-        nvinfer1::Dims maxKVGenerationShape
-            = createDims({maxBatchSize, 2, numKVHeads, args.maxSeqLen, headSize});
+        nvinfer1::Dims minKVGenerationShape = createDims({minBatchSize, 2, numKVHeads, args.maxSeqLen, headSize});
+        nvinfer1::Dims optKVGenerationShape = createDims({optBatchSize, 2, numKVHeads, args.maxSeqLen, headSize});
+        nvinfer1::Dims maxKVGenerationShape = createDims({maxBatchSize, 2, numKVHeads, args.maxSeqLen, headSize});
 
         for (int i = 0; i < nbKVCacheInputs; ++i)
         {
@@ -355,7 +364,7 @@ private:
 
         if (args.eagleBuildParams.isEagleDraft || args.eagleBuildParams.isEagleBase)
         {
-            const int32_t attnMaskAlignSize = 32;
+            int32_t const attnMaskAlignSize = 32;
             result &= setOptimizationProfile(contextProfile, "attention_mask", createDims({minBatchSize, 1, 1}),
                 createDims({optBatchSize, 1, 1}), createDims({maxBatchSize, 1, 1}));
             result &= setOptimizationProfile(generationProfile, "attention_mask", createDims({minBatchSize, 1, 1}),

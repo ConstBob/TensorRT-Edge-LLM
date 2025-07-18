@@ -8,7 +8,6 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import math
 import os
 import time
 
@@ -16,13 +15,9 @@ import modelopt.torch.quantization as mtq
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from modelopt.torch.quantization.nn import TensorQuantizer
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoProcessor
-from transformers.models.qwen2_vl.modeling_qwen2_vl import \
-    apply_rotary_pos_emb_vision
-from utils.export_utils import QwenVisionAttention
 
 
 def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
@@ -120,8 +115,8 @@ def _quantize_model(model, quant_config, calib_dataloader=None):
 
     Example usage:
     from modelopt.torch.utils.dataset_utils import create_forward_loop
-    model = ...  # Initilaize the model
-    tokenizer = ...  # Initilaize the tokenizer
+    model = ...  # Initialize the model
+    tokenizer = ...  # Initialize the tokenizer
     quant_cfg = ...  # Setup quantization configuration
     forward_loop = create_forward_loop(model=model, dataset_name="cnn_dailymail", tokenizer=tokenizer)
     mtq.quantize(model, quant_cfg, forward_loop=forward_loop)

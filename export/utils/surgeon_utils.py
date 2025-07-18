@@ -10,7 +10,6 @@
 
 import re
 import time
-from enum import Enum
 from typing import Union
 
 import numpy as np
@@ -327,7 +326,8 @@ def insert_attention_plugin(graph: gs.Graph,
     print("Replacing MHA Pattern with AttentionPlugin...")
     num_q_heads = require_config_key("num_attention_heads")
     num_kv_heads = require_config_key("num_key_value_heads")
-    head_size = config.get("head_dim", None) or require_config_key("hidden_size") // num_q_heads
+    head_size = config.get(
+        "head_dim", None) or require_config_key("hidden_size") // num_q_heads
     partial_rotary_factor = config.get("partial_rotary_factor", 1.0)
     rotary_dim = int(head_size * partial_rotary_factor)
 
@@ -361,8 +361,9 @@ def insert_attention_plugin(graph: gs.Graph,
         graph.inputs.remove(clear_outputs(i))
 
     context_lengths = gs.Variable("context_lengths", np.int32, ['batch_size'])
-    rope_rotary_cos_sin = gs.Variable("rope_rotary_cos_sin", np.float32,
-                                      ['rope_batch_size', 'rope_max_position_length', rotary_dim])
+    rope_rotary_cos_sin = gs.Variable(
+        "rope_rotary_cos_sin", np.float32,
+        ['rope_batch_size', 'rope_max_position_length', rotary_dim])
 
     graph.inputs.append(context_lengths)
     graph.inputs.append(rope_rotary_cos_sin)
@@ -461,11 +462,13 @@ def insert_attention_plugin(graph: gs.Graph,
                                 shape=kv_output_shape)
         graph.outputs.append(kv_output)
 
-        graph.layer(name=f"Attention-{i}",
-                    op="AttentionPlugin",
-                    inputs=[qkv, kv_input, context_lengths, rope_rotary_cos_sin] + extra_inputs,
-                    outputs=[attn_output, kv_output],
-                    attrs=attention_attrs)
+        graph.layer(
+            name=f"Attention-{i}",
+            op="AttentionPlugin",
+            inputs=[qkv, kv_input, context_lengths, rope_rotary_cos_sin] +
+            extra_inputs,
+            outputs=[attn_output, kv_output],
+            attrs=attention_attrs)
     graph.cleanup().toposort()
     end_time = time.time()
     print(f"AttentionPlugin inserted in {end_time - start_time}s. ")
@@ -675,7 +678,7 @@ def insert_int4_gemm_plugin(graph: gs.Graph, state_dict: dict):
             gs.Constant), f"Both inputs for node {node.name} are not Constant!"
         gemm_name = node.name
         weight = node.inputs[weight_id]
-        onnx_weight_name = weight.name
+        weight.name
 
         # Should not clear outputs because qkv shares the same input
         input = node.inputs[1 - weight_id]

@@ -48,23 +48,23 @@ __inline__ __device__ void dequantize_s4_to_fp16x2(half2 const& source, uint4* r
 
     // Shift right by 8 to now consider elt_45 and elt_67. Issue first to hide RAW dependency if we issue
     // immediately before required.
-    const uint32_t top_i4s = i4s >> 8;
+    uint32_t const top_i4s = i4s >> 8;
     // Extract elt_01 - (i4s & 0x000f000f) | 0x64006400
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
-                 : "=r"(h[0])
-                 : "r"(i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        : "=r"(h[0])
+        : "r"(i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
     // Extract elt_23 (i4s & 0x00f000f0) | 0x64006400
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
-                 : "=r"(h[1])
-                 : "r"(i4s), "n"(TOP_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        : "=r"(h[1])
+        : "r"(i4s), "n"(TOP_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
     // Extract elt_45 (top_i4s & 0x000f000f) | 0x64006400
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
-                 : "=r"(h[2])
-                 : "r"(top_i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        : "=r"(h[2])
+        : "r"(top_i4s), "n"(BOTTOM_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
     // Extract elt_67 (top_i4s & 0x00f000f0) | 0x64006400
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
-                 : "=r"(h[3])
-                 : "r"(top_i4s), "n"(TOP_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
+        : "=r"(h[3])
+        : "r"(top_i4s), "n"(TOP_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
 
     // I use inline PTX below because I am not sure if the compiler will emit float2half instructions if I use the
     // half2 ctor. In this case, I chose performance reliability over code readability.

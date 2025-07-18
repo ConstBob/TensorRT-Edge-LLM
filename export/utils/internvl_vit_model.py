@@ -279,7 +279,6 @@ except ImportError:
 except Exception:
     logger.warning(
         'discovered apex but it failed to load, falling back to InternRMSNorm')
-    pass
 
 NORM2FN = {
     'rms_norm': InternRMSNorm,

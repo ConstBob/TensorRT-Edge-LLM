@@ -39,7 +39,7 @@
  * Helper functions
  */
 // Replace special chars to support std::regex
-static const std::regex specialChars{R"([[\^$.|?*+(){}])"};
+static std::regex const specialChars{R"([[\^$.|?*+(){}])"};
 
 // reverse map<token, id> to map<id, token>
 BPERanksToToken reverseEncoder(BPETokenToRanks const& encoder);
@@ -84,7 +84,7 @@ struct codepointFlags
     uint16_t isNfd : 1;
 
     // decode from uint16
-    inline codepointFlags(const uint16_t flags = 0)
+    inline codepointFlags(uint16_t const flags = 0)
     {
         *reinterpret_cast<uint16_t*>(this) = flags;
     }
@@ -101,21 +101,21 @@ struct codepointFlags
 };
 
 // unicode categories
-static const std::map<std::string, int> kUatEnum = {
+static std::map<std::string, int> const kUatEnum = {
     {"\\p{N}", codepointFlags::NUMBER},
     {"\\p{L}", codepointFlags::LETTER},
     {"\\p{P}", codepointFlags::PUNCTUATION},
 };
 
-static const std::map<int, int> kUcatCpt = {
+static std::map<int, int> const kUcatCpt = {
     {codepointFlags::NUMBER, 0xD1},
     {codepointFlags::LETTER, 0xD2},
     {codepointFlags::PUNCTUATION, 0xD3},
 };
 
-static const std::map<int, std::string> kUcatMap = {
-    {codepointFlags::NUMBER, "\x30-\x39"},                                             // 0-9
-    {codepointFlags::LETTER, "\x41-\x5A\x61-\x7A"},                                    // A-Za-z
+static std::map<int, std::string> const kUcatMap = {
+    {codepointFlags::NUMBER, "\x30-\x39"},          // 0-9
+    {codepointFlags::LETTER, "\x41-\x5A\x61-\x7A"}, // A-Za-z
     {codepointFlags::PUNCTUATION,
         "\x21-\x23\x25-\x2A\x2C-\x2F\x3A-\x3B\x3F-\x40\\\x5B-\\\x5D\x5F\\\x7B\\\x7D"}, // !-#%-*,-/:-;?-@\[-\]_\{\}
 };
@@ -132,4 +132,4 @@ uint32_t unicodeCptFromUtf8(std::string const& utf8, size_t& offset);
 
 std::string unicodeCptToUtf8(uint32_t cp);
 
-codepointFlags unicodeCptFlags(const uint32_t cp);
+codepointFlags unicodeCptFlags(uint32_t const cp);

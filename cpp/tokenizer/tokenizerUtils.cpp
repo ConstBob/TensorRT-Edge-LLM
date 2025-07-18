@@ -320,7 +320,7 @@ bool unicodeCollapseRegex(std::string const& expr, std::regex& regex)
                 if (expr[i + 0] == '\\' && i + 4 < expr.size() && expr[i + 1] == 'p' && expr[i + 2] == '{'
                     && expr[i + 4] == '}')
                 {
-                    const std::string pat = expr.substr(i, 5);
+                    std::string const pat = expr.substr(i, 5);
                     if (kUatEnum.find(pat) != kUatEnum.end())
                     {
                         if (!inside)
@@ -463,9 +463,9 @@ static std::vector<codepointFlags> unicodeCptFlagsArray()
     return cpt_flags;
 }
 
-codepointFlags unicodeCptFlags(const uint32_t cp)
+codepointFlags unicodeCptFlags(uint32_t const cp)
 {
-    static const codepointFlags undef(codepointFlags::UNDEFINED);
+    static codepointFlags const undef(codepointFlags::UNDEFINED);
     static auto const cptFlags = unicodeCptFlagsArray();
     return cp < cptFlags.size() ? cptFlags[cp] : undef;
 }
