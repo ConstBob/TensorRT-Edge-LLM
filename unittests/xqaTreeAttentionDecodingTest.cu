@@ -4,9 +4,9 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
-#include "attentionPlugin/xqa/decoderXQARunner.h"
 #include "common/common.h"
 #include "common/cudaUtils.h"
+#include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "references.h"
 #include "testUtils.h"
 

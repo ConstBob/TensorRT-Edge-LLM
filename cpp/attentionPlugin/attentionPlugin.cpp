@@ -11,10 +11,12 @@
  */
 
 #include "attentionPlugin.h"
-#include "attentionPlugin/fmha-v2/contextFMHARunner.h"
-#include "attentionPlugin/xqa/decoderXQARunner.h"
-#include "pluginUtils.h"
-#include "posEnc/applyRopeWriteKV.h"
+#include "common/common.h"
+#include "common/cudaUtils.h"
+
+#include "kernels/posEncoding/applyRopeWriteKV.h"
+#include "kernels/decodeAttentionKernels/decoderXQARunner.h"
+#include "kernels/contextAttentionKernels/contextFMHARunner.h"
 
 #include <cassert>
 #include <mutex>

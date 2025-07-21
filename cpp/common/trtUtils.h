@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -32,6 +33,14 @@ inline nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
         dims.d[i] = shape[i];
     }
     return dims;
+}
+
+inline std::int64_t volume(nvinfer1::Dims const& dims)
+{
+
+    return dims.nbDims < 0 ? -1
+        : dims.nbDims == 0 ? 0
+                           : std::accumulate(dims.d, dims.d + dims.nbDims, std::int64_t{1}, std::multiplies<>{});
 }
 
 struct EngineInputDesc

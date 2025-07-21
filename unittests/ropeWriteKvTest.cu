@@ -2,9 +2,9 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
-#include "attentionPlugin/posEnc/applyRopeWriteKV.h"
 #include "common/cudaUtils.h"
-#include "common/posEncoding/initializeCosSinCache.h"
+#include "kernels/posEncoding/applyRopeWriteKV.h"
+#include "kernels/posEncoding/initializeCosSinCache.h"
 #include "references.h"
 #include "testUtils.h"
 

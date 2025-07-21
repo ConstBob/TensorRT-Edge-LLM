@@ -1,5 +1,5 @@
 #pragma once
-#include "common/common.h"
+
 #include <cstdint>
 
 struct EagleCommonParams

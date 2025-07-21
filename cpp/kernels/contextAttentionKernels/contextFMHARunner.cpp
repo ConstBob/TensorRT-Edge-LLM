@@ -11,10 +11,12 @@
  */
 
 #include "contextFMHARunner.h"
-#include "attentionPlugin/fmha-v2/cubin/fmha_cubin.h"
-#include "attentionPlugin/pluginUtils.h"
+
+#include "common/common.h"
+#include "cubin/fmha_cubin.h"
 
 #include <cuda_fp16.h>
+#include <cuda.h>
 #include <math.h>
 #include <memory>
 #include <mutex>
@@ -199,12 +201,12 @@ public:
             }
             else
             {
-                checkCu(cuModuleLoadData(&hModule, kernelMeta.mCubin));
+                CUDA_DRIVER_CHECK(cuModuleLoadData(&hModule, kernelMeta.mCubin));
                 mModules.insert(std::make_pair(kernelMeta.mCubin, hModule));
             }
 
             FMHAKernelFuncInfo funcInfo{};
-            checkCu(cuModuleGetFunction(&funcInfo.mDeviceFunction, hModule, kernelMeta.mFuncName));
+            CUDA_DRIVER_CHECK(cuModuleGetFunction(&funcInfo.mDeviceFunction, hModule, kernelMeta.mFuncName));
             funcInfo.mSharedMemBytes = kernelMeta.mSharedMemBytes;
             funcInfo.mThreadsPerCTA = kernelMeta.mThreadsPerCTA;
             funcInfo.mUnrollStep = kernelMeta.mUnrollStep;
@@ -212,7 +214,7 @@ public:
 
             if (funcInfo.mSharedMemBytes >= 48 * 1024)
             {
-                checkCu(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                CUDA_DRIVER_CHECK(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     funcInfo.mSharedMemBytes));
             }
             FMHAKernelHashKey hashKey{kernelMeta.mDataType, static_cast<int32_t>(kernelMeta.mS),
@@ -389,6 +391,6 @@ void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2& 
     int32_t unroll = (params.s + kernelInfo.mUnrollStep - 1) / kernelInfo.mUnrollStep;
     // on Ampere/Ada flash attention, we launch blocks (steps, h, b)
     // TODO: Generalize the logic for more architectures.
-    checkCu(cuLaunchKernel(kernelInfo.mDeviceFunction, unroll, params.h, params.b, kernelInfo.mThreadsPerCTA, 1, 1,
+    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, unroll, params.h, params.b, kernelInfo.mThreadsPerCTA, 1, 1,
         kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }

@@ -2,10 +2,10 @@
 #ifndef EAGLE_H
 #define EAGLE_H
 #include "common/benchmarkProfiler.h"
-#include "common/common.h"
 #include "common/json.h"
 #include "decoder/decoder.h"
-#include "utils/eagleUtilKernels.h"
+#include "kernels/speculative/eagleUtilKernels.h"
+
 #include <NvInferRuntime.h>
 #include <cfloat>
 #include <cuda_runtime_api.h>

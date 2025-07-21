@@ -1,6 +1,5 @@
 #include "eagle.h"
 #include "common/common.h"
-#include "eagle/utils/eagleUtilKernels.h"
 #include "sampler/sampling.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
