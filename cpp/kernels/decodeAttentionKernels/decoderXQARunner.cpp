@@ -11,10 +11,12 @@
  */
 
 #include "decoderXQARunner.h"
-#include "attentionPlugin/pluginUtils.h"
-#include "attentionPlugin/xqa/cubin/xqa_kernel_cubin.h"
+
+#include "common/common.h"
+#include "cubin/xqa_kernel_cubin.h"
 
 #include <algorithm>
+#include <cuda.h>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -167,23 +169,23 @@ public:
             }
             else
             {
-                checkCu(cuModuleLoadData(&hModule, kernelMeta.mCubin));
+                CUDA_DRIVER_CHECK(cuModuleLoadData(&hModule, kernelMeta.mCubin));
                 mModules.insert(std::make_pair(kernelMeta.mCubin, hModule));
             }
 
             XQAKernelFuncInfo funcInfo{};
-            checkCu(cuModuleGetFunction(&funcInfo.mDeviceFunction, hModule, kernelMeta.mFuncName));
+            CUDA_DRIVER_CHECK(cuModuleGetFunction(&funcInfo.mDeviceFunction, hModule, kernelMeta.mFuncName));
 
             uint32_t* deviceSmemSize{nullptr};
             size_t dataSize{0};
-            checkCu(cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&deviceSmemSize), &dataSize, hModule, "smemSize"));
-            checkCuda(cudaMemcpy(&funcInfo.mSharedMemBytes, deviceSmemSize, dataSize, cudaMemcpyDeviceToHost));
+            CUDA_DRIVER_CHECK(cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&deviceSmemSize), &dataSize, hModule, "smemSize"));
+            CUDA_CHECK(cudaMemcpy(&funcInfo.mSharedMemBytes, deviceSmemSize, dataSize, cudaMemcpyDeviceToHost));
 
             // Set 46KB threshold here because we have to take static/driver shared memory into consideration.
-            // Default value for shared memory is 48KB, copy the logic from TRT-LLM
+            // Default value for shared memory is 48KB.
             if (funcInfo.mSharedMemBytes >= 46 * 1024)
             {
-                checkCu(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                CUDA_DRIVER_CHECK(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     funcInfo.mSharedMemBytes));
             }
             XQAKernelRuntimeHashKey hashKey{
@@ -326,7 +328,7 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     // context. Current measured workload doesn't get performance gain from multi-block launch.
     dim3 const dimGrid{1, mNumKVHeads, mBatchSize};
     dim3 const dimCta{128, 1, 2};
-    checkCu(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y, dimCta.z,
+    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y, dimCta.z,
         kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }
 
@@ -351,6 +353,6 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
     int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / CTA_TILE_Y + 1;
     dim3 const dimGrid{1, mNumKVHeads * tokenBlockPerGroup, mBatchSize};
     dim3 const dimCta{128, 1, 2};
-    checkCu(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y, dimCta.z,
+    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y, dimCta.z,
         kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }

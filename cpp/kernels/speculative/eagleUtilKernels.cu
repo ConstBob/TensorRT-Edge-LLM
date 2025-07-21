@@ -1,4 +1,6 @@
 #include "eagleUtilKernels.h"
+
+#include "common/common.h"
 #include "memoryUtils.h"
 #include <cub/cub.cuh>
 #include <cuda.h>

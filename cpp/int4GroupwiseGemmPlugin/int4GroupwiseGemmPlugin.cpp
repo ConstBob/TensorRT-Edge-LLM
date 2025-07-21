@@ -11,7 +11,7 @@
  */
 
 #include "int4GroupwiseGemmPlugin.h"
-#include "int4GroupwiseGemmPlugin/kernel/int4GroupwiseGemm.h"
+#include "kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h"
 
 #include <cassert>
 #include <cstring>

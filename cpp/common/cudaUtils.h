@@ -17,38 +17,6 @@
 #include <cuda_runtime.h>
 #include <numeric>
 
-static char const* _cudaGetErrorEnum(cublasStatus_t error)
-{
-    switch (error)
-    {
-    case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
-
-    case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
-
-    case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
-
-    case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
-
-    case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
-
-    case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
-
-    case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
-
-    case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
-
-    case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
-
-    case CUBLAS_STATUS_LICENSE_ERROR: return "CUBLAS_STATUS_LICENSE_ERROR";
-    }
-    return "<unknown>";
-}
-
-static char const* _cudaGetErrorEnum(cudaError_t error)
-{
-    return cudaGetErrorString(error);
-}
-
 inline int getDevice()
 {
     int current_dev_id = 0;
@@ -77,14 +45,6 @@ inline bool isCudaLaunchBlocking()
     }
 
     return result;
-}
-
-static std::int64_t volume(nvinfer1::Dims const& dims)
-{
-
-    return dims.nbDims < 0 ? -1
-        : dims.nbDims == 0 ? 0
-                           : std::accumulate(dims.d, dims.d + dims.nbDims, std::int64_t{1}, std::multiplies<>{});
 }
 
 /// Get the memory info

@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include <cuda.h>
+
 inline void check(bool condition, std::string errorMsg)
 {
     if (!condition)
@@ -37,7 +39,9 @@ inline std::string vformat(char const* fmt, va_list args)
     va_copy(args0, args);
     auto const size = vsnprintf(nullptr, 0, fmt, args0);
     if (size <= 0)
+    {
         return "";
+    }
 
     std::string stringBuf(size, char{});
     auto const size2 = std::vsnprintf(&stringBuf[0], size + 1, fmt, args);
@@ -64,6 +68,20 @@ inline void _checkCuda(cudaError_t result, char const* const func, [[maybe_unuse
         throw std::runtime_error(fmtstr("CUDA runtime error in %s: %s", func, cudaGetErrorString(result)));
     }
 }
+
+inline void _checkCudaDriver(CUresult result, char const* const func, [[maybe_unused]] char const* const file,
+    [[maybe_unused]] int const line)
+{
+    if (result)
+    {
+        char const* errorName = nullptr;
+        if (cuGetErrorName(result, &errorName) != CUDA_SUCCESS)
+        {
+            errorName = "CUDA driver API error happened, but we failed to get error name.";
+        }
+        throw std::runtime_error(fmtstr("CUDA driver API error in %s: %s", func, errorName));
+    }
+}
 /*
  * Macros compliant with TensorRT coding conventions
  */
@@ -71,6 +89,12 @@ inline void _checkCuda(cudaError_t result, char const* const func, [[maybe_unuse
     do                                                                                                                 \
     {                                                                                                                  \
         _checkCuda((stat), #stat, __FILE__, __LINE__);                                                                 \
+    } while (0)
+
+#define CUDA_DRIVER_CHECK(stat)                                                                                        \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        _checkCudaDriver((stat), #stat, __FILE__, __LINE__);                                                                 \
     } while (0)
 
 inline std::string extractFolderName(std::string const& path)

@@ -12,7 +12,7 @@
 
 #include "decoder.h"
 #include "common/json.h"
-#include "common/posEncoding/initializeCosSinCache.h"
+#include "kernels/posEncoding/initializeCosSinCache.h"
 #include "sampler/sampling.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
