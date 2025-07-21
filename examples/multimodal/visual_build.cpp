@@ -333,7 +333,7 @@ int main(int argc, char** argv)
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    auto pluginHandles = loadPlugins();
+    auto pluginHandles = loadEdgellmPluginLib();
 
     if (args.vlmBuildParams.modelType != "qwen2_vl" && args.vlmBuildParams.modelType != "qwen2_5_vl"
         && args.vlmBuildParams.modelType != "internvl3")

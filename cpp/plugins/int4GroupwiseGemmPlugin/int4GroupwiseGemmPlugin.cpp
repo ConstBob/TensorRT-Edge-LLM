@@ -12,9 +12,9 @@
 
 #include "int4GroupwiseGemmPlugin.h"
 #include "kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h"
+#include "plugins/utils/pluginUtils.h"
 
 #include <cassert>
-#include <cstring>
 #include <cuda_fp16.h>
 #include <mutex>
 #include <optional>
@@ -22,77 +22,15 @@
 #include <iostream>
 
 using namespace nvinfer1;
-using namespace drivellm;
+using namespace drivellm::plugins;
 
 namespace
 {
 constexpr char const* kINT4_GEMM_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_GEMM_PLUGIN_NAME{"Int4GroupwiseGemmPlugin"};
 
+// Enforce groupsize to be 128, can be further extended to support 64.
 constexpr int32_t kGROUP_SIZE{128};
-
-template <typename T>
-nvinfer1::PluginFieldType toFieldType();
-#define SPECIALIZE_TO_FIELD_TYPE(T, type)                                                                              \
-    template <>                                                                                                        \
-    [[maybe_unused]] nvinfer1::PluginFieldType toFieldType<T>()                                                        \
-    {                                                                                                                  \
-        return nvinfer1::PluginFieldType::type;                                                                        \
-    }
-SPECIALIZE_TO_FIELD_TYPE(float, kFLOAT32)
-SPECIALIZE_TO_FIELD_TYPE(int32_t, kINT32)
-#undef SPECIALIZE_TO_FIELD_TYPE
-
-template <typename T>
-std::optional<T> parsePluginScalarField(std::string const& fieldName, nvinfer1::PluginFieldCollection const* fc)
-{
-    for (int32_t i = 0; i < fc->nbFields; ++i)
-    {
-        PluginField const& pluginField = fc->fields[i];
-        if (fieldName.compare(pluginField.name) == 0)
-        {
-            assert(toFieldType<T>() == pluginField.type);
-            assert(pluginField.length == 1 && pluginField.data != nullptr);
-            return std::optional{*static_cast<T const*>(pluginField.data)};
-        }
-    }
-
-    return std::nullopt;
-}
-
-template <typename T, class Enable = void>
-struct Serializer
-{
-};
-
-template <typename T>
-struct Serializer<T, typename std::enable_if_t<std::is_arithmetic_v<T> || std::is_enum_v<T>>>
-{
-    static void serialize(void** buffer, T const& value)
-    {
-        ::memcpy(*buffer, &value, sizeof(T));
-        reinterpret_cast<char*&>(*buffer) += sizeof(T);
-    }
-    static void deserialize(void const** buffer, size_t* buffer_size, T* value)
-    {
-        assert(*buffer_size >= sizeof(T));
-        ::memcpy(value, *buffer, sizeof(T));
-        reinterpret_cast<char const*&>(*buffer) += sizeof(T);
-        *buffer_size -= sizeof(T);
-    }
-};
-
-template <typename T>
-inline void serializeValue(void** buffer, T const& value)
-{
-    return Serializer<T>::serialize(buffer, value);
-}
-
-template <typename T>
-inline void deserializeValue(void const** buffer, size_t* buffer_size, T* value)
-{
-    return Serializer<T>::deserialize(buffer, buffer_size, value);
-}
 
 } // namespace
 

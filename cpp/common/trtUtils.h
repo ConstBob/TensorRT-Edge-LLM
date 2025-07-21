@@ -107,18 +107,18 @@ struct DlDeleter
     }
 };
 
-inline std::unique_ptr<void, DlDeleter> loadAttentionPlugin(void)
+inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
 {
-    char const* pluginPath = std::getenv("ATTENTION_PLUGIN_PATH");
+    char const* pluginPath = std::getenv("EDGELLM_PLUGIN_PATH");
 
     if (pluginPath != nullptr)
     {
-        LOG_INFO("ATTENTION_PLUGIN_PATH: %s", pluginPath);
+        LOG_INFO("EDGELLM_PLUGIN_PATH: %s", pluginPath);
     }
     else
     {
-        LOG_INFO("ATTENTION_PLUGIN_PATH variable is not set. Default to build/libAttentionPlugin.so");
-        pluginPath = "build/libAttentionPlugin.so";
+        LOG_INFO("EDGELLM_PLUGIN_PATH variable is not set. Default to build/libNvInfer_edgellm_plugin.so");
+        pluginPath = "build/libNvInfer_edgellm_plugin.so";
     }
 
     auto handle = std::unique_ptr<void, DlDeleter>(dlopen(pluginPath, RTLD_LAZY));
@@ -130,39 +130,6 @@ inline std::unique_ptr<void, DlDeleter> loadAttentionPlugin(void)
     return handle;
 }
 
-inline std::unique_ptr<void, DlDeleter> loadInt4GemmPlugin(void)
-{
-    char const* pluginPath = std::getenv("INT4_GEMM_PLUGIN_PATH");
-
-    if (pluginPath != nullptr)
-    {
-        LOG_INFO("INT4_GEMM_PLUGIN_PATH: %s", pluginPath);
-    }
-    else
-    {
-        LOG_INFO("INT4_GEMM_PLUGIN_PATH variable is not set. Default to build/libInt4GemmPlugin.so");
-        pluginPath = "build/libInt4GemmPlugin.so";
-    }
-
-    auto handle = std::unique_ptr<void, DlDeleter>(dlopen(pluginPath, RTLD_LAZY));
-    if (!handle)
-    {
-        LOG_WARNING("Cannot open plugin library: %s", dlerror());
-        return std::unique_ptr<void, DlDeleter>(nullptr);
-    }
-    return handle;
-}
-
-inline std::vector<std::unique_ptr<void, DlDeleter>> loadPlugins(bool int4GemmPlugin = true)
-{
-    std::vector<std::unique_ptr<void, DlDeleter>> handles;
-    handles.push_back(loadAttentionPlugin());
-    if (int4GemmPlugin)
-    {
-        handles.push_back(loadInt4GemmPlugin());
-    }
-    return handles;
-}
 
 // StreamReader ported from TRT-LLM to read from engine file.
 class StreamReader final : public nvinfer1::IStreamReader
