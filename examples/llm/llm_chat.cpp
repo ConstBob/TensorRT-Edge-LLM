@@ -196,7 +196,7 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    auto pluginHandles = loadPlugins();
+    auto pluginHandles = loadEdgellmPluginLib();
 
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.baseParams.tokenizerPath);

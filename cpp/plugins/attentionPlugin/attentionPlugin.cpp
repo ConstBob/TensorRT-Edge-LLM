@@ -17,6 +17,7 @@
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "kernels/contextAttentionKernels/contextFMHARunner.h"
+#include "plugins/utils/pluginUtils.h"
 
 #include <cassert>
 #include <mutex>
@@ -24,87 +25,12 @@
 #include <vector>
 
 using namespace nvinfer1;
-using namespace drivellm;
+using namespace drivellm::plugins;
 
 namespace
 {
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
-
-constexpr int32_t kDEVICE_ALIGNMENT{128}; // Make sure all device pointers are aligned by 128.
-
-int8_t* alignDevicePtr(void* ptr)
-{
-    // Convert the pointer to an integer
-    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-    uintptr_t aligned_addr = (addr + kDEVICE_ALIGNMENT) & ~static_cast<uintptr_t>(kDEVICE_ALIGNMENT);
-
-    // Convert the aligned address back to a pointer
-    return reinterpret_cast<int8_t*>(aligned_addr);
-}
-
-template <typename T>
-nvinfer1::PluginFieldType toFieldType();
-#define SPECIALIZE_TO_FIELD_TYPE(T, type)                                                                              \
-    template <>                                                                                                        \
-    nvinfer1::PluginFieldType toFieldType<T>()                                                                         \
-    {                                                                                                                  \
-        return nvinfer1::PluginFieldType::type;                                                                        \
-    }
-SPECIALIZE_TO_FIELD_TYPE(float, kFLOAT32)
-SPECIALIZE_TO_FIELD_TYPE(int32_t, kINT32)
-#undef SPECIALIZE_TO_FIELD_TYPE
-
-template <typename T>
-std::optional<T> parsePluginScalarField(std::string const& fieldName, nvinfer1::PluginFieldCollection const* fc)
-{
-    for (int32_t i = 0; i < fc->nbFields; ++i)
-    {
-        PluginField const& pluginField = fc->fields[i];
-        if (fieldName.compare(pluginField.name) == 0)
-        {
-            check(toFieldType<T>() == pluginField.type, "Mismatch datatype of plugin field");
-            check(pluginField.length == 1 && pluginField.data != nullptr, "Invalid plugin field");
-            return std::optional{*static_cast<T const*>(pluginField.data)};
-        }
-    }
-
-    return std::nullopt;
-}
-
-template <typename T, class Enable = void>
-struct Serializer
-{
-};
-
-template <typename T>
-struct Serializer<T, typename std::enable_if_t<std::is_arithmetic_v<T> || std::is_enum_v<T>>>
-{
-    static void serialize(void** buffer, T const& value)
-    {
-        ::memcpy(*buffer, &value, sizeof(T));
-        reinterpret_cast<char*&>(*buffer) += sizeof(T);
-    }
-    static void deserialize(void const** buffer, size_t* buffer_size, T* value)
-    {
-        assert(*buffer_size >= sizeof(T));
-        ::memcpy(value, *buffer, sizeof(T));
-        reinterpret_cast<char const*&>(*buffer) += sizeof(T);
-        *buffer_size -= sizeof(T);
-    }
-};
-
-template <typename T>
-inline void serializeValue(void** buffer, T const& value)
-{
-    return Serializer<T>::serialize(buffer, value);
-}
-
-template <typename T>
-inline void deserializeValue(void const** buffer, size_t* buffer_size, T* value)
-{
-    return Serializer<T>::deserialize(buffer, buffer_size, value);
-}
 
 } // namespace
 

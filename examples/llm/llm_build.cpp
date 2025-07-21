@@ -575,7 +575,7 @@ int main(int argc, char** argv)
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    auto pluginHandles = loadPlugins();
+    auto pluginHandles = loadEdgellmPluginLib();
 
     // Create the builder
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));

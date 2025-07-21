@@ -18,21 +18,22 @@
 
 namespace drivellm
 {
-class AttentionPlugin : public nvinfer1::IPluginV2DynamicExt
+namespace plugins
+{
+class Int4GroupwsieGemmPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
     // Plugin constructor and attention specific utility methods
-    AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t isEagleMode);
+    Int4GroupwsieGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize);
 
-    AttentionPlugin(std::string const& name, void const* data, size_t length);
+    Int4GroupwsieGemmPlugin(std::string const& name, void const* data, size_t length);
 
     // Force to distinguish different instances of the plugin.
-    AttentionPlugin() = delete;
+    Int4GroupwsieGemmPlugin() = delete;
 
-    AttentionPlugin(AttentionPlugin const&) = delete;
+    Int4GroupwsieGemmPlugin(Int4GroupwsieGemmPlugin const&) = delete;
 
-    ~AttentionPlugin() override;
+    ~Int4GroupwsieGemmPlugin() override;
 
     // IPluginV2DynamicExt Methods
     nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
@@ -73,28 +74,17 @@ protected:
     std::string mLayerName;
     std::string mNamespace;
 
-    // Number of heads and head dimension are specified by model and are runtime constant.
-    int32_t mNumHeadQ{};
-    int32_t mNumHeadKV{};
-    int32_t mNumElemPerHead{};
-    // Eagle uses tree attention
-    int32_t mEnableTreeAttention{0};
-    // Runtime configuration of the plugin to specify max batchSize and kv-cache capacity.
-    // Here the kvcache capacity refers to max number of tokens per input context.
-    int32_t mMaxBatchSize{};
-    int32_t mKVCacheCapacity{};
-
-    // Datatype of QKV and kvCache. Only supports FP16 as of now.
-    nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
-    int32_t mSMVersion;
+    int32_t mGemmN{};
+    int32_t mGemmK{};
+    int32_t mGroupSize{};
 };
 
-class AttentionPluginCreator : public nvinfer1::IPluginCreator
+class Int4GroupwsieGemmPluginCreator : public nvinfer1::IPluginCreator
 {
 public:
-    AttentionPluginCreator();
+    Int4GroupwsieGemmPluginCreator();
 
-    ~AttentionPluginCreator() override = default;
+    ~Int4GroupwsieGemmPluginCreator() override = default;
 
     char const* getPluginName() const noexcept override;
 
@@ -117,4 +107,5 @@ private:
     std::string mNamespace;
 };
 
+} // namespace plugins
 } // namespace drivellm
