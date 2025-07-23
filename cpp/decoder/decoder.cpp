@@ -553,6 +553,9 @@ void Decoder<T>::initCudaGraph()
                 CUDA_CHECK(cudaGraphExecDestroy(mGenerationGraphExec));
                 mGenerationGraphExec = nullptr;
             }
+            // Call enqueueV3() once prior to cudaGraph capture to execute TRT dynamic shape machine.
+            // TRT shape machine could invoke host memory operation on Thor that invalidate cudaGraph capture.
+            mGenerationExecutionContext->enqueueV3(mStream);
             CUDA_CHECK(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeGlobal));
             mGenerationExecutionContext->enqueueV3(mStream);
             CUDA_CHECK(cudaStreamEndCapture(mStream, &mGenerationGraph));
