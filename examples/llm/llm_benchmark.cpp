@@ -38,6 +38,7 @@ struct LLMBenchmarkArgs
     int64_t numRuns{10};
     int64_t warmUp{2};
     LoraWeights loraWeights;
+    bool usePadding{1};
 };
 
 void printUsage(char const* programName)
@@ -53,6 +54,9 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --warmUp         Provide warm up iterations before benchmark starts. Default = 2." << std::endl;
     std::cerr << "  --numRuns        Minimal number of iterations to run during benchmarking. Default = 10."
+              << std::endl;
+    std::cerr << "  --usePadding     Use padding for the input. When it is used, padding will be added up to the "
+                 "maxContextLength (maxInputLen at llm_build). Default = 1 (true)."
               << std::endl;
     CommonUsage::printBenchmarkOptions();
     CommonUsage::printEagleOptions();
@@ -195,9 +199,10 @@ float calculateAverage(std::vector<T> const& vec)
 
 bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
 {
-    static struct option benchmarkOptions[] = {{"inputLength", required_argument, 0, 1001},
-        {"maxLength", required_argument, 0, 1002}, {"warmUp", required_argument, 0, 1003},
-        {"numRuns", required_argument, 0, 1004}, {"loraWeights", required_argument, 0, 1005}, {0, 0, 0, 0}};
+    static struct option benchmarkOptions[]
+        = {{"inputLength", required_argument, 0, 1001}, {"maxLength", required_argument, 0, 1002},
+            {"warmUp", required_argument, 0, 1003}, {"numRuns", required_argument, 0, 1004},
+            {"loraWeights", required_argument, 0, 1005}, {"usePadding", required_argument, 0, 1006}, {0, 0, 0, 0}};
 
     struct option long_options[64];
     int idx = 0;
@@ -259,6 +264,12 @@ bool parseLLMBenchmarkArgs(LLMBenchmarkArgs& args, int argc, char* argv[])
                 {
                     return false;
                 }
+            }
+            break;
+        case 1006:
+            if (optarg)
+            {
+                args.usePadding = std::stoi(optarg);
             }
             break;
         default: return false;
@@ -323,6 +334,10 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
 
     if (eagleMode)
     {
+        if (args.usePadding)
+        {
+            LOG_WARNING("Padding is not supported in Eagle mode. Proceeding without padding.");
+        }
 
         auto tokenizer = args.baseParams.tokenizerPath.empty() ? nullptr : std::make_unique<Tokenizer>();
         tokenizer->loadFromHF(args.baseParams.tokenizerPath);
@@ -433,7 +448,9 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
     }
     else
     {
-        std::vector<int64_t> inputIds(batchSize * maxContextLength, -1);
+        int64_t inputIdsStride = args.usePadding ? maxContextLength : args.inputLength;
+
+        std::vector<int64_t> inputIds(batchSize * inputIdsStride, -1);
         std::vector<int32_t> contextLengths(batchSize, args.inputLength);
         std::vector<int64_t> lastTokenIds(batchSize, args.inputLength - 1);
         std::random_device dev;
@@ -441,7 +458,7 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
         std::uniform_int_distribution<std::mt19937::result_type> dist(0, 1000);
         for (int i = 0; i < batchSize; ++i)
         {
-            auto beginIter = inputIds.begin() + i * maxContextLength;
+            auto beginIter = inputIds.begin() + i * inputIdsStride;
             std::generate(beginIter, beginIter + args.inputLength, [&rng, &dist]() { return dist(rng); });
             outputIds[i].reserve(generationConfig.maxLength);
         }
@@ -511,7 +528,16 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
         }
         LOG_INFO(oss.str().c_str());
         LOG_INFO("batch_size: %d", batchSize);
-        LOG_INFO("input_length per batch: %d", args.inputLength);
+        if (args.usePadding)
+        {
+            LOG_INFO("input_length per batch (with padding): %d", inputIdsStride);
+            LOG_INFO("actual input_length per batch: %d", args.inputLength);
+        }
+        else
+        {
+            LOG_INFO("input_length per batch (no padding): %d", inputIdsStride);
+        }
+
         LOG_INFO("output_length per batch: %d", maxNewTokens);
         LOG_INFO("seq_latency(ms): %.2f", averageSeqLatency);
         LOG_INFO("first_token_latency(ms): %.2f", averageFirstTokenLatency);
