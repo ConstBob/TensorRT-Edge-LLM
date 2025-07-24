@@ -1,6 +1,7 @@
 #include "common/common.h"
 #include "initializeCosSinCache.h"
 
+#include <cstdint>
 #include <cuda_runtime.h>
 
 namespace drivellm
@@ -198,8 +199,8 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
 }
 
 template <int32_t RotaryDim>
-__global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency,
-    int32_t rotaryEmbeddingMaxPositions)
+__global__ void initializeMRopeCosSinKernel(
+    float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryEmbeddingMaxPositions)
 {
     // In this kernel, each warp compute 4 "position" of the cos/sin cache, and loop until max position.
     // Each CTA will be assigned 4 warps so it proceeds 16 positions in an iteration.
@@ -222,7 +223,7 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
 
     float ropeConstants[RotaryDim / 16];
 
-    #pragma unroll
+#pragma unroll
     for (uint32_t i = 0; i < RotaryDim / 16; ++i)
     {
         uint32_t zid = tIdx + i * 8;
@@ -233,7 +234,7 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
     {
         uint32_t cosSinOffset = batchIdx * rotaryEmbeddingMaxPositions * RotaryDim + posIdx * RotaryDim;
 
-        #pragma unroll
+#pragma unroll
         for (uint32_t i = 0; i < RotaryDim / 16; ++i)
         {
             // 64 dims are divived to 3 groups according to mrope section [16, 24, 24]
@@ -241,7 +242,7 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
             // Selects mropePositionIds at [bs, j, posIdx] for group j = 0, 1, 2.
             int32_t j = (i < 2) ? 0 : (i < 5) ? 1 : 2;
             int mropePosIdx = mropePositionIds[batchPositionIdsOffset + j * rotaryEmbeddingMaxPositions + posIdx];
-            
+
             float invFreq = mropePosIdx / ropeConstants[i];
             float cosVal = cos(invFreq);
             float sinVal = sin(invFreq);
@@ -253,8 +254,8 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
     }
 }
 
-void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency,
-    int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, cudaStream_t stream)
+void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryDim,
+    int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, cudaStream_t stream)
 {
     // Each CTA get assigned 128 threads.
     dim3 block(8, 16);
@@ -266,11 +267,9 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     void* kernelPtr{nullptr};
     switch (rotaryDim)
     {
-        case 128:
-            kernelPtr = (void*) initializeMRopeCosSinKernel<128>;
-            break;
-        default:
-            throw std::runtime_error("Un-implemented rotaryDim for initializeMRopeCosSin: " + std::to_string(rotaryDim));
+    case 128: kernelPtr = (void*) initializeMRopeCosSinKernel<128>; break;
+    default:
+        throw std::runtime_error("Un-implemented rotaryDim for initializeMRopeCosSin: " + std::to_string(rotaryDim));
     }
     int32_t maxBlockPerSM{};
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, kernelPtr, 128, 0));
@@ -278,12 +277,8 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     int32_t const numBlocks = std::min(maxBlockPerSM * numSMs, rotaryEmbeddingMaxPositions / 16);
     dim3 grid(numBlocks, batchSize);
 
-    void* kernelArgs[] = {
-        reinterpret_cast<void*>(&cosSinCache),
-        reinterpret_cast<void*>(&mropePositionIds),
-        reinterpret_cast<void*>(&rotaryBaseFrequency),
-        reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)
-    };
+    void* kernelArgs[] = {reinterpret_cast<void*>(&cosSinCache), reinterpret_cast<void*>(&mropePositionIds),
+        reinterpret_cast<void*>(&rotaryBaseFrequency), reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)};
     CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
 }
 
