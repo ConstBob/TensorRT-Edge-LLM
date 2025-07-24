@@ -197,5 +197,95 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
     }
 }
 
+template <int32_t RotaryDim>
+__global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency,
+    int32_t rotaryEmbeddingMaxPositions)
+{
+    // In this kernel, each warp compute 4 "position" of the cos/sin cache, and loop until max position.
+    // Each CTA will be assigned 4 warps so it proceeds 16 positions in an iteration.
+    // mropePositionIds: [bs, 3, rotaryEmbeddingMaxPositions]
+    //     Represent [T, H, W] information for each token position
+    // cosSinCache: [bs, rotaryEmbeddingMaxPositions, rotaryDim]
+    //     Combine [T, H, W] information into rotaryDim. Each will take [16, 24, 24] dims.
+
+    uint32_t const bIdx = blockIdx.x;
+    uint32_t const tIdx = threadIdx.x;
+    uint32_t const tIdy = threadIdx.y;
+
+    uint32_t const bDimY = blockDim.y;
+    uint32_t const gDimX = gridDim.x;
+
+    uint32_t const startPosIdx = bIdx * bDimY + tIdy;
+    uint32_t const posStride = gDimX * bDimY;
+    uint32_t const batchIdx = blockIdx.y;
+    uint32_t batchPositionIdsOffset = batchIdx * 3 * rotaryEmbeddingMaxPositions;
+
+    float ropeConstants[RotaryDim / 16];
+
+    #pragma unroll
+    for (uint32_t i = 0; i < RotaryDim / 16; ++i)
+    {
+        uint32_t zid = tIdx + i * 8;
+        ropeConstants[i] = pow(rotaryBaseFrequency, 2 * zid / (float) RotaryDim);
+    }
+
+    for (uint32_t posIdx = startPosIdx; posIdx < rotaryEmbeddingMaxPositions; posIdx += posStride)
+    {
+        uint32_t cosSinOffset = batchIdx * rotaryEmbeddingMaxPositions * RotaryDim + posIdx * RotaryDim;
+
+        #pragma unroll
+        for (uint32_t i = 0; i < RotaryDim / 16; ++i)
+        {
+            // 64 dims are divived to 3 groups according to mrope section [16, 24, 24]
+            // Each iteration i processes 8 dims, for i in range [0 ~ 8). Group i by [2, 3, 3].
+            // Selects mropePositionIds at [bs, j, posIdx] for group j = 0, 1, 2.
+            int32_t j = (i < 2) ? 0 : (i < 5) ? 1 : 2;
+            int mropePosIdx = mropePositionIds[batchPositionIdsOffset + j * rotaryEmbeddingMaxPositions + posIdx];
+            
+            float invFreq = mropePosIdx / ropeConstants[i];
+            float cosVal = cos(invFreq);
+            float sinVal = sin(invFreq);
+
+            uint32_t zid = tIdx + i * 8;
+            cosSinCache[cosSinOffset + zid] = cosVal;
+            cosSinCache[cosSinOffset + zid + RotaryDim / 2] = sinVal;
+        }
+    }
+}
+
+void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency,
+    int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, cudaStream_t stream)
+{
+    // Each CTA get assigned 128 threads.
+    dim3 block(8, 16);
+
+    cudaDeviceProp deviceProp;
+    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
+    int32_t const numSMs = deviceProp.multiProcessorCount;
+
+    void* kernelPtr{nullptr};
+    switch (rotaryDim)
+    {
+        case 128:
+            kernelPtr = (void*) initializeMRopeCosSinKernel<128>;
+            break;
+        default:
+            throw std::runtime_error("Un-implemented rotaryDim for initializeMRopeCosSin: " + std::to_string(rotaryDim));
+    }
+    int32_t maxBlockPerSM{};
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, kernelPtr, 128, 0));
+
+    int32_t const numBlocks = std::min(maxBlockPerSM * numSMs, rotaryEmbeddingMaxPositions / 16);
+    dim3 grid(numBlocks, batchSize);
+
+    void* kernelArgs[] = {
+        reinterpret_cast<void*>(&cosSinCache),
+        reinterpret_cast<void*>(&mropePositionIds),
+        reinterpret_cast<void*>(&rotaryBaseFrequency),
+        reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)
+    };
+    CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
+}
+
 } // namespace kernel
 } // namespace drivellm

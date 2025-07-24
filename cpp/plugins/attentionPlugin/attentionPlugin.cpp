@@ -175,7 +175,7 @@ bool AttentionPlugin::supportsFormatCombination(
         status &= tensorDesc.type == DataType::kFLOAT;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
-        status &= tensorDesc.dims.d[2] == mNumElemPerHead;
+        status &= tensorDesc.dims.d[2] <= mNumElemPerHead;
         return status;
     };
     auto checkAttentionMask = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {

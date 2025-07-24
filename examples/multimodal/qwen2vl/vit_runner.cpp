@@ -14,6 +14,7 @@
 #include <cmath>
 #include <random>
 #include <tuple>
+#include "kernels/posEncoding/initializeCosSinCache.h"
 
 bool Qwen2ViTRunner::setup(std::filesystem::path const& fp, cudaStream_t& stream, int llmBatchSize)
 {
@@ -352,6 +353,7 @@ void Qwen2ViTRunner::visualPreprocess(std::vector<unsigned char*> const& imageBu
 void Qwen2ViTRunner::getRopeIdx(std::vector<std::vector<int64_t>> const& batchInputIds,
     std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<int64_t>& mropePositionIds)
 {
+    // According to transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLModel.get_rope_index
     int totalImageIdx = 0;
 
     for (auto inputIds : batchInputIds)
@@ -419,52 +421,24 @@ void Qwen2ViTRunner::getRopeIdx(std::vector<std::vector<int64_t>> const& batchIn
 void Qwen2ViTRunner::generateMropeParams(
     std::vector<std::vector<int64_t>> const& batchInputIds, std::vector<std::vector<int64_t>> const& visualGridTHWs)
 {
-    std::vector<float> mropeRotaryCosSin;
-
-    std::vector<int64_t> mropePositionIds; // (bs, 3, maxPositionEmbeddings)
+    // Init mropePositionIds
+    // mropePositionIds: (bs, 3, maxPositionEmbeddings)
+    // Get [T, H, W] information for each token position
+    std::vector<int64_t> mropePositionIds;
     getRopeIdx(batchInputIds, visualGridTHWs, mropePositionIds);
 
-    std::vector<std::vector<float>> sinusoidInp(
-        mConfig.maxPositionEmbeddings, std::vector<float>(mConfig.mropeEmbDim / 2));
-    initRotaryEmbedding(mConfig.maxPositionEmbeddings, mConfig.mropeEmbDim, mConfig.theta, sinusoidInp);
+    void* mropePositionIdsDevice;
+    CUDA_CHECK(cudaMalloc(&mropePositionIdsDevice, mropePositionIds.size() * sizeof(int64_t)));
+    CUDA_CHECK(cudaMemcpy(mropePositionIdsDevice, mropePositionIds.data(),
+        mropePositionIds.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+    mDeviceBuffer["mropePositionIds"] = mropePositionIdsDevice;
 
-    std::vector<std::vector<float>> cosOri(mConfig.maxPositionEmbeddings, std::vector<float>(mConfig.mropeEmbDim / 2));
-    std::vector<std::vector<float>> sinOri(mConfig.maxPositionEmbeddings, std::vector<float>(mConfig.mropeEmbDim / 2));
-    for (int i = 0; i < mConfig.maxPositionEmbeddings; ++i)
-    {
-        for (int j = 0; j < (mConfig.mropeEmbDim / 2); ++j)
-        {
-            cosOri[i][j] = cos(sinusoidInp[i][j]);
-            sinOri[i][j] = sin(sinusoidInp[i][j]);
-        }
-    }
+    // Initialize mropeRotaryCosSin
+    drivellm::kernel::initializeMRopeCosSin(reinterpret_cast<float*>(mDeviceBuffer["mropeRotaryCosSin"]),
+        reinterpret_cast<int64_t*>(mropePositionIdsDevice), mConfig.theta, mConfig.mropeEmbDim,
+        mConfig.maxPositionEmbeddings, mConfig.llmBatchSize, mStream);
 
-    std::vector<int> mRopeSections{0, 16, 40, 64}; // cumsum of {16, 24, 24}
-    int64_t mropeRotaryCosSinSize = mConfig.llmBatchSize * mConfig.maxPositionEmbeddings * mConfig.mropeEmbDim;
-    mropeRotaryCosSin.resize(mropeRotaryCosSinSize);
-
-    for (int b = 0; b < mConfig.llmBatchSize; ++b)
-    {
-        for (int sec = 0; sec < 3; ++sec)
-        {
-            for (int i = 0; i < mConfig.maxPositionEmbeddings; ++i)
-            {
-                int pos
-                    = mropePositionIds[b * 3 * mConfig.maxPositionEmbeddings + sec * mConfig.maxPositionEmbeddings + i];
-                for (int j = mRopeSections[sec]; j < mRopeSections[sec + 1]; ++j)
-                {
-                    int cosDstIdx
-                        = b * mConfig.maxPositionEmbeddings * mConfig.mropeEmbDim + i * mConfig.mropeEmbDim + j;
-                    int32_t sinOffset = mConfig.mropeEmbDim / 2;
-                    mropeRotaryCosSin[cosDstIdx] = cosOri[pos][j];
-                    mropeRotaryCosSin[cosDstIdx + sinOffset] = sinOri[pos][j];
-                }
-            }
-        }
-    }
-
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["mropeRotaryCosSin"], mropeRotaryCosSin.data(),
-        mropeRotaryCosSinSize * sizeof(float), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaFree(mropePositionIdsDevice));
 }
 
 std::string Qwen2ViTRunner::applyChatTemplate(std::string const& inputString, int const& numImage,
