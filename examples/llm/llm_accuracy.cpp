@@ -278,7 +278,7 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer, GenerationC
     if (args.eagleParams.eagleEnginePath.empty())
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(args.baseParams.enginePath);
+        engineConfig = EngineConfig(args.baseParams.enginePath, !args.baseParams.noCudaGraph);
     }
     else
     {

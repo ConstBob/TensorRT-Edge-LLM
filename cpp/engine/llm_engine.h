@@ -32,8 +32,9 @@ struct EngineConfig
     bool isEagle3{false};
     int32_t maxDecodingTokens{60};
     bool useCudaGraph{true};
+    int32_t batchSize{1};
     EngineConfig() = default;
-    EngineConfig(std::string const& base_engine_path);
+    EngineConfig(std::string const& base_engine_path, bool use_cuda_graph = true, int32_t batch_size = 1);
     EngineConfig(std::string const& base_engine_path, std::string const& eagle_engine_path, int32_t max_path_len,
         int32_t top_k, bool is_eagle3, int32_t max_decoding_tokens, bool use_cuda_graph = true);
 };

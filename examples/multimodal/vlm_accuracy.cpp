@@ -442,7 +442,7 @@ std::unique_ptr<LLMEngineHalf> getLLMEngine(BaseParams const& baseParams, EagleP
     else
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(baseParams.enginePath);
+        engineConfig = EngineConfig(baseParams.enginePath, !baseParams.noCudaGraph);
     }
     auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
     llmEngine->setupExtraInputs(vitrunner->getExtraLLMInputs());

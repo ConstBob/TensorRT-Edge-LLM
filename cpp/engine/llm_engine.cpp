@@ -16,8 +16,10 @@
 #include <numeric>
 #include <stdexcept>
 
-EngineConfig::EngineConfig(std::string const& base_engine_path)
+EngineConfig::EngineConfig(std::string const& base_engine_path, bool use_cuda_graph, int32_t batch_size)
     : baseEnginePath(base_engine_path)
+    , useCudaGraph(use_cuda_graph)
+    , batchSize(batch_size)
 {
 }
 
@@ -245,7 +247,7 @@ typename LLMEngine<T>::ModelPtr LLMEngine<T>::createModel(EngineConfig const& co
     if (config.eagleEnginePath.empty())
     {
         // Single decoder mode
-        baseDecoder->setup(config.baseEnginePath, stream, config.useCudaGraph);
+        baseDecoder->setup(config.baseEnginePath, stream, config.useCudaGraph, config.batchSize);
         return std::move(baseDecoder);
     }
     else

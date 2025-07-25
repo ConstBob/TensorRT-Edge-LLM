@@ -161,7 +161,7 @@ bool parseVlmChatArgs(VlmChatArgs& args, int argc, char* argv[])
 }
 
 template <typename ViTRunnerType>
-std::unique_ptr<LLMEngineHalf> getLLMEngine(BaseParams const& baseParams, EagleParams const& eagleParams,
+std::unique_ptr<LLMEngineHalf> getLLMEngine(int32_t batchSize, BaseParams const& baseParams, EagleParams const& eagleParams,
     LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
 {
     EngineConfig engineConfig;
@@ -175,7 +175,7 @@ std::unique_ptr<LLMEngineHalf> getLLMEngine(BaseParams const& baseParams, EagleP
     else
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(baseParams.enginePath);
+        engineConfig = EngineConfig(baseParams.enginePath, !baseParams.noCudaGraph, batchSize);
     }
     auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
     llmEngine->setupExtraInputs(vitrunner->getExtraLLMInputs());
@@ -212,7 +212,7 @@ void decodeQwen2VL(BaseParams const& baseParams, EagleParams const& eagleParams,
     auto vitrunner = new Qwen2ViTRunner(vlmRunParams.modelType);
     vitrunner->setup(vlmRunParams.visualEnginePath, stream, batchSize);
 
-    auto llmEngine = getLLMEngine<Qwen2ViTRunner>(baseParams, eagleParams, loraWeights, stream, vitrunner);
+    auto llmEngine = getLLMEngine<Qwen2ViTRunner>(batchSize, baseParams, eagleParams, loraWeights, stream, vitrunner);
 
     // Preprocess
     std::vector<half> visualInput;
@@ -301,7 +301,7 @@ void decodeInternVL3(BaseParams const& baseParams, EagleParams const& eagleParam
     auto vitrunner = new InternVLViTRunner(vlmRunParams.modelType);
     vitrunner->setup(vlmRunParams.visualEnginePath, stream, batchSize);
 
-    auto llmEngine = getLLMEngine<InternVLViTRunner>(baseParams, eagleParams, loraWeights, stream, vitrunner);
+    auto llmEngine = getLLMEngine<InternVLViTRunner>(batchSize, baseParams, eagleParams, loraWeights, stream, vitrunner);
 
     // Preprocess
     std::vector<half> visualInput;
