@@ -207,7 +207,7 @@ int main(int argc, char* argv[])
     if (args.eagleParams.eagleEnginePath.empty())
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(args.baseParams.enginePath);
+        engineConfig = EngineConfig(args.baseParams.enginePath, !args.baseParams.noCudaGraph);
     }
     else
     {

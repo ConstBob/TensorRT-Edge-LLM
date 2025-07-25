@@ -561,6 +561,7 @@ void Decoder<T>::initCudaGraph()
             CUDA_CHECK(cudaStreamEndCapture(mStream, &mGenerationGraph));
             CUDA_CHECK(cudaGraphInstantiate(&mGenerationGraphExec, mGenerationGraph, 0));
             mCudaGraphCaptured = true;
+            LOG_INFO("Cuda graph captured successfully.");
         }
         catch (std::exception const& e)
         {
@@ -576,6 +577,9 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
     std::shared_ptr<BenchmarkProfiler> const profiler)
 {
+    // Initialize
+    initCudaGraph();
+
     // The generation step stop at longest sequence reach the maxLength.
     int32_t generationIter = *std::max_element(contextLengths.begin(), contextLengths.end());
     memset(mHostBuffer["finished_states"], 0, sizeof(bool) * mConfig.batchSize);
@@ -636,9 +640,12 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         }
         return generatedToken;
     };
+
+    // Context phase
     // Extra model inputs should be set with `setupExtraInputs` before this function
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
         mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+
     generateForContext(
         mDeviceBuffer["input_ids"], contextLengths, lastTokenIds, {2, {mConfig.batchSize, mConfig.maxInputLength}});
 
@@ -651,6 +658,7 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         profiler->recordDeviceStart("generation");
     }
 
+    // Generation phase
     while (generationIter < generationConfig.maxLength && unfinishedBatchNum != 0)
     {
 
@@ -682,7 +690,7 @@ void Decoder<T>::generateForContext(void* inputIds, std::vector<int32_t>& contex
     mContextExecutionContext->setInputShape("input_ids", inputDims);
 
     mContextExecutionContext->enqueueV3(mStream);
-    initCudaGraph();
+
     LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
     LOG_DEBUG("Context phase kv cache:\n%s", printKVCache().c_str());
 }
