@@ -123,7 +123,7 @@ private:
     void allocateExtraBufferForEagle();
     void allocateExtraBufferForVanilla();
     void allocateCommonBuffers();
-    void initCudaGraph();
+    void initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextLengths);
     // These are used as debugging functions
     std::string printKVCache();
     std::string printLogits();
