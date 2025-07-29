@@ -535,7 +535,7 @@ std::string Decoder<T>::printLogits()
     return formatFloat16Vector(logits, mConfig.batchSize);
 }
 template <typename T>
-void Decoder<T>::initCudaGraph()
+void Decoder<T>::initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextLengths)
 {
     // Capture cuda graph only on the first run. This cuda graph will be cached and reused for all the other runs.
     if (mUseCudaGraph && !mCudaGraphCaptured)
@@ -553,6 +553,12 @@ void Decoder<T>::initCudaGraph()
                 CUDA_CHECK(cudaGraphExecDestroy(mGenerationGraphExec));
                 mGenerationGraphExec = nullptr;
             }
+            // Set up inputs to valid values to comply with decoding phase enqueueV3() call.
+            // This won't have side effect for ongoing request.
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
+                mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
+            CUDA_CHECK(cudaMemsetAsync(mDeviceBuffer["last_token_ids"], 0,
+                mConfig.batchSize * sizeof(int64_t), mStream));
             // Call enqueueV3() once prior to cudaGraph capture to execute TRT dynamic shape machine.
             // TRT shape machine could invoke host memory operation on Thor that invalidate cudaGraph capture.
             mGenerationExecutionContext->enqueueV3(mStream);
@@ -577,8 +583,8 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
     std::shared_ptr<BenchmarkProfiler> const profiler)
 {
-    // Initialize
-    initCudaGraph();
+    // Initialize decoding phase cuda graph
+    initDecodingPhaseCudaGraph(contextLengths);
 
     // The generation step stop at longest sequence reach the maxLength.
     int32_t generationIter = *std::max_element(contextLengths.begin(), contextLengths.end());
