@@ -127,7 +127,7 @@ __device__ __forceinline__ DVec<T> vecApplyRopeNonInterleave(
 template <typename T>
 __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSinCache, int32_t const* kvCacheEndLens,
     int32_t const* tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim)
+    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen)
 {
     // Each CTA will process multiple tokens of a single head which each thread handles 16 / sizeof(T) elements.
     // blockDim.x: number of threads to process each token, blockDim.y: number of tokens processed by each CTA.
@@ -135,7 +135,8 @@ __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSi
     //     1. The input tokens are batched with [B, qSeqLen], we use batchIdx info to write KVCache.
     //     2. Always write KVCache with layout of [B, Hk + Hv, S, headDim] where S = kvCacheCapacityLen.
     //     3. The QKV tensor has layout of [B, S, Hq+Hk+Hv, headDim] where S = qSeqLen.
-    //     4. The cosSinCache has layout of [S_max, rotaryDim] where S_max = maxPositionEmbeddings.
+    //     4. The cosSinCache has layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim] where cosSinCacheSeqLen >= kvCacheCapacityLen.
+    //        cosSinCacheBatchSize can be 1 (all batches share the same cache) or equal to input batch size.
     //     5. Write to qOut ([B, SHq, headDim] layout) if qOut is provided, otherwise overwrite QKV.
     //     6. kvCacheEndLens: Length of KVCache after insertion the entries by this kernel.
 
@@ -173,15 +174,18 @@ __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSi
     // Vectorized load sin/cos cache from global memory.
     // If pos ids are not provided, use token idx in the sequence as cos/sinc cache posId.
     // non-interleaved rope:
-    //      - cosVec = cosSinCache[sinCosCachePos][(tx * vec_size) % (rotaryDim / 2)]
-    //      - sinVec = cosSinCache[sinCosCachePos][(tx * vec_size) % (rotaryDim / 2) + rotaryDim / 2]
+    //      - cosVec = cosSinCache[cosSinCacheBatchIdx][sinCosCachePos][(tx * vec_size) % (rotaryDim / 2)]
+    //      - sinVec = cosSinCache[cosSinCacheBatchIdx][sinCosCachePos][(tx * vec_size) % (rotaryDim / 2) + rotaryDim / 2]
+    // where cosSinCacheBatchIdx = (cosSinCacheBatchSize == 1) ? 0 : batchIdx
     uint32_t const sinOffset = rotaryDim / 2;
     uint32_t cosOffset;
     DVec<float> cosVec;
     DVec<float> sinVec;
     cosOffset = (tIdx * DVec<float>::vec_size) % (rotaryDim / 2);
-    cosVec.load(cosSinCache + sinCosCachePos * rotaryDim + cosOffset);
-    sinVec.load(cosSinCache + sinCosCachePos * rotaryDim + (cosOffset + sinOffset));
+    int32_t const cosSinCacheBatchIdx = (cosSinCacheBatchSize == 1) ? 0 : batchIdx;
+    int32_t const cosSinCacheOffset = cosSinCacheBatchIdx * cosSinCacheSeqLen * rotaryDim + sinCosCachePos * rotaryDim;
+    cosVec.load(cosSinCache + cosSinCacheOffset + cosOffset);
+    sinVec.load(cosSinCache + cosSinCacheOffset + (cosOffset + sinOffset));
 
     // tokenIdx is the index of the token in the "flattened" BxS sequence
     int32_t const eleOffsetToken = tokenIdx * (numQHead + numKVHead * 2) * headDim;
@@ -239,7 +243,7 @@ __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSi
 void launchApplyRopeWriteKV(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
     int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens,
     int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim,
-    cudaStream_t stream)
+    int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream)
 {
     constexpr uint32_t vecSize = DVec<half>::vec_size;
     constexpr uint32_t threadsPerBlock = 128;
@@ -256,37 +260,37 @@ void launchApplyRopeWriteKV(half* qkv, half* kvCache, half* qOut, float const* c
     dim3 block(bDimX, bDimY);
 
     applyRopeWriteKV<half><<<grid, block, 0, stream>>>(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds,
-        qSeqLen, totalNumTokens, kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim);
+        qSeqLen, totalNumTokens, kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen);
 }
 
 void launchApplyRopeWriteKVContext(half* qkv, half* kvCache, float const* cosSinCache, int32_t qSeqLen,
     int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim,
-    uint32_t rotaryDim, cudaStream_t stream)
+    uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream)
 {
     // For current context phase design, we always write to KVCache from start and inplace update QKV.
     half* qOut = nullptr;
     int32_t* kvCacheEndLens = nullptr;
     int32_t* tokenPosIds = nullptr;
     launchApplyRopeWriteKV(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds, qSeqLen, totalNumTokens,
-        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, stream);
+        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
 }
 
 void launchApplyRopeWriteKVDecode(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
     int32_t const* kvCacheEndLens, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, cudaStream_t stream)
+    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream)
 {
     int32_t* tokenPosIds = nullptr;
     launchApplyRopeWriteKV(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds, qSeqLen, totalNumTokens,
-        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, stream);
+        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
 }
 
 void launchApplyRopeWriteKVTreeDecode(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
     int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens,
     int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim,
-    cudaStream_t stream)
+    int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream)
 {
     launchApplyRopeWriteKV(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds, qSeqLen, totalNumTokens,
-        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, stream);
+        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
 }
 
 } // namespace kernel
