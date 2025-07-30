@@ -19,7 +19,7 @@ struct AttnParams
 };
 
 void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnParams, int32_t const kvCacheCapacity,
-    int32_t const qSeqLen, float ropeTheta = 10000.0f)
+    int32_t const qSeqLen, float ropeTheta = 10000.0f, int32_t cosSinCacheBatchSize = 1, int32_t cosSinCacheSeqLen = 0)
 {
     cudaStream_t stream{nullptr};
 
@@ -28,7 +28,13 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
     uint32_t const numQHeads = attnParams.numQHeads;
     uint32_t const numKVHeads = attnParams.numKVHeads;
     int32_t const kvCacheVolume = batchSize * (numKVHeads + numKVHeads) * kvCacheCapacity * headDim;
-    int32_t const cosSinCacheVolume = kvCacheCapacity * rotaryDim;
+
+    assert(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == batchSize);
+    if (cosSinCacheSeqLen == 0)
+    {
+        cosSinCacheSeqLen = kvCacheCapacity;
+    }
+    int32_t const cosSinCacheVolume = cosSinCacheBatchSize * cosSinCacheSeqLen * rotaryDim;
 
     std::vector<half> qkvInput;
     std::vector<half> qkvReference;
@@ -37,7 +43,8 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
     float const ropeScale = 1.0f;
     thrust::device_vector<float> cosSinCacheDevice(cosSinCacheVolume);
     std::vector<float> cosSinCache(cosSinCacheVolume);
-    if (rotaryDim % 64 == 0)
+    bool const useRegularRope = cosSinCacheBatchSize == 1 && rotaryDim % 64 == 0;
+    if (useRegularRope)
     {
         // Initialize normal CosSinCache to real values.
         initializeNormalRopeCosSin(thrust::raw_pointer_cast(cosSinCacheDevice.data()), ropeTheta, ropeScale, rotaryDim,
@@ -45,7 +52,7 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
     }
     else
     {
-        // Random initialize CosSinCache for non-64-multiple rotaryDim.
+        // Random initialize CosSinCache for non-64-multiple rotaryDim or cosSinCacheBatchSize != 1.
         uniformFloatinitialization(cosSinCache, -1, 1);
         thrust::copy(cosSinCache.begin(), cosSinCache.end(), cosSinCacheDevice.begin());
     }
@@ -69,17 +76,20 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
 
             std::vector<half> qRoped;
             std::vector<half> kRoped;
-            if (rotaryDim % 64 == 0)
+            if (useRegularRope)
             {
                 qRoped = ropeRef(qij, numQHeads, headDim, rotaryDim, j, ropeScale, ropeTheta, permuteRope);
                 kRoped = ropeRef(kij, numKVHeads, headDim, rotaryDim, j, ropeScale, ropeTheta, permuteRope);
             }
             else
             {
+                // Calculate the correct batch index for cosSinCache
+                int32_t const cosSinCacheBatchIdx = (cosSinCacheBatchSize == 1) ? 0 : i;
+                int32_t const cosSinCacheOffset = cosSinCacheBatchIdx * cosSinCacheSeqLen * rotaryDim + j * rotaryDim;
                 auto const cosVec = std::vector<float>(
-                    cosSinCache.begin() + j * rotaryDim, cosSinCache.begin() + j * rotaryDim + rotaryDim / 2);
-                auto const sinVec = std::vector<float>(cosSinCache.begin() + j * rotaryDim + rotaryDim / 2,
-                    cosSinCache.begin() + j * rotaryDim + rotaryDim);
+                    cosSinCache.begin() + cosSinCacheOffset, cosSinCache.begin() + cosSinCacheOffset + rotaryDim / 2);
+                auto const sinVec = std::vector<float>(cosSinCache.begin() + cosSinCacheOffset + rotaryDim / 2,
+                    cosSinCache.begin() + cosSinCacheOffset + rotaryDim);
 
                 qRoped = ropeRefCosSin(qij, numQHeads, headDim, rotaryDim, cosVec, sinVec, permuteRope);
                 kRoped = ropeRefCosSin(kij, numKVHeads, headDim, rotaryDim, cosVec, sinVec, permuteRope);
@@ -99,7 +109,7 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
     // Set qOut, kvCacheStartIds, tokenPosIds to nullptr since they are not used in prefill case.
     launchApplyRopeWriteKVContext(thrust::raw_pointer_cast(qkvDevice.data()),
         thrust::raw_pointer_cast(kvCacheDevice.data()), thrust::raw_pointer_cast(cosSinCacheDevice.data()), qSeqLen,
-        tokenToProcess, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim, stream);
+        tokenToProcess, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     thrust::host_vector<half> qkvOut(qkvInput.size());
@@ -149,11 +159,13 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
     std::cout << "TestRopeWriteKvPrefill "
               << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
               << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
-              << " qSeqLen: " << qSeqLen << std::endl;
+              << " qSeqLen: " << qSeqLen << " cosSinCacheBatchSize: " << cosSinCacheBatchSize
+              << " cosSinCacheSeqLen: " << cosSinCacheSeqLen << std::endl;
 }
 
 void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams, int32_t const kvCacheCapacity,
-    int32_t const qLen, float ropeTheta = 10000.0f, bool const isTreeAttention = false)
+    int32_t const qLen, float ropeTheta = 10000.0f, bool const isTreeAttention = false,
+    int32_t cosSinCacheBatchSize = 1, int32_t cosSinCacheSeqLen = 0)
 {
     // Not tested for MROPE which supply positional encoding coefficients as input tensor.
     EXPECT_TRUE(qLen == 1 || isTreeAttention);
@@ -167,7 +179,12 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     // QKV tensor has layout [B, S, Hq+Hk+Hv, D]. KV cache has layout [B, 2, S, Hkv, D].
     std::vector<half> qkvInput;
     std::vector<half> kvCache(batchSize * 2 * numKVHeads * kvCacheCapacity * headDim, 0);
-    int32_t const cosSinCacheVolume = kvCacheCapacity * rotaryDim;
+    assert(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == batchSize);
+    if (cosSinCacheSeqLen == 0)
+    {
+        cosSinCacheSeqLen = kvCacheCapacity;
+    }
+    int32_t const cosSinCacheVolume = cosSinCacheBatchSize * cosSinCacheSeqLen * rotaryDim;
 
     // Reference output of Q, K, V all have layout [B, S, H, D].
     std::vector<half> qreference;
@@ -183,7 +200,8 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     float const ropeScale = 1.0f;
     thrust::device_vector<float> cosSinCacheDevice(cosSinCacheVolume);
     std::vector<float> cosSinCache(cosSinCacheVolume);
-    if (rotaryDim % 64 == 0)
+    bool const useRegularRope = cosSinCacheBatchSize == 1 && rotaryDim % 64 == 0;
+    if (useRegularRope)
     {
         // Initialize normal CosSinCache to real values.
         initializeNormalRopeCosSin(thrust::raw_pointer_cast(cosSinCacheDevice.data()), ropeTheta, ropeScale, rotaryDim,
@@ -191,7 +209,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     }
     else
     {
-        // Random initialize CosSinCache for non-64-multiple rotaryDim.
+        // Random initialize CosSinCache for non-64-multiple rotaryDim or cosSinCacheBatchSize != 1.
         uniformFloatinitialization(cosSinCache, -1, 1);
         thrust::copy(cosSinCache.begin(), cosSinCache.end(), cosSinCacheDevice.begin());
     }
@@ -227,17 +245,21 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
 
             std::vector<half> qRefij;
             std::vector<half> kRefij;
-            if (rotaryDim % 64 == 0)
+            if (useRegularRope)
             {
                 qRefij = ropeRef(qi, numQHeads, headDim, rotaryDim, seqIdx, ropeScale, ropeTheta, permuteRope);
                 kRefij = ropeRef(ki, numKVHeads, headDim, rotaryDim, seqIdx, ropeScale, ropeTheta, permuteRope);
             }
             else
             {
+                // Calculate the correct batch index for cosSinCache
+                int32_t const cosSinCacheBatchIdx = (cosSinCacheBatchSize == 1) ? 0 : i;
+                int32_t const cosSinCacheOffset = cosSinCacheBatchIdx * cosSinCacheSeqLen * rotaryDim + seqIdx * rotaryDim;
+                
                 auto const cosVec = std::vector<float>(
-                    cosSinCache.begin() + seqIdx * rotaryDim, cosSinCache.begin() + seqIdx * rotaryDim + rotaryDim / 2);
-                auto const sinVec = std::vector<float>(cosSinCache.begin() + seqIdx * rotaryDim + rotaryDim / 2,
-                    cosSinCache.begin() + seqIdx * rotaryDim + rotaryDim);
+                    cosSinCache.begin() + cosSinCacheOffset, cosSinCache.begin() + cosSinCacheOffset + rotaryDim / 2);
+                auto const sinVec = std::vector<float>(cosSinCache.begin() + cosSinCacheOffset + rotaryDim / 2,
+                    cosSinCache.begin() + cosSinCacheOffset + rotaryDim);
 
                 qRefij = ropeRefCosSin(qi, numQHeads, headDim, rotaryDim, cosVec, sinVec, permuteRope);
                 kRefij = ropeRefCosSin(ki, numKVHeads, headDim, rotaryDim, cosVec, sinVec, permuteRope);
@@ -261,7 +283,8 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
         launchApplyRopeWriteKVDecode(thrust::raw_pointer_cast(qkvDevice.data()),
             thrust::raw_pointer_cast(kvCacheDevice.data()), thrust::raw_pointer_cast(qOutDevice.data()),
             thrust::raw_pointer_cast(cosSinCacheDevice.data()), thrust::raw_pointer_cast(seqLensDevice.data()), qLen,
-            tokenToProcess, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim, stream);
+            tokenToProcess, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize,
+            cosSinCacheSeqLen, stream);
     }
     else
     {
@@ -269,7 +292,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
             thrust::raw_pointer_cast(kvCacheDevice.data()), thrust::raw_pointer_cast(qOutDevice.data()),
             thrust::raw_pointer_cast(cosSinCacheDevice.data()), thrust::raw_pointer_cast(seqLensDevice.data()),
             thrust::raw_pointer_cast(customSeqLensDevice.data()), qLen, tokenToProcess, kvCacheCapacity, numQHeads,
-            numKVHeads, headDim, rotaryDim, stream);
+            numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -313,10 +336,12 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
               << "BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
               << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " KVCacheCapacity: " << kvCacheCapacity
               << " QLength: " << qLen << " Total Sequence Lengths (including past KVcache): " << fullSeqLens
-              << " RopeScale: " << ropeScale << " RopeTheta: " << ropeTheta << std::endl;
+              << " RopeScale: " << ropeScale << " RopeTheta: " << ropeTheta << " cosSinCacheBatchSize: " << cosSinCacheBatchSize
+              << " cosSinCacheSeqLen: " << cosSinCacheSeqLen << std::endl;
 }
 
-void BenchmarkRopeWriteKv(uint32_t const batchSize, AttnParams const& attnParams, int32_t const qSeqLen)
+void BenchmarkRopeWriteKv(uint32_t const batchSize, AttnParams const& attnParams, int32_t const qSeqLen,
+    int32_t cosSinCacheBatchSize = 1)
 {
     uint32_t const headDim = attnParams.headDim;
     uint32_t const rotaryDim = attnParams.rotaryDim;
@@ -325,7 +350,8 @@ void BenchmarkRopeWriteKv(uint32_t const batchSize, AttnParams const& attnParams
     int32_t const kvCacheCapacity = 1024 + qSeqLen;
 
     std::vector<half> qkvInput(batchSize * qSeqLen * (numQHeads + 2 * numKVHeads) * headDim);
-    std::vector<float> cosSinCache(kvCacheCapacity * rotaryDim);
+    assert(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == batchSize);
+    std::vector<float> cosSinCache(cosSinCacheBatchSize * kvCacheCapacity * rotaryDim);
 
     uniformFloatinitialization(cosSinCache, -1, 1);
     uniformFloatinitialization(qkvInput);
@@ -341,7 +367,7 @@ void BenchmarkRopeWriteKv(uint32_t const batchSize, AttnParams const& attnParams
         launchApplyRopeWriteKV(thrust::raw_pointer_cast(qkvDevice.data()),
             thrust::raw_pointer_cast(kvCacheDevice.data()), nullptr, thrust::raw_pointer_cast(cosSinCacheDevice.data()),
             nullptr, nullptr, qSeqLen, tokenToProcess, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim,
-            stream);
+            cosSinCacheBatchSize, kvCacheCapacity, stream);
     };
 
     constexpr int32_t numWarmup = 10;
@@ -366,7 +392,8 @@ void BenchmarkRopeWriteKv(uint32_t const batchSize, AttnParams const& attnParams
     float elapsedTime{0.0f};
     cudaEventElapsedTime(&elapsedTime, start, stop);
     std::cout << "Bench Perf: BatchSize: " << batchSize << " QHeadNum: " << numQHeads << " KVHeadNum: " << numKVHeads
-              << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " qSeqLen: " << qSeqLen << std::endl;
+              << " HeadSize: " << headDim << " RotaryDim: " << rotaryDim << " qSeqLen: " << qSeqLen
+              << " cosSinCacheBatchSize: " << cosSinCacheBatchSize << std::endl;
     std::cout << "RopeWriteKv(non-interleave) time: " << elapsedTime / numBenchIter << " ms" << std::endl;
 }
 
@@ -382,6 +409,8 @@ TEST(RopeWriteKvPrefill, Accuracy)
     TestRopeWriteKvPrefill(4, {16, 4, 64, 64}, 2048, 512);
     // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 512
     TestRopeWriteKvPrefill(2, {24, 8, 128, 96}, 4096, 512);
+    // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 512, cosSinCacheBatchSize = 2, cosSinCacheSeqLen = 8192
+    TestRopeWriteKvPrefill(2, {24, 8, 128, 96}, 4096, 512, 10000.0f, 2, 8192);
 }
 
 TEST(RopeWriteKvDecodeVanilla, Accuracy)
@@ -401,6 +430,9 @@ TEST(RopeWriteKvDecodeVanilla, Accuracy)
     // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 1, isTreeAttention =
     // false
     TestRopeWriteKvDecode(2, {24, 8, 128, 96}, 4096, 1, 10000.0f, false);
+    // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 1, isTreeAttention =
+    // false, cosSinCacheBatchSize = 2, cosSinCacheSeqLen = 8192
+    TestRopeWriteKvDecode(2, {24, 8, 128, 96}, 4096, 1, 10000.0f, false, 2, 8192);
 }
 
 TEST(RopeWriteKvDecodeTreeAttention, Accuracy)
@@ -420,6 +452,9 @@ TEST(RopeWriteKvDecodeTreeAttention, Accuracy)
     // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 512, isTreeAttention
     // = true
     TestRopeWriteKvDecode(2, {24, 8, 128, 96}, 4096, 32, 10000.0f, true);
+    // QheadNum = 24, kvHeadNum = 8, headSize = 128, rotaryDim = 96, kvCacheCapacity = 4096, qLen = 512, isTreeAttention
+    // = true, cosSinCacheBatchSize = 2, cosSinCacheSeqLen = 8192
+    TestRopeWriteKvDecode(2, {24, 8, 128, 96}, 4096, 32, 10000.0f, true, 2, 8192);
 }
 
 TEST(RopeWriteKvPrefill, Benchmark)
@@ -432,6 +467,8 @@ TEST(RopeWriteKvPrefill, Benchmark)
     BenchmarkRopeWriteKv(1, {28, 7, 128, 128}, 4096);
     // QheadNum = 16, kvHeadNum = 4, headSize = 64, rotaryDim = 64, qLen = 1024
     BenchmarkRopeWriteKv(4, {16, 4, 64, 64}, 1024);
+    // QheadNum = 32, kvHeadNum = 8, headSize = 128, rotaryDim = 128, qLen = 512, cosSinCacheBatchSize = 2
+    BenchmarkRopeWriteKv(2, {32, 8, 128, 128}, 512, 2);
 }
 
 void TestLongRopeCosSin(int32_t rotaryDim, int32_t kvCacheCapacity, int32_t maxPositionEmbeddings = 131072,

@@ -334,9 +334,13 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t const kvCacheInputLength = kvCacheInputDesc.dims.d[kKV_CACHE_SEQUENCE_LENGTH_DIM_IDX];
     bool const isContextPhase = kvCacheInputLength == 0;
 
-    // Obtain rotaryDim
+    // Obtain cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim
     PluginTensorDesc const& posEncodingCosSinDesc = inputDesc[kPOS_ENCODING_COS_SIN_IDX];
+    constexpr int32_t kCOS_SIN_BATCH_SIZE_IDX{0};
+    constexpr int32_t kCOS_SIN_SEQ_LEN_IDX{1};
     constexpr int32_t kCOS_SIN_ROTARY_DIM_IDX{2};
+    int32_t const cosSinCacheBatchSize = static_cast<int32_t>(posEncodingCosSinDesc.dims.d[kCOS_SIN_BATCH_SIZE_IDX]);
+    int32_t const cosSinCacheSeqLen = static_cast<int32_t>(posEncodingCosSinDesc.dims.d[kCOS_SIN_SEQ_LEN_IDX]);
     int32_t const rotaryDim = static_cast<int32_t>(posEncodingCosSinDesc.dims.d[kCOS_SIN_ROTARY_DIM_IDX]);
 
     // Check the runtime batch size and input context length are valid for execution.
@@ -344,6 +348,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         "Runtime batchsize exceed max batch size. This will overflow device data buffer");
     check(runtimeSeqLen < mKVCacheCapacity,
         "Runtime sequence length exceed max total context lengths. This will overflow KVCache buffer");
+    check(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == runtimeBatchSize,
+        "cosSinCacheBatchSize must be 1 or runtimeBatchSize");
+    check(cosSinCacheSeqLen >= mKVCacheCapacity, "cosSinCacheSeqLen must be greater than or equal to mKVCacheCapacity");
     check(rotaryDim <= mNumElemPerHead, "Rotary dimension exceed head size");
 
     half* qkvDevicePtr = reinterpret_cast<half*>(const_cast<void*>(inputs[kQKV_INPUT_IDX]));
@@ -373,7 +380,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
         drivellm::kernel::launchApplyRopeWriteKVContext(qkvDevicePtr, kvCacheDevicePtr, posEncodingCosSinDevicePtr,
             runtimeSeqLen, totalProcessToken, mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim,
-            stream);
+            cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
         auto fmhaRunner = ContextFMHARunner(
@@ -401,13 +408,13 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
             drivellm::kernel::launchApplyRopeWriteKVTreeDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
                 posEncodingCosSinDevicePtr, seqLengthDevicePtr, customSeqIndex, runtimeSeqLen, totalProcessToken,
-                mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, stream);
+                mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
         }
         else
         {
             drivellm::kernel::launchApplyRopeWriteKVDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
                 posEncodingCosSinDevicePtr, seqLengthDevicePtr, runtimeSeqLen, totalProcessToken, mKVCacheCapacity,
-                mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, stream);
+                mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
         }
         // Prepare GQA runner parameter to dispatch kernel
         auto xqaRunner
