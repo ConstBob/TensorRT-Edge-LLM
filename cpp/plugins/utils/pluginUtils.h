@@ -16,8 +16,8 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <string>
 #include <optional>
+#include <string>
 
 namespace drivellm
 {
@@ -39,7 +39,7 @@ template <typename T>
 nvinfer1::PluginFieldType toFieldType();
 #define SPECIALIZE_TO_FIELD_TYPE(T, type)                                                                              \
     template <>                                                                                                        \
-    inline nvinfer1::PluginFieldType toFieldType<T>()                                                                         \
+    inline nvinfer1::PluginFieldType toFieldType<T>()                                                                  \
     {                                                                                                                  \
         return nvinfer1::PluginFieldType::type;                                                                        \
     }

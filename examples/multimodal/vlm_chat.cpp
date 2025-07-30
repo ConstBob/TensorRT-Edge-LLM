@@ -161,8 +161,8 @@ bool parseVlmChatArgs(VlmChatArgs& args, int argc, char* argv[])
 }
 
 template <typename ViTRunnerType>
-std::unique_ptr<LLMEngineHalf> getLLMEngine(int32_t batchSize, BaseParams const& baseParams, EagleParams const& eagleParams,
-    LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
+std::unique_ptr<LLMEngineHalf> getLLMEngine(int32_t batchSize, BaseParams const& baseParams,
+    EagleParams const& eagleParams, LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
 {
     EngineConfig engineConfig;
     bool eagleMode = !eagleParams.eagleEnginePath.empty();
@@ -301,7 +301,8 @@ void decodeInternVL3(BaseParams const& baseParams, EagleParams const& eagleParam
     auto vitrunner = new InternVLViTRunner(vlmRunParams.modelType);
     vitrunner->setup(vlmRunParams.visualEnginePath, stream, batchSize);
 
-    auto llmEngine = getLLMEngine<InternVLViTRunner>(batchSize, baseParams, eagleParams, loraWeights, stream, vitrunner);
+    auto llmEngine
+        = getLLMEngine<InternVLViTRunner>(batchSize, baseParams, eagleParams, loraWeights, stream, vitrunner);
 
     // Preprocess
     std::vector<half> visualInput;

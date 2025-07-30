@@ -557,8 +557,8 @@ void Decoder<T>::initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextL
             // This won't have side effect for ongoing request.
             CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
                 mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
-            CUDA_CHECK(cudaMemsetAsync(mDeviceBuffer["last_token_ids"], 0,
-                mConfig.batchSize * sizeof(int64_t), mStream));
+            CUDA_CHECK(
+                cudaMemsetAsync(mDeviceBuffer["last_token_ids"], 0, mConfig.batchSize * sizeof(int64_t), mStream));
             // Call enqueueV3() once prior to cudaGraph capture to execute TRT dynamic shape machine.
             // TRT shape machine could invoke host memory operation on Thor that invalidate cudaGraph capture.
             mGenerationExecutionContext->enqueueV3(mStream);

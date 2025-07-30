@@ -11,10 +11,10 @@
  */
 
 #include "vit_runner.h"
+#include "kernels/posEncoding/initializeCosSinCache.h"
 #include <cmath>
 #include <random>
 #include <tuple>
-#include "kernels/posEncoding/initializeCosSinCache.h"
 
 bool Qwen2ViTRunner::setup(std::filesystem::path const& fp, cudaStream_t& stream, int llmBatchSize)
 {
@@ -429,8 +429,8 @@ void Qwen2ViTRunner::generateMropeParams(
 
     void* mropePositionIdsDevice;
     CUDA_CHECK(cudaMalloc(&mropePositionIdsDevice, mropePositionIds.size() * sizeof(int64_t)));
-    CUDA_CHECK(cudaMemcpy(mropePositionIdsDevice, mropePositionIds.data(),
-        mropePositionIds.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mropePositionIdsDevice, mropePositionIds.data(), mropePositionIds.size() * sizeof(int64_t),
+        cudaMemcpyHostToDevice));
     mDeviceBuffer["mropePositionIds"] = mropePositionIdsDevice;
 
     // Initialize mropeRotaryCosSin

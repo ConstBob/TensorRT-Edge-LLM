@@ -15,8 +15,8 @@
 #include "common/common.h"
 #include "cubin/fmha_cubin.h"
 
-#include <cuda_fp16.h>
 #include <cuda.h>
+#include <cuda_fp16.h>
 #include <math.h>
 #include <memory>
 #include <mutex>
@@ -214,8 +214,8 @@ public:
 
             if (funcInfo.mSharedMemBytes >= 48 * 1024)
             {
-                CUDA_DRIVER_CHECK(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    funcInfo.mSharedMemBytes));
+                CUDA_DRIVER_CHECK(cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes));
             }
             FMHAKernelHashKey hashKey{kernelMeta.mDataType, static_cast<int32_t>(kernelMeta.mS),
                 static_cast<int32_t>(kernelMeta.mD), kernelMeta.mUnrollStep != 0, kernelMeta.mFP32Accumulation,
@@ -391,6 +391,6 @@ void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2& 
     int32_t unroll = (params.s + kernelInfo.mUnrollStep - 1) / kernelInfo.mUnrollStep;
     // on Ampere/Ada flash attention, we launch blocks (steps, h, b)
     // TODO: Generalize the logic for more architectures.
-    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, unroll, params.h, params.b, kernelInfo.mThreadsPerCTA, 1, 1,
-        kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
+    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, unroll, params.h, params.b, kernelInfo.mThreadsPerCTA,
+        1, 1, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }

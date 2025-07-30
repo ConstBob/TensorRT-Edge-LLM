@@ -1,17 +1,44 @@
 variables:
   TRT_BRANCH: "main"
 
+workflow:
+  rules:
+    # Skip draft MRs completely
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
+      when: never
+    # Run for non-draft MRs
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 stages:
+- pre_commit_checks
 - build
 - export
 - test
 
+# Pre-commit code quality checks
+pre_commit_checks:
+  stage: pre_commit_checks
+  variables:
+    PLATFORM: tensorrt-runner
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-cross-aarch64-jp6-cuda$CUDA_VERSION
+  tags:
+    - cpu-k8s
+  script:
+    - echo "Installing dependencies"
+    - apt update
+    - apt install -y python3 python3-pip git curl
+    - echo "Installing pre-commit hooks"
+    - pip3 install pre-commit
+    - pre-commit install
+    - echo "Running pre-commit checks on all files"
+    - pre-commit run --all-files || (echo "❌ Pre-commit checks failed!" && echo "💡 To fix this locally, run:" && echo "   pip install pre-commit" && echo "   pre-commit install" && echo "   pre-commit run --all-files" && exit 1)
+    - echo "✅ Pre-commit checks passed!"
+  interruptible: true
+
 # Building and testing with A10 Linux
 linux_native_build_and_test:
   stage: build
-  needs: []
-  only:
-    - merge_requests
   variables:
     PLATFORM: tensorrt-runner
     CUDA_VERSION: "12.9"
@@ -21,15 +48,9 @@ linux_native_build_and_test:
     - linux-a10-k8s
   image: "$IMAGE"
   script:
-    # install dependencies
+    - echo "Installing dependencies"
     - apt update
     - apt install -y python3 python3-pip git curl
-    # setup ssh key for git clone
-    - cp -r ~/ssh_content ~/.ssh
-    - chmod -R 400 ~/.ssh/runner
-    - chmod -R 600 ~/.ssh/config
-    - ls /data
-    - realpath .
     - echo "Setting up git submodule"
     - git submodule update --init --recursive
     - echo "Downloading TensorRT package"
@@ -53,8 +74,6 @@ linux_native_build_and_test:
 # Cross build for JP6 Orin
 jp6_cross_build:
   stage: build
-  only:
-    - merge_requests
   variables:
     PLATFORM: tensorrt-runner
     CUDA_VERSION: "12.9"
@@ -64,13 +83,9 @@ jp6_cross_build:
     - cpu-k8s
   image: "$IMAGE"
   script:
-    # install dependencies
+    - echo "Installing dependencies"
     - apt update
     - apt install -y python3 python3-pip git curl
-    # setup ssh key for git clone
-    - cp -r ~/ssh_content ~/.ssh
-    - chmod -R 400 ~/.ssh/runner
-    - chmod -R 600 ~/.ssh/config
     - echo "Setting up git submodule"
     - git submodule update --init --recursive
     - echo "Downloading TensorRT package"
@@ -92,8 +107,6 @@ jp6_cross_build:
     expire_in: 30 minutes
 
 orin_unit_test:
-  only:
-    - merge_requests
   stage: test
   dependencies:
     - jp6_cross_build
@@ -101,16 +114,16 @@ orin_unit_test:
     - p3730-k8s
   image: "ubuntu:24.04"
   script:
-    # install dependencies
+    - echo "Installing dependencies"
     - apt update
     - apt install -y openssh-client sshpass rsync nfs-common
-    - echo "Setting up environment"
+    - echo "Copying password to device scripts"
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_run.sh
     # clean up the packages in the board
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no nvidia@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_init.sh
     - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
-    # sync tensorrt-edge-llm source to the board
+    - echo "Syncing tensorrt-edge-llm source to the board"
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" . nvidia@192.168.55.1:/home/nvidia/tensorrt-edge-llm
     # run test
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no nvidia@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_run.sh

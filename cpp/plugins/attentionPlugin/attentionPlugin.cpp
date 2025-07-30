@@ -14,9 +14,9 @@
 #include "common/common.h"
 #include "common/cudaUtils.h"
 
-#include "kernels/posEncoding/applyRopeWriteKV.h"
-#include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "kernels/contextAttentionKernels/contextFMHARunner.h"
+#include "kernels/decodeAttentionKernels/decoderXQARunner.h"
+#include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "plugins/utils/pluginUtils.h"
 
 #include <cassert>
@@ -408,7 +408,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
             drivellm::kernel::launchApplyRopeWriteKVTreeDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
                 posEncodingCosSinDevicePtr, seqLengthDevicePtr, customSeqIndex, runtimeSeqLen, totalProcessToken,
-                mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+                mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize,
+                cosSinCacheSeqLen, stream);
         }
         else
         {
