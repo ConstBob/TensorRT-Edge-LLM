@@ -58,7 +58,9 @@ file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")
 add_library(NvInfer_edgellm_plugin SHARED ${PLUGIN_CPP_SRCS})
 set_target_properties(NvInfer_edgellm_plugin PROPERTIES VERSION 1.0 SOVERSION 1)
 set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
-                                                 ${CMAKE_BINARY_DIR})
-target_include_directories(NvInfer_edgellm_plugin PRIVATE ${COMMON_INCLUDE_DIRS})
-target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt llmSdkKernels ${CUDA_DRIVER_LIB})
+                                                        ${CMAKE_BINARY_DIR})
+target_include_directories(NvInfer_edgellm_plugin
+                           PRIVATE ${COMMON_INCLUDE_DIRS})
+target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt llmSdkKernels
+                      ${CUDA_DRIVER_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)

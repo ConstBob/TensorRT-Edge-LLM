@@ -499,12 +499,10 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
         {
             for (int i = 0; i < rotaryEmbeddingMaxPositions; ++i)
             {
-                int pos
-                    = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
+                int pos = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
                 for (int j = mRopeSections[sec]; j < mRopeSections[sec + 1]; ++j)
                 {
-                    int cosDstIdx
-                        = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
+                    int cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
                     int32_t sinOffset = rotaryDim / 2;
                     mropeRotaryCosSin[cosDstIdx] = cosOri[pos][j];
                     mropeRotaryCosSin[cosDstIdx + sinOffset] = sinOri[pos][j];

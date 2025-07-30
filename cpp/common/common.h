@@ -69,8 +69,8 @@ inline void _checkCuda(cudaError_t result, char const* const func, [[maybe_unuse
     }
 }
 
-inline void _checkCudaDriver(CUresult result, char const* const func, [[maybe_unused]] char const* const file,
-    [[maybe_unused]] int const line)
+inline void _checkCudaDriver(
+    CUresult result, char const* const func, [[maybe_unused]] char const* const file, [[maybe_unused]] int const line)
 {
     if (result)
     {
@@ -94,7 +94,7 @@ inline void _checkCudaDriver(CUresult result, char const* const func, [[maybe_un
 #define CUDA_DRIVER_CHECK(stat)                                                                                        \
     do                                                                                                                 \
     {                                                                                                                  \
-        _checkCudaDriver((stat), #stat, __FILE__, __LINE__);                                                                 \
+        _checkCudaDriver((stat), #stat, __FILE__, __LINE__);                                                           \
     } while (0)
 
 inline std::string extractFolderName(std::string const& path)

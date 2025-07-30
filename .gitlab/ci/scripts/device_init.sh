@@ -3,6 +3,7 @@ set -e
 echo "Setting up device environment"
 
 ssh_folder="$HOME/.ssh"
+tensorrt_edge_llm_folder="$HOME/tensorrt-edge-llm"
 board_password={BOARDPASSWORD}
 
 echo $board_password | sudo -S apt update
@@ -12,6 +13,12 @@ if [ -d "$ssh_folder" ] ; then
     echo $board_password | sudo -S chmod -R 777 ~/.ssh
     rm -rf "$ssh_folder"
     echo "ssh key removed"
+fi
+
+if [ -d "$tensorrt_edge_llm_folder" ] ; then
+    echo $board_password | sudo -S chmod -R 777 "$tensorrt_edge_llm_folder"
+    rm -rf "$tensorrt_edge_llm_folder"
+    echo "tensorrt-edge-llm folder removed"
 fi
 
 mkdir $ssh_folder

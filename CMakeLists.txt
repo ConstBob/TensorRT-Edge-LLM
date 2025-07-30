@@ -131,8 +131,7 @@ if(BUILD_UNIT_TESTS)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
   target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS}
                                               ${CMAKE_SOURCE_DIR})
-  target_link_libraries(
-    unitTest PRIVATE gtest gtest_main llmSdkCore ${CUDART_LIB}
-                     ${CUDA_DRIVER_LIB})
+  target_link_libraries(unitTest PRIVATE gtest gtest_main llmSdkCore
+                                         ${CUDART_LIB} ${CUDA_DRIVER_LIB})
   add_cross_build_link_options(unitTest)
 endif()

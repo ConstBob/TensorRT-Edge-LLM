@@ -130,7 +130,6 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
     return handle;
 }
 
-
 // StreamReader ported from TRT-LLM to read from engine file.
 class StreamReader final : public nvinfer1::IStreamReader
 {

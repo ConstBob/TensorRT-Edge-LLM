@@ -178,15 +178,16 @@ public:
 
             uint32_t* deviceSmemSize{nullptr};
             size_t dataSize{0};
-            CUDA_DRIVER_CHECK(cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&deviceSmemSize), &dataSize, hModule, "smemSize"));
+            CUDA_DRIVER_CHECK(
+                cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&deviceSmemSize), &dataSize, hModule, "smemSize"));
             CUDA_CHECK(cudaMemcpy(&funcInfo.mSharedMemBytes, deviceSmemSize, dataSize, cudaMemcpyDeviceToHost));
 
             // Set 46KB threshold here because we have to take static/driver shared memory into consideration.
             // Default value for shared memory is 48KB.
             if (funcInfo.mSharedMemBytes >= 46 * 1024)
             {
-                CUDA_DRIVER_CHECK(cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    funcInfo.mSharedMemBytes));
+                CUDA_DRIVER_CHECK(cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes));
             }
             XQAKernelRuntimeHashKey hashKey{
                 kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mNumQHeadsOverKV, kernelMeta.mBeamWidth};
@@ -328,8 +329,8 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     // context. Current measured workload doesn't get performance gain from multi-block launch.
     dim3 const dimGrid{1, mNumKVHeads, mBatchSize};
     dim3 const dimCta{128, 1, 2};
-    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y, dimCta.z,
-        kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
+    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y,
+        dimCta.z, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }
 
 void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)
@@ -353,6 +354,6 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
     int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / CTA_TILE_Y + 1;
     dim3 const dimGrid{1, mNumKVHeads * tokenBlockPerGroup, mBatchSize};
     dim3 const dimCta{128, 1, 2};
-    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y, dimCta.z,
-        kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
+    CUDA_DRIVER_CHECK(cuLaunchKernel(kernelInfo.mDeviceFunction, dimGrid.x, dimGrid.y, dimGrid.z, dimCta.x, dimCta.y,
+        dimCta.z, kernelInfo.mSharedMemBytes, stream, kernelParams, nullptr));
 }
