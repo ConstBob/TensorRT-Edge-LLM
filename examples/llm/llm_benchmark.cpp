@@ -63,7 +63,7 @@ void printUsage(char const* programName)
     CommonUsage::printLoraOptions();
 };
 
-void warmupRun(std::unique_ptr<LLMEngineHalf>& llmEngine, std::vector<int64_t>& inputIds,
+void warmupRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int64_t>& inputIds,
     std::vector<int32_t>& contextLengths, std::vector<std::vector<int64_t>>& outputIds,
     GenerationConfig const& generationConfig, int64_t warmUp, cudaStream_t stream, Tokenizer* tokenizer = nullptr)
 {
@@ -81,7 +81,7 @@ void warmupRun(std::unique_ptr<LLMEngineHalf>& llmEngine, std::vector<int64_t>& 
     cudaDeviceSynchronize();
 }
 
-void benchmarkRun(std::unique_ptr<LLMEngineHalf>& llmEngine, std::vector<int64_t>& inputIds,
+void benchmarkRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int64_t>& inputIds,
     std::vector<int32_t>& contextLengths, std::vector<std::vector<int64_t>>& outputIds,
     GenerationConfig const& generationConfig, std::shared_ptr<BenchmarkProfiler> const profiler, int64_t numRuns,
     cudaStream_t stream, std::vector<int32_t>* newTokensNumbers, std::vector<int32_t>* iterNumbers,
@@ -301,7 +301,7 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
             args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
     }
     profiler->recordHostStart("decoder setup");
-    auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
+    auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
     bool const eagleMode = llmEngine->isEagleModel();
@@ -329,7 +329,7 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
     }
 
     auto const batchSize = llmEngine->getBatchSize();
-    auto const maxContextLength = llmEngine->getMaxContextLength();
+    auto const maxContextLength = llmEngine->getMaxSupportedInputLength();
     std::vector<std::vector<int64_t>> outputIds(batchSize);
 
     if (eagleMode)
@@ -576,7 +576,7 @@ int main(int argc, char* argv[])
 
     auto pluginHandles = loadEdgellmPluginLib();
 
-    GenerationConfig generationConfig{args.maxLength, args.maxLength, 1, 0};
+    GenerationConfig generationConfig{args.maxLength, args.maxLength, 1, 1};
 
     if (args.eagleParams.eagleEnginePath.empty())
     {

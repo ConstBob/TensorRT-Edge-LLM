@@ -1,6 +1,5 @@
 #pragma once
-#ifndef EAGLE_H
-#define EAGLE_H
+
 #include "common/benchmarkProfiler.h"
 #include "common/json.h"
 #include "decoder/decoder.h"
@@ -15,11 +14,14 @@
 #include <string>
 #include <vector>
 
-template <typename T>
 class Eagle
 {
 public:
-    Eagle(std::unique_ptr<Decoder<T>> baseModel, std::unique_ptr<Decoder<T>> draftModel, cudaStream_t stream,
+    using LogitsType = half;
+    using KVCacheType = half;
+    using HiddenStatesType = half;
+
+    Eagle(std::unique_ptr<Decoder> baseModel, std::unique_ptr<Decoder> draftModel, cudaStream_t stream,
         std::string eagleEnginePath, int32_t maxPathLen = 6, int32_t topK = 10, bool isEagle3 = false,
         int32_t maxDecodingTokens = 60)
         : mBaseModel(std::move(baseModel))
@@ -32,7 +34,7 @@ public:
         // for eagle plus 1
         mMaxSeqLen = modelConfig.maxLength + 1;
         mVocabSize = modelConfig.vocabSize;
-        mMaxInputLength = modelConfig.maxInputLength;
+        mMaxInputLength = modelConfig.maxSupportedInputLength;
         // don't contain root node
         mMaxDraftTokens = maxDecodingTokens - 1;
         mMaxDecodingTokens = maxDecodingTokens;
@@ -68,9 +70,10 @@ public:
         bool isEagle3 = false, std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
         std::vector<int32_t>* newTokens = nullptr, std::vector<int32_t>* iterNumbers = nullptr);
     size_t getDeviceMemorySize() const noexcept;
-    void getLastHostLogits(std::vector<T>& hostLogits);
+    void getLastHostLogits(std::vector<half>& hostLogits);
     int64_t getModelBatchSize() const noexcept;
-    int64_t getMaxContextLength() const noexcept;
+    int64_t getMinSupportedInputLength() const noexcept;
+    int64_t getMaxSupportedInputLength() const noexcept;
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
     void setupRopeCosSin(std::string const& configPath);
 
@@ -91,7 +94,7 @@ public:
 private:
     void addNewBufferForModelIO();
     void invokeSamplingAndAccept(int64_t* draftIds, int32_t const curTokensPerStep, int64_t endIds);
-    void invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t layerIdx, T* hs_draft);
+    void invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t layerIdx, HiddenStatesType* hs_draft);
     void invokeUpdateCumScoresAndParentsIds(int32_t layerIdx);
     void invokeAssembleDraftIdsAndPathAndMaskAndPositionIds();
     void invokeInitializeAttentionMaskCausal();
@@ -106,8 +109,8 @@ private:
     void initDraftVoc();
     void setupExtraInputsForBaseModel();
     void setupExtraInputsForDraftModel(std::vector<int32_t> const& contextLengths);
-    std::unique_ptr<Decoder<T>> mBaseModel;
-    std::unique_ptr<Decoder<T>> mDraftModel;
+    std::unique_ptr<Decoder> mBaseModel;
+    std::unique_ptr<Decoder> mDraftModel;
 
     std::map<std::string, void*> mEagleDeviceBuffer;
     std::map<std::string, void*> mEagleHostBuffer;
@@ -133,5 +136,3 @@ private:
 
     cudaStream_t mStream;
 };
-
-#endif

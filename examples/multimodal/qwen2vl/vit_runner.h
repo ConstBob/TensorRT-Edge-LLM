@@ -83,7 +83,7 @@ public:
 
     void textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
         std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
-        std::vector<int32_t>& contextLengths, int const maxContextLength);
+        std::vector<int32_t>& contextLengths, int32_t const maxSupportedInputLength, bool enableDynamicShape);
 
     void getWindowIndex(std::vector<std::vector<int64_t>> const& grids, std::vector<half>& windowAttentionMask,
         std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex);

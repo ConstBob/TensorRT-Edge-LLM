@@ -220,7 +220,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     auto vitrunner = new Qwen2ViTRunner(modelType);
-    auto decoder = new Decoder<half>();
+    auto decoder = new Decoder();
 
     profiler->startTiming();
     profiler->recordDeviceMemStart();
@@ -253,7 +253,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     std::vector<half> visualInput;
     std::vector<half> visualAttentionMask;
     std::vector<float> visualRotaryPosEmb;
-    std::vector<int64_t> inputIds(batchSize * decoder->getMaxContextLength(), -1);
+    std::vector<int64_t> inputIds(batchSize * decoder->getMaxSupportedInputLength(), -1);
     std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
     // Only initialized for qwen2_5_vl
     std::vector<half> visualWindowAttentionMask;
@@ -262,7 +262,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
 
     vitrunner->initRandomInputs(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
         visualWindowIndex, reverseWindowIndex, inputIds, textTokenLength, imageTokenLength,
-        decoder->getMaxContextLength());
+        decoder->getMaxSupportedInputLength());
 
     for (int i = 0; i < warmUp; i++)
     {
@@ -331,7 +331,7 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     auto vitrunner = new InternVLViTRunner(modelType);
-    auto decoder = new Decoder<half>();
+    auto decoder = new Decoder();
 
     profiler->startTiming();
     profiler->recordDeviceMemStart();
@@ -361,11 +361,11 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
 
     // Preprocess
     std::vector<half> visualInput;
-    std::vector<int64_t> inputIds(batchSize * decoder->getMaxContextLength(), -1);
+    std::vector<int64_t> inputIds(batchSize * decoder->getMaxSupportedInputLength(), -1);
     std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
 
     vitrunner->initRandomInputs(
-        visualInput, inputIds, textTokenLength, imageTokenLength, decoder->getMaxContextLength());
+        visualInput, inputIds, textTokenLength, imageTokenLength, decoder->getMaxSupportedInputLength());
     for (int i = 0; i < warmUp; i++)
     {
         // Warmup for profiler
@@ -409,7 +409,7 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
 void benchmarkVLM(VlmBenchmarkArgs const& args)
 {
     int totalSeqLength = args.textTokenLength + args.imageTokenLength + args.outputLength;
-    GenerationConfig generationConfig{totalSeqLength, totalSeqLength, 1, 0};
+    GenerationConfig generationConfig{totalSeqLength, totalSeqLength, 1, 1};
 
     std::vector<std::vector<int64_t>> outputIds(args.batchSize);
     for (int i = 0; i < args.batchSize; ++i)

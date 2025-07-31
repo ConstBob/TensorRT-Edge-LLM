@@ -34,16 +34,16 @@ struct EngineConfig
     bool useCudaGraph{true};
     int32_t batchSize{1};
     EngineConfig() = default;
-    EngineConfig(std::string const& base_engine_path, bool use_cuda_graph = true, int32_t batch_size = 1);
+    EngineConfig(std::string const& base_engine_path, bool useCudaGraph = true, int32_t batch_size = 1);
     EngineConfig(std::string const& base_engine_path, std::string const& eagle_engine_path, int32_t max_path_len,
         int32_t top_k, bool is_eagle3, int32_t max_decoding_tokens, bool use_cuda_graph = true);
 };
 
-template <typename T>
 class LLMEngine
 {
 public:
-    using ModelPtr = std::variant<std::unique_ptr<Decoder<T>>, std::unique_ptr<Eagle<T>>>;
+    using LogitsType = half;
+    using ModelPtr = std::variant<std::unique_ptr<Decoder>, std::unique_ptr<Eagle>>;
 
     explicit LLMEngine(EngineConfig const& config, cudaStream_t stream);
 
@@ -55,12 +55,13 @@ public:
     ~LLMEngine() = default;
     bool isEagleModel() const;
 
-    int32_t getMaxContextLength() const;
+    int32_t getMinSupportedInputLength() const;
+    int32_t getMaxSupportedInputLength() const;
     int64_t getBatchSize() const;
-    std::unique_ptr<Decoder<T>>& getDecoder();
-    std::unique_ptr<Eagle<T>>& getEagle();
+    std::unique_ptr<Decoder>& getDecoder();
+    std::unique_ptr<Eagle>& getEagle();
     int64_t getDeviceMemorySize();
-    void getLastHostLogits(std::vector<T>& hostLogits);
+    void getLastHostLogits(std::vector<LogitsType>& hostLogits);
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
     void setupRopeCosSin(std::string const& configPath);
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> const& contextLengths,
@@ -70,19 +71,16 @@ public:
         bool autoDecode = false);
 
     // Input processing methods
-    void processInputSequence(std::string const& inputString, Tokenizer* tokenizer,
-        std::vector<int32_t>& contextLengths, std::vector<int64_t>& inputIds, int64_t batchIdx, int64_t padId,
-        bool truncate = true, bool padding = true);
+    std::vector<int64_t> processInputSequence(std::vector<std::string> const& inputStrings, Tokenizer* tokenizer,
+        std::vector<int32_t>& contextLengths, int64_t padId);
 
 private:
     ModelPtr mModel;
-    int32_t mMaxContextLength;
+    int32_t mMaxSupportedInputLength;
+    int32_t mMinSupportedInputLength;
     int64_t mBatchSize;
     bool mIsEagle3;
 
-    int64_t calculatePrefixSum(std::vector<int32_t> const& contextLengths, int32_t i) const;
     ModelPtr createModel(EngineConfig const& config, cudaStream_t stream);
     void updateModelDimensions();
 };
-
-using LLMEngineHalf = LLMEngine<half>;

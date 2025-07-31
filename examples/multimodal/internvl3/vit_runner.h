@@ -69,7 +69,7 @@ public:
 
     void textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
         std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
-        std::vector<int32_t>& contextLengths, int const maxContextLength);
+        std::vector<int32_t>& contextLengths, int32_t const maxSupportedInputLength, bool enableDynamicShape);
 
     void internVLViTInfer(std::vector<half> const& input);
 

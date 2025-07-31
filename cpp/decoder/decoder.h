@@ -29,14 +29,15 @@
 struct ModelConfig
 // This is the model config inferred from optimization profiles
 {
-    int64_t batchSize;
-    int64_t numHead;
-    int64_t hiddenSizePerHead;
-    int64_t rotaryDim;
-    int64_t maxInputLength;
-    int64_t maxLength; // Equivalent to maxOutputLength;
-    int64_t numLayers;
-    int64_t vocabSize;
+    int64_t batchSize{0};
+    int64_t numHead{0};
+    int64_t hiddenSizePerHead{0};
+    int64_t rotaryDim{0};
+    int64_t minSupportedInputLength{0};
+    int64_t maxSupportedInputLength{0};
+    int64_t maxLength{0}; // Equivalent to maxOutputLength;
+    int64_t numLayers{0};
+    int64_t vocabSize{0};
 };
 
 struct GenerationConfig
@@ -47,17 +48,20 @@ struct GenerationConfig
     int64_t topK;
 };
 
-template <typename T>
 class Decoder
 {
 public:
+    using LogitsType = half;
+    using KVCacheType = half;
+    using LoraWeightType = half;
+
     Decoder()
         : mStream{nullptr}
         , mEngine{nullptr}
         , mContextExecutionContext{nullptr}
         , mGenerationExecutionContext{nullptr}
         , isSetup{false}
-        , mConfig{0, 0, 0, 0, 0, 0, 0, 0}
+        , mConfig{}
         , mDeviceBuffer{}
         , mUseCudaGraph{false}
         , mCudaGraphCaptured{false}
@@ -84,10 +88,13 @@ public:
     void* getDeviceBuffer(std::string const& name);
     ModelConfig const getModelConfig() const noexcept;
 
-    void getLastHostLogits(std::vector<T>& hostLogits);
+    void getLastHostLogits(std::vector<LogitsType>& hostLogits);
     size_t getDeviceMemorySize() const noexcept;
     int64_t getModelBatchSize() const noexcept;
-    int64_t getMaxContextLength() const noexcept;
+
+    int64_t getMaxSupportedInputLength() const noexcept;
+    int64_t getMinSupportedInputLength() const noexcept;
+
     ~Decoder()
     {
         for (auto deviceMem : mDeviceBuffer)

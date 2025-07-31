@@ -25,8 +25,7 @@
 #include <sstream>
 #include <utility>
 
-template <typename T>
-bool Decoder<T>::setup(
+bool Decoder::setup(
     std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph, int64_t batchSize, bool isEagle)
 {
     try
@@ -70,8 +69,8 @@ bool Decoder<T>::setup(
     }
     return true;
 }
-template <typename T>
-void Decoder<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
+
+void Decoder::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
 {
     for (size_t i = 0; i < extraInputs.size(); ++i)
     {
@@ -99,8 +98,7 @@ void Decoder<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInput
     }
 }
 
-template <typename T>
-void Decoder<T>::setupRopeCosSin(std::string const& configPath)
+void Decoder::setupRopeCosSin(std::string const& configPath)
 {
     drivellm::JsonRoot root;
     root.parseFromPath(configPath);
@@ -211,8 +209,7 @@ bool checkDimsEqual(nvinfer1::Dims& A, nvinfer1::Dims& B)
 }
 
 // Helper function to check a certain input tensor has static shape
-template <typename T>
-bool Decoder<T>::checkStaticShape(std::string& name)
+bool Decoder::checkStaticShape(std::string& name)
 {
     for (int32_t i = 0; i < mEngine->getNbOptimizationProfiles(); ++i)
     {
@@ -231,13 +228,13 @@ bool Decoder<T>::checkStaticShape(std::string& name)
     return true;
 }
 
-template <typename T>
-bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
+bool Decoder::validateAndFillConfig(int64_t batchSize)
 {
     int64_t numHead;
     int64_t hiddenSizePerHead;
     int64_t rotaryDim;
-    int64_t maxInputLength;
+    int64_t minSupportedInputLength;
+    int64_t maxSupportedInputLength;
     int64_t maxLength;
     int64_t nbIOs = static_cast<int64_t>(mEngine->getNbIOTensors());
     int64_t numLayers = 0;
@@ -250,13 +247,13 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
         }
     }
     numLayers = numLayers / 2;
-    std::string inputIdsName = "input_ids";
-    nvinfer1::Dims inputIdsShapeContext
+    std::string const inputIdsName = "input_ids";
+    nvinfer1::Dims inputIdsShapeContextMax
         = mEngine->getProfileShape(inputIdsName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
     nvinfer1::Dims inputIdsShapeContextMin
         = mEngine->getProfileShape(inputIdsName.c_str(), 0, nvinfer1::OptProfileSelector::kMIN);
     int64_t minBatchSize = inputIdsShapeContextMin.d[0];
-    int64_t maxBatchSize = inputIdsShapeContext.d[0];
+    int64_t maxBatchSize = inputIdsShapeContextMax.d[0];
     // If min = max, this is a static shape engine.
     if (minBatchSize == maxBatchSize)
     {
@@ -267,7 +264,8 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
         // This is a dynamic batch engine, but we need to check if the provided batchSize is between min and max
         assert(batchSize >= minBatchSize && batchSize <= maxBatchSize);
     }
-    maxInputLength = inputIdsShapeContext.d[1];
+    minSupportedInputLength = inputIdsShapeContextMin.d[1];
+    maxSupportedInputLength = inputIdsShapeContextMax.d[1];
     if (!mIsEagle)
     {
         nvinfer1::Dims inputIdsShapeGeneration
@@ -307,12 +305,13 @@ bool Decoder<T>::validateAndFillConfig(int64_t batchSize)
     nvinfer1::Dims rotaryDimShape = mEngine->getTensorShape("rope_rotary_cos_sin");
     rotaryDim = rotaryDimShape.d[2];
 
-    mConfig = {batchSize, numHead, hiddenSizePerHead, rotaryDim, maxInputLength, maxLength, numLayers, vocabSize};
+    mConfig = {batchSize, numHead, hiddenSizePerHead, rotaryDim, minSupportedInputLength, maxSupportedInputLength,
+        maxLength, numLayers, vocabSize};
 
     return 0;
 }
-template <typename T>
-void Decoder<T>::allocateBufferForKVCache()
+
+void Decoder::allocateBufferForKVCache()
 {
     int32_t sizeOfHalf = 2;
     // Allocate buffers for kv cache and set the shape
@@ -342,8 +341,7 @@ void Decoder<T>::allocateBufferForKVCache()
     }
 }
 
-template <typename T>
-void Decoder<T>::allocateCommonBuffers()
+void Decoder::allocateCommonBuffers()
 {
     allocateBufferForKVCache();
     void* contextLengthDevice;
@@ -361,28 +359,27 @@ void Decoder<T>::allocateCommonBuffers()
 
     // Initialize dummy LoRA buffer
     void* dummyLoraBuffer;
-    CUDA_CHECK(cudaMalloc(&dummyLoraBuffer, sizeof(T)));
+    CUDA_CHECK(cudaMalloc(&dummyLoraBuffer, sizeof(LoraWeightType)));
     mDeviceBuffer["dummy_lora"] = dummyLoraBuffer;
 
     void* samplingWorkspaceBuffer;
     drivellm::SamplingParams samplingParams(mConfig.batchSize, mConfig.vocabSize, 1.0f, 1);
     size_t workspaceSize
-        = drivellm::getTopKtopPSamplingWorkspaceSize<T>(mConfig.batchSize, mConfig.vocabSize, samplingParams);
+        = drivellm::getTopKtopPSamplingWorkspaceSize<LogitsType>(mConfig.batchSize, mConfig.vocabSize, samplingParams);
     CUDA_CHECK(cudaMalloc(&samplingWorkspaceBuffer, workspaceSize));
     mDeviceBuffer["samplingWorkspace"] = samplingWorkspaceBuffer;
 }
 
-template <typename T>
-void Decoder<T>::allocateExtraBufferForEagle()
+void Decoder::allocateExtraBufferForEagle()
 {
     void* lastTokenIdsDevice;
-    CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * mConfig.maxSupportedInputLength * sizeof(int64_t)));
     mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
     mContextExecutionContext->setInputShape("last_token_ids", {1, {1}});
     mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
 }
-template <typename T>
-void Decoder<T>::allocateExtraBufferForVanilla()
+
+void Decoder::allocateExtraBufferForVanilla()
 {
     int32_t sizeOfHalf = 2;
     void* lastTokenIdsDevice;
@@ -408,8 +405,7 @@ void Decoder<T>::allocateExtraBufferForVanilla()
     mHostBuffer["finished_states"] = malloc(mConfig.batchSize * sizeof(bool));
 }
 
-template <typename T>
-void Decoder<T>::allocateBuffer()
+void Decoder::allocateBuffer()
 {
     allocateCommonBuffers();
     if (mIsEagle)
@@ -422,8 +418,7 @@ void Decoder<T>::allocateBuffer()
     }
 }
 
-template <typename T>
-void Decoder<T>::addNewBuffer(std::string const& name, nvinfer1::Dims const dimsContext, int sizeOfByte)
+void Decoder::addNewBuffer(std::string const& name, nvinfer1::Dims const dimsContext, int sizeOfByte)
 {
 
     void* devicePtr;
@@ -442,8 +437,7 @@ void Decoder<T>::addNewBuffer(std::string const& name, nvinfer1::Dims const dims
     return;
 }
 
-template <typename T>
-void* Decoder<T>::getDeviceBuffer(std::string const& name)
+void* Decoder::getDeviceBuffer(std::string const& name)
 {
     auto it = mDeviceBuffer.find(name);
     if (it != mDeviceBuffer.end())
@@ -498,8 +492,7 @@ std::string formatFloat16Vector(std::vector<half> const& vec, int64_t batchSize)
 }
 
 // This is a helper function to dump kv cache information
-template <typename T>
-std::string Decoder<T>::printKVCache()
+std::string Decoder::printKVCache()
 {
     std::ostringstream oss;
     size_t totalKVSize = mConfig.batchSize * 2 * mConfig.hiddenSizePerHead * mConfig.numHead * mConfig.maxLength;
@@ -508,7 +501,7 @@ std::string Decoder<T>::printKVCache()
         "mConfig.hiddenSizePerHead: %d, mConfig.numHead: %d\n",
         totalKVSize, mConfig.batchSize, mConfig.numLayers, mConfig.maxLength, mConfig.hiddenSizePerHead,
         mConfig.numHead);
-    std::vector<T> kvCache(totalKVSize, 0.0);
+    std::vector<KVCacheType> kvCache(totalKVSize, 0.0);
     oss << "Context Length is: " << mConfig.maxLength << std::endl;
     auto const sizeOfHalf = 2;
     size_t const bytesPerLayer = totalKVSize * sizeOfHalf;
@@ -524,18 +517,17 @@ std::string Decoder<T>::printKVCache()
 }
 
 // This is a helper function to print logits
-template <typename T>
-std::string Decoder<T>::printLogits()
+std::string Decoder::printLogits()
 {
     size_t totalLogitSize = mConfig.batchSize * 1 * mConfig.vocabSize;
-    std::vector<T> logits(totalLogitSize, 0.0);
+    std::vector<LogitsType> logits(totalLogitSize, 0.0);
     CUDA_CHECK(cudaMemcpyAsync(
-        logits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(T), cudaMemcpyDeviceToHost, mStream));
+        logits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(LogitsType), cudaMemcpyDeviceToHost, mStream));
     CUDA_CHECK(cudaStreamSynchronize(mStream));
     return formatFloat16Vector(logits, mConfig.batchSize);
 }
-template <typename T>
-void Decoder<T>::initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextLengths)
+
+void Decoder::initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextLengths)
 {
     // Capture cuda graph only on the first run. This cuda graph will be cached and reused for all the other runs.
     if (mUseCudaGraph && !mCudaGraphCaptured)
@@ -578,16 +570,26 @@ void Decoder<T>::initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextL
     }
 }
 
-template <typename T>
-void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
+void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
     std::shared_ptr<BenchmarkProfiler> const profiler)
 {
     // Initialize decoding phase cuda graph
     initDecodingPhaseCudaGraph(contextLengths);
 
+    int32_t maxInputContextLength = *std::max_element(contextLengths.begin(), contextLengths.end());
+    // if Enable dynamic shape, the input contexts are padded to max input lengths within this batch,
+    // Otherwise the input contexts are padded to maxSupportedInputLength.
+    bool const engineSupportDynamicShape = mConfig.minSupportedInputLength != mConfig.maxSupportedInputLength;
+    int32_t const contextLenStride
+        = engineSupportDynamicShape ? maxInputContextLength : mConfig.maxSupportedInputLength;
+    if (inputIds.size() != contextLenStride * mConfig.batchSize)
+    {
+        throw std::runtime_error("InputIds for generation are not padded correctly.");
+    }
+
     // The generation step stop at longest sequence reach the maxLength.
-    int32_t generationIter = *std::max_element(contextLengths.begin(), contextLengths.end());
+    int32_t generationIter = maxInputContextLength;
     memset(mHostBuffer["finished_states"], 0, sizeof(bool) * mConfig.batchSize);
     auto finishedStates = reinterpret_cast<bool*>(mHostBuffer["finished_states"]);
     int64_t unfinishedBatchNum = mConfig.batchSize;
@@ -595,7 +597,7 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
     std::vector<int64_t> lastTokenIds(mConfig.batchSize);
     for (int i = 0; i < mConfig.batchSize; i++)
     {
-        assert(mConfig.maxInputLength >= contextLengths[i]);
+        assert(mConfig.maxSupportedInputLength >= contextLengths[i]);
         lastTokenIds[i] = contextLengths[i] - 1;
         outputIds[i].clear();
     }
@@ -613,11 +615,12 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
         // TODO: add temperature, top_k and top_p sampling
         drivellm::SamplingParams params(mConfig.batchSize, mConfig.vocabSize, 1.0f, 1, 1.0f);
 
-        drivellm::topKtopPSamplingFromLogits<T>(reinterpret_cast<T const*>(mDeviceBuffer["logits"]), // logits
-            deviceSelectedIndices,                                                                   // selected_indices
-            params,                                                                                  // params
-            mDeviceBuffer["samplingWorkspace"],                                                      // workspace
-            drivellm::getTopKtopPSamplingWorkspaceSize<T>(
+        drivellm::topKtopPSamplingFromLogits<LogitsType>(
+            reinterpret_cast<LogitsType const*>(mDeviceBuffer["logits"]), // logits
+            deviceSelectedIndices,                                        // selected_indices
+            params,                                                       // params
+            mDeviceBuffer["samplingWorkspace"],                           // workspace
+            drivellm::getTopKtopPSamplingWorkspaceSize<LogitsType>(
                 mConfig.batchSize, mConfig.vocabSize, params), // workspaceSize
             mStream                                            // stream
         );
@@ -649,11 +652,11 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
 
     // Context phase
     // Extra model inputs should be set with `setupExtraInputs` before this function
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(),
-        mConfig.batchSize * mConfig.maxInputLength * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(), inputIds.size() * sizeof(int64_t),
+        cudaMemcpyHostToDevice, mStream));
 
     generateForContext(
-        mDeviceBuffer["input_ids"], contextLengths, lastTokenIds, {2, {mConfig.batchSize, mConfig.maxInputLength}});
+        mDeviceBuffer["input_ids"], contextLengths, lastTokenIds, {2, {mConfig.batchSize, contextLenStride}});
 
     auto generatedToken = sampleToken();
     std::fill(lastTokenIds.begin(), lastTokenIds.end(), 0);
@@ -682,8 +685,7 @@ void Decoder<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int3
     }
 }
 
-template <typename T>
-void Decoder<T>::generateForContext(void* inputIds, std::vector<int32_t>& contextLengths,
+void Decoder::generateForContext(void* inputIds, std::vector<int32_t>& contextLengths,
     std::vector<int64_t> const& lastTokenIds, nvinfer1::Dims const inputDims)
 {
     // check input batch size
@@ -697,12 +699,10 @@ void Decoder<T>::generateForContext(void* inputIds, std::vector<int32_t>& contex
 
     mContextExecutionContext->enqueueV3(mStream);
 
-    LOG_DEBUG("Context phase logits:\n%s", printLogits().c_str());
-    LOG_DEBUG("Context phase kv cache:\n%s", printKVCache().c_str());
+    LOG_DEBUG("Invoke context phase enqueue with inputDims: [%d, %d]", inputDims.d[0], inputDims.d[1]);
 }
 
-template <typename T>
-void Decoder<T>::generateForDecode(std::vector<int32_t>& contextLengths, std::vector<int64_t>& lastTokenIds)
+void Decoder::generateForDecode(std::vector<int32_t>& contextLengths, std::vector<int64_t>& lastTokenIds)
 {
 
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
@@ -719,45 +719,43 @@ void Decoder<T>::generateForDecode(std::vector<int32_t>& contextLengths, std::ve
     {
         mGenerationExecutionContext->enqueueV3(mStream);
     }
-    LOG_DEBUG("Generation phase logits:\n%s", printLogits().c_str());
 }
 
-template <typename T>
-void Decoder<T>::getLastHostLogits(std::vector<T>& hostLogits)
+void Decoder::getLastHostLogits(std::vector<LogitsType>& hostLogits)
 {
     size_t totalLogitSize = mConfig.batchSize * 1 * mConfig.vocabSize;
     hostLogits.resize(totalLogitSize);
-    CUDA_CHECK(
-        cudaMemcpy(hostLogits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(T), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostLogits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(LogitsType), cudaMemcpyDeviceToHost));
     return;
 }
 
-template <typename T>
-size_t Decoder<T>::getDeviceMemorySize() const noexcept
+size_t Decoder::getDeviceMemorySize() const noexcept
 {
     return mEngine->getDeviceMemorySizeV2();
 }
 
-template <typename T>
-int64_t Decoder<T>::getModelBatchSize() const noexcept
+int64_t Decoder::getModelBatchSize() const noexcept
 {
     return mConfig.batchSize;
 }
 
-template <typename T>
-int64_t Decoder<T>::getMaxContextLength() const noexcept
+int64_t Decoder::getMinSupportedInputLength() const noexcept
 {
-    return mConfig.maxInputLength;
+    return mConfig.minSupportedInputLength;
 }
 
-template <typename T>
-ModelConfig const Decoder<T>::getModelConfig() const noexcept
+int64_t Decoder::getMaxSupportedInputLength() const noexcept
+{
+    return mConfig.maxSupportedInputLength;
+}
+
+ModelConfig const Decoder::getModelConfig() const noexcept
 {
     return mConfig;
 }
 
-template <typename T>
-bool Decoder<T>::addLora(std::string const& name, std::string const& filePath)
+bool Decoder::addLora(std::string const& name, std::string const& filePath)
 {
     if (name == "None")
     {
@@ -787,8 +785,7 @@ bool Decoder<T>::addLora(std::string const& name, std::string const& filePath)
     }
 }
 
-template <typename T>
-bool Decoder<T>::switchLora(std::string const& name)
+bool Decoder::switchLora(std::string const& name)
 {
     // Get the number of bindings in the engine
     int32_t numBindings = mEngine->getNbIOTensors();
@@ -882,8 +879,7 @@ bool Decoder<T>::switchLora(std::string const& name)
     return true;
 }
 
-template <typename T>
-std::vector<std::string> Decoder<T>::getLoraNames() const
+std::vector<std::string> Decoder::getLoraNames() const
 {
     std::vector<std::string> names = {"None"};
     for (auto const& [name, _] : mLoraWeights)
@@ -892,5 +888,3 @@ std::vector<std::string> Decoder<T>::getLoraNames() const
     }
     return names;
 }
-
-template class Decoder<half>;

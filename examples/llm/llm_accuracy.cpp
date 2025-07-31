@@ -226,7 +226,7 @@ std::vector<TestData> parseCSVFile(fs::path const& csvPath, int maxRecordNum = -
     return res;
 }
 
-void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer, GenerationConfig generationConfig)
+void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer)
 {
     std::unordered_map<std::string, std::vector<TestData>> testSubject2Data, devSubject2Data;
     std::vector<std::string> subjects;
@@ -287,8 +287,10 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer, GenerationC
             args.eagleParams.maxPathLen, args.eagleParams.topK, args.eagleParams.isEagle3,
             args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
     }
-    auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
+    auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     bool const eagleMode = llmEngine->isEagleModel();
+    int const maxEngineSupportedISL = llmEngine->getMaxSupportedInputLength();
+    bool const engineSupportDynamicShape = llmEngine->getMinSupportedInputLength() != maxEngineSupportedISL;
 
     // Initialize rope_rotary_cos_sin
     std::string baseFolderPath = extractFolderName(args.baseParams.enginePath);
@@ -357,7 +359,7 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer, GenerationC
             }
 
             std::vector<std::vector<int64_t>> outputIds(1);
-            generationConfig.maxLength = inputIds.size() + 1;
+            GenerationConfig generationConfig{inputIds.size() + 1, 0, 1, 1};
 
             if (inputIds.size() > 2048)
             {
@@ -365,6 +367,13 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer, GenerationC
                 continue;
             }
             contextLengths[0] = inputIds.size();
+
+            // PadInputIds to maxSupportedInputLength if engine is built with static shape mode.
+            if (!engineSupportDynamicShape)
+            {
+                inputIds.resize(maxEngineSupportedISL, tokenizer->getPadId());
+            }
+
             llmEngine->generate(
                 inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, nullptr, tokenizer);
 
@@ -426,11 +435,9 @@ int main(int argc, char* argv[])
 
     auto pluginHandles = loadEdgellmPluginLib();
 
-    GenerationConfig generationConfig{0, 0, 1, 0};
-
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.baseParams.tokenizerPath);
 
-    mmluAccuracy(args, tokenizer.get(), generationConfig);
+    mmluAccuracy(args, tokenizer.get());
     return EXIT_SUCCESS;
 };
