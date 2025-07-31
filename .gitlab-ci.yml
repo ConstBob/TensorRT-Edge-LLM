@@ -9,6 +9,7 @@ workflow:
       when: never
     # Run for non-draft MRs
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never
 
 stages:
 - pre_commit_checks
