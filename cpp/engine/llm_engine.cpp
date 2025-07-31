@@ -19,7 +19,6 @@
 EngineConfig::EngineConfig(std::string const& base_engine_path, bool use_cuda_graph, int32_t batch_size)
     : baseEnginePath(base_engine_path)
     , useCudaGraph(use_cuda_graph)
-    , batchSize(batch_size)
 {
 }
 
@@ -35,15 +34,27 @@ EngineConfig::EngineConfig(std::string const& base_engine_path, std::string cons
 {
 }
 
-template <typename T>
-LLMEngine<T>::LLMEngine(EngineConfig const& config, cudaStream_t stream)
+LLMEngine::LLMEngine(EngineConfig const& config, cudaStream_t stream)
 {
     try
     {
         mIsEagle3 = config.isEagle3;
         mModel = createModel(config, stream);
         // get context length and batch size
-        updateModelDimensions();
+        if (isEagleModel())
+        {
+            auto& eagle = std::get<std::unique_ptr<Eagle>>(mModel);
+            mMaxSupportedInputLength = eagle->getMaxSupportedInputLength();
+            mMinSupportedInputLength = eagle->getMinSupportedInputLength();
+            mBatchSize = eagle->getModelBatchSize();
+        }
+        else
+        {
+            auto& decoder = std::get<std::unique_ptr<Decoder>>(mModel);
+            mMaxSupportedInputLength = decoder->getMaxSupportedInputLength();
+            mMinSupportedInputLength = decoder->getMinSupportedInputLength();
+            mBatchSize = decoder->getModelBatchSize();
+        }
     }
     catch (std::exception const& e)
     {
@@ -51,46 +62,45 @@ LLMEngine<T>::LLMEngine(EngineConfig const& config, cudaStream_t stream)
     }
 }
 
-template <typename T>
-bool LLMEngine<T>::isEagleModel() const
+bool LLMEngine::isEagleModel() const
 {
-    return std::holds_alternative<std::unique_ptr<Eagle<T>>>(mModel);
+    return std::holds_alternative<std::unique_ptr<Eagle>>(mModel);
 }
 
-template <typename T>
-int32_t LLMEngine<T>::getMaxContextLength() const
+int32_t LLMEngine::getMinSupportedInputLength() const
 {
-    return mMaxContextLength;
+    return mMinSupportedInputLength;
 }
 
-template <typename T>
-int64_t LLMEngine<T>::getBatchSize() const
+int32_t LLMEngine::getMaxSupportedInputLength() const
+{
+    return mMaxSupportedInputLength;
+}
+
+int64_t LLMEngine::getBatchSize() const
 {
     return mBatchSize;
 }
 
-template <typename T>
-std::unique_ptr<Decoder<T>>& LLMEngine<T>::getDecoder()
+std::unique_ptr<Decoder>& LLMEngine::getDecoder()
 {
     if (!isEagleModel())
     {
-        return std::get<std::unique_ptr<Decoder<T>>>(mModel);
+        return std::get<std::unique_ptr<Decoder>>(mModel);
     }
     throw std::runtime_error("getDecoder() called in Eagle mode - use getEagle() instead");
 }
 
-template <typename T>
-std::unique_ptr<Eagle<T>>& LLMEngine<T>::getEagle()
+std::unique_ptr<Eagle>& LLMEngine::getEagle()
 {
     if (isEagleModel())
     {
-        return std::get<std::unique_ptr<Eagle<T>>>(mModel);
+        return std::get<std::unique_ptr<Eagle>>(mModel);
     }
     throw std::runtime_error("getEagle() called in standard mode - use getDecoder() instead");
 }
 
-template <typename T>
-int64_t LLMEngine<T>::getDeviceMemorySize()
+int64_t LLMEngine::getDeviceMemorySize()
 {
     if (isEagleModel())
     {
@@ -104,8 +114,7 @@ int64_t LLMEngine<T>::getDeviceMemorySize()
     }
 }
 
-template <typename T>
-void LLMEngine<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
+void LLMEngine::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
 {
     if (isEagleModel())
     {
@@ -119,8 +128,7 @@ void LLMEngine<T>::setupExtraInputs(std::vector<EngineInputDesc> const& extraInp
     }
 }
 
-template <typename T>
-void LLMEngine<T>::setupRopeCosSin(std::string const& configPath)
+void LLMEngine::setupRopeCosSin(std::string const& configPath)
 {
     if (isEagleModel())
     {
@@ -134,8 +142,7 @@ void LLMEngine<T>::setupRopeCosSin(std::string const& configPath)
     }
 }
 
-template <typename T>
-void LLMEngine<T>::getLastHostLogits(std::vector<T>& hostLogits)
+void LLMEngine::getLastHostLogits(std::vector<LogitsType>& hostLogits)
 {
     if (isEagleModel())
     {
@@ -149,8 +156,7 @@ void LLMEngine<T>::getLastHostLogits(std::vector<T>& hostLogits)
     }
 }
 
-template <typename T>
-void LLMEngine<T>::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> const& contextLengths,
+void LLMEngine::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> const& contextLengths,
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig const& generationConfig,
     std::vector<int32_t>* newTokensNumbers, std::vector<int32_t>* iterNumbers,
     std::shared_ptr<BenchmarkProfiler> const profiler, Tokenizer* tokenizer, bool autoDecode)
@@ -197,52 +203,47 @@ void LLMEngine<T>::generate(std::vector<int64_t> const& inputIds, std::vector<in
     }
 }
 
-template <typename T>
-void LLMEngine<T>::processInputSequence(std::string const& inputString, Tokenizer* tokenizer,
-    std::vector<int32_t>& contextLengths, std::vector<int64_t>& inputIds, int64_t batchIdx, int64_t padId,
-    bool truncate, bool padding)
+std::vector<int64_t> LLMEngine::processInputSequence(std::vector<std::string> const& inputStrings, Tokenizer* tokenizer,
+    std::vector<int32_t>& contextLengths, int64_t padId)
 {
     // Process and tokenize input string, then store tokens in the appropriate batch position
-    std::vector<int64_t> batchInputIds = tokenizer->encode(inputString, true);
-    int32_t inputSize = static_cast<int32_t>(batchInputIds.size());
+    int32_t batchSize = static_cast<int32_t>(inputStrings.size());
+    if (batchSize != mBatchSize)
+    {
+        throw std::runtime_error("Batch size mismatch for engine setup config.");
+    }
+    contextLengths.resize(batchSize, 0);
+    std::vector<std::vector<int64_t>> batchInputIds;
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        auto tokenizedInput = tokenizer->encode(inputStrings[i], true);
+        batchInputIds.emplace_back(tokenizedInput);
+        contextLengths[i] = static_cast<int32_t>(tokenizedInput.size());
+    }
+    int32_t maxInputLengthInBatch = *std::max_element(contextLengths.begin(), contextLengths.end());
 
-    if (inputSize > mMaxContextLength)
+    if (maxInputLengthInBatch > mMaxSupportedInputLength)
     {
-        if (truncate)
-        {
-            std::cout << "Warning: input length > max context length. The last tokens will be truncated." << std::endl;
-        }
-        else
-        {
-            throw std::runtime_error("Input length exceeds max context length");
-        }
+        throw std::runtime_error("Input length exceeds max supported input context length");
     }
-    contextLengths[batchIdx] = std::min(inputSize, mMaxContextLength);
-    if (padding)
+
+    // Depends on the engine config, we may either pad input ids to maxSupportedInputLength
+    // or pad inputs to largest input length in the batch.
+    bool const useMaxSupportedISLPadding = mMinSupportedInputLength == mMaxSupportedInputLength;
+    int64_t sequenceStride = useMaxSupportedISLPadding ? mMaxSupportedInputLength
+                                                       : std::max(mMinSupportedInputLength, maxInputLengthInBatch);
+
+    std::vector<int64_t> result(sequenceStride * batchSize, padId);
+    for (int32_t i = 0; i < batchSize; ++i)
     {
-        batchInputIds.resize(mMaxContextLength, padId);
-        std::copy(batchInputIds.begin(), batchInputIds.end(), inputIds.begin() + batchIdx * mMaxContextLength);
+        std::copy(batchInputIds[i].begin(), batchInputIds[i].end(), result.begin() + i * sequenceStride);
     }
-    else
-    {
-        int64_t offset = calculatePrefixSum(contextLengths, batchIdx);
-        std::copy(batchInputIds.begin(), batchInputIds.end(), inputIds.begin() + offset);
-    }
+    return result;
 }
 
-template <typename T>
-int64_t LLMEngine<T>::calculatePrefixSum(std::vector<int32_t> const& contextLengths, int32_t i) const
+typename LLMEngine::ModelPtr LLMEngine::createModel(EngineConfig const& config, cudaStream_t stream)
 {
-    // Calculate the sum of context lengths from index 0 to i-1 (prefix sum)
-    if (i <= 0)
-        return 0;
-    return std::accumulate(contextLengths.begin(), contextLengths.begin() + i, 0LL);
-}
-
-template <typename T>
-typename LLMEngine<T>::ModelPtr LLMEngine<T>::createModel(EngineConfig const& config, cudaStream_t stream)
-{
-    auto baseDecoder = std::make_unique<Decoder<T>>();
+    auto baseDecoder = std::make_unique<Decoder>();
 
     if (config.eagleEnginePath.empty())
     {
@@ -254,30 +255,9 @@ typename LLMEngine<T>::ModelPtr LLMEngine<T>::createModel(EngineConfig const& co
     {
         // Eagle mode - requires both base and draft decoders
         baseDecoder->setup(config.baseEnginePath, stream, config.useCudaGraph, 1, true);
-        auto draftDecoder = std::make_unique<Decoder<T>>();
+        auto draftDecoder = std::make_unique<Decoder>();
         draftDecoder->setup(config.eagleEnginePath, stream, config.useCudaGraph, 1, true);
-        return std::make_unique<Eagle<T>>(std::move(baseDecoder), std::move(draftDecoder), stream,
-            config.eagleEnginePath, config.maxPathLen, config.topK, config.isEagle3, config.maxDecodingTokens);
+        return std::make_unique<Eagle>(std::move(baseDecoder), std::move(draftDecoder), stream, config.eagleEnginePath,
+            config.maxPathLen, config.topK, config.isEagle3, config.maxDecodingTokens);
     }
 }
-
-template <typename T>
-void LLMEngine<T>::updateModelDimensions()
-{
-    if (isEagleModel())
-    {
-        // Extract dimensions (context length and batch size) from Eagle model (Eagle mode)
-        auto& eagle = std::get<std::unique_ptr<Eagle<T>>>(mModel);
-        mMaxContextLength = eagle->getMaxContextLength();
-        mBatchSize = eagle->getModelBatchSize();
-    }
-    else
-    {
-        // Extract dimensions  (context length and batch size) from standard Decoder model (non-Eagle mode)
-        auto& decoder = std::get<std::unique_ptr<Decoder<T>>>(mModel);
-        mMaxContextLength = decoder->getMaxContextLength();
-        mBatchSize = decoder->getModelBatchSize();
-    }
-}
-
-template class LLMEngine<half>;

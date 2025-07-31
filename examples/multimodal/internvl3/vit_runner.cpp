@@ -275,9 +275,10 @@ std::string InternVLViTRunner::applyChatTemplate(std::string const& inputString,
 
 void InternVLViTRunner::textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
     std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
-    std::vector<int32_t>& contextLengths, int const maxContextLength)
+    std::vector<int32_t>& contextLengths, int32_t const maxSupportedInputLength, bool enableDynamicShape)
 {
     std::vector<std::vector<int64_t>> batchInputIds;
+    std::vector<int32_t> batchInputLengths;
     int totalImageIdx = 0;
     int value = mConfig.vocabSize;
     for (size_t i = 0; i < inputStrings.size(); ++i)
@@ -295,19 +296,22 @@ void InternVLViTRunner::textPreprocess(std::vector<std::string> const& inputStri
             }
         }
         batchInputIds.emplace_back(ids);
+        batchInputLengths.emplace_back(static_cast<int32_t>(ids.size()));
     }
 
-    // Pad to maxContextLength
+    int32_t maxContextLengthInBatch = *std::max_element(batchInputLengths.begin(), batchInputLengths.end());
+    if (maxContextLengthInBatch > maxSupportedInputLength)
+    {
+        throw std::runtime_error("Input context lengths exceeds the maximum supported inputLength of TensorRT Engine.");
+    }
+    int32_t contextLenStride = enableDynamicShape ? maxContextLengthInBatch : maxSupportedInputLength;
+
     int64_t padId = tokenizer->getPadId();
     for (size_t i = 0; i < batchInputIds.size(); ++i)
     {
-        int32_t inputSize = static_cast<int32_t>(batchInputIds[i].size());
-        if (inputSize > maxContextLength)
-        {
-            LOG_WARNING("Input length > maxContextLength. The last tokens will be truncated.");
-        }
-        contextLengths.emplace_back(std::min(inputSize, maxContextLength));
-        batchInputIds[i].resize(maxContextLength, padId);
+        int32_t inputSize = batchInputLengths[i];
+        contextLengths.emplace_back(inputSize);
+        batchInputIds[i].resize(contextLenStride, padId);
         inputIds.insert(inputIds.end(), batchInputIds[i].begin(), batchInputIds[i].end());
     }
 }

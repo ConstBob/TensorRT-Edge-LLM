@@ -428,7 +428,7 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
 }
 
 template <typename ViTRunnerType>
-std::unique_ptr<LLMEngineHalf> getLLMEngine(BaseParams const& baseParams, EagleParams const& eagleParams,
+std::unique_ptr<LLMEngine> getLLMEngine(BaseParams const& baseParams, EagleParams const& eagleParams,
     LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
 {
     EngineConfig engineConfig;
@@ -444,7 +444,7 @@ std::unique_ptr<LLMEngineHalf> getLLMEngine(BaseParams const& baseParams, EagleP
         LOG_INFO("Running in standard LLM mode.");
         engineConfig = EngineConfig(baseParams.enginePath, !baseParams.noCudaGraph);
     }
-    auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
+    auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     llmEngine->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     // Load and switch to LoRA weights if provided
@@ -483,9 +483,9 @@ void evalQwen2VL(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer
         return;
     }
 
-    int maxInputLength = llmEngine->getMaxContextLength();
-
-    GenerationConfig generationConfig{maxInputLength + 256, 0, 1, 0};
+    int const maxSupportedInputLength = llmEngine->getMaxSupportedInputLength();
+    bool const enableDynamicShape = llmEngine->getMinSupportedInputLength() != maxSupportedInputLength;
+    GenerationConfig generationConfig{maxSupportedInputLength + 256, 0, 1, 1};
 
     int i = 0;
     LOG_INFO("Starting running tests.");
@@ -540,8 +540,8 @@ void evalQwen2VL(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer
 
         std::string prompt = data->format();
         int numImage = data->images.size();
-        vitrunner->textPreprocess(
-            {prompt}, {numImage}, visualGridTHWs, tokenizer, inputIds, contextLengths, maxInputLength);
+        vitrunner->textPreprocess({prompt}, {numImage}, visualGridTHWs, tokenizer, inputIds, contextLengths,
+            maxSupportedInputLength, enableDynamicShape);
 
         // Infer
         if (vlmRunParams.modelType == "qwen2_vl")
@@ -589,8 +589,9 @@ void evalInternVL3(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokeniz
         return;
     }
 
-    int maxInputLength = llmEngine->getMaxContextLength();
-    GenerationConfig generationConfig{maxInputLength + 256, 0, 1, 0};
+    int const maxSupportedInputLength = llmEngine->getMaxSupportedInputLength();
+    bool const enableDynamicShape = llmEngine->getMinSupportedInputLength() != maxSupportedInputLength;
+    GenerationConfig generationConfig{maxSupportedInputLength + 256, 0, 1, 1};
 
     int i = 0;
     LOG_INFO("Starting running tests.");
@@ -661,8 +662,8 @@ void evalInternVL3(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokeniz
 
         std::string prompt = data->format();
         int numImage = data->images.size();
-        vitrunner->textPreprocess(
-            {prompt}, {numImage}, imageTokenLengths, tokenizer, inputIds, contextLengths, maxInputLength);
+        vitrunner->textPreprocess({prompt}, {numImage}, imageTokenLengths, tokenizer, inputIds, contextLengths,
+            maxSupportedInputLength, enableDynamicShape);
 
         // Infer
         vitrunner->internVLViTInfer(visualInput);

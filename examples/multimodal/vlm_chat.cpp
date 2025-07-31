@@ -161,8 +161,8 @@ bool parseVlmChatArgs(VlmChatArgs& args, int argc, char* argv[])
 }
 
 template <typename ViTRunnerType>
-std::unique_ptr<LLMEngineHalf> getLLMEngine(int32_t batchSize, BaseParams const& baseParams,
-    EagleParams const& eagleParams, LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
+std::unique_ptr<LLMEngine> getLLMEngine(int32_t batchSize, BaseParams const& baseParams, EagleParams const& eagleParams,
+    LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
 {
     EngineConfig engineConfig;
     bool eagleMode = !eagleParams.eagleEnginePath.empty();
@@ -177,7 +177,7 @@ std::unique_ptr<LLMEngineHalf> getLLMEngine(int32_t batchSize, BaseParams const&
         LOG_INFO("Running in standard LLM mode.");
         engineConfig = EngineConfig(baseParams.enginePath, !baseParams.noCudaGraph, batchSize);
     }
-    auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
+    auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     llmEngine->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     // Load and switch to LoRA weights if provided
@@ -258,10 +258,12 @@ void decodeQwen2VL(BaseParams const& baseParams, EagleParams const& eagleParams,
         }
     }
 
+    int const maxSupportedInputLength = llmEngine->getMaxSupportedInputLength();
+    bool const enableDynamicShape = llmEngine->getMinSupportedInputLength() != maxSupportedInputLength;
     vitrunner->visualPreprocess(
         imageBuffers, imageSizes, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
-    vitrunner->textPreprocess(
-        inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths, llmEngine->getMaxContextLength());
+    vitrunner->textPreprocess(inputStrings, numImages, visualGridTHWs, tokenizer, inputIds, contextLengths,
+        maxSupportedInputLength, enableDynamicShape);
 
     // Infer
     if (vlmRunParams.modelType == "qwen2_vl")
@@ -365,10 +367,12 @@ void decodeInternVL3(BaseParams const& baseParams, EagleParams const& eagleParam
             stbi_image_free(image);
         }
     }
+    int const maxSupportedInputLength = llmEngine->getMaxSupportedInputLength();
+    bool const enableDynamicShape = llmEngine->getMinSupportedInputLength() != maxSupportedInputLength;
     vitrunner->visualPreprocess(
         imageBuffers, thumbnailImageBuffers, imageSizes, visualInput, imageTokenLengths, useThumbnail);
     vitrunner->textPreprocess(inputStrings, numImages, imageTokenLengths, tokenizer, inputIds, contextLengths,
-        llmEngine->getMaxContextLength());
+        maxSupportedInputLength, enableDynamicShape);
 
     // Infer
     vitrunner->internVLViTInfer(visualInput);
@@ -461,7 +465,7 @@ int main(int argc, char* argv[])
 
     auto pluginHandles = loadEdgellmPluginLib();
 
-    GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
+    GenerationConfig generationConfig{args.maxLength, 0, 1, 1};
     auto tokenizer = std::make_unique<Tokenizer>();
     tokenizer->loadFromHF(args.baseParams.tokenizerPath);
     auto output = decode(args.baseParams, args.eagleParams, args.vlmRunParams, args.inputStrings, args.imagePaths,

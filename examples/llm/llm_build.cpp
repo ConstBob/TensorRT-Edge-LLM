@@ -77,57 +77,6 @@ public:
         setupProfilesForLora();
         // TODO: add other profiles here
     }
-    std::string generateTRTExecCommand()
-    {
-        int64_t minInputLen = args.maxInputLen;
-        int64_t optInputLen = args.maxInputLen;
-        int64_t maxInputLen = args.maxInputLen;
-        int64_t optBatchSize = args.batchSize;
-        int64_t minBatchSize, maxBatchSize;
-        if (args.dynamicShape)
-        {
-            minInputLen = 1;
-            optInputLen = maxInputLen / 2;
-            minBatchSize = 1;
-            maxBatchSize = args.maxBatchSize;
-        }
-        else
-        {
-            minBatchSize = args.batchSize;
-            maxBatchSize = args.batchSize;
-        }
-
-        int64_t maxLength = args.maxSeqLen;
-
-        std::string trtExecCommand = fmtstr(
-            "Equivalent trtexec command: trtexec --onnx=%s --saveEngine=%s --staticPlugins=${ATTENTION_PLUGIN_PATH} "
-            "--stronglyTyped "
-            "--verbose "
-            "--profile=0 "
-            "--minShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
-            "rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--optShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
-            "rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--maxShapes=input_ids:%ldx%ld,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
-            "rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--profile=1 "
-            "--minShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
-            "rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--optShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
-            "rope_rotary_cos_sin:%ldx%ldx%ld "
-            "--maxShapes=input_ids:%ldx1,context_lengths:%ld,last_token_ids:%ldx1,past_key_values.*:%ldx2x%ldx0x%ld,"
-            "rope_rotary_cos_sin:%ldx%ldx%ld",
-            args.onnxPath.c_str(), args.enginePath.c_str(), minBatchSize, minInputLen, minBatchSize, minBatchSize,
-            minBatchSize, numKVHeads, headSize, minBatchSize, maxLength, rotaryDim, optBatchSize, optInputLen,
-            optBatchSize, optBatchSize, optBatchSize, numKVHeads, headSize, optBatchSize, maxLength, rotaryDim,
-            maxBatchSize, maxInputLen, maxBatchSize, maxBatchSize, maxBatchSize, numKVHeads, headSize, maxBatchSize,
-            maxPositionEmbeddings, rotaryDim, minBatchSize, minBatchSize, minBatchSize, minBatchSize, numKVHeads,
-            maxLength, headSize, minBatchSize, maxLength, rotaryDim, optBatchSize, optBatchSize, optBatchSize,
-            optBatchSize, numKVHeads, maxLength, headSize, optBatchSize, maxLength, rotaryDim, maxBatchSize,
-            maxBatchSize, maxBatchSize, maxBatchSize, numKVHeads, maxLength, headSize, maxBatchSize,
-            maxPositionEmbeddings, rotaryDim);
-        return trtExecCommand;
-    }
 
     void saveConfigJson()
     {
@@ -666,9 +615,6 @@ int main(int argc, char** argv)
     ofs.close();
     LOG_INFO("Engine saved to %s", args.enginePath.c_str());
     profileManager.saveConfigJson();
-    if (!args.eagleBuildParams.isEagleBase && !args.eagleBuildParams.isEagleDraft)
-    {
-        LOG_INFO(profileManager.generateTRTExecCommand().c_str());
-    }
+
     return EXIT_SUCCESS;
 }

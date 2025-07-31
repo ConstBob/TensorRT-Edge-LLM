@@ -131,7 +131,7 @@ bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
     return true;
 }
 
-void interactiveLoraSelection(std::unique_ptr<Decoder<half>>& decoder)
+void interactiveLoraSelection(std::unique_ptr<Decoder>& decoder)
 {
     if (decoder->getLoraNames().size() > 1)
     {
@@ -216,11 +216,9 @@ int main(int argc, char* argv[])
             args.eagleParams.maxPathLen, args.eagleParams.topK, args.eagleParams.isEagle3,
             args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
     }
-    auto llmEngine = std::make_unique<LLMEngineHalf>(engineConfig, stream);
+    auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     auto const batchSize = llmEngine->getBatchSize();
-    auto const contextLength = llmEngine->getMaxContextLength();
     bool const eagleMode = llmEngine->isEagleModel();
-    bool const padding = eagleMode ? false : true;
 
     if (eagleMode && batchSize != 1)
     {
@@ -230,12 +228,12 @@ int main(int argc, char* argv[])
 
     std::vector<int64_t> inputIds;
     std::vector<int32_t> contextLengths(batchSize, 0);
+
     int64_t padId = tokenizer->getPadId();
-    GenerationConfig generationConfig{args.maxLength, 0, 1, 0};
+    GenerationConfig generationConfig{args.maxLength, 0, 1, 1};
     std::string quitString = "quit";
     std::cout << "Welcome to NVIDIA DriveOS LLM SDK! Please enter your prompts. Enter quit to exit the program."
               << std::endl;
-    inputIds.resize(batchSize * contextLength, padId);
 
     // Initialize rope_rotary_cos_sin
     std::string baseFolderPath = extractFolderName(args.baseParams.enginePath);
@@ -279,6 +277,7 @@ int main(int argc, char* argv[])
                 auto& decoderPtr = llmEngine->getDecoder();
                 interactiveLoraSelection(decoderPtr);
             }
+            std::vector<std::string> inputStrings;
             for (int64_t i = 0; i < batchSize; ++i)
             {
                 std::string inputString;
@@ -289,10 +288,9 @@ int main(int argc, char* argv[])
                     std::cout << "Exit. Thanks for using DriveOS LLM SDK!" << std::endl;
                     return EXIT_SUCCESS;
                 }
-
-                llmEngine->processInputSequence(
-                    inputString, tokenizer.get(), contextLengths, inputIds, i, padId, true, padding);
+                inputStrings.emplace_back(inputString);
             }
+            inputIds = llmEngine->processInputSequence(inputStrings, tokenizer.get(), contextLengths, padId);
             std::vector<std::vector<int64_t>> outputIds(batchSize);
             for (int i = 0; i < batchSize; ++i)
             {
@@ -320,9 +318,9 @@ int main(int argc, char* argv[])
     {
         std::string inputString = args.inputStrings[i];
         std::cout << "Input string for batch: " << i << ": " << inputString << std::endl;
-        llmEngine->processInputSequence(
-            inputString, tokenizer.get(), contextLengths, inputIds, i, padId, true, padding);
     }
+
+    inputIds = llmEngine->processInputSequence(args.inputStrings, tokenizer.get(), contextLengths, padId);
     std::vector<std::vector<int64_t>> outputIds(batchSize);
     for (int i = 0; i < batchSize; ++i)
     {
