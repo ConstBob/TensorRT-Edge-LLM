@@ -1,5 +1,6 @@
 variables:
   TRT_BRANCH: "main"
+  BOARD_USER: "nvidia"
 
 workflow:
   rules:
@@ -12,7 +13,6 @@ workflow:
 stages:
 - pre_commit_checks
 - build
-- export
 - test
 
 # Pre-commit code quality checks
@@ -36,8 +36,8 @@ pre_commit_checks:
     - echo "✅ Pre-commit checks passed!"
   interruptible: true
 
-# Building and testing with A10 Linux
-linux_native_build_and_test:
+# Building and testing with A30 Linux
+a30_model_export:
   stage: build
   variables:
     PLATFORM: tensorrt-runner
@@ -45,29 +45,35 @@ linux_native_build_and_test:
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.2.2-53e0399a/12.9-r575/Linux-x64-manylinux_2_28/tar/TensorRT-10.13.2.2.Linux.x86_64-gnu.cuda-12.9.tar.gz"
   tags:
-    - linux-a10-k8s
+    - a30-drive-k8s
   image: "$IMAGE"
   script:
     - echo "Installing dependencies"
     - apt update
     - apt install -y python3 python3-pip git curl
-    - echo "Setting up git submodule"
-    - git submodule update --init --recursive
-    - echo "Downloading TensorRT package"
-    - wget -q $TRT_LINK
-    - mkdir -p TensorRT-linux
-    - tar -xvf TensorRT-*.tar.gz -C TensorRT-linux --strip-components=1
+    - echo "Testing model export"
+    - ls /trtllm_data
     - export LLM_SDK_DIR=$(pwd)
-    - echo "Building TensorRT Edge LLM SDK"
-    - mkdir -p build
-    - cd build
-    - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-linux -DCUDA_VERSION=$CUDA_VERSION -DBUILD_UNIT_TESTS=ON
-    - make -j16
-    - echo "Built TensorRT Edge LLM SDK"
-    - echo "Running unit tests"
-    - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
-    - ./unitTest
-    - echo "Done running unit tests"
+    - cd $LLM_SDK_DIR/export
+    - pip3 install -r requirements.txt
+    - pip3 install -r requirements_int4.txt
+    - export ONNX_MODEL_DIR=$LLM_SDK_DIR/models
+    - mkdir -p $ONNX_MODEL_DIR
+    - export TORCH_MODEL_DIR=/trtllm_data/llm-models
+    - export MODEL_NAME=Qwen2.5-0.5B-Instruct
+    - echo "Exporting model to fp16"
+    - python3 llm_export.py --torch_dir $TORCH_MODEL_DIR/$MODEL_NAME --output_dir $ONNX_MODEL_DIR/$MODEL_NAME-fp16 --dtype fp16
+    - cp $TORCH_MODEL_DIR/$MODEL_NAME/tokenizer_config.json $ONNX_MODEL_DIR/$MODEL_NAME-fp16/
+    - cp $TORCH_MODEL_DIR/$MODEL_NAME/tokenizer.json $ONNX_MODEL_DIR/$MODEL_NAME-fp16/
+    - echo "Exporting model to int4"
+    - python3 llm_export.py --torch_dir $TORCH_MODEL_DIR/$MODEL_NAME --output_dir $ONNX_MODEL_DIR/$MODEL_NAME-int4 --dtype int4
+    - cp $TORCH_MODEL_DIR/$MODEL_NAME/tokenizer_config.json $ONNX_MODEL_DIR/$MODEL_NAME-int4/
+    - cp $TORCH_MODEL_DIR/$MODEL_NAME/tokenizer.json $ONNX_MODEL_DIR/$MODEL_NAME-int4/
+    - echo "Done testing model export."
+  artifacts:
+    paths:
+      - models
+    expire_in: 1 hour
   interruptible: true
 
 
@@ -94,6 +100,7 @@ jp6_cross_build:
     - tar -xvf TensorRT-*.tar.gz -C TensorRT-jp6 --strip-components=1
     - export LLM_SDK_DIR=$(pwd)
     - echo "Building TensorRT Edge LLM SDK"
+    - rm -rf build-jp6
     - mkdir -p build-jp6
     - cd build-jp6
     - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-jp6 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_cross_toolchain.cmake -DAUTO_TARGET=orin -DBUILD_UNIT_TESTS=ON
@@ -104,12 +111,13 @@ jp6_cross_build:
     paths:
       - build-jp6
       - TensorRT-jp6
-    expire_in: 30 minutes
+    expire_in: 1 hour
 
-orin_unit_test:
+orin_test:
   stage: test
   dependencies:
     - jp6_cross_build
+    - a30_model_export
   tags:
     - p3730-k8s
   image: "ubuntu:24.04"
@@ -121,12 +129,64 @@ orin_unit_test:
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_run.sh
     # clean up the packages in the board
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no nvidia@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_init.sh
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_init.sh
     - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
     - echo "Syncing tensorrt-edge-llm source to the board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" . nvidia@192.168.55.1:/home/nvidia/tensorrt-edge-llm
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" . $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm
     # run test
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no nvidia@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_run.sh
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_run.sh
     - if [ $? -ne 0 ]; then echo "Error occurred during testing"; exit 1; fi
 
   interruptible: true
+
+a30_build_and_test:
+  stage: test
+  dependencies:
+    - a30_model_export
+  variables:
+    PLATFORM: tensorrt-runner
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.2.2-53e0399a/12.9-r575/Linux-x64-manylinux_2_28/tar/TensorRT-10.13.2.2.Linux.x86_64-gnu.cuda-12.9.tar.gz"
+  tags:
+    - a30-drive-k8s
+  image: "$IMAGE"
+  script:
+    - echo "Installing dependencies"
+    - apt update
+    - apt install -y python3 python3-pip git curl
+    - echo "Setting up git submodule"
+    - git submodule update --init --recursive
+    - echo "Downloading TensorRT package"
+    - wget -q $TRT_LINK
+    - mkdir -p TensorRT-linux
+    - tar -xvf TensorRT-*.tar.gz -C TensorRT-linux --strip-components=1
+    - export LLM_SDK_DIR=$(pwd)
+    - echo "Building TensorRT Edge LLM SDK"
+    - rm -rf build
+    - mkdir -p build
+    - cd build
+    - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-linux -DCUDA_VERSION=$CUDA_VERSION -DBUILD_UNIT_TESTS=ON
+    - make -j16
+    - echo "Built TensorRT Edge LLM SDK"
+    - echo "Running unit tests"
+    - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
+    - ./unitTest
+    - echo "Done running unit tests"
+    - export ONNX_MODEL_DIR=$LLM_SDK_DIR/models
+    - mkdir -p $ONNX_MODEL_DIR
+    - export MODEL_NAME=Qwen2.5-0.5B-Instruct
+    - cd $LLM_SDK_DIR
+    - export ENGINE_DIR=$LLM_SDK_DIR/engines
+    - mkdir -p $ENGINE_DIR
+    - ./build/examples/llm/llm_build --onnxPath=$ONNX_MODEL_DIR/$MODEL_NAME-fp16/model.onnx --enginePath=$ENGINE_DIR/$MODEL_NAME-fp16/model.engine --maxSeqLen=4096 --maxInputLen=128 --maxBatchSize=1 --dynamicShape
+    - ./build/examples/llm/llm_build --onnxPath=$ONNX_MODEL_DIR/$MODEL_NAME-int4/model.onnx --enginePath=$ENGINE_DIR/$MODEL_NAME-int4/model.engine --maxSeqLen=4096 --maxInputLen=128 --maxBatchSize=1 --dynamicShape
+    - echo "Done testing engine build"
+    - echo "Testing FP16 engine inference"
+    - ./build/examples/llm/llm_chat --enginePath=$ENGINE_DIR/$MODEL_NAME-fp16/model.engine --maxLength=64 --inputString="What is NVIDIA?" --tokenizerPath=$ONNX_MODEL_DIR/$MODEL_NAME-fp16/
+    - ./build/examples/llm/llm_benchmark --enginePath=$ENGINE_DIR/$MODEL_NAME-fp16/model.engine --inputLength=128 --maxLength=256 
+    - echo "Testing INT4 engine inference"
+    - ./build/examples/llm/llm_chat --enginePath=$ENGINE_DIR/$MODEL_NAME-int4/model.engine --maxLength=64 --inputString="What is NVIDIA?" --tokenizerPath=$ONNX_MODEL_DIR/$MODEL_NAME-int4/
+    - ./build/examples/llm/llm_benchmark --enginePath=$ENGINE_DIR/$MODEL_NAME-int4/model.engine --inputLength=128 --maxLength=256 
+    - echo "Done testing engine inference"
+    - rm -rf $ENGINE_DIR

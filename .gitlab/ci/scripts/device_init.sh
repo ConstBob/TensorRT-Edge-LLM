@@ -21,7 +21,7 @@ if [ -d "$tensorrt_edge_llm_folder" ] ; then
     echo "tensorrt-edge-llm folder removed"
 fi
 
-mkdir $ssh_folder
+mkdir -p $ssh_folder
 
 # Mount data folder if not yet
 if mount | grep /scratch.drivellm_onnx > /dev/null; then
@@ -31,6 +31,14 @@ else
   echo $board_password | sudo -S mount -t nfs 10.32.209.5:/raid0/modelopt-trt-data/drive-llm /scratch.drivellm_onnx
   ls /scratch.drivellm_onnx
   echo "shared ONNX directory is mounted"
+fi
+
+# Check if llmdata folder exists
+if [ -d "/llmdata" ] ; then
+  ls /llmdata
+  echo "llmdata folder is mounted"
+else
+  echo "llmdata folder is not mounted"
 fi
 
 echo "Environment is ready!"
