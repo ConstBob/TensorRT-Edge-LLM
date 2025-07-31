@@ -52,14 +52,14 @@ a30_model_export:
     - apt update
     - apt install -y python3 python3-pip git curl
     - echo "Testing model export"
-    - ls /trtllm_data
+    - ls /scratch.trt_llm_data
     - export LLM_SDK_DIR=$(pwd)
     - cd $LLM_SDK_DIR/export
     - pip3 install -r requirements.txt
     - pip3 install -r requirements_int4.txt
     - export ONNX_MODEL_DIR=$LLM_SDK_DIR/models
     - mkdir -p $ONNX_MODEL_DIR
-    - export TORCH_MODEL_DIR=/trtllm_data/llm-models
+    - export TORCH_MODEL_DIR=/scratch.trt_llm_data/llm-models
     - export MODEL_NAME=Qwen2.5-0.5B-Instruct
     - echo "Exporting model to fp16"
     - python3 llm_export.py --torch_dir $TORCH_MODEL_DIR/$MODEL_NAME --output_dir $ONNX_MODEL_DIR/$MODEL_NAME-fp16 --dtype fp16
