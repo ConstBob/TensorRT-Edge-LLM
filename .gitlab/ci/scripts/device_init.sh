@@ -24,21 +24,21 @@ fi
 mkdir -p $ssh_folder
 
 # Mount data folder if not yet
-if mount | grep /scratch.drivellm_onnx > /dev/null; then
-  echo "shared ONNX directory has already been mounted"
+if mount | grep /scratch.edge_llm_data > /dev/null; then
+  echo "/scratch.edge_llm_data folder is already mounted"
 else
-  echo $board_password | sudo -S mkdir -p /scratch.drivellm_onnx
-  echo $board_password | sudo -S mount -t nfs 10.32.209.5:/raid0/modelopt-trt-data/drive-llm /scratch.drivellm_onnx
-  ls /scratch.drivellm_onnx
-  echo "shared ONNX directory is mounted"
+  echo $board_password | sudo -S mkdir -p /scratch.edge_llm_data
+  echo $board_password | sudo -S mount -t nfs 10.32.209.5:/raid0/modelopt-trt-data/drive-llm /scratch.edge_llm_data
+  ls /scratch.edge_llm_data
+  echo "/scratch.edge_llm_data folder is mounted"
 fi
 
 # Check if llmdata folder exists
-if [ -d "/llmdata" ] ; then
-  ls /llmdata
-  echo "llmdata folder is mounted"
+if [ -d "/scratch.trt_llm_data" ] ; then
+  ls /scratch.trt_llm_data
+  echo "/scratch.trt_llm_data folder is mounted"
 else
-  echo "llmdata folder is not mounted"
+  echo "/scratch.trt_llm_data folder is not mounted"
 fi
 
 echo "Environment is ready!"
