@@ -13,10 +13,12 @@
 #include <cassert>
 #include <fstream>
 #include <limits>
+#include <nlohmann/json.hpp>
 
-#include "common/json.h"
 #include "tokenizer.h"
 #include "tokenizerUtils.h"
+
+using Json = nlohmann::json;
 
 // BPE
 BPE::BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, std::string const& patStr)
@@ -553,66 +555,41 @@ void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRa
         std::string content((std::istreambuf_iterator<char>(config)), std::istreambuf_iterator<char>());
         config.close();
 
-        drivellm::JsonRoot jsonRoot;
-        if (jsonRoot.parse(content))
+        Json jsonConfig;
+        try
         {
-            auto root = jsonRoot.getRoot();
-            if (root.isObject())
+            jsonConfig = Json::parse(content);
+        }
+        catch (Json::parse_error const& e)
+        {
+            LOG_ERROR("Failed to parse tokenizer_config.json: %s", e.what());
+            return;
+        }
+
+        auto parseField = [specialTokens, jsonConfig](std::string const& field) {
+            if (jsonConfig[field].is_string())
             {
-                if (root.hasMember("bos_token"))
+                if (!jsonConfig[field].is_null())
                 {
-                    if (root["bos_token"].isString())
-                    {
-                        std::string token = root["bos_token"].getString();
-                        this->mBosId = token == "null" ? -1 : specialTokens[token];
-                    }
-                    else if (root["bos_token"].isObject())
-                    {
-                        std::string token = root["bos_token"]["content"].getString();
-                        this->mBosId = token == "null" ? -1 : specialTokens[token];
-                    }
-                }
-                if (root.hasMember("eos_token"))
-                {
-                    if (root["eos_token"].isString())
-                    {
-                        std::string token = root["eos_token"].getString();
-                        this->mEosId = token == "null" ? -1 : specialTokens[token];
-                    }
-                    else if (root["eos_token"].isObject())
-                    {
-                        std::string token = root["eos_token"]["content"].getString();
-                        this->mEosId = token == "null" ? -1 : specialTokens[token];
-                    }
-                }
-                if (root.hasMember("pad_token"))
-                {
-                    if (root["pad_token"].isString())
-                    {
-                        std::string token = root["pad_token"].getString();
-                        this->mPadId = token == "null" ? -1 : specialTokens[token];
-                    }
-                    else if (root["pad_token"].isObject())
-                    {
-                        std::string token = root["pad_token"]["content"].getString();
-                        this->mPadId = token == "null" ? -1 : specialTokens[token];
-                    }
-                }
-                if (root.hasMember("unk_token"))
-                {
-                    if (root["unk_token"].isString())
-                    {
-                        std::string token = root["unk_token"].getString();
-                        this->mUnkId = token == "null" ? -1 : specialTokens[token];
-                    }
-                    else if (root["unk_token"].isObject())
-                    {
-                        std::string token = root["unk_token"]["content"].getString();
-                        this->mUnkId = token == "null" ? -1 : specialTokens[token];
-                    }
+                    std::string token = jsonConfig[field].get<std::string>();
+                    return specialTokens.at(token);
                 }
             }
-        }
+            else if (jsonConfig[field].is_object())
+            {
+                if (!jsonConfig[field]["content"].is_null())
+                {
+                    std::string token = jsonConfig[field]["content"].get<std::string>();
+                    return specialTokens.at(token);
+                }
+            }
+            return -1L;
+        };
+
+        this->mBosId = parseField("bos_token");
+        this->mEosId = parseField("eos_token");
+        this->mPadId = parseField("pad_token");
+        this->mUnkId = parseField("unk_token");
     }
     else
     {

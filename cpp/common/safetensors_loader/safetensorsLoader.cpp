@@ -1,8 +1,13 @@
 #include "safetensorsLoader.h"
+
+#include "common/common.h"
 #include "common/logger.h"
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <nlohmann/json.hpp>
+
+using Json = nlohmann::json;
 
 namespace drivellm
 {
@@ -23,29 +28,26 @@ SafeTensorsLoader::~SafeTensorsLoader()
             info.gpuPtr = nullptr;
         }
     }
-
-    // Clear the file buffer
-    mFileBuffer.clear();
-    mFileBuffer.shrink_to_fit();
 }
 
 bool SafeTensorsLoader::loadFromFileToGPU()
 {
     // Read the file into memory
-    if (!readTensorData())
+    MmapReader mmapReader(mFilePath);
+    if (!mmapReader.loadFile(mFilePath))
     {
-        LOG_ERROR("Failed to read tensor data from file");
+        LOG_ERROR("Failed to use MMap to read safetensors file from path: %s", mFilePath.c_str());
         return false;
     }
 
     // Read the header size (8 bytes)
-    uint64_t headerSize = *reinterpret_cast<uint64_t*>(mFileBuffer.data());
+    uint64_t headerSize = *reinterpret_cast<uint64_t const*>(mmapReader.getByteData());
 
     // Read the metadata JSON
-    std::string metadataStr(reinterpret_cast<char*>(mFileBuffer.data() + sizeof(headerSize)), headerSize);
+    std::string metadataStr(reinterpret_cast<char const*>(mmapReader.getByteData() + sizeof(headerSize)), headerSize);
 
     // Parse the metadata
-    if (!parseMetadata(metadataStr))
+    if (!parseJsonHeader(metadataStr))
     {
         LOG_ERROR("Failed to parse metadata");
         return false;
@@ -55,7 +57,7 @@ bool SafeTensorsLoader::loadFromFileToGPU()
     size_t tensorDataStart = sizeof(headerSize) + headerSize;
     for (auto& [name, info] : mTensorInfo)
     {
-        uint8_t const* tensorData = mFileBuffer.data() + tensorDataStart + info.dataOffsets[0];
+        int8_t const* tensorData = mmapReader.getByteData() + tensorDataStart + info.dataOffsets[0];
 
         if (!loadTensorToGPU(info, tensorData))
         {
@@ -64,42 +66,10 @@ bool SafeTensorsLoader::loadFromFileToGPU()
         }
     }
 
-    // Clear the file buffer after loading to GPU
-    mFileBuffer.clear();
-    mFileBuffer.shrink_to_fit();
-
     return true;
 }
 
-bool SafeTensorsLoader::readTensorData()
-{
-    // Open the file
-    // TODO: use mmap to read the file
-    std::ifstream file(mFilePath, std::ios::binary | std::ios::ate);
-    if (!file.is_open())
-    {
-        LOG_ERROR("Failed to open file: %s", mFilePath.c_str());
-        return false;
-    }
-
-    // Get file size
-    size_t fileSize = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    // Read the entire file into memory
-    mFileBuffer.resize(fileSize);
-    file.read(reinterpret_cast<char*>(mFileBuffer.data()), fileSize);
-
-    if (file.fail())
-    {
-        LOG_ERROR("Failed to read file");
-        return false;
-    }
-
-    return true;
-}
-
-bool SafeTensorsLoader::loadTensorToGPU(SafeTensorsInfo& info, uint8_t const* data)
+bool SafeTensorsLoader::loadTensorToGPU(SafeTensorsInfo& info, int8_t const* data)
 {
     // Calculate total elements
     size_t totalElements = 1;
@@ -128,99 +98,49 @@ bool SafeTensorsLoader::loadTensorToGPU(SafeTensorsInfo& info, uint8_t const* da
     return true;
 }
 
-bool SafeTensorsLoader::parseMetadata(std::string const& metadataStr)
+bool SafeTensorsLoader::parseJsonHeader(std::string const& metadataStr)
 {
-    mMetadata = std::make_unique<JsonRoot>();
-    if (!mMetadata->parse(metadataStr))
+    Json header;
+    try
     {
-        LOG_ERROR("Failed to parse JSON metadata");
+        header = Json::parse(metadataStr);
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse JSON metadata: %s", e.what());
+        LOG_ERROR("Detailed Json parsing error: %s", e.what());
         return false;
     }
 
-    auto root = mMetadata->getRoot();
-    if (!root.isObject())
-    {
-        LOG_ERROR("Root is not an object");
-        return false;
-    }
+    auto validateTensorEntry = [](Json const& value) {
+        return value.is_object() && value.contains("dtype") && value["dtype"].is_string() && value.contains("shape")
+            && value["shape"].is_array() && value.contains("data_offsets") && value["data_offsets"].is_array()
+            && value["data_offsets"].size() == 2;
+    };
 
-    // Parse each tensor's metadata
-    for (size_t i = 0; i < root.size(); ++i)
+    for (auto const& [key, value] : header.items())
     {
-        auto tensorNode = root[i];
-        std::string tensorName = tensorNode.getName();
-        // skip __metadata__
-        if (tensorName == "__metadata__")
+        if (key == "__metadata__")
         {
+            LOG_DEBUG("Loading SafeTensor Header, Metadata: %s", value.dump().c_str());
             continue;
         }
-        if (!tensorNode.isObject())
+
+        if (validateTensorEntry(value))
         {
-            LOG_ERROR("Tensor %s is not an object", tensorName.c_str());
+            SafeTensorsInfo info;
+            info.shape = value["shape"].get<std::vector<size_t>>();
+            info.dtype = value["dtype"].get<std::string>();
+            info.dataOffsets[0] = value["data_offsets"][0].get<size_t>();
+            info.dataOffsets[1] = value["data_offsets"][1].get<size_t>();
+            mTensorInfo[key] = info;
+        }
+        else
+        {
+            LOG_ERROR("Malformed tensor entry of SafeTensor object: %s : %s", key.c_str(), value.dump().c_str());
             return false;
         }
-
-        SafeTensorsInfo info;
-        if (!parseSafeTensorsInfo(tensorNode, info))
-        {
-            LOG_ERROR("Failed to parse tensor info for %s", tensorName.c_str());
-            return false;
-        }
-
-        mTensorInfo[tensorName] = info;
     }
-
-    return true;
-}
-
-bool SafeTensorsLoader::parseSafeTensorsInfo(JsonNode& node, SafeTensorsInfo& info)
-{
-    // Parse shape
-    auto shapeNode = node["shape"];
-    if (!shapeNode.isArray())
-    {
-        LOG_ERROR("Error parsing tensor info: shape is not an array");
-        return false;
-    }
-
-    info.shape.clear();
-    for (size_t i = 0; i < shapeNode.size(); ++i)
-    {
-        if (!shapeNode[i].isInteger())
-        {
-            LOG_ERROR("Error parsing tensor info: shape element is not an integer");
-            return false;
-        }
-        info.shape.push_back(shapeNode[i].getInteger());
-    }
-
-    // Parse dtype
-    auto dtypeNode = node["dtype"];
-    if (!dtypeNode.isString())
-    {
-        LOG_ERROR("Error parsing tensor info: dtype is not a string");
-        return false;
-    }
-    info.dtype = dtypeNode.getString();
-
-    // Parse data_offsets
-    auto offsetsNode = node["data_offsets"];
-    if (!offsetsNode.isArray() || offsetsNode.size() != 2)
-    {
-        LOG_ERROR("Error parsing tensor info: data offsets is not an array of size 2");
-        return false;
-    }
-
-    for (size_t i = 0; i < 2; ++i)
-    {
-        if (!offsetsNode[i].isInteger())
-        {
-            LOG_ERROR("Error parsing tensor info: data offset is not an integer");
-            return false;
-        }
-        info.dataOffsets[i] = offsetsNode[i].getInteger();
-    }
-
     return true;
 }
 

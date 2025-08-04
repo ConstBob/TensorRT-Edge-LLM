@@ -16,6 +16,7 @@
 #include "engine/llm_engine.h"
 #include "llm_param.h"
 #include "tokenizer/tokenizer.h"
+
 #include <NvInferRuntime.h>
 #include <algorithm>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include <getopt.h>
 #include <iomanip>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <random>
 #include <sstream>
 #include <string>
@@ -136,26 +138,29 @@ std::vector<std::string> extract_question_contents_with_json_parser(std::string 
     std::string line;
     while (std::getline(file, line))
     {
-        drivellm::JsonRoot json_root;
-        if (!json_root.parse(line))
+        Json jsonConfig;
+        try
         {
-            fprintf(stderr, "Error: Failed to parse JSON line: %s\n", line.c_str());
+            jsonConfig = Json::parse(line);
+        }
+        catch (Json::parse_error const& e)
+        {
+            LOG_ERROR("Failed to parse JSON line: %s", e.what());
             continue;
         }
 
-        drivellm::JsonNode root_node = json_root.getRoot();
-        if (root_node.isObject() && root_node.hasMember("question"))
+        if (jsonConfig.contains("question"))
         {
-            drivellm::JsonNode question_node = root_node["question"];
-            if (question_node.isArray())
+            auto questionNode = jsonConfig["question"];
+            if (questionNode.is_array())
             {
                 std::string combined_content;
-                for (size_t i = 0; i < question_node.size(); ++i)
+                for (size_t i = 0; i < questionNode.size(); i++)
                 {
-                    drivellm::JsonNode element_node = question_node[i];
-                    if (element_node.isString())
+                    auto elementNode = questionNode[i];
+                    if (elementNode.is_string())
                     {
-                        std::string segment = element_node.getString();
+                        std::string segment = elementNode.get<std::string>();
                         // Apply JSON unescaping
                         // Order matters: \\ must be replaced first, then specific escapes like \", \/
                         // then simple char escapes like \n, \t.

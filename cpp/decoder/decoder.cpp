@@ -11,7 +11,6 @@
  */
 
 #include "decoder.h"
-#include "common/json.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "sampler/sampling.h"
 #include <NvInferRuntime.h>
@@ -21,9 +20,13 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <utility>
+
+using Json = nlohmann::json;
 
 bool Decoder::setup(
     std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph, int64_t batchSize, bool isEagle)
@@ -41,6 +44,11 @@ bool Decoder::setup(
         else
         {
             auto mmapReader = std::make_unique<MmapReader>(fp);
+            if (mmapReader->getData() == nullptr)
+            {
+                LOG_ERROR("Failed to use MMap to read engine from file path: %s", fp.string().c_str());
+                return false;
+            }
             mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
                 mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
         }
@@ -100,26 +108,61 @@ void Decoder::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
 
 void Decoder::setupRopeCosSin(std::string const& configPath)
 {
-    drivellm::JsonRoot root;
-    root.parseFromPath(configPath);
-    auto rootNode = root.getRoot();
+    Json jsonConfig;
+
+    std::ifstream configFileStream(configPath);
+    if (!configFileStream.is_open())
+    {
+        LOG_ERROR("setupRopeCosSin(): Failed to open config file: %s", configPath.c_str());
+        throw std::runtime_error("setupRopeCosSin(): Failed to open config file: " + configPath);
+    }
+
+    try
+    {
+        jsonConfig = Json::parse(configFileStream);
+        configFileStream.close();
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("setupRopeCosSin(): Failed to parse config file with error: %s", e.what());
+        throw std::runtime_error("setupRopeCosSin(): Failed to parse config file: " + configPath);
+    }
 
     std::string ropeType = "default";
-
     float rotaryScale = 1.0f;
-    float rotaryTheta = rootNode["rope_theta"].getFloat();
-    int32_t maxPositionEmbeddings = rootNode["max_position_embeddings"].getInteger();
+    float rotaryTheta = 100000.0f;
+    int32_t maxPositionEmbeddings = 32768;
 
-    if (rootNode.hasMember("rope_scaling"))
+    if (jsonConfig.contains("rope_scaling"))
     {
-        if (rootNode["rope_scaling"].hasMember("type"))
+        if (jsonConfig["rope_scaling"].contains("type"))
         {
-            ropeType = rootNode["rope_scaling"]["type"].getString();
+            ropeType = jsonConfig["rope_scaling"]["type"].get<std::string>();
         }
     }
 
+    if (jsonConfig.contains("rope_theta"))
+    {
+        rotaryTheta = jsonConfig["rope_theta"].get<float>();
+    }
+
+    if (jsonConfig.contains("max_position_embeddings"))
+    {
+        maxPositionEmbeddings = jsonConfig["max_position_embeddings"].get<int32_t>();
+    }
+
+    LOG_DEBUG("Setup Rope Cos Sin with type: %s, scale: %f, theta: %f, maxPositionEmbeddings: %d", ropeType.c_str(),
+        rotaryScale, rotaryTheta, maxPositionEmbeddings);
+
     if (ropeType == "default")
     {
+        if (mConfig.maxLength > maxPositionEmbeddings)
+        {
+            LOG_WARNING(
+                "Context length is greater than maxPositionEmbeddings indicated by model config, this could cause "
+                "generation results");
+        }
+
         // Allocate buffer
         void* ropeRotaryCosSinDevice;
         CUDA_CHECK(cudaMalloc(&ropeRotaryCosSinDevice, mConfig.maxLength * mConfig.rotaryDim * sizeof(float)));
@@ -152,16 +195,11 @@ void Decoder::setupRopeCosSin(std::string const& configPath)
 
         // Helper function to read factor data from json
         auto readFactorData = [&](std::string const& factorName) -> float* {
-            auto factorNode = rootNode["rope_scaling"][factorName];
-            assert(factorNode.size() == mConfig.rotaryDim / 2
+            auto factorValue = jsonConfig["rope_scaling"][factorName];
+            assert(factorValue.is_array() && factorValue.size() == mConfig.rotaryDim / 2
                 && (std::string(factorName) + " size should be equal to rotaryDim / 2").c_str());
 
-            std::vector<float> factor;
-            factor.reserve(factorNode.size());
-            for (size_t i = 0; i < factorNode.size(); ++i)
-            {
-                factor.emplace_back(factorNode[i].getFloat());
-            }
+            std::vector<float> factor = factorValue.get<std::vector<float>>();
 
             float* factorDevice;
             CUDA_CHECK(cudaMalloc(&factorDevice, factor.size() * sizeof(float)));
@@ -172,8 +210,7 @@ void Decoder::setupRopeCosSin(std::string const& configPath)
 
         auto shortFactorDevice = readFactorData("short_factor");
         auto longFactorDevice = readFactorData("long_factor");
-        int32_t maxPositionEmbeddings = rootNode["max_position_embeddings"].getInteger();
-        int32_t originalMaxPositionEmbeddings = rootNode["original_max_position_embeddings"].getInteger();
+        int32_t originalMaxPositionEmbeddings = jsonConfig["original_max_position_embeddings"].get<int32_t>();
 
         drivellm::kernel::initializeLongRopeCosSin(reinterpret_cast<float*>(shortCosSinDevice),
             reinterpret_cast<float*>(longCosSinDevice), shortFactorDevice, longFactorDevice, rotaryTheta,
