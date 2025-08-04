@@ -39,3 +39,8 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
 
 void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int64_t> const& mropePositionIds,
     float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize);
+
+// Embedding lookup reference functions
+std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::vector<half> const& embeddingTable,
+    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
+    std::optional<std::vector<half>> const& imageEmbeds = std::nullopt, int64_t imageTokenLen = 0);
