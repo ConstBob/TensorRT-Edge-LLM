@@ -22,8 +22,6 @@ using namespace drivellm;
 // Test configuration
 int32_t const ACCURACY_BATCH_SIZE = 4;
 int32_t const ACCURACY_VOCAB_SIZE = 20;
-std::vector<int32_t> const PERFORMANCE_BATCH_SIZES = {1, 4};
-int32_t const PERFORMANCE_VOCAB_SIZE = 100000;
 uint64_t const TEST_SEED = 42;
 
 // Test fixture for sampling tests
@@ -315,7 +313,7 @@ TEST_F(SamplingTest, SelectAllTopKErrorHandlingReturnLogProbsFalseWithNonNullTop
     CUDA_CHECK(cudaFree(dTopKIndices));
 }
 
-// Unified sampling tests (accuracy + performance)
+// Unified sampling tests (accuracy only)
 class SamplingTests : public SamplingTest
 {
 protected:
@@ -328,8 +326,6 @@ protected:
         int topK;
         float topP;
         float temperature;
-        double avgTimeMs;
-        double throughputSamplesPerSec;
         bool accuracyPassed;
         std::string errorMessage;
     };
@@ -348,8 +344,6 @@ protected:
         result.temperature = temperature;
         result.accuracyPassed = true;
         result.errorMessage = "";
-        result.avgTimeMs = 0.0;
-        result.throughputSamplesPerSec = 0.0;
 
         T* dLogits;
         int64_t* dSelectedIndices;
@@ -395,73 +389,9 @@ protected:
 
         return result;
     }
-
-    template <typename T>
-    TestResult runSamplingPerformanceTest(
-        std::string const& methodName, int batchSize, int vocabSize, int topK, float topP, float temperature)
-    {
-        TestResult result;
-        result.typeName = std::is_same_v<T, float> ? "FP32" : std::is_same_v<T, half> ? "FP16" : "BF16";
-        result.methodName = methodName;
-        result.batchSize = batchSize;
-        result.vocabSize = vocabSize;
-        result.topK = topK;
-        result.topP = topP;
-        result.temperature = temperature;
-        result.accuracyPassed = true;
-        result.errorMessage = "";
-
-        T* dLogits;
-        int64_t* dSelectedIndices;
-
-        CUDA_CHECK(cudaMalloc(&dLogits, batchSize * vocabSize * sizeof(T)));
-        CUDA_CHECK(cudaMalloc(&dSelectedIndices, batchSize * sizeof(int64_t)));
-
-        std::vector<std::vector<float>> hostLogits;
-        this->template generateTestLogits<T>(dLogits, hostLogits, batchSize, vocabSize);
-
-        // Run performance test
-        int const numIterations = 5;
-        int const warmupIterations = 1;
-
-        // Warmup
-        for (int i = 0; i < warmupIterations; ++i)
-        {
-            SamplingParams params(batchSize, vocabSize, temperature, topK, topP);
-            size_t workspaceSize = getTopKtopPSamplingWorkspaceSize<T>(batchSize, vocabSize, params);
-            void* workspace;
-            cudaMalloc(&workspace, workspaceSize);
-            topKtopPSamplingFromLogits<T>(dLogits, dSelectedIndices, params, workspace, workspaceSize, 0, TEST_SEED, 0);
-            cudaFree(workspace);
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Benchmark
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < numIterations; ++i)
-        {
-            SamplingParams params(batchSize, vocabSize, temperature, topK, topP);
-            size_t workspaceSize = getTopKtopPSamplingWorkspaceSize<T>(batchSize, vocabSize, params);
-            void* workspace;
-            cudaMalloc(&workspace, workspaceSize);
-            topKtopPSamplingFromLogits<T>(dLogits, dSelectedIndices, params, workspace, workspaceSize, 0, TEST_SEED, 0);
-            cudaFree(workspace);
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        auto end = std::chrono::high_resolution_clock::now();
-        double totalTimeMs = std::chrono::duration<double, std::milli>(end - start).count();
-        result.avgTimeMs = totalTimeMs / numIterations;
-        result.throughputSamplesPerSec = (batchSize * numIterations) / (totalTimeMs / 1000.0);
-
-        CUDA_CHECK(cudaFree(dLogits));
-        CUDA_CHECK(cudaFree(dSelectedIndices));
-
-        return result;
-    }
 };
 
-// Unified returnAllTopK tests (accuracy + performance)
+// Unified returnAllTopK tests (accuracy only)
 class ReturnAllTopKTests : public SamplingTest
 {
 protected:
@@ -475,8 +405,6 @@ protected:
         bool returnLogProbs;
         bool normalizeLogProbs;
         bool inputHasProbs;
-        double avgTimeMs;
-        double throughputSamplesPerSec;
         bool accuracyPassed;
         std::string errorMessage;
     };
@@ -496,8 +424,6 @@ protected:
         result.inputHasProbs = inputHasProbs;
         result.accuracyPassed = true;
         result.errorMessage = "";
-        result.avgTimeMs = 0.0;
-        result.throughputSamplesPerSec = 0.0;
 
         T* dInput;
         float* dTopKValues = nullptr;
@@ -620,126 +546,12 @@ protected:
 
         return result;
     }
-
-    template <typename T>
-    TestResult runReturnAllTopKPerformanceTest(
-        int batchSize, int vocabSize, int topK, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs)
-    {
-        TestResult result;
-        result.typeName = std::is_same_v<T, float> ? "FP32" : std::is_same_v<T, half> ? "FP16" : "BF16";
-        result.methodName = "SelectAllTopK";
-        result.batchSize = batchSize;
-        result.vocabSize = vocabSize;
-        result.topK = topK;
-        result.returnLogProbs = returnLogProbs;
-        result.normalizeLogProbs = normalizeLogProbs;
-        result.inputHasProbs = inputHasProbs;
-        result.accuracyPassed = true;
-        result.errorMessage = "";
-
-        T* dInput;
-        float* dTopKValues = nullptr;
-        int64_t* dTopKIndices;
-
-        CUDA_CHECK(cudaMalloc(&dInput, batchSize * vocabSize * sizeof(T)));
-        CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * vocabSize * sizeof(int64_t)));
-
-        if (returnLogProbs)
-        {
-            CUDA_CHECK(cudaMalloc(&dTopKValues, batchSize * topK * sizeof(float)));
-        }
-
-        std::vector<std::vector<float>> hostLogits;
-        std::vector<std::vector<float>> hostProbs;
-        std::vector<T> flatHostProbs;
-
-        // Generate test data
-        this->template generateTestLogits<T>(dInput, hostLogits, batchSize, vocabSize);
-
-        if (inputHasProbs)
-        {
-            // Convert logits to probabilities
-            hostProbs.resize(batchSize);
-            flatHostProbs.resize(batchSize * vocabSize);
-
-            for (int b = 0; b < batchSize; ++b)
-            {
-                hostProbs[b].resize(vocabSize);
-                auto probs = softmaxRef(hostLogits[b]);
-
-                for (int v = 0; v < vocabSize; ++v)
-                {
-                    hostProbs[b][v] = probs[v];
-
-                    if constexpr (std::is_same_v<T, half>)
-                    {
-                        flatHostProbs[b * vocabSize + v] = __float2half(hostProbs[b][v]);
-                    }
-                    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
-                    {
-                        flatHostProbs[b * vocabSize + v] = __float2bfloat16(hostProbs[b][v]);
-                    }
-                    else
-                    {
-                        flatHostProbs[b * vocabSize + v] = static_cast<T>(hostProbs[b][v]);
-                    }
-                }
-            }
-
-            CUDA_CHECK(
-                cudaMemcpy(dInput, flatHostProbs.data(), batchSize * vocabSize * sizeof(T), cudaMemcpyHostToDevice));
-        }
-
-        // Run performance test
-        int const numIterations = 5;
-        int const warmupIterations = 1;
-
-        // Warmup
-        for (int i = 0; i < warmupIterations; ++i)
-        {
-            size_t workspaceSize = getSelectAllTopKWorkspaceSize<T>(batchSize, vocabSize, topK);
-            void* workspace;
-            cudaMalloc(&workspace, workspaceSize);
-            selectAllTopKFromLogits<T>(dInput, dTopKValues, dTopKIndices, batchSize, vocabSize, topK, workspace,
-                workspaceSize, 0, returnLogProbs, normalizeLogProbs, inputHasProbs);
-            cudaFree(workspace);
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Benchmark
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < numIterations; ++i)
-        {
-            size_t workspaceSize = getSelectAllTopKWorkspaceSize<T>(batchSize, vocabSize, topK);
-            void* workspace;
-            cudaMalloc(&workspace, workspaceSize);
-            selectAllTopKFromLogits<T>(dInput, dTopKValues, dTopKIndices, batchSize, vocabSize, topK, workspace,
-                workspaceSize, 0, returnLogProbs, normalizeLogProbs, inputHasProbs);
-            cudaFree(workspace);
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        auto end = std::chrono::high_resolution_clock::now();
-        double totalTimeMs = std::chrono::duration<double, std::milli>(end - start).count();
-        result.avgTimeMs = totalTimeMs / numIterations;
-        result.throughputSamplesPerSec = (batchSize * numIterations) / (totalTimeMs / 1000.0);
-
-        CUDA_CHECK(cudaFree(dInput));
-        CUDA_CHECK(cudaFree(dTopKIndices));
-        if (dTopKValues != nullptr)
-        {
-            CUDA_CHECK(cudaFree(dTopKValues));
-        }
-
-        return result;
-    }
 };
 
 // Sampling tests
-TEST_F(SamplingTests, SamplingAccuracyAndPerformance)
+TEST_F(SamplingTests, SamplingAccuracy)
 {
     std::vector<SamplingTests::TestResult> accuracyResults;
-    std::vector<SamplingTests::TestResult> performanceResults;
 
     // Test configurations
     struct SamplingConfig
@@ -767,7 +579,7 @@ TEST_F(SamplingTests, SamplingAccuracyAndPerformance)
     };
 
     // Run accuracy tests with small vocab size
-    for (int batchSize : PERFORMANCE_BATCH_SIZES)
+    for (int batchSize : {1, 4})
     {
         for (auto const& config : configs)
         {
@@ -785,28 +597,6 @@ TEST_F(SamplingTests, SamplingAccuracyAndPerformance)
             auto resultBf16 = runSamplingAccuracyTest<__nv_bfloat16>(
                 config.methodName, batchSize, ACCURACY_VOCAB_SIZE, config.topK, config.topP, config.temperature);
             accuracyResults.push_back(resultBf16);
-        }
-    }
-
-    // Run performance tests with large vocab size
-    for (int batchSize : PERFORMANCE_BATCH_SIZES)
-    {
-        for (auto const& config : configs)
-        {
-            // FP32
-            auto resultFp32 = runSamplingPerformanceTest<float>(
-                config.methodName, batchSize, PERFORMANCE_VOCAB_SIZE, config.topK, config.topP, config.temperature);
-            performanceResults.push_back(resultFp32);
-
-            // FP16
-            auto resultFp16 = runSamplingPerformanceTest<half>(
-                config.methodName, batchSize, PERFORMANCE_VOCAB_SIZE, config.topK, config.topP, config.temperature);
-            performanceResults.push_back(resultFp16);
-
-            // BF16
-            auto resultBf16 = runSamplingPerformanceTest<__nv_bfloat16>(
-                config.methodName, batchSize, PERFORMANCE_VOCAB_SIZE, config.topK, config.topP, config.temperature);
-            performanceResults.push_back(resultBf16);
         }
     }
 
@@ -852,42 +642,6 @@ TEST_F(SamplingTests, SamplingAccuracyAndPerformance)
                   << " | " << std::setw(8) << accuracyStr << std::endl;
     }
 
-    // Print performance results table
-    std::cout << "\nSampling Performance Results:" << std::endl;
-    std::cout
-        << "Type | Method   | Batch | PerfVocabSize | TopK | TopP  | Temp  | Avg Time (ms) | Throughput (samples/sec)"
-        << std::endl;
-    std::cout
-        << "-----|----------|-------|---------------|------|-------|-------|---------------|-------------------------"
-        << std::endl;
-
-    for (auto const& result : performanceResults)
-    {
-        std::string topKStr = (result.topK == 0) ? "N/A" : std::to_string(result.topK);
-
-        std::string topPStr;
-        if (result.topP == 1.0f)
-        {
-            topPStr = "N/A";
-        }
-        else
-        {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(2) << result.topP;
-            topPStr = oss.str();
-        }
-
-        std::ostringstream tempOss;
-        tempOss << std::fixed << std::setprecision(2) << result.temperature;
-        std::string tempStr = tempOss.str();
-
-        std::cout << std::setw(4) << result.typeName << " | " << std::setw(8) << result.methodName << " | "
-                  << std::setw(5) << result.batchSize << " | " << std::setw(13) << result.vocabSize << " | "
-                  << std::setw(4) << topKStr << " | " << std::setw(5) << topPStr << " | " << std::setw(5) << tempStr
-                  << " | " << std::setw(13) << std::fixed << std::setprecision(4) << result.avgTimeMs << " | "
-                  << std::setw(23) << std::fixed << std::setprecision(1) << result.throughputSamplesPerSec << std::endl;
-    }
-
     // Print summary
     if (allAccuracyTestsPassed)
     {
@@ -905,10 +659,9 @@ TEST_F(SamplingTests, SamplingAccuracyAndPerformance)
 }
 
 // SelectAllTopK tests
-TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracyAndPerformance)
+TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracy)
 {
     std::vector<ReturnAllTopKTests::TestResult> accuracyResults;
-    std::vector<ReturnAllTopKTests::TestResult> performanceResults;
 
     // Test configurations using booleans
     struct TopKConfig
@@ -933,7 +686,7 @@ TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracyAndPerformance)
     };
 
     // Run accuracy tests with small vocab size
-    for (int batchSize : PERFORMANCE_BATCH_SIZES)
+    for (int batchSize : {1, 4})
     {
         for (auto const& config : configs)
         {
@@ -951,28 +704,6 @@ TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracyAndPerformance)
             auto resultBf16 = runReturnAllTopKAccuracyTest<__nv_bfloat16>(batchSize, ACCURACY_VOCAB_SIZE, config.topK,
                 config.returnLogProbs, config.normalizeLogProbs, config.inputHasProbs);
             accuracyResults.push_back(resultBf16);
-        }
-    }
-
-    // Run performance tests with large vocab size
-    for (int batchSize : PERFORMANCE_BATCH_SIZES)
-    {
-        for (auto const& config : configs)
-        {
-            // FP32
-            auto resultFp32 = runReturnAllTopKPerformanceTest<float>(batchSize, PERFORMANCE_VOCAB_SIZE, config.topK,
-                config.returnLogProbs, config.normalizeLogProbs, config.inputHasProbs);
-            performanceResults.push_back(resultFp32);
-
-            // FP16
-            auto resultFp16 = runReturnAllTopKPerformanceTest<half>(batchSize, PERFORMANCE_VOCAB_SIZE, config.topK,
-                config.returnLogProbs, config.normalizeLogProbs, config.inputHasProbs);
-            performanceResults.push_back(resultFp16);
-
-            // BF16
-            auto resultBf16 = runReturnAllTopKPerformanceTest<__nv_bfloat16>(batchSize, PERFORMANCE_VOCAB_SIZE,
-                config.topK, config.returnLogProbs, config.normalizeLogProbs, config.inputHasProbs);
-            performanceResults.push_back(resultBf16);
         }
     }
 
@@ -1003,29 +734,6 @@ TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracyAndPerformance)
                   << std::setw(4) << result.topK << " | " << std::setw(14) << returnLogProbsStr << " | "
                   << std::setw(17) << normalizeLogProbsStr << " | " << std::setw(13) << inputHasProbsStr << " | "
                   << std::setw(12) << result.vocabSize << " | " << std::setw(8) << accuracyStr << std::endl;
-    }
-
-    // Print performance results table
-    std::cout << "\nSelectAllTopK Performance Results:" << std::endl;
-    std::cout << "Type | Batch | TopK | ReturnLogProbs | NormalizeLogProbs | InputHasProbs | PerfVocabSize | Avg Time "
-                 "(ms) | Throughput (samples/sec)"
-              << std::endl;
-    std::cout << "-----|-------|------|----------------|-------------------|---------------|---------------|-----------"
-                 "----|-------------------------"
-              << std::endl;
-
-    for (auto const& result : performanceResults)
-    {
-        std::string returnLogProbsStr = result.returnLogProbs ? "true" : "false";
-        std::string normalizeLogProbsStr = result.normalizeLogProbs ? "true" : "false";
-        std::string inputHasProbsStr = result.inputHasProbs ? "true" : "false";
-
-        std::cout << std::setw(4) << result.typeName << " | " << std::setw(5) << result.batchSize << " | "
-                  << std::setw(4) << result.topK << " | " << std::setw(14) << returnLogProbsStr << " | "
-                  << std::setw(17) << normalizeLogProbsStr << " | " << std::setw(13) << inputHasProbsStr << " | "
-                  << std::setw(13) << result.vocabSize << " | " << std::setw(13) << std::fixed << std::setprecision(3)
-                  << result.avgTimeMs << " | " << std::setw(23) << std::fixed << std::setprecision(1)
-                  << result.throughputSamplesPerSec << std::endl;
     }
 
     // Print summary
