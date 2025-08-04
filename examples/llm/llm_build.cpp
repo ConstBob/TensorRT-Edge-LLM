@@ -13,19 +13,22 @@
 #include "NvOnnxParser.h"
 #include "common/common.h"
 #include "common/cudaUtils.h"
-#include "common/json.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "llm_param.h"
+
 #include <NvInfer.h>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+
+using Json = nlohmann::json;
 
 struct LLMBuildArgs
 {
@@ -130,33 +133,51 @@ private:
             args.vlmBuildParams.minImageTokens = args.vlmBuildParams.imageTokens;
         }
 
-        drivellm::JsonRoot root;
         std::string onnxFolderPath = extractFolderName(args.onnxPath);
-        std::string json_path = onnxFolderPath + "/config.json";
-        root.parseFromPath(json_path);
-        auto rootNode = root.getRoot();
-        hiddenSizeDim = rootNode["hidden_size"].getInteger();
-        targetModelOutputHiddenDim = args.eagleBuildParams.isEagle3 ? hiddenSizeDim * 3 : hiddenSizeDim;
-        numKVHeads = rootNode["num_key_value_heads"].getInteger();
-        auto numAttentionHeads = rootNode["num_attention_heads"].getInteger();
-        if (rootNode.hasMember("head_dim"))
+        std::string jsonPath = onnxFolderPath + "/config.json";
+
+        std::ifstream configFileStream(jsonPath);
+        if (!configFileStream.is_open())
         {
-            headSize = rootNode["head_dim"].getInteger();
+            LOG_ERROR("llm_build: Failed to open config file to acquire model parameters from config.json: %s",
+                jsonPath.c_str());
+            throw std::runtime_error(
+                "llm_build: Failed to open config file to acquire model parameters from config.json: " + jsonPath);
+        }
+
+        Json jsonConfig;
+        try
+        {
+            jsonConfig = Json::parse(configFileStream);
+        }
+        catch (Json::parse_error const& e)
+        {
+            LOG_ERROR("llm_build: Failed to parse config file: %s", e.what());
+        }
+
+        hiddenSizeDim = jsonConfig["hidden_size"].get<int32_t>();
+        targetModelOutputHiddenDim = args.eagleBuildParams.isEagle3 ? hiddenSizeDim * 3 : hiddenSizeDim;
+        numKVHeads = jsonConfig["num_key_value_heads"].get<int32_t>();
+        auto numAttentionHeads = jsonConfig["num_attention_heads"].get<int32_t>();
+        if (jsonConfig.contains("head_dim"))
+        {
+            headSize = jsonConfig["head_dim"].get<int32_t>();
         }
         else
         {
             headSize = hiddenSizeDim / numAttentionHeads;
         }
-        if (rootNode.hasMember("partial_rotary_factor"))
+
+        if (jsonConfig.contains("partial_rotary_factor"))
         {
-            rotaryDim = (int64_t) (rootNode["partial_rotary_factor"].getFloat() * headSize);
+            rotaryDim = (int64_t) (jsonConfig["partial_rotary_factor"].get<float>() * headSize);
         }
         else
         {
             rotaryDim = headSize;
         }
-        maxPositionEmbeddings = rootNode["max_position_embeddings"].getInteger();
-        nbKVCacheInputs = rootNode["num_hidden_layers"].getInteger();
+        maxPositionEmbeddings = jsonConfig["max_position_embeddings"].get<int32_t>();
+        nbKVCacheInputs = jsonConfig["num_hidden_layers"].get<int32_t>();
     }
 
     void setupExtraProfilesForVLM()

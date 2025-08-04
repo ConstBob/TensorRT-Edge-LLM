@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/benchmarkProfiler.h"
-#include "common/json.h"
 #include "decoder/decoder.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 
@@ -10,9 +9,10 @@
 #include <cuda_runtime_api.h>
 #include <map>
 #include <memory>
-#include <optional>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
+using Json = nlohmann::json;
 
 class Eagle
 {
@@ -44,20 +44,36 @@ public:
         mEagleEnginePath = eagleEnginePath;
         mMaxDraftTokensPerStep = mMaxPathLen * mTopK;
 
-        drivellm::JsonRoot root;
+        Json jsonConfig;
         std::string folderPath = extractFolderName(mEagleEnginePath);
         std::string configPath = folderPath + "/config.json";
-        root.parseFromPath(configPath);
-        auto rootNode = root.getRoot();
-        mHiddenDim = rootNode["hidden_size"].getInteger();
-        mTargetOutputHiddenDim = isEagle3 ? mHiddenDim * 3 : mHiddenDim;
-        if (isEagle3 && rootNode.hasMember("draft_vocab_size"))
+
+        std::ifstream configFileStream(configPath);
+        if (!configFileStream.is_open())
         {
-            mDraftVocabSize = rootNode["draft_vocab_size"].getInteger();
+            LOG_ERROR("Eagle Decoder: Failed to open config file: %s", configPath.c_str());
+            throw std::runtime_error("Eagle Decoder: Failed to open config file: " + configPath);
+        }
+
+        try
+        {
+            jsonConfig = Json::parse(configFileStream);
+        }
+        catch (Json::parse_error const& e)
+        {
+            LOG_ERROR("Failed to parse config file: %s", e.what());
+            throw std::runtime_error("Eagle: Fail to parse config file to obtain model parameters");
+        }
+
+        mHiddenDim = jsonConfig["hidden_size"].get<int32_t>();
+        mTargetOutputHiddenDim = isEagle3 ? mHiddenDim * 3 : mHiddenDim;
+        if (isEagle3 && jsonConfig.contains("draft_vocab_size"))
+        {
+            mDraftVocabSize = jsonConfig["draft_vocab_size"].get<int32_t>();
         }
         else
         {
-            mDraftVocabSize = rootNode["vocab_size"].getInteger();
+            mDraftVocabSize = jsonConfig["vocab_size"].get<int32_t>();
         }
         eagleCommonParamsInit();
         allocateEagleBuffer();

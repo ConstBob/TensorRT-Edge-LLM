@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/json.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -30,15 +29,11 @@ public:
     std::unordered_map<std::string, SafeTensorsInfo> const& getSafeTensorsInfo() const;
 
 private:
-    bool parseMetadata(std::string const& metadataStr);
-    bool parseSafeTensorsInfo(JsonNode& node, SafeTensorsInfo& info);
-    bool loadTensorToGPU(SafeTensorsInfo& info, uint8_t const* data);
-    bool readTensorData();
+    bool parseJsonHeader(std::string const& metadataStr);
+    bool loadTensorToGPU(SafeTensorsInfo& info, int8_t const* data);
 
     std::string mFilePath;
     std::unordered_map<std::string, SafeTensorsInfo> mTensorInfo;
-    std::unique_ptr<JsonRoot> mMetadata;
-    std::vector<uint8_t> mFileBuffer; // Temporary buffer for file data
 };
 
 } // namespace drivellm

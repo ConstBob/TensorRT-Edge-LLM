@@ -16,13 +16,9 @@
 #include "logger.h"
 #include <NvInfer.h>
 #include <dlfcn.h>
-#include <fcntl.h>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <vector>
 
 inline nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
@@ -161,71 +157,6 @@ public:
         return mFile.gcount();
     }
     std::ifstream mFile;
-};
-
-class MmapReader
-{
-public:
-    MmapReader(std::filesystem::path fp)
-    {
-        std::string const enginePath = fp.string();
-        int fd = open(enginePath.c_str(), O_RDONLY);
-        if (fd <= 0)
-        {
-            throw std::runtime_error(fmtstr("Cannot open engine file: %s", enginePath));
-        }
-        try
-        {
-            struct stat status;
-            if (fstat(fd, &status) != 0)
-            {
-                throw std::runtime_error(fmtstr("Engine file %s fstat failed.", enginePath));
-            }
-            mBytes = status.st_size;
-            if (mBytes == 0)
-            {
-                throw std::runtime_error(fmtstr("Engine file %s is empty.", enginePath));
-            }
-            mData = mmap(nullptr, mBytes, PROT_READ, MAP_SHARED, fd, 0);
-            if (mData == MAP_FAILED)
-            {
-                mData = nullptr;
-                throw std::runtime_error(fmtstr("Engine file %s mmap failed.", enginePath));
-            }
-        }
-        catch (...)
-        {
-            close(fd);
-            throw;
-        }
-        close(fd);
-    }
-    MmapReader()
-        : mData(nullptr)
-        , mBytes(0)
-    {
-    }
-    ~MmapReader()
-    {
-        if (mData != nullptr && mData != MAP_FAILED)
-        {
-            munmap(mData, mBytes);
-            mData = nullptr;
-            mBytes = 0;
-        }
-    }
-    void const* getData() const
-    {
-        return mData;
-    }
-    size_t getSize() const
-    {
-        return mBytes;
-    }
-
-private:
-    void* mData;
-    size_t mBytes;
 };
 
 struct TensorInfo

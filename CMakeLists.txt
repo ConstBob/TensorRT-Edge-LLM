@@ -102,7 +102,8 @@ find_library(
 
 set(COMMON_INCLUDE_DIRS
     ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/cpp
-    ${CMAKE_SOURCE_DIR}/examples/multimodal)
+    ${CMAKE_SOURCE_DIR}/examples/multimodal
+    ${CMAKE_SOURCE_DIR}/3rdParty/nlohmannJson/include)
 
 add_library(commonLibraryExt INTERFACE)
 target_link_libraries(commonLibraryExt INTERFACE ${NVINFER_LIB} ${CUDART_LIB})
