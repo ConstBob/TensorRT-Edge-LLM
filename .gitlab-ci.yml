@@ -46,7 +46,7 @@ a30_model_export:
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.2.2-53e0399a/12.9-r575/Linux-x64-manylinux_2_28/tar/TensorRT-10.13.2.2.Linux.x86_64-gnu.cuda-12.9.tar.gz"
   tags:
-    - a30-drive-k8s
+    - a30-edgellm-nvks
   image: "$IMAGE"
   script:
     - echo "Installing dependencies"
@@ -150,7 +150,7 @@ a30_build_and_test:
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.2.2-53e0399a/12.9-r575/Linux-x64-manylinux_2_28/tar/TensorRT-10.13.2.2.Linux.x86_64-gnu.cuda-12.9.tar.gz"
   tags:
-    - a30-drive-k8s
+    - a30-edgellm-nvks
   image: "$IMAGE"
   script:
     - echo "Installing dependencies"
