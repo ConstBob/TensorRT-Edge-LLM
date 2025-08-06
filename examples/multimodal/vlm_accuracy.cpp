@@ -588,6 +588,10 @@ void evalInternVL3(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokeniz
         LOG_ERROR("Failed to create LLM engine");
         return;
     }
+    // Initialize rope_rotary_cos_sin
+    std::string baseFolderPath = extractFolderName(baseParams.enginePath);
+    std::string configPath = baseFolderPath + "/config.json";
+    llmEngine->setupRopeCosSin(configPath);
 
     int const maxSupportedInputLength = llmEngine->getMaxSupportedInputLength();
     bool const enableDynamicShape = llmEngine->getMinSupportedInputLength() != maxSupportedInputLength;

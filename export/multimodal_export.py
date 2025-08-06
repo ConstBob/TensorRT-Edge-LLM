@@ -345,91 +345,60 @@ def export_qwen2_5_vl_visual(hf_model, output_dir, dtype, torch_dir):
 
 
 def export_internvl3_visual(hf_model, output_dir, dtype, torch_dir):
-    from utils.internvl_vit_model import InternVisionModel
 
-    # The implementation of InternVLVisionModel requires use_mask_token to be defined in the config.
-    # from transformers.models.internvl.modeling_internvl import InternVLVisionModel
+    class InternVLVisionModel(torch.nn.Module):
 
-    class InternVisionModelOpt(InternVisionModel):
-
-        def __init__(self, config):
-            super().__init__(config)
-            self.channels = config.num_channels
-            self.image_size = config.image_size
+        def __init__(self, hf_model):
+            super().__init__()
+            self.channels = hf_model.config.vision_config.num_channels
+            self.image_size = hf_model.config.vision_config.image_size
+            self.vision_tower = hf_model.model.vision_tower
+            self.multi_modal_projector = hf_model.model.multi_modal_projector
+            self.downsample_ratio = hf_model.config.downsample_ratio
+            self.pixel_shuffle = hf_model.model.pixel_shuffle
+            self.device = hf_model.device
+            self.dtype = hf_model.dtype
 
         def forward(self, pixel_values):
             pixel_values = pixel_values.reshape(-1, self.channels,
-                                                self.image_size,
-                                                self.image_size)
-            output_hidden_states = (self.config.output_hidden_states)
-            return_dict = self.config.use_return_dict
-            hidden_states = self.embeddings(pixel_values)
-            encoder_outputs = self.encoder(
-                inputs_embeds=hidden_states,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict)
-            last_hidden_state = encoder_outputs.last_hidden_state
-            return last_hidden_state[:, 1:, :]
+                                                self.image_size[0],
+                                                self.image_size[1])
+            vision_features = self.vision_tower(pixel_values).last_hidden_state
+            vision_features = vision_features[:, 1:, :]
+            channels = vision_features.shape[1]
+            feature_size = int(channels**0.5)
+            batch_size = vision_features.shape[0]
 
-    class InternVisionWrapper(torch.nn.Module):
+            # Reshape tensor to spatial dimensions
+            vision_features = vision_features.reshape(batch_size, feature_size,
+                                                      feature_size, -1)
 
-        def __init__(self, vision_model, mlp, downsample_ratio=0.5):
-            super().__init__()
-            self.vision_model = vision_model
-            self.mlp = mlp
-            self.downsample_ratio = downsample_ratio
+            # Apply downsampling using pixel shuffle
+            vision_features = self.pixel_shuffle(
+                vision_features, scale_factor=self.downsample_ratio)
 
-        def pixel_shuffle(self, x, scale_factor=0.5):
-            n, w, h, c = x.size()
-            # N, W, H, C --> N, W, H * scale, C // scale
-            x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
-            # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
-            x = x.permute(0, 2, 1, 3).contiguous()
-            # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
-            x = x.view(n, int(h * scale_factor), int(w * scale_factor),
-                       int(c / (scale_factor * scale_factor)))
-            return x
+            # Reshape tensor to prepare for projection
+            vision_features = vision_features.reshape(
+                batch_size, -1, vision_features.shape[-1])
 
-        def extract_feature(self, vit_embeds):
-            h = w = int(vit_embeds.shape[1]**0.5)
-            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
-            vit_embeds = self.pixel_shuffle(vit_embeds,
-                                            scale_factor=self.downsample_ratio)
-            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1,
-                                            vit_embeds.shape[-1])
-            vit_embeds = self.mlp(vit_embeds)
-            return vit_embeds
+            # Project features through multi-modal projector
+            vision_features = self.multi_modal_projector(vision_features)
+            return vision_features.reshape(-1, vision_features.shape[-1])
 
-        def forward(self, pixel_values):
-            vit_embeds = self.vision_model(pixel_values)
-            vit_embeds = self.extract_feature(vit_embeds)
-            return vit_embeds.reshape(-1, vit_embeds.shape[-1])
-
-    vision_model = InternVisionModelOpt._from_config(
-        hf_model.config.vision_config,
-        torch_dtype=torch.float16,
-    )
-    vision_model.load_state_dict(hf_model.vision_model.state_dict())
-    vision_model.eval().cuda()
-
-    mlp = hf_model.mlp1
-    model = InternVisionWrapper(vision_model, mlp,
-                                hf_model.config.downsample_ratio)
+    model = InternVLVisionModel(hf_model)
 
     # Quantize
     if dtype == "fp8":
-        # TODO: Add support for fp8 quantization
-        print(
-            "Skipping quantization... fp8 quantization is not yet supported for InternVL3 visual encoder."
-        )
+        model = quantize_visual(model, dtype, hf_model.config.model_type,
+                                torch_dir)
 
     # dummy input
     hw = 32 * 32
-    in_chans = vision_model.config.num_channels
-    patch_size = vision_model.config.patch_size
-    input = torch.randn((hw, in_chans * patch_size * patch_size),
+    in_chans = hf_model.config.vision_config.num_channels
+    patch_size = hf_model.config.vision_config.patch_size
+    input = torch.randn((hw, in_chans * patch_size[0] * patch_size[1]),
                         dtype=torch.float16,
-                        device=vision_model.device)
+                        device=model.device)
     dynamic_axes = {
         'input': {
             0: 'hw'
@@ -458,12 +427,12 @@ def export_visual(hf_model, args):
                             f"visual_enc_onnx_{args.visualType}")
 
     if args.model_type == 'qwen2_vl':
-        export_qwen2_vl_visual(hf_model, onnx_dir, args.visualType,
+        export_qwen2_vl_visual(hf_model.visual, onnx_dir, args.visualType,
                                args.torch_dir)
     elif args.model_type == 'qwen2_5_vl':
-        export_qwen2_5_vl_visual(hf_model, onnx_dir, args.visualType,
+        export_qwen2_5_vl_visual(hf_model.visual, onnx_dir, args.visualType,
                                  args.torch_dir)
-    elif args.model_type == 'internvl_chat':
+    elif args.model_type == 'internvl':
         export_internvl3_visual(hf_model, onnx_dir, args.visualType,
                                 args.torch_dir)
     else:
@@ -503,13 +472,10 @@ def export_visual(hf_model, args):
 def main(args):
     model_loader = ModelLoader(args.torch_dir, args.config_path)
     args.model_type = model_loader.get_model_type()
-    if args.model_type not in ['qwen2_vl', 'qwen2_5_vl', 'internvl_chat']:
+    if args.model_type not in ['qwen2_vl', 'qwen2_5_vl', 'internvl']:
         raise ValueError(f"Invalid model type {args.model_type}")
     hf_model = model_loader.load_model()
-    if args.model_type == 'internvl_chat':
-        export_visual(hf_model, args)
-    else:
-        export_visual(hf_model.visual, args)
+    export_visual(hf_model, args)
 
 
 if __name__ == '__main__':

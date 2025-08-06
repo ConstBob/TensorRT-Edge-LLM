@@ -306,6 +306,11 @@ void decodeInternVL3(BaseParams const& baseParams, EagleParams const& eagleParam
     auto llmEngine
         = getLLMEngine<InternVLViTRunner>(batchSize, baseParams, eagleParams, loraWeights, stream, vitrunner);
 
+    // Initialize rope_rotary_cos_sin
+    std::string baseFolderPath = extractFolderName(baseParams.enginePath);
+    std::string configPath = baseFolderPath + "/config.json";
+    llmEngine->setupRopeCosSin(configPath);
+
     // Preprocess
     std::vector<half> visualInput;
     std::vector<int64_t> imageTokenLengths;

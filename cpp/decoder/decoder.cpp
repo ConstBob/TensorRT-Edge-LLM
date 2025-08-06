@@ -154,7 +154,7 @@ void Decoder::setupRopeCosSin(std::string const& configPath)
     LOG_DEBUG("Setup Rope Cos Sin with type: %s, scale: %f, theta: %f, maxPositionEmbeddings: %d", ropeType.c_str(),
         rotaryScale, rotaryTheta, maxPositionEmbeddings);
 
-    if (ropeType == "default")
+    if (ropeType == "default" || ropeType == "dynamic")
     {
         if (mConfig.maxLength > maxPositionEmbeddings)
         {
@@ -163,6 +163,11 @@ void Decoder::setupRopeCosSin(std::string const& configPath)
                 "generation results");
         }
 
+        if (ropeType == "dynamic")
+        {
+            assert(mConfig.maxLength <= maxPositionEmbeddings
+                && "We don't support dynamic rope for sequence length > maxPositionEmbeddings");
+        }
         // Allocate buffer
         void* ropeRotaryCosSinDevice;
         CUDA_CHECK(cudaMalloc(&ropeRotaryCosSinDevice, mConfig.maxLength * mConfig.rotaryDim * sizeof(float)));
