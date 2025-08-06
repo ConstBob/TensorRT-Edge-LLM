@@ -567,6 +567,10 @@ void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRa
         }
 
         auto parseField = [specialTokens, jsonConfig](std::string const& field) {
+            if (!jsonConfig.contains(field))
+            {
+                return -1L;
+            }
             if (jsonConfig[field].is_string())
             {
                 if (!jsonConfig[field].is_null())
