@@ -36,11 +36,20 @@ We describe how to run supported models in the below section.
     Visual and LLM part is exported to two separate ONNX files. For details, please refer to [export README](../../export/README.md). 
     ```bash
     cd drive-llm
+
     # LLM part onnx export:
-      python3 llm_export.py --torch_dir tmp/hf_models/${MODEL_NAME} --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir tmp/onnx/${MODEL_NAME} --use_prompt_tuning True
+    python3 ./export/llm_export.py \
+    --torch_dir tmp/hf_models/${MODEL_NAME} \
+    --output_dir tmp/onnx/${MODEL_NAME} \
+    --dtype [fp16|fp8|int4|nvfp4|int4_ootb] \
+    --use_prompt_tuning True
+    
     # Visual part onnx export:
-      export visualType=[fp16|fp8]
-      python3 multimodal_export.py --torch_dir tmp/hf_models/${MODEL_NAME} --output_dir tmp/onnx/${MODEL_NAME} --visualType ${visualType}
+    export visualType=[fp16|fp8]
+    python3 ./export/multimodal_export.py \
+    --torch_dir tmp/hf_models/${MODEL_NAME} \
+    --output_dir tmp/onnx/${MODEL_NAME} \
+    --visualType ${visualType}
     ```
 
 **Notes:**
@@ -167,11 +176,12 @@ The `llm_build` binary is used to build LLM part TensorRT engines and `visual_bu
 1. Download Huggingface weights
 
     Supported models:
-    - [InternVL3-1B](https://huggingface.co/OpenGVLab/InternVL3-1B)
+    - [InternVL3-1B-hf](https://huggingface.co/OpenGVLab/InternVL3-1B-hf)
+    - [InternVL3-2B-hf](https://huggingface.co/OpenGVLab/InternVL3-2B-hf)
 
     ```bash
     git lfs install
-    export MODEL_NAME="InternVL3-1B"
+    export MODEL_NAME="InternVL3-1B-hf"
     git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
 
     export MODEL_TYPE="internvl3"
@@ -184,24 +194,25 @@ The `llm_build` binary is used to build LLM part TensorRT engines and `visual_bu
     # LLM part onnx export:
     ```bash
     cd drive-llm
-    python3 ./export/llm_export.py --torch_dir tmp/hf_models/${MODEL_NAME} \
-    --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir tmp/onnx/${MODEL_NAME} \
-    --use_prompt_tuning True
-    ```
-    # Visual part onnx export:
-    ```bash
-    cd drive-llm
-    export visualType=[fp16|fp8]
-    python3 ./export/multimodal_export.py --torch_dir tmp/hf_models/${MODEL_NAME} \
+
+    # LLM part onnx export:
+    python3 ./export/llm_export.py \
+    --torch_dir tmp/hf_models/${MODEL_NAME} \
+    --output_dir tmp/onnx/${MODEL_NAME} \
     --dtype [fp16|fp8|int4|nvfp4|int4_ootb] \
+    --use_prompt_tuning True
+    
+    # Visual part onnx export:
+    export visualType=[fp16|fp8]
+    python3 ./export/multimodal_export.py \
+    --torch_dir tmp/hf_models/${MODEL_NAME} \
     --output_dir tmp/onnx/${MODEL_NAME} \
     --visualType ${visualType}
     ```
 
 
 **Notes:**
-1. InternVL3 visual encoder currently only supports FP16 precision.
-2. InternVL3 uses a downsampling ratio of 0.5 in the visual encoder, resulting in 4x fewer output tokens compared to input visual tokens.
+1. InternVL3 uses a downsampling ratio of 0.5 in the visual encoder, resulting in 4x fewer output tokens compared to input visual tokens.
 
 ### Image Preprocess and Number of Image Tokens
 
@@ -390,11 +401,13 @@ To match MMMU evaluation [config](https://github.com/open-compass/VLMEvalKit/blo
 
 4. Evaluate results with python script.
     ```bash
-    python ./scripts/mmmu.py --csv_path=./mmmu-results.tsv --output_path=./mmmu-results-eval.json
+    python ./scripts/mmmu.py --csv_path=./mmmu-results.csv --output_path=./mmmu-results-eval.json
     ```
 
 **Notes:**
 Drive-LLM MMMU score is different from Qwen official. Drive-LLM MMMU implementation follows [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU), while Qwen-VL uses [VLMEvalkit](https://github.com/open-compass/VLMEvalKit). VLMEvalkit provides higher MMMU scores due to different prompt setup and evaluation method. It also requires higher memory that is not suitable for edge devices. Drive-LLM MMMU scores are aligned with official MMMU-Benchmark results with HuggingFace implementation, providing confidence in VLM accuracy. For details, please refer to [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU) or [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) for getting HuggingFace model accuracy scores.
+
+Similarly, for the InternVL3-1B model as well, the official results are calculated using VLMEvalKit. In addition to the reasons mentioned above, our score is lower as we allow a maximum of 6 patches (of 448x448x3) per image during preprocessing as opposed to the official implementation which allows 12 max patches. This was done to reduce the memory requirement. Furthermore, our accuracy score is achieved with float16 precision compared to the bf16 precision that the official implementation uses. When VLMEvalKit is run with our constraints of 6 max patches, and float16 precision, we achieve the same accuracy score.
 
 ## LoRA Support
 

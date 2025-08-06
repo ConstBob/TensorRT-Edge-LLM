@@ -310,7 +310,7 @@ class ModelLoader:
             )
             extra_inputs.update(extra_inputs_draft)
             extra_dyn_axes.update(extra_dyn_axes_draft)
-        if self.model_type in ['qwen2_vl', 'qwen2_5_vl', 'internvl_chat']:
+        if self.model_type in ['qwen2_vl', 'qwen2_5_vl', 'internvl']:
             dummy_len = 10
             image_embeds = torch.randn(
                 (dummy_len, self.hf_model.config.hidden_size),
@@ -347,12 +347,13 @@ class ModelLoader:
                 self.torch_dir,
                 torch_dtype=torch.float16,
             )
-        elif self.model_type == 'internvl_chat':
-            from transformers import AutoModel
-            self.hf_model = AutoModel.from_pretrained(
+        elif self.model_type == 'internvl':
+            from transformers import InternVLForConditionalGeneration
+            self.hf_model = InternVLForConditionalGeneration.from_pretrained(
                 self.torch_dir,
                 torch_dtype=torch.float16,
-                trust_remote_code=True)
+            )
+            self.hf_model.config.hidden_size = self.hf_model.config.text_config.hidden_size
         else:
             from transformers import AutoModelForCausalLM
             self.hf_model = AutoModelForCausalLM.from_pretrained(

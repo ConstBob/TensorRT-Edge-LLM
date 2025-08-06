@@ -333,6 +333,10 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
     auto vitrunner = new InternVLViTRunner(modelType);
     auto decoder = new Decoder();
 
+    // Initialize rope_rotary_cos_sin
+    std::string baseFolderPath = extractFolderName(llmEnginePath);
+    std::string configPath = baseFolderPath + "/config.json";
+
     profiler->startTiming();
     profiler->recordDeviceMemStart();
     profiler->recordHostMemStart();
@@ -340,6 +344,8 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
     vitrunner->setup(visualEnginePath, stream, batchSize);
     decoder->setup(llmEnginePath, stream, useCudaGraph, batchSize);
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
+    decoder->setupRopeCosSin(configPath);
+
     // Load and switch to LoRA weights if provided
     if (loraWeights.hasWeights())
     {

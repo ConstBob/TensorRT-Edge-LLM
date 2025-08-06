@@ -205,11 +205,26 @@ def get_vit_calib_dataloader(
                 "grid_thw": inputs["image_grid_thw"],
             }
 
-        # Limit pixels to reasonable size. Too large images will cause OOM.
-        processor = AutoProcessor.from_pretrained(torch_dir,
-                                                  min_pixels=128 * 28 * 28,
-                                                  max_pixels=2048 * 28 * 28)
-        dataset = dataset.map(_preprocess,
+        def _preprocess_internvl(data, processor):
+            image_inputs = []
+            for (key, value) in data.items():
+                if "image" in key and isinstance(value, Image.Image):
+                    image_inputs.append(value.convert("RGB"))
+            inputs = processor(images=image_inputs, )
+            return {"pixel_values": inputs["pixel_values"]}
+
+        preprocess_fn = _preprocess_internvl if model_type == "internvl" else _preprocess
+        if model_type == "internvl":
+            processor = AutoProcessor.from_pretrained(torch_dir)
+            processor = processor.image_processor
+        else:
+            # Limit pixels to reasonable size. Too large images will cause OOM.
+            processor = AutoProcessor.from_pretrained(torch_dir,
+                                                      min_pixels=128 * 28 * 28,
+                                                      max_pixels=2048 * 28 *
+                                                      28)
+
+        dataset = dataset.map(preprocess_fn,
                               batched=False,
                               fn_kwargs={"processor": processor},
                               remove_columns=dataset.column_names)
@@ -278,6 +293,23 @@ def get_vit_calib_dataloader(
                 return inputs
 
         dataset = QwenViTDataset(dataset, model)
+    elif model_type == "internvl":
+
+        class InternVLDataset(Dataset):
+
+            def __init__(self, data, model):
+                self.data = data
+                self.model = model
+
+            def __len__(self):
+                return len(self.data)
+
+            def __getitem__(self, idx):
+                raw_data = self.data[idx]
+                pixel_values = raw_data["pixel_values"].to(self.model.dtype)
+                return {"pixel_values": pixel_values}
+
+        dataset = InternVLDataset(dataset, model)
     else:
         raise NotImplementedError(f"Invalid model type {model_type}")
 
@@ -293,9 +325,11 @@ def quantize_visual(model, precision, model_type, torch_dir):
     # Also disable Conv3d to avoid accuracy degradation.
     quant_config = mtq.FP8_DEFAULT_CFG
     quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
+    quant_config["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
 
-    # With TensorRT10.10, disable `attn.proj` layers to avoid performance degradation.
+    # Disable `attn.proj` layers to avoid performance degradation.
     quant_config["quant_cfg"]["*attn.proj*"] = {"enable": False}
+    quant_config["quant_cfg"]["*attention.proj*"] = {"enable": False}
 
     data_loader = get_vit_calib_dataloader(model,
                                            model_type,

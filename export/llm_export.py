@@ -10,7 +10,6 @@
 
 import argparse
 import os
-import shutil
 import time
 
 import onnx
@@ -163,6 +162,11 @@ def modelopt_quantized(torch_dir):
     return os.path.exists(os.path.join(torch_dir, "modelopt_state.pth"))
 
 
+def write_model_config_to_json(model, output_dir):
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        f.write(model.config.to_json_string())
+
+
 def export_raw_llm(model,
                    output_dir,
                    dtype,
@@ -202,7 +206,7 @@ def export_raw_llm(model,
                     output_dir,
                     extra_inputs=extra_inputs,
                     extra_dyn_axes=extra_dyn_axes)
-        shutil.copy(config_path, os.path.join(output_dir, "config.json"))
+        write_model_config_to_json(model, output_dir)
 
     # Need to quantize model to fp8, int4 or nvfp4
     if dtype in ["fp8", "int4", "nvfp4", "int4_ootb"]:
@@ -237,8 +241,7 @@ def export_raw_llm(model,
                             output_dir,
                             extra_inputs=extra_inputs,
                             extra_dyn_axes=extra_dyn_axes)
-                shutil.copy(config_path, os.path.join(output_dir,
-                                                      "config.json"))
+                write_model_config_to_json(model, output_dir)
 
             # Compress weights
             quantized_model_dir = f"{output_dir}_{dtype}_quantized"
@@ -292,7 +295,9 @@ def surgeon_llm(raw_onnx_path,
         config = AutoConfig.from_pretrained(
             config_path,
             trust_remote_code=True,
-        ).to_dict()
+        )
+        if config.model_type == 'internvl':
+            config = config.text_config
     else:
         print(
             "Warning: DriveOS LLM SDK currently does not support OOTB(Out-of-the-box) TensorRT so far."
@@ -304,15 +309,9 @@ def surgeon_llm(raw_onnx_path,
     print(f"Importing ONNX graph takes {t1 - t0}s.")
 
     if mode == "plugin":
-        if config['model_type'] == "internvl_chat":
-            graph = insert_attention_plugin(graph, config['llm_config'],
-                                            max_seq_length,
-                                            extra_plugin_inputs,
-                                            extra_plugin_attributes)
-        else:
-            graph = insert_attention_plugin(graph, config, max_seq_length,
-                                            extra_plugin_inputs,
-                                            extra_plugin_attributes)
+        graph = insert_attention_plugin(graph, config.to_dict(),
+                                        max_seq_length, extra_plugin_inputs,
+                                        extra_plugin_attributes)
     if eagle_base:
         graph = insert_gather_last_token_eagle(graph, False)
     elif eagle_draft:
@@ -376,12 +375,8 @@ def surgeon_llm(raw_onnx_path,
                     location=f"onnx_model.data",
                     convert_attribute=True)
 
-    if os.path.exists(config_path):
-        if config_path.endswith("config.json"):
-            shutil.copy(config_path, os.path.join(output_dir, "config.json"))
-        else:
-            shutil.copy(os.path.join(config_path, "config.json"),
-                        os.path.join(output_dir, "config.json"))
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        f.write(config.to_json_string())
 
     t3 = time.time()
     print(f"Surgeon LLM completed in {t3 - t2}s.")
@@ -471,9 +466,35 @@ def main(args):
                 model = model_loader.load_model_with_lora(
                     model, args.lora_dir, args.lora_mode)
             extra_inputs, extra_dyn_axes = model_loader.prepare_extra_inputs()
+
+            if model.config.model_type in [
+                    'internvl', 'qwen2_vl', 'qwen2_5_vl'
+            ]:
+                # This is a workaround to modelopt issue with quantizing the entire model.
+                # Ideally we would like to only quantize the language model, but in VLMs,
+                #   the model.model has both language model and vision model.
+                from transformers.models.qwen2.modeling_qwen2 import \
+                    Qwen2ForCausalLM
+
+                class LanguageModel(Qwen2ForCausalLM):
+
+                    def __init__(self, model):
+                        super().__init__(model.config.text_config)
+                        self.model = model.language_model
+                        self.vocab_size = model.config.text_config.vocab_size
+                        self.lm_head = model.lm_head
+                        self.config = model.config.text_config
+
+                    def forward(self, input_ids):
+                        outputs = self.model(input_ids)
+                        hidden_states = outputs[0]
+                        logits = self.lm_head(hidden_states)
+                        return logits
+
+                model = LanguageModel(model)
+
             state_dict = export_raw_llm(
-                model if model_loader.model_type != "internvl_chat" else
-                model.language_model,
+                model,
                 onnx_dir,
                 args.dtype,
                 args.config_path,
@@ -488,14 +509,13 @@ def main(args):
 
     extra_plugin_inputs, extra_plugin_attributes = model_loader.add_extra_plugin_inputs(
     )
-    # Providing the config path to config.json results in a hf validation error for internvl_chat.
+
     surgeon_llm(
         raw_onnx_path,
         args.output_dir,
         args.dtype,
         args.mode,
-        args.config_path
-        if model_loader.model_type != "internvl_chat" else args.torch_dir,
+        args.config_path,
         state_dict,
         args.max_seq_length,
         lm_head_precision=args.lm_head,
