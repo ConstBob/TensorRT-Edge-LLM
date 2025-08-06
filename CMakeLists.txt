@@ -8,10 +8,10 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
-cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
-  driveos_llm_sdk
+  tensorrt_edgellm_sdk
   VERSION 0.1.0.1
   LANGUAGES CXX CUDA)
 
