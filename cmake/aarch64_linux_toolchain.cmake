@@ -8,37 +8,17 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
+# aarch64_toolchain.cmake
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
 
 # Specify the cross-compiler
-find_program(
-  CMAKE_C_COMPILER
-  NAMES aarch64-linux-gnu-gcc
-  PATHS /usr/local/bin /usr/bin
-  NO_DEFAULT_PATH)
-
-find_program(
-  CMAKE_CXX_COMPILER
-  NAMES aarch64-linux-gnu-g++
-  PATHS /usr/local/bin /usr/bin
-  NO_DEFAULT_PATH)
-
 set(CMAKE_C_COMPILER /usr/bin/aarch64-linux-gnu-gcc)
 set(CMAKE_CXX_COMPILER /usr/bin/aarch64-linux-gnu-g++)
 
 set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
 
-# Point CUDA to aarch cross targets.
-set(CUDA_VERSION 12.8)
-set(CUDA_DIR
-    /usr/local/cuda/targets/aarch64-linux
-    CACHE STRING "CUDA ROOT dir")
-
-set(CUDA_TARGET_DIR /usr/local/cuda/${AUTO_TARGET}/targets/aarch64-linux)
-
-# Use host nvcc
 set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
 set(CMAKE_CUDA_HOST_COMPILER
     ${CMAKE_CXX_COMPILER}
@@ -49,11 +29,30 @@ set(CMAKE_CUDA_FLAGS
     CACHE STRING "" FORCE)
 
 # Specify the architecture for CUDA
-if("${AUTO_TARGET}" STREQUAL "thor")
+if("${EMBEDDED_TARGET}" STREQUAL "auto-thor")
   set(CMAKE_CUDA_ARCHITECTURES 101)
-endif()
-if("${AUTO_TARGET}" STREQUAL "orin")
+  set(CUDA_VERSION 12.8)
+  set(CUDA_DIR
+      /usr/local/cuda/targets/aarch64-linux
+      CACHE STRING "CUDA toolkit dir")
+elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-thor")
+  set(CMAKE_CUDA_ARCHITECTURES 110)
+  set(CUDA_VERSION 13.0)
+  set(CUDA_DIR
+      /usr/local/cuda/targets/sbsa-linux
+      CACHE STRING "CUDA toolkit dir")
+elseif("${EMBEDDED_TARGET}" STREQUAL "orin")
   set(CMAKE_CUDA_ARCHITECTURES 87)
+  set(CUDA_VERSION 12.6)
+  set(CUDA_DIR
+      /usr/local/cuda/targets/aarch64-linux
+      CACHE STRING "CUDA toolkit dir")
+elseif("${EMBEDDED_TARGET}" STREQUAL "n1")
+  set(CMAKE_CUDA_ARCHITECTURES 121)
+  set(CUDA_VERSION 13.0)
+  set(CUDA_DIR
+      /usr/local/cuda/targets/sbsa-linux
+      CACHE STRING "CUDA toolkit dir")
 endif()
 
 # Tell CMake how to search for the libraries and programs

@@ -59,25 +59,28 @@ Model | FP16 | INT4 | FP8 | NVFP4
 
 ### 1. Build the C++ Project
 
-The C++ project can be built in Linux x86 host with cross build:
+The C++ project's CMake build system support native build for x86 and aarch64 linux system. It also support cross compilation for aarch64 target on x86 host.
 
+Build in Linux x86 and run with datacenter/consumer GPUs
 ```bash
-cd drive-llm
+cd tensorrt-edgellm
 mkdir build
 cd build
-cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_cross_toolchain.cmake -DAUTO_TARGET=thor
-make
+cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} 
+make -j
 ```
 
-Built in Linux aarch64 with native build:
+Cross and native build for aarch64 linux systems. Support hardware lists: [auto-thor, jetson-thor, orin, n1x]
 
 ```bash
 cd build
-cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_native_toolchain.cmake -DAUTO_TARGET=thor
-make
+cmake .. -DTRT_PACKAGE_DIR={TRT-Package-Path} -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake -DEMBEDDED_TARGET={hardware-type}
+make -j
 ```
 
-To build and run DriveOS LLM SDK in x86 machine for rapid development, the `-DCMAKE_TOOCHAIN_FILE` and `-DAUTO_TARGET` is not needed. The binaries are generated in `examples` folder to be used later. The AttentionPlugin library will also be there in `libAttentionPlugin.so`, and the Int4GemmPlugin in `libint4GemmPlugin.so`.
+To build unittests of the project, add CMake build flag `-DBUILD_UNIT_TESTS=on`  
+
+To override the default CUDA toolkit version of this project, add CMake build flag `-DCUDA_VERSION={Your-selected-Version}`, for example `-DCUDA_VERSION=12.9`
 
 ### 2. Export ONNX from PyTorch Checkpoint
 

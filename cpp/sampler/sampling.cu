@@ -365,9 +365,27 @@ struct TopK_2
     }
 };
 
+template <typename T>
+struct maxOpFunctor
+{
+    __device__ __forceinline__ T operator()(T const& a, T const& b) const
+    {
+        return a > b ? a : b;
+    }
+};
+
+template <typename T>
+struct sumOpFunctor
+{
+    __device__ __forceinline__ T operator()(T const& a, T const& b) const
+    {
+        return a + b;
+    }
+};
+
 // Reduction operator for top-k
 template <typename T>
-struct reduce_topk_op_2
+struct topk2MaxOpFunctor
 {
     __device__ __forceinline__ TopK_2<T> operator()(TopK_2<T> const& a, TopK_2<T> const& b) const
     {
@@ -413,7 +431,7 @@ __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, 
             partial.insert((float) sVal[i], i);
         }
 
-        TopK_2<float> total = BlockReduce(tempStorage).Reduce(partial, reduce_topk_op_2<float>());
+        TopK_2<float> total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor<float>());
 
         if (tid == 0)
         {
@@ -536,7 +554,7 @@ __global__ void topKStage1(
             partial.insert(tmpLogits[index], index);
         }
 
-        TopK_2<T> total = BlockReduce(tempStorage).Reduce(partial, reduce_topk_op_2<T>());
+        TopK_2<T> total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor<T>());
 
         if (tid == 0)
         {
@@ -600,7 +618,7 @@ __global__ void topKStage2Sampling(int32_t const* __restrict__ topKTmpIdBuf, T* 
             partial.insert(static_cast<float>(sVal[i]), i);
         }
 
-        TopK_2<float> total = BlockReduce(tempStorage).Reduce(partial, reduce_topk_op_2<float>());
+        TopK_2<float> total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor<float>());
 
         if (tid == 0)
         {
@@ -701,7 +719,8 @@ __global__ void softmaxKernel(T const* logits, T* probs, int32_t batchSize, int3
         threadMax = fmaxf(threadMax, logit);
     }
 
-    float blockMax = BlockReduce(tempStorage).Reduce(threadMax, cub::Max());
+    // Use customed reductionOp to WAR CUDA12/13 compatibility issue
+    float blockMax = BlockReduce(tempStorage).Reduce(threadMax, maxOpFunctor<float>());
     if (tid == 0)
     {
         maxLogit = blockMax;
@@ -719,7 +738,7 @@ __global__ void softmaxKernel(T const* logits, T* probs, int32_t batchSize, int3
         threadSum += expLogit;
     }
 
-    float blockSum = BlockReduce(tempStorage).Reduce(threadSum, cub::Sum());
+    float blockSum = BlockReduce(tempStorage).Reduce(threadSum, sumOpFunctor<float>());
     if (tid == 0)
     {
         sumExp = blockSum;
@@ -794,7 +813,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* 
         partial.insert(probs[index], elemId);
     }
 
-    TopK_2<T> total = BlockReduce(temp_storage).Reduce(partial, reduce_topk_op_2<T>());
+    TopK_2<T> total = BlockReduce(temp_storage).Reduce(partial, topk2MaxOpFunctor<T>());
 
     if (threadId == 0)
     {

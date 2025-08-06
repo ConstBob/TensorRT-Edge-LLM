@@ -104,7 +104,7 @@ jp6_cross_build:
     - rm -rf build-jp6
     - mkdir -p build-jp6
     - cd build-jp6
-    - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-jp6 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_cross_toolchain.cmake -DAUTO_TARGET=orin -DBUILD_UNIT_TESTS=ON
+    - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-jp6 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake -DEMBEDDED_TARGET=orin -DBUILD_UNIT_TESTS=ON
     - make -j16
     - echo "Built TensorRT Edge LLM SDK"
   interruptible: true

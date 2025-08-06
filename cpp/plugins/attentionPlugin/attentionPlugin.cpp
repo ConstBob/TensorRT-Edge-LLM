@@ -32,6 +32,15 @@ namespace
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
 
+// Workaround for CUDA12/13 Thor re-numbering. The kernels themselves have version compatibility.
+void applyThorSMRenumberWAR(int32_t& smVersion)
+{
+    if (smVersion == 110)
+    {
+        smVersion = 101;
+    }
+}
+
 } // namespace
 
 // Static class fields initialization
@@ -51,6 +60,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mEnableTreeAttention(enableTreeAttention)
 {
     mSMVersion = getSMVersion();
+    applyThorSMRenumberWAR(mSMVersion);
 
     bool canImplement = ContextFMHARunner::canImplement(mNumElemPerHead, mSMVersion, mDataType)
         && DecoderXQARunner::canImplement(mNumHeadQ, mNumHeadKV, mSMVersion, mDataType);
@@ -78,6 +88,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mEnableTreeAttention);
 
     mSMVersion = getSMVersion();
+    applyThorSMRenumberWAR(mSMVersion);
+
     ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
     // TODO: Fix me too pass spec-deocde support through plugin attributes.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
