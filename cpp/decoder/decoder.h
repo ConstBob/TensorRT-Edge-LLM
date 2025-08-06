@@ -84,6 +84,7 @@ public:
 
     void generateForDecode(std::vector<int32_t>& contextLengths, std::vector<int64_t>& lastTokenIds);
     void addNewBuffer(std::string const& name, nvinfer1::Dims const dimsContext, int sizeOfByte);
+    void initDecodingPhaseCudaGraph();
 
     void* getDeviceBuffer(std::string const& name);
     ModelConfig const getModelConfig() const noexcept;
@@ -130,7 +131,7 @@ private:
     void allocateExtraBufferForEagle();
     void allocateExtraBufferForVanilla();
     void allocateCommonBuffers();
-    void initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextLengths);
+
     // These are used as debugging functions
     std::string printKVCache();
     std::string printLogits();

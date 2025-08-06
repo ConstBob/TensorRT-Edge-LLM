@@ -79,6 +79,7 @@ public:
         allocateEagleBuffer();
         addNewBufferForModelIO();
         setupExtraInputsForBaseModel();
+        setupExtraInputsForDraftModelDecode();
     };
 
     void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
@@ -120,11 +121,13 @@ private:
         int32_t& generationIter, int64_t& unfinishedBatchNum, std::vector<int32_t>& contextLengths);
     void allocateEagleBuffer();
     void invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
+    void initDecodingPhaseCudaGraph();
 
     void eagleCommonParamsInit();
     void initDraftVoc();
     void setupExtraInputsForBaseModel();
-    void setupExtraInputsForDraftModel(std::vector<int32_t> const& contextLengths);
+    void setupExtraInputsForDraftModelContext(std::vector<int32_t> const& contextLengths);
+    void setupExtraInputsForDraftModelDecode();
     std::unique_ptr<Decoder> mBaseModel;
     std::unique_ptr<Decoder> mDraftModel;
 

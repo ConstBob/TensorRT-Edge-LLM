@@ -569,7 +569,7 @@ std::string Decoder::printLogits()
     return formatFloat16Vector(logits, mConfig.batchSize);
 }
 
-void Decoder::initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextLengths)
+void Decoder::initDecodingPhaseCudaGraph()
 {
     // Capture cuda graph only on the first run. This cuda graph will be cached and reused for all the other runs.
     if (mUseCudaGraph && !mCudaGraphCaptured)
@@ -589,7 +589,9 @@ void Decoder::initDecodingPhaseCudaGraph(std::vector<int32_t> const& contextLeng
             }
             // Set up inputs to valid values to comply with decoding phase enqueueV3() call.
             // This won't have side effect for ongoing request.
-            CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
+            // Use cudaMemcpyAsync instead of cudaMemsetAsync to properly set integer values
+            std::vector<int32_t> dummyContextLengths(mConfig.batchSize, 128);
+            CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], dummyContextLengths.data(),
                 mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
             CUDA_CHECK(
                 cudaMemsetAsync(mDeviceBuffer["last_token_ids"], 0, mConfig.batchSize * sizeof(int64_t), mStream));
@@ -617,7 +619,7 @@ void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t
     std::shared_ptr<BenchmarkProfiler> const profiler)
 {
     // Initialize decoding phase cuda graph
-    initDecodingPhaseCudaGraph(contextLengths);
+    initDecodingPhaseCudaGraph();
 
     int32_t maxInputContextLength = *std::max_element(contextLengths.begin(), contextLengths.end());
     // if Enable dynamic shape, the input contexts are padded to max input lengths within this batch,

@@ -273,6 +273,7 @@ void Eagle::allocateEagleBuffer()
     //[mBatchSize,topk*(depth+1),topk]
     void* treePositionIdsDevice;
     CUDA_CHECK(cudaMalloc(&treePositionIdsDevice, mBatchSize * mMaxDraftTokensPerStep * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(treePositionIdsDevice, 0, mBatchSize * mMaxDraftTokensPerStep * sizeof(int32_t)));
     mEagleDeviceBuffer["treePositionIds"] = treePositionIdsDevice;
 
     //[mBatchSize,maxDecodingTokens,maxDecodingTokens] for the verification
@@ -290,6 +291,7 @@ void Eagle::allocateEagleBuffer()
     //[mBatchSize,maxDecodingTokens]
     void* positionIdsVerificationDevice;
     CUDA_CHECK(cudaMalloc(&positionIdsVerificationDevice, mBatchSize * mMaxDecodingTokens * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(positionIdsVerificationDevice, 0, mBatchSize * mMaxDecodingTokens * sizeof(int32_t)));
     mEagleDeviceBuffer["positionIdsVerification"] = positionIdsVerificationDevice;
 
     // for eagle_0   for all draft model:[bs,mMaxDecodingTokens]
@@ -391,7 +393,6 @@ void Eagle::addNewBufferForModelIO()
 
 void Eagle::setupExtraInputsForBaseModel()
 {
-
     // for base model context:
     std::vector<EngineInputDesc> extraInputsForBaseModelContext;
     extraInputsForBaseModelContext.push_back(EngineInputDesc(
@@ -416,9 +417,8 @@ void Eagle::setupExtraInputsForBaseModel()
     mBaseModel->setupExtraInputs(extraInputsForBaseModelDecode);
 }
 
-void Eagle::setupExtraInputsForDraftModel(std::vector<int32_t> const& contextLengths)
+void Eagle::setupExtraInputsForDraftModelContext(std::vector<int32_t> const& contextLengths)
 {
-
     // for draft model context,only for bs=1
     std::vector<EngineInputDesc> extraInputsForDraftModelContext;
     auto const hiddenStates = mBaseModel->getDeviceBuffer("hidden_states");
@@ -437,7 +437,10 @@ void Eagle::setupExtraInputsForDraftModel(std::vector<int32_t> const& contextLen
     extraInputsForDraftModelContext.push_back(
         EngineInputDesc("last_token_ids", nullptr, last_token_ids_device, {}, {1, {mBatchSize}}));
     mDraftModel->setupExtraInputs(extraInputsForDraftModelContext);
+}
 
+void Eagle::setupExtraInputsForDraftModelDecode()
+{
     // for draft model decode:
     std::vector<EngineInputDesc> extraInputsForDraftModelDecode;
     extraInputsForDraftModelDecode.push_back(EngineInputDesc("input_ids", nullptr,
@@ -453,12 +456,11 @@ void Eagle::setupExtraInputsForDraftModel(std::vector<int32_t> const& contextLen
     extraInputsForDraftModelDecode.push_back(
         EngineInputDesc("hidden_states_from_draft", nullptr, mEagleDeviceBuffer["hiddenStatesDraftDecodeFromDraft"], {},
             {3, {mBatchSize, mMaxDraftTokensPerStep, mHiddenDim}}));
-    extraInputsForDraftModelDecode.push_back(
-        EngineInputDesc("last_token_ids", nullptr, last_token_ids_device, {}, {1, {mBatchSize * mTopK}}));
+    extraInputsForDraftModelDecode.push_back(EngineInputDesc(
+        "last_token_ids", nullptr, mEagleDeviceBuffer["last_token_ids"], {}, {1, {mBatchSize * mTopK}}));
 
     mDraftModel->setupExtraInputs(extraInputsForDraftModelDecode);
 }
-
 void Eagle::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
 {
     mBaseModel->setupExtraInputs(extraInputs);
@@ -498,6 +500,12 @@ void Eagle::getLastHostLogits(std::vector<LogitsType>& hostLogits)
     return;
 }
 
+void Eagle::initDecodingPhaseCudaGraph()
+{
+    mBaseModel->initDecodingPhaseCudaGraph();
+    mDraftModel->initDecodingPhaseCudaGraph();
+}
+
 void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
     std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds, bool isEagle3,
     std::shared_ptr<BenchmarkProfiler> const profiler, std::vector<int32_t>* newTokensNumbers,
@@ -513,7 +521,10 @@ void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> 
     auto inputIdsDevice = mBaseModel->getDeviceBuffer("input_ids");
     CUDA_CHECK(cudaMemcpyAsync(inputIdsDevice, inputIds.data(), mBatchSize * contextLengths[0] * sizeof(int64_t),
         cudaMemcpyHostToDevice, mStream));
-    setupExtraInputsForDraftModel(contextLengths);
+    setupExtraInputsForDraftModelContext(contextLengths);
+
+    // Initialize decoding phase cuda graph
+    initDecodingPhaseCudaGraph();
 
     mBaseModel->generateForContext(inputIdsDevice, contextLengths, lastTokenIds, {2, {mBatchSize, contextLengths[0]}});
     if (profiler)
