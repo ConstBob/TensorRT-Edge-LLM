@@ -8,6 +8,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import json
 import os
 import time
 
@@ -15,6 +16,7 @@ import onnx
 import onnx_graphsurgeon as gs
 import torch
 import torch.nn as nn
+from export_model_config import export_config
 from llm_export import get_config_path, llm_arguments
 from utils.export_utils import ModelLoader, QwenVisionAttention, torch_to_onnx
 from utils.quantization_utils import quantize_visual
@@ -467,6 +469,11 @@ def export_visual(hf_model, args):
                         all_tensors_to_one_file=True,
                         location=f"onnx_model.data",
                         convert_attribute=True)
+
+    # 3. Export config.json
+    config_dict = export_config(hf_model.config, "vision")
+    with open(os.path.join(onnx_dir, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
 
 
 def main(args):
