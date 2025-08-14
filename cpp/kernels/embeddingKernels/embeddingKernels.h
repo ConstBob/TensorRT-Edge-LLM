@@ -31,7 +31,7 @@ void embeddingLookup(
  * @param stream CUDA stream for execution
  */
 void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
-    rt::Tensor const& imageEmbeds, int32_t vocabSize, rt::Tensor& output, cudaStream_t stream = 0);
+    rt::Tensor const& imageEmbeds, rt::Tensor& output, cudaStream_t stream = 0);
 
 } // namespace kernels
 } // namespace drivellm

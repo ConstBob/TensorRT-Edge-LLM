@@ -46,7 +46,7 @@ struct LLMBenchmarkArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] <--enginePath str> <--inputLength int> <--maxLength int> [--warmUp int] [--numRuns int]"
+              << " [--help] <--engineDir str> <--inputLength int> <--maxLength int> [--warmUp int] [--numRuns int]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     CommonUsage::printBaseOptions();
@@ -65,8 +65,8 @@ void printUsage(char const* programName)
     CommonUsage::printLoraOptions();
 };
 
-void warmupRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int64_t>& inputIds,
-    std::vector<int32_t>& contextLengths, std::vector<std::vector<int64_t>>& outputIds,
+void warmupRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int32_t>& inputIds,
+    std::vector<int32_t>& contextLengths, std::vector<std::vector<int32_t>>& outputIds,
     GenerationConfig const& generationConfig, int64_t warmUp, cudaStream_t stream, Tokenizer* tokenizer = nullptr)
 {
     for (int64_t i = 0; i < warmUp; i++)
@@ -83,8 +83,8 @@ void warmupRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int64_t>& inpu
     cudaDeviceSynchronize();
 }
 
-void benchmarkRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int64_t>& inputIds,
-    std::vector<int32_t>& contextLengths, std::vector<std::vector<int64_t>>& outputIds,
+void benchmarkRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int32_t>& inputIds,
+    std::vector<int32_t>& contextLengths, std::vector<std::vector<int32_t>>& outputIds,
     GenerationConfig const& generationConfig, std::shared_ptr<BenchmarkProfiler> const profiler, int64_t numRuns,
     cudaStream_t stream, std::vector<int32_t>* newTokensNumbers, std::vector<int32_t>* iterNumbers,
     Tokenizer* tokenizer = nullptr)
@@ -293,17 +293,17 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     EngineConfig engineConfig;
-    if (args.eagleParams.eagleEnginePath.empty())
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(args.baseParams.enginePath, !args.baseParams.noCudaGraph);
+        engineConfig = EngineConfig(args.baseParams.engineDir, !args.baseParams.noCudaGraph);
     }
     else
     {
         LOG_INFO("Running in Eagle mode.");
-        engineConfig = EngineConfig(args.baseParams.enginePath, args.eagleParams.eagleEnginePath,
-            args.eagleParams.maxPathLen, args.eagleParams.topK, args.eagleParams.isEagle3,
-            args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
+        engineConfig = EngineConfig(args.baseParams.engineDir, args.eagleParams.baseModelDir,
+            args.eagleParams.draftModelDir, args.eagleParams.maxPathLen, args.eagleParams.topK,
+            args.eagleParams.isEagle3, args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
     }
     profiler->recordHostStart("decoder setup");
     auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
@@ -312,9 +312,7 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
     bool const eagleMode = llmEngine->isEagleModel();
 
     // Initialize rope_rotary_cos_sin
-    std::string baseFolderPath = extractFolderName(args.baseParams.enginePath);
-    std::string configPath = baseFolderPath + "/config.json";
-    llmEngine->setupRopeCosSin(configPath);
+    llmEngine->setupRopeCosSin();
 
     // Load and switch to LoRA weights if provided
     if (args.loraWeights.hasWeights() && !eagleMode)
@@ -335,7 +333,7 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
 
     auto const batchSize = llmEngine->getBatchSize();
     auto const maxContextLength = llmEngine->getMaxSupportedInputLength();
-    std::vector<std::vector<int64_t>> outputIds(batchSize);
+    std::vector<std::vector<int32_t>> outputIds(batchSize);
 
     if (eagleMode)
     {
@@ -344,18 +342,23 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
             LOG_WARNING("Padding is not supported in Eagle mode. Proceeding without padding.");
         }
 
-        auto tokenizer = args.baseParams.tokenizerPath.empty() ? nullptr : std::make_unique<Tokenizer>();
-        tokenizer->loadFromHF(args.baseParams.tokenizerPath);
+        auto tokenizer = std::make_unique<Tokenizer>();
+        // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
+        if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
+        {
+            tokenizer->loadFromHF(args.baseParams.engineDir);
+        }
+        else
+        {
+            tokenizer->loadFromHF(args.eagleParams.baseModelDir);
+        }
         if (!tokenizer)
         {
-            LOG_ERROR(
-                "Failed to load tokenizer: %s, please provide the tokenizer path with --tokenizerPath for Eagle mode "
-                "benchmark",
-                args.baseParams.tokenizerPath.c_str());
+            LOG_ERROR("Failed to load tokenizer from engine directory: %s", args.baseParams.engineDir.c_str());
             return;
         }
 
-        std::vector<int64_t> inputIds(batchSize);
+        std::vector<int32_t> inputIds(batchSize);
         std::vector<int32_t> contextLengths(batchSize, 0);
         for (int i = 0; i < batchSize; ++i)
         {
@@ -455,9 +458,9 @@ void benchmarkLLM(LLMBenchmarkArgs const& args, GenerationConfig const& generati
     {
         int64_t inputIdsStride = args.usePadding ? maxContextLength : args.inputLength;
 
-        std::vector<int64_t> inputIds(batchSize * inputIdsStride, -1);
+        std::vector<int32_t> inputIds(batchSize * inputIdsStride, -1);
         std::vector<int32_t> contextLengths(batchSize, args.inputLength);
-        std::vector<int64_t> lastTokenIds(batchSize, args.inputLength - 1);
+        std::vector<int32_t> lastTokenIds(batchSize, args.inputLength - 1);
         std::random_device dev;
         std::mt19937 rng(dev());
         std::uniform_int_distribution<std::mt19937::result_type> dist(0, 1000);
@@ -583,7 +586,7 @@ int main(int argc, char* argv[])
 
     GenerationConfig generationConfig{args.maxLength, args.maxLength, 1, 1};
 
-    if (args.eagleParams.eagleEnginePath.empty())
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
     {
         if ((args.inputLength < 1) || (args.maxLength < 1))
         {

@@ -75,14 +75,14 @@ public:
      *
      * @return True if the setup is successful, false otherwise.
      */
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int llmBatchSize);
+    bool setup(std::filesystem::path const& fp, cudaStream_t stream, int llmBatchSize);
 
     void visualPreprocess(std::vector<unsigned char*> const& imageBuffers,
         std::vector<std::vector<int>> const& imageSizes, std::vector<half>& patches, std::vector<half>& attentionMask,
         std::vector<float>& rotaryPosEmb, std::vector<std::vector<int64_t>>& grids);
 
     void textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
-        std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
+        std::vector<std::vector<int64_t>> const& visualGridTHWs, Tokenizer* tokenizer, std::vector<int32_t>& inputIds,
         std::vector<int32_t>& contextLengths, int32_t const maxSupportedInputLength, bool enableDynamicShape);
 
     void getWindowIndex(std::vector<std::vector<int64_t>> const& grids, std::vector<half>& windowAttentionMask,
@@ -99,7 +99,7 @@ public:
 
     void initRandomInputs(std::vector<half>& visualInput, std::vector<half>& visualAttentionMask,
         std::vector<float>& visualRotaryPosEmb, std::vector<half>& windowAttentionMask,
-        std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex, std::vector<int64_t>& inputIds,
+        std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex, std::vector<int32_t>& inputIds,
         int const textTokenLength, int const imageTokenLength, int const maxContextLength);
 
     void allocateBuffer();
@@ -144,8 +144,8 @@ private:
     /**
      * Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
      */
-    void getRopeIdx(std::vector<std::vector<int64_t>> const& batchInputIds,
+    void getRopeIdx(std::vector<std::vector<int32_t>> const& batchInputIds,
         std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<int64_t>& mropePositionIds);
-    void generateMropeParams(std::vector<std::vector<int64_t>> const& batchInputIds,
+    void generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
         std::vector<std::vector<int64_t>> const& visualGridTHWs);
 };

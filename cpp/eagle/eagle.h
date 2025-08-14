@@ -17,13 +17,13 @@ using Json = nlohmann::json;
 class Eagle
 {
 public:
-    using LogitsType = half;
+    using LogitsType = float;
     using KVCacheType = half;
     using HiddenStatesType = half;
 
     Eagle(std::unique_ptr<Decoder> baseModel, std::unique_ptr<Decoder> draftModel, cudaStream_t stream,
-        std::string eagleEnginePath, int32_t maxPathLen = 6, int32_t topK = 10, bool isEagle3 = false,
-        int32_t maxDecodingTokens = 60)
+        std::string baseModelDir, std::string draftModelDir, int32_t maxPathLen = 6, int32_t topK = 10,
+        bool isEagle3 = false, int32_t maxDecodingTokens = 60)
         : mBaseModel(std::move(baseModel))
         , mDraftModel(std::move(draftModel))
         , mStream(stream)
@@ -41,35 +41,62 @@ public:
         mMaxPathLen = maxPathLen;
         mTopK = topK;
         mIsEagle3 = isEagle3;
-        mEagleEnginePath = eagleEnginePath;
+        mBaseModelDir = baseModelDir;
+        mDraftModelDir = draftModelDir;
         mMaxDraftTokensPerStep = mMaxPathLen * mTopK;
 
+        // Load config from base model directory (base_config.json)
         Json jsonConfig;
-        std::string folderPath = extractFolderName(mEagleEnginePath);
-        std::string configPath = folderPath + "/config.json";
-
-        std::ifstream configFileStream(configPath);
-        if (!configFileStream.is_open())
+        std::string baseConfigPath = baseModelDir + "/base_config.json";
+        std::ifstream baseConfigFileStream(baseConfigPath);
+        if (!baseConfigFileStream.is_open())
         {
-            LOG_ERROR("Eagle Decoder: Failed to open config file: %s", configPath.c_str());
-            throw std::runtime_error("Eagle Decoder: Failed to open config file: " + configPath);
+            LOG_ERROR("Eagle Decoder: Failed to open base config file: %s", baseConfigPath.c_str());
+            throw std::runtime_error("Eagle Decoder: Failed to open base config file: " + baseConfigPath);
         }
 
         try
         {
-            jsonConfig = Json::parse(configFileStream);
+            jsonConfig = Json::parse(baseConfigFileStream);
         }
         catch (Json::parse_error const& e)
         {
-            LOG_ERROR("Failed to parse config file: %s", e.what());
-            throw std::runtime_error("Eagle: Fail to parse config file to obtain model parameters");
+            LOG_ERROR("Failed to parse base config file: %s", e.what());
+            throw std::runtime_error("Eagle: Fail to parse base config file to obtain model parameters");
         }
 
         mHiddenDim = jsonConfig["hidden_size"].get<int32_t>();
         mTargetOutputHiddenDim = isEagle3 ? mHiddenDim * 3 : mHiddenDim;
-        if (isEagle3 && jsonConfig.contains("draft_vocab_size"))
+
+        // For draft vocab size, try to get from draft config first, then fall back to base config
+        if (isEagle3)
         {
-            mDraftVocabSize = jsonConfig["draft_vocab_size"].get<int32_t>();
+            std::string draftConfigPath = draftModelDir + "/draft_config.json";
+            std::ifstream draftConfigFileStream(draftConfigPath);
+            if (draftConfigFileStream.is_open())
+            {
+                try
+                {
+                    Json draftJsonConfig = Json::parse(draftConfigFileStream);
+                    if (draftJsonConfig.contains("draft_vocab_size"))
+                    {
+                        mDraftVocabSize = draftJsonConfig["draft_vocab_size"].get<int32_t>();
+                    }
+                    else
+                    {
+                        throw std::runtime_error(
+                            "Eagle3 Decoder: draft_vocab_size not found in draft config file: " + draftConfigPath);
+                    }
+                }
+                catch (Json::parse_error const& e)
+                {
+                    throw std::runtime_error("Eagle3 Decoder: Failed to parse draft config file: " + draftConfigPath);
+                }
+            }
+            else
+            {
+                throw std::runtime_error("Eagle3 Decoder: Failed to open draft config file: " + draftConfigPath);
+            }
         }
         else
         {
@@ -82,17 +109,17 @@ public:
         setupExtraInputsForDraftModelDecode();
     };
 
-    void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
-        std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
+    void generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> contextLengths,
+        std::vector<std::vector<int32_t>>& outputIds, GenerationConfig generationConfig, int32_t endIds = -1,
         bool isEagle3 = false, std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
         std::vector<int32_t>* newTokens = nullptr, std::vector<int32_t>* iterNumbers = nullptr);
     size_t getDeviceMemorySize() const noexcept;
-    void getLastHostLogits(std::vector<half>& hostLogits);
+    void getLastHostLogits(std::vector<LogitsType>& hostLogits);
     int64_t getModelBatchSize() const noexcept;
     int64_t getMinSupportedInputLength() const noexcept;
     int64_t getMaxSupportedInputLength() const noexcept;
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
-    void setupRopeCosSin(std::string const& configPath);
+    void setupRopeCosSin();
 
     ~Eagle()
     {
@@ -110,7 +137,7 @@ public:
 
 private:
     void addNewBufferForModelIO();
-    void invokeSamplingAndAccept(int64_t* draftIds, int32_t const curTokensPerStep, int64_t endIds);
+    void invokeSamplingAndAccept(int32_t* draftIds, int32_t const curTokensPerStep, int32_t endIds);
     void invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t layerIdx, HiddenStatesType* hs_draft);
     void invokeUpdateCumScoresAndParentsIds(int32_t layerIdx);
     void invokeAssembleDraftIdsAndPathAndMaskAndPositionIds();
@@ -134,7 +161,8 @@ private:
     std::map<std::string, void*> mEagleDeviceBuffer;
     std::map<std::string, void*> mEagleHostBuffer;
     EagleCommonParams mEagleCommonParams;
-    std::string mEagleEnginePath;
+    std::string mBaseModelDir;
+    std::string mDraftModelDir;
     std::vector<int64_t> acceptedLengthsHost{mBatchSize};
     std::vector<int64_t> lastLogitsOffsetHost{mBatchSize};
 

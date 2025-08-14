@@ -10,6 +10,7 @@
 
 import argparse
 import os
+import shutil
 import time
 
 import onnx
@@ -23,6 +24,39 @@ from utils.lora import insert_dynamic_lora, insert_static_lora
 from utils.surgeon_utils import (insert_attention_plugin,
                                  insert_gather_last_token,
                                  insert_gather_last_token_eagle)
+
+
+def save_tokenizer_to_output_dir(torch_dir, output_dir):
+    """
+    Save tokenizer files from torch_dir to output_dir.
+    
+    Args:
+        torch_dir: str, Path to the PyTorch model directory containing tokenizer files
+        output_dir: str, Path to the output directory where ONNX model is saved
+    """
+    tokenizer_files = [
+        "tokenizer_config.json",
+        "tokenizer.json",
+    ]
+
+    saved_files = []
+    for filename in tokenizer_files:
+        src_path = os.path.join(torch_dir, filename)
+        dst_path = os.path.join(output_dir, filename)
+
+        if os.path.exists(src_path):
+            try:
+                shutil.copy2(src_path, dst_path)
+                saved_files.append(filename)
+                print(f"Saved tokenizer file: {filename}")
+            except Exception as e:
+                print(f"Failed to copy {filename}: {e}")
+
+    if saved_files:
+        print(
+            f"Tokenizer files saved to {output_dir}: {', '.join(saved_files)}")
+    else:
+        print(f"Warning: No tokenizer files found in {torch_dir}")
 
 
 def llm_arguments():
@@ -103,6 +137,12 @@ def llm_arguments():
         choices=["merged", "none", "static", "dynamic"],
         help=
         "LoRA mode. Currently merged mode (weights merged into base model), static mode (weights not merged) and dynamic mode (weights as inputs) are supported",
+        required=False)
+    parser.add_argument(
+        '--tokenizer_dir',
+        type=str,
+        help=
+        "The directory containing tokenizer files (if different from torch_dir or when using existing ONNX)",
         required=False)
     parser.add_argument(
         '--eagle_base',
@@ -469,7 +509,7 @@ def main(args):
 
             if model.config.model_type in [
                     'internvl', 'qwen2_vl', 'qwen2_5_vl'
-            ]:
+            ] and not args.eagle_draft:
                 # This is a workaround to modelopt issue with quantizing the entire model.
                 # Ideally we would like to only quantize the language model, but in VLMs,
                 #   the model.model has both language model and vision model.
@@ -527,6 +567,14 @@ def main(args):
         eagle_base=args.eagle_base,
         eagle_draft=args.eagle_draft,
         eagle3=args.eagle3)
+
+    # Save tokenizer files to output directory
+    if args.tokenizer_dir is None:
+        tokenizer_source_dir = args.torch_dir
+    else:
+        tokenizer_source_dir = args.tokenizer_dir
+
+    save_tokenizer_to_output_dir(tokenizer_source_dir, args.output_dir)
 
     if args.eagle3 and args.eagle_draft:
         model_loader.save_d2t_for_eagle3_draft(args.output_dir)

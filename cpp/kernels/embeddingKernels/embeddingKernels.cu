@@ -274,7 +274,7 @@ void embeddingLookup(
 }
 
 void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
-    rt::Tensor const& imageEmbeds, int32_t vocabSize, rt::Tensor& output, cudaStream_t stream)
+    rt::Tensor const& imageEmbeds, rt::Tensor& output, cudaStream_t stream)
 {
     // Validate input shapes
     auto const inputShape = inputIds.getShape();
@@ -289,6 +289,7 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
+    int64_t const vocabSize = embeddingShape[0];
     int64_t const hiddenSize = embeddingShape[1];
     int64_t const imageTokenLen = imageShape[0];
 

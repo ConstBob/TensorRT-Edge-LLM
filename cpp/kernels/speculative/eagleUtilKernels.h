@@ -20,12 +20,12 @@ struct EagleCommonParams
 };
 struct AcceptDraftTokensByIdsWithPathsParams
 {
-    int64_t* outputIds{nullptr};
-    int64_t* inputIdsDraftDecode{nullptr};
+    int32_t* outputIds{nullptr};
+    int32_t* inputIdsDraftDecode{nullptr};
     //! input buffer [bs, maxDraftTokens]
-    int64_t* draftIds{nullptr};
+    int32_t* draftIds{nullptr};
     //! input buffer [bs, maxDecodingTokens-1]
-    int64_t* targetIds{nullptr};
+    int32_t* targetIds{nullptr};
     //! input buffer [bs]
     int32_t* contextLengths{nullptr};
     //! output buffer [bs]
@@ -37,7 +37,7 @@ struct AcceptDraftTokensByIdsWithPathsParams
     //! input buffer [bs,maxDecodingTokens,maxPathLen+1]
     int32_t* paths{nullptr};
     //! input buffer [bs]
-    int64_t endIds{0};
+    int32_t endIds{0};
 
     int32_t curTokensPerStep{1};
 };
@@ -46,7 +46,7 @@ template <typename T>
 struct UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams
 {
     //! input buffer [bs,topk,topk]
-    int64_t* outputIdsAllDraft{nullptr};
+    int32_t* outputIdsAllDraft{nullptr};
     //! input buffer[bs,topk,hidden_dim]
     T* inputHiddenStatesDraft{nullptr};
     //! input buffer[bs,topk,topk]
@@ -59,21 +59,21 @@ struct UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScores
     bool* treeMaskUpdateforAttention{nullptr};
 
     //! input buffer[bs,topk]
-    int64_t* treeIndices{nullptr};
+    int32_t* treeIndices{nullptr};
     //! input buffer[bs]
     int32_t* curContextLengths{nullptr};
 
     //! input buffer[bs,topk*topk]
     float* cumScoresForThirdTopk{nullptr};
     //! input buffer[bs,topk]
-    int64_t* outputIdsForThirdTopk{nullptr};
+    int32_t* outputIdsForThirdTopk{nullptr};
     //! input buffer[bs,maxPathLen*topk*topk]
-    int64_t* allTokens{nullptr};
+    int32_t* allTokens{nullptr};
     //! input buffer[bs,topk]
-    int64_t* draftVoc{nullptr};
+    int32_t* draftVoc{nullptr};
 
     //! output buffer[bs,topk]--->[bs,maxPathLen,topk]
-    int64_t* selectedOutputIdsDraft{nullptr};
+    int32_t* selectedOutputIdsDraft{nullptr};
     //! output buffer[bs,topk,hidden_dim]
     T* outputHiddenStatesDraft{nullptr};
     //! output buffer[bs,topk*(depth+1)]
@@ -99,9 +99,9 @@ struct UpdateCumScoresAndParentsIdsParams
     //! input buffer [bs,topk]
     float* intermediateScores{nullptr};
     //! input buffer [bs,topk]
-    int64_t* outputIdsCurrentDraft{nullptr};
+    int32_t* outputIdsCurrentDraft{nullptr};
     //! output buffer [bs,topk,topk]
-    int64_t* parantsIds{nullptr};
+    int64_t* parentsIds{nullptr};
     //! output buffer [bs,topk]
     float* cumScores{nullptr};
     int32_t layerIdx{0};
@@ -112,13 +112,13 @@ struct UpdateCumScoresAndParentsIdsParams
 struct AssembleDraftIdsAndPathAndMaskAndPositionIdsParams
 {
     //! input buffer [bs,topk]
-    int64_t* fourthTopKIds{nullptr};
+    int32_t* fourthTopKIds{nullptr};
     //! input buffer [bs,p_len] p_len=510
-    int64_t* allDraftIds{nullptr};
+    int32_t* allDraftIds{nullptr};
     //! input buffer [bs,p_len]
     int64_t* allDraftIdsAncestors{nullptr};
     //! input buffer [bs,maxSeqLen]
-    int64_t* modelInputIds{nullptr};
+    int32_t* modelInputIds{nullptr};
     //! input buffer [bs]
     int32_t* contextLengths{nullptr};
     //! output buffer [bs,maxDecodingTokens,maxDecodingTokens]
@@ -126,7 +126,7 @@ struct AssembleDraftIdsAndPathAndMaskAndPositionIdsParams
     //! output buffer [bs,maxDecodingTokens]
     int32_t* positionIds{nullptr};
     //! output buffer [bs,maxDecodingDraftTokens]
-    int64_t* draftIds{nullptr};
+    int32_t* draftIds{nullptr};
     //! output buffer [bs,maxDecodingDraftTokens]
     int64_t* draftIdsAncestors{nullptr};
     //! output buffer [bs,maxDecodingTokens,maxPathLen]

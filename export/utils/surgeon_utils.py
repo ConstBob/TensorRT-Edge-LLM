@@ -62,11 +62,8 @@ def no_none_elements(l):
 
 def find_last_reshape_node(graph: gs.Graph):
 
-    reshape_nodes = []
-    for node in graph.nodes:
-        if node.op == "Reshape":
-            reshape_nodes.append(node)
-    sorted_nodes = list(graph.toposort().nodes)
+    graph.cleanup().toposort()
+    sorted_nodes = list(graph.nodes)
     reshape_nodes = [node for node in sorted_nodes if node.op == "Reshape"]
     last_reshape = None
     if reshape_nodes:
@@ -100,6 +97,7 @@ def insert_gather_last_token_eagle(graph: gs.Graph,
     """
     start_time = time.time()
     print("Inserting GatherND to only compute logits for last token...")
+    graph.cleanup().toposort()
 
     logits = None
     for output in graph.outputs:
@@ -109,9 +107,8 @@ def insert_gather_last_token_eagle(graph: gs.Graph,
     assert logits, "Cannot find logits output in the graph!"
 
     lm_head_matmul = logits.inputs[0]
-    for i in range(5):
+    for _ in range(5):
         if "/lm_head/MatMul" in lm_head_matmul.name:
-            lm_head_matmul = clear_outputs(lm_head_matmul)
             break
         if "Gather" in lm_head_matmul.name:
             end_time = time.time()
@@ -141,11 +138,12 @@ def insert_gather_last_token_eagle(graph: gs.Graph,
         graph.layer(
             name="/lm_head/Gather",
             op="Gather",
-            inputs=[reshape_output, last_token_ids],  # 使用 reshape 的输出作为输入
+            inputs=[reshape_output,
+                    last_token_ids],  # Use reshape output as input
             outputs=[gather_output],
             attrs={"batch_dims": 1})
-        for node in graph.nodes:
-            if reshape_output in node.inputs and node.op != "Gather":
+        for node in reshape_output.outputs:
+            if node.op != "Gather":
                 node.inputs = [
                     gather_output if x == reshape_output else x
                     for x in node.inputs
@@ -171,23 +169,15 @@ def insert_gather_last_token_eagle(graph: gs.Graph,
         lm_head_matmul.inputs = [gather_output, lm_head_weight]
 
     if eagle_draft:
-        logits = clear_inputs(logits)
-        softmax_input = gs.Variable("/lm_head/Softmax_Input", np.float16)
-        softmax_output = logits
-        lm_head_matmul.outputs = [softmax_input]
+        op_before_logits = logits.inputs[0]
+        softmax_input = gs.Variable("/lm_head/Softmax_Input", np.float32)
+        op_before_logits.outputs = [softmax_input]
+        softmax_input.inputs = [op_before_logits]
         graph.layer(name="/lm_head/Softmax",
                     op="Softmax",
                     inputs=[softmax_input],
-                    outputs=[softmax_output],
+                    outputs=[logits],
                     attrs={"axis": -1})
-    else:
-        # Remove the last cast layer so logits are in fp16 instead of fp32
-        logits = clear_inputs(logits)
-        lm_head_matmul.outputs = [logits]
-        logits.inputs = [lm_head_matmul]
-    logits.dtype = np.float16
-    # Force logits to have shape of [batch_size, vocab_size].
-    logits.shape = [logits.shape[0], logits.shape[1]]
     graph.cleanup().toposort()
 
     end_time = time.time()
@@ -223,9 +213,8 @@ def insert_gather_last_token(graph: gs.Graph):
     assert logits, "Cannot find logits output in the graph!"
 
     lm_head_matmul = logits.inputs[0]
-    for i in range(5):
+    for _ in range(5):
         if "/lm_head/MatMul" in lm_head_matmul.name:
-            lm_head_matmul = clear_outputs(lm_head_matmul)
             break
         if "Gather" in lm_head_matmul.name:
             end_time = time.time()
@@ -256,14 +245,6 @@ def insert_gather_last_token(graph: gs.Graph):
 
     gather_output.outputs = [lm_head_matmul]
     lm_head_matmul.inputs = [gather_output, lm_head_weight]
-
-    # Remove the last cast layer so logits are in fp16 instead of fp32
-    logits = clear_inputs(logits)
-    lm_head_matmul.outputs = [logits]
-    logits.inputs = [lm_head_matmul]
-    logits.dtype = np.float16
-    # Force logits to have shape of [batch_size, vocab_size].
-    logits.shape = [logits.shape[0], logits.shape[2]]
 
     graph.cleanup().toposort()
     end_time = time.time()

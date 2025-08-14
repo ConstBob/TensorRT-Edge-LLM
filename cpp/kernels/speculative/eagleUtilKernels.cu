@@ -26,9 +26,9 @@ __inline__ __device__ int32_t packMaskBits(bool* mask, int32_t startIdx, int32_t
 }
 
 template <int32_t BLOCK_SIZE>
-__global__ void acceptDraftTokensByIdsWithPaths(int64_t* outputIds, int64_t* inputIdsDraftDecode,
-    int64_t const* draftIds, int64_t const* targetIds, int32_t* sequenceLengths, int64_t* acceptedLen,
-    int32_t* bestPathIds, int64_t* finishedFinal, int32_t const* paths, int64_t const endId,
+__global__ void acceptDraftTokensByIdsWithPaths(int32_t* outputIds, int32_t* inputIdsDraftDecode,
+    int32_t const* draftIds, int32_t const* targetIds, int32_t* sequenceLengths, int64_t* acceptedLen,
+    int32_t* bestPathIds, int64_t* finishedFinal, int32_t const* paths, int32_t const endId,
     int32_t const curTokensPerStep, int64_t const batchSize, int32_t const maxSeqLen, int32_t const maxPathLen,
     int32_t const maxDecodingTokens)
 {
@@ -175,12 +175,12 @@ void dispatchAcceptDraftTokensByIdsWithPaths(
 }
 
 template <typename T>
-__global__ void updateDraftInputIdsAndTreeMaskAndPositionIds(int64_t* outputIdsAllDraft,
-    int64_t* selectedOutputIdsDraft, int64_t* treeIndices, bool* treeMaskInput, bool* treeMaskInit,
+__global__ void updateDraftInputIdsAndTreeMaskAndPositionIds(int32_t* outputIdsAllDraft,
+    int32_t* selectedOutputIdsDraft, int32_t* treeIndices, bool* treeMaskInput, bool* treeMaskInit,
     bool* treeMaskUpdate, bool* treeMaskUpdateforAttention, int32_t* packedTreeMaskUpdateforAttention,
     int32_t* treePositionIds, int32_t* curContextLengths, int32_t* packedTreeMaskUpdateforAttentionNoPadding,
-    float* intermediateScores, float* cumScoresForThirdTopk, int64_t* outputIdsForThirdTopk, int64_t* allTokens,
-    int64_t const* draftVoc, int32_t topK, int32_t layerIdx, int32_t maxLength, int32_t batchSize, int32_t maxPathLen)
+    float* intermediateScores, float* cumScoresForThirdTopk, int32_t* outputIdsForThirdTopk, int32_t* allTokens,
+    int32_t const* draftVoc, int32_t topK, int32_t layerIdx, int32_t maxLength, int32_t batchSize, int32_t maxPathLen)
 {
     auto const idx = blockIdx.x * blockDim.x + threadIdx.x;
     auto const bs = idx / (maxLength * topK);
@@ -324,7 +324,7 @@ __global__ void updateDraftInputIdsAndTreeMaskAndPositionIds(int64_t* outputIdsA
 }
 
 template <typename T>
-__global__ void updateHiddenStates(T* inputHiddenStatesDraft, T* outputHiddenStatesDraft, int64_t* treeIndices,
+__global__ void updateHiddenStates(T* inputHiddenStatesDraft, T* outputHiddenStatesDraft, int32_t* treeIndices,
     int32_t batchSize, int32_t topK, int32_t hiddenDim, int32_t layerIdx, int32_t maxPathLen)
 {
     auto const idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -388,11 +388,11 @@ template void dispatchUpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionId
     UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<half> const& params,
     EagleCommonParams const& commonParams);
 
-inline __device__ void insertionSortOutputIds(int64_t* outputIds, int32_t n)
+inline __device__ void insertionSortOutputIds(int32_t* outputIds, int32_t n)
 {
     for (int32_t ii = 1; ii < n; ++ii)
     {
-        int64_t key = outputIds[ii];
+        int32_t key = outputIds[ii];
         int32_t jj = ii - 1;
 
         while (jj >= 0 && outputIds[jj] > key)
@@ -403,7 +403,7 @@ inline __device__ void insertionSortOutputIds(int64_t* outputIds, int32_t n)
         outputIds[jj + 1] = key;
     }
 }
-inline __device__ int64_t findAncestorIndex(int64_t* draftIds, int32_t tokenIdx, int32_t topK, int32_t maxDraftTokens)
+inline __device__ int64_t findAncestorIndex(int32_t* draftIds, int32_t tokenIdx, int32_t topK, int32_t maxDraftTokens)
 {
     int target = tokenIdx - 1;
     int left = 0;
@@ -423,9 +423,9 @@ inline __device__ int64_t findAncestorIndex(int64_t* draftIds, int32_t tokenIdx,
     return left;
 }
 
-__global__ void assembleDraftIdsAndTreeMaskAndPositionIdsAndPredecessors(int64_t const* thirdTopKIds,
-    int64_t const* allDraftIds, int64_t const* allDraftIdsAncestors, int64_t const* modelInputIds,
-    int32_t const* contextLengths, bool* treeMask, int32_t* positionIds, int64_t* draftIds, int64_t* draftIdsAncestors,
+__global__ void assembleDraftIdsAndTreeMaskAndPositionIdsAndPredecessors(int32_t const* thirdTopKIds,
+    int32_t const* allDraftIds, int64_t const* allDraftIdsAncestors, int32_t const* modelInputIds,
+    int32_t const* contextLengths, bool* treeMask, int32_t* positionIds, int32_t* draftIds, int64_t* draftIdsAncestors,
     int32_t* packedTreeMaskVerification, int32_t const batchSize, int32_t const maxDraftTokens,
     int32_t const maxDecodingTokens, int32_t const topK, int64_t const maxSeqLen)
 {
@@ -438,19 +438,19 @@ __global__ void assembleDraftIdsAndTreeMaskAndPositionIdsAndPredecessors(int64_t
         int const batchIdx = idx / maxDecodingTokens;
         int const tokenIdx = idx % maxDecodingTokens;
 
-        int64_t const* curThirdTopKIds = thirdTopKIds + batchIdx * maxDraftTokens;
-        int64_t const* curAllDraftIds = allDraftIds + batchIdx * maxDraftTokens;
+        int32_t const* curThirdTopKIds = thirdTopKIds + batchIdx * maxDraftTokens;
+        int32_t const* curAllDraftIds = allDraftIds + batchIdx * maxDraftTokens;
         int64_t const* curAllDraftIdsAncestors = allDraftIdsAncestors + batchIdx * maxDraftTokens;
         bool* curTreeMask = treeMask + batchIdx * maxDecodingTokens * maxDecodingTokens;
         int32_t* curPositionIds = positionIds + batchIdx * maxDecodingTokens;
-        int64_t* curDraftIds = draftIds + batchIdx * maxDecodingTokens;
+        int32_t* curDraftIds = draftIds + batchIdx * maxDecodingTokens;
         int64_t* curDraftIdsAncestors = draftIdsAncestors + batchIdx * maxDraftTokens;
-        int64_t const* curModelInputIds = modelInputIds + batchIdx * maxSeqLen;
+        int32_t const* curModelInputIds = modelInputIds + batchIdx * maxSeqLen;
 
         extern __shared__ char smem[];
         bool* curMask = (bool*) (smem) + threadIdx.x * maxDecodingTokens;
 
-        int64_t* sortedIds = (int64_t*) (smem + blockDim.x * maxDecodingTokens * sizeof(bool));
+        int32_t* sortedIds = (int32_t*) (smem + blockDim.x * maxDecodingTokens * sizeof(bool));
 
         // The first thread in each block is responsible for sorting
         if (threadIdx.x == 0)
@@ -633,7 +633,7 @@ void dispatchAssembleDraftIdsAndPathAndMaskAndPositionIds(
     auto gridSize = (commonParams.maxDecodingTokens * commonParams.batchSize + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     size_t smemSize = (BLOCK_SIZE * commonParams.maxDecodingTokens * sizeof(bool)
-                          + commonParams.maxDecodingTokens * sizeof(int64_t) + 15)
+                          + commonParams.maxDecodingTokens * sizeof(int32_t) + 15)
         & ~15;
     assembleDraftIdsAndTreeMaskAndPositionIdsAndPredecessors<<<gridSize, BLOCK_SIZE, smemSize, commonParams.stream>>>(
         params.fourthTopKIds, params.allDraftIds, params.allDraftIdsAncestors, params.modelInputIds,
@@ -649,7 +649,7 @@ void dispatchAssembleDraftIdsAndPathAndMaskAndPositionIds(
 }
 
 __global__ void updateCumScoresAndParentsIds(float* outputLogProbsAllDraft, float* intermediateScores, float* cumScores,
-    int64_t* outputIdsCurrentDraft, int64_t* parantsIds, int32_t bias, int32_t layerIdx, int32_t topK,
+    int32_t* outputIdsCurrentDraft, int64_t* parentsIds, int32_t bias, int32_t layerIdx, int32_t topK,
     int32_t batchSize, int32_t maxPathLen)
 {
     auto const idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -676,13 +676,13 @@ __global__ void updateCumScoresAndParentsIds(float* outputLogProbsAllDraft, floa
             int parentIdx = bs * topK * topK + layerIdx * topK - topK + 1 + tokenIdx;
             if (layerIdx == 1)
             {
-                parantsIds[parentIdx] = tokenIdx + bias;
+                parentsIds[parentIdx] = tokenIdx + bias;
             }
             else
             {
                 auto const src = outputIdsCurrentDraft[bs * topK + tokenIdx];
 
-                parantsIds[parentIdx] = src + bias;
+                parentsIds[parentIdx] = src + bias;
             }
         }
 
@@ -699,7 +699,7 @@ void dispatchUpdateCumScoresAndParentsIds(
     constexpr int32_t BLOCK_SIZE = 128;
     int64_t gridSize = (commonParams.batchSize * commonParams.topK * commonParams.topK + BLOCK_SIZE - 1) / BLOCK_SIZE;
     updateCumScoresAndParentsIds<<<gridSize, BLOCK_SIZE, 0, commonParams.stream>>>(params.outputLogProbsAllDraft,
-        params.intermediateScores, params.cumScores, params.outputIdsCurrentDraft, params.parantsIds, params.bias,
+        params.intermediateScores, params.cumScores, params.outputIdsCurrentDraft, params.parentsIds, params.bias,
         params.layerIdx, commonParams.topK, commonParams.batchSize, commonParams.maxPathLen);
 }
 

@@ -40,23 +40,21 @@ struct VlmBenchmarkArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] [--enginePath=<path to LLM engine>] [--visualEnginePath=<path to visual engine>]"
-                 " <--imageTokenLength int> <--textTokenLength int> <--outputLength int> [--warmUp int] [--numRuns "
-                 "int] [--batchSize int]"
+              << " [--help] [--engineDir=<path to LLM engine directory>] [--visualEnginePath=<path to visual engine>]"
+                 " [--modelType=<model type>] [--textTokenLength=<int>] [--imageTokenLength=<int>]"
+                 " [--outputLength=<int>] [--warmUp=<int>] [--numRuns=<int>] [--batchSize=<int>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  --textTokenLength   Provide the number of text tokens to the runtime. Required. " << std::endl;
-    std::cerr << "  --imageTokenLength  Provide the number of image tokens to the runtime. Required. " << std::endl;
-    std::cerr << "  --outputLength      Provide the output token length for the generation session (NOT including the "
-                 "input). Required."
-              << std::endl;
-    std::cerr << "  --warmUp            Provide warm up iterations before benchmark starts. Default = 2." << std::endl;
-    std::cerr << "  --numRuns           Minimal number of iterations to run during benchmarking. Default = 10."
-              << std::endl;
-    std::cerr << "  --batchSize         Provide the batch size for benchmarking. Default = 1." << std::endl;
     CommonUsage::printBaseOptions();
     CommonUsage::printVLMRunOptions();
     CommonUsage::printLoraOptions();
+    std::cerr << "  --textTokenLength   Provide the text token length. Required. " << std::endl;
+    std::cerr << "  --imageTokenLength  Provide the image token length. Required. " << std::endl;
+    std::cerr << "  --outputLength      Provide the output length. Required. " << std::endl;
+    std::cerr << "  --warmUp            Provide warm up iterations before benchmark starts. Default = 2." << std::endl;
+    std::cerr << "  --numRuns           Minimal number of iterations to run during benchmarking. Default = 10."
+              << std::endl;
+    std::cerr << "  --batchSize         Provide the batch size. Default = 1." << std::endl;
 };
 
 bool parseVlmBenchmarkArgs(VlmBenchmarkArgs& args, int argc, char* argv[])
@@ -79,7 +77,7 @@ bool parseVlmBenchmarkArgs(VlmBenchmarkArgs& args, int argc, char* argv[])
     int opt;
     while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
-        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, false))
+        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg))
         {
             continue;
         }
@@ -211,7 +209,7 @@ void printBenchmarkResult(std::shared_ptr<BenchmarkProfiler> const profiler, int
 
 size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
-    int const imageTokenLength, std::vector<std::vector<int64_t>>& outputIds,
+    int const imageTokenLength, std::vector<std::vector<int32_t>>& outputIds,
     std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph,
     std::string const& modelType, LoraWeights const& loraWeights)
 {
@@ -227,7 +225,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     profiler->recordHostMemStart();
     profiler->recordHostStart("decoder setup");
     vitrunner->setup(visualEnginePath, stream, batchSize);
-    decoder->setup(llmEnginePath, stream, useCudaGraph, batchSize);
+    decoder->setup(llmEnginePath, batchSize, false, "", useCudaGraph, stream);
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
     // Load and switch to LoRA weights if provided
@@ -253,7 +251,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     std::vector<half> visualInput;
     std::vector<half> visualAttentionMask;
     std::vector<float> visualRotaryPosEmb;
-    std::vector<int64_t> inputIds(batchSize * decoder->getMaxSupportedInputLength(), -1);
+    std::vector<int32_t> inputIds(batchSize * decoder->getMaxSupportedInputLength(), -1);
     std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
     // Only initialized for qwen2_5_vl
     std::vector<half> visualWindowAttentionMask;
@@ -322,7 +320,7 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
 
 size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
     GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
-    int const imageTokenLength, std::vector<std::vector<int64_t>>& outputIds,
+    int const imageTokenLength, std::vector<std::vector<int32_t>>& outputIds,
     std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph,
     std::string const& modelType, LoraWeights const& loraWeights)
 {
@@ -333,18 +331,14 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
     auto vitrunner = new InternVLViTRunner(modelType);
     auto decoder = new Decoder();
 
-    // Initialize rope_rotary_cos_sin
-    std::string baseFolderPath = extractFolderName(llmEnginePath);
-    std::string configPath = baseFolderPath + "/config.json";
-
     profiler->startTiming();
     profiler->recordDeviceMemStart();
     profiler->recordHostMemStart();
     profiler->recordHostStart("decoder setup");
     vitrunner->setup(visualEnginePath, stream, batchSize);
-    decoder->setup(llmEnginePath, stream, useCudaGraph, batchSize);
+    decoder->setup(llmEnginePath, batchSize, false, "", useCudaGraph, stream);
     decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
-    decoder->setupRopeCosSin(configPath);
+    decoder->setupRopeCosSin();
 
     // Load and switch to LoRA weights if provided
     if (loraWeights.hasWeights())
@@ -367,7 +361,7 @@ size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::files
 
     // Preprocess
     std::vector<half> visualInput;
-    std::vector<int64_t> inputIds(batchSize * decoder->getMaxSupportedInputLength(), -1);
+    std::vector<int32_t> inputIds(batchSize * decoder->getMaxSupportedInputLength(), -1);
     std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
 
     vitrunner->initRandomInputs(
@@ -417,7 +411,7 @@ void benchmarkVLM(VlmBenchmarkArgs const& args)
     int totalSeqLength = args.textTokenLength + args.imageTokenLength + args.outputLength;
     GenerationConfig generationConfig{totalSeqLength, totalSeqLength, 1, 1};
 
-    std::vector<std::vector<int64_t>> outputIds(args.batchSize);
+    std::vector<std::vector<int32_t>> outputIds(args.batchSize);
     for (int i = 0; i < args.batchSize; ++i)
     {
         outputIds[i].reserve(args.outputLength);
@@ -428,13 +422,13 @@ void benchmarkVLM(VlmBenchmarkArgs const& args)
 
     if (args.vlmRunParams.modelType == "qwen2_vl" || args.vlmRunParams.modelType == "qwen2_5_vl")
     {
-        deviceMemorySize = benchmarkQwen2VL(args.baseParams.enginePath, args.vlmRunParams.visualEnginePath,
+        deviceMemorySize = benchmarkQwen2VL(args.baseParams.engineDir, args.vlmRunParams.visualEnginePath,
             generationConfig, args.batchSize, args.textTokenLength, args.imageTokenLength, outputIds, profiler,
             args.warmUp, args.numRuns, !args.baseParams.noCudaGraph, args.vlmRunParams.modelType, args.loraWeights);
     }
     else if (args.vlmRunParams.modelType == "internvl3")
     {
-        deviceMemorySize = benchmarkInternVL3(args.baseParams.enginePath, args.vlmRunParams.visualEnginePath,
+        deviceMemorySize = benchmarkInternVL3(args.baseParams.engineDir, args.vlmRunParams.visualEnginePath,
             generationConfig, args.batchSize, args.textTokenLength, args.imageTokenLength, outputIds, profiler,
             args.warmUp, args.numRuns, !args.baseParams.noCudaGraph, args.vlmRunParams.modelType, args.loraWeights);
     }

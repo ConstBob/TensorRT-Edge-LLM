@@ -35,27 +35,26 @@ namespace drivellm
 // WORKSPACE MANAGEMENT STRUCTURE
 // ========================================================================
 
-// Internal workspace structure for memory management
-template <typename T>
+// Internal workspace structure for memory management (FP32 only)
 struct SamplingWorkspace
 {
     void* ptr;
     size_t size;
 
     // Buffer pointers and sizes for different sampling methods
-    T* topkTempLogits;
+    float* topkTempLogits;
     int32_t* topkIndices;
-    T* topkValues;
+    float* topkValues;
 
     void* toppTempStorage; // Keep as void* for CUB temp storage
-    T* toppProbs;
-    T* toppSortedProbs;
+    float* toppProbs;
+    float* toppSortedProbs;
     int32_t* toppSortedIdVals;
     int32_t* toppIdVals;
     int32_t* toppOffsetBuf;
     int32_t* toppBeginOffsetBuf;
     int32_t* toppTopKIndices;
-    T* toppTopKValues;
+    float* toppTopKValues;
     int32_t* toppEarlyExitFlags;
 
     SamplingWorkspace()
@@ -95,17 +94,17 @@ struct SamplingWorkspace
         if (params.useTopK)
         {
             // Top-K workspace layout
-            size_t tempLogitsSize = alignSize(params.batchSize * params.vocabSize * sizeof(T));
+            size_t tempLogitsSize = alignSize(params.batchSize * params.vocabSize * sizeof(float));
             size_t indicesSize = alignSize(params.batchSize * 8 * params.topK * sizeof(int32_t)); // BLOCKS_PER_BEAM = 8
-            size_t valuesSize = alignSize(params.batchSize * 8 * params.topK * sizeof(T));
+            size_t valuesSize = alignSize(params.batchSize * 8 * params.topK * sizeof(float));
 
-            topkTempLogits = reinterpret_cast<T*>(static_cast<char*>(ptr) + offset);
+            topkTempLogits = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset);
             offset += tempLogitsSize;
 
             topkIndices = reinterpret_cast<int32_t*>(static_cast<char*>(ptr) + offset);
             offset += indicesSize;
 
-            topkValues = reinterpret_cast<T*>(static_cast<char*>(ptr) + offset);
+            topkValues = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset);
             offset += valuesSize;
         }
         else if (params.useTopP)
@@ -113,19 +112,19 @@ struct SamplingWorkspace
             // Top-P workspace layout
             // Calculate CUB temp storage size
             size_t cubTempStorageSize;
-            cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr, cubTempStorageSize, static_cast<T*>(nullptr),
-                static_cast<T*>(nullptr), static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
-                static_cast<int32_t>(params.vocabSize * params.batchSize), params.batchSize,
-                static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr));
+            cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr, cubTempStorageSize,
+                static_cast<float*>(nullptr), static_cast<float*>(nullptr), static_cast<int32_t*>(nullptr),
+                static_cast<int32_t*>(nullptr), static_cast<int32_t>(params.vocabSize * params.batchSize),
+                params.batchSize, static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr));
 
             toppTempStorage = static_cast<char*>(ptr) + offset;
             offset += alignSize(cubTempStorageSize);
 
-            toppProbs = reinterpret_cast<T*>(static_cast<char*>(ptr) + offset);
-            offset += alignSize(params.batchSize * params.vocabSize * sizeof(T));
+            toppProbs = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset);
+            offset += alignSize(params.batchSize * params.vocabSize * sizeof(float));
 
-            toppSortedProbs = reinterpret_cast<T*>(static_cast<char*>(ptr) + offset);
-            offset += alignSize(params.batchSize * params.vocabSize * sizeof(T));
+            toppSortedProbs = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset);
+            offset += alignSize(params.batchSize * params.vocabSize * sizeof(float));
 
             toppSortedIdVals = reinterpret_cast<int32_t*>(static_cast<char*>(ptr) + offset);
             offset += alignSize(params.batchSize * params.vocabSize * sizeof(int32_t));
@@ -142,8 +141,8 @@ struct SamplingWorkspace
             toppTopKIndices = reinterpret_cast<int32_t*>(static_cast<char*>(ptr) + offset);
             offset += alignSize(params.batchSize * params.vocabSize * sizeof(int32_t));
 
-            toppTopKValues = reinterpret_cast<T*>(static_cast<char*>(ptr) + offset);
-            offset += alignSize(params.batchSize * params.vocabSize * sizeof(T));
+            toppTopKValues = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset);
+            offset += alignSize(params.batchSize * params.vocabSize * sizeof(float));
 
             toppEarlyExitFlags = reinterpret_cast<int32_t*>(static_cast<char*>(ptr) + offset);
             offset += alignSize(params.batchSize * sizeof(int32_t));
@@ -173,17 +172,17 @@ struct SamplingWorkspace
         size_t offset = 0;
 
         // Same layout as top-K sampling
-        size_t tempLogitsSize = alignSize(batchSize * vocabSize * sizeof(T));
+        size_t tempLogitsSize = alignSize(batchSize * vocabSize * sizeof(float));
         size_t indicesSize = alignSize(batchSize * 8 * topK * sizeof(int32_t)); // BLOCKS_PER_BEAM = 8
-        size_t valuesSize = alignSize(batchSize * 8 * topK * sizeof(T));
+        size_t valuesSize = alignSize(batchSize * 8 * topK * sizeof(float));
 
-        topkTempLogits = reinterpret_cast<T*>(static_cast<char*>(ptr) + offset);
+        topkTempLogits = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset);
         offset += tempLogitsSize;
 
         topkIndices = reinterpret_cast<int32_t*>(static_cast<char*>(ptr) + offset);
         offset += indicesSize;
 
-        topkValues = reinterpret_cast<T*>(static_cast<char*>(ptr) + offset);
+        topkValues = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset);
         offset += valuesSize;
 
         // Validate workspace size
@@ -199,8 +198,7 @@ struct SamplingWorkspace
 // WORKSPACE SIZE CALCULATION
 // ========================================================================
 
-// Enhanced workspace size calculation that handles alignment
-template <typename T>
+// Enhanced workspace size calculation that handles alignment (FP32 only)
 size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, SamplingParams const& params)
 {
     size_t workspaceSize = 0;
@@ -213,28 +211,28 @@ size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, Sa
 
     if (params.useTopK)
     {
-        workspaceSize += alignSize(batchSize * vocabSize * sizeof(T));             // temp logits
+        workspaceSize += alignSize(batchSize * vocabSize * sizeof(float));         // temp logits
         workspaceSize += alignSize(batchSize * 8 * params.topK * sizeof(int32_t)); // top-k indices
-        workspaceSize += alignSize(batchSize * 8 * params.topK * sizeof(T));       // top-k values
+        workspaceSize += alignSize(batchSize * 8 * params.topK * sizeof(float));   // top-k values
     }
     else if (params.useTopP)
     {
         // Calculate CUB temp storage size
         size_t cubTempStorageSize;
-        cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr, cubTempStorageSize, static_cast<T*>(nullptr),
-            static_cast<T*>(nullptr), static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
+        cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr, cubTempStorageSize, static_cast<float*>(nullptr),
+            static_cast<float*>(nullptr), static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
             static_cast<int32_t>(vocabSize * batchSize), batchSize, static_cast<int32_t*>(nullptr),
             static_cast<int32_t*>(nullptr));
 
         workspaceSize += alignSize(cubTempStorageSize);                      // CUB temp storage
-        workspaceSize += alignSize(batchSize * vocabSize * sizeof(T));       // probs
-        workspaceSize += alignSize(batchSize * vocabSize * sizeof(T));       // sorted probs
+        workspaceSize += alignSize(batchSize * vocabSize * sizeof(float));   // probs
+        workspaceSize += alignSize(batchSize * vocabSize * sizeof(float));   // sorted probs
         workspaceSize += alignSize(batchSize * vocabSize * sizeof(int32_t)); // sorted id vals
         workspaceSize += alignSize(batchSize * vocabSize * sizeof(int32_t)); // id vals
         workspaceSize += alignSize((batchSize + 1) * sizeof(int32_t));       // offset buf
         workspaceSize += alignSize((batchSize + 1) * sizeof(int32_t));       // begin offset buf
         workspaceSize += alignSize(batchSize * vocabSize * sizeof(int32_t)); // top-k indices
-        workspaceSize += alignSize(batchSize * vocabSize * sizeof(T));       // top-k values
+        workspaceSize += alignSize(batchSize * vocabSize * sizeof(float));   // top-k values
         workspaceSize += alignSize(batchSize * sizeof(int32_t));             // early exit flags
     }
     else
@@ -246,8 +244,7 @@ size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, Sa
     return workspaceSize;
 }
 
-// Calculate workspace size for selectAllTopK
-template <typename T>
+// Calculate workspace size for selectAllTopK (FP32 only)
 size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK)
 {
     auto alignSize = [](size_t size) -> size_t {
@@ -256,97 +253,28 @@ size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32
     };
 
     size_t workspaceSize = 0;
-    workspaceSize += alignSize(batchSize * vocabSize * sizeof(T));      // temp logits
+    workspaceSize += alignSize(batchSize * vocabSize * sizeof(float));  // temp logits
     workspaceSize += alignSize(batchSize * 8 * topK * sizeof(int32_t)); // top-k indices
-    workspaceSize += alignSize(batchSize * 8 * topK * sizeof(T));       // top-k values
+    workspaceSize += alignSize(batchSize * 8 * topK * sizeof(float));   // top-k values
 
     return workspaceSize;
 }
 
-// Device functions for math operations
-template <typename T>
-__device__ T exp_device(T x);
-
-template <>
-__device__ float exp_device<float>(float x)
+// Device functions for math operations (FP32 only)
+__device__ float exp_device(float x)
 {
     return expf(x);
 }
 
-template <>
-__device__ half exp_device<half>(half x)
-{
-    return __float2half(__expf(__half2float(x)));
-}
-
-template <>
-__device__ __nv_bfloat16 exp_device<__nv_bfloat16>(__nv_bfloat16 x)
-{
-    return __float2bfloat16(__expf(__bfloat162float(x)));
-}
-
-template <typename T>
-__device__ T max_device(T a, T b);
-
-template <>
-__device__ float max_device<float>(float a, float b)
+__device__ float max_device(float a, float b)
 {
     return fmaxf(a, b);
 }
 
-template <>
-__device__ half max_device<half>(half a, half b)
-{
-    return __hmax(a, b);
-}
-
-template <>
-__device__ __nv_bfloat16 max_device<__nv_bfloat16>(__nv_bfloat16 a, __nv_bfloat16 b)
-{
-    return __hmax(a, b);
-}
-
-// Helper function to convert T to float
-template <typename T>
-__device__ float toFloat(T x)
-{
-    if constexpr (std::is_same_v<T, float>)
-    {
-        return x;
-    }
-    else if constexpr (std::is_same_v<T, half>)
-    {
-        return __half2float(x);
-    }
-    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
-    {
-        return __bfloat162float(x);
-    }
-}
-
-// Helper function to convert float to T
-template <typename T>
-__device__ T fromFloat(float x)
-{
-    if constexpr (std::is_same_v<T, float>)
-    {
-        return x;
-    }
-    else if constexpr (std::is_same_v<T, half>)
-    {
-        return __float2half(x);
-    }
-    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
-    {
-        return __float2bfloat16(x);
-    }
-}
-
-// Helper structures for top-k reduction operations (similar to TRT-LLM)
-template <typename T>
+// Helper structures for top-k reduction operations (FP32 only)
 struct TopK_2
 {
-    T value;
+    float value;
     int32_t index;
 
     __device__ __forceinline__ void init()
@@ -355,7 +283,7 @@ struct TopK_2
         index = -1;
     }
 
-    __device__ __forceinline__ void insert(T elem, int32_t elemId)
+    __device__ __forceinline__ void insert(float elem, int32_t elemId)
     {
         if (elem > value)
         {
@@ -365,39 +293,36 @@ struct TopK_2
     }
 };
 
-template <typename T>
 struct maxOpFunctor
 {
-    __device__ __forceinline__ T operator()(T const& a, T const& b) const
+    __device__ __forceinline__ float operator()(float const& a, float const& b) const
     {
         return a > b ? a : b;
     }
 };
 
-template <typename T>
 struct sumOpFunctor
 {
-    __device__ __forceinline__ T operator()(T const& a, T const& b) const
+    __device__ __forceinline__ float operator()(float const& a, float const& b) const
     {
         return a + b;
     }
 };
 
-// Reduction operator for top-k
-template <typename T>
+// Reduction operator for top-k (FP32 only)
 struct topk2MaxOpFunctor
 {
-    __device__ __forceinline__ TopK_2<T> operator()(TopK_2<T> const& a, TopK_2<T> const& b) const
+    __device__ __forceinline__ TopK_2 operator()(TopK_2 const& a, TopK_2 const& b) const
     {
         return a.value > b.value ? a : b;
     }
 };
 
-// Stage 2 kernel for returnAllTopK that matches the old sampler's approach
-template <typename T, int BLOCK_SIZE>
-__global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, T* topKTmpValBuf,
-    int64_t* outputIndices, float* outputValues, T* outputTValues, int32_t batchSize, int32_t vocabSize, int32_t topK,
-    int32_t blocksPerBeam, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs)
+// Stage 2 kernel for returnAllTopK that matches the old sampler's approach (FP32 only)
+template <int BLOCK_SIZE>
+__global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, float* topKTmpValBuf,
+    int32_t* outputIndices, float* outputValues, float* outputTValues, int32_t batchSize, int32_t vocabSize,
+    int32_t topK, int32_t blocksPerBeam, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs)
 {
     auto const tid = static_cast<int32_t>(threadIdx.x);
     auto const batchIdx = static_cast<int32_t>(blockIdx.x);
@@ -408,17 +333,17 @@ __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, 
     auto const size = topK * blocksPerBeam;
     auto const stride = topK * blocksPerBeam;
 
-    typedef cub::BlockReduce<TopK_2<float>, BLOCK_SIZE> BlockReduce;
+    typedef cub::BlockReduce<TopK_2, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
     extern __shared__ char array[];
     __shared__ float sSum;
-    T* sVal = topKTmpValBuf + batchIdx * stride;
+    float* sVal = topKTmpValBuf + batchIdx * stride;
     auto* sId = reinterpret_cast<int32_t*>(array);
     if (tid == 0)
     {
         sSum = 0.0f;
     }
-    TopK_2<float> partial;
+    TopK_2 partial;
 
     auto sVal2 = reinterpret_cast<float*>(sId + topK);
     float maxLogit;
@@ -428,10 +353,10 @@ __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, 
 #pragma unroll
         for (int32_t i = tid; i < size; i += BLOCK_SIZE)
         {
-            partial.insert((float) sVal[i], i);
+            partial.insert(sVal[i], i);
         }
 
-        TopK_2<float> total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor<float>());
+        TopK_2 total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor());
 
         if (tid == 0)
         {
@@ -477,7 +402,7 @@ __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, 
 
             if (outputTValues != nullptr)
             {
-                outputTValues[batchIdx * topK + ki] = fromFloat<T>(expLogit);
+                outputTValues[batchIdx * topK + ki] = expLogit;
             }
         }
     }
@@ -505,12 +430,12 @@ struct BlockPrefixCallbackOp
 // TOP-K SAMPLING KERNELS (Based on TensorRT-LLM two-stage approach)
 // =======================================================================================
 
-// Stage 1: Find top-K elements using iterative block-level reduction
-template <typename T, int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
-__global__ void topKStage1(
-    T const* __restrict__ logits, T* tmpLogits, int32_t* topKTmpIdBuf, T* topKTmpValBuf, SamplingParams const params)
+// Stage 1: Find top-K elements using iterative block-level reduction (FP32 only)
+template <int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
+__global__ void topKStage1(float const* __restrict__ logits, float* tmpLogits, int32_t* topKTmpIdBuf,
+    float* topKTmpValBuf, SamplingParams const params)
 {
-    typedef cub::BlockReduce<TopK_2<T>, BLOCK_SIZE_> BlockReduce;
+    typedef cub::BlockReduce<TopK_2, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
 
     auto const tid = static_cast<int32_t>(threadIdx.x);
@@ -530,17 +455,15 @@ __global__ void topKStage1(
     auto const tmpLogBufIndex = batchId * vocabSize;
     auto const tmpTopKBufIndex = batchId * BLOCKS_PER_BEAM_ * k + blockLane * k;
 
-    TopK_2<T> partial;
-    bool const IS_FP16 = std::is_same<T, half>::value;
-    T const MAX_T_VAL = (IS_FP16) ? fromFloat<T>(HALF_FLT_MAX) : fromFloat<T>(FLT_MAX);
+    TopK_2 partial;
+    float const MAX_T_VAL = FLT_MAX;
 
     // Copy logits to temporary buffer and apply temperature
     for (auto elemId = tid + blockLane * BLOCK_SIZE_; elemId < vocabSize; elemId += BLOCK_SIZE_ * BLOCKS_PER_BEAM_)
     {
         auto localIndex = elemId + tmpLogBufIndex;
-        T logit = logits[localIndex];
-        float floatLogit = toFloat(logit) * invTemp;
-        tmpLogits[localIndex] = fromFloat<T>(floatLogit);
+        float logit = logits[localIndex];
+        tmpLogits[localIndex] = logit * invTemp;
     }
 
     // Find top-K elements iteratively
@@ -554,7 +477,7 @@ __global__ void topKStage1(
             partial.insert(tmpLogits[index], index);
         }
 
-        TopK_2<T> total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor<T>());
+        TopK_2 total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor());
 
         if (tid == 0)
         {
@@ -571,13 +494,12 @@ __global__ void topKStage1(
     }
 }
 
-// Stage 2: Sample from top-K elements using softmax
-template <typename T, int BLOCK_SIZE_>
-__global__ void topKStage2Sampling(int32_t const* __restrict__ topKTmpIdBuf, T* topKTmpValBuf,
-    int64_t* __restrict__ selectedIndices, SamplingParams const params, uint64_t philoxSeed, uint64_t philoxOffset)
+// Stage 2: Sample from top-K elements using softmax (FP32 only)
+template <int BLOCK_SIZE_>
+__global__ void topKStage2Sampling(int32_t const* __restrict__ topKTmpIdBuf, float* topKTmpValBuf,
+    int32_t* __restrict__ selectedIndices, SamplingParams const params, uint64_t philoxSeed, uint64_t philoxOffset)
 {
-    bool const IS_FP16 = std::is_same<T, half>::value;
-    T const MAX_T_VAL = (IS_FP16) ? fromFloat<T>(HALF_FLT_MAX) : fromFloat<T>(FLT_MAX);
+    float const MAX_T_VAL = FLT_MAX;
 
     auto const tid = static_cast<int32_t>(threadIdx.x);
     auto const batchIdx = static_cast<int32_t>(blockIdx.x);
@@ -592,18 +514,18 @@ __global__ void topKStage2Sampling(int32_t const* __restrict__ topKTmpIdBuf, T* 
     auto const size = k * 8; // BLOCKS_PER_BEAM = 8
     auto const stride = k * 8;
 
-    typedef cub::BlockReduce<TopK_2<float>, BLOCK_SIZE_> BlockReduce;
+    typedef cub::BlockReduce<TopK_2, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
     extern __shared__ char array[];
     __shared__ float sSum;
-    T* sVal = topKTmpValBuf + batchIdx * stride;
+    float* sVal = topKTmpValBuf + batchIdx * stride;
     auto* sId = reinterpret_cast<int32_t*>(array);
 
     if (tid == 0)
     {
         sSum = 0.0f;
     }
-    TopK_2<float> partial;
+    TopK_2 partial;
 
     auto sVal2 = reinterpret_cast<float*>(sId + k);
     float maxLogit;
@@ -615,10 +537,10 @@ __global__ void topKStage2Sampling(int32_t const* __restrict__ topKTmpIdBuf, T* 
 #pragma unroll
         for (int32_t i = tid; i < size; i += BLOCK_SIZE_)
         {
-            partial.insert(static_cast<float>(sVal[i]), i);
+            partial.insert(sVal[i], i);
         }
 
-        TopK_2<float> total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor<float>());
+        TopK_2 total = BlockReduce(tempStorage).Reduce(partial, topk2MaxOpFunctor());
 
         if (tid == 0)
         {
@@ -694,8 +616,9 @@ __global__ void topKStage2Sampling(int32_t const* __restrict__ topKTmpIdBuf, T* 
 // SOFTMAX KERNEL (Required for Top-P sampling)
 // =======================================================================================
 
-template <typename T, int BLOCK_SIZE>
-__global__ void softmaxKernel(T const* logits, T* probs, int32_t batchSize, int32_t vocabSize, float temperature)
+template <int BLOCK_SIZE>
+__global__ void softmaxKernel(
+    float const* logits, float* probs, int32_t batchSize, int32_t vocabSize, float temperature)
 {
     auto const batchId = static_cast<int32_t>(blockIdx.x);
     auto const tid = static_cast<int32_t>(threadIdx.x);
@@ -715,12 +638,12 @@ __global__ void softmaxKernel(T const* logits, T* probs, int32_t batchSize, int3
     float threadMax = -FLT_MAX;
     for (int32_t i = tid; i < vocabSize; i += BLOCK_SIZE)
     {
-        auto logit = toFloat(logits[offset + i]) * invTemp;
+        auto logit = logits[offset + i] * invTemp;
         threadMax = fmaxf(threadMax, logit);
     }
 
     // Use customed reductionOp to WAR CUDA12/13 compatibility issue
-    float blockMax = BlockReduce(tempStorage).Reduce(threadMax, maxOpFunctor<float>());
+    float blockMax = BlockReduce(tempStorage).Reduce(threadMax, maxOpFunctor());
     if (tid == 0)
     {
         maxLogit = blockMax;
@@ -732,13 +655,13 @@ __global__ void softmaxKernel(T const* logits, T* probs, int32_t batchSize, int3
     float threadSum = 0.0f;
     for (int32_t i = tid; i < vocabSize; i += BLOCK_SIZE)
     {
-        auto logit = toFloat(logits[offset + i]) * invTemp;
+        auto logit = logits[offset + i] * invTemp;
         auto expLogit = expf(logit - maxLogit);
-        probs[offset + i] = fromFloat<T>(expLogit);
+        probs[offset + i] = expLogit;
         threadSum += expLogit;
     }
 
-    float blockSum = BlockReduce(tempStorage).Reduce(threadSum, sumOpFunctor<float>());
+    float blockSum = BlockReduce(tempStorage).Reduce(threadSum, sumOpFunctor());
     if (tid == 0)
     {
         sumExp = blockSum;
@@ -748,8 +671,8 @@ __global__ void softmaxKernel(T const* logits, T* probs, int32_t batchSize, int3
     // Normalize to get probabilities
     for (int32_t i = tid; i < vocabSize; i += BLOCK_SIZE)
     {
-        auto prob = toFloat(probs[offset + i]) / sumExp;
-        probs[offset + i] = fromFloat<T>(prob);
+        auto prob = probs[offset + i] / sumExp;
+        probs[offset + i] = prob;
     }
 }
 
@@ -783,10 +706,10 @@ __global__ void topPInitialize(
     }
 }
 
-// Early exit optimization: check if highest probability token exceeds threshold
-template <typename T, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* probs, int32_t* topKTmpIdBuf,
-    T* topKTmpValBuf, int32_t* earlyExitFlags, int32_t vocabSize, float topP, int32_t batchSize)
+// Early exit optimization: check if highest probability token exceeds threshold (FP32 only)
+template <int THREADBLOCK_SIZE>
+__launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(float const* probs, int32_t* topKTmpIdBuf,
+    float* topKTmpValBuf, int32_t* earlyExitFlags, int32_t vocabSize, float topP, int32_t batchSize)
 {
     auto const threadId = static_cast<int32_t>(threadIdx.x);
     auto const batchId = static_cast<int32_t>(blockIdx.x);
@@ -796,12 +719,11 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* 
 
     float pThreshold = topP;
 
-    typedef cub::BlockReduce<TopK_2<T>, THREADBLOCK_SIZE> BlockReduce;
+    typedef cub::BlockReduce<TopK_2, THREADBLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
-    TopK_2<T> partial;
+    TopK_2 partial;
 
-    bool const IS_FP16 = std::is_same<T, half>::value;
-    T const MAX_T_VAL = (IS_FP16) ? fromFloat<T>(HALF_FLT_MAX) : fromFloat<T>(FLT_MAX);
+    float const MAX_T_VAL = FLT_MAX;
 
     partial.value = -MAX_T_VAL;
     partial.index = -1;
@@ -813,13 +735,13 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* 
         partial.insert(probs[index], elemId);
     }
 
-    TopK_2<T> total = BlockReduce(temp_storage).Reduce(partial, topk2MaxOpFunctor<T>());
+    TopK_2 total = BlockReduce(temp_storage).Reduce(partial, topk2MaxOpFunctor());
 
     if (threadId == 0)
     {
-        T sumProb = total.value;
+        float sumProb = total.value;
 
-        if (static_cast<float>(sumProb) >= pThreshold)
+        if (sumProb >= pThreshold)
         {
             // Early exit: set flag and store the selected token
             earlyExitFlags[batchId] = 1;
@@ -836,8 +758,8 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void topPBeamTopKKernel(T const* 
 }
 
 // Final sampling stage using block-level prefix sum
-template <typename T, int blockSize>
-__global__ void topPSampling(T const* sortedProbs, int32_t const* sortedIdVals, int64_t* selectedIndices,
+template <int blockSize>
+__global__ void topPSampling(float const* sortedProbs, int32_t const* sortedIdVals, int32_t* selectedIndices,
     int32_t const* topKTmpIdBuf, int32_t const* earlyExitFlags, int32_t vocabSize, uint64_t philoxSeed,
     uint64_t philoxOffset, float topP, int32_t batchSize)
 {
@@ -875,7 +797,7 @@ __global__ void topPSampling(T const* sortedProbs, int32_t const* sortedIdVals, 
 
     for (int vi = tid; vi < end; vi += blockSize)
     {
-        auto threadProb = (vi < vocabSize) ? static_cast<float>(sortedProbs[offset + vi]) : 0.f;
+        auto threadProb = (vi < vocabSize) ? (sortedProbs[offset + vi]) : 0.f;
         BlockScan(tempStorage).InclusiveSum(threadProb, threadOffset, prefixOp);
         count = __syncthreads_count(randNumS <= threadOffset);
         selectedTokenId = vi;
@@ -899,9 +821,8 @@ __global__ void topPSampling(T const* sortedProbs, int32_t const* sortedIdVals, 
 // HOST WRAPPER FUNCTIONS
 // =======================================================================================
 
-// Updated sampling function with automatic workspace allocation fallback
-template <typename T>
-void topKtopPSamplingFromLogits(T const* logits, int64_t* selectedIndices, SamplingParams const& params,
+// Updated sampling function with automatic workspace allocation fallback (FP32 only)
+void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, SamplingParams const& params,
     void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed, uint64_t philoxOffset)
 {
     assert(logits != nullptr && selectedIndices != nullptr);
@@ -911,7 +832,7 @@ void topKtopPSamplingFromLogits(T const* logits, int64_t* selectedIndices, Sampl
     int const BLOCKS_PER_BEAM = 8;
 
     // Setup workspace partitioning
-    SamplingWorkspace<T> ws;
+    SamplingWorkspace ws;
     ws.setupWorkspace(workspace, workspaceSize, params);
 
     // Validate workspace buffers
@@ -927,7 +848,7 @@ void topKtopPSamplingFromLogits(T const* logits, int64_t* selectedIndices, Sampl
         dim3 grid1(params.batchSize * BLOCKS_PER_BEAM);
         dim3 block1(BLOCK_SIZE);
 
-        topKStage1<T, BLOCK_SIZE, BLOCKS_PER_BEAM>
+        topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM>
             <<<grid1, block1, 0, stream>>>(logits, ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
 
         // Stage 2: Sample from top-K elements
@@ -935,7 +856,7 @@ void topKtopPSamplingFromLogits(T const* logits, int64_t* selectedIndices, Sampl
         dim3 block2(BLOCK_SIZE);
         size_t sharedMemSize = params.topK * sizeof(int32_t) + params.topK * sizeof(float);
 
-        topKStage2Sampling<T, BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(
+        topKStage2Sampling<BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(
             ws.topkIndices, ws.topkValues, selectedIndices, params, philoxSeed, philoxOffset);
     }
     else if (params.useTopP)
@@ -945,7 +866,7 @@ void topKtopPSamplingFromLogits(T const* logits, int64_t* selectedIndices, Sampl
         // Stage 0: Convert logits to probabilities using softmax
         int const SOFTMAX_BLOCK_SIZE = 256;
 
-        softmaxKernel<T, SOFTMAX_BLOCK_SIZE><<<params.batchSize, SOFTMAX_BLOCK_SIZE, 0, stream>>>(
+        softmaxKernel<SOFTMAX_BLOCK_SIZE><<<params.batchSize, SOFTMAX_BLOCK_SIZE, 0, stream>>>(
             logits, ws.toppProbs, params.batchSize, params.vocabSize, params.temperature);
 
         // Stage 1: Initialize
@@ -955,33 +876,32 @@ void topKtopPSamplingFromLogits(T const* logits, int64_t* selectedIndices, Sampl
         // Stage 2: Early exit optimization
         int const BLOCK_SIZE_TOPK = 256;
 
-        topPBeamTopKKernel<T, BLOCK_SIZE_TOPK><<<params.batchSize, BLOCK_SIZE_TOPK, 0, stream>>>(ws.toppProbs,
+        topPBeamTopKKernel<BLOCK_SIZE_TOPK><<<params.batchSize, BLOCK_SIZE_TOPK, 0, stream>>>(ws.toppProbs,
             ws.toppTopKIndices, ws.toppTopKValues, ws.toppEarlyExitFlags, params.vocabSize, params.topP,
             params.batchSize);
 
         // Stage 3: Sort probabilities in descending order
         size_t cubTempStorageSize;
-        cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr, cubTempStorageSize, static_cast<T*>(nullptr),
-            static_cast<T*>(nullptr), static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
+        cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr, cubTempStorageSize, static_cast<float*>(nullptr),
+            static_cast<float*>(nullptr), static_cast<int32_t*>(nullptr), static_cast<int32_t*>(nullptr),
             static_cast<int32_t>(params.vocabSize * params.batchSize), params.batchSize, static_cast<int32_t*>(nullptr),
             static_cast<int32_t*>(nullptr));
 
         cub::DeviceSegmentedRadixSort::SortPairsDescending(ws.toppTempStorage, cubTempStorageSize, ws.toppProbs,
             ws.toppSortedProbs, ws.toppIdVals, ws.toppSortedIdVals, params.vocabSize * params.batchSize,
-            params.batchSize, ws.toppBeginOffsetBuf, ws.toppOffsetBuf + 1, 0, sizeof(T) * 8, stream);
+            params.batchSize, ws.toppBeginOffsetBuf, ws.toppOffsetBuf + 1, 0, sizeof(float) * 8, stream);
 
         // Stage 4: Sample using block-level prefix sum
         int const SAMPLING_BLOCK_SIZE = 256;
 
-        topPSampling<T, SAMPLING_BLOCK_SIZE><<<params.batchSize, SAMPLING_BLOCK_SIZE, 0, stream>>>(ws.toppSortedProbs,
+        topPSampling<SAMPLING_BLOCK_SIZE><<<params.batchSize, SAMPLING_BLOCK_SIZE, 0, stream>>>(ws.toppSortedProbs,
             ws.toppSortedIdVals, selectedIndices, ws.toppTopKIndices, ws.toppEarlyExitFlags, params.vocabSize,
             philoxSeed, philoxOffset, params.topP, params.batchSize);
     }
 }
 
-// selectAllTopK function with automatic workspace allocation fallback
-template <typename T>
-void selectAllTopKFromLogits(T const* input, float* topKValues, int64_t* topKIndices, int32_t batchSize,
+// selectAllTopK function with automatic workspace allocation fallback (FP32 only)
+void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* topKIndices, int32_t batchSize,
     int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream, bool returnLogProbs,
     bool normalizeLogProbs, bool inputHasProbs)
 {
@@ -1001,7 +921,7 @@ void selectAllTopKFromLogits(T const* input, float* topKValues, int64_t* topKInd
     constexpr int32_t BLOCKS_PER_BEAM = 8;
 
     // Setup workspace partitioning
-    SamplingWorkspace<T> ws;
+    SamplingWorkspace ws;
     ws.setupWorkspaceForTopK(workspace, workspaceSize, batchSize, vocabSize, topK);
 
     // Create sampling parameters with temperature = 1.0 (no modification of input values)
@@ -1011,7 +931,7 @@ void selectAllTopKFromLogits(T const* input, float* topKValues, int64_t* topKInd
     dim3 grid1(batchSize * BLOCKS_PER_BEAM);
     dim3 block1(BLOCK_SIZE);
 
-    topKStage1<T, BLOCK_SIZE, BLOCKS_PER_BEAM>
+    topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM>
         <<<grid1, block1, 0, stream>>>(input, ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
 
     // Stage 2: Second top-K selection from 8*K results (matches old sampler for returnAllTopK)
@@ -1019,49 +939,9 @@ void selectAllTopKFromLogits(T const* input, float* topKValues, int64_t* topKInd
     dim3 block2(BLOCK_SIZE);
     size_t sharedMemSize = topK * sizeof(int32_t) + topK * sizeof(float);
 
-    topKStage2ReturnAllTopK<T, BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(ws.topkIndices, ws.topkValues,
+    topKStage2ReturnAllTopK<BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(ws.topkIndices, ws.topkValues,
         topKIndices, topKValues, returnLogProbs ? ws.topkTempLogits : nullptr, batchSize, vocabSize, topK,
         BLOCKS_PER_BEAM, returnLogProbs, normalizeLogProbs, inputHasProbs);
 }
-
-// Explicit template instantiations
-template void topKtopPSamplingFromLogits<float>(float const* logits, int64_t* selectedIndices,
-    SamplingParams const& params, void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed,
-    uint64_t philoxOffset);
-
-template void topKtopPSamplingFromLogits<half>(half const* logits, int64_t* selectedIndices,
-    SamplingParams const& params, void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed,
-    uint64_t philoxOffset);
-
-template void topKtopPSamplingFromLogits<__nv_bfloat16>(__nv_bfloat16 const* logits, int64_t* selectedIndices,
-    SamplingParams const& params, void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed,
-    uint64_t philoxOffset);
-
-template void selectAllTopKFromLogits<float>(float const* input, float* topKValues, int64_t* topKIndices,
-    int32_t batchSize, int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream,
-    bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs);
-
-template void selectAllTopKFromLogits<half>(half const* input, float* topKValues, int64_t* topKIndices,
-    int32_t batchSize, int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream,
-    bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs);
-
-template void selectAllTopKFromLogits<__nv_bfloat16>(__nv_bfloat16 const* input, float* topKValues,
-    int64_t* topKIndices, int32_t batchSize, int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize,
-    cudaStream_t stream, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs);
-
-template size_t getTopKtopPSamplingWorkspaceSize<float>(
-    int32_t batchSize, int32_t vocabSize, SamplingParams const& params);
-
-template size_t getTopKtopPSamplingWorkspaceSize<half>(
-    int32_t batchSize, int32_t vocabSize, SamplingParams const& params);
-
-template size_t getTopKtopPSamplingWorkspaceSize<__nv_bfloat16>(
-    int32_t batchSize, int32_t vocabSize, SamplingParams const& params);
-
-template size_t getSelectAllTopKWorkspaceSize<float>(int32_t batchSize, int32_t vocabSize, int32_t topK);
-
-template size_t getSelectAllTopKWorkspaceSize<half>(int32_t batchSize, int32_t vocabSize, int32_t topK);
-
-template size_t getSelectAllTopKWorkspaceSize<__nv_bfloat16>(int32_t batchSize, int32_t vocabSize, int32_t topK);
 
 } // namespace drivellm

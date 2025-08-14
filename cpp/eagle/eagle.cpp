@@ -30,7 +30,7 @@ void Eagle::eagleCommonParamsInit()
     mEagleCommonParams.kvCacheSeqLen = mBaseModel->getModelConfig().maxLength;
 }
 
-void Eagle::invokeSamplingAndAccept(int64_t* draftIds, int32_t const curTokensPerStep, int64_t endIds)
+void Eagle::invokeSamplingAndAccept(int32_t* draftIds, int32_t const curTokensPerStep, int32_t endIds)
 {
     auto const logits_last_token = mBaseModel->getDeviceBuffer("logits");
 
@@ -46,20 +46,19 @@ void Eagle::invokeSamplingAndAccept(int64_t* draftIds, int32_t const curTokensPe
 
     // Create sampling parameters for greedy sampling (top_k=1)
     drivellm::SamplingParams samplingParams(batchSize, mVocabSize, 1.0f, 1);
-    auto allocatedWorkspaceSize
-        = drivellm::getTopKtopPSamplingWorkspaceSize<LogitsType>(batchSize, mVocabSize, samplingParams);
+    auto allocatedWorkspaceSize = drivellm::getTopKtopPSamplingWorkspaceSize(batchSize, mVocabSize, samplingParams);
 
-    drivellm::topKtopPSamplingFromLogits<LogitsType>(reinterpret_cast<LogitsType const*>(logits_last_token),
-        static_cast<int64_t*>(mEagleDeviceBuffer["targetIds"]), samplingParams,
+    drivellm::topKtopPSamplingFromLogits(reinterpret_cast<LogitsType const*>(logits_last_token),
+        static_cast<int32_t*>(mEagleDeviceBuffer["targetIds"]), samplingParams,
         mEagleDeviceBuffer["workspaceForVerification"], allocatedWorkspaceSize, mStream);
 
     auto const hiddenStates = static_cast<HiddenStatesType*>(mBaseModel->getDeviceBuffer("hidden_states"));
 
     AcceptDraftTokensByIdsWithPathsParams accparms;
-    accparms.outputIds = static_cast<int64_t*>(mBaseModel->getDeviceBuffer("input_ids"));
-    accparms.inputIdsDraftDecode = static_cast<int64_t*>(mEagleDeviceBuffer["selectedOutputIdsDraft"]);
+    accparms.outputIds = static_cast<int32_t*>(mBaseModel->getDeviceBuffer("input_ids"));
+    accparms.inputIdsDraftDecode = static_cast<int32_t*>(mEagleDeviceBuffer["selectedOutputIdsDraft"]);
     accparms.draftIds = draftIds;
-    accparms.targetIds = static_cast<int64_t*>(mEagleDeviceBuffer["targetIds"]);
+    accparms.targetIds = static_cast<int32_t*>(mEagleDeviceBuffer["targetIds"]);
     accparms.contextLengths = static_cast<int32_t*>(mBaseModel->getDeviceBuffer("context_lengths"));
     accparms.paths = static_cast<int32_t*>(mEagleDeviceBuffer["paths"]);
     accparms.bestPathIds = static_cast<int32_t*>(mEagleDeviceBuffer["bestPathIds"]);
@@ -99,52 +98,52 @@ void Eagle::invokeInitializeAttentionMaskCausal()
 void Eagle::initDraftVoc()
 {
     std::vector<int64_t> draftVocHost(mDraftVocabSize);
-    std::filesystem::path engineFilePath(mEagleEnginePath);
-    auto const draftVocPath = engineFilePath.parent_path().string() + "/d2t.bin";
+    std::string draftVocPath = mDraftModelDir + "/d2t.bin";
     std::ifstream fin(draftVocPath, std::ios::binary);
     if (!fin)
     {
-        printf("Error: Failed to open d2t.bin in path %s, it must be provided for Eagle3.\n", draftVocPath.c_str());
-        exit(EXIT_FAILURE);
+        LOG_ERROR("Failed to open d2t.bin in path %s, it must be provided for Eagle3.", draftVocPath.c_str());
+        throw std::runtime_error("d2t.bin is required for Eagle3 but not found in: " + draftVocPath);
     }
     fin.seekg(0, std::ios::end);
     std::streamsize fileSize = fin.tellg();
     if (fileSize == 0)
     {
-        printf("Error: d2t.bin file is empty in path %s\n", draftVocPath.c_str());
-        exit(EXIT_FAILURE);
+        LOG_ERROR("d2t.bin file is empty in path %s", draftVocPath.c_str());
+        throw std::runtime_error("d2t.bin file is empty in: " + draftVocPath);
     }
-    if (fileSize != mDraftVocabSize * sizeof(int64_t))
+    if (fileSize != mDraftVocabSize * sizeof(int32_t))
     {
-        printf("Error: d2t.bin file size mismatch. Got: %ld, Expected: %ld\n", (long) fileSize,
-            (long) (mDraftVocabSize * sizeof(int64_t)));
-        exit(EXIT_FAILURE);
+        LOG_ERROR("d2t.bin file size mismatch. Got: %ld, Expected: %ld", (long) fileSize,
+            (long) (mDraftVocabSize * sizeof(int32_t)));
+        throw std::runtime_error("d2t.bin file size mismatch");
     }
     fin.seekg(0, std::ios::beg);
-    fin.read(reinterpret_cast<char*>(draftVocHost.data()), mDraftVocabSize * sizeof(int64_t));
+    fin.read(reinterpret_cast<char*>(draftVocHost.data()), mDraftVocabSize * sizeof(int32_t));
     if (!fin)
     {
-        printf("Error: Failed to read d2t.bin in path %s, it must be provided for Eagle3.\n", draftVocPath.c_str());
-        exit(EXIT_FAILURE);
+        LOG_ERROR("Failed to read d2t.bin in path %s, it must be provided for Eagle3.", draftVocPath.c_str());
+        throw std::runtime_error("Failed to read d2t.bin from: " + draftVocPath);
     }
-    CUDA_CHECK(cudaMemcpyAsync(mEagleDeviceBuffer["draftVoc"], draftVocHost.data(), mDraftVocabSize * sizeof(int64_t),
+    CUDA_CHECK(cudaMemcpyAsync(mEagleDeviceBuffer["draftVoc"], draftVocHost.data(), mDraftVocabSize * sizeof(int32_t),
         cudaMemcpyHostToDevice, mStream));
 }
 
 void Eagle::allocateEagleBuffer()
 {
+
     //[bs,maxDraftTokens,mMaxDraftTokens]
     void* allDraftIdsDevice;
-    CUDA_CHECK(cudaMalloc(&allDraftIdsDevice, mBatchSize * mMaxDraftTokens * mMaxDraftTokens * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&allDraftIdsDevice, mBatchSize * mMaxDraftTokens * mMaxDraftTokens * sizeof(int32_t)));
     mEagleDeviceBuffer["allDraftIds"] = allDraftIdsDevice;
 
     // target model inputids:[maxDraftTokens,maxDraftTokens]
     void* decodingInputIdsDevice;
-    CUDA_CHECK(cudaMalloc(&decodingInputIdsDevice, mBatchSize * mMaxDecodingTokens * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&decodingInputIdsDevice, mBatchSize * mMaxDecodingTokens * sizeof(int32_t)));
     mEagleDeviceBuffer["draftIds"] = decodingInputIdsDevice;
 
     void* targetIdsDevice;
-    CUDA_CHECK(cudaMalloc(&targetIdsDevice, mBatchSize * mMaxDecodingTokens * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&targetIdsDevice, mBatchSize * mMaxDecodingTokens * sizeof(int32_t)));
     mEagleDeviceBuffer["targetIds"] = targetIdsDevice;
 
     void* draftIdsAncestorsDevice;
@@ -153,7 +152,7 @@ void Eagle::allocateEagleBuffer()
 
     // draft model input ids:[mBatchSize,mMaxPathLen,mTopK]
     void* selectedOutputIdsDraftDevice;
-    CUDA_CHECK(cudaMalloc(&selectedOutputIdsDraftDevice, mBatchSize * mMaxDraftTokensPerStep * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&selectedOutputIdsDraftDevice, mBatchSize * mMaxDraftTokensPerStep * sizeof(int32_t)));
     mEagleDeviceBuffer["selectedOutputIdsDraft"] = selectedOutputIdsDraftDevice;
 
     // for update kv cache
@@ -212,17 +211,17 @@ void Eagle::allocateEagleBuffer()
 
     //[mBatchSize,mMaxPathLen,topk*topk]
     void* allTokensDevice;
-    CUDA_CHECK(cudaMalloc(&allTokensDevice, mBatchSize * mMaxPathLen * mTopK * mTopK * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&allTokensDevice, mBatchSize * mMaxPathLen * mTopK * mTopK * sizeof(int32_t)));
     mEagleDeviceBuffer["allTokens"] = allTokensDevice;
 
     //[mBatchSize,mMaxPathLen,topk] [6,10]
-    void* parantsIdsDevice;
-    CUDA_CHECK(cudaMalloc(&parantsIdsDevice, mBatchSize * mMaxPathLen * mTopK * sizeof(int64_t)));
-    mEagleDeviceBuffer["parantsIds"] = parantsIdsDevice;
+    void* parentsIdsDevice;
+    CUDA_CHECK(cudaMalloc(&parentsIdsDevice, mBatchSize * mMaxPathLen * mTopK * sizeof(int64_t)));
+    mEagleDeviceBuffer["parentsIds"] = parentsIdsDevice;
 
     //[mBatchSize,topk,topk] for eagle draft every step for second topk in whole process: 100
     void* outputIdsAllDraftDevice;
-    CUDA_CHECK(cudaMalloc(&outputIdsAllDraftDevice, mBatchSize * mTopK * mTopK * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&outputIdsAllDraftDevice, mBatchSize * mTopK * mTopK * sizeof(int32_t)));
     mEagleDeviceBuffer["outputIdsAllDraft"] = outputIdsAllDraftDevice;
 
     //[mBatchSize,topk,topk] - float version for eagle utility kernels
@@ -232,7 +231,7 @@ void Eagle::allocateEagleBuffer()
 
     //[mBatchSize,topk] for third topk in whole process: 10 out of 100
     void* outputIdsCurrentDraftDevice;
-    CUDA_CHECK(cudaMalloc(&outputIdsCurrentDraftDevice, mBatchSize * mTopK * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&outputIdsCurrentDraftDevice, mBatchSize * mTopK * sizeof(int32_t)));
     mEagleDeviceBuffer["outputIdsCurrentDraft"] = outputIdsCurrentDraftDevice;
 
     //[mBatchSize,topk,topk]
@@ -309,7 +308,7 @@ void Eagle::allocateEagleBuffer()
 
     //[mBatchSize,mMaxDraftTokens]
     void* fourthTopKIdsDevice;
-    CUDA_CHECK(cudaMalloc(&fourthTopKIdsDevice, mBatchSize * mMaxDraftTokens * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&fourthTopKIdsDevice, mBatchSize * mMaxDraftTokens * sizeof(int32_t)));
     mEagleDeviceBuffer["fourthTopKIds"] = fourthTopKIdsDevice;
 
     //[mBatchSize,mMaxDraftTokens]
@@ -318,41 +317,40 @@ void Eagle::allocateEagleBuffer()
     mEagleDeviceBuffer["fourthTopkProbs"] = fourthTopkProbsDevice;
 
     // for topk1: torch.Size([1, 152064])
-    auto const workspaceSize1 = drivellm::getSelectAllTopKWorkspaceSize<LogitsType>(mBatchSize, mVocabSize, mTopK);
+    auto const workspaceSize1 = drivellm::getSelectAllTopKWorkspaceSize(mBatchSize, mVocabSize, mTopK);
     void* topk1WorkspaceDevice;
     CUDA_CHECK(cudaMalloc(&topk1WorkspaceDevice, workspaceSize1));
     mEagleDeviceBuffer["topk1Workspace"] = topk1WorkspaceDevice;
 
     // for topk2
-    auto const workspaceSize2
-        = drivellm::getSelectAllTopKWorkspaceSize<LogitsType>(mTopK * mBatchSize, mVocabSize, mTopK);
+    auto const workspaceSize2 = drivellm::getSelectAllTopKWorkspaceSize(mTopK * mBatchSize, mVocabSize, mTopK);
     void* topk2WorkspaceDevice;
     CUDA_CHECK(cudaMalloc(&topk2WorkspaceDevice, workspaceSize2));
     mEagleDeviceBuffer["topk2Workspace"] = topk2WorkspaceDevice;
 
     // for topk3: [bs*topk,topk] - now using float type since cumScores is float
-    auto const workspaceSize3 = drivellm::getSelectAllTopKWorkspaceSize<float>(mBatchSize, mTopK * mTopK, mTopK);
+    auto const workspaceSize3 = drivellm::getSelectAllTopKWorkspaceSize(mBatchSize, mTopK * mTopK, mTopK);
     void* topk3WorkspaceDevice;
     CUDA_CHECK(cudaMalloc(&topk3WorkspaceDevice, workspaceSize3));
     mEagleDeviceBuffer["topk3Workspace"] = topk3WorkspaceDevice;
 
     // for topk4:[bs*topk, mMaxPathLen*mTopK] - now using float type since allScores is float
     auto const workspaceSize4
-        = drivellm::getSelectAllTopKWorkspaceSize<float>(mBatchSize, mMaxPathLen * mTopK * mTopK, mMaxDraftTokens);
+        = drivellm::getSelectAllTopKWorkspaceSize(mBatchSize, mMaxPathLen * mTopK * mTopK, mMaxDraftTokens);
     void* topk4WorkspaceDevice;
     CUDA_CHECK(cudaMalloc(&topk4WorkspaceDevice, workspaceSize4));
     mEagleDeviceBuffer["topk4Workspace"] = topk4WorkspaceDevice;
 
     // for verification - use sampling workspace since top_k=1
     drivellm::SamplingParams verificationParams(mBatchSize * mMaxDecodingTokens, mVocabSize, 1.0f, 1);
-    auto const workspaceSizeForVerification = drivellm::getTopKtopPSamplingWorkspaceSize<LogitsType>(
-        mBatchSize * mMaxDecodingTokens, mVocabSize, verificationParams);
+    auto const workspaceSizeForVerification
+        = drivellm::getTopKtopPSamplingWorkspaceSize(mBatchSize * mMaxDecodingTokens, mVocabSize, verificationParams);
     void* workspaceForVerificationDevice;
     CUDA_CHECK(cudaMalloc(&workspaceForVerificationDevice, workspaceSizeForVerification));
     mEagleDeviceBuffer["workspaceForVerification"] = workspaceForVerificationDevice;
 
     void* draftVocDevice;
-    CUDA_CHECK(cudaMalloc(&draftVocDevice, mDraftVocabSize * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&draftVocDevice, mDraftVocabSize * sizeof(int32_t)));
     mEagleDeviceBuffer["draftVoc"] = draftVocDevice;
     if (mIsEagle3)
     {
@@ -382,7 +380,8 @@ int64_t Eagle::getMaxSupportedInputLength() const noexcept
 void Eagle::addNewBufferForModelIO()
 {
     // add new buffer for base model and draft model IO
-    mBaseModel->addNewBuffer("input_ids", {2, {mBatchSize, mMaxInputLength}}, sizeof(int64_t));
+    mBaseModel->addNewBuffer("input_ids", {2, {mBatchSize, mMaxInputLength}}, sizeof(int32_t));
+
     mBaseModel->addNewBuffer(
         "hidden_states", {3, {mBatchSize, mMaxInputLength, mTargetOutputHiddenDim}}, sizeof(HiddenStatesType));
     mBaseModel->addNewBuffer("logits", {2, {mBatchSize * mMaxDecodingTokens, mVocabSize}}, sizeof(LogitsType));
@@ -467,10 +466,10 @@ void Eagle::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
     mDraftModel->setupExtraInputs(extraInputs);
 }
 
-void Eagle::setupRopeCosSin(std::string const& configPath)
+void Eagle::setupRopeCosSin()
 {
-    mBaseModel->setupRopeCosSin(configPath);
-    mDraftModel->setupRopeCosSin(configPath);
+    mBaseModel->setupRopeCosSin();
+    mDraftModel->setupRopeCosSin();
 }
 
 size_t Eagle::getDeviceMemorySize() const noexcept
@@ -506,8 +505,8 @@ void Eagle::initDecodingPhaseCudaGraph()
     mDraftModel->initDecodingPhaseCudaGraph();
 }
 
-void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
-    std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds, bool isEagle3,
+void Eagle::generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> contextLengths,
+    std::vector<std::vector<int32_t>>& outputIds, GenerationConfig generationConfig, int32_t endIds, bool isEagle3,
     std::shared_ptr<BenchmarkProfiler> const profiler, std::vector<int32_t>* newTokensNumbers,
     std::vector<int32_t>* iterNumbers)
 {
@@ -519,7 +518,7 @@ void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> 
         lastTokenIds[i] = contextLengths[i] - 1;
     }
     auto inputIdsDevice = mBaseModel->getDeviceBuffer("input_ids");
-    CUDA_CHECK(cudaMemcpyAsync(inputIdsDevice, inputIds.data(), mBatchSize * contextLengths[0] * sizeof(int64_t),
+    CUDA_CHECK(cudaMemcpyAsync(inputIdsDevice, inputIds.data(), mBatchSize * contextLengths[0] * sizeof(int32_t),
         cudaMemcpyHostToDevice, mStream));
     setupExtraInputsForDraftModelContext(contextLengths);
 
@@ -544,7 +543,7 @@ void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> 
     {
         // only for bs=1
         void* inputIdsDeviceForDraft
-            = static_cast<void*>(static_cast<int64_t*>(mBaseModel->getDeviceBuffer("input_ids")) + 1);
+            = static_cast<void*>(static_cast<int32_t*>(mBaseModel->getDeviceBuffer("input_ids")) + 1);
         mDraftModel->generateForContext(
             inputIdsDeviceForDraft, contextLengthForDraft, lastTokenIds, {2, {mBatchSize, contextLengths[0]}});
         draftModelDecodeInfer(contextLengthForDraft);
@@ -563,7 +562,7 @@ void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> 
         CUDA_CHECK(cudaMemcpyAsync(mBaseModel->getDeviceBuffer("context_lengths"), tempContextLengths.data(),
             mBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
 
-        invokeSamplingAndAccept(static_cast<int64_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
+        invokeSamplingAndAccept(static_cast<int32_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
         invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
         std::for_each(
             contextLengths.begin(), contextLengths.end(), [this](int32_t& val) { val -= mMaxDecodingTokens; });
@@ -610,7 +609,7 @@ void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> 
             CUDA_CHECK(cudaMemcpyAsync(mBaseModel->getDeviceBuffer("context_lengths"), tempContextLengths.data(),
                 mBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
 
-            invokeSamplingAndAccept(static_cast<int64_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
+            invokeSamplingAndAccept(static_cast<int32_t*>(mEagleDeviceBuffer["draftIds"]), mMaxDecodingTokens, endIds);
             invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds();
             std::for_each(
                 contextLengths.begin(), contextLengths.end(), [this](int32_t& val) { val -= mMaxDecodingTokens; });
@@ -638,9 +637,10 @@ void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> 
         {
             iterNumbers->push_back(iterNum);
         }
+        // Copy output directly as int32_t
         CUDA_CHECK(cudaMemcpyAsync(outputIds[i].data(),
-            static_cast<int64_t*>(mBaseModel->getDeviceBuffer("input_ids")) + initContextLengths[i],
-            newLen * sizeof(int64_t), cudaMemcpyDeviceToHost, mStream));
+            static_cast<int32_t*>(mBaseModel->getDeviceBuffer("input_ids")) + initContextLengths[i],
+            newLen * sizeof(int32_t), cudaMemcpyDeviceToHost, mStream));
     }
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 
@@ -650,8 +650,8 @@ void Eagle::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> 
 void Eagle::invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t layerIdx, HiddenStatesType* hs_draft)
 {
     UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<HiddenStatesType> params;
-    params.outputIdsAllDraft = static_cast<int64_t*>(mEagleDeviceBuffer["outputIdsAllDraft"]);
-    params.selectedOutputIdsDraft = static_cast<int64_t*>(mEagleDeviceBuffer["selectedOutputIdsDraft"]);
+    params.outputIdsAllDraft = static_cast<int32_t*>(mEagleDeviceBuffer["outputIdsAllDraft"]);
+    params.selectedOutputIdsDraft = static_cast<int32_t*>(mEagleDeviceBuffer["selectedOutputIdsDraft"]);
     params.inputHiddenStatesDraft = hs_draft;
     params.outputHiddenStatesDraft
         = static_cast<HiddenStatesType*>(mEagleDeviceBuffer["hiddenStatesDraftDecodeFromDraft"]);
@@ -663,15 +663,15 @@ void Eagle::invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t l
         = static_cast<int32_t*>(mEagleDeviceBuffer["packedTreeMaskUpdateforAttention"]);
     params.packedTreeMaskUpdateforAttentionNoPadding
         = static_cast<int32_t*>(mEagleDeviceBuffer["packedTreeMaskUpdateforAttentionNoPadding"]);
-    params.treeIndices = static_cast<int64_t*>(mEagleDeviceBuffer["outputIdsCurrentDraft"]);
+    params.treeIndices = static_cast<int32_t*>(mEagleDeviceBuffer["outputIdsCurrentDraft"]);
     params.treePositionIds = static_cast<int32_t*>(mEagleDeviceBuffer["treePositionIds"]);
     params.intermediateScores = static_cast<float*>(mEagleDeviceBuffer["intermediateScores"]);
     params.cumScoresForThirdTopk = static_cast<float*>(mEagleDeviceBuffer["cumScores"]);
-    params.outputIdsForThirdTopk = static_cast<int64_t*>(mEagleDeviceBuffer["outputIdsCurrentDraft"]);
-    params.allTokens = static_cast<int64_t*>(mEagleDeviceBuffer["allTokens"]);
+    params.outputIdsForThirdTopk = static_cast<int32_t*>(mEagleDeviceBuffer["outputIdsCurrentDraft"]);
+    params.allTokens = static_cast<int32_t*>(mEagleDeviceBuffer["allTokens"]);
     if (mIsEagle3)
     {
-        params.draftVoc = static_cast<int64_t*>(mEagleDeviceBuffer["draftVoc"]);
+        params.draftVoc = static_cast<int32_t*>(mEagleDeviceBuffer["draftVoc"]);
     }
     else
     {
@@ -695,8 +695,8 @@ void Eagle::invokeUpdateCumScoresAndParentsIds(int32_t layerIdx)
     params.intermediateScores = static_cast<float*>(mEagleDeviceBuffer["intermediateScores"]);
     // cu_scores = topk_p + params.intermediateScores
     params.cumScores = static_cast<float*>(mEagleDeviceBuffer["cumScores"]);
-    params.outputIdsCurrentDraft = static_cast<int64_t*>(mEagleDeviceBuffer["outputIdsCurrentDraft"]);
-    params.parantsIds = static_cast<int64_t*>(mEagleDeviceBuffer["parantsIds"]);
+    params.outputIdsCurrentDraft = static_cast<int32_t*>(mEagleDeviceBuffer["outputIdsCurrentDraft"]);
+    params.parentsIds = static_cast<int64_t*>(mEagleDeviceBuffer["parentsIds"]);
     params.bias = bias;
     params.layerIdx = layerIdx;
     dispatchUpdateCumScoresAndParentsIds(params, mEagleCommonParams);
@@ -714,19 +714,19 @@ void Eagle::draftDecodePostProcess(int32_t layerIdx)
     {
         batchSize = 1 * mBatchSize;
         workspace = mEagleDeviceBuffer["topk1Workspace"];
-        workspaceSize = drivellm::getSelectAllTopKWorkspaceSize<LogitsType>(batchSize, mDraftVocabSize, mTopK);
+        workspaceSize = drivellm::getSelectAllTopKWorkspaceSize(batchSize, mDraftVocabSize, mTopK);
     }
     else
     {
         batchSize = mTopK * mBatchSize;
         workspace = mEagleDeviceBuffer["topk2Workspace"];
-        workspaceSize = drivellm::getSelectAllTopKWorkspaceSize<LogitsType>(batchSize, mDraftVocabSize, mTopK);
+        workspaceSize = drivellm::getSelectAllTopKWorkspaceSize(batchSize, mDraftVocabSize, mTopK);
     }
 
     // Use selectAllTopK to get all top-K elements with log probabilities
-    drivellm::selectAllTopKFromLogits<LogitsType>(reinterpret_cast<LogitsType const*>(logits_last_token_draft),
+    drivellm::selectAllTopKFromLogits(reinterpret_cast<LogitsType const*>(logits_last_token_draft),
         static_cast<float*>(mEagleDeviceBuffer["outputLogProbsAllDraftFloat"]), // top_k_values (float log probs)
-        static_cast<int64_t*>(mEagleDeviceBuffer["outputIdsAllDraft"]),         // top_k_indices
+        static_cast<int32_t*>(mEagleDeviceBuffer["outputIdsAllDraft"]),         // top_k_indices
         batchSize, mDraftVocabSize, mTopK, workspace, workspaceSize, mStream,
         true,  // return_log_probs
         false, // normalize log probs
@@ -739,7 +739,7 @@ void Eagle::draftDecodePostProcess(int32_t layerIdx)
         CUDA_CHECK(cudaMemcpyAsync(mEagleDeviceBuffer["allScores"], mEagleDeviceBuffer["outputLogProbsAllDraftFloat"],
             mTopK * sizeof(float), cudaMemcpyDeviceToDevice, mStream));
         invokeUpdateCumScoresAndParentsIds(layerIdx);
-        CUDA_CHECK(cudaMemsetAsync(mEagleDeviceBuffer["parantsIds"], 0, sizeof(int64_t), mStream)); // first = 0,init 0
+        CUDA_CHECK(cudaMemsetAsync(mEagleDeviceBuffer["parentsIds"], 0, sizeof(int64_t), mStream)); // first = 0,init 0
     }
     else
     {
@@ -751,11 +751,10 @@ void Eagle::draftDecodePostProcess(int32_t layerIdx)
             cudaMemcpyDeviceToDevice, mStream));
         // Use selectAllTopK with float since cumScores is float
         // 10 out of 100
-        auto allocatedWorkspaceSize3 = drivellm::getSelectAllTopKWorkspaceSize<float>(1, mTopK * mTopK, mTopK);
-        drivellm::selectAllTopKFromLogits<float>(
-            static_cast<float const*>(mEagleDeviceBuffer["cumScores"]), // input as float
-            nullptr,                                                    // don't need values output for this case
-            static_cast<int64_t*>(mEagleDeviceBuffer["outputIdsCurrentDraft"]), // top_k_indices
+        auto allocatedWorkspaceSize3 = drivellm::getSelectAllTopKWorkspaceSize(1, mTopK * mTopK, mTopK);
+        drivellm::selectAllTopKFromLogits(static_cast<float const*>(mEagleDeviceBuffer["cumScores"]), // input as float
+            nullptr, // don't need values output for this case
+            static_cast<int32_t*>(mEagleDeviceBuffer["outputIdsCurrentDraft"]), // top_k_indices
             1,                                                                  // batch_size
             mTopK * mTopK,                                                      // vocab_size
             mTopK,                                                              // top_k
@@ -774,11 +773,10 @@ void Eagle::invokeAssembleDraftIdsAndPathAndMaskAndPositionIds()
 {
     // Use selectAllTopK with float since allScores is float
     auto allocatedWorkspaceSize4
-        = drivellm::getSelectAllTopKWorkspaceSize<float>(mBatchSize, mMaxPathLen * mTopK * mTopK, mMaxDraftTokens);
-    drivellm::selectAllTopKFromLogits<float>(
-        static_cast<float const*>(mEagleDeviceBuffer["allScores"]), // input as float
+        = drivellm::getSelectAllTopKWorkspaceSize(mBatchSize, mMaxPathLen * mTopK * mTopK, mMaxDraftTokens);
+    drivellm::selectAllTopKFromLogits(static_cast<float const*>(mEagleDeviceBuffer["allScores"]), // input as float
         nullptr,                                                    // don't need values output for this case
-        static_cast<int64_t*>(mEagleDeviceBuffer["fourthTopKIds"]), // top_k_indices
+        static_cast<int32_t*>(mEagleDeviceBuffer["fourthTopKIds"]), // top_k_indices
         mBatchSize,                                                 // batch_size
         mMaxPathLen * mTopK * mTopK,                                // vocab_size
         mMaxDraftTokens,                                            // top_k
@@ -789,15 +787,15 @@ void Eagle::invokeAssembleDraftIdsAndPathAndMaskAndPositionIds()
     );
 
     AssembleDraftIdsAndPathAndMaskAndPositionIdsParams assembleParams;
-    assembleParams.fourthTopKIds = static_cast<int64_t*>(mEagleDeviceBuffer["fourthTopKIds"]);
-    assembleParams.allDraftIds = static_cast<int64_t*>(mEagleDeviceBuffer["allTokens"]);
-    assembleParams.allDraftIdsAncestors = static_cast<int64_t*>(mEagleDeviceBuffer["parantsIds"]);
-    assembleParams.modelInputIds = static_cast<int64_t*>(mBaseModel->getDeviceBuffer("input_ids"));
+    assembleParams.fourthTopKIds = static_cast<int32_t*>(mEagleDeviceBuffer["fourthTopKIds"]);
+    assembleParams.allDraftIds = static_cast<int32_t*>(mEagleDeviceBuffer["allTokens"]);
+    assembleParams.allDraftIdsAncestors = static_cast<int64_t*>(mEagleDeviceBuffer["parentsIds"]);
+    assembleParams.modelInputIds = static_cast<int32_t*>(mBaseModel->getDeviceBuffer("input_ids"));
     assembleParams.contextLengths = static_cast<int32_t*>(mBaseModel->getDeviceBuffer("context_lengths"));
 
     assembleParams.treeMask = static_cast<bool*>(mEagleDeviceBuffer["treeMaskVerification"]);
     assembleParams.positionIds = static_cast<int32_t*>(mEagleDeviceBuffer["positionIdsVerification"]);
-    assembleParams.draftIds = static_cast<int64_t*>(mEagleDeviceBuffer["draftIds"]);
+    assembleParams.draftIds = static_cast<int32_t*>(mEagleDeviceBuffer["draftIds"]);
     assembleParams.draftIdsAncestors = static_cast<int64_t*>(mEagleDeviceBuffer["draftIdsAncestors"]);
     assembleParams.paths = static_cast<int32_t*>(mEagleDeviceBuffer["paths"]);
     assembleParams.validPathNum = static_cast<int32_t*>(mEagleDeviceBuffer["validPathNum"]);

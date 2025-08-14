@@ -38,8 +38,8 @@ struct LLMChatArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] [--interactive] [--enginePath=<path to TensorRT engine>] "
-                 "[--maxLength=<int>] [--tokenizerPath=<path to HF tokenizer>] [--inputString=<input string for "
+              << " [--help] [--interactive] [--engineDir=<path to TensorRT engine directory>] "
+                 "[--maxLength=<int>] [--inputString=<input string for "
                  "one batch>] [--loraWeights=<name:path>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
@@ -73,7 +73,7 @@ bool parseLLMChatArgs(LLMChatArgs& args, int argc, char* argv[])
     int opt;
     while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
-        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, true))
+        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg))
         {
             continue;
         }
@@ -199,22 +199,30 @@ int main(int argc, char* argv[])
     auto pluginHandles = loadEdgellmPluginLib();
 
     auto tokenizer = std::make_unique<Tokenizer>();
-    tokenizer->loadFromHF(args.baseParams.tokenizerPath);
+    // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
+    {
+        tokenizer->loadFromHF(args.baseParams.engineDir);
+    }
+    else
+    {
+        tokenizer->loadFromHF(args.eagleParams.baseModelDir);
+    }
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     EngineConfig engineConfig;
-    if (args.eagleParams.eagleEnginePath.empty())
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(args.baseParams.enginePath, !args.baseParams.noCudaGraph);
+        engineConfig = EngineConfig(args.baseParams.engineDir, !args.baseParams.noCudaGraph);
     }
     else
     {
         LOG_INFO("Running in Eagle mode.");
-        engineConfig = EngineConfig(args.baseParams.enginePath, args.eagleParams.eagleEnginePath,
-            args.eagleParams.maxPathLen, args.eagleParams.topK, args.eagleParams.isEagle3,
-            args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
+        engineConfig = EngineConfig(args.baseParams.engineDir, args.eagleParams.baseModelDir,
+            args.eagleParams.draftModelDir, args.eagleParams.maxPathLen, args.eagleParams.topK,
+            args.eagleParams.isEagle3, args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
     }
     auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     auto const batchSize = llmEngine->getBatchSize();
@@ -226,19 +234,16 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    std::vector<int64_t> inputIds;
+    std::vector<int32_t> inputIds;
     std::vector<int32_t> contextLengths(batchSize, 0);
 
-    int64_t padId = tokenizer->getPadId();
+    int32_t padId = tokenizer->getPadId();
     GenerationConfig generationConfig{args.maxLength, 0, 1, 1};
     std::string quitString = "quit";
     std::cout << "Welcome to NVIDIA DriveOS LLM SDK! Please enter your prompts. Enter quit to exit the program."
               << std::endl;
 
-    // Initialize rope_rotary_cos_sin
-    std::string baseFolderPath = extractFolderName(args.baseParams.enginePath);
-    std::string configPath = baseFolderPath + "/config.json";
-    llmEngine->setupRopeCosSin(configPath);
+    llmEngine->setupRopeCosSin();
 
     // Load LoRA weights
     if (!eagleMode)
@@ -291,7 +296,7 @@ int main(int argc, char* argv[])
                 inputStrings.emplace_back(inputString);
             }
             inputIds = llmEngine->processInputSequence(inputStrings, tokenizer.get(), contextLengths, padId);
-            std::vector<std::vector<int64_t>> outputIds(batchSize);
+            std::vector<std::vector<int32_t>> outputIds(batchSize);
             for (int i = 0; i < batchSize; ++i)
             {
                 outputIds[i].reserve(generationConfig.maxLength);
@@ -321,7 +326,7 @@ int main(int argc, char* argv[])
     }
 
     inputIds = llmEngine->processInputSequence(args.inputStrings, tokenizer.get(), contextLengths, padId);
-    std::vector<std::vector<int64_t>> outputIds(batchSize);
+    std::vector<std::vector<int32_t>> outputIds(batchSize);
     for (int i = 0; i < batchSize; ++i)
     {
         outputIds[i].reserve(generationConfig.maxLength);
