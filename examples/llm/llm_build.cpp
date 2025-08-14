@@ -20,6 +20,7 @@
 #include <NvInfer.h>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
@@ -27,14 +28,15 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using Json = nlohmann::json;
 
 struct LLMBuildArgs
 {
     bool help{false};
-    std::string onnxPath;
-    std::string enginePath;
+    std::string onnxDir;
+    std::string engineDir;
     int64_t batchSize{1};
     int64_t maxInputLen{128};
     int64_t maxSeqLen{4096};
@@ -81,20 +83,86 @@ public:
         // TODO: add other profiles here
     }
 
-    void saveConfigJson()
+    bool saveConfigJson()
     {
-        // Copy config.json to engine path
-        auto configPath = extractFolderName(args.onnxPath) + "/config.json";
-        std::string targetConfigPath = extractFolderName(args.enginePath) + "/config.json";
-        copyFile(configPath, targetConfigPath);
+        // Determine config file name based on model type
+        std::string configFileName;
+        if (args.eagleBuildParams.isEagleDraft)
+        {
+            configFileName = "draft_config.json";
+        }
+        else if (args.eagleBuildParams.isEagleBase)
+        {
+            configFileName = "base_config.json";
+        }
+        else
+        {
+            configFileName = "config.json";
+        }
 
+        // Copy config.json to engine directory with appropriate name
+        std::string configPath = args.onnxDir + "/config.json";
+        std::string targetConfigPath = args.engineDir + "/" + configFileName;
+
+        int configResult = copyFile(configPath, targetConfigPath);
+        if (configResult != EXIT_SUCCESS)
+        {
+            LOG_ERROR("Failed to copy config.json to %s", targetConfigPath.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    bool copyTokenizerFiles()
+    {
+        // List of common tokenizer files to copy
+        std::vector<std::string> tokenizerFiles = {
+            "tokenizer_config.json",
+            "tokenizer.json",
+        };
+
+        bool allSuccess = true;
+        for (auto const& filename : tokenizerFiles)
+        {
+            std::string srcPath = args.onnxDir + "/" + filename;
+            std::string dstPath = args.engineDir + "/" + filename;
+
+            // Check if tokenizer file exists before copying
+            int result = copyFile(srcPath, dstPath);
+            if (result == EXIT_SUCCESS)
+            {
+                LOG_INFO("Copied tokenizer file: %s", filename.c_str());
+            }
+            else
+            {
+                LOG_WARNING("Failed to copy tokenizer file %s", filename.c_str());
+                allSuccess = false;
+            }
+        }
+        return allSuccess;
+    }
+
+    bool copyD2tFile()
+    {
+        // Copy d2t.bin to engine directory if it exists (optional)
         if (args.eagleBuildParams.isEagle3 && args.eagleBuildParams.isEagleDraft)
         {
-            // Copy d2t.bin to enginePath if it exists
-            std::string d2tPath = extractFolderName(args.onnxPath) + "/d2t.bin";
-            std::string targettD2tPath = extractFolderName(args.enginePath) + "/d2t.bin";
-            copyFile(d2tPath, targettD2tPath);
+            std::string d2tPath = args.onnxDir + "/d2t.bin";
+            std::string targetD2tPath = args.engineDir + "/d2t.bin";
+
+            int d2tResult = copyFile(d2tPath, targetD2tPath);
+            if (d2tResult == EXIT_SUCCESS)
+            {
+                LOG_INFO("Copied d2t.bin to %s", targetD2tPath.c_str());
+                return true;
+            }
+            else
+            {
+                LOG_WARNING("Failed to copy d2t.bin to %s", targetD2tPath.c_str());
+                return false;
+            }
         }
+        return true; // No d2t file to copy, so consider it successful
     }
 
 private:
@@ -108,13 +176,13 @@ private:
     int64_t minBatchSize;
     int64_t maxBatchSize;
     int64_t numKVHeads;
+    int64_t hiddenSize;
     int64_t headSize;
     int64_t rotaryDim;
     int32_t nbKVCacheInputs;
     int32_t maxPositionEmbeddings;
 
     // for eagle
-    int32_t hiddenSizeDim;
     int32_t targetModelOutputHiddenDim;
 
     void initializeModelDimensions()
@@ -133,8 +201,7 @@ private:
             args.vlmBuildParams.minImageTokens = args.vlmBuildParams.imageTokens;
         }
 
-        std::string onnxFolderPath = extractFolderName(args.onnxPath);
-        std::string jsonPath = onnxFolderPath + "/config.json";
+        std::string jsonPath = args.onnxDir + "/config.json";
 
         std::ifstream configFileStream(jsonPath);
         if (!configFileStream.is_open())
@@ -155,8 +222,8 @@ private:
             LOG_ERROR("llm_build: Failed to parse config file: %s", e.what());
         }
 
-        hiddenSizeDim = jsonConfig["hidden_size"].get<int32_t>();
-        targetModelOutputHiddenDim = args.eagleBuildParams.isEagle3 ? hiddenSizeDim * 3 : hiddenSizeDim;
+        hiddenSize = jsonConfig["hidden_size"].get<int32_t>();
+        targetModelOutputHiddenDim = args.eagleBuildParams.isEagle3 ? hiddenSize * 3 : hiddenSize;
         numKVHeads = jsonConfig["num_key_value_heads"].get<int32_t>();
         auto numAttentionHeads = jsonConfig["num_attention_heads"].get<int32_t>();
         if (jsonConfig.contains("head_dim"))
@@ -165,7 +232,7 @@ private:
         }
         else
         {
-            headSize = hiddenSizeDim / numAttentionHeads;
+            headSize = hiddenSize / numAttentionHeads;
         }
 
         if (jsonConfig.contains("partial_rotary_factor"))
@@ -216,14 +283,17 @@ private:
         result &= setOptimizationProfile(generationProfile, "context_lengths", createDims({minBatchSize}),
             createDims({optBatchSize}), createDims({maxBatchSize}));
 
+        // TODO: Enable stricter maxLength check via config to WAR this issue.
+        int64_t profileMaxPositionEmbeddings = std::max(static_cast<int64_t>(maxPositionEmbeddings), args.maxSeqLen);
+
         result &= setOptimizationProfile(contextProfile, "rope_rotary_cos_sin",
             createDims({minBatchSize, args.maxSeqLen, rotaryDim}),
             createDims({optBatchSize, args.maxSeqLen, rotaryDim}),
-            createDims({maxBatchSize, maxPositionEmbeddings, rotaryDim}));
+            createDims({maxBatchSize, profileMaxPositionEmbeddings, rotaryDim}));
         result &= setOptimizationProfile(generationProfile, "rope_rotary_cos_sin",
             createDims({minBatchSize, args.maxSeqLen, rotaryDim}),
             createDims({optBatchSize, args.maxSeqLen, rotaryDim}),
-            createDims({maxBatchSize, maxPositionEmbeddings, rotaryDim}));
+            createDims({maxBatchSize, profileMaxPositionEmbeddings, rotaryDim}));
 
         setupKVCacheProfiles();
 
@@ -303,12 +373,11 @@ private:
         {
 
             result &= setOptimizationProfile(contextProfile, "hidden_states_from_draft",
-                createDims({minBatchSize, 1, hiddenSizeDim}),
-                createDims({optBatchSize, args.maxInputLen / 2, hiddenSizeDim}),
-                createDims({maxBatchSize, args.maxInputLen, hiddenSizeDim}));
+                createDims({minBatchSize, 1, hiddenSize}), createDims({optBatchSize, args.maxInputLen / 2, hiddenSize}),
+                createDims({maxBatchSize, args.maxInputLen, hiddenSize}));
             result &= setOptimizationProfile(generationProfile, "hidden_states_from_draft",
-                createDims({minBatchSize, 1, hiddenSizeDim}), createDims({optBatchSize, mMaxTokens / 2, hiddenSizeDim}),
-                createDims({maxBatchSize, mMaxTokens, hiddenSizeDim}));
+                createDims({minBatchSize, 1, hiddenSize}), createDims({optBatchSize, mMaxTokens / 2, hiddenSize}),
+                createDims({maxBatchSize, mMaxTokens, hiddenSize}));
 
             result &= setOptimizationProfile(contextProfile, "hidden_states_input",
                 createDims({minBatchSize, 1, targetModelOutputHiddenDim}),
@@ -409,13 +478,13 @@ private:
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] --onnxPath <path> --enginePath <path> [--batchSize <int>] [--maxInputLen <int>] "
+              << " [--help] --onnxDir <dir> --engineDir <dir> [--batchSize <int>] [--maxInputLen <int>] "
                  "[--maxSeqLen <int>] [--dynamicShape] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help               Display this help message" << std::endl;
-    std::cerr << "  --onnxPath           Provide the input onnx file path. Required. " << std::endl;
-    std::cerr << "  --enginePath         Provide the output TensorRT engine file path. Required. " << std::endl;
+    std::cerr << "  --onnxDir            Provide the input ONNX directory path. Required. " << std::endl;
+    std::cerr << "  --engineDir          Provide the output TensorRT engine directory path. Required. " << std::endl;
     std::cerr << "  --batchSize          Provide the desired batch_size for builder. Default = 1" << std::endl;
     std::cerr << "  --maxBatchSize       Provide the maximum batch_size for builder. Default = 4" << std::endl;
     std::cerr << "  --maxInputLen        Provide the maximum input length for the model. Default = 128" << std::endl;
@@ -431,8 +500,8 @@ void printUsage(char const* programName)
 
 bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
 {
-    static struct option buildOptions[] = {{"help", no_argument, 0, 701}, {"onnxPath", required_argument, 0, 702},
-        {"enginePath", required_argument, 0, 703}, {"batchSize", required_argument, 0, 704},
+    static struct option buildOptions[] = {{"help", no_argument, 0, 701}, {"onnxDir", required_argument, 0, 702},
+        {"engineDir", required_argument, 0, 703}, {"batchSize", required_argument, 0, 704},
         {"maxInputLen", required_argument, 0, 705}, {"maxSeqLen", required_argument, 0, 706},
         {"debug", no_argument, 0, 707}, {"dynamicShape", no_argument, 0, 708},
         {"maxBatchSize", required_argument, 0, 709}, {"maxLoraRank", required_argument, 0, 710}, {0, 0, 0, 0}};
@@ -464,22 +533,22 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         case 702:
             if (optarg)
             {
-                args.onnxPath = optarg;
+                args.onnxDir = optarg;
             }
             else
             {
-                LOG_ERROR("--onnxPath requires option argument.");
+                LOG_ERROR("--onnxDir requires option argument.");
                 return false;
             }
             break;
         case 703:
             if (optarg)
             {
-                args.enginePath = optarg;
+                args.engineDir = optarg;
             }
             else
             {
-                LOG_ERROR("--enginePath requires option argument.");
+                LOG_ERROR("--engineDir requires option argument.");
                 return false;
             }
             break;
@@ -547,6 +616,16 @@ int main(int argc, char** argv)
 
     auto pluginHandles = loadEdgellmPluginLib();
 
+    // Validate input directory and required files
+    std::string configPath = args.onnxDir + "/config.json";
+    std::ifstream configFile(configPath);
+    if (!configFile.good())
+    {
+        LOG_ERROR("config.json not found in onnx directory: %s", args.onnxDir.c_str());
+        return EXIT_FAILURE;
+    }
+    configFile.close();
+
     // Create the builder
     auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
     if (!builder)
@@ -572,10 +651,20 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    // Parse the ONNX model
-    if (!parser->parseFromFile(args.onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    // Find and parse the ONNX model file
+    std::string onnxFilePath = args.onnxDir + "/model.onnx";
+    std::ifstream onnxFile(onnxFilePath);
+    if (!onnxFile.good())
     {
-        LOG_ERROR("Failed to parse ONNX file: %s", args.onnxPath.c_str());
+
+        LOG_ERROR("No ONNX model file found in directory: %s (expected model.onnx)", args.onnxDir.c_str());
+        return EXIT_FAILURE;
+    }
+    onnxFile.close();
+
+    if (!parser->parseFromFile(onnxFilePath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    {
+        LOG_ERROR("Failed to parse ONNX file: %s", onnxFilePath.c_str());
         return EXIT_FAILURE;
     }
 
@@ -611,31 +700,61 @@ int main(int argc, char** argv)
         LOG_ERROR("Failed to build engine.");
         return EXIT_FAILURE;
     }
-    std::string folderPath = extractFolderName(args.enginePath);
-    if (folderPath != "")
+
+    // Create engine directory if it doesn't exist
+    if (!std::filesystem::exists(args.engineDir))
     {
-        if (!std::filesystem::exists(folderPath))
+        if (std::filesystem::create_directories(args.engineDir))
         {
-            if (std::filesystem::create_directories(folderPath))
-            {
-                LOG_INFO("Created directory %s for saving LLM engine.", folderPath.c_str());
-            }
-            else
-            {
-                LOG_INFO("Failed to create directory %s for saving LLM engine.", folderPath.c_str());
-            }
+            LOG_INFO("Created directory %s for saving LLM engine.", args.engineDir.c_str());
+        }
+        else
+        {
+            LOG_ERROR("Failed to create directory %s for saving LLM engine.", args.engineDir.c_str());
+            return EXIT_FAILURE;
         }
     }
-    std::ofstream ofs(args.enginePath, std::ios::out | std::ios::binary);
+    else
+    {
+        LOG_INFO("Engine directory %s already exists, the LLM engine will be overwritten.", args.engineDir.c_str());
+    }
+
+    // Determine engine file name based on model type
+    std::string engineFileName;
+    if (args.eagleBuildParams.isEagleDraft)
+    {
+        engineFileName = "eagle_draft.engine";
+    }
+    else if (args.eagleBuildParams.isEagleBase)
+    {
+        engineFileName = "eagle_base.engine";
+    }
+    else
+    {
+        engineFileName = "llm.engine";
+    }
+
+    // Save engine with appropriate name
+    std::string engineFilePath = args.engineDir + "/" + engineFileName;
+    std::ofstream ofs(engineFilePath, std::ios::out | std::ios::binary);
     if (!ofs)
     {
-        LOG_ERROR("Failed to open file for writing: %s", args.enginePath.c_str());
+        LOG_ERROR("Failed to open file for writing: %s", engineFilePath.c_str());
         return EXIT_FAILURE;
     }
     ofs.write(static_cast<char*>(engine->data()), engine->size());
     ofs.close();
-    LOG_INFO("Engine saved to %s", args.enginePath.c_str());
-    profileManager.saveConfigJson();
+    LOG_INFO("Engine saved to %s", engineFilePath.c_str());
+
+    // Copy config.json and other required files
+    bool configSuccess = profileManager.saveConfigJson();
+    bool tokenizerSuccess = profileManager.copyTokenizerFiles();
+    bool d2tSuccess = profileManager.copyD2tFile();
+
+    if (!configSuccess || !tokenizerSuccess || !d2tSuccess)
+    {
+        return EXIT_FAILURE;
+    }
 
     return EXIT_SUCCESS;
 }

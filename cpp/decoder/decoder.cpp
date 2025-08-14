@@ -28,25 +28,45 @@
 
 using Json = nlohmann::json;
 
-bool Decoder::setup(
-    std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph, int64_t batchSize, bool isEagle)
+bool Decoder::setup(std::string modelDir, int64_t batchSize, bool isEagle, std::string modelType, bool useCudaGraph,
+    cudaStream_t stream)
 {
     try
     {
+        // Determine engine file path based on model type
+        std::string engineFileName;
+        if (isEagle)
+        {
+            if (modelType == "draft")
+            {
+                engineFileName = "eagle_draft.engine";
+            }
+            else
+            {
+                engineFileName = "eagle_base.engine";
+            }
+        }
+        else
+        {
+            engineFileName = "llm.engine";
+        }
+
+        std::filesystem::path enginePath = std::filesystem::path(modelDir) / engineFileName;
+
         mStream = stream;
         mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
         char const* disableMmapLoad = std::getenv("DISABLE_MMAP_LOAD");
         if (disableMmapLoad != nullptr)
         {
-            StreamReader _sr(fp);
+            StreamReader _sr(enginePath);
             mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
         }
         else
         {
-            auto mmapReader = std::make_unique<MmapReader>(fp);
+            auto mmapReader = std::make_unique<MmapReader>(enginePath);
             if (mmapReader->getData() == nullptr)
             {
-                LOG_ERROR("Failed to use MMap to read engine from file path: %s", fp.string().c_str());
+                LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());
                 return false;
             }
             mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
@@ -58,9 +78,13 @@ bool Decoder::setup(
         assert(mEngine->getNbOptimizationProfiles() == 2 && "The engine requires 2 optimization profiles");
         mContextExecutionContext->setOptimizationProfileAsync(0, mStream);
         mGenerationExecutionContext->setOptimizationProfileAsync(1, mStream);
-        // before allocateBuffer()
+
+        // Set model parameters
         mIsEagle = isEagle;
-        mEnginePath = fp;
+        mEnginePath = enginePath;
+        mModelDir = modelDir;
+        mModelType = modelType;
+
         validateAndFillConfig(batchSize);
         allocateBuffer();
         mUseCudaGraph = useCudaGraph;
@@ -106,9 +130,27 @@ void Decoder::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs)
     }
 }
 
-void Decoder::setupRopeCosSin(std::string const& configPath)
+void Decoder::setupRopeCosSin()
 {
     Json jsonConfig;
+
+    // Determine config file path based on model type
+    std::string configPath;
+    if (mIsEagle)
+    {
+        if (mModelType == "draft")
+        {
+            configPath = mModelDir + "/draft_config.json";
+        }
+        else
+        {
+            configPath = mModelDir + "/base_config.json";
+        }
+    }
+    else
+    {
+        configPath = mModelDir + "/config.json";
+    }
 
     std::ifstream configFileStream(configPath);
     if (!configFileStream.is_open())
@@ -154,13 +196,15 @@ void Decoder::setupRopeCosSin(std::string const& configPath)
     LOG_DEBUG("Setup Rope Cos Sin with type: %s, scale: %f, theta: %f, maxPositionEmbeddings: %d", ropeType.c_str(),
         rotaryScale, rotaryTheta, maxPositionEmbeddings);
 
-    if (ropeType == "default" || ropeType == "dynamic")
+    // TODO: Unify ropeType to change llama3 into default
+    if (ropeType == "default" || ropeType == "dynamic" || ropeType == "llama3")
     {
         if (mConfig.maxLength > maxPositionEmbeddings)
         {
             LOG_WARNING(
-                "Context length is greater than maxPositionEmbeddings indicated by model config, this could cause "
-                "generation results");
+                "maxLength %d is greater than maxPositionEmbeddings %d indicated by model config, this could cause "
+                "generation results",
+                mConfig.maxLength, maxPositionEmbeddings);
         }
 
         if (ropeType == "dynamic")
@@ -407,7 +451,7 @@ void Decoder::allocateCommonBuffers()
     void* samplingWorkspaceBuffer;
     drivellm::SamplingParams samplingParams(mConfig.batchSize, mConfig.vocabSize, 1.0f, 1);
     size_t workspaceSize
-        = drivellm::getTopKtopPSamplingWorkspaceSize<LogitsType>(mConfig.batchSize, mConfig.vocabSize, samplingParams);
+        = drivellm::getTopKtopPSamplingWorkspaceSize(mConfig.batchSize, mConfig.vocabSize, samplingParams);
     CUDA_CHECK(cudaMalloc(&samplingWorkspaceBuffer, workspaceSize));
     mDeviceBuffer["samplingWorkspace"] = samplingWorkspaceBuffer;
 }
@@ -488,7 +532,7 @@ void* Decoder::getDeviceBuffer(std::string const& name)
     }
     else
     {
-        assert(false && "The tensor name provided for device buffer doesn't find.");
+        throw std::runtime_error("The tensor name provided for device buffer doesn't find: " + name);
     }
     return nullptr;
 }
@@ -558,17 +602,6 @@ std::string Decoder::printKVCache()
     return oss.str();
 }
 
-// This is a helper function to print logits
-std::string Decoder::printLogits()
-{
-    size_t totalLogitSize = mConfig.batchSize * 1 * mConfig.vocabSize;
-    std::vector<LogitsType> logits(totalLogitSize, 0.0);
-    CUDA_CHECK(cudaMemcpyAsync(
-        logits.data(), mDeviceBuffer["logits"], totalLogitSize * sizeof(LogitsType), cudaMemcpyDeviceToHost, mStream));
-    CUDA_CHECK(cudaStreamSynchronize(mStream));
-    return formatFloat16Vector(logits, mConfig.batchSize);
-}
-
 void Decoder::initDecodingPhaseCudaGraph()
 {
     // Capture cuda graph only on the first run. This cuda graph will be cached and reused for all the other runs.
@@ -614,8 +647,8 @@ void Decoder::initDecodingPhaseCudaGraph()
     }
 }
 
-void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
-    std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds,
+void Decoder::generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> contextLengths,
+    std::vector<std::vector<int32_t>>& outputIds, GenerationConfig generationConfig, int32_t endIds,
     std::shared_ptr<BenchmarkProfiler> const profiler)
 {
     // Initialize decoding phase cuda graph
@@ -653,26 +686,24 @@ void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t
     auto sampleToken = [this, &outputIds, &generationIter, endIds, &generationConfig, &finishedStates, &contextLengths,
                            &unfinishedBatchNum]() {
         // Get device memory for selected indices
-        int64_t* deviceSelectedIndices = reinterpret_cast<int64_t*>(mDeviceBuffer["selected_indices"]);
+        int32_t* deviceSelectedIndices = reinterpret_cast<int32_t*>(mDeviceBuffer["selected_indices"]);
 
         // Use greedy sampling (top_k=1, temperature=1.0f)
         // TODO: add temperature, top_k and top_p sampling
         drivellm::SamplingParams params(mConfig.batchSize, mConfig.vocabSize, 1.0f, 1, 1.0f);
 
-        drivellm::topKtopPSamplingFromLogits<LogitsType>(
-            reinterpret_cast<LogitsType const*>(mDeviceBuffer["logits"]), // logits
-            deviceSelectedIndices,                                        // selected_indices
-            params,                                                       // params
-            mDeviceBuffer["samplingWorkspace"],                           // workspace
-            drivellm::getTopKtopPSamplingWorkspaceSize<LogitsType>(
-                mConfig.batchSize, mConfig.vocabSize, params), // workspaceSize
-            mStream                                            // stream
+        drivellm::topKtopPSamplingFromLogits(reinterpret_cast<LogitsType const*>(mDeviceBuffer["logits"]), // logits
+            deviceSelectedIndices,              // selected_indices
+            params,                             // params
+            mDeviceBuffer["samplingWorkspace"], // workspace
+            drivellm::getTopKtopPSamplingWorkspaceSize(mConfig.batchSize, mConfig.vocabSize, params), // workspaceSize
+            mStream                                                                                   // stream
         );
 
-        // Copy results back to host directly as int64_t
-        std::vector<int64_t> generatedToken(mConfig.batchSize);
+        // Copy results back to host directly as int32_t
+        std::vector<int32_t> generatedToken(mConfig.batchSize);
 
-        CUDA_CHECK(cudaMemcpyAsync(generatedToken.data(), deviceSelectedIndices, mConfig.batchSize * sizeof(int64_t),
+        CUDA_CHECK(cudaMemcpyAsync(generatedToken.data(), deviceSelectedIndices, mConfig.batchSize * sizeof(int32_t),
             cudaMemcpyDeviceToHost, mStream));
         CUDA_CHECK(cudaStreamSynchronize(mStream));
 
@@ -696,7 +727,7 @@ void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t
 
     // Context phase
     // Extra model inputs should be set with `setupExtraInputs` before this function
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(), inputIds.size() * sizeof(int64_t),
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], inputIds.data(), inputIds.size() * sizeof(int32_t),
         cudaMemcpyHostToDevice, mStream));
 
     generateForContext(
@@ -714,9 +745,8 @@ void Decoder::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t
     // Generation phase
     while (generationIter < generationConfig.maxLength && unfinishedBatchNum != 0)
     {
-
         CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["input_ids"], generatedToken.data(),
-            mConfig.batchSize * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+            mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
 
         generateForDecode(contextLengths, lastTokenIds);
 

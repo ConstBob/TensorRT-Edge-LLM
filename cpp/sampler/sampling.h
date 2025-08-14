@@ -47,22 +47,19 @@ struct SamplingParams
 };
 
 // Forward declaration for internal workspace structure
-template <typename T>
 struct SamplingWorkspace;
 
 // ========================================================================
 // MAIN SAMPLING FUNCTIONS
 // ========================================================================
 
-// Main sampling function with workspace
-template <typename T>
-void topKtopPSamplingFromLogits(T const* logits, int64_t* selectedIndices, SamplingParams const& params,
+// Main sampling function with workspace (FP32 only)
+void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, SamplingParams const& params,
     void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
 
-// Select all top-K elements with workspace
+// Select all top-K elements with workspace (FP32 only)
 // TODO: The definition of logits will be formalized in the next release
-template <typename T>
-void selectAllTopKFromLogits(T const* input, float* topKValues, int64_t* topKIndices, int32_t batchSize,
+void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* topKIndices, int32_t batchSize,
     int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream,
     bool returnLogProbs = false, bool normalizeLogProbs = true, bool inputHasProbs = false);
 
@@ -70,12 +67,10 @@ void selectAllTopKFromLogits(T const* input, float* topKValues, int64_t* topKInd
 // WORKSPACE SIZE CALCULATION
 // ========================================================================
 
-// Get workspace size for sampling
-template <typename T>
+// Get workspace size for sampling (FP32 only)
 size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, SamplingParams const& params);
 
-// Get workspace size for selectAllTopK
-template <typename T>
+// Get workspace size for selectAllTopK (FP32 only)
 size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK);
 
 } // namespace drivellm

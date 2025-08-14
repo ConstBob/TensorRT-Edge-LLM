@@ -15,7 +15,7 @@
 #include <random>
 #include <tuple>
 
-bool InternVLViTRunner::setup(std::filesystem::path const& fp, cudaStream_t& stream, int llmBatchSize)
+bool InternVLViTRunner::setup(std::filesystem::path const& fp, cudaStream_t stream, int llmBatchSize)
 {
     try
     {
@@ -274,17 +274,17 @@ std::string InternVLViTRunner::applyChatTemplate(std::string const& inputString,
 }
 
 void InternVLViTRunner::textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
-    std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
+    std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer, std::vector<int32_t>& inputIds,
     std::vector<int32_t>& contextLengths, int32_t const maxSupportedInputLength, bool enableDynamicShape)
 {
-    std::vector<std::vector<int64_t>> batchInputIds;
+    std::vector<std::vector<int32_t>> batchInputIds;
     std::vector<int32_t> batchInputLengths;
     int totalImageIdx = 0;
     int value = mConfig.vocabSize;
     for (size_t i = 0; i < inputStrings.size(); ++i)
     {
         std::string prompt = applyChatTemplate(inputStrings[i], numImages[i], imageTokenLengths, totalImageIdx);
-        std::vector<int64_t> ids = tokenizer->encode(prompt);
+        std::vector<int32_t> ids = tokenizer->encode(prompt);
         // replace vis tokens
         for (size_t j = 0; j < ids.size(); ++j)
         {
@@ -306,7 +306,7 @@ void InternVLViTRunner::textPreprocess(std::vector<std::string> const& inputStri
     }
     int32_t contextLenStride = enableDynamicShape ? maxContextLengthInBatch : maxSupportedInputLength;
 
-    int64_t padId = tokenizer->getPadId();
+    int32_t padId = tokenizer->getPadId();
     for (size_t i = 0; i < batchInputIds.size(); ++i)
     {
         int32_t inputSize = batchInputLengths[i];
@@ -342,7 +342,7 @@ void InternVLViTRunner::internVLViTInfer(std::vector<half> const& input)
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 }
 
-void InternVLViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vector<int64_t>& inputIds,
+void InternVLViTRunner::initRandomInputs(std::vector<half>& visualInput, std::vector<int32_t>& inputIds,
     int const textTokenLength, int const imageTokenLength, int const maxContextLength)
 {
     std::random_device dev;

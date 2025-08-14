@@ -51,7 +51,7 @@ struct GenerationConfig
 class Decoder
 {
 public:
-    using LogitsType = half;
+    using LogitsType = float;
     using KVCacheType = half;
     using LoraWeightType = half;
 
@@ -70,13 +70,13 @@ public:
         , mIsEagle{false}
     {
     }
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, bool useCudaGraph = false, int64_t batchSize = 1,
-        bool isEagle = false);
+    bool setup(std::string modelDir, int64_t batchSize = 1, bool isEagle = false, std::string modelType = "",
+        bool useCudaGraph = false, cudaStream_t stream = nullptr);
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
-    void setupRopeCosSin(std::string const& configPath);
+    void setupRopeCosSin();
 
-    void generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> contextLengths,
-        std::vector<std::vector<int64_t>>& outputIds, GenerationConfig generationConfig, int64_t endIds = -1,
+    void generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> contextLengths,
+        std::vector<std::vector<int32_t>>& outputIds, GenerationConfig generationConfig, int32_t endIds = -1,
         std::shared_ptr<BenchmarkProfiler> const profiler = nullptr);
 
     void generateForContext(void* inputIds, std::vector<int32_t>& contextLengths,
@@ -134,8 +134,9 @@ private:
 
     // These are used as debugging functions
     std::string printKVCache();
-    std::string printLogits();
     std::string mEnginePath;
+    std::string mModelDir;
+    std::string mModelType;
 
     bool mUseCudaGraph{true};
     bool mCudaGraphCaptured{false};

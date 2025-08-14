@@ -74,8 +74,8 @@ struct MMMUTestData
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] [--enginePath=<path to LLM engine>] [--visualEnginePath=<path to visual engine>]"
-                 " [--tokenizerPath=<path to HF tokenizer>] [--datasetPath=<path to dataset>]"
+              << " [--help] [--engineDir=<path to LLM engine directory>] [--visualEnginePath=<path to visual engine>]"
+                 " [--datasetPath=<path to dataset>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     CommonUsage::printBaseOptions();
@@ -106,7 +106,7 @@ bool parseMultimodalAccuracyArgs(MultimodalAccuracyArgs& args, int argc, char* a
     int opt;
     while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
-        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, true))
+        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg))
         {
             continue;
         }
@@ -432,17 +432,18 @@ std::unique_ptr<LLMEngine> getLLMEngine(BaseParams const& baseParams, EagleParam
     LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
 {
     EngineConfig engineConfig;
-    bool eagleMode = !eagleParams.eagleEnginePath.empty();
+    bool eagleMode = !eagleParams.baseModelDir.empty() && !eagleParams.draftModelDir.empty();
     if (eagleMode)
     {
         LOG_INFO("Running in Eagle mode.");
-        engineConfig = EngineConfig(baseParams.enginePath, eagleParams.eagleEnginePath, eagleParams.maxPathLen,
-            eagleParams.topK, eagleParams.isEagle3, eagleParams.maxDecodingTokens, !baseParams.noCudaGraph);
+        engineConfig = EngineConfig(baseParams.engineDir, eagleParams.baseModelDir, eagleParams.draftModelDir,
+            eagleParams.maxPathLen, eagleParams.topK, eagleParams.isEagle3, eagleParams.maxDecodingTokens,
+            !baseParams.noCudaGraph);
     }
     else
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(baseParams.enginePath, !baseParams.noCudaGraph);
+        engineConfig = EngineConfig(baseParams.engineDir, !baseParams.noCudaGraph);
     }
     auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     llmEngine->setupExtraInputs(vitrunner->getExtraLLMInputs());
@@ -502,9 +503,9 @@ void evalQwen2VL(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer
         std::vector<half> visualAttentionMask;
         std::vector<float> visualRotaryPosEmb;
         std::vector<std::vector<int64_t>> visualGridTHWs;
-        std::vector<int64_t> inputIds;
+        std::vector<int32_t> inputIds;
         std::vector<int32_t> contextLengths;
-        std::vector<std::vector<int64_t>> outputIds(1);
+        std::vector<std::vector<int32_t>> outputIds(1);
 
         // Preprocess
         std::vector<unsigned char*> imageBuffers;
@@ -589,9 +590,7 @@ void evalInternVL3(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokeniz
         return;
     }
     // Initialize rope_rotary_cos_sin
-    std::string baseFolderPath = extractFolderName(baseParams.enginePath);
-    std::string configPath = baseFolderPath + "/config.json";
-    llmEngine->setupRopeCosSin(configPath);
+    llmEngine->setupRopeCosSin();
 
     int const maxSupportedInputLength = llmEngine->getMaxSupportedInputLength();
     bool const enableDynamicShape = llmEngine->getMinSupportedInputLength() != maxSupportedInputLength;
@@ -610,10 +609,10 @@ void evalInternVL3(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokeniz
 
         bool useThumbnail = true;
         std::vector<half> visualInput;
-        std::vector<int64_t> inputIds;
+        std::vector<int32_t> inputIds;
         std::vector<int64_t> imageTokenLengths;
         std::vector<int32_t> contextLengths;
-        std::vector<std::vector<int64_t>> outputIds(1);
+        std::vector<std::vector<int32_t>> outputIds(1);
 
         // Preprocess
         std::vector<unsigned char*> imageBuffers;
@@ -748,7 +747,15 @@ int main(int argc, char* argv[])
     auto pluginHandles = loadEdgellmPluginLib();
 
     auto tokenizer = std::make_unique<Tokenizer>();
-    tokenizer->loadFromHF(args.baseParams.tokenizerPath);
+    // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
+    {
+        tokenizer->loadFromHF(args.baseParams.engineDir);
+    }
+    else
+    {
+        tokenizer->loadFromHF(args.eagleParams.baseModelDir);
+    }
     mmmuAccuracy(args, tokenizer.get());
 
     return EXIT_SUCCESS;

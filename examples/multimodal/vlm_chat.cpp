@@ -39,20 +39,20 @@ struct VlmChatArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] [--enginePath=<path to LLM engine>] [--visualEnginePath=<path to visual engine>]"
-                 " [--tokenizerPath=<path to HF tokenizer>] [--inputString=<input string for one batch>]"
-                 " [--imagePaths=<image paths for one batch>] [--maxLength=<int>]"
+              << " [--help] [--engineDir=<path to LLM engine directory>] [--visualEnginePath=<path to visual engine>]"
+                 " [--modelType=<model type>] [--inputString=<input string>] [--imagePaths=<image paths>]"
+                 " [--maxLength=<int>] [--loraWeights=<name:path>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  --inputString       Provide the input string to the runtime. Required. " << std::endl;
-    std::cerr << "  --imagePaths        Provide the input image paths to the runtime. Required. " << std::endl;
-    std::cerr << "  --maxLength         Provide the maximum output length for the generation session (including the "
-                 "input). Default = 1024."
-              << std::endl;
     CommonUsage::printBaseOptions();
     CommonUsage::printEagleOptions();
     CommonUsage::printVLMRunOptions();
     CommonUsage::printLoraOptions();
+    std::cerr << "  --inputString    Provide the input string to the runtime. " << std::endl;
+    std::cerr << "  --imagePaths     Provide the image paths separated by comma. " << std::endl;
+    std::cerr << "  --maxLength      Provide the maximum output length for the generation session (including the "
+                 "input). Default = 1024"
+              << std::endl;
 };
 
 bool parseVlmChatArgs(VlmChatArgs& args, int argc, char* argv[])
@@ -76,7 +76,7 @@ bool parseVlmChatArgs(VlmChatArgs& args, int argc, char* argv[])
     int opt;
     while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
-        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, true))
+        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg))
         {
             continue;
         }
@@ -165,17 +165,18 @@ std::unique_ptr<LLMEngine> getLLMEngine(int32_t batchSize, BaseParams const& bas
     LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
 {
     EngineConfig engineConfig;
-    bool eagleMode = !eagleParams.eagleEnginePath.empty();
+    bool eagleMode = !eagleParams.baseModelDir.empty() && !eagleParams.draftModelDir.empty();
     if (eagleMode)
     {
         LOG_INFO("Running in Eagle mode.");
-        engineConfig = EngineConfig(baseParams.enginePath, eagleParams.eagleEnginePath, eagleParams.maxPathLen,
-            eagleParams.topK, eagleParams.isEagle3, eagleParams.maxDecodingTokens, !baseParams.noCudaGraph);
+        engineConfig = EngineConfig(baseParams.engineDir, eagleParams.baseModelDir, eagleParams.draftModelDir,
+            eagleParams.maxPathLen, eagleParams.topK, eagleParams.isEagle3, eagleParams.maxDecodingTokens,
+            !baseParams.noCudaGraph);
     }
     else
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(baseParams.enginePath, !baseParams.noCudaGraph, batchSize);
+        engineConfig = EngineConfig(baseParams.engineDir, !baseParams.noCudaGraph, batchSize);
     }
     auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     llmEngine->setupExtraInputs(vitrunner->getExtraLLMInputs());
@@ -203,7 +204,7 @@ std::unique_ptr<LLMEngine> getLLMEngine(int32_t batchSize, BaseParams const& bas
 void decodeQwen2VL(BaseParams const& baseParams, EagleParams const& eagleParams, VLMRunParams const& vlmRunParams,
     std::vector<std::string>& inputStrings, std::vector<std::vector<std::string>> const& imagePaths,
     Tokenizer* tokenizer, GenerationConfig const& generationConfig, int32_t const batchSize,
-    std::vector<std::vector<int64_t>>& outputIds, LoraWeights const& loraWeights)
+    std::vector<std::vector<int32_t>>& outputIds, LoraWeights const& loraWeights)
 {
     // Setup
     cudaStream_t stream;
@@ -219,7 +220,7 @@ void decodeQwen2VL(BaseParams const& baseParams, EagleParams const& eagleParams,
     std::vector<half> visualAttentionMask;
     std::vector<float> visualRotaryPosEmb;
     std::vector<std::vector<int64_t>> visualGridTHWs;
-    std::vector<int64_t> inputIds;
+    std::vector<int32_t> inputIds;
     std::vector<int32_t> contextLengths;
 
     // Load images
@@ -294,7 +295,7 @@ void decodeQwen2VL(BaseParams const& baseParams, EagleParams const& eagleParams,
 void decodeInternVL3(BaseParams const& baseParams, EagleParams const& eagleParams, VLMRunParams const& vlmRunParams,
     std::vector<std::string>& inputStrings, std::vector<std::vector<std::string>> const& imagePaths,
     Tokenizer* tokenizer, GenerationConfig const& generationConfig, int32_t const batchSize,
-    std::vector<std::vector<int64_t>>& outputIds, LoraWeights const& loraWeights, bool const useThumbnail)
+    std::vector<std::vector<int32_t>>& outputIds, LoraWeights const& loraWeights, bool const useThumbnail)
 {
     // Setup
     cudaStream_t stream;
@@ -307,14 +308,12 @@ void decodeInternVL3(BaseParams const& baseParams, EagleParams const& eagleParam
         = getLLMEngine<InternVLViTRunner>(batchSize, baseParams, eagleParams, loraWeights, stream, vitrunner);
 
     // Initialize rope_rotary_cos_sin
-    std::string baseFolderPath = extractFolderName(baseParams.enginePath);
-    std::string configPath = baseFolderPath + "/config.json";
-    llmEngine->setupRopeCosSin(configPath);
+    llmEngine->setupRopeCosSin();
 
     // Preprocess
     std::vector<half> visualInput;
     std::vector<int64_t> imageTokenLengths;
-    std::vector<int64_t> inputIds;
+    std::vector<int32_t> inputIds;
     std::vector<int32_t> contextLengths;
 
     // Load images
@@ -413,7 +412,7 @@ std::vector<std::string> decode(BaseParams const& baseParams, EagleParams const&
         imagePaths.emplace_back(std::vector<std::string>{});
     }
 
-    std::vector<std::vector<int64_t>> outputIds(batchSize);
+    std::vector<std::vector<int32_t>> outputIds(batchSize);
     for (int i = 0; i < batchSize; ++i)
     {
         outputIds[i].reserve(generationConfig.maxLength);
@@ -472,7 +471,15 @@ int main(int argc, char* argv[])
 
     GenerationConfig generationConfig{args.maxLength, 0, 1, 1};
     auto tokenizer = std::make_unique<Tokenizer>();
-    tokenizer->loadFromHF(args.baseParams.tokenizerPath);
+    // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
+    {
+        tokenizer->loadFromHF(args.baseParams.engineDir);
+    }
+    else
+    {
+        tokenizer->loadFromHF(args.eagleParams.baseModelDir);
+    }
     auto output = decode(args.baseParams, args.eagleParams, args.vlmRunParams, args.inputStrings, args.imagePaths,
         tokenizer.get(), generationConfig, args.loraWeights);
 

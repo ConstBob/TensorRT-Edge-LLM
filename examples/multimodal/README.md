@@ -1,548 +1,377 @@
-# DriveOS LLM SDK Example: Multimodal Models
+# TensorRT Edge LLM Example: Multimodal Models
 
-This document shows how to run multimodal pipelines with DriveOS LLM SDK, e.g. from image+text input modalities to text output.
+## Prerequisites
 
-Multimodal models' LLM part and multimodal part are separated into two TensorRT engines. While LLM part is similar to LLM-only models, multimodal part is model-specific. Multimodal runner combines the two parts together. The multimodal features of shape `[batch_size, num_multimodal_features, multimodal_hidden_dim]` is flattened as `[batch_size * num_multimodal_features, multimodal_hidden_dim]` and passed like a prompt embedding table together with other model specific inputs.
+An ONNX model that complies with the TensorRT Edge LLM runtime should be ready following [ONNX export](../../export/README.md). To run inference with real data, a tokenizer file is also required.
 
-We describe how to run supported models in the below section.
+### ONNX Folder Structure
 
-- [Qwen2-VL and Qwen2.5-VL](#qwen2-vl-and-qwen2_5-vl)
-- [InternVL3](#internvl3)
+The ONNX export process creates the following folder structure:
 
-## Qwen2-VL and Qwen2.5-VL
+```
+onnx_models/${MODEL_NAME}/
+├── model.onnx                    # Main LLM model ONNX file
+├── config.json                   # LLM model configuration
+├── tokenizer_config.json         # Tokenizer configuration
+├── tokenizer.json               # Tokenizer vocabulary
+└── visual_enc_onnx_${visualType}/
+    └── model.onnx               # Visual encoder ONNX file
+```
 
-### Prerequisites
+### Image Tokens and Preprocessing
 
-1. Download Huggingface weights
+Multimodal models process images into tokens that are fed into the LLM. The number of image tokens depends on the model architecture:
 
-    Supported models:
-    - [Qwen2-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct)
-    - [Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct)
-    - [Qwen2.5-vl-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
-    - [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)
+#### Qwen2-VL and Qwen2.5-VL
+- An image with height × width = `N×28×28` pixels generates `N` image tokens
+- Default preprocessing: `minPixels = 128×28×28, maxPixels = 512×28×28`
+- Example: A 1944×1176 image generates 486 image tokens
 
-    ```bash
-    git lfs install
-    export MODEL_NAME="Qwen2-VL-7B-Instruct"
-    git clone https://huggingface.co/Qwen/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+#### InternVL3
+- Uses a downsampling ratio of 0.5, resulting in 4x fewer output tokens
+- Images are resized to multiples of 448 while maintaining aspect ratio
+- Maximum 6 patches (448×448×3) per image to keep token count low
+- Thumbnail image adds 256 additional tokens
+- Example: A 1344×896 image with thumbnail generates 1792 image tokens
 
-    export MODEL_TYPE="qwen2_vl"
-    # or
-    export MODEL_TYPE="qwen2_5_vl"
-    ```
+**Key Points:**
+- Total image tokens in a batch must match `--imageTokens` for static engines
+- For dynamic engines, tokens must be within `[--minImageTokens, --maxImageTokens]` range
+- Image preprocessing is handled by model-specific runners (`Qwen2ViTRunner`, `InternVLViTRunner`)
 
-2. Export to ONNX
+## Engine Build
 
-    Visual and LLM part is exported to two separate ONNX files. For details, please refer to [export README](../../export/README.md). 
-    ```bash
-    cd drive-llm
+The `llm_build` binary builds LLM TensorRT engines, while `visual_build` builds visual encoder engines. Both engines are required for multimodal inference.
 
-    # LLM part onnx export:
-    python3 ./export/llm_export.py \
-    --torch_dir tmp/hf_models/${MODEL_NAME} \
-    --output_dir tmp/onnx/${MODEL_NAME} \
-    --dtype [fp16|fp8|int4|nvfp4|int4_ootb] \
-    --use_prompt_tuning True
-    
-    # Visual part onnx export:
-    export visualType=[fp16|fp8]
-    python3 ./export/multimodal_export.py \
-    --torch_dir tmp/hf_models/${MODEL_NAME} \
-    --output_dir tmp/onnx/${MODEL_NAME} \
-    --visualType ${visualType}
-    ```
+### Standard VLM (Naive Decoding)
+
+**Build LLM Engine:**
+```bash
+./build/examples/llm/llm_build \
+--onnxDir=onnx_models/${MODEL_NAME} \
+--engineDir=engines/${MODEL_NAME} \
+--batchSize=1 \
+--maxInputLen=1024 \
+--maxSeqLen=4096 \
+--usePromptTuning
+```
+
+**Build Visual Engine:**
+```bash
+./build/examples/multimodal/visual_build \
+--visualOnnxPath=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
+--modelType=${MODEL_TYPE} \
+--imageTokens=486
+```
+
+### Dynamic Shape Support
+
+**LLM Engine:**
+```bash
+./build/examples/llm/llm_build \
+--onnxDir=onnx_models/${MODEL_NAME} \
+--engineDir=engines/${MODEL_NAME} \
+--maxInputLen=1024 \
+--maxSeqLen=4096 \
+--dynamicShape \
+--maxBatchSize=1 \
+--usePromptTuning
+```
+
+**Visual Engine:**
+```bash
+./build/examples/multimodal/visual_build \
+--visualOnnxPath=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
+--modelType=${MODEL_TYPE} \
+--dynamicShape \
+--minImageTokens=128 \
+--maxImageTokens=512
+```
+
+### EAGLE VLM (Speculative Decoding)
+
+For EAGLE VLM, build separate base and draft LLM engines plus visual engine:
+
+**Base LLM Engine:**
+```bash
+./build/examples/llm/llm_build \
+--onnxDir=onnx_models/${MODEL_NAME}_eagle3_base \
+--engineDir=engines/${MODEL_NAME}_eagle3_base \
+--batchSize=1 \
+--maxInputLen=1024 \
+--maxSeqLen=4096 \
+--dynamicShape \
+--maxBatchSize=1 \
+--isEagleBase \
+--isEagle3 \
+--usePromptTuning
+```
+
+**Draft LLM Engine:**
+```bash
+./build/examples/llm/llm_build \
+--onnxDir=onnx_models/${MODEL_NAME}_eagle3_draft \
+--engineDir=engines/${MODEL_NAME}_eagle3_draft \
+--batchSize=1 \
+--maxInputLen=1024 \
+--maxSeqLen=4096 \
+--dynamicShape \
+--maxBatchSize=1 \
+--isEagleDraft \
+--isEagle3 \
+--usePromptTuning
+```
+
+**Visual Engine (shared):**
+```bash
+./build/examples/multimodal/visual_build \
+--visualOnnxPath=onnx_models/${MODEL_NAME}_eagle3_base/visual_enc_onnx_${visualType}/model.onnx \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
+--modelType=${MODEL_TYPE} \
+--dynamicShape \
+--minImageTokens=128 \
+--maxImageTokens=512
+```
 
 **Notes:**
-1. We support FP8 VIT quantization. A NVIDIA research has shown that FP8 VIT can preserve VLM accuracy while increasing VIT performance. For details you can refer to this [paper](https://arxiv.org/pdf/2412.04468).
-2. In TensorRT10.10, user need to disable `attn.proj` layers to get best FP8 VIT performance.
-3. Qwen2.5-VL 3B VIT with FP16 precision has occasional overflow issue from the last transformer block and we observed the same issue with HuggingFace using Pytorch backend. We applied a work-around to cast the last down_proj to FP32 in [multimodal_export.py](../../export/multimodal_export.py).
+- `--maxSeqLen` must be greater than `--maxInputLen`
+- `maxSeqLen` must match the `kv_cache_capacity` field in the ONNX `AttentionPlugin` node
+- For EAGLE2 models, remove the `--isEagle3` flag
 
-### Image Preprocess and Number of Image Tokens
+## Required Folder Structure
 
-1. Image preprocess methods is located in `Qwen2ViTRunner`, which is aligned to huggingface Qwen2-VL/Qwen2.5-VL official image preprocessor.
-2. As a sample, `Qwen2ViTRunner` uses third-party header-only library `stb_image` to read and resize jpeg images. Users should customize image preprocess methods according to their needs, e.g. support other image format, use other libraries.
-3. User should set appropriate `imageTokens` in `visual_build` and `llm_build` and resize input images to appropriate shapes to match engine build config.
-    1. For Qwen2-VL/Qwen2.5-VL, an image with height * width = `N*28*28` pixels will generate `N` image tokens.
-    2. Total number of image tokens generated by all images in a batch should be equal to `--imageTokens` for static shape LLM engine, or should be within the range `[--minImageTokens, --maxImageTokens]` for dynamic shape LLM engine.
-    3. In `vlm_chat`, we set default `minPixels = 128*28*28, maxPixels = 512*28*28` in `adjustImageSize`, which means each image will become [128, 512] image tokens. Under this preprocess config, `qwen2vl/pics/demo.jpeg` is resized to input shape [1944, 1176] for VIT and generates 486 image tokens.
-    4. In `vlm_accuracy`, we set default `minPixels = 1280*28*28, maxPixels = 6620*28*28`.
+### Standard VLM Engine
 
-### Build Engine
+```
+engines/${MODEL_NAME}/
+├── llm.engine                    # LLM TensorRT engine file
+├── config.json                   # LLM model configuration
+├── tokenizer_config.json         # Tokenizer configuration
+└── tokenizer.json               # Tokenizer vocabulary
 
-The `llm_build` binary is used to build LLM part TensorRT engines and `visual_build` binary is used to build visual part TensorRT engines(like ViT). Corresponding to ONNX, we build visual engine and LLM engine respectively.
+visual_engines/${MODEL_NAME}/
+└── visual_enc_${visualType}.engine  # Visual encoder TensorRT engine
+```
 
-1. Static shape
+### EAGLE VLM Engine Structure
 
-    Specify `--batchSize` and `--imageTokens`. For production, use static shape for better performance unless dynamic shape is necessary.
+```
+engines/${MODEL_NAME}_base/
+├── eagle_base.engine            # Base LLM TensorRT engine
+├── base_config.json             # Base LLM configuration
+├── tokenizer_config.json        # Tokenizer configuration (shared)
+└── tokenizer.json              # Tokenizer vocabulary (shared)
 
-    Building the LLM part:
-    ```bash
-    ./build/examples/llm/llm_build \
-    --onnxPath=tmp/onnx/${MODEL_NAME}/model.onnx \
-    --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-    --usePromptTuning \
-    --modelType=${MODEL_TYPE} \
-    --maxInputLen=1024 --maxSeqLen=4096 \
-    --batchSize=1 --imageTokens=486
-    ```
+engines/${MODEL_NAME}_draft/
+├── eagle_draft.engine           # Draft LLM TensorRT engine
+├── draft_config.json            # Draft LLM configuration
+└── d2t.bin                     # Draft-to-target mapping (Eagle3 only, optional)
 
-    For dynamic LoRA support, add the following flags:
-    ```bash
-    --maxLoraRank=<max_rank> --loraWeights=<path_to_lora_weights_safetensors>
-    ```
+visual_engines/${MODEL_NAME}/
+└── visual_enc_${visualType}.engine  # Visual encoder TensorRT engine
+```
 
-    Building the visual part:
-    ```bash
-    ./build/examples/multimodal/visual_build \
-    --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
-    --modelType=${MODEL_TYPE} \
-    --imageTokens=486
-    ```
+## Running Inference
 
-2. Dynamic shape
+### Chat Interface
 
-    Add `--dynamicShape` and specify `--maxBatchSize`, `--minImageTokens` and `--minImageTokens`.
-    Building the LLM part:
-    ```bash
-    ./build/examples/llm/llm_build \
-    --onnxPath=tmp/onnx/${MODEL_NAME}/model.onnx \
-    --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-    --usePromptTuning \
-    --modelType=${MODEL_TYPE} \
-    --maxInputLen=1024 --maxSeqLen=4096 \
-    --dynamicShape \
-    --maxBatchSize=1 --minImageTokens=128 --maxImageTokens=512
-    ```
-
-    For dynamic LoRA support, add the following flags:
-    ```bash
-    --maxLoraRank=<max_rank>
-    ```
-
-    Building the visual part:
-    ```bash
-    ./build/examples/multimodal/visual_build \
-    --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
-    --modelType=${MODEL_TYPE} \
-    --dynamicShape \
-    --minImageTokens=128 --maxImageTokens=512
-    ```
-
-### VLM Chat
-
+**Standard VLM:**
 ```bash
 ./build/examples/multimodal/vlm_chat \
---tokenizerPath=tmp/hf_models/${MODEL_NAME} \
---enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
---visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
+--engineDir=engines/${MODEL_NAME} \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
 --modelType=${MODEL_TYPE} \
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/pics/demo.jpeg"
 ```
 
-**Notes:**
-1. `vlm_chat` default `minPixels = 128*28*28, maxPixels = 512*28*28`. The above example command uses `--imageTokens=486` to match "qwen2vl/pics/demo.jpeg" size. Users should modify `--imageTokens` or `minPixels`, `maxPixels` according to their needs. For more details, please reference [Image Preprocess](#Image-Preprocess).
-
-2. `vlm_chat` uses command line arguments to pass prompts and images.
-    1. `--inputString` takes input prompt for one batch. `--imagePaths` takes image paths for one batch. Multiple image paths in one batch should be separated with comma `','`, for example,
-    ```bash
-    --inputString="Identify the similarities between these images." \
-    --imagePaths="image1.jpeg,image2.jpeg"
-    ```
-    2. One `--inputString` and one `--imagePaths` are paired as inputs for one batch. `batchSize` equals to the maximum of number of `--inputString` and number of `--imagePaths`.
-    3. For any batch that contains `--imagePaths` only, `--inputString` is set to default prompt `Describe this image.`. For any batch that contains `--inputString` only, `--imagePaths` is set to empty, which is equivalent to pure LLM inference.
-    4. Users may modify input passing according to their needs.
-
-### Benchmark Performance
-
-```bash
-./build/examples/multimodal/vlm_benchmark \
---enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
---visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
---textTokenLength=512 --imageTokenLength=486 --outputLength=256 \
-[--warmUp=2 --numRuns=10]
-```
-
-**Notes:**
-1. `--imageTokenLength` should be equal to `--imageTokens` for static shape LLM engine, or should be within the range `[--minImageTokens, --maxImageTokens]` for dynamic shape LLM engine.
-
-## InternVL3
-
-### Prerequisites
-
-1. Download Huggingface weights
-
-    Supported models:
-    - [InternVL3-1B-hf](https://huggingface.co/OpenGVLab/InternVL3-1B-hf)
-    - [InternVL3-2B-hf](https://huggingface.co/OpenGVLab/InternVL3-2B-hf)
-
-    ```bash
-    git lfs install
-    export MODEL_NAME="InternVL3-1B-hf"
-    git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-
-    export MODEL_TYPE="internvl3"
-    ```
-
-2. Export to ONNX
-
-    Visual and LLM part is exported to two separate ONNX files. For details, please refer to [export README](../../export/README.md). 
-
-    # LLM part onnx export:
-    ```bash
-    cd drive-llm
-
-    # LLM part onnx export:
-    python3 ./export/llm_export.py \
-    --torch_dir tmp/hf_models/${MODEL_NAME} \
-    --output_dir tmp/onnx/${MODEL_NAME} \
-    --dtype [fp16|fp8|int4|nvfp4|int4_ootb] \
-    --use_prompt_tuning True
-    
-    # Visual part onnx export:
-    export visualType=[fp16|fp8]
-    python3 ./export/multimodal_export.py \
-    --torch_dir tmp/hf_models/${MODEL_NAME} \
-    --output_dir tmp/onnx/${MODEL_NAME} \
-    --visualType ${visualType}
-    ```
-
-
-**Notes:**
-1. InternVL3 uses a downsampling ratio of 0.5 in the visual encoder, resulting in 4x fewer output tokens compared to input visual tokens.
-
-### Image Preprocess and Number of Image Tokens
-
-1. Image preprocess methods is located in `InternVLViTRunner`, which is aligned to huggingface InternVL3 official image preprocessor.
-2. As a sample, `InternVLViTRunner` uses third-party header-only library `stb_image` to read and resize jpeg images. Users should customize image preprocess methods according to their needs, e.g. support other image format, use other libraries.
-3. User should set appropriate `imageTokens` in `visual_build` and `llm_build` and resize input images to appropriate shapes to match engine build config.
-    1. For InternVL3, an image with resized_height * resized_width = `N*3*28*28` pixels will generate `N` image tokens. Here is the resize is performed so height/width are multiples of 448 while maintaining the aspect ratio as much as possible. Furthermore, if you plan to include the thumbnail image (enabled by default) along with the blocks, an additional 448x448x3 image is appended which adds another 256 tokens to image tokens. 
-    2. In the preprocessing implementation, the number of blocks of 448x448x3 in the image are capped at 6 to keep the number of image tokens low. So the possible aspect ratios (w, h) are - `{{1, 1}, {1, 2}, {2, 1}, {3, 1}, {1, 3}, {2, 2}, {4, 1}, {1, 4}, {5, 1}, {1, 5}, {1, 6}, {6, 1}, {3, 2}, {2, 3}}`. This can easily be configured by editing this in `vlm_chat`. 
-    3. The demo image `internvl3/pics/demo.jpeg` is closest to the aspect ratio `{3,2}`. Therefore the image is resized to [1344, 896], and after addition of thumbnail image, results in total `(6+1) * 256 = 1792` image tokens. 
-    4. Total number of image tokens generated by all images in a batch should be equal to `--imageTokens` for static shape LLM engine, or should be within the range `[--minImageTokens, --maxImageTokens]` for dynamic shape LLM engine.
-    6. In `vlm_accuracy`, we set default aspect ratios to be the same as `vlm_chat`.
-
-### Build Engine
-
-The `llm_build` binary is used to build LLM part TensorRT engines and `visual_build` binary is used to build visual part TensorRT engines(like ViT). Corresponding to ONNX, we build visual engine and LLM engine respectively.
-
-1. Static shape
-
-    Specify `--batchSize` and `--imageTokens`. For production, use static shape for better performance unless dynamic shape is necessary.
-
-    Building the LLM part:
-    ```bash
-    ./build/examples/llm/llm_build \
-    --onnxPath=tmp/onnx/${MODEL_NAME}/model.onnx \
-    --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-    --usePromptTuning \
-    --modelType=${MODEL_TYPE} \
-    --maxInputLen=2048 --maxSeqLen=4096 \
-    --batchSize=1 --imageTokens=1792
-    ```
-
-    For dynamic LoRA support, add the following flags:
-    ```bash
-    --maxLoraRank=<max_rank> --loraWeights=<path_to_lora_weights_safetensors>
-    ```
-
-    Building the visual part:
-    ```bash
-    ./build/examples/multimodal/visual_build \
-    --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
-    --modelType=${MODEL_TYPE} \
-    --imageTokens=1792
-    ```
-
-
-2. Dynamic shape
-
-    Add `--dynamicShape` and specify `--maxBatchSize`, `--minImageTokens` and `--maxImageTokens`.
-    ```bash
-    ./build/examples/llm/llm_build \
-    --onnxPath=tmp/onnx/${MODEL_NAME}/model.onnx \
-    --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-    --usePromptTuning \
-    --modelType=${MODEL_TYPE} \
-    --maxInputLen=2048 --maxSeqLen=4096 \
-    --dynamicShape \
-    --maxBatchSize=1 --minImageTokens=256 --maxImageTokens=1792
-    ```
-
-    For dynamic LoRA support, add the following flags:
-    ```bash
-    --maxLoraRank=<max_rank>
-    ```
-
-    Building the visual part:
-    ```bash
-    ./build/examples/multimodal/visual_build \
-    --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
-    --modelType=${MODEL_TYPE} \
-    --dynamicShape \
-    --minImageTokens=256 --maxImageTokens=1792
-    ```
-
-### VLM Chat
-
+**EAGLE VLM:**
 ```bash
 ./build/examples/multimodal/vlm_chat \
---tokenizerPath=tmp/hf_models/${MODEL_NAME} \
---enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
---visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
---inputString="Describe the picture." \
---imagePaths="examples/multimodal/pics/demo.jpeg" \
---maxLength=2048
-```
-
-**Notes:**
-1. InternVL3 uses the same command line interface as Qwen2-VL for consistency.
-2. Multiple image paths in one batch should be separated with comma `','`.
-3. For any batch that contains `--imagePaths` only, `--inputString` is set to default prompt `Describe this image.`. For any batch that contains `--inputString` only, `--imagePaths` is set to empty, which is equivalent to pure LLM inference.
-
-### Benchmark Performance
-
-```bash
-./build/examples/multimodal/vlm_benchmark \
---enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
---visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
---textTokenLength=512 --imageTokenLength=256 --outputLength=256 \
-[--warmUp=2 --numRuns=10]
-```
-
-**Notes:**
-1. `--imageTokenLength` should be equal to `--imageTokens` for static shape LLM engine, or should be within the range `[--minImageTokens, --maxImageTokens]` for dynamic shape LLM engine.
-
-### Evaluate Accuracy with MMMU
-
-To match MMMU evaluation [config](https://github.com/open-compass/VLMEvalKit/blob/9ca28fd06bac52d0c42845dac8891dd9e6354611/vlmeval/config.py#L253-L264) and TensorRT shape requirement, we need to generate ONNX and TensorRT engines with the following config: `--minImageTokens=1280`, `--maxImageTokens=6620`, `--maxInputLen=7168`, `--maxSeqLen=8192`.
-
-1. Use [prepare_mmmu_onnx.py](../../scripts/prepare_mmmu_onnx.py) to set `kv_cache_capacity=8192` in LLM ONNX for Qwen-VL models.
-    ```bash
-    python3 ./scripts/prepare_mmmu_onnx.py \
-    --input_path tmp/onnx/${MODEL_NAME}/model.onnx \
-    --output_path tmp/onnx/${MODEL_NAME}/llm_onnx_mmmu/model.onnx
-    ```
-
-    Whereas for InternVL3 model set it to 10240. 
-    ```bash
-    python3 ./scripts/prepare_mmmu_onnx.py \
-    --input_path tmp/onnx/${MODEL_NAME}/model.onnx \
-    --output_path tmp/onnx/${MODEL_NAME}/llm_onnx_mmmu/model.onnx \
-    -kv 10240
-    ```
-
-2. Build engine
-    Building the LLM part:
-    ```bash
-    ./build/examples/llm/llm_build \
-    --onnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx_mmmu/model.onnx \
-    --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.mmmu.engine \
-    --usePromptTuning \
-    --modelType=${MODEL_TYPE} \
-    --maxInputLen=7168 --maxSeqLen=8192 \
-    --dynamicShape \
-    --maxBatchSize=1 --minImageTokens=1280 --maxImageTokens=6620
-    ```
-
-    Building the visual part:
-    ```bash
-    ./build/examples/multimodal/visual_build \
-    --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.mmmu.engine \
-    --modelType=${MODEL_TYPE} \
-    --dynamicShape \
-    --minImageTokens=1280 --maxImageTokens=6620
-    ```
-
-    For InternVL3 model:
-
-    Building the LLM part:
-    ```bash
-    ./build/examples/llm/llm_build \
-    --onnxPath=tmp/onnx/${MODEL_NAME}/llm_onnx_mmmu/model.onnx \
-    --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.mmmu.engine \
-    --usePromptTuning \
-    --modelType=${MODEL_TYPE} \
-    --maxInputLen=9216 --maxSeqLen=10240 \
-    --dynamicShape \
-    --maxBatchSize=1 --minImageTokens=512 --maxImageTokens=8960
-    ```
-
-    Building the visual part:
-    ```bash
-    ./build/examples/multimodal/visual_build \
-    --visualOnnxPath=tmp/onnx/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.mmmu.engine \
-    --modelType=${MODEL_TYPE} \
-    --dynamicShape \
-    --minImageTokens=512 --maxImageTokens=8960
-    ```
-
-3. Collect inference results on MMMU-val dataset.
-    ```bash
-    wget https://opencompass.openxlab.space/utils/VLMEval/MMMU_DEV_VAL.tsv
-
-    ./build/examples/multimodal/vlm_accuracy \
-    --tokenizerPath=tmp/hf_models/${MODEL_NAME} \
-    --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.mmmu.engine \
-    --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_encoder_fp16.mmmu.engine \
-    --modelType=${MODEL_TYPE} \
-    --datasetPath=./MMMU_DEV_VAL.tsv \
-    --outputPath=./mmmu-results.csv
-    ```
-
-4. Evaluate results with python script.
-    ```bash
-    python ./scripts/mmmu.py --csv_path=./mmmu-results.csv --output_path=./mmmu-results-eval.json
-    ```
-
-**Notes:**
-Drive-LLM MMMU score is different from Qwen official. Drive-LLM MMMU implementation follows [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU), while Qwen-VL uses [VLMEvalkit](https://github.com/open-compass/VLMEvalKit). VLMEvalkit provides higher MMMU scores due to different prompt setup and evaluation method. It also requires higher memory that is not suitable for edge devices. Drive-LLM MMMU scores are aligned with official MMMU-Benchmark results with HuggingFace implementation, providing confidence in VLM accuracy. For details, please refer to [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU) or [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) for getting HuggingFace model accuracy scores.
-
-Similarly, for the InternVL3-1B model as well, the official results are calculated using VLMEvalKit. In addition to the reasons mentioned above, our score is lower as we allow a maximum of 6 patches (of 448x448x3) per image during preprocessing as opposed to the official implementation which allows 12 max patches. This was done to reduce the memory requirement. Furthermore, our accuracy score is achieved with float16 precision compared to the bf16 precision that the official implementation uses. When VLMEvalKit is run with our constraints of 6 max patches, and float16 precision, we achieve the same accuracy score.
-
-## LoRA Support
-
-DriveOS LLM SDK supports dynamic LoRA (Low-Rank Adaptation) for efficient model adaptation.
-
-- **Build-time:** Use `--maxLoraRank=<max_rank>` in `llm_build` to enable dynamic LoRA support. Omit for static/merged LoRA.
-- **Runtime:** Use `--loraWeights=name:path_to_lora_weights.safetensors` in `vlm_chat`, `vlm_benchmark`, or `vlm_accuracy` to load LoRA weights. Omit for static/merged LoRA.
-
-> **Warning:**
-> - You must process LoRA weights using `export/process_lora_weights.py` before use.
-> - You are responsible for ensuring the LoRA weights are valid and compatible.
-> - For static/merged LoRA, do **not** use these flags.
-
-### Example: 
-
-The visual part building is same as above, below show the examples for building LLM part engine
-
-**Without dynamic LoRA:**
-```bash
-./build/examples/llm/llm_build \
-  --onnxPath=tmp/onnx/${MODEL_NAME}/model.onnx \
-  --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-  --modelType=${MODEL_TYPE} \
-  --maxInputLen=1024 --maxSeqLen=4096 \
-  --batchSize=1 --imageTokens=486
-```
-
-**With dynamic LoRA:**
-```bash
-./build/examples/llm/llm_build \
-  --onnxPath=tmp/onnx/${MODEL_NAME}/model.onnx \
-  --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-  --modelType=${MODEL_TYPE} \
-  --maxInputLen=1024 --maxSeqLen=4096 \
-  --batchSize=1 --imageTokens=486 \
-  --maxLoraRank=16
-```
-
-### Example: Runtime Inference
-
-**Without dynamic LoRA:**
-```bash
-./build/examples/multimodal/vlm_chat \
-  --tokenizerPath=tmp/hf_models/${MODEL_NAME} \
-  --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-  --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
-  --modelType=${MODEL_TYPE} \
-  --inputString="Describe the picture." \
-  --imagePaths="examples/multimodal/pics/demo.jpeg"
-```
-
-**With dynamic LoRA:**
-```bash
-./build/examples/multimodal/vlm_chat \
-  --tokenizerPath=tmp/hf_models/${MODEL_NAME} \
-  --enginePath=tmp/trt_engines/${MODEL_NAME}/llm.engine \
-  --visualEnginePath=tmp/trt_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
-  --modelType=${MODEL_TYPE} \
-  --inputString="Describe the picture." \
-  --imagePaths="examples/multimodal/pics/demo.jpeg" \
-  --loraWeights=my_lora:processed_lora_weights.safetensors
-```
-
-## Eagle Decoding Support for VLM
-
-Taking "Qwen2-VL-7B-Instruct" and Eagle3 as an example:
-
-1. Export to ONNX
-
-    Visual and LLM part is exported to two separate ONNX files. For details, please refer to [export README](../../export/README.md). 
-    ```bash
-    export MODEL_NAME="Qwen2-VL-7B-Instruct"
-    export EAGLE_MODEL_NAME="EAGLE3-Qwen2-VL-7B-Instruct"
-    export TORCH_DIR=tmp/hf_models/${MODEL_NAME}
-    export EAGLE3_TORCH_DIR=tmp/hf_models/${EAGLE_MODEL_NAME}
-    export EAGLE3_ONNX_BASE_DIR=tmp/hf_models/${TORCH_DIR}"-Eagle3-Base"
-    export EAGLE3_ONNX_DRAFT_DIR=tmp/hf_models/${TORCH_DIR}"-Eagle3-Draft"
-    cd drive-llm
-    # Visual part onnx export:
-      export visualType=[fp16|fp8]
-      python3 multimodal_export.py --torch_dir ${TORCH_DIR} --output_dir ${EAGLE3_ONNX_BASE_DIR} --visualType ${visualType}
-    # LLM part onnx export for base model:
-      python3 llm_export.py --torch_dir ${TORCH_DIR} --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir ${EAGLE3_ONNX_BASE_DIR} --use_prompt_tuning True --eagle_base True --eagle3 True
-    # LLM part onnx export for draft model:
-      python3 llm_export.py --torch_dir ${TORCH_DIR} --dtype [fp16|fp8|int4|nvfp4|int4_ootb] --output_dir $EAGLE3_ONNX_DRAFT_DIR --eagle_torch_dir ${EAGLE3_TORCH_DIR} --use_prompt_tuning True --eagle_draft True --eagle3 True
-    ```
-
-2. Build TensorRT engines
-
-    Building the base model LLM part:
-    ```bash
-    export EAGLE3_BASE_ENGINE_DIR=${EAGLE3_ONNX_BASE_DIR}"-Engine"
-    ./build/examples/llm/llm_build \
-    --onnxPath=${EAGLE3_ONNX_BASE_DIR}/model.onnx \
-    --enginePath=${EAGLE3_BASE_ENGINE_DIR}/llm.engine \
-    --usePromptTuning \
-    --modelType=${MODEL_TYPE} \
-    --maxInputLen=1024 --maxSeqLen=4096 \
-    --dynamicShape \
-    --maxBatchSize=1 --minImageTokens=128 --maxImageTokens=512 \
-    --isEagleBase --isEagle3
-    ```
-    Building the visual part:
-    ```bash
-    ./build/examples/multimodal/visual_build \
-    --visualOnnxPath=${EAGLE3_ONNX_BASE_DIR}/visual_enc_onnx_${visualType}/model.onnx \
-    --visualEnginePath=${EAGLE3_BASE_ENGINE_DIR}/visual_enc_${visualType}.engine \
-    --modelType=${MODEL_TYPE} \
-    --dynamicShape \
-    --minImageTokens=128 --maxImageTokens=512
-    ```
-    Building the draft model LLM part:
-    ```bash
-    export EAGLE3_DRAFT_ENGINE_DIR=${EAGLE3_ONNX_DRAFT_DIR}"-Engine"
-    ./build/examples/llm/llm_build \
-    --onnxPath=${EAGLE3_ONNX_DRAFT_DIR}/model.onnx \
-    --enginePath=${EAGLE3_DRAFT_ENGINE_DIR}/llm.engine \
-    --usePromptTuning \
-    --modelType=${MODEL_TYPE} \
-    --maxInputLen=1024 --maxSeqLen=4096 \
-    --dynamicShape \
-    --maxBatchSize=1 --minImageTokens=128 --maxImageTokens=512 \
-    --isEagleDraft --isEagle3
-    ```
-
-3. VLM Chat
-
-```bash
-./build/examples/multimodal/vlm_chat \
---tokenizerPath=${TORCH_DIR} \
---enginePath=${EAGLE3_BASE_ENGINE_DIR}/llm.engine \
---eagleEnginePath=${EAGLE3_DRAFT_ENGINE_DIR}/llm.engine \
---visualEnginePath=${EAGLE3_BASE_ENGINE_DIR}/visual_enc_${visualType}.engine \
+--baseModelDir=engines/${MODEL_NAME}_eagle3_base \
+--draftModelDir=engines/${MODEL_NAME}_eagle3_draft \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
 --modelType=${MODEL_TYPE} \
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/pics/demo.jpeg" \
 --isEagle3
+```
+
+**Multiple Images:**
+```bash
+--inputString="Identify the similarities between these images." \
+--imagePaths="image1.jpeg,image2.jpeg"
+```
+
+**Notes:**
+- Multiple image paths in one batch should be separated with comma `','`
+- For batches with only `--imagePaths`, `--inputString` defaults to "Describe this image."
+- For batches with only `--inputString`, `--imagePaths` is set to empty (pure LLM inference)
+
+### Benchmark Performance
+
+**Standard VLM:**
+```bash
+./build/examples/multimodal/vlm_benchmark \
+--engineDir=engines/${MODEL_NAME} \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
+--modelType=${MODEL_TYPE} \
+--textTokenLength=512 \
+--imageTokenLength=486 \
+--outputLength=256 \
+--warmUp=2 \
+--numRuns=10
+```
+
+**EAGLE VLM:**
+```bash
+./build/examples/multimodal/vlm_benchmark \
+--baseModelDir=engines/${MODEL_NAME}_eagle3_base \
+--draftModelDir=engines/${MODEL_NAME}_eagle3_draft \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
+--modelType=${MODEL_TYPE} \
+--textTokenLength=512 \
+--imageTokenLength=486 \
+--outputLength=256 \
+--isEagle3 \
+--warmUp=2 \
+--numRuns=10
+```
+
+### Accuracy Evaluation (MMMU)
+
+**Download Dataset:**
+```bash
+wget https://opencompass.openxlab.space/utils/VLMEval/MMMU_DEV_VAL.tsv
+```
+
+**MMMU Engine Build Requirements:**
+
+To match MMMU evaluation [config](https://github.com/open-compass/VLMEvalKit/blob/9ca28fd06bac52d0c42845dac8891dd9e6354611/vlmeval/config.py#L253-L264) and TensorRT shape requirements, you need specific engine configurations:
+
+**For Qwen-VL Models:**
+```bash
+# Use prepare_mmmu_onnx.py to set kv_cache_capacity=8192 in LLM ONNX
+python3 ./scripts/prepare_mmmu_onnx.py \
+--input_path onnx_models/${MODEL_NAME}/model.onnx \
+--output_path onnx_models/${MODEL_NAME}/llm_onnx_mmmu/model.onnx
+
+# Copy all non-ONNX files to maintain folder architecture
+cp onnx_models/${MODEL_NAME}/*.json onnx_models/${MODEL_NAME}/llm_onnx_mmmu/
+cp onnx_models/${MODEL_NAME}/*.safetensors onnx_models/${MODEL_NAME}/llm_onnx_mmmu/
+
+# Build LLM engine
+./build/examples/llm/llm_build \
+--onnxDir=onnx_models/${MODEL_NAME}/llm_onnx_mmmu \
+--engineDir=engines/${MODEL_NAME} \
+--maxInputLen=7168 --maxSeqLen=8192 \
+--dynamicShape \
+--maxBatchSize=1 \
+--usePromptTuning
+
+# Build visual engine
+./build/examples/multimodal/visual_build \
+--visualOnnxPath=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.mmmu.engine \
+--modelType=${MODEL_TYPE} \
+--dynamicShape \
+--minImageTokens=1280 --maxImageTokens=6620
+```
+
+**For InternVL3 Model:**
+```bash
+# Use prepare_mmmu_onnx.py to set kv_cache_capacity=10240 in LLM ONNX
+python3 ./scripts/prepare_mmmu_onnx.py \
+--input_path onnx_models/${MODEL_NAME}/model.onnx \
+--output_path onnx_models/${MODEL_NAME}/llm_onnx_mmmu/model.onnx \
+-kv 10240
+
+# Copy all non-ONNX files to maintain folder architecture
+cp onnx_models/${MODEL_NAME}/*.json onnx_models/${MODEL_NAME}/llm_onnx_mmmu/
+cp onnx_models/${MODEL_NAME}/*.safetensors onnx_models/${MODEL_NAME}/llm_onnx_mmmu/
+
+# Build LLM engine
+./build/examples/llm/llm_build \
+--onnxDir=onnx_models/${MODEL_NAME}/llm_onnx_mmmu \
+--engineDir=engines/${MODEL_NAME} \
+--maxInputLen=9216 --maxSeqLen=10240 \
+--dynamicShape \
+--maxBatchSize=1 \
+--usePromptTuning
+
+# Build visual engine
+./build/examples/multimodal/visual_build \
+--visualOnnxPath=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.mmmu.engine \
+--modelType=${MODEL_TYPE} \
+--dynamicShape \
+--minImageTokens=512 --maxImageTokens=8960
+```
+
+**Run Evaluation:**
+```bash
+./build/examples/multimodal/vlm_accuracy \
+--engineDir=engines/${MODEL_NAME} \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.mmmu.engine \
+--modelType=${MODEL_TYPE} \
+--datasetPath=./MMMU_DEV_VAL.tsv \
+--outputPath=./mmmu-results.csv
+```
+
+**Evaluate Results:**
+```bash
+python ./scripts/mmmu.py \
+--csv_path=./mmmu-results.csv \
+--output_path=./mmmu-results-eval.json
+```
+
+**Important Notes for InternVL3:**
+- **Accuracy Score Differences**: TensorRT Edge LLM MMMU scores for InternVL3 are lower than official results because:
+  1. **Evaluation Framework**: Official results use VLMEvalKit, while TensorRT Edge LLM follows MMMU-Benchmark methodology
+  2. **Patch Limitations**: We limit images to maximum 6 patches (448×448×3) per image vs 12 patches in official implementation to reduce memory requirements
+  3. **Precision**: Our accuracy is achieved with float16 precision vs bf16 precision in official implementation
+- **Score Validation**: When VLMEvalKit is run with our constraints (6 max patches, float16 precision), we achieve the same accuracy score as TensorRT Edge LLM
+- **Memory Optimization**: The patch limitation was implemented to reduce memory requirements for edge devices while maintaining reasonable accuracy
+
+## Runtime LoRA Switching
+
+TensorRT Edge LLM supports dynamic LoRA (Low-Rank Adaptation) for efficient model adaptation.
+
+### LoRA Weights Processing
+
+Before using LoRA weights, process them using the provided script:
+
+```bash
+python export/process_lora_weights.py --input_dir /path/to/lora/adapter --output_dir /path/to/processed/lora --dtype fp16
+```
+
+### Build with LoRA Support
+
+Add `--maxLoraRank=<max_rank>` to enable dynamic LoRA support:
+
+```bash
+./build/examples/llm/llm_build \
+--onnxDir=onnx_models/${MODEL_NAME} \
+--engineDir=engines/${MODEL_NAME} \
+--batchSize=1 \
+--maxInputLen=1024 \
+--maxSeqLen=4096 \
+--maxLoraRank=16 \
+--usePromptTuning
+```
+
+### Runtime LoRA Usage
+
+Use `--loraWeights=name:path_to_lora_weights.safetensors` in any inference binary:
+
+```bash
+./build/examples/multimodal/vlm_chat \
+--engineDir=engines/${MODEL_NAME} \
+--visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
+--modelType=${MODEL_TYPE} \
+--inputString="Describe the picture." \
+--imagePaths="examples/multimodal/pics/demo.jpeg" \
+--loraWeights=my_lora:processed_lora_weights.safetensors
 ```

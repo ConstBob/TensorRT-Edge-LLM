@@ -566,10 +566,10 @@ void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRa
             return;
         }
 
-        auto parseField = [specialTokens, jsonConfig](std::string const& field) {
+        auto parseField = [specialTokens, jsonConfig](std::string const& field) -> Rank {
             if (!jsonConfig.contains(field))
             {
-                return -1L;
+                return -1;
             }
             if (jsonConfig[field].is_string())
             {
@@ -587,7 +587,7 @@ void Tokenizer::loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRa
                     return specialTokens.at(token);
                 }
             }
-            return -1L;
+            return -1;
         };
 
         this->mBosId = parseField("bos_token");

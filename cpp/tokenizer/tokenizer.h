@@ -20,7 +20,7 @@
 #include <unordered_set>
 #include <vector>
 
-using Rank = std::int64_t;
+using Rank = std::int32_t;
 using BPETokenToRanks = std::unordered_map<std::string, Rank>;
 using BPERanksToToken = std::unordered_map<Rank, std::string>;
 

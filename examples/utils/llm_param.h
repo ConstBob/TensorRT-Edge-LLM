@@ -20,8 +20,7 @@
 
 struct BaseParams
 {
-    std::string enginePath;
-    std::string tokenizerPath{""};
+    std::string engineDir;
     bool help{false};
     bool debug{false};
     bool noCudaGraph{false};
@@ -29,7 +28,8 @@ struct BaseParams
 
 struct EagleParams
 {
-    std::string eagleEnginePath{""};
+    std::string baseModelDir{""};
+    std::string draftModelDir{""};
     bool isEagle3{false};
     int32_t maxDecodingTokens{60};
     int32_t topK{10};
@@ -114,7 +114,7 @@ extern const struct option eagleBuildOptions[];
 extern const struct option vlmBuildOptions[];
 extern const struct option vlmRunOptions[];
 
-bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg, bool requireTokenizer = false);
+bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg);
 bool parseEagleOptions(EagleParams& eagleParams, int opt, char const* optarg);
 bool parseEagleBuildOptions(EagleBuildParams& eagleBuildParams, int opt, char const* optarg);
 bool parseVLMBuildOptions(VLMBuildParams& vlmBuildParams, int opt, char const* optarg);

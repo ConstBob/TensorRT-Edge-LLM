@@ -95,6 +95,7 @@ class WrapperModelForCausalLM(torch.nn.Module):
         hidden_states = outputs[0]
         past_key_values = outputs.past_key_values.to_legacy_cache()
         logits = self.lm_head(hidden_states)
+        logits = logits.to(torch.float32)
         return logits, past_key_values
 
 
@@ -145,6 +146,7 @@ class WrapperEagleBaseModelForCausalLM(WrapperModelForCausalLM):
         hidden_states_reshape = last_hidden_states.reshape(
             -1, last_hidden_states.size(2))
         logits = self.lm_head(hidden_states_reshape)
+        logits = logits.to(torch.float32)
         if self.eagle3:
             return logits, past_key_values, hidden_states
         else:
@@ -212,7 +214,8 @@ class WrapperEagleDraftModelForCausalLM(WrapperModelForCausalLM):
         past_key_values = outputs[1]
 
         logits = self.lm_head(hidden_states_reshape)
-        #hidden_states will added as output in insert_gather_last_token_eagle
+        logits = logits.to(torch.float32)
+        # hidden_states will added as output in insert_gather_last_token_eagle
         return logits, past_key_values
 
 
@@ -429,7 +432,7 @@ class ModelLoader:
         d2t_tensor = ea_layer_state_dict['d2t']
         d2t_path = os.path.join(onnx_dir, "d2t.bin")
         with open(d2t_path, 'wb') as f:
-            f.write(d2t_tensor.numpy().astype(np.int64).tobytes())
+            f.write(d2t_tensor.numpy().astype(np.int32).tobytes())
 
 
 def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
@@ -453,7 +456,7 @@ def llm_to_onnx(model, output_dir, extra_inputs={}, extra_dyn_axes={}):
     dummy_bs = 1
     dummy_len = 10
     dummy_input_ids = torch.randint(100, (dummy_bs, dummy_len),
-                                    dtype=torch.int64).cuda()
+                                    dtype=torch.int32).cuda()
     input_names = ["input_ids"]
     output_names = ["logits"]
     dynamic_axes = {"input_ids": {0: "batch_size", 1: "seq_len"}}

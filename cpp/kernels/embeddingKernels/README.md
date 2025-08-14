@@ -1,6 +1,6 @@
 # Embedding Kernels
 
-This directory contains CUDA kernels for efficient embedding lookup operations in the TensorRT Edge LLM SDK.
+CUDA kernels for efficient embedding lookup operations in TensorRT Edge LLM.
 
 ## Overview
 
@@ -10,8 +10,8 @@ The embedding kernels provide two main functionalities:
 2. **Embedding Lookup with Image Insertion**: Handles multimodal models with image embeddings following the PromptTuningEmbedding logic
 
 **Note**: 
-1. These kernels only support FP16 (half precision) data type for optimal performance and memory efficiency.
-2. For image embedding insertion, it is assumed that in the `input_ids`, image tokens start from `vocab_size`, and increases to `vocab_size + num_image_tokens`. e.g. if the vocab size is 150000, `input_ids` may look like `[5, 10000, 150000, 150001, 150002, 150003, 8, 1000]`. Image tokens do not need to be consecutive but the size of `image_embeds` should be exactly `[num_image_tokens, hidden_size]`.
+- These kernels only support FP16 (half precision) data type for optimal performance and memory efficiency
+- For image embedding insertion, image tokens start from `vocab_size` and increase to `vocab_size + num_image_tokens`
 
 ## Functions
 
@@ -29,15 +29,10 @@ void embeddingLookup(
 ```
 
 **Parameters:**
-- `inputIds`: Input token IDs with shape `[batchSize, seqLen]`
-- `embeddingTable`: Embedding table with shape `[vocabSize, hiddenSize]` (FP16 only)
-- `output`: Output hidden states with shape `[batchSize, seqLen, hiddenSize]` (FP16 only)
+- `inputIds`: Input token IDs with shape `[batchSize, seqLen]` (INT32)
+- `embeddingTable`: Embedding table with shape `[vocabSize, hiddenSize]` (FP16)
+- `output`: Output hidden states with shape `[batchSize, seqLen, hiddenSize]` (FP16)
 - `stream`: CUDA stream for asynchronous execution (optional)
-
-**Data Type Requirements:**
-- `inputIds`: INT32
-- `embeddingTable`: FP16 (kHALF)
-- `output`: FP16 (kHALF)
 
 ### `embeddingLookupWithImageInsertion`
 
@@ -55,11 +50,11 @@ void embeddingLookupWithImageInsertion(
 ```
 
 **Parameters:**
-- `inputIds`: Input token IDs with shape `[batchSize, seqLen]`
-- `embeddingTable`: Embedding table with shape `[vocabSize, hiddenSize]` (FP16 only)
-- `imageEmbeds`: Image embeddings with shape `[imageTokenLen, hiddenSize]` (FP16 only)
+- `inputIds`: Input token IDs with shape `[batchSize, seqLen]` (INT32)
+- `embeddingTable`: Embedding table with shape `[vocabSize, hiddenSize]` (FP16)
+- `imageEmbeds`: Image embeddings with shape `[imageTokenLen, hiddenSize]` (FP16)
 - `vocabSize`: Vocabulary size for normal tokens (tokens > vocabSize are treated as image tokens)
-- `output`: Output hidden states with shape `[batchSize, seqLen, hiddenSize]` (FP16 only)
+- `output`: Output hidden states with shape `[batchSize, seqLen, hiddenSize]` (FP16)
 - `stream`: CUDA stream for asynchronous execution (optional)
 
 **Logic:**

@@ -5,8 +5,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <iomanip>
@@ -14,7 +12,6 @@
 #include <random>
 #include <set>
 #include <sstream>
-#include <type_traits>
 #include <vector>
 
 using namespace drivellm;
@@ -39,12 +36,11 @@ protected:
         // Cleanup is handled by individual tests
     }
 
-    // Generate deterministic test logits
-    template <typename T>
-    void generateTestLogits(T* dLogits, std::vector<std::vector<float>>& hostLogits, int batchSize, int vocabSize)
+    // Generate deterministic test logits (FP32 only)
+    void generateTestLogits(float* dLogits, std::vector<std::vector<float>>& hostLogits, int batchSize, int vocabSize)
     {
         hostLogits.resize(batchSize);
-        std::vector<T> flatHostLogits(batchSize * vocabSize);
+        std::vector<float> flatHostLogits(batchSize * vocabSize);
 
         // Generate deterministic but varied logits for testing using testUtils
         for (int b = 0; b < batchSize; ++b)
@@ -86,31 +82,19 @@ protected:
             std::mt19937 gen(rd());
             std::shuffle(hostLogits[b].begin(), hostLogits[b].end(), gen);
 
-            // Convert to appropriate type
+            // Copy to flat array (FP32 only)
             for (int v = 0; v < vocabSize; ++v)
             {
-                if constexpr (std::is_same_v<T, half>)
-                {
-                    flatHostLogits[b * vocabSize + v] = __float2half(hostLogits[b][v]);
-                }
-                else if constexpr (std::is_same_v<T, __nv_bfloat16>)
-                {
-                    flatHostLogits[b * vocabSize + v] = __float2bfloat16(hostLogits[b][v]);
-                }
-                else
-                {
-                    flatHostLogits[b * vocabSize + v] = static_cast<T>(hostLogits[b][v]);
-                }
+                flatHostLogits[b * vocabSize + v] = hostLogits[b][v];
             }
         }
 
         CUDA_CHECK(
-            cudaMemcpy(dLogits, flatHostLogits.data(), batchSize * vocabSize * sizeof(T), cudaMemcpyHostToDevice));
+            cudaMemcpy(dLogits, flatHostLogits.data(), batchSize * vocabSize * sizeof(float), cudaMemcpyHostToDevice));
     }
 
-    // Validate sampling results
-    template <typename T>
-    bool validateSamplingResults(std::vector<int64_t> const& gpuResults,
+    // Validate sampling results (FP32 only)
+    bool validateSamplingResults(std::vector<int32_t> const& gpuResults,
         std::vector<std::vector<float>> const& hostLogits, SamplingParams const& params)
     {
         bool allValid = true;
@@ -136,7 +120,7 @@ protected:
             }
 
             // Check if token is in allowed set
-            if (allowedTokens.count(static_cast<int32_t>(gpuResults[b])) == 0)
+            if (allowedTokens.count(gpuResults[b]) == 0)
             {
                 // Output detailed debug info without throwing
                 std::cout << "=== SAMPLING VALIDATION FAILED ===" << std::endl;
@@ -163,9 +147,8 @@ protected:
         return allValid;
     }
 
-    // Validate selectAllTopK results
-    template <typename T>
-    bool validateSelectAllTopKResults(std::vector<float> const& gpuValues, std::vector<int64_t> const& gpuIndices,
+    // Validate selectAllTopK results (FP32 only)
+    bool validateSelectAllTopKResults(std::vector<float> const& gpuValues, std::vector<int32_t> const& gpuIndices,
         std::vector<std::vector<float>> const& hostInput, int topK, int batchSize, bool returnLogProbs = false,
         bool normalizeLogProbs = false, bool inputHasProbs = false)
     {
@@ -195,7 +178,7 @@ protected:
                     continue;
                 }
 
-                int32_t gpuIdx = static_cast<int32_t>(gpuIndices[b * topK + k]);
+                int32_t gpuIdx = gpuIndices[b * topK + k];
 
                 // Only check gpuValues if the vector is not empty (returnLogProbs=true case)
                 float gpuVal = 0.0f;
@@ -213,12 +196,12 @@ protected:
                 bool found = false;
                 for (auto const& expected : expectedResults)
                 {
-                    if (expected.second == static_cast<int32_t>(gpuIdx))
+                    if (expected.second == gpuIdx)
                     {
                         // Only check value if gpuValues is not empty
                         if (!gpuValues.empty())
                         {
-                            if (!validateValue<T>(gpuVal, expected.first, gpuIdx, b, k, "SelectAllTopK"))
+                            if (!validateValue<float>(gpuVal, expected.first, gpuIdx, b, k, "SelectAllTopK"))
                             {
                                 allValid = false;
                             }
@@ -248,24 +231,24 @@ TEST_F(SamplingTest, SelectAllTopKErrorHandlingReturnLogProbsWithNullptr)
     int const topK = 5;
 
     float* dInput;
-    int64_t* dTopKIndices;
+    int32_t* dTopKIndices;
 
     CUDA_CHECK(cudaMalloc(&dInput, batchSize * vocabSize * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * vocabSize * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * vocabSize * sizeof(int32_t)));
 
     std::vector<std::vector<float>> hostLogits;
-    this->template generateTestLogits<float>(dInput, hostLogits, batchSize, vocabSize);
+    generateTestLogits(dInput, hostLogits, batchSize, vocabSize);
 
     // Calculate workspace size and allocate workspace
-    size_t workspaceSize = getSelectAllTopKWorkspaceSize<float>(batchSize, vocabSize, topK);
+    size_t workspaceSize = getSelectAllTopKWorkspaceSize(batchSize, vocabSize, topK);
     void* workspace;
     CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
     // Test that calling with returnLogProbs=true and nullptr topKValues throws an exception
     EXPECT_THROW(
         {
-            selectAllTopKFromLogits<float>(dInput, nullptr, dTopKIndices, batchSize, vocabSize, topK, workspace,
-                workspaceSize, 0, true, false, false);
+            selectAllTopKFromLogits(dInput, nullptr, dTopKIndices, batchSize, vocabSize, topK, workspace, workspaceSize,
+                0, true, false, false);
         },
         std::invalid_argument)
         << "Should throw exception when returnLogProbs=true and topKValues=nullptr";
@@ -284,24 +267,24 @@ TEST_F(SamplingTest, SelectAllTopKErrorHandlingReturnLogProbsFalseWithNonNullTop
 
     float* dInput;
     float* dTopKValues;
-    int64_t* dTopKIndices;
+    int32_t* dTopKIndices;
 
     CUDA_CHECK(cudaMalloc(&dInput, batchSize * vocabSize * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&dTopKValues, batchSize * topK * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * vocabSize * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * vocabSize * sizeof(int32_t)));
 
     std::vector<std::vector<float>> hostLogits;
-    this->template generateTestLogits<float>(dInput, hostLogits, batchSize, vocabSize);
+    generateTestLogits(dInput, hostLogits, batchSize, vocabSize);
 
     // Calculate workspace size and allocate workspace
-    size_t workspaceSize = getSelectAllTopKWorkspaceSize<float>(batchSize, vocabSize, topK);
+    size_t workspaceSize = getSelectAllTopKWorkspaceSize(batchSize, vocabSize, topK);
     void* workspace;
     CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
     // Test that calling with returnLogProbs=false and non-null topKValues throws an exception
     EXPECT_THROW(
         {
-            selectAllTopKFromLogits<float>(dInput, dTopKValues, dTopKIndices, batchSize, vocabSize, topK, workspace,
+            selectAllTopKFromLogits(dInput, dTopKValues, dTopKIndices, batchSize, vocabSize, topK, workspace,
                 workspaceSize, 0, false, false, false);
         },
         std::invalid_argument)
@@ -319,7 +302,6 @@ class SamplingTests : public SamplingTest
 protected:
     struct TestResult
     {
-        std::string typeName;
         std::string methodName;
         int batchSize;
         int vocabSize;
@@ -330,12 +312,10 @@ protected:
         std::string errorMessage;
     };
 
-    template <typename T>
     TestResult runSamplingAccuracyTest(
         std::string const& methodName, int batchSize, int vocabSize, int topK, float topP, float temperature)
     {
         TestResult result;
-        result.typeName = std::is_same_v<T, float> ? "FP32" : std::is_same_v<T, half> ? "FP16" : "BF16";
         result.methodName = methodName;
         result.batchSize = batchSize;
         result.vocabSize = vocabSize;
@@ -345,30 +325,30 @@ protected:
         result.accuracyPassed = true;
         result.errorMessage = "";
 
-        T* dLogits;
-        int64_t* dSelectedIndices;
+        float* dLogits;
+        int32_t* dSelectedIndices;
 
-        CUDA_CHECK(cudaMalloc(&dLogits, batchSize * vocabSize * sizeof(T)));
-        CUDA_CHECK(cudaMalloc(&dSelectedIndices, batchSize * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&dLogits, batchSize * vocabSize * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dSelectedIndices, batchSize * sizeof(int32_t)));
 
         std::vector<std::vector<float>> hostLogits;
-        this->template generateTestLogits<T>(dLogits, hostLogits, batchSize, vocabSize);
+        generateTestLogits(dLogits, hostLogits, batchSize, vocabSize);
 
         // Run accuracy test
         SamplingParams params(batchSize, vocabSize, temperature, topK, topP);
-        size_t workspaceSize = getTopKtopPSamplingWorkspaceSize<T>(batchSize, vocabSize, params);
+        size_t workspaceSize = getTopKtopPSamplingWorkspaceSize(batchSize, vocabSize, params);
         void* workspace;
         CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
-        topKtopPSamplingFromLogits<T>(dLogits, dSelectedIndices, params, workspace, workspaceSize, 0, TEST_SEED, 0);
+        topKtopPSamplingFromLogits(dLogits, dSelectedIndices, params, workspace, workspaceSize, 0, TEST_SEED, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        std::vector<int64_t> gpuResults(batchSize);
+        std::vector<int32_t> gpuResults(batchSize);
         CUDA_CHECK(
-            cudaMemcpy(gpuResults.data(), dSelectedIndices, batchSize * sizeof(int64_t), cudaMemcpyDeviceToHost));
+            cudaMemcpy(gpuResults.data(), dSelectedIndices, batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
         // Run validation and get result
-        bool validationPassed = this->template validateSamplingResults<T>(gpuResults, hostLogits, params);
+        bool validationPassed = validateSamplingResults(gpuResults, hostLogits, params);
 
         // Set result based on validation
         result.accuracyPassed = validationPassed;
@@ -383,7 +363,6 @@ protected:
                                       << ", topK=" << topK << ", topP=" << topP << ", temperature=" << temperature;
 
         CUDA_CHECK(cudaFree(workspace));
-
         CUDA_CHECK(cudaFree(dLogits));
         CUDA_CHECK(cudaFree(dSelectedIndices));
 
@@ -397,7 +376,6 @@ class ReturnAllTopKTests : public SamplingTest
 protected:
     struct TestResult
     {
-        std::string typeName;
         std::string methodName;
         int batchSize;
         int vocabSize;
@@ -409,12 +387,10 @@ protected:
         std::string errorMessage;
     };
 
-    template <typename T>
     TestResult runReturnAllTopKAccuracyTest(
         int batchSize, int vocabSize, int topK, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs)
     {
         TestResult result;
-        result.typeName = std::is_same_v<T, float> ? "FP32" : std::is_same_v<T, half> ? "FP16" : "BF16";
         result.methodName = "SelectAllTopK";
         result.batchSize = batchSize;
         result.vocabSize = vocabSize;
@@ -425,12 +401,12 @@ protected:
         result.accuracyPassed = true;
         result.errorMessage = "";
 
-        T* dInput;
+        float* dInput;
         float* dTopKValues = nullptr;
-        int64_t* dTopKIndices;
+        int32_t* dTopKIndices;
 
-        CUDA_CHECK(cudaMalloc(&dInput, batchSize * vocabSize * sizeof(T)));
-        CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * vocabSize * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&dInput, batchSize * vocabSize * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * vocabSize * sizeof(int32_t)));
 
         if (returnLogProbs)
         {
@@ -439,10 +415,10 @@ protected:
 
         std::vector<std::vector<float>> hostLogits;
         std::vector<std::vector<float>> hostProbs;
-        std::vector<T> flatHostProbs;
+        std::vector<float> flatHostProbs;
 
         // Generate test data
-        this->template generateTestLogits<T>(dInput, hostLogits, batchSize, vocabSize);
+        generateTestLogits(dInput, hostLogits, batchSize, vocabSize);
 
         if (inputHasProbs)
         {
@@ -458,58 +434,46 @@ protected:
                 for (int v = 0; v < vocabSize; ++v)
                 {
                     hostProbs[b][v] = probs[v];
-
-                    if constexpr (std::is_same_v<T, half>)
-                    {
-                        flatHostProbs[b * vocabSize + v] = __float2half(hostProbs[b][v]);
-                    }
-                    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
-                    {
-                        flatHostProbs[b * vocabSize + v] = __float2bfloat16(hostProbs[b][v]);
-                    }
-                    else
-                    {
-                        flatHostProbs[b * vocabSize + v] = static_cast<T>(hostProbs[b][v]);
-                    }
+                    flatHostProbs[b * vocabSize + v] = hostProbs[b][v];
                 }
             }
 
-            CUDA_CHECK(
-                cudaMemcpy(dInput, flatHostProbs.data(), batchSize * vocabSize * sizeof(T), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(
+                dInput, flatHostProbs.data(), batchSize * vocabSize * sizeof(float), cudaMemcpyHostToDevice));
         }
 
         // Run accuracy test
-        size_t workspaceSize = getSelectAllTopKWorkspaceSize<T>(batchSize, vocabSize, topK);
+        size_t workspaceSize = getSelectAllTopKWorkspaceSize(batchSize, vocabSize, topK);
         void* workspace;
         CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
-        selectAllTopKFromLogits<T>(dInput, dTopKValues, dTopKIndices, batchSize, vocabSize, topK, workspace,
-            workspaceSize, 0, returnLogProbs, normalizeLogProbs, inputHasProbs);
+        selectAllTopKFromLogits(dInput, dTopKValues, dTopKIndices, batchSize, vocabSize, topK, workspace, workspaceSize,
+            0, returnLogProbs, normalizeLogProbs, inputHasProbs);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         bool validationPassed = false;
         if (returnLogProbs)
         {
             std::vector<float> gpuValues(batchSize * topK);
-            std::vector<int64_t> gpuIndices(batchSize * topK);
+            std::vector<int32_t> gpuIndices(batchSize * topK);
             CUDA_CHECK(
                 cudaMemcpy(gpuValues.data(), dTopKValues, batchSize * topK * sizeof(float), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(
-                gpuIndices.data(), dTopKIndices, batchSize * topK * sizeof(int64_t), cudaMemcpyDeviceToHost));
+                gpuIndices.data(), dTopKIndices, batchSize * topK * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
             std::vector<std::vector<float>>& hostInput = inputHasProbs ? hostProbs : hostLogits;
-            validationPassed = this->template validateSelectAllTopKResults<T>(
+            validationPassed = validateSelectAllTopKResults(
                 gpuValues, gpuIndices, hostInput, topK, batchSize, returnLogProbs, normalizeLogProbs, inputHasProbs);
         }
         else
         {
-            std::vector<int64_t> gpuIndices(batchSize * topK);
+            std::vector<int32_t> gpuIndices(batchSize * topK);
             CUDA_CHECK(cudaMemcpy(
-                gpuIndices.data(), dTopKIndices, batchSize * topK * sizeof(int64_t), cudaMemcpyDeviceToHost));
+                gpuIndices.data(), dTopKIndices, batchSize * topK * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
             std::vector<std::vector<float>>& hostInput = inputHasProbs ? hostProbs : hostLogits;
-            validationPassed = this->template validateSelectAllTopKResults<T>(
-                std::vector<float>(), gpuIndices, hostInput, topK, batchSize);
+            validationPassed
+                = validateSelectAllTopKResults(std::vector<float>(), gpuIndices, hostInput, topK, batchSize);
         }
 
         // Set result based on validation
@@ -536,7 +500,6 @@ protected:
         }
 
         CUDA_CHECK(cudaFree(workspace));
-
         CUDA_CHECK(cudaFree(dInput));
         CUDA_CHECK(cudaFree(dTopKIndices));
         if (dTopKValues != nullptr)
@@ -583,27 +546,16 @@ TEST_F(SamplingTests, SamplingAccuracy)
     {
         for (auto const& config : configs)
         {
-            // FP32
-            auto resultFp32 = runSamplingAccuracyTest<float>(
+            auto result = runSamplingAccuracyTest(
                 config.methodName, batchSize, ACCURACY_VOCAB_SIZE, config.topK, config.topP, config.temperature);
-            accuracyResults.push_back(resultFp32);
-
-            // FP16
-            auto resultFp16 = runSamplingAccuracyTest<half>(
-                config.methodName, batchSize, ACCURACY_VOCAB_SIZE, config.topK, config.topP, config.temperature);
-            accuracyResults.push_back(resultFp16);
-
-            // BF16
-            auto resultBf16 = runSamplingAccuracyTest<__nv_bfloat16>(
-                config.methodName, batchSize, ACCURACY_VOCAB_SIZE, config.topK, config.topP, config.temperature);
-            accuracyResults.push_back(resultBf16);
+            accuracyResults.push_back(result);
         }
     }
 
     // Print accuracy results table
-    std::cout << "\nSampling Accuracy Results:" << std::endl;
-    std::cout << "Type | Method   | Batch | AccVocabSize | TopK | TopP  | Temp  | Accuracy" << std::endl;
-    std::cout << "-----|----------|-------|--------------|------|-------|-------|----------" << std::endl;
+    std::cout << "\nSampling Accuracy Results (FP32 only):" << std::endl;
+    std::cout << "Method   | Batch | AccVocabSize | TopK | TopP  | Temp  | Accuracy" << std::endl;
+    std::cout << "---------|-------|--------------|------|-------|-------|----------" << std::endl;
 
     bool allAccuracyTestsPassed = true;
     std::vector<std::string> accuracyErrorMessages;
@@ -636,10 +588,9 @@ TEST_F(SamplingTests, SamplingAccuracy)
             accuracyErrorMessages.push_back(result.errorMessage);
         }
 
-        std::cout << std::setw(4) << result.typeName << " | " << std::setw(8) << result.methodName << " | "
-                  << std::setw(5) << result.batchSize << " | " << std::setw(12) << result.vocabSize << " | "
-                  << std::setw(4) << topKStr << " | " << std::setw(5) << topPStr << " | " << std::setw(5) << tempStr
-                  << " | " << std::setw(8) << accuracyStr << std::endl;
+        std::cout << std::setw(8) << result.methodName << " | " << std::setw(5) << result.batchSize << " | "
+                  << std::setw(12) << result.vocabSize << " | " << std::setw(4) << topKStr << " | " << std::setw(5)
+                  << topPStr << " | " << std::setw(5) << tempStr << " | " << std::setw(8) << accuracyStr << std::endl;
     }
 
     // Print summary
@@ -690,28 +641,17 @@ TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracy)
     {
         for (auto const& config : configs)
         {
-            // FP32
-            auto resultFp32 = runReturnAllTopKAccuracyTest<float>(batchSize, ACCURACY_VOCAB_SIZE, config.topK,
+            auto result = runReturnAllTopKAccuracyTest(batchSize, ACCURACY_VOCAB_SIZE, config.topK,
                 config.returnLogProbs, config.normalizeLogProbs, config.inputHasProbs);
-            accuracyResults.push_back(resultFp32);
-
-            // FP16
-            auto resultFp16 = runReturnAllTopKAccuracyTest<half>(batchSize, ACCURACY_VOCAB_SIZE, config.topK,
-                config.returnLogProbs, config.normalizeLogProbs, config.inputHasProbs);
-            accuracyResults.push_back(resultFp16);
-
-            // BF16
-            auto resultBf16 = runReturnAllTopKAccuracyTest<__nv_bfloat16>(batchSize, ACCURACY_VOCAB_SIZE, config.topK,
-                config.returnLogProbs, config.normalizeLogProbs, config.inputHasProbs);
-            accuracyResults.push_back(resultBf16);
+            accuracyResults.push_back(result);
         }
     }
 
     // Print accuracy results table
-    std::cout << "\nSelectAllTopK Accuracy Results:" << std::endl;
-    std::cout << "Type | Batch | TopK | ReturnLogProbs | NormalizeLogProbs | InputHasProbs | AccVocabSize | Accuracy"
+    std::cout << "\nSelectAllTopK Accuracy Results (FP32 only):" << std::endl;
+    std::cout << "Batch | TopK | ReturnLogProbs | NormalizeLogProbs | InputHasProbs | AccVocabSize | Accuracy"
               << std::endl;
-    std::cout << "-----|-------|------|----------------|-------------------|---------------|--------------|----------"
+    std::cout << "------|------|----------------|-------------------|---------------|--------------|----------"
               << std::endl;
 
     bool allAccuracyTestsPassed = true;
@@ -730,10 +670,10 @@ TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracy)
             accuracyErrorMessages.push_back(result.errorMessage);
         }
 
-        std::cout << std::setw(4) << result.typeName << " | " << std::setw(5) << result.batchSize << " | "
-                  << std::setw(4) << result.topK << " | " << std::setw(14) << returnLogProbsStr << " | "
-                  << std::setw(17) << normalizeLogProbsStr << " | " << std::setw(13) << inputHasProbsStr << " | "
-                  << std::setw(12) << result.vocabSize << " | " << std::setw(8) << accuracyStr << std::endl;
+        std::cout << std::setw(5) << result.batchSize << " | " << std::setw(4) << result.topK << " | " << std::setw(14)
+                  << returnLogProbsStr << " | " << std::setw(17) << normalizeLogProbsStr << " | " << std::setw(13)
+                  << inputHasProbsStr << " | " << std::setw(12) << result.vocabSize << " | " << std::setw(8)
+                  << accuracyStr << std::endl;
     }
 
     // Print summary

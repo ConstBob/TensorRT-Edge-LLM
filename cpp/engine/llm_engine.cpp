@@ -16,16 +16,19 @@
 #include <numeric>
 #include <stdexcept>
 
-EngineConfig::EngineConfig(std::string const& base_engine_path, bool use_cuda_graph, int32_t batch_size)
-    : baseEnginePath(base_engine_path)
+EngineConfig::EngineConfig(std::string const& engine_dir, bool use_cuda_graph, int32_t batch_size)
+    : engineDir(engine_dir)
     , useCudaGraph(use_cuda_graph)
+    , batchSize(batch_size)
 {
 }
 
-EngineConfig::EngineConfig(std::string const& base_engine_path, std::string const& eagle_engine_path,
-    int32_t max_path_len, int32_t top_k, bool is_eagle3, int32_t max_decoding_tokens, bool use_cuda_graph)
-    : baseEnginePath(base_engine_path)
-    , eagleEnginePath(eagle_engine_path)
+EngineConfig::EngineConfig(std::string const& engine_dir, std::string const& base_model_dir,
+    std::string const& draft_model_dir, int32_t max_path_len, int32_t top_k, bool is_eagle3,
+    int32_t max_decoding_tokens, bool use_cuda_graph)
+    : engineDir(engine_dir)
+    , baseModelDir(base_model_dir)
+    , draftModelDir(draft_model_dir)
     , maxPathLen(max_path_len)
     , topK(top_k)
     , isEagle3(is_eagle3)
@@ -128,17 +131,17 @@ void LLMEngine::setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs
     }
 }
 
-void LLMEngine::setupRopeCosSin(std::string const& configPath)
+void LLMEngine::setupRopeCosSin()
 {
     if (isEagleModel())
     {
         auto& eagle = getEagle();
-        eagle->setupRopeCosSin(configPath);
+        eagle->setupRopeCosSin();
     }
     else
     {
         auto& decoder = getDecoder();
-        decoder->setupRopeCosSin(configPath);
+        decoder->setupRopeCosSin();
     }
 }
 
@@ -156,8 +159,8 @@ void LLMEngine::getLastHostLogits(std::vector<LogitsType>& hostLogits)
     }
 }
 
-void LLMEngine::generate(std::vector<int64_t> const& inputIds, std::vector<int32_t> const& contextLengths,
-    std::vector<std::vector<int64_t>>& outputIds, GenerationConfig const& generationConfig,
+void LLMEngine::generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> const& contextLengths,
+    std::vector<std::vector<int32_t>>& outputIds, GenerationConfig const& generationConfig,
     std::vector<int32_t>* newTokensNumbers, std::vector<int32_t>* iterNumbers,
     std::shared_ptr<BenchmarkProfiler> const profiler, Tokenizer* tokenizer, bool autoDecode)
 {
@@ -203,8 +206,8 @@ void LLMEngine::generate(std::vector<int64_t> const& inputIds, std::vector<int32
     }
 }
 
-std::vector<int64_t> LLMEngine::processInputSequence(std::vector<std::string> const& inputStrings, Tokenizer* tokenizer,
-    std::vector<int32_t>& contextLengths, int64_t padId)
+std::vector<int32_t> LLMEngine::processInputSequence(std::vector<std::string> const& inputStrings, Tokenizer* tokenizer,
+    std::vector<int32_t>& contextLengths, int32_t padId)
 {
     // Process and tokenize input string, then store tokens in the appropriate batch position
     int32_t batchSize = static_cast<int32_t>(inputStrings.size());
@@ -213,7 +216,7 @@ std::vector<int64_t> LLMEngine::processInputSequence(std::vector<std::string> co
         throw std::runtime_error("Batch size mismatch for engine setup config.");
     }
     contextLengths.resize(batchSize, 0);
-    std::vector<std::vector<int64_t>> batchInputIds;
+    std::vector<std::vector<int32_t>> batchInputIds;
     for (int32_t i = 0; i < batchSize; ++i)
     {
         auto tokenizedInput = tokenizer->encode(inputStrings[i], true);
@@ -230,10 +233,10 @@ std::vector<int64_t> LLMEngine::processInputSequence(std::vector<std::string> co
     // Depends on the engine config, we may either pad input ids to maxSupportedInputLength
     // or pad inputs to largest input length in the batch.
     bool const useMaxSupportedISLPadding = mMinSupportedInputLength == mMaxSupportedInputLength;
-    int64_t sequenceStride = useMaxSupportedISLPadding ? mMaxSupportedInputLength
+    int32_t sequenceStride = useMaxSupportedISLPadding ? mMaxSupportedInputLength
                                                        : std::max(mMinSupportedInputLength, maxInputLengthInBatch);
 
-    std::vector<int64_t> result(sequenceStride * batchSize, padId);
+    std::vector<int32_t> result(sequenceStride * batchSize, padId);
     for (int32_t i = 0; i < batchSize; ++i)
     {
         std::copy(batchInputIds[i].begin(), batchInputIds[i].end(), result.begin() + i * sequenceStride);
@@ -245,19 +248,20 @@ typename LLMEngine::ModelPtr LLMEngine::createModel(EngineConfig const& config, 
 {
     auto baseDecoder = std::make_unique<Decoder>();
 
-    if (config.eagleEnginePath.empty())
+    if (config.baseModelDir.empty() && config.draftModelDir.empty())
     {
-        // Single decoder mode
-        baseDecoder->setup(config.baseEnginePath, stream, config.useCudaGraph, config.batchSize);
+        // Single decoder mode (naive decoding)
+        baseDecoder->setup(config.engineDir, config.batchSize, false, "", config.useCudaGraph, stream);
         return std::move(baseDecoder);
     }
     else
     {
         // Eagle mode - requires both base and draft decoders
-        baseDecoder->setup(config.baseEnginePath, stream, config.useCudaGraph, 1, true);
+        baseDecoder->setup(config.baseModelDir, 1, true, "base", config.useCudaGraph, stream);
         auto draftDecoder = std::make_unique<Decoder>();
-        draftDecoder->setup(config.eagleEnginePath, stream, config.useCudaGraph, 1, true);
-        return std::make_unique<Eagle>(std::move(baseDecoder), std::move(draftDecoder), stream, config.eagleEnginePath,
-            config.maxPathLen, config.topK, config.isEagle3, config.maxDecodingTokens);
+        draftDecoder->setup(config.draftModelDir, 1, true, "draft", config.useCudaGraph, stream);
+
+        return std::make_unique<Eagle>(std::move(baseDecoder), std::move(draftDecoder), stream, config.baseModelDir,
+            config.draftModelDir, config.maxPathLen, config.topK, config.isEagle3, config.maxDecodingTokens);
     }
 }

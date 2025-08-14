@@ -15,17 +15,17 @@
 namespace CommonOptions
 {
 
-const struct option baseOptions[]
-    = {{"enginePath", optional_argument, 0, 1}, {"tokenizerPath", optional_argument, 0, 2}, {"help", no_argument, 0, 3},
-        {"debug", no_argument, 0, 4}, {"noCudaGraph", no_argument, 0, 5}, {0, 0, 0, 0}};
+const struct option baseOptions[] = {{"engineDir", optional_argument, 0, 1}, {"help", no_argument, 0, 3},
+    {"debug", no_argument, 0, 4}, {"noCudaGraph", no_argument, 0, 5}, {0, 0, 0, 0}};
 
 const struct option eagleBuildOptions[] = {{"isEagleBase", no_argument, 0, 101}, {"isEagleDraft", no_argument, 0, 102},
     {"isEagle3", no_argument, 0, 103}, {"maxDecodingTokens", optional_argument, 0, 104},
     {"mMaxDraftTokensPerStep", optional_argument, 0, 105}, {0, 0, 0, 0}};
 
-const struct option eagleOptions[] = {{"eagleEnginePath", optional_argument, 0, 201}, {"isEagle3", no_argument, 0, 202},
-    {"maxDecodingTokens", optional_argument, 0, 203}, {"topK", optional_argument, 0, 204},
-    {"maxPathLen", optional_argument, 0, 205}, {0, 0, 0, 0}};
+const struct option eagleOptions[]
+    = {{"baseModelDir", optional_argument, 0, 201}, {"draftModelDir", optional_argument, 0, 202},
+        {"isEagle3", no_argument, 0, 203}, {"maxDecodingTokens", optional_argument, 0, 204},
+        {"topK", optional_argument, 0, 205}, {"maxPathLen", optional_argument, 0, 206}, {0, 0, 0, 0}};
 
 const struct option vlmBuildOptions[] = {{"modelType", optional_argument, 0, 301},
     {"imageTokens", optional_argument, 0, 302}, {"minImageTokens", optional_argument, 0, 303},
@@ -34,33 +34,19 @@ const struct option vlmBuildOptions[] = {{"modelType", optional_argument, 0, 301
 const struct option vlmRunOptions[]
     = {{"visualEnginePath", required_argument, 0, 401}, {"modelType", optional_argument, 0, 402}, {0, 0, 0, 0}};
 
-bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg, bool requireTokenizer)
+bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg)
 {
     switch (opt)
     {
-    case 1: // enginePath
+    case 1: // engineDir
         if (optarg)
         {
-            baseParams.enginePath = optarg;
+            baseParams.engineDir = optarg;
         }
         else
         {
-            std::cerr << "ERROR: --enginePath requires option argument" << std::endl;
+            std::cerr << "ERROR: --engineDir requires option argument" << std::endl;
             return false;
-        }
-        break;
-    case 2: // tokenizerPath
-        if (optarg)
-        {
-            baseParams.tokenizerPath = optarg;
-        }
-        else
-        {
-            if (requireTokenizer)
-            {
-                std::cerr << "ERROR: --tokenizerPath requires option argument" << std::endl;
-                return false;
-            }
         }
         break;
     case 3: // help
@@ -81,26 +67,30 @@ bool parseEagleOptions(EagleParams& eagleParams, int opt, char const* optarg)
 {
     switch (opt)
     {
-    case 201: // eagleEnginePath
+    case 201: // baseModelDir
         if (optarg)
-            eagleParams.eagleEnginePath = optarg;
+            eagleParams.baseModelDir = optarg;
         break;
-    case 202: // isEagle3
+    case 202: // draftModelDir
+        if (optarg)
+            eagleParams.draftModelDir = optarg;
+        break;
+    case 203: // isEagle3
         eagleParams.isEagle3 = true;
         break;
-    case 203: // maxDecodingTokens
+    case 204: // maxDecodingTokens
         if (optarg)
         {
             eagleParams.maxDecodingTokens = std::stoi(optarg);
         }
         break;
-    case 204: // topK
+    case 205: // topK
         if (optarg)
         {
             eagleParams.topK = std::stoi(optarg);
         }
         break;
-    case 205: // maxPathLen
+    case 206: // maxPathLen
         if (optarg)
         {
             eagleParams.maxPathLen = std::stoi(optarg);
@@ -206,9 +196,7 @@ namespace CommonUsage
 {
 void printBaseOptions()
 {
-    std::cerr << "  --enginePath          Provide the path to the engine file. Required." << std::endl;
-    std::cerr << "  --tokenizerPath       Provide the path to HF tokenizer. Required for chat, and accuracy modes."
-              << std::endl;
+    std::cerr << "  --engineDir           Provide the path to the engine directory. Required." << std::endl;
     std::cerr << "  --help                Print help message." << std::endl;
     std::cerr << "  --debug               Print debug message." << std::endl;
     std::cerr << "  --noCudaGraph         Disable CUDA graph." << std::endl;
@@ -216,7 +204,8 @@ void printBaseOptions()
 
 void printEagleOptions()
 {
-    std::cerr << "  --eagleEnginePath     Provide the input Eagle engine file path. Required for Eagle mode."
+    std::cerr << "  --baseModelDir        Provide the base model directory path. Required for Eagle mode." << std::endl;
+    std::cerr << "  --draftModelDir       Provide the draft model directory path. Required for Eagle mode."
               << std::endl;
     std::cerr << "  --isEagle3            Use Eagle3 mode. Default is Eagle2." << std::endl;
     std::cerr
@@ -238,9 +227,7 @@ void printLoraOptions()
 
 void printBenchmarkOptions()
 {
-    std::cerr << "  --tokenizerPath       Provide the path to HF tokenizer. Required for Eagle models, optional for "
-                 "standard models."
-              << std::endl;
+    std::cerr << "  --engineDir           Provide the path to the engine directory. Required." << std::endl;
 }
 
 void printEagleBuildOptions()

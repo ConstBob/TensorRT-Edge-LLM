@@ -61,21 +61,21 @@ public:
      *
      * @return True if the setup is successful, false otherwise.
      */
-    bool setup(std::filesystem::path const& fp, cudaStream_t& stream, int llmBatchSize);
+    bool setup(std::filesystem::path const& fp, cudaStream_t stream, int llmBatchSize);
 
     void visualPreprocess(std::vector<unsigned char*> const& imageBuffers,
         std::vector<unsigned char*> const& thumbnailImageBuffers, std::vector<std::vector<int>> const& imageSizes,
         std::vector<half>& patches, std::vector<int64_t>& imageTokenLengths, bool useThumbnail);
 
     void textPreprocess(std::vector<std::string> const& inputStrings, std::vector<int> const& numImages,
-        std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer, std::vector<int64_t>& inputIds,
+        std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer, std::vector<int32_t>& inputIds,
         std::vector<int32_t>& contextLengths, int32_t const maxSupportedInputLength, bool enableDynamicShape);
 
     void internVLViTInfer(std::vector<half> const& input);
 
     std::vector<EngineInputDesc> getExtraLLMInputs();
 
-    void initRandomInputs(std::vector<half>& visualInput, std::vector<int64_t>& inputIds, int const textTokenLength,
+    void initRandomInputs(std::vector<half>& visualInput, std::vector<int32_t>& inputIds, int const textTokenLength,
         int const imageTokenLength, int const maxContextLength);
 
     void allocateBuffer();

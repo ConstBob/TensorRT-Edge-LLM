@@ -64,8 +64,8 @@ struct TestData
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] [--inputString=<input>] [--enginePath=<path to TensorRT engine>] "
-                 "[--maxLength=<int>] [--tokenizerPath=<path to HF tokenizer>] "
+              << " [--help] [--inputString=<input>] [--engineDir=<path to TensorRT engine directory>] "
+                 "[--maxLength=<int>] "
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --datasetPath    Provide the dataset path for evaluation." << std::endl;
@@ -93,7 +93,7 @@ bool parseLLMAccuracyArgs(LLMAccuracyArgs& args, int argc, char* argv[])
 
     while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1)
     {
-        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg, true))
+        if (CommonOptions::parseBaseOptions(args.baseParams, opt, optarg))
         {
             continue;
         }
@@ -275,17 +275,17 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer)
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     EngineConfig engineConfig;
-    if (args.eagleParams.eagleEnginePath.empty())
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
     {
         LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(args.baseParams.enginePath, !args.baseParams.noCudaGraph);
+        engineConfig = EngineConfig(args.baseParams.engineDir, !args.baseParams.noCudaGraph);
     }
     else
     {
         LOG_INFO("Running in Eagle mode.");
-        engineConfig = EngineConfig(args.baseParams.enginePath, args.eagleParams.eagleEnginePath,
-            args.eagleParams.maxPathLen, args.eagleParams.topK, args.eagleParams.isEagle3,
-            args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
+        engineConfig = EngineConfig(args.baseParams.engineDir, args.eagleParams.baseModelDir,
+            args.eagleParams.draftModelDir, args.eagleParams.maxPathLen, args.eagleParams.topK,
+            args.eagleParams.isEagle3, args.eagleParams.maxDecodingTokens, !args.baseParams.noCudaGraph);
     }
     auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
     bool const eagleMode = llmEngine->isEagleModel();
@@ -293,9 +293,7 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer)
     bool const engineSupportDynamicShape = llmEngine->getMinSupportedInputLength() != maxEngineSupportedISL;
 
     // Initialize rope_rotary_cos_sin
-    std::string baseFolderPath = extractFolderName(args.baseParams.enginePath);
-    std::string configPath = baseFolderPath + "/config.json";
-    llmEngine->setupRopeCosSin(configPath);
+    llmEngine->setupRopeCosSin();
 
     // Load and switch to LoRA weights if provided
     if (args.loraWeights.hasWeights() && !eagleMode)
@@ -343,7 +341,7 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer)
         for (auto const& data : testData)
         {
             std::string prompt;
-            std::vector<int64_t> inputIds;
+            std::vector<int32_t> inputIds;
 
             uint16_t devPromptNum = 5;
             do
@@ -358,7 +356,7 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer)
                 LOG_DEBUG("Prompt: %s", prompt.c_str());
             }
 
-            std::vector<std::vector<int64_t>> outputIds(1);
+            std::vector<std::vector<int32_t>> outputIds(1);
             GenerationConfig generationConfig{inputIds.size() + 1, 0, 1, 1};
 
             if (inputIds.size() > 2048)
@@ -377,11 +375,11 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer)
             llmEngine->generate(
                 inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, nullptr, tokenizer);
 
-            std::vector<half> hostLogits;
+            std::vector<float> hostLogits;
             llmEngine->getLastHostLogits(hostLogits);
 
             int bestIdx = 0;
-            half val = hostLogits[choices[0]];
+            float val = hostLogits[choices[0]];
             for (int i = 1; i < 4; i++)
             {
                 if (val < hostLogits[choices[i]])
@@ -436,7 +434,15 @@ int main(int argc, char* argv[])
     auto pluginHandles = loadEdgellmPluginLib();
 
     auto tokenizer = std::make_unique<Tokenizer>();
-    tokenizer->loadFromHF(args.baseParams.tokenizerPath);
+    // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
+    {
+        tokenizer->loadFromHF(args.baseParams.engineDir);
+    }
+    else
+    {
+        tokenizer->loadFromHF(args.eagleParams.baseModelDir);
+    }
 
     mmluAccuracy(args, tokenizer.get());
     return EXIT_SUCCESS;
