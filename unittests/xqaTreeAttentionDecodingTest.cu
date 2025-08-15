@@ -121,24 +121,36 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
     EXPECT_FALSE(NanValueDetected);
 }
 
-TEST(XQATreeAttentionDecodingTest, accuracyKVRatio4)
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio4HeadDim128)
 {
     /// KVSequence 256, QSequence 48
     TestXQATreeAttentionDecodingAccuracy(1, 32, 8, 128, 512, 10);
     /// KVSequence 128, QSequence 64
     TestXQATreeAttentionDecodingAccuracy(1, 32, 8, 128, 256, 32);
-    /// KVSequence 64, QSequence 128， KV-head = 3
+    /// KVSequence 64, QSequence 128
     TestXQATreeAttentionDecodingAccuracy(1, 32, 8, 128, 320, 60);
 }
 
-TEST(XQATreeAttentionDecodingTest, accuracyKVRatio8)
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio8HeadDim128)
 {
     /// KVSequence 256, QSequence 48
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 256, 48);
     /// KVSequence 128, QSequence 64
     TestXQATreeAttentionDecodingAccuracy(1, 32, 4, 128, 128, 64);
-    /// KVSequence 64, QSequence 128， KV-head = 3
+    /// KVSequence 192, QSequence 60 KV-head = 3
     TestXQATreeAttentionDecodingAccuracy(1, 24, 3, 128, 192, 60);
     /// KVSequence 512, QSequence 20， KV-head = 3
     TestXQATreeAttentionDecodingAccuracy(1, 24, 3, 128, 512, 20);
+}
+
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio7HeadDim64)
+{
+    /// KVSequence 256, QSequence 48
+    TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 256, 48);
+    /// KVSequence 128, QSequence 64
+    TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 128, 64);
+    /// KVSequence 192, QSequence 60
+    TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 192, 60);
+    /// KVSequence 512, QSequence 20
+    TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 512, 20);
 }
