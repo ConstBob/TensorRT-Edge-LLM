@@ -159,6 +159,20 @@ void LLMEngine::getLastHostLogits(std::vector<LogitsType>& hostLogits)
     }
 }
 
+ModelConfig LLMEngine::getBaseModelConfig()
+{
+    if (isEagleModel())
+    {
+        auto& eagle = getEagle();
+        return eagle->getBaseModelConfig();
+    }
+    else
+    {
+        auto& decoder = getDecoder();
+        return decoder->getModelConfig();
+    }
+}
+
 void LLMEngine::generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> const& contextLengths,
     std::vector<std::vector<int32_t>>& outputIds, GenerationConfig const& generationConfig,
     std::vector<int32_t>* newTokensNumbers, std::vector<int32_t>* iterNumbers,
@@ -186,7 +200,7 @@ void LLMEngine::generate(std::vector<int32_t> const& inputIds, std::vector<int32
     else
     {
         auto& decoder = getDecoder();
-        int64_t eosId = -1;
+        int32_t eosId = -1;
         if (tokenizer)
         {
             eosId = tokenizer->getEosId();

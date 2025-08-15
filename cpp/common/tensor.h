@@ -140,8 +140,10 @@ private:
 class Tensor
 {
 public:
-    //! Disable default constructor, copy constructor and assignment operator explicitly.
-    Tensor() = delete;
+    Tensor() = default;
+
+    //! Disable copy constructor and assignment operator explicitly to enforce explicit
+    //! memory ownership transfer.
     Tensor(Tensor const& other) = delete;
     Tensor& operator=(Tensor const& other) = delete;
 

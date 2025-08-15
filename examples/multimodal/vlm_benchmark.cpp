@@ -13,16 +13,16 @@
 #include "common/common.h"
 #include "decoder/decoder.h"
 #include "engine/llm_engine.h"
-#include "internvl3/vit_runner.h"
-#include "llm_param.h"
-#include "qwen2vl/vit_runner.h"
+#include "exampleUtils.h"
+#include "multimodal/internViTRunner.h"
+#include "multimodal/multimodalRunner.h"
+#include "multimodal/qwenViTRunner.h"
 #include "tokenizer/tokenizer.h"
 #include <cuda_profiler_api.h>
 #include <dlfcn.h>
 #include <getopt.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include <stb_image.h>
+using namespace drivellm::rt;
 
 struct VlmBenchmarkArgs
 {
@@ -40,8 +40,9 @@ struct VlmBenchmarkArgs
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] [--engineDir=<path to LLM engine directory>] [--visualEnginePath=<path to visual engine>]"
-                 " [--modelType=<model type>] [--textTokenLength=<int>] [--imageTokenLength=<int>]"
+              << " [--help] [--engineDir=<path to LLM engine directory>] [--visualEngineDir=<path to visual engine "
+                 "directory>]"
+                 " [--textTokenLength=<int>] [--imageTokenLength=<int>]"
                  " [--outputLength=<int>] [--warmUp=<int>] [--numRuns=<int>] [--batchSize=<int>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
@@ -207,101 +208,68 @@ void printBenchmarkResult(std::shared_ptr<BenchmarkProfiler> const profiler, int
     LOG_INFO("========================================================");
 }
 
-size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
-    GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
-    int const imageTokenLength, std::vector<std::vector<int32_t>>& outputIds,
-    std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph,
-    std::string const& modelType, LoraWeights const& loraWeights)
+size_t benchmarkMultimodal(BaseParams const& baseParams, VLMRunParams const& vlmRunParams,
+    LoraWeights const& loraWeights, GenerationConfig const& generationConfig, int const batchSize,
+    int const textTokenLength, int const imageTokenLength, std::vector<std::vector<int32_t>>& outputIds,
+    std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns)
 {
     // Setup
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    auto vitrunner = new Qwen2ViTRunner(modelType);
-    auto decoder = new Decoder();
-
     profiler->startTiming();
     profiler->recordDeviceMemStart();
     profiler->recordHostMemStart();
     profiler->recordHostStart("decoder setup");
-    vitrunner->setup(visualEnginePath, stream, batchSize);
-    decoder->setup(llmEnginePath, batchSize, false, "", useCudaGraph, stream);
-    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
 
-    // Load and switch to LoRA weights if provided
-    if (loraWeights.hasWeights())
-    {
-        auto loraPair = loraWeights.getFirst();
-        if (!decoder->addLora(loraPair.first, loraPair.second))
-        {
-            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraPair.first.c_str(), loraPair.second.c_str());
-            return 0;
-        }
-        if (!decoder->switchLora(loraPair.first))
-        {
-            LOG_ERROR("Failed to switch to LoRA: %s", loraPair.first.c_str());
-            return 0;
-        }
-    }
+    auto multimodalRunner = getMultimodalRunner(vlmRunParams, stream);
+    // This script does not support benchmarking VLM Eagle models, passing default EagleParams
+    auto llmEngine = getLLMEngine(batchSize, baseParams, EagleParams(), loraWeights, stream);
+    llmEngine->setupExtraInputs(multimodalRunner->getComputedEmbeddings());
 
     profiler->recordHostEnd("decoder setup");
     profiler->stopTiming();
 
     // Preprocess
-    std::vector<half> visualInput;
-    std::vector<half> visualAttentionMask;
-    std::vector<float> visualRotaryPosEmb;
-    std::vector<int32_t> inputIds(batchSize * decoder->getMaxSupportedInputLength(), -1);
-    std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
-    // Only initialized for qwen2_5_vl
-    std::vector<half> visualWindowAttentionMask;
-    std::vector<int64_t> visualWindowIndex;
-    std::vector<int64_t> reverseWindowIndex;
+    auto modelConfig = llmEngine->getBaseModelConfig();
+    int const maxSupportedInputLength = modelConfig.maxSupportedInputLength;
+    int const minSupportedInputLength = modelConfig.minSupportedInputLength;
+    int const inputLength = textTokenLength + imageTokenLength;
+    if (inputLength > maxSupportedInputLength || inputLength < minSupportedInputLength)
+    {
+        throw std::runtime_error("Input length is out of range: " + std::to_string(inputLength) + " (min: "
+            + std::to_string(minSupportedInputLength) + ", max: " + std::to_string(maxSupportedInputLength) + ")");
+    }
 
-    vitrunner->initRandomInputs(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
-        visualWindowIndex, reverseWindowIndex, inputIds, textTokenLength, imageTokenLength,
-        decoder->getMaxSupportedInputLength());
+    std::vector<int32_t> inputIds(batchSize * inputLength, -1);
+    std::vector<int32_t> contextLengths(batchSize, inputLength);
+    multimodalRunner->initRandomInputs(inputIds, batchSize, textTokenLength, imageTokenLength, inputLength, stream);
 
+    // Warmup for profiler
     for (int i = 0; i < warmUp; i++)
     {
-        // Warmup for profiler
         profiler->recordHostStart("pipeline latency");
-        if (modelType == "qwen2_vl")
-        {
-            vitrunner->qwen2ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
-        }
-        else
-        {
-            vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
-                visualWindowIndex, reverseWindowIndex);
-        }
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler);
+        multimodalRunner->infer(stream);
+        llmEngine->generate(inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, profiler);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("pipeline latency");
     }
     cudaDeviceSynchronize();
 
+    // Benchmark
     profiler->startTiming();
     cudaProfilerStart();
     for (int i = 0; i < numRuns; i++)
     {
         profiler->recordHostStart("pipeline latency");
         profiler->recordHostStart("visual encoder latency");
-        if (modelType == "qwen2_vl")
-        {
-            vitrunner->qwen2ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
-        }
-        else
-        {
-            vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
-                visualWindowIndex, reverseWindowIndex);
-        }
+        multimodalRunner->infer(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("visual encoder latency");
 
         profiler->recordHostStart("seq latency");
         profiler->recordHostStart("first token latency");
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler);
+        llmEngine->generate(inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, profiler);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         profiler->recordHostEnd("seq latency");
         profiler->recordHostEnd("pipeline latency");
@@ -309,104 +277,13 @@ size_t benchmarkQwen2VL(std::filesystem::path const& llmEnginePath, std::filesys
     cudaProfilerStop();
     profiler->stopTiming();
 
-    size_t deviceMemorySize = decoder->getDeviceMemorySize();
-
+    // Cleanup
+    size_t deviceMemorySize = llmEngine->getDeviceMemorySize();
     CUDA_CHECK(cudaStreamDestroy(stream));
-    delete vitrunner;
-    delete decoder;
-
     return deviceMemorySize;
 }
 
-size_t benchmarkInternVL3(std::filesystem::path const& llmEnginePath, std::filesystem::path const& visualEnginePath,
-    GenerationConfig const& generationConfig, int const batchSize, int const textTokenLength,
-    int const imageTokenLength, std::vector<std::vector<int32_t>>& outputIds,
-    std::shared_ptr<BenchmarkProfiler> const profiler, int const warmUp, int const numRuns, bool useCudaGraph,
-    std::string const& modelType, LoraWeights const& loraWeights)
-{
-    // Setup
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
-    auto vitrunner = new InternVLViTRunner(modelType);
-    auto decoder = new Decoder();
-
-    profiler->startTiming();
-    profiler->recordDeviceMemStart();
-    profiler->recordHostMemStart();
-    profiler->recordHostStart("decoder setup");
-    vitrunner->setup(visualEnginePath, stream, batchSize);
-    decoder->setup(llmEnginePath, batchSize, false, "", useCudaGraph, stream);
-    decoder->setupExtraInputs(vitrunner->getExtraLLMInputs());
-    decoder->setupRopeCosSin();
-
-    // Load and switch to LoRA weights if provided
-    if (loraWeights.hasWeights())
-    {
-        auto loraPair = loraWeights.getFirst();
-        if (!decoder->addLora(loraPair.first, loraPair.second))
-        {
-            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraPair.first.c_str(), loraPair.second.c_str());
-            return 0;
-        }
-        if (!decoder->switchLora(loraPair.first))
-        {
-            LOG_ERROR("Failed to switch to LoRA: %s", loraPair.first.c_str());
-            return 0;
-        }
-    }
-
-    profiler->recordHostEnd("decoder setup");
-    profiler->stopTiming();
-
-    // Preprocess
-    std::vector<half> visualInput;
-    std::vector<int32_t> inputIds(batchSize * decoder->getMaxSupportedInputLength(), -1);
-    std::vector<int32_t> contextLengths(batchSize, textTokenLength + imageTokenLength);
-
-    vitrunner->initRandomInputs(
-        visualInput, inputIds, textTokenLength, imageTokenLength, decoder->getMaxSupportedInputLength());
-    for (int i = 0; i < warmUp; i++)
-    {
-        // Warmup for profiler
-        profiler->recordHostStart("pipeline latency");
-        vitrunner->internVLViTInfer(visualInput);
-
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        profiler->recordHostEnd("pipeline latency");
-    }
-    cudaDeviceSynchronize();
-    profiler->startTiming();
-    cudaProfilerStart();
-    for (int i = 0; i < numRuns; i++)
-    {
-        profiler->recordHostStart("pipeline latency");
-        profiler->recordHostStart("visual encoder latency");
-        vitrunner->internVLViTInfer(visualInput);
-
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        profiler->recordHostEnd("visual encoder latency");
-
-        profiler->recordHostStart("seq latency");
-        profiler->recordHostStart("first token latency");
-        decoder->generate(inputIds, contextLengths, outputIds, generationConfig, -1, profiler);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        profiler->recordHostEnd("seq latency");
-        profiler->recordHostEnd("pipeline latency");
-    }
-    cudaProfilerStop();
-    profiler->stopTiming();
-    size_t deviceMemorySize = decoder->getDeviceMemorySize();
-
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    delete vitrunner;
-    delete decoder;
-
-    return deviceMemorySize;
-}
-
-void benchmarkVLM(VlmBenchmarkArgs const& args)
+void benchmark(VlmBenchmarkArgs const& args)
 {
     int totalSeqLength = args.textTokenLength + args.imageTokenLength + args.outputLength;
     GenerationConfig generationConfig{totalSeqLength, totalSeqLength, 1, 1};
@@ -420,22 +297,8 @@ void benchmarkVLM(VlmBenchmarkArgs const& args)
     auto profiler = std::make_shared<BenchmarkProfiler>();
     size_t deviceMemorySize;
 
-    if (args.vlmRunParams.modelType == "qwen2_vl" || args.vlmRunParams.modelType == "qwen2_5_vl")
-    {
-        deviceMemorySize = benchmarkQwen2VL(args.baseParams.engineDir, args.vlmRunParams.visualEnginePath,
-            generationConfig, args.batchSize, args.textTokenLength, args.imageTokenLength, outputIds, profiler,
-            args.warmUp, args.numRuns, !args.baseParams.noCudaGraph, args.vlmRunParams.modelType, args.loraWeights);
-    }
-    else if (args.vlmRunParams.modelType == "internvl3")
-    {
-        deviceMemorySize = benchmarkInternVL3(args.baseParams.engineDir, args.vlmRunParams.visualEnginePath,
-            generationConfig, args.batchSize, args.textTokenLength, args.imageTokenLength, outputIds, profiler,
-            args.warmUp, args.numRuns, !args.baseParams.noCudaGraph, args.vlmRunParams.modelType, args.loraWeights);
-    }
-    else
-    {
-        throw std::runtime_error("Only support Qwen2-VL and InternVL3 models for Multimodal models.");
-    }
+    deviceMemorySize = benchmarkMultimodal(args.baseParams, args.vlmRunParams, args.loraWeights, generationConfig,
+        args.batchSize, args.textTokenLength, args.imageTokenLength, outputIds, profiler, args.warmUp, args.numRuns);
 
     printBenchmarkResult(
         profiler, args.batchSize, args.textTokenLength, args.imageTokenLength, args.outputLength, deviceMemorySize);
@@ -471,7 +334,8 @@ int main(int argc, char* argv[])
         LOG_ERROR("Please specify --textTokenLength, --imageTokenLength and --outputLength for benchmark.");
         return EXIT_FAILURE;
     }
-    benchmarkVLM(args);
+
+    benchmark(args);
 
     return EXIT_SUCCESS;
 };

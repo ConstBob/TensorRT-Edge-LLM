@@ -14,5 +14,8 @@ file(GLOB_RECURSE EXAMPLE_UTILS_CU_SOURCES "*.cu")
 add_library(exampleUtils STATIC ${EXAMPLE_UTILS_CPP_SOURCES}
                                 ${EXAMPLE_UTILS_CU_SOURCES})
 
-target_include_directories(exampleUtils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-                                               ${COMMON_INCLUDE_DIRS})
+target_include_directories(
+  exampleUtils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${COMMON_INCLUDE_DIRS}
+                      ${CMAKE_SOURCE_DIR}/3rdParty/stb)
+
+target_link_libraries(exampleUtils PRIVATE llmSdkCore commonLibraryExt)

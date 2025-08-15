@@ -118,6 +118,7 @@ public:
     int64_t getModelBatchSize() const noexcept;
     int64_t getMinSupportedInputLength() const noexcept;
     int64_t getMaxSupportedInputLength() const noexcept;
+    ModelConfig getBaseModelConfig() const noexcept;
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
     void setupRopeCosSin();
 

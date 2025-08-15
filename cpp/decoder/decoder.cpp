@@ -211,6 +211,10 @@ void Decoder::setupRopeCosSin()
         {
             assert(mConfig.maxLength <= maxPositionEmbeddings
                 && "We don't support dynamic rope for sequence length > maxPositionEmbeddings");
+            // For dynamic rope, the original huggingface formula:
+            // base = base * ((factor * seq_len / max_position_embeddings) - (factor - 1)) ** (dim / (dim - 2))
+            // With default seq_len = max_position_embeddings, base = base * (factor - (factor - 1)) ** (dim / (dim -
+            // 2)) = base
         }
         // Allocate buffer
         void* ropeRotaryCosSinDevice;
@@ -268,6 +272,23 @@ void Decoder::setupRopeCosSin()
         // Free shortFactorDevice and longFactorDevice
         CUDA_CHECK(cudaFree(shortFactorDevice));
         CUDA_CHECK(cudaFree(longFactorDevice));
+    }
+    else if (ropeType == "mrope")
+    {
+        // Allocate buffer
+        void* ropeRotaryCosSinDevice;
+        CUDA_CHECK(cudaMalloc(
+            &ropeRotaryCosSinDevice, mConfig.batchSize * mConfig.maxLength * mConfig.rotaryDim * sizeof(float)));
+        mDeviceBuffer["rope_rotary_cos_sin"] = ropeRotaryCosSinDevice;
+
+        // Setup extra inputs
+        std::vector<EngineInputDesc> extraInputs;
+        extraInputs.emplace_back(EngineInputDesc{"rope_rotary_cos_sin", mDeviceBuffer["rope_rotary_cos_sin"],
+            mDeviceBuffer["rope_rotary_cos_sin"], {3, {mConfig.batchSize, mConfig.maxLength, mConfig.rotaryDim}},
+            {3, {mConfig.batchSize, mConfig.maxLength, mConfig.rotaryDim}}});
+        setupExtraInputs(extraInputs);
+
+        // Initialize need to be done during runtime. Implemented in QwenViTRunner::generateMropeParams
     }
     else
     {
@@ -440,7 +461,7 @@ void Decoder::allocateCommonBuffers()
 
     // Allocate buffer for selected indices (used by sampling kernels)
     void* selectedIndicesDevice;
-    CUDA_CHECK(cudaMalloc(&selectedIndicesDevice, mConfig.batchSize * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&selectedIndicesDevice, mConfig.batchSize * sizeof(int32_t)));
     mDeviceBuffer["selected_indices"] = selectedIndicesDevice;
 
     // Initialize dummy LoRA buffer
@@ -467,7 +488,6 @@ void Decoder::allocateExtraBufferForEagle()
 
 void Decoder::allocateExtraBufferForVanilla()
 {
-    int32_t sizeOfHalf = 2;
     void* lastTokenIdsDevice;
     CUDA_CHECK(cudaMalloc(&lastTokenIdsDevice, mConfig.batchSize * 1 * sizeof(int64_t)));
     mContextExecutionContext->setTensorAddress("last_token_ids", lastTokenIdsDevice);
@@ -477,13 +497,13 @@ void Decoder::allocateExtraBufferForVanilla()
     mDeviceBuffer["last_token_ids"] = lastTokenIdsDevice;
 
     void* inputIdsDevice;
-    CUDA_CHECK(cudaMalloc(&inputIdsDevice, (mConfig.batchSize * mConfig.maxLength) * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&inputIdsDevice, (mConfig.batchSize * mConfig.maxLength) * sizeof(int32_t)));
     mDeviceBuffer["input_ids"] = inputIdsDevice;
     mGenerationExecutionContext->setTensorAddress("input_ids", inputIdsDevice);
     mGenerationExecutionContext->setInputShape("input_ids", {2, {mConfig.batchSize, 1}});
 
     void* logitsDevice;
-    CUDA_CHECK(cudaMalloc(&logitsDevice, (mConfig.batchSize * mConfig.vocabSize) * sizeOfHalf));
+    CUDA_CHECK(cudaMalloc(&logitsDevice, (mConfig.batchSize * mConfig.vocabSize) * sizeof(float)));
     mDeviceBuffer["logits"] = logitsDevice;
     mContextExecutionContext->setTensorAddress("logits", logitsDevice);
     mGenerationExecutionContext->setTensorAddress("logits", logitsDevice);

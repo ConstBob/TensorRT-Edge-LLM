@@ -13,20 +13,15 @@
 #include "common/common.h"
 #include "decoder/decoder.h"
 #include "engine/llm_engine.h"
-#include "internvl3/vit_runner.h"
-#include "llm_param.h"
-#include "qwen2vl/vit_runner.h"
+#include "exampleUtils.h"
+#include "multimodal/internViTRunner.h"
+#include "multimodal/multimodalRunner.h"
+#include "multimodal/qwenViTRunner.h"
 #include "tokenizer/tokenizer.h"
-#include <cuda_profiler_api.h>
 #include <dlfcn.h>
 #include <getopt.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include <stb_image.h>
-#include <stb_image_resize2.h>
-
-using namespace nvinfer1;
+using namespace drivellm::rt;
 
 struct MultimodalAccuracyArgs
 {
@@ -74,7 +69,8 @@ struct MMMUTestData
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
-              << " [--help] [--engineDir=<path to LLM engine directory>] [--visualEnginePath=<path to visual engine>]"
+              << " [--help] [--engineDir=<path to LLM engine directory>] [--visualEngineDir=<path to visual engine "
+                 "directory>]"
                  " [--datasetPath=<path to dataset>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
@@ -171,7 +167,8 @@ std::vector<unsigned char> base64Decode(std::string const& encoded)
     int encodedLength = encoded.size();
     if (encodedLength % 4)
     {
-        throw std::runtime_error("Invalid base64 length, must be multiple of 4!");
+        throw std::runtime_error(
+            "Invalid base64 length: " + std::to_string(encodedLength) + ", must be multiple of 4!");
     }
 
     for (int i = 0; i < encodedLength; i += 4)
@@ -427,177 +424,83 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
     outFile.close();
 }
 
-template <typename ViTRunnerType>
-std::unique_ptr<LLMEngine> getLLMEngine(BaseParams const& baseParams, EagleParams const& eagleParams,
-    LoraWeights const& loraWeights, cudaStream_t stream, ViTRunnerType* vitrunner)
+void loadImages(std::vector<std::vector<unsigned char>> const& rawBuffers, std::vector<ImageData>& imageBuffer,
+    std::string const& modelType, std::unique_ptr<MultimodalRunner> const& multimodalRunner,
+    bool const useThumbnail = true)
 {
-    EngineConfig engineConfig;
-    bool eagleMode = !eagleParams.baseModelDir.empty() && !eagleParams.draftModelDir.empty();
-    if (eagleMode)
+    for (auto& buffer : rawBuffers)
     {
-        LOG_INFO("Running in Eagle mode.");
-        engineConfig = EngineConfig(baseParams.engineDir, eagleParams.baseModelDir, eagleParams.draftModelDir,
-            eagleParams.maxPathLen, eagleParams.topK, eagleParams.isEagle3, eagleParams.maxDecodingTokens,
-            !baseParams.noCudaGraph);
-    }
-    else
-    {
-        LOG_INFO("Running in standard LLM mode.");
-        engineConfig = EngineConfig(baseParams.engineDir, !baseParams.noCudaGraph);
-    }
-    auto llmEngine = std::make_unique<LLMEngine>(engineConfig, stream);
-    llmEngine->setupExtraInputs(vitrunner->getExtraLLMInputs());
+        // Load image from memory
+        ImageData image = loadImageFromMemory(buffer.data(), buffer.size());
+        int width = image.width;
+        int height = image.height;
+        int resizedHeight, resizedWidth;
+        int thumbnailW, thumbnailH;
 
-    // Load and switch to LoRA weights if provided
-    if (loraWeights.hasWeights() && !eagleMode)
-    {
-        auto& decoderPtr = llmEngine->getDecoder();
-        auto loraPair = loraWeights.getFirst();
-        if (!decoderPtr->addLora(loraPair.first, loraPair.second))
+        // Resize image using multimodal runner's resize method
+        if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
         {
-            LOG_ERROR("Failed to load LoRA weights: %s from %s", loraPair.first.c_str(), loraPair.second.c_str());
-            return nullptr;
+            // Restrict each image to [1280, 6620] image tokens.
+            // Diviving original height and width by 2 to deal with a few images with large size.
+            QwenViTConfig* config = static_cast<QwenViTConfig*>(multimodalRunner->getConfig());
+            int factor = config->patchSize * config->mergeSize;
+            auto [h, w] = QwenViTRunner::resizeImage(height / 2, width / 2, factor, 1280 * 28 * 28, 6620 * 28 * 28);
+            resizedHeight = h;
+            resizedWidth = w;
         }
-        if (!decoderPtr->switchLora(loraPair.first))
+        else if (modelType == "internvl")
         {
-            LOG_ERROR("Failed to switch to LoRA: %s", loraPair.first.c_str());
-            return nullptr;
-        }
-    }
-
-    return llmEngine;
-}
-
-void evalQwen2VL(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer, VLMRunParams const& vlmRunParams,
-    LoraWeights const& loraWeights, EagleParams const& eagleParams, BaseParams const& baseParams)
-{
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
-    auto vitrunner = new Qwen2ViTRunner(vlmRunParams.modelType);
-    vitrunner->setup(vlmRunParams.visualEnginePath, stream, 1);
-
-    auto llmEngine = getLLMEngine<Qwen2ViTRunner>(baseParams, eagleParams, loraWeights, stream, vitrunner);
-    if (!llmEngine)
-    {
-        LOG_ERROR("Failed to create LLM engine");
-        return;
-    }
-
-    int const maxSupportedInputLength = llmEngine->getMaxSupportedInputLength();
-    bool const enableDynamicShape = llmEngine->getMinSupportedInputLength() != maxSupportedInputLength;
-    GenerationConfig generationConfig{maxSupportedInputLength + 256, 0, 1, 1};
-
-    int i = 0;
-    LOG_INFO("Starting running tests.");
-
-    for (auto data : dataset)
-    {
-        if (data->split != "validation")
-        {
-            continue;
-        }
-        LOG_INFO(data->id.c_str());
-
-        std::vector<half> visualInput;
-        std::vector<half> visualAttentionMask;
-        std::vector<float> visualRotaryPosEmb;
-        std::vector<std::vector<int64_t>> visualGridTHWs;
-        std::vector<int32_t> inputIds;
-        std::vector<int32_t> contextLengths;
-        std::vector<std::vector<int32_t>> outputIds(1);
-
-        // Preprocess
-        std::vector<unsigned char*> imageBuffers;
-        std::vector<std::vector<int>> imageSizes;
-        for (auto& buffer : data->images)
-        {
-            int width{0}, height{0}, channels{0};
-            int desiredChannels = 3;
-            unsigned char* image
-                = stbi_load_from_memory(buffer.data(), buffer.size(), &width, &height, &channels, desiredChannels);
-            if (image == nullptr)
-            {
-                LOG_ERROR("Failed to load image: %s", stbi_failure_reason());
-                continue;
-            }
-
-            // Diviving by 2 to deal with a few images with large size.
-            // Otherwise, it requires larger dynamic shape range, which is not supported by TensorRT.
-            auto [resizedHeight, resizedWidth]
-                = vitrunner->adjustImageSize(height / 2, width / 2, 1280 * 28 * 28, 6620 * 28 * 28);
-            unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
-            stbir_resize_uint8_linear(
-                image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
-
-            imageBuffers.emplace_back(resizedImage);
-            imageSizes.emplace_back(std::vector<int>{resizedWidth, resizedHeight, desiredChannels});
-
-            stbi_image_free(image);
-        }
-
-        vitrunner->visualPreprocess(
-            imageBuffers, imageSizes, visualInput, visualAttentionMask, visualRotaryPosEmb, visualGridTHWs);
-
-        std::string prompt = data->format();
-        int numImage = data->images.size();
-        vitrunner->textPreprocess({prompt}, {numImage}, visualGridTHWs, tokenizer, inputIds, contextLengths,
-            maxSupportedInputLength, enableDynamicShape);
-
-        // Infer
-        if (vlmRunParams.modelType == "qwen2_vl")
-        {
-            vitrunner->qwen2ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb);
+            // Downsize to max number of 6 patches to limit the number of image tokens.
+            InternViTConfig* config = static_cast<InternViTConfig*>(multimodalRunner->getConfig());
+            auto [h, w]
+                = InternViTRunner::resizeImage(height, width, config->blockImageSizeH, config->blockImageSizeW, 1, 6);
+            resizedHeight = h;
+            resizedWidth = w;
+            thumbnailH = config->blockImageSizeH;
+            thumbnailW = config->blockImageSizeW;
         }
         else
         {
-            std::vector<half> visualWindowAttentionMask;
-            std::vector<int64_t> visualWindowIndex;
-            std::vector<int64_t> reverseWindowIndex;
-            vitrunner->getWindowIndex(visualGridTHWs, visualWindowAttentionMask, visualWindowIndex, reverseWindowIndex);
-            vitrunner->qwen2_5ViTInfer(visualInput, visualAttentionMask, visualRotaryPosEmb, visualWindowAttentionMask,
-                visualWindowIndex, reverseWindowIndex);
+            // Default keep original size
+            resizedHeight = height;
+            resizedWidth = width;
         }
-        llmEngine->generate(
-            inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, nullptr, tokenizer, false);
 
-        std::string pred = tokenizer->decode(outputIds[0], true);
-        data->pred = pred;
+        ImageData resizedImage = resizeImage(image, resizedWidth, resizedHeight);
+        imageBuffer.emplace_back(resizedImage);
 
-        ++i;
-        for (auto& buffer : imageBuffers)
+        // Insert thumbnail image for some models
+        if (useThumbnail && modelType == "internvl")
         {
-            free(buffer);
+            ImageData thumbnailImage = resizeImage(image, thumbnailW, thumbnailH, true);
+            imageBuffer.emplace_back(thumbnailImage);
         }
     }
-
-    LOG_INFO("Collected results on %d questions.", i);
 }
 
-void evalInternVL3(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer, VLMRunParams const& vlmRunParams,
-    LoraWeights const& loraWeights, EagleParams const& eagleParams, BaseParams const& baseParams)
+void evalMultimodal(BaseParams const& baseParams, EagleParams const& eagleParams, VLMRunParams const& vlmRunParams,
+    LoraWeights const& loraWeights, std::vector<MMMUTestData*> const& dataset, Tokenizer* tokenizer)
 {
+    // Setup
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    auto vitrunner = new InternVLViTRunner(vlmRunParams.modelType);
-    vitrunner->setup(vlmRunParams.visualEnginePath, stream, 1);
+    auto multimodalRunner = getMultimodalRunner(vlmRunParams, stream);
+    // Batch size = 1
+    auto llmEngine = getLLMEngine(1, baseParams, eagleParams, loraWeights, stream);
+    llmEngine->setupExtraInputs(multimodalRunner->getComputedEmbeddings());
 
-    auto llmEngine = getLLMEngine<InternVLViTRunner>(baseParams, eagleParams, loraWeights, stream, vitrunner);
-    if (!llmEngine)
-    {
-        LOG_ERROR("Failed to create LLM engine");
-        return;
-    }
-    // Initialize rope_rotary_cos_sin
-    llmEngine->setupRopeCosSin();
+    auto modelConfig = llmEngine->getBaseModelConfig();
+    int const maxSupportedInputLength = modelConfig.maxSupportedInputLength;
+    bool const enableDynamicShape = modelConfig.minSupportedInputLength != maxSupportedInputLength;
+    int const maxLength = modelConfig.maxLength;
+    int const rotaryDim = modelConfig.rotaryDim;
 
-    int const maxSupportedInputLength = llmEngine->getMaxSupportedInputLength();
-    bool const enableDynamicShape = llmEngine->getMinSupportedInputLength() != maxSupportedInputLength;
     GenerationConfig generationConfig{maxSupportedInputLength + 256, 0, 1, 1};
 
     int i = 0;
     LOG_INFO("Starting running tests.");
+    std::vector<std::vector<int32_t>> outputIds(1);
 
     for (auto data : dataset)
     {
@@ -606,92 +509,58 @@ void evalInternVL3(std::vector<MMMUTestData*> const& dataset, Tokenizer* tokeniz
             continue;
         }
         LOG_INFO(data->id.c_str());
+        outputIds[0].clear();
 
-        bool useThumbnail = true;
-        std::vector<half> visualInput;
+        std::vector<ImageData> imageBuffer;
         std::vector<int32_t> inputIds;
-        std::vector<int64_t> imageTokenLengths;
         std::vector<int32_t> contextLengths;
-        std::vector<std::vector<int32_t>> outputIds(1);
 
-        // Preprocess
-        std::vector<unsigned char*> imageBuffers;
-        std::vector<unsigned char*> thumbnailImageBuffers;
-        std::vector<std::vector<int>> imageSizes;
-        for (auto& buffer : data->images)
+        try
         {
-            int width{0}, height{0}, channels{0};
-            int desiredChannels = 3;
-            unsigned char* image
-                = stbi_load_from_memory(buffer.data(), buffer.size(), &width, &height, &channels, desiredChannels);
-            if (image == nullptr)
-            {
-                LOG_ERROR("Failed to load image: %s", stbi_failure_reason());
-                continue;
-            }
+            // Load images
+            loadImages(data->images, imageBuffer, multimodalRunner->getModelType(), multimodalRunner, true);
 
-            // Restricting to max 4 448x448 blocks. Some questions have more than 4 images.
-            // Otherwise, it requires larger dynamic shape range, which is not supported by TensorRT.
-            std::vector<std::pair<int, int>> targetRatios = {{1, 1}, {1, 2}, {2, 1}, {3, 1}, {1, 3}, {2, 2}, {4, 1},
-                {1, 4}, {5, 1}, {1, 5}, {1, 6}, {6, 1}, {3, 2}, {2, 3}};
-            // {{1, 1}, {1, 2}, {2, 1}, {3, 1}, {1, 3}, {2, 2}, {4, 1}, {1, 4}};
-            auto [resizedHeight, resizedWidth] = vitrunner->adjustImageSize(height, width, targetRatios);
-            unsigned char* resizedImage = (unsigned char*) malloc(resizedHeight * resizedWidth * desiredChannels);
-            stbir_resize_uint8_linear(
-                image, width, height, 0, resizedImage, resizedWidth, resizedHeight, 0, stbir_pixel_layout::STBIR_RGB);
+            // Preprocess
+            std::string prompt = data->format();
+            void* ropeRotaryCosSinDevice = llmEngine->getDecoder()->getDeviceBuffer("rope_rotary_cos_sin");
+            multimodalRunner->preprocess({prompt}, {imageBuffer}, inputIds, contextLengths, tokenizer,
+                maxSupportedInputLength, enableDynamicShape, ropeRotaryCosSinDevice, maxLength, rotaryDim, stream);
 
-            imageBuffers.emplace_back(resizedImage);
-            imageSizes.emplace_back(std::vector<int>{resizedWidth, resizedHeight, desiredChannels});
+            // Infer
+            multimodalRunner->infer(stream);
+            llmEngine->generate(
+                inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, nullptr, tokenizer);
 
-            if (useThumbnail)
-            {
-                int thumbnailImageSize = 448;
-                unsigned char* thumbnailImage
-                    = (unsigned char*) malloc(thumbnailImageSize * thumbnailImageSize * desiredChannels);
-                stbir_resize_uint8_linear(image, width, height, 0, thumbnailImage, thumbnailImageSize,
-                    thumbnailImageSize, 0, stbir_pixel_layout::STBIR_RGB);
-                thumbnailImageBuffers.emplace_back(thumbnailImage);
-            }
-            else
-            {
-                thumbnailImageBuffers.emplace_back(nullptr);
-            }
+            std::string pred = tokenizer->decode(outputIds[0], true);
+            data->pred = pred;
 
-            stbi_image_free(image);
+            ++i;
         }
-
-        vitrunner->visualPreprocess(
-            imageBuffers, thumbnailImageBuffers, imageSizes, visualInput, imageTokenLengths, useThumbnail);
-
-        std::string prompt = data->format();
-        int numImage = data->images.size();
-        vitrunner->textPreprocess({prompt}, {numImage}, imageTokenLengths, tokenizer, inputIds, contextLengths,
-            maxSupportedInputLength, enableDynamicShape);
-
-        // Infer
-        vitrunner->internVLViTInfer(visualInput);
-        llmEngine->generate(
-            inputIds, contextLengths, outputIds, generationConfig, nullptr, nullptr, nullptr, tokenizer, false);
-
-        std::string pred = tokenizer->decode(outputIds[0], true);
-        data->pred = pred;
-
-        ++i;
-        for (auto& buffer : imageBuffers)
+        catch (std::exception const& e)
         {
-            free(buffer);
-        }
-        for (auto& buffer : thumbnailImageBuffers)
-        {
-            free(buffer);
+            LOG_ERROR("Failed to run inference: %s", e.what());
+            continue;
         }
     }
 
     LOG_INFO("Collected results on %d questions.", i);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return;
 }
 
-void mmmuAccuracy(MultimodalAccuracyArgs const& args, Tokenizer* tokenizer)
+void accuracy(MultimodalAccuracyArgs const& args)
 {
+    auto tokenizer = std::make_unique<Tokenizer>();
+    // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
+    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
+    {
+        tokenizer->loadFromHF(args.baseParams.engineDir);
+    }
+    else
+    {
+        tokenizer->loadFromHF(args.eagleParams.baseModelDir);
+    }
+
     std::vector<MMMUTestData*> dataset;
     try
     {
@@ -705,20 +574,21 @@ void mmmuAccuracy(MultimodalAccuracyArgs const& args, Tokenizer* tokenizer)
         return;
     }
 
-    if (args.vlmRunParams.modelType == "qwen2_vl" || args.vlmRunParams.modelType == "qwen2_5_vl")
+    // Ensure output directory exists
+    std::filesystem::path outputPath(args.outputPath);
+    std::filesystem::path dir = outputPath.parent_path();
+    if (!dir.empty() && !std::filesystem::exists(dir))
     {
-        evalQwen2VL(dataset, tokenizer, args.vlmRunParams, args.loraWeights, args.eagleParams, args.baseParams);
-    }
-    else if (args.vlmRunParams.modelType == "internvl3")
-    {
-        evalInternVL3(dataset, tokenizer, args.vlmRunParams, args.loraWeights, args.eagleParams, args.baseParams);
-    }
-    else
-    {
-        throw std::runtime_error("Only support Qwen2-VL and InternVL3 models for Multimodal models.");
+        std::error_code ec;
+        if (!std::filesystem::create_directories(dir, ec) && ec)
+        {
+            throw std::runtime_error("Failed to create output directory: " + dir.string());
+        }
     }
 
-    saveResult(args.outputPath, dataset);
+    evalMultimodal(args.baseParams, args.eagleParams, args.vlmRunParams, args.loraWeights, dataset, tokenizer.get());
+
+    saveResult(outputPath, dataset);
 }
 
 int main(int argc, char* argv[])
@@ -746,17 +616,7 @@ int main(int argc, char* argv[])
 
     auto pluginHandles = loadEdgellmPluginLib();
 
-    auto tokenizer = std::make_unique<Tokenizer>();
-    // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
-    if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
-    {
-        tokenizer->loadFromHF(args.baseParams.engineDir);
-    }
-    else
-    {
-        tokenizer->loadFromHF(args.eagleParams.baseModelDir);
-    }
-    mmmuAccuracy(args, tokenizer.get());
+    accuracy(args);
 
     return EXIT_SUCCESS;
 };

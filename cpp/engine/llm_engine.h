@@ -62,6 +62,7 @@ public:
     std::unique_ptr<Decoder>& getDecoder();
     std::unique_ptr<Eagle>& getEagle();
     int64_t getDeviceMemorySize();
+    ModelConfig getBaseModelConfig();
     void getLastHostLogits(std::vector<LogitsType>& hostLogits);
     void setupExtraInputs(std::vector<EngineInputDesc> const& extraInputs);
     void setupRopeCosSin();

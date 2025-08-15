@@ -24,15 +24,15 @@ Multimodal models process images into tokens that are fed into the LLM. The numb
 
 #### Qwen2-VL and Qwen2.5-VL
 - An image with height × width = `N×28×28` pixels generates `N` image tokens
-- Default preprocessing: `minPixels = 128×28×28, maxPixels = 512×28×28`
-- Example: A 1944×1176 image generates 486 image tokens
+- By default resize with `minPixels = 128×28×28, maxPixels = 512×28×28` to keep token count low. User can change this when calling `QwenViTRunner::resizeImage`.
+- Example: `demo.jpg` is resized to `1944×1176` and generates `486` image tokens
 
 #### InternVL3
-- Uses a downsampling ratio of 0.5, resulting in 4x fewer output tokens
-- Images are resized to multiples of 448 while maintaining aspect ratio
-- Maximum 6 patches (448×448×3) per image to keep token count low
-- Thumbnail image adds 256 additional tokens
-- Example: A 1344×896 image with thumbnail generates 1792 image tokens
+- Images are resized to multiples of `448x448` while maintaining aspect ratio as much as it can
+- Each `448x448` generates `256` image tokens.
+- By default resize with maximum 6 patches per image to keep token count low. User can change this when calling `internViTRunner::resizeImage`
+- By default use thumbnail image, which adds one more patch and `256` additional tokens
+- Example: `demo.jpg` is resized to 6 patches with thumbnail generates `1792` image tokens
 
 **Key Points:**
 - Total image tokens in a batch must match `--imageTokens` for static engines
@@ -41,9 +41,21 @@ Multimodal models process images into tokens that are fed into the LLM. The numb
 
 ## Engine Build
 
-The `llm_build` binary builds LLM TensorRT engines, while `visual_build` builds visual encoder engines. Both engines are required for multimodal inference.
+The `llm_build` binary builds LLM TensorRT engines, while `visual_build` builds visual encoder engines. Both engines are required for multimodal inference. Image tokens configuration should match for LLM engines and visual encoder engines.
 
 ### Standard VLM (Naive Decoding)
+
+The following config can run `vlm_chat` on `demo.jpg` with default code. User should configure `IMAGE_TOKENS` for different input image.
+
+```bash
+# For QwenVL models
+export IMAGE_TOKENS=486
+export MAX_INPUT_LEN=1024
+
+# For InternVL3 models  
+export IMAGE_TOKENS=1792
+export MAX_INPUT_LEN=2048
+```
 
 **Build LLM Engine:**
 ```bash
@@ -51,18 +63,18 @@ The `llm_build` binary builds LLM TensorRT engines, while `visual_build` builds 
 --onnxDir=onnx_models/${MODEL_NAME} \
 --engineDir=engines/${MODEL_NAME} \
 --batchSize=1 \
---maxInputLen=1024 \
+--maxInputLen=${MAX_INPUT_LEN} \
 --maxSeqLen=4096 \
+--imageTokens=${IMAGE_TOKENS} \
 --usePromptTuning
 ```
 
 **Build Visual Engine:**
 ```bash
 ./build/examples/multimodal/visual_build \
---visualOnnxPath=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
---imageTokens=486
+--onnxDir=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType} \
+--engineDir=visual_engines/${MODEL_NAME} \
+--imageTokens=${IMAGE_TOKENS}
 ```
 
 ### Dynamic Shape Support
@@ -75,19 +87,17 @@ The `llm_build` binary builds LLM TensorRT engines, while `visual_build` builds 
 --maxInputLen=1024 \
 --maxSeqLen=4096 \
 --dynamicShape \
---maxBatchSize=1 \
+--maxBatchSize=1 --minImageTokens=128 --maxImageTokens=512 \
 --usePromptTuning
 ```
 
 **Visual Engine:**
 ```bash
 ./build/examples/multimodal/visual_build \
---visualOnnxPath=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
+--onnxDir=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType} \
+--engineDir=visual_engines/${MODEL_NAME} \
 --dynamicShape \
---minImageTokens=128 \
---maxImageTokens=512
+--minImageTokens=128 --maxImageTokens=512
 ```
 
 ### EAGLE VLM (Speculative Decoding)
@@ -127,9 +137,8 @@ For EAGLE VLM, build separate base and draft LLM engines plus visual engine:
 **Visual Engine (shared):**
 ```bash
 ./build/examples/multimodal/visual_build \
---visualOnnxPath=onnx_models/${MODEL_NAME}_eagle3_base/visual_enc_onnx_${visualType}/model.onnx \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
+--onnxDir=onnx_models/${MODEL_NAME}_eagle3_base/visual_enc_onnx_${visualType} \
+--engineDir=visual_engines/${MODEL_NAME} \
 --dynamicShape \
 --minImageTokens=128 \
 --maxImageTokens=512
@@ -181,8 +190,7 @@ visual_engines/${MODEL_NAME}/
 ```bash
 ./build/examples/multimodal/vlm_chat \
 --engineDir=engines/${MODEL_NAME} \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
+--visualEngineDir=visual_engines/${MODEL_NAME} \
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/pics/demo.jpeg"
 ```
@@ -192,17 +200,10 @@ visual_engines/${MODEL_NAME}/
 ./build/examples/multimodal/vlm_chat \
 --baseModelDir=engines/${MODEL_NAME}_eagle3_base \
 --draftModelDir=engines/${MODEL_NAME}_eagle3_draft \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
+--visualEngineDir=visual_engines/${MODEL_NAME} \
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/pics/demo.jpeg" \
 --isEagle3
-```
-
-**Multiple Images:**
-```bash
---inputString="Identify the similarities between these images." \
---imagePaths="image1.jpeg,image2.jpeg"
 ```
 
 **Notes:**
@@ -216,8 +217,7 @@ visual_engines/${MODEL_NAME}/
 ```bash
 ./build/examples/multimodal/vlm_benchmark \
 --engineDir=engines/${MODEL_NAME} \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
+--visualEngineDir=visual_engines/${MODEL_NAME} \
 --textTokenLength=512 \
 --imageTokenLength=486 \
 --outputLength=256 \
@@ -230,8 +230,7 @@ visual_engines/${MODEL_NAME}/
 ./build/examples/multimodal/vlm_benchmark \
 --baseModelDir=engines/${MODEL_NAME}_eagle3_base \
 --draftModelDir=engines/${MODEL_NAME}_eagle3_draft \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
+--visualEngineDir=visual_engines/${MODEL_NAME} \
 --textTokenLength=512 \
 --imageTokenLength=486 \
 --outputLength=256 \
@@ -258,24 +257,19 @@ python3 ./scripts/prepare_mmmu_onnx.py \
 --input_path onnx_models/${MODEL_NAME}/model.onnx \
 --output_path onnx_models/${MODEL_NAME}/llm_onnx_mmmu/model.onnx
 
-# Copy all non-ONNX files to maintain folder architecture
-cp onnx_models/${MODEL_NAME}/*.json onnx_models/${MODEL_NAME}/llm_onnx_mmmu/
-cp onnx_models/${MODEL_NAME}/*.safetensors onnx_models/${MODEL_NAME}/llm_onnx_mmmu/
-
 # Build LLM engine
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME}/llm_onnx_mmmu \
 --engineDir=engines/${MODEL_NAME} \
 --maxInputLen=7168 --maxSeqLen=8192 \
 --dynamicShape \
---maxBatchSize=1 \
+--maxBatchSize=1 --minImageTokens=1280 --maxImageTokens=6620 \
 --usePromptTuning
 
 # Build visual engine
 ./build/examples/multimodal/visual_build \
---visualOnnxPath=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.mmmu.engine \
---modelType=${MODEL_TYPE} \
+--onnxDir=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType} \
+--engineDir=visual_engines/${MODEL_NAME} \
 --dynamicShape \
 --minImageTokens=1280 --maxImageTokens=6620
 ```
@@ -288,36 +282,41 @@ python3 ./scripts/prepare_mmmu_onnx.py \
 --output_path onnx_models/${MODEL_NAME}/llm_onnx_mmmu/model.onnx \
 -kv 10240
 
-# Copy all non-ONNX files to maintain folder architecture
-cp onnx_models/${MODEL_NAME}/*.json onnx_models/${MODEL_NAME}/llm_onnx_mmmu/
-cp onnx_models/${MODEL_NAME}/*.safetensors onnx_models/${MODEL_NAME}/llm_onnx_mmmu/
-
 # Build LLM engine
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME}/llm_onnx_mmmu \
 --engineDir=engines/${MODEL_NAME} \
 --maxInputLen=9216 --maxSeqLen=10240 \
 --dynamicShape \
---maxBatchSize=1 \
+--maxBatchSize=1 --minImageTokens=512 --maxImageTokens=8960 \
 --usePromptTuning
 
 # Build visual engine
 ./build/examples/multimodal/visual_build \
---visualOnnxPath=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType}/model.onnx \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.mmmu.engine \
---modelType=${MODEL_TYPE} \
+--onnxDir=onnx_models/${MODEL_NAME}/visual_enc_onnx_${visualType} \
+--engineDir=visual_engines/${MODEL_NAME} \
 --dynamicShape \
 --minImageTokens=512 --maxImageTokens=8960
 ```
 
-**Run Evaluation:**
+**Standard VLM:**
 ```bash
 ./build/examples/multimodal/vlm_accuracy \
 --engineDir=engines/${MODEL_NAME} \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.mmmu.engine \
---modelType=${MODEL_TYPE} \
+--visualEngineDir=visual_engines/${MODEL_NAME} \
 --datasetPath=./MMMU_DEV_VAL.tsv \
 --outputPath=./mmmu-results.csv
+```
+
+**EAGLE VLM:**
+```bash
+./build/examples/multimodal/vlm_accuracy \
+--baseModelDir=engines/${MODEL_NAME}_eagle3_base \
+--draftModelDir=engines/${MODEL_NAME}_eagle3_draft \
+--visualEngineDir=visual_engines/${MODEL_NAME} \
+--datasetPath=./MMMU_DEV_VAL.tsv \
+--outputPath=./mmmu-results.csv \
+--isEagle3
 ```
 
 **Evaluate Results:**
@@ -335,9 +334,12 @@ python ./scripts/mmmu.py \
 - **Score Validation**: When VLMEvalKit is run with our constraints (6 max patches, float16 precision), we achieve the same accuracy score as TensorRT Edge LLM
 - **Memory Optimization**: The patch limitation was implemented to reduce memory requirements for edge devices while maintaining reasonable accuracy
 
+**Notes:**
+TensorRT Edge-LLM SDK's MMMU_VAL scores are aligned with original HuggingFace models under the same preprocessing setup. Our MMMU implementation follows [MMMU-Benchmark](https://github.com/MMMU-Benchmark/MMMU).
+
 ## Runtime LoRA Switching
 
-TensorRT Edge LLM supports dynamic LoRA (Low-Rank Adaptation) for efficient model adaptation.
+TensorRT Edge-LLM supports dynamic LoRA (Low-Rank Adaptation) for efficient model adaptation.
 
 ### LoRA Weights Processing
 
@@ -369,8 +371,7 @@ Use `--loraWeights=name:path_to_lora_weights.safetensors` in any inference binar
 ```bash
 ./build/examples/multimodal/vlm_chat \
 --engineDir=engines/${MODEL_NAME} \
---visualEnginePath=visual_engines/${MODEL_NAME}/visual_enc_${visualType}.engine \
---modelType=${MODEL_TYPE} \
+--visualEngineDir=visual_engines/${MODEL_NAME} \
 --inputString="Describe the picture." \
 --imagePaths="examples/multimodal/pics/demo.jpeg" \
 --loraWeights=my_lora:processed_lora_weights.safetensors
