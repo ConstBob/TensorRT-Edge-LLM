@@ -47,8 +47,6 @@ struct EagleBuildParams
 
 struct VLMBuildParams
 {
-
-    std::string modelType{"qwen2_vl"};
     int64_t imageTokens{512};
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
@@ -57,8 +55,7 @@ struct VLMBuildParams
 
 struct VLMRunParams
 {
-    std::string visualEnginePath{""};
-    std::string modelType{"qwen2_vl"};
+    std::string visualEngineDir{""};
 };
 
 struct LoraWeights

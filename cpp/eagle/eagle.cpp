@@ -367,6 +367,11 @@ int64_t Eagle::getModelBatchSize() const noexcept
     return mBatchSize;
 }
 
+ModelConfig Eagle::getBaseModelConfig() const noexcept
+{
+    return mBaseModel->getModelConfig();
+}
+
 int64_t Eagle::getMinSupportedInputLength() const noexcept
 {
     return mBaseModel->getMinSupportedInputLength();

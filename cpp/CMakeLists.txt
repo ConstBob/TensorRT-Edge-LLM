@@ -30,6 +30,7 @@ file(GLOB_RECURSE DECODER_CPP_SRCS "decoder/*.cpp")
 file(GLOB_RECURSE EAGLE_CU_SRCS "eagle/*.cu")
 file(GLOB_RECURSE EAGLE_CPP_SRCS "eagle/*.cpp")
 file(GLOB_RECURSE ENGINE_CPP_SRCS "engine/*.cpp")
+file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 
 add_library(llmSdkKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS})
 target_include_directories(llmSdkKernels PRIVATE ${COMMON_INCLUDE_DIRS})
@@ -44,9 +45,9 @@ add_library(
   ${ENGINE_CPP_SRCS}
   ${KERNELS_CPP_SRCS}
   ${KERNELS_CU_SRCS}
-  ${SAMPLER_CU_SRCS})
+  ${SAMPLER_CU_SRCS}
+  ${MULTIMODAL_CPP_SRCS})
 target_include_directories(llmSdkCore PRIVATE ${COMMON_INCLUDE_DIRS})
-target_link_libraries(llmSdkCore PUBLIC llmSdkKernels)
 
 # Generate tokenizer C++ static library
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")

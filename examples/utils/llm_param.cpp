@@ -27,12 +27,11 @@ const struct option eagleOptions[]
         {"isEagle3", no_argument, 0, 203}, {"maxDecodingTokens", optional_argument, 0, 204},
         {"topK", optional_argument, 0, 205}, {"maxPathLen", optional_argument, 0, 206}, {0, 0, 0, 0}};
 
-const struct option vlmBuildOptions[] = {{"modelType", optional_argument, 0, 301},
-    {"imageTokens", optional_argument, 0, 302}, {"minImageTokens", optional_argument, 0, 303},
-    {"maxImageTokens", optional_argument, 0, 304}, {"usePromptTuning", no_argument, 0, 305}, {0, 0, 0, 0}};
+const struct option vlmBuildOptions[]
+    = {{"imageTokens", optional_argument, 0, 301}, {"minImageTokens", optional_argument, 0, 302},
+        {"maxImageTokens", optional_argument, 0, 303}, {"usePromptTuning", no_argument, 0, 304}, {0, 0, 0, 0}};
 
-const struct option vlmRunOptions[]
-    = {{"visualEnginePath", required_argument, 0, 401}, {"modelType", optional_argument, 0, 402}, {0, 0, 0, 0}};
+const struct option vlmRunOptions[] = {{"visualEngineDir", required_argument, 0, 401}, {0, 0, 0, 0}};
 
 bool parseBaseOptions(BaseParams& baseParams, int opt, char const* optarg)
 {
@@ -138,28 +137,22 @@ bool parseVLMBuildOptions(VLMBuildParams& vlmBuildParams, int opt, char const* o
     case 301:
         if (optarg)
         {
-            vlmBuildParams.modelType = optarg;
+            vlmBuildParams.imageTokens = std::stoll(optarg);
         }
         break;
     case 302:
         if (optarg)
         {
-            vlmBuildParams.imageTokens = std::stoll(optarg);
+            vlmBuildParams.minImageTokens = std::stoll(optarg);
         }
         break;
     case 303:
         if (optarg)
         {
-            vlmBuildParams.minImageTokens = std::stoll(optarg);
-        }
-        break;
-    case 304:
-        if (optarg)
-        {
             vlmBuildParams.maxImageTokens = std::stoll(optarg);
         }
         break;
-    case 305: vlmBuildParams.usePromptTuning = true; break;
+    case 304: vlmBuildParams.usePromptTuning = true; break;
     default: return false;
     }
     return true;
@@ -172,18 +165,12 @@ bool parseVLMRunOptions(VLMRunParams& vlmRunParams, int opt, char const* optarg)
     case 401:
         if (optarg)
         {
-            vlmRunParams.visualEnginePath = optarg;
+            vlmRunParams.visualEngineDir = optarg;
         }
         else
         {
-            std::cerr << "ERROR: --visualEnginePath requires option argument" << std::endl;
+            std::cerr << "ERROR: --visualEngineDir requires option argument" << std::endl;
             return false;
-        }
-        break;
-    case 402:
-        if (optarg)
-        {
-            vlmRunParams.modelType = optarg;
         }
         break;
     default: return false;
@@ -243,7 +230,6 @@ void printEagleBuildOptions()
 
 void printVLMBuildOptions()
 {
-    std::cerr << "  --modelType         Model type for VLM build. Default = qwen2_vl." << std::endl;
     std::cerr << "  --imageTokens       Number of image tokens. Default = 512." << std::endl;
     std::cerr << "  --minImageTokens    Minimum number of image tokens. Default = 4." << std::endl;
     std::cerr << "  --maxImageTokens    Maximum number of image tokens. Default = 1024." << std::endl;
@@ -252,7 +238,6 @@ void printVLMBuildOptions()
 
 void printVLMRunOptions()
 {
-    std::cerr << "  --visualEnginePath  Provide the visual TensorRT engine file path. Required." << std::endl;
-    std::cerr << "  --modelType         Provide the model type. Default = qwen2_vl." << std::endl;
+    std::cerr << "  --visualEngineDir   Provide the visual TensorRT engine directory path. Required." << std::endl;
 }
 } // namespace CommonUsage
