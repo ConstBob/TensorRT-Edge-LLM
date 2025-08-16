@@ -187,3 +187,56 @@ a30_build_and_test:
     - ./build/examples/llm/llm_benchmark --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --inputLength=128 --maxLength=256 
     - echo "Done testing engine inference"
     - rm -rf $ENGINE_DIR
+
+
+rtx5080_build_and_test:
+  stage: test
+  dependencies:
+    - a30_model_export
+  variables:
+    PLATFORM: tensorrt-runner
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.3.4-8498df40/12.9-r575/Linux-x64-manylinux_2_28/tar/TensorRT-10.13.3.4.Linux.x86_64-gnu.cuda-12.9.tar.gz"
+  tags:
+    - rtx5080-edgellm-nvks
+  image: "$IMAGE"
+  script:
+    - echo "Installing dependencies"
+    - apt update
+    - apt install -y python3 python3-pip git curl
+    - echo "Setting up git submodule"
+    - git submodule update --init --recursive
+    - echo "Downloading TensorRT package"
+    - wget -q $TRT_LINK
+    - mkdir -p TensorRT-linux
+    - tar -xvf TensorRT-*.tar.gz -C TensorRT-linux --strip-components=1
+    - export LLM_SDK_DIR=$(pwd)
+    - echo "Building TensorRT Edge LLM SDK"
+    - rm -rf build
+    - mkdir -p build
+    - cd build
+    - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-linux -DCUDA_VERSION=$CUDA_VERSION -DBUILD_UNIT_TESTS=ON
+    - make -j16
+    - echo "Built TensorRT Edge LLM SDK"
+    - echo "Running unit tests"
+    - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
+    - ./unitTest
+    - echo "Done running unit tests"
+    - export ONNX_MODEL_DIR=$LLM_SDK_DIR/models
+    - mkdir -p $ONNX_MODEL_DIR
+    - export MODEL_NAME=Qwen2.5-0.5B-Instruct
+    - cd $LLM_SDK_DIR
+    - export ENGINE_DIR=$LLM_SDK_DIR/engines
+    - mkdir -p $ENGINE_DIR
+    - ./build/examples/llm/llm_build --onnxDir=$ONNX_MODEL_DIR/$MODEL_NAME-fp16 --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16 --maxSeqLen=4096 --maxInputLen=128 --maxBatchSize=1 --dynamicShape
+    - ./build/examples/llm/llm_build --onnxDir=$ONNX_MODEL_DIR/$MODEL_NAME-int4 --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --maxSeqLen=4096 --maxInputLen=128 --maxBatchSize=1 --dynamicShape
+    - echo "Done testing engine build"
+    - echo "Testing FP16 engine inference"
+    - ./build/examples/llm/llm_chat --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16 --maxLength=64 --inputString="What is NVIDIA?"
+    - ./build/examples/llm/llm_benchmark --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16 --inputLength=128 --maxLength=256 
+    - echo "Testing INT4 engine inference"
+    - ./build/examples/llm/llm_chat --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --maxLength=64 --inputString="What is NVIDIA?"
+    - ./build/examples/llm/llm_benchmark --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --inputLength=128 --maxLength=256 
+    - echo "Done testing engine inference"
+    - rm -rf $ENGINE_DIR
