@@ -321,15 +321,20 @@ def quantize_visual(model, precision, model_type, torch_dir):
         "fp8"
     ], f"Only fp8(W8A8) is recommended for vit. You passed an unsupported precision: {precision}."
 
-    # Set quantization config, this will only enable FP8 GEMMs that not belong to multihead attention modules.
-    # Also disable Conv3d to avoid accuracy degradation.
+    # Set quantization config, enable FP8 MHA and FP8 GEMM
     quant_config = mtq.FP8_DEFAULT_CFG
+    quant_config["quant_cfg"]["*[qkv]_bmm_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None
+    }
+    quant_config["quant_cfg"]["*softmax_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None
+    }
+
+    # Disable Conv to avoid accuracy degradation.
     quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
     quant_config["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
-
-    # Disable `attn.proj` layers to avoid performance degradation.
-    quant_config["quant_cfg"]["*attn.proj*"] = {"enable": False}
-    quant_config["quant_cfg"]["*attention.proj*"] = {"enable": False}
 
     data_loader = get_vit_calib_dataloader(model,
                                            model_type,
