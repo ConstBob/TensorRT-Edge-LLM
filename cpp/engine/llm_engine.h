@@ -21,6 +21,10 @@
 #include <variant>
 #include <vector>
 
+namespace drivellm
+{
+namespace rt
+{
 struct GenerationConfig;
 
 struct EngineConfig
@@ -70,12 +74,12 @@ public:
     void generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> const& contextLengths,
         std::vector<std::vector<int32_t>>& outputIds, GenerationConfig const& generationConfig,
         std::vector<int32_t>* newTokensNumbers = nullptr, std::vector<int32_t>* iterNumbers = nullptr,
-        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr, Tokenizer* tokenizer = nullptr,
-        bool autoDecode = false);
+        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
+        drivellm::tokenizer::Tokenizer* tokenizer = nullptr, bool autoDecode = false);
 
     // Input processing methods
-    std::vector<int32_t> processInputSequence(std::vector<std::string> const& inputStrings, Tokenizer* tokenizer,
-        std::vector<int32_t>& contextLengths, int32_t padId);
+    std::vector<int32_t> processInputSequence(std::vector<std::string> const& inputStrings,
+        drivellm::tokenizer::Tokenizer* tokenizer, std::vector<int32_t>& contextLengths, int32_t padId);
 
 private:
     ModelPtr mModel;
@@ -87,3 +91,6 @@ private:
     ModelPtr createModel(EngineConfig const& config, cudaStream_t stream);
     void updateModelDimensions();
 };
+
+} // namespace rt
+} // namespace drivellm

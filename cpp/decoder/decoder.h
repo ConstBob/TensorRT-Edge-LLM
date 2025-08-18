@@ -26,6 +26,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace drivellm
+{
+namespace rt
+{
+
 struct ModelConfig
 // This is the model config inferred from optimization profiles
 {
@@ -146,3 +151,6 @@ private:
     bool mIsEagle;
     std::unordered_map<std::string, std::unique_ptr<drivellm::SafeTensorsLoader>> mLoraWeights;
 };
+
+} // namespace rt
+} // namespace drivellm

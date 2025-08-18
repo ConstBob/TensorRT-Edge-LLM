@@ -25,5 +25,5 @@ drivellm::rt::ImageData resizeImage(
 std::unique_ptr<drivellm::rt::MultimodalRunner> getMultimodalRunner(
     VLMRunParams const& vlmRunParams, cudaStream_t stream);
 
-std::unique_ptr<LLMEngine> getLLMEngine(int32_t batchSize, BaseParams const& baseParams, EagleParams const& eagleParams,
-    LoraWeights const& loraWeights, cudaStream_t stream);
+std::unique_ptr<drivellm::rt::LLMEngine> getLLMEngine(int32_t batchSize, BaseParams const& baseParams,
+    EagleParams const& eagleParams, LoraWeights const& loraWeights, cudaStream_t stream);

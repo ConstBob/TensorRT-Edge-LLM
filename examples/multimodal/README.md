@@ -1,8 +1,8 @@
-# TensorRT Edge LLM Example: Multimodal Models
+# TensorRT Edge-LLM Example: Multimodal Models
 
 ## Prerequisites
 
-An ONNX model that complies with the TensorRT Edge LLM runtime should be ready following [ONNX export](../../export/README.md). To run inference with real data, a tokenizer file is also required.
+An ONNX model that complies with the TensorRT Edge-LLM runtime should be ready following [ONNX export](../../export/README.md). To run inference with real data, a tokenizer file is also required.
 
 ### ONNX Folder Structure
 
@@ -327,11 +327,11 @@ python ./scripts/mmmu.py \
 ```
 
 **Important Notes for InternVL3:**
-- **Accuracy Score Differences**: TensorRT Edge LLM MMMU scores for InternVL3 are lower than official results because:
-  1. **Evaluation Framework**: Official results use VLMEvalKit, while TensorRT Edge LLM follows MMMU-Benchmark methodology
+- **Accuracy Score Differences**: TensorRT Edge-LLM MMMU scores for InternVL3 are lower than official results because:
+  1. **Evaluation Framework**: Official results use VLMEvalKit, while TensorRT Edge-LLM follows MMMU-Benchmark methodology
   2. **Patch Limitations**: We limit images to maximum 6 patches (448×448×3) per image vs 12 patches in official implementation to reduce memory requirements
   3. **Precision**: Our accuracy is achieved with float16 precision vs bf16 precision in official implementation
-- **Score Validation**: When VLMEvalKit is run with our constraints (6 max patches, float16 precision), we achieve the same accuracy score as TensorRT Edge LLM
+- **Score Validation**: When VLMEvalKit is run with our constraints (6 max patches, float16 precision), we achieve the same accuracy score as TensorRT Edge-LLM
 - **Memory Optimization**: The patch limitation was implemented to reduce memory requirements for edge devices while maintaining reasonable accuracy
 
 **Notes:**

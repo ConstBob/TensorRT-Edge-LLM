@@ -29,6 +29,11 @@
 #include <unordered_set>
 #include <vector>
 
+namespace drivellm
+{
+namespace tokenizer
+{
+
 struct rangeNfd
 {
     uint32_t first;
@@ -43,3 +48,6 @@ extern std::unordered_set<uint32_t> const unicodeSetWhitespace;
 extern std::unordered_map<uint32_t, uint32_t> const unicodeMapLowercase;
 extern std::unordered_map<uint32_t, uint32_t> const unicodeMapUppercase;
 extern std::vector<rangeNfd> const unicodeRangesNfd;
+
+} // namespace tokenizer
+} // namespace drivellm

@@ -2,7 +2,7 @@
  * This file is based on MIT-licensed code from
  * https://github.com/ggerganov/llama.cpp/blob/master/src/unicode.h
  *
- * Modifications and enhancements by DriveOS LLM-SDK team, 2025.
+ * Modifications and enhancements by TensorRT Edge-LLM team, 2025.
  *
  * Original license:
  * MIT License
@@ -33,6 +33,11 @@
 
 #include "tokenizerUtils.h"
 #include "unicodeData.h"
+
+namespace drivellm
+{
+namespace tokenizer
+{
 
 BPERanksToToken reverseEncoder(BPETokenToRanks const& encoder)
 {
@@ -469,3 +474,6 @@ codepointFlags unicodeCptFlags(uint32_t const cp)
     static auto const cptFlags = unicodeCptFlagsArray();
     return cp < cptFlags.size() ? cptFlags[cp] : undef;
 }
+
+} // namespace tokenizer
+} // namespace drivellm

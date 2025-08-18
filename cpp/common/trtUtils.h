@@ -21,6 +21,9 @@
 #include <stdexcept>
 #include <vector>
 
+namespace drivellm
+{
+
 inline nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
 {
     nvinfer1::Dims dims{static_cast<int32_t>(shape.size()), {}};
@@ -169,3 +172,5 @@ struct TensorInfo
     {
     }
 };
+
+} // namespace drivellm

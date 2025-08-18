@@ -1,8 +1,8 @@
-# TensorRT Edge LLM: Large Language Model Inference Framework for Edge Platforms
+# TensorRT Edge-LLM: Large Language Model Inference Framework for Edge Platforms
 
 ## Introduction
 
-TensorRT Edge LLM is a lightweight C++ software toolkit that showcases TensorRT's capability and performance for deploying Large Language Models (LLMs) and Vision Language Models (VLMs) on Edge Platforms (Jetson and Auto). With TensorRT Edge LLM, users can:
+TensorRT Edge-LLM (formerly named as DriveOS LLM SDK) is a lightweight C++ software toolkit that showcases TensorRT's capability and performance for deploying Large Language Models (LLMs) and Vision Language Models (VLMs) on Edge Platforms (Jetson and Auto). With TensorRT Edge-LLM, users can:
 
 1. Quantize and export PyTorch models to [ONNX Format](https://onnx.ai/) on Linux x86 systems
 2. Build TensorRT engines and run end-to-end LLM inference, including tokenization and sampling, on Edge Platforms
@@ -61,9 +61,13 @@ Model | FP16 | INT4 | FP8 | NVFP4
 
 - **Thor**: Full support for all precisions
 - **Orin**: Support FP16 and INT4
-- **x86 Linux**: Preview feature for Data Center or Gaming GPUs with SM80, SM86 or SM89 in FP16 and INT4. SM89 also supports FP8 E2E inference
+- **N1X**: Full support for all precisions
+- **x86 Linux**: Preview feature for Data Center or Gaming GPUs with SM80, SM86, SM89 or SM120 in FP16 and INT4. SM89 and SM120 also supports FP8 E2E inference and SM120 supports NVFP4 precision.
 
 ## Getting Started
+
+### 0. Set up dependencies
+If you are using `git`, a simple `git submodule update` is needed to pull the dependencies. Otherwise please run `git clone https://github.com/nlohmann/json.git 3rdParty/nlohmannJson`  as this is required for the project.
 
 ### 1. Build the C++ Project
 

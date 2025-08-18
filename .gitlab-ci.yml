@@ -96,13 +96,13 @@ jp6_cross_build:
     - mkdir -p TensorRT-jp6
     - tar -xvf TensorRT-*.tar.gz -C TensorRT-jp6 --strip-components=1
     - export LLM_SDK_DIR=$(pwd)
-    - echo "Building TensorRT Edge LLM SDK"
+    - echo "Building TensorRT Edge-LLM SDK"
     - rm -rf build-jp6
     - mkdir -p build-jp6
     - cd build-jp6
     - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-jp6 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake -DEMBEDDED_TARGET=orin -DBUILD_UNIT_TESTS=ON
     - make -j16
-    - echo "Built TensorRT Edge LLM SDK"
+    - echo "Built TensorRT Edge-LLM SDK"
   interruptible: true
   artifacts:
     paths:
@@ -159,13 +159,13 @@ a30_build_and_test:
     - mkdir -p TensorRT-linux
     - tar -xvf TensorRT-*.tar.gz -C TensorRT-linux --strip-components=1
     - export LLM_SDK_DIR=$(pwd)
-    - echo "Building TensorRT Edge LLM SDK"
+    - echo "Building TensorRT Edge-LLM SDK"
     - rm -rf build
     - mkdir -p build
     - cd build
     - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-linux -DCUDA_VERSION=$CUDA_VERSION -DBUILD_UNIT_TESTS=ON
     - make -j16
-    - echo "Built TensorRT Edge LLM SDK"
+    - echo "Built TensorRT Edge-LLM SDK"
     - echo "Running unit tests"
     - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
     - ./unitTest
@@ -212,13 +212,13 @@ rtx5080_build_and_test:
     - mkdir -p TensorRT-linux
     - tar -xvf TensorRT-*.tar.gz -C TensorRT-linux --strip-components=1
     - export LLM_SDK_DIR=$(pwd)
-    - echo "Building TensorRT Edge LLM SDK"
+    - echo "Building TensorRT Edge-LLM SDK"
     - rm -rf build
     - mkdir -p build
     - cd build
     - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-linux -DCUDA_VERSION=$CUDA_VERSION -DBUILD_UNIT_TESTS=ON
     - make -j16
-    - echo "Built TensorRT Edge LLM SDK"
+    - echo "Built TensorRT Edge-LLM SDK"
     - echo "Running unit tests"
     - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
     - ./unitTest

@@ -2,7 +2,7 @@
  * This file is based on MIT-licensed code from
  * https://github.com/ggerganov/llama.cpp/blob/master/src/unicode.h
  *
- * Modifications and enhancements by DriveOS LLM-SDK team, 2025.
+ * Modifications and enhancements by TensorRT Edge-LLM team, 2025.
  *
  * Original license:
  * MIT License
@@ -34,6 +34,16 @@
 #include "tokenizer.h"
 #include <cassert>
 #include <iostream>
+#include <map>
+#include <regex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace drivellm
+{
+namespace tokenizer
+{
 
 /**
  * Helper functions
@@ -133,3 +143,6 @@ uint32_t unicodeCptFromUtf8(std::string const& utf8, size_t& offset);
 std::string unicodeCptToUtf8(uint32_t cp);
 
 codepointFlags unicodeCptFlags(uint32_t const cp);
+
+} // namespace tokenizer
+} // namespace drivellm

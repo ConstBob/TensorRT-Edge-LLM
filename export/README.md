@@ -1,6 +1,6 @@
-# TensorRT Edge LLM ONNX Exporter
+# TensorRT Edge-LLM ONNX Exporter
 
-This folder contains scripts to export ONNX models from PyTorch models. The exported ONNX model follows the format required by TensorRT Edge LLM runtime, so it can later be converted into a TensorRT engine for E2E LLM inference applications on the Auto platform.
+This folder contains scripts to export ONNX models from PyTorch models. The exported ONNX model follows the format required by TensorRT Edge-LLM runtime, so it can later be converted into a TensorRT engine for E2E LLM inference applications on the Auto platform.
 
 ## Table of Contents
 

@@ -1,7 +1,7 @@
 # This file is based on Apache-Licensed code from
 # https://github.com/MMMU-Benchmark/MMMU/blob/main/mmmu/main_parse_and_eval.py by MMMU-Benchmark.
 #
-# Modifications and enhancements by DriveOS LLM-SDK team, 2025.
+# Modifications and enhancements by TensorRT Edge-LLM team, 2025.
 #
 # Original license:
 # Copyright (c) 2025 The MMMU Authors

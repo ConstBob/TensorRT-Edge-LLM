@@ -1,3 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
 #include "common/common.h"
 #include "common/tensor.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
@@ -101,7 +113,7 @@ TEST_F(EmbeddingLookupTest, StandardEmbeddingLookupAccuracy)
             embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
 
         // Run GPU kernel
-        kernels::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor);
+        kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor);
 
         // Get result from GPU
         std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
@@ -152,7 +164,7 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeError)
 
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
-        { kernels::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor); }, std::runtime_error)
+        { kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor); }, std::runtime_error)
         << "Kernel should error out when hiddenSize is not a multiple of 8";
 }
 
@@ -200,7 +212,7 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeErrorWithImageInsertion)
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
         {
-            kernels::embeddingLookupWithImageInsertion(
+            kernel::embeddingLookupWithImageInsertion(
                 inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor);
         },
         std::runtime_error)
@@ -239,7 +251,7 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandling)
         embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
 
     // Run GPU kernel
-    kernels::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor);
+    kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor);
 
     // Get result from GPU
     std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
@@ -319,7 +331,7 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandlingWithImageInsertion)
         imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice));
 
     // Run GPU kernel
-    kernels::embeddingLookupWithImageInsertion(inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor);
+    kernel::embeddingLookupWithImageInsertion(inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor);
 
     // Get result from GPU
     std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
@@ -413,7 +425,7 @@ TEST_F(EmbeddingLookupTest, EmbeddingLookupWithImageInsertionAccuracy)
             cudaMemcpyHostToDevice));
 
         // Run GPU kernel
-        kernels::embeddingLookupWithImageInsertion(
+        kernel::embeddingLookupWithImageInsertion(
             inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor);
 
         // Get result from GPU

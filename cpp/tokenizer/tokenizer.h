@@ -14,11 +14,17 @@
 #include <cassert>
 #include <filesystem>
 #include <forward_list>
+#include <memory>
 #include <regex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace drivellm
+{
+namespace tokenizer
+{
 
 using Rank = std::int32_t;
 using BPETokenToRanks = std::unordered_map<std::string, Rank>;
@@ -139,3 +145,6 @@ protected:
     Rank mUnkId;
     std::string mRegexExpr;
 };
+
+} // namespace tokenizer
+} // namespace drivellm

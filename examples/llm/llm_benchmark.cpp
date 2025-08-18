@@ -31,6 +31,10 @@
 #include <string>
 #include <vector>
 
+using namespace drivellm;
+using namespace drivellm::rt;
+using namespace drivellm::tokenizer;
+
 struct LLMBenchmarkArgs
 {
     BaseParams baseParams;
@@ -67,7 +71,8 @@ void printUsage(char const* programName)
 
 void warmupRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int32_t>& inputIds,
     std::vector<int32_t>& contextLengths, std::vector<std::vector<int32_t>>& outputIds,
-    GenerationConfig const& generationConfig, int64_t warmUp, cudaStream_t stream, Tokenizer* tokenizer = nullptr)
+    GenerationConfig const& generationConfig, int64_t warmUp, cudaStream_t stream,
+    drivellm::tokenizer::Tokenizer* tokenizer = nullptr)
 {
     for (int64_t i = 0; i < warmUp; i++)
     {
@@ -87,7 +92,7 @@ void benchmarkRun(std::unique_ptr<LLMEngine>& llmEngine, std::vector<int32_t>& i
     std::vector<int32_t>& contextLengths, std::vector<std::vector<int32_t>>& outputIds,
     GenerationConfig const& generationConfig, std::shared_ptr<BenchmarkProfiler> const profiler, int64_t numRuns,
     cudaStream_t stream, std::vector<int32_t>* newTokensNumbers, std::vector<int32_t>* iterNumbers,
-    Tokenizer* tokenizer = nullptr)
+    drivellm::tokenizer::Tokenizer* tokenizer = nullptr)
 {
     profiler->startTiming();
     cudaProfilerStart();

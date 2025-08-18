@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
+using namespace drivellm;
 using namespace drivellm::rt;
 
 // Ensure STB implementation is only defined once

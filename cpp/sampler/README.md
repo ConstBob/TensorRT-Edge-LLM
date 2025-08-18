@@ -1,4 +1,4 @@
-# TensorRT Edge LLM Sampling Unit
+# TensorRT Edge-LLM Sampling Unit
 
 High-performance CUDA sampling API for language model inference supporting Top-K, Top-P, and combined sampling methods with manual workspace management.
 

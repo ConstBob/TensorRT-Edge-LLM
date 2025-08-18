@@ -80,11 +80,11 @@ protected:
     int32_t mNumHeadQ{};
     int32_t mNumHeadKV{};
     int32_t mNumElemPerHead{};
-    // Eagle uses tree attention
-    int32_t mEnableTreeAttention{0};
     // Runtime configuration of the plugin to specify max batchSize and kv-cache capacity.
     // Here the kvcache capacity refers to max number of tokens per input context.
     int32_t mMaxBatchSize{};
+    // Eagle uses tree attention
+    int32_t mEnableTreeAttention{0};
     int32_t mKVCacheCapacity{};
 
     // Datatype of QKV and kvCache. Only supports FP16 as of now.

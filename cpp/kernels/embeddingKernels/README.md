@@ -1,6 +1,6 @@
 # Embedding Kernels
 
-CUDA kernels for efficient embedding lookup operations in TensorRT Edge LLM.
+CUDA kernels for efficient embedding lookup operations in TensorRT Edge-LLM.
 
 ## Overview
 

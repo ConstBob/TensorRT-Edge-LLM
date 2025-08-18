@@ -22,6 +22,7 @@
 #include <dlfcn.h>
 #include <getopt.h>
 
+using namespace drivellm;
 using namespace drivellm::rt;
 
 struct VlmBenchmarkArgs
@@ -243,7 +244,7 @@ size_t benchmarkMultimodal(BaseParams const& baseParams, VLMRunParams const& vlm
 
     std::vector<int32_t> inputIds(batchSize * inputLength, -1);
     std::vector<int32_t> contextLengths(batchSize, inputLength);
-    multimodalRunner->initRandomInputs(inputIds, batchSize, textTokenLength, imageTokenLength, inputLength, stream);
+    multimodalRunner->initRandomInputs(inputIds, batchSize, imageTokenLength, inputLength, stream);
 
     // Warmup for profiler
     for (int i = 0; i < warmUp; i++)

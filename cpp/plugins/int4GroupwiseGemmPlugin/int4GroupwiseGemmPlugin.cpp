@@ -22,7 +22,10 @@
 #include <iostream>
 
 using namespace nvinfer1;
-using namespace drivellm::plugins;
+namespace drivellm
+{
+namespace plugins
+{
 
 namespace
 {
@@ -199,12 +202,12 @@ int32_t Int4GroupwsieGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
 
     if (M <= 6)
     {
-        gemv_forward_cuda_new(
+        drivellm::kernel::gemv_forward_cuda_new(
             gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
     }
     else
     {
-        gemm_forward_cuda_new(
+        drivellm::kernel::gemm_forward_cuda_new(
             gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
     }
     return 0;
@@ -311,3 +314,6 @@ nvinfer1::IPluginV2* Int4GroupwsieGemmPluginCreator::deserializePlugin(
     }
     return nullptr;
 }
+
+} // namespace plugins
+} // namespace drivellm

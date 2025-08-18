@@ -1,3 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
 #include "eagle.h"
 #include "common/common.h"
 #include "sampler/sampling.h"
@@ -11,6 +23,11 @@
 #include <numeric>
 #include <sstream>
 #include <utility>
+
+namespace drivellm
+{
+namespace rt
+{
 
 void Eagle::eagleCommonParamsInit()
 {
@@ -52,9 +69,7 @@ void Eagle::invokeSamplingAndAccept(int32_t* draftIds, int32_t const curTokensPe
         static_cast<int32_t*>(mEagleDeviceBuffer["targetIds"]), samplingParams,
         mEagleDeviceBuffer["workspaceForVerification"], allocatedWorkspaceSize, mStream);
 
-    auto const hiddenStates = static_cast<HiddenStatesType*>(mBaseModel->getDeviceBuffer("hidden_states"));
-
-    AcceptDraftTokensByIdsWithPathsParams accparms;
+    drivellm::kernel::AcceptDraftTokensByIdsWithPathsParams accparms;
     accparms.outputIds = static_cast<int32_t*>(mBaseModel->getDeviceBuffer("input_ids"));
     accparms.inputIdsDraftDecode = static_cast<int32_t*>(mEagleDeviceBuffer["selectedOutputIdsDraft"]);
     accparms.draftIds = draftIds;
@@ -75,7 +90,7 @@ void Eagle::invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds()
     void* hiddenStates = mBaseModel->getDeviceBuffer("hidden_states");
     static_assert(std::is_same_v<KVCacheType, HiddenStatesType>, "KVCacheType and HiddenStatesType must be the same");
 
-    UpdateKVCacheParams<KVCacheType> params;
+    drivellm::kernel::UpdateKVCacheParams<KVCacheType> params;
     params.KVCache = static_cast<KVCacheType*>(KVCache);
     params.paths = static_cast<int32_t*>(mEagleDeviceBuffer["paths"]);
     params.bestPathIds = static_cast<int32_t*>(mEagleDeviceBuffer["bestPathIds"]);
@@ -84,15 +99,16 @@ void Eagle::invokeUpdateKVCacheAndHiddenStatesAndTreePositionIds()
     params.hiddenStates = static_cast<HiddenStatesType*>(hiddenStates);
     params.hiddenStatesInputs = static_cast<HiddenStatesType*>(mEagleDeviceBuffer["hiddenStatesDraftDecode"]);
     params.treePositionIds = static_cast<int32_t*>(mEagleDeviceBuffer["treePositionIds"]);
-    dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds<HiddenStatesType>(params, mEagleCommonParams);
+    drivellm::kernel::dispatchUpdateKVCacheAndHiddenStatesAndTreePositionIds<HiddenStatesType>(
+        params, mEagleCommonParams);
 }
 
 void Eagle::invokeInitializeAttentionMaskCausal()
 {
-    InitCausalAttentionMaskParams params;
+    drivellm::kernel::InitCausalAttentionMaskParams params;
     params.mask = static_cast<bool*>(mEagleDeviceBuffer["attentionMaskCausal"]);
     params.packedMask = static_cast<int32_t*>(mEagleDeviceBuffer["packedAttentionMaskCausal"]);
-    dispatchInitializeAttentionMaskCausal(params, mEagleCommonParams);
+    drivellm::kernel::dispatchInitializeAttentionMaskCausal(params, mEagleCommonParams);
 }
 
 void Eagle::initDraftVoc()
@@ -112,7 +128,7 @@ void Eagle::initDraftVoc()
         LOG_ERROR("d2t.bin file is empty in path %s", draftVocPath.c_str());
         throw std::runtime_error("d2t.bin file is empty in: " + draftVocPath);
     }
-    if (fileSize != mDraftVocabSize * sizeof(int32_t))
+    if (static_cast<size_t>(fileSize) != mDraftVocabSize * sizeof(int32_t))
     {
         LOG_ERROR("d2t.bin file size mismatch. Got: %ld, Expected: %ld", (long) fileSize,
             (long) (mDraftVocabSize * sizeof(int32_t)));
@@ -411,7 +427,7 @@ void Eagle::setupExtraInputsForBaseModel()
         "input_ids", nullptr, mEagleDeviceBuffer["draftIds"], {}, {2, {mBatchSize, mMaxDecodingTokens}}));
     extraInputsForBaseModelDecode.push_back(
         EngineInputDesc("attention_mask", nullptr, mEagleDeviceBuffer["packedTreeMaskVerification"], {},
-            {3, {mBatchSize, mMaxDecodingTokens, divUp(mMaxDecodingTokens, 32)}}));
+            {3, {mBatchSize, mMaxDecodingTokens, static_cast<int64_t>(divUp(mMaxDecodingTokens, 32))}}));
     extraInputsForBaseModelDecode.push_back(EngineInputDesc("attention_pos_id", nullptr,
         mEagleDeviceBuffer["positionIdsVerification"], {}, {2, {mBatchSize, mMaxDecodingTokens}}));
 
@@ -451,7 +467,7 @@ void Eagle::setupExtraInputsForDraftModelDecode()
         mEagleDeviceBuffer["selectedOutputIdsDraft"], {}, {2, {mBatchSize, mMaxDraftTokensPerStep}}));
     extraInputsForDraftModelDecode.push_back(
         EngineInputDesc("attention_mask", nullptr, mEagleDeviceBuffer["packedTreeMaskUpdateforAttentionNoPadding"], {},
-            {3, {mBatchSize, mMaxDraftTokensPerStep, divUp(mMaxDraftTokensPerStep, 32)}}));
+            {3, {mBatchSize, mMaxDraftTokensPerStep, static_cast<int64_t>(divUp(mMaxDraftTokensPerStep, 32))}}));
     extraInputsForDraftModelDecode.push_back(EngineInputDesc("attention_pos_id", nullptr,
         mEagleDeviceBuffer["treePositionIds"], {}, {2, {mBatchSize, mMaxDraftTokensPerStep}}));
     extraInputsForDraftModelDecode.push_back(
@@ -486,12 +502,12 @@ void Eagle::getLastHostLogits(std::vector<LogitsType>& hostLogits)
 {
     size_t totalLogitSize = mBatchSize * mVocabSize;
     hostLogits.resize(totalLogitSize);
-    GetLastLogitsOffsetParams params;
+    drivellm::kernel::GetLastLogitsOffsetParams params;
     params.paths = static_cast<int32_t*>(mEagleDeviceBuffer["paths"]);
     params.bestPathIds = static_cast<int32_t*>(mEagleDeviceBuffer["bestPathIds"]);
     params.acceptedLengths = static_cast<int64_t*>(mEagleDeviceBuffer["acceptedLengths"]);
     params.lastLogitsOffset = static_cast<int64_t*>(mEagleDeviceBuffer["lastLogitsOffset"]);
-    dispatchGetLastLogitsOffset(params, mEagleCommonParams);
+    drivellm::kernel::dispatchGetLastLogitsOffset(params, mEagleCommonParams);
     CUDA_CHECK(cudaMemcpyAsync(lastLogitsOffsetHost.data(), mEagleDeviceBuffer["lastLogitsOffset"],
         mBatchSize * sizeof(int64_t), cudaMemcpyDeviceToHost, mStream));
     for (int i = 0; i < mBatchSize; i++)
@@ -511,7 +527,7 @@ void Eagle::initDecodingPhaseCudaGraph()
 }
 
 void Eagle::generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> contextLengths,
-    std::vector<std::vector<int32_t>>& outputIds, GenerationConfig generationConfig, int32_t endIds, bool isEagle3,
+    std::vector<std::vector<int32_t>>& outputIds, GenerationConfig generationConfig, int32_t endIds,
     std::shared_ptr<BenchmarkProfiler> const profiler, std::vector<int32_t>* newTokensNumbers,
     std::vector<int32_t>* iterNumbers)
 {
@@ -654,7 +670,8 @@ void Eagle::generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> 
 
 void Eagle::invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t layerIdx, HiddenStatesType* hs_draft)
 {
-    UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<HiddenStatesType> params;
+    drivellm::kernel::UpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScoresParams<HiddenStatesType>
+        params;
     params.outputIdsAllDraft = static_cast<int32_t*>(mEagleDeviceBuffer["outputIdsAllDraft"]);
     params.selectedOutputIdsDraft = static_cast<int32_t*>(mEagleDeviceBuffer["selectedOutputIdsDraft"]);
     params.inputHiddenStatesDraft = hs_draft;
@@ -685,8 +702,8 @@ void Eagle::invokeUpdateDraInputIdsAndHSAndTrMaAndPosIdsAndInterScores(int32_t l
     params.layerIdx = layerIdx;
     params.maxLength = mMaxDraftTokensPerStep;
     params.curContextLengths = static_cast<int32_t*>(mBaseModel->getDeviceBuffer("context_lengths"));
-    dispatchUpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScores<HiddenStatesType>(
-        params, mEagleCommonParams);
+    drivellm::kernel::dispatchUpdateDraftInputIdsAndHiddenStatesAndTreeMaskAndPositionIdsAndInterScores<
+        HiddenStatesType>(params, mEagleCommonParams);
 }
 
 void Eagle::invokeUpdateCumScoresAndParentsIds(int32_t layerIdx)
@@ -695,7 +712,7 @@ void Eagle::invokeUpdateCumScoresAndParentsIds(int32_t layerIdx)
     auto const bias2 = std::max(0, layerIdx - 2);
     auto const bias = 1 + mTopK * mTopK * bias2 + bias1;
 
-    UpdateCumScoresAndParentsIdsParams params;
+    drivellm::kernel::UpdateCumScoresAndParentsIdsParams params;
     params.outputLogProbsAllDraft = static_cast<float*>(mEagleDeviceBuffer["outputLogProbsAllDraftFloat"]);
     params.intermediateScores = static_cast<float*>(mEagleDeviceBuffer["intermediateScores"]);
     // cu_scores = topk_p + params.intermediateScores
@@ -704,7 +721,7 @@ void Eagle::invokeUpdateCumScoresAndParentsIds(int32_t layerIdx)
     params.parentsIds = static_cast<int64_t*>(mEagleDeviceBuffer["parentsIds"]);
     params.bias = bias;
     params.layerIdx = layerIdx;
-    dispatchUpdateCumScoresAndParentsIds(params, mEagleCommonParams);
+    drivellm::kernel::dispatchUpdateCumScoresAndParentsIds(params, mEagleCommonParams);
 }
 
 void Eagle::draftDecodePostProcess(int32_t layerIdx)
@@ -791,7 +808,7 @@ void Eagle::invokeAssembleDraftIdsAndPathAndMaskAndPositionIds()
         false  // compute softmax
     );
 
-    AssembleDraftIdsAndPathAndMaskAndPositionIdsParams assembleParams;
+    drivellm::kernel::AssembleDraftIdsAndPathAndMaskAndPositionIdsParams assembleParams;
     assembleParams.fourthTopKIds = static_cast<int32_t*>(mEagleDeviceBuffer["fourthTopKIds"]);
     assembleParams.allDraftIds = static_cast<int32_t*>(mEagleDeviceBuffer["allTokens"]);
     assembleParams.allDraftIdsAncestors = static_cast<int64_t*>(mEagleDeviceBuffer["parentsIds"]);
@@ -805,7 +822,7 @@ void Eagle::invokeAssembleDraftIdsAndPathAndMaskAndPositionIds()
     assembleParams.paths = static_cast<int32_t*>(mEagleDeviceBuffer["paths"]);
     assembleParams.validPathNum = static_cast<int32_t*>(mEagleDeviceBuffer["validPathNum"]);
     assembleParams.packedTreeMaskVerification = static_cast<int32_t*>(mEagleDeviceBuffer["packedTreeMaskVerification"]);
-    dispatchAssembleDraftIdsAndPathAndMaskAndPositionIds(assembleParams, mEagleCommonParams);
+    drivellm::kernel::dispatchAssembleDraftIdsAndPathAndMaskAndPositionIds(assembleParams, mEagleCommonParams);
 }
 
 void Eagle::draftModelDecodeInfer(std::vector<int32_t> tempContextLengthForDraft)
@@ -818,7 +835,7 @@ void Eagle::draftModelDecodeInfer(std::vector<int32_t> tempContextLengthForDraft
         mBatchSize * mMaxDraftTokensPerStep * mTargetOutputHiddenDim * sizeof(HiddenStatesType), mStream));
     std::for_each(tempContextLengthForDraft.begin(), tempContextLengthForDraft.end(),
         [this](int& val) { val += mMaxDraftTokensPerStep; });
-    for (size_t treeIdx = 0; treeIdx < mMaxPathLen - 1; treeIdx++)
+    for (int32_t treeIdx = 0; treeIdx < mMaxPathLen - 1; treeIdx++)
     {
         std::iota(lastTokenIds.begin(), lastTokenIds.end(), layerIdx * mTopK);
         ++layerIdx;
@@ -843,7 +860,7 @@ void Eagle::updateGenerationStatus(
     CUDA_CHECK(cudaStreamSynchronize(mStream));
     auto finishedStates = reinterpret_cast<int32_t*>(mEagleHostBuffer["finishedFinal"]);
     generationIter = *std::max_element(contextLengths.begin(), contextLengths.end());
-    for (size_t bi = 0; bi < mBatchSize; bi++)
+    for (int64_t bi = 0; bi < mBatchSize; bi++)
     {
         if (finishedStates[bi])
         {
@@ -851,3 +868,6 @@ void Eagle::updateGenerationStatus(
         }
     }
 }
+
+} // namespace rt
+} // namespace drivellm

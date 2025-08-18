@@ -31,6 +31,9 @@
 #include <unordered_map>
 #include <vector>
 
+namespace drivellm
+{
+
 inline size_t monitorDeviceMemory(std::atomic_bool& done)
 {
     // A simple memory monitor function that monitors peak GPU memory usage
@@ -243,3 +246,5 @@ private:
     std::atomic_bool hostMemDone{false};
     bool timingStarted{false};
 };
+
+} // namespace drivellm

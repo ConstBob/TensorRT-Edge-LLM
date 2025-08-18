@@ -10,15 +10,20 @@
  * its affiliates is strictly prohibited.
  */
 
+#include "tokenizer.h"
+#include "tokenizerUtils.h"
 #include <cassert>
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
-
-#include "tokenizer.h"
-#include "tokenizerUtils.h"
+#include <stdexcept>
 
 using Json = nlohmann::json;
+
+namespace drivellm
+{
+namespace tokenizer
+{
 
 // BPE
 BPE::BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, std::string const& patStr)
@@ -621,3 +626,6 @@ void Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
 
     LOG_INFO("Loaded tokenizer from %s", modelDir.c_str());
 }
+
+} // namespace tokenizer
+} // namespace drivellm

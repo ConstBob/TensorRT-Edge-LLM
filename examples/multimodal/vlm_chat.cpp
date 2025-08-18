@@ -21,7 +21,9 @@
 #include <dlfcn.h>
 #include <getopt.h>
 
+using namespace drivellm;
 using namespace drivellm::rt;
+using namespace drivellm::tokenizer;
 
 struct VlmChatArgs
 {

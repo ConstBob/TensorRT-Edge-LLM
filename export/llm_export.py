@@ -340,7 +340,7 @@ def surgeon_llm(raw_onnx_path,
             config = config.text_config
     else:
         print(
-            "Warning: DriveOS LLM SDK currently does not support OOTB(Out-of-the-box) TensorRT so far."
+            "Warning: TensorRT Edge-LLM currently does not support OOTB(Out-of-the-box) TensorRT so far."
         )
 
     t0 = time.time()
@@ -424,7 +424,7 @@ def surgeon_llm(raw_onnx_path,
 
 def check_dtype_support(args):
     """
-    Check whether the dtype is supported by DriveOS LLM SDK. Returns False if it is not supported because of:
+    Check whether the dtype is supported by TensorRT Edge-LLM. Returns False if it is not supported because of:
     1. Modelopt < 0.23.0 does not support nvfp4
     2. Modelopt > 0.19.0 has accuracy issues for int4
     """

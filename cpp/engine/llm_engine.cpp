@@ -16,6 +16,11 @@
 #include <numeric>
 #include <stdexcept>
 
+namespace drivellm
+{
+namespace rt
+{
+
 EngineConfig::EngineConfig(std::string const& engine_dir, bool use_cuda_graph, int32_t batch_size)
     : engineDir(engine_dir)
     , useCudaGraph(use_cuda_graph)
@@ -176,7 +181,7 @@ ModelConfig LLMEngine::getBaseModelConfig()
 void LLMEngine::generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> const& contextLengths,
     std::vector<std::vector<int32_t>>& outputIds, GenerationConfig const& generationConfig,
     std::vector<int32_t>* newTokensNumbers, std::vector<int32_t>* iterNumbers,
-    std::shared_ptr<BenchmarkProfiler> const profiler, Tokenizer* tokenizer, bool autoDecode)
+    std::shared_ptr<BenchmarkProfiler> const profiler, drivellm::tokenizer::Tokenizer* tokenizer, bool autoDecode)
 {
 
     if (isEagleModel())
@@ -187,8 +192,8 @@ void LLMEngine::generate(std::vector<int32_t> const& inputIds, std::vector<int32
             LOG_ERROR("tokenizer must be provided under eagle mode for generate()");
             throw std::runtime_error("tokenizer must be provided under eagle mode for generate()");
         }
-        eagle->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), mIsEagle3,
-            profiler, newTokensNumbers, iterNumbers);
+        eagle->generate(inputIds, contextLengths, outputIds, generationConfig, tokenizer->getEosId(), profiler,
+            newTokensNumbers, iterNumbers);
         if (autoDecode)
         {
             for (int i = 0; i < mBatchSize; ++i)
@@ -220,8 +225,8 @@ void LLMEngine::generate(std::vector<int32_t> const& inputIds, std::vector<int32
     }
 }
 
-std::vector<int32_t> LLMEngine::processInputSequence(std::vector<std::string> const& inputStrings, Tokenizer* tokenizer,
-    std::vector<int32_t>& contextLengths, int32_t padId)
+std::vector<int32_t> LLMEngine::processInputSequence(std::vector<std::string> const& inputStrings,
+    drivellm::tokenizer::Tokenizer* tokenizer, std::vector<int32_t>& contextLengths, int32_t padId)
 {
     // Process and tokenize input string, then store tokens in the appropriate batch position
     int32_t batchSize = static_cast<int32_t>(inputStrings.size());
@@ -266,7 +271,7 @@ typename LLMEngine::ModelPtr LLMEngine::createModel(EngineConfig const& config, 
     {
         // Single decoder mode (naive decoding)
         baseDecoder->setup(config.engineDir, config.batchSize, false, "", config.useCudaGraph, stream);
-        return std::move(baseDecoder);
+        return baseDecoder;
     }
     else
     {
@@ -279,3 +284,6 @@ typename LLMEngine::ModelPtr LLMEngine::createModel(EngineConfig const& config, 
             config.draftModelDir, config.maxPathLen, config.topK, config.isEagle3, config.maxDecodingTokens);
     }
 }
+
+} // namespace rt
+} // namespace drivellm

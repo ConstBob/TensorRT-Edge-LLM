@@ -29,6 +29,11 @@
 
 #include "unicodeData.h"
 
+namespace drivellm
+{
+namespace tokenizer
+{
+
 std::vector<std::pair<uint32_t, uint16_t>> const unicodeRangesFlags = {
     // start, flags // last=next_start-1
     {0x000000, 0x0080},
@@ -7054,3 +7059,6 @@ std::vector<rangeNfd> const unicodeRangesNfd = {
     {0x02FA1C, 0x02FA1C, 0x009F3B},
     {0x02FA1D, 0x02FA1D, 0x02A600},
 };
+
+} // namespace tokenizer
+} // namespace drivellm
