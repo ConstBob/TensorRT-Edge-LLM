@@ -1,7 +1,7 @@
 # This file is based on MIT-licensed code from
 # https://github.com/hendrycks/test/blob/master/evaluate.py.
 #
-# Modifications and enhancements by DriveOS LLM-SDK team, 2024.
+# Modifications and enhancements by TensorRT Edge-LLM team, 2024.
 #
 # Original license:
 # MIT License

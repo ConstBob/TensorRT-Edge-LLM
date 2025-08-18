@@ -25,6 +25,10 @@
 #include <string>
 #include <vector>
 
+using namespace drivellm;
+using namespace drivellm::rt;
+using namespace drivellm::tokenizer;
+
 struct LLMChatArgs
 {
     bool interactive{false};
@@ -198,7 +202,7 @@ int main(int argc, char* argv[])
 
     auto pluginHandles = loadEdgellmPluginLib();
 
-    auto tokenizer = std::make_unique<Tokenizer>();
+    auto tokenizer = std::make_unique<drivellm::tokenizer::Tokenizer>();
     // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
     if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
     {
@@ -240,7 +244,7 @@ int main(int argc, char* argv[])
     int32_t padId = tokenizer->getPadId();
     GenerationConfig generationConfig{args.maxLength, 0, 1, 1};
     std::string quitString = "quit";
-    std::cout << "Welcome to NVIDIA DriveOS LLM SDK! Please enter your prompts. Enter quit to exit the program."
+    std::cout << "Welcome to TensorRT Edge-LLM! Please enter your prompts. Enter quit to exit the program."
               << std::endl;
 
     llmEngine->setupRopeCosSin();
@@ -290,7 +294,7 @@ int main(int argc, char* argv[])
                 std::getline(std::cin, inputString);
                 if (inputString == quitString)
                 {
-                    std::cout << "Exit. Thanks for using DriveOS LLM SDK!" << std::endl;
+                    std::cout << "Exit. Thanks for using TensorRT Edge-LLM!" << std::endl;
                     return EXIT_SUCCESS;
                 }
                 inputStrings.emplace_back(inputString);

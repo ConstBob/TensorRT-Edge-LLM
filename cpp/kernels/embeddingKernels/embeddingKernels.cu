@@ -5,7 +5,7 @@
 
 namespace drivellm
 {
-namespace kernels
+namespace kernel
 {
 
 namespace
@@ -315,5 +315,5 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
         seqLen, vocabSize, hiddenSize, imageTokenLen, stream);
 }
 
-} // namespace kernels
+} // namespace kernel
 } // namespace drivellm

@@ -17,6 +17,9 @@
 #include <cuda_runtime.h>
 #include <numeric>
 
+namespace drivellm
+{
+
 inline int getDevice()
 {
     int current_dev_id = 0;
@@ -79,3 +82,5 @@ inline int getSMVersion()
 #else
 #define sync_check_cuda_error()
 #endif
+
+} // namespace drivellm

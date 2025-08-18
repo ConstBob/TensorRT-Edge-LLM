@@ -1,3 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
 #pragma once
 
 #include "common/benchmarkProfiler.h"
@@ -5,14 +17,20 @@
 #include "kernels/speculative/eagleUtilKernels.h"
 
 #include <NvInferRuntime.h>
-#include <cfloat>
 #include <cuda_runtime_api.h>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 #include <vector>
 using Json = nlohmann::json;
+
+namespace drivellm
+{
+namespace rt
+{
 
 class Eagle
 {
@@ -111,8 +129,8 @@ public:
 
     void generate(std::vector<int32_t> const& inputIds, std::vector<int32_t> contextLengths,
         std::vector<std::vector<int32_t>>& outputIds, GenerationConfig generationConfig, int32_t endIds = -1,
-        bool isEagle3 = false, std::shared_ptr<BenchmarkProfiler> const profiler = nullptr,
-        std::vector<int32_t>* newTokens = nullptr, std::vector<int32_t>* iterNumbers = nullptr);
+        std::shared_ptr<BenchmarkProfiler> const profiler = nullptr, std::vector<int32_t>* newTokens = nullptr,
+        std::vector<int32_t>* iterNumbers = nullptr);
     size_t getDeviceMemorySize() const noexcept;
     void getLastHostLogits(std::vector<LogitsType>& hostLogits);
     int64_t getModelBatchSize() const noexcept;
@@ -161,7 +179,7 @@ private:
 
     std::map<std::string, void*> mEagleDeviceBuffer;
     std::map<std::string, void*> mEagleHostBuffer;
-    EagleCommonParams mEagleCommonParams;
+    drivellm::kernel::EagleCommonParams mEagleCommonParams;
     std::string mBaseModelDir;
     std::string mDraftModelDir;
     std::vector<int64_t> acceptedLengthsHost{mBatchSize};
@@ -184,3 +202,6 @@ private:
 
     cudaStream_t mStream;
 };
+
+} // namespace rt
+} // namespace drivellm

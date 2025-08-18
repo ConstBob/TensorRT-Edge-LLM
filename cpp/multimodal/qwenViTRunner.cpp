@@ -13,8 +13,10 @@
 #include "qwenViTRunner.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include <cmath>
+#include <fstream>
 #include <nlohmann/json.hpp>
 #include <random>
+#include <stdexcept>
 #include <tuple>
 
 using Json = nlohmann::json;
@@ -473,7 +475,7 @@ void QwenViTRunner::getRopeIdx(std::vector<int64_t>& mropePositionIds,
 
         for (int i = 0; i < 3; ++i)
         {
-            assert(positionIds[i].size() == maxPositionEmbeddings);
+            assert(static_cast<int>(positionIds[i].size()) == maxPositionEmbeddings);
             mropePositionIds.insert(mropePositionIds.end(), positionIds[i].begin(), positionIds[i].end());
         }
     }
@@ -489,7 +491,7 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     getRopeIdx(mropePositionIds, batchInputIds, imageGridTHWs, maxPositionEmbeddings);
 
     auto mropePositionIdsDevice
-        = rt::Tensor({mropePositionIds.size()}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+        = rt::Tensor({static_cast<int64_t>(mropePositionIds.size())}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
     CUDA_CHECK(cudaMemcpyAsync(mropePositionIdsDevice.rawPointer(), mropePositionIds.data(),
         mropePositionIds.size() * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
 
@@ -532,7 +534,8 @@ std::string QwenViTRunner::applyChatTemplate(std::string const& inputString, int
 
 void QwenViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds,
     std::vector<int32_t>& batchInputLengths, std::vector<std::string> const& inputStrings,
-    std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer)
+    std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths,
+    drivellm::tokenizer::Tokenizer* tokenizer)
 {
     int totalImageIdx = 0;
     int value = mConfig.vocabSize;
@@ -626,7 +629,7 @@ void QwenViTRunner::getWindowIndex(std::vector<std::vector<int64_t>> const& imag
 
 void QwenViTRunner::preprocess(std::vector<std::string> const& inputStrings,
     std::vector<std::vector<ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-    std::vector<int32_t>& contextLengths, Tokenizer* tokenizer, int const maxSupportedInputLength,
+    std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer, int const maxSupportedInputLength,
     bool enableDynamicShape, void* ropeRotaryCosSinDevice, int const maxPositionEmbeddings, int const rotaryDim,
     cudaStream_t stream)
 {
@@ -645,8 +648,8 @@ void QwenViTRunner::preprocess(std::vector<std::string> const& inputStrings,
         maxSupportedInputLength, enableDynamicShape);
 }
 
-void QwenViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const textTokenLength,
-    int const imageTokenLength, int const inputLength, cudaStream_t stream)
+void QwenViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
+    int const inputLength, cudaStream_t stream)
 {
     std::random_device dev;
     std::mt19937 rng(dev());

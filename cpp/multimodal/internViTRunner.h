@@ -15,9 +15,6 @@
 #include "multimodalRunner.h"
 #include <common/tensor.h>
 #include <cuda_fp16.h>
-#include <filesystem>
-#include <memory>
-#include <string>
 #include <vector>
 
 namespace drivellm
@@ -48,14 +45,15 @@ public:
 
     void preprocess(std::vector<std::string> const& inputStrings,
         std::vector<std::vector<ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-        std::vector<int32_t>& contextLengths, Tokenizer* tokenizer, int const maxSupportedInputLength,
-        bool enableDynamicShape, void* ropeRotaryCosSinDevice, int const maxPositionEmbeddings, int const rotaryDim,
+        std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer,
+        int const maxSupportedInputLength, bool enableDynamicShape, void* ropeRotaryCosSinDevice [[maybe_unused]],
+        int const maxPositionEmbeddings [[maybe_unused]], int const rotaryDim [[maybe_unused]],
         cudaStream_t stream) override;
 
     std::vector<EngineInputDesc> getComputedEmbeddings() override;
 
-    void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const textTokenLength,
-        int const imageTokenLength, int const inputLength, cudaStream_t stream) override;
+    void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
+        int const inputLength, cudaStream_t stream) override;
 
     void validateAndFillConfig(std::string const& configPath) override;
     void allocateBuffer() override;
@@ -71,7 +69,7 @@ public:
 private:
     void textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths,
         std::vector<std::string> const& inputStrings, std::vector<int64_t> const& numImagePerBatch,
-        std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer) override;
+        std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer) override;
 
     std::string applyChatTemplate(std::string const& inputString, int const& numImages,
         std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true) override;

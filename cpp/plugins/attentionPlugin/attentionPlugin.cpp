@@ -25,7 +25,11 @@
 #include <vector>
 
 using namespace nvinfer1;
-using namespace drivellm::plugins;
+
+namespace drivellm
+{
+namespace plugins
+{
 
 namespace
 {
@@ -571,3 +575,6 @@ nvinfer1::IPluginV2* AttentionPluginCreator::deserializePlugin(
     }
     return nullptr;
 }
+
+} // namespace plugins
+} // namespace drivellm

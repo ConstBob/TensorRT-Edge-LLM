@@ -19,7 +19,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  *
- * Modification made by DriveOS LLM-SDK team to follow TensorRT's Int4 weights-only
+ * Modification made by TensorRT Edge-LLM team to follow TensorRT's Int4 weights-only
  * quantization semantics.
  */
 
@@ -28,9 +28,13 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+namespace drivellm
+{
+namespace kernel
+{
+
 __inline__ __device__ void dequantize_s4_to_fp16x2(half2 const& source, uint4* result)
 {
-    // uint4 result;
 
     uint32_t* h = reinterpret_cast<uint32_t*>(result);
     uint32_t const i4s = reinterpret_cast<uint32_t const&>(source);
@@ -89,6 +93,7 @@ __inline__ __device__ void dequantize_s4_to_fp16x2(half2 const& source, uint4* r
     asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[2]) : "r"(h[2]), "r"(FP16_TOP_MAGIC_NUM));
     // Convert elt_67
     asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[3]) : "r"(h[3]), "r"(ONE_SIXTEENTH), "r"(NEG_72));
-
-    // return result;
 }
+
+} // namespace kernel
+} // namespace drivellm

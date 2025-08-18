@@ -19,7 +19,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  *
- * Modification made by DriveOS LLM-SDK team to follow TensorRT's Int4 weights-only
+ * Modification made by TensorRT Edge-LLM team to follow TensorRT's Int4 weights-only
  * quantization semantics.
  */
 
@@ -30,6 +30,11 @@
 #define PACK_FACTOR 8
 #define WARP_SIZE 32
 #define MEM_ACCESS_SIZE 128
+
+namespace drivellm
+{
+namespace kernel
+{
 
 // Reduce sum within the warp using the tree reduction algorithm.
 template <int Num, int WarpSize>
@@ -234,3 +239,6 @@ void gemv_forward_cuda_new(half* in_feats, int8_t* weights_device, half* scaling
     default: throw std::runtime_error("Unsupported batch size for gemv kernel.\n");
     }
 }
+
+} // namespace kernel
+} // namespace drivellm

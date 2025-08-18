@@ -15,6 +15,9 @@
 #include "common.h"
 #include "cuda_runtime_api.h"
 
+namespace drivellm
+{
+
 class CudaEvent
 {
 
@@ -63,3 +66,5 @@ private:
 
     EventPtr mEvent;
 };
+
+} // namespace drivellm

@@ -29,6 +29,11 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+using namespace drivellm;
+using namespace drivellm::rt;
+using namespace drivellm::tokenizer;
+
 namespace fs = std::filesystem;
 
 struct LLMAccuracyArgs
@@ -357,7 +362,7 @@ void mmluAccuracy(LLMAccuracyArgs const& args, Tokenizer* tokenizer)
             }
 
             std::vector<std::vector<int32_t>> outputIds(1);
-            GenerationConfig generationConfig{inputIds.size() + 1, 0, 1, 1};
+            GenerationConfig generationConfig{static_cast<int64_t>(inputIds.size()) + 1, 0, 1, 1};
 
             if (inputIds.size() > 2048)
             {

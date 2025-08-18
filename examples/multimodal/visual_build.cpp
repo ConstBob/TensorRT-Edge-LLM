@@ -27,6 +27,7 @@
 #include <string>
 
 using Json = nlohmann::json;
+using namespace drivellm;
 
 struct ViTBuildArgs
 {

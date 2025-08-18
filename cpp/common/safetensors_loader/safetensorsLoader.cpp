@@ -1,3 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
 #include "safetensorsLoader.h"
 
 #include "common/common.h"
@@ -24,7 +36,7 @@ SafeTensorsLoader::~SafeTensorsLoader()
     {
         if (info.gpuPtr)
         {
-            cudaFree(info.gpuPtr);
+            CUDA_CHECK(cudaFree(info.gpuPtr));
             info.gpuPtr = nullptr;
         }
     }
@@ -33,18 +45,13 @@ SafeTensorsLoader::~SafeTensorsLoader()
 bool SafeTensorsLoader::loadFromFileToGPU()
 {
     // Read the file into memory
-    MmapReader mmapReader(mFilePath);
-    if (!mmapReader.loadFile(mFilePath))
-    {
-        LOG_ERROR("Failed to use MMap to read safetensors file from path: %s", mFilePath.c_str());
-        return false;
-    }
+    std::unique_ptr<MmapReader> mmapReader = std::make_unique<MmapReader>(mFilePath);
 
     // Read the header size (8 bytes)
-    uint64_t headerSize = *reinterpret_cast<uint64_t const*>(mmapReader.getByteData());
+    uint64_t headerSize = *reinterpret_cast<uint64_t const*>(mmapReader->getByteData());
 
     // Read the metadata JSON
-    std::string metadataStr(reinterpret_cast<char const*>(mmapReader.getByteData() + sizeof(headerSize)), headerSize);
+    std::string metadataStr(reinterpret_cast<char const*>(mmapReader->getByteData() + sizeof(headerSize)), headerSize);
 
     // Parse the metadata
     if (!parseJsonHeader(metadataStr))
@@ -57,7 +64,7 @@ bool SafeTensorsLoader::loadFromFileToGPU()
     size_t tensorDataStart = sizeof(headerSize) + headerSize;
     for (auto& [name, info] : mTensorInfo)
     {
-        int8_t const* tensorData = mmapReader.getByteData() + tensorDataStart + info.dataOffsets[0];
+        int8_t const* tensorData = mmapReader->getByteData() + tensorDataStart + info.dataOffsets[0];
 
         if (!loadTensorToGPU(info, tensorData))
         {
@@ -86,14 +93,14 @@ bool SafeTensorsLoader::loadTensorToGPU(SafeTensorsInfo& info, int8_t const* dat
     }
 
     // Allocate GPU memory
-    cudaMalloc(&info.gpuPtr, totalElements * sizeof(uint16_t));
+    CUDA_CHECK(cudaMalloc(&info.gpuPtr, totalElements * sizeof(uint16_t)));
     if (!info.gpuPtr)
     {
         LOG_ERROR("Failed to allocate GPU memory");
         return false;
     }
 
-    cudaMemcpy(info.gpuPtr, data, totalElements * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(info.gpuPtr, data, totalElements * sizeof(uint16_t), cudaMemcpyHostToDevice));
 
     return true;
 }

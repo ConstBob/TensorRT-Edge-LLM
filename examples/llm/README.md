@@ -1,8 +1,8 @@
-# TensorRT Edge LLM Example: Decoder-only Language Models
+# TensorRT Edge-LLM Example: Decoder-only Language Models
 
 ## Prerequisites
 
-An ONNX model that complies with the TensorRT Edge LLM runtime should be ready following [ONNX export](../../export/README.md). To run inference with real data, a tokenizer file is also required.
+An ONNX model that complies with the TensorRT Edge-LLM runtime should be ready following [ONNX export](../../export/README.md). To run inference with real data, a tokenizer file is also required.
 
 ### ONNX Folder Structure
 
@@ -168,7 +168,7 @@ tar -xf data.tar
 
 ## Runtime LoRA Switching
 
-TensorRT Edge LLM supports dynamic LoRA (Low-Rank Adaptation) for efficient model adaptation.
+TensorRT Edge-LLM supports dynamic LoRA (Low-Rank Adaptation) for efficient model adaptation.
 
 ### LoRA Weights Processing
 

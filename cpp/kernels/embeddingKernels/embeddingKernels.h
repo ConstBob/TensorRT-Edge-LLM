@@ -6,7 +6,7 @@
 
 namespace drivellm
 {
-namespace kernels
+namespace kernel
 {
 
 /**
@@ -33,5 +33,5 @@ void embeddingLookup(
 void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
     rt::Tensor const& imageEmbeds, rt::Tensor& output, cudaStream_t stream = 0);
 
-} // namespace kernels
+} // namespace kernel
 } // namespace drivellm

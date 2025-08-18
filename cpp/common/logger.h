@@ -16,6 +16,9 @@
 #include <NvInferRuntime.h>
 #include <string>
 
+namespace drivellm
+{
+
 // Logger for TensorRT info/warning/errors
 class Logger : public nvinfer1::ILogger
 {
@@ -135,3 +138,5 @@ inline Logger gLogger{};
             gLogger.warning(fmtstr(__VA_ARGS__));                                                                      \
         }                                                                                                              \
     } while (0)
+
+} // namespace drivellm

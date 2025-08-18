@@ -12,8 +12,10 @@
 
 #include "internViTRunner.h"
 #include <cmath>
+#include <fstream>
 #include <nlohmann/json.hpp>
 #include <random>
+#include <stdexcept>
 #include <tuple>
 
 using Json = nlohmann::json;
@@ -290,7 +292,8 @@ std::string InternViTRunner::applyChatTemplate(std::string const& inputString, i
 
 void InternViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds,
     std::vector<int32_t>& batchInputLengths, std::vector<std::string> const& inputStrings,
-    std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths, Tokenizer* tokenizer)
+    std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths,
+    drivellm::tokenizer::Tokenizer* tokenizer)
 {
     int totalImageIdx = 0;
     int value = mConfig.vocabSize;
@@ -317,9 +320,9 @@ void InternViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInp
 
 void InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
     std::vector<std::vector<ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-    std::vector<int32_t>& contextLengths, Tokenizer* tokenizer, int const maxSupportedInputLength,
-    bool enableDynamicShape, void* ropeRotaryCosSinDevice, int const maxPositionEmbeddings, int const rotaryDim,
-    cudaStream_t stream)
+    std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer, int const maxSupportedInputLength,
+    bool enableDynamicShape, void* ropeRotaryCosSinDevice [[maybe_unused]],
+    int const maxPositionEmbeddings [[maybe_unused]], int const rotaryDim [[maybe_unused]], cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImagePerBatch;
@@ -333,8 +336,8 @@ void InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
         maxSupportedInputLength, enableDynamicShape);
 }
 
-void InternViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const textTokenLength,
-    int const imageTokenLength, int const inputLength, cudaStream_t stream)
+void InternViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
+    int const inputLength, cudaStream_t stream)
 {
     std::random_device dev;
     std::mt19937 rng(dev());

@@ -18,12 +18,17 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  *
- * Modification made by DriveOS LLM-SDK team to follow TensorRT's Int4 weights-only
+ * Modification made by TensorRT Edge-LLM team to follow TensorRT's Int4 weights-only
  * quantization semantics.
  */
 
 #include "dequantize.cuh"
 #include <cuda_pipeline_primitives.h>
+
+namespace drivellm
+{
+namespace kernel
+{
 
 #if (__CUDACC_VER_MAJOR__ >= 11) && (__CUDACC_VER_MINOR__ >= 4)
 #define L2_CACHEHINT(size) ".L2::" #size "B"
@@ -481,3 +486,6 @@ void gemm_forward_cuda_new(half* in_feats, int8_t* weights_device, half* scaling
     kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(
         in_feats, kernel, scaling_factors, out_feats, m, n, k);
 }
+
+} // namespace kernel
+} // namespace drivellm

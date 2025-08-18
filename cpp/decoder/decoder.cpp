@@ -28,6 +28,11 @@
 
 using Json = nlohmann::json;
 
+namespace drivellm
+{
+namespace rt
+{
+
 bool Decoder::setup(std::string modelDir, int64_t batchSize, bool isEagle, std::string modelType, bool useCudaGraph,
     cudaStream_t stream)
 {
@@ -249,7 +254,7 @@ void Decoder::setupRopeCosSin()
         // Helper function to read factor data from json
         auto readFactorData = [&](std::string const& factorName) -> float* {
             auto factorValue = jsonConfig["rope_scaling"][factorName];
-            assert(factorValue.is_array() && factorValue.size() == mConfig.rotaryDim / 2
+            assert(factorValue.is_array() && static_cast<int64_t>(factorValue.size()) == mConfig.rotaryDim / 2
                 && (std::string(factorName) + " size should be equal to rotaryDim / 2").c_str());
 
             std::vector<float> factor = factorValue.get<std::vector<float>>();
@@ -603,8 +608,8 @@ std::string Decoder::printKVCache()
     std::ostringstream oss;
     size_t totalKVSize = mConfig.batchSize * 2 * mConfig.hiddenSizePerHead * mConfig.numHead * mConfig.maxLength;
     printf(
-        "totalKVSize: %d and mConfig.batchSize: %d, mConfig.numLayers: %d, mConfig.maxLength: %d, "
-        "mConfig.hiddenSizePerHead: %d, mConfig.numHead: %d\n",
+        "totalKVSize: %zu and mConfig.batchSize: %ld, mConfig.numLayers: %ld, mConfig.maxLength: %ld, "
+        "mConfig.hiddenSizePerHead: %ld, mConfig.numHead: %ld\n",
         totalKVSize, mConfig.batchSize, mConfig.numLayers, mConfig.maxLength, mConfig.hiddenSizePerHead,
         mConfig.numHead);
     std::vector<KVCacheType> kvCache(totalKVSize, 0.0);
@@ -680,7 +685,7 @@ void Decoder::generate(std::vector<int32_t> const& inputIds, std::vector<int32_t
     bool const engineSupportDynamicShape = mConfig.minSupportedInputLength != mConfig.maxSupportedInputLength;
     int32_t const contextLenStride
         = engineSupportDynamicShape ? maxInputContextLength : mConfig.maxSupportedInputLength;
-    if (inputIds.size() != contextLenStride * mConfig.batchSize)
+    if (inputIds.size() != static_cast<size_t>(contextLenStride * mConfig.batchSize))
     {
         throw std::runtime_error("InputIds for generation are not padded correctly.");
     }
@@ -783,7 +788,8 @@ void Decoder::generateForContext(void* inputIds, std::vector<int32_t>& contextLe
     std::vector<int64_t> const& lastTokenIds, nvinfer1::Dims const inputDims)
 {
     // check input batch size
-    assert(contextLengths.size() == mConfig.batchSize && "Input batch size does not match engine batch size.");
+    assert(static_cast<int64_t>(contextLengths.size()) == mConfig.batchSize
+        && "Input batch size does not match engine batch size.");
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["context_lengths"], contextLengths.data(),
         mConfig.batchSize * sizeof(int32_t), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mDeviceBuffer["last_token_ids"], lastTokenIds.data(),
@@ -982,3 +988,6 @@ std::vector<std::string> Decoder::getLoraNames() const
     }
     return names;
 }
+
+} // namespace rt
+} // namespace drivellm

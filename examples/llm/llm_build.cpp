@@ -31,6 +31,7 @@
 #include <vector>
 
 using Json = nlohmann::json;
+using namespace drivellm;
 
 struct LLMBuildArgs
 {
@@ -56,8 +57,8 @@ public:
         : args(args)
         , contextProfile(contextProfile)
         , generationProfile(generationProfile)
-        , result(result)
         , network(network)
+        , result(result)
     {
 
         initializeModelDimensions();
@@ -407,9 +408,10 @@ private:
             result &= setOptimizationProfile(contextProfile, "attention_mask", createDims({minBatchSize, 1, 1}),
                 createDims({optBatchSize, 1, 1}), createDims({maxBatchSize, 1, 1}));
             result &= setOptimizationProfile(generationProfile, "attention_mask", createDims({minBatchSize, 1, 1}),
-                createDims(
-                    {optBatchSize, mMaxTokens / 2, divUp(mMaxTokens / 2, attnMaskAlignSize) * attnMaskAlignSize}),
-                createDims({maxBatchSize, mMaxTokens, divUp(mMaxTokens, attnMaskAlignSize) * attnMaskAlignSize}));
+                createDims({optBatchSize, mMaxTokens / 2,
+                    static_cast<int64_t>(divUp(mMaxTokens / 2, attnMaskAlignSize) * attnMaskAlignSize)}),
+                createDims({maxBatchSize, mMaxTokens,
+                    static_cast<int64_t>(divUp(mMaxTokens, attnMaskAlignSize) * attnMaskAlignSize)}));
             result &= setOptimizationProfile(contextProfile, "attention_pos_id", createDims({minBatchSize, 1}),
                 createDims({optBatchSize, 1}), createDims({maxBatchSize, 1}));
             result &= setOptimizationProfile(generationProfile, "attention_pos_id", createDims({minBatchSize, 1}),
@@ -676,7 +678,6 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    int32_t const nbInputs = network->getNbInputs();
     auto* contextProfile = builder->createOptimizationProfile();
     auto* generationProfile = builder->createOptimizationProfile();
 

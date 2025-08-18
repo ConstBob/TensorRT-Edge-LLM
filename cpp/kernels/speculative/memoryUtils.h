@@ -1,8 +1,25 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
 #pragma once
 
 #include <cassert>
 #include <cstdint>
 #include <cuda_runtime.h>
+
+namespace drivellm
+{
+namespace kernel
+{
 
 __device__ __forceinline__ int4 reduceMaxInt4(int4 a, int4 b)
 {
@@ -46,3 +63,5 @@ __inline__ __host__ __device__ T constexpr divUp(T m, T n)
 {
     return (m + n - 1) / n;
 }
+} // namespace kernel
+} // namespace drivellm

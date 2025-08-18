@@ -66,9 +66,9 @@ public:
     // Preprocess all inputs for multimodal runner and LLM runner
     virtual void preprocess(std::vector<std::string> const& inputStrings,
         std::vector<std::vector<ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-        std::vector<int32_t>& contextLengths, Tokenizer* tokenizer, int const maxSupportedInputLength,
-        bool enableDynamicShape, void* ropeRotaryCosSinDevice, int const maxPositionEmbeddings, int const rotaryDim,
-        cudaStream_t stream)
+        std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer,
+        int const maxSupportedInputLength, bool enableDynamicShape, void* ropeRotaryCosSinDevice,
+        int const maxPositionEmbeddings, int const rotaryDim, cudaStream_t stream)
         = 0;
 
     // Multimodal inference
@@ -78,8 +78,8 @@ public:
     virtual std::vector<EngineInputDesc> getComputedEmbeddings() = 0;
 
     // Initialize random inputs for benchmark purpose
-    virtual void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const textTokenLength,
-        int const imageTokenLength, int const inputLength, cudaStream_t stream)
+    virtual void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
+        int const inputLength, cudaStream_t stream)
         = 0;
 
     // Parse and fill config from config file and engine
@@ -106,7 +106,7 @@ protected:
     virtual void textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int32_t>& batchInputLengths, std::vector<std::string> const& inputStrings,
         std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths,
-        Tokenizer* tokenizer)
+        drivellm::tokenizer::Tokenizer* tokenizer)
         = 0;
 
     // Apply chat template to prompt and insert multimodal token placeholders

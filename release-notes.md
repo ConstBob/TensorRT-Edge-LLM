@@ -1,4 +1,21 @@
 # Release Notes
+## 0.2.0
+- Added formal CUDA13.0 support
+- Refactored SM120 and SM121 support
+- Unified `int32_t` for input_ids and `float` for logits
+- Replaced `jsmn` with `nlohmann/json` for better Json read/write support.
+- Improved Attention performance by passing `rope_rotary_cos_sin` as model inputs
+- Supported longrope
+- Refactored Multimodal Runners and added them into `cpp` folder
+- Improved runtime parsing from config files and folder structure
+- Added runtime `Tensor` class
+
+## 0.1.1
+- Added EAGLE support for Qwen2.5-VL
+- Added model support for DeepSeek-Distilled Qwen, InternVL3-1B
+- Improved Sampler API
+- Improved EAGLE pipeline
+
 ## 0.1.0
 - Initial bring up of EAGLE2 & EAGLE3 with tree attention kernels
 - Initial bring up of static and dynamic LoRA

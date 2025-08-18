@@ -1,3 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
 #include "eagleUtilKernels.h"
 
 #include "common/common.h"
@@ -8,6 +20,11 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+
+namespace drivellm
+{
+namespace kernel
+{
 
 __inline__ __device__ int32_t packMaskBits(bool* mask, int32_t startIdx, int32_t maxLength)
 {
@@ -130,7 +147,6 @@ __global__ void acceptDraftTokensByIdsWithPaths(int32_t* outputIds, int32_t* inp
 
         auto const acceptedLength = totalShared.x;
         auto const bestPathIdx = totalShared.y;
-        auto const bestNextIdx = numTokensPerStep == 1 ? 0 : totalShared.w;
         auto const pathOffset = batchIdx * maxDecodingTokens * (maxPathLen + 1) + bestPathIdx * (maxPathLen + 1);
 
         for (auto ti = static_cast<int32_t>(threadIdx.x); ti < acceptedLength + 1;
@@ -936,3 +952,6 @@ void dispatchGetLastLogitsOffset(GetLastLogitsOffsetParams const& params, EagleC
         params.bestPathIds, params.acceptedLengths, commonParams.batchSize, commonParams.maxPathLen,
         commonParams.maxDecodingTokens);
 }
+
+} // namespace kernel
+} // namespace drivellm

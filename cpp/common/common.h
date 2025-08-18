@@ -29,6 +29,9 @@
 
 #include <cuda.h>
 
+namespace drivellm
+{
+
 inline void check(bool condition, std::string errorMsg)
 {
     if (!condition)
@@ -152,11 +155,9 @@ public:
 
     MmapReader(std::filesystem::path const& fp)
     {
-        bool status = loadFile(fp);
-        if (!status)
+        if (!loadFile(fp))
         {
-            mData = nullptr;
-            mBytes = 0;
+            throw std::runtime_error("Failed to load file in MmapReader constructor");
         }
     }
 
@@ -178,7 +179,7 @@ public:
         }
     }
 
-    bool loadFile(std::filesystem::path const& fp) noexcept
+    bool loadFile(std::filesystem::path const& fp)
     {
         // Release any existing memory
         release();
@@ -187,30 +188,34 @@ public:
         int fd = open(filePath.c_str(), O_RDONLY);
         if (fd <= 0)
         {
-            throw std::runtime_error(fmtstr("MmapReader: Cannot open file: %s", filePath.c_str()));
+            std::string errorMsg = fmtstr("MmapReader: Cannot open file: %s", filePath.c_str());
+            std::cerr << errorMsg << std::endl;
+            return false;
         }
-        try
-        {
-            struct stat status;
-            if (fstat(fd, &status) != 0)
-            {
-                throw std::runtime_error(fmtstr("MmapReader: fstat failed for file: %s", filePath.c_str()));
-            }
-            mBytes = status.st_size;
-            if (mBytes == 0)
-            {
-                throw std::runtime_error(fmtstr("MmapReader: File %s is empty.", filePath.c_str()));
-            }
-            mData = mmap(nullptr, mBytes, PROT_READ, MAP_SHARED, fd, 0);
-            if (mData == MAP_FAILED)
-            {
-                mData = nullptr;
-                throw std::runtime_error(fmtstr("MmapReader: mmap failed for file: %s", filePath.c_str()));
-            }
-        }
-        catch (...)
+
+        struct stat status;
+        if (fstat(fd, &status) != 0)
         {
             close(fd);
+            std::string errorMsg = fmtstr("MmapReader: fstat failed for file: %s", filePath.c_str());
+            std::cerr << errorMsg << std::endl;
+            return false;
+        }
+        mBytes = status.st_size;
+        if (mBytes == 0)
+        {
+            close(fd);
+            std::string errorMsg = fmtstr("MmapReader: File %s is empty.", filePath.c_str());
+            std::cerr << errorMsg << std::endl;
+            return false;
+        }
+        mData = mmap(nullptr, mBytes, PROT_READ, MAP_SHARED, fd, 0);
+        if (mData == MAP_FAILED)
+        {
+            mData = nullptr;
+            close(fd);
+            std::string errorMsg = fmtstr("MmapReader: mmap failed for file: %s", filePath.c_str());
+            std::cerr << errorMsg << std::endl;
             return false;
         }
         close(fd);
@@ -236,3 +241,5 @@ private:
     void* mData;
     size_t mBytes;
 };
+
+} // namespace drivellm
