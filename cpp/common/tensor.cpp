@@ -76,6 +76,47 @@ std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape)
 }
 } // namespace
 
+int64_t Coords::volume() const
+{
+    if (mNumDims == 0)
+    {
+        return 0;
+    }
+    int64_t vol = 1;
+    for (int32_t i = 0; i < mNumDims; ++i)
+    {
+        vol *= mDims[i];
+    }
+    return vol;
+}
+
+nvinfer1::Dims Coords::getTRTDims() const
+{
+    nvinfer1::Dims dims;
+    dims.nbDims = mNumDims;
+    for (int32_t i = 0; i < mNumDims; ++i)
+    {
+        dims.d[i] = mDims[i];
+    }
+    return dims;
+}
+
+std::string Coords::formatString() const
+{
+    std::stringstream ss;
+    ss << "[";
+    for (int32_t i = 0; i < mNumDims; ++i)
+    {
+        ss << mDims[i];
+        if (i < mNumDims - 1)
+        {
+            ss << ", ";
+        }
+    }
+    ss << "]";
+    return ss.str();
+}
+
 Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType)
 {
     if (shape.volume() == 0)
@@ -123,18 +164,7 @@ Tensor::Tensor(void* data, Coords const& shape, DeviceType deviceType, nvinfer1:
 
 Tensor::~Tensor()
 {
-    if (ownMemory)
-    {
-        if (mDeviceType == DeviceType::kCPU)
-        {
-            free(data);
-        }
-        else
-        {
-            CUDA_CHECK(cudaFree(data));
-        }
-        data = nullptr;
-    }
+    releaseResource();
 }
 
 Tensor::Tensor(Tensor&& other) noexcept
@@ -154,13 +184,14 @@ Tensor::Tensor(Tensor&& other) noexcept
     other.mDeviceType = DeviceType::kCPU;
     other.mDataType = DataType::kFLOAT;
     other.ownMemory = false;
+    other.memoryCapacity = 0;
 }
 
 Tensor& Tensor::operator=(Tensor&& other) noexcept
 {
     if (this != &other)
     {
-        this->~Tensor();
+        releaseResource();
         this->data = other.data;
         this->mShape = other.mShape;
         this->mStrides = other.mStrides;
@@ -173,9 +204,10 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept
         other.data = nullptr;
         other.mShape = {};
         other.mStrides = {};
-        other.mDeviceType = DeviceType::kCPU;
-        other.mDataType = DataType::kFLOAT;
+        other.mDeviceType = {};
+        other.mDataType = {};
         other.ownMemory = false;
+        other.memoryCapacity = 0;
     }
     return *this;
 }
@@ -250,6 +282,28 @@ bool Tensor::reshape(Coords shape) noexcept
     mShape = shape;
     mStrides = computeStrides(shape);
     return true;
+}
+
+void Tensor::releaseResource()
+{
+    if (ownMemory)
+    {
+        if (mDeviceType == DeviceType::kCPU)
+        {
+            free(data);
+        }
+        else
+        {
+            CUDA_CHECK(cudaFree(data));
+        }
+    }
+    data = nullptr;
+    ownMemory = false;
+    memoryCapacity = 0;
+    mShape = Coords{};
+    mStrides = std::array<int64_t, kMAX_DIMS>{};
+    mDeviceType = {};
+    mDataType = {};
 }
 
 } // namespace rt
