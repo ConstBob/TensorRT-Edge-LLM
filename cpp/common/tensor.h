@@ -52,7 +52,8 @@ struct is_arithmetic_ext<__nv_bfloat16> : std::true_type
 };
 
 //! Array of dimensions that used to store the shape of a tensor.
-//! All dimensions shall be non-negative.
+//! Support up to 8 dimensions with all dimensions are non-negative.
+//! Default constructor create empty coords with 0 dimensions and 0 volumes.
 class Coords
 {
 public:
@@ -116,30 +117,11 @@ public:
         return mDims[idx];
     }
 
-    int64_t volume() const
-    {
-        if (mNumDims == 0)
-        {
-            return 0;
-        }
-        int64_t vol = 1;
-        for (int32_t i = 0; i < mNumDims; ++i)
-        {
-            vol *= mDims[i];
-        }
-        return vol;
-    }
+    int64_t volume() const;
 
-    nvinfer1::Dims getTRTDims() const
-    {
-        nvinfer1::Dims dims;
-        dims.nbDims = mNumDims;
-        for (int32_t i = 0; i < mNumDims; ++i)
-        {
-            dims.d[i] = mDims[i];
-        }
-        return dims;
-    }
+    nvinfer1::Dims getTRTDims() const;
+
+    std::string formatString() const;
 
 private:
     std::array<int64_t, kMAX_DIMS> mDims{};
@@ -149,6 +131,7 @@ private:
 //! Tensor class that wrap linear layout tensor.
 //! The underlying memory can either be owned by the tensor object or be reused from another allocation.
 //! The Tensor Object support reshapes when memory is owned by the object and has sufficient capacity.
+//! The default constructor creates an empty tensor object with zero volume with no underlying memory.
 class Tensor
 {
 public:
@@ -156,6 +139,7 @@ public:
 
     //! Disable copy constructor and assignment operator explicitly to enforce explicit
     //! memory ownership transfer.
+    //! Non-owned tensor object can be constructed explicitly to workaround the limitation of deleted copy constructor.
     Tensor(Tensor const& other) = delete;
     Tensor& operator=(Tensor const& other) = delete;
 
@@ -182,6 +166,9 @@ public:
     nvinfer1::DataType getDataType() const noexcept;
     nvinfer1::Dims getTRTDims() const noexcept;
     bool getOwnMemory() const noexcept;
+
+    //! Return the memory capacity of the underlying buffer when the instance is constructed.
+    //! The value can be different from getShape().volume() * sizeof(dataType) when the tensor is reshaped.
     int64_t getMemoryCapacity() const noexcept;
 
     //! Get stride of the tensor.
@@ -219,15 +206,18 @@ public:
     [[nodiscard]] bool reshape(Coords extent) noexcept;
 
 private:
-    Coords mShape;
-    std::array<int64_t, kMAX_DIMS> mStrides;
-    DeviceType mDeviceType;
-    nvinfer1::DataType mDataType;
-    void* data{nullptr};
-    bool ownMemory{false};
+    Coords mShape{};
+    std::array<int64_t, kMAX_DIMS> mStrides{};
+    DeviceType mDeviceType{};
+    nvinfer1::DataType mDataType{};
+    void* data{};
+    bool ownMemory{};
 
     // Determined once the tensor is constructed.
-    int64_t memoryCapacity{0};
+    int64_t memoryCapacity{};
+
+    //! Release the owned memory of tensor and set the tensor object to "empty" state.
+    void releaseResource();
 };
 
 } // namespace rt
