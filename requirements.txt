@@ -1,0 +1,6 @@
+torch~=2.8.0
+transformers~=4.55.2
+nvidia-modelopt
+datasets
+tqdm
+numpy

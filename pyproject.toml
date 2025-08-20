@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensorrt-edgellm"
+version = "0.2.0"
+description = "A Python package for quantizing and exporting LLMs for edge deployment"
+readme = "tensorrt_edgellm/README.md"
+authors = [
+    {name = "NVIDIA", email = "TBD@nvidia.com"}
+]
+maintainers = [
+    {name = "NVIDIA", email = "TBD@nvidia.com"}
+]
+keywords = ["TBD"]
+classifiers = [
+    "TBD"
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch~=2.8.0",
+    "transformers~=4.55.2",
+    "nvidia-modelopt",
+    "datasets",
+    "tqdm",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+]
+
+[project.scripts]
+tensorrt-edgellm-quantize = "tensorrt_edgellm.scripts.quantize_llm:main"
+
+# Version is now managed by tensorrt_edgellm._version module
+# Remove setuptools_scm configuration since we use custom versioning
+
+[tool.setuptools]
+packages = ["tensorrt_edgellm"]
+
+[tool.setuptools.package-data]
+tensorrt_edgellm = ["README.md"]

@@ -13,3 +13,5 @@ data.tar
 *.tar.gz
 internal/
 *.log
+*.egg-info
+.DS_Store/
