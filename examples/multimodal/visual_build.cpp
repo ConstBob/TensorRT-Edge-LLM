@@ -114,46 +114,56 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
     return true;
 }
 
-std::string generateViTTRTExecCommand(ViTBuildArgs const& args, std::string const& modelType, int64_t const& patchSize,
-    int64_t const& ropeEmbdSize, int64_t const& minHW, int64_t const& optHW, int64_t const& maxHW)
+std::string generateQwenViTProfileStr(int64_t const& minHW, int64_t const& optHW, int64_t const& maxHW,
+    int64_t const& inputDim, int64_t const& ropeEmbdSize, std::string const& modelType)
 {
-    std::string onnxPath = args.onnxDir + "/model.onnx";
-    std::string enginePath = args.engineDir + "/visual.engine";
-    std::string trtExecCommand
-        = fmtstr("Equivalent ViT trtexec command: trtexec --onnx=%s --saveEngine=%s --stronglyTyped --verbose ",
-            onnxPath.c_str(), enginePath.c_str());
-
+    std::string profileStr;
     if (modelType == "qwen2_vl")
     {
-        trtExecCommand += fmtstr(
+        profileStr += fmtstr(
             "--minShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld "
             "--optShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld "
             "--maxShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld ",
-            minHW, patchSize, minHW, ropeEmbdSize, minHW, minHW, optHW, patchSize, optHW, ropeEmbdSize, optHW, optHW,
-            maxHW, patchSize, maxHW, ropeEmbdSize, maxHW, maxHW);
+            minHW, inputDim, minHW, ropeEmbdSize, minHW, minHW, optHW, inputDim, optHW, ropeEmbdSize, optHW, optHW,
+            maxHW, inputDim, maxHW, ropeEmbdSize, maxHW, maxHW);
     }
     else if (modelType == "qwen2_5_vl")
     {
-        trtExecCommand += fmtstr(
+        profileStr += fmtstr(
             "--minShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld,window_attention_mask:1x%ldx%ld,"
             "window_index:%ld,reverse_window_index:%ld "
             "--optShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld,window_attention_mask:1x%ldx%ld,"
             "window_index:%ld,reverse_window_index:%ld "
             "--maxShapes=input:%ldx%ld,rotary_pos_emb:%ldx%ld,attention_mask:1x%ldx%ld,window_attention_mask:1x%ldx%ld,"
             "window_index:%ld,reverse_window_index:%ld ",
-            minHW, patchSize, minHW, ropeEmbdSize, minHW, minHW, minHW, minHW, minHW / 4, minHW / 4, optHW, patchSize,
-            optHW, ropeEmbdSize, optHW, optHW, optHW, optHW, optHW / 4, optHW / 4, maxHW, patchSize, maxHW,
-            ropeEmbdSize, maxHW, maxHW, maxHW, maxHW, maxHW / 4, maxHW / 4);
-    }
-    else if (modelType == "internvl")
-    {
-        trtExecCommand += fmtstr(
-            "--minShapes=input:%ldx%ld "
-            "--optShapes=input:%ldx%ld "
-            "--maxShapes=input:%ldx%ld ",
-            minHW, patchSize, optHW, patchSize, maxHW, patchSize);
+            minHW, inputDim, minHW, ropeEmbdSize, minHW, minHW, minHW, minHW, minHW / 4, minHW / 4, optHW, inputDim,
+            optHW, ropeEmbdSize, optHW, optHW, optHW, optHW, optHW / 4, optHW / 4, maxHW, inputDim, maxHW, ropeEmbdSize,
+            maxHW, maxHW, maxHW, maxHW, maxHW / 4, maxHW / 4);
     }
 
+    return profileStr;
+}
+
+std::string generateInternViTProfileStr(int64_t const& minNumBlocks, int64_t const& optNumBlocks,
+    int64_t const& maxNumBlocks, int64_t const& numChannels, int64_t const& imageSizeH, int64_t const& imageSizeW)
+{
+    std::string profileStr;
+    profileStr += fmtstr(
+        "--minShapes=input:%ldx%ldx%ldx%ld "
+        "--optShapes=input:%ldx%ldx%ldx%ld "
+        "--maxShapes=input:%ldx%ldx%ldx%ld ",
+        minNumBlocks, numChannels, imageSizeH, imageSizeW, optNumBlocks, numChannels, imageSizeH, imageSizeW,
+        maxNumBlocks, numChannels, imageSizeH, imageSizeW);
+    return profileStr;
+}
+
+std::string generateViTTRTExecCommand(ViTBuildArgs const& args, std::string const& profileStr)
+{
+    std::string onnxPath = args.onnxDir + "/model.onnx";
+    std::string enginePath = args.engineDir + "/visual.engine";
+    std::string trtExecCommand
+        = fmtstr("Equivalent ViT trtexec command: trtexec --onnx=%s --saveEngine=%s --stronglyTyped --verbose %s",
+            onnxPath.c_str(), enginePath.c_str(), profileStr.c_str());
     return trtExecCommand;
 }
 
@@ -186,38 +196,13 @@ int buildViT(ViTBuildArgs const& args)
         return EXIT_FAILURE;
     }
 
-    // TODO: Unify the model_type at runtime and here.
-    std::string modelType = jsonConfig["vision_config"]["model_type"].get<std::string>();
-
     // Validate model type
+    std::string modelType = jsonConfig["vision_config"]["model_type"].get<std::string>();
     if (modelType != "qwen2_vl" && modelType != "qwen2_5_vl" && modelType != "internvl_vision")
     {
         LOG_ERROR("Currently only Qwen2-VL, Qwen2.5-VL and InternVL are supported for VLM. You provided: %s",
             modelType.c_str());
         return EXIT_FAILURE;
-    }
-
-    int64_t minHW, optHW, maxHW;
-    if (args.dynamicShape)
-    {
-        // In Qwen2-VL, HW is always 4ximageTokens because it equals to spatial_merge_size ** 2.
-        minHW = args.vlmBuildParams.minImageTokens * 4;
-        maxHW = args.vlmBuildParams.maxImageTokens * 4;
-        // InternVL ViT model has a reshape which requires HW to be divisible by 1024
-        if (modelType == "internvl_vision")
-        {
-            optHW = (minHW / 1024 + maxHW / 1024) / 2 * 1024;
-        }
-        else
-        {
-            optHW = (minHW + maxHW) / 2;
-        }
-    }
-    else
-    {
-        minHW = args.vlmBuildParams.imageTokens * 4;
-        optHW = minHW;
-        maxHW = minHW;
     }
 
     // Create the builder
@@ -253,7 +238,7 @@ int buildViT(ViTBuildArgs const& args)
         return EXIT_FAILURE;
     }
 
-    // Add optimization profile
+    // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config)
     {
@@ -261,58 +246,112 @@ int buildViT(ViTBuildArgs const& args)
         return EXIT_FAILURE;
     }
 
-    int32_t const nbInputs = network->getNbInputs();
+    // Set optimization profile
     auto* visualProfile = builder->createOptimizationProfile();
-    // TODO: add support to read ropeEmbdSize and patchSize from config file
-    // Currently the definition is different from the config, so we need to infer it from the ONNX model.
-    int64_t patchSize = 0;
-    int64_t ropeEmbdSize = 0;
-    for (int32_t i = 0; i < nbInputs; ++i)
-    {
-        if (strcmp(network->getInput(i)->getName(), "input") == 0)
-        {
-            patchSize = network->getInput(i)->getDimensions().d[1];
-        }
-        else if (strcmp(network->getInput(i)->getName(), "rotary_pos_emb") == 0)
-        {
-            ropeEmbdSize = network->getInput(i)->getDimensions().d[1];
-        }
-    }
-
-    if ((patchSize == 0))
-    {
-        LOG_ERROR("Cannot infer patchSize. Do you have proper ONNX input: input?");
-        return EXIT_FAILURE;
-    }
-
-    if ((modelType == "qwen2_5_vl" || modelType == "qwen2_vl") && (ropeEmbdSize == 0))
-    {
-        LOG_ERROR("Cannot infer ropeEmbdSize. Do you have proper ONNX input: rotary_pos_emb?");
-        return EXIT_FAILURE;
-    }
-
-    // set dimensions for input tensors. Only context phase input can possibly be dynamic
     bool result = true;
-
-    result &= setOptimizationProfile(visualProfile, "input", createDims({minHW, patchSize}),
-        createDims({optHW, patchSize}), createDims({maxHW, patchSize}));
+    std::string profileStr;
 
     if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
     {
+        int64_t minHW, optHW, maxHW;
+        if (args.dynamicShape)
+        {
+            // In Qwen2-VL, HW is always 4ximageTokens because it equals to spatial_merge_size ** 2.
+            minHW = args.vlmBuildParams.minImageTokens * 4;
+            maxHW = args.vlmBuildParams.maxImageTokens * 4;
+            optHW = (minHW + maxHW) / 2;
+        }
+        else
+        {
+            minHW = args.vlmBuildParams.imageTokens * 4;
+            optHW = minHW;
+            maxHW = minHW;
+        }
+
+        // Currently the definition is different from the config, so we need to infer it from the ONNX model.
+        int32_t const nbInputs = network->getNbInputs();
+        int64_t inputDim = 0;
+        int64_t ropeEmbdSize = 0;
+        for (int32_t i = 0; i < nbInputs; ++i)
+        {
+            if (strcmp(network->getInput(i)->getName(), "input") == 0)
+            {
+                inputDim = network->getInput(i)->getDimensions().d[1];
+            }
+            else if (strcmp(network->getInput(i)->getName(), "rotary_pos_emb") == 0)
+            {
+                ropeEmbdSize = network->getInput(i)->getDimensions().d[1];
+            }
+        }
+
+        if (inputDim == 0)
+        {
+            LOG_ERROR("Cannot infer inputDim. Do you have proper ONNX input: input?");
+            return EXIT_FAILURE;
+        }
+
+        if (ropeEmbdSize == 0)
+        {
+            LOG_ERROR("Cannot infer ropeEmbdSize. Do you have proper ONNX input: rotary_pos_emb?");
+            return EXIT_FAILURE;
+        }
+
+        result &= setOptimizationProfile(visualProfile, "input", createDims({minHW, inputDim}),
+            createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
         result &= setOptimizationProfile(visualProfile, "rotary_pos_emb", createDims({minHW, ropeEmbdSize}),
             createDims({optHW, ropeEmbdSize}), createDims({maxHW, ropeEmbdSize}));
         result &= setOptimizationProfile(visualProfile, "attention_mask", createDims({1, minHW, minHW}),
             createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
-    }
 
-    if (modelType == "qwen2_5_vl")
+        if (modelType == "qwen2_5_vl")
+        {
+            result &= setOptimizationProfile(visualProfile, "window_attention_mask", createDims({1, minHW, minHW}),
+                createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
+            result &= setOptimizationProfile(visualProfile, "window_index", createDims({minHW / 4}),
+                createDims({optHW / 4}), createDims({maxHW / 4}));
+            result &= setOptimizationProfile(visualProfile, "reverse_window_index", createDims({minHW / 4}),
+                createDims({optHW / 4}), createDims({maxHW / 4}));
+        }
+
+        profileStr = generateQwenViTProfileStr(minHW, optHW, maxHW, inputDim, ropeEmbdSize, modelType);
+    }
+    else if (modelType == "internvl_vision")
     {
-        result &= setOptimizationProfile(visualProfile, "window_attention_mask", createDims({1, minHW, minHW}),
-            createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
-        result &= setOptimizationProfile(
-            visualProfile, "window_index", createDims({minHW / 4}), createDims({optHW / 4}), createDims({maxHW / 4}));
-        result &= setOptimizationProfile(visualProfile, "reverse_window_index", createDims({minHW / 4}),
-            createDims({optHW / 4}), createDims({maxHW / 4}));
+        int64_t minNumBlocks, optNumBlocks, maxNumBlocks;
+        if (args.dynamicShape)
+        {
+            if (args.vlmBuildParams.minImageTokens % 256 != 0 || args.vlmBuildParams.maxImageTokens % 256 != 0)
+            {
+                LOG_ERROR("minImageTokens and maxImageTokens must be divisible by 256 for InternVL ViT model.");
+                return EXIT_FAILURE;
+            }
+            minNumBlocks = args.vlmBuildParams.minImageTokens / 256;
+            maxNumBlocks = args.vlmBuildParams.maxImageTokens / 256;
+            optNumBlocks = (minNumBlocks + maxNumBlocks) / 2;
+        }
+        else
+        {
+            if (args.vlmBuildParams.imageTokens % 256 != 0)
+            {
+                LOG_ERROR("imageTokens must be divisible by 256 for InternVL ViT model.");
+                return EXIT_FAILURE;
+            }
+            minNumBlocks = args.vlmBuildParams.imageTokens / 256;
+            optNumBlocks = minNumBlocks;
+            maxNumBlocks = minNumBlocks;
+        }
+
+        int64_t numChannels = jsonConfig["vision_config"]["num_channels"].get<int64_t>();
+        int64_t imageSizeH = jsonConfig["vision_config"]["image_size"][0].get<int64_t>();
+        int64_t imageSizeW = jsonConfig["vision_config"]["image_size"][1].get<int64_t>();
+
+        result &= setOptimizationProfile(visualProfile, "input",
+            createDims({minNumBlocks, numChannels, imageSizeH, imageSizeW}),
+            createDims({optNumBlocks, numChannels, imageSizeH, imageSizeW}),
+            createDims({maxNumBlocks, numChannels, imageSizeH, imageSizeW}));
+
+        profileStr = generateInternViTProfileStr(
+            minNumBlocks, optNumBlocks, maxNumBlocks, numChannels, imageSizeH, imageSizeW);
     }
 
     if (!result)
@@ -322,8 +361,9 @@ int buildViT(ViTBuildArgs const& args)
     }
 
     config->addOptimizationProfile(visualProfile);
-    auto engine = builder->buildSerializedNetwork(*network, *config);
 
+    // Build the engine
+    auto engine = builder->buildSerializedNetwork(*network, *config);
     if (!engine)
     {
         LOG_ERROR("Failed to build engine.");
@@ -371,7 +411,7 @@ int buildViT(ViTBuildArgs const& args)
         LOG_WARNING("Failed to copy config.json to %s", targetConfigPath.c_str());
     }
 
-    LOG_INFO(generateViTTRTExecCommand(args, modelType, patchSize, ropeEmbdSize, minHW, optHW, maxHW).c_str());
+    LOG_INFO(generateViTTRTExecCommand(args, profileStr).c_str());
     return EXIT_SUCCESS;
 }
 
