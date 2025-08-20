@@ -32,10 +32,10 @@ public:
 
     // The function will setup kernel parameters except device pointers.
     // Device pointers shall be set by caller of FMHA runner.
-    void setupParams(Fused_multihead_attention_params_v2& params);
+    void setupParams(FusedMultiheadAttentionParamsV2& params);
 
     // Dispatch FMHA kernel.
-    void dispatchFMHAKernel(Fused_multihead_attention_params_v2& params, cudaStream_t const& stream);
+    void dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream);
 
     // Static methods to check kernel availability and load cubins into device.
     static bool canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType);
@@ -50,7 +50,7 @@ private:
     int32_t mHeadSize;
 
     int32_t mSmVersion;
-    Launch_params mLaunchParams;
+    LaunchParams mLaunchParams;
 };
 
 } // namespace drivellm
