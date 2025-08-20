@@ -9,7 +9,6 @@
 # its affiliates is strictly prohibited.
 
 import os
-import time
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -134,11 +133,7 @@ def _quantize_model(model, quant_config, calib_dataloader=None):
                 data = data.to(model.device)
                 model(data)
 
-    print("Starting quantization...")
-    start_time = time.time()
     mtq.quantize(model, quant_config, forward_loop=calibrate_loop)
-    end_time = time.time()
-    print(f"Quantization finishes in {end_time - start_time}s.")
 
     return model
 
