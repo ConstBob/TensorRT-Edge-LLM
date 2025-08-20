@@ -14,6 +14,7 @@
 #include "common/common.h"
 #include "common/cudaUtils.h"
 
+#include "kernels/contextAttentionKernels/calCuSeqLen.h"
 #include "kernels/contextAttentionKernels/contextFMHARunner.h"
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
@@ -401,13 +402,17 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         // Prepare FMHA_v2 params to launch FMHA kernel
         auto fmhaRunner = ContextFMHARunner(
             mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mSMVersion);
-        Fused_multihead_attention_params_v2 params{};
-        params.clear();
+        FusedMultiheadAttentionParamsV2 params{};
+        memset(&params, 0, sizeof(params));
         fmhaRunner.setupParams(params);
 
         // Set device ptr for FMHA kernel.
         params.qkv_ptr = qkvDevicePtr;
-        params.cu_q_seqlens = seqLengthDevicePtr;
+        int32_t* cuSeqLensDevice = nullptr;
+        CUDA_CHECK(cudaMalloc(&cuSeqLensDevice, (runtimeBatchSize + 1) * sizeof(int32_t)));
+        drivellm::kernel::calCuSeqLens(seqLengthDevicePtr, cuSeqLensDevice, runtimeBatchSize, stream);
+        params.cu_q_seqlens = cuSeqLensDevice;
+        params.cu_kv_seqlens = cuSeqLensDevice;
         params.o_ptr = attentionResultDevicePtr;
 
         // Dispatch FMHA kernel

@@ -94,7 +94,7 @@ int32_t attentionMaskTypeToInt(ContextAttentionMaskType type)
     {
     case ContextAttentionMaskType::PADDING: result = 0; break;
     case ContextAttentionMaskType::CAUSAL: result = 1; break;
-    case ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL: result = 2; break;
+    case ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL: result = 2; break;
     }
     return result;
 }
@@ -187,7 +187,8 @@ public:
         for (int32_t i = 0; i < mKernelMetaCount; ++i)
         {
             auto const& kernelMeta = mKernelMeta[i];
-            if (kernelMeta.mDataType != mDataType || kernelMeta.mSM != mSMVersion || kernelMeta.mCubin == nullptr)
+            if (kernelMeta.mDataTypeIn != mDataType || kernelMeta.mDataTypeOut != mDataType
+                || kernelMeta.mSM != mSMVersion || kernelMeta.mCubin == nullptr)
             {
                 continue;
             }
@@ -217,7 +218,7 @@ public:
                 CUDA_DRIVER_CHECK(cuFuncSetAttribute(funcInfo.mDeviceFunction,
                     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funcInfo.mSharedMemBytes));
             }
-            FMHAKernelHashKey hashKey{kernelMeta.mDataType, static_cast<int32_t>(kernelMeta.mS),
+            FMHAKernelHashKey hashKey{kernelMeta.mDataTypeIn, static_cast<int32_t>(kernelMeta.mS),
                 static_cast<int32_t>(kernelMeta.mD), kernelMeta.mUnrollStep != 0, kernelMeta.mFP32Accumulation,
                 kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType, kernelMeta.mTiled};
             mFunctions.insert(std::make_pair(hashKey, funcInfo));
@@ -302,11 +303,15 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     , mHeadSize(headSize)
     , mSmVersion(smVersion)
 {
-    mLaunchParams.set_default_kernel_selection_params();
-    mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
-
     // The context FMHA-v2 kernels taken by the project only support ampere/ada for
     // reference on x86 machine, Orin/Thor for production on auto platforms.
+    cudaDeviceProp props;
+    CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
+    mLaunchParams.multi_processor_count = props.multiProcessorCount;
+    mLaunchParams.device_l2_cache_size = props.l2CacheSize;
+    // Only causal attention kernel get integrated and used now.
+    mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
+
     bool const isSm8x = (smVersion == fmha_v2::kSM_80 || smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87
         || smVersion == fmha_v2::kSM_89);
     bool const isSm101 = (smVersion == fmha_v2::kSM_101);
@@ -318,7 +323,6 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
         // always use flash attention kernels for Ampere/Ada
         mLaunchParams.flash_attention = true;
         // flash attention kernles s = 0 (support any seq length)
-        mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
 
         if (mPaddedSequenceLen <= 64 || mHeadSize < 256)
@@ -327,17 +331,17 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
             // in unroll dimension tile size (K). for short sequence length (s<=128), tiled kernels
             // can suffer from tile quantization loss.
             // Also flash attention tiled kernel is generally faster when head_size>=256
-            mLaunchParams.granular_tiling = false;
+            mLaunchParams.use_granular_tiling = false;
         }
         else
         {
             // otherwise, choose tiled FMHA-v2 flash-attention kernel.
-            mLaunchParams.granular_tiling = true;
+            mLaunchParams.use_granular_tiling = true;
         }
     }
 }
 
-void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
+void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
 {
     float const invSqrtScale = (1.f / sqrtf(mHeadSize));
 
@@ -356,9 +360,14 @@ void ContextFMHARunner::setupParams(Fused_multihead_attention_params_v2& params)
     params.h_q_per_kv = mNumHeads / mNumKVHeads;
     params.s = mPaddedSequenceLen; // max sequence length of a batch of input queries.
     params.d = mHeadSize;
+    params.dv = mHeadSize;
+    params.is_s_padded = true;
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
-    params.qkv_stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
+    int64_t stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
+    params.q_stride_in_bytes = stride_in_bytes;
+    params.k_stride_in_bytes = stride_in_bytes;
+    params.v_stride_in_bytes = stride_in_bytes;
 }
 
 bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType)
@@ -375,13 +384,13 @@ bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::Data
     return fmhaKernelList != nullptr;
 }
 
-void ContextFMHARunner::dispatchFMHAKernel(Fused_multihead_attention_params_v2& params, cudaStream_t const& stream)
+void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream)
 {
     check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr,
         "Device pointers are supposed to be valid");
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
-        attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.granular_tiling};
+        attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling};
     FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
     FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
     check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
