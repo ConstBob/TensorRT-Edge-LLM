@@ -23,6 +23,8 @@ from peft import PeftConfig, PeftModel, load_peft_weights
 from torch import Tensor
 from torch.nn import Embedding
 from transformers import DynamicCache
+from transformers.models.internvl.modeling_internvl import \
+    InternVLVisionAttention
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     VisionAttention, apply_rotary_pos_emb_vision)
 
@@ -585,3 +587,97 @@ class QuantQwenVisionAttention(QwenVisionAttention):
 
 mtq.register(original_cls=QwenVisionAttention,
              quantized_cls=QuantQwenVisionAttention)
+
+
+class QuantInternVLVisionAttention(InternVLVisionAttention):
+    """
+    Quantized MHA version of QwenVisionAttention.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._setup()
+
+    def _setup(self):
+        self.q_bmm_quantizer = TensorQuantizer()
+        self.k_bmm_quantizer = TensorQuantizer()
+        self.v_bmm_quantizer = TensorQuantizer()
+        self.softmax_quantizer = TensorQuantizer()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+
+        query_states = query_states.reshape(batch_size, seq_len,
+                                            self.num_heads,
+                                            self.head_dim).transpose(1, 2)
+        key_states = key_states.reshape(batch_size, seq_len, self.num_heads,
+                                        self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, self.num_heads,
+                                         self.head_dim).transpose(1, 2)
+
+        attn_output, attn_weights = self.quant_eager_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scale,
+            is_causal=False,
+            **kwargs,
+        )
+        attn_output = attn_output.reshape(batch_size, seq_len, self.embed_dim)
+
+        output = self.projection_layer(attn_output)
+        output = self.projection_dropout(output)
+
+        outputs = (output, attn_weights) if output_attentions else (output,
+                                                                    None)
+        return outputs
+
+    def quant_eager_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        query = self.q_bmm_quantizer(query)
+        key = self.k_bmm_quantizer(key)
+
+        attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, :key.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        # No upcasting of the attention weights to float32 in this implementation
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = torch.nn.functional.dropout(attn_weights,
+                                                   p=dropout,
+                                                   training=self.training)
+
+        attn_weights = self.softmax_quantizer(attn_weights)
+        value = self.v_bmm_quantizer(value)
+        attn_output = torch.matmul(attn_weights, value)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        return attn_output, attn_weights
+
+
+mtq.register(original_cls=InternVLVisionAttention,
+             quantized_cls=QuantInternVLVisionAttention)

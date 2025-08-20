@@ -352,40 +352,21 @@ def export_internvl3_visual(hf_model, output_dir, dtype, torch_dir):
 
         def __init__(self, hf_model):
             super().__init__()
-            self.channels = hf_model.config.vision_config.num_channels
-            self.image_size = hf_model.config.vision_config.image_size
-            self.vision_tower = hf_model.model.vision_tower
-            self.multi_modal_projector = hf_model.model.multi_modal_projector
-            self.downsample_ratio = hf_model.config.downsample_ratio
-            self.pixel_shuffle = hf_model.model.pixel_shuffle
+            self.model = hf_model.model
+            self.vision_feature_layer = hf_model.config.vision_feature_layer
+            self.vision_feature_select_strategy = hf_model.config.vision_feature_select_strategy
             self.device = hf_model.device
             self.dtype = hf_model.dtype
 
         def forward(self, pixel_values):
-            pixel_values = pixel_values.reshape(-1, self.channels,
-                                                self.image_size[0],
-                                                self.image_size[1])
-            vision_features = self.vision_tower(pixel_values).last_hidden_state
-            vision_features = vision_features[:, 1:, :]
-            channels = vision_features.shape[1]
-            feature_size = int(channels**0.5)
-            batch_size = vision_features.shape[0]
-
-            # Reshape tensor to spatial dimensions
-            vision_features = vision_features.reshape(batch_size, feature_size,
-                                                      feature_size, -1)
-
-            # Apply downsampling using pixel shuffle
-            vision_features = self.pixel_shuffle(
-                vision_features, scale_factor=self.downsample_ratio)
-
-            # Reshape tensor to prepare for projection
-            vision_features = vision_features.reshape(
-                batch_size, -1, vision_features.shape[-1])
-
-            # Project features through multi-modal projector
-            vision_features = self.multi_modal_projector(vision_features)
-            return vision_features.reshape(-1, vision_features.shape[-1])
+            image_features = self.model.get_image_features(
+                pixel_values=pixel_values,
+                vision_feature_layer=self.vision_feature_layer,
+                vision_feature_select_strategy=self.
+                vision_feature_select_strategy,
+            )
+            # Reshape to (-1, feature_dim)
+            return image_features.reshape(-1, image_features.shape[-1])
 
     model = InternVLVisionModel(hf_model)
 
@@ -394,16 +375,17 @@ def export_internvl3_visual(hf_model, output_dir, dtype, torch_dir):
         model = quantize_visual(model, dtype, hf_model.config.model_type,
                                 torch_dir)
 
-    # dummy input
-    hw = 32 * 32
-    in_chans = hf_model.config.vision_config.num_channels
-    patch_size = hf_model.config.vision_config.patch_size
-    input = torch.randn((hw, in_chans * patch_size[0] * patch_size[1]),
-                        dtype=torch.float16,
-                        device=model.device)
+    # # dummy input
+    num_patches = 1
+    input = torch.randn(
+        (num_patches, hf_model.config.vision_config.num_channels,
+         hf_model.config.vision_config.image_size[0],
+         hf_model.config.vision_config.image_size[1]),
+        dtype=torch.float16,
+        device=model.device)
     dynamic_axes = {
         'input': {
-            0: 'hw'
+            0: 'num_blocks'
         },
     }
 

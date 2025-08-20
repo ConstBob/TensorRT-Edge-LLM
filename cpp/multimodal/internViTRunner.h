@@ -24,9 +24,9 @@ namespace rt
 
 struct InternViTConfig
 {
-    int64_t maxHW{0};
-    int64_t minHW{0};
-    int64_t inputDim{0};
+    int64_t maxNumBlocks{0};
+    int64_t minNumBlocks{0};
+    int64_t numChannels{0};
     int64_t outHiddenSize{0};
     int64_t vocabSize;
     int64_t patchSizeH;
@@ -76,7 +76,7 @@ private:
 
     // InternVL-specific methods
     void formatPatch(ImageData const& image, std::vector<half>& patches, std::vector<int64_t>& imageTokenLengths,
-        int64_t& numImagePerBatch, int64_t& totalSeqLength);
+        int64_t& numImagePerBatch, int64_t& totalNumBlocks);
 
     void imagePreprocess(std::vector<std::vector<ImageData>> const& imageBuffers,
         std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImagePerBatch, cudaStream_t stream);
