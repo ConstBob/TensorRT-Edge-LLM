@@ -10,7 +10,8 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "llmEngineRunner.h"
+#include "runtime/llmEngineRunner.h"
+#include "runtime/llmRuntimeUtils.h"
 
 #include "common/logger.h"
 #include <sstream>
@@ -36,17 +37,6 @@ std::string formatEngineConfig(drivellm::rt::LLMEngineRunnerConfig const& config
 
     return ss.str();
 }
-
-// Identity case where we need to have external Rope CosSinCache.
-bool identifyContextDependentRopeConfig(Json const& configJson)
-{
-    if (configJson.contains("rope_scaling"))
-    {
-        return configJson["rope_scaling"].contains("type")
-            && configJson["rope_scaling"]["type"].get<std::string>() == "mrope";
-    }
-    return false;
-}
 } // namespace
 
 namespace drivellm
@@ -68,8 +58,8 @@ std::string const ropeCosSinName{"rope_rotary_cos_sin"};
 LLMEngineRunner::LLMEngineRunner(
     std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream)
 {
-    LOG_INFO("Initializing LLMEngineRunner from engine file: {}", enginePath.string());
-    LOG_INFO("Using config file {}", configPath.string());
+    LOG_INFO("Initializing LLMEngineRunner from engine file: %s", enginePath.string().c_str());
+    LOG_INFO("Using config file %s", configPath.string().c_str());
 
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
@@ -95,7 +85,7 @@ LLMEngineRunner::LLMEngineRunner(
     std::ifstream configFileStream(configPath);
     if (!configFileStream.is_open())
     {
-        LOG_ERROR("Failed to open config file: %s", configPath.string());
+        LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
         throw std::runtime_error("Failed to open config file: " + configPath.string());
     }
     try
@@ -109,15 +99,20 @@ LLMEngineRunner::LLMEngineRunner(
         throw std::runtime_error("Failed to parse config file: " + configPath.string());
     }
 
-    mConfig.useContextDependentRope = identifyContextDependentRopeConfig(configJson);
-    if (!mConfig.useContextDependentRope)
+    auto ropeConfig = collectBaseRopeConfig(configJson);
+    if (ropeConfig.type != RopeType::kMRope)
     {
         LOG_DEBUG("LLMEngineRunner(): Initialize persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
             = rt::Tensor({1, mConfig.maxSequenceLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
         mContextExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
         mGenerationExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
-        // TODO: Unify the move the logic from legacy decoder.cpp to here.
+        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
+        if (!initRopeStatus)
+        {
+            LOG_ERROR("LLMEngineRunner(): Failed to initialize persistent Rope CosSinCache.");
+            throw std::runtime_error("Failed to initialize persistent Rope CosSinCache.");
+        }
     }
     else
     {
@@ -126,6 +121,7 @@ LLMEngineRunner::LLMEngineRunner(
                 rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
         // Shape has to be set during the engine execution time since it depends on the active batch size.
+        // So with MRope we only bind the tensor address here.
     }
     mContextExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
     mGenerationExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
@@ -133,19 +129,14 @@ LLMEngineRunner::LLMEngineRunner(
     // Instantiate the KVCache instance of the EngineRunner.
     this->mKVCache = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers,
         mConfig.maxSupportedBatchSize, mConfig.maxSequenceLength, mConfig.numKVHeads, mConfig.headDim});
-    bool const bindKVCacheStatus = this->bindKVCacheToEngine();
-    if (!bindKVCacheStatus)
-    {
-        LOG_ERROR("LLMEngineRunner(): Failed to bind KVCache to the Engine.");
-        throw std::runtime_error("Failed to bind KVCache to the Engine.");
-    }
 
     // Instantiate other GPU memory input that needed by the Engine execution.
     this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT64);
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
-}
 
-LLMEngineRunner::~LLMEngineRunner() {}
+    // Synchronize the stream to ensure all the operations have completed.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
 
 void LLMEngineRunner::initializeConfigFromEngine()
 {
@@ -161,6 +152,7 @@ void LLMEngineRunner::initializeConfigFromEngine()
     {
         std::string const bindingName = mEngine->getIOTensorName(i);
         Dims const tensorDim = mEngine->getTensorShape(bindingName.c_str());
+
         if (identifyKVCacheBinding(bindingName, tensorDim))
         {
             if (nbKVCacheInputs == 0)
@@ -193,14 +185,16 @@ void LLMEngineRunner::initializeConfigFromEngine()
     Dims const ropeCosSinCacheDim = mEngine->getTensorShape(ropeCosSinName.c_str());
     mConfig.rotaryDim = ropeCosSinCacheDim.d[2];
 
-    LOG_INFO("Loaded LLMEngineRunner with config: %s", formatEngineConfig(mConfig));
+    LOG_INFO("Loaded LLMEngineRunner with config: %s", formatEngineConfig(mConfig).c_str());
 }
 
-bool LLMEngineRunner::bindKVCacheToEngine()
+bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
 {
     // Prepare special input binding shape for prefill stage KVCache input.
     // TODO: Unify the semantics to always pass full KVCache shape.
-    Dims const kvCacheDimPrefillIn = {5, {mConfig.maxSupportedBatchSize, 2, mConfig.numKVHeads, 0, mConfig.headDim}};
+    Dims const kvCacheDimPrefillIn = {5, {activeBatchSize, 2, mConfig.numKVHeads, 0, mConfig.headDim}};
+    Dims const kvCacheDimDecodeIn
+        = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength, mConfig.headDim}};
     bool status{true};
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
     {
@@ -215,8 +209,7 @@ bool LLMEngineRunner::bindKVCacheToEngine()
             &= mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
 
         status &= mContextExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimPrefillIn);
-        status &= mGenerationExecutionContext->setInputShape(
-            pastKeyValuesName.c_str(), kvCacheBlock.getShape().getTRTDims());
+        status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimDecodeIn);
     }
     return status;
 }
@@ -248,7 +241,7 @@ bool LLMEngineRunner::prefillStepInputValidation(
         return false;
     }
     bool const isBatchValid = activeBatchSize <= mConfig.maxSupportedBatchSize
-        && contextLengths.getShape()[0] == activeBatchSize && contextLengths.getShape()[1] == activeBatchSize;
+        && contextLengths.getShape()[0] == activeBatchSize && outputLogits.getShape()[0] == activeBatchSize;
     if (!isBatchValid)
     {
         LOG_ERROR(
@@ -330,13 +323,14 @@ bool LLMEngineRunner::executePrefillStep(
         &= mContextExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mContextExecutionContext->setInputShape(
         lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
-
     // Engine output tensors.
     setEngineIOStatus &= mContextExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
+    // Bind the KVCache IO to the engine.
+    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
     if (!setEngineIOStatus)
     {
-        LOG_ERROR("executePrefill(): Failed to set engine input tensors.");
+        LOG_ERROR("executePrefill(): Failed to bind engine input and output tensors.");
         return false;
     }
 
@@ -349,6 +343,7 @@ bool LLMEngineRunner::executePrefillStep(
         return false;
     }
 
+    LOG_DEBUG("executePrefill(): Prefill stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
 }
 
@@ -381,6 +376,7 @@ bool LLMEngineRunner::vanlliaDecodingStepInputValidation(rt::Tensor const& input
             "[activeBatchSize, 1] and the output tensor should have shape [activeBatchSize, VocabSize].");
         return false;
     }
+
     return true;
 }
 
@@ -422,7 +418,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
 
     if (!setEngineIOStatus)
     {
-        LOG_ERROR("executeGeneration(): Failed to set engine input tensors.");
+        LOG_ERROR("executeVanillaDecodingStep(): Failed to set engine input tensors.");
         return false;
     }
 
@@ -431,9 +427,12 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
-        LOG_ERROR("executeGeneration(): Failed on TensorRT decode stage enqueueV3() call.");
+        LOG_ERROR("executeVanillaDecodingStep(): Failed on TensorRT decode stage enqueueV3() call.");
         return false;
     }
+
+    LOG_DEBUG("executeVanillaDecodingStep(): Decoding stage execution completed for request with batch size %d.",
+        activeBatchSize);
     return true;
 }
 

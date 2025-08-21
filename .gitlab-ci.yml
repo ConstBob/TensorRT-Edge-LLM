@@ -185,6 +185,7 @@ a30_build_and_test:
     - echo "Testing INT4 engine inference"
     - ./build/examples/llm/llm_chat --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --maxLength=64 --inputString="What is NVIDIA?"
     - ./build/examples/llm/llm_benchmark --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --inputLength=128 --maxLength=256 
+    - ./build/examples/llm/llm_inference --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16
     - echo "Done testing engine inference"
     - rm -rf $ENGINE_DIR
 
@@ -238,5 +239,6 @@ rtx5080_build_and_test:
     - echo "Testing INT4 engine inference"
     - ./build/examples/llm/llm_chat --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --maxLength=64 --inputString="What is NVIDIA?"
     - ./build/examples/llm/llm_benchmark --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --inputLength=128 --maxLength=256 
+    - ./build/examples/llm/llm_inference --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16
     - echo "Done testing engine inference"
     - rm -rf $ENGINE_DIR
