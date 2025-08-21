@@ -20,7 +20,8 @@ mkdir -p $ENGINE_DIR
 echo "Done testing engine build"
 echo "Testing FP16 engine inference"
 ./build/examples/llm/llm_chat --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16 --maxLength=64 --inputString="What is NVIDIA?" 
-./build/examples/llm/llm_benchmark --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16 --inputLength=128 --maxLength=256 
+./build/examples/llm/llm_benchmark --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16 --inputLength=128 --maxLength=256
+./build/examples/llm/llm_inference --engineDir=$ENGINE_DIR/$MODEL_NAME-fp16
 echo "Testing INT4 engine inference"
 ./build/examples/llm/llm_chat --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --maxLength=64 --inputString="What is NVIDIA?"
 ./build/examples/llm/llm_benchmark --engineDir=$ENGINE_DIR/$MODEL_NAME-int4 --inputLength=128 --maxLength=256 

@@ -39,3 +39,11 @@ target_include_directories(
   llm_accuracy PRIVATE ${COMMON_INCLUDE_DIRS}
                        ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_accuracy)
+
+add_executable(llm_inference llm_inference.cpp)
+target_link_libraries(llm_inference PRIVATE llmSdkCore tokenizer exampleUtils
+                                            commonLibraryExt)
+target_include_directories(
+  llm_inference PRIVATE ${COMMON_INCLUDE_DIRS}
+                        ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(llm_inference)

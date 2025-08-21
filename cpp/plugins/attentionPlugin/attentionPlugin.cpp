@@ -292,8 +292,13 @@ DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::Di
     }
     else
     {
-        // Output[1] is KVCache, identical input[1]
-        output = inputs[1];
+        // Output[1] is KVCache
+        output.nbDims = 5;
+        output.d[0] = inputs[1].d[0];
+        output.d[1] = inputs[1].d[1];
+        output.d[2] = exprBuilder.constant(mNumHeadKV);
+        output.d[3] = exprBuilder.constant(mKVCacheCapacity);
+        output.d[4] = exprBuilder.constant(mNumElemPerHead);
     }
     return output;
 }

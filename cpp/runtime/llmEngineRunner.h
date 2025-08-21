@@ -54,7 +54,7 @@ public:
     LLMEngineRunner(
         std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream);
 
-    ~LLMEngineRunner();
+    ~LLMEngineRunner() = default;
 
     //! API entry to get the Rope CosSinCache tensor.
     //! The API is useful when the rope cos/sin cache depends on the context which cannot be initialized
@@ -108,7 +108,8 @@ private:
 
     void initializeConfigFromEngine();
 
-    bool bindKVCacheToEngine();
+    //! The Function is used to bind the KVCache to the LLM engine for a new set of requests.
+    bool bindKVCacheToEngine(int32_t activeBatchSize);
 
     bool prefillStepInputValidation(
         rt::Tensor const& inputIds, rt::Tensor const& contextLengths, rt::Tensor const& outputLogits);
