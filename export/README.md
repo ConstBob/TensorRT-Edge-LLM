@@ -10,6 +10,7 @@ This folder contains scripts to export ONNX models from PyTorch models. The expo
 4. [Export Visual Models](#export-visual-models)
 5. [Support Matrix](#support-matrix)
 6. [LoRA Support](#lora-support)
+7. [Persistent KV Cache Support](#persistent-kv-cache-support)
 
 ## Prerequisites
 
@@ -257,6 +258,27 @@ python3 process_lora_weights.py \
     --input_dir ${LORA_WEIGHTS_DIR} \
     --output_dir ${PROCESSED_LORA_DIR}
 ```
+
+## Persistent KV Cache Support
+
+For models that require persistent KV cache functionality, use the convenience script to modify existing ONNX models:
+
+```bash
+python3 prepare_persistent_kv_cache_onnx.py \
+    --input_dir ${INPUT_ONNX_DIR} \
+    --output_dir ${OUTPUT_ONNX_DIR}
+```
+
+**Parameters:**
+- `--input_dir`: Path to the input ONNX model directory
+- `--output_dir`: Path to save the modified ONNX model
+
+**What it does:**
+- Adds `has_persistent_kv_cache = 1` attribute to all AttentionPlugin nodes
+- Adds a shared `kvcache_start_index` input (int32) to the model graph
+- Copies all non-ONNX files from input to output directory
+
+This script allows you to enable persistent KV cache support without re-exporting the entire model.
 
 ## Important Notes
 
