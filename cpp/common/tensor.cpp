@@ -21,7 +21,7 @@ namespace drivellm
 namespace rt
 {
 
-namespace
+namespace utils
 {
 
 size_t getTypeSize(DataType dataType)
@@ -74,7 +74,7 @@ std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape)
     }
     return strides;
 }
-} // namespace
+} // namespace utils
 
 int64_t Coords::volume() const
 {
@@ -117,7 +117,7 @@ std::string Coords::formatString() const
     return ss.str();
 }
 
-Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType)
+Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType, std::string const& name)
 {
     if (shape.volume() == 0)
     {
@@ -133,9 +133,9 @@ Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType da
     mDeviceType = deviceType;
     mDataType = dataType;
     ownMemory = true;
-    mStrides = computeStrides(shape);
-
-    memoryCapacity = shape.volume() * getTypeSize(dataType);
+    mStrides = utils::computeStrides(shape);
+    mName = name;
+    memoryCapacity = shape.volume() * utils::getTypeSize(dataType);
     if (deviceType == DeviceType::kCPU)
     {
         data = malloc(memoryCapacity);
@@ -150,16 +150,18 @@ Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType da
     }
 }
 
-Tensor::Tensor(void* data, Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType) noexcept
+Tensor::Tensor(void* data, Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType,
+    std::string const& name) noexcept
 {
     // Populate the tensor information and only serve as a data container with shape.
     mShape = shape;
     mDeviceType = deviceType;
     mDataType = dataType;
     ownMemory = false;
-    mStrides = computeStrides(shape);
+    mStrides = utils::computeStrides(shape);
     this->data = data;
-    memoryCapacity = shape.volume() * getTypeSize(dataType);
+    memoryCapacity = shape.volume() * utils::getTypeSize(dataType);
+    mName = name;
 }
 
 Tensor::~Tensor()
@@ -176,7 +178,7 @@ Tensor::Tensor(Tensor&& other) noexcept
     this->mDataType = other.mDataType;
     this->ownMemory = other.ownMemory;
     this->memoryCapacity = other.memoryCapacity;
-
+    this->mName = other.mName;
     // Reset the other tensor.
     other.data = nullptr;
     other.mShape = Coords{};
@@ -185,6 +187,7 @@ Tensor::Tensor(Tensor&& other) noexcept
     other.mDataType = DataType::kFLOAT;
     other.ownMemory = false;
     other.memoryCapacity = 0;
+    other.mName = {};
 }
 
 Tensor& Tensor::operator=(Tensor&& other) noexcept
@@ -199,7 +202,7 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept
         this->mDataType = other.mDataType;
         this->ownMemory = other.ownMemory;
         this->memoryCapacity = other.memoryCapacity;
-
+        this->mName = other.mName;
         // Reset the other tensor.
         other.data = nullptr;
         other.mShape = {};
@@ -208,6 +211,7 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept
         other.mDataType = {};
         other.ownMemory = false;
         other.memoryCapacity = 0;
+        other.mName = {};
     }
     return *this;
 }
@@ -225,6 +229,11 @@ DeviceType Tensor::getDeviceType() const noexcept
 DataType Tensor::getDataType() const noexcept
 {
     return mDataType;
+}
+
+std::string const& Tensor::getName() const noexcept
+{
+    return mName;
 }
 
 bool Tensor::getOwnMemory() const noexcept
@@ -279,13 +288,13 @@ bool Tensor::reshape(Coords shape) noexcept
         return false;
     }
 
-    if (static_cast<int64_t>(shape.volume() * getTypeSize(mDataType)) > memoryCapacity)
+    if (static_cast<int64_t>(shape.volume() * utils::getTypeSize(mDataType)) > memoryCapacity)
     {
         return false;
     }
 
     mShape = shape;
-    mStrides = computeStrides(shape);
+    mStrides = utils::computeStrides(shape);
     return true;
 }
 
@@ -309,6 +318,7 @@ void Tensor::releaseResource()
     mStrides = std::array<int64_t, kMAX_DIMS>{};
     mDeviceType = {};
     mDataType = {};
+    mName = {};
 }
 
 } // namespace rt

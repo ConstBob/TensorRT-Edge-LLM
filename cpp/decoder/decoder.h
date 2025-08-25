@@ -14,7 +14,7 @@
 
 #include "common/benchmarkProfiler.h"
 #include "common/common.h"
-#include "common/safetensors_loader/safetensorsLoader.h"
+#include "common/safetensorsUtils.h"
 #include "common/trtUtils.h"
 #include <NvInferRuntime.h>
 #include <cfloat>
@@ -149,7 +149,7 @@ private:
     cudaGraphExec_t mGenerationGraphExec;
     // Flag indicating Eagle pattern mode(target + draft models)
     bool mIsEagle;
-    std::unordered_map<std::string, std::unique_ptr<drivellm::SafeTensorsLoader>> mLoraWeights;
+    std::unordered_map<std::string, std::vector<drivellm::rt::Tensor>> mLoraWeights;
 };
 
 } // namespace rt

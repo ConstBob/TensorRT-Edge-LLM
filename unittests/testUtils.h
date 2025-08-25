@@ -13,6 +13,8 @@
 #pragma once
 
 #include <cmath>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <iomanip>
 #include <iostream>
 #include <ostream>
@@ -131,33 +133,4 @@ static std::pair<float, float> getTolerance()
     {
         return {1e-4f, 1e-6f}; // Default
     }
-}
-
-static bool checkBounds(int index, int size, std::string const& arrayName, int batch, int pos)
-{
-    if (index >= size)
-    {
-        std::cout << "Index out of bounds for " << arrayName << " at batch " << batch << " position " << pos
-                  << " (index " << index << ", size " << size << ")" << std::endl;
-        return false;
-    }
-    return true;
-}
-
-template <typename T>
-static bool validateValue(
-    float gpuVal, float expectedVal, int32_t gpuIdx, int batch, int pos, std::string const& testName)
-{
-    auto [rtol, atol] = getTolerance<T>();
-    if (!isclose(gpuVal, expectedVal, rtol, atol))
-    {
-        float absError = std::abs(gpuVal - expectedVal);
-        float relError = std::abs(gpuVal - expectedVal) / std::abs(expectedVal);
-        std::cout << testName << " validation failed at batch " << batch << " position " << pos
-                  << ": GPU=" << std::fixed << std::setprecision(8) << gpuVal << ", Expected=" << std::fixed
-                  << std::setprecision(8) << expectedVal << " (abs_error=" << absError << ", rel_error=" << relError
-                  << ")" << std::endl;
-        return false;
-    }
-    return true;
 }

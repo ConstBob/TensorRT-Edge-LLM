@@ -154,11 +154,12 @@ public:
     //! @param extent: The shape of the tensor (must has non-zero volume).
     //! @param deviceType: The device type to allocate memory on.
     //! @param dataType: The data type of the tensor. (sub-type like kInt4 or kE2M1 are not supported)
-    Tensor(Coords const& extent, DeviceType deviceType, nvinfer1::DataType dataType);
+    Tensor(Coords const& extent, DeviceType deviceType, nvinfer1::DataType dataType, std::string const& name = "");
 
     //! Constructor that reuses the memory of another tensor.
     //! Memory is indeed not owned by the tensor object, the caller should ensure the lifecycle of the memory.
-    Tensor(void* data, Coords const& extent, DeviceType deviceType, nvinfer1::DataType dataType) noexcept;
+    Tensor(void* data, Coords const& extent, DeviceType deviceType, nvinfer1::DataType dataType,
+        std::string const& name = "") noexcept;
 
     //! Getter methods for tensor attributes.
     Coords getShape() const noexcept;
@@ -167,6 +168,7 @@ public:
     nvinfer1::Dims getTRTDims() const noexcept;
     bool getOwnMemory() const noexcept;
     bool isEmpty() const noexcept;
+    std::string const& getName() const noexcept;
 
     //! Return the memory capacity of the underlying buffer when the instance is constructed.
     //! The value can be different from getShape().volume() * sizeof(dataType) when the tensor is reshaped.
@@ -207,6 +209,7 @@ public:
     [[nodiscard]] bool reshape(Coords extent) noexcept;
 
 private:
+    std::string mName{};
     Coords mShape{};
     std::array<int64_t, kMAX_DIMS> mStrides{};
     DeviceType mDeviceType{};
@@ -220,6 +223,12 @@ private:
     //! Release the owned memory of tensor and set the tensor object to "empty" state.
     void releaseResource();
 };
+
+namespace utils
+{
+size_t getTypeSize(nvinfer1::DataType dataType);
+std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape);
+} // namespace utils
 
 } // namespace rt
 } // namespace drivellm
