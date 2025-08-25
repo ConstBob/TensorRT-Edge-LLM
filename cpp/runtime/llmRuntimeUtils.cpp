@@ -51,10 +51,16 @@ RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config)
     if (ropeScalingIt != config.end())
     {
         auto ropeTypeIt = ropeScalingIt->find("type");
+        auto mropeSectionIt = ropeScalingIt->find("mrope_section");
         if (ropeTypeIt != ropeScalingIt->end())
         {
             std::string const ropeTypeStr = ropeTypeIt->get<std::string>();
-            if (ropeTypeStr == "default" || ropeTypeStr == "llama3")
+            if (ropeTypeStr == "default" && mropeSectionIt != ropeScalingIt->end())
+            {
+                // transformers `Qwen2_5_VLVisionConfig` change type from 'mrope' to 'default'
+                ropeConfig.type = RopeType::kMRope;
+            }
+            else if (ropeTypeStr == "default" || ropeTypeStr == "llama3")
             {
                 // Route the llama3 config to default type.
                 ropeConfig.type = RopeType::kDefault;
@@ -66,10 +72,6 @@ RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config)
             else if (ropeTypeStr == "longrope")
             {
                 ropeConfig.type = RopeType::kLongRope;
-            }
-            else if (ropeTypeStr == "mrope")
-            {
-                ropeConfig.type = RopeType::kMRope;
             }
         }
     }

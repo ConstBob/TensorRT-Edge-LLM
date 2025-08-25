@@ -13,8 +13,11 @@
 #pragma once
 
 #include "common/common.h"
+#include "common/tensor.h"
 #include "common/trtUtils.h"
 #include "engine/llm_engine.h"
+#include "runtime/imageUtils.h"
+#include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 #include <cuda_fp16.h>
 #include <filesystem>
@@ -31,31 +34,6 @@ namespace drivellm
 namespace rt
 {
 
-// Image data structure for managing loaded images
-class ImageData
-{
-public:
-    std::shared_ptr<unsigned char[]> buffer;
-    int width;
-    int height;
-    int channels;
-    bool isThumbnail;
-
-    ImageData(unsigned char* data, int w, int h, int c, bool thumbnail = false)
-        : buffer(data)
-        , width(w)
-        , height(h)
-        , channels(c)
-        , isThumbnail(thumbnail)
-    {
-    }
-
-    unsigned char* data() const
-    {
-        return buffer.get();
-    }
-};
-
 class MultimodalRunner
 {
 public:
@@ -63,19 +41,32 @@ public:
     MultimodalRunner(std::string const& engineDir, cudaStream_t stream);
     virtual ~MultimodalRunner() = default;
 
+    // Static factory method to create appropriate MultimodalRunner instance
+    static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, cudaStream_t stream);
+
     // Preprocess all inputs for multimodal runner and LLM runner
+    // TODO: Clean Old API
     virtual void preprocess(std::vector<std::string> const& inputStrings,
-        std::vector<std::vector<ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
+        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
         std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer,
         int const maxSupportedInputLength, bool enableDynamicShape, void* ropeRotaryCosSinDevice,
         int const maxPositionEmbeddings, int const rotaryDim, cudaStream_t stream)
         = 0;
 
-    // Multimodal inference
-    virtual void infer(cudaStream_t stream);
+    virtual bool preprocess(std::vector<std::string> const& inputStrings,
+        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
+        std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& inputIdsLengths,
+        drivellm::tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+        = 0;
 
-    // Get multimodal output embeddings. Used to setup extra inputs for LLM.
+    // Multimodal inference
+    virtual bool infer(cudaStream_t stream) = 0;
+
+    // TODO: Clean Old API. Get multimodal output embeddings. Used to setup extra inputs for LLM.
     virtual std::vector<EngineInputDesc> getComputedEmbeddings() = 0;
+
+    // Get multimodal output embeddings.
+    virtual rt::Tensor& getOutputEmbedding();
 
     // Initialize random inputs for benchmark purpose
     virtual void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
@@ -97,7 +88,7 @@ public:
     }
 
 protected:
-    // Flatten batch inputs ids to 1D array with padding and initialize context lengths
+    // TODO: Clean Old API. Flatten batch inputs ids to 1D array with padding and initialize context lengths
     virtual void flattenBatch(std::vector<int32_t>& inputIds, std::vector<int32_t>& contextLengths,
         std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths, int32_t const padId,
         int const maxSupportedInputLength, bool enableDynamicShape);
@@ -119,6 +110,7 @@ protected:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
+    rt::Tensor mOutputEmbedding;
 };
 
 } // namespace rt

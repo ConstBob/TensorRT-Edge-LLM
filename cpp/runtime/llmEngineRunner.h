@@ -69,23 +69,26 @@ public:
     //! Inputs:
     //!     inputIds [GPU]: The input token_ids for the batch of new requests.
     //!     contextLengths [CPU]: The context lengths for each sequence in the batch.
+    //!     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings for the batch of requests.
     //!     outputLogits [GPU]: The output logits for the batch of requests..
     //!     stream: The CUDA stream to execute the prefill stp.
     //! Returns:
     //!     True if the prefill step is successful, false otherwise.
-    bool executePrefillStep(
-        rt::Tensor const& inputIds, rt::Tensor const& contextLengths, rt::Tensor& outputLogits, cudaStream_t stream);
+    bool executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
+        rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, cudaStream_t stream);
 
     //! API entry to execute one vanilla decoding engine action for a batched request. The API will perform decoding
     //!     operations fill the KVCache of the new generated tokens and produce the output logits. The decoding
     //!     operation shall be performed after the prefill step is completed.
     //! Inputs:
     //!     inputIds [GPU]: The input token_ids for the batch of new requests.
+    //!     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings for the batch of requests.
     //!     outputLogits [GPU]: The output logits for the batch of requests.
     //!     stream: The CUDA stream to execute the decoding step.
     //! Returns:
     //!     True if the decoding step is successful, false otherwise.
-    bool executeVanillaDecodingStep(rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream);
+    bool executeVanillaDecodingStep(rt::Tensor const& inputIds, rt::Tensor const& multimodalEmbeddings,
+        rt::Tensor& outputLogits, cudaStream_t stream);
 
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
