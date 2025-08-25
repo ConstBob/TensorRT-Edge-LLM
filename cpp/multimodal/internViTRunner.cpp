@@ -98,22 +98,23 @@ void InternViTRunner::allocateBuffer()
     // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
     LOG_INFO("InternViTRunner::allocateBuffer() mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d",
         mConfig.maxNumBlocks * 256, mConfig.outHiddenSize);
-    mVitOutput = rt::Tensor(
+    mOutputEmbedding = rt::Tensor(
         {mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    mContext->setTensorAddress("output", mVitOutput.rawPointer());
+    mContext->setTensorAddress("output", mOutputEmbedding.rawPointer());
 }
 
 std::vector<EngineInputDesc> InternViTRunner::getComputedEmbeddings()
 {
     std::vector<EngineInputDesc> extraInputs;
 
-    extraInputs.emplace_back(EngineInputDesc{"image_embeds", mVitOutput.rawPointer(), mVitOutput.rawPointer(),
-        {2, {mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}}, {2, {1, mConfig.outHiddenSize}}});
+    extraInputs.emplace_back(
+        EngineInputDesc{"image_embeds", mOutputEmbedding.rawPointer(), mOutputEmbedding.rawPointer(),
+            {2, {mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}}, {2, {1, mConfig.outHiddenSize}}});
 
     return extraInputs;
 }
 
-void InternViTRunner::formatPatch(ImageData const& image, std::vector<half>& patches,
+void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<half>& patches,
     std::vector<int64_t>& imageTokenLengths, int64_t& numImagePerBatch, int64_t& totalNumBlocks)
 {
     int height = image.height;
@@ -191,7 +192,7 @@ std::vector<std::pair<int, int>> InternViTRunner::getAllSupportedAspectRatios(
     return aspectRatios;
 }
 
-std::tuple<int, int> InternViTRunner::resizeImage(int const height, int const width, int const targetTileHeight,
+std::tuple<int, int> InternViTRunner::getResizedImageSize(int const height, int const width, int const targetTileHeight,
     int const targetTileWidth, int const minImageTiles, int const maxImageTiles)
 {
     auto targetRatios = getAllSupportedAspectRatios(minImageTiles, maxImageTiles);
@@ -222,8 +223,8 @@ std::tuple<int, int> InternViTRunner::resizeImage(int const height, int const wi
     return {bestRatio.second * targetTileHeight, bestRatio.first * targetTileWidth};
 }
 
-void InternViTRunner::imagePreprocess(std::vector<std::vector<ImageData>> const& imageBuffers,
-    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImagePerBatch, cudaStream_t stream)
+void InternViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
+    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImagePerBatch, bool doResize, cudaStream_t stream)
 {
     std::vector<half> patches;
     int64_t totalNumBlocks = 0;
@@ -233,7 +234,21 @@ void InternViTRunner::imagePreprocess(std::vector<std::vector<ImageData>> const&
         int64_t numImage{0};
         for (auto const& image : imageBuffer)
         {
-            formatPatch(image, patches, imageTokenLengths, numImage, totalNumBlocks);
+            if (doResize)
+            {
+                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width,
+                    mConfig.blockImageSizeH, mConfig.blockImageSizeW, mConfig.minImageTiles, mConfig.maxImageTiles);
+                auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
+                formatPatch(resizedImage, patches, imageTokenLengths, numImage, totalNumBlocks);
+
+                auto thumbnailImage
+                    = rt::imageUtils::resizeImage(image, mConfig.blockImageSizeW, mConfig.blockImageSizeH, true);
+                formatPatch(thumbnailImage, patches, imageTokenLengths, numImage, totalNumBlocks);
+            }
+            else
+            {
+                formatPatch(image, patches, imageTokenLengths, numImage, totalNumBlocks);
+            }
         }
         numImagePerBatch.emplace_back(numImage);
     }
@@ -245,10 +260,10 @@ void InternViTRunner::imagePreprocess(std::vector<std::vector<ImageData>> const&
             + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
     }
 
-    mContext->setInputShape(
-        "input", {4, {totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW}});
     CUDA_CHECK(cudaMemcpyAsync(
         mVitInput.rawPointer(), patches.data(), patches.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
+    mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
 }
 
 std::string InternViTRunner::applyChatTemplate(std::string const& inputString, int const& numImages,
@@ -313,14 +328,14 @@ void InternViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInp
 }
 
 void InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
-    std::vector<std::vector<ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
+    std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
     std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer, int const maxSupportedInputLength,
     bool enableDynamicShape, void* ropeRotaryCosSinDevice [[maybe_unused]],
     int const maxPositionEmbeddings [[maybe_unused]], int const rotaryDim [[maybe_unused]], cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImagePerBatch;
-    imagePreprocess(imageBuffers, imageTokenLengths, numImagePerBatch, stream);
+    imagePreprocess(imageBuffers, imageTokenLengths, numImagePerBatch, false, stream);
 
     std::vector<std::vector<int32_t>> batchInputIds;
     std::vector<int32_t> batchInputLengths;
@@ -328,6 +343,43 @@ void InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
 
     flattenBatch(inputIds, contextLengths, batchInputIds, batchInputLengths, tokenizer->getPadId(),
         maxSupportedInputLength, enableDynamicShape);
+}
+
+bool InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
+    std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
+    std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& inputIdsLengths,
+    drivellm::tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+{
+    std::vector<int64_t> imageTokenLengths;
+    std::vector<int64_t> numImagePerBatch;
+
+    try
+    {
+        imagePreprocess(imageBuffers, imageTokenLengths, numImagePerBatch, true, stream);
+        textPreprocess(batchInputIds, inputIdsLengths, inputStrings, numImagePerBatch, imageTokenLengths, tokenizer);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("InternViTRunner::preprocess() failed: %s", e.what());
+        return false;
+    }
+
+    return true;
+}
+
+bool InternViTRunner::infer(cudaStream_t stream)
+{
+    bool setEngineIOStatus{true};
+    setEngineIOStatus &= mContext->setInputShape("input", mVitInput.getShape().getTRTDims());
+    if (!setEngineIOStatus)
+    {
+        LOG_ERROR("InternViTRunner::infer(): Failed to bind engine input tensors.");
+        return false;
+    }
+
+    mContext->enqueueV3(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
 }
 
 void InternViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
@@ -354,10 +406,10 @@ void InternViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const
     std::vector<half> patches(totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     std::generate(patches.begin(), patches.end(), [&rng, &dist]() { return __float2half(dist(rng)); });
-    mContext->setInputShape(
-        "input", {4, {totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW}});
     CUDA_CHECK(cudaMemcpyAsync(
         mVitInput.rawPointer(), patches.data(), patches.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
+    mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
 
     // Init input ids
     std::uniform_int_distribution<std::mt19937::result_type> intDist(0, 10000);

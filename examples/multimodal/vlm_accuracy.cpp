@@ -426,14 +426,14 @@ void saveResult(std::filesystem::path const& outputPath, std::vector<MMMUTestDat
     outFile.close();
 }
 
-void loadImages(std::vector<std::vector<unsigned char>> const& rawBuffers, std::vector<ImageData>& imageBuffer,
-    std::string const& modelType, std::unique_ptr<MultimodalRunner> const& multimodalRunner,
-    bool const useThumbnail = true)
+void loadImages(std::vector<std::vector<unsigned char>> const& rawBuffers,
+    std::vector<rt::imageUtils::ImageData>& imageBuffer, std::string const& modelType,
+    std::unique_ptr<MultimodalRunner> const& multimodalRunner, bool const useThumbnail = true)
 {
     for (auto& buffer : rawBuffers)
     {
         // Load image from memory
-        ImageData image = loadImageFromMemory(buffer.data(), buffer.size());
+        auto image = rt::imageUtils::loadImageFromMemory(buffer.data(), buffer.size());
         int width = image.width;
         int height = image.height;
         int resizedHeight, resizedWidth;
@@ -446,7 +446,8 @@ void loadImages(std::vector<std::vector<unsigned char>> const& rawBuffers, std::
             // Diviving original height and width by 2 to deal with a few images with large size.
             QwenViTConfig* config = static_cast<QwenViTConfig*>(multimodalRunner->getConfig());
             int factor = config->patchSize * config->mergeSize;
-            auto [h, w] = QwenViTRunner::resizeImage(height / 2, width / 2, factor, 1280 * 28 * 28, 6620 * 28 * 28);
+            auto [h, w]
+                = QwenViTRunner::getResizedImageSize(height / 2, width / 2, factor, 1280 * 28 * 28, 6620 * 28 * 28);
             resizedHeight = h;
             resizedWidth = w;
         }
@@ -454,8 +455,8 @@ void loadImages(std::vector<std::vector<unsigned char>> const& rawBuffers, std::
         {
             // Downsize to max number of 6 patches to limit the number of image tokens.
             InternViTConfig* config = static_cast<InternViTConfig*>(multimodalRunner->getConfig());
-            auto [h, w]
-                = InternViTRunner::resizeImage(height, width, config->blockImageSizeH, config->blockImageSizeW, 1, 6);
+            auto [h, w] = InternViTRunner::getResizedImageSize(
+                height, width, config->blockImageSizeH, config->blockImageSizeW, 1, 6);
             resizedHeight = h;
             resizedWidth = w;
             thumbnailH = config->blockImageSizeH;
@@ -468,13 +469,13 @@ void loadImages(std::vector<std::vector<unsigned char>> const& rawBuffers, std::
             resizedWidth = width;
         }
 
-        ImageData resizedImage = resizeImage(image, resizedWidth, resizedHeight);
+        auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
         imageBuffer.emplace_back(resizedImage);
 
         // Insert thumbnail image for some models
         if (useThumbnail && modelType == "internvl")
         {
-            ImageData thumbnailImage = resizeImage(image, thumbnailW, thumbnailH, true);
+            auto thumbnailImage = rt::imageUtils::resizeImage(image, thumbnailW, thumbnailH, true);
             imageBuffer.emplace_back(thumbnailImage);
         }
     }
@@ -487,7 +488,7 @@ void evalMultimodal(BaseParams const& baseParams, EagleParams const& eagleParams
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    auto multimodalRunner = getMultimodalRunner(vlmRunParams, stream);
+    auto multimodalRunner = MultimodalRunner::create(vlmRunParams.visualEngineDir, stream);
     // Batch size = 1
     auto llmEngine = getLLMEngine(1, baseParams, eagleParams, loraWeights, stream);
     llmEngine->setupExtraInputs(multimodalRunner->getComputedEmbeddings());
@@ -513,7 +514,7 @@ void evalMultimodal(BaseParams const& baseParams, EagleParams const& eagleParams
         LOG_INFO(data->id.c_str());
         outputIds[0].clear();
 
-        std::vector<ImageData> imageBuffer;
+        std::vector<rt::imageUtils::ImageData> imageBuffer;
         std::vector<int32_t> inputIds;
         std::vector<int32_t> contextLengths;
 

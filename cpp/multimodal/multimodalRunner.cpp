@@ -11,8 +11,13 @@
  */
 
 #include "multimodalRunner.h"
+#include "multimodal/internViTRunner.h"
+#include "multimodal/qwenViTRunner.h"
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <stdexcept>
 
 namespace drivellm
 {
@@ -45,6 +50,47 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     mContext->setOptimizationProfileAsync(0, stream);
 }
 
+std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir, cudaStream_t stream)
+{
+    std::unique_ptr<MultimodalRunner> multimodalRunner;
+
+    // Read config.json to determine model type
+    std::string configPath = multimodalEngineDir + "/config.json";
+    std::ifstream configFileStream(configPath);
+    if (!configFileStream.is_open())
+    {
+        throw std::runtime_error("Failed to open config file: " + configPath);
+    }
+
+    nlohmann::json jsonConfig;
+    try
+    {
+        jsonConfig = nlohmann::json::parse(configFileStream);
+        configFileStream.close();
+    }
+    catch (nlohmann::json::parse_error const& e)
+    {
+        throw std::runtime_error("Failed to parse config file: " + std::string(e.what()));
+    }
+
+    std::string modelType = jsonConfig["model_type"].get<std::string>();
+
+    if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
+    {
+        multimodalRunner = std::make_unique<QwenViTRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == "internvl")
+    {
+        multimodalRunner = std::make_unique<InternViTRunner>(multimodalEngineDir, stream);
+    }
+    else
+    {
+        throw std::runtime_error("Unsupported model type: " + modelType);
+    }
+
+    return multimodalRunner;
+}
+
 void MultimodalRunner::flattenBatch(std::vector<int32_t>& inputIds, std::vector<int32_t>& contextLengths,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths, int32_t const padId,
     int const maxSupportedInputLength, bool enableDynamicShape)
@@ -68,10 +114,9 @@ void MultimodalRunner::flattenBatch(std::vector<int32_t>& inputIds, std::vector<
     }
 }
 
-void MultimodalRunner::infer(cudaStream_t stream)
+rt::Tensor& MultimodalRunner::getOutputEmbedding()
 {
-    mContext->enqueueV3(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return mOutputEmbedding;
 }
 
 } // namespace rt

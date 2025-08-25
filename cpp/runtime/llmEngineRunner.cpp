@@ -54,6 +54,7 @@ std::string const contextLengthsName{"context_lengths"};
 std::string const lastTokenIdsName{"last_token_ids"};
 std::string const logitsName{"logits"};
 std::string const ropeCosSinName{"rope_rotary_cos_sin"};
+std::string const multimodalEmbeddingsName{"image_embeds"};
 
 LLMEngineRunner::LLMEngineRunner(
     std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream)
@@ -105,8 +106,6 @@ LLMEngineRunner::LLMEngineRunner(
         LOG_DEBUG("LLMEngineRunner(): Initialize persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
             = rt::Tensor({1, mConfig.maxSequenceLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mContextExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
-        mGenerationExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
         bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
         if (!initRopeStatus)
         {
@@ -120,8 +119,8 @@ LLMEngineRunner::LLMEngineRunner(
             = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim},
                 rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
+        // Value has to be initialized during the engine execution time since it depends on runtime input.
         // Shape has to be set during the engine execution time since it depends on the active batch size.
-        // So with MRope we only bind the tensor address here.
     }
     mContextExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
     mGenerationExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
@@ -277,8 +276,8 @@ bool LLMEngineRunner::prefillStepInputValidation(
     return true;
 }
 
-bool LLMEngineRunner::executePrefillStep(
-    rt::Tensor const& inputIds, rt::Tensor const& hostContextLengths, rt::Tensor& outputLogits, cudaStream_t stream)
+bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& hostContextLengths,
+    rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, cudaStream_t stream)
 {
     bool const validateInputStatus = this->prefillStepInputValidation(inputIds, hostContextLengths, outputLogits);
     if (!validateInputStatus)
@@ -323,6 +322,17 @@ bool LLMEngineRunner::executePrefillStep(
         &= mContextExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mContextExecutionContext->setInputShape(
         lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mContextExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+
+    if (!multimodalEmbeddings.isEmpty())
+    {
+        setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
+        setEngineIOStatus &= mContextExecutionContext->setInputShape(
+            multimodalEmbeddingsName.c_str(), multimodalEmbeddings.getShape().getTRTDims());
+    }
+
     // Engine output tensors.
     setEngineIOStatus &= mContextExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
     // Bind the KVCache IO to the engine.
@@ -381,7 +391,7 @@ bool LLMEngineRunner::vanlliaDecodingStepInputValidation(rt::Tensor const& input
 }
 
 bool LLMEngineRunner::executeVanillaDecodingStep(
-    rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream)
+    rt::Tensor const& inputIds, rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, cudaStream_t stream)
 {
     bool const validateInputStatus = this->vanlliaDecodingStepInputValidation(inputIds, outputLogits);
     if (!validateInputStatus)
@@ -412,6 +422,17 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         &= mGenerationExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+
+    if (!multimodalEmbeddings.isEmpty())
+    {
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
+        auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
+    }
 
     // Engine output tensors.
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());

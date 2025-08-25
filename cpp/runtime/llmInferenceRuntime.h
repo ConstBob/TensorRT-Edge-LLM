@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "multimodal/multimodalRunner.h"
 #include "runtime/llmEngineRunner.h"
 #include "tokenizer/tokenizer.h"
 
@@ -28,6 +29,7 @@ struct LLMGenerationRequest
         std::string userPrompt;
     };
     std::vector<Prompt> prompts;
+    std::vector<std::vector<rt::imageUtils::ImageData>> imageBuffers;
     float temperature;
     float topP;
     int64_t topK;
@@ -43,7 +45,7 @@ struct LLMGenerationResponse
 class LLMInferenceRuntime
 {
 public:
-    LLMInferenceRuntime(std::string const& engineDir, cudaStream_t stream);
+    LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir, cudaStream_t stream);
     ~LLMInferenceRuntime() = default;
 
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
@@ -52,6 +54,7 @@ public:
 
 private:
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};
+    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};
 
     rt::Tensor mSamplingWorkspace{};
@@ -64,6 +67,9 @@ private:
 
     bool prepareInputIds(LLMGenerationRequest const& request, std::vector<int32_t>& packedInputIds,
         std::vector<int32_t>& inputIdsLengths);
+    bool packInputIds(std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& inputIdsLengths,
+        std::vector<int32_t>& packedInputIds);
+    bool getInputTexts(LLMGenerationRequest const& request, std::vector<std::string>& inputTexts);
 };
 } // namespace rt
 } // namespace drivellm

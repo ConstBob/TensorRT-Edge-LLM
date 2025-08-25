@@ -14,9 +14,7 @@
 #include "decoder/decoder.h"
 #include "engine/llm_engine.h"
 #include "exampleUtils.h"
-#include "multimodal/internViTRunner.h"
 #include "multimodal/multimodalRunner.h"
-#include "multimodal/qwenViTRunner.h"
 #include "tokenizer/tokenizer.h"
 #include <cuda_profiler_api.h>
 #include <dlfcn.h>
@@ -223,7 +221,7 @@ size_t benchmarkMultimodal(BaseParams const& baseParams, VLMRunParams const& vlm
     profiler->recordHostMemStart();
     profiler->recordHostStart("decoder setup");
 
-    auto multimodalRunner = getMultimodalRunner(vlmRunParams, stream);
+    auto multimodalRunner = MultimodalRunner::create(vlmRunParams.visualEngineDir, stream);
     // This script does not support benchmarking VLM Eagle models, passing default EagleParams
     auto llmEngine = getLLMEngine(batchSize, baseParams, EagleParams(), loraWeights, stream);
     llmEngine->setupExtraInputs(multimodalRunner->getComputedEmbeddings());

@@ -166,6 +166,7 @@ public:
     nvinfer1::DataType getDataType() const noexcept;
     nvinfer1::Dims getTRTDims() const noexcept;
     bool getOwnMemory() const noexcept;
+    bool isEmpty() const noexcept;
 
     //! Return the memory capacity of the underlying buffer when the instance is constructed.
     //! The value can be different from getShape().volume() * sizeof(dataType) when the tensor is reshaped.

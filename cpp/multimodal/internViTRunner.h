@@ -35,6 +35,10 @@ struct InternViTConfig
     int64_t blockImageSizeW;
     std::vector<double> imageMean{0.485, 0.456, 0.406};
     std::vector<double> imageStd{0.229, 0.224, 0.225};
+
+    // Resize configuration. TODO: add to json config
+    int64_t minImageTiles{1};
+    int64_t maxImageTiles{6};
 };
 
 class InternViTRunner : public MultimodalRunner
@@ -43,14 +47,23 @@ public:
     InternViTRunner(std::string const& engineDir, cudaStream_t stream);
     ~InternViTRunner() = default;
 
+    // TODO: Clean Old API
     void preprocess(std::vector<std::string> const& inputStrings,
-        std::vector<std::vector<ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
+        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
         std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer,
         int const maxSupportedInputLength, bool enableDynamicShape, void* ropeRotaryCosSinDevice [[maybe_unused]],
         int const maxPositionEmbeddings [[maybe_unused]], int const rotaryDim [[maybe_unused]],
         cudaStream_t stream) override;
 
+    // TODO: Clean Old API
     std::vector<EngineInputDesc> getComputedEmbeddings() override;
+
+    bool preprocess(std::vector<std::string> const& inputStrings,
+        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
+        std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& inputIdsLengths,
+        drivellm::tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+
+    bool infer(cudaStream_t stream) override;
 
     void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
         int const inputLength, cudaStream_t stream) override;
@@ -60,7 +73,7 @@ public:
     void* getConfig() override;
 
     // InternVL-specific methods
-    static std::tuple<int, int> resizeImage(int const height, int const width, int const targetTileHeight,
+    static std::tuple<int, int> getResizedImageSize(int const height, int const width, int const targetTileHeight,
         int const targetTileWidth, int const minImageTiles, int const maxImageTiles);
 
     static std::vector<std::pair<int, int>> getAllSupportedAspectRatios(
@@ -75,15 +88,15 @@ private:
         std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true) override;
 
     // InternVL-specific methods
-    void formatPatch(ImageData const& image, std::vector<half>& patches, std::vector<int64_t>& imageTokenLengths,
-        int64_t& numImagePerBatch, int64_t& totalNumBlocks);
+    void formatPatch(rt::imageUtils::ImageData const& image, std::vector<half>& patches,
+        std::vector<int64_t>& imageTokenLengths, int64_t& numImagePerBatch, int64_t& totalNumBlocks);
 
-    void imagePreprocess(std::vector<std::vector<ImageData>> const& imageBuffers,
-        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImagePerBatch, cudaStream_t stream);
+    void imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
+        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImagePerBatch, bool doResize,
+        cudaStream_t stream);
 
     InternViTConfig mConfig;
     rt::Tensor mVitInput{};
-    rt::Tensor mVitOutput{};
 };
 
 } // namespace rt

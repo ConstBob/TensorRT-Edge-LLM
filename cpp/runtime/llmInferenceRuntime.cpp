@@ -1,7 +1,10 @@
 #include "llmInferenceRuntime.h"
 
 #include "common/logger.h"
+#include "multimodal/multimodalRunner.h"
 #include "sampler/sampling.h"
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 using namespace nvinfer1;
 
@@ -9,7 +12,8 @@ namespace drivellm
 {
 namespace rt
 {
-LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, cudaStream_t stream)
+LLMInferenceRuntime::LLMInferenceRuntime(
+    std::string const& engineDir, std::string const& multimodalEngineDir, cudaStream_t stream)
 {
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
@@ -59,10 +63,24 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, cudaStrea
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
     LOG_INFO("Start loading tokenizer from model directory: %s", engineDir.c_str());
     mTokenizer->loadFromHF(engineDir);
+
+    // Optional: Setup multimodal engine runner
+    if (!multimodalEngineDir.empty())
+    {
+        try
+        {
+            mMultimodalRunner = MultimodalRunner::create(multimodalEngineDir, stream);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to initialize MultimodalRunner: %s", e.what());
+            throw std::runtime_error("Failed to initialize MultimodalRunner: " + std::string(e.what()));
+        }
+        LOG_INFO("MultimodalRunner successfully loaded and initialized multimodal engine.");
+    }
 }
 
-bool LLMInferenceRuntime::prepareInputIds(
-    LLMGenerationRequest const& request, std::vector<int32_t>& packedInputIds, std::vector<int32_t>& inputIdsLengths)
+bool LLMInferenceRuntime::getInputTexts(LLMGenerationRequest const& request, std::vector<std::string>& inputTexts)
 {
     int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
 
@@ -79,19 +97,56 @@ bool LLMInferenceRuntime::prepareInputIds(
         return false;
     }
 
-    std::vector<std::string> inputTexts;
-    std::vector<std::vector<int32_t>> inputIdsVec;
-    inputIdsLengths.resize(activeBatchSize, 0);
+    if (mMultimodalRunner)
+    {
+        int32_t const imageBuffersBatchSize = static_cast<int32_t>(request.imageBuffers.size());
+        if (activeBatchSize != imageBuffersBatchSize)
+        {
+            LOG_ERROR("LLMInferenceRuntime(): The batch size of prompts and image buffers is not the same.");
+            return false;
+        }
+    }
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        std::string inputText = request.prompts[i].systemPrompt + request.prompts[i].userPrompt;
-        inputTexts.emplace_back(inputText);
-        auto tokenizedInput = mTokenizer->encode(inputText, true);
-        inputIdsVec.emplace_back(tokenizedInput);
-        inputIdsLengths[i] = static_cast<int32_t>(tokenizedInput.size());
+        inputTexts.emplace_back(request.prompts[i].systemPrompt + request.prompts[i].userPrompt);
     }
 
+    return true;
+}
+
+bool LLMInferenceRuntime::prepareInputIds(
+    LLMGenerationRequest const& request, std::vector<int32_t>& packedInputIds, std::vector<int32_t>& inputIdsLengths)
+{
+    std::vector<std::string> inputTexts;
+    if (!getInputTexts(request, inputTexts))
+    {
+        LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
+        return false;
+    }
+
+    std::vector<std::vector<int32_t>> inputIdsVec;
+    inputIdsLengths.clear();
+
+    for (auto& inputText : inputTexts)
+    {
+        auto tokenizedInput = mTokenizer->encode(inputText, true);
+        inputIdsVec.emplace_back(tokenizedInput);
+        inputIdsLengths.emplace_back(static_cast<int32_t>(tokenizedInput.size()));
+    }
+
+    if (!packInputIds(inputIdsVec, inputIdsLengths, packedInputIds))
+    {
+        LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
+        return false;
+    }
+
+    return true;
+}
+
+bool LLMInferenceRuntime::packInputIds(std::vector<std::vector<int32_t>>& batchInputIds,
+    std::vector<int32_t>& inputIdsLengths, std::vector<int32_t>& packedInputIds)
+{
     int32_t const minInputLength = *std::min_element(inputIdsLengths.begin(), inputIdsLengths.end());
     int32_t const maxInputLength = *std::max_element(inputIdsLengths.begin(), inputIdsLengths.end());
 
@@ -108,24 +163,60 @@ bool LLMInferenceRuntime::prepareInputIds(
         return false;
     }
 
+    int32_t const activeBatchSize = static_cast<int32_t>(batchInputIds.size());
     packedInputIds.resize(activeBatchSize * maxInputLength, mTokenizer->getPadId());
 
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        std::copy(inputIdsVec[i].begin(), inputIdsVec[i].end(), packedInputIds.begin() + i * maxInputLength);
+        std::copy(batchInputIds[i].begin(), batchInputIds[i].end(), packedInputIds.begin() + i * maxInputLength);
     }
 
     return true;
 }
+
 bool LLMInferenceRuntime::handleRequest(
     LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
 {
     std::vector<int32_t> packedInputIds;
     std::vector<int32_t> inputIdsLengths;
-    if (!prepareInputIds(request, packedInputIds, inputIdsLengths))
+
+    if (!mMultimodalRunner)
     {
-        LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
-        return false;
+        if (!prepareInputIds(request, packedInputIds, inputIdsLengths))
+        {
+            LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
+            return false;
+        }
+    }
+    else
+    {
+        std::vector<std::string> batchInputTexts;
+        if (!getInputTexts(request, batchInputTexts))
+        {
+            LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
+            return false;
+        }
+
+        std::vector<std::vector<int32_t>> batchInputIds;
+        if (!mMultimodalRunner->preprocess(batchInputTexts, request.imageBuffers, batchInputIds, inputIdsLengths,
+                mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
+        {
+            LOG_ERROR(
+                "LLMInferenceRuntime(): Multimodal input request processing failed. This request cannot be handled.");
+            return false;
+        }
+
+        if (!packInputIds(batchInputIds, inputIdsLengths, packedInputIds))
+        {
+            LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
+            return false;
+        }
+
+        if (!mMultimodalRunner->infer(stream))
+        {
+            LOG_ERROR("LLMInferenceRuntime(): Multimodal inference failed. This request cannot be handled.");
+            return false;
+        }
     }
 
     int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
@@ -181,7 +272,10 @@ bool LLMInferenceRuntime::handleRequest(
     CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), packedInputIds.data(),
         activeBatchSize * maxInputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     memcpy(mHostContextLengths.dataPointer<int32_t>(), inputIdsLengths.data(), activeBatchSize * sizeof(int32_t));
-    mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, mOutputLogits, stream);
+    // Use empty tensor for when no multimodal runner is available
+    rt::Tensor emptyTensor{};
+    rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
+    mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
     auto generatedToken = sampleTokens();
 
     mInputIds.reshape({activeBatchSize, 1});
@@ -189,7 +283,7 @@ bool LLMInferenceRuntime::handleRequest(
     {
         CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), generatedToken.data(), activeBatchSize * sizeof(int32_t),
             cudaMemcpyHostToDevice, stream));
-        mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, mOutputLogits, stream);
+        mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, multimodalEmbeddings, mOutputLogits, stream);
         generatedToken = sampleTokens();
     }
 
@@ -199,7 +293,7 @@ bool LLMInferenceRuntime::handleRequest(
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         response.outputIds.emplace_back(outputIds[i]);
-        response.outputTexts.emplace_back(mTokenizer->decode(outputIds[i]));
+        response.outputTexts.emplace_back(mTokenizer->decode(outputIds[i], true));
     }
 
     return true;

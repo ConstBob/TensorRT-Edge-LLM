@@ -257,6 +257,11 @@ Dims Tensor::getTRTDims() const noexcept
     return dims;
 }
 
+bool Tensor::isEmpty() const noexcept
+{
+    return data == nullptr;
+}
+
 void* Tensor::rawPointer() noexcept
 {
     return data;

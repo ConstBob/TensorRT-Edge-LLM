@@ -13,17 +13,7 @@
 #pragma once
 #include "engine/llm_engine.h"
 #include "llm_param.h"
-#include "multimodal/multimodalRunner.h"
 #include <vector>
-
-// Image loading and resizing helper functions
-drivellm::rt::ImageData loadImageFromFile(std::string const& path);
-drivellm::rt::ImageData loadImageFromMemory(unsigned char const* data, size_t size);
-drivellm::rt::ImageData resizeImage(
-    drivellm::rt::ImageData const& image, int newWidth, int newHeight, bool isThumbnail = false);
-
-std::unique_ptr<drivellm::rt::MultimodalRunner> getMultimodalRunner(
-    VLMRunParams const& vlmRunParams, cudaStream_t stream);
 
 std::unique_ptr<drivellm::rt::LLMEngine> getLLMEngine(int32_t batchSize, BaseParams const& baseParams,
     EagleParams const& eagleParams, LoraWeights const& loraWeights, cudaStream_t stream);
