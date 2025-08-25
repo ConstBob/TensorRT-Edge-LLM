@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <nlohmann/json.hpp>
+#include <unordered_map>
 
 namespace drivellm
 {
@@ -54,7 +55,7 @@ public:
     LLMEngineRunner(
         std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream);
 
-    ~LLMEngineRunner() = default;
+    ~LLMEngineRunner();
 
     //! API entry to get the Rope CosSinCache tensor.
     //! The API is useful when the rope cos/sin cache depends on the context which cannot be initialized
@@ -90,11 +91,24 @@ public:
     bool executeVanillaDecodingStep(rt::Tensor const& inputIds, rt::Tensor const& multimodalEmbeddings,
         rt::Tensor& outputLogits, cudaStream_t stream);
 
+    //! API entry to capture the CUDA graph for the decoding step. If CUDA graph capture is successful, later
+    //!     call to executeVanillaDecodingStep() will always launch the captured CUDA graph.
+    //! Inputs:
+    //!     inputIds [GPU]: The input token_ids for the batch of new requests.
+    //!     outputLogits [GPU]: The output logits for the batch of requests.
+    //!     stream: The CUDA stream to execute the decoding step.
+    //! Returns:
+    //!     True if the CUDA graph capture is successful, false otherwise.
+    bool captureVanillaDecodingCudaGraph(rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream);
+
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext;
+    //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
+    //! which denote the input/output shapes and other execution properties.
+    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
 
     LLMEngineRunnerConfig mConfig{};
 

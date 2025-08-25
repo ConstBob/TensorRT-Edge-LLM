@@ -75,7 +75,7 @@ int main(int argc, char* argv[])
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed to initialize LLMInferenceRuntime: {}", e.what());
-        return 1;
+        return EXIT_FAILURE;
     }
 
     rt::LLMGenerationRequest request;
@@ -95,6 +95,13 @@ int main(int argc, char* argv[])
     {
         request.prompts.emplace_back(
             rt::LLMGenerationRequest::Prompt{"", "Introduce NVIDIA and introduce the CEO of this company."});
+        // Capture CUDA graph and execute the graph for text only input.
+        // TODO: Enable CUDA graph capture for multimodal inputs.
+        bool const captureStatus = llmInferenceRuntime->captureDecodingCUDAGraph(stream);
+        if (!captureStatus)
+        {
+            LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
+        }
     }
 
     if (llmInferenceRuntime->handleRequest(request, response, stream))

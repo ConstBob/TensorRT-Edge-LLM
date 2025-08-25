@@ -301,8 +301,19 @@ bool LLMInferenceRuntime::handleRequest(
 
 bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
-    // TODO: Implement the graph capture logic.
-    return false;
+    int32_t const maxSupportedBatchSize = mEngineConfig.maxSupportedBatchSize;
+    int32_t const minSupportedBatchSize = mEngineConfig.enableDynamicShape ? 1 : maxSupportedBatchSize;
+
+    bool captureStatus{true};
+    // Capture the CUDA graph for all available batch sizes.
+    for (int32_t batchSize = minSupportedBatchSize; batchSize <= maxSupportedBatchSize; ++batchSize)
+    {
+        mInputIds.reshape({batchSize, 1});
+        mOutputLogits.reshape({batchSize, mEngineConfig.vocabSize});
+        captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(mInputIds, mOutputLogits, stream);
+    }
+
+    return captureStatus;
 }
 
 } // namespace rt
