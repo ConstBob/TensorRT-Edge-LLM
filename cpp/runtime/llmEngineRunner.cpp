@@ -14,9 +14,11 @@
 #include "runtime/llmRuntimeUtils.h"
 
 #include "common/logger.h"
+#include <functional>
 #include <sstream>
 #include <string>
 
+using namespace drivellm;
 using namespace nvinfer1;
 using Json = nlohmann::json;
 
@@ -36,6 +38,31 @@ std::string formatEngineConfig(drivellm::rt::LLMEngineRunnerConfig const& config
        << "  maxSequenceLength: " << config.maxSequenceLength;
 
     return ss.str();
+}
+
+template <typename T>
+void hashCombine(size_t& seed, T const& value)
+{
+    constexpr size_t kDELTA = 0x9e3779b9;
+    seed ^= std::hash<T>()(value) + kDELTA + (seed << 6) + (seed >> 2);
+}
+
+// Compute a unique hash value that can distinguish the various decoding steps.
+// Extend this function when we need to capture more information.
+size_t hashDecodingInput(rt::Tensor const& inputIds, rt::Tensor const& outputLogits)
+{
+    // For vanilla decoding step, the shape can be distingusihed by active batch size.
+    // Also capture the pointer address to ensure we are read/write correct locations.
+    int64_t const activeBatchSize = inputIds.getShape()[0];
+    uintptr_t const inputIdsAddr = reinterpret_cast<uintptr_t>(inputIds.rawPointer());
+    uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
+
+    size_t hashValue = 0;
+    hashCombine(hashValue, activeBatchSize);
+    hashCombine(hashValue, inputIdsAddr);
+    hashCombine(hashValue, outputLogitsAddr);
+
+    return hashValue;
 }
 } // namespace
 
@@ -119,8 +146,6 @@ LLMEngineRunner::LLMEngineRunner(
             = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim},
                 rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
-        // Value has to be initialized during the engine execution time since it depends on runtime input.
-        // Shape has to be set during the engine execution time since it depends on the active batch size.
     }
     mContextExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
     mGenerationExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
@@ -185,6 +210,15 @@ void LLMEngineRunner::initializeConfigFromEngine()
     mConfig.rotaryDim = ropeCosSinCacheDim.d[2];
 
     LOG_INFO("Loaded LLMEngineRunner with config: %s", formatEngineConfig(mConfig).c_str());
+}
+
+LLMEngineRunner::~LLMEngineRunner()
+{
+    for (auto& [hashValue, graphPair] : mCudaGraphs)
+    {
+        CUDA_CHECK(cudaGraphDestroy(graphPair.first));
+        CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
+    }
 }
 
 bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
@@ -408,8 +442,100 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     // For vanllia decode stage, the selected token indices are always 0.
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
 
+    // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
+    size_t const graphHash = hashDecodingInput(inputIds, outputLogits);
+    if (mCudaGraphs.find(graphHash) != mCudaGraphs.end())
+    {
+        LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for this decoding step.");
+        cudaGraphExec_t graphExec = mCudaGraphs[graphHash].second;
+        CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
+    }
+    else
+    {
+        bool setEngineIOStatus{true};
+        // Engine input tensors.
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            inputIdsName.c_str(), const_cast<void*>(inputIds.rawPointer()));
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), inputIds.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            contextLengthsName.c_str(), contextLengthDevice.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            contextLengthsName.c_str(), contextLengthDevice.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+        if (!multimodalEmbeddings.isEmpty())
+        {
+            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+                multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
+            auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
+            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+                multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
+        }
+        // Engine output tensors.
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
+
+        if (!setEngineIOStatus)
+        {
+            LOG_ERROR("executeVanillaDecodingStep(): Failed to set engine input tensors.");
+            return false;
+        }
+
+        // launch the engine execution.
+        bool executeStatus{true};
+        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+        if (!executeStatus)
+        {
+            LOG_ERROR("executeVanillaDecodingStep(): Failed on TensorRT decode stage enqueueV3() call.");
+            return false;
+        }
+    }
+
+    LOG_DEBUG("executeVanillaDecodingStep(): Decoding stage execution completed for request with batch size %d.",
+        activeBatchSize);
+    return true;
+}
+
+bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
+    rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream)
+{
+    size_t const hashValue = hashDecodingInput(inputIds, outputLogits);
+    if (mCudaGraphs.find(hashValue) != mCudaGraphs.end())
+    {
+        LOG_INFO("captureVanillaDecodingCudaGraph(): CUDA graph already captured for the input tensors.");
+        return true;
+    }
+
+    // To avoid CUDA graph error from TensorRT engine, we need to enqueueV3() once prior to graph capture.
+    // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
+    int64_t const activeBatchSize = inputIds.getShape()[0];
+    constexpr int32_t simulateCacheLength{128};
+    std::vector<int32_t> simulateCacheLengths(activeBatchSize, simulateCacheLength);
+    rt::Tensor const prefillLengthsTensor(
+        simulateCacheLengths.data(), {activeBatchSize}, DeviceType::kCPU, DataType::kINT32);
+    mKVCache.resetForNewSequences(activeBatchSize, stream);
+    mKVCache.commitPrefillRequest(prefillLengthsTensor, stream);
+
+    // Validate the condition here after the simulate prefill step.
+    bool const validateInputStatus = this->vanlliaDecodingStepInputValidation(inputIds, outputLogits);
+    if (!validateInputStatus)
+    {
+        LOG_ERROR("captureVanillaDecodingCudaGraph(): Generation request is invalid, unable to capture CUDA graph.");
+        return false;
+    }
+
+    // Set shape of mSelectTokenIndices and set value to all zero..
+    mSelectTokenIndices.reshape({activeBatchSize, 1});
+    CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
+
+    // Set engine I/O using the same logic as executeVanillaDecodingStep().
+    rt::Tensor& contextLengthDevice = mKVCache.getKVCacheLengths();
     bool setEngineIOStatus{true};
-    // Engine input tensors.
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         inputIdsName.c_str(), const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
@@ -425,35 +551,38 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
 
-    if (!multimodalEmbeddings.isEmpty())
-    {
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
-        auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
-    }
-
     // Engine output tensors.
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
 
+    // Bind the KVCache since we haven't executed the real prefill step.
+    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
     if (!setEngineIOStatus)
     {
-        LOG_ERROR("executeVanillaDecodingStep(): Failed to set engine input tensors.");
+        LOG_ERROR(
+            "captureVanillaDecodingCudaGraph(): Failed to set engine input tensors, unable to capture CUDA graph.");
         return false;
     }
 
-    // launch the engine execution.
     bool executeStatus{true};
     executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
-        LOG_ERROR("executeVanillaDecodingStep(): Failed on TensorRT decode stage enqueueV3() call.");
+        LOG_ERROR("captureVanillaDecodingCudaGraph(): Failed on TensorRT engine enqueueV3() call.");
         return false;
     }
 
-    LOG_DEBUG("executeVanillaDecodingStep(): Decoding stage execution completed for request with batch size %d.",
-        activeBatchSize);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    cudaGraph_t graph;
+    cudaGraphExec_t graphExec;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
+    mCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
+
+    LOG_INFO("captureVanillaDecodingCudaGraph(): CUDA graph captured successfully for input shape %s.",
+        inputIds.getShape().formatString().c_str());
     return true;
 }
 
