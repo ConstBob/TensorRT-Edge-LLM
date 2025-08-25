@@ -865,17 +865,16 @@ bool Decoder::addLora(std::string const& name, std::string const& filePath)
 
     try
     {
-        auto loader = std::make_unique<drivellm::SafeTensorsLoader>(filePath);
-
-        // Load all tensors to GPU
-        if (!loader->loadFromFileToGPU())
+        // Load tensors using the new unified interface
+        std::vector<drivellm::rt::Tensor> tensors;
+        if (!drivellm::rt::safetensors::loadSafetensors(filePath, tensors, mStream))
         {
-            LOG_WARNING("Failed to load LoRA weights to GPU from: %s", filePath.c_str());
+            LOG_WARNING("Failed to load LoRA weights from: %s", filePath.c_str());
             return false;
         }
 
-        // Store the loader in our map
-        mLoraWeights[name] = std::move(loader);
+        // Store the tensors in our map
+        mLoraWeights[name] = std::move(tensors);
         return true;
     }
     catch (std::exception const& e)
@@ -929,8 +928,7 @@ bool Decoder::switchLora(std::string const& name)
         return false;
     }
 
-    auto& loraLoader = it->second;
-    auto const& tensorInfo = loraLoader->getSafeTensorsInfo();
+    auto& loraTensors = it->second;
 
     // Iterate through all bindings
     for (int32_t i = 0; i < numBindings; ++i)
@@ -943,14 +941,16 @@ bool Decoder::switchLora(std::string const& name)
             nvinfer1::Dims shape = mEngine->getProfileShape(bindingName, 0, nvinfer1::OptProfileSelector::kMAX);
 
             // Try to find the tensor in the LoRA weights
-            auto tensorIt = tensorInfo.find(bindingName);
-            if (tensorIt != tensorInfo.end() && tensorIt->second.gpuPtr != nullptr)
+            auto tensorIt = std::find_if(loraTensors.begin(), loraTensors.end(),
+                [bindingName](rt::Tensor const& tensor) { return tensor.getName() == bindingName; });
+
+            if (tensorIt != loraTensors.end())
             {
                 // Found matching tensor, use its data
                 mContextExecutionContext->setInputShape(bindingName, shape);
                 mGenerationExecutionContext->setInputShape(bindingName, shape);
-                mContextExecutionContext->setTensorAddress(bindingName, tensorIt->second.gpuPtr);
-                mGenerationExecutionContext->setTensorAddress(bindingName, tensorIt->second.gpuPtr);
+                mContextExecutionContext->setTensorAddress(bindingName, tensorIt->rawPointer());
+                mGenerationExecutionContext->setTensorAddress(bindingName, tensorIt->rawPointer());
             }
             else
             {

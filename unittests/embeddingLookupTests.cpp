@@ -33,7 +33,7 @@ static constexpr bool DEBUG_MODE = false;
 namespace
 {
 
-// Helper function to compare results using testUtils tolerance
+// Helper function to compare results using direct half comparison
 bool compareResults(
     std::vector<half> const& ref, std::vector<half> const& test, std::string const& testName = "Embedding Lookup")
 {
@@ -46,10 +46,10 @@ bool compareResults(
 
     for (size_t i = 0; i < ref.size(); ++i)
     {
-        float refVal = __half2float(ref[i]);
-        float testVal = __half2float(test[i]);
-        if (!validateValue<half>(testVal, refVal, i, 0, 0, testName))
+        if (!isclose(test[i], ref[i], 1e-2, 1e-2))
         {
+            std::cout << testName << " validation failed at index " << i << ": expected=" << __half2float(ref[i])
+                      << ", got=" << __half2float(test[i]) << std::endl;
             return false;
         }
     }
@@ -277,8 +277,7 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandling)
             for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
             {
                 int64_t const resultIdx = tokenIdx * hiddenSize + elementIdx;
-                float const value = __half2float(gpuResult[resultIdx]);
-                EXPECT_NEAR(value, 0.0f, 1e-6)
+                EXPECT_TRUE(isclose(gpuResult[resultIdx], __float2half(0.0f), 1e-6, 1e-6))
                     << "Out-of-bounds token " << tokenId << " should produce zero embedding at element " << elementIdx;
             }
         }
@@ -369,8 +368,7 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandlingWithImageInsertion)
             for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
             {
                 int64_t const resultIdx = tokenIdx * hiddenSize + elementIdx;
-                float const value = __half2float(gpuResult[resultIdx]);
-                EXPECT_NEAR(value, 0.0f, 1e-6)
+                EXPECT_TRUE(isclose(gpuResult[resultIdx], __float2half(0.0f), 1e-6, 1e-6))
                     << "Out-of-bounds token " << tokenId << " should produce zero embedding at element " << elementIdx;
             }
         }

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/safetensors_loader/safetensorsLoader.h"
 #include "common/tensor.h"
 #include <cuda_runtime.h>
 

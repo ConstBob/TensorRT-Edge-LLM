@@ -168,7 +168,7 @@ TEST(TensorTest, DeviceTensorOwnMemory)
 TEST(TensorTest, DeviceTensorNonOwnMemory)
 {
     void* devicePtr{nullptr};
-    CUDA_CHECK(cudaMalloc(&devicePtr, 512));
+    CUDA_CHECK(cudaMallocAsync(&devicePtr, 512, 0));
 
     rt::Tensor tensor(devicePtr, {4, 8, 16}, rt::DeviceType::kGPU, nvinfer1::DataType::kFP8);
     ASSERT_FALSE(tensor.getOwnMemory());
@@ -200,4 +200,47 @@ TEST(TensorTest, DeviceTensorNonOwnMemory)
 
     ASSERT_NE(tensor2.rawPointer(), nullptr);
     ASSERT_EQ(tensor.rawPointer(), nullptr);
+
+    // Clean up the manually allocated memory
+    CUDA_CHECK(cudaFreeAsync(devicePtr, 0));
+}
+
+TEST(TensorTest, TensorNameFunctionality)
+{
+    // Test tensor with name
+    rt::Tensor namedTensor({2, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "test_tensor");
+    ASSERT_EQ(namedTensor.getName(), "test_tensor");
+
+    // Test tensor with empty name (default)
+    rt::Tensor unnamedTensor({2, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    ASSERT_EQ(unnamedTensor.getName(), "");
+
+    // Test tensor with explicit empty name
+    rt::Tensor explicitEmptyTensor({2, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "");
+    ASSERT_EQ(explicitEmptyTensor.getName(), "");
+
+    // Test tensor with long name
+    std::string longName = "very_long_tensor_name_with_many_characters_for_testing_purposes";
+    rt::Tensor longNamedTensor({1, 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT, longName);
+    ASSERT_EQ(longNamedTensor.getName(), longName);
+
+    // Test non-own memory tensor with name
+    void* devicePtr{nullptr};
+    CUDA_CHECK(cudaMallocAsync(&devicePtr, 24, 0));
+    rt::Tensor nonOwnNamedTensor(devicePtr, {2, 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "non_own_tensor");
+    ASSERT_EQ(nonOwnNamedTensor.getName(), "non_own_tensor");
+
+    // Test move constructor preserves name
+    rt::Tensor movedTensor = std::move(namedTensor);
+    ASSERT_EQ(movedTensor.getName(), "test_tensor");
+    ASSERT_EQ(namedTensor.getName(), ""); // Original tensor should have empty name after move
+
+    // Test move assignment preserves name
+    rt::Tensor assignedTensor({1, 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "original_name");
+    assignedTensor = std::move(movedTensor);
+    ASSERT_EQ(assignedTensor.getName(), "test_tensor");
+    ASSERT_EQ(movedTensor.getName(), ""); // Moved tensor should have empty name after assignment
+
+    // Clean up the manually allocated memory
+    CUDA_CHECK(cudaFreeAsync(devicePtr, 0));
 }
