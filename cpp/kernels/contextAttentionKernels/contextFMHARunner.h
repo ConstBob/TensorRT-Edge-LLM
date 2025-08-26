@@ -22,7 +22,7 @@ class ContextFMHARunner
 {
 public:
     ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t paddedSeqLen, int32_t numQHeads,
-        int32_t numKvHeads, int32_t headSize, int32_t smVersion);
+        int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout);
 
     ContextFMHARunner() = delete;
 

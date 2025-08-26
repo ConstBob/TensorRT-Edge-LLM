@@ -26,7 +26,7 @@ class AttentionPlugin : public nvinfer1::IPluginV2DynamicExt
 public:
     // Plugin constructor and attention specific utility methods
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t isEagleMode);
+        int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t isEagleMode, int32_t hasPersistentKVCache);
 
     AttentionPlugin(std::string const& name, void const* data, size_t length);
 
@@ -84,12 +84,15 @@ protected:
     // Here the kvcache capacity refers to max number of tokens per input context.
     int32_t mMaxBatchSize{};
     // Eagle uses tree attention
-    int32_t mEnableTreeAttention{0};
+    int32_t mEnableTreeAttention{};
     int32_t mKVCacheCapacity{};
 
     // Datatype of QKV and kvCache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion;
+
+    // Whether to use the persistent kv cache.
+    int32_t mHasPersistentKVCache{};
 };
 
 class AttentionPluginCreator : public nvinfer1::IPluginCreator

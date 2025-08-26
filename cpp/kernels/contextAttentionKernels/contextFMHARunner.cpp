@@ -14,6 +14,7 @@
 
 #include "common/common.h"
 #include "cubin/fmha_cubin.h"
+#include "fmhaParams_v2.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -99,6 +100,19 @@ int32_t attentionMaskTypeToInt(ContextAttentionMaskType type)
     return result;
 }
 
+int32_t attentionInputLayoutToInt(AttentionInputLayout layout)
+{
+    int32_t result{};
+    switch (layout)
+    {
+    case AttentionInputLayout::PACKED_QKV: result = 0; break;
+    case AttentionInputLayout::CONTIGUOUS_Q_KV: result = 1; break;
+    case AttentionInputLayout::Q_PAGED_KV: result = 2; break;
+    case AttentionInputLayout::SEPARATE_Q_K_V: result = 3; break;
+    }
+    return result;
+}
+
 struct FMHAKernelLoadHashKey
 {
     FMHADataType data_type;
@@ -131,6 +145,7 @@ struct FMHAKernelHashKey
     bool flash_attention;
     int32_t attention_mask_type;
     bool tiled;
+    int32_t attention_input_layout;
 
     bool operator==(FMHAKernelHashKey const& other) const
     {
@@ -139,7 +154,7 @@ struct FMHAKernelHashKey
         return data_type == other.data_type && (sequenceLen == other.sequenceLen || flash_attention == true)
             && headSize == other.headSize && unroll == other.unroll && force_fp32_acc == other.force_fp32_acc
             && flash_attention == other.flash_attention && attention_mask_type && other.attention_mask_type
-            && tiled == other.tiled;
+            && tiled == other.tiled && attention_input_layout == other.attention_input_layout;
     }
 };
 
@@ -220,7 +235,8 @@ public:
             }
             FMHAKernelHashKey hashKey{kernelMeta.mDataTypeIn, static_cast<int32_t>(kernelMeta.mS),
                 static_cast<int32_t>(kernelMeta.mD), kernelMeta.mUnrollStep != 0, kernelMeta.mFP32Accumulation,
-                kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType, kernelMeta.mTiled};
+                kernelMeta.mFlashAttention, kernelMeta.mAttentionMaskType, kernelMeta.mTiled,
+                kernelMeta.mAttentionInputLayout};
             mFunctions.insert(std::make_pair(hashKey, funcInfo));
         }
     }
@@ -294,7 +310,7 @@ inline FMHAKernelList* getFMHAKernels(FMHADataType type, int32_t sm)
 }; // namespace
 
 ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t paddedSeqLen,
-    int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion)
+    int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout)
     : mDataType(dataType)
     , mBatchSize(batchSize)
     , mPaddedSequenceLen(paddedSeqLen)
@@ -311,6 +327,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     mLaunchParams.device_l2_cache_size = props.l2CacheSize;
     // Only causal attention kernel get integrated and used now.
     mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
+    mLaunchParams.attention_input_layout = inputLayout;
 
     bool const isSm8x = (smVersion == fmha_v2::kSM_80 || smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87
         || smVersion == fmha_v2::kSM_89);
@@ -325,6 +342,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
         // flash attention kernles s = 0 (support any seq length)
         mLaunchParams.force_unroll = true;
 
+        // TODO: Check if still proper for contiguous q-kv input layout
         if (mPaddedSequenceLen <= 64 || mHeadSize < 256)
         {
             // flash attention tiled kernels allows larger free dim tile size (M, N) with flexibility
@@ -364,10 +382,25 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
     params.is_s_padded = true;
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
-    int64_t stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
-    params.q_stride_in_bytes = stride_in_bytes;
-    params.k_stride_in_bytes = stride_in_bytes;
-    params.v_stride_in_bytes = stride_in_bytes;
+
+    check(mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV
+            || mLaunchParams.attention_input_layout == AttentionInputLayout::CONTIGUOUS_Q_KV,
+        "Unsupported input layout");
+    if (mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV)
+    {
+        int64_t stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
+        params.q_stride_in_bytes = stride_in_bytes;
+        params.k_stride_in_bytes = stride_in_bytes;
+        params.v_stride_in_bytes = stride_in_bytes;
+    }
+    else
+    {
+        int64_t q_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
+        int64_t kv_stride_in_bytes = (2 * mNumKVHeads) * mHeadSize * sizeof(half);
+        params.q_stride_in_bytes = q_stride_in_bytes;
+        params.k_stride_in_bytes = kv_stride_in_bytes;
+        params.v_stride_in_bytes = kv_stride_in_bytes;
+    }
 }
 
 bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType)
@@ -386,11 +419,21 @@ bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::Data
 
 void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream)
 {
-    check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr,
-        "Device pointers are supposed to be valid");
+    if (mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV)
+    {
+        check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr,
+            "Device pointers are supposed to be valid");
+    }
+    else // CONTIGUOUS_Q_KV
+    {
+        check(params.q_ptr != nullptr && params.kv_ptr != nullptr && params.o_ptr != nullptr
+                && params.cu_q_seqlens != nullptr && params.cu_kv_seqlens != nullptr,
+            "Device pointers are supposed to be valid");
+    }
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
-        attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling};
+        attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling,
+        attentionInputLayoutToInt(mLaunchParams.attention_input_layout)};
     FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
     FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
     check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
