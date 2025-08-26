@@ -101,10 +101,25 @@ index 5f14c8fec..8bfe89a66 100644
  ###################################################################################################
  
 diff --git a/cpp/kernels/fmha_v2/setup.py b/cpp/kernels/fmha_v2/setup.py
-index 8434d4225..32597fe7d 100644
+index 8434d4225..397610050 100644
 --- a/cpp/kernels/fmha_v2/setup.py
 +++ b/cpp/kernels/fmha_v2/setup.py
-@@ -4893,6 +4893,72 @@ def enumerate_hmma_flash_kernels_base(specs,
+@@ -1986,11 +1986,10 @@ def selected_mask_types(kspec):
+                 padding_mask = '0'
+         # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
+         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
+-            causal_mask = '0'
++            causal_mask = '1'
+             sliding_or_chunked_causal_mask = '0'
+-            if kspec.head_size not in [32, 64, 72, 128]:
+-                padding_mask = '0'
+-                custom_mask = '0'
++            padding_mask = '0'
++            custom_mask = '0'
+         # paged kv cache is always needed in gpt variants.
+         # cross-attention also needs paged kv cache.
+         elif kspec.input_layout == InputLayout.Q_PAGED_KV:
+@@ -4893,6 +4892,72 @@ def enumerate_hmma_flash_kernels_base(specs,
                      enable_attn_logit_softcapping=enable_attn_logit_softcapping)
              )
  
@@ -177,7 +192,7 @@ index 8434d4225..32597fe7d 100644
  
  def enumerate_qgmma_kernels(specs, sm=90):
      specs.append(
-@@ -6151,6 +6217,27 @@ def enumerate_kernels():
+@@ -6151,6 +6216,27 @@ def enumerate_kernels():
  
      # Current fp16 384 kernel does 1x8 (smem limit), STEP=48. FP16 does not currently have noloop.
  
@@ -185,10 +200,10 @@ index 8434d4225..32597fe7d 100644
 +        if "ENABLE_SM12X" in os.environ:
 +            sm_list = [120, 121]
 +        else:
-+            sm_list = [80, 86, 89, 87, 101]
++            sm_list = [80, 86, 87, 89, 101]
 +
 +        for sm in sm_list:
-+            for input_layout in [InputLayout.PACKED_QKV]:
++            for input_layout in [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV]:
 +                enumerate_hmma_flash_kernels_edge_llm(specs, sm=sm, dtype='fp16', input_layout=input_layout)
 +
 +        # TRT-EdgeLLM uses the head_interleaved=False mode.
@@ -205,3 +220,42 @@ index 8434d4225..32597fe7d 100644
      # SM 90
      enumerate_hgmma_tma_kernels(specs, sm=90)
      enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype='fp16')
+diff --git a/cpp/kernels/fmha_v2/src/fused_multihead_attention.h b/cpp/kernels/fmha_v2/src/fused_multihead_attention.h
+index 4b6cfaae4..3d110e6d1 100644
+--- a/cpp/kernels/fmha_v2/src/fused_multihead_attention.h
++++ b/cpp/kernels/fmha_v2/src/fused_multihead_attention.h
+@@ -141,7 +141,7 @@ struct Fused_multihead_attention_params_base
+ #endif
+ 
+     // The dimensions.
+-    int b, h, s, d;
++    int b, h, s, d, s_kv;
+     // The scaling factors for the kernel.
+     uint32_t scale_bmm1, scale_softmax, scale_bmm2;
+     // The bmm2 scaling factors in the device.
+diff --git a/cpp/kernels/fmha_v2/src/fused_multihead_attention_demo_bert_params.h b/cpp/kernels/fmha_v2/src/fused_multihead_attention_demo_bert_params.h
+index bacb4938c..e37044e12 100644
+--- a/cpp/kernels/fmha_v2/src/fused_multihead_attention_demo_bert_params.h
++++ b/cpp/kernels/fmha_v2/src/fused_multihead_attention_demo_bert_params.h
+@@ -124,7 +124,7 @@ struct Fused_multihead_attention_params_v2
+     int blocks_per_tma_load_log2;
+ 
+     // The dimensions. In ordinary multi-head attention (MHA), there are equal number of QKV heads
+-    int b, h, h_kv, h_q_per_kv, s, d;
++    int b, h, h_kv, h_q_per_kv, s, s_kv, d;
+     // The dimension of V. If unset, dv = d.
+     int dv = 0;
+     // The number of grouped heads in the seqlen dimension.
+diff --git a/cpp/kernels/fmha_v2/src/fused_multihead_attention_kernel.h b/cpp/kernels/fmha_v2/src/fused_multihead_attention_kernel.h
+index 7cde1d403..956ed4256 100644
+--- a/cpp/kernels/fmha_v2/src/fused_multihead_attention_kernel.h
++++ b/cpp/kernels/fmha_v2/src/fused_multihead_attention_kernel.h
+@@ -130,7 +130,7 @@ struct Single_cta<2>
+         {
+             sum_s = params.s * bidb;
+             // FIXME: might need s_kv here.
+-            sum_s_kv = params.s * bidb;
++            sum_s_kv = params.s_kv * bidb;
+         }
+         else
+         {

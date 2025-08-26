@@ -116,7 +116,7 @@ enum class AttentionInputLayout
 {
     // QKV are packed into [B, S, 3, H, D] layout.
     PACKED_QKV = 0,
-    // Q has contiguous [B, S, H, D] layout, while KV has contiguous [B, 2, H, S, D] layout.
+    // Q has contiguous [Compact_S, H, D] layout, while KV has contiguous [Compact_S, 2, H, D] layout.
     CONTIGUOUS_Q_KV,
     // Q has contiguous [B, S, H, D] layout, while paged KV layout are blocks of indices with shape
     // of [B, 2, Blocks_per_Seq], and the indice indicates the block distance to the pool ptr in
@@ -181,7 +181,7 @@ struct FusedMultiheadAttentionParamsV2
     int blocks_per_tma_load_log2;
 
     // The dimensions. In ordinary multi-head attention (MHA), there are equal number of QKV heads
-    int b, h, h_kv, h_q_per_kv, s, d;
+    int b, h, h_kv, h_q_per_kv, s, s_kv, d;
     // The dimension of V. If unset, dv = d.
     int dv = 0;
     // The number of grouped heads in the seqlen dimension.

@@ -29,7 +29,7 @@ inline int8_t* alignDevicePtr(void* ptr)
 {
     // Convert the pointer to an integer
     uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-    uintptr_t aligned_addr = (addr + kDEVICE_ALIGNMENT) & ~static_cast<uintptr_t>(kDEVICE_ALIGNMENT);
+    uintptr_t aligned_addr = (addr + kDEVICE_ALIGNMENT - 1) & ~static_cast<uintptr_t>(kDEVICE_ALIGNMENT - 1);
 
     // Convert the aligned address back to a pointer
     return reinterpret_cast<int8_t*>(aligned_addr);

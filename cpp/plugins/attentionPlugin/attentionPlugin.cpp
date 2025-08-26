@@ -14,13 +14,14 @@
 #include "common/common.h"
 #include "common/cudaUtils.h"
 
-#include "kernels/contextAttentionKernels/calCuSeqLen.h"
 #include "kernels/contextAttentionKernels/contextFMHARunner.h"
+#include "kernels/contextAttentionKernels/utilKernels.h"
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "plugins/utils/pluginUtils.h"
 
 #include <cassert>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -55,7 +56,7 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t enableTreeAttention)
+    int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t enableTreeAttention, int32_t hasPersistentKVCache)
     : mLayerName(name)
     , mNumHeadQ(numQHeads)
     , mNumHeadKV(numKVHeads)
@@ -63,6 +64,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mMaxBatchSize(maxBatchSize)
     , mKVCacheCapacity(kvCacheCapacity)
     , mEnableTreeAttention(enableTreeAttention)
+    , mHasPersistentKVCache(hasPersistentKVCache)
 {
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -91,6 +93,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mNumHeadKV);
     deserializeValue(&data, &length, &mNumElemPerHead);
     deserializeValue(&data, &length, &mEnableTreeAttention);
+    deserializeValue(&data, &length, &mHasPersistentKVCache);
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -105,8 +108,8 @@ AttentionPlugin::~AttentionPlugin() {}
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(
-        mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize, mKVCacheCapacity, mEnableTreeAttention);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize,
+        mKVCacheCapacity, mEnableTreeAttention, mHasPersistentKVCache);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -147,6 +150,8 @@ bool AttentionPlugin::supportsFormatCombination(
     //      Real context length: [B] (a vector of scalars) with type int32_t.
     //      RoPE cos/sin cache: [B or 1, Smax, D] (a tensor of scalars) with type float.
     //            Rope CosSin can be ND vector depending on rope type.
+    //      Persistent KV cache length [B] (a vector of scalars) with type int32_t.
+
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [B, S, Hq, D]
     //      KV-cache tensor, same as the above.
@@ -209,6 +214,13 @@ bool AttentionPlugin::supportsFormatCombination(
         status &= tensorDesc.dims.nbDims == 2;
         return status;
     };
+    auto checkKVCacheStartIdx = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+        bool status{true};
+        status &= tensorDesc.type == DataType::kINT32;
+        status &= tensorDesc.format == TensorFormat::kLINEAR;
+        status &= tensorDesc.dims.nbDims == 1;
+        return status;
+    };
 
     // Output tensor checks
     auto checkAttentionOutput = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
@@ -227,10 +239,13 @@ bool AttentionPlugin::supportsFormatCombination(
 
     try
     {
-
         if (mEnableTreeAttention)
         {
             assert(nbInputs == 6 && nbOutputs == 2);
+        }
+        else if (mHasPersistentKVCache)
+        {
+            assert(nbInputs == 5 && nbOutputs == 2);
         }
         else
         {
@@ -246,8 +261,18 @@ bool AttentionPlugin::supportsFormatCombination(
             case 1: result = checkKVCache(inOut[1]); break;
             case 2: result = checkSequenceLen(inOut[2]); break;
             case 3: result = checkPosEncodingCosSin(inOut[3]); break;
-            case 4: result = checkAttentionMask(inOut[4]); break;
+            case 4:
+                if (mEnableTreeAttention)
+                {
+                    result = checkAttentionMask(inOut[4]);
+                }
+                else // mHasPersistentKVCache
+                {
+                    result = checkKVCacheStartIdx(inOut[4]);
+                }
+                break;
             case 5: result = checkAttentionPosId(inOut[5]); break;
+            case 6: result = checkKVCacheStartIdx(inOut[6]); break;
             default: break;
             }
         }
@@ -318,13 +343,31 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     // For FMHA kernel we need a buffer to store prefix sum of context lengths.
     // For GQA kernel we need to reserve a buffer space to store the Q tensor after rope transformation.
 
+    int32_t workspaceSize = 0;
     constexpr int32_t nbBytesPerData{2};
+
+    workspaceSize += (mMaxBatchSize + 1) * sizeof(int32_t); // nbBytesCuQSeqLens
+
     // The worksapce will be used to store the Q tensor. For eagle mode, maxDecodingTokens means the number of Q tensor.
     // Set maxDecodingTokens to 128, which means the max value supported is 128. Please change it if need more.
     constexpr int32_t maxDecodingTokens = 128;
-    int32_t const nbBytesQTensor = nbBytesPerData * mMaxBatchSize * mNumHeadQ * mNumElemPerHead * maxDecodingTokens;
     // Add alignment to ensure we have enough device space at worst scenrio.
-    return nbBytesQTensor + kDEVICE_ALIGNMENT;
+    // TODO: more detailed workspace size calculation
+    workspaceSize
+        += nbBytesPerData * mMaxBatchSize * mNumHeadQ * mNumElemPerHead * maxDecodingTokens; // nbBytesQTensor for XQA
+
+    if (mHasPersistentKVCache)
+    {
+        workspaceSize += (mMaxBatchSize + 1) * sizeof(int32_t); // nbBytesCuTotalKvCacheLens
+        workspaceSize += mMaxBatchSize * sizeof(int32_t);       // nbBytesCuKvCacheEndIdxs
+        workspaceSize += nbBytesPerData * mMaxBatchSize * mNumHeadQ * mNumElemPerHead
+            * mKVCacheCapacity; // nbBytesQTensor for FMHA
+        workspaceSize += nbBytesPerData * mMaxBatchSize * mKVCacheCapacity * 2 * mNumHeadKV
+            * mNumElemPerHead; // nbBytesKVCacheCompact
+    }
+
+    // alignDevicePtr run 5 times
+    return workspaceSize + kDEVICE_ALIGNMENT * 5;
 }
 
 int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
@@ -340,6 +383,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     // Optional Inputs that only used with spec decoding tree attention.
     constexpr int32_t kATTENTION_MASK_INPUT_IDX{4};
     constexpr int32_t kATTENTION_POS_ID_INPUT_IDX{5};
+
+    // Optional Inputs that only used with persistent KV cache.
+    constexpr int32_t kKV_CACHE_START_IDX_INPUT_IDX{4};
 
     // Obtain execution time batch size, input context length, and KV-cache capacity per sequence.
     constexpr int32_t kQKV_INPUT_BATCH_DIM_IDX{0};
@@ -389,36 +435,83 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         customSeqIndex = reinterpret_cast<int32_t*>(const_cast<void*>(inputs[kATTENTION_POS_ID_INPUT_IDX]));
     }
 
-    // Align workspace to be minimal aligned.
     int8_t* alignedWorkspacePtr = alignDevicePtr(workspace);
 
+    int32_t const* kvCacheStartIdxPtr = nullptr;
     if (isContextPhase)
     {
+        if (mHasPersistentKVCache)
+        {
+            kvCacheStartIdxPtr = reinterpret_cast<int32_t const*>(inputs[kKV_CACHE_START_IDX_INPUT_IDX]);
+        }
+
         // At Context phase. Do 1. Apply rope and write KVCache. 2. Dispatch FMHA runner.
         // RoPE kernel now only handle padded input sequence, we treat all "tokens" in the
         // padded input as processing targets.
         // TODO: Explore non-padded input format.
         int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
+        AttentionInputLayout attentionInputLayout
+            = mHasPersistentKVCache ? AttentionInputLayout::CONTIGUOUS_Q_KV : AttentionInputLayout::PACKED_QKV;
 
-        drivellm::kernel::launchApplyRopeWriteKVContext(qkvDevicePtr, kvCacheDevicePtr, posEncodingCosSinDevicePtr,
-            runtimeSeqLen, totalProcessToken, mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim,
-            cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+        int32_t* cuQSeqLensDevicePtr = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
+        alignedWorkspacePtr += (runtimeBatchSize + 1) * sizeof(int32_t);
+        alignedWorkspacePtr = alignDevicePtr(alignedWorkspacePtr);
+
+        int32_t* cuTotalKvCacheLensDevicePtr = nullptr;
+        int32_t* kvCacheEndIdxsDevicePtr = nullptr;
+        if (mHasPersistentKVCache)
+        {
+            cuTotalKvCacheLensDevicePtr = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
+            alignedWorkspacePtr += (runtimeBatchSize + 1) * sizeof(int32_t);
+            alignedWorkspacePtr = alignDevicePtr(alignedWorkspacePtr);
+            kvCacheEndIdxsDevicePtr = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
+            alignedWorkspacePtr += (runtimeBatchSize) * sizeof(int32_t);
+            alignedWorkspacePtr = alignDevicePtr(alignedWorkspacePtr);
+        }
+        drivellm::kernel::calCuQCuKVSeqLensAndKVEndIdxs(seqLengthDevicePtr, cuQSeqLensDevicePtr, kvCacheStartIdxPtr,
+            cuTotalKvCacheLensDevicePtr, kvCacheEndIdxsDevicePtr, runtimeSeqLen, runtimeBatchSize, stream);
+
+        auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadKV,
+            mNumElemPerHead, mSMVersion, attentionInputLayout);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
-        auto fmhaRunner = ContextFMHARunner(
-            mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mSMVersion);
         FusedMultiheadAttentionParamsV2 params{};
         memset(&params, 0, sizeof(params));
         fmhaRunner.setupParams(params);
+        params.cu_q_seqlens = cuQSeqLensDevicePtr;
 
-        // Set device ptr for FMHA kernel.
-        params.qkv_ptr = qkvDevicePtr;
-        int32_t* cuSeqLensDevice = nullptr;
-        CUDA_CHECK(cudaMalloc(&cuSeqLensDevice, (runtimeBatchSize + 1) * sizeof(int32_t)));
-        drivellm::kernel::calCuSeqLens(seqLengthDevicePtr, cuSeqLensDevice, runtimeBatchSize, stream);
-        params.cu_q_seqlens = cuSeqLensDevice;
-        params.cu_kv_seqlens = cuSeqLensDevice;
-        params.o_ptr = attentionResultDevicePtr;
+        if (attentionInputLayout == AttentionInputLayout::CONTIGUOUS_Q_KV)
+        {
+            half* qVecDevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
+            alignedWorkspacePtr += (runtimeBatchSize * runtimeSeqLen * mNumHeadQ * mNumElemPerHead * sizeof(half));
+            alignedWorkspacePtr = alignDevicePtr(alignedWorkspacePtr);
+            // q: [b, s, hq+hk+hv, d] -> [compact_s, hq, d]
+            drivellm::kernel::launchApplyRopeWriteContinuousQAndKVCache(qkvDevicePtr, kvCacheDevicePtr,
+                posEncodingCosSinDevicePtr, qVecDevicePtr, kvCacheEndIdxsDevicePtr, runtimeSeqLen, totalProcessToken,
+                mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize,
+                cosSinCacheSeqLen, stream);
+
+            half* kvCacheFMHADevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
+            // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
+            drivellm::kernel::cvtKVCachelayoutXQAToFMHA<half>(kvCacheDevicePtr, kvCacheFMHADevicePtr, runtimeBatchSize,
+                mKVCacheCapacity, mNumHeadKV, mNumElemPerHead, stream);
+
+            // Set device ptr for FMHA kernel.
+            params.s_kv = mKVCacheCapacity;
+            params.q_ptr = qVecDevicePtr;
+            params.kv_ptr = kvCacheFMHADevicePtr;
+            params.cu_kv_seqlens = cuTotalKvCacheLensDevicePtr;
+            params.o_ptr = attentionResultDevicePtr;
+        }
+        else
+        { // PACKED_QKV
+            drivellm::kernel::launchApplyRopeWriteKVContext(qkvDevicePtr, kvCacheDevicePtr, posEncodingCosSinDevicePtr,
+                runtimeSeqLen, totalProcessToken, mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim,
+                cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+            params.qkv_ptr = qkvDevicePtr;
+            params.cu_kv_seqlens = cuQSeqLensDevicePtr;
+            params.o_ptr = attentionResultDevicePtr;
+        }
 
         // Dispatch FMHA kernel
         fmhaRunner.dispatchFMHAKernel(params, stream);
@@ -474,7 +567,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mMaxBatchSize) + sizeof(mKVCacheCapacity) + sizeof(mNumHeadQ) + sizeof(mNumHeadKV)
-        + sizeof(mNumElemPerHead) + sizeof(mEnableTreeAttention);
+        + sizeof(mNumElemPerHead) + sizeof(mEnableTreeAttention) + sizeof(mHasPersistentKVCache);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
@@ -485,6 +578,7 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&buffer, mNumHeadKV);
     serializeValue(&buffer, mNumElemPerHead);
     serializeValue(&buffer, mEnableTreeAttention);
+    serializeValue(&buffer, mHasPersistentKVCache);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -511,6 +605,7 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("has_persistent_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -553,6 +648,9 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         // Make enable_tree_attention optional with default value 0
         std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
         int32_t enableTreeAttentionValue = enableTreeAttention.value_or(0);
+        // Make has_persistent_kv_cache optional with default value 0
+        std::optional<int32_t> hasPersistentKVCache = parsePluginScalarField<int32_t>("has_persistent_kv_cache", fc);
+        int32_t hasPersistentKVCacheValue = hasPersistentKVCache.value_or(0);
 
         // Enforce Core parameters are specified.
         bool checkRequiredFields = maxBatchSize.has_value() && kvCacheCapacity.has_value() && numQHeads.has_value()
@@ -562,8 +660,9 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
             return nullptr;
         }
 
-        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
-            headSize.value(), maxBatchSize.value(), kvCacheCapacity.value(), enableTreeAttentionValue);
+        AttentionPlugin* plugin
+            = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(), headSize.value(),
+                maxBatchSize.value(), kvCacheCapacity.value(), enableTreeAttentionValue, hasPersistentKVCacheValue);
 
         return plugin;
     }
