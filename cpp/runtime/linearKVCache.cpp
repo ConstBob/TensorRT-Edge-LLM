@@ -80,6 +80,14 @@ rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx)
         KVCacheTypeTRT);
 }
 
+rt::Tensor LinearKVCache::getKVCacheBuffer()
+{
+    return rt::Tensor(mDeviceKVCache,
+        {mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength,
+            mConfig.headDim},
+        DeviceType::kGPU, KVCacheTypeTRT);
+}
+
 void LinearKVCache::resetForNewSequences(int32_t batchSize, cudaStream_t stream)
 {
     if (batchSize > mConfig.maxBatchSize)

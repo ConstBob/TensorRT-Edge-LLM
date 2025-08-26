@@ -60,6 +60,9 @@ public:
     //! @return A non-owned tensor object that points to the KVCache memory with shape information.
     rt::Tensor getKVCacheForDecoderLayer(int32_t decoderLayerIdx);
 
+    //! Get the full KVCache buffer as a non-owned tensor.
+    rt::Tensor getKVCacheBuffer();
+
     //! Reset the KVCache buffer state for a new setup of input context.
     //! @param batchSize The number of active sequences in this batch of requests.
     //! @param stream The stream is used to perform GPU memory operations.
