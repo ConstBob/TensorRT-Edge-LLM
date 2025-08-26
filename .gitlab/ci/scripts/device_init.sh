@@ -7,7 +7,7 @@ tensorrt_edge_llm_folder="$HOME/tensorrt-edge-llm"
 board_password={BOARDPASSWORD}
 
 echo $board_password | sudo -S apt update
-echo $board_password | sudo -S apt install -y python3.10 python3-pip git curl nfs-common python3.10-venv
+echo $board_password | sudo -S apt install -y python3.10 python3-pip git curl nfs-common
 
 if [ -d "$ssh_folder" ] ; then
     echo $board_password | sudo -S chmod -R 777 ~/.ssh
@@ -40,5 +40,14 @@ if [ -d "/scratch.trt_llm_data" ] ; then
 else
   echo "/scratch.trt_llm_data folder is not mounted"
 fi
+
+# Check if edge_llm_cache folder exists
+if [ -d "/scratch.edge_llm_cache" ] ; then
+  ls /scratch.edge_llm_cache
+  echo "/scratch.edge_llm_cache folder is mounted"
+else
+  echo "/scratch.edge_llm_cache folder is not mounted"
+fi
+
 
 echo "Environment is ready!"
