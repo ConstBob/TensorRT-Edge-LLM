@@ -1,0 +1,7 @@
+# L0 Export Tests - Model export smoke tests
+# Model export tests
+tests:
+  - tests/test_model_export.py::test_llm_model_export[Qwen2.5-0.5B-Instruct-fp16-4096]
+  - tests/test_model_export.py::test_llm_model_export[Qwen2.5-0.5B-Instruct-int4-4096] 
+  - tests/test_model_export.py::test_vlm_model_export[Qwen2.5-VL-3B-Instruct-int4-4096]
+  
