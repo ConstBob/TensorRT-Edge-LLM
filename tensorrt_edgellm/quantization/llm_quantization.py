@@ -100,7 +100,7 @@ DISABLE_VISUAL_CONFIG: Dict[str, Any] = {
 
 def get_llm_calib_dataloader(
     tokenizer: AutoTokenizer,
-    dataset_name_or_dir: str = "cnn_dailymail",
+    dataset_dir: str = "cnn_dailymail",
     batch_size: int = 1,
     num_samples: int = 512,
     max_length: int = 512,
@@ -110,7 +110,7 @@ def get_llm_calib_dataloader(
     
     Args:
         tokenizer: HuggingFace tokenizer for text processing
-        dataset_name_or_dir: Dataset name or local directory path
+        dataset_dir: Dataset name or local directory path
         batch_size: Batch size for the dataloader
         num_samples: Number of samples to use for calibration
         max_length: Maximum sequence length for tokenization
@@ -121,22 +121,20 @@ def get_llm_calib_dataloader(
     Raises:
         NotImplementedError: If dataset format is not supported
     """
-    print(f"Loading calibration dataset from {dataset_name_or_dir}")
-    if "cnn_dailymail" in dataset_name_or_dir:
-        dataset = load_dataset(dataset_name_or_dir,
-                               name="3.0.0",
-                               split="train")
+    print(f"Loading calibration dataset from {dataset_dir}")
+    if "cnn_dailymail" in dataset_dir:
+        dataset = load_dataset(dataset_dir, name="3.0.0", split="train")
         dataset = dataset["article"][:num_samples]
-    elif os.path.isdir(dataset_name_or_dir):
+    elif os.path.isdir(dataset_dir):
         print(
-            f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
+            f"Recognized local dataset repo {dataset_dir} for calibration; "
             "assuming the calibration data are in the train split and text column."
         )
-        dataset = load_dataset(dataset_name_or_dir, split="train")
+        dataset = load_dataset(dataset_dir, split="train")
         dataset = dataset["text"][:num_samples]
     else:
         raise NotImplementedError(
-            f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
+            f"Unsupported dataset name or local repo directory: {dataset_dir}."
         )
 
     batch_encoded = tokenizer.batch_encode_plus(dataset,
@@ -170,9 +168,9 @@ def get_llm_quant_config(
     """
     # Get base config
     if quantization == "fp8":
-        quant_cfg = mtq.FP8_DEFAULT_CFG
+        quant_cfg = mtq.FP8_DEFAULT_CFG.copy()
     elif quantization == "int4_awq":
-        quant_cfg = mtq.INT4_AWQ_CFG
+        quant_cfg = mtq.INT4_AWQ_CFG.copy()
         # Only restrict LM head quantization for int4_awq
         if lm_head_quantization not in [None, "int4_awq"]:
             raise ValueError(
@@ -180,7 +178,7 @@ def get_llm_quant_config(
             )
     elif quantization == "nvfp4":
         if hasattr(mtq, "NVFP4_DEFAULT_CFG"):
-            quant_cfg = mtq.NVFP4_DEFAULT_CFG
+            quant_cfg = mtq.NVFP4_DEFAULT_CFG.copy()
         else:
             raise ValueError(
                 "NVFP4_DEFAULT_CFG is not supported in this version of modelopt."
@@ -213,7 +211,7 @@ def quantize_llm(
     model: Union[AutoModelForCausalLM, AutoModelForImageTextToText],
     tokenizer: AutoTokenizer,
     quantization: str,
-    dataset_name_or_dir: str = "cnn_dailymail",
+    dataset_dir: str = "cnn_dailymail",
     lm_head_quantization: Optional[str] = None,
 ) -> Union[AutoModelForCausalLM, AutoModelForImageTextToText]:
     """
@@ -223,7 +221,7 @@ def quantize_llm(
         model: The model to quantize (causal LM or image-text model)
         tokenizer: Tokenizer for text processing
         quantization: Quantization method ("fp8", "int4_awq", "nvfp4")
-        dataset_name_or_dir: Dataset for calibration
+        dataset_dir: Dataset for calibration
         lm_head_quantization: Optional LM head quantization method
         
     Returns:
@@ -240,10 +238,9 @@ def quantize_llm(
         batch_size = 16
     else:
         batch_size = 1
-    data_loader = get_llm_calib_dataloader(
-        tokenizer=tokenizer,
-        dataset_name_or_dir=dataset_name_or_dir,
-        batch_size=batch_size)
+    data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
+                                           dataset_dir=dataset_dir,
+                                           batch_size=batch_size)
     quant_config = get_llm_quant_config(quantization, lm_head_quantization)
     quantized_model = quantize_model(model, quant_config, data_loader)
 
@@ -251,7 +248,7 @@ def quantize_llm(
 
 
 def load_hf_model(
-    torch_dir: str,
+    model_dir: str,
     torch_dtype: str = "fp16"
 ) -> Tuple[Union[AutoModelForCausalLM, AutoModelForImageTextToText],
            AutoTokenizer]:
@@ -259,7 +256,7 @@ def load_hf_model(
     Load a HuggingFace model and tokenizer with automatic model type detection.
     
     Args:
-        torch_dir: Directory containing the model files
+        model_dir: Directory containing the model files
         torch_dtype: Torch data type ("fp16", "bf16")
         
     Returns:
@@ -278,7 +275,7 @@ def load_hf_model(
 
     # Try loading as AutoModelForCausalLM first
     try:
-        model = AutoModelForCausalLM.from_pretrained(torch_dir,
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
                                                      torch_dtype=dtype).cuda()
     except Exception:
         # If that fails, try AutoModelForImageTextToText
@@ -286,12 +283,12 @@ def load_hf_model(
             # TODO: Need a WAR to quantize only the language model.
             # In VLMs, the model has both model.language_model and model.vision_model.
             model = AutoModelForImageTextToText.from_pretrained(
-                torch_dir, torch_dtype=dtype).cuda()
+                model_dir, torch_dtype=dtype).cuda()
         except Exception as e:
             raise ValueError(
-                f"Could not load model from {torch_dir}. Error: {e}")
+                f"Could not load model from {model_dir}. Error: {e}")
 
-    tokenizer = AutoTokenizer.from_pretrained(torch_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
     # Set tokenizer padding token if needed
     if tokenizer.pad_token != "<unk>":
@@ -303,22 +300,22 @@ def load_hf_model(
 
 
 def quantize_and_save_model(
-    torch_dir: str,
+    model_dir: str,
     output_dir: str,
     quantization: Optional[str] = None,
     torch_dtype: str = "fp16",
-    dataset_name_or_dir: str = "cnn_dailymail",
+    dataset_dir: str = "cnn_dailymail",
     lm_head_quantization: Optional[str] = None,
 ) -> None:
     """
     Load a model, quantize it if specified, and save the result.
     
     Args:
-        torch_dir: Directory containing the input model
+        model_dir: Directory containing the input model
         output_dir: Directory to save the quantized model
         quantization: Optional quantization method to apply (None, fp8, int4_awq, nvfp4)
         torch_dtype: Torch data type for model loading (fp16, bf16)
-        dataset_name_or_dir: Dataset for calibration
+        dataset_dir: Dataset for calibration
         lm_head_quantization: Optional LM head quantization method (None, fp8, int4_awq, nvfp4)
         
     Raises:
@@ -326,14 +323,14 @@ def quantize_and_save_model(
     """
     start_time = time.time()
     # Load model and tokenizer
-    model, tokenizer = load_hf_model(torch_dir, torch_dtype)
+    model, tokenizer = load_hf_model(model_dir, torch_dtype)
 
     if quantization is not None:
         if is_quantized(model):
             print(f"Model is already quantized, skipping quantization.")
         else:
-            model = quantize_llm(model, tokenizer, quantization,
-                                 dataset_name_or_dir, lm_head_quantization)
+            model = quantize_llm(model, tokenizer, quantization, dataset_dir,
+                                 lm_head_quantization)
     quant_end_time = time.time()
     print(f"Quantization finished in {quant_end_time - start_time}s.")
 

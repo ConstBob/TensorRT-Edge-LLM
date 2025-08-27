@@ -1,0 +1,146 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+"""
+Visual model export functionality for TensorRT Edge-LLM.
+
+This module provides functions to export visual components of multimodal models
+(Qwen2-VL, Qwen2.5-VL, InternVL3) to ONNX format with optional quantization support.
+"""
+
+import json
+import os
+from typing import Optional
+
+import torch
+from transformers import AutoModelForImageTextToText, AutoProcessor
+
+from tensorrt_edgellm.quantization.visual_quantization import quantize_visual
+# Import visual model wrappers
+from tensorrt_edgellm.visual_models.internvl3_model import (
+    InternVLVisionModel, export_internvl3_visual)
+from tensorrt_edgellm.visual_models.qwen2_5_vl_model import (
+    Qwen2_5_VisionTransformerPretrainedModelPatch, export_qwen2_5_vl_visual)
+from tensorrt_edgellm.visual_models.qwen2_vl_model import (
+    Qwen2VisionTransformerPretrainedModelPatch, export_qwen2_vl_visual)
+
+from .config_export import export_vision_config
+
+
+def visual_export(model_dir: str,
+                  output_dir: str,
+                  dtype: str,
+                  quantization: Optional[str],
+                  device: str = "cuda") -> str:
+    """
+    Export visual model using the appropriate wrapper based on model architecture.
+    
+    This function loads a multimodal model, extracts its visual component, wraps it
+    in the appropriate model wrapper, applies quantization if requested, and exports
+    it to ONNX format.
+    
+    Args:
+        model_dir: Directory containing the torch model
+        output_dir: Directory to save the exported ONNX model
+        dtype: Data type for export (currently only "fp16" supported)
+        quantization: Quantization type ("fp8" or None)
+        device: Device to load the model on (default: "cuda", options: cpu, cuda, cuda:0, cuda:1, etc.)
+    
+    Returns:
+        str: Path to the output directory where the exported model is saved
+    
+    Raises:
+        ValueError: If unsupported dtype or quantization is provided
+        ValueError: If unsupported model type is detected
+    """
+    # Validate input parameters
+    assert dtype == "fp16", f"Only fp16 is supported for dtype. You passed: {dtype}"
+    # TODO: Add quantization support
+    assert quantization in [
+        "fp8", None
+    ], f"Only fp8 or None is supported for quantization. You passed: {quantization}"
+
+    # Convert dtype string to torch dtype
+    # TODO: Add support for bf16
+    torch_dtype = torch.float16
+
+    # Load the model and processor
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_dir, torch_dtype=torch_dtype, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(model_dir,
+                                              trust_remote_code=True)
+
+    # Get visual model from the multimodal model
+    model_type = model.config.model_type
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Detect model architecture and use appropriate wrapper
+    if model_type == 'qwen2_vl':
+        print(f"Exporting Qwen2-VL visual model from {model_dir}")
+        # Create Qwen2-VL wrapper model
+        wrapped_model = Qwen2VisionTransformerPretrainedModelPatch._from_config(
+            model.visual.config,
+            torch_dtype=torch_dtype,
+        )
+        wrapped_model.load_state_dict(model.visual.state_dict())
+        wrapped_model.eval().to(device)
+
+        # Apply quantization to wrapped model if requested
+        if quantization == "fp8":
+            wrapped_model = quantize_visual(wrapped_model, "fp8", processor,
+                                            "lmms-lab/MMMU")
+
+        # Export using the wrapper's export function
+        export_qwen2_vl_visual(wrapped_model, output_dir, torch_dtype,
+                               quantization)
+
+    elif model_type == 'qwen2_5_vl':
+        print(f"Exporting Qwen2.5-VL visual model from {model_dir}")
+        # Create Qwen2.5-VL wrapper model
+        wrapped_model = Qwen2_5_VisionTransformerPretrainedModelPatch._from_config(
+            model.visual.config,
+            torch_dtype=torch_dtype,
+        )
+        wrapped_model.load_state_dict(model.visual.state_dict())
+        wrapped_model.eval().to(device)
+
+        # Apply quantization to wrapped model if requested
+        if quantization == "fp8":
+            wrapped_model = quantize_visual(wrapped_model, "fp8", processor,
+                                            "lmms-lab/MMMU")
+
+        # Export using the wrapper's export function
+        export_qwen2_5_vl_visual(wrapped_model, output_dir, torch_dtype,
+                                 quantization)
+
+    elif model_type == 'internvl':
+        print(f"Exporting InternVL3 visual model from {model_dir}")
+        # Create InternVL3 wrapper model
+        wrapped_model = InternVLVisionModel(model)
+        wrapped_model.eval().to(device)
+
+        # Export using the wrapper's export function
+        export_internvl3_visual(wrapped_model, output_dir, torch_dtype,
+                                quantization)
+
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
+    # Export model configuration to JSON
+    config_dict = export_vision_config(model.config)
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    print(
+        f"Visual export completed for {model_type} with dtype={dtype}, quantization={quantization}, device={device}"
+    )
+    print(f"Exported to: {output_dir}")
+    return output_dir

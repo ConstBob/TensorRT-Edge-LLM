@@ -33,6 +33,8 @@ dev = [
 
 [project.scripts]
 tensorrt-edgellm-quantize = "tensorrt_edgellm.scripts.quantize_llm:main"
+tensorrt-edgellm-export-visual = "tensorrt_edgellm.scripts.export_visual:main"
+tensorrt-edgellm-export-llm = "tensorrt_edgellm.scripts.export_llm:main"
 
 # Version is now managed by tensorrt_edgellm._version module
 # Remove setuptools_scm configuration since we use custom versioning
