@@ -24,11 +24,11 @@ pip install -e .
 ```bash
 # Example with all options
 tensorrt-edgellm-quantize \
-    --torch_dir $TORCH_DIR \
+    --model_dir $TORCH_DIR \
     --output_dir $QUANTIZED_TORCH_DIR$ \
     --quantization [fp8 | int4_awq | nvfp4 | None] \
     --torch_dtype [fp16 | bf16] \
-    --dataset_name_or_dir cnn_dailymail \
+    --dataset_dir cnn_dailymail \
     --lm_head_quantization [fp8 | int4_awq | nvfp4 | None]
 ```
 
@@ -38,7 +38,7 @@ tensorrt-edgellm-quantize \
 from tensorrt_edgellm import quantize_and_save_model
 
 quantize_and_save_model(
-    torch_dir="/path/to/your/model",
+    model_dir="/path/to/your/model",
     output_dir="/path/to/output",
     quantization="fp8",
     torch_dtype="fp16"
