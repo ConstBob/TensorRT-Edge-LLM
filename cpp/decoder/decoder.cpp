@@ -11,6 +11,7 @@
  */
 
 #include "decoder.h"
+#include "common/mmapReader.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "sampler/sampling.h"
 #include <NvInferRuntime.h>
@@ -68,7 +69,7 @@ bool Decoder::setup(std::string modelDir, int64_t batchSize, bool isEagle, std::
         }
         else
         {
-            auto mmapReader = std::make_unique<MmapReader>(enginePath);
+            auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
             if (mmapReader->getData() == nullptr)
             {
                 LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());

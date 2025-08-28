@@ -11,6 +11,7 @@
  */
 
 #include "multimodalRunner.h"
+#include "common/mmapReader.h"
 #include "multimodal/internViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
 #include <algorithm>
@@ -40,7 +41,7 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     }
     else
     {
-        auto mmapReader = std::make_unique<MmapReader>(enginePath);
+        auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
         mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
             mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
     }

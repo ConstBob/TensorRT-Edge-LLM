@@ -14,6 +14,7 @@
 #include "runtime/llmRuntimeUtils.h"
 
 #include "common/logger.h"
+#include "common/mmapReader.h"
 #include <functional>
 #include <sstream>
 #include <string>
@@ -91,7 +92,7 @@ LLMEngineRunner::LLMEngineRunner(
 
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
-    auto mmapReader = std::make_unique<MmapReader>(enginePath);
+    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
     if (mmapReader->getData() == nullptr)
     {
         LOG_ERROR("LLMEngineRunner(): Failed to use MMap to read engine from file path: %s", enginePath.string());
