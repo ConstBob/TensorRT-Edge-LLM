@@ -14,6 +14,7 @@
 
 #include "common/common.h"
 #include "common/logger.h"
+#include "common/mmapReader.h"
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -178,10 +179,10 @@ bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>&
     tensors.clear();
 
     // Read the file into memory
-    std::unique_ptr<MmapReader> mmapReader;
+    std::unique_ptr<file_io::MmapReader> mmapReader;
     try
     {
-        mmapReader = std::make_unique<MmapReader>(filePath.string());
+        mmapReader = std::make_unique<file_io::MmapReader>(filePath.string());
     }
     catch (std::runtime_error const& e)
     {
