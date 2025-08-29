@@ -73,8 +73,8 @@ def _export_eagle_draft_config(
         eagle_version: str = "eagle3") -> Dict[str, Any]:
     """Export EAGLE draft configuration with required fields."""
     required_fields = [
-        "hidden_size", "intermediate_size", "num_hidden_layers",
-        "num_attention_heads", "num_key_value_heads"
+        "hidden_size", "max_position_embeddings", "intermediate_size",
+        "num_hidden_layers", "num_attention_heads", "num_key_value_heads"
     ]
 
     draft_config = {}

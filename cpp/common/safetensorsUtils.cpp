@@ -17,6 +17,7 @@
 #include "common/mmapReader.h"
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <set>

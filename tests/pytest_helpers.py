@@ -19,6 +19,7 @@ class PipelineTestType(enum.Enum):
     BUILD = "build"
     CHAT = "chat"
     BENCHMARK = "benchmark"
+    INFERENCE = "inference"
 
 
 def run_command(cmd: List[str],
@@ -127,6 +128,8 @@ class UnifiedTaskExecutor:
             return self.execute_chat_test()
         elif test_type == PipelineTestType.BENCHMARK:
             return self.execute_benchmark_test()
+        elif test_type == PipelineTestType.INFERENCE:
+            return self.execute_inference_test()
         else:
             raise ValueError(f"Unknown test type: {test_type}")
 
@@ -187,6 +190,15 @@ class UnifiedTaskExecutor:
         cmd = build_command(cmd_key, self.config, self.executable_files)
         result = self.run_cmd(cmd, get_command_timeout(cmd_key))
         result['test_type'] = PipelineTestType.BENCHMARK.value
+        return result
+
+    def execute_inference_test(self) -> Dict[str, Any]:
+        """Execute inference test - adapts to config type"""
+        cmd_key = 'vlm_llm_inference' if hasattr(
+            self.config, 'get_engine_visual_path') else 'llm_inference'
+        cmd = build_command(cmd_key, self.config, self.executable_files)
+        result = self.run_cmd(cmd, get_command_timeout(cmd_key))
+        result['test_type'] = PipelineTestType.INFERENCE.value
         return result
 
     def execute_command(self, cmd, task_name="", timeout=300):

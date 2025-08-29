@@ -25,7 +25,7 @@ void printUsage(char const* programName)
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
     static struct option inferenceOptions[]
-        = {{"engineDir", required_argument, 0, 901}, {"multimodalEngineDir", optional_argument, 0, 902}, {0, 0, 0, 0}};
+        = {{"engineDir", required_argument, 0, 901}, {"multimodalEngineDir", required_argument, 0, 902}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)

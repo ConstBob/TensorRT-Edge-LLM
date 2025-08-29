@@ -1,0 +1,395 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
+#pragma once
+
+#include <NvInfer.h>
+#include <filesystem>
+#include <memory>
+#include <nlohmann/json.hpp>
+#include <sstream>
+#include <string>
+
+using Json = nlohmann::json;
+
+namespace drivellm
+{
+
+namespace builder
+{
+
+//! Configuration structure for LLM model building.
+//! Contains all parameters needed to configure the TensorRT engine building process
+//! for Large Language Models, including standard LLMs, Eagle models, and Vision-Language Models.
+struct LLMBuilderConfig
+{
+    int64_t maxInputLen{128};          //!< Maximum input sequence length for the model
+    bool isVlm{false};                 //!< Whether this is a Vision-Language Model (VLM)
+    int64_t minImageTokens{4};         //!< Minimum number of image tokens (VLM only)
+    int64_t maxImageTokens{1024};      //!< Maximum number of image tokens (VLM only)
+    bool eagleDraft{false};            //!< Whether this is an Eagle draft model
+    bool eagleBase{false};             //!< Whether this is an Eagle base model
+    bool eagle2{false};                //!< Whether to use Eagle2 (default is Eagle3)
+    int64_t maxBatchSize{4};           //!< Maximum batch size for inference
+    int64_t maxLoraRank{0};            //!< Maximum LoRA rank (0 = no LoRA support)
+    int64_t maxSeqLen{4096};           //!< Maximum sequence length for the model
+    int64_t maxDecodingTokens{60};     //!< Maximum number of decoding tokens per step (Eagle)
+    int64_t maxDraftTokensPerStep{60}; //!< Maximum number of draft tokens per step (Eagle draft)
+
+    //! Convert configuration to JSON format for serialization.
+    //! @return JSON object containing all configuration parameters
+    Json toJson() const
+    {
+        Json json;
+        json["max_input_len"] = maxInputLen;
+        json["is_vlm"] = isVlm;
+        if (isVlm)
+        {
+            json["min_image_tokens"] = minImageTokens;
+            json["max_image_tokens"] = maxImageTokens;
+        }
+        json["eagle_draft"] = eagleDraft;
+        json["eagle_base"] = eagleBase;
+        json["eagle2"] = eagle2;
+        json["max_batch_size"] = maxBatchSize;
+        json["max_lora_rank"] = maxLoraRank;
+        json["max_seq_len"] = maxSeqLen;
+        json["max_decoding_tokens"] = maxDecodingTokens;
+        json["max_draft_tokens_per_step"] = maxDraftTokensPerStep;
+        return json;
+    }
+
+    //! Create configuration from JSON format.
+    //! @param json JSON object containing configuration parameters
+    //! @return LLMBuilderConfig object with parsed parameters
+    static LLMBuilderConfig fromJson(Json const& json)
+    {
+        LLMBuilderConfig config;
+        if (json.contains("max_input_len"))
+        {
+            config.maxInputLen = json["max_input_len"];
+        }
+        if (json.contains("is_vlm"))
+        {
+            config.isVlm = json["is_vlm"];
+        }
+        if (json.contains("min_image_tokens"))
+        {
+            config.minImageTokens = json["min_image_tokens"];
+        }
+        if (json.contains("max_image_tokens"))
+        {
+            config.maxImageTokens = json["max_image_tokens"];
+        }
+        if (json.contains("eagle_draft"))
+        {
+            config.eagleDraft = json["eagle_draft"];
+        }
+        if (json.contains("eagle_base"))
+        {
+            config.eagleBase = json["eagle_base"];
+        }
+        if (json.contains("eagle2"))
+        {
+            config.eagle2 = json["eagle2"];
+        }
+        if (json.contains("max_batch_size"))
+        {
+            config.maxBatchSize = json["max_batch_size"];
+        }
+        if (json.contains("max_lora_rank"))
+        {
+            config.maxLoraRank = json["max_lora_rank"];
+        }
+        if (json.contains("max_seq_len"))
+        {
+            config.maxSeqLen = json["max_seq_len"];
+        }
+        if (json.contains("max_decoding_tokens"))
+        {
+            config.maxDecodingTokens = json["max_decoding_tokens"];
+        }
+        if (json.contains("max_draft_tokens_per_step"))
+        {
+            config.maxDraftTokensPerStep = json["max_draft_tokens_per_step"];
+        }
+        return config;
+    }
+
+    //! Convert configuration to human-readable string format.
+    //! @return String representation of the configuration for debugging/logging
+    std::string toString() const
+    {
+        std::ostringstream oss;
+        oss << "LLMBuilderConfig:\n";
+        oss << "  maxInputLen: " << maxInputLen << "\n";
+        oss << "  isVlm: " << (isVlm ? "true" : "false") << "\n";
+        if (isVlm)
+        {
+            oss << "  minImageTokens: " << minImageTokens << "\n";
+            oss << "  maxImageTokens: " << maxImageTokens << "\n";
+        }
+        oss << "  eagleDraft: " << (eagleDraft ? "true" : "false") << "\n";
+        oss << "  eagleBase: " << (eagleBase ? "true" : "false") << "\n";
+        oss << "  eagle2: " << (eagle2 ? "true" : "false") << "\n";
+        oss << "  maxBatchSize: " << maxBatchSize << "\n";
+        oss << "  maxLoraRank: " << maxLoraRank << "\n";
+        oss << "  maxSeqLen: " << maxSeqLen << "\n";
+        oss << "  maxDecodingTokens: " << maxDecodingTokens << "\n";
+        oss << "  maxDraftTokensPerStep: " << maxDraftTokensPerStep << "\n";
+        return oss.str();
+    }
+};
+
+//! Configuration structure for visual model building.
+//! Contains parameters needed to configure the TensorRT engine building process
+//! for visual encoders used in Vision-Language Models.
+struct VisualBuilderConfig
+{
+    int64_t minImageTokens{4};    //!< Minimum number of image tokens
+    int64_t maxImageTokens{1024}; //!< Maximum number of image tokens
+
+    //! Convert configuration to JSON format for serialization.
+    //! @return JSON object containing all configuration parameters
+    Json toJson() const
+    {
+        Json json;
+        json["min_image_tokens"] = minImageTokens;
+        json["max_image_tokens"] = maxImageTokens;
+        return json;
+    }
+
+    //! Create configuration from JSON format.
+    //! @param json JSON object containing configuration parameters
+    //! @return VisualBuilderConfig object with parsed parameters
+    static VisualBuilderConfig fromJson(Json const& json)
+    {
+        VisualBuilderConfig config;
+        if (json.contains("min_image_tokens"))
+        {
+            config.minImageTokens = json["min_image_tokens"];
+        }
+        if (json.contains("max_image_tokens"))
+        {
+            config.maxImageTokens = json["max_image_tokens"];
+        }
+        return config;
+    }
+
+    //! Convert configuration to human-readable string format.
+    //! @return String representation of the configuration for debugging/logging
+    std::string toString() const
+    {
+        std::ostringstream oss;
+        oss << "VisualBuilderConfig:\n";
+        oss << "  minImageTokens: " << minImageTokens << "\n";
+        oss << "  maxImageTokens: " << maxImageTokens << "\n";
+        return oss.str();
+    }
+};
+
+//! Builder class for Large Language Model TensorRT engines.
+//! Handles the complete process of building TensorRT engines from ONNX models
+//! for various types of LLMs including standard models, Eagle models, and VLMs.
+class LLMBuilder
+{
+public:
+    //! Constructor for LLMBuilder.
+    //! @param onnxDir Directory containing the ONNX model and configuration files
+    //! @param engineDir Directory where the built engine and related files will be saved
+    //! @param config Configuration object specifying build parameters
+    LLMBuilder(
+        std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config);
+
+    //! Destructor.
+    ~LLMBuilder() = default;
+
+    //! Build the TensorRT engine from the ONNX model.
+    //! This method performs the complete build process including:
+    //! - Loading and parsing the ONNX model
+    //! - Setting up optimization profiles
+    //! - Building the TensorRT engine
+    //! - Copying necessary files to the engine directory
+    //! @return true if build was successful, false otherwise
+    bool build();
+
+private:
+    std::filesystem::path mOnnxDir;   //!< Directory containing ONNX model files
+    std::filesystem::path mEngineDir; //!< Directory for saving built engine
+    LLMBuilderConfig mBuilderConfig;  //!< Build configuration
+
+    //! Parse the model configuration from config.json.
+    //! Extracts model dimensions and parameters needed for optimization profile setup.
+    //! @return true if parsing was successful, false otherwise
+    bool parseConfig();
+
+    //! Set up optimization profiles for LLM models.
+    //! Creates context and generation profiles with appropriate dynamic shapes.
+    //! @param builder TensorRT builder object
+    //! @param config TensorRT builder config object
+    //! @param network TensorRT network definition
+    //! @return true if setup was successful, false otherwise
+    bool setupLLMOptimizationProfiles(
+        nvinfer1::IBuilder* builder, nvinfer1::IBuilderConfig* config, nvinfer1::INetworkDefinition const* network);
+
+    //! Set up common optimization profiles shared by all LLM types.
+    //! Configures context lengths, rotary embeddings, and KV cache profiles.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @return true if setup was successful, false otherwise
+    bool setupCommonProfiles(
+        nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
+
+    //! Set up optimization profiles for vanilla (non-Eagle) LLM models.
+    //! Configures input IDs and last token IDs for standard transformer models.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @return true if setup was successful, false otherwise
+    bool setupVanillaProfiles(
+        nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
+
+    //! Set up optimization profiles for Eagle models.
+    //! Configures Eagle-specific inputs like hidden states and attention masks.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @return true if setup was successful, false otherwise
+    bool setupEagleProfiles(
+        nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
+
+    //! Set up optimization profiles for Vision-Language Models.
+    //! Configures image embedding inputs for VLM processing.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
+    //! @return true if setup was successful, false otherwise
+    bool setupVLMProfiles(nvinfer1::IOptimizationProfile* contextProfile,
+        nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network);
+
+    //! Set up optimization profiles for LoRA-enabled models.
+    //! Configures LoRA weight matrices with dynamic rank support.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for LoRA input analysis
+    //! @return true if setup was successful, false otherwise
+    bool setupLoraProfiles(nvinfer1::IOptimizationProfile* contextProfile,
+        nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network);
+
+    //! Set up optimization profiles for KV cache tensors.
+    //! Configures dynamic shapes for key-value cache inputs across all layers.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @return true if setup was successful, false otherwise
+    bool setupKVCacheProfiles(
+        nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
+
+    //! Copy and save the model configuration with builder config.
+    //! Creates a config.json file in the engine directory with both original model config
+    //! and builder configuration parameters.
+    //! @return true if copying was successful, false otherwise
+    bool copyConfig();
+
+    //! Copy tokenizer files to the engine directory.
+    //! Copies tokenizer_config.json and tokenizer.json files needed for inference.
+    //! @return true if copying was successful, false otherwise
+    bool copyTokenizerFiles();
+
+    //! Copy Eagle-specific files to the engine directory.
+    //! Copies d2t.bin file for Eagle3 draft models.
+    //! @return true if copying was successful, false otherwise
+    bool copyEagleFiles();
+
+    // Model dimensions extracted from config.json
+    int64_t mHiddenSize{0};                 //!< Hidden size of the model
+    int64_t mNumKVHeads{0};                 //!< Number of key-value heads
+    int64_t mHeadSize{0};                   //!< Size of each attention head
+    int64_t mRotaryDim{0};                  //!< Dimension for rotary position embeddings
+    int32_t mNbKVCacheInputs{0};            //!< Number of KV cache inputs (layers)
+    int32_t mMaxPositionEmbeddings{0};      //!< Maximum position embeddings
+    int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
+    Json mModelConfig;                      //!< Parsed model configuration
+};
+
+//! Builder class for visual encoder TensorRT engines.
+//! Handles the complete process of building TensorRT engines from ONNX models
+//! for visual encoders used in Vision-Language Models.
+class VisualBuilder
+{
+public:
+    //! Constructor for VisualBuilder.
+    //! @param onnxDir Directory containing the ONNX model and configuration files
+    //! @param engineDir Directory where the built engine and related files will be saved
+    //! @param config Configuration object specifying build parameters
+    VisualBuilder(std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir,
+        VisualBuilderConfig const& config);
+
+    //! Destructor.
+    ~VisualBuilder() = default;
+
+    //! Build the TensorRT engine from the ONNX model.
+    //! This method performs the complete build process including:
+    //! - Loading and parsing the ONNX model
+    //! - Setting up optimization profiles
+    //! - Building the TensorRT engine
+    //! - Copying necessary files to the engine directory
+    //! @return true if build was successful, false otherwise
+    bool build();
+
+private:
+    std::filesystem::path mOnnxDir;     //!< Directory containing ONNX model files
+    std::filesystem::path mEngineDir;   //!< Directory for saving built engine
+    VisualBuilderConfig mBuilderConfig; //!< Build configuration
+    std::string mModelType;             //!< Model type inferred from config.json
+
+    //! Parse the model configuration from config.json.
+    //! Extracts model type and dimensions needed for optimization profile setup.
+    //! @return true if parsing was successful, false otherwise
+    bool parseConfig();
+
+    //! Set up optimization profile for visual models.
+    //! Creates a single optimization profile with appropriate dynamic shapes.
+    //! @param builder TensorRT builder object
+    //! @param config TensorRT builder config object
+    //! @param network TensorRT network definition
+    //! @return true if setup was successful, false otherwise
+    bool setupVisualOptimizationProfile(
+        nvinfer1::IBuilder* builder, nvinfer1::IBuilderConfig* config, nvinfer1::INetworkDefinition const* network);
+
+    //! Set up optimization profile for Qwen ViT models.
+    //! Configures inputs for Qwen2-VL and Qwen2.5-VL visual encoders.
+    //! @param profile Optimization profile to configure
+    //! @param network TensorRT network definition for input analysis
+    //! @return true if setup was successful, false otherwise
+    bool setupQwenViTProfile(nvinfer1::IOptimizationProfile* profile, nvinfer1::INetworkDefinition const* network);
+
+    //! Set up optimization profile for InternVL ViT models.
+    //! Configures inputs for InternVL visual encoders.
+    //! @param profile Optimization profile to configure
+    //! @return true if setup was successful, false otherwise
+    bool setupInternViTProfile(nvinfer1::IOptimizationProfile* profile);
+
+    //! Copy and save the model configuration with builder config.
+    //! Creates a config.json file in the engine directory with both original model config
+    //! and builder configuration parameters.
+    //! @return true if copying was successful, false otherwise
+    bool copyConfig();
+
+    // Model dimensions extracted from config.json
+    int64_t mNumChannels{0};   //!< Number of input channels
+    int64_t mImageSizeH{0};    //!< Image height
+    int64_t mImageSizeW{0};    //!< Image width
+    int64_t mInputDim{0};      //!< Input dimension for Qwen models
+    int64_t mRopeEmbedSize{0}; //!< Rotary position embedding size
+    Json mModelConfig;         //!< Parsed model configuration
+};
+
+} // namespace builder
+} // namespace drivellm

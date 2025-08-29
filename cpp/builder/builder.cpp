@@ -1,0 +1,1046 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
+#include "builder.h"
+#include "common/common.h"
+#include "common/cudaUtils.h"
+#include "common/logger.h"
+#include "common/trtUtils.h"
+
+#include <NvInfer.h>
+#include <NvOnnxParser.h>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+
+using namespace drivellm;
+
+namespace drivellm
+{
+namespace builder
+{
+
+namespace
+{
+//! Utility functions for TensorRT engine building
+
+//! Create TensorRT dimensions from a vector of shape values.
+//! @param shape Vector of dimension sizes
+//! @return TensorRT Dims object with the specified dimensions
+nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
+{
+    nvinfer1::Dims dims;
+    dims.nbDims = static_cast<int32_t>(shape.size());
+    for (int32_t i = 0; i < dims.nbDims; ++i)
+    {
+        dims.d[i] = shape[i];
+    }
+    return dims;
+}
+//! Validate optimization profile dimensions.
+//! Ensures that min <= opt <= max for all dimensions and that all profiles have the same number of dimensions.
+//! @param minDims Minimum dimensions for the optimization profile
+//! @param optDims Optimal dimensions for the optimization profile
+//! @param maxDims Maximum dimensions for the optimization profile
+//! @return true if dimensions are valid, false otherwise
+bool checkOptimizationProfileDims(
+    nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims)
+{
+    if (minDims.nbDims != optDims.nbDims || optDims.nbDims != maxDims.nbDims)
+    {
+        LOG_ERROR("Dimension count mismatch: minDims.nbDims=%d, optDims.nbDims=%d, maxDims.nbDims=%d", minDims.nbDims,
+            optDims.nbDims, maxDims.nbDims);
+        return false;
+    }
+    for (int i = 0; i < minDims.nbDims; ++i)
+    {
+        if (minDims.d[i] > optDims.d[i] || optDims.d[i] > maxDims.d[i])
+        {
+            LOG_ERROR("Dimension value mismatch at index %d: min=%d, opt=%d, max=%d", i, minDims.d[i], optDims.d[i],
+                maxDims.d[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+//! Set optimization profile dimensions for a specific input.
+//! Validates the dimensions and sets them on the optimization profile.
+//! @param profile Optimization profile to configure
+//! @param inputName Name of the input tensor
+//! @param minDims Minimum dimensions for the input
+//! @param optDims Optimal dimensions for the input
+//! @param maxDims Maximum dimensions for the input
+//! @return true if setting was successful, false otherwise
+bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const* inputName,
+    nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims)
+{
+    if (!checkOptimizationProfileDims(minDims, optDims, maxDims))
+    {
+        LOG_INFO("setOptimizationProfile: %s is not valid", inputName);
+        return false;
+    }
+    return profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, minDims)
+        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, optDims)
+        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
+}
+//! Print detailed information about the TensorRT network.
+//! Shows input and output tensor names and shapes for debugging purposes.
+//! @param network TensorRT network definition to analyze
+//! @param prefix Optional prefix for the output string
+//! @return Formatted string containing network information
+std::string printNetworkInfo(nvinfer1::INetworkDefinition const* network, std::string const& prefix = "")
+{
+    std::ostringstream oss;
+    std::string title = prefix.empty() ? "Network Information:" : prefix + " Network Information:";
+    oss << title << "\n";
+    oss << "  Inputs (" << network->getNbInputs() << "):\n";
+    for (int i = 0; i < network->getNbInputs(); ++i)
+    {
+        auto* input = network->getInput(i);
+        auto dims = input->getDimensions();
+        std::string dimStr = "(";
+        for (int j = 0; j < dims.nbDims; ++j)
+        {
+            if (j > 0)
+                dimStr += ", ";
+            dimStr += std::to_string(dims.d[j]);
+        }
+        dimStr += ")";
+        oss << "    " << input->getName() << ": " << dimStr << "\n";
+    }
+
+    oss << "  Outputs (" << network->getNbOutputs() << "):\n";
+    for (int i = 0; i < network->getNbOutputs(); ++i)
+    {
+        auto* output = network->getOutput(i);
+        auto dims = output->getDimensions();
+        std::string dimStr = "(";
+        for (int j = 0; j < dims.nbDims; ++j)
+        {
+            if (j > 0)
+                dimStr += ", ";
+            dimStr += std::to_string(dims.d[j]);
+        }
+        dimStr += ")";
+        oss << "    " << output->getName() << ": " << dimStr << "\n";
+    }
+    return oss.str();
+}
+
+//! Print detailed information about an optimization profile.
+//! Shows the min, optimal, and max dimensions for each input in the profile.
+//! @param profile Optimization profile to analyze
+//! @param profileName Name of the profile for display purposes
+//! @param network TensorRT network definition for input analysis
+//! @return Formatted string containing optimization profile information
+std::string printOptimizationProfile(nvinfer1::IOptimizationProfile const* profile, std::string const& profileName,
+    nvinfer1::INetworkDefinition const* network)
+{
+    std::ostringstream oss;
+    oss << "Optimization Profile: " << profileName << "\n";
+
+    // Print dimensions for each input in this profile
+    for (int j = 0; j < network->getNbInputs(); ++j)
+    {
+        char const* inputName = network->getInput(j)->getName();
+        if (inputName != nullptr)
+        {
+            auto minDims = profile->getDimensions(inputName, nvinfer1::OptProfileSelector::kMIN);
+            auto optDims = profile->getDimensions(inputName, nvinfer1::OptProfileSelector::kOPT);
+            auto maxDims = profile->getDimensions(inputName, nvinfer1::OptProfileSelector::kMAX);
+
+            std::string minStr = "(";
+            std::string optStr = "(";
+            std::string maxStr = "(";
+
+            for (int k = 0; k < minDims.nbDims; ++k)
+            {
+                if (k > 0)
+                {
+                    minStr += ", ";
+                    optStr += ", ";
+                    maxStr += ", ";
+                }
+                minStr += std::to_string(minDims.d[k]);
+                optStr += std::to_string(optDims.d[k]);
+                maxStr += std::to_string(maxDims.d[k]);
+            }
+            minStr += ")";
+            optStr += ")";
+            maxStr += ")";
+
+            oss << "  " << inputName << ": MIN=" << minStr << ", OPT=" << optStr << ", MAX=" << maxStr << "\n";
+        }
+    }
+    return oss.str();
+}
+} // namespace
+
+// LLMBuilder implementation
+
+LLMBuilder::LLMBuilder(
+    std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config)
+    : mOnnxDir(onnxDir)
+    , mEngineDir(engineDir)
+    , mBuilderConfig(config)
+{
+}
+
+bool LLMBuilder::build()
+{
+    // Load plugin library
+    auto pluginHandles = loadEdgellmPluginLib();
+
+    // Parse model config
+    if (!parseConfig())
+    {
+        return false;
+    }
+
+    // Create builder
+    auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
+    if (!builder)
+    {
+        LOG_ERROR("Failed to create builder.");
+        return false;
+    }
+
+    // Create network definition
+    auto const stronglyTyped = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+    auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(stronglyTyped));
+    if (!network)
+    {
+        LOG_ERROR("Failed to create network.");
+        return false;
+    }
+
+    // Create ONNX parser
+    auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, gLogger));
+    if (!parser)
+    {
+        LOG_ERROR("Failed to create parser.");
+        return false;
+    }
+
+    // Parse ONNX model
+    std::string onnxFilePath = mOnnxDir.string() + "/model.onnx";
+    if (!parser->parseFromFile(onnxFilePath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    {
+        LOG_ERROR("Failed to parse ONNX file: %s", onnxFilePath.c_str());
+        return false;
+    }
+
+    // Print network information
+    LOG_DEBUG("%s", printNetworkInfo(network.get(), "LLM").c_str());
+
+    // Create builder config
+    auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+    if (!config)
+    {
+        LOG_ERROR("Failed to create builder config.");
+        return false;
+    }
+
+    // Setup optimization profiles
+    if (!setupLLMOptimizationProfiles(builder.get(), config.get(), network.get()))
+    {
+        return false;
+    }
+
+    // Build engine
+    // Create engine directory
+    if (!std::filesystem::exists(mEngineDir))
+    {
+        if (!std::filesystem::create_directories(mEngineDir))
+        {
+            LOG_ERROR("Failed to create directory %s", mEngineDir.string().c_str());
+            return false;
+        }
+        LOG_INFO("Created directory %s for saving LLM engine.", mEngineDir.string().c_str());
+    }
+
+    // Determine engine file name
+    std::string engineFileName;
+    if (mBuilderConfig.eagleDraft)
+    {
+        engineFileName = "eagle_draft.engine";
+    }
+    else if (mBuilderConfig.eagleBase)
+    {
+        engineFileName = "eagle_base.engine";
+    }
+    else
+    {
+        engineFileName = "llm.engine";
+    }
+    std::string engineFilePath = mEngineDir.string() + "/" + engineFileName;
+    auto engine = builder->buildSerializedNetwork(*network, *config);
+
+    if (!engine)
+    {
+        LOG_ERROR("Failed to build engine.");
+        return false;
+    }
+    std::ofstream ofs(engineFilePath, std::ios::out | std::ios::binary);
+    if (!ofs)
+    {
+        LOG_ERROR("Failed to open file for writing: %s", engineFilePath.c_str());
+        return false;
+    }
+    ofs.write(static_cast<char*>(engine->data()), engine->size());
+    ofs.close();
+    LOG_INFO("Engine saved to %s", engineFilePath.c_str());
+
+    // Copy files and save builder config
+    // Copy config.json with builder config
+    if (!copyConfig())
+    {
+        return false;
+    }
+
+    // Copy tokenizer files
+    if (!copyTokenizerFiles())
+    {
+        return false;
+    }
+
+    // Copy Eagle-specific files
+    if (!copyEagleFiles())
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool LLMBuilder::parseConfig()
+{
+    std::string jsonPath = mOnnxDir.string() + "/config.json";
+    std::ifstream configFileStream(jsonPath);
+    if (!configFileStream.is_open())
+    {
+        LOG_ERROR("Failed to open config file: %s", jsonPath.c_str());
+        return false;
+    }
+
+    try
+    {
+        mModelConfig = Json::parse(configFileStream);
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse config file: %s", e.what());
+        return false;
+    }
+
+    mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
+    mTargetModelOutputHiddenDim = mBuilderConfig.eagle2 ? mHiddenSize : mHiddenSize * 3;
+    mNumKVHeads = mModelConfig["num_key_value_heads"].get<int32_t>();
+    auto numAttentionHeads = mModelConfig["num_attention_heads"].get<int32_t>();
+
+    if (mModelConfig.contains("head_dim"))
+    {
+        mHeadSize = mModelConfig["head_dim"].get<int32_t>();
+    }
+    else
+    {
+        mHeadSize = mHiddenSize / numAttentionHeads;
+    }
+
+    if (mModelConfig.contains("partial_rotary_factor"))
+    {
+        mRotaryDim = static_cast<int64_t>(mModelConfig["partial_rotary_factor"].get<float>() * mHeadSize);
+    }
+    else
+    {
+        mRotaryDim = mHeadSize;
+    }
+
+    mMaxPositionEmbeddings = mModelConfig["max_position_embeddings"].get<int32_t>();
+    mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
+
+    return true;
+}
+
+bool LLMBuilder::setupLLMOptimizationProfiles(
+    nvinfer1::IBuilder* builder, nvinfer1::IBuilderConfig* config, nvinfer1::INetworkDefinition const* network)
+{
+    auto* contextProfile = builder->createOptimizationProfile();
+    auto* generationProfile = builder->createOptimizationProfile();
+
+    bool result = true;
+
+    // Setup common profiles
+    result &= setupCommonProfiles(contextProfile, generationProfile);
+
+    // Setup model-specific profiles
+    if (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft)
+    {
+        result &= setupEagleProfiles(contextProfile, generationProfile);
+    }
+    else
+    {
+        result &= setupVanillaProfiles(contextProfile, generationProfile);
+    }
+
+    if (mBuilderConfig.isVlm)
+    {
+        result &= setupVLMProfiles(contextProfile, generationProfile, network);
+    }
+
+    if (mBuilderConfig.maxLoraRank > 0)
+    {
+        result &= setupLoraProfiles(contextProfile, generationProfile, network);
+    }
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup optimization profiles");
+        return false;
+    }
+
+    LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", network).c_str());
+    LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", network).c_str());
+
+    config->addOptimizationProfile(contextProfile);
+    config->addOptimizationProfile(generationProfile);
+
+    return true;
+}
+
+bool LLMBuilder::setupCommonProfiles(
+    nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
+{
+    bool result = true;
+
+    // Context lengths
+    result &= setOptimizationProfile(contextProfile, "context_lengths", createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    result &= setOptimizationProfile(generationProfile, "context_lengths", createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+
+    // Rope rotary cos sin
+    int64_t profileMaxPositionEmbeddings
+        = std::max(static_cast<int64_t>(mMaxPositionEmbeddings), mBuilderConfig.maxSeqLen);
+    result &= setOptimizationProfile(contextProfile, "rope_rotary_cos_sin",
+        createDims({1, mBuilderConfig.maxSeqLen, mRotaryDim}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxSeqLen, mRotaryDim}),
+        createDims({mBuilderConfig.maxBatchSize, profileMaxPositionEmbeddings, mRotaryDim}));
+    result &= setOptimizationProfile(generationProfile, "rope_rotary_cos_sin",
+        createDims({1, mBuilderConfig.maxSeqLen, mRotaryDim}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxSeqLen, mRotaryDim}),
+        createDims({mBuilderConfig.maxBatchSize, profileMaxPositionEmbeddings, mRotaryDim}));
+
+    // KV cache profiles
+    result &= setupKVCacheProfiles(contextProfile, generationProfile);
+
+    return result;
+}
+
+bool LLMBuilder::setupVanillaProfiles(
+    nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
+{
+    bool result = true;
+
+    // Input IDs - always dynamic
+    result &= setOptimizationProfile(contextProfile, "input_ids", createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
+    result &= setOptimizationProfile(generationProfile, "input_ids", createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+
+    // Last token IDs
+    result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+    result &= setOptimizationProfile(generationProfile, "last_token_ids", createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+
+    return result;
+}
+
+bool LLMBuilder::setupEagleProfiles(
+    nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
+{
+    bool result = true;
+
+    int const maxTokens
+        = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTokensPerStep : mBuilderConfig.maxDecodingTokens;
+
+    // Input IDs
+    result &= setOptimizationProfile(contextProfile, "input_ids", createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
+    result &= setOptimizationProfile(generationProfile, "input_ids", createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
+
+    if (mBuilderConfig.eagleDraft)
+    {
+        // Hidden states from draft
+        result &= setOptimizationProfile(contextProfile, "hidden_states_from_draft", createDims({1, 1, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+        result &= setOptimizationProfile(generationProfile, "hidden_states_from_draft", createDims({1, 1, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
+
+        // Hidden states input
+        result &= setOptimizationProfile(contextProfile, "hidden_states_input",
+            createDims({1, 1, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mTargetModelOutputHiddenDim}));
+        result &= setOptimizationProfile(generationProfile, "hidden_states_input",
+            createDims({1, 1, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens, mTargetModelOutputHiddenDim}));
+
+        // Last token IDs
+        result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1}),
+            createDims({mBuilderConfig.maxInputLen / 2}), createDims({mBuilderConfig.maxInputLen}));
+        result &= setOptimizationProfile(
+            generationProfile, "last_token_ids", createDims({1}), createDims({maxTokens / 2}), createDims({maxTokens}));
+    }
+    else if (mBuilderConfig.eagleBase)
+    {
+        // Last token IDs
+        result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1}),
+            createDims({mBuilderConfig.maxInputLen / 2}), createDims({mBuilderConfig.maxInputLen}));
+        result &= setOptimizationProfile(
+            generationProfile, "last_token_ids", createDims({1}), createDims({maxTokens / 2}), createDims({maxTokens}));
+    }
+
+    // Attention mask and position ID
+    if (mBuilderConfig.eagleDraft || mBuilderConfig.eagleBase)
+    {
+        int32_t const attnMaskAlignSize = 32;
+        result &= setOptimizationProfile(contextProfile, "attention_mask", createDims({1, 1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, 1, 1}), createDims({mBuilderConfig.maxBatchSize, 1, 1}));
+        result &= setOptimizationProfile(generationProfile, "attention_mask", createDims({1, 1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2,
+                static_cast<int64_t>(divUp(maxTokens / 2, attnMaskAlignSize) * attnMaskAlignSize)}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens,
+                static_cast<int64_t>(divUp(maxTokens, attnMaskAlignSize) * attnMaskAlignSize)}));
+
+        result &= setOptimizationProfile(contextProfile, "attention_pos_id", createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+        result &= setOptimizationProfile(generationProfile, "attention_pos_id", createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens}));
+    }
+
+    return result;
+}
+
+bool LLMBuilder::setupVLMProfiles(nvinfer1::IOptimizationProfile* contextProfile,
+    nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network)
+{
+    bool result = true;
+
+    // Find image_embeds input
+    int32_t imageHiddenSize = 0;
+    for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
+    {
+        if (strcmp(network->getInput(idx)->getName(), "image_embeds") == 0)
+        {
+            imageHiddenSize = network->getInput(idx)->getDimensions().d[1];
+            break;
+        }
+    }
+
+    if (imageHiddenSize == 0)
+    {
+        LOG_ERROR("Please add image_embeds as inputs for VLM.");
+        return false;
+    }
+
+    int64_t optImageTokens = (mBuilderConfig.maxImageTokens + mBuilderConfig.minImageTokens) / 2;
+
+    result &= setOptimizationProfile(contextProfile, "image_embeds",
+        createDims({mBuilderConfig.minImageTokens, imageHiddenSize}), createDims({optImageTokens, imageHiddenSize}),
+        createDims({mBuilderConfig.maxImageTokens, imageHiddenSize}));
+    result &= setOptimizationProfile(generationProfile, "image_embeds", createDims({1, imageHiddenSize}),
+        createDims({1, imageHiddenSize}), createDims({1, imageHiddenSize}));
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup optimization profiles at setupVLMProfiles().");
+    }
+
+    return result;
+}
+
+bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile* contextProfile,
+    nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network)
+{
+    bool result = true;
+
+    // Add LoRA optimization profiles if maxLoraRank > 0
+    if (mBuilderConfig.maxLoraRank > 0)
+    {
+        for (int i = 0; i < network->getNbInputs(); ++i)
+        {
+            auto* input = network->getInput(i);
+            std::string inputName = input->getName();
+
+            if (inputName.find("lora_A") != std::string::npos)
+            {
+                // For lora_A, the shape is [gemm_k, lora_rank]
+                auto dims = input->getDimensions();
+                if (dims.nbDims == 2)
+                {
+                    int64_t gemm_k = dims.d[0];
+                    result &= setOptimizationProfile(contextProfile, inputName.c_str(),
+                        createDims({gemm_k, 0}),                              // min shape
+                        createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}), // opt shape
+                        createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
+                    result &= setOptimizationProfile(generationProfile, inputName.c_str(),
+                        createDims({gemm_k, 0}),                              // min shape
+                        createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}), // opt shape
+                        createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
+                }
+            }
+            else if (inputName.find("lora_B") != std::string::npos)
+            {
+                // For lora_B, the shape is [lora_rank, gemm_n]
+                auto dims = input->getDimensions();
+                if (dims.nbDims == 2)
+                {
+                    int64_t gemm_n = dims.d[1];
+                    result &= setOptimizationProfile(contextProfile, inputName.c_str(),
+                        createDims({0, gemm_n}),                              // min shape
+                        createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}), // opt shape
+                        createDims({mBuilderConfig.maxLoraRank, gemm_n}));    // max shape
+                    result &= setOptimizationProfile(generationProfile, inputName.c_str(),
+                        createDims({0, gemm_n}),                              // min shape
+                        createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}), // opt shape
+                        createDims({mBuilderConfig.maxLoraRank, gemm_n}));    // max shape
+                }
+            }
+        }
+    }
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup optimization profiles at setupLoraProfiles().");
+    }
+
+    return result;
+}
+
+bool LLMBuilder::setupKVCacheProfiles(
+    nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
+{
+    bool result = true;
+
+    nvinfer1::Dims minKVContextShape = createDims({1, 2, mNumKVHeads, 0, mHeadSize});
+    nvinfer1::Dims optKVContextShape = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, 0, mHeadSize});
+    nvinfer1::Dims maxKVContextShape = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, 0, mHeadSize});
+
+    nvinfer1::Dims minKVGenerationShape = createDims({1, 2, mNumKVHeads, mBuilderConfig.maxSeqLen, mHeadSize});
+    nvinfer1::Dims optKVGenerationShape
+        = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxSeqLen, mHeadSize});
+    nvinfer1::Dims maxKVGenerationShape
+        = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxSeqLen, mHeadSize});
+
+    for (int i = 0; i < mNbKVCacheInputs; ++i)
+    {
+        result &= setOptimizationProfile(contextProfile, fmtstr("past_key_values.%d", i).c_str(), minKVContextShape,
+            optKVContextShape, maxKVContextShape);
+        result &= setOptimizationProfile(generationProfile, fmtstr("past_key_values.%d", i).c_str(),
+            minKVGenerationShape, optKVGenerationShape, maxKVGenerationShape);
+    }
+
+    return result;
+}
+
+bool LLMBuilder::copyConfig()
+{
+    // Determine config file name based on model type
+    std::string targetConfigPath;
+    if (mBuilderConfig.eagleDraft)
+    {
+        targetConfigPath = mEngineDir.string() + "/draft_config.json";
+    }
+    else if (mBuilderConfig.eagleBase)
+    {
+        targetConfigPath = mEngineDir.string() + "/base_config.json";
+    }
+    else
+    {
+        targetConfigPath = mEngineDir.string() + "/config.json";
+    }
+
+    // Create a copy of mModelConfig and add builder config
+    Json configWithBuilder = mModelConfig;
+    configWithBuilder["builder_config"] = mBuilderConfig.toJson();
+
+    // Write updated config
+    std::ofstream targetConfigFile(targetConfigPath);
+    if (!targetConfigFile.is_open())
+    {
+        LOG_ERROR("Failed to open target config file: %s", targetConfigPath.c_str());
+        return false;
+    }
+    targetConfigFile << configWithBuilder.dump(2);
+    targetConfigFile.close();
+
+    LOG_INFO("Copied config.json with builder config to %s", targetConfigPath.c_str());
+    return true;
+}
+
+bool LLMBuilder::copyTokenizerFiles()
+{
+    // Eagle3 draft model does not need tokenizer files
+    if (mBuilderConfig.eagleDraft)
+    {
+        return true;
+    }
+
+    std::vector<std::string> tokenizerFiles = {"tokenizer_config.json", "tokenizer.json"};
+    bool allSuccess = true;
+
+    for (auto const& filename : tokenizerFiles)
+    {
+        std::string srcPath = mOnnxDir.string() + "/" + filename;
+        std::string dstPath = mEngineDir.string() + "/" + filename;
+
+        if (copyFile(srcPath, dstPath))
+        {
+            LOG_INFO("Copied tokenizer file: %s", filename.c_str());
+        }
+        else
+        {
+            LOG_WARNING("Failed to copy tokenizer file %s", filename.c_str());
+            allSuccess = false;
+        }
+    }
+
+    return allSuccess;
+}
+
+bool LLMBuilder::copyEagleFiles()
+{
+    // Copy d2t.bin for Eagle3 draft models
+    if (!mBuilderConfig.eagle2 && mBuilderConfig.eagleDraft)
+    {
+        std::string d2tPath = mOnnxDir.string() + "/d2t.bin";
+        std::string targetD2tPath = mEngineDir.string() + "/d2t.bin";
+
+        if (copyFile(d2tPath, targetD2tPath))
+        {
+            LOG_INFO("Copied d2t.bin to %s", targetD2tPath.c_str());
+        }
+        else
+        {
+            LOG_WARNING("Failed to copy d2t.bin to %s", targetD2tPath.c_str());
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// VisualBuilder implementation
+
+VisualBuilder::VisualBuilder(
+    std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, VisualBuilderConfig const& config)
+    : mOnnxDir(onnxDir)
+    , mEngineDir(engineDir)
+    , mBuilderConfig(config)
+{
+}
+
+bool VisualBuilder::build()
+{
+    // Load plugin library
+    auto pluginHandles = loadEdgellmPluginLib();
+
+    // Parse model config
+    if (!parseConfig())
+    {
+        return false;
+    }
+
+    // Create builder
+    auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(gLogger));
+    if (!builder)
+    {
+        LOG_ERROR("Failed to create builder.");
+        return false;
+    }
+
+    // Create network definition
+    auto const stronglyTyped = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+    auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(stronglyTyped));
+    if (!network)
+    {
+        LOG_ERROR("Failed to create network.");
+        return false;
+    }
+
+    // Create ONNX parser
+    auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, gLogger));
+    if (!parser)
+    {
+        LOG_ERROR("Failed to create parser.");
+        return false;
+    }
+
+    // Parse ONNX model
+    std::string onnxPath = mOnnxDir.string() + "/model.onnx";
+    if (!parser->parseFromFile(onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    {
+        LOG_ERROR("Failed to parse ONNX file: %s", onnxPath.c_str());
+        return false;
+    }
+
+    // Print network information
+    LOG_DEBUG("%s", printNetworkInfo(network.get(), "Visual").c_str());
+
+    // Create builder config
+    auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+    if (!config)
+    {
+        LOG_ERROR("Failed to create builder config.");
+        return false;
+    }
+
+    // Setup optimization profile
+    if (!setupVisualOptimizationProfile(builder.get(), config.get(), network.get()))
+    {
+        return false;
+    }
+
+    // Create engine directory
+    if (!std::filesystem::exists(mEngineDir))
+    {
+        if (!std::filesystem::create_directories(mEngineDir))
+        {
+            LOG_ERROR("Failed to create directory %s", mEngineDir.string().c_str());
+            return false;
+        }
+        LOG_INFO("Created directory %s for saving Visual engine.", mEngineDir.string().c_str());
+    }
+
+    // Save engine
+    std::string engineFilePath = mEngineDir.string() + "/visual.engine";
+    auto engine = builder->buildSerializedNetwork(*network, *config);
+
+    if (!engine)
+    {
+        LOG_ERROR("Failed to build engine.");
+        return false;
+    }
+    std::ofstream ofs(engineFilePath, std::ios::out | std::ios::binary);
+    if (!ofs)
+    {
+        LOG_ERROR("Failed to open file for writing: %s", engineFilePath.c_str());
+        return false;
+    }
+    ofs.write(static_cast<char*>(engine->data()), engine->size());
+    ofs.close();
+    LOG_INFO("Engine saved to %s", engineFilePath.c_str());
+
+    // Copy config
+    if (!copyConfig())
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool VisualBuilder::parseConfig()
+{
+    std::string configPath = mOnnxDir.string() + "/config.json";
+    std::ifstream configFileStream(configPath);
+    if (!configFileStream.is_open())
+    {
+        LOG_ERROR("Failed to open config file: %s", configPath.c_str());
+        return false;
+    }
+
+    try
+    {
+        mModelConfig = Json::parse(configFileStream);
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse config file: %s", e.what());
+        return false;
+    }
+
+    // Read model type from vision_config.model_type
+    if (!mModelConfig.contains("vision_config") || !mModelConfig["vision_config"].contains("model_type"))
+    {
+        LOG_ERROR("vision_config.model_type not found in config.json");
+        return false;
+    }
+
+    mModelType = mModelConfig["vision_config"]["model_type"].get<std::string>();
+
+    if (mModelType != "qwen2_vl" && mModelType != "qwen2_5_vl" && mModelType != "internvl_vision")
+    {
+        LOG_ERROR("Currently only Qwen2-VL, Qwen2.5-VL and InternVL are supported for VLM. You provided: %s",
+            mModelType.c_str());
+        return false;
+    }
+
+    if (mModelType == "internvl_vision")
+    {
+        mNumChannels = mModelConfig["vision_config"]["num_channels"].get<int64_t>();
+        mImageSizeH = mModelConfig["vision_config"]["image_size"][0].get<int64_t>();
+        mImageSizeW = mModelConfig["vision_config"]["image_size"][1].get<int64_t>();
+    }
+
+    return true;
+}
+
+bool VisualBuilder::setupVisualOptimizationProfile(
+    nvinfer1::IBuilder* const builder, nvinfer1::IBuilderConfig* config, nvinfer1::INetworkDefinition const* network)
+{
+    auto* visualProfile = builder->createOptimizationProfile();
+    bool result = true;
+
+    if (mModelType == "qwen2_vl" || mModelType == "qwen2_5_vl")
+    {
+        result = setupQwenViTProfile(visualProfile, network);
+    }
+    else if (mModelType == "internvl_vision")
+    {
+        result = setupInternViTProfile(visualProfile);
+    }
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup optimization profile");
+        return false;
+    }
+
+    LOG_DEBUG("%s", printOptimizationProfile(visualProfile, "visual_profile", network).c_str());
+
+    config->addOptimizationProfile(visualProfile);
+    return true;
+}
+
+bool VisualBuilder::setupQwenViTProfile(
+    nvinfer1::IOptimizationProfile* profile, nvinfer1::INetworkDefinition const* network)
+{
+    bool result = true;
+
+    // In Qwen2-VL, HW is always 4ximageTokens because it equals to spatial_merge_size ** 2.
+    int64_t minHW = mBuilderConfig.minImageTokens * 4;
+    int64_t maxHW = mBuilderConfig.maxImageTokens * 4;
+    int64_t optHW = (minHW + maxHW) / 2;
+
+    // Infer dimensions from the network
+    int64_t inputDim = 0;
+    int64_t ropeEmbedSize = 0;
+
+    for (int32_t i = 0; i < network->getNbInputs(); ++i)
+    {
+        auto* input = network->getInput(i);
+        if (strcmp(input->getName(), "input") == 0)
+        {
+            inputDim = input->getDimensions().d[1];
+        }
+        else if (strcmp(input->getName(), "rotary_pos_emb") == 0)
+        {
+            ropeEmbedSize = input->getDimensions().d[1];
+        }
+    }
+
+    if (inputDim == 0)
+    {
+        LOG_ERROR("Cannot infer inputDim. Do you have proper ONNX input: input?");
+        return false;
+    }
+
+    if (ropeEmbedSize == 0)
+    {
+        LOG_ERROR("Cannot infer ropeEmbedSize. Do you have proper ONNX input: rotary_pos_emb?");
+        return false;
+    }
+
+    result &= setOptimizationProfile(
+        profile, "input", createDims({minHW, inputDim}), createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
+    result &= setOptimizationProfile(profile, "rotary_pos_emb", createDims({minHW, ropeEmbedSize}),
+        createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
+    result &= setOptimizationProfile(profile, "attention_mask", createDims({1, minHW, minHW}),
+        createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
+
+    if (mModelType == "qwen2_5_vl")
+    {
+        result &= setOptimizationProfile(profile, "window_attention_mask", createDims({1, minHW, minHW}),
+            createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
+        result &= setOptimizationProfile(
+            profile, "window_index", createDims({minHW / 4}), createDims({optHW / 4}), createDims({maxHW / 4}));
+        result &= setOptimizationProfile(
+            profile, "reverse_window_index", createDims({minHW / 4}), createDims({optHW / 4}), createDims({maxHW / 4}));
+    }
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup optimization profile at setupQwenViTProfile().");
+    }
+
+    return result;
+}
+
+bool VisualBuilder::setupInternViTProfile(nvinfer1::IOptimizationProfile* profile)
+{
+    bool result = true;
+
+    if (mBuilderConfig.minImageTokens % 256 != 0 || mBuilderConfig.maxImageTokens % 256 != 0)
+    {
+        LOG_ERROR("minImageTokens and maxImageTokens must be divisible by 256 for InternVL ViT model.");
+        return false;
+    }
+
+    int64_t minNumBlocks = mBuilderConfig.minImageTokens / 256;
+    int64_t maxNumBlocks = mBuilderConfig.maxImageTokens / 256;
+    int64_t optNumBlocks = (minNumBlocks + maxNumBlocks) / 2;
+
+    result
+        &= setOptimizationProfile(profile, "input", createDims({minNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
+            createDims({optNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
+            createDims({maxNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}));
+
+    return result;
+}
+
+bool VisualBuilder::copyConfig()
+{
+    std::string targetConfigPath = mEngineDir.string() + "/config.json";
+
+    // Create a copy of mModelConfig and add builder config
+    Json configWithBuilder = mModelConfig;
+    configWithBuilder["builder_config"] = mBuilderConfig.toJson();
+
+    // Write updated config
+    std::ofstream targetConfigFile(targetConfigPath);
+    if (!targetConfigFile.is_open())
+    {
+        LOG_ERROR("Failed to open target config file: %s", targetConfigPath.c_str());
+        return false;
+    }
+    targetConfigFile << configWithBuilder.dump(2);
+    targetConfigFile.close();
+
+    LOG_INFO("Copied config.json with builder config to %s", targetConfigPath.c_str());
+    return true;
+}
+
+} // namespace builder
+} // namespace drivellm

@@ -67,18 +67,12 @@ def save_tokenizer_to_output_dir(model_dir: str, output_dir: str) -> None:
         print(f"Warning: No tokenizer files found in {model_dir}")
 
 
-def save_d2t_for_eagle3_draft(model_dir: str, output_dir: str) -> None:
+def save_d2t_for_eagle3_draft(draft_model: nn.Module, output_dir: str) -> None:
     """Save d2t.bin for Eagle3 draft model."""
-    # TODO: Use safetensors save the d2t.bin
-    load_model_path = os.path.join(model_dir, "pytorch_model.bin")
-    ea_layer_state_dict = torch.load(load_model_path, weights_only=True)
-    # When the  draft vocab size is not equal to the base vocab size, we need to map the token id from draft to base using d2t.bin
-    d2t_tensor = ea_layer_state_dict['d2t']
+    d2t_tensor = draft_model.d2t
     d2t_path = os.path.join(output_dir, "d2t.bin")
     with open(d2t_path, 'wb') as f:
-        f.write(d2t_tensor.numpy().astype(np.int32).tobytes())
-    del ea_layer_state_dict
-    gc.collect()
+        f.write(d2t_tensor.cpu().numpy().astype(np.int32).tobytes())
     print(f"Saved d2t.bin to {output_dir}")
 
 
@@ -643,6 +637,9 @@ def export_eagle_models(base_model_dir: str,
         json.dump(draft_config, f, indent=2)
     print(f"Draft model configuration saved to {config_path}")
 
+    if not eagle2:
+        save_d2t_for_eagle3_draft(draft_model, draft_output_dir)
+
     # Export base model
     print(f"Exporting base model to {base_output_dir}")
     base_dummy_inputs = create_dummy_inputs(
@@ -668,9 +665,6 @@ def export_eagle_models(base_model_dir: str,
 
     # Save tokenizer files to base output directory
     save_tokenizer_to_output_dir(base_model_dir, base_output_dir)
-
-    if not eagle2:
-        save_d2t_for_eagle3_draft(draft_model_dir, draft_output_dir)
 
     end_time = time.time()
     print(

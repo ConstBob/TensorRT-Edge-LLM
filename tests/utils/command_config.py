@@ -15,8 +15,8 @@ COMMANDS = {
             '--onnxDir={onnx_dir}', '--engineDir={engine_dir}',
             '--maxInputLen={max_input_len}', '--maxSeqLen={max_seq_len}'
         ],
-        'static_args': ['--batchSize={batch_size}'],
-        'dynamic_args': ['--dynamicShape', '--maxBatchSize={max_batch_size}']
+        'static_args': ['--maxBatchSize={batch_size}'],
+        'dynamic_args': ['--maxBatchSize={max_batch_size}']
     },
     'llm_chat': {
         'executable':
@@ -38,6 +38,11 @@ COMMANDS = {
             '--maxLength={total_length}', '--warmUp=2', '--numRuns=10'
         ]
     },
+    'llm_inference': {
+        'executable': 'llm_inference',
+        'timeout': 300,
+        'base_args': ['--engineDir={engine_dir}']
+    },
 
     # VLM Commands
     'vlm_llm_build': {
@@ -48,12 +53,14 @@ COMMANDS = {
         'base_args': [
             '--onnxDir={onnx_dir}', '--engineDir={engine_dir}',
             '--maxInputLen={max_input_len}', '--maxSeqLen={max_seq_len}',
-            '--usePromptTuning'
+            '--vlm'
         ],
-        'static_args':
-        ['--batchSize={batch_size}', '--imageTokens={image_tokens}'],
+        'static_args': [
+            '--maxBatchSize={batch_size}', '--minImageTokens={image_tokens}',
+            '--maxImageTokens={image_tokens}'
+        ],
         'dynamic_args': [
-            '--dynamicShape', '--maxBatchSize={max_batch_size}',
+            '--maxBatchSize={max_batch_size}',
             '--minImageTokens={min_image_tokens}',
             '--maxImageTokens={max_image_tokens}'
         ]
@@ -65,9 +72,10 @@ COMMANDS = {
         1800,
         'base_args':
         ['--onnxDir={visual_onnx_dir}', '--engineDir={visual_engine_dir}'],
-        'static_args': ['--imageTokens={image_tokens}'],
+        'static_args':
+        ['--minImageTokens={image_tokens}', '--maxImageTokens={image_tokens}'],
         'dynamic_args': [
-            '--dynamicShape', '--minImageTokens={min_image_tokens}',
+            '--minImageTokens={min_image_tokens}',
             '--maxImageTokens={max_image_tokens}'
         ]
     },
@@ -95,6 +103,16 @@ COMMANDS = {
             '--imageTokenLength={image_token_length}',
             '--outputLength={output_seq_len}', '--batchSize={batch_size}',
             '--warmUp=2', '--numRuns=10'
+        ]
+    },
+    'vlm_llm_inference': {
+        'executable':
+        'llm_inference',
+        'timeout':
+        1200,
+        'base_args': [
+            '--engineDir={engine_dir}',
+            '--multimodalEngineDir={visual_engine_dir}'
         ]
     }
 }

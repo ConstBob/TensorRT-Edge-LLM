@@ -110,7 +110,7 @@ inline std::string extractFolderName(std::string const& path)
     return "";
 }
 
-inline int copyFile(std::string const& srcPath, std::string const& dstPath)
+inline bool copyFile(std::string const& srcPath, std::string const& dstPath)
 {
     if (srcPath == dstPath)
     {
@@ -122,7 +122,7 @@ inline int copyFile(std::string const& srcPath, std::string const& dstPath)
         if (!source)
         {
             printf("Failed to open file for reading: %s", srcPath.c_str());
-            return EXIT_FAILURE;
+            return false;
         }
 
         std::ofstream dest(dstPath, std::ios::out | std::ios::binary);
@@ -134,10 +134,10 @@ inline int copyFile(std::string const& srcPath, std::string const& dstPath)
         else
         {
             printf("Failed to copy file to %s", dstPath.c_str());
-            return EXIT_FAILURE;
+            return false;
         }
     }
-    return EXIT_SUCCESS;
+    return true;
 }
 
 } // namespace drivellm
