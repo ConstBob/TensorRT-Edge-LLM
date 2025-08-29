@@ -10,21 +10,20 @@
 
 add_executable(visual_build visual_build.cpp)
 target_link_libraries(visual_build PRIVATE ${NV_ONNX_PARSER_LIB}
-                                           commonLibraryExt exampleUtils)
-target_include_directories(
-  visual_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR} ${COMMON_INCLUDE_DIRS}
-                       ${CMAKE_SOURCE_DIR}/examples/utils)
+                                           commonLibraryExt edgellmBuilder)
+target_include_directories(visual_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
+                                                ${COMMON_INCLUDE_DIRS})
 add_cross_build_link_options(visual_build)
 
 add_executable(vlm_chat vlm_chat.cpp)
-target_link_libraries(vlm_chat PRIVATE llmSdkCore tokenizer commonLibraryExt
-                                       exampleUtils)
+target_link_libraries(vlm_chat PRIVATE edgellmCore edgellmTokenizer
+                                       commonLibraryExt exampleUtils)
 target_include_directories(vlm_chat PRIVATE ${COMMON_INCLUDE_DIRS}
                                             ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(vlm_chat)
 
 add_executable(vlm_benchmark vlm_benchmark.cpp)
-target_link_libraries(vlm_benchmark PRIVATE llmSdkCore tokenizer
+target_link_libraries(vlm_benchmark PRIVATE edgellmCore edgellmTokenizer
                                             commonLibraryExt exampleUtils)
 target_include_directories(
   vlm_benchmark PRIVATE ${COMMON_INCLUDE_DIRS}
@@ -32,7 +31,7 @@ target_include_directories(
 add_cross_build_link_options(vlm_benchmark)
 
 add_executable(vlm_accuracy vlm_accuracy.cpp)
-target_link_libraries(vlm_accuracy PRIVATE llmSdkCore tokenizer
+target_link_libraries(vlm_accuracy PRIVATE edgellmCore edgellmTokenizer
                                            commonLibraryExt exampleUtils)
 target_include_directories(
   vlm_accuracy PRIVATE ${COMMON_INCLUDE_DIRS}

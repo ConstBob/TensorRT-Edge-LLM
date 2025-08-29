@@ -70,6 +70,7 @@ def executable_files(test_config):
         'llm_chat': f"{build_dir}/examples/llm/llm_chat",
         'llm_benchmark': f"{build_dir}/examples/llm/llm_benchmark",
         'llm_accuracy': f"{build_dir}/examples/llm/llm_accuracy",
+        'llm_inference': f"{build_dir}/examples/llm/llm_inference",
         'visual_build': f"{build_dir}/examples/multimodal/visual_build",
         'vlm_chat': f"{build_dir}/examples/multimodal/vlm_chat",
         'vlm_benchmark': f"{build_dir}/examples/multimodal/vlm_benchmark",

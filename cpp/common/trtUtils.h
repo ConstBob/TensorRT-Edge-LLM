@@ -24,16 +24,6 @@
 namespace drivellm
 {
 
-inline nvinfer1::Dims createDims(std::vector<int64_t> const& shape)
-{
-    nvinfer1::Dims dims{static_cast<int32_t>(shape.size()), {}};
-    for (size_t i = 0; i < shape.size(); ++i)
-    {
-        dims.d[i] = shape[i];
-    }
-    return dims;
-}
-
 inline std::int64_t volume(nvinfer1::Dims const& dims)
 {
 
@@ -59,40 +49,6 @@ struct EngineInputDesc
     {
     }
 };
-
-inline bool checkOptimizationProfileDims(
-    nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims)
-{
-    if (minDims.nbDims != optDims.nbDims || optDims.nbDims != maxDims.nbDims)
-    {
-        LOG_ERROR("Dimension count mismatch: minDims.nbDims=%d, optDims.nbDims=%d, maxDims.nbDims=%d", minDims.nbDims,
-            optDims.nbDims, maxDims.nbDims);
-        return false;
-    }
-    for (int i = 0; i < minDims.nbDims; ++i)
-    {
-        if (minDims.d[i] > optDims.d[i] || optDims.d[i] > maxDims.d[i])
-        {
-            LOG_ERROR("Dimension value mismatch at index %d: min=%d, opt=%d, max=%d", i, minDims.d[i], optDims.d[i],
-                maxDims.d[i]);
-            return false;
-        }
-    }
-    return true;
-}
-
-inline bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const* inputName,
-    nvinfer1::Dims const& minDims, nvinfer1::Dims const& optDims, nvinfer1::Dims const& maxDims)
-{
-    if (!checkOptimizationProfileDims(minDims, optDims, maxDims))
-    {
-        LOG_INFO("setOptimizationProfile: %s is not valid", inputName);
-        return false;
-    }
-    return profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, minDims)
-        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT, optDims)
-        && profile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX, maxDims);
-}
 
 // Define a custom deleter type to handle the noexcept attribute
 struct DlDeleter
@@ -128,39 +84,6 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
     }
     return handle;
 }
-
-// StreamReader ported from TRT-LLM to read from engine file.
-class StreamReader final : public nvinfer1::IStreamReader
-{
-public:
-    StreamReader(std::filesystem::path fp)
-    {
-        mFile.open(fp.string(), std::ios::binary | std::ios::in);
-        if (!mFile.good())
-        {
-            throw std::runtime_error(fmtstr("Cannot open engine file: %s", fp.string()));
-        };
-    }
-
-    virtual ~StreamReader()
-    {
-        if (mFile.is_open())
-        {
-            mFile.close();
-        }
-    }
-
-    int64_t read(void* destination, int64_t nbBytes) final
-    {
-        if (!mFile.good())
-        {
-            return -1;
-        }
-        mFile.read(static_cast<char*>(destination), nbBytes);
-        return mFile.gcount();
-    }
-    std::ifstream mFile;
-};
 
 struct TensorInfo
 {

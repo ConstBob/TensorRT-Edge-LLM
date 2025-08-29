@@ -27,3 +27,10 @@ class TestVLMPipeline:
         execute_pipeline_test(test_param, test_config, executable_files,
                               execution_mode, remote_config, test_logger,
                               PipelineTestType.BENCHMARK, VLMTestConfig, "VLM")
+
+    def test_inference(self, test_param: str, test_config, executable_files,
+                       execution_mode, remote_config, test_logger):
+        """Test inference with parameterized configs"""
+        execute_pipeline_test(test_param, test_config, executable_files,
+                              execution_mode, remote_config, test_logger,
+                              PipelineTestType.INFERENCE, VLMTestConfig, "VLM")

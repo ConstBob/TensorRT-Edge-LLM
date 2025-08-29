@@ -1,5 +1,4 @@
 build/
-build*/
 *_engine/
 *.engine
 *_onnx/

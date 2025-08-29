@@ -33,18 +33,9 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     std::string enginePath = engineDir + "/visual.engine";
 
     // Load engine
-    char const* disableMmapLoad = std::getenv("DISABLE_MMAP_LOAD");
-    if (disableMmapLoad != nullptr)
-    {
-        StreamReader _sr(enginePath);
-        mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
-    }
-    else
-    {
-        auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-        mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-            mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-    }
+    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
+    mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
     // Create context and set optimization profile
     mContext = std::unique_ptr<nvinfer1::IExecutionContext>(mVisualEngine->createExecutionContext());

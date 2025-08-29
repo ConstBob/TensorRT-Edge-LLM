@@ -192,7 +192,8 @@ class Eagle2DraftModel(nn.Module):
         config = AutoConfig.from_pretrained(draft_model_dir)
 
         if use_prompt_tuning:
-            config = config.text_config
+            if hasattr(config, 'text_config'):
+                config = config.text_config
 
         # Hard overwrite the config max_position_embeddings
         print(
@@ -208,7 +209,7 @@ class Eagle2DraftModel(nn.Module):
                     f"Model file not found at {pytorch_bin_path} or {safetensors_path}"
                 )
             draft_state_dict = load_file(safetensors_path,
-                                         device=base_model.device)
+                                         device=str(base_model.device))
         else:
             draft_state_dict = torch.load(pytorch_bin_path,
                                           weights_only=True,

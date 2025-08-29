@@ -112,6 +112,8 @@ def build_export_commands(config: ExportConfig) -> List[List[str]]:
     ]
     if config.max_seq_len:
         llm_cmd.append(f"--max_seq_len={config.max_seq_len}")
+    if config.export_type == ExportType.VLM:
+        llm_cmd.append("--use_prompt_tuning=True")
     commands.append(llm_cmd)
 
     if config.export_type == ExportType.VLM:

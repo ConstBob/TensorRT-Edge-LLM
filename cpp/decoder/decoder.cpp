@@ -61,23 +61,14 @@ bool Decoder::setup(std::string modelDir, int64_t batchSize, bool isEagle, std::
 
         mStream = stream;
         mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-        char const* disableMmapLoad = std::getenv("DISABLE_MMAP_LOAD");
-        if (disableMmapLoad != nullptr)
+        auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
+        if (mmapReader->getData() == nullptr)
         {
-            StreamReader _sr(enginePath);
-            mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(mRuntime->deserializeCudaEngine(_sr));
+            LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());
+            return false;
         }
-        else
-        {
-            auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-            if (mmapReader->getData() == nullptr)
-            {
-                LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());
-                return false;
-            }
-            mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-                mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-        }
+        mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+            mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
         mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
         mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());

@@ -120,7 +120,7 @@ target_link_options(commonLibraryExt INTERFACE
                     "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
 # Build Core libraries of the project. attentionPlugin shared library and
-# llmSdkCore/tokenizer static library will be generated.
+# edgellmCore/edgellmTokenizer/edgellmBuilder static library will be generated.
 add_subdirectory(cpp)
 
 # Build C++ examples to showcase the usage
@@ -138,7 +138,7 @@ if(BUILD_UNIT_TESTS)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
   target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS}
                                               ${CMAKE_SOURCE_DIR})
-  target_link_libraries(unitTest PRIVATE gtest gtest_main llmSdkCore
+  target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore
                                          ${CUDART_LIB} ${CUDA_DRIVER_LIB})
   add_cross_build_link_options(unitTest)
 endif()

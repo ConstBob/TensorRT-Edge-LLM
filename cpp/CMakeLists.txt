@@ -22,7 +22,6 @@ set(CMAKE_CUDA_FLAGS_DEBUG "")
 
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
-file(GLOB_RECURSE COMMON_CU_SRCS "common/*.cu")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
@@ -32,11 +31,11 @@ file(GLOB_RECURSE ENGINE_CPP_SRCS "engine/*.cpp")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
 
-add_library(llmSdkKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS})
-target_include_directories(llmSdkKernels PRIVATE ${COMMON_INCLUDE_DIRS})
+add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS})
+target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
 
 add_library(
-  llmSdkCore STATIC
+  edgellmCore STATIC
   ${COMMON_CPP_SRCS}
   ${COMMON_CU_SRCS}
   ${DECODER_CPP_SRCS}
@@ -47,12 +46,19 @@ add_library(
   ${SAMPLER_CU_SRCS}
   ${MULTIMODAL_CPP_SRCS}
   ${RUNTIME_CPP_SRCS})
-target_include_directories(llmSdkCore PRIVATE ${COMMON_INCLUDE_DIRS})
+target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
 
 # Generate tokenizer C++ static library
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
-add_library(tokenizer STATIC ${TOKENIZER_CPP_SRCS})
-target_include_directories(tokenizer PRIVATE ${COMMON_INCLUDE_DIRS})
+add_library(edgellmTokenizer STATIC ${TOKENIZER_CPP_SRCS})
+target_include_directories(edgellmTokenizer PRIVATE ${COMMON_INCLUDE_DIRS})
+
+# Generate builder C++ static library
+file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
+add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS})
+target_include_directories(edgellmBuilder PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
+                                                  ${COMMON_INCLUDE_DIRS})
+target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB})
 
 # Generate the TensorRT plugin shared libraries
 file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")
@@ -62,6 +68,6 @@ set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                         ${CMAKE_BINARY_DIR})
 target_include_directories(NvInfer_edgellm_plugin
                            PRIVATE ${COMMON_INCLUDE_DIRS})
-target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt llmSdkKernels
+target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt edgellmKernels
                       ${CUDA_DRIVER_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)

@@ -60,6 +60,7 @@ class Eagle3DraftModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.use_prompt_tuning = use_prompt_tuning
+        self.d2t = None
 
         self.draft_vocab_size = getattr(config, "draft_vocab_size",
                                         config.vocab_size)
@@ -215,7 +216,8 @@ class Eagle3DraftModel(nn.Module):
         config = AutoConfig.from_pretrained(draft_model_dir)
 
         if use_prompt_tuning:
-            config = config.text_config
+            if hasattr(config, 'text_config'):
+                config = config.text_config
 
         # Hard overwrite the config max_position_embeddings
         print(
@@ -231,7 +233,7 @@ class Eagle3DraftModel(nn.Module):
                     f"Model file not found at {pytorch_bin_path} or {safetensors_path}"
                 )
             draft_state_dict = load_file(safetensors_path,
-                                         device=base_model.device)
+                                         device=str(base_model.device))
         else:
             draft_state_dict = torch.load(pytorch_bin_path,
                                           weights_only=True,
@@ -239,17 +241,17 @@ class Eagle3DraftModel(nn.Module):
 
         # Handle EAGLE3 specific key mapping
         processed_state_dict = {}
+        model = cls(config, use_prompt_tuning=use_prompt_tuning)
         for key, value in draft_state_dict.items():
-            if 'd2t' in key or 't2d' in key:
-                # Skip d2t and t2d keys as they will be processed later
-                continue
-            if 'midlayer' in key:
+            if 'd2t' in key:
+                model.d2t = value
+            elif 'midlayer' in key:
                 new_key = key.replace('midlayer', 'layers.0')
                 processed_state_dict[new_key] = value
+            elif 't2d' in key:
+                continue
             else:
                 processed_state_dict[key] = value
-
-        model = cls(config, use_prompt_tuning=use_prompt_tuning)
 
         # Use weights from base model if missing
         if base_model is not None:
