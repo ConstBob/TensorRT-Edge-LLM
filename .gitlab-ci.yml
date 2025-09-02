@@ -47,7 +47,6 @@ a30_model_export:
     PLATFORM: tensorrt-runner
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.2.2-53e0399a/12.9-r575/Linux-x64-manylinux_2_28/tar/TensorRT-10.13.2.2.Linux.x86_64-gnu.cuda-12.9.tar.gz"
     CACHE_DIR: "/scratch.edge_llm_cache/L0/$CI_PIPELINE_ID/a30_model_export"
   tags:
     - a30-edgellm-nvks
@@ -93,8 +92,8 @@ jp6_cross_build:
   variables:
     PLATFORM: tensorrt-runner
     CUDA_VERSION: "12.9"
+    TRT_VERSION: "10.13.3.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-cross-aarch64-jp6-cuda$CUDA_VERSION
-    TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.2.2-53e0399a/12.9-r575/jp6-aarch64/tar/TensorRT-10.13.2.2.jp6.aarch64-gnu.cuda-12.9.tar.gz"
     CACHE_DIR: "/scratch.edge_llm_cache/L0/$CI_PIPELINE_ID/jp6_cross_build"
   tags:
     - a30-edgellm-nvks
@@ -104,12 +103,15 @@ jp6_cross_build:
     - echo "Installing dependencies"
     - apt update
     - apt install -y python3 python3-pip git curl
-    - echo "Setting up git submodule"
-    - git submodule update --init --recursive
-    - echo "Downloading TensorRT package"
-    - wget -q $TRT_LINK
-    - mkdir -p TensorRT-jp6
-    - tar -xvf TensorRT-*.tar.gz -C TensorRT-jp6 --strip-components=1
+    - echo "Checking cached dependencies"
+    - export TRT_CACHE_PATH="/scratch.edge_llm_cache/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
+    - if [ ! -d "/scratch.edge_llm_cache/3rdParty" ]; then echo "3rdParty cache not found at /scratch.edge_llm_cache/3rdParty"; exit 1; fi
+    - if [ ! -d "$TRT_CACHE_PATH" ]; then echo "TensorRT JP6 cache not found at $TRT_CACHE_PATH"; exit 1; fi
+    - echo "All cached dependencies found"
+    - echo "Copying 3rdParty dependencies from cache"
+    - cp -r /scratch.edge_llm_cache/3rdParty .
+    - echo "Copying TensorRT JP6 package from cache"
+    - cp -r "$TRT_CACHE_PATH" TensorRT-jp6
     - export LLM_SDK_DIR=$(pwd)
     - echo "Building TensorRT Edge-LLM SDK"
     - rm -rf build-jp6
@@ -187,8 +189,8 @@ a30_build_and_test:
   variables:
     PLATFORM: tensorrt-runner
     CUDA_VERSION: "12.9"
+    TRT_VERSION: "10.13.3.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.2.2-53e0399a/12.9-r575/Linux-x64-manylinux_2_28/tar/TensorRT-10.13.2.2.Linux.x86_64-gnu.cuda-12.9.tar.gz"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
@@ -196,12 +198,15 @@ a30_build_and_test:
     - echo "Installing dependencies"
     - apt update
     - apt install -y python3 python3-pip git curl
-    - echo "Setting up git submodule"
-    - git submodule update --init --recursive
-    - echo "Downloading TensorRT package"
-    - wget -q $TRT_LINK
-    - mkdir -p TensorRT-linux
-    - tar -xvf TensorRT-*.tar.gz -C TensorRT-linux --strip-components=1
+    - echo "Checking cached dependencies"
+    - export TRT_CACHE_PATH="/scratch.edge_llm_cache/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
+    - if [ ! -d "/scratch.edge_llm_cache/3rdParty" ]; then echo "3rdParty cache not found at /scratch.edge_llm_cache/3rdParty"; exit 1; fi
+    - if [ ! -d "$TRT_CACHE_PATH" ]; then echo "TensorRT x86_64 cache not found at $TRT_CACHE_PATH"; exit 1; fi
+    - echo "All cached dependencies found"
+    - echo "Copying 3rdParty dependencies from cache"
+    - cp -r /scratch.edge_llm_cache/3rdParty .
+    - echo "Copying TensorRT x86_64 package from cache"
+    - cp -r "$TRT_CACHE_PATH" TensorRT-linux
     - export LLM_SDK_DIR=$(pwd)
     - cd $LLM_SDK_DIR
     - echo "Installing pytest dependencies"
@@ -229,7 +234,7 @@ rtx5080_build_and_test:
       PLATFORM: tensorrt-runner
       CUDA_VERSION: "12.9"
       IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-      TRT_LINK: "http://cuda-repo/release-candidates/Libraries/TensorRT/v10.13/10.13.3.4-8498df40/12.9-r575/Linux-x64-manylinux_2_28/tar/TensorRT-10.13.3.4.Linux.x86_64-gnu.cuda-12.9.tar.gz"
+      TRT_VERSION: "10.13.3.9"
     tags:
       - rtx5080-edgellm-nvks
     timeout: 1h30m
@@ -238,17 +243,15 @@ rtx5080_build_and_test:
       - echo "Installing dependencies"
       - apt update
       - apt install -y python3 python3-pip git curl
-      - echo "Setting up git submodule"
-      - echo "Starting git submodule update at $(date '+%Y-%m-%d %H:%M:%S')"
-      - start_time=$(date +%s)
-      - git submodule update --init --recursive
-      - end_time=$(date +%s)
-      - duration=$((end_time - start_time))
-      - echo "Git submodule update completed in ${duration}s at $(date '+%Y-%m-%d %H:%M:%S')"
-      - echo "Downloading TensorRT package"
-      - wget -q $TRT_LINK
-      - mkdir -p TensorRT-linux
-      - tar -xvf TensorRT-*.tar.gz -C TensorRT-linux --strip-components=1
+      - echo "Checking cached dependencies"
+      - export TRT_CACHE_PATH="/scratch.edge_llm_cache/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
+      - if [ ! -d "/scratch.edge_llm_cache/3rdParty" ]; then echo "3rdParty cache not found at /scratch.edge_llm_cache/3rdParty"; exit 1; fi
+      - if [ ! -d "$TRT_CACHE_PATH" ]; then echo "TensorRT x86_64 cache not found at $TRT_CACHE_PATH"; exit 1; fi
+      - echo "All cached dependencies found"
+      - echo "Copying 3rdParty dependencies from cache"
+      - cp -r /scratch.edge_llm_cache/3rdParty .
+      - echo "Copying TensorRT x86_64 package from cache"
+      - cp -r "$TRT_CACHE_PATH" TensorRT-linux
       - export LLM_SDK_DIR=$(pwd)
       - cd $LLM_SDK_DIR
       - echo "Installing pytest dependencies"
