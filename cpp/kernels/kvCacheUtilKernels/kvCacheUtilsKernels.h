@@ -19,7 +19,21 @@ namespace drivellm
 namespace kernel
 {
 
-void incrementKVCacheLengths(rt::Tensor& kvCacheLengths, int32_t activeBatchSize, cudaStream_t stream);
+//! Increment the lengthTensor by increment for each entry.
+//! Inputs:
+//! - lengthTensor: The tensor to be incremented.
+//! - increment: The increment value.
+//! - stream: The CUDA stream to be used.
+//! @note LengthTensor shall reside on GPU and have data type of int32_t.
+void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStream_t stream);
+
+//! Increment the lengthTensor by the newLengthTensor for each entry.
+//! Inputs:
+//! - lengthTensor: The tensor to be incremented.
+//! - newIncrementTensor: The tensor to be used as increment value.
+//! - stream: The CUDA stream to be used.
+//! @note LengthTensor and newIncrementTensor shall reside on GPU, have equal length, and have data type of int32_t.
+void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrementTensor, cudaStream_t stream);
 
 //! Helper function to instantiate the KVCache from a pre-computed KVCache tensor. Used to support KVCache reuse across
 //! multiple inference requests to speedup prefill step.

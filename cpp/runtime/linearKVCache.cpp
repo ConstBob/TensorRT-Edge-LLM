@@ -12,6 +12,7 @@
 
 #include "runtime/linearKVCache.h"
 
+#include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include <cuda_bf16.h>
@@ -88,33 +89,38 @@ rt::Tensor LinearKVCache::getKVCacheBuffer()
         DeviceType::kGPU, KVCacheTypeTRT);
 }
 
-void LinearKVCache::resetForNewSequences(int32_t batchSize, cudaStream_t stream)
+void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, cudaStream_t stream)
 {
-    if (batchSize > mConfig.maxBatchSize)
-    {
-        throw std::runtime_error(
-            "BatchSize of this batch of sequences exceeds the maximum batchSize supported by the KVCache");
-    }
+    int32_t const batchSize = static_cast<int32_t>(reuseKVCacheLengths.getShape()[0]);
+    check::check(
+        batchSize <= mConfig.maxBatchSize, "Batch size of request shall not exceed the max supported batch size.");
+    check::check(
+        reuseKVCacheLengths.getDeviceType() == DeviceType::kCPU, "The reuseKVCacheLengths tensor shall reside on CPU.");
+    check::check(reuseKVCacheLengths.getDataType() == mDeviceKVCacheLengths.getDataType(),
+        "The data type of the reuseKVCacheLengths tensor shall match the data type of the Device KVCache Lengths.");
+
     mActiveBatchSize = batchSize;
-    CUDA_CHECK(
-        cudaMemsetAsync(mDeviceKVCacheLengths.rawPointer(), 0, mDeviceKVCacheLengths.getMemoryCapacity(), stream));
-    assert(mDeviceKVCacheLengths.reshape({mActiveBatchSize}));
+    mDeviceKVCacheLengths.reshape({mActiveBatchSize});
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceKVCacheLengths.rawPointer(), reuseKVCacheLengths.rawPointer(),
+        reuseKVCacheLengths.getMemoryCapacity(), cudaMemcpyHostToDevice, stream));
 }
 
-void LinearKVCache::commitPrefillRequest(rt::Tensor const& prefillLengths, cudaStream_t stream)
+void LinearKVCache::commitPrefillRequest(rt::Tensor const& newContextLengths, cudaStream_t stream)
 {
-    assert(prefillLengths.getDataType() == DataType::kINT32);
-    assert(prefillLengths.getDeviceType() == DeviceType::kCPU);
-    assert(prefillLengths.getShape().getNumDims() == 1);
-    assert(prefillLengths.getShape()[0] == mActiveBatchSize);
+    check::check(newContextLengths.getDataType() == DataType::kINT32,
+        "The newContextLengths tensor shall have data type of int32_t.");
+    check::check(
+        newContextLengths.getDeviceType() == DeviceType::kGPU, "The newContextLengths tensor shall reside on GPU.");
+    check::check(newContextLengths.getShape()[0] == mActiveBatchSize,
+        "The newContextLengths tensor shall have the same batch size as the active batch size.");
 
-    CUDA_CHECK(cudaMemcpyAsync(mDeviceKVCacheLengths.rawPointer(), prefillLengths.rawPointer(),
-        prefillLengths.getShape()[0] * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    kernel::incrementLengthTensor(mDeviceKVCacheLengths, newContextLengths, stream);
 }
 
 void LinearKVCache::commitDecodeRequest(cudaStream_t stream)
 {
-    kernel::incrementKVCacheLengths(mDeviceKVCacheLengths, mActiveBatchSize, stream);
+    constexpr int32_t kDECODE_INCREMENT{1};
+    kernel::incrementLengthTensor(mDeviceKVCacheLengths, kDECODE_INCREMENT, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

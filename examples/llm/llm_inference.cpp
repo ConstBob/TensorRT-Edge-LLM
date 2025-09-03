@@ -80,9 +80,9 @@ int main(int argc, char* argv[])
 
     rt::LLMGenerationRequest request;
     request.temperature = 1.0f;
-    request.topP = 0.9f;
-    request.topK = 20;
-    request.maxGenerateLength = 128;
+    request.topP = 0.8f;
+    request.topK = 50;
+    request.maxGenerateLength = 256;
     rt::LLMGenerationResponse response;
 
     if (!args.multimodalEngineDir.empty())
@@ -93,14 +93,25 @@ int main(int argc, char* argv[])
     }
     else
     {
-        request.prompts.emplace_back(
-            rt::LLMGenerationRequest::Prompt{"", "Introduce NVIDIA and introduce the CEO of this company."});
+        std::string const systemPrompt
+            = "<|im_start|>system\nYou are a helpful assistant and you want to provide friendly answers for the user's "
+              "question and provide a concise answer if possible.<|im_end|>\n<|im_start|>user\n";
+        std::string const userPrompt
+            = "Please introduce the company NVIDIA and its CEO.<|im_end|>\n<|im_start|>assistant\n";
+        request.prompts.emplace_back(rt::LLMGenerationRequest::Prompt{systemPrompt, userPrompt});
+
         // Capture CUDA graph and execute the graph for text only input.
         // TODO: Enable CUDA graph capture for multimodal inputs.
         bool const captureStatus = llmInferenceRuntime->captureDecodingCUDAGraph(stream);
         if (!captureStatus)
         {
             LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
+        }
+        bool const saveCacheStatus = llmInferenceRuntime->genAndSaveSystemPromptKVCache(systemPrompt, stream);
+        if (!saveCacheStatus)
+        {
+            LOG_WARNING(
+                "Failed to save system prompt KVCache. May be KVCache reuse feature is not enabled in the engine.");
         }
     }
 

@@ -11,12 +11,13 @@
  */
 
 #include "runtime/llmEngineRunner.h"
-#include "runtime/llmRuntimeUtils.h"
 
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
 #include "common/stringUtils.h"
+#include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
+#include "runtime/llmRuntimeUtils.h"
 #include <fstream>
 #include <functional>
 #include <sstream>
@@ -34,9 +35,10 @@ std::string formatEngineConfig(drivellm::rt::LLMEngineRunnerConfig const& config
 
     ss << std::boolalpha;
     ss << "LLMEngineRunnerConfig:"
-       << "  enableDynamicShape: " << config.enableDynamicShape << "  numDecoderLayers: " << config.numDecoderLayers
-       << "  numKVHeads: " << config.numKVHeads << "  headDim: " << config.headDim
-       << "  rotaryDim: " << config.rotaryDim << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
+       << "  enableDynamicShape: " << config.enableDynamicShape << "  enableReuseKVCache: " << config.enableReuseKVCache
+       << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
+       << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
+       << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
        << "  minSupportedInputLength: " << config.minSupportedInputLength
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
        << "  maxSequenceLength: " << config.maxSequenceLength;
@@ -86,6 +88,7 @@ std::string const lastTokenIdsName{"last_token_ids"};
 std::string const logitsName{"logits"};
 std::string const ropeCosSinName{"rope_rotary_cos_sin"};
 std::string const multimodalEmbeddingsName{"image_embeds"};
+std::string const kvCacheStartIndexName{"kvcache_start_index"};
 
 LLMEngineRunner::LLMEngineRunner(
     std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream)
@@ -161,6 +164,9 @@ LLMEngineRunner::LLMEngineRunner(
     // Instantiate other GPU memory input that needed by the Engine execution.
     this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT64);
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
+    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    CUDA_CHECK(
+        cudaMemsetAsync(mSequenceContextLengths.rawPointer(), 0, mSequenceContextLengths.getMemoryCapacity(), stream));
 
     // Synchronize the stream to ensure all the operations have completed.
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -174,6 +180,12 @@ void LLMEngineRunner::initializeConfigFromEngine()
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
         return tensorDim.nbDims == 5 && bindingName.find("present_key_values") != std::string::npos;
     };
+    // If the engine comes with "kvcache_start_index" binding, it means the engine enables reuse KVCache.
+    // TODO: Enable the kvCacheReuse feature by default.
+    auto identifyReuseKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
+        return tensorDim.nbDims == 1 && bindingName.find("kvcache_start_index") != std::string::npos;
+    };
+
     int32_t nbKVCacheInputs{0};
     int32_t numIOBindings = mEngine->getNbIOTensors();
     for (int32_t i = 0; i < numIOBindings; ++i)
@@ -190,6 +202,10 @@ void LLMEngineRunner::initializeConfigFromEngine()
                 mConfig.headDim = tensorDim.d[4];
             }
             ++nbKVCacheInputs;
+        }
+        if (identifyReuseKVCacheBinding(bindingName, tensorDim))
+        {
+            mConfig.enableReuseKVCache = true;
         }
     }
     mConfig.numDecoderLayers = nbKVCacheInputs;
@@ -261,6 +277,11 @@ LLMEngineRunnerConfig LLMEngineRunner::getEngineConfig() const
     return mConfig;
 }
 
+rt::LinearKVCache& LLMEngineRunner::getLinearKVCache()
+{
+    return mKVCache;
+}
+
 bool LLMEngineRunner::prefillStepInputValidation(
     rt::Tensor const& inputIds, rt::Tensor const& contextLengths, rt::Tensor const& outputLogits)
 {
@@ -328,8 +349,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     int32_t activeBatchSize = inputIds.getShape()[0];
 
     // conduct preparation work for the engine execution.
-    mKVCache.resetForNewSequences(activeBatchSize, stream);
     mSelectTokenIndices.reshape({activeBatchSize, 1});
+    mSequenceContextLengths.reshape({activeBatchSize});
 
     std::vector<int64_t> selectTokenIndicesHost(activeBatchSize, 0);
     int32_t const* contextLengthsData = hostContextLengths.dataPointer<int32_t>();
@@ -339,12 +360,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     }
     CUDA_CHECK(cudaMemcpyAsync(mSelectTokenIndices.rawPointer(), selectTokenIndicesHost.data(),
         activeBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-
-    // Commit prefill request sequence will help propagate the context length data to GPU.
-    // We need to supply the contextLength because of AttentionPlugin design.
-    // TODO: Update this logic to always pass the KVCache start indices prior to execution.
-    mKVCache.commitPrefillRequest(hostContextLengths, stream);
-    rt::Tensor& contextLengthDevice = mKVCache.getKVCacheLengths();
+    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), hostContextLengths.rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
     bool setEngineIOStatus{true};
     // Engine input tensors.
@@ -353,22 +370,28 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     setEngineIOStatus
         &= mContextExecutionContext->setInputShape(inputIdsName.c_str(), inputIds.getShape().getTRTDims());
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(contextLengthsName.c_str(), contextLengthDevice.rawPointer());
+        &= mContextExecutionContext->setTensorAddress(contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        contextLengthsName.c_str(), contextLengthDevice.getShape().getTRTDims());
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
     setEngineIOStatus
         &= mContextExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mContextExecutionContext->setInputShape(
         lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus
         &= mContextExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
-
     if (!multimodalEmbeddings.isEmpty())
     {
         setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
             multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
         setEngineIOStatus &= mContextExecutionContext->setInputShape(
             multimodalEmbeddingsName.c_str(), multimodalEmbeddings.getShape().getTRTDims());
+    }
+    if (mConfig.enableReuseKVCache)
+    {
+        setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+            kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mContextExecutionContext->setInputShape(
+            kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().getShape().getTRTDims());
     }
 
     // Engine output tensors.
@@ -390,6 +413,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
         LOG_ERROR("executePrefill(): Failed on TensorRT prefill stage enqueueV3() call.");
         return false;
     }
+    // Prefill operation has completed, commit the new contents with KVCache.
+    mKVCache.commitPrefillRequest(mSequenceContextLengths, stream);
 
     LOG_DEBUG("executePrefill(): Prefill stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
@@ -439,12 +464,14 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     }
 
     int32_t activeBatchSize = inputIds.getShape()[0];
-    // conduct preparation work for the engine execution.
-    // TODO: Adjust the logic to pass in KVCache start indices prior to execution.
-    mKVCache.commitDecodeRequest(stream);
-    rt::Tensor& contextLengthDevice = mKVCache.getKVCacheLengths();
     // For vanllia decode stage, the selected token indices are always 0.
+    // Also setup the sequence length of each sequence for this run based on committed KVCache length.
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
+    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), mKVCache.getKVCacheLengths().rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+    // Increment the sequence length due to the implementation constraint of AttentionPlugin.
+    constexpr int32_t kDECODE_INCREMENT{1};
+    kernel::incrementLengthTensor(mSequenceContextLengths, kDECODE_INCREMENT, stream);
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
     size_t const graphHash = hashDecodingInput(inputIds, outputLogits);
@@ -463,9 +490,9 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         setEngineIOStatus
             &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), inputIds.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            contextLengthsName.c_str(), contextLengthDevice.rawPointer());
+            contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            contextLengthsName.c_str(), contextLengthDevice.getShape().getTRTDims());
+            contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
             lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -479,6 +506,13 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
             auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
             setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
                 multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
+        }
+        if (mConfig.enableReuseKVCache)
+        {
+            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+                kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().rawPointer());
+            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+                kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().getShape().getTRTDims());
         }
         // Engine output tensors.
         setEngineIOStatus
@@ -500,6 +534,8 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         }
     }
 
+    // Completed decoding step, commit the KVCache length of this run.
+    mKVCache.commitDecodeRequest(stream);
     LOG_DEBUG("executeVanillaDecodingStep(): Decoding stage execution completed for request with batch size %d.",
         activeBatchSize);
     return true;
@@ -519,11 +555,11 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
     int64_t const activeBatchSize = inputIds.getShape()[0];
     constexpr int32_t simulateCacheLength{128};
-    std::vector<int32_t> simulateCacheLengths(activeBatchSize, simulateCacheLength);
-    rt::Tensor const prefillLengthsTensor(
-        simulateCacheLengths.data(), {activeBatchSize}, DeviceType::kCPU, DataType::kINT32);
-    mKVCache.resetForNewSequences(activeBatchSize, stream);
-    mKVCache.commitPrefillRequest(prefillLengthsTensor, stream);
+    std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
+    rt::Tensor const reuseKVCacheLengthsTensor(
+        reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+
+    mKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
 
     // Validate the condition here after the simulate prefill step.
     bool const validateInputStatus = this->vanlliaDecodingStepInputValidation(inputIds, outputLogits);
@@ -533,27 +569,37 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         return false;
     }
 
-    // Set shape of mSelectTokenIndices and set value to all zero..
+    // Set shape of mSelectTokenIndices and set value to all zero.
+    // Set sequence context length input for decoding step.
     mSelectTokenIndices.reshape({activeBatchSize, 1});
+    mSequenceContextLengths.reshape({activeBatchSize});
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
+    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), mKVCache.getKVCacheLengths().rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
 
     // Set engine I/O using the same logic as executeVanillaDecodingStep().
-    rt::Tensor& contextLengthDevice = mKVCache.getKVCacheLengths();
     bool setEngineIOStatus{true};
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         inputIdsName.c_str(), const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
         &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), inputIds.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(contextLengthsName.c_str(), contextLengthDevice.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        contextLengthsName.c_str(), contextLengthDevice.getShape().getTRTDims());
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
     setEngineIOStatus
         &= mGenerationExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+    if (mConfig.enableReuseKVCache)
+    {
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    }
 
     // Engine output tensors.
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
@@ -585,7 +631,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
     mCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
 
-    LOG_INFO("captureVanillaDecodingCudaGraph(): CUDA graph captured successfully for input shape %s.",
+    LOG_DEBUG("captureVanillaDecodingCudaGraph(): CUDA graph captured successfully for input shape %s.",
         inputIds.getShape().formatString().c_str());
     return true;
 }

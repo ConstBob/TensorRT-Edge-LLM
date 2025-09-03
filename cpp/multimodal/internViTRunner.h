@@ -60,8 +60,8 @@ public:
 
     bool preprocess(std::vector<std::string> const& inputStrings,
         std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-        std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& inputIdsLengths,
-        drivellm::tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        std::vector<std::vector<int32_t>>& batchInputIds, tokenizer::Tokenizer* tokenizer,
+        rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
     bool infer(cudaStream_t stream) override;
 

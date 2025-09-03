@@ -41,6 +41,7 @@ struct LLMBuildArgs
     bool isVlm{false};
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
+    bool enableReuseKVCache{false};
 };
 
 void printUsage(char const* programName)
@@ -73,6 +74,8 @@ void printUsage(char const* programName)
     std::cerr << "  --vlm                     Enable VLM mode" << std::endl;
     std::cerr << "  --minImageTokens          Minimum image tokens for VLM. Default = 4" << std::endl;
     std::cerr << "  --maxImageTokens          Maximum image tokens for VLM. Default = 1024" << std::endl;
+    std::cerr << "  --enableReuseKVCache      Enable KVCache reuse to speed up prefill execution. Default = false"
+              << std::endl;
 }
 
 bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
@@ -84,7 +87,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"eagleDraft", no_argument, 0, 709}, {"eagleBase", no_argument, 0, 710}, {"eagle2", no_argument, 0, 711},
         {"maxDecodingTokens", required_argument, 0, 712}, {"maxDraftTokensPerStep", required_argument, 0, 713},
         {"vlm", no_argument, 0, 714}, {"minImageTokens", required_argument, 0, 715},
-        {"maxImageTokens", required_argument, 0, 716}, {0, 0, 0, 0}};
+        {"maxImageTokens", required_argument, 0, 716}, {"enableReuseKVCache", no_argument, 0, 717}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", buildOptions, nullptr)) != -1)
@@ -167,6 +170,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxImageTokens = std::stoi(optarg);
             }
             break;
+        case 717: args.enableReuseKVCache = true; break;
         default: LOG_ERROR("Invalid Argument %c is %s.", opt, optarg); return false;
         }
     }
@@ -213,6 +217,7 @@ int main(int argc, char** argv)
     config.maxSeqLen = args.maxSeqLen;
     config.maxBatchSize = args.maxBatchSize;
     config.maxLoraRank = args.maxLoraRank;
+    config.enableReuseKVCache = args.enableReuseKVCache;
     config.eagleDraft = args.eagleDraft;
     config.eagleBase = args.eagleBase;
     config.eagle2 = args.eagle2;
