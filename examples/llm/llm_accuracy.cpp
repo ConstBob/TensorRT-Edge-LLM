@@ -10,7 +10,6 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "common/common.h"
 #include "common/trtUtils.h"
 #include "decoder/decoder.h"
 #include "engine/llm_engine.h"
@@ -55,12 +54,12 @@ struct TestData
         std::string prompt = question;
         for (int i = 0; i < 4; i++)
         {
-            prompt += fmtstr("\n%c. %s", 'A' + i, options[i].c_str());
+            prompt += format::fmtstr("\n%c. %s", 'A' + i, options[i].c_str());
         }
         prompt += "\nAnswer:";
         if (includeAnswer)
         {
-            prompt += fmtstr(" %s\n\n", ans.c_str());
+            prompt += format::fmtstr(" %s\n\n", ans.c_str());
         }
         return prompt;
     }

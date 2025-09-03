@@ -12,9 +12,10 @@
 
 #pragma once
 
-#include "common.h"
+#include "checkMacros.h"
 #include "cuda_runtime_api.h"
-
+#include <memory>
+#include <type_traits>
 namespace drivellm
 {
 

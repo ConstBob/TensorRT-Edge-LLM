@@ -31,7 +31,8 @@ file(GLOB_RECURSE ENGINE_CPP_SRCS "engine/*.cpp")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
 
-add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS})
+add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
+                                  ${COMMON_CPP_SRCS})
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
 
 add_library(
@@ -55,7 +56,7 @@ target_include_directories(edgellmTokenizer PRIVATE ${COMMON_INCLUDE_DIRS})
 
 # Generate builder C++ static library
 file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
-add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS})
+add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS} ${COMMON_CPP_SRCS})
 target_include_directories(edgellmBuilder PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                   ${COMMON_INCLUDE_DIRS})
 target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB})

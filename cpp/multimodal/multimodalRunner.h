@@ -12,7 +12,6 @@
 
 #pragma once
 
-#include "common/common.h"
 #include "common/tensor.h"
 #include "common/trtUtils.h"
 #include "engine/llm_engine.h"

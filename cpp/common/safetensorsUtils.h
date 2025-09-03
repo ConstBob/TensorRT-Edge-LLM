@@ -12,7 +12,6 @@
 
 #pragma once
 
-#include "common.h"
 #include "logger.h"
 #include "tensor.h"
 #include <filesystem>

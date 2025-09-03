@@ -10,7 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "common/common.h"
+#include "common/checkMacros.h"
 #include "references.h"
 #include "sampler/sampling.h"
 #include "testUtils.h"

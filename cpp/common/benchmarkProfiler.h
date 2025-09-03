@@ -12,7 +12,6 @@
 
 #pragma once
 
-#include "common.h"
 #include "cudaEvent.h"
 #include "cudaUtils.h"
 #include "logger.h"
@@ -21,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <numeric>
@@ -144,7 +144,7 @@ public:
     auto recordDeviceMemEnd()
     {
         deviceMemDone = true;
-        check(peakDeviceMem.valid(), "Must call `recordDeviceMemStart` before calling `recordDeviceMemEnd`. ");
+        check::check(peakDeviceMem.valid(), "Must call `recordDeviceMemStart` before calling `recordDeviceMemEnd`. ");
         return peakDeviceMem.get();
     }
 
@@ -184,7 +184,7 @@ public:
     auto recordHostMemEnd()
     {
         hostMemDone = true;
-        check(peakHostMem.valid(), "Must call `recordHostMemStart` before calling `recordHostMemEnd`. ");
+        check::check(peakHostMem.valid(), "Must call `recordHostMemStart` before calling `recordHostMemEnd`. ");
         return peakHostMem.get();
     }
 

@@ -11,8 +11,7 @@
  */
 
 #include "contextFMHARunner.h"
-
-#include "common/common.h"
+#include "common/checkMacros.h"
 #include "cubin/fmha_cubin.h"
 #include "fmhaParams_v2.h"
 
@@ -70,7 +69,7 @@ static inline void set_alpha(uint32_t& alpha, float norm, FMHADataType dtype)
     }
     else
     {
-        check(false, "Unsupported type for alpha value");
+        check::check(false, "Unsupported type for alpha value");
     }
 }
 
@@ -333,7 +332,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
         || smVersion == fmha_v2::kSM_89);
     bool const isSm101 = (smVersion == fmha_v2::kSM_101);
     bool const isSm12x = (smVersion == fmha_v2::kSM_120 || smVersion == fmha_v2::kSM_121);
-    check((isSm8x || isSm101 || isSm12x), "Other SMs are not supported by context FMHA-v2 kernels");
+    check::check((isSm8x || isSm101 || isSm12x), "Other SMs are not supported by context FMHA-v2 kernels");
     // Handle kernel selection under different context.
     if (isSm8x || isSm101 || isSm12x)
     {
@@ -383,7 +382,7 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
 
-    check(mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV
+    check::check(mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV
             || mLaunchParams.attention_input_layout == AttentionInputLayout::CONTIGUOUS_Q_KV,
         "Unsupported input layout");
     if (mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV)
@@ -421,12 +420,12 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
 {
     if (mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV)
     {
-        check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr,
+        check::check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr,
             "Device pointers are supposed to be valid");
     }
     else // CONTIGUOUS_Q_KV
     {
-        check(params.q_ptr != nullptr && params.kv_ptr != nullptr && params.o_ptr != nullptr
+        check::check(params.q_ptr != nullptr && params.kv_ptr != nullptr && params.o_ptr != nullptr
                 && params.cu_q_seqlens != nullptr && params.cu_kv_seqlens != nullptr,
             "Device pointers are supposed to be valid");
     }
@@ -436,7 +435,7 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
         attentionInputLayoutToInt(mLaunchParams.attention_input_layout)};
     FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
     FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
-    check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
+    check::check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
 
     void* kernelParams[] = {&params, nullptr};
     // Right now we onlu use flash attention kernel

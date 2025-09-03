@@ -12,8 +12,9 @@
 
 #pragma once
 
-#include "common.h"
+#include "stringUtils.h"
 #include <NvInferRuntime.h>
+#include <iostream>
 #include <string>
 
 namespace drivellm
@@ -111,7 +112,7 @@ inline Logger gLogger{};
     {                                                                                                                  \
         if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kVERBOSE)                                               \
         {                                                                                                              \
-            gLogger.debug(fmtstr(__VA_ARGS__));                                                                        \
+            gLogger.debug(format::fmtstr(__VA_ARGS__));                                                                \
         }                                                                                                              \
     } while (0)
 #define LOG_INFO(...)                                                                                                  \
@@ -119,7 +120,7 @@ inline Logger gLogger{};
     {                                                                                                                  \
         if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kINFO)                                                  \
         {                                                                                                              \
-            gLogger.info(fmtstr(__VA_ARGS__));                                                                         \
+            gLogger.info(format::fmtstr(__VA_ARGS__));                                                                 \
         }                                                                                                              \
     } while (0)
 #define LOG_ERROR(...)                                                                                                 \
@@ -127,7 +128,7 @@ inline Logger gLogger{};
     {                                                                                                                  \
         if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kERROR)                                                 \
         {                                                                                                              \
-            gLogger.error(fmtstr(__VA_ARGS__));                                                                        \
+            gLogger.error(format::fmtstr(__VA_ARGS__));                                                                \
         }                                                                                                              \
     } while (0)
 #define LOG_WARNING(...)                                                                                               \
@@ -135,7 +136,7 @@ inline Logger gLogger{};
     {                                                                                                                  \
         if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kWARNING)                                               \
         {                                                                                                              \
-            gLogger.warning(fmtstr(__VA_ARGS__));                                                                      \
+            gLogger.warning(format::fmtstr(__VA_ARGS__));                                                              \
         }                                                                                                              \
     } while (0)
 

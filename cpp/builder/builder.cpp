@@ -11,8 +11,8 @@
  */
 
 #include "builder.h"
-#include "common/common.h"
 #include "common/cudaUtils.h"
+#include "common/fileUtils.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
 
@@ -655,9 +655,9 @@ bool LLMBuilder::setupKVCacheProfiles(
 
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
-        result &= setOptimizationProfile(contextProfile, fmtstr("past_key_values.%d", i).c_str(), minKVContextShape,
-            optKVContextShape, maxKVContextShape);
-        result &= setOptimizationProfile(generationProfile, fmtstr("past_key_values.%d", i).c_str(),
+        result &= setOptimizationProfile(contextProfile, format::fmtstr("past_key_values.%d", i).c_str(),
+            minKVContextShape, optKVContextShape, maxKVContextShape);
+        result &= setOptimizationProfile(generationProfile, format::fmtstr("past_key_values.%d", i).c_str(),
             minKVGenerationShape, optKVGenerationShape, maxKVGenerationShape);
     }
 
@@ -715,7 +715,7 @@ bool LLMBuilder::copyTokenizerFiles()
         std::string srcPath = mOnnxDir.string() + "/" + filename;
         std::string dstPath = mEngineDir.string() + "/" + filename;
 
-        if (copyFile(srcPath, dstPath))
+        if (file_io::copyFile(srcPath, dstPath))
         {
             LOG_INFO("Copied tokenizer file: %s", filename.c_str());
         }
@@ -737,7 +737,7 @@ bool LLMBuilder::copyEagleFiles()
         std::string d2tPath = mOnnxDir.string() + "/d2t.bin";
         std::string targetD2tPath = mEngineDir.string() + "/d2t.bin";
 
-        if (copyFile(d2tPath, targetD2tPath))
+        if (file_io::copyFile(d2tPath, targetD2tPath))
         {
             LOG_INFO("Copied d2t.bin to %s", targetD2tPath.c_str());
         }
