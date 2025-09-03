@@ -10,6 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
+#include "common/checkMacros.h"
 #include "kvCacheUtilsKernels.h"
 #include <cuda_fp16.h>
 #include <stdexcept>
@@ -44,21 +45,53 @@ struct DVec<half>
     }
 };
 
-__global__ void incrementKVCacheLengthsKernel(int32_t* kvCacheLengths, int32_t activeBatchSize)
+__global__ void incrementLengthTensorKernel(
+    int32_t* lengthTensor, int32_t const* incrementLength, int32_t increment, int32_t activeBatchSize)
 {
     int32_t tIdx = blockIdx.x * blockDim.x + threadIdx.x;
     int32_t gridSize = blockDim.x * gridDim.x;
     for (int32_t i = tIdx; i < activeBatchSize; i += gridSize)
     {
-        kvCacheLengths[i] += 1;
+        if (incrementLength == nullptr)
+        {
+            lengthTensor[i] += increment;
+        }
+        else
+        {
+            lengthTensor[i] += incrementLength[i];
+        }
     }
 }
-void incrementKVCacheLengths(rt::Tensor& kvCacheLengths, int32_t activeBatchSize, cudaStream_t stream)
+void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStream_t stream)
 {
+    check::check(lengthTensor.getDeviceType() == rt::DeviceType::kGPU, "The lengthTensor shall reside on GPU.");
+    check::check(
+        lengthTensor.getDataType() == nvinfer1::DataType::kINT32, "The lengthTensor shall have data type of int32_t.");
+
     constexpr int32_t kBLOCK_SIZE = 32;
     constexpr int32_t kGRID_SIZE = 1;
-    incrementKVCacheLengthsKernel<<<kGRID_SIZE, kBLOCK_SIZE, 0, stream>>>(
-        kvCacheLengths.dataPointer<int32_t>(), activeBatchSize);
+    int32_t const activeBatchSize = lengthTensor.getShape()[0];
+
+    incrementLengthTensorKernel<<<kGRID_SIZE, kBLOCK_SIZE, 0, stream>>>(
+        lengthTensor.dataPointer<int32_t>(), nullptr, increment, activeBatchSize);
+}
+
+void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrementTensor, cudaStream_t stream)
+{
+    check::check(lengthTensor.getShape()[0] == newIncrementTensor.getShape()[0],
+        "The lengthTensor and newIncrementTensor shall have the same batch size.");
+    check::check(lengthTensor.getDeviceType() == rt::DeviceType::kGPU
+            && newIncrementTensor.getDeviceType() == rt::DeviceType::kGPU,
+        "Both input tensors shall reside on GPU.");
+    check::check(lengthTensor.getDataType() == nvinfer1::DataType::kINT32
+            && newIncrementTensor.getDataType() == nvinfer1::DataType::kINT32,
+        "Both input tensors shall have data type of int32_t.");
+
+    constexpr int32_t kBLOCK_SIZE = 32;
+    constexpr int32_t kGRID_SIZE = 1;
+    int32_t const activeBatchSize = lengthTensor.getShape()[0];
+    incrementLengthTensorKernel<<<kGRID_SIZE, kBLOCK_SIZE, 0, stream>>>(
+        lengthTensor.dataPointer<int32_t>(), newIncrementTensor.dataPointer<int32_t>(), 0, activeBatchSize);
 }
 
 // TODO: Check if CUTE can improve the peroformance or clarity of this kernel.

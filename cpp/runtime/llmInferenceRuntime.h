@@ -42,6 +42,13 @@ struct LLMGenerationResponse
     std::vector<std::string> outputTexts;
 };
 
+struct SystemPromptKVCache
+{
+    std::string systemPrompt;
+    std::vector<tokenizer::Rank> tokenizedPrompt;
+    rt::Tensor kvCacheContent;
+};
+
 class LLMInferenceRuntime
 {
 public:
@@ -52,10 +59,19 @@ public:
 
     bool captureDecodingCUDAGraph(cudaStream_t stream);
 
+    //! Execute the prefill step generation of the KVCache for the prompt and save for later usage.
+    //! Input:
+    //! - prompt: The system prompt to generate the KVCache.
+    //! - stream: The CUDA stream used for the generation.
+    //! Output:
+    //! - true if the KVCache is generated and saved successfully, false otherwise.
+    bool genAndSaveSystemPromptKVCache(std::string const& prompt, cudaStream_t stream);
+
 private:
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};
+    std::unordered_map<size_t, SystemPromptKVCache> mSystemPromptKVCache{};
 
     rt::Tensor mSamplingWorkspace{};
     rt::Tensor mInputIds{};
@@ -65,11 +81,11 @@ private:
 
     LLMEngineRunnerConfig mEngineConfig{};
 
-    bool prepareInputIds(LLMGenerationRequest const& request, std::vector<int32_t>& packedInputIds,
-        std::vector<int32_t>& inputIdsLengths);
-    bool packInputIds(std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& inputIdsLengths,
-        std::vector<int32_t>& packedInputIds);
-    bool getInputTexts(LLMGenerationRequest const& request, std::vector<std::string>& inputTexts);
+    bool examineAndExtractInputTexts(LLMGenerationRequest const& request, std::vector<std::string>& inputTexts,
+        std::vector<std::string>& systemPrompts);
+
+    bool setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
+        std::vector<std::string> const& systemPrompts, cudaStream_t stream);
 };
 } // namespace rt
 } // namespace drivellm

@@ -1,6 +1,7 @@
 #include "llmInferenceRuntime.h"
 
 #include "common/logger.h"
+#include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "sampler/sampling.h"
 #include <fstream>
@@ -8,6 +9,16 @@
 
 using namespace nvinfer1;
 
+namespace
+{
+
+// Left a utility function here in case we want to move to a better hashing method.
+size_t hashSystemPrompt(std::string const& systemPrompt)
+{
+    return std::hash<std::string>{}(systemPrompt);
+}
+
+} // namespace
 namespace drivellm
 {
 namespace rt
@@ -80,7 +91,8 @@ LLMInferenceRuntime::LLMInferenceRuntime(
     }
 }
 
-bool LLMInferenceRuntime::getInputTexts(LLMGenerationRequest const& request, std::vector<std::string>& inputTexts)
+bool LLMInferenceRuntime::examineAndExtractInputTexts(
+    LLMGenerationRequest const& request, std::vector<std::string>& inputTexts, std::vector<std::string>& systemPrompts)
 {
     int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
 
@@ -110,66 +122,92 @@ bool LLMInferenceRuntime::getInputTexts(LLMGenerationRequest const& request, std
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         inputTexts.emplace_back(request.prompts[i].systemPrompt + request.prompts[i].userPrompt);
+        systemPrompts.emplace_back(request.prompts[i].systemPrompt);
     }
 
     return true;
 }
 
-bool LLMInferenceRuntime::prepareInputIds(
-    LLMGenerationRequest const& request, std::vector<int32_t>& packedInputIds, std::vector<int32_t>& inputIdsLengths)
+bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
+    std::vector<std::string> const& systemPrompts, cudaStream_t stream)
 {
-    std::vector<std::string> inputTexts;
-    if (!getInputTexts(request, inputTexts))
+    std::vector<std::vector<int32_t>> processedInputIds;
+    std::vector<int32_t> processedIdsLengths;
+    std::vector<int32_t> packedInputIds;
+    int32_t const activeBatchSize = static_cast<int32_t>(batchedInputIds.size());
+
+    rt::LinearKVCache& linearKVCache = mLLMEngineRunner->getLinearKVCache();
+    rt::Tensor kvCacheBuffer = linearKVCache.getKVCacheBuffer();
+
+    // Record the length of the reused KVCache for each sequence.
+    rt::Tensor reuseKVCacheLengths = rt::Tensor({activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+    int32_t* reuseKVCacheLengthsData = reuseKVCacheLengths.dataPointer<int32_t>();
+
+    // Search if the system prompt has been cached. If there are cached system prompts, insert
+    // the pre-computed KVCache and remove the contents from inputIds.
+    for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
-        return false;
+        auto promptHash = hashSystemPrompt(systemPrompts[i]);
+        if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+        {
+            auto& precachedKVCache = mSystemPromptKVCache[promptHash];
+            auto const& kvCacheContent = precachedKVCache.kvCacheContent;
+            kernel::instantiateKVCacheFromTensor(kvCacheBuffer, kvCacheContent, i, stream);
+            int32_t reuseLength = static_cast<int32_t>(kvCacheContent.getShape()[3]);
+            processedInputIds.emplace_back(batchedInputIds[i].begin() + reuseLength, batchedInputIds[i].end());
+            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size() - reuseLength));
+            reuseKVCacheLengthsData[i] = reuseLength;
+            // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
+            check::check(
+                reuseLength < batchedInputIds[i].size(), "The reuse length shall not exceed the input length.");
+            bool const matchIds = std::equal(precachedKVCache.tokenizedPrompt.begin(),
+                precachedKVCache.tokenizedPrompt.end(), batchedInputIds[i].begin());
+            if (!matchIds)
+            {
+                LOG_WARNING(
+                    "LLMInferenceRuntime(): Though system prompt strings are matched, token_ids are not perfectly "
+                    "aligned. "
+                    "This may generate incorrect result, please check your system prompt design.");
+            }
+        }
+        else
+        {
+            processedInputIds.emplace_back(batchedInputIds[i]);
+            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size()));
+            reuseKVCacheLengthsData[i] = 0;
+        }
     }
 
-    std::vector<std::vector<int32_t>> inputIdsVec;
-    inputIdsLengths.clear();
-
-    for (auto& inputText : inputTexts)
-    {
-        auto tokenizedInput = mTokenizer->encode(inputText, true);
-        inputIdsVec.emplace_back(tokenizedInput);
-        inputIdsLengths.emplace_back(static_cast<int32_t>(tokenizedInput.size()));
-    }
-
-    if (!packInputIds(inputIdsVec, inputIdsLengths, packedInputIds))
-    {
-        LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
-        return false;
-    }
-
-    return true;
-}
-
-bool LLMInferenceRuntime::packInputIds(std::vector<std::vector<int32_t>>& batchInputIds,
-    std::vector<int32_t>& inputIdsLengths, std::vector<int32_t>& packedInputIds)
-{
-    int32_t const minInputLength = *std::min_element(inputIdsLengths.begin(), inputIdsLengths.end());
-    int32_t const maxInputLength = *std::max_element(inputIdsLengths.begin(), inputIdsLengths.end());
-
-    if (minInputLength == 0)
-    {
-        LOG_ERROR("LLMInferenceRuntime(): The batch of requests contains empty prompts.");
-        return false;
-    }
-
+    // Pack inputIds, instantiate input data for prefill step, and reset the KVCache state.
+    int32_t const maxInputLength = *std::max_element(processedIdsLengths.begin(), processedIdsLengths.end());
     if (maxInputLength > mEngineConfig.maxSupportedInputLength)
     {
-        LOG_ERROR("Max tokenized Input length (%d) exceeds the max supported input length of the LLM Engine (%d)",
+        LOG_ERROR(
+            "LLMInferenceRuntime(): The max input length (%d) exceeds the max supported input length (%d) of the LLM "
+            "Engine.",
             maxInputLength, mEngineConfig.maxSupportedInputLength);
         return false;
     }
 
-    int32_t const activeBatchSize = static_cast<int32_t>(batchInputIds.size());
-    packedInputIds.resize(activeBatchSize * maxInputLength, mTokenizer->getPadId());
-
+    // The LLM Engine could also have minSupportedInputLength constraint.
+    int32_t const packedInputLength = std::max(maxInputLength, mEngineConfig.minSupportedInputLength);
+    packedInputIds.resize(activeBatchSize * packedInputLength, mTokenizer->getPadId());
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        std::copy(batchInputIds[i].begin(), batchInputIds[i].end(), packedInputIds.begin() + i * maxInputLength);
+        // Pad each sequence to the max length of this batch.
+        // TODO: Implement remove input padding for better efficiency until multi-batch.
+        std::copy(
+            processedInputIds[i].begin(), processedInputIds[i].end(), packedInputIds.begin() + i * packedInputLength);
     }
+
+    linearKVCache.resetForNewSequences(reuseKVCacheLengths, stream);
+    mInputIds.reshape({activeBatchSize, packedInputLength});
+    mHostContextLengths.reshape({activeBatchSize});
+    mOutputLogits.reshape({activeBatchSize, mEngineConfig.vocabSize});
+
+    CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), packedInputIds.data(),
+        activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    memcpy(mHostContextLengths.dataPointer<int32_t>(), processedIdsLengths.data(), activeBatchSize * sizeof(int32_t));
 
     return true;
 }
@@ -177,38 +215,30 @@ bool LLMInferenceRuntime::packInputIds(std::vector<std::vector<int32_t>>& batchI
 bool LLMInferenceRuntime::handleRequest(
     LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
 {
-    std::vector<int32_t> packedInputIds;
-    std::vector<int32_t> inputIdsLengths;
+    std::vector<std::vector<int32_t>> batchedInputIds;
+    std::vector<std::string> batchSystemPrompts;
+    std::vector<std::string> batchInputTexts;
+
+    if (!examineAndExtractInputTexts(request, batchInputTexts, batchSystemPrompts))
+    {
+        LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
+        return false;
+    }
 
     if (!mMultimodalRunner)
     {
-        if (!prepareInputIds(request, packedInputIds, inputIdsLengths))
+        for (auto& inputText : batchInputTexts)
         {
-            LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
-            return false;
+            batchedInputIds.emplace_back(mTokenizer->encode(inputText, true));
         }
     }
     else
     {
-        std::vector<std::string> batchInputTexts;
-        if (!getInputTexts(request, batchInputTexts))
-        {
-            LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
-            return false;
-        }
-
-        std::vector<std::vector<int32_t>> batchInputIds;
-        if (!mMultimodalRunner->preprocess(batchInputTexts, request.imageBuffers, batchInputIds, inputIdsLengths,
-                mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
+        if (!mMultimodalRunner->preprocess(batchInputTexts, request.imageBuffers, batchedInputIds, mTokenizer.get(),
+                mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
         {
             LOG_ERROR(
                 "LLMInferenceRuntime(): Multimodal input request processing failed. This request cannot be handled.");
-            return false;
-        }
-
-        if (!packInputIds(batchInputIds, inputIdsLengths, packedInputIds))
-        {
-            LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
             return false;
         }
 
@@ -219,27 +249,32 @@ bool LLMInferenceRuntime::handleRequest(
         }
     }
 
-    int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
-    int32_t const maxInputIdsLength = *std::max_element(inputIdsLengths.begin(), inputIdsLengths.end());
-    int32_t maxGenerationLength = request.maxGenerateLength;
-    if (maxInputIdsLength + maxGenerationLength > mEngineConfig.maxSupportedInputLength)
+    // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
+    // preparation, reset the KVCache state, and apply reused prefix KVCache if available.
+    if (!setUpForPrefillExecution(batchedInputIds, batchSystemPrompts, stream))
     {
-        maxGenerationLength = mEngineConfig.maxSupportedInputLength - maxInputIdsLength;
-        LOG_WARNING(
-            "LLMInferenceRuntime(): With requested max generation length (%d), the total sequence length (%d) may "
-            "exceed the max supported input length (%d) of the LLM Engine."
-            "Reduce the generation length of this request to %d to avoid the truncation of the generated tokens.",
-            request.maxGenerateLength, maxInputIdsLength + request.maxGenerateLength,
-            mEngineConfig.maxSupportedInputLength, maxGenerationLength);
+        LOG_ERROR("LLMInferenceRuntime(): Prefill execution setup failed. This request cannot be handled.");
+        return false;
     }
 
-    mInputIds.reshape({activeBatchSize, maxInputIdsLength});
-    mOutputLogits.reshape({activeBatchSize, mEngineConfig.vocabSize});
-    mHostContextLengths.reshape({activeBatchSize});
+    int32_t const activeBatchSize = mInputIds.getShape()[0];
+    int32_t const maxInputIdsLength = mInputIds.getShape()[1];
+    int32_t maxGenerationLength = request.maxGenerateLength;
+    if (maxInputIdsLength + maxGenerationLength > mEngineConfig.maxSequenceLength)
+    {
+        maxGenerationLength = mEngineConfig.maxSequenceLength - maxInputIdsLength;
+        LOG_WARNING(
+            "LLMInferenceRuntime(): With requested max generation length (%d), the total sequence length (%d) may "
+            "exceed the max sequence length (%d) of the LLM Engine."
+            "Reduce the generation length of this request to %d to avoid the truncation of the generated tokens.",
+            request.maxGenerateLength, maxInputIdsLength + request.maxGenerateLength, mEngineConfig.maxSequenceLength,
+            maxGenerationLength);
+    }
 
+    // Set up data structures to store the generated results during decoding.
+    // Also set up sampling parameters and sampling lambda function.
     int32_t unFinishedBatchNum = activeBatchSize;
     int32_t generationIter{0};
-
     std::vector<std::vector<int32_t>> outputIds(activeBatchSize);
     std::vector<bool> finishedStates(activeBatchSize, false);
     std::vector<int32_t> selectedTokenIdsHost(activeBatchSize, 0);
@@ -269,10 +304,8 @@ bool LLMInferenceRuntime::handleRequest(
         return selectedTokenIdsHost;
     };
 
-    CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), packedInputIds.data(),
-        activeBatchSize * maxInputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    memcpy(mHostContextLengths.dataPointer<int32_t>(), inputIdsLengths.data(), activeBatchSize * sizeof(int32_t));
-    // Use empty tensor for when no multimodal runner is available
+    // Use empty tensor for when no multimodal runner is available.
+    // All other data input used by prefill step is already set up in setUpForPrefillExecution().
     rt::Tensor emptyTensor{};
     rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
     mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
@@ -313,7 +346,80 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(mInputIds, mOutputLogits, stream);
     }
 
+    if (captureStatus)
+    {
+        LOG_INFO("LLMInferenceRuntime(): Successfully captured the decoding CUDA graph for all execution batch sizes.");
+    }
     return captureStatus;
+}
+
+bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(std::string const& prompt, cudaStream_t stream)
+{
+    // TODO: Enable the system prompt KVCache feature by default and remove this check.
+    if (!mEngineConfig.enableReuseKVCache)
+    {
+        LOG_ERROR("LLMInferenceRuntime(): The system prompt KVCache feature is not enabled in the engine.");
+        return false;
+    }
+
+    // hash the prompt if check if the prompt cache already exists.
+    size_t const promptHash = hashSystemPrompt(prompt);
+    if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+    {
+        LOG_INFO(
+            "LLMInferenceRuntime(): The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
+        return true;
+    }
+
+    auto tokenizedPrompt = mTokenizer->encode(prompt, true);
+    int32_t const promptIdsLength = static_cast<int32_t>(tokenizedPrompt.size());
+    int32_t const activeBatchSize = 1;
+
+    if (promptIdsLength > mEngineConfig.maxSupportedInputLength)
+    {
+        LOG_ERROR(
+            "LLMInferenceRuntime(): The prompt length (%d) exceeds the max supported input length (%d) of the LLM "
+            "Engine.",
+            promptIdsLength, mEngineConfig.maxSupportedInputLength);
+        return false;
+    }
+
+    std::vector<std::vector<int32_t>> batchedInputIds(activeBatchSize, tokenizedPrompt);
+    std::vector<std::string> batchedSystemPrompts(activeBatchSize, prompt);
+    if (!setUpForPrefillExecution(batchedInputIds, batchedSystemPrompts, stream))
+    {
+        LOG_ERROR(
+            "LLMInferenceRuntime(): Prefill execution setup failed. Cannot generate the KVCache for this prompt.");
+        return false;
+    }
+
+    // Execute prefill step to initialize the KVCache data.
+    rt::Tensor emptyTensor{};
+    mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, emptyTensor, mOutputLogits, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Copy out the KVCache content from the prefill step.
+    auto& linearKVCache = mLLMEngineRunner->getLinearKVCache();
+    auto cacheConfig = linearKVCache.getConfig();
+    auto kvCacheBuffer = linearKVCache.getKVCacheBuffer();
+    rt::Coords savedKVCacheShape{
+        cacheConfig.numDecoderLayers, 2, cacheConfig.numKVHeads, promptIdsLength, cacheConfig.headDim};
+
+    SystemPromptKVCache savedKVCache;
+    savedKVCache.systemPrompt = prompt;
+    savedKVCache.tokenizedPrompt = tokenizedPrompt;
+    savedKVCache.kvCacheContent
+        = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT);
+
+    // We only process one sequence at a time.
+    constexpr int32_t CACHE_BATCH_IDX{0};
+    kernel::saveKVCacheIntoTensor(savedKVCache.kvCacheContent, kvCacheBuffer, CACHE_BATCH_IDX, stream);
+    mSystemPromptKVCache.insert({promptHash, std::move(savedKVCache)});
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    LOG_DEBUG("LLMInferenceRuntime(): The KVCache is saved for the prompt: {%s}", prompt.c_str());
+
+    return true;
 }
 
 } // namespace rt

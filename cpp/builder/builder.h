@@ -36,6 +36,7 @@ struct LLMBuilderConfig
     bool isVlm{false};                 //!< Whether this is a Vision-Language Model (VLM)
     int64_t minImageTokens{4};         //!< Minimum number of image tokens (VLM only)
     int64_t maxImageTokens{1024};      //!< Maximum number of image tokens (VLM only)
+    bool enableReuseKVCache{false};    //!< Whether to enable KVCache reuse
     bool eagleDraft{false};            //!< Whether this is an Eagle draft model
     bool eagleBase{false};             //!< Whether this is an Eagle base model
     bool eagle2{false};                //!< Whether to use Eagle2 (default is Eagle3)
@@ -57,6 +58,7 @@ struct LLMBuilderConfig
             json["min_image_tokens"] = minImageTokens;
             json["max_image_tokens"] = maxImageTokens;
         }
+        json["enable_reuse_kvcache"] = enableReuseKVCache;
         json["eagle_draft"] = eagleDraft;
         json["eagle_base"] = eagleBase;
         json["eagle2"] = eagle2;
@@ -89,6 +91,10 @@ struct LLMBuilderConfig
         if (json.contains("max_image_tokens"))
         {
             config.maxImageTokens = json["max_image_tokens"];
+        }
+        if (json.contains("enable_reuse_kvcache"))
+        {
+            config.enableReuseKVCache = json["enable_reuse_kvcache"];
         }
         if (json.contains("eagle_draft"))
         {

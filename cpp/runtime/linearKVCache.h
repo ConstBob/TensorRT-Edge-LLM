@@ -63,12 +63,12 @@ public:
     //! Get the full KVCache buffer as a non-owned tensor.
     rt::Tensor getKVCacheBuffer();
 
-    //! Reset the KVCache buffer state for a new setup of input context.
-    //! @param batchSize The number of active sequences in this batch of requests.
+    //! Asynchronously reset the KVCache buffer state for a new setup of input context.
+    //! @param hostReuseKVCacheLengths The lengths of the KVCache to be reused from precomputed KVCache content.
     //! @param stream The stream is used to perform GPU memory operations.
-    void resetForNewSequences(int32_t batchSize, cudaStream_t stream);
+    void resetForNewSequences(rt::Tensor const& hostReuseKVCacheLengths, cudaStream_t stream);
 
-    //! Commit the KVCache buffer for a prefill request, record stored KVCache lengths.
+    //! Asynchronously commit the KVCache buffer for a prefill request, record stored KVCache lengths.
     //! @param prefillLengths The context length of the prefill requests.
     //! @param stream The stream is used to perform GPU memory operations.
     void commitPrefillRequest(rt::Tensor const& prefillLengths, cudaStream_t stream);

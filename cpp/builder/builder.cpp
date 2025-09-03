@@ -443,6 +443,16 @@ bool LLMBuilder::setupCommonProfiles(
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxSeqLen, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, profileMaxPositionEmbeddings, mRotaryDim}));
 
+    // If enable reuse KVCache, we need to add a profile for the KVCache start index.
+    // As a future improvement, we should enable KVCache reuse feature by default and remove the if statement.
+    if (mBuilderConfig.enableReuseKVCache)
+    {
+        result &= setOptimizationProfile(contextProfile, "kvcache_start_index", createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        result &= setOptimizationProfile(generationProfile, "kvcache_start_index", createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    }
+
     // KV cache profiles
     result &= setupKVCacheProfiles(contextProfile, generationProfile);
 

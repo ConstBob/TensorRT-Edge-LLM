@@ -669,12 +669,15 @@ void QwenViTRunner::preprocess(std::vector<std::string> const& inputStrings,
 
 bool QwenViTRunner::preprocess(std::vector<std::string> const& inputStrings,
     std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-    std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& inputIdsLengths,
-    drivellm::tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    std::vector<std::vector<int32_t>>& batchInputIds, tokenizer::Tokenizer* tokenizer,
+    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     std::vector<std::vector<int64_t>> imageGridTHWs;
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImagePerBatch;
+
+    // TODO: Clean out the field, only put here for compatibility with old API.
+    std::vector<int32_t> inputIdsLengths;
 
     try
     {

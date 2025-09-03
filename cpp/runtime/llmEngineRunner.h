@@ -28,6 +28,7 @@ namespace rt
 struct LLMEngineRunnerConfig
 {
     bool enableDynamicShape{false};
+    bool enableReuseKVCache{false};
     bool useContextDependentRope{false};
     int32_t numDecoderLayers{};
     int32_t numKVHeads{};
@@ -61,6 +62,8 @@ public:
     //! The API is useful when the rope cos/sin cache depends on the context which cannot be initialized
     //! in advance when creating the LLMEngineRunner instance.
     rt::Tensor& getRopeCosSinCacheTensor();
+
+    rt::LinearKVCache& getLinearKVCache();
 
     LLMEngineRunnerConfig getEngineConfig() const;
 
@@ -119,6 +122,13 @@ private:
     //! The select token indices tensor is used to select indices from hidden states to pass to
     //! the LM head of LLM model. Enforce to be int64_t to align with ONNX Gather-ND specification.
     rt::Tensor mSelectTokenIndices{};
+
+    //! The tensor has different meaning for prefill and decoding phase due to implementation of
+    //! the AttentionPlugin. Used as LLM engine input.
+    //! For prefill phase, the field denotes the actual content length of input_ids for each sequence.
+    //! For decoding phase, this field denotes the cumulative length of the sequence length of prefill
+    //!     plus generated tokens (including the length in "current" run).
+    rt::Tensor mSequenceContextLengths{};
 
     //! The LinearKVCache tensor that carried for the LLM model execution.
     rt::LinearKVCache mKVCache{};
