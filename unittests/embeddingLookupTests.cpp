@@ -10,7 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "common/common.h"
+#include "common/checkMacros.h"
 #include "common/tensor.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "references.h"

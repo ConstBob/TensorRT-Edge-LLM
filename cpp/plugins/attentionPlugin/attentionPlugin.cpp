@@ -11,7 +11,6 @@
  */
 
 #include "attentionPlugin.h"
-#include "common/common.h"
 #include "common/cudaUtils.h"
 
 #include "kernels/contextAttentionKernels/contextFMHARunner.h"
@@ -412,14 +411,15 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t const rotaryDim = static_cast<int32_t>(posEncodingCosSinDesc.dims.d[kCOS_SIN_ROTARY_DIM_IDX]);
 
     // Check the runtime batch size and input context length are valid for execution.
-    check(runtimeBatchSize < mMaxBatchSize,
+    check::check(runtimeBatchSize < mMaxBatchSize,
         "Runtime batchsize exceed max batch size. This will overflow device data buffer");
-    check(runtimeSeqLen < mKVCacheCapacity,
+    check::check(runtimeSeqLen < mKVCacheCapacity,
         "Runtime sequence length exceed max total context lengths. This will overflow KVCache buffer");
-    check(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == runtimeBatchSize,
+    check::check(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == runtimeBatchSize,
         "cosSinCacheBatchSize must be 1 or runtimeBatchSize");
-    check(cosSinCacheSeqLen >= mKVCacheCapacity, "cosSinCacheSeqLen must be greater than or equal to mKVCacheCapacity");
-    check(rotaryDim <= mNumElemPerHead, "Rotary dimension exceed head size");
+    check::check(
+        cosSinCacheSeqLen >= mKVCacheCapacity, "cosSinCacheSeqLen must be greater than or equal to mKVCacheCapacity");
+    check::check(rotaryDim <= mNumElemPerHead, "Rotary dimension exceed head size");
 
     half* qkvDevicePtr = reinterpret_cast<half*>(const_cast<void*>(inputs[kQKV_INPUT_IDX]));
     int32_t const* seqLengthDevicePtr = reinterpret_cast<int32_t const*>(inputs[kINPUT_LENGTH_INPUT_IDX]);

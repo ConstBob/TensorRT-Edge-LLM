@@ -11,8 +11,8 @@
  */
 
 #include "tensor.h"
-
-#include "common.h"
+#include "checkMacros.h"
+#include <sstream>
 
 using namespace nvinfer1;
 

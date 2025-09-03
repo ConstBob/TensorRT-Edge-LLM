@@ -14,7 +14,7 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
-#include "common/common.h"
+#include "common/checkMacros.h"
 #include "common/tensor.h"
 
 using namespace drivellm;

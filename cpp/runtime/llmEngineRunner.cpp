@@ -13,8 +13,11 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 
+#include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
+#include "common/stringUtils.h"
+#include <fstream>
 #include <functional>
 #include <sstream>
 #include <string>
@@ -232,8 +235,8 @@ bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
     bool status{true};
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
     {
-        std::string const pastKeyValuesName = fmtstr("past_key_values.%d", i);
-        std::string const presentKeyValuesName = fmtstr("present_key_values.%d", i);
+        std::string const pastKeyValuesName = format::fmtstr("past_key_values.%d", i);
+        std::string const presentKeyValuesName = format::fmtstr("present_key_values.%d", i);
 
         rt::Tensor kvCacheBlock = mKVCache.getKVCacheForDecoderLayer(i);
         status &= mContextExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());

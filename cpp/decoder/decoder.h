@@ -13,7 +13,6 @@
 #pragma once
 
 #include "common/benchmarkProfiler.h"
-#include "common/common.h"
 #include "common/safetensorsUtils.h"
 #include "common/trtUtils.h"
 #include <NvInferRuntime.h>

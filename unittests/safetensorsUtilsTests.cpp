@@ -10,7 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "common/common.h"
+#include "common/checkMacros.h"
 #include "common/safetensorsUtils.h"
 #include "testUtils.h"
 #include <cuda_bf16.h>

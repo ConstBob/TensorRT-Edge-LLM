@@ -12,7 +12,7 @@
 
 #include "mmapReader.h"
 
-#include "common.h"
+#include "stringUtils.h"
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
@@ -69,7 +69,7 @@ bool MmapReader::loadFile(std::filesystem::path const& fp)
     int fd = open(filePath.c_str(), O_RDONLY);
     if (fd <= 0)
     {
-        std::string errorMsg = fmtstr("MmapReader: Cannot open file: %s", filePath.c_str());
+        std::string errorMsg = format::fmtstr("MmapReader: Cannot open file: %s", filePath.c_str());
         std::cerr << errorMsg << std::endl;
         return false;
     }
@@ -78,7 +78,7 @@ bool MmapReader::loadFile(std::filesystem::path const& fp)
     if (fstat(fd, &status) != 0)
     {
         close(fd);
-        std::string errorMsg = fmtstr("MmapReader: fstat failed for file: %s", filePath.c_str());
+        std::string errorMsg = format::fmtstr("MmapReader: fstat failed for file: %s", filePath.c_str());
         std::cerr << errorMsg << std::endl;
         return false;
     }
@@ -86,7 +86,7 @@ bool MmapReader::loadFile(std::filesystem::path const& fp)
     if (mBytes == 0)
     {
         close(fd);
-        std::string errorMsg = fmtstr("MmapReader: File %s is empty.", filePath.c_str());
+        std::string errorMsg = format::fmtstr("MmapReader: File %s is empty.", filePath.c_str());
         std::cerr << errorMsg << std::endl;
         return false;
     }
@@ -96,7 +96,7 @@ bool MmapReader::loadFile(std::filesystem::path const& fp)
         mData = nullptr;
         mBytes = 0;
         close(fd);
-        std::string errorMsg = fmtstr("MmapReader: mmap failed for file: %s", filePath.c_str());
+        std::string errorMsg = format::fmtstr("MmapReader: mmap failed for file: %s", filePath.c_str());
         std::cerr << errorMsg << std::endl;
         return false;
     }

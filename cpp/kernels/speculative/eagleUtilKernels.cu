@@ -10,9 +10,8 @@
  * its affiliates is strictly prohibited.
  */
 
+#include "common/checkMacros.h"
 #include "eagleUtilKernels.h"
-
-#include "common/common.h"
 #include "memoryUtils.h"
 #include <cub/cub.cuh>
 #include <cuda.h>

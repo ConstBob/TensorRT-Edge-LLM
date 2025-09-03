@@ -12,6 +12,7 @@
 
 #include "decoder.h"
 #include "common/mmapReader.h"
+#include "common/stringUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "sampler/sampling.h"
 #include <NvInferRuntime.h>
@@ -379,7 +380,7 @@ bool Decoder::validateAndFillConfig(int64_t batchSize)
 
     for (int32_t i = 0; i < numLayers; ++i)
     {
-        std::string kvName = fmtstr("past_key_values.%d", i);
+        std::string kvName = format::fmtstr("past_key_values.%d", i);
         nvinfer1::Dims kvShapeContext = mEngine->getProfileShape(kvName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
         nvinfer1::Dims kvShapeGeneration
             = mEngine->getProfileShape(kvName.c_str(), 1, nvinfer1::OptProfileSelector::kMAX);
@@ -431,8 +432,8 @@ void Decoder::allocateBufferForKVCache()
     mDeviceBuffer["kv_cache"] = kvCacheDevice;
     for (int32_t i = 0; i < mConfig.numLayers; ++i)
     {
-        std::string pastKeyValuesName = fmtstr("past_key_values.%d", i);
-        std::string presentKeyValuesName = fmtstr("present_key_values.%d", i);
+        std::string pastKeyValuesName = format::fmtstr("past_key_values.%d", i);
+        std::string presentKeyValuesName = format::fmtstr("present_key_values.%d", i);
         void* curLayerKVCacheAddr = static_cast<uint8_t*>(kvCacheDevice) + bytesPerLayer * i;
         mContextExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), curLayerKVCacheAddr);
         mContextExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), curLayerKVCacheAddr);

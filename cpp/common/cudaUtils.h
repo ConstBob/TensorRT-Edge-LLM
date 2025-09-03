@@ -12,10 +12,11 @@
 
 #pragma once
 
-#include "common.h"
+#include "common/checkMacros.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <numeric>
+#include <tuple>
 
 namespace drivellm
 {

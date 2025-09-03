@@ -11,8 +11,7 @@
  */
 
 #include "safetensorsUtils.h"
-
-#include "common/common.h"
+#include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
 #include <cmath>

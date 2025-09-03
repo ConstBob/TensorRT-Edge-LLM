@@ -1,4 +1,5 @@
-#include "common/common.h"
+#include "common/checkMacros.h"
+#include "common/stringUtils.h"
 #include "embeddingKernels.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -204,8 +205,8 @@ void launchEmbeddingLookupKernel(int32_t const* inputIds, half const* embeddingT
     uint32_t const totalTokens = batchSize * seqLen;
 
     // Validate that hiddenSize is a multiple of vecSize to avoid partial loads
-    check(hiddenSize % vecSize == 0,
-        fmtstr("hiddenSize must be a multiple of %d for efficient vectorized access", vecSize));
+    check::check(hiddenSize % vecSize == 0,
+        format::fmtstr("hiddenSize must be a multiple of %d for efficient vectorized access", vecSize));
 
     // Use 2D CTA: (32, 4) - 4 warps per block
     dim3 const threadsPerBlock(32, 4);               // (32, 4) = 128 threads total
@@ -224,8 +225,8 @@ void launchEmbeddingLookupWithImageInsertionKernel(int32_t const* inputIds, half
     uint32_t const totalTokens = batchSize * seqLen;
 
     // Validate that hiddenSize is a multiple of vecSize to avoid partial loads
-    check(hiddenSize % vecSize == 0,
-        fmtstr("hiddenSize must be a multiple of %d for efficient vectorized access", vecSize));
+    check::check(hiddenSize % vecSize == 0,
+        format::fmtstr("hiddenSize must be a multiple of %d for efficient vectorized access", vecSize));
 
     // Use 2D CTA: (32, 4) - 4 warps per block
     dim3 const threadsPerBlock(32, 4);               // (32, 4) = 128 threads total
@@ -245,23 +246,23 @@ void embeddingLookup(
     auto const embeddingShape = embeddingTable.getShape();
     auto const outputShape = output.getShape();
 
-    check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
-    check(embeddingShape.getNumDims() == 2, "embeddingTable must be 2D tensor [vocabSize, hiddenSize]");
-    check(outputShape.getNumDims() == 3, "output must be 3D tensor [batchSize, seqLen, hiddenSize]");
+    check::check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
+    check::check(embeddingShape.getNumDims() == 2, "embeddingTable must be 2D tensor [vocabSize, hiddenSize]");
+    check::check(outputShape.getNumDims() == 3, "output must be 3D tensor [batchSize, seqLen, hiddenSize]");
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
     int32_t const vocabSize = embeddingShape[0];
     int64_t const hiddenSize = embeddingShape[1];
 
-    check(outputShape[0] == batchSize, "Output batch size mismatch");
-    check(outputShape[1] == seqLen, "Output sequence length mismatch");
-    check(outputShape[2] == hiddenSize, "Output hidden size mismatch");
+    check::check(outputShape[0] == batchSize, "Output batch size mismatch");
+    check::check(outputShape[1] == seqLen, "Output sequence length mismatch");
+    check::check(outputShape[2] == hiddenSize, "Output hidden size mismatch");
 
     // Validate data types
-    check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
-    check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16");
-    check(output.getDataType() == nvinfer1::DataType::kHALF, "output must be FP16");
+    check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
+    check::check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16");
+    check::check(output.getDataType() == nvinfer1::DataType::kHALF, "output must be FP16");
 
     // Get device pointers
     int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
@@ -282,10 +283,10 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
     auto const imageShape = imageEmbeds.getShape();
     auto const outputShape = output.getShape();
 
-    check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
-    check(embeddingShape.getNumDims() == 2, "embeddingTable must be 2D tensor [vocabSize, hiddenSize]");
-    check(imageShape.getNumDims() == 2, "imageEmbeds must be 2D tensor [imageTokenLen, hiddenSize]");
-    check(outputShape.getNumDims() == 3, "output must be 3D tensor [batchSize, seqLen, hiddenSize]");
+    check::check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
+    check::check(embeddingShape.getNumDims() == 2, "embeddingTable must be 2D tensor [vocabSize, hiddenSize]");
+    check::check(imageShape.getNumDims() == 2, "imageEmbeds must be 2D tensor [imageTokenLen, hiddenSize]");
+    check::check(outputShape.getNumDims() == 3, "output must be 3D tensor [batchSize, seqLen, hiddenSize]");
 
     int64_t const batchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
@@ -293,16 +294,16 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
     int64_t const hiddenSize = embeddingShape[1];
     int64_t const imageTokenLen = imageShape[0];
 
-    check(embeddingShape[1] == imageShape[1], "Hidden size mismatch between embeddingTable and imageEmbeds");
-    check(outputShape[0] == batchSize, "Output batch size mismatch");
-    check(outputShape[1] == seqLen, "Output sequence length mismatch");
-    check(outputShape[2] == hiddenSize, "Output hidden size mismatch");
+    check::check(embeddingShape[1] == imageShape[1], "Hidden size mismatch between embeddingTable and imageEmbeds");
+    check::check(outputShape[0] == batchSize, "Output batch size mismatch");
+    check::check(outputShape[1] == seqLen, "Output sequence length mismatch");
+    check::check(outputShape[2] == hiddenSize, "Output hidden size mismatch");
 
     // Validate data types
-    check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
-    check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16");
-    check(imageEmbeds.getDataType() == nvinfer1::DataType::kHALF, "imageEmbeds must be FP16");
-    check(output.getDataType() == nvinfer1::DataType::kHALF, "output must be FP16");
+    check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
+    check::check(embeddingTable.getDataType() == nvinfer1::DataType::kHALF, "embeddingTable must be FP16");
+    check::check(imageEmbeds.getDataType() == nvinfer1::DataType::kHALF, "imageEmbeds must be FP16");
+    check::check(output.getDataType() == nvinfer1::DataType::kHALF, "output must be FP16");
 
     // Get device pointers
     int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();

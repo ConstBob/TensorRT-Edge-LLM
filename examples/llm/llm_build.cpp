@@ -11,7 +11,8 @@
  */
 
 #include "builder/builder.h"
-#include "common/common.h"
+#include "common/cudaUtils.h"
+#include "common/fileUtils.h"
 #include "common/logger.h"
 
 #include <cstdlib>

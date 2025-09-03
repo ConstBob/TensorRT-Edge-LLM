@@ -16,7 +16,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
-#include "common/common.h"
+#include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "references.h"

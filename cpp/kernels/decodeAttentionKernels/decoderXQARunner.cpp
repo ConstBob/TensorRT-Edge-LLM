@@ -11,14 +11,14 @@
  */
 
 #include "decoderXQARunner.h"
-
-#include "common/common.h"
+#include "common/checkMacros.h"
 #include "cubin/xqa_kernel_cubin.h"
 
 #include <algorithm>
 #include <cuda.h>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -311,7 +311,7 @@ bool DecoderXQARunner::loadDecodeXQAKernels(int32_t smVersion, DataType dataType
 void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)
 {
     // Check all device pointers are valid.
-    check(params.output != nullptr && params.qInputPtr != nullptr && params.kvCache.data != nullptr
+    check::check(params.output != nullptr && params.qInputPtr != nullptr && params.kvCache.data != nullptr
             && params.kvCache.sequence_lengths != nullptr,
         "Invalid device pointer passed to kernel dispatch function");
 
@@ -319,7 +319,7 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     auto hashKey = getRuntimeHashKeyFromXQAParams(params);
     XQAKernelList* xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion, useSpecDecode);
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
-    check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the GQA");
+    check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the GQA");
 
     void* kernelParams[] = {&params.numKVheads, &params.output, &params.qInputPtr, &params.kvCache, &params.batchSize,
         &params.kvScale, &params.semaphores, &params.scratch, nullptr};
@@ -336,7 +336,7 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
 void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cudaStream_t const& stream)
 {
     // Check all device pointers are valid.
-    check(params.output != nullptr && params.qInputPtr != nullptr && params.kvCache.data != nullptr
+    check::check(params.output != nullptr && params.qInputPtr != nullptr && params.kvCache.data != nullptr
             && params.kvCache.sequence_lengths != nullptr && params.treeAttnMask != nullptr,
         "Invalid device pointer passed to kernel dispatch function");
 
@@ -344,7 +344,7 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
     auto hashKey = getRuntimeHashKeyFromXQAParamsSpecDecode(params);
     XQAKernelList* xqaKernelList = getXQAKernels(trtToXqaDataType(mDataType), mSmVersion, useSpecDecode);
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
-    check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the Spec-DecodeGQA");
+    check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the Spec-DecodeGQA");
 
     void* kernelParams[] = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen,
         &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.kvCache, &params.batchSize,
