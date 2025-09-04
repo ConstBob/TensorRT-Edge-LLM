@@ -121,6 +121,12 @@ __global__ void acceptDraftTokensByIdsWithPaths(int32_t* outputIds, int32_t* inp
                 auto const targetTokenIdx = batchIdx * maxDecodingTokens + tokenId;
                 targetToken = targetIds[targetTokenIdx];
                 nextIdx = tokenId;
+
+                if (ti == maxPathLen)
+                {
+                    hasEnd = targetToken == endId;
+                    acceptedLength = hasEnd ? ti : ti + 1;
+                }
             }
 
             // Get longest path of the thread
