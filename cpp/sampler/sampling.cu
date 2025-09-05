@@ -270,6 +270,11 @@ __device__ float max_device(float a, float b)
     return fmaxf(a, b);
 }
 
+__device__ float invTemp_device(float temperature)
+{
+    return (temperature < 1e-3f) ? 1000.0f : 1.0f / temperature;
+}
+
 // Helper structures for top-k reduction operations (FP32 only)
 struct TopK_2
 {
@@ -449,7 +454,7 @@ __global__ void topKStage1(float const* __restrict__ logits, float* tmpLogits, i
     auto const vocabSize = params.vocabSize;
     auto const k = params.topK;
     auto const temperature = params.temperature;
-    auto const invTemp = (temperature == 0.0f) ? 0.0f : 1.0f / temperature;
+    auto const invTemp = invTemp_device(temperature);
 
     auto const tmpLogBufIndex = batchId * vocabSize;
     auto const tmpTopKBufIndex = batchId * BLOCKS_PER_BEAM_ * k + blockLane * k;
@@ -626,7 +631,7 @@ __global__ void softmaxKernel(
         return;
 
     auto const offset = batchId * vocabSize;
-    auto const invTemp = (temperature == 0.0f) ? 0.0f : 1.0f / temperature;
+    auto const invTemp = invTemp_device(temperature);
 
     typedef cub::BlockReduce<float, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;

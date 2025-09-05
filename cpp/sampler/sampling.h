@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <common/logger.h>
 #include <cstdint>
 #include <stdexcept>
 
@@ -30,18 +31,38 @@ struct SamplingParams
     bool useTopP;
 
     // Constructor with default values
-    SamplingParams(int32_t batchSize, int32_t vocabSize, float temperature = 1.0f, int32_t topK = 0, float topP = 1.0f)
-        : batchSize(batchSize)
-        , vocabSize(vocabSize)
-        , temperature(temperature)
-        , topK(topK)
-        , topP(topP)
-        , useTopK(topK > 0)
-        , useTopP(topP < 1.0f)
+    SamplingParams(
+        int32_t batchSize_, int32_t vocabSize_, float temperature_ = 1.0f, int32_t topK_ = 0, float topP_ = 1.0f)
+        : batchSize(batchSize_)
+        , vocabSize(vocabSize_)
+        , temperature(temperature_)
+        , topK(topK_)
+        , topP(topP_)
+        , useTopK(topK_ > 0)
+        , useTopP(topP_ < 1.0f)
     {
         if (!useTopK && !useTopP)
         {
             throw std::invalid_argument("Either topK or topP must be set");
+        }
+
+        if (temperature < 0.0f)
+        {
+            throw std::invalid_argument("Temperature must be greater than 0.0f");
+        }
+
+        if (temperature < 1e-3f)
+        {
+            if (topK != 1 || topP != 1.0f)
+            {
+                LOG_WARNING(
+                    "Temperature is 0.0f, but topK is not 1 or topP is not 1.0f, this may cause numerical instability. "
+                    "Setting topK to 1 and topP to 1.0f");
+                topK = 1;
+                topP = 1.0f;
+                useTopK = true;
+                useTopP = false;
+            }
         }
     }
 };
