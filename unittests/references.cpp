@@ -170,7 +170,7 @@ std::vector<half> ropeRefCosSin(std::vector<half> const& input, int32_t const nu
 std::vector<float> softmaxRef(std::vector<float> const& logits, float temperature)
 {
     std::vector<float> scaledLogits(logits.size());
-    float invTemp = (temperature == 0.0f) ? 0.0f : 1.0f / temperature;
+    float invTemp = (temperature < 1e-3f) ? 1000.0f : 1.0f / temperature;
 
     for (size_t i = 0; i < logits.size(); ++i)
     {
@@ -221,6 +221,15 @@ std::set<int32_t> getTopKAllowedTokensRef(std::vector<float> const& logits, int3
 
 std::set<int32_t> getTopPAllowedTokensRef(std::vector<float> const& logits, float topP, float temperature)
 {
+    // When temperature = 0.0f, we should always pick the highest probability token
+    // This matches the behavior in SamplingParams constructor
+    if (temperature < 1e-3f)
+    {
+        int32_t idxMax = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+        // Return only the highest probability token
+        return std::set<int32_t>{idxMax};
+    }
+
     std::vector<std::pair<float, int32_t>> logitPairs;
     for (int32_t i = 0; i < static_cast<int32_t>(logits.size()); ++i)
     {
@@ -271,6 +280,15 @@ std::set<int32_t> getTopPAllowedTokensRef(std::vector<float> const& logits, floa
 std::set<int32_t> getCombinedAllowedTokensRef(
     std::vector<float> const& logits, int32_t topK, float topP, float temperature)
 {
+    // When temperature = 0.0f, we should always pick the highest probability token
+    // This matches the behavior in SamplingParams constructor
+    if (temperature < 1e-3f)
+    {
+        int32_t idxMax = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+        // Return only the highest probability token
+        return std::set<int32_t>{idxMax};
+    }
+
     std::vector<std::pair<float, int32_t>> logitPairs;
     for (int32_t i = 0; i < static_cast<int32_t>(logits.size()); ++i)
     {

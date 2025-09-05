@@ -295,6 +295,43 @@ TEST_F(SamplingTest, SelectAllTopKErrorHandlingReturnLogProbsFalseWithNonNullTop
     CUDA_CHECK(cudaFree(dTopKIndices));
 }
 
+// Test temperature = 0.0f parameter override behavior
+TEST_F(SamplingTest, TemperatureZeroParameterOverride)
+{
+    // Test that when temperature = 0.0f, the SamplingParams constructor
+    // correctly overrides topK to 1 and topP to 1.0f regardless of input
+
+    // Test case 1: Correct config (should not trigger warning)
+    {
+        SamplingParams params1(4, 20, 0.0f, 1, 1.0f);
+        EXPECT_EQ(params1.temperature, 0.0f);
+        EXPECT_EQ(params1.topK, 1);
+        EXPECT_EQ(params1.topP, 1.0f);
+        EXPECT_TRUE(params1.useTopK);
+        EXPECT_FALSE(params1.useTopP);
+    }
+
+    // Test case 2: Incorrect config (should trigger warning and override)
+    {
+        SamplingParams params2(4, 20, 0.0f, 20, 0.9f);
+        EXPECT_EQ(params2.temperature, 0.0f);
+        EXPECT_EQ(params2.topK, 1);    // Should be overridden
+        EXPECT_EQ(params2.topP, 1.0f); // Should be overridden
+        EXPECT_TRUE(params2.useTopK);
+        EXPECT_FALSE(params2.useTopP);
+    }
+
+    // Test case 3: Another incorrect config
+    {
+        SamplingParams params3(4, 20, 0.0f, 5, 0.8f);
+        EXPECT_EQ(params3.temperature, 0.0f);
+        EXPECT_EQ(params3.topK, 1);    // Should be overridden
+        EXPECT_EQ(params3.topP, 1.0f); // Should be overridden
+        EXPECT_TRUE(params3.useTopK);
+        EXPECT_FALSE(params3.useTopP);
+    }
+}
+
 // Unified sampling tests (accuracy only)
 class SamplingTestSuites : public SamplingTest
 {
@@ -501,19 +538,13 @@ TEST_F(SamplingTestSuites, SamplingAccuracy)
     };
 
     std::vector<SamplingConfig> configs = {
-        {"TopK", 20, 1.0f, 1.0f},
-        {"TopK", 50, 1.0f, 1.0f},
-        {"TopK", 100, 1.0f, 1.0f},
-        {"TopP", 0, 0.9f, 1.0f},
-        {"TopP", 0, 0.95f, 1.0f},
-        {"TopP", 0, 0.99f, 1.0f},
-        {"TopKTopP", 20, 0.9f, 1.0f},
-        {"TopKTopP", 50, 0.95f, 1.0f},
-        {"TopKTopP", 100, 0.99f, 1.0f},
-        {"TopK", 20, 1.0f, 0.5f},
-        {"TopK", 20, 1.0f, 1.5f},
-        {"TopP", 0, 0.9f, 0.5f},
+        {"TopK", 20, 1.0f, 1.0f}, {"TopK", 50, 1.0f, 1.0f}, {"TopK", 100, 1.0f, 1.0f}, {"TopP", 0, 0.9f, 1.0f},
+        {"TopP", 0, 0.95f, 1.0f}, {"TopP", 0, 0.99f, 1.0f}, {"TopKTopP", 20, 0.9f, 1.0f}, {"TopKTopP", 50, 0.95f, 1.0f},
+        {"TopKTopP", 100, 0.99f, 1.0f}, {"TopK", 20, 1.0f, 0.5f}, {"TopK", 20, 1.0f, 1.5f}, {"TopP", 0, 0.9f, 0.5f},
         {"TopP", 0, 0.9f, 1.5f},
+        // Temperature = 0.0f tests - should always pick topK = 1 regardless of config
+        {"TempZero", 1, 1.0f, 0.0f},  // Correct config for temperature = 0.0f
+        {"TempZero", 20, 0.9f, 0.0f}, // Incorrect config - should be overridden to topK = 1, topP = 1.0f
     };
 
     // Run accuracy tests with small vocab size
