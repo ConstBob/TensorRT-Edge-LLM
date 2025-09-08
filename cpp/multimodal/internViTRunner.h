@@ -33,6 +33,7 @@ struct InternViTConfig
     int64_t patchSizeW;
     int64_t blockImageSizeH;
     int64_t blockImageSizeW;
+    int32_t imageTokenId;
     std::vector<double> imageMean{0.485, 0.456, 0.406};
     std::vector<double> imageStd{0.229, 0.224, 0.225};
 
@@ -58,9 +59,10 @@ public:
     // TODO: Clean Old API
     std::vector<EngineInputDesc> getComputedEmbeddings() override;
 
-    bool preprocess(std::vector<std::string> const& inputStrings,
-        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-        std::vector<std::vector<int32_t>>& batchInputIds, tokenizer::Tokenizer* tokenizer,
+    bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
+        tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+
+    std::string preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
     bool infer(cudaStream_t stream) override;
@@ -80,12 +82,22 @@ public:
         int const minImageTiles = 1, int const maxImageTiles = 12);
 
 private:
+    // TODO: Clean Old API
     void textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths,
         std::vector<std::string> const& inputStrings, std::vector<int64_t> const& numImagePerBatch,
-        std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer) override;
+        std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer);
 
+    // TODO: Clean Old API
     std::string applyChatTemplate(std::string const& inputString, int const& numImages,
-        std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true) override;
+        std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true);
+
+    void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
+        std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths,
+        drivellm::tokenizer::Tokenizer* tokenizer);
+
+    std::string applyChatTemplateSystem(std::string const& systemPrompt);
+
+    std::string applyChatTemplateUser(std::string const& userPrompt, int const& numImage, bool addGenerationPrompt);
 
     // InternVL-specific methods
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<half>& patches,

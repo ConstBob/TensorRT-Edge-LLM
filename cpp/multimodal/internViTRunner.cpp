@@ -62,6 +62,7 @@ void InternViTRunner::validateAndFillConfig(std::string const& configPath)
         throw std::invalid_argument("InternViTRunner::validateAndFillConfig(): Invalid model type: " + mModelType);
     }
 
+    mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
     auto textConfig = jsonConfig["text_config"];
     mConfig.vocabSize = textConfig["vocab_size"].get<int32_t>();
 
@@ -278,7 +279,7 @@ std::string InternViTRunner::applyChatTemplate(std::string const& inputString, i
     // Images
     for (int i = 0; i < numImages; ++i)
     {
-        int imagePadLen = imageTokenLengths[totalImageIdx++];
+        int imagePadLen = imageTokenLengths.at(totalImageIdx++);
 
         prompt += "<img>";
         for (int j = 0; j < imagePadLen; ++j)
@@ -305,7 +306,7 @@ void InternViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInp
     drivellm::tokenizer::Tokenizer* tokenizer)
 {
     int totalImageIdx = 0;
-    int value = mConfig.vocabSize;
+    int32_t imageTokenId = mConfig.vocabSize;
 
     for (size_t i = 0; i < inputStrings.size(); ++i)
     {
@@ -315,11 +316,10 @@ void InternViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInp
         // replace vis tokens
         for (size_t j = 0; j < ids.size(); ++j)
         {
-            // <IMG_CONTEXT>
-            if (ids[j] == 151667)
+            if (ids[j] == mConfig.imageTokenId)
             {
-                ids[j] = value;
-                ++value;
+                ids[j] = imageTokenId;
+                ++imageTokenId;
             }
         }
         batchInputLengths.emplace_back(static_cast<int32_t>(ids.size()));
@@ -345,21 +345,86 @@ void InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
         maxSupportedInputLength, enableDynamicShape);
 }
 
-bool InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
-    std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-    std::vector<std::vector<int32_t>>& batchInputIds, tokenizer::Tokenizer* tokenizer,
+std::string InternViTRunner::applyChatTemplateSystem(std::string const& systemPrompt)
+{
+    return "<|im_start|>system\n" + systemPrompt + "<|im_end|>\n";
+}
+
+std::string InternViTRunner::applyChatTemplateUser(
+    std::string const& userPrompt, int const& numImage, bool addGenerationPrompt)
+{
+    std::string prompt = "<|im_start|>user\n";
+    for (int i = 0; i < numImage; ++i)
+    {
+        prompt += "<img><IMG_CONTEXT></img>\n";
+    }
+    prompt += userPrompt + "<|im_end|>\n";
+
+    if (addGenerationPrompt)
+    {
+        prompt += "<|im_start|>assistant\n";
+    }
+
+    return prompt;
+}
+
+void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
+    std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImagePerBatch,
+    std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer)
+{
+    if (numImagePerBatch.size() != request.prompts.size())
+    {
+        std::string errorMsg = "InternViTRunner::textPreprocess() numImagePerBatch.size() != request.prompts.size(), "
+            + std::to_string(numImagePerBatch.size()) + " != " + std::to_string(request.prompts.size());
+        LOG_ERROR("%s", errorMsg.c_str());
+        throw std::runtime_error(errorMsg);
+    }
+
+    int imageIndex = 0;
+    // Image token id will start from vocabSize and increment for each image token position
+    int32_t imageTokenId = mConfig.vocabSize;
+
+    for (size_t i = 0; i < request.prompts.size(); ++i)
+    {
+        // Direct concate to avoid extra copy
+        std::string prompt = applyChatTemplateSystem(request.prompts[i].systemPrompt)
+            + applyChatTemplateUser(request.prompts[i].userPrompt, numImagePerBatch[i], true);
+        std::vector<int32_t> ids = tokenizer->encode(prompt);
+
+        // replace vis tokens
+        std::vector<int32_t> newIds;
+        for (size_t j = 0; j < ids.size(); ++j)
+        {
+            if (ids[j] == mConfig.imageTokenId)
+            {
+                int64_t numImageTokens = imageTokenLengths.at(imageIndex);
+                for (int k = 0; k < numImageTokens; ++k)
+                {
+                    newIds.push_back(imageTokenId);
+                    ++imageTokenId;
+                }
+                ++imageIndex;
+            }
+            else
+            {
+                newIds.push_back(ids[j]);
+            }
+        }
+        batchInputIds.emplace_back(std::move(newIds));
+    }
+}
+
+bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
+    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer* tokenizer,
     rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImagePerBatch;
 
-    // TODO: Clean out the field, only put here for compatibility with old API.
-    std::vector<int32_t> inputIdsLengths;
-
     try
     {
-        imagePreprocess(imageBuffers, imageTokenLengths, numImagePerBatch, true, stream);
-        textPreprocess(batchInputIds, inputIdsLengths, inputStrings, numImagePerBatch, imageTokenLengths, tokenizer);
+        imagePreprocess(request.imageBuffers, imageTokenLengths, numImagePerBatch, true, stream);
+        textPreprocess(request, batchedInputIds, numImagePerBatch, imageTokenLengths, tokenizer);
     }
     catch (std::exception const& e)
     {
@@ -368,6 +433,12 @@ bool InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
     }
 
     return true;
+}
+
+std::string InternViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+{
+    return applyChatTemplateSystem(systemPrompt);
 }
 
 bool InternViTRunner::infer(cudaStream_t stream)
@@ -415,8 +486,8 @@ void InternViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const
     mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
 
     // Init input ids
-    std::uniform_int_distribution<std::mt19937::result_type> intDist(0, 10000);
-    int value = mConfig.vocabSize;
+    std::uniform_int_distribution<std::mt19937::result_type> intDist(0, mConfig.vocabSize - 1);
+    int32_t imageTokenId = mConfig.vocabSize;
     for (int i = 0; i < batchSize; ++i)
     {
         auto beginIter = inputIds.begin() + i * inputLength;
@@ -424,8 +495,8 @@ void InternViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const
         // Replace image tokens at the beginning of each batch
         for (int j = 0; j < imageTokenLength; ++j)
         {
-            *(beginIter + j) = value;
-            ++value;
+            *(beginIter + j) = imageTokenId;
+            ++imageTokenId;
         }
     }
 }
