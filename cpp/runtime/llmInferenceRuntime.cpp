@@ -91,8 +91,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(
     }
 }
 
-bool LLMInferenceRuntime::examineAndExtractInputTexts(
-    LLMGenerationRequest const& request, std::vector<std::string>& inputTexts, std::vector<std::string>& systemPrompts)
+bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
 {
     int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
 
@@ -117,12 +116,6 @@ bool LLMInferenceRuntime::examineAndExtractInputTexts(
             LOG_ERROR("LLMInferenceRuntime(): The batch size of prompts and image buffers is not the same.");
             return false;
         }
-    }
-
-    for (int32_t i = 0; i < activeBatchSize; ++i)
-    {
-        inputTexts.emplace_back(request.prompts[i].systemPrompt + request.prompts[i].userPrompt);
-        systemPrompts.emplace_back(request.prompts[i].systemPrompt);
     }
 
     return true;
@@ -217,25 +210,51 @@ bool LLMInferenceRuntime::handleRequest(
 {
     std::vector<std::vector<int32_t>> batchedInputIds;
     std::vector<std::string> batchSystemPrompts;
-    std::vector<std::string> batchInputTexts;
 
-    if (!examineAndExtractInputTexts(request, batchInputTexts, batchSystemPrompts))
+    if (!examineRequest(request))
     {
-        LOG_ERROR("LLMInferenceRuntime(): Input request processing failed. This request cannot be handled.");
+        LOG_ERROR("LLMInferenceRuntime(): Input request examination failed. This request cannot be handled.");
         return false;
     }
 
+    int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
+
+    // Preprocess system prompts and save KVCache for each sequence.
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        if (mMultimodalRunner)
+        {
+            batchSystemPrompts.emplace_back(mMultimodalRunner->preprocessSystemPrompt(request.prompts[i].systemPrompt,
+                mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream));
+        }
+        else
+        {
+            // TODO: apply chat template for system prompt
+            batchSystemPrompts.emplace_back(std::move(request.prompts[i].systemPrompt));
+        }
+        bool const saveCacheStatus = genAndSaveSystemPromptKVCache(batchSystemPrompts[i], stream);
+        if (!saveCacheStatus)
+        {
+            LOG_WARNING(
+                "Failed to save system prompt KVCache. May be KVCache reuse feature is not enabled in the engine.");
+        }
+    }
+
+    // Preprocess user prompts and encode them.
     if (!mMultimodalRunner)
     {
-        for (auto& inputText : batchInputTexts)
+        for (int32_t i = 0; i < activeBatchSize; ++i)
         {
+            // TODO: apply chat template for user prompt.
+            std::string userPrompt = request.prompts[i].userPrompt;
+            std::string inputText = batchSystemPrompts[i] + userPrompt;
             batchedInputIds.emplace_back(mTokenizer->encode(inputText, true));
         }
     }
     else
     {
-        if (!mMultimodalRunner->preprocess(batchInputTexts, request.imageBuffers, batchedInputIds, mTokenizer.get(),
-                mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
+        if (!mMultimodalRunner->preprocess(
+                request, batchedInputIds, mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
         {
             LOG_ERROR(
                 "LLMInferenceRuntime(): Multimodal input request processing failed. This request cannot be handled.");
@@ -257,7 +276,6 @@ bool LLMInferenceRuntime::handleRequest(
         return false;
     }
 
-    int32_t const activeBatchSize = mInputIds.getShape()[0];
     int32_t const maxInputIdsLength = mInputIds.getShape()[1];
     int32_t maxGenerationLength = request.maxGenerateLength;
     if (maxInputIdsLength + maxGenerationLength > mEngineConfig.maxSequenceLength)
@@ -395,7 +413,8 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(std::string const& promp
 
     // Execute prefill step to initialize the KVCache data.
     rt::Tensor emptyTensor{};
-    mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, emptyTensor, mOutputLogits, stream);
+    rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
+    mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Copy out the KVCache content from the prefill step.

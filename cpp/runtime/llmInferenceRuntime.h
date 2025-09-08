@@ -14,33 +14,13 @@
 
 #include "multimodal/multimodalRunner.h"
 #include "runtime/llmEngineRunner.h"
+#include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 
 namespace drivellm
 {
 namespace rt
 {
-
-struct LLMGenerationRequest
-{
-    struct Prompt
-    {
-        std::string systemPrompt;
-        std::string userPrompt;
-    };
-    std::vector<Prompt> prompts;
-    std::vector<std::vector<rt::imageUtils::ImageData>> imageBuffers;
-    float temperature;
-    float topP;
-    int64_t topK;
-    int64_t maxGenerateLength; // Max length of the generated tokens.
-};
-
-struct LLMGenerationResponse
-{
-    std::vector<std::vector<int32_t>> outputIds;
-    std::vector<std::string> outputTexts;
-};
 
 struct SystemPromptKVCache
 {
@@ -81,8 +61,7 @@ private:
 
     LLMEngineRunnerConfig mEngineConfig{};
 
-    bool examineAndExtractInputTexts(LLMGenerationRequest const& request, std::vector<std::string>& inputTexts,
-        std::vector<std::string>& systemPrompts);
+    bool examineRequest(LLMGenerationRequest const& request);
 
     bool setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
         std::vector<std::string> const& systemPrompts, cudaStream_t stream);

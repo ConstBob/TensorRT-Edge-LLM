@@ -64,6 +64,9 @@ void QwenViTRunner::validateAndFillConfig(std::string const& configPath)
 
     mConfig.vocabSize = jsonConfig["vocab_size"].get<int32_t>();
     mConfig.visionStartTokenId = jsonConfig["vision_start_token_id"].get<int32_t>();
+    mConfig.visionTokenId = jsonConfig["vision_token_id"].get<int32_t>();
+    mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
+    mConfig.videoTokenId = jsonConfig["video_token_id"].get<int32_t>();
     mConfig.mropeTheta = jsonConfig["rope_theta"].get<float>();
     auto visionConfig = jsonConfig["vision_config"];
     mConfig.patchSize = visionConfig["spatial_patch_size"].get<int32_t>();
@@ -529,7 +532,7 @@ std::string QwenViTRunner::applyChatTemplate(std::string const& inputString, int
     // Images
     for (int i = 0; i < numImage; ++i)
     {
-        int imagePadLen = imageTokenLengths[totalImageIdx++];
+        int imagePadLen = imageTokenLengths.at(totalImageIdx++);
 
         prompt += "<|vision_start|>";
         for (int j = 0; j < imagePadLen; ++j)
@@ -557,7 +560,8 @@ void QwenViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInput
     drivellm::tokenizer::Tokenizer* tokenizer)
 {
     int totalImageIdx = 0;
-    int value = mConfig.vocabSize;
+    // Image token id will start from vocabSize and increment for each image token position
+    int32_t imageTokenId = mConfig.vocabSize;
 
     for (size_t i = 0; i < inputStrings.size(); ++i)
     {
@@ -567,11 +571,10 @@ void QwenViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInput
         // replace vis tokens
         for (size_t j = 0; j < ids.size(); ++j)
         {
-            // <|vision_pad|>, <|image_pad|>, <|video_pad|>
-            if (ids[j] == 151654 || ids[j] == 151655 || ids[j] == 151656)
+            if (ids[j] == mConfig.visionTokenId || ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
             {
-                ids[j] = value;
-                ++value;
+                ids[j] = imageTokenId;
+                ++imageTokenId;
             }
         }
         batchInputLengths.emplace_back(static_cast<int32_t>(ids.size()));
@@ -667,23 +670,88 @@ void QwenViTRunner::preprocess(std::vector<std::string> const& inputStrings,
         maxSupportedInputLength, enableDynamicShape);
 }
 
-bool QwenViTRunner::preprocess(std::vector<std::string> const& inputStrings,
-    std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-    std::vector<std::vector<int32_t>>& batchInputIds, tokenizer::Tokenizer* tokenizer,
+std::string QwenViTRunner::applyChatTemplateSystem(std::string const& systemPrompt)
+{
+    return "<|im_start|>system\n" + systemPrompt + "<|im_end|>\n";
+}
+
+std::string QwenViTRunner::applyChatTemplateUser(
+    std::string const& userPrompt, int const& numImage, bool addGenerationPrompt)
+{
+    std::string prompt = "<|im_start|>user\n";
+    for (int i = 0; i < numImage; ++i)
+    {
+        prompt += "<|vision_start|><|image_pad|><|vision_end|>";
+    }
+    prompt += userPrompt + "<|im_end|>\n";
+
+    if (addGenerationPrompt)
+    {
+        prompt += "<|im_start|>assistant\n";
+    }
+
+    return prompt;
+}
+
+void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
+    std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImagePerBatch,
+    std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer)
+{
+    if (numImagePerBatch.size() != request.prompts.size())
+    {
+        std::string errorMsg = "QwenViTRunner::textPreprocess() numImagePerBatch.size() != request.prompts.size(), "
+            + std::to_string(numImagePerBatch.size()) + " != " + std::to_string(request.prompts.size());
+        LOG_ERROR("%s", errorMsg.c_str());
+        throw std::runtime_error(errorMsg);
+    }
+
+    int imageIndex = 0;
+    // Image token id will start from vocabSize and increment for each image token position
+    int32_t imageTokenId = mConfig.vocabSize;
+
+    for (size_t i = 0; i < request.prompts.size(); ++i)
+    {
+        // Direct concate to avoid extra copy
+        std::string prompt = applyChatTemplateSystem(request.prompts[i].systemPrompt)
+            + applyChatTemplateUser(request.prompts[i].userPrompt, numImagePerBatch[i], true);
+        std::vector<int32_t> ids = tokenizer->encode(prompt);
+
+        // insert image tokens
+        std::vector<int32_t> newIds;
+        for (size_t j = 0; j < ids.size(); ++j)
+        {
+            if (ids[j] == mConfig.visionTokenId || ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
+            {
+                int64_t numImageTokens = imageTokenLengths.at(imageIndex);
+                for (int k = 0; k < numImageTokens; ++k)
+                {
+                    newIds.push_back(imageTokenId);
+                    ++imageTokenId;
+                }
+                ++imageIndex;
+            }
+            else
+            {
+                newIds.push_back(ids[j]);
+            }
+        }
+        batchInputIds.emplace_back(std::move(newIds));
+    }
+}
+
+bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
+    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer* tokenizer,
     rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     std::vector<std::vector<int64_t>> imageGridTHWs;
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImagePerBatch;
 
-    // TODO: Clean out the field, only put here for compatibility with old API.
-    std::vector<int32_t> inputIdsLengths;
-
     try
     {
-        imagePreprocess(imageBuffers, imageGridTHWs, imageTokenLengths, numImagePerBatch, true, stream);
-        textPreprocess(batchInputIds, inputIdsLengths, inputStrings, numImagePerBatch, imageTokenLengths, tokenizer);
-        generateMropeParams(batchInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
+        imagePreprocess(request.imageBuffers, imageGridTHWs, imageTokenLengths, numImagePerBatch, true, stream);
+        textPreprocess(request, batchedInputIds, numImagePerBatch, imageTokenLengths, tokenizer);
+        generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
     }
     catch (std::exception const& e)
     {
@@ -692,6 +760,20 @@ bool QwenViTRunner::preprocess(std::vector<std::string> const& inputStrings,
     }
 
     return true;
+}
+
+std::string QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+{
+    std::string prompt = applyChatTemplateSystem(systemPrompt);
+
+    std::vector<int32_t> ids = tokenizer->encode(prompt);
+    std::vector<std::vector<int32_t>> batchedInputIds;
+    batchedInputIds.emplace_back(std::move(ids));
+    std::vector<std::vector<int64_t>> imageGridTHWs;
+    generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
+
+    return prompt;
 }
 
 bool QwenViTRunner::infer(cudaStream_t stream)
@@ -779,8 +861,8 @@ void QwenViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const b
     }
 
     // Init input ids
-    std::uniform_int_distribution<std::mt19937::result_type> intDist(0, 10000);
-    int value = mConfig.vocabSize;
+    std::uniform_int_distribution<std::mt19937::result_type> intDist(0, mConfig.vocabSize - 1);
+    int32_t imageTokenId = mConfig.vocabSize;
     for (int i = 0; i < batchSize; ++i)
     {
         auto beginIter = inputIds.begin() + i * inputLength;
@@ -788,8 +870,8 @@ void QwenViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const b
         // Replace image tokens at the beginning of each batch
         for (int j = 0; j < imageTokenLength; ++j)
         {
-            *(beginIter + j) = value;
-            ++value;
+            *(beginIter + j) = imageTokenId;
+            ++imageTokenId;
         }
     }
 }

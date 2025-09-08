@@ -52,9 +52,11 @@ public:
         cudaStream_t stream)
         = 0;
 
-    virtual bool preprocess(std::vector<std::string> const& inputStrings,
-        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-        std::vector<std::vector<int32_t>>& batchInputIds, tokenizer::Tokenizer* tokenizer,
+    virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
+        tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+        = 0;
+
+    virtual std::string preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
         = 0;
 
@@ -91,18 +93,6 @@ protected:
     virtual void flattenBatch(std::vector<int32_t>& inputIds, std::vector<int32_t>& contextLengths,
         std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths, int32_t const padId,
         int const maxSupportedInputLength, bool enableDynamicShape);
-
-    // Get batch input ids and lengths from input strings
-    virtual void textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds,
-        std::vector<int32_t>& batchInputLengths, std::vector<std::string> const& inputStrings,
-        std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths,
-        drivellm::tokenizer::Tokenizer* tokenizer)
-        = 0;
-
-    // Apply chat template to prompt and insert multimodal token placeholders
-    virtual std::string applyChatTemplate(std::string const& inputString, int const& numImage,
-        std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true)
-        = 0;
 
     // Common members
     std::string mModelType;

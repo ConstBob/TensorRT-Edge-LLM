@@ -13,14 +13,39 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "runtime/imageUtils.h"
 
 #include <cstdint>
 #include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
 
 namespace drivellm
 {
 namespace rt
 {
+
+// LLM Generation Request/Response types
+struct LLMGenerationRequest
+{
+    struct Prompt
+    {
+        std::string systemPrompt;
+        std::string userPrompt;
+    };
+    std::vector<Prompt> prompts;
+    std::vector<std::vector<rt::imageUtils::ImageData>> imageBuffers;
+    float temperature;
+    float topP;
+    int64_t topK;
+    int64_t maxGenerateLength; // Max length of the generated tokens.
+};
+
+struct LLMGenerationResponse
+{
+    std::vector<std::vector<int32_t>> outputIds;
+    std::vector<std::string> outputTexts;
+};
 
 enum class RopeType
 {
