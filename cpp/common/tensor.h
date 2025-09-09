@@ -233,6 +233,9 @@ namespace utils
 {
 size_t getTypeSize(nvinfer1::DataType dataType);
 std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape);
+
+//! Format the tensor object as a string for debugging purpose.
+std::string formatString(Tensor const& tensor);
 } // namespace utils
 
 } // namespace rt

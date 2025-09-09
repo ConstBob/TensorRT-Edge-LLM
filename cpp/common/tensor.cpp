@@ -17,6 +17,7 @@
 
 #include "tensor.h"
 #include "checkMacros.h"
+
 #include <sstream>
 
 using namespace nvinfer1;
@@ -60,6 +61,7 @@ size_t getTypeSize(DataType dataType)
     }
     default:
     {
+        // Sub-byte types cannot be processed here.
         throw std::runtime_error("Other types are not supported");
     }
     }
