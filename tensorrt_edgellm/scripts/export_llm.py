@@ -83,13 +83,10 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        # Determine EAGLE version
-        eagle2 = args.eagle2
-
         # Export model(s)
         llm_export(model_dir=args.model_dir,
                    output_dir=args.output_dir,
-                   eagle2=eagle2,
+                   eagle2=args.eagle2,
                    draft_model_dir=args.draft_model_dir,
                    max_position_embeddings=args.max_position_embeddings,
                    device=args.device)

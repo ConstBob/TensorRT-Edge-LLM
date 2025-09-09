@@ -15,7 +15,8 @@
 
 import modelopt.torch.quantization as mtq
 import torch
-from datasets import load_dataset
+from datasets import (concatenate_datasets, get_dataset_config_names,
+                      load_dataset)
 from PIL import Image
 from torch.nn import functional as F
 from torch.utils.data import Dataset
@@ -24,6 +25,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
 
+from ..visual_models.internvl3_model import InternVLVisionModel
 from .quantization_utils import quantize_model
 
 
@@ -32,9 +34,19 @@ def get_visual_calib_dataloader(
     processor,
     dataset_dir="lmms-lab/MMMU",
 ):
-    if "MMMU" in dataset_dir:
+    # There are 2 possible dataset: lmms-lab/MMMU and MMMU/MMMU. The first one does not have any configs.
+    # https://huggingface.co/datasets/lmms-lab/MMMU
+    # https://huggingface.co/datasets/MMMU/MMMU
+
+    if "lmms-lab/MMMU" in dataset_dir:
         # Default use MMMU_DEV. It's recommended to use your own dataset for calibration.
         dataset = load_dataset(dataset_dir, split="dev")
+    elif "MMMU" in dataset_dir:
+        dataset_configs = get_dataset_config_names(dataset_dir)
+        dataset = concatenate_datasets([
+            load_dataset(dataset_dir, config, split="dev")
+            for config in dataset_configs
+        ])
     else:
         raise NotImplementedError(
             f"Unsupported dataset name or local repo directory: {dataset_dir}."
@@ -56,7 +68,18 @@ def get_visual_calib_dataloader(
             "grid_thw": inputs["image_grid_thw"],
         }
 
-    dataset = dataset.map(_preprocess,
+    def _preprocess_internvl(data, processor):
+        image_inputs = []
+        for (key, value) in data.items():
+            if "image" in key and isinstance(value, Image.Image):
+                image_inputs.append(value.convert("RGB"))
+        inputs = processor(images=image_inputs, )
+        return {"pixel_values": inputs["pixel_values"]}
+
+    preprocess_fn = _preprocess_internvl if isinstance(
+        model, InternVLVisionModel) else _preprocess
+
+    dataset = dataset.map(preprocess_fn,
                           batched=False,
                           fn_kwargs={"processor": processor},
                           remove_columns=dataset.column_names)
@@ -124,29 +147,52 @@ def get_visual_calib_dataloader(
                 return inputs
 
         dataset = QwenViTDataset(dataset, model)
-    else:
-        raise NotImplementedError(f"Invalid model type {type(model)}")
+    elif isinstance(model, InternVLVisionModel):
+
+        class InternVLDataset(Dataset):
+
+            def __init__(self, data, model):
+                self.data = data
+                self.model = model
+
+            def __len__(self):
+                return len(self.data)
+
+            def __getitem__(self, idx):
+                raw_data = self.data[idx]
+                pixel_values = raw_data["pixel_values"].to(self.model.dtype)
+                return {"pixel_values": pixel_values}
+
+        dataset = InternVLDataset(dataset, model)
 
     return dataset
 
 
 def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
-    assert isinstance(model,
-                      Qwen2_5_VisionTransformerPretrainedModel) or isinstance(
-                          model, Qwen2VisionTransformerPretrainedModel
-                      ), f"Invalid model type {type(model)}"
+    assert isinstance(
+        model, (Qwen2_5_VisionTransformerPretrainedModel,
+                Qwen2VisionTransformerPretrainedModel,
+                InternVLVisionModel)), f"Invalid model type {type(model)}"
     assert precision in [
         "fp8"
     ], f"Only fp8(W8A8) is supported for visual model. You passed an unsupported precision: {precision}."
     assert "MMMU" in dataset_dir, f"Unsupported dataset name or local repo directory: {dataset_dir}."
 
-    # Set quantization config, this will only enable FP8 GEMMs that not belong to multihead attention modules.
-    # Also disable Conv3d to avoid accuracy degradation.
     quant_config = mtq.FP8_DEFAULT_CFG.copy()
-    quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
 
-    # With TensorRT 10.x, disable `attn.proj` layers to avoid performance degradation.
-    quant_config["quant_cfg"]["*attn.proj*"] = {"enable": False}
+    # Enable FP8 MHA and FP8 GEMM
+    quant_config["quant_cfg"]["*[qkv]_bmm_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None
+    }
+    quant_config["quant_cfg"]["*softmax_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None
+    }
+
+    # Disable Conv to avoid accuracy degradation
+    quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
+    quant_config["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
     data_loader = get_visual_calib_dataloader(model, processor, dataset_dir)
     quantized_model = quantize_model(model, quant_config, data_loader)
     mtq.print_quant_summary(quantized_model)

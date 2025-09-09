@@ -34,7 +34,7 @@ import sys
 import traceback
 
 from tensorrt_edgellm.quantization.llm_quantization import \
-    quantize_and_save_model
+    quantize_and_save_llm
 
 
 def main() -> None:
@@ -42,7 +42,7 @@ def main() -> None:
     Main function that parses command line arguments and quantizes the model.
     
     This function sets up argument parsing for the quantization script and calls
-    the quantize_and_save_model function with the provided parameters.
+    the quantize_and_save_llm function with the provided parameters.
     """
     parser = argparse.ArgumentParser(
         description="Quantize a model using NVIDIA ModelOpt")
@@ -57,12 +57,12 @@ def main() -> None:
     parser.add_argument("--quantization",
                         type=str,
                         required=False,
-                        choices=["fp8", "int4_awq", "nvfp4"],
+                        choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
                         default=None,
                         help="Quantization method to use")
     parser.add_argument("--torch_dtype",
                         type=str,
-                        choices=["fp16", "bf16"],
+                        choices=["fp16"],
                         required=False,
                         default="fp16",
                         help="High precision dtype for model loading")
@@ -74,19 +74,23 @@ def main() -> None:
     parser.add_argument("--lm_head_quantization",
                         type=str,
                         required=False,
-                        choices=["fp8", "int4_awq", "nvfp4"],
+                        choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
                         default=None,
                         help="Quantization method for language model head")
 
     args = parser.parse_args()
 
     try:
-        quantize_and_save_model(model_dir=args.model_dir,
-                                output_dir=args.output_dir,
-                                quantization=args.quantization,
-                                torch_dtype=args.torch_dtype,
-                                dataset_dir=args.dataset_dir,
-                                lm_head_quantization=args.lm_head_quantization)
+        if args.quantization == "mxfp8" or args.lm_head_quantization == "mxfp8":
+            print(
+                "Warning: MXFP8 quantization is not currently supported for TensorRT Edge-LLM. This will be supported in the future."
+            )
+        quantize_and_save_llm(model_dir=args.model_dir,
+                              output_dir=args.output_dir,
+                              quantization=args.quantization,
+                              torch_dtype=args.torch_dtype,
+                              dataset_dir=args.dataset_dir,
+                              lm_head_quantization=args.lm_head_quantization)
         print("Model quantization completed successfully!")
     except Exception as e:
         print(f"Error during model quantization: {e}")

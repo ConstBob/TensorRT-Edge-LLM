@@ -220,7 +220,8 @@ class EnvironmentConfig:
         self.remote_config = remote_config
 
         self.llm_sdk_dir = os.environ.get('LLM_SDK_DIR', os.getcwd())
-        self.onnx_model_dir = os.environ.get('ONNX_MODEL_DIR', 'models')
+        print(f"LLM SDK DIR: {self.llm_sdk_dir}")
+        self.onnx_dir = os.environ.get('ONNX_DIR', 'models')
         self.engine_dir = os.environ.get('ENGINE_DIR', 'engines')
         self.build_dir = 'build'
 

@@ -12,16 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+Common definitions for TensorRT Edge-LLM.
 
-# Unified ONNX export configuration
-# This file contains all ONNX export settings used across the codebase
+This module contains common definitions for TensorRT Edge-LLM.
+"""
 
 # ONNX opset version for all exports
-opset_version = 19
-
-# Export settings
-do_constant_folding = True
-save_as_external_data = True
-all_tensors_to_one_file = True
-location = "onnx_model.data"
-convert_attribute = True
+ONNX_OPSET_VERSION = 19

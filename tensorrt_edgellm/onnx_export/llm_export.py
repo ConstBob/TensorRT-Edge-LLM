@@ -38,9 +38,9 @@ from typing import Any, Dict
 
 import modelopt.torch.opt as mto
 import numpy as np
-import onnx
 import torch
 import torch.nn as nn
+from modelopt.torch.quantization.utils import is_quantized_linear
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
 mto.enable_huggingface_checkpointing()
@@ -49,12 +49,36 @@ from ..llm_models.layers.attention_plugin import \
     register_attention_plugin_onnx_symbolic_functions
 from ..llm_models.layers.gather_nd import \
     register_gather_nd_onnx_symbolic_functions
+from ..llm_models.layers.int4_gemm_plugin import (
+    register_int4_gemm_plugin_onnx_symbolic_functions,
+    replace_torch_quant_linear_with_plugin)
 from ..llm_models.models.eagle2_draft import Eagle2DraftModel
 from ..llm_models.models.eagle3_draft import Eagle3DraftModel
 from ..llm_models.models.llm_model import EdgeLLMModelForCausalLM
-from ..onnx_config import (all_tensors_to_one_file, convert_attribute,
-                           location, opset_version, save_as_external_data)
 from .config_export import export_llm_config
+from .onnx_utils import export_onnx
+
+
+def is_nvfp4_linear(module: nn.Module) -> bool:
+    """Check if the module is a quantized linear layer with NVFP4 quantization. The test is designed for identification purpose only, not designed to be comprehensive.
+    Adapted from TensorRT Model Optimizer: https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/modelopt/torch/_deploy/utils/torch_onnx.py
+    """
+    if is_quantized_linear(module):
+        return module.input_quantizer.block_sizes is not None and module.input_quantizer.block_sizes.get(
+            "scale_bits", None) == (4, 3)
+    else:
+        return False
+
+
+def is_mxfp8_linear(module: nn.Module) -> bool:
+    """Check if the module is a quantized linear layer with MXFP8 quantization. The test is designed for identification purpose only, not designed to be comprehensive.
+    Adapted from TensorRT Model Optimizer: https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/modelopt/torch/_deploy/utils/torch_onnx.py
+    """
+    if is_quantized_linear(module):
+        return module.input_quantizer.block_sizes is not None and module.input_quantizer.block_sizes.get(
+            "scale_bits", None) == (8, 0)
+    else:
+        return False
 
 
 def save_tokenizer_to_output_dir(model_dir: str, output_dir: str) -> None:
@@ -121,15 +145,15 @@ def load_model(model_dir: str,
     # Try loading as AutoModelForCausalLM first
     try:
         model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=dtype,
-            trust_remote_code=True).eval().to(device)
+            model_dir, trust_remote_code=True,
+            torch_dtype=dtype).eval().to(device)
         use_prompt_tuning = False
     except Exception:
         # If that fails, try AutoModelForImageTextToText
         try:
             model = AutoModelForImageTextToText.from_pretrained(
-                model_dir, torch_dtype=dtype,
-                trust_remote_code=True).eval().to(device)
+                model_dir, trust_remote_code=True,
+                torch_dtype=dtype).eval().to(device)
             use_prompt_tuning = True
             print(
                 "Detected AutoModelForImageTextToText, enabling prompt tuning")
@@ -143,8 +167,16 @@ def load_model(model_dir: str,
                                          use_prompt_tuning,
                                          max_position_embeddings)
 
-    # Convert to target dtype
-    edge_model = edge_model.to(dtype)
+    # WAR for nvfp4 and mxfp8 quantization
+    for module in edge_model.modules():
+        if is_nvfp4_linear(module):
+            module.input_quantizer._trt_high_precision_dtype = "Half" if dtype == torch.float16 else "BFloat16"
+            module.input_quantizer._onnx_quantizer_type = "dynamic"
+            module.weight_quantizer._onnx_quantizer_type = "static"
+        elif is_mxfp8_linear(module):
+            module.input_quantizer._trt_high_precision_dtype = "Half"
+            module.input_quantizer._onnx_quantizer_type = "dynamic"
+            module.weight_quantizer._onnx_quantizer_type = "static"
     del model
     gc.collect()
     if device.startswith("cuda"):
@@ -236,18 +268,18 @@ def create_dummy_inputs(model: nn.Module,
     head_dim = hidden_size // num_heads
     max_position_embeddings = model_config.max_position_embeddings
 
-    dtype = next(model.parameters()).dtype
     device = next(model.parameters()).device
 
     # Create dummy past key values
     past_key_values = []
     for _ in range(num_layers):
+        # Only FP16 KV Cache is supported for now. More precision will be supported in the future.
         past_key_value = torch.randn(batch_size,
                                      2,
                                      num_kv_heads,
                                      seq_len,
                                      head_dim,
-                                     dtype=dtype,
+                                     dtype=torch.float16,
                                      device=device)
         past_key_values.append(past_key_value)
 
@@ -296,7 +328,7 @@ def create_dummy_inputs(model: nn.Module,
     if use_prompt_tuning:
         image_embeds = torch.randn(image_token_len,
                                    hidden_size,
-                                   dtype=dtype,
+                                   dtype=torch.float16,
                                    device=device)
         base_inputs['image_embeds'] = image_embeds
 
@@ -322,20 +354,21 @@ def create_dummy_inputs(model: nn.Module,
             batch_size,
             seq_len,
             target_hidden_size,
-            dtype=dtype,
+            dtype=torch.float16,
             device=device)
-        base_inputs['hidden_states_from_draft'] = torch.randn(batch_size,
-                                                              seq_len,
-                                                              hidden_size,
-                                                              dtype=dtype,
-                                                              device=device)
+        base_inputs['hidden_states_from_draft'] = torch.randn(
+            batch_size,
+            seq_len,
+            hidden_size,
+            dtype=torch.float16,
+            device=device)
 
     return base_inputs
 
 
 def export_model_to_onnx(model: nn.Module,
                          dummy_inputs: Dict[str, Any],
-                         output_path: str,
+                         output_dir: str,
                          is_eagle_base: bool = False,
                          is_eagle_draft: bool = False,
                          use_prompt_tuning: bool = False) -> None:
@@ -345,12 +378,12 @@ def export_model_to_onnx(model: nn.Module,
     Args:
         model: The model to export
         dummy_inputs: Dummy inputs for tracing
-        output_path: Path to save the ONNX model
+        output_dir: Directory to save the ONNX model
         is_eagle_base: Whether this is an EAGLE base model
         is_eagle_draft: Whether this is an EAGLE draft model
         use_prompt_tuning: Whether the model uses prompt tuning
     """
-    print(f"Exporting model to ONNX format: {output_path}")
+    print(f"Exporting model to ONNX format: {output_dir}")
 
     try:
         # Set model to evaluation mode
@@ -386,7 +419,7 @@ def export_model_to_onnx(model: nn.Module,
         if use_prompt_tuning:
             base_inputs.append(dummy_inputs['image_embeds'])
 
-        input_args = tuple(base_inputs)
+        inputs = tuple(base_inputs)
 
         # Create input names
         input_names = [f'past_key_values.{i}' for i in range(num_layers)] + [
@@ -484,38 +517,8 @@ def export_model_to_onnx(model: nn.Module,
         register_gather_nd_onnx_symbolic_functions()
 
         # Export to ONNX
-        t0 = time.time()
-        with torch.inference_mode():
-            torch.onnx.export(model,
-                              input_args,
-                              output_path,
-                              export_params=True,
-                              dynamic_axes=dynamic_axes,
-                              input_names=input_names,
-                              output_names=output_names,
-                              opset_version=opset_version)
-        t1 = time.time()
-        print(f"ONNX export completed in {t1 - t0}s. Apply post-processing...")
-
-        # Post-processing
-        onnx_model = onnx.load(output_path)
-        print(
-            "Removing all the files in the output directory except for .json files"
-        )
-        for file in os.listdir(os.path.dirname(output_path)):
-            if file.endswith(".json"):
-                continue
-            os.remove(os.path.join(os.path.dirname(output_path), file))
-
-        # Save the model to the output directory
-        onnx.save_model(onnx_model,
-                        output_path,
-                        save_as_external_data=save_as_external_data,
-                        all_tensors_to_one_file=all_tensors_to_one_file,
-                        location=location,
-                        convert_attribute=convert_attribute)
-        t2 = time.time()
-        print(f"ONNX post-processing completed in {t2 - t1}s")
+        export_onnx(model, inputs, output_dir, input_names, output_names,
+                    dynamic_axes)
 
     except Exception as e:
         raise RuntimeError(f"Failed to export model to ONNX: {str(e)}")
@@ -549,6 +552,15 @@ def export_standard_model(model_dir: str,
         max_position_embeddings=max_position_embeddings,
         device=device)
 
+    if hasattr(model.config, "quantization_config"):
+        print("Detected quantization config in the loaded model")
+        if model.config.quantization_config.quant_method == "gptq":
+            print(
+                "Detected GPTQ quantization, replacing TorchQuantLinear with Int4GemmPluginModule"
+            )
+            register_int4_gemm_plugin_onnx_symbolic_functions()
+            model = replace_torch_quant_linear_with_plugin(model)
+
     # Create dummy inputs
     dummy_inputs = create_dummy_inputs(model,
                                        is_eagle_base=False,
@@ -557,10 +569,9 @@ def export_standard_model(model_dir: str,
                                        use_prompt_tuning=use_prompt_tuning)
 
     # Export to ONNX
-    onnx_path = os.path.join(output_dir, "model.onnx")
     export_model_to_onnx(model,
                          dummy_inputs,
-                         onnx_path,
+                         output_dir,
                          is_eagle_base=False,
                          is_eagle_draft=False,
                          use_prompt_tuning=use_prompt_tuning)
@@ -636,10 +647,9 @@ def export_eagle_models(base_model_dir: str,
         is_eagle_draft=True,
         eagle2=eagle2,
         use_prompt_tuning=use_prompt_tuning)
-    draft_onnx_path = os.path.join(draft_output_dir, "model.onnx")
     export_model_to_onnx(draft_model,
                          draft_dummy_inputs,
-                         draft_onnx_path,
+                         draft_output_dir,
                          is_eagle_base=False,
                          is_eagle_draft=True,
                          use_prompt_tuning=use_prompt_tuning)

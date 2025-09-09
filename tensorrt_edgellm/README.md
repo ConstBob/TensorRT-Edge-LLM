@@ -1,13 +1,6 @@
 # TensorRT Edge-LLM
 
-A Python package for quantizing and exporting Large Language Models (LLMs) for edge deployment using NVIDIA ModelOpt.
-
-## Features
-
-- **Model Quantization**: Support for FP8, INT4 AWQ, and NVFP4 quantization
-- **PyTorch Compatibility**: Quantized models can be loaded by PyTorch for ONNX export
-- **HuggingFace Integration**: Seamless integration with HuggingFace models and datasets
-- **Command-line Interface**: Easy-to-use CLI for model quantization
+A Python package for quantizing and exporting Large Language Models (LLMs) and visual models for edge deployment using NVIDIA TensorRT Edge-LLM runtime.
 
 ## Installation
 
@@ -19,66 +12,128 @@ pip install -e .
 
 ## Quick Start
 
-### Command Line Interface
+### Model Quantization
 
 ```bash
-# Example with all options
-tensorrt-edgellm-quantize \
-    --model_dir $TORCH_DIR \
-    --output_dir $QUANTIZED_TORCH_DIR$ \
-    --quantization [fp8 | int4_awq | nvfp4 | None] \
-    --torch_dtype [fp16 | bf16] \
-    --dataset_dir cnn_dailymail \
-    --lm_head_quantization [fp8 | int4_awq | nvfp4 | None]
+# Quantize LLM to FP8
+tensorrt-edgellm-quantize-llm \
+  --model_dir /path/to/model \
+  --output_dir /path/to/output \
+  --quantization fp8
 ```
 
-### Python API
+### Language Model Export
 
-```python
-from tensorrt_edgellm import quantize_and_save_model
+```bash
+# Standard model
+tensorrt-edgellm-export-llm \
+  --model_dir /path/to/model \
+  --output_dir /path/to/output
 
-quantize_and_save_model(
-    model_dir="/path/to/your/model",
-    output_dir="/path/to/output",
-    quantization="fp8",
-    torch_dtype="fp16"
-)
+# EAGLE model (base + draft)
+tensorrt-edgellm-export-llm \
+  --model_dir /path/to/base_model \
+  --draft_model_dir /path/to/draft_model \
+  --output_dir /path/to/output \
+  --eagle2
 ```
 
-## Quantization Methods
+### Visual Model Export
 
-- **FP8 GEMM**: 8-bit floating point quantization for both activation and weights
-- **INT4 AWQ**: 4-bit integer weight quantization with activation in 16-bit with smoothing
-- **NVFP4**: 4-bit floating point quantization with dynamic scaling for both activation and weights
+```bash
+# Without quantization
+tensorrt-edgellm-export-visual \
+  --model_dir /path/to/model \
+  --output_dir /path/to/output
 
-## Data Types
+# With FP8 quantization
+tensorrt-edgellm-export-visual \
+  --model_dir /path/to/model \
+  --output_dir /path/to/output \
+  --quantization fp8
+```
 
-- **FP16**: 16-bit floating point (IEEE 754 half precision) - faster on most hardware, wider dynamic range
-- **BF16**: 16-bit Brain Floating Point - better numerical stability, preserves more precision in extreme values
+## Command Line Interface
 
-## Output Format
+### Quantization using nvidia-modelopt
 
-The quantized model is saved using [ModelOpt's HuggingFace checkpointing APIs](https://nvidia.github.io/TensorRT-Model-Optimizer/guides/6_save_load.html#modelopt-save-restore-using-huggingface-checkpointing-apis) to ensure PyTorch compatibility:
+```bash
+tensorrt-edgellm-quantize-llm [OPTIONS]
+```
+
+**Required Arguments:**
+- `--model_dir`: Input model directory
+- `--output_dir`: Output directory for quantized model
+
+**Optional Arguments:**
+- `--quantization`: Quantization method (`fp8`, `int4_awq`, `nvfp4`, `mxfp8`)
+- `--torch_dtype`: Model loading dtype (`fp16`, default: `fp16`)
+- `--dataset_dir`: Calibration dataset (default: `cnn_dailymail`)
+- `--lm_head_quantization`: LM head quantization method
+
+**Model Format:**
+Quantized models are saved in uncompressed [HuggingFace format](https://nvidia.github.io/TensorRT-Model-Optimizer/guides/2_save_load.html#modelopt-save-restore-using-huggingface-checkpointing-apis) for PyTorch compatibility. Note that compressed checkpoint cannot be loaded by HuggingFace `from_pretrained` function so `tensorrt-edgellm-export-llm` cannot support it. It will be supported in the future.
 
 ```
 output_dir/
 ├── config.json              # Model configuration
 ├── hf_quant_config.json     # Quantization configuration
-├── modelopt_state.pth       # ModelOpt state (architecture modifications)
-├── model.safetensors        # Model weights (safetensors format). May have multiple files.
-├── tokenizer.json           # Tokenizer configuration
-├── tokenizer_config.json    # Tokenizer settings
-└── ...                      # Other tokenizer files
+├── modelopt_state.pth       # ModelOpt state
+├── model.safetensors        # Model weights
+├── tokenizer.json           # Tokenizer files
+└── tokenizer_config.json    # Tokenizer configuration
 ```
 
-**Note**: This format preserves original weights and amax values in safetensors format, ensuring the model can be loaded by PyTorch for ONNX export. Compressed checkpoints are not used to maintain compatibility.
+### Language Model Export
 
-## Loading Quantized Models
-
-```python
-import modelopt.torch.opt as mto
-from transformers import AutoModelForCausalLM
-
-mto.enable_huggingface_checkpointing()
-model = AutoModelForCausalLM.from_pretrained("/path/to/quantized/model")
+```bash
+tensorrt-edgellm-export-llm [OPTIONS]
 ```
+
+**Required Arguments:**
+- `--model_dir`: Input model directory
+- `--output_dir`: Output directory for ONNX model
+
+**Optional Arguments:**
+- `--draft_model_dir`: Draft model directory (for EAGLE)
+- `--eagle2`: Use EAGLE2 (default: EAGLE3)
+- `--max_position_embeddings`: Max position embeddings (default: 4096)
+- `--device`: Device for model loading (default: `cuda`)
+
+### Visual Model Export
+
+```bash
+tensorrt-edgellm-export-visual [OPTIONS]
+```
+
+**Required Arguments:**
+- `--model_dir`: Input model directory
+- `--output_dir`: Output directory for ONNX model
+
+**Optional Arguments:**
+- `--dtype`: Export dtype (`fp16`, default: `fp16`)
+- `--quantization`: Quantization method (`fp8`)
+- `--device`: Device for model loading (default: `cuda`)
+
+## Quantization Methods
+
+| Method | Description |
+|--------|-------------|
+| FP8 | 8-bit floating point quantization |
+| INT4 AWQ | 4-bit integer weight quantization |
+| INT4 GPTQ | 4-bit GPTQ weight quantization |
+| NVFP4 | 4-bit floating point quantization |
+
+**Note:** 
+
+For INT4 GPTQ checkpoint, there is no need to run `tensorrt-edgellm-quantize-llm`. Please follow  additional requirement is needed. Please follow [GPTQModel](https://github.com/ModelCloud/GPTQModel) to run quantization, or directly acquire a checkpoint from HuggingFace Hub. Additional dependency is needed. `gptqmodel` only has wheel for certain CUDA version, but we only need the frontend to load and export the model.
+```
+BUILD_CUDA_EXT=0 pip install -v gptqmodel --no-build-isolation
+```
+
+## Limitations
+
+- Only FP16 precision is currently supported, BF16 is not supported
+- MXFP8 quantization is not supported
+
+

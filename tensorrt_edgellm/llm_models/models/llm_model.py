@@ -78,13 +78,13 @@ class EdgeLLMModel(nn.Module):
         self.use_prompt_tuning = use_prompt_tuning
 
         # Keep all the original components
-        self.embed_tokens = hf_model.embed_tokens
-        self.norm = hf_model.norm
-        self.rotary_emb = hf_model.rotary_emb
+        self.torch_dtype = hf_model.dtype
+        self.embed_tokens = hf_model.embed_tokens.to(self.torch_dtype)
+        self.norm = hf_model.norm.to(self.torch_dtype)
 
         # Replace decoder layers with our custom ones
         self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayer(hf_layer, eagle3_draft=False)
+            EdgeLLMDecoderLayer(hf_layer, self.torch_dtype, eagle3_draft=False)
             for hf_layer in hf_model.layers
         ])
 
@@ -213,9 +213,12 @@ class EdgeLLMModelForCausalLM(nn.Module):
         if use_prompt_tuning:
             language_model = hf_model.language_model
             self.config = hf_model.config.text_config
+            if hasattr(hf_model.config, "quantization_config"):
+                self.config.quantization_config = hf_model.config.quantization_config
         else:
             language_model = hf_model.model
             self.config = hf_model.config
+        self.torch_dtype = hf_model.dtype
 
         # Hard overwrite the config max_position_embeddings
         print(
@@ -310,7 +313,9 @@ class EdgeLLMModelForCausalLM(nn.Module):
             hidden_states_1 = all_hidden_states[idx[1]]
             hidden_states_2 = all_hidden_states[idx[2]]
             hidden_states = torch.cat(
-                [hidden_states_0, hidden_states_1, hidden_states_2], dim=-1)
+                [hidden_states_0, hidden_states_1, hidden_states_2],
+                dim=-1).to(self.torch_dtype)
+
             return logits, hidden_states, tuple(present_key_values)
         elif self.is_eagle2_base:
             # EAGLE2 base model: return last hidden states

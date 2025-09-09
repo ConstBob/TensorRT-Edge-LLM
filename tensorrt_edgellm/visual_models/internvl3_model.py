@@ -22,21 +22,15 @@ TODO: Input/output names have been aligned with the old multimodal_export.py for
       Future refactoring should consider more descriptive names while maintaining backward compatibility.
 """
 
-import io
-import os
-import time
 from typing import Any, Optional, Tuple
 
 import modelopt.torch.quantization as mtq
-import onnx
 import torch
 from modelopt.torch.quantization.nn import TensorQuantizer
 from transformers.models.internvl.modeling_internvl import \
     InternVLVisionAttention
 
-from ..onnx_config import (all_tensors_to_one_file, convert_attribute,
-                           do_constant_folding, location, opset_version,
-                           save_as_external_data)
+from ..onnx_export.onnx_utils import export_onnx
 
 
 class QuantInternVLVisionAttention(InternVLVisionAttention):
@@ -206,10 +200,11 @@ class InternVLVisionModel(torch.nn.Module):
         return image_features.reshape(-1, image_features.shape[-1])
 
 
-def export_internvl3_visual(model: InternVLVisionModel,
-                            output_dir: str,
-                            torch_dtype: torch.dtype,
-                            quantization: Optional[str] = None) -> None:
+def export_internvl3_visual(
+    model: InternVLVisionModel,
+    output_dir: str,
+    torch_dtype: torch.dtype,
+) -> None:
     """
     Export InternVL3 visual model to ONNX format.
     
@@ -220,7 +215,6 @@ def export_internvl3_visual(model: InternVLVisionModel,
         model: InternVL3 vision model wrapper
         output_dir: Directory to save the exported ONNX model
         torch_dtype: PyTorch data type for the model
-        quantization: Quantization type (not supported for InternVL3)
     """
 
     # dummy input
@@ -230,6 +224,7 @@ def export_internvl3_visual(model: InternVLVisionModel,
                          model.config.vision_config.image_size[1]),
                         dtype=torch_dtype,
                         device=model.device)
+    inputs = (input, )
     dynamic_axes = {
         'input': {
             0: 'num_blocks'
@@ -240,39 +235,5 @@ def export_internvl3_visual(model: InternVLVisionModel,
     input_names = ["input"]
     output_names = ["output"]
 
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-
-    start_time = time.time()
-
-    # Export to BytesIO first to avoid intermediate file I/O
-    bytes_io = io.BytesIO()
-    with torch.inference_mode():
-        torch.onnx.export(
-            model,
-            (input, ),
-            bytes_io,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            opset_version=opset_version,
-            do_constant_folding=do_constant_folding,
-        )
-
-    # Load from bytes and apply post-processing
-    onnx_bytes = bytes_io.getvalue()
-    onnx_model = onnx.load_model_from_string(onnx_bytes)
-
-    # Save the final ONNX model
-    output_path = f'{output_dir}/model.onnx'
-    onnx.save_model(onnx_model,
-                    output_path,
-                    save_as_external_data=save_as_external_data,
-                    all_tensors_to_one_file=all_tensors_to_one_file,
-                    location=location,
-                    convert_attribute=convert_attribute)
-
-    end_time = time.time()
-    print(
-        f"InternVL3 visual encoder ONNX Export completed in {end_time - start_time}s. ONNX file is saved to {output_dir}."
-    )
+    export_onnx(model, inputs, output_dir, input_names, output_names,
+                dynamic_axes)

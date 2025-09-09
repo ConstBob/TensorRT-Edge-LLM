@@ -22,14 +22,10 @@ TODO: Input/output names have been aligned with the old multimodal_export.py for
       Future refactoring should consider more descriptive names while maintaining backward compatibility.
 """
 
-import io
 import math
-import os
-import time
-from typing import Any, Optional
+from typing import Any
 
 import modelopt.torch.quantization as mtq
-import onnx
 import torch
 import torch.nn as nn
 from modelopt.torch.quantization.nn import TensorQuantizer
@@ -37,9 +33,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VisionTransformerPretrainedModel, Qwen2VLVisionBlock, VisionAttention,
     apply_rotary_pos_emb_vision)
 
-from ..onnx_config import (all_tensors_to_one_file, convert_attribute,
-                           do_constant_folding, location, opset_version,
-                           save_as_external_data)
+from ..onnx_export.onnx_utils import export_onnx
 
 
 class Qwen2VisionAttentionPatch(VisionAttention):
@@ -254,10 +248,11 @@ class Qwen2VisionTransformerPretrainedModelPatch(
         return res
 
 
-def export_qwen2_vl_visual(model: Qwen2VisionTransformerPretrainedModelPatch,
-                           output_dir: str,
-                           torch_dtype: torch.dtype,
-                           quantization: Optional[str] = None) -> None:
+def export_qwen2_vl_visual(
+    model: Qwen2VisionTransformerPretrainedModelPatch,
+    output_dir: str,
+    torch_dtype: torch.dtype,
+) -> None:
     """
     Export Qwen2-VL visual model to ONNX format.
     
@@ -268,7 +263,6 @@ def export_qwen2_vl_visual(model: Qwen2VisionTransformerPretrainedModelPatch,
         model: Patched Qwen2-VL vision transformer model
         output_dir: Directory to save the exported ONNX model
         torch_dtype: PyTorch data type for the model
-        quantization: Quantization type (currently not used for Qwen2-VL)
     """
 
     # Prepare dummy inputs for ONNX export
@@ -313,38 +307,5 @@ def export_qwen2_vl_visual(model: Qwen2VisionTransformerPretrainedModelPatch,
         },
     }
 
-    start_time = time.time()
-
-    # Export to BytesIO first to avoid intermediate file I/O
-    bytes_io = io.BytesIO()
-    os.makedirs(output_dir, exist_ok=True)
-
-    with torch.inference_mode():
-        torch.onnx.export(
-            model,
-            inputs,
-            bytes_io,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            opset_version=opset_version,
-            do_constant_folding=do_constant_folding,
-        )
-
-    # Load from bytes and apply post-processing
-    onnx_bytes = bytes_io.getvalue()
-    onnx_model = onnx.load_model_from_string(onnx_bytes)
-
-    # Save the final ONNX model
-    output_path = f'{output_dir}/model.onnx'
-    onnx.save_model(onnx_model,
-                    output_path,
-                    save_as_external_data=save_as_external_data,
-                    all_tensors_to_one_file=all_tensors_to_one_file,
-                    location=location,
-                    convert_attribute=convert_attribute)
-
-    end_time = time.time()
-    print(
-        f"Qwen2-VL visual encoder ONNX Export from torch completed in {end_time - start_time}s. "
-        f"ONNX file is saved to {output_dir}.")
+    export_onnx(model, inputs, output_dir, input_names, output_names,
+                dynamic_axes)

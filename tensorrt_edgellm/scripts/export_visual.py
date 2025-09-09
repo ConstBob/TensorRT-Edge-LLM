@@ -70,6 +70,13 @@ def main() -> None:
         default=None,
         help="Quantization method to use (fp8 for FP8 quantization)")
     parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        required=False,
+        default="lmms-lab/MMMU",
+        help=
+        "Dataset directory to use for quantization (default: lmms-lab/MMMU)")
+    parser.add_argument(
         "--device",
         type=str,
         required=False,
@@ -85,6 +92,7 @@ def main() -> None:
                       output_dir=args.output_dir,
                       dtype=args.dtype,
                       quantization=args.quantization,
+                      dataset_dir=args.dataset_dir,
                       device=args.device)
         print("Visual model export completed successfully!")
     except Exception as e:

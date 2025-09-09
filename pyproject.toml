@@ -20,11 +20,13 @@ classifiers = [
 requires-python = ">=3.8"
 dependencies = [
     "torch~=2.8.0",
-    "transformers~=4.55.2",
-    "nvidia-modelopt",
-    "datasets",
-    "tqdm",
-    "numpy",
+    "transformers==4.55.2",
+    "nvidia-modelopt[torch]==0.35.0",
+    "nvidia-modelopt[onnx]==0.35.0",
+    "onnx==1.18.0",
+    "datasets==4.0.0",
+    "tqdm~=4.67.1",
+    "numpy~=2.3.0",
 ]
 
 [project.optional-dependencies]
@@ -32,15 +34,13 @@ dev = [
 ]
 
 [project.scripts]
-tensorrt-edgellm-quantize = "tensorrt_edgellm.scripts.quantize_llm:main"
+tensorrt-edgellm-quantize-llm = "tensorrt_edgellm.scripts.quantize_llm:main"
 tensorrt-edgellm-export-visual = "tensorrt_edgellm.scripts.export_visual:main"
 tensorrt-edgellm-export-llm = "tensorrt_edgellm.scripts.export_llm:main"
 
-# Version is now managed by tensorrt_edgellm._version module
-# Remove setuptools_scm configuration since we use custom versioning
-
-[tool.setuptools]
-packages = ["tensorrt_edgellm"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tensorrt_edgellm*"]
 
 [tool.setuptools.package-data]
 tensorrt_edgellm = ["README.md"]

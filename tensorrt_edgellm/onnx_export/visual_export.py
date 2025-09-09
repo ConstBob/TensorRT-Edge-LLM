@@ -42,6 +42,7 @@ def visual_export(model_dir: str,
                   output_dir: str,
                   dtype: str,
                   quantization: Optional[str],
+                  dataset_dir: Optional[str] = "lmms-lab/MMMU",
                   device: str = "cuda") -> str:
     """
     Export visual model using the appropriate wrapper based on model architecture.
@@ -78,8 +79,6 @@ def visual_export(model_dir: str,
     # Load the model and processor
     model = AutoModelForImageTextToText.from_pretrained(
         model_dir, torch_dtype=torch_dtype, trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained(model_dir,
-                                              trust_remote_code=True)
 
     # Get visual model from the multimodal model
     model_type = model.config.model_type
@@ -95,17 +94,20 @@ def visual_export(model_dir: str,
             model.visual.config,
             torch_dtype=torch_dtype,
         )
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  min_pixels=128 * 28 * 28,
+                                                  max_pixels=2048 * 28 * 28,
+                                                  trust_remote_code=True)
         wrapped_model.load_state_dict(model.visual.state_dict())
         wrapped_model.eval().to(device)
 
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
-            wrapped_model = quantize_visual(wrapped_model, "fp8", processor,
-                                            "lmms-lab/MMMU")
+            wrapped_model = quantize_visual(wrapped_model, quantization,
+                                            processor, dataset_dir)
 
         # Export using the wrapper's export function
-        export_qwen2_vl_visual(wrapped_model, output_dir, torch_dtype,
-                               quantization)
+        export_qwen2_vl_visual(wrapped_model, output_dir, torch_dtype)
 
     elif model_type == 'qwen2_5_vl':
         print(f"Exporting Qwen2.5-VL visual model from {model_dir}")
@@ -114,27 +116,35 @@ def visual_export(model_dir: str,
             model.visual.config,
             torch_dtype=torch_dtype,
         )
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  min_pixels=128 * 28 * 28,
+                                                  max_pixels=2048 * 28 * 28,
+                                                  trust_remote_code=True)
         wrapped_model.load_state_dict(model.visual.state_dict())
         wrapped_model.eval().to(device)
-
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
-            wrapped_model = quantize_visual(wrapped_model, "fp8", processor,
-                                            "lmms-lab/MMMU")
+            wrapped_model = quantize_visual(wrapped_model, quantization,
+                                            processor, dataset_dir)
 
         # Export using the wrapper's export function
-        export_qwen2_5_vl_visual(wrapped_model, output_dir, torch_dtype,
-                                 quantization)
+        export_qwen2_5_vl_visual(wrapped_model, output_dir, torch_dtype)
 
     elif model_type == 'internvl':
         print(f"Exporting InternVL3 visual model from {model_dir}")
         # Create InternVL3 wrapper model
         wrapped_model = InternVLVisionModel(model)
+        processor = AutoProcessor.from_pretrained(
+            model_dir, trust_remote_code=True).image_processor
         wrapped_model.eval().to(device)
 
+        # Apply quantization to wrapped model if requested
+        if quantization == "fp8":
+            wrapped_model = quantize_visual(wrapped_model, quantization,
+                                            processor, dataset_dir)
+
         # Export using the wrapper's export function
-        export_internvl3_visual(wrapped_model, output_dir, torch_dtype,
-                                quantization)
+        export_internvl3_visual(wrapped_model, output_dir, torch_dtype)
 
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
