@@ -104,25 +104,23 @@ jp6_cross_build:
     - apt update
     - apt install -y python3 python3-pip git curl
     - echo "Checking cached dependencies"
-    - export TRT_CACHE_PATH="/scratch.edge_llm_cache/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
-    - if [ ! -d "/scratch.edge_llm_cache/3rdParty" ]; then echo "3rdParty cache not found at /scratch.edge_llm_cache/3rdParty"; exit 1; fi
-    - if [ ! -d "$TRT_CACHE_PATH" ]; then echo "TensorRT JP6 cache not found at $TRT_CACHE_PATH"; exit 1; fi
+    - export TRT_CACHE_PATH="trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
+    - mkdir -p $TRT_CACHE_PATH
+    - cp -r /scratch.edge_llm_cache/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION/* $TRT_CACHE_PATH/
     - echo "All cached dependencies found"
     - echo "Copying 3rdParty dependencies from cache"
     - cp -r /scratch.edge_llm_cache/3rdParty .
-    - echo "Copying TensorRT JP6 package from cache"
-    - cp -r "$TRT_CACHE_PATH" TensorRT-jp6
+    - echo "Using TensorRT JP6 package directly from cache"
     - export LLM_SDK_DIR=$(pwd)
     - echo "Building TensorRT Edge-LLM SDK"
     - rm -rf build-jp6
     - mkdir -p build-jp6
     - cd build-jp6
-    - cmake .. -DTRT_PACKAGE_DIR=$LLM_SDK_DIR/TensorRT-jp6 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake -DEMBEDDED_TARGET=orin -DBUILD_UNIT_TESTS=ON
+    - cmake .. -DTRT_PACKAGE_DIR=$TRT_CACHE_PATH -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake -DEMBEDDED_TARGET=orin -DBUILD_UNIT_TESTS=ON
     - make -j16
     - echo "Built TensorRT Edge-LLM SDK"
     - echo "Copying build artifacts to cache directory"
     - cp -r $LLM_SDK_DIR/build-jp6 $CACHE_DIR/build
-    - cp -r $LLM_SDK_DIR/TensorRT-jp6 $CACHE_DIR/
     - echo "Build artifacts saved to $CACHE_DIR"
     - ls -la $CACHE_DIR
   interruptible: true
@@ -133,6 +131,10 @@ orin_test:
   dependencies:
     - jp6_cross_build
     - a30_model_export
+  variables:
+    CUDA_VERSION: "12.9"
+    TRT_VERSION: "10.13.3.9"
+    TRT_CACHE_PATH: "/scratch.edge_llm_cache/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
   tags:
     - p3730-k8s
   image: "ubuntu:24.04"
@@ -149,8 +151,13 @@ orin_test:
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" . $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm
     - echo "Syncing JP6 build artifacts from cache to board"
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $CACHE_DIR/jp6_cross_build/build $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm
-    - echo "Syncing TensorRT JP6 libraries from cache to board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $CACHE_DIR/jp6_cross_build/TensorRT-jp6 $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm
+    - echo "Creating TensorRT directory structure on Orin device"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "mkdir -p /home/$BOARD_USER/tensorrt-edge-llm/trt_softwares/TensorRT-$TRT_VERSION"
+    - echo "Syncing TensorRT JP6 libraries to device"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $TRT_CACHE_PATH $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm/trt_softwares/TensorRT-$TRT_VERSION/
+    - echo "Setting up TensorRT environment on device"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "echo 'export TRT_CACHE_PATH=/home/$BOARD_USER/tensorrt-edge-llm/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION' >> /home/$BOARD_USER/.bashrc"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "echo 'export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/home/$BOARD_USER/tensorrt-edge-llm/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION/lib' >> /home/$BOARD_USER/.bashrc"
     - echo "Syncing models to the board"
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $CACHE_DIR/a30_model_export/onnx_models $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "ls -la /home/$BOARD_USER/tensorrt-edge-llm/"
@@ -176,7 +183,7 @@ orin_test:
     - ls -la $TEST_LOG_DIR
     - echo "Copying engine files back to cache directory"
     - mkdir -p $CACHE_DIR/orin_test/engines
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm/engines/ $CACHE_DIR/orin_test/engines/ || echo "No engines to copy back"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av --no-owner --no-group -e "ssh -o StrictHostKeyChecking=no" $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm/engines/ $CACHE_DIR/orin_test/engines/ || echo "No engines to copy back"
     - echo "Engine files copied to cache:$CACHE_DIR/orin_test/engines/"
     - ls -la $CACHE_DIR/orin_test/engines/ || echo "No engines generated"
   interruptible: true
@@ -205,14 +212,13 @@ a30_build_and_test:
     - echo "All cached dependencies found"
     - echo "Copying 3rdParty dependencies from cache"
     - cp -r /scratch.edge_llm_cache/3rdParty .
-    - echo "Copying TensorRT x86_64 package from cache"
-    - cp -r "$TRT_CACHE_PATH" TensorRT-linux
+    - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=$(pwd)
     - cd $LLM_SDK_DIR
     - echo "Installing pytest dependencies"
     - pip3 install -r tests/requirements.txt
     - echo "Setting up test environment"
-    - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
+    - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$TRT_CACHE_PATH/lib
     - export ONNX_DIR=$CACHE_DIR/a30_model_export/onnx_models
     - export ENGINE_DIR=$CACHE_DIR/a30_build_and_test/engines
     - export TEST_LOG_DIR=$CACHE_DIR/a30_build_and_test/logs
@@ -237,7 +243,6 @@ rtx5080_build_and_test:
       TRT_VERSION: "10.13.3.9"
     tags:
       - rtx5080-edgellm-nvks
-    timeout: 1h30m
     image: "$IMAGE"
     script:
       - echo "Installing dependencies"
@@ -250,14 +255,13 @@ rtx5080_build_and_test:
       - echo "All cached dependencies found"
       - echo "Copying 3rdParty dependencies from cache"
       - cp -r /scratch.edge_llm_cache/3rdParty .
-      - echo "Copying TensorRT x86_64 package from cache"
-      - cp -r "$TRT_CACHE_PATH" TensorRT-linux
+      - echo "Using TensorRT x86_64 package directly from cache"
       - export LLM_SDK_DIR=$(pwd)
       - cd $LLM_SDK_DIR
       - echo "Installing pytest dependencies"
       - pip3 install -r tests/requirements.txt
       - echo "Setting up test environment"
-      - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
+      - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$TRT_CACHE_PATH/lib
       - export ONNX_DIR=$CACHE_DIR/a30_model_export/onnx_models
       - export ENGINE_DIR=$CACHE_DIR/rtx5080_build_and_test/engines
       - export TEST_LOG_DIR=$CACHE_DIR/rtx5080_build_and_test/logs
@@ -270,4 +274,3 @@ rtx5080_build_and_test:
       - ls -la $TEST_LOG_DIR
       - rm -rf $ENGINE_DIR
     interruptible: true
-

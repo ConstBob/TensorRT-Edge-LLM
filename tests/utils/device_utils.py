@@ -92,6 +92,10 @@ except:
         return None
 
     def _get_tensorrt_package(self, workspace: str) -> str:
+        trt_cache_path = os.environ.get('TRT_CACHE_PATH')
+        if trt_cache_path and self._verify_tensorrt(trt_cache_path):
+            return trt_cache_path
+
         find_result = self.run_command(
             ['find', workspace, '-name', 'libnvinfer.so*', '-type', 'f'],
             timeout=30)
