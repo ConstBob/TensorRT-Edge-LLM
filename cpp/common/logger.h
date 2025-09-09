@@ -107,7 +107,7 @@ public:
     }
 
 private:
-    nvinfer1::ILogger::Severity _minSeverity = nvinfer1::ILogger::Severity::kVERBOSE;
+    nvinfer1::ILogger::Severity _minSeverity = nvinfer1::ILogger::Severity::kINFO;
 };
 
 inline Logger gLogger{};

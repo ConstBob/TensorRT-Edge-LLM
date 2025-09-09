@@ -20,10 +20,12 @@
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <ostream>
 #include <random>
+#include <utility>
 #include <vector>
 
 template <typename T>
@@ -139,3 +141,29 @@ static std::pair<float, float> getTolerance()
         return {1e-4f, 1e-6f}; // Default
     }
 }
+
+// A template class to hold any callable function
+template <typename F>
+class Defer
+{
+public:
+    // Constructor captures the function to be deferred
+    explicit Defer(F func)
+        : func_(std::move(func))
+    {
+    }
+
+    // Destructor executes the function when the object goes out of scope
+    ~Defer()
+    {
+        func_();
+    }
+
+    // Disable copying to prevent the deferred function
+    // from being called multiple times.
+    Defer(Defer const&) = delete;
+    Defer& operator=(Defer const&) = delete;
+
+private:
+    F func_; // The stored function (e.g., a lambda)
+};

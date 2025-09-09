@@ -18,9 +18,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include <numeric>
 
 #include "common/checkMacros.h"
+#include "common/logger.h"
 #include "common/tensor.h"
+#include "testUtils.h"
 
 using namespace drivellm;
 
@@ -248,4 +251,49 @@ TEST(TensorTest, TensorNameFunctionality)
 
     // Clean up the manually allocated memory
     CUDA_CHECK(cudaFreeAsync(devicePtr, 0));
+}
+
+TEST(TensorTest, TensorFormatString)
+{
+    // Set to verbose to print the tensor format string
+    nvinfer1::ILogger::Severity logLevel = gLogger.getLevel();
+    gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
+
+    // Use defer to restore the log level to handle case where
+    // failure happens in the test.
+    Defer defer([&gLogger, logLevel]() { gLogger.setLevel(logLevel); });
+
+    // Print some small tensor for sanity check
+    std::vector<float> hostData(24);
+    std::iota(hostData.begin(), hostData.end(), 1.0f);
+    rt::Tensor tensor(hostData.data(), {2, 3, 4}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    LOG_DEBUG("Tensor format with CPU tensor: %s", rt::utils::formatString(tensor).c_str());
+
+    // Print GPU tensor
+    std::vector<half> hostData2(24);
+    for (size_t i = 0; i < hostData2.size(); ++i)
+    {
+        hostData2[i] = __float2half(25.0f - hostData[i]);
+    }
+    rt::Tensor tensor2({2, 3, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    CUDA_CHECK(cudaMemcpy(tensor2.rawPointer(), hostData2.data(), tensor2.getMemoryCapacity(), cudaMemcpyHostToDevice));
+    LOG_DEBUG("Tensor format with GPU tensor: %s", rt::utils::formatString(tensor2).c_str());
+
+    // Try case where one dimension is large
+    std::vector<int32_t> hostData3(64);
+    std::iota(hostData3.begin(), hostData3.end(), 1);
+    rt::Tensor tensor3({64}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
+    memcpy(tensor3.rawPointer(), hostData3.data(), tensor3.getMemoryCapacity());
+    LOG_DEBUG("Tensor format with large dimension: %s", rt::utils::formatString(tensor3).c_str());
+
+    // Try case where src tensor has been reshaped.
+    rt::Tensor tensor4({8, 8, 8}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT8);
+    std::vector<int8_t> hostData4(512);
+    for (size_t i = 0; i < hostData4.size(); ++i)
+    {
+        hostData4[i] = static_cast<int8_t>(i) % 8;
+    }
+    memcpy(tensor4.rawPointer(), hostData4.data(), tensor4.getMemoryCapacity());
+    ASSERT_TRUE(tensor4.reshape({3, 3, 3}));
+    LOG_DEBUG("Tensor format with reshaped tensor: %s", rt::utils::formatString(tensor4).c_str());
 }
