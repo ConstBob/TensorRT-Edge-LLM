@@ -4,14 +4,13 @@
 tests:
   - tests/test_common.py::test_build_project
   - tests/test_common.py::test_unit_tests
-  - tests/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-bs1-mxil2048-mxsl4096-osl128]
-  - tests/test_llm_pipeline.py::test_inference_chat[Qwen2.5-0.5B-Instruct-fp16-bs1-mxil2048-mxsl4096-osl128]
-  - tests/test_llm_pipeline.py::test_inference_benchmark[Qwen2.5-0.5B-Instruct-fp16-bs1-mxil2048-mxsl4096-osl128]
-  - tests/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-bs1-mxil2048-mxsl4096-osl128]
-  - tests/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-int4-bs1-mxil2048-mxsl4096-osl128]
-  - tests/test_llm_pipeline.py::test_inference_chat[Qwen2.5-0.5B-Instruct-int4-bs1-mxil2048-mxsl4096-osl128]
-  - tests/test_llm_pipeline.py::test_inference_benchmark[Qwen2.5-0.5B-Instruct-int4-bs1-mxil2048-mxsl4096-osl128] 
-  - tests/test_vlm_pipeline.py::test_engine_build[Qwen2.5-VL-3B-Instruct-int4-mxil2048-mxsl4096-mxbs1-mnit128-mxit1024-dynamic]
-  - tests/test_vlm_pipeline.py::test_inference_chat[Qwen2.5-VL-3B-Instruct-int4-mxil2048-mxsl4096-mxbs1-mnit128-mxit1024-dynamic]
-  - tests/test_vlm_pipeline.py::test_inference_benchmark[Qwen2.5-VL-3B-Instruct-int4-mxil2048-mxsl4096-mxbs1-mnit128-mxit1024-dynamic]
-  - tests/test_vlm_pipeline.py::test_inference[Qwen2.5-VL-3B-Instruct-int4-mxil2048-mxsl4096-mxbs1-mnit128-mxit1024-dynamic]
+  # FP16 LLM tests
+  - tests/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-mxbs1-mxil2048-mxsl4096-osl128]
+  - tests/test_llm_pipeline.py::test_chat[Qwen2.5-0.5B-Instruct-fp16-mxbs1-mxil2048-mxsl4096-osl128]
+  - tests/test_llm_pipeline.py::test_benchmark[Qwen2.5-0.5B-Instruct-fp16-mxbs1-mxil2048-mxsl4096-osl128]
+  - tests/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-llm_basic]
+  # VLM tests with INT4
+  - tests/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-hf-int4_awq-mxil4096-mxsl8192-mxbs1-mnit256-mxit3072]
+  - tests/test_vlm_pipeline.py::test_chat[InternVL3-1B-hf-int4_awq-mxil4096-mxsl8192-mxbs1-mnit256-mxit3072]
+  - tests/test_vlm_pipeline.py::test_benchmark[InternVL3-1B-hf-int4_awq-mxil4096-mxsl8192-mxbs1-mnit256-mxit3072]
+  - tests/test_vlm_pipeline.py::test_inference[InternVL3-1B-hf-int4_awq-mxsl8192-vlm_basic]

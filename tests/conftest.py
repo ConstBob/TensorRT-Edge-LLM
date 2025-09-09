@@ -16,22 +16,31 @@ from utils.device_utils import DeviceDetector
 
 
 @pytest.fixture(scope="session")
-def test_config():
+def global_config():
     """Load test config from environment"""
     return {
-        'llm_sdk_dir': os.environ.get('LLM_SDK_DIR', os.getcwd()),
-        'onnx_model_dir': os.environ.get('ONNX_MODEL_DIR', 'models'),
-        'engine_dir': os.environ.get('ENGINE_DIR', 'engines'),
-        'trt_lib_path': os.environ.get('TRT_LIB_PATH', 'TensorRT-linux/lib'),
-        'build_dir': 'build',
+        'llm_sdk_dir':
+        os.environ.get('LLM_SDK_DIR', os.getcwd()),
+        'torch_dir':
+        os.environ.get('TORCH_DIR', '/scratch.trt_llm_data/llm-models'),
+        'onnx_dir':
+        os.environ.get('ONNX_DIR', 'models'),
+        'engine_dir':
+        os.environ.get('ENGINE_DIR', 'engines'),
+        'trt_lib_path':
+        os.environ.get('TRT_LIB_PATH', 'TensorRT-linux/lib'),
+        'build_dir':
+        'build',
+        'test_log_dir':
+        os.environ.get('TEST_LOG_DIR', 'logs'),
     }
 
 
 @pytest.fixture(scope="session", autouse=True)
-def setup_environment(test_config):
+def setup_environment(global_config):
     """Setup environment and library paths"""
-    llm_sdk_dir = test_config['llm_sdk_dir']
-    trt_lib_path = os.path.join(llm_sdk_dir, test_config['trt_lib_path'])
+    llm_sdk_dir = global_config['llm_sdk_dir']
+    trt_lib_path = os.path.join(llm_sdk_dir, global_config['trt_lib_path'])
 
     def _contains_trt_lib(dir_path: str) -> bool:
         try:
@@ -54,17 +63,17 @@ def setup_environment(test_config):
     else:
         os.environ['LD_LIBRARY_PATH'] = trt_lib_path
 
-    os.makedirs(test_config['onnx_model_dir'], exist_ok=True)
-    os.makedirs(test_config['engine_dir'], exist_ok=True)
+    os.makedirs(global_config['onnx_dir'], exist_ok=True)
+    os.makedirs(global_config['engine_dir'], exist_ok=True)
 
-    log_dir_path = os.environ.get('TEST_LOG_DIR', 'logs')
+    log_dir_path = global_config['test_log_dir']
     os.makedirs(log_dir_path, exist_ok=True)
 
 
 @pytest.fixture
-def executable_files(test_config):
+def executable_files(global_config):
     """Paths to build executables"""
-    build_dir = test_config['build_dir']
+    build_dir = global_config['build_dir']
     return {
         'llm_build': f"{build_dir}/examples/llm/llm_build",
         'llm_chat': f"{build_dir}/examples/llm/llm_chat",
@@ -116,12 +125,12 @@ def remote_config(request):
 
 
 @pytest.fixture(autouse=True)
-def test_logger(request):
+def test_logger(request, global_config):
     """Create individual logger for each test"""
     test_name = request.node.name
     test_function = request.function.__name__
 
-    log_dir_path = os.environ.get('TEST_LOG_DIR', 'logs')
+    log_dir_path = global_config['test_log_dir']
     log_dir = Path(log_dir_path)
     log_dir.mkdir(exist_ok=True, parents=True)
 
@@ -167,8 +176,7 @@ def test_logger(request):
 
     logger.info("Environment Information:")
     logger.info(f"  LLM_SDK_DIR: {os.environ.get('LLM_SDK_DIR', 'Not set')}")
-    logger.info(
-        f"  ONNX_MODEL_DIR: {os.environ.get('ONNX_MODEL_DIR', 'Not set')}")
+    logger.info(f"  ONNX_DIR: {os.environ.get('ONNX_DIR', 'Not set')}")
     logger.info(f"  ENGINE_DIR: {os.environ.get('ENGINE_DIR', 'Not set')}")
     logger.info(
         f"  LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'Not set')}")
@@ -214,13 +222,6 @@ def pytest_addoption(parser):
                      action="store",
                      default="/home/nvidia/tensorrt-edge-llm",
                      help="Remote workspace directory")
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_configure(config):
-    """Configure pytest with custom settings"""
-    log_dir_path = os.environ.get('TEST_LOG_DIR', 'logs')
-    Path(log_dir_path).mkdir(exist_ok=True, parents=True)
 
 
 def pytest_runtest_setup(item):

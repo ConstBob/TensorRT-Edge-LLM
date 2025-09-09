@@ -264,6 +264,7 @@ class EdgeLLMDecoderLayer(nn.Module):
     def __init__(self,
                  config_or_module: Union[nn.Module, Any],
                  index: int = 0,
+                 torch_dtype: torch.dtype = torch.float16,
                  eagle3_draft: bool = False) -> None:
         """
         Initialize the EdgeLLMDecoderLayer module.
@@ -276,6 +277,7 @@ class EdgeLLMDecoderLayer(nn.Module):
         super().__init__()
 
         self.eagle3_draft = eagle3_draft
+        self.torch_dtype = torch_dtype
 
         # Handle both config and module inputs
         if isinstance(config_or_module, nn.Module):
@@ -283,8 +285,10 @@ class EdgeLLMDecoderLayer(nn.Module):
             decoder_layer = config_or_module
             self.hidden_size: int = decoder_layer.hidden_size
             self.mlp = decoder_layer.mlp
-            self.input_layernorm = decoder_layer.input_layernorm
-            self.post_attention_layernorm = decoder_layer.post_attention_layernorm
+            self.input_layernorm = decoder_layer.input_layernorm.to(
+                torch_dtype)
+            self.post_attention_layernorm = decoder_layer.post_attention_layernorm.to(
+                torch_dtype)
 
             # Replace attention with custom implementation
             self.self_attn = EdgeLLMAttention(decoder_layer.self_attn,
@@ -294,22 +298,25 @@ class EdgeLLMDecoderLayer(nn.Module):
             config = config_or_module
             self.hidden_size: int = config.hidden_size
             self.post_attention_layernorm = LlamaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps)
+                config.hidden_size, eps=config.rms_norm_eps).to(torch_dtype)
 
             # Handle input layernorm based on model type and layer index
             if eagle3_draft:
                 # EAGLE3 draft: all layers have input_layernorm and hidden_norm
-                self.hidden_norm = LlamaRMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
-                self.input_layernorm = LlamaRMSNorm(config.hidden_size,
-                                                    eps=config.rms_norm_eps)
+                self.hidden_norm = LlamaRMSNorm(
+                    config.hidden_size,
+                    eps=config.rms_norm_eps).to(torch_dtype)
+                self.input_layernorm = LlamaRMSNorm(
+                    config.hidden_size,
+                    eps=config.rms_norm_eps).to(torch_dtype)
             else:
                 # EAGLE2 draft: layer 0 doesn't have input_layernorm
                 if not config.input_layernorm:
                     self.input_layernorm = None
                 else:
                     self.input_layernorm = LlamaRMSNorm(
-                        config.hidden_size, eps=config.rms_norm_eps)
+                        config.hidden_size,
+                        eps=config.rms_norm_eps).to(torch_dtype)
 
             # Create attention module from config based on model type
             if "qwen" in config.model_type:

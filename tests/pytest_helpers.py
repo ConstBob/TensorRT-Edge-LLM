@@ -6,8 +6,10 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, List
 
+from runtime_test_config import BaseRuntimeTestConfig
+from utils.accuracy_utils import check_rouge_score
 from utils.command_config import build_command, get_command_timeout
-from utils.remote_utils import enhance_config_with_remote_paths
+from utils.remote_utils import RemoteConfig
 
 
 class ExecutionMode:
@@ -67,19 +69,46 @@ def check_file_exists(filepath: str,
         return os.path.exists(filepath)
 
 
-def validate_model_files(config,
-                         test_config: Dict[str, str],
-                         remote_host: str = None) -> None:
-    """Simple validation - check required ONNX files"""
-    files = [config.get_onnx_llm_path(test_config['onnx_model_dir'])]
+def get_file_content(filepath: str,
+                     remote_host: str = None,
+                     remote_password: str = None) -> str:
+    """Get file content with proper error handling"""
+    if remote_host:
+        # First check if file exists
+        if not check_file_exists(filepath, remote_host, remote_password):
+            raise FileNotFoundError(f"Remote file not found: {filepath}")
 
-    if hasattr(config, 'get_onnx_visual_path'):  # VLM
-        files.append(config.get_onnx_visual_path(
-            test_config['onnx_model_dir']))
+        result = run_command(['cat', filepath], remote_host, None, 300,
+                             remote_password)
+        if not result['success']:
+            raise RuntimeError(
+                f"Failed to read remote file {filepath}: {result.get('error', 'Unknown error')}"
+            )
 
-    for filepath in files:
-        if not check_file_exists(filepath, remote_host):
-            raise FileNotFoundError(f"Required file not found: {filepath}")
+        content = result['output']
+        if not content or not content.strip():
+            raise ValueError(
+                f"Remote file {filepath} is empty or contains only whitespace")
+
+        return content
+    else:
+        # Local file handling
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Local file not found: {filepath}")
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            if not content or not content.strip():
+                raise ValueError(
+                    f"Local file {filepath} is empty or contains only whitespace"
+                )
+
+            return content
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read local file {filepath}: {str(e)}")
 
 
 @contextmanager
@@ -98,10 +127,10 @@ class UnifiedTaskExecutor:
     """Universal task executor for both LLM and VLM"""
 
     def __init__(self,
-                 config,
+                 config: BaseRuntimeTestConfig,
                  executable_files: Dict[str, str],
                  execution_mode: str = ExecutionMode.LOCAL,
-                 remote_config=None,
+                 remote_config: RemoteConfig = None,
                  logger=None):
         self.config = config
         self.executable_files = executable_files
@@ -111,12 +140,16 @@ class UnifiedTaskExecutor:
 
         # Simple command executor setup
         if execution_mode == ExecutionMode.REMOTE:
-            remote_host = f"{remote_config.user}@{remote_config.host}"
-            remote_workspace = remote_config.remote_workspace
-            remote_password = remote_config.password
+            self.remote_host = f"{remote_config.user}@{remote_config.host}"
+            self.remote_workspace = remote_config.remote_workspace
+            self.remote_password = remote_config.password
             self.run_cmd = lambda cmd, timeout=300: run_command(
-                cmd, remote_host, remote_workspace, timeout, remote_password)
+                cmd, self.remote_host, self.remote_workspace, timeout, self.
+                remote_password)
         else:
+            self.remote_host = None
+            self.remote_workspace = None
+            self.remote_password = None
             self.run_cmd = lambda cmd, timeout=300: run_command(
                 cmd, None, None, timeout)
 
@@ -135,9 +168,9 @@ class UnifiedTaskExecutor:
 
     def execute_build_test(self) -> Dict[str, Any]:
         """Execute build test - adapts to config type"""
-        self._ensure_engine_directories_exist()
+        self.create_engine_dirs()
 
-        if hasattr(self.config, 'get_engine_visual_path'):  # VLM
+        if self.config.type == "vlm":  # VLM
             llm_cmd = build_command('vlm_llm_build', self.config,
                                     self.executable_files)
             llm_result = self.run_cmd(llm_cmd,
@@ -165,7 +198,7 @@ class UnifiedTaskExecutor:
                 'test_type':
                 PipelineTestType.BUILD.value
             }
-        else:  # LLM
+        elif self.config.type == "llm":  # LLM
             cmd = build_command('llm_build', self.config,
                                 self.executable_files)
             result = self.run_cmd(cmd, get_command_timeout('llm_build'))
@@ -174,9 +207,7 @@ class UnifiedTaskExecutor:
 
     def execute_chat_test(self) -> Dict[str, Any]:
         """Execute chat test - adapts to config type"""
-        cmd_key = 'vlm_chat' if hasattr(
-            self.config, 'get_engine_visual_path') else 'llm_chat'
-
+        cmd_key = 'vlm_chat' if self.config.type == "vlm" else 'llm_chat'
         cmd = build_command(cmd_key, self.config, self.executable_files)
         result = self.run_cmd(cmd, get_command_timeout(cmd_key))
         result['test_type'] = PipelineTestType.CHAT.value
@@ -184,9 +215,7 @@ class UnifiedTaskExecutor:
 
     def execute_benchmark_test(self) -> Dict[str, Any]:
         """Execute benchmark test - adapts to config type"""
-        cmd_key = 'vlm_benchmark' if hasattr(
-            self.config, 'get_engine_visual_path') else 'llm_benchmark'
-
+        cmd_key = 'vlm_benchmark' if self.config.type == "vlm" else 'llm_benchmark'
         cmd = build_command(cmd_key, self.config, self.executable_files)
         result = self.run_cmd(cmd, get_command_timeout(cmd_key))
         result['test_type'] = PipelineTestType.BENCHMARK.value
@@ -194,55 +223,82 @@ class UnifiedTaskExecutor:
 
     def execute_inference_test(self) -> Dict[str, Any]:
         """Execute inference test - adapts to config type"""
-        cmd_key = 'vlm_llm_inference' if hasattr(
-            self.config, 'get_engine_visual_path') else 'llm_inference'
+        cmd_key = 'vlm_llm_inference' if self.config.type == "vlm" else 'llm_inference'
         cmd = build_command(cmd_key, self.config, self.executable_files)
         result = self.run_cmd(cmd, get_command_timeout(cmd_key))
         result['test_type'] = PipelineTestType.INFERENCE.value
+        rouge_score = check_rouge_score(
+            get_file_content(self.config.get_output_json_file(),
+                             self.remote_host, self.remote_password),
+            # The test case file is not hosted on the remote server, so we pass None for the remote host and password
+            get_file_content(self.config.get_test_case_file(), None, None))
+        result['rouge_score'] = rouge_score
         return result
 
-    def execute_command(self, cmd, task_name="", timeout=300):
-        """Simple command execution interface for compatibility"""
-        return self.run_cmd(cmd, timeout)
-
-    def _ensure_engine_directories_exist(self):
+    def create_engine_dirs(self):
         """Create engine directories as needed"""
-        base_dirs = getattr(self.config, '_base_dirs', {})
-        engine_dir = base_dirs.get('engine_dir', 'engines')
 
-        llm_engine_path = self.config.get_engine_llm_path(engine_dir)
-        llm_engine_dir = os.path.dirname(llm_engine_path)
+        llm_engine_dir = self.config.get_llm_engine_dir()
         self.run_cmd(['mkdir', '-p', llm_engine_dir], 30)
 
-        if hasattr(self.config, 'get_engine_visual_path'):
-            visual_engine_path = self.config.get_engine_visual_path(engine_dir)
-            visual_engine_dir = os.path.dirname(visual_engine_path)
+        if self.config.type == "vlm":
+            visual_engine_dir = self.config.get_visual_engine_dir()
             self.run_cmd(['mkdir', '-p', visual_engine_dir], 30)
 
 
-def execute_pipeline_test(test_param: str, test_config: Dict[str, str],
-                          executable_files: Dict[str, str],
-                          execution_mode: str, remote_config, test_logger,
-                          test_type: PipelineTestType, config_class,
-                          pipeline_name: str):
-    """Simple test execution"""
+def execute_pipeline_test(test_param: str, executable_files: Dict[str, str],
+                          execution_mode: str, remote_config: RemoteConfig,
+                          test_logger: Any, test_type: PipelineTestType,
+                          config_class: type,
+                          global_config: Dict[str, Any]) -> None:
+    """
+    Execute a pipeline test with the specified configuration.
+    
+    This function provides a unified interface for executing pipeline tests
+    across different model types (LLM/VLM) and test types (build, chat, benchmark, inference).
+    It creates the appropriate configuration object and executes the test using
+    the UnifiedTaskExecutor.
+    
+    Args:
+        test_param: Test parameter string defining model configuration
+        executable_files: Dictionary mapping task names to executable paths
+        execution_mode: Execution mode (local or remote)
+        remote_config: Remote execution configuration for SSH-based testing
+        test_logger: Logger instance for test output and debugging
+        test_type: Type of pipeline test to execute
+        config_class: Configuration class to use (LLMRuntimeTestConfig or VLMRuntimeTestConfig)
+        global_config: Global test configuration including paths and settings
+        
+    Raises:
+        pytest.fail: If the test execution fails
+        
+    Example:
+        >>> execute_pipeline_test(
+        ...     "Qwen2.5-0.5B-fp16-bs1-mxil2048", 
+        ...     executables, "local", None, logger,
+        ...     PipelineTestType.BUILD, LLMRuntimeTestConfig, global_config
+        ... )
+    """
+    # Create configuration object from test parameter string
+    config = config_class.from_test_string(test_param,
+                                           global_config['onnx_dir'],
+                                           global_config['engine_dir'])
 
-    config = config_class.from_test_param(test_param)
-    enhanced_config = enhance_config_with_remote_paths(config, test_config,
-                                                       execution_mode,
-                                                       remote_config)
-    executor = UnifiedTaskExecutor(enhanced_config, executable_files,
-                                   execution_mode, remote_config, test_logger)
+    # Create task executor
+    executor = UnifiedTaskExecutor(config, executable_files, execution_mode,
+                                   remote_config, test_logger)
 
     if test_logger:
         test_logger.info(
-            f"Starting {pipeline_name} {test_type.value} test for {config.model_name}-{config.precision}"
+            f"Starting {config.type} {test_type.value} test for {config.model_name}-{config.precision}"
         )
 
+    # Execute the test with timing context
     with timer_context(
-            f"{pipeline_name} {test_type.value} for {config.model_name}"):
+            f"{config.type} {test_type.value} for {config.model_name}"):
         result = executor.execute_test(test_type)
 
+        # Log output if logger is available
         if test_logger:
             all_output = []
             if result.get('output'):
@@ -255,8 +311,9 @@ def execute_pipeline_test(test_param: str, test_config: Dict[str, str],
                     if line.strip():
                         test_logger.info(f"  {line}")
 
+        # Fail the test if execution was unsuccessful
         if not result['success']:
             import pytest
             pytest.fail(
-                f"{pipeline_name} {test_type.value} failed: {result.get('error', 'Unknown error')}"
+                f"{config.type} {test_type.value} failed: {result.get('error', 'Unknown error')}"
             )

@@ -59,27 +59,27 @@ a30_model_export:
     - echo "Testing model export"
     - ls /scratch.trt_llm_data
     - export LLM_SDK_DIR=$(pwd)
-    - echo "Installing export dependencies"
-    - cd $LLM_SDK_DIR/export
-    - pip3 install -r requirements.txt
-    - pip3 install -r requirements_int4.txt
+    - echo "Installing package dependencies"
     - cd $LLM_SDK_DIR
+    - pip3 install build
+    - python3 -m build --wheel --outdir dist .
+    - pip3 install dist/*.whl
     - echo "Installing pytest dependencies"
     - pip3 install -r tests/requirements.txt
     - echo "Setting up test environment"
-    - export ONNX_MODEL_DIR=$CACHE_DIR/models
-    - export TORCH_MODEL_DIR=/scratch.trt_llm_data/llm-models
+    - export ONNX_DIR=$CACHE_DIR/onnx_models
+    - export TORCH_DIR=/scratch.trt_llm_data/llm-models
     - export TEST_LOG_DIR=$CACHE_DIR/logs
-    - mkdir -p $ONNX_MODEL_DIR
+    - mkdir -p $ONNX_DIR
     - mkdir -p $TEST_LOG_DIR
     - echo "Running L0 export tests with pytest"
     - python3 -m pytest tests --priority=l0_export -v --color=yes --html=$TEST_LOG_DIR/test_report_l0_export.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_l0_export.xml
     - ls -la $CACHE_DIR/../
     - ls -la $CACHE_DIR
     - echo "Models exported to cache directory $CACHE_DIR"
-    - ls -la $CACHE_DIR/models
+    - ls -la $CACHE_DIR/onnx_models
     - echo "Remove useless folders"
-    - rm -rf $CACHE_DIR/models/*_quantized
+    - rm -rf $CACHE_DIR/onnx_models/*quantized*
     - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
     - ls -la $TEST_LOG_DIR
     - df -h /scratch.edge_llm_cache
@@ -152,9 +152,9 @@ orin_test:
     - echo "Syncing TensorRT JP6 libraries from cache to board"
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $CACHE_DIR/jp6_cross_build/TensorRT-jp6 $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm
     - echo "Syncing models to the board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $CACHE_DIR/a30_model_export/models $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $CACHE_DIR/a30_model_export/onnx_models $BOARD_USER@192.168.55.1:/home/$BOARD_USER/tensorrt-edge-llm
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "ls -la /home/$BOARD_USER/tensorrt-edge-llm/"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "ls -la /home/$BOARD_USER/tensorrt-edge-llm/models"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "ls -la /home/$BOARD_USER/tensorrt-edge-llm/onnx_models"
     - echo "Creating Python virtual environment"
     - python3 -m venv venv
     - source venv/bin/activate
@@ -166,7 +166,7 @@ orin_test:
     - echo "Creating remote directories"
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "mkdir -p /home/$BOARD_USER/tensorrt-edge-llm/logs"
     - echo "Running L0 pipeline tests on Orin with pytest (remote execution mode)"
-    - export ONNX_MODEL_DIR=/home/$BOARD_USER/tensorrt-edge-llm/models
+    - export ONNX_DIR=/home/$BOARD_USER/tensorrt-edge-llm/onnx_models
     - export ENGINE_DIR=/home/$BOARD_USER/tensorrt-edge-llm/engines
     - export TEST_LOG_DIR=$CACHE_DIR/orin_test/logs
     - mkdir -p $TEST_LOG_DIR
@@ -213,12 +213,12 @@ a30_build_and_test:
     - pip3 install -r tests/requirements.txt
     - echo "Setting up test environment"
     - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
-    - export ONNX_MODEL_DIR=$CACHE_DIR/a30_model_export/models
+    - export ONNX_DIR=$CACHE_DIR/a30_model_export/onnx_models
     - export ENGINE_DIR=$CACHE_DIR/a30_build_and_test/engines
     - export TEST_LOG_DIR=$CACHE_DIR/a30_build_and_test/logs
     - mkdir -p $ENGINE_DIR $TEST_LOG_DIR
-    - echo "Reading models from cache directory:$CACHE_DIR/a30_model_export/models"
-    - ls -la $CACHE_DIR/a30_model_export/models/ || echo "Warning:Cache directory not accessible or empty"
+    - echo "Reading models from cache directory:$ONNX_DIR"
+    - ls -la $ONNX_DIR/ || echo "Warning:Cache directory not accessible or empty"
     - echo "Running L0 pipeline tests with pytest"
     - python3 -m pytest tests/ --priority=l0_pipeline_a30 -v --color=yes --html=$TEST_LOG_DIR/test_report_l0_pipeline_a30.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_l0_pipeline_a30.xml
     - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
@@ -258,12 +258,12 @@ rtx5080_build_and_test:
       - pip3 install -r tests/requirements.txt
       - echo "Setting up test environment"
       - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LLM_SDK_DIR/TensorRT-linux/lib
-      - export ONNX_MODEL_DIR=$CACHE_DIR/a30_model_export/models
+      - export ONNX_DIR=$CACHE_DIR/a30_model_export/onnx_models
       - export ENGINE_DIR=$CACHE_DIR/rtx5080_build_and_test/engines
       - export TEST_LOG_DIR=$CACHE_DIR/rtx5080_build_and_test/logs
       - mkdir -p $ENGINE_DIR $TEST_LOG_DIR
-      - echo "Reading models from cache directory:$CACHE_DIR/a30_model_export/models"
-      - ls -la $CACHE_DIR/a30_model_export/models/ || echo "Warning:Cache directory not accessible or empty"
+      - echo "Reading models from cache directory:$ONNX_DIR"
+      - ls -la $ONNX_DIR/ || echo "Warning:Cache directory not accessible or empty"
       - echo "Running L0 pipeline tests with pytest"
       - python3 -m pytest tests/ --priority=l0_pipeline_rtx5080 -v --color=yes --html=$TEST_LOG_DIR/test_report_l0_pipeline_rtx5080.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_l0_pipeline_rtx5080.xml
       - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"

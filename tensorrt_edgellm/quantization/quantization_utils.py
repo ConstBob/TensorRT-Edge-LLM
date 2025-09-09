@@ -52,8 +52,8 @@ def quantize_model(
             model: Model to calibrate
         """
         # Create progress bar for calibration
-        pbar = tqdm(calib_dataloader, desc="Calibrating", unit="num_samples")
         print(f"Calibrating model on {len(calib_dataloader)} samples...")
+        pbar = tqdm(calib_dataloader, desc="Calibrating", unit="num_samples")
         for data in pbar:
             if isinstance(data, dict):
                 data = {k: v.to(model.device) for k, v in data.items()}

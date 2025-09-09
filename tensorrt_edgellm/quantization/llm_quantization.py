@@ -102,6 +102,33 @@ NVFP4_LM_HEAD_CONFIG: Dict[str, Any] = {
     }
 }
 
+# MXFP8 quantization configuration for language model head.
+MXFP8_LM_HEAD_CONFIG: Dict[str, Any] = {
+    "quant_cfg": {
+        "*lm_head.input_quantizer": {
+            "num_bits": (4, 3),
+            "block_sizes": {
+                -1: 32,
+                "type": "dynamic",
+                "scale_bits": (8, 0)
+            },
+            "enable": True,
+        },
+        "*lm_head.weight_quantizer": {
+            "num_bits": (4, 3),
+            "block_sizes": {
+                -1: 32,
+                "type": "dynamic",
+                "scale_bits": (8, 0)
+            },
+            "enable": True,
+        },
+        "default": {
+            "enable": False
+        }
+    }
+}
+
 # Configuration to disable visual model quantization.
 DISABLE_VISUAL_CONFIG: Dict[str, Any] = {
     "quant_cfg": {
@@ -185,18 +212,10 @@ def get_llm_quant_config(
         quant_cfg = mtq.FP8_DEFAULT_CFG.copy()
     elif quantization == "int4_awq":
         quant_cfg = mtq.INT4_AWQ_CFG.copy()
-        # Only restrict LM head quantization for int4_awq
-        if lm_head_quantization not in [None, "int4_awq"]:
-            raise ValueError(
-                f"Unsupported LM head quantization: {lm_head_quantization} for int4_awq."
-            )
     elif quantization == "nvfp4":
-        if hasattr(mtq, "NVFP4_DEFAULT_CFG"):
-            quant_cfg = mtq.NVFP4_DEFAULT_CFG.copy()
-        else:
-            raise ValueError(
-                "NVFP4_DEFAULT_CFG is not supported in this version of modelopt."
-            )
+        quant_cfg = mtq.NVFP4_DEFAULT_CFG.copy()
+    elif quantization == "mxfp8":
+        quant_cfg = mtq.MXFP8_DEFAULT_CFG.copy()
     else:
         raise ValueError(f"Unsupported quantization: {quantization}")
 
@@ -214,6 +233,8 @@ def get_llm_quant_config(
             quant_cfg["quant_cfg"].update(INT4_AWQ_LM_HEAD_CONFIG["quant_cfg"])
         elif lm_head_quantization == "nvfp4":
             quant_cfg["quant_cfg"].update(NVFP4_LM_HEAD_CONFIG["quant_cfg"])
+        elif lm_head_quantization == "mxfp8":
+            quant_cfg["quant_cfg"].update(MXFP8_LM_HEAD_CONFIG["quant_cfg"])
 
     # Disable visual model
     quant_cfg["quant_cfg"].update(DISABLE_VISUAL_CONFIG["quant_cfg"])
@@ -244,8 +265,8 @@ def quantize_llm(
     Raises:
         AssertionError: If quantization method is not supported
     """
-    assert quantization in ["fp8", "int4_awq", "nvfp4"]
-    assert lm_head_quantization in [None, "fp8", "int4_awq", "nvfp4"]
+    assert quantization in ["fp8", "int4_awq", "nvfp4", "mxfp8"]
+    assert lm_head_quantization in [None, "fp8", "int4_awq", "nvfp4", "mxfp8"]
 
     # Get calibration dataloader
     if "int4" in quantization:
@@ -271,7 +292,7 @@ def load_hf_model(
     
     Args:
         model_dir: Directory containing the model files
-        torch_dtype: Torch data type ("fp16", "bf16")
+        torch_dtype: Torch data type ("fp16")
         
     Returns:
         Tuple of (model, tokenizer)
@@ -282,27 +303,28 @@ def load_hf_model(
     # Convert torch_dtype string to torch dtype
     if torch_dtype == "fp16":
         dtype = torch.float16
-    elif torch_dtype == "bf16":
-        dtype = torch.bfloat16
     else:
         raise ValueError(f"Unsupported torch_dtype: {torch_dtype}")
 
     # Try loading as AutoModelForCausalLM first
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                     torch_dtype=dtype).cuda()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, torch_dtype=dtype,
+            trust_remote_code=True).to(dtype).cuda()
     except Exception:
         # If that fails, try AutoModelForImageTextToText
         try:
             # TODO: Need a WAR to quantize only the language model.
             # In VLMs, the model has both model.language_model and model.vision_model.
             model = AutoModelForImageTextToText.from_pretrained(
-                model_dir, torch_dtype=dtype).cuda()
+                model_dir, torch_dtype=dtype,
+                trust_remote_code=True).to(dtype).cuda()
         except Exception as e:
             raise ValueError(
                 f"Could not load model from {model_dir}. Error: {e}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                              trust_remote_code=True)
 
     # Set tokenizer padding token if needed
     if tokenizer.pad_token != "<unk>":
@@ -313,7 +335,7 @@ def load_hf_model(
     return model, tokenizer
 
 
-def quantize_and_save_model(
+def quantize_and_save_llm(
     model_dir: str,
     output_dir: str,
     quantization: Optional[str] = None,
@@ -328,7 +350,7 @@ def quantize_and_save_model(
         model_dir: Directory containing the input model
         output_dir: Directory to save the quantized model
         quantization: Optional quantization method to apply (None, fp8, int4_awq, nvfp4)
-        torch_dtype: Torch data type for model loading (fp16, bf16)
+        torch_dtype: Torch data type for model loading (fp16)
         dataset_dir: Dataset for calibration
         lm_head_quantization: Optional LM head quantization method (None, fp8, int4_awq, nvfp4)
         

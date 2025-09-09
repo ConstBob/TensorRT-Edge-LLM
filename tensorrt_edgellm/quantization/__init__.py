@@ -12,3 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+Quantization utilities for TensorRT Edge-LLM.
+
+This module provides functions for quantizing LLM and visual models using NVIDIA ModelOpt.
+"""
+
+from .llm_quantization import quantize_and_save_llm
+
+__all__ = [
+    "quantize_and_save_llm",
+]

@@ -28,10 +28,10 @@ Key Features:
 - ONNX export for LLM and visual models
 
 Example Usage:
-    from tensorrt_edgellm import quantize_and_save_model, llm_export, visual_export
+    from tensorrt_edgellm import quantize_and_save_llm, llm_export, visual_export
     
     # Quantize and save a model
-    quantize_and_save_model(
+    quantize_and_save_llm(
         model_dir="path/to/model",
         output_dir="path/to/output",
         quantization="fp8"
@@ -83,8 +83,7 @@ Example Usage:
 
 from .onnx_export.llm_export import llm_export
 from .onnx_export.visual_export import visual_export
-from .quantization.llm_quantization import quantize_and_save_model
-from .quantization.quantization_utils import quantize_model
+from .quantization.llm_quantization import quantize_and_save_llm
 
 try:
     from ._version import __version__
@@ -95,8 +94,7 @@ __author__ = "NVIDIA"
 __email__ = "TBD@nvidia.com"
 
 __all__ = [
-    "quantize_and_save_model",
-    "quantize_model",
+    "quantize_and_save_llm",
     "llm_export",
     "visual_export",
 ]

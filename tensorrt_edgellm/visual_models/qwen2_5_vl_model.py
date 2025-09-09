@@ -22,25 +22,19 @@ TODO: Input/output names have been aligned with the old multimodal_export.py for
       Future refactoring should consider more descriptive names while maintaining backward compatibility.
 """
 
-import io
 import math
-import os
-import time
-from typing import Any, Optional
+from typing import Any
 
 import modelopt.torch.quantization as mtq
-import onnx
 import torch
 import torch.nn as nn
 from modelopt.torch.quantization.nn import TensorQuantizer
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionTransformerPretrainedModel, Qwen2_5_VLMLP,
-    Qwen2_5_VLVisionAttention, Qwen2_5_VLVisionBlock,
+    Qwen2_5_VLPatchMerger, Qwen2_5_VLVisionAttention, Qwen2_5_VLVisionBlock,
     apply_rotary_pos_emb_vision)
 
-from ..onnx_config import (all_tensors_to_one_file, convert_attribute,
-                           do_constant_folding, location, opset_version,
-                           save_as_external_data)
+from ..onnx_export.onnx_utils import export_onnx
 
 
 class Qwen2_5_VLVisionAttentionPatch(Qwen2_5_VLVisionAttention):
@@ -287,6 +281,20 @@ class Qwen2_5_VLVisionBlockPatch(Qwen2_5_VLVisionBlock):
         return hidden_states
 
 
+class Qwen2_5_VLPatchMergerWAR(Qwen2_5_VLPatchMerger):
+    "WAR for Qwen2.5-VL 3B FP16 overflow"
+
+    def __init__(self,
+                 dim: int,
+                 context_dim: int,
+                 spatial_merge_size: int = 2) -> None:
+        super().__init__(dim, context_dim, spatial_merge_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.mlp(self.ln_q(x).to(torch.float16).view(-1, self.hidden_size))
+        return x
+
+
 class Qwen2_5_VisionTransformerPretrainedModelPatch(
         Qwen2_5_VisionTransformerPretrainedModel):
     """
@@ -316,7 +324,7 @@ class Qwen2_5_VisionTransformerPretrainedModelPatch(
         if config.out_hidden_size == 2048:
             self.blocks[-1] = Qwen2_5_VLVisionBlockPatchWAR(
                 config, config._attn_implementation)
-            self.merger = Qwen2_5_VLPatchMergerPatch(
+            self.merger = Qwen2_5_VLPatchMergerWAR(
                 dim=config.out_hidden_size,
                 context_dim=config.hidden_size,
                 spatial_merge_size=config.spatial_merge_size,
@@ -371,10 +379,10 @@ class Qwen2_5_VisionTransformerPretrainedModelPatch(
 
 
 def export_qwen2_5_vl_visual(
-        model: Qwen2_5_VisionTransformerPretrainedModelPatch,
-        output_dir: str,
-        torch_dtype: torch.dtype,
-        quantization: Optional[str] = None) -> None:
+    model: Qwen2_5_VisionTransformerPretrainedModelPatch,
+    output_dir: str,
+    torch_dtype: torch.dtype,
+) -> None:
     """
     Export Qwen2.5-VL visual model to ONNX format.
     
@@ -385,7 +393,6 @@ def export_qwen2_5_vl_visual(
         model: Patched Qwen2.5-VL vision transformer model
         output_dir: Directory to save the exported ONNX model
         torch_dtype: PyTorch data type for the model
-        quantization: Quantization type
     """
 
     # Prepare dummy input sizes (will be replaced by dynamic axes)
@@ -450,41 +457,13 @@ def export_qwen2_5_vl_visual(
         },
     }
 
-    start_time = time.time()
-    os.makedirs(output_dir, exist_ok=True)
+    inputs = (input_tensor, rotary_pos_emb, attention_mask,
+              window_attention_mask, window_index, reverse_window_index)
+    input_names = [
+        "input", "rotary_pos_emb", "attention_mask", "window_attention_mask",
+        "window_index", "reverse_window_index"
+    ]
+    output_names = ["output"]
 
-    # Export to BytesIO first to avoid intermediate file I/O
-    bytes_io = io.BytesIO()
-    with torch.inference_mode():
-        torch.onnx.export(
-            model,
-            (input_tensor, rotary_pos_emb, attention_mask,
-             window_attention_mask, window_index, reverse_window_index),
-            bytes_io,
-            input_names=[
-                "input", "rotary_pos_emb", "attention_mask",
-                "window_attention_mask", "window_index", "reverse_window_index"
-            ],
-            output_names=["output"],
-            dynamic_axes=dynamic_axes,
-            opset_version=opset_version,
-            do_constant_folding=do_constant_folding,
-        )
-
-    # Load from bytes and apply post-processing
-    onnx_bytes = bytes_io.getvalue()
-    onnx_model = onnx.load_model_from_string(onnx_bytes)
-
-    # Save the final ONNX model
-    output_path = f'{output_dir}/model.onnx'
-    onnx.save_model(onnx_model,
-                    output_path,
-                    save_as_external_data=save_as_external_data,
-                    all_tensors_to_one_file=all_tensors_to_one_file,
-                    location=location,
-                    convert_attribute=convert_attribute)
-
-    end_time = time.time()
-    print(
-        f"Qwen2.5-VL visual encoder ONNX Export from torch completed in {end_time - start_time}s. "
-        f"ONNX file is saved to {output_dir}.")
+    export_onnx(model, inputs, output_dir, input_names, output_names,
+                dynamic_axes)

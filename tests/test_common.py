@@ -76,8 +76,7 @@ def build_project(arch: str, cuda_version: str, trt_package_dir: str,
 class TestProjectCommon:
     """Test suite for common project tasks (build and unit tests)"""
 
-    def test_remote_setup(self, test_config, execution_mode, remote_config,
-                          test_logger):
+    def test_remote_setup(self, execution_mode, remote_config, test_logger):
         """Test remote workspace setup - only runs in remote mode"""
         if execution_mode != ExecutionMode.REMOTE:
             pytest.skip("Remote setup test only runs in remote execution mode")
@@ -88,8 +87,8 @@ class TestProjectCommon:
         test_logger.info(
             f"Setting up remote workspace on {remote_config.host}")
 
-    def test_build_project(self, request, test_config, execution_mode,
-                           remote_config, test_logger):
+    def test_build_project(self, request, execution_mode, remote_config,
+                           test_logger):
         """Test project build - builds all components"""
         target = getattr(request, 'param', 'auto')
         test_logger.info(
@@ -138,13 +137,13 @@ class TestProjectCommon:
 
         test_logger.info(f"Build completed for {device_config.target}")
 
-    def test_unit_tests(self, test_config, executable_files, execution_mode,
+    def test_unit_tests(self, global_config, executable_files, execution_mode,
                         remote_config, test_logger):
         """Test unit tests execution - model independent"""
         test_logger.info(
             f"Starting unit tests execution in {execution_mode} mode")
 
-        build_dir = test_config.get('build_dir', 'build')
+        build_dir = global_config.get('build_dir', 'build')
         if execution_mode == ExecutionMode.REMOTE:
             test_logger.info("Executing: UNIT TESTS")
             remote_host = f"{remote_config.user}@{remote_config.host}"
@@ -212,21 +211,21 @@ class TestProjectCommon:
             pytest.fail(
                 f"Unit tests failed: {result.get('error', 'Unknown error')}")
 
-    def _detect_device_config(self, test_config: EnvironmentConfig,
+    def _detect_device_config(self, environment_config: EnvironmentConfig,
                               logger) -> DeviceConfig:
         """Detect device configuration for the current environment"""
 
-        if test_config.execution_mode == ExecutionMode.REMOTE:
-            remote_host = f"{test_config.remote_config.user}@{test_config.remote_config.host}"
-            remote_workspace = test_config.remote_config.remote_workspace
-            remote_password = test_config.remote_config.password
+        if environment_config.execution_mode == ExecutionMode.REMOTE:
+            remote_host = f"{environment_config.remote_config.user}@{environment_config.remote_config.host}"
+            remote_workspace = environment_config.remote_config.remote_workspace
+            remote_password = environment_config.remote_config.password
             run_cmd_func = lambda cmd, timeout=300: run_command(
                 cmd, remote_host, remote_workspace, timeout, remote_password)
         else:
             run_cmd_func = lambda cmd, timeout=300: run_command(
                 cmd, None, None, timeout)
 
-        workspace = test_config.get_workspace()
+        workspace = environment_config.get_workspace()
         device_config = DeviceConfig.auto_detect(run_cmd_func, workspace)
 
         if logger:

@@ -28,7 +28,7 @@ The module contains:
 import torch
 from torch.onnx import symbolic_helper
 
-from ...onnx_config import opset_version
+from ...common import ONNX_OPSET_VERSION
 
 
 @symbolic_helper.parse_args("v", "v", "i")
@@ -108,6 +108,6 @@ def register_gather_nd_onnx_symbolic_functions() -> None:
 
     # Register our custom symbolic functions
     register_custom_op_symbolic("trt::gather_nd", symbolic_gather_nd,
-                                opset_version)
+                                ONNX_OPSET_VERSION)
 
     print("Registered ONNX symbolic functions for custom gather_nd")

@@ -32,13 +32,13 @@ from onnx.defs import OpSchema
 from torch.onnx import register_custom_op_symbolic, symbolic_helper
 from torch.onnx.symbolic_helper import _get_tensor_sizes
 
-from ...onnx_config import opset_version
+from ...common import ONNX_OPSET_VERSION
 
 # Define ONNX OpSchema for AttentionPlugin
 attention_plugin_schema = OpSchema(
     name="AttentionPlugin",
     domain="trt",
-    since_version=opset_version,
+    since_version=ONNX_OPSET_VERSION,
     doc=
     "Custom TensorRT attention plugin with RoPE, KV cache, and attention computation.",
     inputs=[
@@ -264,6 +264,6 @@ def register_attention_plugin_onnx_symbolic_functions() -> None:
 
     # Register our custom symbolic functions
     register_custom_op_symbolic("trt::attention_plugin",
-                                symbolic_attention_plugin, opset_version)
+                                symbolic_attention_plugin, ONNX_OPSET_VERSION)
 
     print("Registered ONNX symbolic functions for custom attention plugin")

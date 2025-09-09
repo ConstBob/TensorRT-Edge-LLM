@@ -1,4 +1,6 @@
 build/
+dist/
+*.egg-info
 *_engine/
 *.engine
 *_onnx/
@@ -12,5 +14,4 @@ data.tar
 *.tar.gz
 internal/
 *.log
-*.egg-info
 .DS_Store/
