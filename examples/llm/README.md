@@ -98,7 +98,7 @@ engines/${MODEL_NAME}_draft/
 ./build/examples/llm/llm_chat \
 --engineDir=engines/${MODEL_NAME} \
 --maxLength=64 \
---interactivte
+--interactive
 ```
 
 **With Input String:**
@@ -116,7 +116,7 @@ engines/${MODEL_NAME}_draft/
 --draftModelDir=engines/${MODEL_NAME}_draft \
 --maxLength=1024 \
 --isEagle3 \
---interactivte
+--interactive
 ```
 
 ### Benchmark Performance
