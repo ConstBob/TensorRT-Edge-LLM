@@ -274,11 +274,20 @@ std::vector<std::string> decode(VlmChatArgs args)
     // For EAGLE mode, load tokenizer from baseModelDir, otherwise from engineDir
     if (args.eagleParams.baseModelDir.empty() && args.eagleParams.draftModelDir.empty())
     {
-        tokenizer->loadFromHF(args.baseParams.engineDir);
+        if (!tokenizer->loadFromHF(args.baseParams.engineDir))
+        {
+            LOG_ERROR("Failed to load tokenizer from engine directory: %s", args.baseParams.engineDir.c_str());
+            return {};
+        }
     }
     else
     {
-        tokenizer->loadFromHF(args.eagleParams.baseModelDir);
+        if (!tokenizer->loadFromHF(args.eagleParams.baseModelDir))
+        {
+            LOG_ERROR(
+                "Failed to load tokenizer from eagle base model directory: %s", args.eagleParams.baseModelDir.c_str());
+            return {};
+        }
     }
 
     // Set default inputString and imagePaths to batchSize

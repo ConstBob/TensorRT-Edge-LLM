@@ -87,10 +87,13 @@ LLMInferenceRuntime::LLMInferenceRuntime(
     }
 
     // Setup tokenizer
-    // TODO: The tokenizer loading can fail, need to improve the error handling.
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
     LOG_INFO("Start loading tokenizer from model directory: %s", engineDir.c_str());
-    mTokenizer->loadFromHF(engineDir);
+    if (!mTokenizer->loadFromHF(engineDir))
+    {
+        LOG_ERROR("Failed to load tokenizer from model directory: %s", engineDir.c_str());
+        throw std::runtime_error("Failed to load tokenizer from model directory: " + engineDir);
+    }
 
     // Optional: Setup multimodal engine runner
     if (!multimodalEngineDir.empty())

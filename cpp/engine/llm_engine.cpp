@@ -192,7 +192,7 @@ void LLMEngine::generate(std::vector<int32_t> const& inputIds, std::vector<int32
     if (isEagleModel())
     {
         auto& eagle = getEagle();
-        if (!tokenizer)
+        if (!tokenizer || !tokenizer->isInitialized())
         {
             LOG_ERROR("tokenizer must be provided under eagle mode for generate()");
             throw std::runtime_error("tokenizer must be provided under eagle mode for generate()");

@@ -62,7 +62,7 @@ export MAX_INPUT_LEN=2048
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME} \
 --engineDir=engines/${MODEL_NAME} \
---batchSize=1 \
+--maxBatchSize=1 \
 --maxInputLen=${MAX_INPUT_LEN} \
 --maxSeqLen=4096 \
 --imageTokens=${IMAGE_TOKENS} \
@@ -109,7 +109,7 @@ For EAGLE VLM, build separate base and draft LLM engines plus visual engine:
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME}_eagle3_base \
 --engineDir=engines/${MODEL_NAME}_eagle3_base \
---batchSize=1 \
+--maxBatchSize=1 \
 --maxInputLen=1024 \
 --maxSeqLen=4096 \
 --dynamicShape \
@@ -124,7 +124,7 @@ For EAGLE VLM, build separate base and draft LLM engines plus visual engine:
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME}_eagle3_draft \
 --engineDir=engines/${MODEL_NAME}_eagle3_draft \
---batchSize=1 \
+--maxBatchSize=1 \
 --maxInputLen=1024 \
 --maxSeqLen=4096 \
 --dynamicShape \
@@ -357,7 +357,7 @@ Add `--maxLoraRank=<max_rank>` to enable dynamic LoRA support:
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME} \
 --engineDir=engines/${MODEL_NAME} \
---batchSize=1 \
+--maxBatchSize=1 \
 --maxInputLen=1024 \
 --maxSeqLen=4096 \
 --maxLoraRank=16 \

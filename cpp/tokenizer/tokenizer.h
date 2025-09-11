@@ -20,20 +20,20 @@
 #include <filesystem>
 #include <forward_list>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <regex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "preTokenizer.h"
+#include "tokenEncoder.h"
+
 namespace drivellm
 {
 namespace tokenizer
 {
-
-using Rank = std::int32_t;
-using BPETokenToRanks = std::unordered_map<std::string, Rank>;
-using BPERanksToToken = std::unordered_map<Rank, std::string>;
 
 typedef enum TEXT_PART_TYPE
 {
@@ -72,83 +72,165 @@ struct textPartition
     int const length;
 };
 
-// BPE
-class BPE
-{
-public:
-    BPE(BPETokenToRanks& encoder, BPETokenToRanks& specialTokensEncoder, std::string const& patStr);
-
-    ~BPE() = default;
-
-    bool tokenize(std::string const& text, std::vector<Rank>& output) const noexcept;
-
-    bool detokenize(std::vector<Rank> const& tokens, std::string& bytes, bool skipSpecialTokens = false) const noexcept;
-
-    bool specialTokenPartition(std::string const& text, std::forward_list<textPartition>& partitions) const noexcept;
-
-private:
-    void initRegex(std::string const* patStr);
-
-    void bytePairEncode(std::string const& piece, std::vector<Rank>& output) const;
-
-    std::vector<std::string> regexSplitText(std::string const& text) const;
-
-    BPETokenToRanks mEncoder;
-    BPERanksToToken mDecoder;
-
-    BPETokenToRanks mSpecialTokensEncoder;
-    BPERanksToToken mSpecialTokensDecoder;
-
-    std::regex mRegex;
-    bool mNeedRegexCollapse;
-};
-
-// Tokenizer base class
 class Tokenizer
 {
 public:
     Tokenizer();
+    ~Tokenizer() = default;
 
-    Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
-        Rank const& bosId = -1, Rank const& eosId = -1, Rank const& padId = -1, Rank const& unkId = -1);
+    // TODO: Add constructor with preTokenizer and tokenEncoder
+    // Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
+    //     Rank const& bosId = -1, Rank const& eosId = -1, Rank const& padId = -1, Rank const& unkId = -1);
 
-    virtual ~Tokenizer() = default;
+    /**
+     * @brief Encode text to token IDs
+     * @param text Input text to encode
+     * @param addBos Whether to add beginning-of-sequence token
+     * @param addEos Whether to add end-of-sequence token
+     * @return Vector of token IDs
+     */
+    std::vector<Rank> encode(std::string const& text, bool addBos = false, bool addEos = false) const;
 
-    virtual std::vector<Rank> encode(std::string const& text, bool addBos = false, bool addEos = false) const;
+    /**
+     * @brief Decode token IDs back to text
+     * @param tokens Vector of token IDs
+     * @param skipSpecialTokens Whether to skip special tokens in output
+     * @return Decoded text string
+     */
+    std::string decode(std::vector<Rank> const& tokens, bool skipSpecialTokens = false) const;
 
-    virtual std::string decode(std::vector<Rank> const& tokens, bool skipSpecialTokens = false) const;
+    /**
+     * @brief Load tokenizer from HuggingFace model directory
+     * @param modelDir Path to the model directory containing tokenizer files
+     * @return true if directory exists, tokenizer.json is found and parsed successfully,
+     *         pretokenizer and encoder are created successfully; false if directory doesn't exist,
+     *         tokenizer.json is missing/corrupt, or initialization fails
+     */
+    bool loadFromHF(std::filesystem::path const& modelDir);
 
-    virtual void loadFromHF(std::filesystem::path const& modelDir);
+    // Accessors
+    int getNumVocab() const noexcept
+    {
+        return mNumVocab;
+    }
+    Rank getBosId() const noexcept
+    {
+        return mBosId;
+    }
+    Rank getEosId() const noexcept
+    {
+        return mEosId;
+    }
+    Rank getPadId() const noexcept
+    {
+        return mPadId == -1 ? mEosId : mPadId;
+    }
+    Rank getUnkId() const noexcept
+    {
+        return mUnkId;
+    }
 
-    int getNumVocab() const noexcept;
-
-    Rank getBosId() const noexcept;
-
-    Rank getEosId() const noexcept;
-
-    Rank getPadId() const noexcept;
-
-    Rank getUnkId() const noexcept;
+    /**
+     * @brief Check if tokenizer is properly initialized
+     * @return true if initialized, false otherwise
+     */
+    bool isInitialized() const noexcept;
 
 protected:
-    // manually parse tokenizer.json and tokenizer_config.json without using 3rdparty libraries
-    void loadHFSpecialTokens(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens);
+    /**
+     * @brief Parse tokenizer.json to extract configuration
+     * @param tokenizerFile Path to tokenizer.json file
+     * @param vocab Output vocabulary mapping
+     * @param specialTokens Output special tokens mapping
+     * @return true if file size is valid, file opens successfully, JSON parses correctly,
+     *         and pretokenizer/vocabulary load; false if file is too large, can't be opened,
+     *         contains invalid JSON, or configuration is malformed
+     */
+    bool parseTokenizerConfig(
+        std::filesystem::path const& tokenizerFile, TokenToRanks& vocab, TokenToRanks& specialTokens);
 
-    void loadHFVocab(std::filesystem::path const& modelDir, BPETokenToRanks& vocab);
+    /**
+     * @brief Parse tokenizer_config.json to extract special token IDs
+     * @param configFile Path to tokenizer_config.json file
+     * @param specialTokens Output special tokens mapping
+     * @return true if file size is valid, file opens successfully, and JSON parses correctly;
+     *         false if file is too large, can't be opened, or contains invalid JSON
+     */
+    bool parseSpecialTokenConfig(std::filesystem::path const& configFile, TokenToRanks& specialTokens);
 
-    void loadHFConfig(std::filesystem::path const& modelDir, BPETokenToRanks& specialTokens);
+    /**
+     * @brief Create appropriate pretokenizer based on configuration
+     * @param preTokenizerConfig JSON configuration for pretokenizer
+     * @return Unique pointer to created pretokenizer: RegexSplit for recognized Split/Regex types,
+     *         Sequence for pretokenizer arrays, or default empty Sequence for unknown configurations
+     */
+    std::unique_ptr<PreTokenizer> createPreTokenizer(nlohmann::json const& preTokenizerConfig);
 
-    void appendEos(std::vector<Rank>& output) const noexcept;
+    /**
+     * @brief Determine encoder type from configuration
+     * @param modelConfig JSON configuration for the model
+     * @return TokenEncoder type
+     */
+    TokenEncoder::Type determineEncoderType(nlohmann::json const& modelConfig);
 
-    void appendBos(std::vector<Rank>& output) const noexcept;
+    /**
+     * @brief Load vocabulary from tokenizer.json
+     * @param modelConfig JSON model configuration
+     * @param vocab Output vocabulary mapping
+     * @return true if model configuration contains valid vocab object and tokens are loaded;
+     *         false if vocab section is missing/invalid or no valid tokens found
+     */
+    bool loadVocabulary(nlohmann::json const& modelConfig, TokenToRanks& vocab);
 
+    /**
+     * @brief Load special tokens from tokenizer configuration
+     * @param tokenizerConfig JSON tokenizer configuration
+     * @param configFile JSON config file data
+     * @param specialTokens Output special tokens mapping
+     * @return true if special tokens are extracted and processed successfully;
+     *         false if extraction fails
+     */
+    bool loadSpecialTokens(nlohmann::json const& tokenizerConfig, TokenToRanks& specialTokens);
+
+    /**
+     * @brief Partition text into special tokens and raw text segments using forward_list
+     * @param text Input text to partition
+     * @param partitions Output forward_list of text partitions
+     * @return true if text is partitioned successfully without exceptions;
+     *         false if partitioning fails due to processing errors
+     */
+    bool partitionSpecialTokens(std::string const& text, std::forward_list<textPartition>& partitions) const;
+
+    /**
+     * @brief Add BOS token if configured
+     * @param tokens Token vector to modify
+     */
+    void appendBos(std::vector<Rank>& tokens) const noexcept;
+
+    /**
+     * @brief Add EOS token if configured
+     * @param tokens Token vector to modify
+     */
+    void appendEos(std::vector<Rank>& tokens) const noexcept;
+
+    // Core components
+    std::unique_ptr<PreTokenizer> mPreTokenizer;
+    std::unique_ptr<TokenEncoder> mTokenEncoder;
+
+    // Special token mappings for fast lookup
+    TokenToRanks mSpecialTokensEncoder;
+    std::unordered_map<Rank, std::string> mSpecialTokensDecoder;
+
+    // Configuration
     int mNumVocab;
-    std::unique_ptr<BPE> mBpe;
     Rank mBosId;
     Rank mEosId;
     Rank mPadId;
     Rank mUnkId;
-    std::string mRegexExpr;
+    Rank mImgContextId;
+
+    // State
+    bool mInitialized;
 };
 
 } // namespace tokenizer
