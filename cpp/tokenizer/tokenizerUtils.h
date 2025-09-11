@@ -44,6 +44,7 @@
 #include "common/logger.h"
 #include "tokenizer.h"
 #include <cassert>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <regex>
@@ -63,13 +64,22 @@ namespace tokenizer
 static std::regex const specialChars{R"([[\^$.|?*+(){}])"};
 
 // reverse map<token, id> to map<id, token>
-BPERanksToToken reverseEncoder(BPETokenToRanks const& encoder);
+RanksToToken reverseEncoder(TokenToRanks const& encoder);
 
 // decode hf format token str to normal utf-8
 std::string decodeHFTokenToNormal(std::string const& hfToken);
 
 // deal with regex expressions that c++ regex don't support
 std::string normalizeRegex(std::string const& expr);
+
+/**
+ * @brief Validate file size before reading
+ * @param filePath Path to the file to check
+ * @param maxSizeBytes Maximum allowed file size in bytes
+ * @return true if file exists, size can be determined, and is within limit;
+ *         false if file doesn't exist, size cannot be determined, or exceeds limit
+ */
+bool validateFileSize(std::filesystem::path const& filePath, size_t maxSizeBytes);
 
 /**
  * Unicode Utils

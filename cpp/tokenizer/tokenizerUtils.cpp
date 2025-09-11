@@ -50,9 +50,9 @@ namespace drivellm
 namespace tokenizer
 {
 
-BPERanksToToken reverseEncoder(BPETokenToRanks const& encoder)
+RanksToToken reverseEncoder(TokenToRanks const& encoder)
 {
-    BPERanksToToken decoder;
+    RanksToToken decoder;
     for (auto const& [key, value] : encoder)
     {
         decoder[value] = key;
@@ -184,6 +184,25 @@ std::string normalizeRegex(std::string const& expr)
     }
 
     return normalizedExpr;
+}
+
+bool validateFileSize(std::filesystem::path const& filePath, size_t maxSizeBytes)
+{
+    std::error_code ec;
+    auto fileSize = std::filesystem::file_size(filePath, ec);
+    if (ec)
+    {
+        LOG_ERROR("Failed to get file size for %s: %s", filePath.c_str(), ec.message().c_str());
+        return false;
+    }
+
+    if (fileSize > maxSizeBytes)
+    {
+        LOG_ERROR("File too large: %s (%zu bytes, max: %zu)", filePath.c_str(), fileSize, maxSizeBytes);
+        return false;
+    }
+
+    return true;
 }
 
 /**

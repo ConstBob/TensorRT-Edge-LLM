@@ -26,7 +26,7 @@ The `llm_build` binary is used to build TensorRT engines. All ONNX models have t
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME} \
 --engineDir=engines/${MODEL_NAME} \
---batchSize=1 \
+--maxBatchSize=1 \
 --maxInputLen=128 \
 --maxSeqLen=4096
 ```
@@ -40,7 +40,7 @@ For EAGLE speculative decoding, build separate engines for base and draft models
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME}_eagle3_base \
 --engineDir=engines/${MODEL_NAME}_eagle3_base \
---batchSize=1 \
+--maxBatchSize=1 \
 --maxInputLen=1024 \
 --maxSeqLen=4096 \
 --isEagleBase \
@@ -50,7 +50,7 @@ For EAGLE speculative decoding, build separate engines for base and draft models
 ./build/examples/llm/llm_build \
 --onnxDir=onnx_models/${MODEL_NAME}_eagle3_draft \
 --engineDir=engines/${MODEL_NAME}_eagle3_draft \
---batchSize=1 \
+--maxBatchSize=1 \
 --maxInputLen=1024 \
 --maxSeqLen=4096 \
 --isEagleDraft \
