@@ -44,7 +44,11 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
 
     // Create context and set optimization profile
     mContext = std::unique_ptr<nvinfer1::IExecutionContext>(mVisualEngine->createExecutionContext());
-    mContext->setOptimizationProfileAsync(0, stream);
+    if (!mContext->setOptimizationProfileAsync(0, stream))
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
 }
 
 std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir, cudaStream_t stream)

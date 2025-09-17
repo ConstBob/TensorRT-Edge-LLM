@@ -24,15 +24,21 @@ class BaseRuntimeTestConfig:
     max_input_len: int = 2048
     max_seq_len: int = 4096
     output_seq_len: int = 128
+    max_lora_rank: int = 0
     test_case_file: str = "llm_basic"
 
     def get_model_id(self) -> str:
-        """Generate a unique model identifier combining model name, precision, and sequence length."""
+        """Generate a unique model identifier combining model name, precision, and max sequence length."""
         return f"{self.model_name}-{self.precision}-{self.lm_head_precision}-{self.max_seq_len}"
+
+    def get_engine_id(self) -> str:
+        """Generate a unique engine identifier combining max input length, max batch size, and max LoRA rank."""
+        return f"mxil{self.max_input_len}-mxbs{self.max_batch_size}-mxlr{self.max_lora_rank}"
 
     def get_llm_engine_dir(self) -> str:
         """Get the directory path for LLM TensorRT engines."""
-        return os.path.join(self.engine_dir, self.get_model_id(), "llm")
+        return os.path.join(self.engine_dir, self.get_model_id(),
+                            "llm-" + self.get_engine_id())
 
     def get_llm_onnx_dir(self) -> str:
         """Get the directory path for LLM ONNX model files."""
@@ -46,6 +52,10 @@ class BaseRuntimeTestConfig:
         """Get the output JSON file name."""
         return os.path.join(self.engine_dir, self.get_model_id(),
                             self.param_str + ".json")
+
+    def get_lora_weights_dir(self) -> str:
+        """Get the directory path for LoRA weights."""
+        return os.path.join(self.get_llm_onnx_dir(), "lora_weights")
 
     @classmethod
     def parse_name_and_precision(cls,
@@ -96,6 +106,8 @@ class BaseRuntimeTestConfig:
                 self.max_seq_len = int(part[4:])
             elif part.startswith('osl'):
                 self.output_seq_len = int(part[3:])
+            elif part.startswith('mxlr'):
+                self.max_lora_rank = int(part[4:])
             else:
                 self.test_case_file = part
 

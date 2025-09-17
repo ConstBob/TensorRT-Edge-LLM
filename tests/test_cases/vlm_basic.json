@@ -8,12 +8,12 @@
     "messages": [
         {
             "user": "Please describe the image.",
-            "images": ["examples/multimodal/pics/demo.jpeg"],
+            "images": ["examples/multimodal/pics/woman_and_dog.jpeg"],
             "reference": "The image depicts a serene beach scene during what appears to be either sunrise or sunset, as indicated by the warm, golden light illuminating the sky and the horizon. A woman is sitting on the sand, wearing a plaid shirt and dark pants. She is interacting with a light-colored dog, possibly a Labrador Retriever, which is wearing a colorful harness. The dog is sitting on the sand, and the woman is extending her hand towards the dog, possibly giving it a high-five or a treat. The beach is relatively empty, with only a few footprints visible in the sand, and the ocean is calm with gentle waves."
         },
         {
             "user": "Please compare the following two images.",
-            "images": ["examples/multimodal/pics/image1.jpeg", "examples/multimodal/pics/image2.jpeg"],
+            "images": ["examples/multimodal/pics/red_panda.jpeg", "examples/multimodal/pics/giant_panda.jpeg"],
             "reference": "The two images depict different animals and settings:\n\n1. **First Image (Left):**  \n   - The animal is a red panda, characterized by its reddish-brown fur, white face, and black markings around the eyes and ears.  \n   - It is perched on a wooden structure, possibly in a zoo or a similar environment, with a naturalistic background of trees and branches.  \n   - The red panda appears to be looking directly at the camera.\n\n2. **Second Image (Right):**  \n   - The animal is a giant panda, known for its distinctive black-and-white fur pattern.  \n   - It"
         }
     ]

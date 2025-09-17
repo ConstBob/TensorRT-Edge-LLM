@@ -34,11 +34,19 @@ InternViTRunner::InternViTRunner(std::string const& engineDir, cudaStream_t stre
     : MultimodalRunner(engineDir, stream)
 {
     std::string configPath = engineDir + "/config.json";
-    validateAndFillConfig(configPath);
-    allocateBuffer();
+    if (!validateAndFillConfig(configPath))
+    {
+        LOG_ERROR("InternViTRunner::InternViTRunner(): Failed to validate and fill config");
+        throw std::runtime_error("InternViTRunner::InternViTRunner(): Failed to validate and fill config");
+    }
+    if (!allocateBuffer())
+    {
+        LOG_ERROR("InternViTRunner::InternViTRunner(): Failed to allocate buffer");
+        throw std::runtime_error("InternViTRunner::InternViTRunner(): Failed to allocate buffer");
+    }
 }
 
-void InternViTRunner::validateAndFillConfig(std::string const& configPath)
+bool InternViTRunner::validateAndFillConfig(std::string const& configPath)
 {
     Json jsonConfig;
 
@@ -46,7 +54,7 @@ void InternViTRunner::validateAndFillConfig(std::string const& configPath)
     if (!configFileStream.is_open())
     {
         LOG_ERROR("InternViTRunner::validateAndFillConfig(): Failed to open config file: %s", configPath.c_str());
-        throw std::runtime_error("InternViTRunner::validateAndFillConfig(): Failed to open config file: " + configPath);
+        return false;
     }
 
     try
@@ -57,14 +65,14 @@ void InternViTRunner::validateAndFillConfig(std::string const& configPath)
     catch (Json::parse_error const& e)
     {
         LOG_ERROR("InternViTRunner::validateAndFillConfig(): Failed to parse config file with error: %s", e.what());
-        throw std::runtime_error(
-            "InternViTRunner::validateAndFillConfig(): Failed to parse config file: " + configPath);
+        return false;
     }
 
     mModelType = jsonConfig["model_type"].get<std::string>();
     if (mModelType != "internvl")
     {
-        throw std::invalid_argument("InternViTRunner::validateAndFillConfig(): Invalid model type: " + mModelType);
+        LOG_ERROR("InternViTRunner::validateAndFillConfig(): Invalid model type: %s", mModelType.c_str());
+        return false;
     }
 
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
@@ -84,6 +92,8 @@ void InternViTRunner::validateAndFillConfig(std::string const& configPath)
     mConfig.maxNumBlocks = inputShapeMax.d[0];
     mConfig.minNumBlocks = inputShapeMin.d[0];
     mConfig.outHiddenSize = mVisualEngine->getTensorShape("output").d[1];
+
+    return true;
 }
 
 void* InternViTRunner::getConfig()
@@ -91,8 +101,9 @@ void* InternViTRunner::getConfig()
     return &mConfig;
 }
 
-void InternViTRunner::allocateBuffer()
+bool InternViTRunner::allocateBuffer()
 {
+    bool setTensorAddressStatus{true};
     LOG_INFO(
         "InternViTRunner::allocateBuffer() mConfig.maxNumBlocks: %d, mConfig.numChannels: %d, mConfig.blockImageSizeH: "
         "%d, mConfig.blockImageSizeW: %d",
@@ -100,13 +111,19 @@ void InternViTRunner::allocateBuffer()
     mVitInput
         = rt::Tensor({mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    mContext->setTensorAddress("input", mVitInput.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress("input", mVitInput.rawPointer());
     // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
     LOG_INFO("InternViTRunner::allocateBuffer() mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d",
         mConfig.maxNumBlocks * 256, mConfig.outHiddenSize);
     mOutputEmbedding = rt::Tensor(
         {mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    mContext->setTensorAddress("output", mOutputEmbedding.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress("output", mOutputEmbedding.rawPointer());
+    if (!setTensorAddressStatus)
+    {
+        LOG_ERROR("Failed to set tensor address to the engine");
+        return false;
+    }
+    return true;
 }
 
 std::vector<EngineInputDesc> InternViTRunner::getComputedEmbeddings()
@@ -512,8 +529,13 @@ bool InternViTRunner::infer(cudaStream_t stream)
         return false;
     }
 
-    mContext->enqueueV3(stream);
+    bool enqueueStatus = mContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!enqueueStatus)
+    {
+        LOG_ERROR("InternViTRunner::infer(): Failed to enqueue engine.");
+        return false;
+    }
     return true;
 }
 

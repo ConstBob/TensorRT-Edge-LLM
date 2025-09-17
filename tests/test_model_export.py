@@ -13,6 +13,12 @@ class ExportType(enum.Enum):
     VLM = "VLM"
 
 
+AVAILABLE_LORA_WEIGHTS = {
+    "Qwen2.5-0.5B-Instruct": "Jailbreak-Detector-2-XL",
+    "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-Diagrams2SQL-v2",
+}
+
+
 @dataclass
 class ExportConfig:
     """Config for model export tests"""
@@ -24,6 +30,7 @@ class ExportConfig:
     torch_dir: str = None
     onnx_dir: str = None
     max_seq_len: int = 4096
+    lora: bool = False
 
     @classmethod
     def from_test_string(cls, test_param: str, export_type: ExportType,
@@ -35,6 +42,7 @@ class ExportConfig:
         lm_head_precision = "fp16"
         visual_precision = "fp16"
         max_seq_len = None
+        lora = False
 
         for i, part in enumerate(parts):
             if part in VALID_LLM_PRECISIONS:
@@ -46,6 +54,8 @@ class ExportConfig:
                 visual_precision = part[3:]
             elif part.isdigit():
                 max_seq_len = int(part)
+            elif part == "lora":
+                lora = True
 
         if not llm_precision:
             raise ValueError(
@@ -73,7 +83,8 @@ class ExportConfig:
                    export_type=export_type,
                    max_seq_len=max_seq_len,
                    torch_dir=global_config['torch_dir'],
-                   onnx_dir=global_config['onnx_dir'])
+                   onnx_dir=global_config['onnx_dir'],
+                   lora=lora)
 
     def get_torch_model_dir(self) -> str:
         """Get torch model directory path"""
@@ -90,14 +101,14 @@ class ExportConfig:
     def get_onnx_model_dir(self) -> str:
         """Get output directory for ONNX model"""
         output_name = f"{self.model_name}-{self.llm_precision}-{self.lm_head_precision}-{self.max_seq_len}"
-        return os.path.join(self.onnx_dir, output_name)
+        return os.path.join(self.onnx_dir, "onnx", output_name)
 
     def get_quantized_model_dir(self) -> str:
         """Get quantized model directory path (if quantization is needed)"""
         if self.llm_precision == "fp16":
             return self.get_torch_model_dir()
         quantized_name = f"{self.model_name}-quantized-{self.llm_precision}-{self.lm_head_precision}-{self.max_seq_len}"
-        return os.path.join(self.get_onnx_model_dir(), quantized_name)
+        return os.path.join(self.onnx_dir, "quantized", quantized_name)
 
     def get_llm_onnx_model_dir(self) -> str:
         """Get LLM ONNX model directory path"""
@@ -179,6 +190,27 @@ def build_export_commands(config: ExportConfig) -> List[List[str]]:
                 f"--dataset_dir={config.get_mmmu_dataset_dir()}",
             ]
             commands.append(visual_fp8_cmd)
+    if config.lora:
+        lora_cmd = [
+            "tensorrt-edgellm-insert-lora",
+            f"--onnx_dir={config.get_llm_onnx_model_dir()}"
+        ]
+        commands.append(lora_cmd)
+        if config.model_name in AVAILABLE_LORA_WEIGHTS:
+            # TODO: This is hardcoded for now, we should use a more flexible way to get the lora weights path
+            lora_weights_dir = os.path.join(
+                "/scratch.edge_llm_cache", "lora_weights",
+                AVAILABLE_LORA_WEIGHTS[config.model_name])
+            process_lora_cmd = [
+                "tensorrt-edgellm-process-lora",
+                f"--input_dir={lora_weights_dir}",
+                f"--output_dir={os.path.join(config.get_llm_onnx_model_dir(), 'lora_weights')}"
+            ]
+            commands.append(process_lora_cmd)
+        else:
+            raise ValueError(
+                f"No LoRA weights available for {config.model_name}. Please add it to AVAILABLE_LORA_WEIGHTS"
+            )
 
     return commands
 
@@ -190,6 +222,12 @@ def validate_export_result(config: ExportConfig) -> None:
     llm_onnx = os.path.join(output_dir, "model.onnx")
     if not os.path.exists(llm_onnx):
         raise FileNotFoundError(f"LLM ONNX model not found: {llm_onnx}")
+
+    if config.lora:
+        lora_onnx = os.path.join(config.get_llm_onnx_model_dir(),
+                                 "lora_model.onnx")
+        if not os.path.exists(lora_onnx):
+            raise FileNotFoundError(f"LoRA ONNX model not found: {lora_onnx}")
 
     if config.export_type == ExportType.VLM:
         # Visual model should be in separate visual subdirectory

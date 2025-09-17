@@ -80,10 +80,10 @@ public:
         = 0;
 
     // Parse and fill config from config file and engine
-    virtual void validateAndFillConfig(std::string const& configPath) = 0;
+    virtual bool validateAndFillConfig(std::string const& configPath) = 0;
 
     // Allocate device buffer
-    virtual void allocateBuffer() = 0;
+    virtual bool allocateBuffer() = 0;
 
     virtual void* getConfig() = 0;
 

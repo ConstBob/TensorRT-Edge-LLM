@@ -17,38 +17,45 @@
 
 #include "llmInferenceRuntime.h"
 
+#include "common/hashUtils.h"
 #include "common/logger.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "sampler/sampling.h"
 #include <fstream>
+#include <functional>
 #include <nlohmann/json.hpp>
+#include <string>
 
 using namespace nvinfer1;
+
+namespace drivellm
+{
 
 namespace
 {
 
 // Left a utility function here in case we want to move to a better hashing method.
-size_t hashSystemPrompt(std::string const& systemPrompt)
+size_t hashSystemPromptWithLoraWeights(std::string const& systemPrompt, std::string const& loraWeightsName)
 {
-    return std::hash<std::string>{}(systemPrompt);
+    size_t hashValue = 0;
+    hash_utils::hashCombine(hashValue, systemPrompt);
+    hash_utils::hashCombine(hashValue, loraWeightsName);
+    return hashValue;
 }
 
 } // namespace
-namespace drivellm
-{
 namespace rt
 {
-LLMInferenceRuntime::LLMInferenceRuntime(
-    std::string const& engineDir, std::string const& multimodalEngineDir, cudaStream_t stream)
+LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
 
     try
     {
-        mLLMEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, stream);
+        mLLMEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
     }
     catch (std::exception const& e)
     {
@@ -132,7 +139,7 @@ bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
 }
 
 bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
-    std::vector<std::string> const& systemPrompts, cudaStream_t stream)
+    std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream)
 {
     std::vector<std::vector<int32_t>> processedInputIds;
     std::vector<int32_t> processedIdsLengths;
@@ -150,7 +157,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     // the pre-computed KVCache and remove the contents from inputIds.
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        auto promptHash = hashSystemPrompt(systemPrompts[i]);
+        auto promptHash = hashSystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
         if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
         {
             auto& precachedKVCache = mSystemPromptKVCache[promptHash];
@@ -212,6 +219,12 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
         activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     memcpy(mHostContextLengths.dataPointer<int32_t>(), processedIdsLengths.data(), activeBatchSize * sizeof(int32_t));
 
+    if (mEngineConfig.maxSupportedLoraRank > 0 && !mLLMEngineRunner->switchLoraWeights(loraWeightsName, stream))
+    {
+        LOG_ERROR("Failed to switch LoRA weights to %s", loraWeightsName.c_str());
+        return false;
+    }
+
     return true;
 }
 
@@ -220,6 +233,7 @@ bool LLMInferenceRuntime::handleRequest(
 {
     std::vector<std::vector<int32_t>> batchedInputIds;
     std::vector<std::string> batchSystemPrompts;
+    std::string loraWeightsName = request.loraWeightsName;
 
     if (!examineRequest(request))
     {
@@ -242,7 +256,7 @@ bool LLMInferenceRuntime::handleRequest(
             // TODO: apply chat template for system prompt
             batchSystemPrompts.emplace_back(std::move(request.prompts[i].systemPrompt));
         }
-        bool const saveCacheStatus = genAndSaveSystemPromptKVCache(batchSystemPrompts[i], stream);
+        bool const saveCacheStatus = genAndSaveSystemPromptKVCache(batchSystemPrompts[i], loraWeightsName, stream);
         if (!saveCacheStatus)
         {
             LOG_WARNING(
@@ -280,7 +294,7 @@ bool LLMInferenceRuntime::handleRequest(
 
     // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
     // preparation, reset the KVCache state, and apply reused prefix KVCache if available.
-    if (!setUpForPrefillExecution(batchedInputIds, batchSystemPrompts, stream))
+    if (!setUpForPrefillExecution(batchedInputIds, batchSystemPrompts, loraWeightsName, stream))
     {
         LOG_ERROR("LLMInferenceRuntime(): Prefill execution setup failed. This request cannot be handled.");
         return false;
@@ -336,7 +350,14 @@ bool LLMInferenceRuntime::handleRequest(
     // All other data input used by prefill step is already set up in setUpForPrefillExecution().
     rt::Tensor emptyTensor{};
     rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
-    mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
+    bool prefillStatus = mLLMEngineRunner->executePrefillStep(
+        mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
+    if (!prefillStatus)
+    {
+        LOG_ERROR(
+            "LLMInferenceRuntime(): Failed to execute prefill step. Cannot generate the KVCache for this prompt.");
+        return false;
+    }
     auto generatedToken = sampleTokens();
 
     mInputIds.reshape({activeBatchSize, 1});
@@ -344,7 +365,13 @@ bool LLMInferenceRuntime::handleRequest(
     {
         CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), generatedToken.data(), activeBatchSize * sizeof(int32_t),
             cudaMemcpyHostToDevice, stream));
-        mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, multimodalEmbeddings, mOutputLogits, stream);
+        bool decodingStatus
+            = mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, multimodalEmbeddings, mOutputLogits, stream);
+        if (!decodingStatus)
+        {
+            LOG_ERROR("LLMInferenceRuntime(): Failed to execute decoding step.");
+            return false;
+        }
         generatedToken = sampleTokens();
     }
 
@@ -363,7 +390,7 @@ bool LLMInferenceRuntime::handleRequest(
 bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
     int32_t const maxSupportedBatchSize = mEngineConfig.maxSupportedBatchSize;
-    int32_t const minSupportedBatchSize = mEngineConfig.enableDynamicShape ? 1 : maxSupportedBatchSize;
+    int32_t const minSupportedBatchSize = 1;
 
     bool captureStatus{true};
     // Capture the CUDA graph for all available batch sizes.
@@ -371,17 +398,35 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     {
         mInputIds.reshape({batchSize, 1});
         mOutputLogits.reshape({batchSize, mEngineConfig.vocabSize});
-        captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(mInputIds, mOutputLogits, stream);
+        captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
+            mInputIds, mOutputLogits, mEmptyLoraWeightsName, stream);
+        if (mEngineConfig.maxSupportedLoraRank > 0)
+        {
+            for (auto const& loraWeightsName : mLLMEngineRunner->getAvailableLoraWeights())
+            {
+                captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
+                    mInputIds, mOutputLogits, loraWeightsName, stream);
+            }
+        }
     }
 
     if (captureStatus)
     {
-        LOG_INFO("LLMInferenceRuntime(): Successfully captured the decoding CUDA graph for all execution batch sizes.");
+        LOG_INFO(
+            "LLMInferenceRuntime(): Successfully captured the decoding CUDA graph for all execution batch sizes and "
+            "LoRA weights.");
+    }
+    else
+    {
+        LOG_WARNING(
+            "LLMInferenceRuntime(): Failed to capture the decoding CUDA graph for some of execution batch sizes and "
+            "LoRA weights.");
     }
     return captureStatus;
 }
 
-bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(std::string const& prompt, cudaStream_t stream)
+bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
+    std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream)
 {
     // TODO: Enable the system prompt KVCache feature by default and remove this check.
     if (!mEngineConfig.enableReuseKVCache)
@@ -391,7 +436,7 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(std::string const& promp
     }
 
     // hash the prompt if check if the prompt cache already exists.
-    size_t const promptHash = hashSystemPrompt(prompt);
+    size_t const promptHash = hashSystemPromptWithLoraWeights(prompt, loraWeightsName);
     if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
     {
         LOG_INFO(
@@ -414,7 +459,7 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(std::string const& promp
 
     std::vector<std::vector<int32_t>> batchedInputIds(activeBatchSize, tokenizedPrompt);
     std::vector<std::string> batchedSystemPrompts(activeBatchSize, prompt);
-    if (!setUpForPrefillExecution(batchedInputIds, batchedSystemPrompts, stream))
+    if (!setUpForPrefillExecution(batchedInputIds, batchedSystemPrompts, loraWeightsName, stream))
     {
         LOG_ERROR(
             "LLMInferenceRuntime(): Prefill execution setup failed. Cannot generate the KVCache for this prompt.");
@@ -424,7 +469,13 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(std::string const& promp
     // Execute prefill step to initialize the KVCache data.
     rt::Tensor emptyTensor{};
     rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
-    mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
+    bool prefillStatus = mLLMEngineRunner->executePrefillStep(
+        mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
+    if (!prefillStatus)
+    {
+        LOG_ERROR("LLMInferenceRuntime(): Failed to execute prefill step.");
+        return false;
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Copy out the KVCache content from the prefill step.

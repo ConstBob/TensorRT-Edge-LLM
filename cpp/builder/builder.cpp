@@ -240,7 +240,17 @@ bool LLMBuilder::build()
     }
 
     // Parse ONNX model
-    std::string onnxFilePath = mOnnxDir.string() + "/model.onnx";
+    std::string onnxFilePath;
+    if (mBuilderConfig.maxLoraRank > 0)
+    {
+        onnxFilePath = mOnnxDir.string() + "/lora_model.onnx";
+        LOG_INFO("Parsing LoRA-enabled ONNX model. Please ensure %s exists.", onnxFilePath.c_str());
+    }
+    else
+    {
+        onnxFilePath = mOnnxDir.string() + "/model.onnx";
+        LOG_INFO("Parsing ONNX model. Please ensure %s exists.", onnxFilePath.c_str());
+    }
     if (!parser->parseFromFile(onnxFilePath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
     {
         LOG_ERROR("Failed to parse ONNX file: %s", onnxFilePath.c_str());
@@ -599,50 +609,71 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile* contextProfil
     nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network)
 {
     bool result = true;
-
-    // Add LoRA optimization profiles if maxLoraRank > 0
-    if (mBuilderConfig.maxLoraRank > 0)
+    if (mBuilderConfig.maxLoraRank == 0)
     {
-        for (int i = 0; i < network->getNbInputs(); ++i)
-        {
-            auto* input = network->getInput(i);
-            std::string inputName = input->getName();
+        LOG_WARNING(
+            "Your model has dynamic LoRA, but max LoRA rank is 0. This is equivalent to no LoRA. Please set "
+            "--maxLoraRank to a positive value if you want to use LoRA.");
+        return true;
+    }
 
-            if (inputName.find("lora_A") != std::string::npos)
+    bool findLoraWeights = false;
+
+    for (int i = 0; i < network->getNbInputs(); ++i)
+    {
+        auto* input = network->getInput(i);
+        std::string inputName = input->getName();
+
+        if (inputName.find("lora_A") != std::string::npos)
+        {
+            if (!findLoraWeights)
             {
-                // For lora_A, the shape is [gemm_k, lora_rank]
-                auto dims = input->getDimensions();
-                if (dims.nbDims == 2)
-                {
-                    int64_t gemm_k = dims.d[0];
-                    result &= setOptimizationProfile(contextProfile, inputName.c_str(),
-                        createDims({gemm_k, 0}),                              // min shape
-                        createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}), // opt shape
-                        createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
-                    result &= setOptimizationProfile(generationProfile, inputName.c_str(),
-                        createDims({gemm_k, 0}),                              // min shape
-                        createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}), // opt shape
-                        createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
-                }
+                findLoraWeights = true;
             }
-            else if (inputName.find("lora_B") != std::string::npos)
+            // For lora_A, the shape is [gemm_k, lora_rank]
+            auto dims = input->getDimensions();
+            if (dims.nbDims == 2)
             {
-                // For lora_B, the shape is [lora_rank, gemm_n]
-                auto dims = input->getDimensions();
-                if (dims.nbDims == 2)
-                {
-                    int64_t gemm_n = dims.d[1];
-                    result &= setOptimizationProfile(contextProfile, inputName.c_str(),
-                        createDims({0, gemm_n}),                              // min shape
-                        createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}), // opt shape
-                        createDims({mBuilderConfig.maxLoraRank, gemm_n}));    // max shape
-                    result &= setOptimizationProfile(generationProfile, inputName.c_str(),
-                        createDims({0, gemm_n}),                              // min shape
-                        createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}), // opt shape
-                        createDims({mBuilderConfig.maxLoraRank, gemm_n}));    // max shape
-                }
+                int64_t gemm_k = dims.d[0];
+                result
+                    &= setOptimizationProfile(contextProfile, inputName.c_str(), createDims({gemm_k, 0}), // min shape
+                        createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}),                             // opt shape
+                        createDims({gemm_k, mBuilderConfig.maxLoraRank}));                                // max shape
+                result &= setOptimizationProfile(generationProfile, inputName.c_str(),
+                    createDims({gemm_k, 0}),                              // min shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}), // opt shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
             }
         }
+        else if (inputName.find("lora_B") != std::string::npos)
+        {
+            if (!findLoraWeights)
+            {
+                findLoraWeights = true;
+            }
+            // For lora_B, the shape is [lora_rank, gemm_n]
+            auto dims = input->getDimensions();
+            if (dims.nbDims == 2)
+            {
+                int64_t gemm_n = dims.d[1];
+                result
+                    &= setOptimizationProfile(contextProfile, inputName.c_str(), createDims({0, gemm_n}), // min shape
+                        createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}),                             // opt shape
+                        createDims({mBuilderConfig.maxLoraRank, gemm_n}));                                // max shape
+                result &= setOptimizationProfile(generationProfile, inputName.c_str(),
+                    createDims({0, gemm_n}),                              // min shape
+                    createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}), // opt shape
+                    createDims({mBuilderConfig.maxLoraRank, gemm_n}));    // max shape
+            }
+        }
+    }
+
+    if (!findLoraWeights)
+    {
+        LOG_ERROR(
+            "Failed to find any LoRA weights inputs in the ONNX model. Have you inserted LoRA weights using "
+            "tensorrt-edgellm-insert-lora command?");
+        return false;
     }
 
     if (!result)

@@ -472,7 +472,7 @@ def export_model_to_onnx(model: nn.Module,
                 1: "seq_len"
             },
             **past_key_values_shapes, "rope_rotary_cos_sin": {
-                0: "batch_size",
+                0: "rope_batch_size",
                 1: "max_position_embeddings"
             },
             "context_lengths": {

@@ -59,11 +59,12 @@ def run_command(cmd: List[str],
 
 def check_file_exists(filepath: str,
                       remote_host: str = None,
-                      remote_password: str = None) -> bool:
+                      remote_password: str = None,
+                      remote_workspace: str = None) -> bool:
     """Simple file existence check"""
     if remote_host:
-        result = run_command(['test', '-f', filepath], remote_host, None, 300,
-                             remote_password)
+        result = run_command(['test', '-f', filepath], remote_host,
+                             remote_workspace, 300, remote_password)
         return result['success']
     else:
         return os.path.exists(filepath)
@@ -71,44 +72,26 @@ def check_file_exists(filepath: str,
 
 def get_file_content(filepath: str,
                      remote_host: str = None,
-                     remote_password: str = None) -> str:
+                     remote_password: str = None,
+                     remote_workspace: str = None) -> str:
     """Get file content with proper error handling"""
-    if remote_host:
-        # First check if file exists
-        if not check_file_exists(filepath, remote_host, remote_password):
-            raise FileNotFoundError(f"Remote file not found: {filepath}")
+    if not check_file_exists(filepath, remote_host, remote_password,
+                             remote_workspace):
+        raise FileNotFoundError(f"File not found: {filepath}")
 
-        result = run_command(['cat', filepath], remote_host, None, 300,
-                             remote_password)
-        if not result['success']:
-            raise RuntimeError(
-                f"Failed to read remote file {filepath}: {result.get('error', 'Unknown error')}"
-            )
+    result = run_command(['cat', filepath], remote_host, remote_workspace, 300,
+                         remote_password)
+    if not result['success']:
+        raise RuntimeError(
+            f"Failed to read file content from {filepath}: {result.get('error', 'Unknown error')}"
+        )
 
-        content = result['output']
-        if not content or not content.strip():
-            raise ValueError(
-                f"Remote file {filepath} is empty or contains only whitespace")
+    content = result['output']
+    if not content or not content.strip():
+        raise ValueError(
+            f"File {filepath} is empty or contains only whitespace")
 
-        return content
-    else:
-        # Local file handling
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Local file not found: {filepath}")
-
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            if not content or not content.strip():
-                raise ValueError(
-                    f"Local file {filepath} is empty or contains only whitespace"
-                )
-
-            return content
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to read local file {filepath}: {str(e)}")
+    return content
 
 
 @contextmanager
@@ -171,18 +154,26 @@ class UnifiedTaskExecutor:
         self.create_engine_dirs()
 
         if self.config.type == "vlm":  # VLM
-            llm_cmd = build_command('vlm_llm_build', self.config,
-                                    self.executable_files)
-            llm_result = self.run_cmd(llm_cmd,
-                                      get_command_timeout('vlm_llm_build'))
-
-            if not llm_result['success']:
-                return {
-                    'success': False,
-                    'error':
-                    f"LLM engine build failed: {llm_result.get('error', 'Unknown error')}",
-                    'test_type': PipelineTestType.BUILD.value
-                }
+            # Skip LLM engine build for VLM models if it already exists
+            llm_result = {'success': True, 'output': '', 'error': None}
+            if check_file_exists(
+                    os.path.join(self.config.get_llm_engine_dir(),
+                                 "llm.engine"), self.remote_host,
+                    self.remote_password, self.remote_workspace):
+                print(f"LLM engine already exists. Skipping LLM engine build")
+            else:
+                llm_cmd = build_command('vlm_llm_build', self.config,
+                                        self.executable_files)
+                llm_result = self.run_cmd(llm_cmd,
+                                          get_command_timeout('vlm_llm_build'))
+                if not llm_result['success']:
+                    return {
+                        'success': False,
+                        'error':
+                        f"LLM engine build failed: {llm_result.get('error', 'Unknown error')}",
+                        'output': llm_result['output'],
+                        'test_type': PipelineTestType.BUILD.value
+                    }
 
             visual_cmd = build_command('vlm_visual_build', self.config,
                                        self.executable_files)
@@ -191,10 +182,12 @@ class UnifiedTaskExecutor:
 
             return {
                 'success':
-                visual_result['success'],
+                visual_result['success'] and llm_result['success'],
                 'error':
                 f"Visual engine build failed: {visual_result.get('error', 'Unknown error')}"
                 if not visual_result['success'] else None,
+                'output':
+                f"Visual engine build output:{visual_result['output']}. LLM engine build output:{llm_result['output']}",
                 'test_type':
                 PipelineTestType.BUILD.value
             }
@@ -225,14 +218,37 @@ class UnifiedTaskExecutor:
         """Execute inference test - adapts to config type"""
         cmd_key = 'vlm_llm_inference' if self.config.type == "vlm" else 'llm_inference'
         cmd = build_command(cmd_key, self.config, self.executable_files)
+        if self.config.max_lora_rank > 0:
+            # Edit the test case file to replace $LORA_WEIGHTS_DIR with the lora weights directory
+            test_case_file = self.config.get_test_case_file()
+            result = self.run_cmd([
+                'sed', '-i',
+                f's|$LORA_WEIGHTS_DIR|{self.config.get_lora_weights_dir()}|g',
+                test_case_file
+            ], 300)
+            if not result['success']:
+                return result
+
         result = self.run_cmd(cmd, get_command_timeout(cmd_key))
+        if not result['success']:
+            return result
+
         result['test_type'] = PipelineTestType.INFERENCE.value
-        rouge_score = check_rouge_score(
-            get_file_content(self.config.get_output_json_file(),
-                             self.remote_host, self.remote_password),
-            # The test case file is not hosted on the remote server, so we pass None for the remote host and password
-            get_file_content(self.config.get_test_case_file(), None, None))
-        result['rouge_score'] = rouge_score
+        try:
+            rouge_score = check_rouge_score(
+                get_file_content(self.config.get_output_json_file(),
+                                 self.remote_host, self.remote_password,
+                                 self.remote_workspace),
+                # The test case file is not hosted on the remote server, so we pass None for the remote host and password
+                get_file_content(self.config.get_test_case_file(),
+                                 self.remote_host, self.remote_password,
+                                 self.remote_workspace))
+            result['rouge_score'] = rouge_score
+        except Exception as e:
+            result[
+                'error'] = f"Failed to calculate rouge score: {str(e)}. Original error: {result['error']}"
+            result['success'] = False
+
         return result
 
     def create_engine_dirs(self):

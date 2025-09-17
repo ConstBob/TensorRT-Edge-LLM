@@ -35,11 +35,19 @@ QwenViTRunner::QwenViTRunner(std::string const& engineDir, cudaStream_t stream)
     : MultimodalRunner(engineDir, stream)
 {
     std::string configPath = engineDir + "/config.json";
-    validateAndFillConfig(configPath);
-    allocateBuffer();
+    if (!validateAndFillConfig(configPath))
+    {
+        LOG_ERROR("QwenViTRunner::QwenViTRunner(): Failed to validate and fill config");
+        throw std::runtime_error("QwenViTRunner::QwenViTRunner(): Failed to validate and fill config");
+    }
+    if (!allocateBuffer())
+    {
+        LOG_ERROR("QwenViTRunner::QwenViTRunner(): Failed to allocate buffer");
+        throw std::runtime_error("QwenViTRunner::QwenViTRunner(): Failed to allocate buffer");
+    }
 }
 
-void QwenViTRunner::validateAndFillConfig(std::string const& configPath)
+bool QwenViTRunner::validateAndFillConfig(std::string const& configPath)
 {
     Json jsonConfig;
 
@@ -47,7 +55,7 @@ void QwenViTRunner::validateAndFillConfig(std::string const& configPath)
     if (!configFileStream.is_open())
     {
         LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Failed to open config file: %s", configPath.c_str());
-        throw std::runtime_error("QwenViTRunner::validateAndFillConfig(): Failed to open config file: " + configPath);
+        return false;
     }
 
     try
@@ -58,13 +66,14 @@ void QwenViTRunner::validateAndFillConfig(std::string const& configPath)
     catch (Json::parse_error const& e)
     {
         LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Failed to parse config file with error: %s", e.what());
-        throw std::runtime_error("QwenViTRunner::validateAndFillConfig(): Failed to parse config file: " + configPath);
+        return false;
     }
 
     mModelType = jsonConfig["model_type"].get<std::string>();
     if (mModelType != "qwen2_5_vl" && mModelType != "qwen2_vl")
     {
-        throw std::invalid_argument("QwenViTRunner::validateAndFillConfig(): Invalid model type: " + mModelType);
+        LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Invalid model type: %s", mModelType.c_str());
+        return false;
     }
 
     mConfig.vocabSize = jsonConfig["vocab_size"].get<int32_t>();
@@ -91,6 +100,8 @@ void QwenViTRunner::validateAndFillConfig(std::string const& configPath)
     mConfig.inputDim = mContext->getTensorShape("input").d[1];
     mConfig.vitPosEmbDim = mContext->getTensorShape("rotary_pos_emb").d[1];
     mConfig.outHiddenSize = mVisualEngine->getTensorShape("output").d[1];
+
+    return true;
 }
 
 void* QwenViTRunner::getConfig()
@@ -98,34 +109,42 @@ void* QwenViTRunner::getConfig()
     return &mConfig;
 }
 
-void QwenViTRunner::allocateBuffer()
+bool QwenViTRunner::allocateBuffer()
 {
+    bool setTensorAddressStatus{true};
     mVitInput = rt::Tensor({mConfig.maxHW, mConfig.inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    mContext->setTensorAddress("input", mVitInput.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress("input", mVitInput.rawPointer());
 
     mAttentionMask = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    mContext->setTensorAddress("attention_mask", mAttentionMask.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress("attention_mask", mAttentionMask.rawPointer());
 
     mRotaryPosEmb = rt::Tensor({mConfig.maxHW, mConfig.vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    mContext->setTensorAddress("rotary_pos_emb", mRotaryPosEmb.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress("rotary_pos_emb", mRotaryPosEmb.rawPointer());
 
     // In Qwen2-VL, VIT input mHW is always 4*numImageTokens because it equals to spatial_merge_size ** 2.
     mOutputEmbedding
         = rt::Tensor({mConfig.maxHW / 4, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    mContext->setTensorAddress("output", mOutputEmbedding.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress("output", mOutputEmbedding.rawPointer());
 
     if (mModelType == "qwen2_5_vl")
     {
         mWindowAttentionMask
             = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-        mContext->setTensorAddress("window_attention_mask", mWindowAttentionMask.rawPointer());
+        setTensorAddressStatus
+            &= mContext->setTensorAddress("window_attention_mask", mWindowAttentionMask.rawPointer());
 
         mWindowIndex = rt::Tensor({mConfig.maxHW / 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-        mContext->setTensorAddress("window_index", mWindowIndex.rawPointer());
+        setTensorAddressStatus &= mContext->setTensorAddress("window_index", mWindowIndex.rawPointer());
 
         mReverseWindowIndex = rt::Tensor({mConfig.maxHW / 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-        mContext->setTensorAddress("reverse_window_index", mReverseWindowIndex.rawPointer());
+        setTensorAddressStatus &= mContext->setTensorAddress("reverse_window_index", mReverseWindowIndex.rawPointer());
     }
+    if (!setTensorAddressStatus)
+    {
+        LOG_ERROR("Failed to set tensor address to the engine");
+        return false;
+    }
+    return true;
 }
 
 std::vector<EngineInputDesc> QwenViTRunner::getComputedEmbeddings()
@@ -903,12 +922,17 @@ bool QwenViTRunner::infer(cudaStream_t stream)
 
     if (!setEngineIOStatus)
     {
-        LOG_ERROR("InternViTRunner::infer(): Failed to bind engine input tensors.");
+        LOG_ERROR("QwenViTRunner::infer(): Failed to bind engine input tensors.");
         return false;
     }
 
-    mContext->enqueueV3(stream);
+    bool enqueueStatus = mContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!enqueueStatus)
+    {
+        LOG_ERROR("QwenViTRunner::infer(): Failed to enqueue engine.");
+        return false;
+    }
     return true;
 }
 

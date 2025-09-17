@@ -30,9 +30,10 @@ namespace drivellm
 {
 namespace rt
 {
+using Json = nlohmann::json;
+
 struct LLMEngineRunnerConfig
 {
-    bool enableDynamicShape{false};
     bool enableReuseKVCache{false};
     bool useContextDependentRope{false};
     int32_t numDecoderLayers{};
@@ -44,6 +45,7 @@ struct LLMEngineRunnerConfig
     int32_t maxSupportedInputLength{};
     int32_t maxSequenceLength{};
     int32_t vocabSize{};
+    int32_t maxSupportedLoraRank{};
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -58,8 +60,8 @@ struct LLMEngineRunnerConfig
 class LLMEngineRunner
 {
 public:
-    LLMEngineRunner(
-        std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream);
+    LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
     ~LLMEngineRunner();
 
@@ -104,10 +106,30 @@ public:
     //! Inputs:
     //!     inputIds [GPU]: The input token_ids for the batch of new requests.
     //!     outputLogits [GPU]: The output logits for the batch of requests.
+    //!     loraWeightsName: The name to the LoRA weights. Empty string if no LoRA weights.
     //!     stream: The CUDA stream to execute the decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
-    bool captureVanillaDecodingCudaGraph(rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream);
+    bool captureVanillaDecodingCudaGraph(
+        rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsName, cudaStream_t stream);
+
+    //! API entry to switch the LoRA weights of the LLM engine.
+    //! Inputs:
+    //!     loraWeightsName: The name of the LoRA weights.
+    //!     stream: The CUDA stream to execute the switch step.
+    //! Returns:
+    //!     True if the LoRA weights switch is successful, false otherwise.
+    bool switchLoraWeights(std::string const& loraWeightsName, cudaStream_t stream);
+
+    //! API entry to get the active LoRA weights name.
+    //! Returns:
+    //!     The active LoRA weights name.
+    std::string getActiveLoraWeightsName() const;
+
+    //! API entry to get the LoRA weights.
+    //! Returns:
+    //!     The LoRA weights names.
+    std::vector<std::string> getAvailableLoraWeights() const;
 
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
@@ -115,8 +137,12 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext;
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
-    //! which denote the input/output shapes and other execution properties.
+    //! which denote the input/output shapes and other execution properties like LoRA weights.
     std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
+
+    //! Holds the LoRA weights for the LLM engine.
+    std::unordered_map<std::string, std::vector<rt::Tensor>> mLoraWeights{};
+    std::string mActiveLoraWeightsName{};
 
     LLMEngineRunnerConfig mConfig{};
 
@@ -138,7 +164,15 @@ private:
     //! The LinearKVCache tensor that carried for the LLM model execution.
     rt::LinearKVCache mKVCache{};
 
-    void initializeConfigFromEngine();
+    //! The dummy LoRA weights tensor is used to bind the LoRA weights to the LLM engine. TensorRT does not support
+    //! nullptr for binding, even when the LoRA rank is 0.
+    rt::Tensor mDummyLoraWeightsTensor{};
+
+    //! Initialize the configuration from the JSON file.
+    bool initializeConfigFromJson(Json const& configJson);
+
+    //! Validate the configuration from the engine.
+    bool validateConfigFromEngine();
 
     //! The Function is used to bind the KVCache to the LLM engine for a new set of requests.
     bool bindKVCacheToEngine(int32_t activeBatchSize);
@@ -147,6 +181,19 @@ private:
         rt::Tensor const& inputIds, rt::Tensor const& contextLengths, rt::Tensor const& outputLogits);
 
     bool vanlliaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
+
+    //! The Function is used to add a LoRA weights to the LLM engine.
+    bool addLoraWeights(std::string const& loraWeightsName, std::string const& loraWeightsPath, cudaStream_t stream);
+
+    //! The Function is used to reset the LoRA weights of the LLM engine to dummy tensors with rank 0.
+    bool resetLoraWeights(cudaStream_t stream);
+
+    //! The Function is used to get the tensor names of the LoRA weights of the LLM engine.
+    //! Returns:
+    //!     The tensor names of the LoRA weights.
+    std::vector<std::string> getLoraWeightsTensorNames() const;
+
+    bool isLoraWeightsSupported() const;
 };
 
 } // namespace rt

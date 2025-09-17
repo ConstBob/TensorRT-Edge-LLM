@@ -22,11 +22,19 @@ The JSON file must contain the following top-level structure:
         {
             "user": "<string>",
             "system": "<string>",  // optional
-            "images": ["<path1>", "<path2>", ...]  // optional
+            "images": ["<path1>", "<path2>", ...],  // optional
+            "lora_weights": "<string>" // optional. Only needed for LoRA engines.
         }
     ]
 }
 ```
+
+## LoRA (Low-Rank Adaptation) Support
+
+LoRA enables fine-tuned model inference using adapter weights. Requirements:
+- TensorRT engine built with LoRA support
+- LoRA weights in `.safetensors` format
+- Different LoRA weights within the same batch is not supported. LoRA weights within the same batch should be the same.
 
 ## Global Parameters
 
@@ -55,6 +63,7 @@ Each message in the `messages` array can contain:
 
 - **`system`** (string): System prompt specific to this message. If not provided, uses `default_system_prompt`
 - **`images`** (array of strings): List of image file paths for multimodal inputs
+- **`lora_weights`** (string): Path to LoRA (Low-Rank Adaptation) weights file for fine-tuned model inference. Only used with LoRA-enabled engines
 
 ## Examples
 
@@ -93,18 +102,45 @@ Each message in the `messages` array can contain:
         {
             "user": "Describe this image.",
             "images": [
-                "examples/multimodal/pics/demo.jpeg"
+                "image.jpeg"
             ]
         },
         {
             "user": "Identify the similarities between these images.",
             "images": [
-                "examples/multimodal/pics/image1.jpeg",
-                "examples/multimodal/pics/image2.jpeg"
+                "image1.jpeg",
+                "image2.jpeg"
             ]
         },
         {
             "user": "Give me a short introduction to large language model."
+        }
+    ]
+}
+```
+
+### LoRA Input
+
+```json
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 0.8,
+    "top_k": 50,
+    "max_generate_length": 256,
+    "default_system_prompt": "You are a helpful assistant.",
+    "messages": [
+        {
+            "user": "Your prompt here",
+            "lora_weights": "/path/to/lora_weights.safetensors"
+        },
+        {
+            "user": "Another prompt with images",
+            "images": [
+                "image1.jpg", 
+                "image2.jpg"
+            ],
+            "lora_weights": "/path/to/another_adapter.safetensors" // This will error out if batch_size = 2.
         }
     ]
 }
@@ -115,10 +151,12 @@ Each message in the `messages` array can contain:
 1. **Batching**: Messages are processed in batches according to the `batch_size` parameter
 2. **System Prompts**: Each message can have its own system prompt, or it will use the default
 3. **Image Loading**: Images are loaded from the specified file paths during processing
-4. **Error Handling**: The tool will throw errors if:
+4. **LoRA Weights**: When specified, LoRA adapter weights are loaded and applied per batch for fine-tuned inference
+5. **Error Handling**: The tool will throw errors if:
    - The JSON file cannot be parsed
    - A message is missing the required `user` field
    - The `messages` field is not an array
+   - LoRA weights are not the same for different prompts inside the same expected batch
 
 ## Notes
 

@@ -21,6 +21,7 @@ COMMANDS = {
             '--maxInputLen={max_input_len}', '--maxSeqLen={max_seq_len}',
             '--maxBatchSize={max_batch_size}'
         ],
+        'lora_args': ['--maxLoraRank={max_lora_rank}']
     },
     'llm_chat': {
         'executable':
@@ -66,6 +67,7 @@ COMMANDS = {
             '--minImageTokens={min_image_tokens}',
             '--maxImageTokens={max_image_tokens}'
         ],
+        'lora_args': ['--maxLoraRank={max_lora_rank}']
     },
     'vlm_visual_build': {
         'executable':
@@ -130,7 +132,8 @@ def _get_command_vars(config: BaseRuntimeTestConfig) -> Dict[str, str]:
         'max_input_len': str(config.max_input_len),
         'max_seq_len': str(config.max_seq_len),
         'output_seq_len': str(config.output_seq_len),
-        'total_length': str(config.output_seq_len + config.max_input_len)
+        'total_length': str(config.output_seq_len + config.max_input_len),
+        'max_lora_rank': str(config.max_lora_rank)
     }
 
     # Add VLM paths if available
@@ -163,6 +166,10 @@ def build_command(command_key: str, config: BaseRuntimeTestConfig,
 
     for arg in cmd_config['base_args']:
         cmd.append(arg.format(**vars_dict))
+
+    if config.max_lora_rank > 0 and 'lora_args' in cmd_config:
+        for arg in cmd_config['lora_args']:
+            cmd.append(arg.format(**vars_dict))
 
     return cmd
 
