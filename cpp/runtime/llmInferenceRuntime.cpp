@@ -128,16 +128,6 @@ bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
         return false;
     }
 
-    if (mMultimodalRunner)
-    {
-        int32_t const imageBuffersBatchSize = static_cast<int32_t>(request.imageBuffers.size());
-        if (activeBatchSize != imageBuffersBatchSize)
-        {
-            LOG_ERROR("LLMInferenceRuntime(): The batch size of prompts and image buffers is not the same.");
-            return false;
-        }
-    }
-
     return true;
 }
 

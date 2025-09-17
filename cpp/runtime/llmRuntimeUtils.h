@@ -37,9 +37,9 @@ struct LLMGenerationRequest
     {
         std::string systemPrompt;
         std::string userPrompt;
+        std::vector<rt::imageUtils::ImageData> imageBuffers;
     };
     std::vector<Prompt> prompts;
-    std::vector<std::vector<rt::imageUtils::ImageData>> imageBuffers;
     float temperature;
     float topP;
     int64_t topK;

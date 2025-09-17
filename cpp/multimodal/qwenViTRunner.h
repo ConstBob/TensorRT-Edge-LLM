@@ -89,7 +89,7 @@ public:
 private:
     // TODO: Clean Old API
     void textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths,
-        std::vector<std::string> const& inputStrings, std::vector<int64_t> const& numImagePerBatch,
+        std::vector<std::string> const& inputStrings, std::vector<int64_t> const& numImages,
         std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer);
 
     // TODO: Clean Old API
@@ -97,7 +97,7 @@ private:
         std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true);
 
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
-        std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths,
+        std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         drivellm::tokenizer::Tokenizer* tokenizer);
 
     std::string applyChatTemplateSystem(std::string const& systemPrompt);
@@ -129,9 +129,13 @@ private:
         std::vector<std::vector<int64_t>> const& imageGridTHWs, rt::Tensor& ropeRotaryCosSinDevice,
         cudaStream_t stream);
 
+    // TODO: Clean Old API
     void imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
         std::vector<std::vector<int64_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths,
-        std::vector<int64_t>& numImagePerBatch, bool doResize, cudaStream_t stream);
+        std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
+
+    void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int64_t>>& imageGridTHWs,
+        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 
     QwenViTConfig mConfig{};
     rt::Tensor mVitInput{};

@@ -121,7 +121,7 @@ std::vector<EngineInputDesc> InternViTRunner::getComputedEmbeddings()
 }
 
 void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<half>& patches,
-    std::vector<int64_t>& imageTokenLengths, int64_t& numImagePerBatch, int64_t& totalNumBlocks)
+    std::vector<int64_t>& imageTokenLengths, int64_t& numImages, int64_t& totalNumBlocks)
 {
     int height = image.height;
     int width = image.width;
@@ -140,7 +140,7 @@ void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     else
     {
         imageTokenLengths.push_back(curTokenLength);
-        ++numImagePerBatch;
+        ++numImages;
     }
 
     std::vector<half> curPatch(height * width * channels);
@@ -230,7 +230,7 @@ std::tuple<int, int> InternViTRunner::getResizedImageSize(int const height, int 
 }
 
 void InternViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImagePerBatch, bool doResize, cudaStream_t stream)
+    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
 {
     std::vector<half> patches;
     int64_t totalNumBlocks = 0;
@@ -256,7 +256,56 @@ void InternViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::Im
                 formatPatch(image, patches, imageTokenLengths, numImage, totalNumBlocks);
             }
         }
-        numImagePerBatch.emplace_back(numImage);
+        numImages.emplace_back(numImage);
+    }
+
+    if (totalNumBlocks < mConfig.minNumBlocks || totalNumBlocks > mConfig.maxNumBlocks)
+    {
+        throw std::runtime_error("totalNumBlocks " + std::to_string(totalNumBlocks)
+            + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
+            + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        mVitInput.rawPointer(), patches.data(), patches.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
+    mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
+}
+
+void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
+    std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
+{
+    std::vector<half> patches;
+    int64_t totalNumBlocks = 0;
+
+    for (auto const& prompt : request.prompts)
+    {
+        int64_t numImage = 0;
+        for (auto const& image : prompt.imageBuffers)
+        {
+            if (doResize)
+            {
+                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width,
+                    mConfig.blockImageSizeH, mConfig.blockImageSizeW, mConfig.minImageTiles, mConfig.maxImageTiles);
+                auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
+                formatPatch(resizedImage, patches, imageTokenLengths, numImage, totalNumBlocks);
+
+                auto thumbnailImage
+                    = rt::imageUtils::resizeImage(image, mConfig.blockImageSizeW, mConfig.blockImageSizeH, true);
+                formatPatch(thumbnailImage, patches, imageTokenLengths, numImage, totalNumBlocks);
+            }
+            else
+            {
+                formatPatch(image, patches, imageTokenLengths, numImage, totalNumBlocks);
+            }
+        }
+        numImages.emplace_back(numImage);
+    }
+
+    if (totalNumBlocks == 0)
+    {
+        mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
+        return;
     }
 
     if (totalNumBlocks < mConfig.minNumBlocks || totalNumBlocks > mConfig.maxNumBlocks)
@@ -307,7 +356,7 @@ std::string InternViTRunner::applyChatTemplate(std::string const& inputString, i
 
 void InternViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds,
     std::vector<int32_t>& batchInputLengths, std::vector<std::string> const& inputStrings,
-    std::vector<int64_t> const& numImagePerBatch, std::vector<int64_t> const& imageTokenLengths,
+    std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
     drivellm::tokenizer::Tokenizer* tokenizer)
 {
     int totalImageIdx = 0;
@@ -315,7 +364,7 @@ void InternViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInp
 
     for (size_t i = 0; i < inputStrings.size(); ++i)
     {
-        std::string prompt = applyChatTemplate(inputStrings[i], numImagePerBatch[i], imageTokenLengths, totalImageIdx);
+        std::string prompt = applyChatTemplate(inputStrings[i], numImages[i], imageTokenLengths, totalImageIdx);
         std::vector<int32_t> ids = tokenizer->encode(prompt);
 
         // replace vis tokens
@@ -339,12 +388,12 @@ void InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
     int const maxPositionEmbeddings [[maybe_unused]], int const rotaryDim [[maybe_unused]], cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;
-    std::vector<int64_t> numImagePerBatch;
-    imagePreprocess(imageBuffers, imageTokenLengths, numImagePerBatch, false, stream);
+    std::vector<int64_t> numImages;
+    imagePreprocess(imageBuffers, imageTokenLengths, numImages, false, stream);
 
     std::vector<std::vector<int32_t>> batchInputIds;
     std::vector<int32_t> batchInputLengths;
-    textPreprocess(batchInputIds, batchInputLengths, inputStrings, numImagePerBatch, imageTokenLengths, tokenizer);
+    textPreprocess(batchInputIds, batchInputLengths, inputStrings, numImages, imageTokenLengths, tokenizer);
 
     flattenBatch(inputIds, contextLengths, batchInputIds, batchInputLengths, tokenizer->getPadId(),
         maxSupportedInputLength, enableDynamicShape);
@@ -374,13 +423,13 @@ std::string InternViTRunner::applyChatTemplateUser(
 }
 
 void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
-    std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImagePerBatch,
+    std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImages,
     std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer)
 {
-    if (numImagePerBatch.size() != request.prompts.size())
+    if (numImages.size() != request.prompts.size())
     {
-        std::string errorMsg = "InternViTRunner::textPreprocess() numImagePerBatch.size() != request.prompts.size(), "
-            + std::to_string(numImagePerBatch.size()) + " != " + std::to_string(request.prompts.size());
+        std::string errorMsg = "InternViTRunner::textPreprocess() numImages.size() != request.prompts.size(), "
+            + std::to_string(numImages.size()) + " != " + std::to_string(request.prompts.size());
         LOG_ERROR("%s", errorMsg.c_str());
         throw std::runtime_error(errorMsg);
     }
@@ -393,7 +442,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     {
         // Direct concate to avoid extra copy
         std::string prompt = applyChatTemplateSystem(request.prompts[i].systemPrompt)
-            + applyChatTemplateUser(request.prompts[i].userPrompt, numImagePerBatch[i], true);
+            + applyChatTemplateUser(request.prompts[i].userPrompt, numImages[i], true);
         std::vector<int32_t> ids = tokenizer->encode(prompt);
 
         // replace vis tokens
@@ -424,12 +473,12 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;
-    std::vector<int64_t> numImagePerBatch;
+    std::vector<int64_t> numImages;
 
     try
     {
-        imagePreprocess(request.imageBuffers, imageTokenLengths, numImagePerBatch, true, stream);
-        textPreprocess(request, batchedInputIds, numImagePerBatch, imageTokenLengths, tokenizer);
+        imagePreprocess(request, imageTokenLengths, numImages, true, stream);
+        textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
     }
     catch (std::exception const& e)
     {
@@ -448,6 +497,13 @@ std::string InternViTRunner::preprocessSystemPrompt(std::string const& systemPro
 
 bool InternViTRunner::infer(cudaStream_t stream)
 {
+    // Skip VIT inference if there are no images to process
+    // Check if the first dimension (sequence length) is 0, indicating no images
+    if (mVitInput.getShape()[0] == 0)
+    {
+        return true;
+    }
+
     bool setEngineIOStatus{true};
     setEngineIOStatus &= mContext->setInputShape("input", mVitInput.getShape().getTRTDims());
     if (!setEngineIOStatus)

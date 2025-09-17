@@ -79,28 +79,7 @@ Each message in the `messages` array can contain:
 }
 ```
 
-### Multimodal Input (Single Image)
-
-```json
-{
-    "batch_size": 1,
-    "temperature": 1.0,
-    "top_p": 0.8,
-    "top_k": 50,
-    "max_generate_length": 256,
-    "default_system_prompt": "You are a helpful assistant.",
-    "messages": [
-        {
-            "user": "Describe this image.",
-            "images": [
-                "examples/multimodal/pics/demo.jpeg"
-            ]
-        }
-    ]
-}
-```
-
-### Multimodal Input (Multiple Images)
+### Multimodal Input
 
 ```json
 {
@@ -123,6 +102,9 @@ Each message in the `messages` array can contain:
                 "examples/multimodal/pics/image1.jpeg",
                 "examples/multimodal/pics/image2.jpeg"
             ]
+        },
+        {
+            "user": "Give me a short introduction to large language model."
         }
     ]
 }
