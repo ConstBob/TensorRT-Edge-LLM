@@ -169,7 +169,6 @@ std::vector<rt::LLMGenerationRequest> parseInputFile(std::filesystem::path const
                 rt::LLMGenerationRequest::Prompt prompt;
                 prompt.systemPrompt = systemPrompt;
                 prompt.userPrompt = userPrompt;
-                request.prompts.push_back(prompt);
 
                 // Parse images if present
                 if (message.contains("images") && message["images"].is_array())
@@ -184,9 +183,10 @@ std::vector<rt::LLMGenerationRequest> parseInputFile(std::filesystem::path const
 
                     if (!imageBuffer.empty())
                     {
-                        request.imageBuffers.push_back(imageBuffer);
+                        prompt.imageBuffers = imageBuffer;
                     }
                 }
+                request.prompts.push_back(prompt);
             }
 
             requests.push_back(request);

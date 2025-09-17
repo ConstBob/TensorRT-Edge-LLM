@@ -957,7 +957,7 @@ bool VisualBuilder::setupQwenViTProfile(
     // In Qwen2-VL, HW is always 4ximageTokens because it equals to spatial_merge_size ** 2.
     int64_t minHW = mBuilderConfig.minImageTokens * 4;
     int64_t maxHW = mBuilderConfig.maxImageTokens * 4;
-    int64_t optHW = (minHW + maxHW) / 2;
+    int64_t optHW = (mBuilderConfig.minImageTokens + mBuilderConfig.maxImageTokens) / 2 * 4;
 
     // Infer dimensions from the network
     int64_t inputDim = 0;
