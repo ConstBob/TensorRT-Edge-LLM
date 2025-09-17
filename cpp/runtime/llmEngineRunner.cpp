@@ -18,19 +18,19 @@
 #include "runtime/llmEngineRunner.h"
 
 #include "common/checkMacros.h"
+#include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
+#include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <fstream>
-#include <functional>
 #include <sstream>
 #include <string>
 
 using namespace drivellm;
 using namespace nvinfer1;
-using Json = nlohmann::json;
 
 namespace
 {
@@ -39,28 +39,20 @@ std::string formatEngineConfig(drivellm::rt::LLMEngineRunnerConfig const& config
     std::stringstream ss;
 
     ss << std::boolalpha;
-    ss << "LLMEngineRunnerConfig:"
-       << "  enableDynamicShape: " << config.enableDynamicShape << "  enableReuseKVCache: " << config.enableReuseKVCache
+    ss << "LLMEngineRunnerConfig:" << "  enableReuseKVCache: " << config.enableReuseKVCache
        << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
        << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
        << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
        << "  minSupportedInputLength: " << config.minSupportedInputLength
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
-       << "  maxSequenceLength: " << config.maxSequenceLength;
-
+       << "  maxSequenceLength: " << config.maxSequenceLength
+       << "  maxSupportedLoraRank: " << config.maxSupportedLoraRank;
     return ss.str();
-}
-
-template <typename T>
-void hashCombine(size_t& seed, T const& value)
-{
-    constexpr size_t kDELTA = 0x9e3779b9;
-    seed ^= std::hash<T>()(value) + kDELTA + (seed << 6) + (seed >> 2);
 }
 
 // Compute a unique hash value that can distinguish the various decoding steps.
 // Extend this function when we need to capture more information.
-size_t hashDecodingInput(rt::Tensor const& inputIds, rt::Tensor const& outputLogits)
+size_t hashDecodingInput(rt::Tensor const& inputIds, rt::Tensor const& outputLogits, std::string const& loraWeightsName)
 {
     // For vanilla decoding step, the shape can be distingusihed by active batch size.
     // Also capture the pointer address to ensure we are read/write correct locations.
@@ -69,10 +61,10 @@ size_t hashDecodingInput(rt::Tensor const& inputIds, rt::Tensor const& outputLog
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
 
     size_t hashValue = 0;
-    hashCombine(hashValue, activeBatchSize);
-    hashCombine(hashValue, inputIdsAddr);
-    hashCombine(hashValue, outputLogitsAddr);
-
+    hash_utils::hashCombine(hashValue, activeBatchSize);
+    hash_utils::hashCombine(hashValue, inputIdsAddr);
+    hash_utils::hashCombine(hashValue, outputLogitsAddr);
+    hash_utils::hashCombine(hashValue, loraWeightsName);
     return hashValue;
 }
 } // namespace
@@ -95,8 +87,8 @@ std::string const ropeCosSinName{"rope_rotary_cos_sin"};
 std::string const multimodalEmbeddingsName{"image_embeds"};
 std::string const kvCacheStartIndexName{"kvcache_start_index"};
 
-LLMEngineRunner::LLMEngineRunner(
-    std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream)
+LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
+    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
     LOG_INFO("Initializing LLMEngineRunner from engine file: %s", enginePath.string().c_str());
     LOG_INFO("Using config file %s", configPath.string().c_str());
@@ -113,12 +105,17 @@ LLMEngineRunner::LLMEngineRunner(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
     mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
     mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
-    mContextExecutionContext->setOptimizationProfileAsync(kCONTEXT_PROFILE_INDEX, stream);
-    mGenerationExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
 
-    // Obtain engine config from TensorRT engine file.
-    // TODO: Obtain the config from json config file and validate When TensorRT engine can implement the config.
-    this->initializeConfigFromEngine();
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mContextExecutionContext->setOptimizationProfileAsync(kCONTEXT_PROFILE_INDEX, stream);
+    setOptimizationProfileStatus
+        &= mGenerationExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
 
     // Initialize persistent Rope CosSinCache buffers if they are not dependent on input context.
     Json configJson;
@@ -137,6 +134,20 @@ LLMEngineRunner::LLMEngineRunner(
     {
         LOG_ERROR("Failed to parse config file with error: %s", e.what());
         throw std::runtime_error("Failed to parse config file: " + configPath.string());
+    }
+
+    if (!this->initializeConfigFromJson(configJson))
+    {
+        LOG_ERROR("Failed to initialize LLMEngineRunner from config file: %s", configPath.string().c_str());
+        throw std::runtime_error("Failed to initialize LLMEngineRunner from config file: " + configPath.string());
+    }
+
+    if (!this->validateConfigFromEngine())
+    {
+        LOG_ERROR("Failed to match config file %s with engine file: %s", configPath.string().c_str(),
+            enginePath.string().c_str());
+        throw std::runtime_error(
+            "Failed to match config file " + configPath.string() + " with engine file: " + enginePath.string());
     }
 
     auto ropeConfig = collectBaseRopeConfig(configJson);
@@ -159,8 +170,16 @@ LLMEngineRunner::LLMEngineRunner(
                 rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
     }
-    mContextExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
-    mGenerationExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
+    bool setRopeCosSinCacheStatus{true};
+    setRopeCosSinCacheStatus
+        &= mContextExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
+    setRopeCosSinCacheStatus
+        &= mGenerationExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
+    if (!setRopeCosSinCacheStatus)
+    {
+        LOG_ERROR("Failed to set rope cos sin cache to the engine");
+        throw std::runtime_error("Failed to set rope cos sin cache to the engine");
+    }
 
     // Instantiate the KVCache instance of the EngineRunner.
     this->mKVCache = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers,
@@ -173,20 +192,138 @@ LLMEngineRunner::LLMEngineRunner(
     CUDA_CHECK(
         cudaMemsetAsync(mSequenceContextLengths.rawPointer(), 0, mSequenceContextLengths.getMemoryCapacity(), stream));
 
+    // Add the LoRA weights to the engine.
+    if (isLoraWeightsSupported())
+    {
+        for (auto const& [loraWeightsName, loraWeightsPath] : loraWeightsMap)
+        {
+            if (loraWeightsPath.empty())
+            {
+                continue;
+            }
+            if (!this->addLoraWeights(loraWeightsName, loraWeightsPath, stream))
+            {
+                LOG_ERROR("Failed to add LoRA weights: %s", loraWeightsName.c_str());
+                throw std::runtime_error("Failed to add LoRA weights: " + loraWeightsName);
+            }
+        }
+    }
+
+    // Initialize the dummy LoRA weights tensor as TensorRT does not support nullptr for binding, even when the LoRA
+    // rank is 0.
+    mDummyLoraWeightsTensor = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    // Reset the LoRA weights to zero tensors.
+    if (!this->resetLoraWeights(stream))
+    {
+        LOG_ERROR("Failed to initialize LoRA weights to zero tensors");
+        throw std::runtime_error("Failed to initialize LoRA weights to zero tensors");
+    }
+
     // Synchronize the stream to ensure all the operations have completed.
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void LLMEngineRunner::initializeConfigFromEngine()
+bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 {
-    // Obtain number of decoder layers from the engine.
-    // Each decoder layer has one input and one output KVCache binding
-    // with layout [B, 2, Hkv, Smax, D]
+    try
+    {
+        // Define required fields for main config
+        std::vector<std::string> const requiredConfigFields = {"num_hidden_layers", "num_key_value_heads", "head_dim",
+            "vocab_size", "partial_rotary_factor", "builder_config"};
+
+        // Validate required fields exist in main config
+        for (auto const& field : requiredConfigFields)
+        {
+            if (!configJson.contains(field))
+            {
+                LOG_ERROR("initializeConfigFromJson(): Missing required field '%s' in config", field.c_str());
+                return false;
+            }
+        }
+
+        auto const& builderConfig = configJson["builder_config"];
+
+        // Define required fields for builder_config
+        std::vector<std::string> const requiredBuilderConfigFields
+            = {"max_batch_size", "max_input_len", "max_seq_len", "max_lora_rank", "enable_reuse_kvcache"};
+
+        // Validate required fields exist in builder_config
+        for (auto const& field : requiredBuilderConfigFields)
+        {
+            if (!builderConfig.contains(field))
+            {
+                LOG_ERROR("initializeConfigFromJson(): Missing required field '%s' in builder_config", field.c_str());
+                return false;
+            }
+        }
+
+        // Extract values with proper type checking
+        mConfig.numDecoderLayers = configJson["num_hidden_layers"].get<int32_t>();
+        mConfig.numKVHeads = configJson["num_key_value_heads"].get<int32_t>();
+        mConfig.headDim = configJson["head_dim"].get<int32_t>();
+
+        auto const partialRotaryFactor = configJson["partial_rotary_factor"].get<float>();
+        mConfig.rotaryDim = static_cast<int32_t>(partialRotaryFactor * static_cast<float>(mConfig.headDim));
+
+        mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
+
+        mConfig.enableReuseKVCache = builderConfig["enable_reuse_kvcache"].get<bool>();
+        mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
+        mConfig.minSupportedInputLength = 1; // TODO: Change this to min input length
+        mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
+        mConfig.maxSequenceLength = builderConfig["max_seq_len"].get<int32_t>();
+        mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
+
+        // Validate configuration values - all must be positive except max_lora_rank
+        std::vector<std::pair<std::string, int32_t>> positiveFields
+            = {{"num_decoder_layers", mConfig.numDecoderLayers}, {"num_key_value_heads", mConfig.numKVHeads},
+                {"head_dim", mConfig.headDim}, {"rotary_dim", mConfig.rotaryDim}, {"vocab_size", mConfig.vocabSize},
+                {"max_batch_size", mConfig.maxSupportedBatchSize}, {"max_input_len", mConfig.maxSupportedInputLength},
+                {"max_seq_len", mConfig.maxSequenceLength}};
+
+        for (auto const& [fieldName, value] : positiveFields)
+        {
+            if (value <= 0)
+            {
+                LOG_ERROR("initializeConfigFromJson(): Invalid %s: %d (must be positive)", fieldName.c_str(), value);
+                return false;
+            }
+        }
+
+        // Validate max_lora_rank separately (must be non-negative)
+        if (mConfig.maxSupportedLoraRank < 0)
+        {
+            LOG_ERROR("initializeConfigFromJson(): Invalid max_lora_rank: %d (must be non-negative)",
+                mConfig.maxSupportedLoraRank);
+            return false;
+        }
+        if (mConfig.maxSupportedInputLength > mConfig.maxSequenceLength)
+        {
+            LOG_ERROR(
+                "initializeConfigFromJson(): Invalid configuration: max_input_len (%d) cannot be greater than "
+                "max_seq_len (%d)",
+                mConfig.maxSupportedInputLength, mConfig.maxSequenceLength);
+            return false;
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("initializeConfigFromJson(): Unexpected error while parsing config: %s", e.what());
+        return false;
+    }
+
+    LOG_INFO("initializeConfigFromJson(): Loaded LLMEngineRunner with config: %s", formatEngineConfig(mConfig).c_str());
+    return true;
+}
+
+bool LLMEngineRunner::validateConfigFromEngine()
+{
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
         return tensorDim.nbDims == 5 && bindingName.find("present_key_values") != std::string::npos;
     };
+
     // If the engine comes with "kvcache_start_index" binding, it means the engine enables reuse KVCache.
-    // TODO: Enable the kvCacheReuse feature by default.
     auto identifyReuseKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
         return tensorDim.nbDims == 1 && bindingName.find("kvcache_start_index") != std::string::npos;
     };
@@ -200,41 +337,84 @@ void LLMEngineRunner::initializeConfigFromEngine()
 
         if (identifyKVCacheBinding(bindingName, tensorDim))
         {
-            if (nbKVCacheInputs == 0)
+            if (mConfig.numKVHeads != tensorDim.d[2])
             {
-                mConfig.numKVHeads = tensorDim.d[2];
-                mConfig.maxSequenceLength = tensorDim.d[3];
-                mConfig.headDim = tensorDim.d[4];
+                LOG_ERROR("numKVHeads is not consistent. From engine: %d, from config: %d", tensorDim.d[2],
+                    mConfig.numKVHeads);
+                return false;
+            }
+            if (mConfig.maxSequenceLength != tensorDim.d[3])
+            {
+                LOG_ERROR("maxSequenceLength is not consistent. From engine: %d, from config: %d", tensorDim.d[3],
+                    mConfig.maxSequenceLength);
+                return false;
+            }
+            if (mConfig.headDim != tensorDim.d[4])
+            {
+                LOG_ERROR(
+                    "headDim is not consistent. From engine: %d, from config: %d", tensorDim.d[4], mConfig.headDim);
+                return false;
             }
             ++nbKVCacheInputs;
         }
         if (identifyReuseKVCacheBinding(bindingName, tensorDim))
         {
-            mConfig.enableReuseKVCache = true;
+            if (!mConfig.enableReuseKVCache)
+            {
+                LOG_ERROR(
+                    "Enable reuse KVCache is not consistent. Identified reuse KVCache binding, but enableReuseKVCache "
+                    "is false from config");
+                return false;
+            }
         }
     }
-    mConfig.numDecoderLayers = nbKVCacheInputs;
-
-    // Obtain inference configs from supported length.
-    // TODO: Obtain the config from json file and compare with TensorRT engine.
+    if (nbKVCacheInputs != mConfig.numDecoderLayers)
+    {
+        LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,
+            mConfig.numDecoderLayers);
+        return false;
+    }
     Dims const minInputCtxShape
         = mEngine->getProfileShape(inputIdsName.c_str(), kCONTEXT_PROFILE_INDEX, OptProfileSelector::kMIN);
     Dims const maxInputCtxShape
         = mEngine->getProfileShape(inputIdsName.c_str(), kCONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
-    mConfig.minSupportedInputLength = minInputCtxShape.d[1];
-    mConfig.maxSupportedInputLength = maxInputCtxShape.d[1];
-    mConfig.maxSupportedBatchSize = maxInputCtxShape.d[0];
-    mConfig.enableDynamicShape = mConfig.minSupportedInputLength != mConfig.maxSupportedInputLength;
+    if (mConfig.minSupportedInputLength != minInputCtxShape.d[1])
+    {
+        LOG_ERROR("minSupportedInputLength is not consistent. From engine: %d, from config: %d", minInputCtxShape.d[1],
+            mConfig.minSupportedInputLength);
+        return false;
+    }
+    if (mConfig.maxSupportedInputLength != maxInputCtxShape.d[1])
+    {
+        LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d", maxInputCtxShape.d[1],
+            mConfig.maxSupportedInputLength);
+        return false;
+    }
+    if (mConfig.maxSupportedBatchSize != maxInputCtxShape.d[0])
+    {
+        LOG_ERROR("maxSupportedBatchSize is not consistent. From engine: %d, from config: %d", maxInputCtxShape.d[0],
+            mConfig.maxSupportedBatchSize);
+        return false;
+    }
 
     // Obtain vocab size from the engine.
     Dims const logitsDim = mEngine->getTensorShape(logitsName.c_str());
-    mConfig.vocabSize = logitsDim.d[1];
+    if (mConfig.vocabSize != logitsDim.d[1])
+    {
+        LOG_ERROR("vocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[1], mConfig.vocabSize);
+        return false;
+    }
 
     // Obtain rotary dim from the engine.
     Dims const ropeCosSinCacheDim = mEngine->getTensorShape(ropeCosSinName.c_str());
-    mConfig.rotaryDim = ropeCosSinCacheDim.d[2];
+    if (mConfig.rotaryDim != ropeCosSinCacheDim.d[2])
+    {
+        LOG_ERROR("rotaryDim is not consistent. From engine: %d, from config: %d", ropeCosSinCacheDim.d[2],
+            mConfig.rotaryDim);
+        return false;
+    }
 
-    LOG_INFO("Loaded LLMEngineRunner with config: %s", formatEngineConfig(mConfig).c_str());
+    return true;
 }
 
 LLMEngineRunner::~LLMEngineRunner()
@@ -315,16 +495,12 @@ bool LLMEngineRunner::prefillStepInputValidation(
             outputLogits.getShape().formatString());
         return false;
     }
-    bool const isSequenceLengthValid = mConfig.enableDynamicShape
-        ? prefillSequenceLength <= mConfig.maxSupportedInputLength
-        : prefillSequenceLength == mConfig.maxSupportedInputLength;
-    if (!isSequenceLengthValid)
+    if (prefillSequenceLength > mConfig.maxSupportedInputLength)
     {
         LOG_ERROR(
-            "executePrefill(): Invalid sequence length of the input tensors. Either input sequence length is larger "
-            "than maxSupportedInputLength or input sequence length is not equal to maxSupportedInputLength with static "
-            "shape LLM Engine. Current inputIds shape: %s.",
-            inputIds.getShape().formatString());
+            "executePrefill(): Invalid sequence length of the input tensors. Input sequence length (%d) is larger "
+            "than maxSupportedInputLength (%d). Current inputIds shape: %s.",
+            prefillSequenceLength, mConfig.maxSupportedInputLength, inputIds.getShape().formatString());
         return false;
     }
     bool const isLogitsShapeValid
@@ -479,7 +655,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     kernel::incrementLengthTensor(mSequenceContextLengths, kDECODE_INCREMENT, stream);
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
-    size_t const graphHash = hashDecodingInput(inputIds, outputLogits);
+    size_t const graphHash = hashDecodingInput(inputIds, outputLogits, mActiveLoraWeightsName);
     if (mCudaGraphs.find(graphHash) != mCudaGraphs.end())
     {
         LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for this decoding step.");
@@ -547,13 +723,24 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
 }
 
 bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
-    rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream)
+    rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
 {
-    size_t const hashValue = hashDecodingInput(inputIds, outputLogits);
+    size_t const hashValue = hashDecodingInput(inputIds, outputLogits, loraWeightsPath);
     if (mCudaGraphs.find(hashValue) != mCudaGraphs.end())
     {
-        LOG_INFO("captureVanillaDecodingCudaGraph(): CUDA graph already captured for the input tensors.");
+        LOG_INFO(
+            "captureVanillaDecodingCudaGraph(): CUDA graph already captured for the input tensors with LoRA weights "
+            "%s.",
+            loraWeightsPath.c_str());
         return true;
+    }
+
+    if (isLoraWeightsSupported() && !this->switchLoraWeights(loraWeightsPath, stream))
+    {
+        LOG_ERROR(
+            "captureVanillaDecodingCudaGraph(): Failed to switch LoRA weights to '%s', unable to capture CUDA graph.",
+            loraWeightsPath.c_str());
+        return false;
     }
 
     // To avoid CUDA graph error from TensorRT engine, we need to enqueueV3() once prior to graph capture.
@@ -636,9 +823,225 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
     mCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
 
-    LOG_DEBUG("captureVanillaDecodingCudaGraph(): CUDA graph captured successfully for input shape %s.",
-        inputIds.getShape().formatString().c_str());
+    if (!executeStatus)
+    {
+        LOG_WARNING(
+            "captureVanillaDecodingCudaGraph(): Failed on TensorRT engine enqueueV3() call during CUDA graph capture.");
+        return false;
+    }
+    else
+    {
+        LOG_DEBUG(
+            "captureVanillaDecodingCudaGraph(): CUDA graph captured successfully for input shape %s with LoRA weights "
+            "'%s' (Empty string if no LoRA weights).",
+            inputIds.getShape().formatString().c_str(), loraWeightsPath.c_str());
+    }
+
     return true;
+}
+
+bool LLMEngineRunner::resetLoraWeights(cudaStream_t stream)
+{
+    if (!isLoraWeightsSupported())
+    {
+        return true;
+    }
+    mActiveLoraWeightsName = "";
+    bool resetStatus{true};
+    for (auto const& loraWeightsTensorName : getLoraWeightsTensorNames())
+    {
+        nvinfer1::Dims zeroShape
+            = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+        resetStatus &= mContextExecutionContext->setTensorAddress(
+            loraWeightsTensorName.c_str(), mDummyLoraWeightsTensor.rawPointer());
+        resetStatus &= mGenerationExecutionContext->setTensorAddress(
+            loraWeightsTensorName.c_str(), mDummyLoraWeightsTensor.rawPointer());
+        if (loraWeightsTensorName.find("lora_A") != std::string::npos)
+        {
+            zeroShape.d[1] = 0;
+        }
+        else if (loraWeightsTensorName.find("lora_B") != std::string::npos)
+        {
+            zeroShape.d[0] = 0;
+        }
+        resetStatus &= mContextExecutionContext->setInputShape(loraWeightsTensorName.c_str(), zeroShape);
+        resetStatus &= mGenerationExecutionContext->setInputShape(loraWeightsTensorName.c_str(), zeroShape);
+        if (!resetStatus)
+        {
+            LOG_ERROR("Failed to reset LoRA weights: %s", loraWeightsTensorName.c_str());
+            return false;
+        }
+    }
+    return resetStatus;
+}
+
+bool LLMEngineRunner::addLoraWeights(
+    std::string const& loraWeightsName, std::string const& loraWeightsPath, cudaStream_t stream)
+{
+    if (!isLoraWeightsSupported())
+    {
+        LOG_ERROR("addLoraWeights(): Engine does not support LoRA weights.");
+    }
+
+    if (mLoraWeights.find(loraWeightsName) != mLoraWeights.end())
+    {
+        LOG_ERROR("addLoraWeights(): LoRA weights %s already added", loraWeightsName.c_str());
+        return false;
+    }
+
+    // Load tensors using the new unified interface
+    std::vector<rt::Tensor> tensors;
+    if (!safetensors::loadSafetensors(loraWeightsPath, tensors, stream))
+    {
+        LOG_ERROR("addLoraWeights(): Failed to load LoRA weights %s from: %s", loraWeightsName.c_str(),
+            loraWeightsPath.c_str());
+        return false;
+    }
+
+    // Validate the LoRA weights do not exceed the max LoRA rank
+    for (auto const& tensor : tensors)
+    {
+        if (tensor.getName().find("lora_A") != std::string::npos)
+        {
+            if (tensor.getShape()[1] > mConfig.maxSupportedLoraRank)
+            {
+                LOG_ERROR("addLoraWeights(): LoRA A (%s) tensor's rank (%d) exceeds the max LoRA rank (%d)",
+                    tensor.getName().c_str(), tensor.getShape()[1], mConfig.maxSupportedLoraRank);
+                return false;
+            }
+        }
+        else if (tensor.getName().find("lora_B") != std::string::npos)
+        {
+            if (tensor.getShape()[0] > mConfig.maxSupportedLoraRank)
+            {
+                LOG_ERROR("addLoraWeights(): LoRA B (%s) tensor's rank (%d) exceeds the max LoRA rank (%d)",
+                    tensor.getName().c_str(), tensor.getShape()[0], mConfig.maxSupportedLoraRank);
+                return false;
+            }
+        }
+    }
+
+    // Store the tensors in our map
+    mLoraWeights[loraWeightsName] = std::move(tensors);
+    LOG_INFO("addLoraWeights(): Added LoRA weights %s from: %s", loraWeightsName.c_str(), loraWeightsPath.c_str());
+    return true;
+}
+
+std::vector<std::string> LLMEngineRunner::getLoraWeightsTensorNames() const
+{
+    std::vector<std::string> loraWeightsTensorNames;
+    // Get the number of bindings in the engine
+    int32_t numBindings = mEngine->getNbIOTensors();
+    for (int32_t i = 0; i < numBindings; ++i)
+    {
+        char const* bindingName = mEngine->getIOTensorName(i);
+        std::string bindingNameStr(bindingName);
+        if (bindingNameStr.find("lora_") != std::string::npos)
+        {
+            loraWeightsTensorNames.push_back(bindingNameStr);
+        }
+    }
+    return loraWeightsTensorNames;
+}
+
+bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cudaStream_t stream)
+{
+    if (!isLoraWeightsSupported())
+    {
+        LOG_ERROR("switchLoraWeights(): API call is invalid. LLM engine does not support LoRA weights.");
+        return false;
+    }
+    if (loraWeightsName.empty())
+    {
+        this->resetLoraWeights(stream);
+        LOG_DEBUG("switchLoraWeights(): Switched to no LoRA weights.");
+        return true;
+    }
+
+    // Check if the requested LoRA exists
+    auto it = mLoraWeights.find(loraWeightsName);
+    if (it == mLoraWeights.end())
+    {
+        LOG_ERROR("switchLoraWeights(): LoRA weights with name '%s' not found", loraWeightsName.c_str());
+        return false;
+    }
+
+    auto& loraTensors = it->second;
+
+    // Iterate through all LoRA weights bindings
+    for (auto const& loraWeightsTensorName : this->getLoraWeightsTensorNames())
+    {
+        // Try to find the tensor in the LoRA weights
+        auto loraTensorIt = std::find_if(loraTensors.begin(), loraTensors.end(),
+            [loraWeightsTensorName](rt::Tensor const& tensor) { return tensor.getName() == loraWeightsTensorName; });
+
+        bool setLoraWeightsStatus{true};
+
+        if (loraTensorIt != loraTensors.end())
+        {
+            // Found matching tensor, use its data
+            setLoraWeightsStatus
+                &= mContextExecutionContext->setInputShape(loraWeightsTensorName.c_str(), loraTensorIt->getTRTDims());
+            setLoraWeightsStatus &= mGenerationExecutionContext->setInputShape(
+                loraWeightsTensorName.c_str(), loraTensorIt->getTRTDims());
+            setLoraWeightsStatus &= mContextExecutionContext->setTensorAddress(
+                loraWeightsTensorName.c_str(), loraTensorIt->rawPointer());
+            setLoraWeightsStatus &= mGenerationExecutionContext->setTensorAddress(
+                loraWeightsTensorName.c_str(), loraTensorIt->rawPointer());
+            LOG_DEBUG("switchLoraWeights(): LoRA weights tensor with name '%s' found. Set shape to %s.",
+                loraWeightsTensorName.c_str(), loraTensorIt->getShape().formatString().c_str());
+        }
+        else
+        {
+            nvinfer1::Dims shape
+                = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+            if (loraWeightsTensorName.find("lora_A") != std::string::npos)
+            {
+                shape.d[1] = 0;
+            }
+            else if (loraWeightsTensorName.find("lora_B") != std::string::npos)
+            {
+                shape.d[0] = 0;
+            }
+            setLoraWeightsStatus &= mContextExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
+            setLoraWeightsStatus &= mGenerationExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
+            mContextExecutionContext->setTensorAddress(
+                loraWeightsTensorName.c_str(), mDummyLoraWeightsTensor.rawPointer());
+            setLoraWeightsStatus &= mGenerationExecutionContext->setTensorAddress(
+                loraWeightsTensorName.c_str(), mDummyLoraWeightsTensor.rawPointer());
+            LOG_DEBUG("switchLoraWeights(): LoRA weights tensor with name '%s' not found. Set shape to rank 0.",
+                loraWeightsTensorName.c_str());
+        }
+        if (!setLoraWeightsStatus)
+        {
+            LOG_ERROR("Failed to set LoRA weights: %s", loraWeightsTensorName.c_str());
+            return false;
+        }
+    }
+    // Set the active LoRA weights name
+    mActiveLoraWeightsName = loraWeightsName;
+    LOG_DEBUG("switchLoraWeights(): Switched to LoRA weights with name '%s'.", loraWeightsName.c_str());
+    return true;
+}
+
+std::string LLMEngineRunner::getActiveLoraWeightsName() const
+{
+    return mActiveLoraWeightsName;
+}
+
+std::vector<std::string> LLMEngineRunner::getAvailableLoraWeights() const
+{
+    std::vector<std::string> loraWeightsNames;
+    for (auto const& [loraWeightsName, _] : mLoraWeights)
+    {
+        loraWeightsNames.push_back(loraWeightsName);
+    }
+    return loraWeightsNames;
+}
+
+bool LLMEngineRunner::isLoraWeightsSupported() const
+{
+    return mConfig.maxSupportedLoraRank > 0;
 }
 
 } // namespace rt

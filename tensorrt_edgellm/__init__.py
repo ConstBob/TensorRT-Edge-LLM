@@ -26,9 +26,10 @@ Key Features:
 - HuggingFace model compatibility
 - Quantization configuration management
 - ONNX export for LLM and visual models
+- LoRA pattern insertion and weight processing
 
 Example Usage:
-    from tensorrt_edgellm import quantize_and_save_llm, llm_export, visual_export
+    from tensorrt_edgellm import quantize_and_save_llm, llm_export, visual_export, insert_lora_and_save, process_lora_weights_and_save
     
     # Quantize and save a model
     quantize_and_save_llm(
@@ -79,9 +80,22 @@ Example Usage:
         output_dir="path/to/output",
         dtype="fp16"
     )
+    
+    # Insert LoRA patterns into ONNX models
+    insert_lora_and_save(
+        onnx_dir="path/to/onnx_model"
+    )
+    
+    # Process LoRA weights
+    process_lora_weights_and_save(
+        input_dir="path/to/adapter",
+        output_dir="path/to/output"
+    )
 """
 
 from .onnx_export.llm_export import llm_export
+from .onnx_export.lora import (insert_lora_and_save,
+                               process_lora_weights_and_save)
 from .onnx_export.visual_export import visual_export
 from .quantization.llm_quantization import quantize_and_save_llm
 
@@ -97,4 +111,6 @@ __all__ = [
     "quantize_and_save_llm",
     "llm_export",
     "visual_export",
+    "insert_lora_and_save",
+    "process_lora_weights_and_save",
 ]

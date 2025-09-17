@@ -40,6 +40,12 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         llm_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
 
+    if "partial_rotary_factor" in config_dict:
+        llm_config["partial_rotary_factor"] = config_dict[
+            "partial_rotary_factor"]
+    else:
+        llm_config["partial_rotary_factor"] = 1.0
+
     llm_config["model_type"] = "llm"
     return llm_config
 
@@ -68,6 +74,11 @@ def _export_eagle_base_config(config_dict: Dict[str, Any],
         )
         eagle_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
+    if "partial_rotary_factor" in config_dict:
+        eagle_config["partial_rotary_factor"] = config_dict[
+            "partial_rotary_factor"]
+    else:
+        eagle_config["partial_rotary_factor"] = 1.0
 
     eagle_config["model_type"] = f"{eagle_version}_base"
     return eagle_config

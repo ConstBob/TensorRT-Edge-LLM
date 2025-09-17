@@ -22,6 +22,11 @@
 #include <fstream>
 #include <getopt.h>
 #include <nlohmann/json.hpp>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 using namespace drivellm;
 using Json = nlohmann::json;
@@ -29,9 +34,9 @@ using Json = nlohmann::json;
 struct LLMInferenceArgs
 {
     std::string engineDir;
-    std::string multimodalEngineDir;
+    std::string multimodalEngineDir{""};
     std::string inputFile;
-    std::string outputFile;
+    std::string outputFile{""};
     bool debug{false};
 };
 
@@ -52,8 +57,8 @@ void printUsage(char const* programName)
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
     static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, 901},
-        {"engineDir", required_argument, 0, 902}, {"multimodalEngineDir", optional_argument, 0, 903},
-        {"outputFile", optional_argument, 0, 904}, {"debug", no_argument, 0, 905}, {0, 0, 0, 0}};
+        {"engineDir", required_argument, 0, 902}, {"multimodalEngineDir", required_argument, 0, 903},
+        {"outputFile", required_argument, 0, 904}, {"debug", no_argument, 0, 905}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -62,8 +67,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {
         case 901: args.inputFile = optarg; break;
         case 902: args.engineDir = optarg; break;
-        case 903: args.multimodalEngineDir = optarg ? optarg : ""; break;
-        case 904: args.outputFile = optarg ? optarg : ""; break;
+        case 903: args.multimodalEngineDir = optarg; break;
+        case 904: args.outputFile = optarg; break;
         case 905: args.debug = true; break;
         default: return false;
         }
@@ -103,7 +108,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     return true;
 }
 
-std::vector<rt::LLMGenerationRequest> parseInputFile(std::filesystem::path const& inputFilePath)
+std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseInputFile(
+    std::filesystem::path const& inputFilePath)
 {
     std::vector<rt::LLMGenerationRequest> requests;
 
@@ -132,6 +138,20 @@ std::vector<rt::LLMGenerationRequest> parseInputFile(std::filesystem::path const
     int64_t topK = inputData.value("top_k", 50);
     int64_t maxGenerateLength = inputData.value("max_generate_length", 256);
     std::string defaultSystemPrompt = inputData.value("default_system_prompt", "");
+    std::unordered_map<std::string, std::string> loraWeightsMap;
+    if (inputData.contains("available_lora_weights") && inputData["available_lora_weights"].is_object())
+    {
+        auto& availableLoraWeights = inputData["available_lora_weights"];
+        for (auto const& [loraWeightsName, loraWeightsPath] : availableLoraWeights.items())
+        {
+            if (loraWeightsMap.find(loraWeightsName) != loraWeightsMap.end())
+            {
+                LOG_ERROR("LoRA weights %s already exists", loraWeightsName.c_str());
+                throw std::runtime_error("LoRA weights " + loraWeightsName + " already exists");
+            }
+            loraWeightsMap[loraWeightsName] = loraWeightsPath.get<std::string>();
+        }
+    }
 
     // Parse messages
     if (inputData.contains("messages") && inputData["messages"].is_array())
@@ -140,7 +160,7 @@ std::vector<rt::LLMGenerationRequest> parseInputFile(std::filesystem::path const
         size_t numMessages = messages.size();
 
         // Process messages in batches according to batchSize
-        for (size_t i = 0; i < numMessages; i += batchSize)
+        for (size_t startIdx = 0; startIdx < numMessages; startIdx += batchSize)
         {
             rt::LLMGenerationRequest request;
             request.temperature = temperature;
@@ -149,10 +169,10 @@ std::vector<rt::LLMGenerationRequest> parseInputFile(std::filesystem::path const
             request.maxGenerateLength = maxGenerateLength;
 
             // Add messages to this batch (up to batchSize messages)
-            size_t endIdx = std::min(i + batchSize, numMessages);
-            for (size_t j = i; j < endIdx; ++j)
+            size_t endIdx = std::min(startIdx + batchSize, numMessages);
+            for (size_t messageIdx = startIdx; messageIdx < endIdx; ++messageIdx)
             {
-                auto const& message = messages[j];
+                auto const& message = messages[messageIdx];
 
                 // Parse system prompt (use message-specific or default)
                 std::string systemPrompt = message.value("system", defaultSystemPrompt);
@@ -169,6 +189,25 @@ std::vector<rt::LLMGenerationRequest> parseInputFile(std::filesystem::path const
                 rt::LLMGenerationRequest::Prompt prompt;
                 prompt.systemPrompt = systemPrompt;
                 prompt.userPrompt = userPrompt;
+                if (message.contains("lora_weights"))
+                {
+                    if (messageIdx == startIdx)
+                    {
+                        request.loraWeightsName = message["lora_weights"].get<std::string>();
+                    }
+                    else
+                    {
+                        if (request.loraWeightsName != message["lora_weights"].get<std::string>())
+                        {
+                            LOG_ERROR(
+                                "Multi-LoRA for the same batch is not supported. Please use the same LoRA weights for "
+                                "all messages in the same batch.");
+                            throw std::runtime_error(
+                                "Multi-LoRA for the same batch is not supported. Please use the same LoRA weights for "
+                                "all messages in the same batch.");
+                        }
+                    }
+                }
 
                 // Parse images if present
                 if (message.contains("images") && message["images"].is_array())
@@ -198,7 +237,7 @@ std::vector<rt::LLMGenerationRequest> parseInputFile(std::filesystem::path const
         throw std::runtime_error("messages is not an array");
     }
 
-    return requests;
+    return std::make_pair(loraWeightsMap, requests);
 }
 
 int main(int argc, char* argv[])
@@ -212,18 +251,38 @@ int main(int argc, char* argv[])
 
     auto pluginHandles = loadEdgellmPluginLib();
     gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
+    // load input file and parse to requests
+    std::unordered_map<std::string, std::string> loraWeightsMap;
+    std::vector<rt::LLMGenerationRequest> requests;
+    try
+    {
+        std::tie(loraWeightsMap, requests) = parseInputFile(args.inputFile);
+        LOG_INFO("Successfully parsed %zu LoRA weights from input file.", loraWeightsMap.size());
+        LOG_INFO("Successfully parsed %zu requests from input file.", requests.size());
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to parse input file: %s", e.what());
+        return EXIT_FAILURE;
+    }
+
+    if (requests.empty())
+    {
+        LOG_ERROR("No valid requests found in input file.");
+        return EXIT_FAILURE;
+    }
 
     std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     try
     {
-        llmInferenceRuntime
-            = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, stream);
+        llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(
+            args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Failed to initialize LLMInferenceRuntime: {}", e.what());
+        LOG_ERROR("Failed to initialize LLMInferenceRuntime: %s", e.what());
         return EXIT_FAILURE;
     }
 
@@ -238,55 +297,37 @@ int main(int argc, char* argv[])
         }
     }
 
-    // load input file and parse to requests
-    std::vector<rt::LLMGenerationRequest> requests;
-    try
-    {
-        requests = parseInputFile(args.inputFile);
-        LOG_INFO("Successfully parsed %zu requests from input file.", requests.size());
-    }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to parse input file: {}", e.what());
-        return EXIT_FAILURE;
-    }
-
-    if (requests.empty())
-    {
-        LOG_ERROR("No valid requests found in input file.");
-        return EXIT_FAILURE;
-    }
-
     // Structure to collect all responses for JSON export
     nlohmann::json outputData;
     outputData["input_file"] = args.inputFile;
     outputData["responses"] = nlohmann::json::array();
 
     // Process each request
-    for (size_t batchIdx = 0; batchIdx < requests.size(); ++batchIdx)
+    for (size_t requestIdx = 0; requestIdx < requests.size(); ++requestIdx)
     {
-        auto& request = requests[batchIdx];
+        auto& request = requests[requestIdx];
         rt::LLMGenerationResponse response;
 
         if (llmInferenceRuntime->handleRequest(request, response, stream))
         {
-            LOG_INFO("Generation finished for batch %zu.", batchIdx);
+            LOG_INFO("Generation finished for request %zu.", requestIdx);
 
-            // Display responses for each prompt in the batch
-            for (size_t i = 0; i < response.outputTexts.size(); ++i)
+            // Display responses for each batch in the request
+            for (size_t batchIdx = 0; batchIdx < response.outputTexts.size(); ++batchIdx)
             {
-                LOG_INFO("Response for prompt %zu:\n%s", i, response.outputTexts[i].c_str());
+                LOG_INFO("Response for request %zu batch %zu:\n%s", requestIdx, batchIdx,
+                    response.outputTexts[batchIdx].c_str());
 
                 nlohmann::json responseJson;
-                responseJson["system_prompt"] = request.prompts[i].systemPrompt;
-                responseJson["user_prompt"] = request.prompts[i].userPrompt;
-                responseJson["output_text"] = response.outputTexts[i];
+                responseJson["system_prompt"] = request.prompts[batchIdx].systemPrompt;
+                responseJson["user_prompt"] = request.prompts[batchIdx].userPrompt;
+                responseJson["output_text"] = response.outputTexts[batchIdx];
                 outputData["responses"].push_back(responseJson);
             }
         }
         else
         {
-            LOG_ERROR("Generation failed for batch %zu.", batchIdx);
+            LOG_ERROR("Generation failed for request %zu.", requestIdx);
             return EXIT_FAILURE;
         }
     }
@@ -305,13 +346,13 @@ int main(int argc, char* argv[])
             }
             else
             {
-                LOG_ERROR("Failed to open output file: {}", args.outputFile);
+                LOG_ERROR("Failed to open output file: %s", args.outputFile.c_str());
                 return EXIT_FAILURE;
             }
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to write output file: {}", e.what());
+            LOG_ERROR("Failed to write output file: %s", e.what());
             return EXIT_FAILURE;
         }
     }

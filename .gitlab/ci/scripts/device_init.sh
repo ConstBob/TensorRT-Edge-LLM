@@ -15,39 +15,22 @@ if [ -d "$ssh_folder" ] ; then
     echo "ssh key removed"
 fi
 
+mkdir -p $ssh_folder
+
 if [ -d "$tensorrt_edge_llm_folder" ] ; then
     echo $board_password | sudo -S chmod -R 777 "$tensorrt_edge_llm_folder"
     rm -rf "$tensorrt_edge_llm_folder"
     echo "tensorrt-edge-llm folder removed"
 fi
 
-mkdir -p $ssh_folder
-
-# Mount data folder if not yet
-if mount | grep /scratch.edge_llm_data > /dev/null; then
-  echo "/scratch.edge_llm_data folder is already mounted"
-else
-  echo $board_password | sudo -S mkdir -p /scratch.edge_llm_data
-  echo $board_password | sudo -S mount -t nfs 10.32.209.5:/raid0/modelopt-trt-data/drive-llm /scratch.edge_llm_data
-  ls /scratch.edge_llm_data
-  echo "/scratch.edge_llm_data folder is mounted"
-fi
-
-# Check if llmdata folder exists
+# Check if scratch.trt_llm_data folder exists
 if [ -d "/scratch.trt_llm_data" ] ; then
   ls /scratch.trt_llm_data
   echo "/scratch.trt_llm_data folder is mounted"
 else
-  echo "/scratch.trt_llm_data folder is not mounted"
+  echo "/scratch.trt_llm_data folder is not mounted." && exit 1
 fi
 
-# Check if edge_llm_cache folder exists
-if [ -d "/scratch.edge_llm_cache" ] ; then
-  ls /scratch.edge_llm_cache
-  echo "/scratch.edge_llm_cache folder is mounted"
-else
-  echo "/scratch.edge_llm_cache folder is not mounted"
-fi
-
+df -h /home
 
 echo "Environment is ready!"

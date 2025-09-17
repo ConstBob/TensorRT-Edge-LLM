@@ -23,7 +23,8 @@ class PackageTester:
 
             # Check required functions
             required_functions = [
-                "quantize_and_save_llm", "llm_export", "visual_export"
+                "quantize_and_save_llm", "llm_export", "visual_export",
+                "insert_lora_and_save", "process_lora_weights_and_save"
             ]
             for func_name in required_functions:
                 if not hasattr(tensorrt_edgellm, func_name):
@@ -44,7 +45,8 @@ class PackageTester:
         """Test command-line tools availability"""
         tools = [
             "tensorrt-edgellm-quantize-llm", "tensorrt-edgellm-export-llm",
-            "tensorrt-edgellm-export-visual"
+            "tensorrt-edgellm-export-visual", "tensorrt-edgellm-insert-lora",
+            "tensorrt-edgellm-process-lora"
         ]
 
         for tool in tools:

@@ -115,6 +115,18 @@ tensorrt-edgellm-export-visual [OPTIONS]
 - `--quantization`: Quantization method (`fp8`)
 - `--device`: Device for model loading (default: `cuda`)
 
+## LoRA Support
+
+```bash
+# Insert LoRA patterns into ONNX model
+tensorrt-edgellm-insert-lora --onnx_dir /path/to/onnx_model
+
+# Process LoRA weights for runtime use
+tensorrt-edgellm-process-lora --input_dir /path/to/adapter --output_dir /path/to/output
+```
+
+The package supports adding LoRA weights into ONNX models. LoRA weights are treated as dynamic model inputs, allowing for efficient fine-tuning. The `lora_model.onnx` and `model.onnx` share the same base weights, with LoRA weights processed through `tensorrt-edgellm-process-lora` before runtime use.
+
 ## Quantization Methods
 
 | Method | Description |

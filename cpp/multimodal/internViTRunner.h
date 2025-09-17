@@ -75,8 +75,8 @@ public:
     void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
         int const inputLength, cudaStream_t stream) override;
 
-    void validateAndFillConfig(std::string const& configPath) override;
-    void allocateBuffer() override;
+    bool validateAndFillConfig(std::string const& configPath) override;
+    bool allocateBuffer() override;
     void* getConfig() override;
 
     // InternVL-specific methods

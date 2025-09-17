@@ -43,7 +43,8 @@ struct LLMGenerationRequest
     float temperature;
     float topP;
     int64_t topK;
-    int64_t maxGenerateLength; // Max length of the generated tokens.
+    int64_t maxGenerateLength;        // Max length of the generated tokens.
+    std::string loraWeightsName = ""; // Name of the LoRA weights. Default to empty string for no LoRA weights.
 };
 
 struct LLMGenerationResponse
