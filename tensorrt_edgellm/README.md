@@ -147,5 +147,6 @@ BUILD_CUDA_EXT=0 pip install -v gptqmodel --no-build-isolation
 
 - Only FP16 precision is currently supported, BF16 is not supported
 - MXFP8 quantization is not supported
+- When vocab_size is not a multiple of 4, the model cannot be quantized to int4_awq. Please use fp16 lm_head.
 
 
