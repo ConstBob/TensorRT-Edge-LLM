@@ -19,130 +19,270 @@
 
 #include "stringUtils.h"
 #include <NvInferRuntime.h>
+#include <chrono>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 namespace drivellm
 {
 
-// Logger for TensorRT info/warning/errors
-class Logger : public nvinfer1::ILogger
+namespace logger
+{
+
+// Source code location information for automatic tracking
+struct SourceLocation
+{
+    char const* file;     // Source file path
+    char const* function; // Function name
+    int32_t lineNumber;   // Line number
+
+    // Constructor with manual location capture
+    SourceLocation(char const* f, char const* func, int32_t l)
+        : file(f)
+        , function(func)
+        , lineNumber(l)
+    {
+    }
+};
+
+/**
+ * @brief Enhanced Logger with automatic location tracking and nvinfer1 compatibility
+ *
+ * Features:
+ * - Automatic source location tracking (file:line:function)
+ * - Configurable formatting (timestamps, location info)
+ * - nvinfer1::ILogger interface for TensorRT integration
+ * - Multiple log levels with performance optimizations
+ */
+class EdgeLLMLogger : public nvinfer1::ILogger
 {
 public:
-    Logger() {};
-    ~Logger() {};
+    EdgeLLMLogger() = default;
+    ~EdgeLLMLogger() = default;
+
+    // nvinfer1::ILogger interface implementation for TensorRT integration
     void log(nvinfer1::ILogger::Severity severity, char const* msg) noexcept override
     {
-        std::string strMsg(msg);
-        switch (severity)
-        {
-        case nvinfer1::ILogger::Severity::kVERBOSE:
-        {
-            debug(msg);
-            break;
-        }
-        case nvinfer1::ILogger::Severity::kERROR:
-        {
-            error(msg);
-            break;
-        }
-        case nvinfer1::ILogger::Severity::kWARNING:
-        {
-            warning(msg);
-            break;
-        }
-        case nvinfer1::ILogger::Severity::kINFO:
-        {
-            info(msg);
-            break;
-        }
-        default:
-        {
-            error(msg);
-            break;
-        }
-        }
+        // Create source location for external library messages
+        SourceLocation extLoc("TensorRT", "TensorRT_Internal", 0);
+        logWithLocation(severity, msg, extLoc);
     }
 
-    void debug(std::string const& msg)
+    // Core logging function with automatic location tracking and formatting
+    void logWithLocation(nvinfer1::ILogger::Severity level, std::string const& msg, SourceLocation const& loc)
     {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kVERBOSE)
+        if (!shouldLog(level))
         {
-            std::cout << "[DEBUG]: " << msg << std::endl;
+            return;
         }
+
+        // Format and output the message
+        std::string formattedMsg = formatLogEntry(level, msg, loc);
+        std::ostream& stream = (level <= nvinfer1::ILogger::Severity::kWARNING) ? std::cerr : std::cout;
+        stream << formattedMsg << std::endl;
     }
 
-    void warning(std::string const& msg)
+    // Convenience methods for different log levels with automatic location tracking
+    void debug(std::string const& msg, SourceLocation const& loc)
     {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kWARNING)
-        {
-            std::cerr << "[WARNING]: " << msg << std::endl;
-        }
+        logWithLocation(nvinfer1::ILogger::Severity::kVERBOSE, msg, loc);
     }
 
-    void error(std::string const& msg)
+    void info(std::string const& msg, SourceLocation const& loc)
     {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kERROR)
-        {
-            std::cerr << "[ERROR]: " << msg << std::endl;
-        }
+        logWithLocation(nvinfer1::ILogger::Severity::kINFO, msg, loc);
     }
 
-    void info(std::string const& msg)
+    void warning(std::string const& msg, SourceLocation const& loc)
     {
-        if (_minSeverity >= nvinfer1::ILogger::Severity::kINFO)
-        {
-            std::cout << "[INFO]: " << msg << std::endl;
-        }
+        logWithLocation(nvinfer1::ILogger::Severity::kWARNING, msg, loc);
     }
 
-    void setLevel(nvinfer1::ILogger::Severity minSeverity)
+    void error(std::string const& msg, SourceLocation const& loc)
     {
-        _minSeverity = minSeverity;
+        logWithLocation(nvinfer1::ILogger::Severity::kERROR, msg, loc);
     }
 
-    nvinfer1::ILogger::Severity getLevel()
+    // Logger configuration methods
+    // Set minimum logging level
+    void setLevel(nvinfer1::ILogger::Severity level)
     {
-        return _minSeverity;
+        mMinLevel = level;
+    }
+
+    // Get current logging level
+    nvinfer1::ILogger::Severity getLevel() const
+    {
+        return mMinLevel;
+    }
+
+    // Display configuration
+    void setShowTimestamp(bool show)
+    {
+        mShowTimestamp = show;
+    }
+    void setShowLocation(bool show)
+    {
+        mShowLocation = show;
+    }
+    void setShowFunction(bool show)
+    {
+        mShowFunction = show;
     }
 
 private:
-    nvinfer1::ILogger::Severity _minSeverity = nvinfer1::ILogger::Severity::kINFO;
+    nvinfer1::ILogger::Severity mMinLevel = nvinfer1::ILogger::Severity::kINFO;
+    bool mShowTimestamp = true;
+    bool mShowLocation = true;
+    bool mShowFunction = true;
+
+    bool shouldLog(nvinfer1::ILogger::Severity level) const
+    {
+        return level <= mMinLevel; // Note: lower values are more severe in TensorRT
+    }
+
+    std::string formatLogEntry(
+        nvinfer1::ILogger::Severity level, std::string const& msg, SourceLocation const& loc) const
+    {
+        std::ostringstream oss;
+
+        // Timestamp
+        if (mShowTimestamp)
+        {
+            auto now = std::chrono::system_clock::now();
+            auto time_t = std::chrono::system_clock::to_time_t(now);
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+            oss << "[" << std::put_time(std::localtime(&time_t), "%H:%M:%S") << "." << std::setfill('0') << std::setw(3)
+                << ms.count() << "] ";
+        }
+
+        // Log level
+        oss << "[" << getLevelString(level) << "]";
+
+        // Location information
+        if (mShowLocation && loc.file)
+        {
+            // Check if this is TensorRT message
+            if (std::string(loc.file) == "TensorRT")
+            {
+                oss << " [TensorRT]";
+            }
+            else
+            {
+                std::filesystem::path p(loc.file);
+                oss << " [" << p.filename().string() << ":" << loc.lineNumber;
+                if (mShowFunction && loc.function)
+                {
+                    oss << ":" << loc.function;
+                }
+                oss << "]";
+            }
+        }
+
+        // Message
+        oss << " " << msg;
+
+        return oss.str();
+    }
+
+    char const* getLevelString(nvinfer1::ILogger::Severity level) const
+    {
+        switch (level)
+        {
+        case nvinfer1::ILogger::Severity::kVERBOSE: return "DEBUG";
+        case nvinfer1::ILogger::Severity::kINFO: return "INFO";
+        case nvinfer1::ILogger::Severity::kWARNING: return "WARNING";
+        case nvinfer1::ILogger::Severity::kERROR: return "ERROR";
+        default: return "UNKNOWN";
+        }
+    }
 };
 
-inline Logger gLogger{};
+// RAII-based function tracer for automatic entry/exit logging
+class ScopedFunctionTracer
+{
+public:
+    ScopedFunctionTracer(EdgeLLMLogger& logger, char const* funcName, SourceLocation const& loc)
+        : mLogger(logger)
+        , mFuncName(funcName)
+        , mLoc(loc)
+    {
+        mLogger.debug("-> Entering " + mFuncName, mLoc);
+    }
+    ~ScopedFunctionTracer()
+    {
+        mLogger.debug("<- Exiting " + mFuncName, mLoc);
+    }
+
+private:
+    EdgeLLMLogger& mLogger;
+    std::string mFuncName;
+    SourceLocation mLoc;
+};
+
+} // namespace logger
+
+inline logger::EdgeLLMLogger gLogger{};
+
+// Primary logging macros with automatic location tracking
+// Usage: LOG_DEBUG("Value: %d", value); LOG_INFO("Message: %s", msg);
 
 #define LOG_DEBUG(...)                                                                                                 \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kVERBOSE)                                               \
-        {                                                                                                              \
-            gLogger.debug(format::fmtstr(__VA_ARGS__));                                                                \
-        }                                                                                                              \
-    } while (0)
+    gLogger.debug(format::fmtstr(__VA_ARGS__), drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+
 #define LOG_INFO(...)                                                                                                  \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kINFO)                                                  \
-        {                                                                                                              \
-            gLogger.info(format::fmtstr(__VA_ARGS__));                                                                 \
-        }                                                                                                              \
-    } while (0)
-#define LOG_ERROR(...)                                                                                                 \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kERROR)                                                 \
-        {                                                                                                              \
-            gLogger.error(format::fmtstr(__VA_ARGS__));                                                                \
-        }                                                                                                              \
-    } while (0)
+    gLogger.info(format::fmtstr(__VA_ARGS__), drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+
 #define LOG_WARNING(...)                                                                                               \
+    gLogger.warning(format::fmtstr(__VA_ARGS__), drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+
+#define LOG_ERROR(...)                                                                                                 \
+    gLogger.error(format::fmtstr(__VA_ARGS__), drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+
+// Conditional logging macros for performance-critical code
+#define LOG_DEBUG_IF(condition, ...)                                                                                   \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (gLogger.getLevel() >= nvinfer1::ILogger::Severity::kWARNING)                                               \
+        if (condition)                                                                                                 \
         {                                                                                                              \
-            gLogger.warning(format::fmtstr(__VA_ARGS__));                                                              \
+            LOG_DEBUG(__VA_ARGS__);                                                                                    \
         }                                                                                                              \
     } while (0)
+
+#define LOG_INFO_IF(condition, ...)                                                                                    \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (condition)                                                                                                 \
+        {                                                                                                              \
+            LOG_INFO(__VA_ARGS__);                                                                                     \
+        }                                                                                                              \
+    } while (0)
+
+#define LOG_WARNING_IF(condition, ...)                                                                                 \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (condition)                                                                                                 \
+        {                                                                                                              \
+            LOG_WARNING(__VA_ARGS__);                                                                                  \
+        }                                                                                                              \
+    } while (0)
+
+#define LOG_ERROR_IF(condition, ...)                                                                                   \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (condition)                                                                                                 \
+        {                                                                                                              \
+            LOG_ERROR(__VA_ARGS__);                                                                                    \
+        }                                                                                                              \
+    } while (0)
+
+// Function tracing macro for automatic entry/exit logging
+#define LOG_TRACE_FUNCTION()                                                                                           \
+    drivellm::logger::ScopedFunctionTracer gTracer(                                                                    \
+        gLogger, __FUNCTION__, drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 } // namespace drivellm

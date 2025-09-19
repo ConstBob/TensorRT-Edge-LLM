@@ -251,7 +251,7 @@ bool LLMBuilder::build()
         onnxFilePath = mOnnxDir.string() + "/model.onnx";
         LOG_INFO("Parsing ONNX model. Please ensure %s exists.", onnxFilePath.c_str());
     }
-    if (!parser->parseFromFile(onnxFilePath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    if (!parser->parseFromFile(onnxFilePath.c_str(), static_cast<int>(gLogger.getLevel())))
     {
         LOG_ERROR("Failed to parse ONNX file: %s", onnxFilePath.c_str());
         return false;
@@ -845,7 +845,7 @@ bool VisualBuilder::build()
 
     // Parse ONNX model
     std::string onnxPath = mOnnxDir.string() + "/model.onnx";
-    if (!parser->parseFromFile(onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)))
+    if (!parser->parseFromFile(onnxPath.c_str(), static_cast<int>(gLogger.getLevel())))
     {
         LOG_ERROR("Failed to parse ONNX file: %s", onnxPath.c_str());
         return false;
