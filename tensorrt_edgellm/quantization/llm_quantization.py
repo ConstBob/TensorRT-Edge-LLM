@@ -360,6 +360,10 @@ def quantize_and_save_llm(
     start_time = time.time()
     # Load model and tokenizer
     model, tokenizer = load_hf_model(model_dir, torch_dtype)
+    if lm_head_quantization == "int4_awq" and model.config.vocab_size % 4 != 0:
+        raise ValueError(
+            f"Model vocabulary size {model.config.vocab_size} is not divisible by 4. This model's lm_head cannot be quantized to int4_awq. Please use a different quantization method for lm_head."
+        )
 
     if quantization is not None:
         if is_quantized(model):
