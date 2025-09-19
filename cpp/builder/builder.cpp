@@ -510,6 +510,12 @@ bool LLMBuilder::setupEagleProfiles(
     result &= setOptimizationProfile(generationProfile, "input_ids", createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
+    // Last token IDs
+    result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    result &= setOptimizationProfile(
+        generationProfile, "last_token_ids", createDims({1}), createDims({maxTokens / 2}), createDims({maxTokens}));
+
     if (mBuilderConfig.eagleDraft)
     {
         // Hidden states from draft
@@ -529,20 +535,6 @@ bool LLMBuilder::setupEagleProfiles(
             createDims({1, 1, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mTargetModelOutputHiddenDim}));
-
-        // Last token IDs
-        result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1}),
-            createDims({mBuilderConfig.maxInputLen / 2}), createDims({mBuilderConfig.maxInputLen}));
-        result &= setOptimizationProfile(
-            generationProfile, "last_token_ids", createDims({1}), createDims({maxTokens / 2}), createDims({maxTokens}));
-    }
-    else if (mBuilderConfig.eagleBase)
-    {
-        // Last token IDs
-        result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1}),
-            createDims({mBuilderConfig.maxInputLen / 2}), createDims({mBuilderConfig.maxInputLen}));
-        result &= setOptimizationProfile(
-            generationProfile, "last_token_ids", createDims({1}), createDims({maxTokens / 2}), createDims({maxTokens}));
     }
 
     // Attention mask and position ID
