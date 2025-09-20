@@ -1,5 +1,0 @@
-# L0 Export Tests - Model export and python package smoke tests
-# Model export tests
-tests:
-  - tests/test_model_export.py::test_llm_model_export[Qwen2.5-0.5B-Instruct-fp8-4096-lora]
-  - tests/test_model_export.py::test_vlm_model_export[InternVL3-1B-hf-nvfp4-lmfp8-8192-vitfp8]

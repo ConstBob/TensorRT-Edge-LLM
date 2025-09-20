@@ -51,8 +51,29 @@ def check_rouge_score(output_json_str, reference_json_str):
         predictions.append(response["output_text"])
 
     rouge_score = calculate_rouge_score(predictions, references)
-    if rouge_score["rouge1"] < 0.25 or rouge_score["rougeL"] < 0.20:
-        pytest.fail(
-            f"Rouge1 (threshold: 0.25) or RougeL (threshold: 0.20) score is too low. Rouge1 score: {rouge_score['rouge1']}. RougeL score: {rouge_score['rougeL']}. references: {references}. predictions: {predictions}"
-        )
+
+    # Check thresholds and provide detailed failure information
+    rouge1_threshold = 0.25
+    rougeL_threshold = 0.20
+
+    if rouge_score["rouge1"] < rouge1_threshold or rouge_score[
+            "rougeL"] < rougeL_threshold:
+        failure_details = [
+            f"ROUGE score below threshold",
+            f"Rouge1: {rouge_score['rouge1']:.4f} (threshold: {rouge1_threshold})",
+            f"RougeL: {rouge_score['rougeL']:.4f} (threshold: {rougeL_threshold})",
+            f"Number of predictions: {len(predictions)}",
+            f"Number of references: {len(references)}"
+        ]
+
+        # Add sample predictions/references for debugging (limit output)
+        if predictions:
+            failure_details.append(
+                f"Sample prediction: {predictions[0][:100]}...")
+        if references:
+            failure_details.append(
+                f"Sample reference: {references[0][:100]}...")
+
+        pytest.fail("\n".join(failure_details))
+
     return rouge_score

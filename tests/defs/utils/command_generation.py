@@ -1,0 +1,241 @@
+"""
+Centralized command configuration
+"""
+
+import os
+from typing import Dict, List, Tuple
+
+from ..config import ModelType, TestConfig
+
+# Available LoRA weights mapping
+AVAILABLE_LORA_WEIGHTS = {
+    "Qwen2.5-0.5B-Instruct": "Jailbreak-Detector-2-XL",
+    "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-Diagrams2SQL-v2",
+}
+
+
+def _generate_quantization_commands(
+        config: TestConfig) -> List[Tuple[List[str], int]]:
+    """Generate quantization commands if needed"""
+    commands = []
+    if config.llm_precision != "fp16":
+        torch_model_dir = config.get_torch_model_dir()
+        quantized_model_dir = config.get_quantized_model_dir()
+
+        quantize_cmd = [
+            "tensorrt-edgellm-quantize-llm", f"--model_dir={torch_model_dir}",
+            f"--output_dir={quantized_model_dir}",
+            f"--quantization={config.llm_precision}",
+            f"--dataset_dir={config.get_cnn_dailymail_dataset_dir()}"
+        ]
+
+        if config.lm_head_precision != "fp16":
+            quantize_cmd.append(
+                f"--lm_head_quantization={config.lm_head_precision}")
+
+        commands.append((quantize_cmd, 900))
+
+    return commands
+
+
+def _generate_llm_export_commands(
+        config: TestConfig) -> List[Tuple[List[str], int]]:
+    """Generate LLM export commands"""
+    torch_model_dir = config.get_torch_model_dir()
+
+    if config.llm_precision != "fp16":
+        # Use quantized model for export
+        model_dir = config.get_quantized_model_dir()
+    else:
+        # Use original torch model for fp16 export
+        model_dir = torch_model_dir
+
+    llm_cmd = [
+        "tensorrt-edgellm-export-llm", f"--model_dir={model_dir}",
+        f"--output_dir={config.get_llm_onnx_dir()}"
+    ]
+
+    llm_cmd.append(f"--max_position_embeddings={config.max_seq_len}")
+
+    return [(llm_cmd, 600)]
+
+
+def _generate_visual_export_commands(
+        config: TestConfig) -> List[Tuple[List[str], int]]:
+    """Generate visual model export commands for VLMs"""
+    commands = []
+    if config.model_type != ModelType.VLM:
+        return commands
+
+    visual_export_cmd = [
+        "tensorrt-edgellm-export-visual",
+        f"--model_dir={config.get_torch_model_dir()}",
+        f"--dtype=fp16",
+    ]
+
+    # Always export fp16 visual model regardless of the precision
+    fp16_visual_export_cmd = visual_export_cmd.copy()
+    fp16_visual_export_cmd.append(
+        f"--output_dir={config.get_visual_onnx_dir('fp16')}")
+    commands.append((fp16_visual_export_cmd, 600))
+
+    if config.visual_precision == "fp8":
+        fp8_visual_export_cmd = visual_export_cmd.copy()
+        fp8_visual_export_cmd.append(f"--quantization=fp8")
+        fp8_visual_export_cmd.append(
+            f"--output_dir={config.get_visual_onnx_dir('fp8')}")
+        fp8_visual_export_cmd.append(
+            f"--dataset_dir={config.get_mmmu_dataset_dir()}")
+        commands.append((fp8_visual_export_cmd, 900))
+    return commands
+
+
+def _generate_lora_commands(config: TestConfig) -> List[Tuple[List[str], int]]:
+    """Generate LoRA processing commands"""
+    commands = []
+    if not config.lora:
+        return commands
+
+    # Insert LoRA command
+    lora_cmd = [
+        "tensorrt-edgellm-insert-lora",
+        f"--onnx_dir={config.get_llm_onnx_dir()}"
+    ]
+    commands.append((lora_cmd, 120))
+
+    # Process LoRA weights if available
+    if config.model_name in AVAILABLE_LORA_WEIGHTS:
+        # TODO: This is hardcoded for now, we should use a more flexible way to get the lora weights path
+        lora_weights_dir = os.path.join(
+            "/scratch.edge_llm_cache", "lora_weights",
+            AVAILABLE_LORA_WEIGHTS[config.model_name])
+        process_lora_cmd = [
+            "tensorrt-edgellm-process-lora", f"--input_dir={lora_weights_dir}",
+            f"--output_dir={config.get_lora_weights_dir()}"
+        ]
+        commands.append((process_lora_cmd, 60))
+    else:
+        raise ValueError(
+            f"No LoRA weights available for {config.model_name}. Please add it to AVAILABLE_LORA_WEIGHTS"
+        )
+
+    return commands
+
+
+def generate_export_commands(
+        config: TestConfig) -> List[Tuple[List[str], int]]:
+    """Generate export commands - returns list of (command, timeout) tuples"""
+    commands = []
+
+    # Generate commands in order: quantization -> LLM export -> visual export -> LoRA
+    commands.extend(_generate_quantization_commands(config))
+    commands.extend(_generate_llm_export_commands(config))
+    commands.extend(_generate_visual_export_commands(config))
+    commands.extend(_generate_lora_commands(config))
+
+    return commands
+
+
+def generate_build_commands(
+        config: TestConfig,
+        executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
+    """Generate build commands - returns list of (command, timeout) tuples"""
+    commands = []
+
+    if config.model_type == ModelType.LLM:
+        # LLM build command
+        cmd = [executable_files['llm_build']]
+        cmd.extend([
+            f"--onnxDir={config.get_llm_onnx_dir()}",
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--maxInputLen={config.max_input_len}",
+            f"--maxSeqLen={config.max_seq_len}",
+            f"--maxBatchSize={config.max_batch_size}"
+        ])
+
+        if config.max_lora_rank > 0:
+            cmd.append(f"--maxLoraRank={config.max_lora_rank}")
+
+        commands.append((cmd, 900))
+
+    elif config.model_type == ModelType.VLM:
+        # VLM LLM build command
+        llm_cmd = [executable_files['llm_build']]
+        llm_cmd.extend([
+            f"--onnxDir={config.get_llm_onnx_dir()}",
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--maxInputLen={config.max_input_len}",
+            f"--maxSeqLen={config.max_seq_len}", "--vlm",
+            f"--maxBatchSize={config.max_batch_size}",
+            f"--minImageTokens={config.min_image_tokens}",
+            f"--maxImageTokens={config.max_image_tokens}"
+        ])
+
+        if config.max_lora_rank > 0:
+            llm_cmd.append(f"--maxLoraRank={config.max_lora_rank}")
+
+        commands.append((llm_cmd, 900))
+
+        # VLM visual build command
+        visual_cmd = [executable_files['visual_build']]
+        visual_cmd.extend([
+            f"--onnxDir={config.get_visual_onnx_dir(config.visual_precision)}",
+            f"--engineDir={config.get_visual_engine_dir()}",
+            f"--minImageTokens={config.min_image_tokens}",
+            f"--maxImageTokens={config.max_image_tokens}"
+        ])
+
+        commands.append((visual_cmd, 900))
+
+    return commands
+
+
+def generate_inference_commands(
+        config: TestConfig,
+        executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
+    """Generate inference commands - returns list of (command, timeout) tuples"""
+    commands = []
+
+    cmd = [executable_files['llm_inference']]
+    cmd.extend([
+        f"--engineDir={config.get_llm_engine_dir()}",
+        f"--inputFile={config.get_test_case_file()}",
+        f"--outputFile={config.get_output_json_file()}"
+    ])
+
+    if config.model_type == ModelType.VLM:
+        cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
+
+    commands.append((cmd, 900))
+    return commands
+
+
+def generate_benchmark_commands(
+        config: TestConfig,
+        executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
+    """Generate benchmark commands - returns list of (command, timeout) tuples"""
+    commands = []
+
+    if config.model_type == ModelType.LLM:
+        cmd = [executable_files['llm_benchmark']]
+        cmd.extend([
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--inputLength={config.max_input_len}",
+            f"--maxLength={config.output_seq_len + config.max_input_len}",
+            "--warmUp=2", "--numRuns=10"
+        ])
+
+    elif config.model_type == ModelType.VLM:
+        cmd = [executable_files['vlm_benchmark']]
+        cmd.extend([
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--visualEngineDir={config.get_visual_engine_dir()}",
+            f"--textTokenLength={config.text_token_length}",
+            f"--imageTokenLength={config.image_token_length}",
+            f"--outputLength={config.output_seq_len}",
+            f"--batchSize={config.max_batch_size}", "--warmUp=2",
+            "--numRuns=10"
+        ])
+
+    commands.append((cmd, 900))
+    return commands

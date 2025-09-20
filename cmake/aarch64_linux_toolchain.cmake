@@ -40,6 +40,10 @@ if("${EMBEDDED_TARGET}" STREQUAL "auto-thor")
   set(CUDA_DIR
       /usr/local/cuda/targets/aarch64-linux
       CACHE STRING "CUDA toolkit dir")
+  set(CUDA_TARGET_DIR
+      /usr/local/cuda/thor/targets/aarch64-linux
+      CACHE STRING "CUDA toolkit target dir")
+  message(STATUS "Using CUDA toolkit dir: ${CUDA_DIR}")
 elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-thor")
   set(CMAKE_CUDA_ARCHITECTURES 110)
   set(CUDA_VERSION 13.0)

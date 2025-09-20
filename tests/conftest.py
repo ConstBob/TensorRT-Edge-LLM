@@ -1,8 +1,9 @@
-import datetime
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 # Add tests directory to path for imports
 tests_dir = Path(__file__).parent
@@ -11,69 +12,110 @@ if str(tests_dir) not in sys.path:
 
 import pytest
 import yaml
-from pytest_helpers import run_command
-from utils.device_utils import DeviceDetector
+
+
+@dataclass
+class RemoteConfig:
+    """Configuration for remote test execution"""
+    host: str
+    user: str
+    password: str
+    remote_workspace: str
+
+
+@dataclass
+class EnvironmentConfig:
+    """Configuration for test environment paths and directories"""
+    llm_sdk_dir: str
+    torch_dir: Optional[str]
+    onnx_dir: str
+    engine_dir: Optional[str]
+    build_dir: str
+    test_log_dir: str
+    trt_package_dir: Optional[str]
+
+    @classmethod
+    def from_environment(cls) -> 'EnvironmentConfig':
+        """Create EnvironmentConfig from required environment variables"""
+        llm_sdk_dir = os.environ.get('LLM_SDK_DIR')
+        if not llm_sdk_dir:
+            raise ValueError(
+                "LLM_SDK_DIR environment variable is required. "
+                "Please set it to the root directory of the TensorRT Edge-LLM project."
+            )
+
+        onnx_dir = os.environ.get('ONNX_DIR')
+        if not onnx_dir:
+            raise ValueError("ONNX_DIR environment variable is required. "
+                             "Please set it to the directory for ONNX models.")
+
+        # Optional directories - will be validated when needed
+        torch_dir = os.environ.get('TORCH_DIR')
+        engine_dir = os.environ.get('ENGINE_DIR')
+        trt_package_dir = os.environ.get('TRT_PACKAGE_DIR')
+
+        build_dir = os.environ.get('BUILD_DIR', 'build')
+        test_log_dir = os.environ.get('TEST_LOG_DIR', 'logs')
+
+        return cls(llm_sdk_dir=llm_sdk_dir,
+                   torch_dir=torch_dir,
+                   onnx_dir=onnx_dir,
+                   engine_dir=engine_dir,
+                   build_dir=build_dir,
+                   test_log_dir=test_log_dir,
+                   trt_package_dir=trt_package_dir)
+
+    def validate_for_export_tests(self):
+        """Validate that required directories are set for export tests"""
+        if not self.torch_dir:
+            raise ValueError(
+                "TORCH_DIR environment variable is required for export tests. "
+                "Please set it to the directory containing torch models.")
+
+    def validate_for_pipeline_tests(self):
+        """Validate that required directories are set for pipeline tests"""
+        if not self.engine_dir:
+            raise ValueError(
+                "ENGINE_DIR environment variable is required for pipeline tests. "
+                "Please set it to the directory for TensorRT engines.")
+
+    def validate_trt_package(self, remote_config=None, logger=None):
+        """Validate that TensorRT package directory exists and contains required files"""
+        if not self.trt_package_dir:
+            raise ValueError("TRT_PACKAGE_DIR environment variable not set")
+
+        from pytest_helpers import run_command
+
+        result = run_command([
+            'bash', '-c', f'test -f {self.trt_package_dir}/include/NvInfer.h'
+        ], remote_config, 10, logger)
+        if not result['success']:
+            raise ValueError(
+                f"Failed to get TensorRT package directory from {self.trt_package_dir}"
+            )
+
+        return self.trt_package_dir
 
 
 @pytest.fixture(scope="session")
-def global_config():
-    """Load test config from environment"""
-    return {
-        'llm_sdk_dir':
-        os.environ.get('LLM_SDK_DIR', os.getcwd()),
-        'torch_dir':
-        os.environ.get('TORCH_DIR', '/scratch.trt_llm_data/llm-models'),
-        'onnx_dir':
-        os.environ.get('ONNX_DIR', 'models'),
-        'engine_dir':
-        os.environ.get('ENGINE_DIR', 'engines'),
-        'trt_lib_path':
-        os.environ.get('TRT_LIB_PATH', 'TensorRT-linux/lib'),
-        'build_dir':
-        'build',
-        'test_log_dir':
-        os.environ.get('TEST_LOG_DIR', 'logs'),
-    }
+def env_config():
+    """Load test environment config from required environment variables"""
+    return EnvironmentConfig.from_environment()
 
 
 @pytest.fixture(scope="session", autouse=True)
-def setup_environment(global_config):
+def setup_environment(env_config):
     """Setup environment and library paths"""
-    llm_sdk_dir = global_config['llm_sdk_dir']
-    trt_lib_path = os.path.join(llm_sdk_dir, global_config['trt_lib_path'])
-
-    def _contains_trt_lib(dir_path: str) -> bool:
-        try:
-            return os.path.isdir(dir_path) and any(
-                name.startswith('libnvinfer.so')
-                for name in os.listdir(dir_path))
-        except Exception:
-            return False
-
-    if not _contains_trt_lib(trt_lib_path):
-        detector = DeviceDetector(run_command)
-        detected_lib = detector.get_tensorrt_lib_dir(llm_sdk_dir)
-        if detected_lib:
-            trt_lib_path = detected_lib
-            os.environ['TRT_LIB_PATH'] = trt_lib_path
-
-    current_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
-    if current_ld_path:
-        os.environ['LD_LIBRARY_PATH'] = f"{current_ld_path}:{trt_lib_path}"
-    else:
-        os.environ['LD_LIBRARY_PATH'] = trt_lib_path
-
-    os.makedirs(global_config['onnx_dir'], exist_ok=True)
-    os.makedirs(global_config['engine_dir'], exist_ok=True)
-
-    log_dir_path = global_config['test_log_dir']
-    os.makedirs(log_dir_path, exist_ok=True)
+    os.makedirs(env_config.onnx_dir, exist_ok=True)
+    if env_config.engine_dir:
+        os.makedirs(env_config.engine_dir, exist_ok=True)
+    os.makedirs(env_config.test_log_dir, exist_ok=True)
 
 
 @pytest.fixture
-def executable_files(global_config):
+def executable_files(env_config):
     """Paths to build executables"""
-    build_dir = global_config['build_dir']
+    build_dir = env_config.build_dir
     return {
         'llm_build': f"{build_dir}/examples/llm/llm_build",
         'llm_chat': f"{build_dir}/examples/llm/llm_chat",
@@ -89,22 +131,11 @@ def executable_files(global_config):
 
 
 @pytest.fixture
-def execution_mode(request):
-    """Get execution mode from command line"""
-    mode_str = request.config.getoption("--execution-mode")
-    # Import from pytest_helpers
-    from pytest_helpers import ExecutionMode
-    return ExecutionMode.LOCAL if mode_str == "local" else ExecutionMode.REMOTE
-
-
-@pytest.fixture
 def remote_config(request):
     """Get remote configuration from command line"""
     execution_mode_str = request.config.getoption("--execution-mode")
 
     if execution_mode_str == "remote":
-        from utils.remote_utils import RemoteConfig
-
         password = request.config.getoption("--remote-password")
         if not password:
             password = os.environ.get('BOARD_PASSWORD_NVKS')
@@ -115,24 +146,40 @@ def remote_config(request):
                 "Use --remote-password or set BOARD_PASSWORD_NVKS environment variable."
             )
 
-        return RemoteConfig(
-            host=request.config.getoption("--remote-host"),
-            user=request.config.getoption("--remote-user"),
-            password=password,
-            remote_workspace=request.config.getoption("--remote-workspace"))
+        remote_user = request.config.getoption("--remote-user")
+        if not remote_user:
+            remote_user = os.environ.get('BOARD_USER')
+        if not remote_user:
+            pytest.fail(
+                "Remote user required for remote execution. "
+                "Use --remote-user or set BOARD_USER environment variable.")
+        remote_host = request.config.getoption("--remote-host")
+        if not remote_host:
+            pytest.fail(
+                "Remote host required for remote execution. "
+                "Use --remote-host or set BOARD_HOST environment variable.")
+
+        remote_workspace = request.config.getoption("--remote-workspace")
+        if not remote_workspace:
+            remote_workspace = os.environ.get('REMOTE_WORKSPACE')
+        if not remote_workspace:
+            pytest.fail(
+                "Remote workspace required for remote execution. "
+                "Use --remote-workspace or set REMOTE_WORKSPACE environment variable."
+            )
+        return RemoteConfig(host=remote_host,
+                            user=remote_user,
+                            password=password,
+                            remote_workspace=remote_workspace)
 
     return None
 
 
 @pytest.fixture(autouse=True)
-def test_logger(request, global_config):
+def test_logger(request, env_config):
     """Create individual logger for each test"""
     test_name = request.node.name
     test_function = request.function.__name__
-
-    log_dir_path = global_config['test_log_dir']
-    log_dir = Path(log_dir_path)
-    log_dir.mkdir(exist_ok=True, parents=True)
 
     if hasattr(request, 'param') or '[' in test_name:
         if '[' in test_name and ']' in test_name:
@@ -146,7 +193,7 @@ def test_logger(request, global_config):
     else:
         log_filename = f"{test_function}.log"
 
-    log_file = log_dir / log_filename
+    log_file = os.path.join(env_config.test_log_dir, log_filename)
 
     logger = logging.getLogger(f"test_{test_name}")
     logger.setLevel(logging.INFO)
@@ -157,39 +204,20 @@ def test_logger(request, global_config):
     file_handler = logging.FileHandler(log_file, mode='w')
     file_handler.setLevel(logging.INFO)
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s',
-                                  datefmt='%Y-%m-%d %H:%M:%S')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
+    formatter_file = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S')
+    file_handler.setFormatter(formatter_file)
 
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
 
-    logger.info("=" * 80)
-    logger.info(f"Starting test: {test_name}")
-    logger.info(f"Test function: {test_function}")
-    logger.info(f"Test file: {request.fspath}")
-    logger.info(f"Timestamp: {datetime.datetime.now().isoformat()}")
-
-    logger.info("Environment Information:")
-    logger.info(f"  LLM_SDK_DIR: {os.environ.get('LLM_SDK_DIR', 'Not set')}")
-    logger.info(f"  ONNX_DIR: {os.environ.get('ONNX_DIR', 'Not set')}")
-    logger.info(f"  ENGINE_DIR: {os.environ.get('ENGINE_DIR', 'Not set')}")
-    logger.info(
-        f"  LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'Not set')}")
-    logger.info("=" * 80)
+    logger.info(f"Starting: {test_name}")
 
     request.node.test_logger = logger
 
     yield logger
 
-    logger.info("=" * 80)
-    logger.info(f"Completed test: {test_name}")
-    logger.info(f"Timestamp: {datetime.datetime.now().isoformat()}")
-    logger.info("=" * 80)
+    logger.info(f"Completed: {test_name}")
 
     for handler in logger.handlers[:]:
         handler.close()
@@ -200,7 +228,6 @@ def pytest_addoption(parser):
     """Add custom command line options"""
     parser.addoption("--priority",
                      action="store",
-                     default="l0",
                      help="Test priority level (l0, l1, etc.)")
     parser.addoption("--execution-mode",
                      action="store",
@@ -209,40 +236,45 @@ def pytest_addoption(parser):
                      help="Execution mode: local or remote")
     parser.addoption("--remote-host",
                      action="store",
-                     default="192.168.55.1",
                      help="Remote host for remote execution")
     parser.addoption("--remote-user",
                      action="store",
-                     default="nvidia",
                      help="Remote user for remote execution")
     parser.addoption("--remote-password",
                      action="store",
                      help="Remote password for remote execution")
     parser.addoption("--remote-workspace",
                      action="store",
-                     default="/home/nvidia/tensorrt-edge-llm",
                      help="Remote workspace directory")
 
 
-def pytest_runtest_setup(item):
-    """Setup before each test"""
-    if hasattr(item, 'test_logger'):
-        item.test_logger.info(f"Setting up test: {item.name}")
+def pytest_runtest_makereport(item, call):
+    """Enhanced test reporting with failure details"""
+    if call.when == "call":
+        test_logger = getattr(item, 'test_logger', None)
 
+        if call.excinfo is not None and test_logger:
+            test_logger.error(f"TEST FAILED: {item.name}")
+            test_logger.error(
+                f"Exception: {call.excinfo.type.__name__}: {str(call.excinfo.value)}"
+            )
 
-def pytest_runtest_teardown(item):
-    """Teardown after each test"""
-    if hasattr(item, 'test_logger'):
-        item.test_logger.info(f"Tearing down test: {item.name}")
+            if hasattr(call.excinfo, 'traceback') and call.excinfo.traceback:
+                tb_entries = list(call.excinfo.traceback)
+                for tb in reversed(tb_entries):
+                    if 'tests/' in str(tb.path) and not str(
+                            tb.path).endswith('conftest.py'):
+                        test_logger.error(f"Location: {tb.path}:{tb.lineno}")
+                        break
 
 
 _test_config_cache = {}
 
 
-def _get_test_config(priority):
+def _get_test_list_file(priority):
     """Get test configuration with caching"""
     if priority not in _test_config_cache:
-        config_file = f"tests/configs/{priority}.yml"
+        config_file = f"tests/test_lists/{priority}.yml"
         try:
             with open(config_file, 'r') as f:
                 _test_config_cache[priority] = yaml.safe_load(f)
@@ -255,12 +287,12 @@ def pytest_generate_tests(metafunc):
     """Generate parameterized tests based on YAML configuration"""
     if "test_param" in metafunc.fixturenames:
         priority = metafunc.config.getoption("--priority", "l0")
-        config = _get_test_config(priority)
+        test_list_file = _get_test_list_file(priority)
 
-        if not config:
+        if not test_list_file:
             return
 
-        test_cases = config.get('tests', [])
+        test_cases = test_list_file.get('tests', [])
         current_test_name = metafunc.function.__name__
 
         relevant_tests = []
@@ -287,13 +319,13 @@ def pytest_generate_tests(metafunc):
 def pytest_collection_modifyitems(config, items):
     """Keep only test functions that are explicitly configured in the YAML file"""
     priority = config.getoption("--priority", "l0")
-    test_config = _get_test_config(priority)
+    test_list_file = _get_test_list_file(priority)
 
-    if not test_config:
+    if not test_list_file:
         return
 
     configured_tests = set()
-    for test_case in test_config.get('tests', []):
+    for test_case in test_list_file.get('tests', []):
         if isinstance(test_case, str):
             test_name = test_case.split('::')[-1]
             configured_tests.add(test_name)
