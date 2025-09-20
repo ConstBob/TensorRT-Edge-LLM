@@ -1,7 +1,8 @@
 variables:
   TRT_BRANCH: "main"
-  PIPELINE_CACHE_DIR: "/scratch.edge_llm_cache/L0/$CI_PIPELINE_ID"
   EDGE_LLM_CACHE_DIR: "/scratch.edge_llm_cache"
+  CACHE_BASE_DIR: "$EDGE_LLM_CACHE_DIR/L0"
+  PIPELINE_CACHE_DIR: "$CACHE_BASE_DIR/$CI_PIPELINE_ID"
   TORCH_DIR: "/scratch.trt_llm_data/llm-models"
   TRT_VERSION: "10.13.3.9"
 
@@ -14,273 +15,239 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - when: never
 
-stages:
-- pre_commit_checks
-- test
-
-# Pre-commit code quality checks
-pre_commit_checks:
-  stage: pre_commit_checks
-  variables:
-    PLATFORM: tensorrt-runner
-    CUDA_VERSION: "12.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-cross-aarch64-jp6-cuda$CUDA_VERSION
-  tags:
-    - cpu-k8s
-  script:
-    - echo "Installing dependencies"
-    - apt update
-    - apt install -y python3 python3-pip git curl
-    - echo "Installing pre-commit hooks"
-    - pip3 install pre-commit
-    - pre-commit install
-    - echo "Running pre-commit checks on all files"
-    - pre-commit run --all-files || (echo "❌ Pre-commit checks failed!" && echo "💡 To fix this locally, run:" && echo "   pip install pre-commit" && echo "   pre-commit install" && echo "   pre-commit run --all-files" && exit 1)
-    - echo "✅ Pre-commit checks passed!"
-  interruptible: true
-
-
-# Building and testing with A30 Linux
-ampere_model_export:
-  stage: test
-  variables:
-    PLATFORM: tensorrt-runner
-    CUDA_VERSION: "12.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/ampere_model_export"
-  tags:
-    - a30-edgellm-nvks
-  image: "$IMAGE"
+.export_onnx_template:
   script:
     - echo "Pipeline start time:$(date)"
-    - mkdir -p $TEST_CACHE_DIR
+    - mkdir -p $ONNX_DIR $TEST_LOG_DIR
     - echo "Installing dependencies"
-    - apt update
-    - apt install -y python3 python3-pip git curl
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip git curl >/dev/null 2>&1
     - echo "Testing model export"
     - ls /scratch.trt_llm_data
     - export LLM_SDK_DIR=$(pwd)
     - echo "Installing package dependencies"
     - cd $LLM_SDK_DIR
-    - pip3 install build
+    - pip3 install -q build
     - python3 -m build --wheel --outdir dist .
     - pip3 install dist/*.whl
     - echo "Installing pytest dependencies"
-    - pip3 install -r tests/requirements.txt
+    - pip3 install -q -r tests/requirements.txt
     - echo "Setting up test environment"
-    - export ONNX_DIR=$TEST_CACHE_DIR
-    - export TEST_LOG_DIR=$TEST_CACHE_DIR/logs
-    - mkdir -p $ONNX_DIR $TEST_LOG_DIR
     - echo "Running L0 export tests with pytest. Time:$(date)"
-    - python3 -m pytest tests --priority=l0_export_ampere -v --color=yes --html=$TEST_LOG_DIR/test_report_l0_export.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_l0_export.xml
-    - echo "Models exported to cache directory $TEST_CACHE_DIR"
-    - ls -la $TEST_CACHE_DIR/onnx
+    - python3 -m pytest tests --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - echo "Models exported to cache directory $ONNX_DIR"
+    - ls -la $ONNX_DIR
     - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
     - echo "Pipeline end time:$(date)"
   interruptible: true
 
-# Building and testing with A30 Linux
-blackwell_model_export:
-  stage: test
-  variables:
-    PLATFORM: tensorrt-runner
-    CUDA_VERSION: "12.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/blackwell_model_export"
-  tags:
-    - a30-edgellm-nvks
-  image: "$IMAGE"
+.x86_test_template:
   script:
     - echo "Pipeline start time:$(date)"
-    - mkdir -p $TEST_CACHE_DIR
+    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR
     - echo "Installing dependencies"
-    - apt update
-    - apt install -y python3 python3-pip git curl
-    - echo "Testing model export"
-    - ls /scratch.trt_llm_data
-    - export LLM_SDK_DIR=$(pwd)
-    - echo "Installing package dependencies"
-    - cd $LLM_SDK_DIR
-    - pip3 install build
-    - python3 -m build --wheel --outdir dist .
-    - pip3 install dist/*.whl
-    - echo "Installing pytest dependencies"
-    - pip3 install -r tests/requirements.txt
-    - echo "Setting up test environment"
-    - export ONNX_DIR=$TEST_CACHE_DIR
-    - export TEST_LOG_DIR=$TEST_CACHE_DIR/logs
-    - mkdir -p $ONNX_DIR $TEST_LOG_DIR
-    - echo "Running L0 export tests with pytest. Time:$(date)"
-    - python3 -m pytest tests --priority=l0_export_blackwell -v --color=yes --html=$TEST_LOG_DIR/test_report_l0_export.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_l0_export.xml
-    - echo "Models exported to cache directory $TEST_CACHE_DIR"
-    - ls -la $TEST_CACHE_DIR/onnx
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
-    - echo "Pipeline end time:$(date)"
-  interruptible: true
-
-# Cross build for JP6 Orin
-jp6_cross_build:
-  stage: test
-  variables:
-    PLATFORM: tensorrt-runner
-    CUDA_VERSION: "12.9"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-cross-aarch64-jp6-cuda$CUDA_VERSION
-    TRT_CACHE_PATH: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/jp6_cross_build"
-  tags:
-    - a30-edgellm-nvks
-  image: "$IMAGE"
-  script:
-    - echo "Pipeline start time:$(date)"
-    - mkdir -p $TEST_CACHE_DIR
-    - echo "Installing dependencies"
-    - apt update
-    - apt install -y python3 python3-pip git curl
-    - echo "Checking cached dependencies"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip git >/dev/null 2>&1
+    - echo "Checking TRT x86_64 package"
+    - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
+    - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=$(pwd)
     - git submodule update --init --recursive
-    - echo "Building TensorRT Edge-LLM SDK"
-    - mkdir -p build-jp6
-    - cd build-jp6
-    - cmake .. -DTRT_PACKAGE_DIR=$TRT_CACHE_PATH -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake -DEMBEDDED_TARGET=orin -DBUILD_UNIT_TESTS=ON
-    - make -j16
-    - echo "Built TensorRT Edge-LLM SDK for Orin"
-    - echo "Copying build artifacts to cache directory"
-    - cp -r $LLM_SDK_DIR/build-jp6 $TEST_CACHE_DIR/build
-    - echo "Build artifacts saved to $TEST_CACHE_DIR"
+    - echo "Installing pytest dependencies"
+    - pip3 install -q -r tests/requirements.txt
+    - echo "Setting up test environment"
+    - echo "Running L0 pipeline tests with pytest. Time:$(date)"
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
+    - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
-  interruptible: true
-
-orin_test:
-  stage: test
-  needs:
-    - jp6_cross_build
-    - ampere_model_export
-  variables:
-    BOARD_USER: "tensorrt_user"
-    CUDA_VERSION: "12.9"
-    TRT_VERSION: "10.13.3.9"
-    TRT_CACHE_PATH: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/orin_test"
-  tags:
-    - p3730-k8s
-  image: "ubuntu:24.04"
+  
+.device_test_template:
   script:
     - echo "Pipeline start time:$(date)"
-    - mkdir -p $TEST_CACHE_DIR
+    - mkdir -p $TEST_LOG_DIR
     - echo "Installing dependencies"
-    - apt update
-    - apt install -y openssh-client sshpass rsync nfs-common python3 python3-pip python3-venv
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq git openssh-client sshpass rsync python3 python3-pip python3-venv >/dev/null 2>&1
     - echo "Copying password to device scripts"
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
     # clean up the packages in the board
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_init.sh
     - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
     - export LLM_SDK_DIR=$(pwd)
+    - git submodule update --init --recursive
     - export REMOTE_WORKSPACE=/home/$BOARD_USER/tensorrt-edge-llm
-    - echo "Creating remote directories and syncing JP6 build artifacts and TRT libraries from host to board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "mkdir -p $REMOTE_WORKSPACE/build  $REMOTE_WORKSPACE/examples $REMOTE_WORKSPACE/unittests $REMOTE_WORKSPACE/tests"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $PIPELINE_CACHE_DIR/jp6_cross_build/build/ $BOARD_USER@192.168.55.1:$REMOTE_WORKSPACE/build/
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/examples/ $BOARD_USER@192.168.55.1:$REMOTE_WORKSPACE/examples/
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/unittests/ $BOARD_USER@192.168.55.1:$REMOTE_WORKSPACE/unittests/
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/tests/ $BOARD_USER@192.168.55.1:$REMOTE_WORKSPACE/tests/
-    - echo "Setting up environment variables on board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "echo 'export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:$TRT_CACHE_PATH/lib' >> /home/$BOARD_USER/.bashrc"
-    - echo "Creating Python virtual environment on host"
-    - python3 -m venv venv
-    - source venv/bin/activate
-    - echo "Installing pytest dependencies in virtual environment"
-    - pip install -r tests/requirements.txt
-    - export ONNX_DIR=$PIPELINE_CACHE_DIR/ampere_model_export/onnx
     - export ENGINE_DIR=$REMOTE_WORKSPACE/engines
-    - export TEST_LOG_DIR=$TEST_CACHE_DIR/logs
-    - mkdir -p $TEST_LOG_DIR
-    - echo "Setup complete. Running L0 pipeline tests on Orin with pytest. Time:$(date)"
-    - source venv/bin/activate && python -m pytest tests/ --priority=l0_pipeline_orin --execution-mode=remote --remote-host=192.168.55.1 --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=/home/$BOARD_USER/tensorrt-edge-llm -v --color=yes --html=$TEST_LOG_DIR/test_report_l0_pipeline_orin.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_l0_pipeline_orin.xml
+    - echo "Creating remote directories and syncing repo from host to board"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "mkdir -p $REMOTE_WORKSPACE $ENGINE_DIR"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@192.168.55.1:$REMOTE_WORKSPACE/
+    - echo "Setting file permissions to 755 to prevent permission issues"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "chmod -R 755 $REMOTE_WORKSPACE"
+    - echo "Installing pytest dependencies in a virtual environment"
+    - python3 -m venv venv && source venv/bin/activate
+    - pip3 install -q -r tests/requirements.txt
+    - echo "Setup complete. Running L0 pipeline tests on device with pytest. Time:$(date)"
+    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=192.168.55.1 --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
     - if [ $? -ne 0 ]; then echo "Error occurred during testing"; exit 1; fi
     - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR. Cleaning up remote workspace."
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "rm -rf $REMOTE_WORKSPACE"
+    - ls -la $TEST_LOG_DIR
+    - deactivate
+    - echo "Pipeline end time:$(date)"
+
+stages:
+- setup
+- test
+
+# Pre-commit code quality checks
+pre_commit_checks:
+  stage: setup
+  variables:
+    CUDA_VERSION: "12.9"
+  tags:
+    - cpu-k8s
+  script:
+    - echo "Installing dependencies"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip python3-venv git >/dev/null 2>&1
+    - echo "Installing pre-commit hooks"
+    - python3 -m venv venv && source venv/bin/activate
+    - pip3 install -q pre-commit
+    - pre-commit install
+    - echo "Running pre-commit checks on all files"
+    - pre-commit run --all-files || (echo "❌ Pre-commit checks failed!" && echo "💡 To fix this locally, run:" && echo "   pip install pre-commit" && echo "   pre-commit install" && echo "   pre-commit run --all-files" && exit 1)
+    - echo "✅ Pre-commit checks passed!"
+    - deactivate
     - echo "Pipeline end time:$(date)"
   interruptible: true
 
+cache_cleanup:
+  stage: setup
+  tags:
+    - a30-edgellm-nvks
+  script:
+    - echo "Pipeline start time:$(date)"
+    - echo "Starting cache cleanup for directories older than 3 days in $CACHE_BASE_DIR"
+    - echo "Current contents in $CACHE_BASE_DIR:"
+    - ls -la "$CACHE_BASE_DIR" || echo "Directory is empty or inaccessible"
+    - echo "Removing directories older than 3 days..."
+    - find "$CACHE_BASE_DIR" -maxdepth 1 -type d -mtime +3 -not -path "$CACHE_BASE_DIR" -exec rm -rf {} \; -print
+    - echo "Cleanup completed. Remaining contents in $CACHE_BASE_DIR:"
+    - ls -la "$CACHE_BASE_DIR" || echo "Directory is empty or inaccessible"
+    - echo "Pipeline end time:$(date)"
+  interruptible: true
 
-a30_build_and_test:
+# Model export for Ampere (fp16 or int4)
+ampere_model_export:
+  stage: test
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/ampere_model_export"
+    PRIORITY: l0_export_ampere
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends: .export_onnx_template
+  interruptible: true
+
+# Model export for Blackwell/Thor (fp8 or fp4)
+blackwell_model_export:
+  stage: test
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/blackwell_model_export"
+    PRIORITY: l0_export_blackwell
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends: .export_onnx_template
+  interruptible: true
+
+# Building and testing with A30 Linux
+a30:
   stage: test
   needs:
     - ampere_model_export
   variables:
-    PLATFORM: tensorrt-runner
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/a30_build_and_test"
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/a30"
+    PRIORITY: l0_pipeline_a30
+    ONNX_DIR: "$PIPELINE_CACHE_DIR/ampere_model_export/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
-  script:
-    - echo "Pipeline start time:$(date)"
-    - mkdir -p $TEST_CACHE_DIR
-    - echo "Installing dependencies"
-    - apt update
-    - apt install -y python3 python3-pip git curl
-    - echo "Checking TRT x86_64 package"
-    - export TRT_CACHE_PATH="$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
-    - if [ ! -d "$TRT_CACHE_PATH" ]; then echo "TensorRT x86_64 cache not found at $TRT_CACHE_PATH"; exit 1; fi
-    - echo "Using TensorRT x86_64 package directly from cache"
-    - export LLM_SDK_DIR=$(pwd)
-    - git submodule update --init --recursive
-    - echo "Installing pytest dependencies"
-    - pip3 install -r tests/requirements.txt
-    - echo "Setting up test environment"
-    - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$TRT_CACHE_PATH/lib
-    - export ONNX_DIR=$PIPELINE_CACHE_DIR/ampere_model_export/onnx
-    - export ENGINE_DIR=$TEST_CACHE_DIR/engines
-    - export TEST_LOG_DIR=$TEST_CACHE_DIR/logs
-    - mkdir -p $ENGINE_DIR $TEST_LOG_DIR
-    - echo "Running L0 pipeline tests with pytest. Time:$(date)"
-    - python3 -m pytest tests/ --priority=l0_pipeline_a30 -v --color=yes --html=$TEST_LOG_DIR/test_report_l0_pipeline_a30.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_l0_pipeline_a30.xml
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
-    - ls -la $TEST_LOG_DIR
-    - echo "Pipeline end time:$(date)"
+  extends: .x86_test_template
   interruptible: true
 
-rtx5080_build_and_test:
+# Building and testing with RTX5080 Linux
+rtx5080:
     stage: test
     needs:
       - blackwell_model_export
     variables:
-      PLATFORM: tensorrt-runner
       CUDA_VERSION: "12.9"
       IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-      TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/rtx5080_build_and_test"
+      TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/rtx5080"
+      PRIORITY: l0_pipeline_rtx5080
+      ONNX_DIR: "$PIPELINE_CACHE_DIR/blackwell_model_export/onnx"
+      TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+      ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+      TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
     tags:
       - rtx5080-edgellm-nvks
     image: "$IMAGE"
-    script:
-      - echo "Pipeline start time:$(date)"
-      - mkdir -p $TEST_CACHE_DIR
-      - echo "Installing dependencies"
-      - apt update
-      - apt install -y python3 python3-pip git curl
-      - echo "Checking cached dependencies"
-      - export TRT_CACHE_PATH="$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
-      - if [ ! -d "$TRT_CACHE_PATH" ]; then echo "TensorRT x86_64 cache not found at $TRT_CACHE_PATH"; exit 1; fi
-      - echo "All cached dependencies found"
-      - echo "Updating submodules"
-      - git submodule update --init --recursive
-      - echo "Using TensorRT x86_64 package directly from cache"
-      - export LLM_SDK_DIR=$(pwd)
-      - cd $LLM_SDK_DIR
-      - git submodule update --init --recursive
-      - echo "Installing pytest dependencies"
-      - pip3 install -r tests/requirements.txt
-      - echo "Setting up test environment"
-      - export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$TRT_CACHE_PATH/lib
-      - export ONNX_DIR=$PIPELINE_CACHE_DIR/blackwell_model_export/onnx
-      - export ENGINE_DIR=$TEST_CACHE_DIR/engines
-      - export TEST_LOG_DIR=$TEST_CACHE_DIR/logs
-      - mkdir -p $ENGINE_DIR $TEST_LOG_DIR
-      - echo "Running L0 pipeline tests with pytest. Time:$(date)"
-      - python3 -m pytest tests/ --priority=l0_pipeline_rtx5080 -v --color=yes --html=$TEST_LOG_DIR/test_report_l0_pipeline_rtx5080.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_l0_pipeline_rtx5080.xml
-      - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
-      - echo "Pipeline end time:$(date)"
+    extends: .x86_test_template
     interruptible: true
+
+# Building and testing with Jetson Orin
+jetson_orin:
+  stage: test
+  needs:
+    - ampere_model_export
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.9"
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/jetson_orin"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
+    PRIORITY: l0_pipeline_orin
+    ONNX_DIR: "$PIPELINE_CACHE_DIR/ampere_model_export/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - p3730-k8s
+  image: "ubuntu:24.04"
+  extends: .device_test_template
+  interruptible: true
+
+
+# Building and testing with Drive Thor
+drive_thor_ferrix:
+  stage: test
+  needs:
+    - blackwell_model_export
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.8"
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/drive_thor_ferrix"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$CUDA_VERSION"
+    PRIORITY: l0_pipeline_thor_ferrix
+    ONNX_DIR: "$PIPELINE_CACHE_DIR/blackwell_model_export/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - thor_drive-nvks
+  image: "ubuntu:24.04"
+  extends: .device_test_template
+  interruptible: true

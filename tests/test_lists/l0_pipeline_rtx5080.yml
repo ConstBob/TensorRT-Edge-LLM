@@ -1,0 +1,22 @@
+# L0 Pipeline Tests - Core pipeline functionality smoke tests  
+
+# Core functionality tests
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+  # FP8 LLM tests
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048]
+  - tests/defs/test_llm_pipeline.py::test_benchmark[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048-bs1-isl2048-osl128]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048-mxbs1-llm_basic]
+  # LoRA LLM tests
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048-mxlr64]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048-mxlr64-llm_lora]
+  # VLM tests with NVFP4 + FP8 lm_head
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-hf-nvfp4-lmfp8-mxsl8192-mxbs1-mxil5120-mnit256-mxit5120]
+  - tests/defs/test_vlm_pipeline.py::test_benchmark[InternVL3-1B-hf-nvfp4-lmfp8-mxsl8192-mxbs1-mxil5120-mnit256-mxit5120-bs1-isl2048-osl128-itl1024-ttl1024]
+  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-hf-nvfp4-lmfp8-mxsl8192-mxbs1-mxil5120-mnit256-mxit5120-vlm_basic]
+  # VLM tests with NVFP4 + FP8 lm_head + FP8 ViT
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-hf-nvfp4-lmfp8-mxsl8192-mxbs1-mxil5120-mnit256-mxit5120-vitfp8]
+  - tests/defs/test_vlm_pipeline.py::test_benchmark[InternVL3-1B-hf-nvfp4-lmfp8-mxsl8192-mxbs1-mxil5120-mnit256-mxit5120-vitfp8-bs1-isl2048-osl128-itl1024-ttl1024]
+  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-hf-nvfp4-lmfp8-mxsl8192-mxbs1-mxil5120-mnit256-mxit5120-vitfp8-vlm_basic]
+  

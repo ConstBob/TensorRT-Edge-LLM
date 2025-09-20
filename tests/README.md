@@ -4,10 +4,11 @@
 
 ### 1. Environment Setup
 ```bash
-export ONNX_DIR=/path/to/onnx/models
-export ENGINE_DIR=/path/to/engine/outputs
-export LLM_SDK_DIR=$(pwd)
-export TORCH_DIR=/path/to/pytorch/models  # For export tests
+export LLM_SDK_DIR=$(pwd)                    # Required: Project root
+export ONNX_DIR=/path/to/onnx/models         # Required: ONNX model directory
+export ENGINE_DIR=/path/to/engine/outputs    # Required for pipeline tests
+export TORCH_DIR=/path/to/pytorch/models     # Required for export tests
+export TRT_PACKAGE_DIR=/path/to/tensorrt     # Optional: TensorRT installation
 ```
 
 ### 2. Install Dependencies
@@ -23,174 +24,182 @@ python -m build --wheel --outdir dist .
 pip install dist/*.whl
 
 # Build C++ components
-mkdir -p build
-cd build
-cmake .. -DTRT_PACKAGE_DIR=/path/to/tensorrt -DBUILD_UNIT_TESTS=ON
-make -j$(nproc)
-cd ..
+mkdir -p build && cd build
+cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DBUILD_UNIT_TESTS=ON
+make -j$(nproc) && cd ..
 ```
 
 ### 4. Run Tests
 ```bash
-# Under tensorrt-edgellm root.
+# Run specific test suite
 pytest --priority=l0_pipeline_a30 -v
+pytest --priority=l0_export_ampere -v
 ```
 
-## Test Types
+## Test Structure
 
-### Unit Tests (C++)
+### Test Categories
+- **Export Tests** (`test_model_export.py`) - PyTorch to ONNX conversion
+- **Package Tests** (`test_package.py`) - Python package functionality
+- **Pipeline Tests** (`test_llm_pipeline.py`, `test_vlm_pipeline.py`) - End-to-end inference
+- **Common Tests** (`test_common.py`) - Build and unit tests
+
+### Available Test Suites
+- `l0_export_ampere.yml` - Model export tests (Ampere GPUs)
+- `l0_export_blackwell.yml` - Model export tests (Blackwell GPUs)
+- `l0_pipeline_a30.yml` - Pipeline tests (A30 GPU)
+- `l0_pipeline_orin.yml` - Pipeline tests (Jetson Orin)
+- `l0_pipeline_rtx5080.yml` - Pipeline tests (RTX 5080)
+- `l0_pipeline_thor_ferrix.yml` - Pipeline tests (Thor/Ferrix)
+
+## Parameter Format
+
+### Model Configuration String
+```
+ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additional-Params]
+```
+
+### Core Parameters
+- **Model**: `Qwen2.5-0.5B-Instruct`, `InternVL3-1B-hf`
+- **Precision**: `fp16`, `fp8`, `int4_awq`, `nvfp4`, `int4_gptq`
+- **LM Head**: `lmfp16`, `lmfp8`, `lmint4_awq`, `lmnvfp4` (optional, defaults to fp16)
+- **Engine Config**: `mxsl4096` (max seq len), `mxbs1` (max batch), `mxil2048` (max input len)
+
+### Task-Specific Parameters
+**Build/Inference:**
+- `mxlr64` - Max LoRA rank (optional)
+- `mnit128`, `mxit1024` - Min/max image tokens (VLM only)
+- `vitfp8` - Visual precision (VLM only)
+
+**Benchmark:**
+- `bs1` - Batch size, `isl2048` - Input seq len, `osl128` - Output seq len
+- `ttl1024`, `itl1024` - Text/image token lengths (VLM only)
+
+**Export:**
+- `lora` - Enable LoRA support
+
+### Examples
 ```bash
-cd build && ./unitTest
+# LLM with FP16 precision
+Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs1-mxil2048
+
+# VLM with INT4 AWQ and LoRA
+Qwen2.5-VL-3B-Instruct-int4_awq-mxsl4096-mxbs1-mxil2048-mnit128-mxit2048-mxlr32
+
+# Benchmark test with FP8
+Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048-bs1-isl2048-osl128
 ```
-
-### Export Tests (Python)
-```bash
-pytest tests/test_model_export.py --priority=l0_export -v
-```
-
-### Package Tests (Python)
-```bash
-pytest tests/test_llm_pipeline.py --priority=l0_pipeline_rtx5080 -v
-```
-
-### Pipeline Tests
-
-
-## Configuration
-
-### Test Configs (`tests/configs/`)
-- `l0_pipeline_a30.yml` - A30 GPU tests
-- `l0_pipeline_orin.yml` - Jetson Orin tests  
-- `l0_pipeline_rtx5080.yml` - RTX5080 tests
-- `l0_export.yml` - Export tests
-
-### Parameter Format
-```
-ModelName-Precision-MaxBatchSize-MaxInputLen-MaxSeqLen-OutputSeqLen
-```
-
-**Examples:**
-- `Qwen2.5-0.5B-Instruct-fp16-mxbs1-mxil2048-mxsl4096-osl128`
-- `InternVL3-1B-hf-int4_awq-mxbs1-mxil2048-mxsl4096-mxbs1-mnit128-mxit1024`
-
-**Parameters:**
-- `mxbs1` = max batch size 1
-- `mxil2048` = max input length 2048
-- `mxsl4096` = max sequence length 4096  
-- `osl128` = output sequence length 128
-- `mnit128` = min image tokens 128 (VLM)
-- `mxit1024` = max image tokens 1024 (VLM)
 
 ## Directory Structure
 
-### ONNX Models (`ONNX_DIR/`)
+### Tests Organization
 ```
-Qwen2.5-0.5B-Instruct-fp16-4096/
-├── model.onnx
-├── onnx_model.data
-├── config.json
-├── tokenizer.json
-└── tokenizer_config.json
+tests/
+├── defs/                    # Test definitions
+│   ├── config.py           # Unified configuration system
+│   ├── test_common.py      # Build and unit tests
+│   ├── test_llm_pipeline.py # LLM pipeline tests
+│   ├── test_vlm_pipeline.py # VLM pipeline tests
+│   ├── test_model_export.py # Export tests
+│   ├── test_package.py     # Package tests
+│   └── utils/              # Utility functions
+│       ├── command_execution.py
+│       ├── command_generation.py
+│       └── accuracy_utils.py
+├── test_lists/             # Test configuration files
+├── test_cases/             # Test input/reference data
+└── conftest.py            # Pytest configuration
+```
 
-InternVL3-1B-hf-int4_awq-4096/
-├── model.onnx
-├── onnx_model.data
-├── config.json
-├── tokenizer.json
-├── tokenizer_config.json
-└── visual-fp16/
+### Model Directory Structure
+**ONNX Models (`ONNX_DIR/`):**
+```
+ModelName-Precision-LmHeadPrecision-MaxSeqLen/
+├── llm/                    # LLM ONNX files
+│   ├── model.onnx
+│   ├── config.json
+│   ├── tokenizer.json
+│   └── lora_model.onnx    # (if LoRA enabled)
+└── visual-{precision}/     # VLM visual models
     ├── model.onnx
     └── config.json
 ```
 
-### Engine Output (`ENGINE_DIR/`)
+**Engine Output (`ENGINE_DIR/`):**
 ```
-llm_engines/
-└── Qwen2.5-0.5B-Instruct-fp16-4096/
-
-visual_engines/
-└── InternVL3-1B-hf-int4_awq-4096/
+ModelName-Precision-LmHeadPrecision-MaxSeqLen/
+├── llm-mxil{N}-mxbs{N}-mxlr{N}/
+│   └── llm.engine
+└── visual-{precision}/
+    └── visual.engine
 ```
 
-## CI Process
+## Remote Execution
 
-The CI pipeline follows this workflow:
+Tests support remote execution on target devices (e.g., Jetson Orin):
 
-### Stage 1: Pre-commit Checks
-- Code quality and linting checks
-- Runs on CPU-only runners
+```bash
+pytest --priority=l0_pipeline_orin \
+       --execution-mode=remote \
+       --remote-host=192.168.55.1 \
+       --remote-user=nvidia \
+       --remote-workspace=/home/nvidia/tensorrt-edge-llm \
+       -v
+```
 
-### Stage 2: Build
-- **`a30_model_export`**: Export PyTorch models to ONNX on A30 GPU
-- **`jp6_cross_build`**: Cross-compile for Jetson Orin (ARM64)
-
-### Stage 3: Test
-- **`orin_test`**: Run tests on physical Jetson Orin device (remote execution)
-- **`a30_build_and_test`**: Build and test on A30 GPU
-- **`rtx5080_build_and_test`**: Build and test on RTX5080 GPU
-
-### Local Test Execution Order
-1. `test_build_project` - Build project
-2. `test_unit_tests` - Run C++ unit tests  
-3. `test_engine_build` - Build TensorRT engines
-4. `test_inference_*` - Run inference tests
+Environment variables for remote execution:
+- `BOARD_HOST`, `BOARD_USER`, `BOARD_PASSWORD_NVKS`
+- `REMOTE_WORKSPACE`
 
 ## Troubleshooting
 
-### Model Files Not Found
+### Common Issues
+**Model Files Not Found:**
 ```bash
 FileNotFoundError: ONNX model not found
 ```
-**Fix**: Verify `ONNX_DIR` path and model structure.
+→ Verify `ONNX_DIR` path and model structure matches expected format.
 
-### Build Executables Not Found
+**Build Executables Not Found:**
 ```bash
 Unit test executable not found: build/unitTest
 ```
-**Fix**: 
-1. Install package: `python -m build --wheel --outdir dist . && pip install dist/*.whl`
-2. Build project with `-DBUILD_UNIT_TESTS=ON`
+→ Ensure project is built with `cmake .. -DBUILD_UNIT_TESTS=ON`
 
-### TensorRT Library Not Found
+**TensorRT Library Not Found:**
 ```bash
 OSError: libnvinfer.so.x: cannot open shared object file
 ```
-**Fix**: Set `LD_LIBRARY_PATH`:
-```bash
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/path/to/tensorrt/lib
-```
+→ Set `TRT_PACKAGE_DIR` or `LD_LIBRARY_PATH=/path/to/tensorrt/lib`
 
 ### Debug Commands
 ```bash
 # Check environment
-echo $LLM_SDK_DIR $ONNX_DIR $ENGINE_DIR $LD_LIBRARY_PATH
+echo $LLM_SDK_DIR $ONNX_DIR $ENGINE_DIR
 
-# Check executables
-ls -la build/unitTest build/examples/llm/llm_build
+# Verbose test output with logs
+pytest --priority=l0_pipeline_a30 -v -s --tb=long
 
-# Verbose test output
-pytest test_llm_pipeline.py -v -s --tb=long
-
-# Check logs
-cat logs/test_unit_tests.log
+# Check individual logs
+ls logs/ && cat logs/test_build_project.log
 ```
 
-## Adding Tests
+## Adding New Tests
 
-### Pipeline Tests
-1. Add to config file (`tests/configs/l0_pipeline_a30.yml`):
-   ```yaml
-   tests:
-     - tests/test_llm_pipeline.py::test_engine_build[MyModel-fp16-bs1-mxil2048-mxsl4096-osl128]
-   ```
-2. Ensure model files in `ONNX_DIR`
-3. Test locally first
+### 1. Add to Test Suite
+Edit appropriate test list file (e.g., `tests/test_lists/l0_pipeline_a30.yml`):
+```yaml
+tests:
+  - tests/defs/test_llm_pipeline.py::test_engine_build[MyModel-fp16-mxsl4096-mxbs1-mxil2048]
+```
 
-### Unit Tests
-1. Add C++ test file in `unittests/`
-2. Update `CMakeLists.txt`
-3. Build and verify:
-   ```bash
-   cd build && make -j$(nproc) && ./unitTest --gtest_filter="MyNewTest.*"
-   ```
+### 2. Ensure Model Files
+Place model files in correct `ONNX_DIR` structure:
+```
+ONNX_DIR/MyModel-fp16-fp16-4096/llm/model.onnx
+```
 
+### 3. Test Locally
+```bash
+pytest --priority=l0_pipeline_a30 -k "MyModel" -v
+```
