@@ -82,6 +82,12 @@ public:
     //! @param stream The stream is used to perform GPU memory operations.
     void commitDecodeRequest(cudaStream_t stream);
 
+    //! Commit the KVCache buffer for a decode request, increment the KVCache lengths by the given increment.
+    //! Handle case where we produce multiple tokens at the same time.
+    //! @param increment The increment value to be added to the KVCache lengths.
+    //! @param stream The stream is used to perform GPU memory operations.
+    void commitDecodeRequest(int32_t increment, cudaStream_t stream);
+
     //! Get the KVCache lengths for active sequences.
     rt::Tensor& getKVCacheLengths();
 

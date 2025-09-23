@@ -129,6 +129,12 @@ void LinearKVCache::commitDecodeRequest(cudaStream_t stream)
     CUDA_CHECK(cudaGetLastError());
 }
 
+void LinearKVCache::commitDecodeRequest(int32_t increment, cudaStream_t stream)
+{
+    kernel::incrementLengthTensor(mDeviceKVCacheLengths, increment, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 rt::Tensor& LinearKVCache::getKVCacheLengths()
 {
     return mDeviceKVCacheLengths;

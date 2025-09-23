@@ -61,3 +61,20 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
 std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::vector<half> const& embeddingTable,
     int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
     std::optional<std::vector<half>> const& imageEmbeds = std::nullopt, int64_t imageTokenLen = 0);
+
+// Eagle draft proposal reference functions
+void assembleDraftTreeDescReference(std::vector<int8_t> const& draftTreeMask,
+    std::vector<int32_t> const& draftTreeLength, std::vector<int32_t> const& sequenceStartIndex,
+    std::vector<int32_t>& packedDraftTreeMask, std::vector<int32_t>& tensorPositionIndices,
+    int32_t paddedDraftTreeSize);
+
+void prepareEagleDraftProposalMiscInputReference(std::vector<int32_t> const& draftTreeLength,
+    std::vector<int32_t> const& sequenceStartIndex, std::vector<int32_t>& sequenceContextLengths,
+    std::vector<int64_t>& selectTokenIndices, int32_t selectTokenLength, int32_t paddedDraftTreeSize);
+
+void prepareEaglePrefillInputReference(
+    std::vector<int32_t>& sequenceContextLengths, std::vector<int64_t>& selectTokenIndices, int32_t sequenceLength);
+
+void prepareEagleAcceptDecodeTokenInputReference(std::vector<int32_t> const& sequenceStartIndices,
+    std::vector<int32_t>& packedTreeMask, std::vector<int32_t>& tensorPositionIndices,
+    std::vector<int64_t>& selectTokenIndices, std::vector<int32_t>& sequenceContextLengths, int32_t acceptedTokenNum);

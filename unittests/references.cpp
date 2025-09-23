@@ -599,3 +599,96 @@ std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::
 
     return result;
 }
+
+void assembleDraftTreeDescReference(std::vector<int8_t> const& draftTreeMask,
+    std::vector<int32_t> const& draftTreeLength, std::vector<int32_t> const& sequenceStartIndex,
+    std::vector<int32_t>& packedDraftTreeMask, std::vector<int32_t>& tensorPositionIndices, int32_t paddedDraftTreeSize)
+{
+    int32_t const kNUM_MASK_PER_ENTRY{32};
+    size_t batchSize = draftTreeLength.size();
+    int32_t const packedTreeMaskLen = (paddedDraftTreeSize + kNUM_MASK_PER_ENTRY - 1) / kNUM_MASK_PER_ENTRY;
+
+    for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        int32_t const actualDraftTreeSize = draftTreeLength[batchIdx];
+        int32_t const sequenceStartIdx = sequenceStartIndex[batchIdx];
+
+        for (size_t tokenIdx = 0; tokenIdx < actualDraftTreeSize; ++tokenIdx)
+        {
+            int32_t attendNodeNum = 0;
+            int32_t const packedTreeMaskOffset
+                = batchIdx * paddedDraftTreeSize * packedTreeMaskLen + tokenIdx * packedTreeMaskLen;
+            for (size_t i = 0; i <= tokenIdx; ++i)
+            {
+                int8_t const maskFlag = draftTreeMask[batchIdx * paddedDraftTreeSize * paddedDraftTreeSize
+                    + tokenIdx * paddedDraftTreeSize + i];
+                if (maskFlag)
+                {
+                    attendNodeNum += 1;
+                    packedDraftTreeMask[packedTreeMaskOffset + i / kNUM_MASK_PER_ENTRY]
+                        |= (1 << (i % kNUM_MASK_PER_ENTRY));
+                }
+            }
+            // A token always attend to itself, subtract 1 to reflect its position in the sequence
+            int32_t tensorPositionIdx = sequenceStartIdx + attendNodeNum - 1;
+            tensorPositionIndices[batchIdx * paddedDraftTreeSize + tokenIdx] = tensorPositionIdx;
+        }
+    }
+}
+
+void prepareEagleDraftProposalMiscInputReference(std::vector<int32_t> const& draftTreeLength,
+    std::vector<int32_t> const& sequenceStartIndex, std::vector<int32_t>& sequenceContextLengths,
+    std::vector<int64_t>& selectTokenIndices, int32_t selectTokenLength, int32_t paddedDraftTreeSize)
+{
+    size_t batchSize = draftTreeLength.size();
+
+    for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        int32_t const draftTreeSize = draftTreeLength[batchIdx];
+        sequenceContextLengths[batchIdx] = sequenceStartIndex[batchIdx] + paddedDraftTreeSize;
+
+        for (size_t i = 0; i < selectTokenLength; ++i)
+        {
+            selectTokenIndices[batchIdx * selectTokenLength + i] = draftTreeSize - selectTokenLength + i;
+        }
+    }
+}
+
+void prepareEaglePrefillInputReference(
+    std::vector<int32_t>& sequenceContextLengths, std::vector<int64_t>& selectTokenIndices, int32_t sequenceLength)
+{
+    size_t const batchSize = sequenceContextLengths.size();
+    for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        sequenceContextLengths[batchIdx] = sequenceLength;
+        selectTokenIndices[batchIdx] = sequenceLength - 1;
+    }
+}
+
+void prepareEagleAcceptDecodeTokenInputReference(std::vector<int32_t> const& sequenceStartIndices,
+    std::vector<int32_t>& packedTreeMask, std::vector<int32_t>& tensorPositionIndices,
+    std::vector<int64_t>& selectTokenIndices, std::vector<int32_t>& sequenceContextLengths, int32_t acceptedTokenNum)
+{
+    size_t const batchSize = sequenceStartIndices.size();
+    for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        // Generate packed tree mask and tensor position indices for each accepted token
+        for (int32_t tokenIdx = 0; tokenIdx < acceptedTokenNum; ++tokenIdx)
+        {
+            int32_t packedTreeMaskValue = 0;
+            // Create casual attention mask: each token attends to all previous tokens including itself
+            for (int32_t i = 0; i <= tokenIdx; ++i)
+            {
+                packedTreeMaskValue |= (1 << i);
+            }
+
+            int32_t const packedTreeMaskOffset = batchIdx * acceptedTokenNum + tokenIdx;
+            packedTreeMask[packedTreeMaskOffset] = packedTreeMaskValue;
+            tensorPositionIndices[packedTreeMaskOffset] = sequenceStartIndices[batchIdx] + tokenIdx;
+        }
+
+        // Set select token index to the last accepted token
+        selectTokenIndices[batchIdx] = acceptedTokenNum - 1;
+        sequenceContextLengths[batchIdx] = sequenceStartIndices[batchIdx] + acceptedTokenNum;
+    }
+}
