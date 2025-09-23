@@ -50,8 +50,7 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     return llm_config
 
 
-def _export_eagle_base_config(config_dict: Dict[str, Any],
-                              eagle_version: str = "eagle3") -> Dict[str, Any]:
+def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Export EAGLE base configuration with required fields."""
     required_fields = [
         "vocab_size", "max_position_embeddings", "hidden_size",
@@ -80,13 +79,11 @@ def _export_eagle_base_config(config_dict: Dict[str, Any],
     else:
         eagle_config["partial_rotary_factor"] = 1.0
 
-    eagle_config["model_type"] = f"{eagle_version}_base"
+    eagle_config["model_type"] = f"eagle3_base"
     return eagle_config
 
 
-def _export_eagle_draft_config(
-        config_dict: Dict[str, Any],
-        eagle_version: str = "eagle3") -> Dict[str, Any]:
+def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Export EAGLE draft configuration with required fields."""
     required_fields = [
         "hidden_size", "max_position_embeddings", "intermediate_size",
@@ -110,20 +107,12 @@ def _export_eagle_draft_config(
             "num_attention_heads"]
 
     # Handle draft_vocab_size based on EAGLE version
-    if eagle_version == "eagle2":
-        if "vocab_size" not in config_dict:
-            raise KeyError("Required field 'vocab_size' not found in config")
-        draft_config["draft_vocab_size"] = config_dict["vocab_size"]
-    elif eagle_version == "eagle3":
-        if "draft_vocab_size" not in config_dict:
-            raise KeyError(
-                "Required field 'draft_vocab_size' not found in config")
-        draft_config["draft_vocab_size"] = config_dict["draft_vocab_size"]
-    else:
-        raise ValueError(f"Unsupported EAGLE version: {eagle_version}")
+    if "draft_vocab_size" not in config_dict:
+        raise KeyError("Required field 'draft_vocab_size' not found in config")
+    draft_config["draft_vocab_size"] = config_dict["draft_vocab_size"]
 
     # Set model_type for draft
-    draft_config["model_type"] = f"{eagle_version}_draft"
+    draft_config["model_type"] = f"eagle3_draft"
 
     return draft_config
 
@@ -140,9 +129,7 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
     return config_dict
 
 
-def export_llm_config(config: Any,
-                      model_type: str,
-                      eagle2: bool = False) -> Dict[str, Any]:
+def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     """Export configuration based on model type and EAGLE version."""
     config_dict = config.to_dict()
 
@@ -150,8 +137,6 @@ def export_llm_config(config: Any,
     config_class_name = config.__class__.__name__
     model_name = config_class_name.lower().replace('config', '')
 
-    # Determine EAGLE version
-    eagle_version = "eagle2" if eagle2 else "eagle3"
     # For other model types, use text_config if available
     if "text_config" in config_dict:
         print("Detected multimodal model, using text_config")
@@ -160,9 +145,9 @@ def export_llm_config(config: Any,
     if model_type == 'llm':
         output_config = _export_native_llm_config(config_dict)
     elif model_type == 'eagle_base':
-        output_config = _export_eagle_base_config(config_dict, eagle_version)
+        output_config = _export_eagle_base_config(config_dict)
     elif model_type == 'eagle_draft':
-        output_config = _export_eagle_draft_config(config_dict, eagle_version)
+        output_config = _export_eagle_draft_config(config_dict)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 

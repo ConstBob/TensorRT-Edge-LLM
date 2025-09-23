@@ -23,7 +23,8 @@ class PackageTester:
 
             # Check required functions
             required_functions = [
-                "quantize_and_save_llm", "llm_export", "visual_export",
+                "quantize_and_save_llm", "quantize_and_save_draft",
+                "export_llm_model", "export_draft_model", "visual_export",
                 "insert_lora_and_save", "process_lora_weights_and_save"
             ]
             for func_name in required_functions:

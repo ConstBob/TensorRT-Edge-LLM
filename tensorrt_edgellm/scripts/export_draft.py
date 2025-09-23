@@ -14,21 +14,18 @@
 # limitations under the License.
 """
 This script provides a command-line interface for exporting language models to ONNX format
-with support for standard models and EAGLE base models.
+with support for EAGLE draft models.
 
 Usage:
-    # Standard model export
-    python export_llm.py --model_dir /path/to/model --output_dir /path/to/output
-    
-    # EAGLE base model export
-    python export_llm.py --model_dir /path/to/base_model --output_dir /path/to/output --is_eagle_base
+    # EAGLE draft model export
+    python export_draft.py --draft_model_dir /path/to/draft_model --output_dir /path/to/output (--use_prompt_tuning)
 """
 
 import argparse
 import sys
 import traceback
 
-from tensorrt_edgellm.onnx_export.llm_export import export_llm_model
+from tensorrt_edgellm.onnx_export.llm_export import export_draft_model
 
 
 def main() -> None:
@@ -36,19 +33,29 @@ def main() -> None:
     Main function that parses command line arguments and exports the LLM model.
     
     This function sets up argument parsing for the LLM export script and calls
-    the export_llm_model function with the provided parameters.
+    the export_draft_model function with the provided parameters.
     """
     parser = argparse.ArgumentParser(
-        description="Export standard/Eagle3 base LLM model to ONNX format")
-    parser.add_argument(
-        "--model_dir",
-        type=str,
-        required=True,
-        help="Path to the input model directory (base model for EAGLE)")
+        description=
+        "Export Eagle3 Draft model to ONNX format using TensorRT Edge-LLM")
+    parser.add_argument("--draft_model_dir",
+                        type=str,
+                        required=True,
+                        help="Path to the draft model directory")
     parser.add_argument("--output_dir",
                         type=str,
                         required=True,
                         help="Path to save the exported ONNX model")
+    parser.add_argument("--use_prompt_tuning",
+                        action="store_true",
+                        help="Whether to use prompt tuning")
+    parser.add_argument(
+        "--base_model_dir",
+        type=str,
+        required=False,
+        help=
+        "Path to the base model directory. Used to copy weights from if the draft weights are incomplete."
+    )
     parser.add_argument(
         "--max_position_embeddings",
         type=int,
@@ -63,22 +70,20 @@ def main() -> None:
         help=
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
-    parser.add_argument("--is_eagle_base",
-                        required=False,
-                        action='store_true',
-                        help="Whether to export the base model")
 
     args = parser.parse_args()
 
     try:
         # Export model(s)
-        export_llm_model(model_dir=args.model_dir,
-                         output_dir=args.output_dir,
-                         max_position_embeddings=args.max_position_embeddings,
-                         device=args.device,
-                         is_eagle_base=args.is_eagle_base)
+        export_draft_model(
+            draft_model_dir=args.draft_model_dir,
+            output_dir=args.output_dir,
+            use_prompt_tuning=args.use_prompt_tuning,
+            base_model_dir=args.base_model_dir,
+            max_position_embeddings=args.max_position_embeddings,
+            device=args.device)
 
-        print("LLM model export completed successfully!")
+        print("Eagle3 Draft model export completed successfully!")
 
     except Exception as e:
         print(f"Error during LLM model export: {e}")

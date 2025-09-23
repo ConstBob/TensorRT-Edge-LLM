@@ -66,3 +66,63 @@ def quantize_model(
     mtq.quantize(model, quant_config, forward_loop=calibrate_loop)
     mtq.print_quant_summary(model)
     return model
+
+
+def quantize_draft_model(
+    base_model: torch.nn.Module,
+    draft_model: torch.nn.Module,
+    quant_config: Dict[str, Any],
+    calib_dataloader: DataLoader,
+) -> torch.nn.Module:
+    """
+    Quantize a PyTorch model using the specified configuration and calibration data.
+    
+    Args:
+        base_model: Base model which is used to generate inputs for the draft model.
+        draft_model: The draft model to quantize
+        quant_config: Quantization configuration dictionary
+        calib_dataloader: DataLoader for calibration data
+        
+    Returns:
+        Quantized PyTorch model
+    """
+
+    # Define calibration loop
+    def calibrate_loop(draft_model: torch.nn.Module) -> None:
+        """
+        Calibration loop that adjusts weights and scaling factors.
+        
+        Args:
+            draft_model: Model to calibrate
+        """
+        # Create progress bar for calibration
+        print(f"Calibrating model on {len(calib_dataloader)} samples...")
+        pbar = tqdm(calib_dataloader, desc="Calibrating", unit="num_samples")
+        assert base_model.device == draft_model.device, "Base model and draft model must be on the same device"
+
+        for data in pbar:
+            if isinstance(data, dict):
+                data = {k: v.to(draft_model.device) for k, v in data.items()}
+                base_model(**data)
+            else:
+                data = data.to(base_model.device)
+                outputs = base_model(data, output_hidden_states=True)
+            all_hidden_states = outputs['hidden_states']
+            idx = [
+                2, ((len(all_hidden_states) - 1) // 2),
+                len(all_hidden_states) - 4
+            ]
+            hidden_states_0 = all_hidden_states[idx[0]]
+            hidden_states_1 = all_hidden_states[idx[1]]
+            hidden_states_2 = all_hidden_states[idx[2]]
+            hidden_states = torch.cat(
+                [hidden_states_0, hidden_states_1, hidden_states_2], dim=-1)
+            hidden_states_from_draft = torch.zeros_like(hidden_states_0)
+            draft_model.quant_forward(hidden_states,
+                                      hidden_states_from_draft,
+                                      input_ids=data)
+
+    # Get quantization config and perform quantization
+    mtq.quantize(draft_model, quant_config, forward_loop=calibrate_loop)
+    mtq.print_quant_summary(draft_model)
+    return draft_model

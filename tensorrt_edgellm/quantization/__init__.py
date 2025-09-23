@@ -18,8 +18,9 @@ Quantization utilities for TensorRT Edge-LLM.
 This module provides functions for quantizing LLM and visual models using NVIDIA ModelOpt.
 """
 
-from .llm_quantization import quantize_and_save_llm
+from .llm_quantization import quantize_and_save_draft, quantize_and_save_llm
 
 __all__ = [
     "quantize_and_save_llm",
+    "quantize_and_save_draft",
 ]
