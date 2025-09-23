@@ -35,8 +35,10 @@ dev = [
 
 [project.scripts]
 tensorrt-edgellm-quantize-llm = "tensorrt_edgellm.scripts.quantize_llm:main"
+tensorrt-edgellm-quantize-draft = "tensorrt_edgellm.scripts.quantize_draft:main"
 tensorrt-edgellm-export-visual = "tensorrt_edgellm.scripts.export_visual:main"
 tensorrt-edgellm-export-llm = "tensorrt_edgellm.scripts.export_llm:main"
+tensorrt-edgellm-export-draft = "tensorrt_edgellm.scripts.export_draft:main"
 tensorrt-edgellm-insert-lora = "tensorrt_edgellm.scripts.insert_lora:main"
 tensorrt-edgellm-process-lora = "tensorrt_edgellm.scripts.process_lora_weights:main"
 

@@ -22,7 +22,7 @@ It supports various quantization schemes including FP8, INT4 AWQ, and NVFP4.
 import json
 import os
 import time
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
@@ -34,7 +34,9 @@ from torch.utils.data import DataLoader
 from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
                           AutoTokenizer)
 
-from .quantization_utils import quantize_model
+from ..llm_models.model_utils import load_eagle3_draft_model, load_hf_model
+from ..llm_models.models.eagle3_draft import Eagle3DraftModel
+from .quantization_utils import quantize_draft_model, quantize_model
 
 mto.enable_huggingface_checkpointing()
 
@@ -277,72 +279,60 @@ def quantize_llm(
                                            dataset_dir=dataset_dir,
                                            batch_size=batch_size)
     quant_config = get_llm_quant_config(quantization, lm_head_quantization)
-    quantized_model = quantize_model(model, quant_config, data_loader)
+    model = quantize_model(model, quant_config, data_loader)
 
-    return quantized_model
-
-
-def load_hf_model(
-    model_dir: str,
-    torch_dtype: str = "fp16"
-) -> Tuple[Union[AutoModelForCausalLM, AutoModelForImageTextToText],
-           AutoTokenizer]:
-    """
-    Load a HuggingFace model and tokenizer with automatic model type detection.
-    
-    Args:
-        model_dir: Directory containing the model files
-        torch_dtype: Torch data type ("fp16")
-        
-    Returns:
-        Tuple of (model, tokenizer)
-        
-    Raises:
-        ValueError: If torch_dtype is not supported or model loading fails
-    """
-    # Convert torch_dtype string to torch dtype
-    if torch_dtype == "fp16":
-        dtype = torch.float16
-    else:
-        raise ValueError(f"Unsupported torch_dtype: {torch_dtype}")
-
-    # Try loading as AutoModelForCausalLM first
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=dtype,
-            trust_remote_code=True).to(dtype).cuda()
-    except Exception:
-        # If that fails, try AutoModelForImageTextToText
-        try:
-            # TODO: Need a WAR to quantize only the language model.
-            # In VLMs, the model has both model.language_model and model.vision_model.
-            model = AutoModelForImageTextToText.from_pretrained(
-                model_dir, torch_dtype=dtype,
-                trust_remote_code=True).to(dtype).cuda()
-        except Exception as e:
-            raise ValueError(
-                f"Could not load model from {model_dir}. Error: {e}")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_dir,
-                                              trust_remote_code=True)
-
-    # Set tokenizer padding token if needed
-    if tokenizer.pad_token != "<unk>":
-        tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    return model, tokenizer
+    return model
 
 
-def quantize_and_save_llm(
-    model_dir: str,
-    output_dir: str,
-    quantization: Optional[str] = None,
-    torch_dtype: str = "fp16",
+def quantize_draft(
+    base_model: Union[AutoModelForCausalLM, AutoModelForImageTextToText],
+    draft_model: Union[Eagle3DraftModel],
+    tokenizer: AutoTokenizer,
+    quantization: str,
     dataset_dir: str = "cnn_dailymail",
     lm_head_quantization: Optional[str] = None,
-) -> None:
+) -> Union[Eagle3DraftModel]:
+    """
+    Quantize a language model using the specified quantization method.
+    
+    Args:
+        base_model: Based model which is used to generate inputs for the draft model.
+        draft_model: The draft model to quantize
+        tokenizer: Tokenizer for text processing
+        quantization: Quantization method ("fp8", "int4_awq", "nvfp4")
+        dataset_dir: Dataset for calibration
+        lm_head_quantization: Optional LM head quantization method
+        
+    Returns:
+        Quantized draft model
+        
+    Raises:
+        AssertionError: If quantization method is not supported
+    """
+    assert quantization in ["fp8", "int4_awq", "nvfp4", "mxfp8"]
+    assert lm_head_quantization in [None, "fp8", "int4_awq", "nvfp4", "mxfp8"]
+
+    # Get calibration dataloader
+    if "int4" in quantization:
+        batch_size = 16
+    else:
+        batch_size = 1
+    data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
+                                           dataset_dir=dataset_dir,
+                                           batch_size=batch_size)
+    quant_config = get_llm_quant_config(quantization, lm_head_quantization)
+    model = quantize_draft_model(base_model, draft_model, quant_config,
+                                 data_loader)
+
+    return model
+
+
+def quantize_and_save_llm(model_dir: str,
+                          output_dir: str,
+                          quantization: Optional[str],
+                          torch_dtype: str = "fp16",
+                          dataset_dir: str = "cnn_dailymail",
+                          lm_head_quantization: Optional[str] = None) -> None:
     """
     Load a model, quantize it if specified, and save the result.
     
@@ -365,12 +355,12 @@ def quantize_and_save_llm(
             f"Model vocabulary size {model.config.vocab_size} is not divisible by 4. This model's lm_head cannot be quantized to int4_awq. Please use a different quantization method for lm_head."
         )
 
-    if quantization is not None:
-        if is_quantized(model):
-            print(f"Model is already quantized, skipping quantization.")
-        else:
-            model = quantize_llm(model, tokenizer, quantization, dataset_dir,
-                                 lm_head_quantization)
+    if is_quantized(model):
+        print(f"Model is already quantized, skipping quantization.")
+    else:
+        model = quantize_llm(model, tokenizer, quantization, dataset_dir,
+                             lm_head_quantization)
+
     quant_end_time = time.time()
     print(f"Quantization finished in {quant_end_time - start_time}s.")
 
@@ -385,6 +375,69 @@ def quantize_and_save_llm(
     quant_config = get_quant_config({
         name: module
         for name, module in model.named_modules()
+    })
+    with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
+        json.dump(quant_config, f)
+
+    end_time = time.time()
+    print(
+        f"Quantized model saved to {output_dir} in {end_time - quant_end_time}s."
+    )
+    print(f"Total time: {end_time - start_time}s.")
+
+
+def quantize_and_save_draft(
+    base_model_dir: str,
+    draft_model_dir: str,
+    output_dir: str,
+    quantization: Optional[str],
+    torch_dtype: str = "fp16",
+    dataset_dir: str = "cnn_dailymail",
+    lm_head_quantization: Optional[str] = None,
+) -> None:
+    """
+    Load a model, quantize it if specified, and save the result.
+    
+    Args:
+        base_model_dir: Directory containing the input model
+        draft_model_dir: Directory containing the draft model
+        output_dir: Directory to save the quantized model
+        quantization: Optional quantization method to apply (None, fp8, int4_awq, nvfp4)
+        torch_dtype: Torch data type for model loading (fp16)
+        dataset_dir: Dataset for calibration
+        lm_head_quantization: Optional LM head quantization method (None, fp8, int4_awq, nvfp4)
+        
+    Raises:
+        ValueError: If model loading fails
+    """
+    start_time = time.time()
+
+    draft_model = load_eagle3_draft_model(draft_model_dir, base_model_dir)
+    if lm_head_quantization == "int4_awq" and draft_model.config.draft_vocab_size % 4 != 0:
+        raise ValueError(
+            f"Model vocabulary size {draft_model.config.draft_vocab_size} is not divisible by 4. This model's lm_head cannot be quantized to int4_awq. Please use a different quantization method for lm_head."
+        )
+
+    if is_quantized(draft_model):
+        print(f"Draft Model is already quantized, skipping quantization.")
+    else:
+        base_model, tokenizer = load_hf_model(base_model_dir, torch_dtype)
+        draft_model = quantize_draft(base_model, draft_model, tokenizer,
+                                     quantization, dataset_dir,
+                                     lm_head_quantization)
+    quant_end_time = time.time()
+    print(f"Quantization finished in {quant_end_time - start_time}s.")
+
+    # Save the quantized model
+    os.makedirs(output_dir, exist_ok=True)
+
+    with torch.inference_mode():
+        draft_model.save_pretrained(output_dir)
+
+    # Save the quant config
+    quant_config = get_quant_config({
+        name: module
+        for name, module in draft_model.named_modules()
     })
     with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
         json.dump(quant_config, f)

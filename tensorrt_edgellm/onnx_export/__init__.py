@@ -19,10 +19,11 @@ This module provides functions for exporting LLM and visual models to ONNX forma
 for deployment on edge devices.
 """
 
-from .llm_export import llm_export
+from .llm_export import export_draft_model, export_llm_model
 from .visual_export import visual_export
 
 __all__ = [
-    "llm_export",
+    "export_draft_model",
+    "export_llm_model",
     "visual_export",
 ]

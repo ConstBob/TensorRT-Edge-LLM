@@ -20,6 +20,14 @@ tensorrt-edgellm-quantize-llm \
   --model_dir /path/to/model \
   --output_dir /path/to/output \
   --quantization fp8
+
+# Quantize Draft Model to FP8
+# base_model_dir specifies the directory of the base model, which is used to generate inputs for the draft model.
+tensorrt-edgellm-quantize-draft \
+  --base_model_dir /path/to/model \
+  --draft_model_dir /path/to/draft/model \
+  --output_dir /path/to/output \
+  --quantization fp8
 ```
 
 ### Language Model Export
@@ -30,12 +38,18 @@ tensorrt-edgellm-export-llm \
   --model_dir /path/to/model \
   --output_dir /path/to/output
 
-# EAGLE model (base + draft)
+# EAGLE model (base)
 tensorrt-edgellm-export-llm \
   --model_dir /path/to/base_model \
   --draft_model_dir /path/to/draft_model \
   --output_dir /path/to/output \
-  --eagle2
+  --is_eagle_base
+
+# EAGLE model (draft)
+tensorrt-edgellm-export-draft \
+  --base_model_dir /path/to/base_model \
+  --draft_model_dir /path/to/draft_model \
+  --output_dir /path/to/output 
 ```
 
 ### Visual Model Export
@@ -96,7 +110,6 @@ tensorrt-edgellm-export-llm [OPTIONS]
 
 **Optional Arguments:**
 - `--draft_model_dir`: Draft model directory (for EAGLE)
-- `--eagle2`: Use EAGLE2 (default: EAGLE3)
 - `--max_position_embeddings`: Max position embeddings (default: 4096)
 - `--device`: Device for model loading (default: `cuda`)
 

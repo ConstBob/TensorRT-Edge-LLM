@@ -12,12 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from transformers.models.llama.modeling_llama import (LlamaAttention, LlamaMLP,
-                                                      LlamaRMSNorm)
+                                                      LlamaRMSNorm,
+                                                      apply_rotary_pos_emb,
+                                                      repeat_kv)
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
 
 from .attention_plugin import attention_plugin
@@ -147,6 +150,9 @@ class EdgeLLMAttention(nn.Module):
         self.hidden_size: int = attention_module.config.hidden_size
         self.num_key_value_heads: int = attention_module.config.num_key_value_heads
         self.num_attention_heads: int = attention_module.config.num_attention_heads
+        assert self.num_attention_heads % self.num_key_value_heads == 0, \
+            f"num_attention_heads ({self.num_attention_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
+        self.num_key_value_groups: int = self.num_attention_heads // self.num_key_value_heads
 
         # Set head dimension
         if hasattr(attention_module.config, 'head_dim'):
@@ -170,7 +176,7 @@ class EdgeLLMAttention(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass for attention computation using the attention plugin.
+        Forward pass for attention computation using the attention plugin for ONNX export.
         
         Args:
             hidden_states: Input hidden states of shape (batch_size, seq_len, hidden_size)
@@ -237,6 +243,78 @@ class EdgeLLMAttention(nn.Module):
 
         return attn_output, present_key_value
 
+    def quant_forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass for attention computation for quantization.
+        
+        Args:
+            hidden_states: Input hidden states of shape (batch_size, seq_len, hidden_size)
+            position_embeddings: Tuple of tensors, containing cos and sin
+            
+        Returns:
+            Attention output of shape (batch_size, seq_len, hidden_size)
+        """
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+        key_states = self.k_proj(hidden_states)
+        if self.k_norm is not None:
+            key_states = self.k_norm(key_states)
+
+        if self.qk_norm is not None:
+            query_states = self.qk_norm(query_states)
+            key_states = self.qk_norm(key_states)
+
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_attention_heads,
+                                         self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
+                                     self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
+                                         self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin)
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(
+            2, 3)) / math.sqrt(self.head_dim)
+
+        # Causal Mask Addition
+        if q_len > 1:
+            # Create a causal mask to prevent attending to future tokens
+            # The mask shape is (1, 1, q_len, q_len) to be broadcastable
+            mask = torch.triu(torch.ones((1, 1, q_len, q_len),
+                                         device=hidden_states.device,
+                                         dtype=torch.bool),
+                              diagonal=1)
+            # Fill the masked positions with a large negative value
+            attn_weights.masked_fill_(mask,
+                                      torch.finfo(attn_weights.dtype).min)
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights,
+                                             dim=-1,
+                                             dtype=torch.float32).to(
+                                                 query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
+
 
 class EdgeLLMDecoderLayer(nn.Module):
     """
@@ -249,12 +327,12 @@ class EdgeLLMDecoderLayer(nn.Module):
     
     For EAGLE3 draft models, this layer processes both input embeddings and
     hidden states separately, applying normalization to each before concatenation.
-    For standard and EAGLE2 draft models, it processes only hidden states.
+    For standard, it processes only hidden states.
     
     Attributes:
         hidden_size: Hidden dimension size
         mlp: Multi-layer perceptron component
-        input_layernorm: Input layer normalization (optional, for EAGLE2 draft layer 0+ and EAGLE3 draft)
+        input_layernorm: Input layer normalization (optional, for EAGLE3 draft)
         post_attention_layernorm: Post-attention layer normalization
         hidden_norm: Hidden normalization for EAGLE3 draft (optional)
         self_attn: Custom attention module with fused operations
@@ -309,14 +387,6 @@ class EdgeLLMDecoderLayer(nn.Module):
                 self.input_layernorm = LlamaRMSNorm(
                     config.hidden_size,
                     eps=config.rms_norm_eps).to(torch_dtype)
-            else:
-                # EAGLE2 draft: layer 0 doesn't have input_layernorm
-                if not config.input_layernorm:
-                    self.input_layernorm = None
-                else:
-                    self.input_layernorm = LlamaRMSNorm(
-                        config.hidden_size,
-                        eps=config.rms_norm_eps).to(torch_dtype)
 
             # Create attention module from config based on model type
             if "qwen" in config.model_type:
@@ -354,7 +424,7 @@ class EdgeLLMDecoderLayer(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass through the decoder layer.
+        Forward pass through the decoder layer for ONNX export.
         
         Args:
             hidden_states: Input hidden states of shape (batch, seq_len, embed_dim)
@@ -400,3 +470,46 @@ class EdgeLLMDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states, present_key_value
+
+    def quant_forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.FloatTensor]:
+        """
+        Forward pass through the decoder layer for quantization.
+
+        Args:
+            hidden_states: Hidden states of shape (batch, seq_len, embed_dim)
+            position_embeddings: Tuple of tensors, containing cos and sin
+            inputs_embeds: Input embeddings of shape (batch, seq_len, embed_dim)
+        """
+
+        residual = hidden_states
+
+        if self.eagle3_draft:
+            if inputs_embeds is None:
+                raise ValueError("inputs_embeds is required for EAGLE3 draft")
+            # EAGLE3 draft: apply layernorm to both inputs and concatenate
+            hidden_states = self.hidden_norm(hidden_states)
+            inputs_embeds = self.input_layernorm(inputs_embeds)
+            hidden_states = torch.cat((inputs_embeds, hidden_states), dim=-1)
+        else:
+            # Standard processing: apply input layernorm if available
+            if self.input_layernorm is not None:
+                hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states = self.self_attn.quant_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings)
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states

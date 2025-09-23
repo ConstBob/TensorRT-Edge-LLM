@@ -29,7 +29,7 @@ Key Features:
 - LoRA pattern insertion and weight processing
 
 Example Usage:
-    from tensorrt_edgellm import quantize_and_save_llm, llm_export, visual_export, insert_lora_and_save, process_lora_weights_and_save
+    from tensorrt_edgellm import quantize_and_save_llm, quantize_and_save_draft, export_llm_model, export_draft_model, visual_export, insert_lora_and_save, process_lora_weights_and_save
     
     # Quantize and save a model
     quantize_and_save_llm(
@@ -37,41 +37,33 @@ Example Usage:
         output_dir="path/to/output",
         quantization="fp8"
     )
+
+    # Quantize and save a model
+    quantize_and_save_draft(
+        base_model_dir="path/to/model",
+        draft_model_dir="path/to/draft_model",
+        output_dir="path/to/output",
+        quantization="fp8"
+    )
     
     # Export LLM to ONNX (standard model)
-    llm_export(
+    export_llm_model(
         model_dir="path/to/model",
         output_dir="path/to/output"
     )
     
-    # Export EAGLE base model to ONNX (EAGLE3)
-    llm_export(
+    # Export EAGLE base model to ONNX (EAGLE3 base model)
+    export_llm_model(
         model_dir="path/to/model",
         output_dir="path/to/output",
-        eagle_base=True
+        is_eagle_base=True
     )
     
-    # Export EAGLE base model to ONNX (EAGLE2)
-    llm_export(
+    # Export EAGLE draft model to ONNX (EAGLE3 draft model)
+    export_draft_model(
         model_dir="path/to/model",
         output_dir="path/to/output",
-        eagle_base=True,
-        eagle2=True
-    )
-    
-    # Export EAGLE draft model to ONNX (EAGLE3)
-    llm_export(
-        model_dir="path/to/model",
-        output_dir="path/to/output",
-        eagle_draft=True
-    )
-    
-    # Export EAGLE draft model to ONNX (EAGLE2)
-    llm_export(
-        model_dir="path/to/model",
-        output_dir="path/to/output",
-        eagle_draft=True,
-        eagle2=True
+        use_prompt_tuning=True,
     )
     
     # Export visual model to ONNX
@@ -93,11 +85,12 @@ Example Usage:
     )
 """
 
-from .onnx_export.llm_export import llm_export
+from .onnx_export.llm_export import export_draft_model, export_llm_model
 from .onnx_export.lora import (insert_lora_and_save,
                                process_lora_weights_and_save)
 from .onnx_export.visual_export import visual_export
-from .quantization.llm_quantization import quantize_and_save_llm
+from .quantization.llm_quantization import (quantize_and_save_draft,
+                                            quantize_and_save_llm)
 
 try:
     from ._version import __version__
@@ -109,7 +102,9 @@ __email__ = "TBD@nvidia.com"
 
 __all__ = [
     "quantize_and_save_llm",
-    "llm_export",
+    "quantize_and_save_draft",
+    "export_draft_model",
+    "export_llm_model",
     "visual_export",
     "insert_lora_and_save",
     "process_lora_weights_and_save",

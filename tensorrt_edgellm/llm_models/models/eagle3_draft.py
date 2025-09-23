@@ -23,17 +23,19 @@ The module contains:
 - Eagle3DraftModel: EAGLE3 draft model class with decoder layers and normalization
 """
 
+import json
 import os
 from typing import Any, List, Optional, Tuple
 
+import modelopt.torch.opt as mto
 import torch
 from safetensors.torch import load_file
 from torch import nn
 from transformers import AutoConfig
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
+from transformers.models.llama.modeling_llama import (LlamaRMSNorm,
+                                                      LlamaRotaryEmbedding)
 
 from ..layers.layers import EdgeLLMDecoderLayer, PromptTuningEmbedding
-from .llm_model import EdgeLLMModelForCausalLM
 
 
 class Eagle3DraftModel(nn.Module):
@@ -74,10 +76,10 @@ class Eagle3DraftModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.use_prompt_tuning = use_prompt_tuning
-        self.d2t = None
-
         self.draft_vocab_size = getattr(config, "draft_vocab_size",
                                         config.vocab_size)
+        self.register_buffer(
+            "d2t", torch.empty(self.draft_vocab_size, dtype=torch.int32))
 
         # Handle target hidden size for fusion
         self.target_hidden_size = config.target_hidden_size if hasattr(
@@ -114,6 +116,15 @@ class Eagle3DraftModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size,
                                  self.draft_vocab_size,
                                  bias=False)
+
+        # This logic is adapted from the transformers implementation for Qwen2.5-VL
+        # See:https://github.com/huggingface/transformers/blob/v4.55.2/src/transformers/models/qwen2_5_vl/configuration_qwen2_5_vl.py#L262
+        if config.rope_scaling is not None and "type" in config.rope_scaling:
+            if config.rope_scaling["type"] == "mrope":
+                config.rope_scaling["type"] = "default"
+            config.rope_scaling["rope_type"] = config.rope_scaling["type"]
+        # We use the LlamaRotaryEmbedding for both Qwen2.5-VL and Llama because our quantization process only deals with text inputs.
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
     @property
     def device(self):
@@ -170,6 +181,10 @@ class Eagle3DraftModel(nn.Module):
 
         # Fuse hidden states and combine with draft hidden states
         hidden_states = self.fc(hidden_states_from_base)
+
+        # TODO: WAR for INT4 ONNX export
+        hidden_states_from_draft = hidden_states_from_draft.to(torch.float16)
+        hidden_states = hidden_states.to(torch.float16)
         hidden_states = hidden_states_from_draft + hidden_states
 
         present_key_values = ()
@@ -202,13 +217,61 @@ class Eagle3DraftModel(nn.Module):
 
         return logits, hidden_states, present_key_values
 
+    def quant_forward(
+        self,
+        hidden_states,
+        hidden_states_from_draft,
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ):
+        """
+        Forward pass for quantization of the EAGLE3 draft model.
+        
+        Args:
+            hidden_states: Concatenated hidden states from three selected layers of the base model of shape (batch_size, seq_len, hidden_size * 3)
+            hidden_states_from_draft: Hidden states from previous draft predictions of shape (batch_size, seq_len, hidden_size)
+            input_ids: Input token IDs of shape (batch_size, seq_len), optional
+            inputs_embeds: Input embeddings tensor of shape (batch_size, seq_len, hidden_size), optional (legacy support)
+        """
+        assert (input_ids is not None) ^ (inputs_embeds is not None), \
+            "Exactly one of input_ids or input_embeds must be specified."
+
+        # Handle input embeddings
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        # Fuse hidden states and combine with draft hidden states
+        hidden_states = self.fc(hidden_states)
+        hidden_states = hidden_states_from_draft + hidden_states
+
+        position_ids = torch.arange(0,
+                                    input_ids.shape[1],
+                                    dtype=input_ids.dtype,
+                                    device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer.quant_forward(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                inputs_embeds=inputs_embeds,
+            )
+
+        hidden_states = hidden_states[:, -1]
+        hidden_states_normed = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states_normed)
+
+        return logits
+
     @classmethod
     def from_pretrained(
         cls,
         draft_model_dir: str,
-        base_model: EdgeLLMModelForCausalLM,
+        base_model_dir: Optional[str] = None,
         use_prompt_tuning: bool = False,
         max_position_embeddings: int = 4096,
+        device: str = "cuda",
     ) -> "Eagle3DraftModel":
         """
         Load a pre-trained EAGLE3 draft model.
@@ -241,63 +304,86 @@ class Eagle3DraftModel(nn.Module):
 
         pytorch_bin_path = os.path.join(draft_model_dir, "pytorch_model.bin")
         safetensors_path = os.path.join(draft_model_dir, "model.safetensors")
-        if not os.path.exists(pytorch_bin_path):
-            if not os.path.exists(safetensors_path):
-                raise FileNotFoundError(
-                    f"Model file not found at {pytorch_bin_path} or {safetensors_path}"
-                )
-            draft_state_dict = load_file(safetensors_path,
-                                         device=str(base_model.device))
-        else:
-            draft_state_dict = torch.load(pytorch_bin_path,
-                                          weights_only=True,
-                                          map_location=base_model.device)
+        # TODO: Compatible with other formats of quantized weights
+        quantized_model_path = os.path.join(draft_model_dir,
+                                            "modelopt_quantized_model.pth")
+        assert os.path.exists(quantized_model_path) or os.path.exists(
+            pytorch_bin_path
+        ) or os.path.exists(
+            safetensors_path
+        ), f"Model file not found at {pytorch_bin_path} or {safetensors_path} or {quantized_model_path}"
 
-        # Handle EAGLE3 specific key mapping
-        processed_state_dict = {}
         model = cls(config, use_prompt_tuning=use_prompt_tuning)
-        for key, value in draft_state_dict.items():
-            if 'd2t' in key:
-                model.d2t = value
-            elif 'midlayer' in key:
-                new_key = key.replace('midlayer', 'layers.0')
-                processed_state_dict[new_key] = value
-            elif 't2d' in key:
-                continue
+
+        if os.path.exists(quantized_model_path):
+            # Load quantized model from modelopt
+            mto.restore(model, quantized_model_path)
+        else:
+            # Load model from pytorch_model.bin or model.safetensors
+            if os.path.exists(pytorch_bin_path):
+                print(f"Loading model from {pytorch_bin_path}")
+                draft_state_dict = torch.load(pytorch_bin_path,
+                                              weights_only=True,
+                                              map_location=device)
             else:
-                processed_state_dict[key] = value
-
-        # Use weights from base model if missing
-        if base_model is not None:
-            base_state_dict = base_model.state_dict()
-
-            # Use embed_tokens.weight from base model if missing
-            if "embed_tokens.weight" not in processed_state_dict:
-                if "embed_tokens.weight" in base_state_dict:
-                    print("Using embed_tokens.weight from base model")
-                    processed_state_dict[
-                        "embed_tokens.weight"] = base_state_dict[
-                            "embed_tokens.weight"]
-                elif "model.embed_tokens.weight" in base_state_dict:
-                    print("Using model.embed_tokens.weight from base model")
-                    processed_state_dict[
-                        "embed_tokens.weight"] = base_state_dict[
-                            "model.embed_tokens.weight"]
+                print(f"Loading model from {safetensors_path}")
+                draft_state_dict = load_file(safetensors_path, device=device)
+            # Handle EAGLE3 specific key mapping
+            processed_state_dict = {}
+            for key, value in draft_state_dict.items():
+                if 'd2t' in key:
+                    processed_state_dict[key] = draft_state_dict[key]
+                elif 'midlayer' in key:
+                    new_key = key.replace('midlayer', 'layers.0')
+                    processed_state_dict[new_key] = value
+                elif 't2d' in key:
+                    continue
                 else:
-                    raise ValueError(
-                        "embed_tokens.weight not found in base model or draft model"
-                    )
+                    processed_state_dict[key] = value
 
-            # Use lm_head.weight from base model if missing
-            if "lm_head.weight" not in processed_state_dict:
-                if "lm_head.weight" in base_state_dict:
-                    print("Using lm_head.weight from base model")
-                    processed_state_dict["lm_head.weight"] = base_state_dict[
-                        "lm_head.weight"]
-                else:
-                    raise ValueError(
-                        "lm_head.weight not found in base model or draft model"
-                    )
+            # Use weights from base model if missing
+            def load_embedding_weights(processed_state_dict, base_model_dir,
+                                       device):
+                from ..model_utils import load_tensor_by_candidate_keys
+                if "embed_tokens.weight" not in processed_state_dict:
+                    assert base_model_dir is not None, "Base model directory is required to load embedding weights"
+                    key_candidates = [
+                        "embed_tokens.weight", "model.embed_tokens.weight",
+                        "model.language_model.embed_tokens.weight"
+                    ]
+                    embed_tokens_weight = load_tensor_by_candidate_keys(
+                        base_model_dir, key_candidates, device)
+                    if embed_tokens_weight is not None:
+                        processed_state_dict[
+                            "embed_tokens.weight"] = embed_tokens_weight
+                    else:
+                        raise ValueError(
+                            "embed_tokens.weight not found in base or draft model"
+                        )
 
-        model.load_state_dict(processed_state_dict)
+            load_embedding_weights(processed_state_dict, base_model_dir,
+                                   device)
+            model.load_state_dict(processed_state_dict)
+
         return model
+
+    def save_pretrained(self, output_dir: str):
+        """
+        Save a model to a directory.
+        
+        Args:
+            output_dir: Directory to save the model
+        """
+
+        # Create directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        mto.save(self, os.path.join(output_dir,
+                                    "modelopt_quantized_model.pth"))
+
+        # Save config
+        config_path = os.path.join(output_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump(self.config.to_dict(), f, indent=2)
+
+        print(f"Model saved to {output_dir}")

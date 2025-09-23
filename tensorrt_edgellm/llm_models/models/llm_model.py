@@ -16,7 +16,7 @@
 LLM Model Implementation for Causal Language Modeling
 
 This module provides the main LLM model implementation for efficient
-accelerated generation. The model supports standard models, EAGLE2, and EAGLE3
+accelerated generation. The model supports standard models and EAGLE3
 variants with unified architecture.
 
 The module contains:
@@ -38,7 +38,7 @@ class EdgeLLMModel(nn.Module):
     EdgeLLM Model for causal language modeling.
     
     This model implements the main component for language modeling, supporting
-    standard models, EAGLE2, and EAGLE3 variants. It processes input through
+    standard models and EAGLE3 variants. It processes input through
     decoder layers with proper normalization and can output hidden states
     for EAGLE variants.
     
@@ -50,22 +50,19 @@ class EdgeLLMModel(nn.Module):
         norm: RMS normalization layer
         embed_tokens: Token embedding layer
         rotary_emb: Rotary embedding layer
-        is_eagle2_base: Whether this is an EAGLE2 base model
-        is_eagle3_base: Whether this is an EAGLE3 base model
+        is_eagle_base: Whether this is an EAGLE3 base model
     """
 
     def __init__(self,
                  hf_model: nn.Module,
-                 is_eagle2_base: bool = False,
-                 is_eagle3_base: bool = False,
+                 is_eagle_base: bool = False,
                  use_prompt_tuning: bool = False) -> None:
         """
         Initialize the EdgeLLM model.
         
         Args:
             hf_model: The original model (LlamaForCausalLM, Qwen2ForCausalLM, etc.)
-            is_eagle2_base: Whether this is an EAGLE2 base model
-            is_eagle3_base: Whether this is an EAGLE3 base model
+            is_eagle_base: Whether this is an EAGLE3 base model
         """
         super().__init__()
 
@@ -73,8 +70,7 @@ class EdgeLLMModel(nn.Module):
         self.config = hf_model.config
         self.padding_idx = self.config.pad_token_id
         self.vocab_size = self.config.vocab_size
-        self.is_eagle2_base = is_eagle2_base
-        self.is_eagle3_base = is_eagle3_base
+        self.is_eagle_base = is_eagle_base
         self.use_prompt_tuning = use_prompt_tuning
 
         # Keep all the original components
@@ -188,14 +184,12 @@ class EdgeLLMModelForCausalLM(nn.Module):
         model: The underlying EdgeLLM model
         lm_head: Language model head for token prediction
         config: Model configuration object
-        is_eagle2_base: Whether this is an EAGLE2 base model
-        is_eagle3_base: Whether this is an EAGLE3 base model
+        is_eagle_base: Whether this is an EAGLE3 base model
     """
 
     def __init__(self,
                  hf_model: nn.Module,
-                 is_eagle2_base: bool = False,
-                 is_eagle3_base: bool = False,
+                 is_eagle_base: bool = False,
                  use_prompt_tuning: bool = False,
                  max_position_embeddings: int = 4096) -> None:
         """
@@ -203,8 +197,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
         
         Args:
             hf_model: The original model (LlamaForCausalLM, Qwen2ForCausalLM, etc.)
-            is_eagle2_base: Whether this is an EAGLE2 base model
-            is_eagle3_base: Whether this is an EAGLE3 base model
+            is_eagle_base: Whether this is an EAGLE3 base model
             use_prompt_tuning: Whether to enable prompt tuning support
             max_position_embeddings: Maximum positional embedding length to use for model initialization
         """
@@ -225,15 +218,15 @@ class EdgeLLMModelForCausalLM(nn.Module):
             f"Setting model max_position_embeddings to {max_position_embeddings}"
         )
         self.config.max_position_embeddings = max_position_embeddings
+        language_model.config.max_position_embeddings = max_position_embeddings
 
         # Create EdgeLLMModel with the original model
-        self.model = EdgeLLMModel(language_model, is_eagle2_base,
-                                  is_eagle3_base, use_prompt_tuning)
+        self.model = EdgeLLMModel(language_model, is_eagle_base,
+                                  use_prompt_tuning)
 
         # Keep the original lm_head
         self.lm_head = hf_model.lm_head
-        self.is_eagle2_base = is_eagle2_base
-        self.is_eagle3_base = is_eagle3_base
+        self.is_eagle_base = is_eagle_base
 
     @property
     def device(self):
@@ -271,11 +264,10 @@ class EdgeLLMModelForCausalLM(nn.Module):
         Returns:
             Union[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]], Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor]]: Model outputs
                 - For standard models: (logits, past_key_values)
-                - For EAGLE2 base: (logits, past_key_values, last_hidden_state)
                 - For EAGLE3 base: (logits, past_key_values, hidden_states)
         """
         # Determine output configuration based on model type
-        output_hidden_states = self.is_eagle3_base
+        output_hidden_states = self.is_eagle_base
 
         # Forward pass through the model
         hidden_states, present_key_values, all_hidden_states = self.model(
@@ -291,7 +283,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
         )
 
         # Extract last token hidden states and compute logits
-        if not self.is_eagle2_base and not self.is_eagle3_base:
+        if not self.is_eagle_base:
             last_hidden_state_gathered = custom_gather_nd(
                 hidden_states, last_token_ids, 1)
         else:
@@ -303,7 +295,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
         logits = logits.to(torch.float32)
 
         # Handle different model types
-        if self.is_eagle3_base:
+        if self.is_eagle_base:
             # EAGLE3 base model: return concatenated hidden states from specific layers
             idx = [
                 2, ((len(all_hidden_states) - 1) // 2),
@@ -316,9 +308,6 @@ class EdgeLLMModelForCausalLM(nn.Module):
                 [hidden_states_0, hidden_states_1, hidden_states_2],
                 dim=-1).to(self.torch_dtype)
 
-            return logits, hidden_states, tuple(present_key_values)
-        elif self.is_eagle2_base:
-            # EAGLE2 base model: return last hidden states
             return logits, hidden_states, tuple(present_key_values)
 
         # Standard model: return logits and past key values

@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-This script provides a command-line interface for quantizing HuggingFace models
+This script provides a command-line interface for quantizing EAGLE3 draft models
 using various quantization schemes supported by NVIDIA ModelOpt.
 
 Usage:
     # Quantize with FP8 quantization
-    python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8
+    python quantize_draft.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8
     
     # Quantize without quantization (default)
-    python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output
+    python quantize_draft.py --model_dir /path/to/model --output_dir /path/to/output
     
     # Quantize with different quantization for LM head
-    python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization int4_awq
+    python quantize_draft.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization int4_awq
 """
 
 import argparse
@@ -32,7 +32,7 @@ import sys
 import traceback
 
 from tensorrt_edgellm.quantization.llm_quantization import \
-    quantize_and_save_llm
+    quantize_and_save_draft
 
 
 def main() -> None:
@@ -40,14 +40,18 @@ def main() -> None:
     Main function that parses command line arguments and quantizes the model.
     
     This function sets up argument parsing for the quantization script and calls
-    the quantize_and_save_llm function with the provided parameters.
+    the quantize_and_save_llm or quantize_and_save_draft function with the provided parameters.
     """
     parser = argparse.ArgumentParser(
         description="Quantize a model using NVIDIA ModelOpt")
-    parser.add_argument("--model_dir",
+    parser.add_argument("--base_model_dir",
                         type=str,
                         required=True,
                         help="Path to the input model directory")
+    parser.add_argument("--draft_model_dir",
+                        type=str,
+                        required=True,
+                        help="Path to the draft model directory")
     parser.add_argument("--output_dir",
                         type=str,
                         required=True,
@@ -83,12 +87,13 @@ def main() -> None:
             print(
                 "Warning: MXFP8 quantization is not currently supported for TensorRT Edge-LLM. This will be supported in the future."
             )
-        quantize_and_save_llm(model_dir=args.model_dir,
-                              output_dir=args.output_dir,
-                              quantization=args.quantization,
-                              torch_dtype=args.torch_dtype,
-                              dataset_dir=args.dataset_dir,
-                              lm_head_quantization=args.lm_head_quantization)
+        quantize_and_save_draft(base_model_dir=args.base_model_dir,
+                                draft_model_dir=args.draft_model_dir,
+                                output_dir=args.output_dir,
+                                quantization=args.quantization,
+                                torch_dtype=args.torch_dtype,
+                                dataset_dir=args.dataset_dir,
+                                lm_head_quantization=args.lm_head_quantization)
         print("Model quantization completed successfully!")
     except Exception as e:
         print(f"Error during model quantization: {e}")

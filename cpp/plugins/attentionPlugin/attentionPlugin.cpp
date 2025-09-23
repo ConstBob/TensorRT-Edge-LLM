@@ -490,7 +490,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             half* qVecDevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
             alignedWorkspacePtr += (runtimeBatchSize * runtimeSeqLen * mNumHeadQ * mNumElemPerHead * sizeof(half));
             alignedWorkspacePtr = alignDevicePtr(alignedWorkspacePtr);
-            // q: [b, s, hq+hk+hv, d] -> [compact_s, hq, d]
+            // q: [b, s, hq+hk+hv, d] -> [b, s, hq, d]
             drivellm::kernel::launchApplyRopeWriteContinuousQAndKVCache(qkvDevicePtr, kvCacheDevicePtr,
                 posEncodingCosSinDevicePtr, qVecDevicePtr, kvCacheEndIdxsDevicePtr, runtimeSeqLen, totalProcessToken,
                 mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize,
