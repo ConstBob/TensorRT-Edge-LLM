@@ -26,7 +26,7 @@ The module contains:
 """
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import onnx
@@ -303,6 +303,17 @@ def gather_rows_by_gidx_order(
     return new_weight, permute_idx
 
 
+class GatherWrapper(nn.Module):
+
+    def __init__(self, module_to_wrap, permute_idx):
+        super().__init__()
+        self.module_to_wrap = module_to_wrap
+        self.register_buffer('permute_idx', permute_idx)
+
+    def forward(self, x):
+        return self.module_to_wrap(x[..., self.permute_idx])
+
+
 class Int4GemmPluginModule(nn.Module):
     """
     Custom module that replaces TorchQuantLinear in GPTQ quantization for ONNX export.
@@ -385,14 +396,15 @@ class Int4GemmPluginModule(nn.Module):
         # Flag to track if weights have been processed for ONNX export
         self._weights_processed = False
 
-    def _process_weights(self) -> None:
+    def _process_weights(self) -> Optional[torch.Tensor]:
         """
         Pre-process weights for Int4GroupwiseGemmPlugin format.
         This is called after loading weights to prepare them for ONNX export.
         """
         if self._weights_processed:
-            return
+            return None
 
+        permute_idx = None
         with torch.no_grad():
             # Process weights for Int4GroupwiseGemmPlugin format
             # First, unpack the packed GPTQ weights
@@ -400,8 +412,8 @@ class Int4GemmPluginModule(nn.Module):
 
             # Handle group-wise quantization if needed
             # Reorder weights according to group indices for non-desc_act models
-            if not self.desc_act:
-                unpacked_qweight, _ = gather_rows_by_gidx_order(
+            if self.desc_act:
+                unpacked_qweight, permute_idx = gather_rows_by_gidx_order(
                     unpacked_qweight, self.g_idx, self.group_size)
 
             # Transpose and pack weights using numpy
@@ -421,6 +433,7 @@ class Int4GemmPluginModule(nn.Module):
                     torch.int8)
 
         self._weights_processed = True
+        return permute_idx
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -456,7 +469,7 @@ class Int4GemmPluginModule(nn.Module):
         return output
 
     def load_state_dict_from_torch_quant_linear(
-            self, torch_quant_linear: nn.Module) -> None:
+            self, torch_quant_linear: nn.Module) -> Optional[torch.Tensor]:
         """
         Load state dict from a TorchQuantLinear module.
         
@@ -474,7 +487,7 @@ class Int4GemmPluginModule(nn.Module):
             self.bias = torch_quant_linear.bias
 
         # Process the weights for ONNX export after loading
-        self._process_weights()
+        return self._process_weights()
 
 
 def register_int4_gemm_plugin_onnx_symbolic_functions() -> None:
@@ -515,7 +528,13 @@ def replace_torch_quant_linear_with_plugin(model: nn.Module) -> nn.Module:
             )
 
             # Load weights from original module (reuses data without copying)
-            new_module.load_state_dict_from_torch_quant_linear(module)
+            permute_idx = new_module.load_state_dict_from_torch_quant_linear(
+                module)
+
+            final_module = new_module
+            if module.desc_act:
+                assert permute_idx is not None, "Permute index should not be None for desc_act models"
+                final_module = GatherWrapper(new_module, permute_idx)
 
             # Replace the module in the model
             parent = model
@@ -525,7 +544,7 @@ def replace_torch_quant_linear_with_plugin(model: nn.Module) -> nn.Module:
             else:
                 module_name = name
 
-            setattr(parent, module_name, new_module)
+            setattr(parent, module_name, final_module)
 
     return model
 
