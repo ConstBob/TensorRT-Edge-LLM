@@ -692,3 +692,46 @@ void prepareEagleAcceptDecodeTokenInputReference(std::vector<int32_t> const& seq
         sequenceContextLengths[batchIdx] = sequenceStartIndices[batchIdx] + acceptedTokenNum;
     }
 }
+
+void prepareEagleBaseTreeDecodingInputReference(std::vector<int8_t> const& baseTreeDecodingMask,
+    std::vector<int32_t> const& sequenceStartIndex, std::vector<int32_t>& packedBaseTreeDecodingMask,
+    std::vector<int32_t>& tensorPositionIndices, std::vector<int32_t>& sequenceContextLengths,
+    std::vector<int64_t>& selectTokenIndices, int32_t treeSize)
+{
+    // baseTreeDecodingMask: (bs, tree-size, tree-size)
+    // sequenceStartIndex: (bs)
+    // packedBaseTreeDecodingMask: (bs, tree-size, divup(tree-size, 32))
+    // tensorPositionIndices: (bs, tree-size)
+    // sequenceContextLengths: (bs)
+    // selectTokenIndices: (bs, tree-size)
+
+    int32_t const kNUM_MASK_PER_ENTRY{32};
+    size_t batchSize = sequenceStartIndex.size();
+    int32_t const packedTreeMaskLen = (treeSize + kNUM_MASK_PER_ENTRY - 1) / kNUM_MASK_PER_ENTRY;
+
+    for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        int32_t const sequenceStartIdx = sequenceStartIndex[batchIdx];
+        sequenceContextLengths[batchIdx] = sequenceStartIdx + treeSize;
+
+        for (size_t tokenIdx = 0; tokenIdx < treeSize; ++tokenIdx)
+        {
+            int32_t attendNodeNum = 0;
+            int32_t const packedTreeMaskOffset = batchIdx * treeSize * packedTreeMaskLen + tokenIdx * packedTreeMaskLen;
+            for (size_t i = 0; i <= tokenIdx; ++i)
+            {
+                int8_t const maskFlag = baseTreeDecodingMask[batchIdx * treeSize * treeSize + tokenIdx * treeSize + i];
+                if (maskFlag)
+                {
+                    attendNodeNum += 1;
+                    packedBaseTreeDecodingMask[packedTreeMaskOffset + i / kNUM_MASK_PER_ENTRY]
+                        |= (1 << (i % kNUM_MASK_PER_ENTRY));
+                }
+            }
+            // A token always attend to itself, subtract 1 to reflect its position in the sequence
+            int32_t tensorPositionIdx = sequenceStartIdx + attendNodeNum - 1;
+            tensorPositionIndices[batchIdx * treeSize + tokenIdx] = tensorPositionIdx;
+            selectTokenIndices[batchIdx * treeSize + tokenIdx] = tokenIdx;
+        }
+    }
+}

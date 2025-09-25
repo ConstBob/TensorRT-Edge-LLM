@@ -101,6 +101,20 @@ public:
     bool executeVanillaDecodingStep(rt::Tensor const& inputIds, rt::Tensor const& multimodalEmbeddings,
         rt::Tensor& outputLogits, cudaStream_t stream);
 
+    //! API entry to execute eagle base tree decoding step. The API will takes a draft tree of input_token_ids.
+    //!     baseTreeDecodingMask denote the relationship between the draft tree nodes.
+    //! Inputs:
+    //!     baseTreeDecodingInputIds [GPU, Int32]: Input token_ids for the base model with shape [1, Tree-Size].
+    //!     baseTreeDecodingMask [GPU, Int32]: Denote the relationship between the base tree nodes with shape
+    //!         [1, Tree-Size, Tree-Size].
+    //!     stream: The CUDA stream to execute the base tree decoding step.
+    //! Outputs:
+    //!     outputLogits [GPU, Float16]: The output logits with shape [topK, base-Vocab-Size].
+    //!     outputHiddenStates [GPU]: The output hidden states with shape [topK, base-hidden-dim].
+    bool executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputIds,
+        rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits,
+        rt::Tensor& outputHiddenStates, cudaStream_t stream);
+
     //! API entry to capture the CUDA graph for the decoding step. If CUDA graph capture is successful, later
     //!     call to executeVanillaDecodingStep() will always launch the captured CUDA graph.
     //! Inputs:
@@ -168,6 +182,12 @@ private:
     //! nullptr for binding, even when the LoRA rank is 0.
     rt::Tensor mDummyLoraWeightsTensor{};
 
+    //! The eagle base position ids tensor within the sequence that used by positional encoding.
+    rt::Tensor mEagleBasePositionIds{};
+
+    //! The eagle base packed mask tensor to indicate the attention relationship between the base verify nodes.
+    rt::Tensor mEagleBasePackedMask{};
+
     //! Initialize the configuration from the JSON file.
     bool initializeConfigFromJson(Json const& configJson);
 
@@ -181,6 +201,9 @@ private:
         rt::Tensor const& inputIds, rt::Tensor const& contextLengths, rt::Tensor const& outputLogits);
 
     bool vanlliaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
+
+    bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputIds,
+        rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
 
     //! The Function is used to add a LoRA weights to the LLM engine.
     bool addLoraWeights(std::string const& loraWeightsName, std::string const& loraWeightsPath, cudaStream_t stream);

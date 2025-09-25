@@ -45,7 +45,8 @@ __global__ void prepareEagleDraftProposalMiscInputKernel(int32_t const* draftTre
     int32_t const batchIdx = blockIdx.x;
     int32_t const blockSize = blockDim.x;
     int32_t const tIdx = threadIdx.x;
-    int32_t const draftTreeSize = draftTreeSizes[batchIdx];
+    // Use draftTreeSizes if provided, otherwise use paddedDraftTreeSize for all batches
+    int32_t const draftTreeSize = (draftTreeSizes != nullptr) ? draftTreeSizes[batchIdx] : paddedDraftTreeSize;
 
     if (tIdx == 0)
     {
@@ -62,7 +63,7 @@ __global__ void prepareEagleDraftProposalMiscInputKernel(int32_t const* draftTre
     }
 }
 
-__global__ void assembleDraftTreeDescKernel(int8_t const* draftTreeMask, int32_t const* draftTreeSize,
+__global__ void assembleDraftTreeDescKernel(int8_t const* draftTreeMask, int32_t const* draftTreeSizes,
     int32_t const* sequenceStartIndices, int32_t* packedDraftTreeMask, int32_t* tensorPositionIndices,
     int32_t const paddedDraftTreeSize)
 {
@@ -76,7 +77,7 @@ __global__ void assembleDraftTreeDescKernel(int8_t const* draftTreeMask, int32_t
 
     int32_t packedTreeMask[kMAX_DRAFT_PACKED_TREE_SIZE] = {0};
     int32_t const packedTreeMaskLen = (paddedDraftTreeSize + kNUM_MASK_PER_ENTRY - 1) / kNUM_MASK_PER_ENTRY;
-    int32_t const actualDraftTreeSize = draftTreeSize[batchIdx];
+    int32_t const actualDraftTreeSize = (draftTreeSizes != nullptr) ? draftTreeSizes[batchIdx] : paddedDraftTreeSize;
     int32_t const sequenceStartIndex = sequenceStartIndices[batchIdx];
 
     // Unpacked tree mask formulate in the format of [batch, padded-draft-tree-size, padded-draft-tree-size].
@@ -158,7 +159,7 @@ void prepareEaglePrefillInputs(rt::Tensor& sequenceContextLengths, rt::Tensor& s
     check::check(sequenceContextLengths.getDataType() == DataType::kINT32
             && selectTokenIndices.getDataType() == DataType::kINT64,
         "Context-length input shall be INT32 and select-token-indices shall be INT64.");
-    uint32_t const batchSize = static_cast<uint32_t>(sequenceContextLengths.getShape()[0]);
+    uint32_t const batchSize = sequenceContextLengths.getShape()[0];
 
     // Assign one warp for each batch.
     dim3 const blockDim{32};
@@ -187,15 +188,15 @@ void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor
             && sequenceContextLengths.getDataType() == DataType::kINT32,
         "Data type check failed for the input tensors.");
 
-    uint32_t const batchSize = static_cast<uint32_t>(draftTreeMask.getShape()[0]);
-    int32_t const paddedDraftTreeSize = static_cast<int32_t>(draftTreeMask.getShape()[1]);
-    int32_t const selectTokenLength = static_cast<int32_t>(selectTokenIndices.getShape()[1]);
+    uint32_t const batchSize = draftTreeMask.getShape()[0];
+    int32_t const paddedDraftTreeSize = draftTreeMask.getShape()[1];
+    int32_t const selectTokenLength = selectTokenIndices.getShape()[1];
 
     check::check(tensorPositionIndices.getShape()[1] == paddedDraftTreeSize,
         "Select token indices shall have shape [batch, padded-draft-tree-size].");
 
     // Round up block size to multiple of warp
-    uint32_t const blocksize = static_cast<uint32_t>(divUp(paddedDraftTreeSize, 32) * 32);
+    uint32_t const blocksize = divUp(paddedDraftTreeSize, 32) * 32;
     // Perform tree mask packing and tensor position indices.
     dim3 const blockDim1{blocksize};
     dim3 const gridDim1{batchSize};
@@ -228,9 +229,9 @@ void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices,
     check::check(packedTreeMask.getShape()[1] == acceptedTokenNum && acceptedTokenNum < 32,
         "Current kernel implementation support accepted token <= 32 per batch. "
         "Packed tree mask shall have shape [batch, accepted-token-num, 1].");
-    uint32_t const batchSize = static_cast<uint32_t>(sequenceStartIndices.getShape()[0]);
+    uint32_t const batchSize = sequenceStartIndices.getShape()[0];
     // Round up block size to multiple of warp size.
-    uint32_t const blocksize = static_cast<uint32_t>(divUp(acceptedTokenNum, 32) * 32);
+    uint32_t const blocksize = divUp(acceptedTokenNum, 32) * 32;
     // Perform casual tree mask packing and tensor position indices.
     dim3 const blockDim{blocksize};
     dim3 const gridDim{batchSize};
@@ -239,6 +240,93 @@ void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices,
         sequenceStartIndices.dataPointer<int32_t>(), packedTreeMask.dataPointer<int32_t>(),
         tensorPositionIndices.dataPointer<int32_t>(), selectTokenIndices.dataPointer<int64_t>(),
         sequenceContextLengths.dataPointer<int32_t>(), acceptedTokenNum);
+}
+
+__global__ void prepareEagleBaseTreeDecodingInputKernel(int8_t const* baseTreeDecodingMask,
+    int32_t const* sequenceStartIndices, int32_t* packedTreeMask, int32_t* tensorPositionIndices,
+    int32_t* sequenceContextLengths, int64_t* selectTokenIndices, int32_t const treeSize)
+{
+    constexpr int32_t kNUM_MASK_PER_ENTRY{32};
+
+    // Each thread will handle one token in the tree to setup the mask and tensor position indices.
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tokenIdx = threadIdx.x;
+
+    if (tokenIdx == 0)
+    {
+        sequenceContextLengths[batchIdx] = sequenceStartIndices[batchIdx] + treeSize;
+    }
+
+    int32_t const packedTreeMaskLen = (treeSize + kNUM_MASK_PER_ENTRY - 1) / kNUM_MASK_PER_ENTRY;
+    int32_t const sequenceStartIndex = sequenceStartIndices[batchIdx];
+
+    // Unpacked tree mask formulate in the format of [batch, tree-size, tree-size].
+    // Packed tree mask len is in format of [batch, tree-size, divup(tree-size, 32)].
+    // Tensor position indices is in format of [batch, tree-size].
+    int32_t const unpackedTreeMaskOffset = batchIdx * treeSize * treeSize + tokenIdx * treeSize;
+    int32_t const packedTreeMaskOffset = batchIdx * treeSize * packedTreeMaskLen + tokenIdx * packedTreeMaskLen;
+    int32_t const tensorPositionOffset = batchIdx * treeSize + tokenIdx;
+    int32_t const selectTokenOffset = batchIdx * treeSize + tokenIdx;
+
+    if (tokenIdx < treeSize)
+    {
+        // With causal attention, the node will only attend to nodes "prior" to itself.
+        int32_t attendNodeNum{0};
+        for (int32_t i = 0; i <= tokenIdx; ++i)
+        {
+            int8_t const maskFlag = baseTreeDecodingMask[unpackedTreeMaskOffset + i];
+            if (maskFlag)
+            {
+                attendNodeNum += 1;
+                packedTreeMask[packedTreeMaskOffset + i / kNUM_MASK_PER_ENTRY] |= (1 << (i % kNUM_MASK_PER_ENTRY));
+            }
+        }
+        // A token always attend to itself, subtract 1 to reflect its position in the sequence.
+        tensorPositionIndices[tensorPositionOffset] = sequenceStartIndex + attendNodeNum - 1;
+        selectTokenIndices[selectTokenOffset] = tokenIdx;
+    }
+}
+
+void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& sequenceStartIndices,
+    rt::Tensor& packedBaseTreeDecodingMask, rt::Tensor& tensorPositionIndices, rt::Tensor& selectTokenIndices,
+    rt::Tensor& sequenceContextLengths, cudaStream_t stream)
+{
+    check::check(baseTreeDecodingMask.getDeviceType() == rt::DeviceType::kGPU
+            && sequenceStartIndices.getDeviceType() == rt::DeviceType::kGPU
+            && packedBaseTreeDecodingMask.getDeviceType() == rt::DeviceType::kGPU
+            && tensorPositionIndices.getDeviceType() == rt::DeviceType::kGPU
+            && selectTokenIndices.getDeviceType() == rt::DeviceType::kGPU
+            && sequenceContextLengths.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(baseTreeDecodingMask.getDataType() == DataType::kINT8
+            && sequenceStartIndices.getDataType() == DataType::kINT32
+            && packedBaseTreeDecodingMask.getDataType() == DataType::kINT32
+            && tensorPositionIndices.getDataType() == DataType::kINT32
+            && selectTokenIndices.getDataType() == DataType::kINT64
+            && sequenceContextLengths.getDataType() == DataType::kINT32,
+        "Data type check failed for the input tensors.");
+
+    uint32_t const batchSize = baseTreeDecodingMask.getShape()[0];
+    int32_t const treeSize = baseTreeDecodingMask.getShape()[1];
+
+    check::check(tensorPositionIndices.getShape()[1] == treeSize,
+        "Tensor position indices shall have shape [batch, tree-size].");
+
+    // Round up block size to multiple of warp
+    uint32_t const blocksize = divUp(treeSize, 32) * 32;
+    // Perform tree mask packing and tensor position indices.
+    dim3 const blockDim{blocksize};
+    dim3 const gridDim{batchSize};
+    assembleDraftTreeDescKernel<<<gridDim, blockDim, 0, stream>>>(baseTreeDecodingMask.dataPointer<int8_t>(), nullptr,
+        sequenceStartIndices.dataPointer<int32_t>(), packedBaseTreeDecodingMask.dataPointer<int32_t>(),
+        tensorPositionIndices.dataPointer<int32_t>(), treeSize);
+
+    // Perform misc input setup, assign one warp for each batch since selectTokenLength is around 8 ~ 12.
+    dim3 const blockDim2{32};
+    dim3 const gridDim2{batchSize};
+    prepareEagleDraftProposalMiscInputKernel<<<gridDim2, blockDim2, 0, stream>>>(nullptr,
+        sequenceStartIndices.dataPointer<int32_t>(), sequenceContextLengths.dataPointer<int32_t>(),
+        selectTokenIndices.dataPointer<int64_t>(), treeSize, treeSize);
 }
 
 } // namespace kernel

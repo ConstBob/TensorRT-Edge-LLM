@@ -78,3 +78,9 @@ void prepareEaglePrefillInputReference(
 void prepareEagleAcceptDecodeTokenInputReference(std::vector<int32_t> const& sequenceStartIndices,
     std::vector<int32_t>& packedTreeMask, std::vector<int32_t>& tensorPositionIndices,
     std::vector<int64_t>& selectTokenIndices, std::vector<int32_t>& sequenceContextLengths, int32_t acceptedTokenNum);
+
+// Eagle base reference functions
+void prepareEagleBaseTreeDecodingInputReference(std::vector<int8_t> const& baseTreeDecodingMask,
+    std::vector<int32_t> const& sequenceStartIndex, std::vector<int32_t>& packedBaseTreeDecodingMask,
+    std::vector<int32_t>& tensorPositionIndices, std::vector<int32_t>& sequenceContextLengths,
+    std::vector<int64_t>& selectTokenIndices, int32_t treeSize);
