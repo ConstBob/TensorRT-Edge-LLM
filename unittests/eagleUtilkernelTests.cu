@@ -295,3 +295,107 @@ TEST(PrepareEagle, PrepareEagleAcceptDecodeTokenInput)
     TestPrepareEagleAcceptDecodeTokenInput(2, 8);
     TestPrepareEagleAcceptDecodeTokenInput(4, 16);
 }
+
+void TestPrepareEagleBaseTreeDecodingInput(int32_t const batchSize, int32_t const treeSize)
+{
+    cudaStream_t stream{nullptr};
+    std::random_device dev;
+    std::mt19937 rng(dev());
+
+    int32_t const packedTreeMaskLen = divUp(treeSize, 32);
+
+    // CPU reference
+    // Inputs
+    std::vector<int8_t> treeMask(batchSize * treeSize * treeSize);
+    std::uniform_int_distribution<std::mt19937::result_type> treeMaskDist(0, 1);
+    std::generate(treeMask.begin(), treeMask.end(), [&treeMaskDist, &rng]() { return treeMaskDist(rng); });
+    std::vector<int32_t> sequenceStartIndex(batchSize);
+    std::uniform_int_distribution<std::mt19937::result_type> sequenceStartIndexDist(128, 1024);
+    std::generate(sequenceStartIndex.begin(), sequenceStartIndex.end(),
+        [&sequenceStartIndexDist, &rng]() { return sequenceStartIndexDist(rng); });
+    // Outputs
+    std::vector<int32_t> packedTreeMaskReference(batchSize * treeSize * packedTreeMaskLen);
+    std::vector<int32_t> tensorPositionIndicesReference(batchSize * treeSize);
+    std::vector<int64_t> selectTokenIndicesReference(batchSize * treeSize);
+    std::vector<int32_t> sequenceContextLengthsReference(batchSize);
+
+    // Call reference function
+    prepareEagleBaseTreeDecodingInputReference(treeMask, sequenceStartIndex, packedTreeMaskReference,
+        tensorPositionIndicesReference, sequenceContextLengthsReference, selectTokenIndicesReference, treeSize);
+
+    // GPU test
+    // Inputs
+    auto treeMaskDevice = rt::Tensor({batchSize, treeSize, treeSize}, rt::DeviceType::kGPU, DataType::kINT8);
+    auto sequenceStartIndexDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    CUDA_CHECK(cudaMemcpyAsync(treeMaskDevice.rawPointer(), treeMask.data(), treeMask.size() * sizeof(int8_t),
+        cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(sequenceStartIndexDevice.rawPointer(), sequenceStartIndex.data(),
+        sequenceStartIndex.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    // Outputs
+    auto packedTreeMaskDevice
+        = rt::Tensor({batchSize, treeSize, packedTreeMaskLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto tensorPositionIndicesDevice = rt::Tensor({batchSize, treeSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto selectTokenIndicesDevice = rt::Tensor({batchSize, treeSize}, rt::DeviceType::kGPU, DataType::kINT64);
+    auto sequenceContextLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    // Call kernel
+    prepareEagleBaseTreeDecodingInputs(treeMaskDevice, sequenceStartIndexDevice, packedTreeMaskDevice,
+        tensorPositionIndicesDevice, selectTokenIndicesDevice, sequenceContextLengthsDevice, stream);
+
+    // Copy back to host
+    std::vector<int32_t> packedTreeMaskHost(batchSize * treeSize * packedTreeMaskLen);
+    std::vector<int32_t> tensorPositionIndicesHost(batchSize * treeSize);
+    std::vector<int64_t> selectTokenIndicesHost(batchSize * treeSize);
+    std::vector<int32_t> sequenceContextLengthsHost(batchSize);
+    CUDA_CHECK(cudaMemcpyAsync(packedTreeMaskHost.data(), packedTreeMaskDevice.rawPointer(),
+        packedTreeMaskHost.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(tensorPositionIndicesHost.data(), tensorPositionIndicesDevice.rawPointer(),
+        tensorPositionIndicesHost.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(selectTokenIndicesHost.data(), selectTokenIndicesDevice.rawPointer(),
+        selectTokenIndicesHost.size() * sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(sequenceContextLengthsHost.data(), sequenceContextLengthsDevice.rawPointer(),
+        sequenceContextLengthsHost.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Verify results
+    for (int i = 0; i < batchSize; i++)
+    {
+        for (int j = 0; j < treeSize; j++)
+        {
+            // Verify packed tree mask
+            for (int k = 0; k < packedTreeMaskLen; k++)
+            {
+                int32_t maskVal = packedTreeMaskHost[i * treeSize * packedTreeMaskLen + j * packedTreeMaskLen + k];
+                int32_t maskRefVal
+                    = packedTreeMaskReference[i * treeSize * packedTreeMaskLen + j * packedTreeMaskLen + k];
+                EXPECT_EQ(maskVal, maskRefVal);
+            }
+            // Verify tensor position indices
+            int32_t positionVal = tensorPositionIndicesHost[i * treeSize + j];
+            int32_t positionRefVal = tensorPositionIndicesReference[i * treeSize + j];
+            EXPECT_EQ(positionVal, positionRefVal);
+        }
+
+        // Verify select token indices
+        for (int j = 0; j < treeSize; j++)
+        {
+            int64_t selectTokenVal = selectTokenIndicesHost[i * treeSize + j];
+            int64_t selectTokenRefVal = selectTokenIndicesReference[i * treeSize + j];
+            EXPECT_EQ(selectTokenVal, selectTokenRefVal);
+        }
+        // Verify sequence context lengths
+        int32_t sequenceContextLengthVal = sequenceContextLengthsHost[i];
+        int32_t sequenceContextLengthRefVal = sequenceContextLengthsReference[i];
+        EXPECT_EQ(sequenceContextLengthVal, sequenceContextLengthRefVal);
+    }
+
+    std::cout << "TestPrepareEagleBaseTreeDecodingInput "
+              << "BatchSize: " << batchSize << " TreeSize: " << treeSize << std::endl;
+}
+
+TEST(PrepareEagle, PrepareEagleBaseTreeDecodingInput)
+{
+    TestPrepareEagleBaseTreeDecodingInput(1, 32);
+    TestPrepareEagleBaseTreeDecodingInput(2, 60);
+    TestPrepareEagleBaseTreeDecodingInput(4, 100);
+}

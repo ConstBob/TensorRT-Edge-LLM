@@ -18,12 +18,14 @@
 #include "runtime/llmEngineRunner.h"
 
 #include "common/checkMacros.h"
+#include "common/cudaUtils.h"
 #include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
 #include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
+#include "kernels/speculative/newEagleUtilKernels.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <fstream>
 #include <sstream>
@@ -86,6 +88,9 @@ std::string const logitsName{"logits"};
 std::string const ropeCosSinName{"rope_rotary_cos_sin"};
 std::string const multimodalEmbeddingsName{"image_embeds"};
 std::string const kvCacheStartIndexName{"kvcache_start_index"};
+std::string const attentionMaskName{"attention_mask"};
+std::string const attentionPosIdName{"attention_pos_id"};
+std::string const outputHiddenStatesName{"hidden_states"};
 
 LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
@@ -718,6 +723,169 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     // Completed decoding step, commit the KVCache length of this run.
     mKVCache.commitDecodeRequest(stream);
     LOG_DEBUG("executeVanillaDecodingStep(): Decoding stage execution completed for request with batch size %d.",
+        activeBatchSize);
+    return true;
+}
+
+bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputIds,
+    rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+{
+    // All input tensors shall reside on GPU.
+    bool const checkInputsGPUTensor = baseTreeDecodingInputIds.getDeviceType() == rt::DeviceType::kGPU
+        && baseTreeDecodingMask.getDeviceType() == rt::DeviceType::kGPU
+        && outputLogits.getDeviceType() == rt::DeviceType::kGPU
+        && outputHiddenStates.getDeviceType() == rt::DeviceType::kGPU;
+    if (!checkInputsGPUTensor)
+    {
+        LOG_ERROR(
+            "eagleBaseTreeDecodingStepInputValidation(): Invalid device type of I/O tensors. All inputs and outputs "
+            "shall "
+            "reside on GPU.");
+        return false;
+    }
+    // Validate datatypes of the input tensors.
+    bool const isInputTypeValid = baseTreeDecodingInputIds.getDataType() == DataType::kINT32
+        && baseTreeDecodingMask.getDataType() == DataType::kINT8 && outputLogits.getDataType() == DataType::kFLOAT
+        && outputHiddenStates.getDataType() == DataType::kHALF;
+    if (!isInputTypeValid)
+    {
+        LOG_ERROR(
+            "eagleBaseTreeDecodingStepInputValidation(): Input token ids shall be INT32, hidden states I/O shall be "
+            "FLOAT16, "
+            "base tree decoding mask shall be INT8, output logits shall be FLOAT32.");
+        return false;
+    }
+    // Validate shapes of the input tensors.
+    bool const isBatchValid = baseTreeDecodingInputIds.getShape()[0] == mKVCache.getActiveBatchSize()
+        && baseTreeDecodingMask.getShape()[0] == mKVCache.getActiveBatchSize();
+    if (!isBatchValid)
+    {
+        LOG_ERROR(
+            "eagleBaseTreeDecodingStepInputValidation(): Invalid batchSize of the input tensors. batchSize shall be "
+            "equal to the active batch "
+            "size set by the previous prefill stage.");
+        return false;
+    }
+
+    int64_t const baseTreeDecodingSize = baseTreeDecodingInputIds.getShape()[1];
+    bool const isBaseTreeDecodingSizeValid = baseTreeDecodingMask.getShape()[1] == baseTreeDecodingSize
+        && baseTreeDecodingMask.getShape()[2] == baseTreeDecodingSize;
+    if (!isBaseTreeDecodingSizeValid)
+    {
+        LOG_ERROR(
+            "eagleBaseTreeDecodingStepInputValidation(): Invalid base tree decoding size of the input tensors. "
+            "Base tree decoding size %d, current base tree decoding mask shape: %s",
+            baseTreeDecodingSize, baseTreeDecodingMask.getShape().formatString());
+        return false;
+    }
+
+    Dims const outputHiddenStatesDim = mEngine->getTensorShape(outputHiddenStatesName.c_str());
+    int32_t const baseModelHiddenDim = outputHiddenStatesDim.d[2];
+    bool const isOutputShapeValid = outputLogits.getShape()[0] == outputHiddenStates.getShape()[0]
+        && outputLogits.getShape()[1] == mConfig.vocabSize && outputHiddenStates.getShape()[1] == baseModelHiddenDim;
+    if (!isOutputShapeValid)
+    {
+        LOG_ERROR(
+            "eagleBaseTreeDecodingStepInputValidation(): Invalid shape of the output tensors. Logits shape shall be "
+            "[select-token-size, %d], hidden states shape shall be [select-token-size, %d], "
+            "current outputLogits shape: %s, outputHiddenStates shape: %s",
+            mConfig.vocabSize, baseModelHiddenDim, outputLogits.getShape().formatString(),
+            outputHiddenStates.getShape().formatString());
+        return false;
+    }
+
+    return true;
+}
+
+bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputIds,
+    rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits,
+    rt::Tensor& outputHiddenStates, cudaStream_t stream)
+{
+    bool const validateInputStatus = this->eagleBaseTreeDecodingStepInputValidation(
+        baseTreeDecodingInputIds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
+    if (!validateInputStatus)
+    {
+        LOG_ERROR(
+            "executeEagleBaseTreeDecodingStep(): Eagle base tree decoding request not performed due to invalid input "
+            "tensors.");
+        return false;
+    }
+
+    int32_t const activeBatchSize = baseTreeDecodingInputIds.getShape()[0];
+    int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputIds.getShape()[1]);
+    int32_t const packedBaseTreeDecodingMaskLen = static_cast<int32_t>(divUp(baseTreeDecodingSize, 32));
+
+    // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
+    // indices, sequence context lengths.
+    mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize});
+    mSequenceContextLengths.reshape({activeBatchSize});
+    mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize});
+    mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen});
+    // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
+    // token" in the sequence.
+    rt::Tensor const& sequenceStartIndices = mKVCache.getKVCacheLengths();
+    kernel::prepareEagleBaseTreeDecodingInputs(baseTreeDecodingMask, sequenceStartIndices, mEagleBasePackedMask,
+        mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
+
+    // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
+    // initialization.
+    bool setEngineIOStatus{true};
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        inputIdsName.c_str(), const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        inputIdsName.c_str(), baseTreeDecodingInputIds.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mEagleBasePackedMask.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        attentionMaskName.c_str(), mEagleBasePackedMask.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        attentionPosIdName.c_str(), mEagleBasePositionIds.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        attentionPosIdName.c_str(), mEagleBasePositionIds.getShape().getTRTDims());
+    if (!multimodalEmbeddings.isEmpty())
+    {
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
+        auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
+    }
+    // Bind the output tensor into the engine.
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
+
+    if (!setEngineIOStatus)
+    {
+        LOG_ERROR("executeEagleBaseTreeDecodingStep(): Failed to bind engine input and output tensors.");
+        return false;
+    }
+
+    // launch the engine execution.
+    bool executeStatus{true};
+    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    if (!executeStatus)
+    {
+        LOG_ERROR(
+            "executeEagleBaseTreeDecodingStep(): Failed on TensorRT eagle base tree decoding stage enqueueV3() call.");
+        return false;
+    }
+
+    // Note in the base tree decoding step we explicitly don't commit the KVCache since we process the "whole tree" in
+    // these steps.
+    LOG_DEBUG(
+        "executeEagleBaseTreeDecodingStep(): Eagle base tree decoding stage execution completed for request with batch "
+        "size %d.",
         activeBatchSize);
     return true;
 }

@@ -72,6 +72,23 @@ void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices,
     rt::Tensor& tensorPositionIndices, rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths,
     int32_t const acceptedTokenNum, cudaStream_t stream);
 
+// The kernel will prepare required inputs to execute the eagle draft proposal step.
+// In detail, the kernel will prepare packed draft tree mask, compute token positional indices, and prepare other
+// MISC inputs to execute the draft proposal step.
+// Inputs:
+//     baseTreeDecodingMask [GPU, Int8]: unpacked base tree decoding mask denotes the relationship between the base tree decoding nodes.
+//         The input is padded with shape [batch, padded-draft-tree-size, padded-draft-tree-size] to ease implementation.
+//     sequenceStartIndices [GPU, Int32]: The start indices of "top level" tree nodes.
+//     stream: The CUDA stream to execute the kernel.
+// Outputs:
+//     packedBaseTreeDecodingMask [GPU, Int32]: Packed base tree decoding mask where each flag takes 1 bit.
+//     tensorPositionIndices [GPU, Int32]: Positional indices of base tree decoding nodes among the sequence.
+//     selectTokenIndices [GPU, Int64]: Denote the position to gather the hidden states and logits output.
+//     sequenceContextLengths [GPU, Int32]: The sequence context lengths input fed into TRT engine.
+void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& sequenceStartIndices,
+    rt::Tensor& packedBaseTreeDecodingMask, rt::Tensor& tensorPositionIndices, rt::Tensor& selectTokenIndices,
+    rt::Tensor& sequenceContextLengths, cudaStream_t stream);
+
 // clang-format on
 
 } // namespace kernel
