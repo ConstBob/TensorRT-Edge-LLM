@@ -20,6 +20,7 @@
 
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
+#include <cfloat>
 
 using namespace nvinfer1;
 
@@ -27,6 +28,9 @@ namespace drivellm
 {
 namespace kernel
 {
+
+constexpr int32_t kROOT_NODE_PREDECESSOR{-1};
+constexpr int32_t kEMPTY_NODE_PREDECESSOR{-5};
 
 __global__ void prepareEaglePrefillInputKernel(
     int32_t* sequenceContextLengths, int64_t* selectTokenIndices, int32_t sequenceLength)
@@ -151,6 +155,325 @@ __global__ void assembleCasualTreeAndSelectIndicesKernel(int32_t const* sequence
     }
 }
 
+__global__ void initializeDraftTreeFullTablesKernel(int32_t const* selectedIndices, float const* logProbs,
+    int32_t const* rootTokens, int32_t const* vocabMappingTable, int32_t* draftIdFullTable, float* draftScoreFullTable,
+    int32_t* draftParentFullTable, int32_t const draftTopK, int32_t const tableLength)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tIdx = threadIdx.x;
+    int32_t const blockSize = blockDim.x;
+
+    for (int32_t i = tIdx; i < tableLength; i += blockSize)
+    {
+        // Root position, token shall be last committed token, with score 0, parent -1.
+        int32_t tableOffset = batchIdx * tableLength + i;
+        if (i == 0)
+        {
+            draftIdFullTable[tableOffset] = rootTokens[batchIdx];
+            draftScoreFullTable[tableOffset] = 0.0f;
+            draftParentFullTable[tableOffset] = kROOT_NODE_PREDECESSOR;
+        }
+        else if (i <= draftTopK)
+        {
+            // First level of the draft tree, token shall be translated into full vocab size.
+            // Score is 0 (root) + log probability, parent points to root (0)
+            int32_t const selectedOffset = batchIdx * draftTopK + i - 1;
+            int32_t const draftTokenId = selectedIndices[selectedOffset];
+            float const logProbVal = logProbs[selectedOffset];
+            int32_t const baseTokenId = vocabMappingTable[draftTokenId];
+            draftIdFullTable[tableOffset] = baseTokenId;
+            draftScoreFullTable[tableOffset] = logProbVal;
+            draftParentFullTable[tableOffset] = 0;
+        }
+        else
+        {
+            // Empty initialize the rest of the table, clear garbage data to reduce confusion.
+            draftIdFullTable[tableOffset] = 0;
+            draftScoreFullTable[tableOffset] = -FLT_MAX;
+            draftParentFullTable[tableOffset] = kEMPTY_NODE_PREDECESSOR;
+        }
+    }
+}
+
+__global__ void initializeDraftTreeInputFirstRoundKernel(int32_t const* draftIdFullTable, int32_t* inputIds,
+    int8_t* draftTreeMask, int32_t* draftTreeLength, int32_t const draftTopK, int32_t const paddedDraftTreeSize)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tIdx = threadIdx.x;
+    int32_t const blockSize = blockDim.x;
+
+    int32_t const tableLength = 1 + draftTopK + draftTopK * draftTopK;
+    for (int32_t i = tIdx; i < paddedDraftTreeSize; i += blockSize)
+    {
+        int32_t const idsOffset = batchIdx * paddedDraftTreeSize + i;
+        // Draft tree mask is in format of [batch, padded-draft-tree-size, padded-draft-tree-size].
+        int32_t const maskOffset = batchIdx * paddedDraftTreeSize * paddedDraftTreeSize + i * paddedDraftTreeSize;
+        if (i < draftTopK)
+        {
+            // Handle non padded part of the output tensors.
+            // First entry of the table is root token, offset 1 to get the first level draft tree.
+            int32_t const tableOffset = batchIdx * tableLength + i + 1;
+            inputIds[idsOffset] = draftIdFullTable[tableOffset];
+            // Prepare tree mask for these tokens.
+            for (int32_t j = 0; j < paddedDraftTreeSize; ++j)
+            {
+                // First layer of the draft token only attend to itself.
+                draftTreeMask[maskOffset + j] = (j == i) ? 1 : 0;
+            }
+        }
+        else
+        {
+            // Padded region, zero initialize the tensors.
+            inputIds[idsOffset] = 0;
+            for (int32_t j = 0; j < paddedDraftTreeSize; ++j)
+            {
+                draftTreeMask[maskOffset + j] = 0;
+            }
+        }
+    }
+
+    // Update the draft tree length.
+    if (tIdx == 0)
+    {
+        draftTreeLength[batchIdx] = draftTopK;
+    }
+}
+
+__global__ void initializeDraftTreeInputKernel(int32_t const* tokenIdsTable, int32_t const* selectedIndices,
+    int32_t* inputIds, int8_t* draftTreeMask, int32_t* draftTreeLength, int32_t const draftTopK,
+    int32_t const paddedDraftTreeSize, int32_t const round)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tIdx = threadIdx.x;
+
+    if (tIdx < draftTopK)
+    {
+        int32_t const selectedIdx = selectedIndices[batchIdx * draftTopK + tIdx];
+        // Each row of the draftTopK x draftTopK matrix will comes from one parent.
+        int32_t const parentidx = selectedIdx / draftTopK;
+        // Each batch will have draftTopK * draftTopK token candidates.
+        int32_t const selectedtokenIds = tokenIdsTable[batchIdx * draftTopK * draftTopK + selectedIdx];
+        // Input ids is padded to paddedDraftTreeSize where each round contains draftTopK tokens.
+        int32_t const inputIdsOffset = batchIdx * paddedDraftTreeSize + (round * draftTopK + tIdx);
+        inputIds[inputIdsOffset] = selectedtokenIds;
+
+        // Where the parent and the token itself locate within the padded draft tree size.
+        int32_t const parentOffset = (round - 1) * draftTopK + parentidx;
+        int32_t const selfOffset = round * draftTopK + tIdx;
+        // Prepare tree mask for these tokens. For this token, it shall attend to itself, and all positions its parent
+        // attend to.
+        int32_t const parentsMaskOffset
+            = batchIdx * paddedDraftTreeSize * paddedDraftTreeSize + parentOffset * paddedDraftTreeSize;
+        int32_t const selfMaskOffset
+            = batchIdx * paddedDraftTreeSize * paddedDraftTreeSize + selfOffset * paddedDraftTreeSize;
+        for (int32_t j = 0; j < paddedDraftTreeSize; ++j)
+        {
+            draftTreeMask[selfMaskOffset + j] = draftTreeMask[parentsMaskOffset + j];
+            if (j == selfOffset)
+            {
+                draftTreeMask[selfMaskOffset + j] = 1;
+            }
+        }
+    }
+
+    // Update tree length from this round.
+    if (tIdx == 0)
+    {
+        draftTreeLength[batchIdx] = round * draftTopK;
+    }
+}
+
+__global__ void assembleDraftHiddenStatesKernel(half const* draftHiddenOutput, int32_t const* selectedIndices,
+    half* draftHiddenInput, int32_t const hiddenDim, int32_t const draftTopK, int32_t const paddedDraftTreeSize,
+    int32_t const round)
+{
+    // The kernel will copy draft hidden states data from last round of output to the input for next round of drafting.
+    // For simplicity, each CTA will be responsible for "one" hidden states in the output.
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const dstHiddenIdx = blockIdx.y;
+    int32_t const tIdx = threadIdx.x;
+    int32_t const blockSize = blockDim.x;
+
+    DVec<half> vecData;
+    constexpr int32_t VEC_SIZE = DVec<half>::vec_size;
+    if (round == 0)
+    {
+        // For first round of drafting, there is only one output hidden entry.
+        int32_t const srcOffset = batchIdx * hiddenDim;
+        int32_t const dstOffset = batchIdx * paddedDraftTreeSize * hiddenDim + dstHiddenIdx * hiddenDim;
+        for (int32_t i = tIdx; i < hiddenDim / VEC_SIZE; i += blockSize)
+        {
+            vecData.load(draftHiddenOutput + srcOffset + i * VEC_SIZE);
+            vecData.store(draftHiddenInput + dstOffset + i * VEC_SIZE);
+        }
+    }
+    else
+    {
+        // For non-first round, the output hidden states have layout of [batch, draftTopK, draft-hidden-size].
+        // We need to find out the corresponding input hidden states index based on selected indices.
+        // Selected indices come from a matrix of [draftTopK, draftTopK]. Each row maps to one src hidden states index.
+        int32_t const selectedIndexOffset = batchIdx * draftTopK + dstHiddenIdx;
+        int32_t const srcHiddenIdx = selectedIndices[selectedIndexOffset] / draftTopK;
+        int32_t const srcOffset = batchIdx * draftTopK * hiddenDim + srcHiddenIdx * hiddenDim;
+
+        // Dst hidden states is in padded shape of [batch, padded-draft-tree-size, draft-hidden-size]. Where
+        // padded-draft-tree-size equals to total-num-round * draftTopK.
+        int32_t const dstOffset
+            = batchIdx * paddedDraftTreeSize * hiddenDim + (round * draftTopK + dstHiddenIdx) * hiddenDim;
+        for (int32_t i = tIdx; i < hiddenDim / VEC_SIZE; i += blockSize)
+        {
+            vecData.load(draftHiddenOutput + srcOffset + i * VEC_SIZE);
+            vecData.store(draftHiddenInput + dstOffset + i * VEC_SIZE);
+        }
+    }
+}
+
+__global__ void assembleIntermediateparentsKernel(
+    int32_t const* selectedIndices, int32_t* intermediateParents, int32_t const draftTopK, int32_t const round)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tIdx = threadIdx.x;
+
+    // Parents points to a location within the large draft tree table, the table have layout of [batch, 1 + draftTopK +
+    // draftTopK * draftTopK * total-num-round]. We can obtain the offset as:
+    int32_t startOffset{};
+    if (round == 0)
+    {
+        startOffset = 1;
+    }
+    else
+    {
+        startOffset = 1 + draftTopK + draftTopK * draftTopK * (round - 1);
+    }
+    // In case we launch more threads than needed in each CTA.
+    if (tIdx < draftTopK)
+    {
+        // For round 0, we don't have to read from selected indices.
+        if (round == 0)
+        {
+            intermediateParents[batchIdx * draftTopK + tIdx] = startOffset + tIdx;
+        }
+        else
+        {
+            // Here selected indices come from a matrix of [draftTopK, draftTopK].
+            int32_t const selectedIdx = selectedIndices[batchIdx * draftTopK + tIdx];
+            intermediateParents[batchIdx * draftTopK + tIdx] = startOffset + selectedIdx;
+        }
+    }
+}
+
+__global__ void computeCuScoresAndTranslateTokenKernel(int32_t const* selectedIndices, float const* logProbs,
+    float const* intermediateScores, int32_t const* vocabMappingTable, int32_t* draftIdTable, float* draftScoreTable,
+    int32_t const draftTopK)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tIdx = threadIdx.x;
+    int32_t const blockSize = blockDim.x;
+
+    for (int32_t i = tIdx; i < draftTopK * draftTopK; i += blockSize)
+    {
+        int32_t const draftTokenIds = selectedIndices[batchIdx * draftTopK * draftTopK + i];
+        int32_t const baseTokenIds = vocabMappingTable[draftTokenIds];
+        int32_t const tableOffset = batchIdx * draftTopK * draftTopK + i;
+        draftIdTable[tableOffset] = baseTokenIds;
+
+        int32_t const parentIdx = i / draftTopK;
+        float const parentScore = intermediateScores[batchIdx * draftTopK + parentIdx];
+        draftScoreTable[tableOffset] = parentScore + logProbs[tableOffset];
+    }
+}
+
+__global__ void updateDraftTreeFullTablesKernel(int32_t const* draftIdTable, float const* draftScoreTable,
+    int32_t const* intermediateParents, int32_t* draftIdFullTable, float* draftScoreFullTable,
+    int32_t* draftParentFullTable, int32_t const draftTopK, int32_t const round, int32_t const fullTableLength)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tIdx = threadIdx.x;
+    int32_t const blockSize = blockDim.x;
+
+    for (int32_t i = tIdx; i < draftTopK * draftTopK; i += blockSize)
+    {
+        int32_t const srcTableOffset = batchIdx * draftTopK * draftTopK + i;
+        // Full table has layout of [batch, 1 + draftTopK + draftTopK * draftTopK * total-num-round].
+        int32_t const dstTableOffset = batchIdx * fullTableLength + (1 + draftTopK + draftTopK * draftTopK * round + i);
+        draftIdFullTable[dstTableOffset] = draftIdTable[srcTableOffset];
+        draftScoreFullTable[dstTableOffset] = draftScoreTable[srcTableOffset];
+        // Obtain the parent index from intermediate parents info we collected previously.
+        int32_t const parentIdx = i / draftTopK;
+        draftParentFullTable[dstTableOffset] = intermediateParents[batchIdx * draftTopK + parentIdx];
+    }
+}
+
+__global__ void constructVerificationDraftTreeKernel(int32_t const* draftIdFullTable,
+    int32_t const* draftParentFullTable, int32_t const* selectedIndices, int32_t* inputIds, int8_t* draftTreeMask,
+    int32_t const fullTableLength, int32_t const verifyTreeSize)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const tIdx = threadIdx.x;
+
+    if (tIdx >= verifyTreeSize)
+    {
+        return;
+    }
+
+    // 10 Should be sufficient since we don't have too many levels of drafting.
+    // We don't use shared memory since the data tables are small and can automatically fit into L1.
+    constexpr int32_t kMAX_DEPTH{10};
+    int32_t parentIndices[kMAX_DEPTH] = {-1};
+    int32_t attendedIndices[kMAX_DEPTH + 1] = {-1};
+
+    int32_t const verifyTreeCTAOffset = batchIdx * verifyTreeSize;
+    int32_t const fullTableCTAOffset = batchIdx * fullTableLength;
+
+    int32_t const selectedIdx = selectedIndices[verifyTreeCTAOffset + tIdx];
+    inputIds[verifyTreeCTAOffset + tIdx] = draftIdFullTable[fullTableCTAOffset + selectedIdx];
+
+    // Collect number of parents and parents indices.
+    int32_t numParents{0};
+    int32_t parentIter = draftParentFullTable[fullTableCTAOffset + selectedIdx];
+
+    // By design, all token will finally trace back to root token which has parent index of -1.
+    // Root token won't attend to any other token.
+    while (parentIter != kROOT_NODE_PREDECESSOR)
+    {
+        numParents += 1;
+        parentIndices[numParents] = parentIter;
+        parentIter = draftParentFullTable[fullTableCTAOffset + parentIter];
+    }
+
+    // To establish the tree mask, we need to find out the location of each parent within the
+    // verify tree. We can iterate the selected indices and match the parent indices we collected.
+    // First each token will attend to itself.
+    attendedIndices[0] = tIdx;
+    // count from myself towrds prior locations.
+    int32_t countIter{tIdx};
+    // Attend iter starts from 1.
+    int32_t attendIter{1};
+    // Reset parent iterator to match from the first predecessor.
+    parentIter = 0;
+    while (countIter >= 0)
+    {
+        countIter -= 1;
+        if (countIter == parentIndices[parentIter])
+        {
+            attendedIndices[attendIter] = countIter;
+            attendIter += 1;
+            parentIter += 1;
+        }
+    }
+    // Now we start to establish the tree mask which have layout of [batch, verify-tree-size, verify-tree-size].
+    int32_t const verifyTreeOffset = batchIdx * verifyTreeSize * verifyTreeSize + tIdx * verifyTreeSize;
+    // First clear the row to all zeros and then fill in the attended indices.
+    for (int32_t i = 0; i < verifyTreeSize; i++)
+    {
+        draftTreeMask[verifyTreeOffset + i] = 0;
+    }
+    for (int32_t i = 0; i < attendIter; i++)
+    {
+        draftTreeMask[verifyTreeOffset + attendedIndices[i]] = 1;
+    }
+}
+
 void prepareEaglePrefillInputs(rt::Tensor& sequenceContextLengths, rt::Tensor& selectTokenIndices,
     int32_t const sequenceLength, cudaStream_t stream)
 {
@@ -241,51 +564,6 @@ void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices,
         sequenceStartIndices.dataPointer<int32_t>(), packedTreeMask.dataPointer<int32_t>(),
         tensorPositionIndices.dataPointer<int32_t>(), selectTokenIndices.dataPointer<int64_t>(),
         sequenceContextLengths.dataPointer<int32_t>(), acceptedTokenNum);
-}
-
-__global__ void prepareEagleBaseTreeDecodingInputKernel(int8_t const* baseTreeDecodingMask,
-    int32_t const* sequenceStartIndices, int32_t* packedTreeMask, int32_t* tensorPositionIndices,
-    int32_t* sequenceContextLengths, int64_t* selectTokenIndices, int32_t const treeSize)
-{
-    constexpr int32_t kNUM_MASK_PER_ENTRY{32};
-
-    // Each thread will handle one token in the tree to setup the mask and tensor position indices.
-    int32_t const batchIdx = blockIdx.x;
-    int32_t const tokenIdx = threadIdx.x;
-
-    if (tokenIdx == 0)
-    {
-        sequenceContextLengths[batchIdx] = sequenceStartIndices[batchIdx] + treeSize;
-    }
-
-    int32_t const packedTreeMaskLen = (treeSize + kNUM_MASK_PER_ENTRY - 1) / kNUM_MASK_PER_ENTRY;
-    int32_t const sequenceStartIndex = sequenceStartIndices[batchIdx];
-
-    // Unpacked tree mask formulate in the format of [batch, tree-size, tree-size].
-    // Packed tree mask len is in format of [batch, tree-size, divup(tree-size, 32)].
-    // Tensor position indices is in format of [batch, tree-size].
-    int32_t const unpackedTreeMaskOffset = batchIdx * treeSize * treeSize + tokenIdx * treeSize;
-    int32_t const packedTreeMaskOffset = batchIdx * treeSize * packedTreeMaskLen + tokenIdx * packedTreeMaskLen;
-    int32_t const tensorPositionOffset = batchIdx * treeSize + tokenIdx;
-    int32_t const selectTokenOffset = batchIdx * treeSize + tokenIdx;
-
-    if (tokenIdx < treeSize)
-    {
-        // With causal attention, the node will only attend to nodes "prior" to itself.
-        int32_t attendNodeNum{0};
-        for (int32_t i = 0; i <= tokenIdx; ++i)
-        {
-            int8_t const maskFlag = baseTreeDecodingMask[unpackedTreeMaskOffset + i];
-            if (maskFlag)
-            {
-                attendNodeNum += 1;
-                packedTreeMask[packedTreeMaskOffset + i / kNUM_MASK_PER_ENTRY] |= (1 << (i % kNUM_MASK_PER_ENTRY));
-            }
-        }
-        // A token always attend to itself, subtract 1 to reflect its position in the sequence.
-        tensorPositionIndices[tensorPositionOffset] = sequenceStartIndex + attendNodeNum - 1;
-        selectTokenIndices[selectTokenOffset] = tokenIdx;
-    }
 }
 
 void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& sequenceStartIndices,
@@ -517,6 +795,276 @@ void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndi
     eagleBaseAssembleHiddenStateKernel<MAX_PATH><<<gridDim2, blockDim2, 0, stream>>>(
         acceptedIndices.dataPointer<int32_t>(), acceptLengths.dataPointer<int32_t>(), hiddenState.dataPointer<half>(),
         batchSize, maxDepth, numTokens, hiddenDim);
+}
+
+void initializeDraftTreeTables(rt::Tensor const& selectedIndices, rt::Tensor const& logProb,
+    rt::Tensor const& rootTokens, rt::Tensor const& vocabMappingTable, rt::Tensor& draftIdFullTable,
+    rt::Tensor& draftScoreFullTable, rt::Tensor& draftParentFullTable, int32_t const draftTopK, cudaStream_t stream)
+{
+    check::check(selectedIndices.getDeviceType() == rt::DeviceType::kGPU
+            && logProb.getDeviceType() == rt::DeviceType::kGPU && rootTokens.getDeviceType() == rt::DeviceType::kGPU
+            && vocabMappingTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftIdFullTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftScoreFullTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftParentFullTable.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(selectedIndices.getDataType() == DataType::kINT32 && logProb.getDataType() == DataType::kFLOAT
+            && rootTokens.getDataType() == DataType::kINT32 && vocabMappingTable.getDataType() == DataType::kINT32
+            && draftIdFullTable.getDataType() == DataType::kINT32
+            && draftScoreFullTable.getDataType() == DataType::kFLOAT
+            && draftParentFullTable.getDataType() == DataType::kINT32,
+        "All datatypes shall be valid.");
+    auto const batchSize = static_cast<uint32_t>(selectedIndices.getShape()[0]);
+    int32_t const tableLength = static_cast<int32_t>(draftIdFullTable.getShape()[1]);
+
+    check::check(selectedIndices.getShape()[1] == draftTopK, "Check selected indices dimension.");
+    check::check(logProb.getShape()[1] == draftTopK, "Check log probability dimension.");
+
+    dim3 blockDim{256};
+    dim3 gridDim{batchSize};
+    initializeDraftTreeFullTablesKernel<<<gridDim, blockDim, 0, stream>>>(selectedIndices.dataPointer<int32_t>(),
+        logProb.dataPointer<float>(), rootTokens.dataPointer<int32_t>(), vocabMappingTable.dataPointer<int32_t>(),
+        draftIdFullTable.dataPointer<int32_t>(), draftScoreFullTable.dataPointer<float>(),
+        draftParentFullTable.dataPointer<int32_t>(), draftTopK, tableLength);
+}
+
+void assembleInitialDraftTreeInput(rt::Tensor const& draftIdFullTable, rt::Tensor const& draftHiddenStatesOutput,
+    rt::Tensor& inputIds, rt::Tensor& draftHiddenStatesInput, rt::Tensor& draftTreeLength, rt::Tensor& draftTreeMask,
+    int32_t const draftTopK, cudaStream_t stream)
+{
+    check::check(draftIdFullTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftHiddenStatesOutput.getDeviceType() == rt::DeviceType::kGPU
+            && inputIds.getDeviceType() == rt::DeviceType::kGPU
+            && draftHiddenStatesInput.getDeviceType() == rt::DeviceType::kGPU
+            && draftTreeLength.getDeviceType() == rt::DeviceType::kGPU
+            && draftTreeMask.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(draftIdFullTable.getDataType() == DataType::kINT32
+            && draftHiddenStatesOutput.getDataType() == DataType::kHALF && inputIds.getDataType() == DataType::kINT32
+            && draftHiddenStatesInput.getDataType() == DataType::kHALF
+            && draftTreeLength.getDataType() == DataType::kINT32 && draftTreeMask.getDataType() == DataType::kINT8,
+        "Data type shall all be valid.");
+    int32_t const batchSize = static_cast<int32_t>(draftIdFullTable.getShape()[0]);
+    int32_t const draftHiddenDim = static_cast<int32_t>(draftHiddenStatesOutput.getShape()[1]);
+    int32_t const paddedDraftTreeSize = static_cast<int32_t>(inputIds.getShape()[1]);
+    check::check(
+        draftHiddenStatesOutput.getShape()[0] == batchSize, "Output hidden only map to last committed token here.");
+    check::check(draftHiddenStatesInput.getShape()[0] == batchSize * paddedDraftTreeSize,
+        "For next round of drafting, place draftTopK candidates.");
+    check::check(draftTreeLength.getShape()[0] == batchSize && draftTreeLength.getShape()[1] == paddedDraftTreeSize
+            && draftTreeLength.getShape()[2] == paddedDraftTreeSize,
+        "Draft tree length shall have shape [batch, padded-draft-tree-size, padded-draft-tree-size].");
+
+    dim3 blockDim1{128};
+    dim3 gridDim1{static_cast<uint32_t>(batchSize)};
+    initializeDraftTreeInputFirstRoundKernel<<<gridDim1, blockDim1, 0, stream>>>(
+        draftIdFullTable.dataPointer<int32_t>(), inputIds.dataPointer<int32_t>(), draftTreeMask.dataPointer<int8_t>(),
+        draftTreeLength.dataPointer<int32_t>(), draftTopK, paddedDraftTreeSize);
+
+    dim3 blockDim2{128};
+    dim3 gridDim2{static_cast<uint32_t>(batchSize), static_cast<uint32_t>(draftTopK)};
+
+    // For first round of hidden states assembly, selected indices is not needed.
+    int32_t* selectedIndices{nullptr};
+    int32_t const round{0};
+
+    assembleDraftHiddenStatesKernel<<<gridDim2, blockDim2, 0, stream>>>(draftHiddenStatesOutput.dataPointer<half>(),
+        selectedIndices, draftHiddenStatesInput.dataPointer<half>(), draftHiddenDim, draftTopK, paddedDraftTreeSize,
+        round);
+}
+
+void assembleDraftTreeInput(rt::Tensor const& draftIdTable, rt::Tensor const& draftHiddenOutput,
+    rt::Tensor const& selectedIndices, rt::Tensor& inputIds, rt::Tensor& draftHiddenStatesInput,
+    rt::Tensor& draftTreeLength, rt::Tensor& draftTreeMask, int32_t const draftTopK, int32_t const round,
+    cudaStream_t stream)
+{
+    check::check(draftIdTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftHiddenOutput.getDeviceType() == rt::DeviceType::kGPU
+            && selectedIndices.getDeviceType() == rt::DeviceType::kGPU
+            && inputIds.getDeviceType() == rt::DeviceType::kGPU
+            && draftHiddenStatesInput.getDeviceType() == rt::DeviceType::kGPU
+            && draftTreeLength.getDeviceType() == rt::DeviceType::kGPU
+            && draftTreeMask.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(draftIdTable.getDataType() == DataType::kINT32 && draftHiddenOutput.getDataType() == DataType::kHALF
+            && selectedIndices.getDataType() == DataType::kINT32 && inputIds.getDataType() == DataType::kINT32
+            && draftHiddenStatesInput.getDataType() == DataType::kHALF
+            && draftTreeLength.getDataType() == DataType::kINT32 && draftTreeMask.getDataType() == DataType::kINT8,
+        "Data type shall all be valid.");
+    int32_t const batchSize = static_cast<int32_t>(draftIdTable.getShape()[0]);
+    int32_t const draftHiddenDim = static_cast<int32_t>(draftHiddenOutput.getShape()[1]);
+    int32_t const paddedDraftTreeSize = static_cast<int32_t>(inputIds.getShape()[1]);
+    check::check(draftIdTable.getShape()[1] == draftTopK * draftTopK, "Check draft id table dimension.");
+    check::check(draftHiddenOutput.getShape()[0] == batchSize * draftTopK, "Check draft hidden output dimension.");
+    check::check(selectedIndices.getShape()[1] == draftTopK, "Check selected indices dimension.");
+    check::check(inputIds.getShape()[0] == batchSize, "Check input ids dimension.");
+    check::check(inputIds.getShape()[1] == paddedDraftTreeSize, "Check input ids dimension.");
+    check::check(draftHiddenStatesInput.getShape()[0] == batchSize * paddedDraftTreeSize,
+        "Check draft hidden states input dimension.");
+
+    dim3 blockDim1{32};
+    dim3 gridDim1{static_cast<uint32_t>(batchSize)};
+    initializeDraftTreeInputKernel<<<gridDim1, blockDim1, 0, stream>>>(draftIdTable.dataPointer<int32_t>(),
+        selectedIndices.dataPointer<int32_t>(), inputIds.dataPointer<int32_t>(), draftTreeMask.dataPointer<int8_t>(),
+        draftTreeLength.dataPointer<int32_t>(), draftTopK, paddedDraftTreeSize, round);
+
+    dim3 blockDim2{128};
+    dim3 gridDim2{static_cast<uint32_t>(batchSize), static_cast<uint32_t>(draftTopK)};
+
+    assembleDraftHiddenStatesKernel<<<gridDim2, blockDim2, 0, stream>>>(draftHiddenOutput.dataPointer<half>(),
+        selectedIndices.dataPointer<int32_t>(), draftHiddenStatesInput.dataPointer<half>(), draftHiddenDim, draftTopK,
+        paddedDraftTreeSize, round);
+}
+
+void assembleInitialIntermediateData(rt::Tensor const& logProbs, rt::Tensor& intermediateParents,
+    rt::Tensor& intermediateScores, int32_t const draftTopK, cudaStream_t stream)
+{
+    check::check(logProbs.getDeviceType() == rt::DeviceType::kGPU
+            && intermediateParents.getDeviceType() == rt::DeviceType::kGPU
+            && intermediateScores.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(logProbs.getDataType() == DataType::kFLOAT && intermediateParents.getDataType() == DataType::kINT32
+            && intermediateScores.getDataType() == DataType::kFLOAT,
+        "Data type shall all be valid.");
+    int32_t const batchSize = static_cast<int32_t>(logProbs.getShape()[0]);
+    check::check(logProbs.getShape()[1] == draftTopK, "Check log probability dimension.");
+    check::check(intermediateParents.getShape()[1] == draftTopK, "Check intermediate parent dimension.");
+    check::check(intermediateScores.getShape()[1] == draftTopK, "Check intermediate score dimension.");
+
+    // We can directly copy the log probabilities to intermediate scores.
+    CUDA_CHECK(cudaMemcpyAsync(intermediateScores.dataPointer<float>(), logProbs.dataPointer<float>(),
+        batchSize * draftTopK * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+
+    // Assemble the interdemidate parents.
+    dim3 blockDim{32};
+    dim3 gridDim{static_cast<uint32_t>(batchSize)};
+
+    // For first round we don't have the selected indices from [draftTopK, draftTopK] candidates.
+    int32_t* selectedIndices{nullptr};
+    int32_t const round{0};
+    assembleIntermediateparentsKernel<<<gridDim, blockDim, 0, stream>>>(
+        selectedIndices, intermediateParents.dataPointer<int32_t>(), draftTopK, round);
+}
+
+void assembleIntermediateData(rt::Tensor const& cuLogProbs, rt::Tensor const& selectedIndices,
+    rt::Tensor& intermediateScores, rt::Tensor& intermediateParents, int32_t const draftTopK, int32_t const round,
+    cudaStream_t stream)
+{
+    check::check(cuLogProbs.getDeviceType() == rt::DeviceType::kGPU
+            && selectedIndices.getDeviceType() == rt::DeviceType::kGPU
+            && intermediateScores.getDeviceType() == rt::DeviceType::kGPU
+            && intermediateParents.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(cuLogProbs.getDataType() == DataType::kFLOAT && selectedIndices.getDataType() == DataType::kINT32
+            && intermediateScores.getDataType() == DataType::kFLOAT
+            && intermediateParents.getDataType() == DataType::kINT32,
+        "Data type shall all be valid.");
+    int32_t const batchSize = static_cast<int32_t>(cuLogProbs.getShape()[0]);
+    check::check(cuLogProbs.getShape()[1] == draftTopK, "Check cu log probability dimension.");
+    check::check(selectedIndices.getShape()[1] == draftTopK, "Check selected indices dimension.");
+    check::check(intermediateScores.getShape()[1] == draftTopK, "Check intermediate score dimension.");
+    check::check(intermediateParents.getShape()[1] == draftTopK, "Check intermediate parent dimension.");
+
+    // We can directly copy the cu log probabilities to intermediate scores.
+    CUDA_CHECK(cudaMemcpyAsync(intermediateScores.dataPointer<float>(), cuLogProbs.dataPointer<float>(),
+        batchSize * draftTopK * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+
+    // Assemble the interdemidate parents.
+    dim3 blockDim{32};
+    dim3 gridDim{static_cast<uint32_t>(batchSize)};
+    assembleIntermediateparentsKernel<<<gridDim, blockDim, 0, stream>>>(
+        selectedIndices.dataPointer<int32_t>(), intermediateParents.dataPointer<int32_t>(), draftTopK, round);
+}
+
+void computeCuScoresAndTranslateToken(rt::Tensor const& selectedIndices, rt::Tensor const& logProbs,
+    rt::Tensor const& intermediateScores, rt::Tensor const& vocabMappingTable, rt::Tensor& draftIdTable,
+    rt::Tensor& draftScoreTable, int32_t const draftTopK, cudaStream_t stream)
+{
+    check::check(selectedIndices.getDeviceType() == rt::DeviceType::kGPU
+            && logProbs.getDeviceType() == rt::DeviceType::kGPU
+            && intermediateScores.getDeviceType() == rt::DeviceType::kGPU
+            && vocabMappingTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftIdTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftScoreTable.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(selectedIndices.getDataType() == DataType::kINT32 && logProbs.getDataType() == DataType::kFLOAT
+            && intermediateScores.getDataType() == DataType::kFLOAT
+            && vocabMappingTable.getDataType() == DataType::kINT32 && draftIdTable.getDataType() == DataType::kINT32
+            && draftScoreTable.getDataType() == DataType::kFLOAT,
+        "Data type shall all be valid.");
+    int32_t const batchSize = static_cast<int32_t>(selectedIndices.getShape()[0]);
+    check::check(selectedIndices.getShape()[1] == draftTopK * draftTopK, "Check selected indices dimension.");
+    check::check(logProbs.getShape()[1] == draftTopK * draftTopK, "Check log probability dimension.");
+    check::check(intermediateScores.getShape()[1] == draftTopK, "Check intermediate score dimension.");
+    check::check(draftIdTable.getShape()[1] == draftTopK * draftTopK, "Check draft id table dimension.");
+    check::check(draftScoreTable.getShape()[1] == draftTopK * draftTopK, "Check draft score table dimension.");
+
+    dim3 blockDim{128};
+    dim3 gridDim{static_cast<uint32_t>(batchSize)};
+    computeCuScoresAndTranslateTokenKernel<<<gridDim, blockDim, 0, stream>>>(selectedIndices.dataPointer<int32_t>(),
+        logProbs.dataPointer<float>(), intermediateScores.dataPointer<float>(),
+        vocabMappingTable.dataPointer<int32_t>(), draftIdTable.dataPointer<int32_t>(),
+        draftScoreTable.dataPointer<float>(), draftTopK);
+}
+
+void updateDraftTreeFullTables(rt::Tensor const& draftIdTable, rt::Tensor const& draftScoreTable,
+    rt::Tensor const& intermediateParents, rt::Tensor& draftIdFullTable, rt::Tensor& draftScoreFullTable,
+    rt::Tensor& draftParentFullTable, int32_t const draftTopK, int32_t const round, cudaStream_t stream)
+{
+    check::check(draftIdTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftScoreTable.getDeviceType() == rt::DeviceType::kGPU
+            && intermediateParents.getDeviceType() == rt::DeviceType::kGPU
+            && draftIdFullTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftScoreFullTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftParentFullTable.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(draftIdTable.getDataType() == DataType::kINT32 && draftScoreTable.getDataType() == DataType::kFLOAT
+            && intermediateParents.getDataType() == DataType::kINT32
+            && draftIdFullTable.getDataType() == DataType::kINT32
+            && draftScoreFullTable.getDataType() == DataType::kFLOAT
+            && draftParentFullTable.getDataType() == DataType::kINT32,
+        "Data type shall all be valid.");
+    int32_t const batchSize = static_cast<int32_t>(draftIdTable.getShape()[0]);
+    int32_t const fullTableLength = static_cast<int32_t>(draftIdFullTable.getShape()[1]);
+
+    check::check(draftIdTable.getShape()[1] == draftTopK * draftTopK, "Check draft id table dimension.");
+    check::check(draftScoreTable.getShape()[1] == draftTopK * draftTopK, "Check draft score table dimension.");
+    check::check(intermediateParents.getShape()[1] == draftTopK, "Check intermediate parent dimension.");
+
+    dim3 blockDim{128};
+    dim3 gridDim{static_cast<uint32_t>(batchSize)};
+    updateDraftTreeFullTablesKernel<<<gridDim, blockDim, 0, stream>>>(draftIdTable.dataPointer<int32_t>(),
+        draftScoreTable.dataPointer<float>(), intermediateParents.dataPointer<int32_t>(),
+        draftIdFullTable.dataPointer<int32_t>(), draftScoreFullTable.dataPointer<float>(),
+        draftParentFullTable.dataPointer<int32_t>(), draftTopK, round, fullTableLength);
+}
+
+void constructVerificationDraftTree(rt::Tensor const& draftIdFullTable, rt::Tensor const& draftParentFullTable,
+    rt::Tensor const& selectedIndices, rt::Tensor& inputIds, rt::Tensor& draftTreeMask, cudaStream_t stream)
+{
+    check::check(draftIdFullTable.getDeviceType() == rt::DeviceType::kGPU
+            && draftParentFullTable.getDeviceType() == rt::DeviceType::kGPU
+            && selectedIndices.getDeviceType() == rt::DeviceType::kGPU
+            && inputIds.getDeviceType() == rt::DeviceType::kGPU
+            && draftTreeMask.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(draftIdFullTable.getDataType() == DataType::kINT32
+            && draftParentFullTable.getDataType() == DataType::kINT32
+            && selectedIndices.getDataType() == DataType::kINT32 && inputIds.getDataType() == DataType::kINT32
+            && draftTreeMask.getDataType() == DataType::kINT8,
+        "Data type shall all be valid.");
+    int32_t const batchSize = static_cast<int32_t>(draftIdFullTable.getShape()[0]);
+    int32_t const fullTableLength = static_cast<int32_t>(draftIdFullTable.getShape()[1]);
+    int32_t const verifyTreeSize = static_cast<int32_t>(selectedIndices.getShape()[1]);
+
+    check::check(verifyTreeSize <= 128,
+        "128 should be sufficient for verify tree size. We use 128 as CTA size to launch the kernel.");
+
+    dim3 blockDim{128};
+    dim3 gridDim{static_cast<uint32_t>(batchSize)};
+    constructVerificationDraftTreeKernel<<<gridDim, blockDim, 0, stream>>>(draftIdFullTable.dataPointer<int32_t>(),
+        draftParentFullTable.dataPointer<int32_t>(), selectedIndices.dataPointer<int32_t>(),
+        inputIds.dataPointer<int32_t>(), draftTreeMask.dataPointer<int8_t>(), fullTableLength, verifyTreeSize);
 }
 
 } // namespace kernel
