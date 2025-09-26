@@ -63,7 +63,7 @@ protected:
         for (int b = 0; b < batchSize; ++b)
         {
             hostLogits[b].resize(vocabSize);
-            uniformFloatinitialization(hostLogits[b], -2.0f, 2.0f);
+            uniformFloatInitialization(hostLogits[b], -2.0f, 2.0f);
 
             // Add some structure to make testing more interesting
             if (vocabSize <= 20)

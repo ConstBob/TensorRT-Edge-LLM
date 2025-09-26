@@ -37,7 +37,7 @@ bool isclose(T a, T b, float rtol, float atol)
 }
 
 template <typename T>
-void uniformFloatinitialization(std::vector<T>& vec, float a = -5.f, float b = 5.f)
+void uniformFloatInitialization(std::vector<T>& vec, float a = -5.f, float b = 5.f)
 {
     std::random_device rd{};
     std::mt19937 gen{rd()};

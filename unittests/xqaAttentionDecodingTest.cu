@@ -51,9 +51,9 @@ void TestXQAAttentionDecodingAccuracy(
         std::vector<half> qi(numQHeads * headSize * qSequenceLength);
         std::vector<half> ki(numKVHeads * headSize * kvLength);
         std::vector<half> vi(numKVHeads * headSize * kvLength);
-        uniformFloatinitialization(qi);
-        uniformFloatinitialization(ki);
-        uniformFloatinitialization(vi);
+        uniformFloatInitialization(qi);
+        uniformFloatInitialization(ki);
+        uniformFloatInitialization(vi);
 
         auto ref = casualAttentionRef(qi, ki, vi, qSequenceLength, kvLength, numQHeads, numKVHeads, headSize);
 

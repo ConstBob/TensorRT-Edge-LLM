@@ -16,78 +16,15 @@
  */
 
 #include "applyRopeWriteKV.h"
+#include "kernels/common/vectorizedTypes.cuh"
 
-#include <cassert>
 #include <cstdint>
-#include <cstdio>
 #include <cuda_fp16.h>
 
 namespace drivellm
 {
 namespace kernel
 {
-
-// Define template type to load/store vectorized data.
-template <typename T>
-struct DVec
-{
-    static constexpr uint32_t vec_size = 0;
-    inline T& operator[](uint32_t idx);
-    inline T const& operator[](uint32_t idx) const;
-    inline void load(T const* ptr);
-    inline void store(T* ptr) const;
-};
-
-// Store float[8] to align with load/store of activation data.
-// Use this to load cos/sin cache.
-template <>
-struct DVec<float>
-{
-    float4 data[2];
-    static constexpr uint32_t vec_size = 8;
-    __device__ __forceinline__ float& operator[](uint32_t idx)
-    {
-        return ((float*) (data))[idx];
-    }
-    __device__ __forceinline__ float const& operator[](uint32_t idx) const
-    {
-        return ((float const*) (data))[idx];
-    }
-    __device__ __forceinline__ void load(float const* ptr)
-    {
-        data[0] = *(reinterpret_cast<float4 const*>(ptr));
-        data[1] = *(reinterpret_cast<float4 const*>(ptr + 4));
-    }
-    __device__ __forceinline__ void store(float* ptr) const
-    {
-        *(reinterpret_cast<float4*>(ptr)) = data[0];
-        *(reinterpret_cast<float4*>(ptr + 4)) = data[1];
-    }
-};
-
-// half[8] into uint4 and enforce granularity of 16 bytes load/store from global memory.
-template <>
-struct DVec<half>
-{
-    uint4 data;
-    static constexpr uint32_t vec_size = 8;
-    __device__ __forceinline__ half& operator[](uint32_t idx)
-    {
-        return reinterpret_cast<half*>(&data)[idx];
-    }
-    __device__ __forceinline__ half const& operator[](uint32_t idx) const
-    {
-        return reinterpret_cast<half const*>(&data)[idx];
-    }
-    __device__ __forceinline__ void load(half const* ptr)
-    {
-        data = *(reinterpret_cast<uint4 const*>(ptr));
-    }
-    __device__ __forceinline__ void store(half* ptr) const
-    {
-        *(reinterpret_cast<uint4*>(ptr)) = data;
-    }
-};
 
 template <typename T>
 __device__ __forceinline__ T applyRope(T const& x, T const& y, float const& cos, float const& sin, bool const isLeft);

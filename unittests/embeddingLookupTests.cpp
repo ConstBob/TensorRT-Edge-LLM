@@ -99,7 +99,7 @@ TEST_F(EmbeddingLookupTest, StandardEmbeddingLookupAccuracy)
         uniformIntInitialization<int32_t>(inputIds, 0, vocabSize - 1);
 
         std::vector<half> embeddingTable(vocabSize * hiddenSize);
-        uniformFloatinitialization<half>(embeddingTable, -1.0f, 1.0f);
+        uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
 
         // Create tensors
         rt::Coords inputShape{batchSize, seqLen};
@@ -149,7 +149,7 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeError)
     uniformIntInitialization<int32_t>(inputIds, 0, vocabSize - 1);
 
     std::vector<half> embeddingTable(vocabSize * hiddenSize);
-    uniformFloatinitialization<half>(embeddingTable, -1.0f, 1.0f);
+    uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
 
     // Create tensors
     rt::Coords inputShape{batchSize, seqLen};
@@ -188,10 +188,10 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeErrorWithImageInsertion)
     uniformIntInitialization<int32_t>(inputIds, 0, vocabSize + imageTokenLen - 1);
 
     std::vector<half> embeddingTable(vocabSize * hiddenSize);
-    uniformFloatinitialization<half>(embeddingTable, -1.0f, 1.0f);
+    uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
 
     std::vector<half> imageEmbeds(imageTokenLen * hiddenSize);
-    uniformFloatinitialization<half>(imageEmbeds, -1.0f, 1.0f);
+    uniformFloatInitialization<half>(imageEmbeds, -1.0f, 1.0f);
 
     // Create tensors
     rt::Coords inputShape{batchSize, seqLen};
@@ -237,7 +237,7 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandling)
     std::vector<int32_t> inputIds = {-1, 0, -1, 10}; // -1 and 10 are out-of-bounds
 
     std::vector<half> embeddingTable(vocabSize * hiddenSize);
-    uniformFloatinitialization<half>(embeddingTable, -1.0f, 1.0f);
+    uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
 
     // Create tensors
     rt::Coords inputShape{batchSize, seqLen};
@@ -308,10 +308,10 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandlingWithImageInsertion)
     std::vector<int32_t> inputIds = {0, 9, 10, -1, 15, 20, -1};
 
     std::vector<half> embeddingTable(vocabSize * hiddenSize);
-    uniformFloatinitialization<half>(embeddingTable, -1.0f, 1.0f);
+    uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
 
     std::vector<half> imageEmbeds(imageTokenLen * hiddenSize);
-    uniformFloatinitialization<half>(imageEmbeds, -1.0f, 1.0f);
+    uniformFloatInitialization<half>(imageEmbeds, -1.0f, 1.0f);
 
     // Create tensors
     rt::Coords inputShape{batchSize, seqLen};
@@ -401,10 +401,10 @@ TEST_F(EmbeddingLookupTest, EmbeddingLookupWithImageInsertionAccuracy)
         uniformIntInitialization<int32_t>(inputIds, 0, vocabSize + imageTokenLen - 1);
 
         std::vector<half> embeddingTable(vocabSize * hiddenSize);
-        uniformFloatinitialization<half>(embeddingTable, -1.0f, 1.0f);
+        uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
 
         std::vector<half> imageEmbeds(imageTokenLen * hiddenSize);
-        uniformFloatinitialization<half>(imageEmbeds, -1.0f, 1.0f);
+        uniformFloatInitialization<half>(imageEmbeds, -1.0f, 1.0f);
 
         // Create tensors
         rt::Coords inputShape{batchSize, seqLen};

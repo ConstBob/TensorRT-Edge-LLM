@@ -735,3 +735,57 @@ void prepareEagleBaseTreeDecodingInputReference(std::vector<int8_t> const& baseT
         }
     }
 }
+
+void eagleBaseCommitKVCacheAndAssembleHiddenStateReference(std::vector<int32_t> const& acceptedIndices,
+    std::vector<int32_t> const& acceptLengths, std::vector<half> const& kvCacheBuffer,
+    std::vector<int32_t> const& kvCacheLengths, std::vector<half> const& hiddenState,
+    std::vector<half>& kvCacheBufferOut, std::vector<half>& hiddenStateOut, int32_t const numLayers,
+    int32_t const maxBatchSize, int32_t const numHeads, int32_t const maxSeqLen, int32_t const headDim,
+    int32_t const maxDepth, int32_t const draftTreeSize, int32_t const baseHiddenDim)
+{
+    size_t const activeBatchSize = acceptLengths.size();
+
+    for (int b = 0; b < activeBatchSize; b++)
+    {
+        int32_t const kvCacheLength = kvCacheLengths[b];
+        int32_t const acceptLength = acceptLengths[b];
+
+        // Start from 1 since the root position will always be accepted.
+        for (int i = 1; i < acceptLength; i++)
+        {
+            int32_t const acceptedIdx = acceptedIndices[b * maxDepth + i];
+            assert(acceptedIdx >= 0 && acceptedIdx + kvCacheLength < maxSeqLen && acceptedIdx < draftTreeSize
+                && "Accepted index out of bounds");
+
+            // kvCacheBuffer: [num-layers, max-batch-size, 2, num-heads, max-seq-len, hidden-size-per-head].
+            for (int l = 0; l < numLayers; l++)
+            {
+                for (int k = 0; k < 2; k++)
+                {
+                    for (int h = 0; h < numHeads; h++)
+                    {
+                        for (int d = 0; d < headDim; d++)
+                        {
+                            int32_t const srcOffset = l * maxBatchSize * 2 * numHeads * maxSeqLen * headDim
+                                + b * 2 * numHeads * maxSeqLen * headDim + k * numHeads * maxSeqLen * headDim
+                                + h * maxSeqLen * headDim + (kvCacheLength + acceptedIdx) * headDim + d;
+
+                            int32_t const dstOffset = l * maxBatchSize * 2 * numHeads * maxSeqLen * headDim
+                                + b * 2 * numHeads * maxSeqLen * headDim + k * numHeads * maxSeqLen * headDim
+                                + h * maxSeqLen * headDim + (kvCacheLength + i) * headDim + d;
+                            kvCacheBufferOut[dstOffset] = kvCacheBuffer[srcOffset];
+                        }
+                    }
+                }
+            }
+
+            // hiddenState: [batch, num-tokens, hidden-dim].
+            for (int d = 0; d < baseHiddenDim; d++)
+            {
+                int32_t const srcOffset = b * draftTreeSize * baseHiddenDim + acceptedIdx * baseHiddenDim + d;
+                int32_t const dstOffset = b * draftTreeSize * baseHiddenDim + i * baseHiddenDim + d;
+                hiddenStateOut[dstOffset] = hiddenState[srcOffset];
+            }
+        }
+    }
+}

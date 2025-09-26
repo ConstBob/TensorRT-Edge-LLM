@@ -48,9 +48,9 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         std::vector<half> vi(numKVHeads * headSize * kvSequenceLength);
         std::vector<int32_t> treeMaski(qSequenceLength * qSequenceLength);
 
-        uniformFloatinitialization(qi);
-        uniformFloatinitialization(ki);
-        uniformFloatinitialization(vi);
+        uniformFloatInitialization(qi);
+        uniformFloatInitialization(ki);
+        uniformFloatInitialization(vi);
         uniformIntInitialization(treeMaski, 0, 1);
 
         auto ref = casualAttentionRef(qi, ki, vi, qSequenceLength, kvSequenceLength, numQHeads, numKVHeads, headSize,

@@ -16,6 +16,7 @@
  */
 
 #include "common/checkMacros.h"
+#include "kernels/common/vectorizedTypes.cuh"
 #include "kvCacheUtilsKernels.h"
 #include <cuda_fp16.h>
 #include <stdexcept>
@@ -24,31 +25,6 @@ namespace drivellm
 {
 namespace kernel
 {
-
-//! Data vectorization helper to load/store data from global memory.
-template <typename T>
-struct DVec
-{
-    static constexpr uint32_t vec_size = 0;
-    inline void load(T const* ptr);
-    inline void store(T* ptr) const;
-};
-
-// half[8] into uint4 and enforce granularity of 16 bytes load/store from global memory.
-template <>
-struct DVec<half>
-{
-    uint4 data;
-    static constexpr uint32_t vec_size = 8;
-    __device__ __forceinline__ void load(half const* ptr)
-    {
-        data = *(reinterpret_cast<uint4 const*>(ptr));
-    }
-    __device__ __forceinline__ void store(half* ptr) const
-    {
-        *(reinterpret_cast<uint4*>(ptr)) = data;
-    }
-};
 
 __global__ void incrementLengthTensorKernel(
     int32_t* lengthTensor, int32_t const* incrementLength, int32_t increment, int32_t activeBatchSize)

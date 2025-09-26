@@ -71,7 +71,7 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
     else
     {
         // Random initialize CosSinCache for non-64-multiple rotaryDim or cosSinCacheBatchSize != 1.
-        uniformFloatinitialization(cosSinCache, -1, 1);
+        uniformFloatInitialization(cosSinCache, -1, 1);
         thrust::copy(cosSinCache.begin(), cosSinCache.end(), cosSinCacheDevice.begin());
     }
 
@@ -83,9 +83,9 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
             std::vector<half> kij(numKVHeads * headDim);
             std::vector<half> vij(numKVHeads * headDim);
 
-            uniformFloatinitialization(qij);
-            uniformFloatinitialization(kij);
-            uniformFloatinitialization(vij);
+            uniformFloatInitialization(qij);
+            uniformFloatInitialization(kij);
+            uniformFloatInitialization(vij);
             // QKV input has layout of [B, S, H, D]
 
             qkvInput.insert(qkvInput.end(), qij.begin(), qij.end());
@@ -229,7 +229,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     else
     {
         // Random initialize CosSinCache for non-64-multiple rotaryDim or cosSinCacheBatchSize != 1.
-        uniformFloatinitialization(cosSinCache, -1, 1);
+        uniformFloatInitialization(cosSinCache, -1, 1);
         thrust::copy(cosSinCache.begin(), cosSinCache.end(), cosSinCacheDevice.begin());
     }
 
@@ -247,9 +247,9 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
             std::vector<half> ki(numKVHeads * headDim);
             std::vector<half> vi(numKVHeads * headDim);
 
-            uniformFloatinitialization(qi);
-            uniformFloatinitialization(ki);
-            uniformFloatinitialization(vi);
+            uniformFloatInitialization(qi);
+            uniformFloatInitialization(ki);
+            uniformFloatInitialization(vi);
 
             qkvInput.insert(qkvInput.end(), qi.begin(), qi.end());
             qkvInput.insert(qkvInput.end(), ki.begin(), ki.end());
@@ -374,8 +374,8 @@ void BenchmarkRopeWriteKv(
     assert(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == batchSize);
     std::vector<float> cosSinCache(cosSinCacheBatchSize * kvCacheCapacity * rotaryDim);
 
-    uniformFloatinitialization(cosSinCache, -1, 1);
-    uniformFloatinitialization(qkvInput);
+    uniformFloatInitialization(cosSinCache, -1, 1);
+    uniformFloatInitialization(qkvInput);
 
     thrust::device_vector<half> qkvDevice(qkvInput);
     thrust::device_vector<float> cosSinCacheDevice(cosSinCache);
@@ -501,7 +501,7 @@ void TestLongRopeCosSin(int32_t rotaryDim, int32_t kvCacheCapacity, int32_t maxP
     std::vector<float> longReference(kvCacheCapacity * rotaryDim);
     std::vector<float> shortFactor(rotaryDim / 2, 1.0f);
     std::vector<float> longFactor(rotaryDim / 2);
-    uniformFloatinitialization(longFactor, 1.0f, float(rotaryDim / 2 - 1));
+    uniformFloatInitialization(longFactor, 1.0f, float(rotaryDim / 2 - 1));
 
     computeLongRopeReference(shortReference, longReference, shortFactor, longFactor, rotaryBaseFrequency, rotaryDim,
         kvCacheCapacity, maxPositionEmbeddings, originalMaxPositionEmbeddings);
@@ -553,7 +553,7 @@ void BenchmarkLongRopeCosSin(int32_t rotaryDim, int32_t kvCacheCapacity, int32_t
 {
     std::vector<float> shortFactor(rotaryDim / 2, 1.0f);
     std::vector<float> longFactor(rotaryDim / 2);
-    uniformFloatinitialization(longFactor, 1.0f, float(rotaryDim / 2 - 1));
+    uniformFloatInitialization(longFactor, 1.0f, float(rotaryDim / 2 - 1));
 
     thrust::device_vector<float> shortCosSinCacheDevice(kvCacheCapacity * rotaryDim);
     thrust::device_vector<float> longCosSinCacheDevice(kvCacheCapacity * rotaryDim);

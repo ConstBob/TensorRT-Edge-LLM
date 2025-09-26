@@ -399,3 +399,133 @@ TEST(PrepareEagle, PrepareEagleBaseTreeDecodingInput)
     TestPrepareEagleBaseTreeDecodingInput(2, 60);
     TestPrepareEagleBaseTreeDecodingInput(4, 100);
 }
+
+struct KVCacheParameters
+{
+    int32_t numDecoderLayers;
+    int32_t maxBatchSize;
+    int32_t maxSequenceLength;
+    int32_t numKVHead;
+    int32_t headDim;
+};
+
+void TestEagleBaseCommitKVCache(KVCacheParameters const& cacheParams, int32_t const maxDepth = 6,
+    int32_t const draftTreeSize = 60, int32_t const baseHiddenDim = 512)
+{
+    cudaStream_t stream{nullptr};
+    static std::random_device dev;
+    static std::mt19937 rng(dev());
+
+    // Generate random inputs
+    std::uniform_int_distribution<int32_t> dist(1, cacheParams.maxBatchSize);
+    int32_t const batchSize = dist(rng);
+
+    std::vector<half> kvCacheBuffer(cacheParams.numDecoderLayers * cacheParams.maxBatchSize * 2 * cacheParams.numKVHead
+        * cacheParams.maxSequenceLength * cacheParams.headDim);
+    uniformFloatInitialization<half>(kvCacheBuffer);
+    std::vector<half> hiddenState(batchSize * draftTreeSize * baseHiddenDim);
+    uniformFloatInitialization<half>(hiddenState);
+    std::vector<int32_t> acceptedIndices(batchSize * maxDepth);
+    uniformIntInitialization(acceptedIndices, 0, draftTreeSize - 1);
+    std::vector<int32_t> acceptLengths(batchSize);
+    uniformIntInitialization(acceptLengths, 0, maxDepth);
+    std::vector<int32_t> kvCacheLengths(batchSize);
+    uniformIntInitialization(kvCacheLengths, 128, 1024);
+
+    // CPU reference, copy input to output first
+    std::vector<half> kvCacheBufferRef(kvCacheBuffer);
+    std::vector<half> hiddenStateRef(hiddenState);
+
+    eagleBaseCommitKVCacheAndAssembleHiddenStateReference(acceptedIndices, acceptLengths, kvCacheBuffer, kvCacheLengths,
+        hiddenState, kvCacheBufferRef, hiddenStateRef, cacheParams.numDecoderLayers, cacheParams.maxBatchSize,
+        cacheParams.numKVHead, cacheParams.maxSequenceLength, cacheParams.headDim, maxDepth, draftTreeSize,
+        baseHiddenDim);
+
+    // Create GPU tensors
+    rt::Tensor kvCacheBufferDevice({cacheParams.numDecoderLayers, cacheParams.maxBatchSize, 2, cacheParams.numKVHead,
+                                       cacheParams.maxSequenceLength, cacheParams.headDim},
+        rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvCacheLengthsDevice({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor acceptedIndicesDevice({batchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor acceptLengthsDevice({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor hiddenStateDevice({batchSize, draftTreeSize, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    CUDA_CHECK(cudaMemcpyAsync(acceptedIndicesDevice.rawPointer(), acceptedIndices.data(),
+        acceptedIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(acceptLengthsDevice.rawPointer(), acceptLengths.data(),
+        acceptLengths.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(kvCacheBufferDevice.rawPointer(), kvCacheBuffer.data(),
+        kvCacheBuffer.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(kvCacheLengthsDevice.rawPointer(), kvCacheLengths.data(),
+        kvCacheLengths.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(hiddenStateDevice.rawPointer(), hiddenState.data(), hiddenState.size() * sizeof(half),
+        cudaMemcpyHostToDevice, stream));
+
+    // Launch kernel
+    eagleBaseCommitKVCacheAndAssembleHiddenState(acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice,
+        kvCacheBufferDevice, hiddenStateDevice, stream);
+
+    // Copy results back to CPU
+    std::vector<half> kvCacheBufferHost(kvCacheBuffer.size());
+    std::vector<half> hiddenStateHost(hiddenState.size());
+
+    CUDA_CHECK(cudaMemcpyAsync(kvCacheBufferHost.data(), kvCacheBufferDevice.rawPointer(),
+        kvCacheBufferHost.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(hiddenStateHost.data(), hiddenStateDevice.rawPointer(),
+        hiddenStateHost.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Verify results
+    for (int b = 0; b < batchSize; b++)
+    {
+        int32_t kvCacheLength = kvCacheLengths[b];
+        int32_t acceptLength = acceptLengths[b];
+
+        // Verify kvCacheBuffer
+        for (int l = 0; l < cacheParams.numDecoderLayers; l++)
+        {
+            for (int k = 0; k < 2; k++)
+            {
+                for (int h = 0; h < cacheParams.numKVHead; h++)
+                {
+                    for (int s = 0; s < acceptLength; s++)
+                    {
+                        for (int d = 0; d < cacheParams.headDim; d++)
+                        {
+                            int32_t offset = l * cacheParams.maxBatchSize * 2 * cacheParams.numKVHead
+                                    * cacheParams.maxSequenceLength * cacheParams.headDim
+                                + b * 2 * cacheParams.numKVHead * cacheParams.maxSequenceLength * cacheParams.headDim
+                                + k * cacheParams.numKVHead * cacheParams.maxSequenceLength * cacheParams.headDim
+                                + h * cacheParams.maxSequenceLength * cacheParams.headDim
+                                + (kvCacheLength + s) * cacheParams.headDim + d;
+                            ASSERT_TRUE(isclose(kvCacheBufferHost[offset], kvCacheBufferRef[offset], 1e-5, 1e-5));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify hiddenState
+        for (int s = 0; s < acceptLength; s++)
+        {
+            for (int d = 0; d < baseHiddenDim; d++)
+            {
+                int32_t offset = b * draftTreeSize * baseHiddenDim + s * baseHiddenDim + d;
+                ASSERT_TRUE(isclose(hiddenStateHost[offset], hiddenStateRef[offset], 1e-5, 1e-5));
+            }
+        }
+    }
+
+    std::cout << "TestEagleBaseCommitKVCache "
+              << "numDecoderLayers: " << cacheParams.numDecoderLayers << " MaxBatchSize: " << cacheParams.maxBatchSize
+              << " numKVHead: " << cacheParams.numKVHead << " maxSequenceLength: " << cacheParams.maxSequenceLength
+              << " HeadDim: " << cacheParams.headDim << " MaxDepth: " << maxDepth << " DraftTreeSize: " << draftTreeSize
+              << " BaseHiddenDim: " << baseHiddenDim << std::endl;
+}
+
+TEST(EagleBaseCommitKVCache, BasicTest)
+{
+    TestEagleBaseCommitKVCache({8, 1, 4096, 4, 128}, 6, 60, 256);
+    TestEagleBaseCommitKVCache({3, 2, 4096, 4, 128}, 6, 24, 256);
+    TestEagleBaseCommitKVCache({3, 4, 4096, 8, 128}, 4, 16, 128);
+}
