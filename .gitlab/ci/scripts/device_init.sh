@@ -1,24 +1,11 @@
 #!/bin/bash
 set -e
 echo "Setting up device environment"
-
-ssh_folder="$HOME/.ssh"
 tensorrt_edge_llm_folder="$HOME/tensorrt-edge-llm"
 board_password={BOARDPASSWORD}
 
-if [ -d "$ssh_folder" ] ; then
-    echo $board_password | sudo -S chmod -R 777 ~/.ssh
-    rm -rf "$ssh_folder"
-    echo "ssh key removed"
-fi
-
-mkdir -p $ssh_folder
-
-if [ -d "$tensorrt_edge_llm_folder" ] ; then
-    echo $board_password | sudo -S chmod -R 777 "$tensorrt_edge_llm_folder"
-    rm -rf "$tensorrt_edge_llm_folder"
-    echo "tensorrt-edge-llm folder removed"
-fi
+# clean up the home directory
+echo $board_password | sudo -S rm -rf "$HOME/*"
 
 mkdir -p $tensorrt_edge_llm_folder
 
