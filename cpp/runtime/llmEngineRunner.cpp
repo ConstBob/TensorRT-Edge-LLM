@@ -496,8 +496,8 @@ bool LLMEngineRunner::prefillStepInputValidation(
             "executePrefill(): Invalid batchSize of the input tensors. Either batchSize is larger than "
             "maxSupportedBatchSize or batchSize is not consistent among the input tensors. "
             "Current inputIds shape: %s, contextLengths shape: %s, logits shape: %s",
-            inputIds.getShape().formatString(), contextLengths.getShape().formatString(),
-            outputLogits.getShape().formatString());
+            inputIds.getShape().formatString().c_str(), contextLengths.getShape().formatString().c_str(),
+            outputLogits.getShape().formatString().c_str());
         return false;
     }
     if (prefillSequenceLength > mConfig.maxSupportedInputLength)
@@ -505,7 +505,7 @@ bool LLMEngineRunner::prefillStepInputValidation(
         LOG_ERROR(
             "executePrefill(): Invalid sequence length of the input tensors. Input sequence length (%d) is larger "
             "than maxSupportedInputLength (%d). Current inputIds shape: %s.",
-            prefillSequenceLength, mConfig.maxSupportedInputLength, inputIds.getShape().formatString());
+            prefillSequenceLength, mConfig.maxSupportedInputLength, inputIds.getShape().formatString().c_str());
         return false;
     }
     bool const isLogitsShapeValid
@@ -515,7 +515,7 @@ bool LLMEngineRunner::prefillStepInputValidation(
         LOG_ERROR(
             "executePrefill(): Invalid shape of the output logits tensor. The output logits tensor should have shape "
             "[activeBatchSize, VocabSize]. Current logits shape is %s.",
-            outputLogits.getShape().formatString());
+            outputLogits.getShape().formatString().c_str());
         return false;
     }
     return true;
@@ -775,7 +775,7 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
         LOG_ERROR(
             "eagleBaseTreeDecodingStepInputValidation(): Invalid base tree decoding size of the input tensors. "
             "Base tree decoding size %d, current base tree decoding mask shape: %s",
-            baseTreeDecodingSize, baseTreeDecodingMask.getShape().formatString());
+            baseTreeDecodingSize, baseTreeDecodingMask.getShape().formatString().c_str());
         return false;
     }
 
@@ -789,8 +789,8 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
             "eagleBaseTreeDecodingStepInputValidation(): Invalid shape of the output tensors. Logits shape shall be "
             "[select-token-size, %d], hidden states shape shall be [select-token-size, %d], "
             "current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.vocabSize, baseModelHiddenDim, outputLogits.getShape().formatString(),
-            outputHiddenStates.getShape().formatString());
+            mConfig.vocabSize, baseModelHiddenDim, outputLogits.getShape().formatString().c_str(),
+            outputHiddenStates.getShape().formatString().c_str());
         return false;
     }
 

@@ -260,8 +260,8 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
         LOG_ERROR(
             "Invalid batch size of the input tensors. Batch size shall be 1, "
             "current inputIds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
-            inputIds.getShape().formatString(), baseModelHiddenStates.getShape().formatString(),
-            draftModelHiddenStates.getShape().formatString());
+            inputIds.getShape().formatString().c_str(), baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -275,8 +275,9 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
             "Invalid sequence length of the input tensors. Sequence length shall be consistent and smaller than max "
             "supported length %d, current inputIds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates "
             "shape: %s",
-            mConfig.maxSupportedInputLength, inputIds.getShape().formatString(),
-            baseModelHiddenStates.getShape().formatString(), draftModelHiddenStates.getShape().formatString());
+            mConfig.maxSupportedInputLength, inputIds.getShape().formatString().c_str(),
+            baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -287,7 +288,8 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
         LOG_ERROR(
             "Invalid hidden size of the input tensors. Hidden size shall be consistent with the model config, "
             "current baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
-            baseModelHiddenStates.getShape().formatString(), draftModelHiddenStates.getShape().formatString());
+            baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -300,8 +302,8 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
         LOG_ERROR(
             "Invalid shape of the output tensors. Logits shape shall be [1, %d], hidden states shape shall be [1, %d], "
             "current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString(),
-            outputHiddenStates.getShape().formatString());
+            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString().c_str(),
+            outputHiddenStates.getShape().formatString().c_str());
         return false;
     }
     return true;
@@ -430,9 +432,10 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
             "Invalid batch size of the input tensors. Batch size shall be 1, current draft tree input ids shape: %s, "
             "base model hidden states shape: %s, draft model hidden states shape: %s, draft tree length shape: %s, "
             "draft tree mask shape: %s",
-            draftTreeInputIds.getShape().formatString(), baseModelHiddenStates.getShape().formatString(),
-            draftModelHiddenStates.getShape().formatString(), draftTreeLength.getShape().formatString(),
-            draftTreeMask.getShape().formatString());
+            draftTreeInputIds.getShape().formatString().c_str(),
+            baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str(), draftTreeLength.getShape().formatString().c_str(),
+            draftTreeMask.getShape().formatString().c_str());
         return false;
     }
 
@@ -447,8 +450,9 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
             "Invalid padded draft tree size of the input tensors. Padded draft tree size shall be smaller than max "
             "limit %d and be consistent among input tensors, current draft tree mask shape: %s, base model hidden "
             "states shape: %s, draft model hidden states shape: %s",
-            mConfig.maxDraftTreeSize, draftTreeMask.getShape().formatString(),
-            baseModelHiddenStates.getShape().formatString(), draftModelHiddenStates.getShape().formatString());
+            mConfig.maxDraftTreeSize, draftTreeMask.getShape().formatString().c_str(),
+            baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -459,7 +463,8 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
         LOG_ERROR(
             "Invalid hidden size of the input tensors. Hidden size shall be consistent with the model config, "
             "current baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
-            baseModelHiddenStates.getShape().formatString(), draftModelHiddenStates.getShape().formatString());
+            baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -471,8 +476,8 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
         LOG_ERROR(
             "Invalid shape of the output tensors. Logits shape shall be [select-token-size, %d], hidden states shape "
             "shall be [select-token-size, %d], current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString(),
-            outputHiddenStates.getShape().formatString());
+            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString().c_str(),
+            outputHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -604,8 +609,8 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
         LOG_ERROR(
             "Invalid batch size of the input tensors. Batch size shall be 1, current accepted tokens shape: %s, base "
             "model hidden states shape: %s, draft model hidden states shape: %s",
-            acceptedTokens.getShape().formatString(), baseModelHiddenStates.getShape().formatString(),
-            draftModelHiddenStates.getShape().formatString());
+            acceptedTokens.getShape().formatString().c_str(), baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -619,8 +624,9 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
             "Invalid accepted token number of the input tensors. Accepted token number shall be smaller than max limit "
             "%d, And be consistent among input tensors, current accepted tokens shape: %s, base model hidden states "
             "shape: %s, draft model hidden states shape: %s",
-            mConfig.maxDraftTreeSize, acceptedTokens.getShape().formatString(),
-            baseModelHiddenStates.getShape().formatString(), draftModelHiddenStates.getShape().formatString());
+            mConfig.maxDraftTreeSize, acceptedTokens.getShape().formatString().c_str(),
+            baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -631,7 +637,8 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
         LOG_ERROR(
             "Invalid hidden size of the input tensors. Hidden size shall be consistent with the model config, "
             "current baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
-            baseModelHiddenStates.getShape().formatString(), draftModelHiddenStates.getShape().formatString());
+            baseModelHiddenStates.getShape().formatString().c_str(),
+            draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -645,8 +652,8 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
         LOG_ERROR(
             "Invalid shape of the output tensors. Logits shape shall be [1, %d], hidden states shape shall be [1, %d], "
             "current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString(),
-            outputHiddenStates.getShape().formatString());
+            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString().c_str(),
+            outputHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
