@@ -43,7 +43,7 @@ void TestKVCacheCopyWithTensor(KVCacheParameters const& cacheParams, int32_t cop
     rt::Tensor kvCacheBuffer = kvCache.getKVCacheBuffer();
     // Instantiate the cache tensor with random data
     std::vector<half> cacheDataHost(cacheTensor.getShape().volume(), 0.0f);
-    uniformFloatinitialization(cacheDataHost);
+    uniformFloatInitialization(cacheDataHost);
 
     // Copy the cache tensor to the KVCache
     CUDA_CHECK(cudaMemcpy(

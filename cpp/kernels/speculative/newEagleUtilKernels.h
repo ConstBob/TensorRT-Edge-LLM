@@ -89,6 +89,20 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
     rt::Tensor& packedBaseTreeDecodingMask, rt::Tensor& tensorPositionIndices, rt::Tensor& selectTokenIndices,
     rt::Tensor& sequenceContextLengths, cudaStream_t stream);
 
+// The kernel will commit KVCache and assemble the hidden state inplace according to the accepted indices and accept lengths.
+// Inputs:
+//     acceptedIndices [GPU, Int32]: The accepted indices with shape [batch, max-depth].
+//     acceptLengths [GPU, Int32]: The accept lengths with shape [batch].
+//     kvCacheBuffer [GPU, Half]: The KVCache buffer with shape [num-layers, max-batch-size, 2, num-heads, max-seq-len, hidden-size-per-head].
+//     kvCacheLengths [GPU, Int32]: The KVCache lengths with shape [batch].
+//     hiddenState [GPU, Half]: The hidden state with shape [batch, num-tokens, base-hidden-dim].
+//     stream: The CUDA stream to execute the kernel.
+// Outputs:
+//     kvCacheBuffer [GPU, Half]: The updated KVCache buffer.
+//     hiddenState [GPU, Half]: The updated hidden state.
+void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
+    rt::Tensor const& kvCacheLengths, rt::Tensor& kvCacheBuffer, rt::Tensor& hiddenState, cudaStream_t stream);
+
 // clang-format on
 
 } // namespace kernel

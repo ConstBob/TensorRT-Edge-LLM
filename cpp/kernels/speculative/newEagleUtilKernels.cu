@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "kernels/common/vectorizedTypes.cuh"
 #include "newEagleUtilKernels.h"
 
 #include "common/checkMacros.h"
@@ -327,6 +328,195 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
     prepareEagleDraftProposalMiscInputKernel<<<gridDim2, blockDim2, 0, stream>>>(nullptr,
         sequenceStartIndices.dataPointer<int32_t>(), sequenceContextLengths.dataPointer<int32_t>(),
         selectTokenIndices.dataPointer<int64_t>(), treeSize, treeSize);
+}
+
+template <int32_t HEAD_DIM, int32_t MAX_PATH>
+__global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int32_t const* acceptLengths,
+    int32_t const* kvCacheLengths, half* kvCacheBuffer, int32_t const activeBatchSize, int32_t const maxDepth,
+    int32_t const numLayers, int32_t const maxBatchSize, int32_t const numHeads, int32_t const maxSeqLen)
+{
+    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128, "Only HEAD_DIM = 64 or 128 are supported");
+    DVec<half> tempBuffer[MAX_PATH];
+
+    // The kernel have assumptions that:
+    //     1. Each CTA will handle multiple heads.
+    //     2. Each thread will copy 16 bytes of data (half[8]), each warp will copy 512 bytes (half[256]) data per
+    //     iteration.
+    //     3. Each CTA contains 128 threads (4 warps).
+    //         blockDim.x = number of threads used to process 1 head = HEAD_DIM / DVec<half>::vec_size
+    //         blockDim.y = number of heads handled by each CTA = 128 / blockDim.x
+    //     4. The KVCache buffer has layout of [numLayers, maxBatchSize, 2, numHeads, maxSeqLen, HEAD_DIM]
+
+    int32_t const tIdx = threadIdx.x;
+    int32_t const tIdy = threadIdx.y;
+    int32_t const bIdx = blockIdx.x;
+    int32_t const headIdx = bIdx * blockDim.y + tIdy;
+
+    int32_t const kvLayerIdx = headIdx / (activeBatchSize * 2 * numHeads);
+    int32_t const kvBatchIdx = (headIdx % (activeBatchSize * 2 * numHeads)) / (2 * numHeads);
+    int32_t const kvHeadIdx = headIdx % (2 * numHeads);
+
+    int32_t const actualAcceptLength = acceptLengths[kvBatchIdx];
+    int32_t const pastKvCacheLength = kvCacheLengths[kvBatchIdx];
+    int32_t const kvCacheOffset = kvLayerIdx * maxBatchSize * 2 * numHeads * maxSeqLen * HEAD_DIM
+        + kvBatchIdx * 2 * numHeads * maxSeqLen * HEAD_DIM + kvHeadIdx * maxSeqLen * HEAD_DIM
+        + pastKvCacheLength * HEAD_DIM;
+
+    // PHASE 1: Collect all accepted data into local temp buffer
+    // Start from 1 since the root position will always be accepted.
+    for (int32_t i = 1; i < actualAcceptLength; ++i)
+    {
+        int32_t const acceptedIdx = acceptedIndices[kvBatchIdx * maxDepth + i];
+        if (acceptedIdx >= 0 && acceptedIdx + pastKvCacheLength < maxSeqLen)
+        {
+            int32_t const srcOffset = kvCacheOffset + acceptedIdx * HEAD_DIM + tIdx * DVec<half>::vec_size;
+            tempBuffer[i].load(kvCacheBuffer + srcOffset);
+        }
+    }
+
+    // PHASE 2: Write from local temp buffer to final positions
+    for (int32_t i = 1; i < actualAcceptLength; ++i)
+    {
+        int32_t const dstOffset = kvCacheOffset + i * HEAD_DIM + tIdx * DVec<half>::vec_size;
+        tempBuffer[i].store(kvCacheBuffer + dstOffset);
+    }
+}
+
+template <int32_t MAX_PATH>
+__global__ void eagleBaseAssembleHiddenStateKernel(int32_t const* acceptedIndices, int32_t const* acceptLengths,
+    half* hiddenState, int32_t const batchSize, int32_t const maxDepth, int32_t const numTokens,
+    int32_t const hiddenDim)
+{
+    DVec<half> tempBuffer[MAX_PATH];
+
+    // The kernel have assumptions that:
+    //     1. Each thread will copy 16 bytes of data (half[8]), each warp will copy 512 bytes (half[256]) data per
+    //     iteration.
+    //     2. Each CTA contains 128 threads (4 warps), a total of 128*8=1024 elements.
+    //         Since hiddenDim can be very large, each CTA will handle part of a batch.
+    //     3. The acceptedIndices has layout of [batch, max-depth]
+    //     4. The hiddenState buffer has layout of [batch, num-tokens, hidden-dim]
+
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const dimIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    int32_t const startIdx = dimIdx * DVec<half>::vec_size;
+
+    if (startIdx >= hiddenDim)
+    {
+        return;
+    }
+
+    int32_t const actualAcceptLength = acceptLengths[batchIdx];
+    int32_t const hiddenStateOffset = batchIdx * numTokens * hiddenDim;
+
+    // PHASE 1: Collect all accepted data into local temp buffer
+    // Start from 1 since the root position will always be accepted.
+    for (int32_t i = 1; i < actualAcceptLength; ++i)
+    {
+        int32_t const acceptedIdx = acceptedIndices[batchIdx * maxDepth + i];
+        if (acceptedIdx >= 0 && acceptedIdx < numTokens)
+        {
+            int32_t const srcOffset = hiddenStateOffset + acceptedIdx * hiddenDim + dimIdx * DVec<half>::vec_size;
+            tempBuffer[i].load(hiddenState + srcOffset);
+        }
+    }
+
+    // PHASE 2: Write from local temp buffer to final positions
+    for (int32_t i = 1; i < actualAcceptLength; ++i)
+    {
+        int32_t const dstOffset = hiddenStateOffset + i * hiddenDim + dimIdx * DVec<half>::vec_size;
+        tempBuffer[i].store(hiddenState + dstOffset);
+    }
+}
+
+void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
+    rt::Tensor const& kvCacheLengths, rt::Tensor& kvCacheBuffer, rt::Tensor& hiddenState, cudaStream_t stream)
+{
+    check::check(acceptedIndices.getDeviceType() == rt::DeviceType::kGPU
+            && acceptLengths.getDeviceType() == rt::DeviceType::kGPU
+            && kvCacheBuffer.getDeviceType() == rt::DeviceType::kGPU
+            && kvCacheLengths.getDeviceType() == rt::DeviceType::kGPU
+            && hiddenState.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(acceptedIndices.getDataType() == DataType::kINT32 && acceptLengths.getDataType() == DataType::kINT32
+            && kvCacheBuffer.getDataType() == DataType::kHALF && kvCacheLengths.getDataType() == DataType::kINT32
+            && hiddenState.getDataType() == DataType::kHALF,
+        "Data type validation failed: acceptedIndices, acceptLengths, and kvCacheLengths should be INT32; "
+        "kvCacheBuffer and hiddenState should be HALF.");
+
+    auto const acceptIndicesShape = acceptedIndices.getShape();
+    auto const acceptLengthsShape = acceptLengths.getShape();
+    auto const kvCacheBufferShape = kvCacheBuffer.getShape();
+    auto const kvCacheLengthsShape = kvCacheLengths.getShape();
+    auto const hiddenStateShape = hiddenState.getShape();
+    check::check(acceptIndicesShape.getNumDims() == 2, "acceptedIndices should be 2D tensor [batch, max-depth].");
+    check::check(acceptLengthsShape.getNumDims() == 1, "acceptLengths should be 1D tensor [batch].");
+    check::check(kvCacheBufferShape.getNumDims() == 6,
+        "kvCacheBuffer should be 6D tensor [num-layers, batch, 2, num-heads, max-seq-len, hidden-size-per-head].");
+    check::check(kvCacheLengthsShape.getNumDims() == 1, "kvCacheLengths should be 1D tensor [batch].");
+    check::check(hiddenStateShape.getNumDims() == 3,
+        "hiddenState should be 3D tensor [batch, draft-tree-size, base-hidden-dim].");
+
+    uint32_t const batchSize = acceptIndicesShape[0];
+    int32_t const maxDepth = acceptIndicesShape[1];
+    check::check(acceptLengthsShape[0] == batchSize, "acceptLengths should have same batch size as acceptedIndices.");
+
+    constexpr int32_t MAX_PATH{8};
+    check::check(maxDepth <= (MAX_PATH + 1), "maxDepth > 9 is not supported by the kernel.");
+
+    // Each CTA has 128 threads, each thread will handle vecSize elements.
+    constexpr uint32_t vecSize = DVec<half>::vec_size;
+    constexpr uint32_t threadsPerBlock = 128;
+
+    // Commit KVCache
+    int32_t const numLayers = kvCacheBufferShape[0];
+    int32_t const maxBatchSize = kvCacheBufferShape[1];
+    int32_t const numHeads = kvCacheBufferShape[3];
+    int32_t const maxSeqLen = kvCacheBufferShape[4];
+    int32_t const headDim = kvCacheBufferShape[5];
+
+    uint32_t const bDimX = headDim / vecSize;
+    uint32_t const headPerBlock = threadsPerBlock * vecSize / headDim;
+    uint32_t const totalNumHeads = numLayers * batchSize * 2 * numHeads;
+    uint32_t const totalNumBlocks = (totalNumHeads + headPerBlock - 1) / headPerBlock;
+
+    dim3 const blockDim1(bDimX, headPerBlock);
+    dim3 const gridDim1{totalNumBlocks};
+
+    switch (headDim)
+    {
+    case 64:
+        eagleBaseCommitKVCacheKernel<64, MAX_PATH>
+            <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndices.dataPointer<int32_t>(),
+                acceptLengths.dataPointer<int32_t>(), kvCacheLengths.dataPointer<int32_t>(),
+                kvCacheBuffer.dataPointer<half>(), batchSize, maxDepth, numLayers, maxBatchSize, numHeads, maxSeqLen);
+        break;
+    case 128:
+        eagleBaseCommitKVCacheKernel<128, MAX_PATH>
+            <<<gridDim1, blockDim1, 0, stream>>>(acceptedIndices.dataPointer<int32_t>(),
+                acceptLengths.dataPointer<int32_t>(), kvCacheLengths.dataPointer<int32_t>(),
+                kvCacheBuffer.dataPointer<half>(), batchSize, maxDepth, numLayers, maxBatchSize, numHeads, maxSeqLen);
+        break;
+    default:
+        throw std::runtime_error(
+            "Only HEAD_DIM = 64 or 128 are supported by eagleBaseCommitKVCacheAndAssembleHiddenState, current HEAD_DIM "
+            "= "
+            + std::to_string(headDim));
+    }
+
+    // Assemble Hidden State
+    int32_t const numTokens = hiddenStateShape[1];
+    int32_t const hiddenDim = hiddenStateShape[2];
+    check::check(hiddenDim % vecSize == 0, "hiddenDim must be divisible by vecSize.");
+
+    uint32_t const dimPerBlock = threadsPerBlock * vecSize;
+    uint32_t const gridY = (hiddenDim + dimPerBlock - 1) / dimPerBlock;
+    dim3 const blockDim2(threadsPerBlock);
+    dim3 const gridDim2{batchSize, gridY};
+
+    eagleBaseAssembleHiddenStateKernel<MAX_PATH><<<gridDim2, blockDim2, 0, stream>>>(
+        acceptedIndices.dataPointer<int32_t>(), acceptLengths.dataPointer<int32_t>(), hiddenState.dataPointer<half>(),
+        batchSize, maxDepth, numTokens, hiddenDim);
 }
 
 } // namespace kernel

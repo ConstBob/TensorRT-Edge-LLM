@@ -62,7 +62,7 @@ std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::
     int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
     std::optional<std::vector<half>> const& imageEmbeds = std::nullopt, int64_t imageTokenLen = 0);
 
-// Eagle draft proposal reference functions
+// Eagle reference functions
 void assembleDraftTreeDescReference(std::vector<int8_t> const& draftTreeMask,
     std::vector<int32_t> const& draftTreeLength, std::vector<int32_t> const& sequenceStartIndex,
     std::vector<int32_t>& packedDraftTreeMask, std::vector<int32_t>& tensorPositionIndices,
@@ -84,3 +84,10 @@ void prepareEagleBaseTreeDecodingInputReference(std::vector<int8_t> const& baseT
     std::vector<int32_t> const& sequenceStartIndex, std::vector<int32_t>& packedBaseTreeDecodingMask,
     std::vector<int32_t>& tensorPositionIndices, std::vector<int32_t>& sequenceContextLengths,
     std::vector<int64_t>& selectTokenIndices, int32_t treeSize);
+
+void eagleBaseCommitKVCacheAndAssembleHiddenStateReference(std::vector<int32_t> const& acceptedIndices,
+    std::vector<int32_t> const& acceptLengths, std::vector<half> const& kvCacheBuffer,
+    std::vector<int32_t> const& kvCacheLengths, std::vector<half> const& hiddenState,
+    std::vector<half>& kvCacheBufferOut, std::vector<half>& hiddenStateOut, int32_t const numLayers,
+    int32_t const maxBatchSize, int32_t const numHeads, int32_t const maxSeqLen, int32_t const headDim,
+    int32_t const maxDepth, int32_t const draftTreeSize, int32_t const baseHiddenDim);

@@ -18,8 +18,8 @@
 #include "common/checkMacros.h"
 #include "common/stringUtils.h"
 #include "embeddingKernels.h"
+#include "kernels/common/vectorizedTypes.cuh"
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 namespace drivellm
 {
@@ -28,41 +28,6 @@ namespace kernel
 
 namespace
 {
-
-// Vectorized data structure for efficient memory access (same as RoPE kernel)
-template <typename T>
-struct DVec
-{
-    static constexpr uint32_t vec_size = 0;
-    inline T& operator[](uint32_t idx);
-    inline T const& operator[](uint32_t idx) const;
-    inline void load(T const* ptr);
-    inline void store(T* ptr) const;
-};
-
-// half[8] into uint4 and enforce granularity of 16 bytes load/store from global memory.
-template <>
-struct DVec<half>
-{
-    uint4 data;
-    static constexpr uint32_t vec_size = 8;
-    __device__ __forceinline__ half& operator[](uint32_t idx)
-    {
-        return reinterpret_cast<half*>(&data)[idx];
-    }
-    __device__ __forceinline__ half const& operator[](uint32_t idx) const
-    {
-        return reinterpret_cast<half const*>(&data)[idx];
-    }
-    __device__ __forceinline__ void load(half const* ptr)
-    {
-        data = *(reinterpret_cast<uint4 const*>(ptr));
-    }
-    __device__ __forceinline__ void store(half* ptr) const
-    {
-        *(reinterpret_cast<uint4*>(ptr)) = data;
-    }
-};
 
 // CUDA kernel for embedding lookup (FP16 only)
 __global__ void embeddingLookupKernel(int32_t const* inputIds, half const* embeddingTable, half* output,
