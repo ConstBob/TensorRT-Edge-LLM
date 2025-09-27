@@ -87,9 +87,7 @@ def is_gptq_model(model: PreTrainedModel) -> bool:
 
 
 def load_hf_model(
-    model_dir: str,
-    torch_dtype: str = "fp16",
-    device: str = "cuda"
+    model_dir: str, dtype: str, device: str
 ) -> Tuple[Union[AutoModelForCausalLM, AutoModelForImageTextToText],
            AutoTokenizer]:
     """
@@ -97,38 +95,40 @@ def load_hf_model(
     
     Args:
         model_dir: Directory containing the model files
-        torch_dtype: Torch data type ("fp16")
+        dtype: Model data type ("fp16")
+        device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
         
     Returns:
         Tuple of (model, tokenizer)
         
     Raises:
-        ValueError: If torch_dtype is not supported or model loading fails
+        ValueError: If dtype is not supported or model loading fails
     """
-    # Convert torch_dtype string to torch dtype
-    if torch_dtype == "fp16":
-        dtype = torch.float16
+    # Convert dtype string to torch dtype
+    if dtype == "fp16":
+        torch_dtype = torch.float16
     else:
-        raise ValueError(f"Unsupported torch_dtype: {torch_dtype}")
+        raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
 
     # Try loading as AutoModelForCausalLM first
     try:
         model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=dtype, trust_remote_code=True).to(device)
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).to(device)
     except Exception:
         # If that fails, try AutoModelForImageTextToText
         try:
             # TODO: Need a WAR to quantize only the language model.
             # In VLMs, the model has both model.language_model and model.vision_model.
             model = AutoModelForImageTextToText.from_pretrained(
-                model_dir, torch_dtype=dtype,
+                model_dir, torch_dtype=torch_dtype,
                 trust_remote_code=True).to(device)
         except Exception as e:
             raise ValueError(
                 f"Could not load model from {model_dir}. Error: {e}")
     if not is_gptq_model(model):
-        model.to(dtype)
+        model.to(torch_dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir,
                                               trust_remote_code=True)
@@ -142,11 +142,9 @@ def load_hf_model(
     return model, tokenizer
 
 
-def load_model(model_dir: str,
-               dtype: str = "fp16",
-               max_position_embeddings: int = 4096,
-               device: str = "cuda",
-               is_eagle_base: bool = False) -> tuple[nn.Module, bool]:
+def load_llm_model(model_dir: str, dtype: str, max_position_embeddings: int,
+                   device: str, enable_reuse_kv_cache: bool,
+                   is_eagle_base: bool) -> tuple[nn.Module, bool]:
     """
     Load a language model (standard or EAGLE base).
     
@@ -155,6 +153,7 @@ def load_model(model_dir: str,
         dtype: Model dtype
         max_position_embeddings: Maximum positional embedding length to use for model initialization
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
+        enable_reuse_kv_cache: Whether to enable persistent KV cache
         is_eagle_base: Whether this is an EAGLE3 base model
         
     Returns:
@@ -166,7 +165,7 @@ def load_model(model_dir: str,
     else:
         print(f"Loading standard model from {model_dir}")
 
-    model, tokenizer = load_hf_model(model_dir, dtype)
+    model, _ = load_hf_model(model_dir, dtype, device)
     use_prompt_tuning = is_vlm(model_dir)
     set_dynamic_quant(model, dtype)
 
@@ -174,7 +173,8 @@ def load_model(model_dir: str,
     # max_position_embeddings is set in EdgeLLMModelForCausalLM
     edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
                                          use_prompt_tuning,
-                                         max_position_embeddings)
+                                         max_position_embeddings,
+                                         enable_reuse_kv_cache)
 
     del model
     gc.collect()
@@ -184,12 +184,11 @@ def load_model(model_dir: str,
     return edge_model, use_prompt_tuning
 
 
-def load_eagle3_draft_model(draft_model_dir: str,
-                            base_model_dir: Optional[str] = None,
-                            use_prompt_tuning: bool = False,
-                            max_position_embeddings: int = 4096,
-                            dtype: str = "fp16",
-                            device: str = "cuda") -> nn.Module:
+def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
+                            use_prompt_tuning: bool,
+                            max_position_embeddings: int, dtype: str,
+                            device: str,
+                            enable_reuse_kv_cache: bool) -> nn.Module:
     """
     Load an EAGLE draft model with base model for weight copying.
     
@@ -198,24 +197,28 @@ def load_eagle3_draft_model(draft_model_dir: str,
         base_model_dir: Directory containing the base model 
         use_prompt_tuning: Whether the model uses prompt tuning
         max_position_embeddings: Maximum positional embedding length to use for model initialization
+        dtype: Model data type ("fp16")
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
+        enable_reuse_kv_cache: Whether to enable KV cache reuse
         
     Returns:
         nn.Module: Draft model
     """
     print(f"Loading eagle3 draft model from {draft_model_dir}")
-    # Convert torch_dtype string to torch dtype
+    # Convert dtype string to torch dtype
     if dtype == "fp16":
         torch_dtype = torch.float16
     else:
-        raise ValueError(f"Unsupported torch_dtype: {dtype}")
+        raise ValueError(f"Unsupported dtype: {dtype}")
 
     # Load draft model using from_pretrained. Draft model only support fp16.
     draft_model = Eagle3DraftModel.from_pretrained(
         draft_model_dir=draft_model_dir,
         base_model_dir=base_model_dir,
         use_prompt_tuning=use_prompt_tuning,
-        max_position_embeddings=max_position_embeddings).eval().to(device)
+        max_position_embeddings=max_position_embeddings,
+        enable_reuse_kv_cache=enable_reuse_kv_cache,
+        device=device).eval().to(device)
     if not is_gptq_model(draft_model):
         draft_model.to(torch_dtype)
 
@@ -224,10 +227,8 @@ def load_eagle3_draft_model(draft_model_dir: str,
     return draft_model
 
 
-def load_tensor_by_candidate_keys(
-        model_dir: str,
-        keys_candidate: List[str],
-        device: str = "cuda") -> Optional[torch.Tensor]:
+def load_tensor_by_candidate_keys(model_dir: str, keys_candidate: List[str],
+                                  device: str) -> Optional[torch.Tensor]:
     """
     Search all .safetensors shards in `model_dir` and lazily load
     the first matching tensor in `candidate_keys`.

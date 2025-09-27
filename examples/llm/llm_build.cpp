@@ -46,7 +46,7 @@ struct LLMBuildArgs
     bool isVlm{false};
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
-    bool enableReuseKVCache{false};
+    bool enableReuseKVCache{true};
 };
 
 void printUsage(char const* programName)

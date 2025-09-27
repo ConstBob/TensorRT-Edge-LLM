@@ -64,12 +64,15 @@ class Eagle3DraftModel(nn.Module):
         self,
         config: Any,
         use_prompt_tuning: bool = False,
+        enable_reuse_kv_cache: bool = False,
     ) -> None:
         """
         Initialize the EAGLE3 draft model.
         
         Args:
             config: Model configuration object containing model parameters
+            use_prompt_tuning: Whether to enable prompt tuning support
+            enable_reuse_kv_cache: Whether to enable persistent KV cache
         """
         super().__init__()
         self.config = config
@@ -103,7 +106,10 @@ class Eagle3DraftModel(nn.Module):
 
         # Decoder layers using our custom EdgeLLMDecoderLayer with config
         self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayer(config, index, eagle3_draft=True)
+            EdgeLLMDecoderLayer(config,
+                                index,
+                                eagle3_draft=True,
+                                enable_reuse_kv_cache=enable_reuse_kv_cache)
             for index in range(config.num_hidden_layers)
         ])
 
@@ -141,6 +147,7 @@ class Eagle3DraftModel(nn.Module):
         hidden_states_from_draft: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        kvcache_start_index: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         image_embeds: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -158,6 +165,7 @@ class Eagle3DraftModel(nn.Module):
             hidden_states_from_draft: Hidden states from previous draft predictions, shape (batch_size, seq_len, hidden_size)
             position_ids: Position IDs for positional encoding, shape (batch_size, seq_len)
             attention_mask: Attention mask for the decoder layers, shape (batch_size, seq_len, seq_len + past_len)
+            kvcache_start_index: Start index of KV cache of shape (batch_size), optional
             input_ids: Input token IDs of shape (batch_size, seq_len), optional (used for standard models and prompt tuning)
             image_embeds: Image embeddings tensor of shape (image_token_len, hidden_size), optional (used with prompt tuning)
             inputs_embeds: Input embeddings tensor of shape (batch_size, seq_len, hidden_size), optional (legacy support)
@@ -203,6 +211,7 @@ class Eagle3DraftModel(nn.Module):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                kvcache_start_index=kvcache_start_index,
             )
             present_key_values += (present_key_value, )
 
@@ -272,6 +281,7 @@ class Eagle3DraftModel(nn.Module):
         use_prompt_tuning: bool = False,
         max_position_embeddings: int = 4096,
         device: str = "cuda",
+        enable_reuse_kv_cache: bool = False,
     ) -> "Eagle3DraftModel":
         """
         Load a pre-trained EAGLE3 draft model.
@@ -281,6 +291,7 @@ class Eagle3DraftModel(nn.Module):
             base_model: Base model to copy weights from if needed
             use_prompt_tuning: Whether to enable prompt tuning support
             max_position_embeddings: Maximum positional embedding length to use for model initialization
+            device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
 
         Returns:
             Eagle3DraftModel: Loaded EAGLE3 draft model instance
@@ -313,7 +324,9 @@ class Eagle3DraftModel(nn.Module):
             safetensors_path
         ), f"Model file not found at {pytorch_bin_path} or {safetensors_path} or {quantized_model_path}"
 
-        model = cls(config, use_prompt_tuning=use_prompt_tuning)
+        model = cls(config,
+                    use_prompt_tuning=use_prompt_tuning,
+                    enable_reuse_kv_cache=enable_reuse_kv_cache)
 
         if os.path.exists(quantized_model_path):
             # Load quantized model from modelopt

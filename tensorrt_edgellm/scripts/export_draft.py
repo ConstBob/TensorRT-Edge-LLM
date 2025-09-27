@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-This script provides a command-line interface for exporting language models to ONNX format
+This script provides a command-line interface for exporting EAGLE3 draft models to ONNX format
 with support for EAGLE draft models.
 
 Usage:
     # EAGLE draft model export
     python export_draft.py --draft_model_dir /path/to/draft_model --output_dir /path/to/output (--use_prompt_tuning)
+
+    # Enable reusing KV cache for system prompts
+    python export_draft.py --draft_model_dir /path/to/draft_model --output_dir /path/to/output --enable_reuse_kv_cache
 """
 
 import argparse
@@ -30,14 +33,14 @@ from tensorrt_edgellm.onnx_export.llm_export import export_draft_model
 
 def main() -> None:
     """
-    Main function that parses command line arguments and exports the LLM model.
+    Main function that parses command line arguments and exports the EAGLE3 draft model.
     
-    This function sets up argument parsing for the LLM export script and calls
+    This function sets up argument parsing for the EAGLE3 draft model export script and calls
     the export_draft_model function with the provided parameters.
     """
     parser = argparse.ArgumentParser(
         description=
-        "Export Eagle3 Draft model to ONNX format using TensorRT Edge-LLM")
+        "Export EAGLE3 Draft model to ONNX format using TensorRT Edge-LLM")
     parser.add_argument("--draft_model_dir",
                         type=str,
                         required=True,
@@ -70,6 +73,11 @@ def main() -> None:
         help=
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
+    parser.add_argument("--enable_reuse_kv_cache",
+                        action="store_true",
+                        required=False,
+                        default=False,
+                        help="Whether to reuse KV cache for system prompts")
 
     args = parser.parse_args()
 
@@ -81,12 +89,13 @@ def main() -> None:
             use_prompt_tuning=args.use_prompt_tuning,
             base_model_dir=args.base_model_dir,
             max_position_embeddings=args.max_position_embeddings,
-            device=args.device)
+            device=args.device,
+            enable_reuse_kv_cache=args.enable_reuse_kv_cache)
 
-        print("Eagle3 Draft model export completed successfully!")
+        print("EAGLE3 Draft model export completed successfully!")
 
     except Exception as e:
-        print(f"Error during LLM model export: {e}")
+        print(f"Error during EAGLE3 draft model export: {e}")
         print("Traceback:")
         traceback.print_exc()
         sys.exit(1)

@@ -50,7 +50,7 @@ from ..llm_models.layers.int4_gemm_plugin import (
     register_int4_gemm_plugin_onnx_symbolic_functions,
     replace_torch_quant_linear_with_plugin)
 from ..llm_models.model_utils import (is_gptq_model, load_eagle3_draft_model,
-                                      load_model)
+                                      load_llm_model)
 from .config_export import export_llm_config
 from .onnx_utils import export_onnx
 
@@ -88,10 +88,9 @@ def save_d2t_for_eagle3_draft(draft_model: nn.Module, output_dir: str) -> None:
     print(f"Saved d2t.bin to {output_dir}")
 
 
-def create_dummy_inputs(model: nn.Module,
-                        is_eagle_base: bool = False,
-                        is_eagle_draft: bool = False,
-                        use_prompt_tuning: bool = False) -> Dict[str, Any]:
+def create_dummy_inputs(model: nn.Module, enable_reuse_kv_cache: bool,
+                        is_eagle_base: bool, is_eagle_draft: bool,
+                        use_prompt_tuning: bool) -> Dict[str, Any]:
     """
     Create dummy inputs for ONNX export.
     
@@ -199,6 +198,12 @@ def create_dummy_inputs(model: nn.Module,
     base_inputs['position_ids'] = position_ids
     base_inputs['attention_mask'] = attention_mask
 
+    # Add input for persistent KV cache
+    if enable_reuse_kv_cache:
+        base_inputs['kvcache_start_index'] = torch.zeros(batch_size,
+                                                         dtype=torch.int32,
+                                                         device=device)
+
     # Add EAGLE-specific inputs
     if is_eagle_draft:
         target_hidden_size = getattr(model_config, 'target_hidden_size',
@@ -239,12 +244,10 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
     return model
 
 
-def export_model_to_onnx(model: nn.Module,
-                         dummy_inputs: Dict[str, Any],
-                         output_dir: str,
-                         is_eagle_base: bool = False,
-                         is_eagle_draft: bool = False,
-                         use_prompt_tuning: bool = False) -> None:
+def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
+                         output_dir: str, enable_reuse_kv_cache: bool,
+                         is_eagle_base: bool, is_eagle_draft: bool,
+                         use_prompt_tuning: bool) -> None:
     """
     Export the model to ONNX format.
     
@@ -252,6 +255,7 @@ def export_model_to_onnx(model: nn.Module,
         model: The model to export
         dummy_inputs: Dummy inputs for tracing
         output_dir: Directory to save the ONNX model
+        enable_reuse_kv_cache: Whether to enable persistent KV cache
         is_eagle_base: Whether this is an EAGLE base model
         is_eagle_draft: Whether this is an EAGLE draft model
         use_prompt_tuning: Whether the model uses prompt tuning
@@ -285,6 +289,11 @@ def export_model_to_onnx(model: nn.Module,
             # Standard models pass None for position_ids and attention_mask
             base_inputs.extend([None, None])
 
+        if enable_reuse_kv_cache:
+            base_inputs.append(dummy_inputs['kvcache_start_index'])
+        else:
+            base_inputs.append(None)
+
         # Add input_ids (always present)
         base_inputs.append(dummy_inputs['input_ids'])
 
@@ -306,6 +315,9 @@ def export_model_to_onnx(model: nn.Module,
 
         if is_eagle_base or is_eagle_draft:
             input_names.extend(['attention_pos_id', 'attention_mask'])
+
+        if enable_reuse_kv_cache:
+            input_names.append('kvcache_start_index')
 
         # Add input_ids (always present)
         input_names.append('input_ids')
@@ -357,6 +369,9 @@ def export_model_to_onnx(model: nn.Module,
             **present_key_values_shapes
         }
 
+        if enable_reuse_kv_cache:
+            dynamic_axes.update({"kvcache_start_index": {0: "batch_size"}})
+
         if is_eagle_draft:
             dynamic_axes.update({
                 "hidden_states_input": {
@@ -401,16 +416,21 @@ def export_llm_model(model_dir: str,
                      output_dir: str,
                      max_position_embeddings: int = 4096,
                      device: str = "cuda",
+                     enable_reuse_kv_cache: bool = True,
                      is_eagle_base: bool = False) -> None:
     """
-    Export a standard model to ONNX format.
+    Export a language model to ONNX format with custom attention plugin.
+    
+    This is the main entry point for exporting standard LLM models and EAGLE base models
+    to ONNX format with TensorRT Edge-LLM optimizations.
     
     Args:
-        model_dir: Directory containing the model
+        model_dir: Directory containing the HuggingFace model
         output_dir: Directory to save the exported ONNX model
-        max_position_embeddings: Maximum positional embedding length to use for model initialization
+        max_position_embeddings: Maximum sequence length for positional embeddings
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
-        is_eagle_base: Whether the model is an EAGLE3 base model
+        enable_reuse_kv_cache: Whether to enable persistent KV cache for system prompts
+        is_eagle_base: Whether the model is an EAGLE3 base model (vs standard LLM)
     """
     start_time = time.time()
 
@@ -423,25 +443,29 @@ def export_llm_model(model_dir: str,
     os.makedirs(output_dir, exist_ok=True)
 
     # Load model
-    model, use_prompt_tuning = load_model(
+    model, use_prompt_tuning = load_llm_model(
         model_dir,
         dtype='fp16',
         max_position_embeddings=max_position_embeddings,
         device=device,
+        enable_reuse_kv_cache=enable_reuse_kv_cache,
         is_eagle_base=is_eagle_base)
 
     model = replace_torch_quant_linear_with_int4_plugin(model)
 
     # Create dummy inputs
-    dummy_inputs = create_dummy_inputs(model,
-                                       is_eagle_base=is_eagle_base,
-                                       is_eagle_draft=False,
-                                       use_prompt_tuning=use_prompt_tuning)
+    dummy_inputs = create_dummy_inputs(
+        model,
+        enable_reuse_kv_cache=enable_reuse_kv_cache,
+        is_eagle_base=is_eagle_base,
+        is_eagle_draft=False,
+        use_prompt_tuning=use_prompt_tuning)
 
     # Export to ONNX
     export_model_to_onnx(model,
                          dummy_inputs,
                          output_dir,
+                         enable_reuse_kv_cache=enable_reuse_kv_cache,
                          is_eagle_base=is_eagle_base,
                          is_eagle_draft=False,
                          use_prompt_tuning=use_prompt_tuning)
@@ -468,15 +492,22 @@ def export_draft_model(draft_model_dir: str,
                        use_prompt_tuning: bool = False,
                        base_model_dir: Optional[str] = None,
                        max_position_embeddings: int = 4096,
-                       device: str = "cuda") -> None:
+                       device: str = "cuda",
+                       enable_reuse_kv_cache: bool = False) -> None:
     """
-    Export complete EAGLE model (both base and draft) to ONNX format.
+    Export an EAGLE draft model to ONNX format with custom attention plugin.
+    
+    This is the main entry point for exporting EAGLE draft models to ONNX format.
+    The draft model requires a base model for weight copying.
     
     Args:
-        draft_model_dir: Directory containing the draft model
-        output_dir: Directory to save the exported ONNX models
-        max_position_embeddings: Maximum positional embedding length to use for model initialization
+        draft_model_dir: Directory containing the EAGLE draft model
+        output_dir: Directory to save the exported ONNX model
+        use_prompt_tuning: Whether the model uses prompt tuning (for VLM models)
+        base_model_dir: Directory containing the base model (for weight copying)
+        max_position_embeddings: Maximum sequence length for positional embeddings
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
+        enable_reuse_kv_cache: Whether to enable persistent KV cache for system prompts
     """
     start_time = time.time()
 
@@ -491,7 +522,7 @@ def export_draft_model(draft_model_dir: str,
     draft_model = load_eagle3_draft_model(draft_model_dir, base_model_dir,
                                           use_prompt_tuning,
                                           max_position_embeddings, 'fp16',
-                                          device)
+                                          device, enable_reuse_kv_cache)
 
     draft_model = replace_torch_quant_linear_with_int4_plugin(draft_model)
 
@@ -499,12 +530,14 @@ def export_draft_model(draft_model_dir: str,
     print(f"Exporting draft model to {output_dir}")
     draft_dummy_inputs = create_dummy_inputs(
         draft_model,
+        enable_reuse_kv_cache=enable_reuse_kv_cache,
         is_eagle_base=False,
         is_eagle_draft=True,
         use_prompt_tuning=use_prompt_tuning)
     export_model_to_onnx(draft_model,
                          draft_dummy_inputs,
                          output_dir,
+                         enable_reuse_kv_cache=enable_reuse_kv_cache,
                          is_eagle_base=False,
                          is_eagle_draft=True,
                          use_prompt_tuning=use_prompt_tuning)

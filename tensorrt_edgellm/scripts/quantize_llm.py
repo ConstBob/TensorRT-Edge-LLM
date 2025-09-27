@@ -58,23 +58,29 @@ def main() -> None:
                         choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
                         default=None,
                         help="Quantization method to use")
-    parser.add_argument("--torch_dtype",
+    parser.add_argument("--dtype",
                         type=str,
                         choices=["fp16"],
                         required=False,
                         default="fp16",
-                        help="High precision dtype for model loading")
+                        help="Model data type for loading")
     parser.add_argument("--dataset_dir",
                         type=str,
                         required=False,
                         default="cnn_dailymail",
-                        help="Dataset directory or name for calibration")
+                        help="Dataset name or path for calibration data")
     parser.add_argument("--lm_head_quantization",
                         type=str,
                         required=False,
                         choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
                         default=None,
                         help="Quantization method for language model head")
+    parser.add_argument(
+        "--device",
+        type=str,
+        required=False,
+        default="cuda",
+        help="Device to use for model loading and quantization")
 
     args = parser.parse_args()
 
@@ -86,9 +92,10 @@ def main() -> None:
         quantize_and_save_llm(model_dir=args.model_dir,
                               output_dir=args.output_dir,
                               quantization=args.quantization,
-                              torch_dtype=args.torch_dtype,
+                              dtype=args.dtype,
                               dataset_dir=args.dataset_dir,
-                              lm_head_quantization=args.lm_head_quantization)
+                              lm_head_quantization=args.lm_head_quantization,
+                              device=args.device)
         print("Model quantization completed successfully!")
     except Exception as e:
         print(f"Error during model quantization: {e}")

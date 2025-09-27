@@ -31,39 +31,49 @@ Key Features:
 Example Usage:
     from tensorrt_edgellm import quantize_and_save_llm, quantize_and_save_draft, export_llm_model, export_draft_model, visual_export, insert_lora_and_save, process_lora_weights_and_save
     
-    # Quantize and save a model
+    # Quantize and save a standard LLM model
     quantize_and_save_llm(
         model_dir="path/to/model",
         output_dir="path/to/output",
-        quantization="fp8"
+        quantization="fp8",
+        dtype="fp16",
+        dataset_dir="cnn_dailymail"
     )
 
-    # Quantize and save a model
+    # Quantize and save an EAGLE draft model
     quantize_and_save_draft(
-        base_model_dir="path/to/model",
+        base_model_dir="path/to/base_model",
         draft_model_dir="path/to/draft_model",
         output_dir="path/to/output",
-        quantization="fp8"
+        quantization="fp8",
+        dtype="fp16",
+        dataset_dir="cnn_dailymail"
     )
     
-    # Export LLM to ONNX (standard model)
-    export_llm_model(
-        model_dir="path/to/model",
-        output_dir="path/to/output"
-    )
-    
-    # Export EAGLE base model to ONNX (EAGLE3 base model)
+    # Export standard LLM to ONNX
     export_llm_model(
         model_dir="path/to/model",
         output_dir="path/to/output",
-        is_eagle_base=True
+        max_position_embeddings=4096,
+        device="cuda",
+        enable_reuse_kv_cache=True
     )
     
-    # Export EAGLE draft model to ONNX (EAGLE3 draft model)
+    # Export EAGLE base model to ONNX
+    export_llm_model(
+        model_dir="path/to/model",
+        output_dir="path/to/output",
+        is_eagle_base=True,
+        enable_reuse_kv_cache=True
+    )
+    
+    # Export EAGLE draft model to ONNX
     export_draft_model(
-        model_dir="path/to/model",
+        draft_model_dir="path/to/draft_model",
         output_dir="path/to/output",
-        use_prompt_tuning=True,
+        base_model_dir="path/to/base_model",
+        use_prompt_tuning=False,
+        enable_reuse_kv_cache=False
     )
     
     # Export visual model to ONNX

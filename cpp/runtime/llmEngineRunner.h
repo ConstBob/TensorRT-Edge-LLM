@@ -34,7 +34,7 @@ using Json = nlohmann::json;
 
 struct LLMEngineRunnerConfig
 {
-    bool enableReuseKVCache{false};
+    bool enableReuseKVCache{true};
     bool useContextDependentRope{false};
     int32_t numDecoderLayers{};
     int32_t numKVHeads{};

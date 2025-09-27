@@ -143,10 +143,10 @@ DISABLE_VISUAL_CONFIG: Dict[str, Any] = {
 
 def get_llm_calib_dataloader(
     tokenizer: AutoTokenizer,
-    dataset_dir: str = "cnn_dailymail",
-    batch_size: int = 1,
-    num_samples: int = 512,
-    max_length: int = 512,
+    dataset_dir: str,
+    batch_size: int,
+    num_samples: int,
+    max_length: int,
 ) -> DataLoader:
     """
     Create a calibration dataloader for LLM quantization.
@@ -195,7 +195,7 @@ def get_llm_calib_dataloader(
 
 def get_llm_quant_config(
         quantization: str,
-        lm_head_quantization: Optional[str] = None) -> Dict[str, Any]:
+        lm_head_quantization: Optional[str]) -> Dict[str, Any]:
     """
     Get quantization configuration for LLM models.
     
@@ -248,8 +248,8 @@ def quantize_llm(
     model: Union[AutoModelForCausalLM, AutoModelForImageTextToText],
     tokenizer: AutoTokenizer,
     quantization: str,
-    dataset_dir: str = "cnn_dailymail",
-    lm_head_quantization: Optional[str] = None,
+    dataset_dir: str,
+    lm_head_quantization: Optional[str],
 ) -> Union[AutoModelForCausalLM, AutoModelForImageTextToText]:
     """
     Quantize a language model using the specified quantization method.
@@ -277,7 +277,9 @@ def quantize_llm(
         batch_size = 1
     data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
                                            dataset_dir=dataset_dir,
-                                           batch_size=batch_size)
+                                           batch_size=batch_size,
+                                           num_samples=512,
+                                           max_length=512)
     quant_config = get_llm_quant_config(quantization, lm_head_quantization)
     model = quantize_model(model, quant_config, data_loader)
 
@@ -289,8 +291,8 @@ def quantize_draft(
     draft_model: Union[Eagle3DraftModel],
     tokenizer: AutoTokenizer,
     quantization: str,
-    dataset_dir: str = "cnn_dailymail",
-    lm_head_quantization: Optional[str] = None,
+    dataset_dir: str,
+    lm_head_quantization: Optional[str],
 ) -> Union[Eagle3DraftModel]:
     """
     Quantize a language model using the specified quantization method.
@@ -319,7 +321,9 @@ def quantize_draft(
         batch_size = 1
     data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
                                            dataset_dir=dataset_dir,
-                                           batch_size=batch_size)
+                                           batch_size=batch_size,
+                                           num_samples=512,
+                                           max_length=512)
     quant_config = get_llm_quant_config(quantization, lm_head_quantization)
     model = quantize_draft_model(base_model, draft_model, quant_config,
                                  data_loader)
@@ -329,27 +333,32 @@ def quantize_draft(
 
 def quantize_and_save_llm(model_dir: str,
                           output_dir: str,
-                          quantization: Optional[str],
-                          torch_dtype: str = "fp16",
+                          quantization: Optional[str] = None,
+                          dtype: str = "fp16",
                           dataset_dir: str = "cnn_dailymail",
-                          lm_head_quantization: Optional[str] = None) -> None:
+                          lm_head_quantization: Optional[str] = None,
+                          device: str = "cuda") -> None:
     """
     Load a model, quantize it if specified, and save the result.
     
+    This is the main entry point for quantizing language models. It supports various
+    quantization schemes including FP8, INT4 AWQ, and NVFP4.
+    
     Args:
-        model_dir: Directory containing the input model
+        model_dir: Directory containing the input HuggingFace model
         output_dir: Directory to save the quantized model
-        quantization: Optional quantization method to apply (None, fp8, int4_awq, nvfp4)
-        torch_dtype: Torch data type for model loading (fp16)
-        dataset_dir: Dataset for calibration
-        lm_head_quantization: Optional LM head quantization method (None, fp8, int4_awq, nvfp4)
+        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "mxfp8")
+        dtype: Model data type for loading ("fp16")
+        dataset_dir: Dataset name or path for calibration data
+        lm_head_quantization: Optional separate quantization for language model head
+        device: Device to use for model loading and quantization ("cuda", "cpu")
         
     Raises:
-        ValueError: If model loading fails
+        ValueError: If model loading fails or quantization parameters are invalid
     """
     start_time = time.time()
     # Load model and tokenizer
-    model, tokenizer = load_hf_model(model_dir, torch_dtype)
+    model, tokenizer = load_hf_model(model_dir, dtype, device)
     if lm_head_quantization == "int4_awq" and model.config.vocab_size % 4 != 0:
         raise ValueError(
             f"Model vocabulary size {model.config.vocab_size} is not divisible by 4. This model's lm_head cannot be quantized to int4_awq. Please use a different quantization method for lm_head."
@@ -390,29 +399,44 @@ def quantize_and_save_draft(
     base_model_dir: str,
     draft_model_dir: str,
     output_dir: str,
-    quantization: Optional[str],
-    torch_dtype: str = "fp16",
+    quantization: Optional[str] = None,
+    device: str = "cuda",
+    dtype: str = "fp16",
     dataset_dir: str = "cnn_dailymail",
     lm_head_quantization: Optional[str] = None,
 ) -> None:
     """
-    Load a model, quantize it if specified, and save the result.
+    Load an EAGLE draft model, quantize it if specified, and save the result.
+    
+    This is the main entry point for quantizing EAGLE draft models. It requires
+    both a base model and draft model directory.
     
     Args:
-        base_model_dir: Directory containing the input model
-        draft_model_dir: Directory containing the draft model
+        base_model_dir: Directory containing the base HuggingFace model
+        draft_model_dir: Directory containing the EAGLE draft model
         output_dir: Directory to save the quantized model
-        quantization: Optional quantization method to apply (None, fp8, int4_awq, nvfp4)
-        torch_dtype: Torch data type for model loading (fp16)
-        dataset_dir: Dataset for calibration
-        lm_head_quantization: Optional LM head quantization method (None, fp8, int4_awq, nvfp4)
+        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "mxfp8")
+        device: Device to use for model loading and quantization ("cuda", "cpu")
+        dtype: Model data type for loading ("fp16")
+        dataset_dir: Dataset name or path for calibration data
+        lm_head_quantization: Optional separate quantization for language model head
         
     Raises:
-        ValueError: If model loading fails
+        ValueError: If model loading fails or quantization parameters are invalid
     """
     start_time = time.time()
 
-    draft_model = load_eagle3_draft_model(draft_model_dir, base_model_dir)
+    # max_positional_embeddings does not matter for quantization.
+    max_position_embeddings = 4096
+    # No VLM inputs are used. VLM models can be quantized using pure text inputs.
+    use_prompt_tuning = False
+    # enable_reuse_kv_cache does not matter for quantization. No system prompts are used.
+    enable_reuse_kv_cache = False
+
+    draft_model = load_eagle3_draft_model(draft_model_dir, base_model_dir,
+                                          use_prompt_tuning,
+                                          max_position_embeddings, dtype,
+                                          device, enable_reuse_kv_cache)
     if lm_head_quantization == "int4_awq" and draft_model.config.draft_vocab_size % 4 != 0:
         raise ValueError(
             f"Model vocabulary size {draft_model.config.draft_vocab_size} is not divisible by 4. This model's lm_head cannot be quantized to int4_awq. Please use a different quantization method for lm_head."
@@ -421,7 +445,7 @@ def quantize_and_save_draft(
     if is_quantized(draft_model):
         print(f"Draft Model is already quantized, skipping quantization.")
     else:
-        base_model, tokenizer = load_hf_model(base_model_dir, torch_dtype)
+        base_model, tokenizer = load_hf_model(base_model_dir, dtype, device)
         draft_model = quantize_draft(base_model, draft_model, tokenizer,
                                      quantization, dataset_dir,
                                      lm_head_quantization)

@@ -113,13 +113,15 @@ class EdgeLLMAttention(nn.Module):
 
     def __init__(self,
                  attention_module: nn.Module,
-                 eagle3_draft: bool = False) -> None:
+                 eagle3_draft: bool = False,
+                 enable_reuse_kv_cache: bool = True) -> None:
         """
         Initialize the EdgeLLMAttention module.
         
         Args:
             attention_module: Original attention module to extract components from
             eagle3_draft: Whether this is an EAGLE3 draft model
+            enable_reuse_kv_cache: Whether to enable KV cache reuse
         """
         super().__init__()
 
@@ -166,12 +168,15 @@ class EdgeLLMAttention(nn.Module):
         # EAGLE3 draft uses 2x hidden_size input dimension
         self.eagle3_draft: bool = eagle3_draft
 
+        self.enable_reuse_kv_cache: bool = enable_reuse_kv_cache
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         past_key_value: torch.Tensor,
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
+        kvcache_start_index: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -183,6 +188,7 @@ class EdgeLLMAttention(nn.Module):
             past_key_value: Past key-value cache of shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
             rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch_size, seq_len, head_dim)
             context_lengths: Context length tensor of shape (batch_size,)
+            kvcache_start_index: Start index of KV cache of shape (batch_size), optional
             attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
             position_ids: Position IDs of shape (batch_size, seq_len), optional
             
@@ -231,8 +237,10 @@ class EdgeLLMAttention(nn.Module):
             self.num_attention_heads,
             self.num_key_value_heads,
             self.max_position_embeddings,
+            self.enable_reuse_kv_cache,
             enable_tree_attention,
             self.head_dim,
+            kvcache_start_index,
             attention_mask,
             position_ids,
         )
@@ -343,7 +351,8 @@ class EdgeLLMDecoderLayer(nn.Module):
                  config_or_module: Union[nn.Module, Any],
                  index: int = 0,
                  torch_dtype: torch.dtype = torch.float16,
-                 eagle3_draft: bool = False) -> None:
+                 eagle3_draft: bool = False,
+                 enable_reuse_kv_cache: bool = True) -> None:
         """
         Initialize the EdgeLLMDecoderLayer module.
         
@@ -351,6 +360,7 @@ class EdgeLLMDecoderLayer(nn.Module):
             config_or_module: Either a decoder layer module or configuration object
             index: Layer index (used for determining layer normalization setup)
             eagle3_draft: Whether this is an EAGLE3 draft model
+            enable_reuse_kv_cache: Whether to enable KV cache reuse
         """
         super().__init__()
 
@@ -369,8 +379,10 @@ class EdgeLLMDecoderLayer(nn.Module):
                 torch_dtype)
 
             # Replace attention with custom implementation
-            self.self_attn = EdgeLLMAttention(decoder_layer.self_attn,
-                                              eagle3_draft=eagle3_draft)
+            self.self_attn = EdgeLLMAttention(
+                decoder_layer.self_attn,
+                eagle3_draft=eagle3_draft,
+                enable_reuse_kv_cache=enable_reuse_kv_cache)
         else:
             # Construct new components from config (for draft models)
             config = config_or_module
@@ -420,6 +432,7 @@ class EdgeLLMDecoderLayer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         inputs_embeds: Optional[torch.Tensor] = None,
+        kvcache_start_index: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -432,6 +445,7 @@ class EdgeLLMDecoderLayer(nn.Module):
             rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch, seq_len, head_dim)
             context_lengths: Context length tensor of shape (batch,)
             inputs_embeds: Input embeddings for EAGLE3 draft of shape (batch, seq_len, embed_dim), optional
+            kvcache_start_index: Start index of KV cache of shape (batch_size), optional
             attention_mask: Attention mask of shape (batch, seq_len, seq_len + past_len), optional
             position_ids: Position IDs of shape (batch, seq_len), optional
             
@@ -455,6 +469,7 @@ class EdgeLLMDecoderLayer(nn.Module):
         # Self attention with residual connection
         hidden_states, present_key_value = self.self_attn(
             hidden_states=hidden_states,
+            kvcache_start_index=kvcache_start_index,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
