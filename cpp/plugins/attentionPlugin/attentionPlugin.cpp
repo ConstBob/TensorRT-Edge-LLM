@@ -60,7 +60,7 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t enableTreeAttention, int32_t hasPersistentKVCache)
+    int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t enableTreeAttention, int32_t enableReuseKVCache)
     : mLayerName(name)
     , mNumHeadQ(numQHeads)
     , mNumHeadKV(numKVHeads)
@@ -68,7 +68,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mMaxBatchSize(maxBatchSize)
     , mKVCacheCapacity(kvCacheCapacity)
     , mEnableTreeAttention(enableTreeAttention)
-    , mHasPersistentKVCache(hasPersistentKVCache)
+    , mEnableReuseKVCache(enableReuseKVCache)
 {
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -97,7 +97,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size
     deserializeValue(&data, &length, &mNumHeadKV);
     deserializeValue(&data, &length, &mNumElemPerHead);
     deserializeValue(&data, &length, &mEnableTreeAttention);
-    deserializeValue(&data, &length, &mHasPersistentKVCache);
+    deserializeValue(&data, &length, &mEnableReuseKVCache);
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -113,7 +113,7 @@ AttentionPlugin::~AttentionPlugin() {}
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
     AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mMaxBatchSize,
-        mKVCacheCapacity, mEnableTreeAttention, mHasPersistentKVCache);
+        mKVCacheCapacity, mEnableTreeAttention, mEnableReuseKVCache);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -243,21 +243,38 @@ bool AttentionPlugin::supportsFormatCombination(
 
     try
     {
-        if (mEnableTreeAttention)
-        {
-            assert(nbInputs == 6 && nbOutputs == 2);
-        }
-        else if (mHasPersistentKVCache)
-        {
-            assert(nbInputs == 5 && nbOutputs == 2);
-        }
-        else
-        {
-            assert(nbInputs == 4 && nbOutputs == 2);
-        }
+        assert(nbOutputs == 2);
 
         bool result{true};
-        if (pos < nbInputs)
+
+        // Check optional inputs, assuming 4 base inputs.
+        int32_t currentOptionalInputIdx = 4;
+        if (mEnableReuseKVCache)
+        {
+            if (pos == currentOptionalInputIdx)
+            {
+                result = checkKVCacheStartIdx(inOut[pos]);
+            }
+            currentOptionalInputIdx++;
+        }
+        if (mEnableTreeAttention)
+        {
+            if (pos == currentOptionalInputIdx)
+            {
+                result = checkAttentionMask(inOut[pos]);
+            }
+            currentOptionalInputIdx++;
+
+            if (pos == currentOptionalInputIdx)
+            {
+                result = checkAttentionPosId(inOut[pos]);
+            }
+            currentOptionalInputIdx++;
+        }
+
+        assert(nbInputs == currentOptionalInputIdx);
+
+        if (pos < 4)
         {
             switch (pos)
             {
@@ -265,22 +282,9 @@ bool AttentionPlugin::supportsFormatCombination(
             case 1: result = checkKVCache(inOut[1]); break;
             case 2: result = checkSequenceLen(inOut[2]); break;
             case 3: result = checkPosEncodingCosSin(inOut[3]); break;
-            case 4:
-                if (mEnableTreeAttention)
-                {
-                    result = checkAttentionMask(inOut[4]);
-                }
-                else // mHasPersistentKVCache
-                {
-                    result = checkKVCacheStartIdx(inOut[4]);
-                }
-                break;
-            case 5: result = checkAttentionPosId(inOut[5]); break;
-            case 6: result = checkKVCacheStartIdx(inOut[6]); break;
-            default: break;
             }
         }
-        else
+        else if (pos >= nbInputs)
         {
             int32_t outPos = pos - nbInputs;
             switch (outPos)
@@ -336,9 +340,25 @@ void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTe
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
+    int32_t currentOptionalInputIdx = 4;
+
+    if (mEnableReuseKVCache)
+    {
+        mKvCacheStartIdxInputIdx = currentOptionalInputIdx;
+        currentOptionalInputIdx++;
+    }
+
+    if (mEnableTreeAttention)
+    {
+        mAttentionMaskInputIdx = currentOptionalInputIdx;
+        currentOptionalInputIdx++;
+
+        mAttentionPosIdInputIdx = currentOptionalInputIdx;
+        currentOptionalInputIdx++;
+    }
 }
 
-// TODO: extend the worksapce calculation to a more generalized form.
+// TODO: extend the workspace calculation to a more generalized form.
 size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
     [[maybe_unused]] int32_t nbOutputs) const noexcept
@@ -352,7 +372,7 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
 
     workspaceSize += (mMaxBatchSize + 1) * sizeof(int32_t); // nbBytesCuQSeqLens
 
-    // The worksapce will be used to store the Q tensor. For eagle mode, maxDecodingTokens means the number of Q tensor.
+    // The workspace will be used to store the Q tensor. For eagle mode, maxDecodingTokens means the number of Q tensor.
     // Set maxDecodingTokens to 128, which means the max value supported is 128. Please change it if need more.
     constexpr int32_t maxDecodingTokens = 128;
     // Add alignment to ensure we have enough device space at worst scenrio.
@@ -360,7 +380,7 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     workspaceSize
         += nbBytesPerData * mMaxBatchSize * mNumHeadQ * mNumElemPerHead * maxDecodingTokens; // nbBytesQTensor for XQA
 
-    if (mHasPersistentKVCache)
+    if (mEnableReuseKVCache)
     {
         workspaceSize += (mMaxBatchSize + 1) * sizeof(int32_t); // nbBytesCuTotalKvCacheLens
         workspaceSize += mMaxBatchSize * sizeof(int32_t);       // nbBytesCuKvCacheEndIdxs
@@ -384,12 +404,23 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     constexpr int32_t kATTENTION_OUTPUT_IDX{0};
     constexpr int32_t kPOS_ENCODING_COS_SIN_IDX{3};
 
-    // Optional Inputs that only used with spec decoding tree attention.
-    constexpr int32_t kATTENTION_MASK_INPUT_IDX{4};
-    constexpr int32_t kATTENTION_POS_ID_INPUT_IDX{5};
+    int32_t kKV_CACHE_START_IDX_INPUT_IDX{};
+    int32_t kATTENTION_MASK_INPUT_IDX{};
+    int32_t kATTENTION_POS_ID_INPUT_IDX{};
 
-    // Optional Inputs that only used with persistent KV cache.
-    constexpr int32_t kKV_CACHE_START_IDX_INPUT_IDX{4};
+    int32_t currentInputIdx = 4;
+    if (mEnableReuseKVCache)
+    {
+        kKV_CACHE_START_IDX_INPUT_IDX = currentInputIdx;
+        currentInputIdx += 1;
+    }
+    if (mEnableTreeAttention)
+    {
+        kATTENTION_MASK_INPUT_IDX = currentInputIdx;
+        currentInputIdx += 1;
+        kATTENTION_POS_ID_INPUT_IDX = currentInputIdx;
+        currentInputIdx += 1;
+    }
 
     // Obtain execution time batch size, input context length, and KV-cache capacity per sequence.
     constexpr int32_t kQKV_INPUT_BATCH_DIM_IDX{0};
@@ -445,7 +476,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t const* kvCacheStartIdxPtr = nullptr;
     if (isContextPhase)
     {
-        if (mHasPersistentKVCache)
+        if (mEnableReuseKVCache)
         {
             kvCacheStartIdxPtr = reinterpret_cast<int32_t const*>(inputs[kKV_CACHE_START_IDX_INPUT_IDX]);
         }
@@ -456,7 +487,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         // TODO: Explore non-padded input format.
         int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
         AttentionInputLayout attentionInputLayout
-            = mHasPersistentKVCache ? AttentionInputLayout::CONTIGUOUS_Q_KV : AttentionInputLayout::PACKED_QKV;
+            = mEnableReuseKVCache ? AttentionInputLayout::CONTIGUOUS_Q_KV : AttentionInputLayout::PACKED_QKV;
 
         int32_t* cuQSeqLensDevicePtr = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
         alignedWorkspacePtr += (runtimeBatchSize + 1) * sizeof(int32_t);
@@ -464,7 +495,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
         int32_t* cuTotalKvCacheLensDevicePtr = nullptr;
         int32_t* kvCacheEndIdxsDevicePtr = nullptr;
-        if (mHasPersistentKVCache)
+        if (mEnableReuseKVCache)
         {
             cuTotalKvCacheLensDevicePtr = reinterpret_cast<int32_t*>(alignedWorkspacePtr);
             alignedWorkspacePtr += (runtimeBatchSize + 1) * sizeof(int32_t);
@@ -572,7 +603,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mMaxBatchSize) + sizeof(mKVCacheCapacity) + sizeof(mNumHeadQ) + sizeof(mNumHeadKV)
-        + sizeof(mNumElemPerHead) + sizeof(mEnableTreeAttention) + sizeof(mHasPersistentKVCache);
+        + sizeof(mNumElemPerHead) + sizeof(mEnableTreeAttention) + sizeof(mEnableReuseKVCache);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
@@ -583,7 +614,7 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&buffer, mNumHeadKV);
     serializeValue(&buffer, mNumElemPerHead);
     serializeValue(&buffer, mEnableTreeAttention);
-    serializeValue(&buffer, mHasPersistentKVCache);
+    serializeValue(&buffer, mEnableReuseKVCache);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -610,7 +641,7 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("has_persistent_kv_cache", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("enable_reuse_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -650,12 +681,12 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         std::optional<int32_t> numQHeads = parsePluginScalarField<int32_t>("num_q_heads", fc);
         std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
-        // Make enable_tree_attention optional with default value 0
+        // Make enable_tree_attention optional with default value 0 (disable by default)
         std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
         int32_t enableTreeAttentionValue = enableTreeAttention.value_or(0);
-        // Make has_persistent_kv_cache optional with default value 0
-        std::optional<int32_t> hasPersistentKVCache = parsePluginScalarField<int32_t>("has_persistent_kv_cache", fc);
-        int32_t hasPersistentKVCacheValue = hasPersistentKVCache.value_or(0);
+        // Make enable_reuse_kv_cache optional with default value 1 (enable by default)
+        std::optional<int32_t> enableReuseKVCache = parsePluginScalarField<int32_t>("enable_reuse_kv_cache", fc);
+        int32_t enableReuseKVCacheValue = enableReuseKVCache.value_or(1);
 
         // Enforce Core parameters are specified.
         bool checkRequiredFields = maxBatchSize.has_value() && kvCacheCapacity.has_value() && numQHeads.has_value()
@@ -667,7 +698,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
 
         AttentionPlugin* plugin
             = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(), headSize.value(),
-                maxBatchSize.value(), kvCacheCapacity.value(), enableTreeAttentionValue, hasPersistentKVCacheValue);
+                maxBatchSize.value(), kvCacheCapacity.value(), enableTreeAttentionValue, enableReuseKVCacheValue);
 
         return plugin;
     }

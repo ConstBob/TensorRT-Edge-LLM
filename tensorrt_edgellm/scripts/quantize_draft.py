@@ -18,13 +18,16 @@ using various quantization schemes supported by NVIDIA ModelOpt.
 
 Usage:
     # Quantize with FP8 quantization
-    python quantize_draft.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8
+    python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output --quantization fp8
     
     # Quantize without quantization (default)
-    python quantize_draft.py --model_dir /path/to/model --output_dir /path/to/output
+    python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output
     
     # Quantize with different quantization for LM head
-    python quantize_draft.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization int4_awq
+    python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization int4_awq
+    
+    # Quantize on CPU
+    python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output --quantization fp8 --device cpu
 """
 
 import argparse
@@ -43,7 +46,7 @@ def main() -> None:
     the quantize_and_save_llm or quantize_and_save_draft function with the provided parameters.
     """
     parser = argparse.ArgumentParser(
-        description="Quantize a model using NVIDIA ModelOpt")
+        description="Quantize a EAGLE3 draft model using NVIDIA ModelOpt")
     parser.add_argument("--base_model_dir",
                         type=str,
                         required=True,
@@ -62,23 +65,29 @@ def main() -> None:
                         choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
                         default=None,
                         help="Quantization method to use")
-    parser.add_argument("--torch_dtype",
+    parser.add_argument("--dtype",
                         type=str,
                         choices=["fp16"],
                         required=False,
                         default="fp16",
-                        help="High precision dtype for model loading")
+                        help="Model data type for loading")
     parser.add_argument("--dataset_dir",
                         type=str,
                         required=False,
                         default="cnn_dailymail",
-                        help="Dataset directory or name for calibration")
+                        help="Dataset name or path for calibration data")
     parser.add_argument("--lm_head_quantization",
                         type=str,
                         required=False,
                         choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
                         default=None,
                         help="Quantization method for language model head")
+    parser.add_argument(
+        "--device",
+        type=str,
+        required=False,
+        default="cuda",
+        help="Device to use for model loading and quantization")
 
     args = parser.parse_args()
 
@@ -91,7 +100,8 @@ def main() -> None:
                                 draft_model_dir=args.draft_model_dir,
                                 output_dir=args.output_dir,
                                 quantization=args.quantization,
-                                torch_dtype=args.torch_dtype,
+                                device=args.device,
+                                dtype=args.dtype,
                                 dataset_dir=args.dataset_dir,
                                 lm_head_quantization=args.lm_head_quantization)
         print("Model quantization completed successfully!")

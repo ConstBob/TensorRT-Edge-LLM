@@ -136,8 +136,8 @@ attention_plugin_schema = OpSchema(
 onnx.defs.register_schema(attention_plugin_schema)
 
 
-@symbolic_helper.parse_args("v", "v", "v", "v", "i", "i", "i", "b", "i", "v",
-                            "v")
+@symbolic_helper.parse_args("v", "v", "v", "v", "i", "i", "i", "b", "b", "i",
+                            "v", "v", "v")
 def symbolic_attention_plugin(
     g: torch.onnx._internal.jit_utils.GraphContext,
     qkv: torch._C.Value,
@@ -147,8 +147,10 @@ def symbolic_attention_plugin(
     num_q_heads: torch._C.Value,
     num_kv_heads: torch._C.Value,
     kv_cache_capacity: torch._C.Value,
+    enable_reuse_kv_cache: torch._C.Value,
     enable_tree_attention: torch._C.Value,
     head_size: torch._C.Value,
+    kvcache_start_index: Optional[torch._C.Value] = None,
     attention_mask: Optional[torch._C.Value] = None,
     position_ids: Optional[torch._C.Value] = None,
 ):
@@ -156,10 +158,17 @@ def symbolic_attention_plugin(
 
     # Build inputs list - only include required inputs
     inputs = [qkv, past_key_value, context_lengths, rope_rotary_cos_sin]
-    if attention_mask is not None and attention_mask.type().kind(
-    ) != 'NoneType':
+    if enable_reuse_kv_cache:
+        assert kvcache_start_index is not None and kvcache_start_index.type(
+        ).kind(
+        ) != 'NoneType', "kvcache_start_index should be provided for persistent KV cache"
+        inputs.append(kvcache_start_index)
+    if enable_tree_attention:
+        assert attention_mask is not None and attention_mask.type().kind(
+        ) != 'NoneType', "attention_mask should be provided for tree attention"
+        assert position_ids is not None and position_ids.type().kind(
+        ) != 'NoneType', "position_ids should be provided for tree attention"
         inputs.append(attention_mask)
-    if position_ids is not None and position_ids.type().kind() != 'NoneType':
         inputs.append(position_ids)
 
     qkv_type = qkv.type()
@@ -171,6 +180,7 @@ def symbolic_attention_plugin(
         num_kv_heads_i=num_kv_heads,
         head_size_i=head_size,
         kv_cache_capacity_i=kv_cache_capacity,
+        enable_reuse_kv_cache_i=1 if enable_reuse_kv_cache else 0,
         enable_tree_attention_i=1 if enable_tree_attention else 0,
         max_batch_size_i=16,
         outputs=2)
@@ -196,8 +206,10 @@ def attention_plugin(
     num_q_heads: int,
     num_kv_heads: int,
     kv_cache_capacity: int,
+    enable_reuse_kv_cache: bool,
     enable_tree_attention: bool,
     head_size: int,
+    kvcache_start_index: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -217,7 +229,9 @@ def attention_plugin(
         num_kv_heads: Number of key-value heads
         kv_cache_capacity: Maximum capacity of KV cache
         enable_tree_attention: Whether to enable tree attention
+        enable_reuse_kv_cache: Whether to enable persistent KV cache
         head_size: Size of each attention head
+        kvcache_start_index: Start index of KV cache of shape (batch_size), optional
         attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
         position_ids: Position IDs tensor of shape (batch_size, seq_len), optional
         
@@ -232,6 +246,8 @@ def attention_plugin(
     if enable_tree_attention:
         assert attention_mask is not None, "attention_mask should be provided for tree attention"
         assert position_ids is not None, "position_ids should be provided for tree attention"
+    if enable_reuse_kv_cache:
+        assert kvcache_start_index is not None, "kvcache_start_index should be provided for persistent KV cache"
 
     batch_size, seq_len, qkv_size = qkv.shape
     assert head_size * (

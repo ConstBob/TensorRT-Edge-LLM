@@ -41,7 +41,7 @@ struct LLMBuilderConfig
     bool isVlm{false};                 //!< Whether this is a Vision-Language Model (VLM)
     int64_t minImageTokens{4};         //!< Minimum number of image tokens (VLM only)
     int64_t maxImageTokens{1024};      //!< Maximum number of image tokens (VLM only)
-    bool enableReuseKVCache{false};    //!< Whether to enable KVCache reuse
+    bool enableReuseKVCache{true};     //!< Whether to enable KVCache reuse
     bool eagleDraft{false};            //!< Whether this is an Eagle draft model
     bool eagleBase{false};             //!< Whether this is an Eagle base model
     bool eagle2{false};                //!< Whether to use Eagle2 (default is Eagle3)
