@@ -91,3 +91,16 @@ void eagleBaseCommitKVCacheAndAssembleHiddenStateReference(std::vector<int32_t> 
     std::vector<half>& kvCacheBufferOut, std::vector<half>& hiddenStateOut, int32_t const numLayers,
     int32_t const maxBatchSize, int32_t const numHeads, int32_t const maxSeqLen, int32_t const headDim,
     int32_t const maxDepth, int32_t const draftTreeSize, int32_t const baseHiddenDim);
+
+// Eagle accept reference function
+struct EagleAcceptResult
+{
+    std::vector<int32_t> acceptedTokenIds;
+    std::vector<int32_t> acceptedIndices;
+    std::vector<int32_t> acceptLengths;
+    int32_t maxAcceptLength;
+};
+
+EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<int32_t> const& tokenIds,
+    std::vector<int8_t> const& attentionMask, int32_t batchSize, int32_t numTokens, int32_t vocabSize,
+    int32_t maxDepth);

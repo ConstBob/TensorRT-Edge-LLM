@@ -789,3 +789,137 @@ void eagleBaseCommitKVCacheAndAssembleHiddenStateReference(std::vector<int32_t> 
         }
     }
 }
+
+// Helper function to compute token depth - count total connections (sum of 1s)
+int32_t computeTokenDepthRef(int32_t tokenIdx, std::vector<int8_t> const& attentionMask, int32_t numTokens)
+{
+    int32_t depth = 0;
+    for (int32_t i = 0; i < numTokens; ++i)
+    {
+        if (attentionMask[tokenIdx * numTokens + i] == 1)
+        {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<int32_t> const& tokenIds,
+    std::vector<int8_t> const& attentionMask, int32_t batchSize, int32_t numTokens, int32_t vocabSize, int32_t maxDepth)
+{
+    EagleAcceptResult result;
+    result.acceptedTokenIds.resize(batchSize * maxDepth, -1);
+    result.acceptedIndices.resize(batchSize * maxDepth, -1);
+    result.acceptLengths.resize(batchSize, 0);
+
+    int32_t maxAcceptLength = 0;
+
+    // Process each batch
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        // Precompute token depths for this batch
+        std::vector<int32_t> tokenDepths(numTokens);
+        int32_t const batchMaskOffset = b * numTokens * numTokens;
+        for (int32_t i = 0; i < numTokens; ++i)
+        {
+            int32_t depth = 0;
+            for (int32_t j = 0; j < numTokens; ++j)
+            {
+                if (attentionMask[batchMaskOffset + i * numTokens + j] == 1)
+                {
+                    depth++;
+                }
+            }
+            tokenDepths[i] = depth;
+        }
+
+        int32_t currentDepth = 1;
+        int32_t currentTokenIdx = 0;
+        int32_t expectedNextDepth = tokenDepths[0] + 1; // Next depth should be current token's depth + 1
+
+        // Token 0 is always accepted
+        int32_t const batchTokenOffset = b * numTokens;
+        result.acceptedTokenIds[b * maxDepth + 0] = tokenIds[batchTokenOffset + 0];
+        result.acceptedIndices[b * maxDepth + 0] = 0;
+        result.acceptLengths[b] = 1;
+
+        // Process subsequent tokens
+        while (currentDepth < maxDepth && currentTokenIdx < numTokens - 1)
+        {
+            // Step 1: Find top-1 token from logits[b][currentTokenIdx]
+            int32_t const logitsOffset = b * numTokens * vocabSize + currentTokenIdx * vocabSize;
+
+            // Find argmax
+            float maxLogit = -std::numeric_limits<float>::infinity();
+            int32_t selectedTokenId = -1;
+
+            for (int32_t v = 0; v < vocabSize; ++v)
+            {
+                if (logits[logitsOffset + v] > maxLogit)
+                {
+                    maxLogit = logits[logitsOffset + v];
+                    selectedTokenId = v;
+                }
+            }
+
+            // Step 2: Find which token in the tree matches the selected token,
+            // is at the correct depth, and attends to the current token
+            int32_t nextTokenIdx = -1;
+
+            for (int32_t checkIdx = 1; checkIdx < numTokens; ++checkIdx)
+            {
+                if (tokenIds[batchTokenOffset + checkIdx] == selectedTokenId
+                    && tokenDepths[checkIdx] == expectedNextDepth)
+                {
+                    // Check attention mask: does checkIdx attend to currentTokenIdx?
+                    int32_t maskOffset = batchMaskOffset + checkIdx * numTokens + currentTokenIdx;
+                    if (attentionMask[maskOffset] == 1)
+                    {
+                        // Found a valid next token
+                        nextTokenIdx = checkIdx;
+                        break; // Take the first match
+                    }
+                }
+            }
+
+            // Step 3: Update results if valid token found
+            if (nextTokenIdx != -1)
+            {
+                result.acceptedTokenIds[b * maxDepth + currentDepth] = selectedTokenId;
+                result.acceptedIndices[b * maxDepth + currentDepth] = nextTokenIdx;
+                result.acceptLengths[b] = currentDepth + 1;
+                currentTokenIdx = nextTokenIdx;
+                currentDepth++;
+                expectedNextDepth++;
+            }
+            else
+            {
+                // No valid next token found, stop
+                break;
+            }
+        }
+
+        // Update max accept length
+        maxAcceptLength = std::max(maxAcceptLength, result.acceptLengths[b]);
+    }
+
+    result.maxAcceptLength = maxAcceptLength;
+
+    // Reshape the result vectors to [batchSize, maxAcceptLength]
+    std::vector<int32_t> reshapedTokenIds(batchSize * maxAcceptLength, -1);
+    std::vector<int32_t> reshapedIndices(batchSize * maxAcceptLength, -1);
+
+    for (int32_t b = 0; b < batchSize; ++b)
+    {
+        for (int32_t i = 0; i < maxAcceptLength; ++i)
+        {
+            reshapedTokenIds[b * maxAcceptLength + i] = result.acceptedTokenIds[b * maxDepth + i];
+            reshapedIndices[b * maxAcceptLength + i] = result.acceptedIndices[b * maxDepth + i];
+        }
+    }
+
+    result.acceptedTokenIds = std::move(reshapedTokenIds);
+    result.acceptedIndices = std::move(reshapedIndices);
+
+    return result;
+}
