@@ -60,7 +60,6 @@ For EAGLE speculative decoding, build separate engines for base and draft models
 **Notes:**
 - `--maxSeqLen` must be greater than `--maxInputLen`
 - `maxSeqLen` must match the `kv_cache_capacity` field in the ONNX `AttentionPlugin` node
-- For EAGLE2 models, remove the `--isEagle3` flag from both commands
 
 ## Required Folder Structure
 

@@ -41,10 +41,8 @@ struct LLMBuilderConfig
     bool isVlm{false};                 //!< Whether this is a Vision-Language Model (VLM)
     int64_t minImageTokens{4};         //!< Minimum number of image tokens (VLM only)
     int64_t maxImageTokens{1024};      //!< Maximum number of image tokens (VLM only)
-    bool enableReuseKVCache{true};     //!< Whether to enable KVCache reuse
     bool eagleDraft{false};            //!< Whether this is an Eagle draft model
     bool eagleBase{false};             //!< Whether this is an Eagle base model
-    bool eagle2{false};                //!< Whether to use Eagle2 (default is Eagle3)
     int64_t maxBatchSize{4};           //!< Maximum batch size for inference
     int64_t maxLoraRank{0};            //!< Maximum LoRA rank (0 = no LoRA support)
     int64_t maxSeqLen{4096};           //!< Maximum sequence length for the model
@@ -63,10 +61,8 @@ struct LLMBuilderConfig
             json["min_image_tokens"] = minImageTokens;
             json["max_image_tokens"] = maxImageTokens;
         }
-        json["enable_reuse_kvcache"] = enableReuseKVCache;
         json["eagle_draft"] = eagleDraft;
         json["eagle_base"] = eagleBase;
-        json["eagle2"] = eagle2;
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_seq_len"] = maxSeqLen;
@@ -97,10 +93,6 @@ struct LLMBuilderConfig
         {
             config.maxImageTokens = json["max_image_tokens"];
         }
-        if (json.contains("enable_reuse_kvcache"))
-        {
-            config.enableReuseKVCache = json["enable_reuse_kvcache"];
-        }
         if (json.contains("eagle_draft"))
         {
             config.eagleDraft = json["eagle_draft"];
@@ -108,10 +100,6 @@ struct LLMBuilderConfig
         if (json.contains("eagle_base"))
         {
             config.eagleBase = json["eagle_base"];
-        }
-        if (json.contains("eagle2"))
-        {
-            config.eagle2 = json["eagle2"];
         }
         if (json.contains("max_batch_size"))
         {
@@ -151,7 +139,6 @@ struct LLMBuilderConfig
         }
         oss << "  eagleDraft: " << (eagleDraft ? "true" : "false") << "\n";
         oss << "  eagleBase: " << (eagleBase ? "true" : "false") << "\n";
-        oss << "  eagle2: " << (eagle2 ? "true" : "false") << "\n";
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxSeqLen: " << maxSeqLen << "\n";
@@ -293,6 +280,12 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupLoraProfiles(nvinfer1::IOptimizationProfile* contextProfile,
         nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network);
+
+    //! Verifies consistency of the KV cache reuse setting.
+    //! Checks if the 'enable_reuse_kv_cache' flag in the config matches the model structure.
+    //! @param network TensorRT network definition for KVCacheReuse input analysis
+    //! @return Returns true if the configuration is consistent with the model, false otherwise.
+    bool checkKVCacheReuse(nvinfer1::INetworkDefinition const* network);
 
     //! Set up optimization profiles for KV cache tensors.
     //! Configures dynamic shapes for key-value cache inputs across all layers.

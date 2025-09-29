@@ -247,7 +247,30 @@ bool AttentionPlugin::supportsFormatCombination(
 
         bool result{true};
 
-        // Check optional inputs, assuming 4 base inputs.
+        if (pos < 4)
+        {
+            switch (pos)
+            {
+            case 0: result = checkGemmQKV(inOut[0]); break;
+            case 1: result = checkKVCache(inOut[1]); break;
+            case 2: result = checkSequenceLen(inOut[2]); break;
+            case 3: result = checkPosEncodingCosSin(inOut[3]); break;
+            default: break;
+            }
+        }
+        else if (pos >= nbInputs)
+        {
+            int32_t outPos = pos - nbInputs;
+            switch (outPos)
+            {
+            case 0: result = checkAttentionOutput(inOut[pos]); break;
+            case 1: result = checkKVCache(inOut[pos]); break;
+            default: break;
+            }
+        }
+
+        // The indices for optional inputs are dynamic, depending on which features are enabled.
+        // We start checking after the 4 base inputs.
         int32_t currentOptionalInputIdx = 4;
         if (mEnableReuseKVCache)
         {
@@ -273,27 +296,6 @@ bool AttentionPlugin::supportsFormatCombination(
         }
 
         assert(nbInputs == currentOptionalInputIdx);
-
-        if (pos < 4)
-        {
-            switch (pos)
-            {
-            case 0: result = checkGemmQKV(inOut[0]); break;
-            case 1: result = checkKVCache(inOut[1]); break;
-            case 2: result = checkSequenceLen(inOut[2]); break;
-            case 3: result = checkPosEncodingCosSin(inOut[3]); break;
-            }
-        }
-        else if (pos >= nbInputs)
-        {
-            int32_t outPos = pos - nbInputs;
-            switch (outPos)
-            {
-            case 0: result = checkAttentionOutput(inOut[pos]); break;
-            case 1: result = checkKVCache(inOut[pos]); break;
-            default: break;
-            }
-        }
 
         return result;
     }
@@ -684,9 +686,9 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         // Make enable_tree_attention optional with default value 0 (disable by default)
         std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
         int32_t enableTreeAttentionValue = enableTreeAttention.value_or(0);
-        // Make enable_reuse_kv_cache optional with default value 1 (enable by default)
+        // Make enable_reuse_kv_cache optional with default value 0 (disable by default)
         std::optional<int32_t> enableReuseKVCache = parsePluginScalarField<int32_t>("enable_reuse_kv_cache", fc);
-        int32_t enableReuseKVCacheValue = enableReuseKVCache.value_or(1);
+        int32_t enableReuseKVCacheValue = enableReuseKVCache.value_or(0);
 
         // Enforce Core parameters are specified.
         bool checkRequiredFields = maxBatchSize.has_value() && kvCacheCapacity.has_value() && numQHeads.has_value()

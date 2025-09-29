@@ -24,6 +24,7 @@
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <fstream>
 #include <iostream>
@@ -260,6 +261,12 @@ bool LLMBuilder::build()
     // Print network information
     LOG_DEBUG("%s", printNetworkInfo(network.get(), "LLM").c_str());
 
+    // Check if the enableReuseKVCache flag is consistent
+    if (!checkKVCacheReuse(network.get()))
+    {
+        return false;
+    }
+
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config)
@@ -361,7 +368,7 @@ bool LLMBuilder::parseConfig()
     }
 
     mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
-    mTargetModelOutputHiddenDim = mBuilderConfig.eagle2 ? mHiddenSize : mHiddenSize * 3;
+    mTargetModelOutputHiddenDim = mHiddenSize * 3;
     mNumKVHeads = mModelConfig["num_key_value_heads"].get<int32_t>();
     auto numAttentionHeads = mModelConfig["num_attention_heads"].get<int32_t>();
 
@@ -460,7 +467,7 @@ bool LLMBuilder::setupCommonProfiles(
 
     // If enable reuse KVCache, we need to add a profile for the KVCache start index.
     // As a future improvement, we should enable KVCache reuse feature by default and remove the if statement.
-    if (mBuilderConfig.enableReuseKVCache)
+    if (mModelConfig["enable_reuse_kv_cache"].get<bool>())
     {
         result &= setOptimizationProfile(contextProfile, "kvcache_start_index", createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
@@ -770,7 +777,7 @@ bool LLMBuilder::copyTokenizerFiles()
 bool LLMBuilder::copyEagleFiles()
 {
     // Copy d2t.bin for Eagle3 draft models
-    if (!mBuilderConfig.eagle2 && mBuilderConfig.eagleDraft)
+    if (mBuilderConfig.eagleDraft)
     {
         std::string d2tPath = mOnnxDir.string() + "/d2t.bin";
         std::string targetD2tPath = mEngineDir.string() + "/d2t.bin";
@@ -1077,6 +1084,31 @@ bool VisualBuilder::copyConfig()
     targetConfigFile.close();
 
     LOG_INFO("Copied config.json with builder config to %s", targetConfigPath.c_str());
+    return true;
+}
+
+bool LLMBuilder::checkKVCacheReuse(nvinfer1::INetworkDefinition const* network)
+{
+    bool enableReuseKVCache = false;
+    for (int i = 0; i < network->getNbInputs(); ++i)
+    {
+        if (strcmp(network->getInput(i)->getName(), "kvcache_start_index") == 0)
+        {
+            enableReuseKVCache = true;
+            LOG_INFO("KV cache reuse is enabled.");
+            break;
+        }
+    }
+
+    if (mModelConfig["enable_reuse_kv_cache"].get<bool>() != enableReuseKVCache)
+    {
+        LOG_ERROR(
+            "Mismatch in 'enable_reuse_kv_cache' setting. Model config has it as '%s', but ONNX analysis indicates "
+            "'%s'.",
+            mModelConfig["enable_reuse_kv_cache"].get<bool>() ? "true" : "false",
+            enableReuseKVCache ? "true" : "false");
+        return false;
+    }
     return true;
 }
 
