@@ -226,6 +226,7 @@ std::string formatString(Tensor const& tensor)
     {
         // Allocate a typed CPU tensor to hold the data on host for printing.
         // Please note "this" could be reshaped so the actutal memory capacity may differ from the cpuTensor.
+        // Default stream is used because this is a debug only function
         cpuTensor = std::make_unique<Tensor>(shape, DeviceType::kCPU, tensor.getDataType(), tensor.getName());
         CUDA_CHECK(cudaMemcpy(
             cpuTensor->rawPointer(), tensor.rawPointer(), cpuTensor->getMemoryCapacity(), cudaMemcpyDeviceToHost));

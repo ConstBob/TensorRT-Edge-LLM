@@ -145,11 +145,7 @@ Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType da
     memoryCapacity = shape.volume() * utils::getTypeSize(dataType);
     if (deviceType == DeviceType::kCPU)
     {
-        data = malloc(memoryCapacity);
-        if (data == nullptr)
-        {
-            throw std::runtime_error("Failed to allocate memory on CPU");
-        }
+        CUDA_CHECK(cudaMallocHost(&data, memoryCapacity));
     }
     else
     {
@@ -311,7 +307,7 @@ void Tensor::releaseResource()
     {
         if (mDeviceType == DeviceType::kCPU)
         {
-            free(data);
+            CUDA_CHECK(cudaFreeHost(data));
         }
         else
         {

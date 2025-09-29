@@ -185,6 +185,8 @@ public:
             size_t dataSize{0};
             CUDA_DRIVER_CHECK(
                 cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&deviceSmemSize), &dataSize, hModule, "smemSize"));
+            // Use of default stream is inevitable and justified here because it is called during kernel loading phase,
+            // not runtime.
             CUDA_CHECK(cudaMemcpy(&funcInfo.mSharedMemBytes, deviceSmemSize, dataSize, cudaMemcpyDeviceToHost));
 
             // Set 46KB threshold here because we have to take static/driver shared memory into consideration.

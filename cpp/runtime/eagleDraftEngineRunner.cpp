@@ -89,8 +89,10 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     this->initializeConfigFromEngine();
 
     // Instantiate the KVCache instance of the EngineRunner.
-    this->mLinearKVCache = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers,
-        kRUNTIME_BATCH_SIZE, mConfig.maxSupportedInputLength, mConfig.numKVHeads, mConfig.headDim});
+    this->mLinearKVCache
+        = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, kRUNTIME_BATCH_SIZE,
+                                mConfig.maxSupportedInputLength, mConfig.numKVHeads, mConfig.headDim},
+            stream);
 
     // By design for tree attention kernel we use, the tree mask will be packed into in32_t values where each bit
     // represents the relationship between two

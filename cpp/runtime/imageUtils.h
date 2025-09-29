@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "common/cudaUtils.h"
+#include "common/tensor.h"
 #include <memory>
 #include <string>
 
@@ -27,29 +29,20 @@ namespace rt
 namespace imageUtils
 {
 
-// Image data structure for managing loaded images
+// ImageData is a shared pointer to a rt::Tensor, used to manage stbi loaded images
+// The tensor is expected to have shape [height, width, channels] and channels is 3 for RGB image
 class ImageData
 {
 public:
-    std::shared_ptr<unsigned char[]> buffer;
-    int width;
-    int height;
-    int channels;
+    std::shared_ptr<rt::Tensor> buffer;
+    int32_t width;
+    int32_t height;
+    int32_t channels;
     bool isThumbnail; // TODO: Clean old API
 
-    ImageData(unsigned char* data, int w, int h, int c, bool thumbnail = false)
-        : buffer(data)
-        , width(w)
-        , height(h)
-        , channels(c)
-        , isThumbnail(thumbnail)
-    {
-    }
+    ImageData(rt::Tensor&& data, bool thumbnail = false);
 
-    unsigned char* data() const
-    {
-        return buffer.get();
-    }
+    unsigned char* data() const;
 };
 
 ImageData loadImageFromFile(std::string const& path);

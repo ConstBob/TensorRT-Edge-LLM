@@ -51,7 +51,7 @@ public:
     //! Initialize the KVCache with the given config.
     //! @param config The config for the KVCache instance. Once allocated, the device memory won't be reallocated.
     LinearKVCache() = default;
-    LinearKVCache(CacheConfig const& config);
+    LinearKVCache(CacheConfig const& config, cudaStream_t stream);
     ~LinearKVCache();
 
     // Delete copy construction and assignments to avoid accidental large data copy.

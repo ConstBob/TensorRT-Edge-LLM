@@ -187,8 +187,10 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     }
 
     // Instantiate the KVCache instance of the EngineRunner.
-    this->mKVCache = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers,
-        mConfig.maxSupportedBatchSize, mConfig.maxSequenceLength, mConfig.numKVHeads, mConfig.headDim});
+    this->mKVCache
+        = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
+                                mConfig.maxSequenceLength, mConfig.numKVHeads, mConfig.headDim},
+            stream);
 
     // Instantiate other GPU memory input that needed by the Engine execution.
     this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT64);

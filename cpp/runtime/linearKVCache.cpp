@@ -30,14 +30,15 @@ namespace drivellm
 namespace rt
 {
 
-LinearKVCache::LinearKVCache(CacheConfig const& config)
+LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
     : mConfig(config)
 {
     int32_t const kvCacheVolume = mConfig.numDecoderLayers * mConfig.maxBatchSize * 2 * mConfig.numKVHeads
         * mConfig.maxSequenceLength * mConfig.headDim;
     CUDA_CHECK(cudaMalloc(&mDeviceKVCache, kvCacheVolume * sizeof(KVCacheType)));
     mDeviceKVCacheLengths = rt::Tensor({mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32);
-    CUDA_CHECK(cudaMemset(mDeviceKVCacheLengths.rawPointer(), 0, mDeviceKVCacheLengths.getMemoryCapacity()));
+    CUDA_CHECK(
+        cudaMemsetAsync(mDeviceKVCacheLengths.rawPointer(), 0, mDeviceKVCacheLengths.getMemoryCapacity(), stream));
 }
 
 LinearKVCache::~LinearKVCache()
