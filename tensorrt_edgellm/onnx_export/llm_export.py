@@ -119,7 +119,11 @@ def create_dummy_inputs(model: nn.Module, enable_reuse_kv_cache: bool,
     num_layers = model_config.num_hidden_layers
     num_heads = model_config.num_attention_heads
     num_kv_heads = model_config.num_key_value_heads
-    head_dim = hidden_size // num_heads
+    # Use head_dim from config if available, otherwise calculate from hidden_size
+    if hasattr(model_config, 'head_dim'):
+        head_dim = model_config.head_dim
+    else:
+        head_dim = hidden_size // num_heads
     max_position_embeddings = model_config.max_position_embeddings
 
     device = next(model.parameters()).device

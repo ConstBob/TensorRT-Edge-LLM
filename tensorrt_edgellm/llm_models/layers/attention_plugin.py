@@ -252,17 +252,18 @@ def attention_plugin(
     batch_size, seq_len, qkv_size = qkv.shape
     assert head_size * (
         num_q_heads + 2 * num_kv_heads
-    ) == qkv_size, "qkv_size should be equal to head_size * (num_q_heads + 2 * num_kv_heads)"
+    ) == qkv_size, f"qkv_size {qkv_size} should be equal to head_size * (num_q_heads + 2 * num_kv_heads) {head_size * (num_q_heads + 2 * num_kv_heads)}"
     assert past_key_value.shape[
-        0] == batch_size, "batch_size of kv_cache should be equal to batch_size of qkv"
-    assert past_key_value.shape[1] == 2, "kv_cache should have 2 tensors"
+        0] == batch_size, f"batch_size of kv_cache {past_key_value.shape[0]} should be equal to batch_size of qkv {batch_size}"
     assert past_key_value.shape[
-        2] == num_kv_heads, "num_kv_heads of kv_cache should be equal to num_kv_heads of qkv"
+        1] == 2, f"kv_cache {past_key_value.shape[1]} should have 2 tensors"
     assert past_key_value.shape[
-        4] == head_size, "head_size of kv_cache should be equal to head_size of qkv"
+        2] == num_kv_heads, f"num_kv_heads of kv_cache {past_key_value.shape[2]} should be equal to num_kv_heads of qkv {num_kv_heads}"
+    assert past_key_value.shape[
+        4] == head_size, f"head_size of kv_cache {past_key_value.shape[4]} should be equal to head_size of qkv {head_size}"
 
-    assert qkv.dtype == torch.float16, "qkv should be in float16"
-    assert past_key_value.dtype == torch.float16, "past_key_value should be in float16"
+    assert qkv.dtype == torch.float16, f"qkv {qkv.dtype} should be in float16"
+    assert past_key_value.dtype == torch.float16, f"past_key_value {past_key_value.dtype} should be in float16"
 
     # Dummy implementation for ONNX export, this is not used in the actual inference
     attn_output = torch.zeros(batch_size,

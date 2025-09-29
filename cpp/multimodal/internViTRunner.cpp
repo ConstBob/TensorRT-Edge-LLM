@@ -21,6 +21,7 @@
 #include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <tuple>
@@ -296,7 +297,6 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 {
     std::vector<half> patches;
     int64_t totalNumBlocks = 0;
-    int32_t totalImageTokens = 0;
 
     for (auto const& prompt : request.prompts)
     {
@@ -322,20 +322,6 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         numImages.emplace_back(numImage);
     }
 
-    // Calculate total image tokens for profiling (InternVL: each block generates 256 tokens)
-    totalImageTokens = static_cast<int32_t>(totalNumBlocks * 256);
-
-    // Record performance data (always count metrics regardless of profiler state)
-    int32_t actualImageCount = 0;
-    for (auto const& prompt : request.prompts)
-    {
-        actualImageCount += static_cast<int32_t>(prompt.imageBuffers.size());
-    }
-    if (actualImageCount > 0 && totalImageTokens > 0)
-    {
-        mMultimodalMetrics.recordRun(actualImageCount, totalImageTokens);
-    }
-
     if (totalNumBlocks == 0)
     {
         mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
@@ -349,10 +335,17 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
     }
 
+    // Calculate total image tokens for profiling (InternVL: each block generates 256 tokens)
+    int64_t totalImageTokens = totalNumBlocks * 256;
+
+    // Record performance data
+    int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), 0);
+    mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
+
     CUDA_CHECK(cudaMemcpyAsync(
         mVitInput.rawPointer(), patches.data(), patches.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
     mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
-    mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
+    mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
 }
 
 std::string InternViTRunner::applyChatTemplate(std::string const& inputString, int const& numImages,

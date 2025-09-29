@@ -199,15 +199,29 @@ class EdgeLLMAttention(nn.Module):
 
         # Apply Q, K, V projections
         query_states = self.q_proj(hidden_states)
-        if self.q_norm is not None:
-            query_states = self.q_norm(query_states)
         key_states = self.k_proj(hidden_states)
+
+        # Calculate shared shapes for normalization
+        if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
+
+        if self.q_norm is not None:
+            query_states = self.q_norm(
+                query_states.view(hidden_shape)).contiguous().view(
+                    bsz, q_len, -1)
         if self.k_norm is not None:
-            key_states = self.k_norm(key_states)
+            key_states = self.k_norm(
+                key_states.view(hidden_shape)).contiguous().view(
+                    bsz, q_len, -1)
 
         if self.qk_norm is not None:
-            query_states = self.qk_norm(query_states)
-            key_states = self.qk_norm(key_states)
+            query_states = self.qk_norm(
+                query_states.view(hidden_shape)).contiguous().view(
+                    bsz, q_len, -1)
+            key_states = self.qk_norm(
+                key_states.view(hidden_shape)).contiguous().view(
+                    bsz, q_len, -1)
 
         value_states = self.v_proj(hidden_states)
 
@@ -269,15 +283,29 @@ class EdgeLLMAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
-        if self.q_norm is not None:
-            query_states = self.q_norm(query_states)
         key_states = self.k_proj(hidden_states)
+
+        # Calculate shared shapes for normalization
+        if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
+
+        if self.q_norm is not None:
+            query_states = self.q_norm(
+                query_states.view(hidden_shape)).contiguous().view(
+                    bsz, q_len, -1)
         if self.k_norm is not None:
-            key_states = self.k_norm(key_states)
+            key_states = self.k_norm(
+                key_states.view(hidden_shape)).contiguous().view(
+                    bsz, q_len, -1)
 
         if self.qk_norm is not None:
-            query_states = self.qk_norm(query_states)
-            key_states = self.qk_norm(key_states)
+            query_states = self.qk_norm(
+                query_states.view(hidden_shape)).contiguous().view(
+                    bsz, q_len, -1)
+            key_states = self.qk_norm(
+                key_states.view(hidden_shape)).contiguous().view(
+                    bsz, q_len, -1)
 
         value_states = self.v_proj(hidden_states)
 
