@@ -107,22 +107,6 @@ float getGenerationAverageTimePerToken(metrics::LLMGenerationMetrics const& gene
     return 0.0f;
 }
 
-//! Utility function for calculating multimodal average time per image
-float getMultimodalAverageTimePerImage(metrics::MultimodalMetrics const& multimodalMetrics)
-{
-    auto timingData = gTimer.getTimingData(metrics::StageNames::kMULTIMODAL_PROCESSING);
-    if (!timingData || timingData->getTotalGpuTimeMs() <= 0.0f)
-    {
-        return 0.0f;
-    }
-
-    if (multimodalMetrics.totalImages > 0)
-    {
-        return timingData->getTotalGpuTimeMs() / multimodalMetrics.totalImages;
-    }
-    return 0.0f;
-}
-
 //! Utility function for calculating multimodal average time per token
 float getMultimodalAverageTimePerToken(metrics::MultimodalMetrics const& multimodalMetrics)
 {
@@ -212,7 +196,7 @@ void printSummary(metrics::LLMPrefillMetrics const& prefillMetrics,
     if (generationMetrics.getTotalRuns() > 0)
     {
         auto timingData = gTimer.getTimingData(metrics::StageNames::kLLM_GENERATION);
-        summary << "=== LLM Generation ===\n";
+        summary << "=== LLM Generation (Excluding sampling after prefill) ===\n";
         summary << "Total Runs: " << generationMetrics.getTotalRuns() << "\n";
         summary << "Generated Tokens: " << generationMetrics.generatedTokens << "\n";
         summary << "Tokens/Second: " << std::fixed << std::setprecision(1)
@@ -228,6 +212,12 @@ void printSummary(metrics::LLMPrefillMetrics const& prefillMetrics,
         }
         summary << "\n";
     }
+    else
+    {
+        summary << "=== LLM Generation (Excluding sampling after prefill) ===\n";
+        summary << "max_generate_length = 1, the model only runs the prefill stage.\n";
+        summary << "\n";
+    }
 
     // Multimodal metrics
     if (multimodalMetrics.getTotalRuns() > 0)
@@ -235,10 +225,7 @@ void printSummary(metrics::LLMPrefillMetrics const& prefillMetrics,
         auto timingData = gTimer.getTimingData(metrics::StageNames::kMULTIMODAL_PROCESSING);
         summary << "=== Multimodal Processing ===\n";
         summary << "Total Runs: " << multimodalMetrics.getTotalRuns() << "\n";
-        summary << "Total Images: " << multimodalMetrics.totalImages << "\n";
         summary << "Total Image Tokens: " << multimodalMetrics.totalImageTokens << "\n";
-        summary << "Average Time per Image: " << std::fixed << std::setprecision(2)
-                << getMultimodalAverageTimePerImage(multimodalMetrics) << " ms\n";
         summary << "Average Time per Token: " << std::fixed << std::setprecision(4)
                 << getMultimodalAverageTimePerToken(multimodalMetrics) << " ms\n";
         if (timingData)
@@ -306,9 +293,7 @@ std::string getJsonSummary(metrics::LLMPrefillMetrics const& prefillMetrics,
         }
         else if (stageId == metrics::StageNames::kMULTIMODAL_PROCESSING)
         {
-            stageJson["total_images"] = multimodalMetrics.totalImages;
             stageJson["total_image_tokens"] = multimodalMetrics.totalImageTokens;
-            stageJson["average_time_per_image_ms"] = getMultimodalAverageTimePerImage(multimodalMetrics);
             stageJson["average_time_per_token_ms"] = getMultimodalAverageTimePerToken(multimodalMetrics);
         }
 

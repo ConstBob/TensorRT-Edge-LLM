@@ -24,6 +24,8 @@
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
+#include <iomanip>
+#include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <tuple>
@@ -44,6 +46,7 @@ struct LLMInferenceArgs
     bool debug{false};
     bool dumpProfile{false};
     int32_t warmup{0};
+    bool dumpOutput{false};
 };
 
 void printUsage(char const* programName)
@@ -51,7 +54,8 @@ void printUsage(char const* programName)
     std::cerr << "Usage: " << programName
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
-                 "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug]"
+                 "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
+                 "[--dumpOutput]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
@@ -62,6 +66,7 @@ void printUsage(char const* programName)
     std::cerr << "  --profileOutputFile       Path to profile JSON output file (optional)" << std::endl;
     std::cerr << "  --warmup                  Number of warmup runs using the first request (default: 0)" << std::endl;
     std::cerr << "  --debug                   Enable debug logging" << std::endl;
+    std::cerr << "  --dumpOutput              Dump inference output to console" << std::endl;
 }
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
@@ -69,7 +74,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, 901},
         {"engineDir", required_argument, 0, 902}, {"multimodalEngineDir", required_argument, 0, 903},
         {"outputFile", required_argument, 0, 904}, {"debug", no_argument, 0, 905}, {"dumpProfile", no_argument, 0, 906},
-        {"profileOutputFile", required_argument, 0, 907}, {"warmup", required_argument, 0, 908}, {0, 0, 0, 0}};
+        {"profileOutputFile", required_argument, 0, 907}, {"warmup", required_argument, 0, 908},
+        {"dumpOutput", no_argument, 0, 909}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -99,6 +105,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case 909: args.dumpOutput = true; break;
         default: return false;
         }
     }
@@ -120,9 +127,16 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("args.multimodalEngineDir: %s", args.multimodalEngineDir.c_str());
     }
 
-    if (!args.outputFile.empty())
+    if (args.outputFile.empty())
     {
-        LOG_INFO("args.outputFile: %s", args.outputFile.c_str());
+        LOG_ERROR("ERROR: --outputFile is required");
+        return false;
+    }
+    LOG_INFO("args.outputFile: %s", args.outputFile.c_str());
+
+    if (args.dumpOutput)
+    {
+        LOG_INFO("args.dumpOutput: enabled");
     }
 
     if (!args.profileOutputFile.empty())
@@ -294,7 +308,6 @@ int main(int argc, char* argv[])
     }
 
     auto pluginHandles = loadEdgellmPluginLib();
-    gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     // load input file and parse to requests
     std::unordered_map<std::string, std::string> loraWeightsMap;
     std::vector<rt::LLMGenerationRequest> requests;
@@ -376,59 +389,71 @@ int main(int argc, char* argv[])
     outputData["input_file"] = args.inputFile;
     outputData["responses"] = nlohmann::json::array();
 
-    // Process each request
+    bool hasFailedRequest = false;
+    std::string errorMessage = "TensorRT Edge LLM cannot handle this request. Fails.";
+    size_t failedCount = 0;
+
+    // Process each request with progress indication
+    LOG_INFO("Processing %zu requests...", requests.size());
     for (size_t requestIdx = 0; requestIdx < requests.size(); ++requestIdx)
     {
         auto& request = requests[requestIdx];
         rt::LLMGenerationResponse response;
 
-        if (llmInferenceRuntime->handleRequest(request, response, stream))
+        // Show progress every 10% or every 100 requests, whichever is smaller
+        size_t progressInterval = std::max(size_t(1), std::min(requests.size() / 10, size_t(100)));
+        if ((requestIdx + 1) % progressInterval == 0 || requestIdx == 0 || requestIdx == requests.size() - 1)
         {
-            LOG_INFO("Generation finished for request %zu.", requestIdx);
+            LOG_INFO("Progress: %zu/%zu (%f%%)", requestIdx + 1, requests.size(),
+                100.0 * (requestIdx + 1) / requests.size());
+        }
 
-            // Display responses for each batch in the request
-            for (size_t batchIdx = 0; batchIdx < response.outputTexts.size(); ++batchIdx)
+        bool requestStatus = llmInferenceRuntime->handleRequest(request, response, stream);
+
+        if (requestStatus)
+        {
+            // Display inference output to console if --dumpOutput is enabled
+            if (args.dumpOutput)
             {
-                LOG_INFO("Response for request %zu batch %zu:\n%s", requestIdx, batchIdx,
-                    response.outputTexts[batchIdx].c_str());
-
-                nlohmann::json responseJson;
-                responseJson["system_prompt"] = request.prompts[batchIdx].systemPrompt;
-                responseJson["user_prompt"] = request.prompts[batchIdx].userPrompt;
-                responseJson["output_text"] = response.outputTexts[batchIdx];
-                outputData["responses"].push_back(responseJson);
+                for (size_t batchIdx = 0; batchIdx < response.outputTexts.size(); ++batchIdx)
+                {
+                    LOG_INFO("Response for request %zu batch %zu: %s", requestIdx, batchIdx,
+                        response.outputTexts[batchIdx].c_str());
+                }
             }
         }
         else
         {
-            LOG_ERROR("Generation failed for request %zu.", requestIdx);
-            return EXIT_FAILURE;
+            // Handle failed request - highlight failures
+            hasFailedRequest = true;
+            failedCount++;
+            LOG_ERROR("*** FAILED *** Request %zu failed to process!", requestIdx);
         }
-    }
 
-    // Export to JSON file if outputFile is provided
-    if (!args.outputFile.empty())
-    {
-        try
+        // Add to JSON output
+        for (size_t batchIdx = 0; batchIdx < request.prompts.size(); ++batchIdx)
         {
-            std::ofstream outputFile(args.outputFile);
-            if (outputFile.is_open())
+            nlohmann::json responseJson;
+            if (requestStatus)
             {
-                outputFile << outputData.dump(4); // Pretty print with 4 spaces indentation
-                outputFile.close();
-                LOG_INFO("All responses exported to: %s", args.outputFile.c_str());
+                responseJson["output_text"] = response.outputTexts[batchIdx];
             }
             else
             {
-                LOG_ERROR("Failed to open output file: %s", args.outputFile.c_str());
-                return EXIT_FAILURE;
+                responseJson["output_text"] = errorMessage;
             }
+            responseJson["request_idx"] = requestIdx;
+            responseJson["system_prompt"] = request.prompts[batchIdx].systemPrompt;
+            responseJson["user_prompt"] = request.prompts[batchIdx].userPrompt;
+            outputData["responses"].push_back(responseJson);
         }
-        catch (std::exception const& e)
-        {
-            LOG_ERROR("Failed to write output file: %s", e.what());
-            return EXIT_FAILURE;
-        }
+    }
+
+    // Final processing summary
+    LOG_INFO("Processing complete: %zu/%zu requests successful", requests.size() - failedCount, requests.size());
+    if (failedCount > 0)
+    {
+        LOG_ERROR("*** %zu REQUESTS FAILED ***", failedCount);
     }
 
     // Stop timing after all benchmark runs complete
@@ -477,5 +502,28 @@ int main(int argc, char* argv[])
         }
     }
 
-    return EXIT_SUCCESS;
+    // Export to JSON file
+    try
+    {
+        std::ofstream outputFile(args.outputFile);
+        if (outputFile.is_open())
+        {
+            outputFile << outputData.dump(4); // Pretty print with 4 spaces indentation
+            outputFile.close();
+            LOG_INFO("All responses exported to: %s", args.outputFile.c_str());
+        }
+        else
+        {
+            LOG_ERROR("Failed to open output file: %s", args.outputFile.c_str());
+            return EXIT_FAILURE;
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to write output file: %s", e.what());
+        return EXIT_FAILURE;
+    }
+
+    // Return false if any request failed
+    return hasFailedRequest ? EXIT_FAILURE : EXIT_SUCCESS;
 }

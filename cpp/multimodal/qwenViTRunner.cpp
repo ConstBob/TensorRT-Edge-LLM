@@ -21,6 +21,7 @@
 #include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <tuple>
@@ -442,8 +443,6 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     std::vector<half> patches;
     int64_t totalSeqLength = 0;
 
-    int32_t totalImageTokens = 0;
-
     for (auto const& prompt : request.prompts)
     {
         int64_t numImage = 0;
@@ -463,23 +462,6 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
             ++numImage;
         }
         numImages.emplace_back(numImage);
-    }
-
-    // Calculate total image tokens for profiling
-    for (auto const& tokenLength : imageTokenLengths)
-    {
-        totalImageTokens += static_cast<int32_t>(tokenLength);
-    }
-
-    // Record performance data (always count metrics regardless of profiler state)
-    int32_t imageCount = 0;
-    for (auto const& prompt : request.prompts)
-    {
-        imageCount += static_cast<int32_t>(prompt.imageBuffers.size());
-    }
-    if (imageCount > 0 && totalImageTokens > 0)
-    {
-        mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
     }
 
     if (totalSeqLength == 0)
@@ -517,11 +499,18 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     std::vector<float> rotaryPosEmb;
     computeRotaryPosEmb(imageGridTHWs, rotaryPosEmb);
 
+    // Calculate total image tokens for profiling. We need to do this because this is the only way to get the total
+    // number of images.
+    int64_t totalImageTokens = totalSeqLength / 4;
+    // Record performance data
+    int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), 0);
+    mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
+
     // Copy to device
     mVitInput.reshape({totalSeqLength, mConfig.inputDim});
     mAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
     mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim});
-    mOutputEmbedding.reshape({totalSeqLength / 4, mConfig.outHiddenSize});
+    mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
 
     CUDA_CHECK(cudaMemcpyAsync(
         mVitInput.rawPointer(), patches.data(), patches.size() * sizeof(half), cudaMemcpyHostToDevice, stream));

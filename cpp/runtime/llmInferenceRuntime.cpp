@@ -400,13 +400,17 @@ bool LLMInferenceRuntime::handleRequest(
         }
     }
 
-    // Record generation and sampling metrics (always count metrics regardless of profiler state)
+    // Record generation and sampling metrics
     int32_t totalGeneratedTokens = 0;
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        totalGeneratedTokens += static_cast<int32_t>(outputIds[i].size());
+        totalGeneratedTokens += static_cast<int32_t>(outputIds[i].size() - 1);
     }
-    mGenerationMetrics.recordRun(totalGeneratedTokens);
+
+    if (totalGeneratedTokens > 0)
+    {
+        mGenerationMetrics.recordRun(totalGeneratedTokens);
+    }
 
     // Clean the response field and fill the generated outputIds and decoded texts.
     response.outputIds.clear();
@@ -499,7 +503,7 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     size_t const promptHash = hashSystemPromptWithLoraWeights(prompt, loraWeightsName);
     if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
     {
-        LOG_INFO(
+        LOG_DEBUG(
             "LLMInferenceRuntime(): The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
         return true;
     }
