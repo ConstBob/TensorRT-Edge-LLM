@@ -17,6 +17,7 @@
 
 #include "qwenViTRunner.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
+#include "profiling/timer.h"
 #include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -441,6 +442,8 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     std::vector<half> patches;
     int64_t totalSeqLength = 0;
 
+    int32_t totalImageTokens = 0;
+
     for (auto const& prompt : request.prompts)
     {
         int64_t numImage = 0;
@@ -460,6 +463,23 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
             ++numImage;
         }
         numImages.emplace_back(numImage);
+    }
+
+    // Calculate total image tokens for profiling
+    for (auto const& tokenLength : imageTokenLengths)
+    {
+        totalImageTokens += static_cast<int32_t>(tokenLength);
+    }
+
+    // Record performance data (always count metrics regardless of profiler state)
+    int32_t imageCount = 0;
+    for (auto const& prompt : request.prompts)
+    {
+        imageCount += static_cast<int32_t>(prompt.imageBuffers.size());
+    }
+    if (imageCount > 0 && totalImageTokens > 0)
+    {
+        mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
     }
 
     if (totalSeqLength == 0)
@@ -907,32 +927,38 @@ bool QwenViTRunner::infer(cudaStream_t stream)
         return true;
     }
 
-    bool setEngineIOStatus{true};
-    setEngineIOStatus &= mContext->setInputShape("input", mVitInput.getShape().getTRTDims());
-    setEngineIOStatus &= mContext->setInputShape("attention_mask", mAttentionMask.getShape().getTRTDims());
-    setEngineIOStatus &= mContext->setInputShape("rotary_pos_emb", mRotaryPosEmb.getShape().getTRTDims());
-    if (mModelType == "qwen2_5_vl")
+    // Profile ViT inference with automatic cleanup
     {
-        setEngineIOStatus
-            &= mContext->setInputShape("window_attention_mask", mWindowAttentionMask.getShape().getTRTDims());
-        setEngineIOStatus &= mContext->setInputShape("window_index", mWindowIndex.getShape().getTRTDims());
-        setEngineIOStatus
-            &= mContext->setInputShape("reverse_window_index", mReverseWindowIndex.getShape().getTRTDims());
+        TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
+
+        bool setEngineIOStatus{true};
+        setEngineIOStatus &= mContext->setInputShape("input", mVitInput.getShape().getTRTDims());
+        setEngineIOStatus &= mContext->setInputShape("attention_mask", mAttentionMask.getShape().getTRTDims());
+        setEngineIOStatus &= mContext->setInputShape("rotary_pos_emb", mRotaryPosEmb.getShape().getTRTDims());
+        if (mModelType == "qwen2_5_vl")
+        {
+            setEngineIOStatus
+                &= mContext->setInputShape("window_attention_mask", mWindowAttentionMask.getShape().getTRTDims());
+            setEngineIOStatus &= mContext->setInputShape("window_index", mWindowIndex.getShape().getTRTDims());
+            setEngineIOStatus
+                &= mContext->setInputShape("reverse_window_index", mReverseWindowIndex.getShape().getTRTDims());
+        }
+
+        if (!setEngineIOStatus)
+        {
+            LOG_ERROR("QwenViTRunner::infer(): Failed to bind engine input tensors.");
+            return false;
+        }
+
+        bool enqueueStatus = mContext->enqueueV3(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (!enqueueStatus)
+        {
+            LOG_ERROR("QwenViTRunner::infer(): Failed to enqueue engine.");
+            return false;
+        }
     }
 
-    if (!setEngineIOStatus)
-    {
-        LOG_ERROR("QwenViTRunner::infer(): Failed to bind engine input tensors.");
-        return false;
-    }
-
-    bool enqueueStatus = mContext->enqueueV3(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (!enqueueStatus)
-    {
-        LOG_ERROR("QwenViTRunner::infer(): Failed to enqueue engine.");
-        return false;
-    }
     return true;
 }
 

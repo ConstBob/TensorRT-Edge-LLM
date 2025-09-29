@@ -16,6 +16,8 @@
  */
 
 #include "internViTRunner.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
 #include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -294,6 +296,7 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 {
     std::vector<half> patches;
     int64_t totalNumBlocks = 0;
+    int32_t totalImageTokens = 0;
 
     for (auto const& prompt : request.prompts)
     {
@@ -317,6 +320,20 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             }
         }
         numImages.emplace_back(numImage);
+    }
+
+    // Calculate total image tokens for profiling (InternVL: each block generates 256 tokens)
+    totalImageTokens = static_cast<int32_t>(totalNumBlocks * 256);
+
+    // Record performance data (always count metrics regardless of profiler state)
+    int32_t actualImageCount = 0;
+    for (auto const& prompt : request.prompts)
+    {
+        actualImageCount += static_cast<int32_t>(prompt.imageBuffers.size());
+    }
+    if (actualImageCount > 0 && totalImageTokens > 0)
+    {
+        mMultimodalMetrics.recordRun(actualImageCount, totalImageTokens);
     }
 
     if (totalNumBlocks == 0)
@@ -521,21 +538,27 @@ bool InternViTRunner::infer(cudaStream_t stream)
         return true;
     }
 
-    bool setEngineIOStatus{true};
-    setEngineIOStatus &= mContext->setInputShape("input", mVitInput.getShape().getTRTDims());
-    if (!setEngineIOStatus)
+    // Profile ViT inference with automatic cleanup
     {
-        LOG_ERROR("InternViTRunner::infer(): Failed to bind engine input tensors.");
-        return false;
+        TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
+
+        bool setEngineIOStatus{true};
+        setEngineIOStatus &= mContext->setInputShape("input", mVitInput.getShape().getTRTDims());
+        if (!setEngineIOStatus)
+        {
+            LOG_ERROR("InternViTRunner::infer(): Failed to bind engine input tensors.");
+            return false;
+        }
+
+        bool enqueueStatus = mContext->enqueueV3(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (!enqueueStatus)
+        {
+            LOG_ERROR("InternViTRunner::infer(): Failed to enqueue engine.");
+            return false;
+        }
     }
 
-    bool enqueueStatus = mContext->enqueueV3(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (!enqueueStatus)
-    {
-        LOG_ERROR("InternViTRunner::infer(): Failed to enqueue engine.");
-        return false;
-    }
     return true;
 }
 

@@ -19,6 +19,8 @@
 #include "common/mmapReader.h"
 #include "multimodal/internViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>

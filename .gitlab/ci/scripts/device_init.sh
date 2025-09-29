@@ -1,15 +1,16 @@
 #!/bin/bash
 set -e
-echo "Setting up device environment"
+echo "Setting up device environment on $HOME directory"
 tensorrt_edge_llm_folder="$HOME/tensorrt-edge-llm"
 board_password={BOARDPASSWORD}
 
+export DEBIAN_FRONTEND=noninteractive
 # clean up the home directory
 echo $board_password | sudo -S rm -rf "$HOME/*"
-
+ls $HOME
 mkdir -p $tensorrt_edge_llm_folder
-
-export DEBIAN_FRONTEND=noninteractive
+ls $HOME
+ls $tensorrt_edge_llm_folder
 echo $board_password | sudo -S apt update -qq >/dev/null 2>&1
 echo $board_password | sudo -S apt install -y -qq python3 python3-pip git curl nfs-common cmake >/dev/null 2>&1
 
