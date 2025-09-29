@@ -20,7 +20,6 @@ struct LLMBuilderConfig {
     int64_t maxImageTokens{1024};       //!< Max image tokens (VLM only)
     bool eagleDraft{false};             //!< Whether this is an Eagle draft model
     bool eagleBase{false};              //!< Whether this is an Eagle base model
-    bool eagle2{false};                 //!< Use Eagle2 (default is Eagle3)
     int64_t maxBatchSize{4};            //!< Maximum batch size
     int64_t maxLoraRank{0};             //!< Maximum LoRA rank (0 = no LoRA)
     int64_t maxSeqLen{4096};            //!< Maximum sequence length
@@ -88,7 +87,6 @@ if (!builder.build()) {
 ```cpp
 LLMBuilderConfig config;
 config.eagleDraft = true;
-config.eagle2 = true;
 config.maxInputLen = 512;
 config.maxBatchSize = 4;
 config.maxSeqLen = 2048;
@@ -126,7 +124,7 @@ builder.build();
 
 ### LLM Models
 - Standard Transformer LLMs
-- Eagle2 and Eagle3 (draft/base)
+- Eagle3 (draft/base)
 - Vision-Language Models (VLM)
 - LoRA-enabled models
 

@@ -237,7 +237,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
     {
         // Define required fields for main config
         std::vector<std::string> const requiredConfigFields = {"num_hidden_layers", "num_key_value_heads", "head_dim",
-            "vocab_size", "partial_rotary_factor", "builder_config"};
+            "vocab_size", "partial_rotary_factor", "builder_config", "enable_reuse_kv_cache"};
 
         // Validate required fields exist in main config
         for (auto const& field : requiredConfigFields)
@@ -253,7 +253,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_batch_size", "max_input_len", "max_seq_len", "max_lora_rank", "enable_reuse_kvcache"};
+            = {"max_batch_size", "max_input_len", "max_seq_len", "max_lora_rank"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -275,7 +275,8 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
 
-        mConfig.enableReuseKVCache = builderConfig["enable_reuse_kvcache"].get<bool>();
+        mConfig.enableReuseKVCache = configJson["enable_reuse_kv_cache"].get<bool>();
+
         mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
         mConfig.minSupportedInputLength = 1; // TODO: Change this to min input length
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();

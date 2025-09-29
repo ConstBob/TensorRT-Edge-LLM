@@ -362,7 +362,8 @@ class Eagle3DraftModel(nn.Module):
                     assert base_model_dir is not None, "Base model directory is required to load embedding weights"
                     key_candidates = [
                         "embed_tokens.weight", "model.embed_tokens.weight",
-                        "model.language_model.embed_tokens.weight"
+                        "model.language_model.embed_tokens.weight",
+                        "language_model.model.embed_tokens.weight"
                     ]
                     embed_tokens_weight = load_tensor_by_candidate_keys(
                         base_model_dir, key_candidates, device)

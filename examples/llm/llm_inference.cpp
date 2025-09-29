@@ -306,7 +306,6 @@ int main(int argc, char* argv[])
         printUsage(argv[0]);
         return 1;
     }
-
     auto pluginHandles = loadEdgellmPluginLib();
     // load input file and parse to requests
     std::unordered_map<std::string, std::string> loraWeightsMap;

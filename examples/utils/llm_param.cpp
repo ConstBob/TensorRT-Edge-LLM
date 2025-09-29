@@ -199,7 +199,6 @@ void printEagleOptions()
     std::cerr << "  --baseModelDir        Provide the base model directory path. Required for Eagle mode." << std::endl;
     std::cerr << "  --draftModelDir       Provide the draft model directory path. Required for Eagle mode."
               << std::endl;
-    std::cerr << "  --isEagle3            Use Eagle3 mode. Default is Eagle2." << std::endl;
     std::cerr
         << "  --maxDecodingTokens   Provide the maximum decoding tokens for target model, the number provided must "
            "be aligned with building phase. Optional, default = 60"

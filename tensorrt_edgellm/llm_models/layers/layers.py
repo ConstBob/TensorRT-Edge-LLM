@@ -436,22 +436,24 @@ class EdgeLLMDecoderLayer(nn.Module):
                 attention_module = LlamaAttention(config, index)
                 self.mlp = LlamaMLP(config)
 
-            self.self_attn = EdgeLLMAttention(attention_module,
-                                              eagle3_draft=eagle3_draft)
+            self.self_attn = EdgeLLMAttention(
+                attention_module,
+                eagle3_draft=eagle3_draft,
+                enable_reuse_kv_cache=enable_reuse_kv_cache)
             if eagle3_draft:
                 # Double the input dimension for the attention module
                 self.self_attn.q_proj = nn.Linear(
                     attention_module.q_proj.in_features * 2,
                     attention_module.q_proj.out_features,
-                    bias=attention_module.q_proj.bias)
+                    bias=attention_module.q_proj.bias is not None)
                 self.self_attn.k_proj = nn.Linear(
                     attention_module.k_proj.in_features * 2,
                     attention_module.k_proj.out_features,
-                    bias=attention_module.k_proj.bias)
+                    bias=attention_module.k_proj.bias is not None)
                 self.self_attn.v_proj = nn.Linear(
                     attention_module.v_proj.in_features * 2,
                     attention_module.v_proj.out_features,
-                    bias=attention_module.v_proj.bias)
+                    bias=attention_module.v_proj.bias is not None)
 
     def forward(
         self,

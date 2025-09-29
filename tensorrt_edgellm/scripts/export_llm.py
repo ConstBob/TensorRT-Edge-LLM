@@ -80,6 +80,11 @@ def main() -> None:
 
     try:
         # Export model(s)
+        if args.is_eagle_base:
+            print(
+                "Exporting the EAGLE base model, KV Cache reuse is disabled.")
+            args.enable_reuse_kv_cache = False
+
         export_llm_model(model_dir=args.model_dir,
                          output_dir=args.output_dir,
                          max_position_embeddings=args.max_position_embeddings,

@@ -49,8 +49,15 @@ tensorrt-edgellm-export-llm \
 tensorrt-edgellm-export-draft \
   --base_model_dir /path/to/base_model \
   --draft_model_dir /path/to/draft_model \
-  --output_dir /path/to/output 
+  --output_dir /path/to/output \
+  [--use_prompt_tuning] # Optional: Uncomment this line for VLM
 ```
+
+**NOTE for Draft Model Export:** 
+1. Please ensure that your draft model weights are compatible with the specified model_type. For example, a Qwen model's `self_attn.q_proj` layer is expected to have a `bias`. If you are using a non-standard architecture (i.e., not from the official Hugging Face transformers library), you must verify that the code is compatible with your model. If not, you will need to adapt it.
+
+2. The `model_type` in the model's `config.json` should be a supported architecture, such as `llama` or `qwen2`. Specify only the core LLM architecture; support for VLM is enabled by adding the `--use_prompt_tuning` flag.
+
 
 ### Visual Model Export
 

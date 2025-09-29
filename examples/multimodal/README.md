@@ -147,7 +147,6 @@ For EAGLE VLM, build separate base and draft LLM engines plus visual engine:
 **Notes:**
 - `--maxSeqLen` must be greater than `--maxInputLen`
 - `maxSeqLen` must match the `kv_cache_capacity` field in the ONNX `AttentionPlugin` node
-- For EAGLE2 models, remove the `--isEagle3` flag
 
 ## Required Folder Structure
 

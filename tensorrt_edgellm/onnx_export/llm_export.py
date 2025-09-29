@@ -476,7 +476,8 @@ def export_llm_model(model_dir: str,
 
     # Save model configuration
     model_type = 'eagle3_base' if is_eagle_base else 'llm'
-    model_config = export_llm_config(model.config, model_type)
+    model_config = export_llm_config(model.config, model_type,
+                                     enable_reuse_kv_cache)
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, 'w') as f:
         json.dump(model_config, f, indent=2)
