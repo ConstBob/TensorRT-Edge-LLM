@@ -27,6 +27,7 @@ repos:
             (?x)^(
                 .*cubin.cpp$ |
                 .*_cubin.h |
+                kernelSrcs/xqa/.* |
                 3rdParty/.*
             )$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
