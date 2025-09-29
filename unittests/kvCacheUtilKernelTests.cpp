@@ -35,8 +35,10 @@ struct KVCacheParameters
 
 void TestKVCacheCopyWithTensor(KVCacheParameters const& cacheParams, int32_t copyBatchIdx, int32_t copySequenceLen)
 {
+    cudaStream_t stream{nullptr};
     rt::LinearKVCache kvCache(rt::LinearKVCache::CacheConfig{cacheParams.numDecoderLayers, cacheParams.maxBatchSize,
-        cacheParams.maxSequenceLength, cacheParams.numKVHead, cacheParams.headDim});
+                                  cacheParams.maxSequenceLength, cacheParams.numKVHead, cacheParams.headDim},
+        stream);
     rt::Tensor cacheTensor
         = rt::Tensor({cacheParams.numDecoderLayers, 2, cacheParams.numKVHead, copySequenceLen, cacheParams.headDim},
             rt::DeviceType::kGPU, DataType::kHALF);
@@ -52,7 +54,6 @@ void TestKVCacheCopyWithTensor(KVCacheParameters const& cacheParams, int32_t cop
 
     // Perform the copy from tensor to Cache and pull the data back to host.
     std::vector<half> kvCacheBufferHost(kvCacheBuffer.getShape().volume(), 0.0f);
-    cudaStream_t stream{nullptr};
     kernel::instantiateKVCacheFromTensor(kvCacheBuffer, cacheTensor, copyBatchIdx, stream);
     CUDA_CHECK(cudaMemcpyAsync(kvCacheBufferHost.data(), kvCacheBuffer.rawPointer(), kvCacheBuffer.getMemoryCapacity(),
         cudaMemcpyDeviceToHost, stream));
