@@ -1,4 +1,8 @@
-# Generating FMHA v2 cubin
+# FMHA_v2
+
+This document outlines the process for generating the pre-compiled FMHA_V2 CUDA kernel binaries (`.cubin` files) and how to run the associated unit tests.
+
+## 1. Generating Kernel Binaries (CUBINs)
 
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
@@ -8,8 +12,11 @@ git apply gen_fmha_cubin.patch
 cd cpp/kernels/fmha_v2
 ```
 
-## Generate cubin for SM 80/86/87/89/101 with CUDA 12.8
+### 1.1. Generate cubins for SM 80, 86, 87, 89, 101
 
+These architectures can be compiled with a **CUDA 12.8** Toolkit.
+
+**Steps:**
 ```bash
 # 1) Generate the arch–specific .cu sources & headers
 export GENERATE_EDGE_LLM=1 GENERATE_CUBIN=1 
@@ -23,7 +30,13 @@ mv generated generated_cuda128
 ```
 ---
 
-## Generate cubin for SM 120 / 121 with CUDA 12.9
+### 1.2. Generate cubins for SM 120, 121
+
+These newer architectures require a more recent **CUDA 12.9** or higher Toolkit.
+
+**Steps:**
+
+1.  **Generate SM 12x CUBINs:**
 
 ```bash
 export GENERATE_EDGE_LLM=1 GENERATE_CUBIN=1 ENABLE_SM12X=1 
@@ -37,6 +50,11 @@ make cubin_demobert -j$(nproc)
 # 3) Avoid overwrite
 mv generated generated_cuda129
 ```
+
+2.  **Merge the new CUBIN files:**
+
+Merge the `generated_cuda128` and `generated_cuda129` dirs into a single cubin dir, located at `cpp/kernels/contextAttentionKernels/cubin`.
+
 
 ## Kernel Unit Test
 ```bash
