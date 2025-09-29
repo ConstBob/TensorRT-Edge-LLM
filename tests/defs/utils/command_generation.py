@@ -200,7 +200,7 @@ def generate_inference_commands(
     cmd.extend([
         f"--engineDir={config.get_llm_engine_dir()}",
         f"--inputFile={config.get_test_case_file()}",
-        f"--outputFile={config.get_output_json_file()}"
+        f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
 
     if config.model_type == ModelType.VLM:

@@ -16,6 +16,9 @@
  */
 
 #include "common/trtUtils.h"
+#include "memoryMonitor.h"
+#include "profileFormatter.h"
+#include "profiling/timer.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <filesystem>
@@ -37,28 +40,36 @@ struct LLMInferenceArgs
     std::string multimodalEngineDir{""};
     std::string inputFile;
     std::string outputFile{""};
+    std::string profileOutputFile{""};
     bool debug{false};
+    bool dumpProfile{false};
+    int32_t warmup{0};
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
-                 "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] [--debug]"
+                 "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
+                 "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  --inputFile     " << std::endl;
-    std::cerr << "  --engineDir     " << std::endl;
-    std::cerr << "  --multimodalEngineDir     " << std::endl;
-    std::cerr << "  --outputFile     " << std::endl;
-    std::cerr << "  --debug     " << std::endl;
+    std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
+    std::cerr << "  --engineDir               Path to engine directory" << std::endl;
+    std::cerr << "  --multimodalEngineDir     Path to multimodal engine directory (optional)" << std::endl;
+    std::cerr << "  --outputFile              Path to output JSON file (optional)" << std::endl;
+    std::cerr << "  --dumpProfile             Dump profiling summary to console" << std::endl;
+    std::cerr << "  --profileOutputFile       Path to profile JSON output file (optional)" << std::endl;
+    std::cerr << "  --warmup                  Number of warmup runs using the first request (default: 0)" << std::endl;
+    std::cerr << "  --debug                   Enable debug logging" << std::endl;
 }
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
     static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, 901},
         {"engineDir", required_argument, 0, 902}, {"multimodalEngineDir", required_argument, 0, 903},
-        {"outputFile", required_argument, 0, 904}, {"debug", no_argument, 0, 905}, {0, 0, 0, 0}};
+        {"outputFile", required_argument, 0, 904}, {"debug", no_argument, 0, 905}, {"dumpProfile", no_argument, 0, 906},
+        {"profileOutputFile", required_argument, 0, 907}, {"warmup", required_argument, 0, 908}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -70,6 +81,24 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         case 903: args.multimodalEngineDir = optarg; break;
         case 904: args.outputFile = optarg; break;
         case 905: args.debug = true; break;
+        case 906: args.dumpProfile = true; break;
+        case 907: args.profileOutputFile = optarg; break;
+        case 908:
+            try
+            {
+                args.warmup = std::stoi(optarg);
+                if (args.warmup < 0)
+                {
+                    LOG_ERROR("Invalid warmup value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid warmup value: %s", optarg);
+                return false;
+            }
+            break;
         default: return false;
         }
     }
@@ -94,6 +123,21 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     if (!args.outputFile.empty())
     {
         LOG_INFO("args.outputFile: %s", args.outputFile.c_str());
+    }
+
+    if (!args.profileOutputFile.empty())
+    {
+        LOG_INFO("args.profileOutputFile: %s", args.profileOutputFile.c_str());
+    }
+
+    if (args.dumpProfile)
+    {
+        LOG_INFO("Profile dumping to console is enabled");
+    }
+
+    if (args.warmup > 0)
+    {
+        LOG_INFO("Warmup runs: %d", args.warmup);
     }
 
     if (args.debug)
@@ -271,6 +315,8 @@ int main(int argc, char* argv[])
         LOG_ERROR("No valid requests found in input file.");
         return EXIT_FAILURE;
     }
+    bool profilerEnabled = args.dumpProfile;
+    MemoryMonitor memoryMonitor;
 
     std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
     cudaStream_t stream;
@@ -295,6 +341,34 @@ int main(int argc, char* argv[])
         {
             LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
         }
+    }
+
+    // Perform warmup runs if requested
+    if (args.warmup > 0)
+    {
+        // Stop profiling for warmup runs
+        gTimer.stopTiming();
+        LOG_INFO("Starting warmup with %d runs using the first request...", args.warmup);
+        auto& firstRequest = requests[0];
+
+        for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
+        {
+            rt::LLMGenerationResponse warmupResponse;
+            if (!llmInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream))
+            {
+                LOG_ERROR("Warmup run %d/%d failed", warmupRun + 1, args.warmup);
+                return EXIT_FAILURE;
+            }
+        }
+        LOG_INFO("Warmup of %d runs completed. Starting actual benchmark runs...", args.warmup);
+    }
+
+    if (profilerEnabled)
+    {
+        // Start profiling for actual runs
+        gTimer.startTiming();
+        // Start memory monitoring for examples
+        memoryMonitor.start();
     }
 
     // Structure to collect all responses for JSON export
@@ -357,5 +431,51 @@ int main(int argc, char* argv[])
         }
     }
 
-    return 0;
+    // Stop timing after all benchmark runs complete
+    // Pending timings are automatically calculated when stopTiming() is called
+    if (profilerEnabled)
+    {
+        gTimer.stopTiming();
+        // Stop memory monitoring for examples
+        memoryMonitor.stop();
+    }
+
+    // Dump profile summary to console
+    size_t peakMemoryBytes = profilerEnabled ? memoryMonitor.getPeakMemory() : 0;
+    if (args.dumpProfile)
+    {
+        auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
+        printSummary(llmInferenceRuntime->getPrefillMetrics(), llmInferenceRuntime->getGenerationMetrics(),
+            multimodalMetrics, peakMemoryBytes);
+    }
+
+    // Export profile to JSON file
+    if (!args.profileOutputFile.empty())
+    {
+        try
+        {
+            auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
+            std::string profileJson = getJsonSummary(llmInferenceRuntime->getPrefillMetrics(),
+                llmInferenceRuntime->getGenerationMetrics(), multimodalMetrics, peakMemoryBytes);
+            std::ofstream profileFile(args.profileOutputFile);
+            if (profileFile.is_open())
+            {
+                profileFile << profileJson;
+                profileFile.close();
+                LOG_INFO("Profile data exported to: %s", args.profileOutputFile.c_str());
+            }
+            else
+            {
+                LOG_ERROR("Failed to open profile output file: %s", args.profileOutputFile.c_str());
+                return EXIT_FAILURE;
+            }
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to write profile output file: %s", e.what());
+            return EXIT_FAILURE;
+        }
+    }
+
+    return EXIT_SUCCESS;
 }

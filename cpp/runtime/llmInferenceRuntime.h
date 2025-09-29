@@ -18,9 +18,12 @@
 #pragma once
 
 #include "multimodal/multimodalRunner.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -57,7 +60,35 @@ public:
     bool genAndSaveSystemPromptKVCache(
         std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream);
 
+    //! Get LLM prefill stage metrics
+    metrics::LLMPrefillMetrics const& getPrefillMetrics() const
+    {
+        return mPrefillMetrics;
+    }
+
+    //! Get LLM generation stage metrics
+    metrics::LLMGenerationMetrics const& getGenerationMetrics() const
+    {
+        return mGenerationMetrics;
+    }
+
+    //! Get multimodal metrics (returns empty metrics if no multimodal runner)
+    metrics::MultimodalMetrics getMultimodalMetrics() const
+    {
+        return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
+    }
+
 private:
+    //! Helper structure to hold token counting results
+    struct TokenCountInfo
+    {
+        int32_t totalReusedTokens{0};
+        int32_t totalComputedTokens{0};
+    };
+
+    //! Calculate token counts (reused vs computed) for performance tracking
+    TokenCountInfo calculateTokenCounts(std::vector<std::vector<int32_t>> const& batchedInputIds,
+        std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName) const;
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};
@@ -71,6 +102,10 @@ private:
     std::string mEmptyLoraWeightsName{""};
 
     LLMEngineRunnerConfig mEngineConfig{};
+
+    // Stage-specific metrics to store number of tokens
+    metrics::LLMPrefillMetrics mPrefillMetrics;
+    metrics::LLMGenerationMetrics mGenerationMetrics;
 
     bool examineRequest(LLMGenerationRequest const& request);
 

@@ -20,6 +20,7 @@
 #include "common/tensor.h"
 #include "common/trtUtils.h"
 #include "engine/llm_engine.h"
+#include "profiling/metrics.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
@@ -93,6 +94,12 @@ public:
         return mModelType;
     }
 
+    //! Get multimodal metrics for this runner
+    metrics::MultimodalMetrics const& getMultimodalMetrics() const
+    {
+        return mMultimodalMetrics;
+    }
+
 protected:
     // TODO: Clean Old API. Flatten batch inputs ids to 1D array with padding and initialize context lengths
     virtual void flattenBatch(std::vector<int32_t>& inputIds, std::vector<int32_t>& contextLengths,
@@ -105,6 +112,7 @@ protected:
     std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
     rt::Tensor mOutputEmbedding;
+    metrics::MultimodalMetrics mMultimodalMetrics;
 };
 
 } // namespace rt

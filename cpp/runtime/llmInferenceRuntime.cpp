@@ -17,10 +17,13 @@
 
 #include "llmInferenceRuntime.h"
 
+#include "common/checkMacros.h"
 #include "common/hashUtils.h"
 #include "common/logger.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "multimodal/multimodalRunner.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <fstream>
 #include <functional>
@@ -300,6 +303,9 @@ bool LLMInferenceRuntime::handleRequest(
         return false;
     }
 
+    // Record context information for performance tracking
+    auto tokenCount = calculateTokenCounts(batchedInputIds, batchSystemPrompts, loraWeightsName);
+
     int32_t const maxInputIdsLength = mInputIds.getShape()[1];
     int32_t maxGenerationLength = request.maxGenerateLength;
     if (maxInputIdsLength + maxGenerationLength > mEngineConfig.maxSequenceLength)
@@ -350,30 +356,57 @@ bool LLMInferenceRuntime::handleRequest(
     // All other data input used by prefill step is already set up in setUpForPrefillExecution().
     rt::Tensor emptyTensor{};
     rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
-    bool prefillStatus = mLLMEngineRunner->executePrefillStep(
-        mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
-    if (!prefillStatus)
+    // Profile all sampling operations as one stage
+    std::vector<int32_t> generatedToken;
+    // Prefill profiling session
     {
-        LOG_ERROR(
-            "LLMInferenceRuntime(): Failed to execute prefill step. Cannot generate the KVCache for this prompt.");
-        return false;
-    }
-    auto generatedToken = sampleTokens();
+        TIME_STAGE(metrics::StageNames::kLLM_PREFILL, stream);
 
-    mInputIds.reshape({activeBatchSize, 1});
-    while (unFinishedBatchNum > 0 && generationIter < maxGenerationLength)
-    {
-        CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), generatedToken.data(), activeBatchSize * sizeof(int32_t),
-            cudaMemcpyHostToDevice, stream));
-        bool decodingStatus
-            = mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, multimodalEmbeddings, mOutputLogits, stream);
-        if (!decodingStatus)
+        bool prefillStatus = mLLMEngineRunner->executePrefillStep(
+            mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
+        if (!prefillStatus)
         {
-            LOG_ERROR("LLMInferenceRuntime(): Failed to execute decoding step.");
+            LOG_ERROR(
+                "LLMInferenceRuntime(): Failed to execute prefill step. Cannot generate the KVCache for this prompt.");
             return false;
         }
         generatedToken = sampleTokens();
     }
+
+    // Record prefill metrics
+    mPrefillMetrics.recordRun(tokenCount.totalReusedTokens, tokenCount.totalComputedTokens);
+
+    // Reshape inputIds for decoding step
+    mInputIds.reshape({activeBatchSize, 1});
+
+    // Profile entire generation phase like benchmark profiler
+    {
+        TIME_STAGE(metrics::StageNames::kLLM_GENERATION, stream);
+
+        while (unFinishedBatchNum > 0 && generationIter < maxGenerationLength)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), generatedToken.data(), activeBatchSize * sizeof(int32_t),
+                cudaMemcpyHostToDevice, stream));
+
+            bool decodingStatus
+                = mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, multimodalEmbeddings, mOutputLogits, stream);
+            if (!decodingStatus)
+            {
+                LOG_ERROR("LLMInferenceRuntime(): Failed to execute decoding step.");
+                return false;
+            }
+
+            generatedToken = sampleTokens();
+        }
+    }
+
+    // Record generation and sampling metrics (always count metrics regardless of profiler state)
+    int32_t totalGeneratedTokens = 0;
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        totalGeneratedTokens += static_cast<int32_t>(outputIds[i].size());
+    }
+    mGenerationMetrics.recordRun(totalGeneratedTokens);
 
     // Clean the response field and fill the generated outputIds and decoded texts.
     response.outputIds.clear();
@@ -423,6 +456,33 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
             "LoRA weights.");
     }
     return captureStatus;
+}
+
+LLMInferenceRuntime::TokenCountInfo LLMInferenceRuntime::calculateTokenCounts(
+    std::vector<std::vector<int32_t>> const& batchedInputIds, std::vector<std::string> const& systemPrompts,
+    std::string const& loraWeightsName) const
+{
+    TokenCountInfo tokenCount;
+    int32_t const activeBatchSize = static_cast<int32_t>(batchedInputIds.size());
+
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        int32_t contextLength = static_cast<int32_t>(batchedInputIds[i].size());
+        // Calculate reused length from system prompt cache
+        auto promptHash = hashSystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
+        if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+        {
+            int32_t reusedLength = static_cast<int32_t>(mSystemPromptKVCache.at(promptHash).tokenizedPrompt.size());
+            tokenCount.totalReusedTokens += reusedLength;
+            tokenCount.totalComputedTokens += (contextLength - reusedLength);
+        }
+        else
+        {
+            tokenCount.totalComputedTokens += contextLength;
+        }
+    }
+
+    return tokenCount;
 }
 
 bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
