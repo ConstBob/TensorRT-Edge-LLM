@@ -132,18 +132,10 @@ public:
         , mKernelMetaCount(0)
         , mSMVersion(sm)
         , mDataType(type)
+        , mSpecDecode(specDecode)
     {
-        if (specDecode)
-        {
-            mKernelMeta = &(xqa::kernels::sXqaKernelMetaInfoSpecDecode[0]);
-            mKernelMetaCount = sizeof(xqa::kernels::sXqaKernelMetaInfoSpecDecode)
-                / sizeof(xqa::kernels::sXqaKernelMetaInfoSpecDecode[0]);
-        }
-        else
-        {
-            mKernelMeta = &(xqa::kernels::sXqaKernelMetaInfo[0]);
-            mKernelMetaCount = sizeof(xqa::kernels::sXqaKernelMetaInfo) / sizeof(xqa::kernels::sXqaKernelMetaInfo[0]);
-        }
+        mKernelMeta = &(xqa::kernels::sXqaKernelMetaInfo[0]);
+        mKernelMetaCount = sizeof(xqa::kernels::sXqaKernelMetaInfo) / sizeof(xqa::kernels::sXqaKernelMetaInfo[0]);
     }
 
     void loadXQAKernels()
@@ -162,6 +154,10 @@ public:
             // Filter out kernel that irrelevant to this project.
             if (kernelMeta.mPagedKVCache == true || kernelMeta.mBeamWidth != 1
                 || kernelMeta.mDataType != kernelMeta.mKVDataType)
+            {
+                continue;
+            }
+            if (kernelMeta.mMultiQueryTokens != mSpecDecode)
             {
                 continue;
             }
@@ -218,6 +214,7 @@ protected:
     TKernelMetaInfo const* mKernelMeta;
     int32_t mKernelMetaCount;
     int32_t mSMVersion;
+    bool mSpecDecode;
     XQADataType mDataType;
     std::unordered_map<unsigned long long const*, CUmodule> mModules;
 
@@ -328,8 +325,9 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
     check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the GQA");
 
-    void* kernelParams[] = {&params.numKVheads, &params.output, &params.qInputPtr, &params.kvCache, &params.batchSize,
-        &params.kvScale, &params.semaphores, &params.scratch, nullptr};
+    void* kernelParams[]
+        = {&params.numKVheads, &params.qScale, &params.output, &params.qInputPtr, &params.attentionSinks,
+            &params.kvCache, &params.batchSize, &params.kvScale, &params.semaphores, &params.scratch};
 
     // The multi-block kernel launch is mainly for long sequence.
     // TODO: Add multiple block launch logic. The launch configuration highly depends on usecase and performance
@@ -354,9 +352,8 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
     check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the Spec-DecodeGQA");
 
     void* kernelParams[] = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen,
-        &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.kvCache, &params.batchSize,
-        &params.kvScale, &params.semaphores, &params.scratch, nullptr};
-
+        &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
+        &params.kvCache, &params.batchSize, &params.kvScale, &params.semaphores, &params.scratch};
     constexpr int32_t CTA_TILE_Y = 32;
     int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / CTA_TILE_Y + 1;
     dim3 const dimGrid{1, mNumKVHeads * tokenBlockPerGroup, mBatchSize};

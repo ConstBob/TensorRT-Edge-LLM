@@ -43,6 +43,9 @@ struct XQALaunchParams
     void* treeAttnMask = nullptr;
     int32_t* qCuSeqLen = nullptr;
 
+    // Attention sinks parameter
+    float const* attentionSinks = nullptr;
+
     // MHA parameter to locate a kernel to launch.
     int32_t numQheads = 0;
     int32_t numKVheads = 0;
