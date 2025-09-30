@@ -96,7 +96,7 @@ void eagleBaseCommitKVCacheAndAssembleHiddenStateReference(std::vector<int32_t> 
 struct EagleAcceptResult
 {
     std::vector<int32_t> acceptedTokenIds;
-    std::vector<int32_t> acceptedIndices;
+    std::vector<int32_t> acceptedLogitsIndices;
     std::vector<int32_t> acceptLengths;
     int32_t maxAcceptLength;
 };

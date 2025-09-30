@@ -56,14 +56,14 @@ protected:
     {
         // Create GPU tensors with proper shapes
         rt::Tensor logitsTensor(
-            {batchSize, numTokens, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
+            {batchSize * numTokens, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "logits");
         rt::Tensor tokenIdsTensor({batchSize, numTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "tokenIds");
         rt::Tensor attentionMaskTensor(
             {batchSize, numTokens, numTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8, "attentionMask");
         rt::Tensor acceptedTokenIdsTensor(
             {batchSize, maxDepth}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptedTokenIds");
-        rt::Tensor acceptedIndicesTensor(
-            {batchSize, maxDepth}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptedIndices");
+        rt::Tensor acceptedLogitsIndicesTensor(
+            {batchSize, maxDepth}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptedLogitsIndices");
         rt::Tensor acceptLengthTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptLength");
 
         // Copy input data to GPU
@@ -83,7 +83,7 @@ protected:
         auto start = std::chrono::high_resolution_clock::now();
         EXPECT_NO_THROW({
             kernel::eagleAccept(logitsTensor, tokenIdsTensor, attentionMaskTensor, acceptedTokenIdsTensor,
-                acceptedIndicesTensor, acceptLengthTensor, maxDepth, workspace, workspaceSize, stream);
+                acceptedLogitsIndicesTensor, acceptLengthTensor, workspace, workspaceSize, stream);
             CUDA_CHECK(cudaDeviceSynchronize());
         });
         auto end = std::chrono::high_resolution_clock::now();
@@ -98,12 +98,12 @@ protected:
 
         // Copy results back to host for validation
         std::vector<int32_t> hostAcceptedTokenIds(batchSize * maxDepth);
-        std::vector<int32_t> hostAcceptedIndices(batchSize * maxDepth);
+        std::vector<int32_t> hostAcceptedLogitsIndices(batchSize * maxDepth);
         std::vector<int32_t> hostAcceptLengths(batchSize);
 
         CUDA_CHECK(cudaMemcpy(hostAcceptedTokenIds.data(), acceptedTokenIdsTensor.rawPointer(),
             batchSize * maxDepth * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(hostAcceptedIndices.data(), acceptedIndicesTensor.rawPointer(),
+        CUDA_CHECK(cudaMemcpy(hostAcceptedLogitsIndices.data(), acceptedLogitsIndicesTensor.rawPointer(),
             batchSize * maxDepth * sizeof(int32_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(hostAcceptLengths.data(), acceptLengthTensor.rawPointer(), batchSize * sizeof(int32_t),
             cudaMemcpyDeviceToHost));
@@ -123,8 +123,9 @@ protected:
                 int32_t idx = b * maxDepth + i;
                 EXPECT_EQ(hostAcceptedTokenIds[idx], refResult.acceptedTokenIds[b * refResult.maxAcceptLength + i])
                     << testName << ": Token ID mismatch at batch " << b << " position " << i;
-                EXPECT_EQ(hostAcceptedIndices[idx], refResult.acceptedIndices[b * refResult.maxAcceptLength + i])
-                    << testName << ": Index mismatch at batch " << b << " position " << i;
+                EXPECT_EQ(
+                    hostAcceptedLogitsIndices[idx], refResult.acceptedLogitsIndices[b * refResult.maxAcceptLength + i])
+                    << testName << ": Logits index mismatch at batch " << b << " position " << i;
             }
 
             // Check that unused positions are properly initialized to -1
@@ -133,15 +134,15 @@ protected:
                 int32_t idx = b * maxDepth + i;
                 EXPECT_EQ(hostAcceptedTokenIds[idx], -1)
                     << testName << ": Unused token ID position should be -1 at batch " << b << " position " << i;
-                EXPECT_EQ(hostAcceptedIndices[idx], -1)
-                    << testName << ": Unused index position should be -1 at batch " << b << " position " << i;
+                EXPECT_EQ(hostAcceptedLogitsIndices[idx], -1)
+                    << testName << ": Unused logits index position should be -1 at batch " << b << " position " << i;
             }
         }
 
         // Run custom validation if provided
         if (validator)
         {
-            validator(hostAcceptedTokenIds, hostAcceptedIndices, hostAcceptLengths, refResult);
+            validator(hostAcceptedTokenIds, hostAcceptedLogitsIndices, hostAcceptLengths, refResult);
         }
         std::cout << testName << " - Duration: " << duration.count() << "ms" << std::endl;
         std::cout << "Accept lengths: ";
@@ -150,12 +151,15 @@ protected:
             std::cout << hostAcceptLengths[b] << " ";
         }
         std::cout << std::endl;
-        std::cout << "Accepted path: ";
-        for (int32_t i = 0; i < hostAcceptLengths[0]; ++i)
+        for (int32_t b = 0; b < batchSize; ++b)
         {
-            std::cout << hostAcceptedTokenIds[i] << " ";
+            std::cout << "Batch " << b << " accepted path: ";
+            for (int32_t i = 0; i < hostAcceptLengths[b]; ++i)
+            {
+                std::cout << hostAcceptedTokenIds[b * maxDepth + i] << " ";
+            }
+            std::cout << std::endl;
         }
-        std::cout << std::endl;
     }
     cudaStream_t stream;
 };
@@ -167,6 +171,14 @@ TEST_F(EagleAcceptTest, MultiBatchSimple)
     constexpr int32_t batchSize = 2;
     constexpr int32_t vocabSize = 10;
     constexpr int32_t maxDepth = 3;
+
+    /*
+     * BATCH 0: Tree [1->2->3], logits pos0->2, pos1->3, pos2->0(default)
+     * Expected: [2,3,0] indices=[0,1,2] length=3
+     *
+     * BATCH 1: Tree [4->5,6], logits pos0->5, pos1->0(default)
+     * Expected: [5,0] indices=[0,1] length=2 (token6 isolated, no path)
+     */
 
     // Setup token IDs: batch 0 = [1,2,3], batch 1 = [4,5,6]
     std::vector<int32_t> tokenIds(batchSize * numTokens);
@@ -192,31 +204,38 @@ TEST_F(EagleAcceptTest, MultiBatchSimple)
     attentionMask[1 * numTokens * numTokens + 1 * numTokens + 0] = 1;
     attentionMask[1 * numTokens * numTokens + 1 * numTokens + 1] = 1;
 
-    // Setup logits to favor the expected path
-    std::vector<float> logits(batchSize * numTokens * vocabSize, -10.0f);
-    logits[0 * numTokens * vocabSize + 0 * vocabSize + 2] = 10.0f; // pos 0 -> token 2
-    logits[0 * numTokens * vocabSize + 1 * vocabSize + 3] = 10.0f; // pos 1 -> token 3
-    logits[1 * numTokens * vocabSize + 0 * vocabSize + 5] = 10.0f; // pos 0 -> token 5
+    // Setup logits to favor the expected path with more realistic values
+    std::vector<float> logits(batchSize * numTokens * vocabSize, -5.0f);
+
+    // Add some noise to avoid uniform values
+    for (int32_t i = 0; i < batchSize * numTokens * vocabSize; ++i)
+    {
+        logits[i] += (i % 7) * 0.01f; // Small variation to break ties consistently
+    }
+
+    logits[0 * numTokens * vocabSize + 0 * vocabSize + 2] = 5.0f; // pos 0 -> token 2
+    logits[0 * numTokens * vocabSize + 1 * vocabSize + 3] = 5.0f; // pos 1 -> token 3
+    logits[0 * numTokens * vocabSize + 2 * vocabSize + 0] = 5.0f; // pos 2 -> token 0 (default)
+    logits[1 * numTokens * vocabSize + 0 * vocabSize + 5] = 5.0f; // pos 0 -> token 5
+    logits[1 * numTokens * vocabSize + 1 * vocabSize + 0] = 5.0f; // pos 1 -> token 0 (default)
 
     runEagleAcceptTest(tokenIds, attentionMask, logits, batchSize, numTokens, vocabSize, maxDepth, "PerBatchDesignTest",
-        [](auto const& acceptedTokenIds, auto const& acceptedIndices, auto const& acceptLengths, auto const&) {
-            EXPECT_EQ(acceptLengths[0], 3) << "Batch 0 should accept 3 tokens";
-            EXPECT_EQ(acceptLengths[1], 2) << "Batch 1 should accept 2 tokens";
+        [](auto const& acceptedTokenIds, auto const& acceptedLogitsIndices, auto const& acceptLengths, auto const&) {
+            EXPECT_EQ(acceptLengths[0], 3) << "Batch 0 should accept 3 tokens (2->3->something)";
+            EXPECT_EQ(acceptLengths[1], 2) << "Batch 1 should accept 2 tokens (5->something)";
 
-            EXPECT_EQ(acceptedTokenIds[0 * 3 + 0], 1) << "Batch 0 token 0";
-            EXPECT_EQ(acceptedTokenIds[0 * 3 + 1], 2) << "Batch 0 token 1";
-            EXPECT_EQ(acceptedTokenIds[0 * 3 + 2], 3) << "Batch 0 token 2";
-            EXPECT_EQ(acceptedIndices[0 * 3 + 0], 0) << "Batch 0 index 0";
-            EXPECT_EQ(acceptedIndices[0 * 3 + 1], 1) << "Batch 0 index 1";
-            EXPECT_EQ(acceptedIndices[0 * 3 + 2], 2) << "Batch 0 index 2";
+            EXPECT_EQ(acceptedTokenIds[0 * 3 + 0], 2) << "Batch 0 token 0";
+            EXPECT_EQ(acceptedTokenIds[0 * 3 + 1], 3) << "Batch 0 token 1";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 3 + 0], 0) << "Batch 0 logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 3 + 1], 1) << "Batch 0 logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 3 + 2], 2) << "Batch 0 logits index 2";
 
-            EXPECT_EQ(acceptedTokenIds[1 * 3 + 0], 4) << "Batch 1 token 0";
-            EXPECT_EQ(acceptedTokenIds[1 * 3 + 1], 5) << "Batch 1 token 1";
-            EXPECT_EQ(acceptedIndices[1 * 3 + 0], 0) << "Batch 1 index 0";
-            EXPECT_EQ(acceptedIndices[1 * 3 + 1], 1) << "Batch 1 index 1";
+            EXPECT_EQ(acceptedTokenIds[1 * 3 + 0], 5) << "Batch 1 token 0";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 0], 0) << "Batch 1 logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 1], 1) << "Batch 1 logits index 1";
 
             EXPECT_EQ(acceptedTokenIds[1 * 3 + 2], -1) << "Batch 1 unused token position should be -1";
-            EXPECT_EQ(acceptedIndices[1 * 3 + 2], -1) << "Batch 1 unused index position should be -1";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 2], -1) << "Batch 1 unused logits index position should be -1";
         });
 }
 
@@ -227,6 +246,15 @@ TEST_F(EagleAcceptTest, MultiBatchAsymmetricTree)
     constexpr int32_t batchSize = 6;
     constexpr int32_t vocabSize = 150;
     constexpr int32_t maxDepth = 5;
+
+    /*
+     * BATCH 0: Tree [90->91->92->93->94], logits 91,92,93,94,0 -> [91,92,93,94,0] length=5
+     * BATCH 1: Tree [90->95->96], logits 95,96,149(not in tree) -> [95,96,149] length=3
+     * BATCH 2: Tree [90->97->98->99->89], logits 97,98,99,89,0 -> [97,98,99,89,0] length=5
+     * BATCH 3: Tree [90->88], logits 88,149(not in tree) -> [88,149] length=2
+     * BATCH 4: Tree [90->87->86->85->84], logits 87,86,85,84,0 -> [87,86,85,84,0] length=5
+     * BATCH 5: Tree [90], logits 149(not in tree) -> [149] length=1
+     */
 
     std::vector<int32_t> tokenIds(batchSize * numTokens);
     std::vector<int8_t> attentionMask(batchSize * numTokens * numTokens, 0);
@@ -289,66 +317,145 @@ TEST_F(EagleAcceptTest, MultiBatchAsymmetricTree)
     }
 
     // Setup logits to control which tokens are selected at each position
-    std::vector<float> logits(batchSize * numTokens * vocabSize, -10.0f);
+    std::vector<float> logits(batchSize * numTokens * vocabSize, -5.0f);
+
+    // Add some noise to avoid uniform values and ensure consistent tie-breaking
+    for (int32_t i = 0; i < batchSize * numTokens * vocabSize; ++i)
+    {
+        logits[i] += (i % 13) * 0.01f; // Small variation to break ties consistently
+    }
 
     // Batch 0: favor path [90->91->92->93->94]
     logits[0 * numTokens * vocabSize + 0 * vocabSize + 91] = 10.0f;
     logits[0 * numTokens * vocabSize + 1 * vocabSize + 92] = 10.0f;
     logits[0 * numTokens * vocabSize + 2 * vocabSize + 93] = 10.0f;
     logits[0 * numTokens * vocabSize + 3 * vocabSize + 94] = 10.0f;
+    logits[0 * numTokens * vocabSize + 4 * vocabSize + 0] = 10.0f; // final position -> token 0
 
     // Batch 1: favor path [90->95->96], then non-existent token for early termination
     logits[1 * numTokens * vocabSize + 0 * vocabSize + 95] = 10.0f;
     logits[1 * numTokens * vocabSize + 1 * vocabSize + 96] = 10.0f;
     logits[1 * numTokens * vocabSize + 2 * vocabSize + 149] = 10.0f; // non-existent token
+    logits[1 * numTokens * vocabSize + 3 * vocabSize + 0] = 10.0f;   // default token
+    logits[1 * numTokens * vocabSize + 4 * vocabSize + 0] = 10.0f;   // default token
 
     // Batch 2: favor path [90->97->98->99->89]
     logits[2 * numTokens * vocabSize + 0 * vocabSize + 97] = 10.0f;
     logits[2 * numTokens * vocabSize + 1 * vocabSize + 98] = 10.0f;
     logits[2 * numTokens * vocabSize + 2 * vocabSize + 99] = 10.0f;
     logits[2 * numTokens * vocabSize + 3 * vocabSize + 89] = 10.0f;
+    logits[2 * numTokens * vocabSize + 4 * vocabSize + 0] = 10.0f; // final position -> token 0
 
     // Batch 3: favor path [90->88], then non-existent token for early termination
     logits[3 * numTokens * vocabSize + 0 * vocabSize + 88] = 10.0f;
     logits[3 * numTokens * vocabSize + 1 * vocabSize + 149] = 10.0f; // non-existent token
+    logits[3 * numTokens * vocabSize + 2 * vocabSize + 0] = 10.0f;   // default token
+    logits[3 * numTokens * vocabSize + 3 * vocabSize + 0] = 10.0f;   // default token
+    logits[3 * numTokens * vocabSize + 4 * vocabSize + 0] = 10.0f;   // default token
 
     // Batch 4: favor path [90->87->86->85->84]
     logits[4 * numTokens * vocabSize + 0 * vocabSize + 87] = 10.0f;
     logits[4 * numTokens * vocabSize + 1 * vocabSize + 86] = 10.0f;
     logits[4 * numTokens * vocabSize + 2 * vocabSize + 85] = 10.0f;
     logits[4 * numTokens * vocabSize + 3 * vocabSize + 84] = 10.0f;
+    logits[4 * numTokens * vocabSize + 4 * vocabSize + 0] = 10.0f; // final position -> token 0
 
     // Batch 5: favor non-existent token immediately for no continuation
     logits[5 * numTokens * vocabSize + 0 * vocabSize + 149] = 15.0f; // non-existent token
     logits[5 * numTokens * vocabSize + 0 * vocabSize + 83] = 5.0f;   // valid but lower priority
+    logits[5 * numTokens * vocabSize + 1 * vocabSize + 0] = 10.0f;   // default token
+    logits[5 * numTokens * vocabSize + 2 * vocabSize + 0] = 10.0f;   // default token
+    logits[5 * numTokens * vocabSize + 3 * vocabSize + 0] = 10.0f;   // default token
+    logits[5 * numTokens * vocabSize + 4 * vocabSize + 0] = 10.0f;   // default token
 
     runEagleAcceptTest(tokenIds, attentionMask, logits, batchSize, numTokens, vocabSize, maxDepth,
         "AsymmetricTreeMultiBatch",
-        [](auto const& acceptedTokenIds, auto const& acceptedIndices, auto const& acceptLengths, auto const&) {
+        [](auto const& acceptedTokenIds, auto const& acceptedLogitsIndices, auto const& acceptLengths, auto const&) {
             EXPECT_EQ(acceptLengths[0], 5) << "Batch 0: long path A";
             EXPECT_EQ(acceptLengths[1], 3) << "Batch 1: short path B";
             EXPECT_EQ(acceptLengths[2], 5) << "Batch 2: longest path C";
             EXPECT_EQ(acceptLengths[3], 2) << "Batch 3: isolated path";
             EXPECT_EQ(acceptLengths[4], 5) << "Batch 4: full chain";
-            EXPECT_EQ(acceptLengths[5], 1) << "Batch 5: no valid continuation";
+            EXPECT_EQ(acceptLengths[5], 1) << "Batch 5: at least 1 token accepted";
 
-            EXPECT_EQ(acceptedTokenIds[0 * 5 + 1], 91) << "Batch 0 path A token";
-            EXPECT_EQ(acceptedIndices[0 * 5 + 1], 1) << "Batch 0 path A index";
-            EXPECT_EQ(acceptedTokenIds[1 * 5 + 1], 95) << "Batch 1 path B token";
-            EXPECT_EQ(acceptedIndices[1 * 5 + 1], 1) << "Batch 1 path B index";
-            EXPECT_EQ(acceptedTokenIds[2 * 5 + 1], 97) << "Batch 2 path C token";
-            EXPECT_EQ(acceptedIndices[2 * 5 + 1], 1) << "Batch 2 path C index";
-            EXPECT_EQ(acceptedTokenIds[3 * 5 + 1], 88) << "Batch 3 isolated token";
-            EXPECT_EQ(acceptedIndices[3 * 5 + 1], 1) << "Batch 3 isolated index";
-            EXPECT_EQ(acceptedTokenIds[4 * 5 + 1], 87) << "Batch 4 chain token";
-            EXPECT_EQ(acceptedIndices[4 * 5 + 1], 1) << "Batch 4 chain index";
+            // Batch 0: path 90->91->92->93->94, logits predict 91,92,93,94
+            EXPECT_EQ(acceptedTokenIds[0 * 5 + 0], 91) << "Batch 0 path A token 0";
+            EXPECT_EQ(acceptedTokenIds[0 * 5 + 1], 92) << "Batch 0 path A token 1";
+            EXPECT_EQ(acceptedTokenIds[0 * 5 + 2], 93) << "Batch 0 path A token 2";
+            EXPECT_EQ(acceptedTokenIds[0 * 5 + 3], 94) << "Batch 0 path A token 3";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 5 + 0], 0) << "Batch 0 path A logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 5 + 1], 1) << "Batch 0 path A logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 5 + 2], 2) << "Batch 0 path A logits index 2";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 5 + 3], 3) << "Batch 0 path A logits index 3";
 
-            EXPECT_EQ(acceptedTokenIds[1 * 5 + 3], -1) << "Batch 1 unused position should be -1";
-            EXPECT_EQ(acceptedIndices[1 * 5 + 3], -1) << "Batch 1 unused position should be -1";
-            EXPECT_EQ(acceptedTokenIds[3 * 5 + 2], -1) << "Batch 3 unused position should be -1";
-            EXPECT_EQ(acceptedIndices[3 * 5 + 2], -1) << "Batch 3 unused position should be -1";
-            EXPECT_EQ(acceptedTokenIds[5 * 5 + 1], -1) << "Batch 5 unused position should be -1";
-            EXPECT_EQ(acceptedIndices[5 * 5 + 1], -1) << "Batch 5 unused position should be -1";
+            // Batch 1: path 90->95->96, logits predict 95,96, then non-existent
+            EXPECT_EQ(acceptedTokenIds[1 * 5 + 0], 95) << "Batch 1 path B token 0";
+            EXPECT_EQ(acceptedTokenIds[1 * 5 + 1], 96) << "Batch 1 path B token 1";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 5 + 0], 0) << "Batch 1 path B logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 5 + 1], 1) << "Batch 1 path B logits index 1";
+
+            // Batch 2: path 90->97->98->99->89, logits predict 97,98,99,89
+            EXPECT_EQ(acceptedTokenIds[2 * 5 + 0], 97) << "Batch 2 path C token 0";
+            EXPECT_EQ(acceptedTokenIds[2 * 5 + 1], 98) << "Batch 2 path C token 1";
+            EXPECT_EQ(acceptedTokenIds[2 * 5 + 2], 99) << "Batch 2 path C token 2";
+            EXPECT_EQ(acceptedTokenIds[2 * 5 + 3], 89) << "Batch 2 path C token 3";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 5 + 0], 0) << "Batch 2 path C logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 5 + 1], 1) << "Batch 2 path C logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 5 + 2], 2) << "Batch 2 path C logits index 2";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 5 + 3], 3) << "Batch 2 path C logits index 3";
+
+            // Batch 3: path 90->88, logits predict 88, then non-existent
+            EXPECT_EQ(acceptedTokenIds[3 * 5 + 0], 88) << "Batch 3 isolated token 0";
+            EXPECT_EQ(acceptedLogitsIndices[3 * 5 + 0], 0) << "Batch 3 isolated logits index 0";
+
+            // Batch 4: path 90->87->86->85->84, logits predict 87,86,85,84
+            EXPECT_EQ(acceptedTokenIds[4 * 5 + 0], 87) << "Batch 4 chain token 0";
+            EXPECT_EQ(acceptedTokenIds[4 * 5 + 1], 86) << "Batch 4 chain token 1";
+            EXPECT_EQ(acceptedTokenIds[4 * 5 + 2], 85) << "Batch 4 chain token 2";
+            EXPECT_EQ(acceptedTokenIds[4 * 5 + 3], 84) << "Batch 4 chain token 3";
+            EXPECT_EQ(acceptedLogitsIndices[4 * 5 + 0], 0) << "Batch 4 chain logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[4 * 5 + 1], 1) << "Batch 4 chain logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[4 * 5 + 2], 2) << "Batch 4 chain logits index 2";
+            EXPECT_EQ(acceptedLogitsIndices[4 * 5 + 3], 3) << "Batch 4 chain logits index 3";
+
+            // Check final accepted tokens for each batch
+            // Batch 0: accepts 5 tokens [91, 92, 93, 94, 0] - the last token (0) is predicted but not in tree
+            EXPECT_EQ(acceptedTokenIds[0 * 5 + 4], 0) << "Batch 0 final token should be 0 (predicted but not in tree)";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 5 + 4], 4) << "Batch 0 final logits position should be 4";
+
+            // Batch 1: accepts 3 tokens [95, 96, 149] - token 149 is predicted but not in tree
+            EXPECT_EQ(acceptedTokenIds[1 * 5 + 2], 149)
+                << "Batch 1 final token should be 149 (predicted but not in tree)";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 5 + 2], 2) << "Batch 1 final logits position should be 2";
+
+            // Batch 2: accepts 5 tokens [97, 98, 99, 89, 0] - the last token (0) is predicted but not in tree
+            EXPECT_EQ(acceptedTokenIds[2 * 5 + 4], 0) << "Batch 2 final token should be 0 (predicted but not in tree)";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 5 + 4], 4) << "Batch 2 final logits position should be 4";
+
+            // Batch 3: accepts 2 tokens [88, 149] - token 149 is predicted but not in tree
+            EXPECT_EQ(acceptedTokenIds[3 * 5 + 1], 149)
+                << "Batch 3 final token should be 149 (predicted but not in tree)";
+            EXPECT_EQ(acceptedLogitsIndices[3 * 5 + 1], 1) << "Batch 3 final logits position should be 1";
+
+            // Batch 4: accepts 5 tokens [87, 86, 85, 84, 0] - the last token (0) is predicted but not in tree
+            EXPECT_EQ(acceptedTokenIds[4 * 5 + 4], 0) << "Batch 4 final token should be 0 (predicted but not in tree)";
+            EXPECT_EQ(acceptedLogitsIndices[4 * 5 + 4], 4) << "Batch 4 final logits position should be 4";
+
+            // Batch 5: accepts 1 token [149] - token 149 is predicted but not in tree
+            EXPECT_EQ(acceptedTokenIds[5 * 5 + 0], 149) << "Batch 5 should accept first predicted token";
+            EXPECT_EQ(acceptedLogitsIndices[5 * 5 + 0], 0) << "Batch 5 logits index 0";
+
+            // Check that positions beyond accept length are -1
+            for (int32_t b = 0; b < 6; ++b)
+            {
+                for (int32_t i = acceptLengths[b]; i < 5; ++i)
+                {
+                    EXPECT_EQ(acceptedTokenIds[b * 5 + i], -1)
+                        << "Batch " << b << " unused position " << i << " should be -1";
+                    EXPECT_EQ(acceptedLogitsIndices[b * 5 + i], -1)
+                        << "Batch " << b << " unused logits position " << i << " should be -1";
+                }
+            }
         });
 }
 
@@ -359,6 +466,12 @@ TEST_F(EagleAcceptTest, ComplexMultiBranchTree)
     constexpr int32_t vocabSize = 1000;
     constexpr int32_t maxDepth = 4;
     constexpr int32_t batchSize = 3;
+
+    /*
+     * BATCH 0: Tree [100->200->300->400], logits 200,300,400,0 -> [200,300,400,0] length=4
+     * BATCH 1: Tree [100->202->302->402], logits 202,302,402,0 -> [202,302,402,0] length=4
+     * BATCH 2: Tree [100->201->304], logits 201,304,999(not in tree) -> [201,304,999] length=3
+     */
 
     std::vector<int32_t> tokenIds(batchSize * numTokens);
     std::vector<int8_t> attentionMask(batchSize * numTokens * numTokens, 0);
@@ -409,56 +522,63 @@ TEST_F(EagleAcceptTest, ComplexMultiBranchTree)
     }
 
     // Setup logits to guide token selection
-    std::vector<float> logits(batchSize * numTokens * vocabSize, -10.0f);
+    std::vector<float> logits(batchSize * numTokens * vocabSize, -5.0f);
+
+    // Add some noise to avoid uniform values and ensure consistent tie-breaking
+    for (int32_t i = 0; i < batchSize * numTokens * vocabSize; ++i)
+    {
+        logits[i] += (i % 17) * 0.01f; // Small variation to break ties consistently
+    }
 
     // Batch 0: favor path [100->200->300->400]
     logits[0 * numTokens * vocabSize + 0 * vocabSize + 200] = 10.0f;
     logits[0 * numTokens * vocabSize + 1 * vocabSize + 300] = 10.0f;
     logits[0 * numTokens * vocabSize + 2 * vocabSize + 400] = 10.0f;
+    logits[0 * numTokens * vocabSize + 3 * vocabSize + 0] = 10.0f; // final position -> token 0
 
     // Batch 1: favor path [100->202->302->402]
     logits[1 * numTokens * vocabSize + 0 * vocabSize + 202] = 10.0f;
     logits[1 * numTokens * vocabSize + 1 * vocabSize + 302] = 10.0f;
     logits[1 * numTokens * vocabSize + 2 * vocabSize + 402] = 10.0f;
+    logits[1 * numTokens * vocabSize + 3 * vocabSize + 0] = 10.0f; // final position -> token 0
 
     // Batch 2: favor path [100->201->304], then non-existent token
     logits[2 * numTokens * vocabSize + 0 * vocabSize + 201] = 10.0f;
     logits[2 * numTokens * vocabSize + 1 * vocabSize + 304] = 10.0f;
     logits[2 * numTokens * vocabSize + 2 * vocabSize + 999] = 10.0f; // non-existent token
+    logits[2 * numTokens * vocabSize + 3 * vocabSize + 0] = 10.0f;   // default token
 
     runEagleAcceptTest(tokenIds, attentionMask, logits, batchSize, numTokens, vocabSize, maxDepth,
         "ComplexMultiBranchTree",
-        [](auto const& acceptedTokenIds, auto const& acceptedIndices, auto const& acceptLengths, auto const&) {
+        [](auto const& acceptedTokenIds, auto const& acceptedLogitsIndices, auto const& acceptLengths, auto const&) {
             EXPECT_EQ(acceptLengths[0], 4) << "Batch 0 should complete full path";
-            EXPECT_EQ(acceptedTokenIds[0 * 4 + 0], 100) << "Batch 0 token 0";
-            EXPECT_EQ(acceptedTokenIds[0 * 4 + 1], 200) << "Batch 0 token 1";
-            EXPECT_EQ(acceptedTokenIds[0 * 4 + 2], 300) << "Batch 0 token 2";
-            EXPECT_EQ(acceptedTokenIds[0 * 4 + 3], 400) << "Batch 0 token 3";
-            EXPECT_EQ(acceptedIndices[0 * 4 + 0], 0) << "Batch 0 index 0";
-            EXPECT_EQ(acceptedIndices[0 * 4 + 1], 1) << "Batch 0 index 1";
-            EXPECT_EQ(acceptedIndices[0 * 4 + 2], 2) << "Batch 0 index 2";
-            EXPECT_EQ(acceptedIndices[0 * 4 + 3], 3) << "Batch 0 index 3";
+            EXPECT_EQ(acceptedTokenIds[0 * 4 + 0], 200) << "Batch 0 token 0";
+            EXPECT_EQ(acceptedTokenIds[0 * 4 + 1], 300) << "Batch 0 token 1";
+            EXPECT_EQ(acceptedTokenIds[0 * 4 + 2], 400) << "Batch 0 token 2";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 4 + 0], 0) << "Batch 0 logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 4 + 1], 1) << "Batch 0 logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 4 + 2], 2) << "Batch 0 logits index 2";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 4 + 3], 3) << "Batch 0 logits index 3";
 
             EXPECT_EQ(acceptLengths[1], 4) << "Batch 1 should complete different path";
-            EXPECT_EQ(acceptedTokenIds[1 * 4 + 0], 100) << "Batch 1 token 0";
-            EXPECT_EQ(acceptedTokenIds[1 * 4 + 1], 202) << "Batch 1 token 1";
-            EXPECT_EQ(acceptedTokenIds[1 * 4 + 2], 302) << "Batch 1 token 2";
-            EXPECT_EQ(acceptedTokenIds[1 * 4 + 3], 402) << "Batch 1 token 3";
-            EXPECT_EQ(acceptedIndices[1 * 4 + 0], 0) << "Batch 1 index 0";
-            EXPECT_EQ(acceptedIndices[1 * 4 + 1], 1) << "Batch 1 index 1";
-            EXPECT_EQ(acceptedIndices[1 * 4 + 2], 2) << "Batch 1 index 2";
-            EXPECT_EQ(acceptedIndices[1 * 4 + 3], 3) << "Batch 1 index 3";
+            EXPECT_EQ(acceptedTokenIds[1 * 4 + 0], 202) << "Batch 1 token 0";
+            EXPECT_EQ(acceptedTokenIds[1 * 4 + 1], 302) << "Batch 1 token 1";
+            EXPECT_EQ(acceptedTokenIds[1 * 4 + 2], 402) << "Batch 1 token 2";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 4 + 0], 0) << "Batch 1 logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 4 + 1], 1) << "Batch 1 logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 4 + 2], 2) << "Batch 1 logits index 2";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 4 + 3], 3) << "Batch 1 logits index 3";
 
-            EXPECT_EQ(acceptLengths[2], 3) << "Batch 2 should terminate early";
-            EXPECT_EQ(acceptedTokenIds[2 * 4 + 0], 100) << "Batch 2 token 0";
-            EXPECT_EQ(acceptedTokenIds[2 * 4 + 1], 201) << "Batch 2 token 1";
-            EXPECT_EQ(acceptedTokenIds[2 * 4 + 2], 304) << "Batch 2 token 2";
-            EXPECT_EQ(acceptedIndices[2 * 4 + 0], 0) << "Batch 2 index 0";
-            EXPECT_EQ(acceptedIndices[2 * 4 + 1], 1) << "Batch 2 index 1";
-            EXPECT_EQ(acceptedIndices[2 * 4 + 2], 2) << "Batch 2 index 2";
+            EXPECT_EQ(acceptLengths[2], 3) << "Batch 2 should terminate after 999 not found";
+            EXPECT_EQ(acceptedTokenIds[2 * 4 + 0], 201) << "Batch 2 token 0";
+            EXPECT_EQ(acceptedTokenIds[2 * 4 + 1], 304) << "Batch 2 token 1";
+            EXPECT_EQ(acceptedTokenIds[2 * 4 + 2], 999) << "Batch 2 token 2 (not in tree)";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 4 + 0], 0) << "Batch 2 logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 4 + 1], 1) << "Batch 2 logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 4 + 2], 2) << "Batch 2 logits index 2";
 
             EXPECT_EQ(acceptedTokenIds[2 * 4 + 3], -1) << "Batch 2 unused token position should be -1";
-            EXPECT_EQ(acceptedIndices[2 * 4 + 3], -1) << "Batch 2 unused index position should be -1";
+            EXPECT_EQ(acceptedLogitsIndices[2 * 4 + 3], -1) << "Batch 2 unused logits index position should be -1";
         });
 }
 
@@ -469,6 +589,11 @@ TEST_F(EagleAcceptTest, SingleBatchLogitTermination)
     constexpr int32_t batchSize = 1;
     constexpr int32_t vocabSize = 50;
     constexpr int32_t maxDepth = 5;
+
+    /*
+     * Tree [15->25->35->45->49], logits pos0->25, pos1->35, pos2->48(not in tree, higher than 45)
+     * Expected: [25,35,48] indices=[0,1,2] length=3 (stops when 48 not found in tree)
+     */
 
     // Setup a complete tree but use logits to cause early termination
     std::vector<int32_t> tokenIds(batchSize * numTokens);
@@ -490,28 +615,92 @@ TEST_F(EagleAcceptTest, SingleBatchLogitTermination)
     }
 
     // Setup logits to cause termination at position 2
-    std::vector<float> logits(batchSize * numTokens * vocabSize, -10.0f);
+    std::vector<float> logits(batchSize * numTokens * vocabSize, -5.0f);
+
+    // Add some noise to avoid uniform values and ensure consistent tie-breaking
+    for (int32_t i = 0; i < batchSize * numTokens * vocabSize; ++i)
+    {
+        logits[i] += (i % 19) * 0.01f; // Small variation to break ties consistently
+    }
 
     logits[0 * vocabSize + 25] = 10.0f; // pos 0 -> token 25 (valid)
     logits[1 * vocabSize + 35] = 10.0f; // pos 1 -> token 35 (valid)
     logits[2 * vocabSize + 48] = 15.0f; // pos 2 -> token 48 (not in tree, higher priority)
     logits[2 * vocabSize + 45] = 5.0f;  // pos 2 -> token 45 (valid but lower priority)
+    logits[3 * vocabSize + 0] = 10.0f;  // pos 3 -> token 0 (default)
+    logits[4 * vocabSize + 0] = 10.0f;  // pos 4 -> token 0 (default)
 
     runEagleAcceptTest(tokenIds, attentionMask, logits, batchSize, numTokens, vocabSize, maxDepth,
         "SingleBatchLogitTermination",
-        [](auto const& acceptedTokenIds, auto const& acceptedIndices, auto const& acceptLengths, auto const&) {
-            EXPECT_EQ(acceptLengths[0], 3) << "Should terminate at position 2 due to logits";
-            EXPECT_EQ(acceptedTokenIds[0], 15) << "Root token";
-            EXPECT_EQ(acceptedTokenIds[1], 25) << "Second token";
-            EXPECT_EQ(acceptedTokenIds[2], 35) << "Third token";
-            EXPECT_EQ(acceptedIndices[0], 0) << "Root index";
-            EXPECT_EQ(acceptedIndices[1], 1) << "Second index";
-            EXPECT_EQ(acceptedIndices[2], 2) << "Third index";
+        [](auto const& acceptedTokenIds, auto const& acceptedLogitsIndices, auto const& acceptLengths, auto const&) {
+            EXPECT_EQ(acceptLengths[0], 3) << "Should accept 3 tokens: 25->35->48";
+            EXPECT_EQ(acceptedTokenIds[0], 25) << "First predicted token";
+            EXPECT_EQ(acceptedTokenIds[1], 35) << "Second predicted token";
+            EXPECT_EQ(acceptedTokenIds[2], 48) << "Third predicted token (not in tree)";
+            EXPECT_EQ(acceptedLogitsIndices[0], 0) << "First logits index";
+            EXPECT_EQ(acceptedLogitsIndices[1], 1) << "Second logits index";
+            EXPECT_EQ(acceptedLogitsIndices[2], 2) << "Third logits index";
 
             EXPECT_EQ(acceptedTokenIds[3], -1) << "Unused token position should be -1";
-            EXPECT_EQ(acceptedIndices[3], -1) << "Unused index position should be -1";
+            EXPECT_EQ(acceptedLogitsIndices[3], -1) << "Unused logits index position should be -1";
             EXPECT_EQ(acceptedTokenIds[4], -1) << "Unused token position should be -1";
-            EXPECT_EQ(acceptedIndices[4], -1) << "Unused index position should be -1";
+            EXPECT_EQ(acceptedLogitsIndices[4], -1) << "Unused logits index position should be -1";
+        });
+}
+
+// Test case where predicted tokens are not in the tree - should still accept them
+TEST_F(EagleAcceptTest, TokensNotInTree)
+{
+    constexpr int32_t numTokens = 3;
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t vocabSize = 100;
+    constexpr int32_t maxDepth = 3;
+
+    /*
+     * Tree [10->20->30], logits pos0->99(not in tree)
+     * Expected: [99] indices=[0] length=1 (immediate termination)
+     */
+
+    // Setup token IDs: [10, 20, 30]
+    std::vector<int32_t> tokenIds(batchSize * numTokens);
+    tokenIds[0] = 10;
+    tokenIds[1] = 20;
+    tokenIds[2] = 30;
+
+    // Setup triangular attention mask (all tokens attend to previous ones)
+    std::vector<int8_t> attentionMask(batchSize * numTokens * numTokens, 0);
+    for (int32_t i = 0; i < numTokens; ++i)
+    {
+        for (int32_t j = 0; j <= i; ++j)
+        {
+            attentionMask[i * numTokens + j] = 1;
+        }
+    }
+
+    // Setup logits to predict tokens NOT in the tree
+    std::vector<float> logits(batchSize * numTokens * vocabSize, -5.0f);
+
+    // Add some noise to avoid uniform values and ensure consistent tie-breaking
+    for (int32_t i = 0; i < batchSize * numTokens * vocabSize; ++i)
+    {
+        logits[i] += (i % 23) * 0.01f; // Small variation to break ties consistently
+    }
+
+    logits[0 * vocabSize + 99] = 10.0f; // pos 0 -> token 99 (not in tree)
+    logits[1 * vocabSize + 98] = 10.0f; // pos 1 -> token 98 (not in tree)
+    logits[2 * vocabSize + 97] = 10.0f; // pos 2 -> token 97 (not in tree)
+
+    runEagleAcceptTest(tokenIds, attentionMask, logits, batchSize, numTokens, vocabSize, maxDepth, "TokensNotInTree",
+        [](auto const& acceptedTokenIds, auto const& acceptedLogitsIndices, auto const& acceptLengths, auto const&) {
+            EXPECT_EQ(acceptLengths[0], 1) << "Should accept at least 1 token (99) even if not in tree";
+
+            EXPECT_EQ(acceptedTokenIds[0], 99) << "Should accept first predicted token (99)";
+            EXPECT_EQ(acceptedLogitsIndices[0], 0) << "Should use logits[0]";
+
+            EXPECT_EQ(acceptedTokenIds[1], -1) << "Should not accept more tokens since 99 not in tree";
+            EXPECT_EQ(acceptedLogitsIndices[1], -1) << "Should not use more logits";
+            EXPECT_EQ(acceptedTokenIds[2], -1) << "Should not accept more tokens";
+            EXPECT_EQ(acceptedLogitsIndices[2], -1) << "Should not use more logits";
         });
 }
 
@@ -519,11 +708,12 @@ TEST_F(EagleAcceptTest, SingleBatchLogitTermination)
 TEST_F(EagleAcceptTest, DeviceValidation)
 {
     // Create one CPU tensor (logits) while others are on GPU - should cause validation failure
-    rt::Tensor logitsTensor({2, 4, 10}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "logits");
+    rt::Tensor logitsTensor({2 * 4, 10}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "logits");
     rt::Tensor tokenIdsTensor({2, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "tokenIds");
     rt::Tensor attentionMaskTensor({2, 4, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8, "attentionMask");
     rt::Tensor acceptedTokenIdsTensor({2, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptedTokenIds");
-    rt::Tensor acceptedIndicesTensor({2, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptedIndices");
+    rt::Tensor acceptedLogitsIndicesTensor(
+        {2, 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptedLogitsIndices");
     rt::Tensor acceptLengthTensor({2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptLength");
 
     // Allocate workspace (still needed for function call)
@@ -533,7 +723,7 @@ TEST_F(EagleAcceptTest, DeviceValidation)
 
     // Kernel should throw due to CPU tensor
     EXPECT_THROW(kernel::eagleAccept(logitsTensor, tokenIdsTensor, attentionMaskTensor, acceptedTokenIdsTensor,
-                     acceptedIndicesTensor, acceptLengthTensor, 4, workspace, workspaceSize, stream),
+                     acceptedLogitsIndicesTensor, acceptLengthTensor, workspace, workspaceSize, stream),
         std::runtime_error)
         << "Should reject CPU tensor";
 

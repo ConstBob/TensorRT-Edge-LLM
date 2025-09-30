@@ -46,3 +46,12 @@ target_include_directories(
   llm_inference PRIVATE ${COMMON_INCLUDE_DIRS}
                         ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_inference)
+
+# Add temporary executable for development and debugging purposes.
+add_executable(llm_inference_eagle llm_inference_eagle.cpp)
+target_link_libraries(llm_inference_eagle PRIVATE edgellmCore edgellmTokenizer
+                                                  exampleUtils commonLibraryExt)
+target_include_directories(
+  llm_inference_eagle PRIVATE ${COMMON_INCLUDE_DIRS}
+                              ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(llm_inference_eagle)

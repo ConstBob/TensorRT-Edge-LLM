@@ -36,6 +36,7 @@ struct LLMEngineRunnerConfig
 {
     bool enableReuseKVCache{true};
     bool useContextDependentRope{false};
+    bool enableEagleSpecDecode{false};
     int32_t numDecoderLayers{};
     int32_t numKVHeads{};
     int32_t headDim{};
@@ -46,6 +47,9 @@ struct LLMEngineRunnerConfig
     int32_t maxSequenceLength{};
     int32_t vocabSize{};
     int32_t maxSupportedLoraRank{};
+    // Attributes that only used with spec-decode
+    int32_t outputHiddenDim{};
+    int32_t maxVerifyTreeSize{};
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -60,6 +64,9 @@ struct LLMEngineRunnerConfig
 class LLMEngineRunner
 {
 public:
+    using OptionalInputTensor = std::optional<std::reference_wrapper<rt::Tensor const>>;
+    using OptionalOutputTensor = std::optional<std::reference_wrapper<rt::Tensor>>;
+
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
@@ -86,7 +93,8 @@ public:
     //! Returns:
     //!     True if the prefill step is successful, false otherwise.
     bool executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
-        rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, cudaStream_t stream);
+        rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, OptionalOutputTensor outputHiddenStates,
+        cudaStream_t stream);
 
     //! API entry to execute one vanilla decoding engine action for a batched request. The API will perform decoding
     //!     operations fill the KVCache of the new generated tokens and produce the output logits. The decoding
@@ -178,9 +186,9 @@ private:
     //! The LinearKVCache tensor that carried for the LLM model execution.
     rt::LinearKVCache mKVCache{};
 
-    //! The dummy LoRA weights tensor is used to bind the LoRA weights to the LLM engine. TensorRT does not support
-    //! nullptr for binding, even when the LoRA rank is 0.
-    rt::Tensor mDummyLoraWeightsTensor{};
+    //! Dummy tensor used to reserved space for un-used input tensors. Apply this workaround since TensorRT
+    //! does not support nullptr for input bindings.
+    rt::Tensor mDummyTensor{};
 
     //! The eagle base position ids tensor within the sequence that used by positional encoding.
     rt::Tensor mEagleBasePositionIds{};
@@ -197,8 +205,8 @@ private:
     //! The Function is used to bind the KVCache to the LLM engine for a new set of requests.
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
-    bool prefillStepInputValidation(
-        rt::Tensor const& inputIds, rt::Tensor const& contextLengths, rt::Tensor const& outputLogits);
+    bool prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
+        rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates);
 
     bool vanlliaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
 

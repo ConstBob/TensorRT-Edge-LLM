@@ -68,7 +68,7 @@ size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens);
  * @param tokenIds Draft tree token IDs with shape [batch_size, num_tokens] (INT32, GPU)
  * @param attentionMask Tree attention mask with shape [batch_size, num_tokens, num_tokens] (INT8, boolean, GPU)
  * @param acceptedTokenIds Output accepted token IDs with shape [batch_size, max_depth] (INT32, GPU)
- * @param acceptedIndices Output corresponding tree indices with shape [batch_size, max_depth] (INT32, GPU)
+ * @param acceptedLogitsIndices Output corresponding logits indices with shape [batch_size, max_depth] (INT32, GPU)
  * @param acceptLength Output tensor with accept lengths for each batch with shape [batch_size] (INT32, GPU)
  * @param maxDepth Maximum number of tokens to accept
  * @param workspace Workspace buffer for temporary allocations
@@ -80,8 +80,8 @@ size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens);
  * @note Shared memory usage: Stage 1: CUB temp storage (~1KB), Stage 2: numTokens * sizeof(int32_t) + small overhead
  */
 void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tensor const& attentionMask,
-    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedIndices, rt::Tensor& acceptLength, int32_t maxDepth,
-    void* workspace, size_t workspaceSize, cudaStream_t stream);
+    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength, void* workspace,
+    size_t workspaceSize, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace drivellm

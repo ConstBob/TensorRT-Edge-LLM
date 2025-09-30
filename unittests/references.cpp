@@ -809,7 +809,7 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
 {
     EagleAcceptResult result;
     result.acceptedTokenIds.resize(batchSize * maxDepth, -1);
-    result.acceptedIndices.resize(batchSize * maxDepth, -1);
+    result.acceptedLogitsIndices.resize(batchSize * maxDepth, -1);
     result.acceptLengths.resize(batchSize, 0);
 
     int32_t maxAcceptLength = 0;
@@ -820,6 +820,7 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
         // Precompute token depths for this batch
         std::vector<int32_t> tokenDepths(numTokens);
         int32_t const batchMaskOffset = b * numTokens * numTokens;
+        int32_t const batchTokenOffset = b * numTokens;
         for (int32_t i = 0; i < numTokens; ++i)
         {
             int32_t depth = 0;
@@ -833,25 +834,22 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
             tokenDepths[i] = depth;
         }
 
-        int32_t currentDepth = 1;
-        int32_t currentTokenIdx = 0;
+        int32_t currentDepth = 0;
+        int32_t currentTokenIdx = 0;                    // Start with token[0], use logits[0] to predict next
         int32_t expectedNextDepth = tokenDepths[0] + 1; // Next depth should be current token's depth + 1
 
-        // Token 0 is always accepted
-        int32_t const batchTokenOffset = b * numTokens;
-        result.acceptedTokenIds[b * maxDepth + 0] = tokenIds[batchTokenOffset + 0];
-        result.acceptedIndices[b * maxDepth + 0] = 0;
-        result.acceptLengths[b] = 1;
+        // Start with accept length 0, will be set to at least 1 in the loop
+        result.acceptLengths[b] = 0;
 
-        // Process subsequent tokens
-        while (currentDepth < maxDepth && currentTokenIdx < numTokens - 1)
+        // Process tokens - always accept at least one
+        for (int32_t step = 0; step < maxDepth && currentTokenIdx < numTokens; ++step)
         {
             // Step 1: Find top-1 token from logits[b][currentTokenIdx]
             int32_t const logitsOffset = b * numTokens * vocabSize + currentTokenIdx * vocabSize;
 
-            // Find argmax
+            // Find argmax with consistent tie-breaking (prefer lower indices)
             float maxLogit = -std::numeric_limits<float>::infinity();
-            int32_t selectedTokenId = -1;
+            int32_t selectedTokenId = 0; // Default to token 0 for consistent behavior
 
             for (int32_t v = 0; v < vocabSize; ++v)
             {
@@ -862,8 +860,13 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
                 }
             }
 
-            // Step 2: Find which token in the tree matches the selected token,
-            // is at the correct depth, and attends to the current token
+            // Step 2: Always accept the selected token
+            result.acceptedTokenIds[b * maxDepth + currentDepth] = selectedTokenId;
+            result.acceptedLogitsIndices[b * maxDepth + currentDepth] = currentTokenIdx;
+            result.acceptLengths[b] = currentDepth + 1;
+            currentDepth++;
+
+            // Step 3: Check if the selected token exists in the tree to continue
             int32_t nextTokenIdx = -1;
 
             for (int32_t checkIdx = 1; checkIdx < numTokens; ++checkIdx)
@@ -875,51 +878,70 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
                     int32_t maskOffset = batchMaskOffset + checkIdx * numTokens + currentTokenIdx;
                     if (attentionMask[maskOffset] == 1)
                     {
-                        // Found a valid next token
+                        // Found a valid next token in tree
                         nextTokenIdx = checkIdx;
                         break; // Take the first match
                     }
                 }
             }
 
-            // Step 3: Update results if valid token found
+            // Step 4: Update for next iteration
             if (nextTokenIdx != -1)
             {
-                result.acceptedTokenIds[b * maxDepth + currentDepth] = selectedTokenId;
-                result.acceptedIndices[b * maxDepth + currentDepth] = nextTokenIdx;
-                result.acceptLengths[b] = currentDepth + 1;
+                // Found valid next token in tree, continue from there
                 currentTokenIdx = nextTokenIdx;
-                currentDepth++;
                 expectedNextDepth++;
             }
             else
             {
-                // No valid next token found, stop
+                // No valid next token found in tree, stop
                 break;
             }
+        }
+
+        // Ensure at least 1 token is always accepted
+        if (result.acceptLengths[b] == 0)
+        {
+            // This should never happen, but as a safety net, accept the first predicted token
+            int32_t const logitsOffset = b * numTokens * vocabSize + 0 * vocabSize;
+            float maxLogit = -std::numeric_limits<float>::infinity();
+            int32_t selectedTokenId = 0; // Default to token 0 for consistent behavior
+            for (int32_t v = 0; v < vocabSize; ++v)
+            {
+                if (logits[logitsOffset + v] > maxLogit)
+                {
+                    maxLogit = logits[logitsOffset + v];
+                    selectedTokenId = v;
+                }
+            }
+            result.acceptedTokenIds[b * maxDepth + 0] = selectedTokenId;
+            result.acceptedLogitsIndices[b * maxDepth + 0] = 0;
+            result.acceptLengths[b] = 1;
         }
 
         // Update max accept length
         maxAcceptLength = std::max(maxAcceptLength, result.acceptLengths[b]);
     }
 
+    // Ensure maxAcceptLength is at least 1
+    maxAcceptLength = std::max(maxAcceptLength, 1);
     result.maxAcceptLength = maxAcceptLength;
 
     // Reshape the result vectors to [batchSize, maxAcceptLength]
     std::vector<int32_t> reshapedTokenIds(batchSize * maxAcceptLength, -1);
-    std::vector<int32_t> reshapedIndices(batchSize * maxAcceptLength, -1);
+    std::vector<int32_t> reshapedLogitsIndices(batchSize * maxAcceptLength, -1);
 
     for (int32_t b = 0; b < batchSize; ++b)
     {
-        for (int32_t i = 0; i < maxAcceptLength; ++i)
+        for (int32_t i = 0; i < result.acceptLengths[b] && i < maxAcceptLength; ++i)
         {
             reshapedTokenIds[b * maxAcceptLength + i] = result.acceptedTokenIds[b * maxDepth + i];
-            reshapedIndices[b * maxAcceptLength + i] = result.acceptedIndices[b * maxDepth + i];
+            reshapedLogitsIndices[b * maxAcceptLength + i] = result.acceptedLogitsIndices[b * maxDepth + i];
         }
     }
 
     result.acceptedTokenIds = std::move(reshapedTokenIds);
-    result.acceptedIndices = std::move(reshapedIndices);
+    result.acceptedLogitsIndices = std::move(reshapedLogitsIndices);
 
     return result;
 }

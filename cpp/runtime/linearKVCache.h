@@ -74,19 +74,13 @@ public:
     void resetForNewSequences(rt::Tensor const& hostReuseKVCacheLengths, cudaStream_t stream);
 
     //! Asynchronously commit the KVCache buffer for a prefill request, record stored KVCache lengths.
-    //! @param prefillLengths The context length of the prefill requests.
+    //! @param newContextLengths [GPU, Int32]: The context length to commit for the KVCache.
     //! @param stream The stream is used to perform GPU memory operations.
-    void commitPrefillRequest(rt::Tensor const& prefillLengths, cudaStream_t stream);
+    void commitSequenceLength(rt::Tensor const& newContextLengths, cudaStream_t stream);
 
     //! Commit the KVCache buffer for a decode request, increment the KVCache lengths by 1 for active sequences.
     //! @param stream The stream is used to perform GPU memory operations.
-    void commitDecodeRequest(cudaStream_t stream);
-
-    //! Commit the KVCache buffer for a decode request, increment the KVCache lengths by the given increment.
-    //! Handle case where we produce multiple tokens at the same time.
-    //! @param increment The increment value to be added to the KVCache lengths.
-    //! @param stream The stream is used to perform GPU memory operations.
-    void commitDecodeRequest(int32_t increment, cudaStream_t stream);
+    void commitSequenceLength(int32_t increment, cudaStream_t stream);
 
     //! Get the KVCache lengths for active sequences.
     rt::Tensor& getKVCacheLengths();
