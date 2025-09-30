@@ -32,7 +32,6 @@ namespace imageUtils
 {
 
 ImageData::ImageData(rt::Tensor&& data, bool thumbnail)
-    : isThumbnail(thumbnail)
 {
     check::check(data.getDataType() == nvinfer1::DataType::kUINT8, "Image data must be UINT8");
     check::check(data.getShape().getNumDims() == 3, "Image data must have 3 dimensions");
@@ -110,7 +109,7 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
     return ImageData(std::move(buffer));
 }
 
-ImageData resizeImage(ImageData const& image, int newWidth, int newHeight, bool isThumbnail)
+ImageData resizeImage(ImageData const& image, int newWidth, int newHeight)
 {
     if (newWidth <= 0 || newHeight <= 0)
     {

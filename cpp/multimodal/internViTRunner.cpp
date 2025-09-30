@@ -16,6 +16,7 @@
  */
 
 #include "internViTRunner.h"
+#include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <cmath>
@@ -140,19 +141,32 @@ std::vector<EngineInputDesc> InternViTRunner::getComputedEmbeddings()
     return extraInputs;
 }
 
-void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<half>& patches,
-    std::vector<int64_t>& imageTokenLengths, int64_t& numImages, int64_t& totalNumBlocks)
+void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
+    int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream)
 {
     int height = image.height;
     int width = image.width;
     int channels = image.channels;
     unsigned char* imageData = image.data(); // In hwc order
 
-    int64_t curNumBlocks = (height / mConfig.blockImageSizeH) * (width / mConfig.blockImageSizeW);
-    totalNumBlocks += curNumBlocks;
+    if (channels != mConfig.numChannels)
+    {
+        throw std::runtime_error("Image channels mismatch, got " + std::to_string(channels) + ", expected "
+            + std::to_string(mConfig.numChannels));
+    }
+    if (height % mConfig.blockImageSizeH != 0 || width % mConfig.blockImageSizeW != 0)
+    {
+        throw std::runtime_error(
+            "Image height or width is not divisible by blockImageSizeH or blockImageSizeW, "
+            "got height: "
+            + std::to_string(height) + ", width: " + std::to_string(width)
+            + ", blockImageSizeH: " + std::to_string(mConfig.blockImageSizeH)
+            + ", blockImageSizeW: " + std::to_string(mConfig.blockImageSizeW));
+    }
 
+    int64_t curNumBlocks = (height / mConfig.blockImageSizeH) * (width / mConfig.blockImageSizeW);
     int64_t curTokenLength = curNumBlocks * 256;
-    if (image.isThumbnail)
+    if (isThumbnail)
     {
         // Add to the last image token length, instead of considered as a new image
         imageTokenLengths.back() += curTokenLength;
@@ -163,39 +177,28 @@ void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
         ++numImages;
     }
 
-    std::vector<half> curPatch(height * width * channels);
+    // Copy image to device.
+    auto imageDevice = rt::Tensor({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    CUDA_CHECK(cudaMemcpyAsync(imageDevice.rawPointer(), imageData, height * width * channels * sizeof(unsigned char),
+        cudaMemcpyHostToDevice, stream));
 
-    // Normalize and transpose into patches of 448x448
-    for (int gridH = 0; gridH < height / mConfig.blockImageSizeH; ++gridH)
-    {
-        for (int gridW = 0; gridW < width / mConfig.blockImageSizeW; ++gridW)
-        {
-            for (int blockH = 0; blockH < mConfig.blockImageSizeH; ++blockH)
-            {
-                for (int blockW = 0; blockW < mConfig.blockImageSizeW; ++blockW)
-                {
-                    for (int c = 0; c < channels; ++c)
-                    {
+    // Normalize image
+    auto normalizedImageDevice
+        = rt::Tensor({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    auto imageMeanDevice = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    auto imageStdDevice = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    CUDA_CHECK(cudaMemcpyAsync(imageMeanDevice.rawPointer(), mConfig.imageMean.data(),
+        mConfig.imageMean.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(imageStdDevice.rawPointer(), mConfig.imageStd.data(),
+        mConfig.imageStd.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    kernel::normalizeImage(imageDevice, imageMeanDevice, imageStdDevice, normalizedImageDevice, stream);
 
-                        // src dimensions: (H, W, C) => (gridH, blockImageSizeH, gridW, blockImageSizeW, C)
-                        int originalH = gridH * mConfig.blockImageSizeH + blockH;
-                        int originalW = gridW * mConfig.blockImageSizeW + blockW;
-                        unsigned char value = imageData[originalH * width * channels + originalW * channels + c];
-                        half normalized = __double2half((value / 255.0 - mConfig.imageMean[c]) / mConfig.imageStd[c]);
+    // Transpose to patch
+    int64_t offset = totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW;
+    kernel::transposeToPatchInternVL(normalizedImageDevice, mVitInput, offset, stream);
 
-                        // dst dimensions: (gridH*gridW, C, blockImageSizeH, blockImageSizeW)
-                        int dstNumBlocks = gridH * (width / mConfig.blockImageSizeW) + gridW;
-                        curPatch[dstNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW
-                            + c * mConfig.blockImageSizeH * mConfig.blockImageSizeW + blockH * mConfig.blockImageSizeW
-                            + blockW]
-                            = normalized;
-                    }
-                }
-            }
-        }
-    }
-
-    patches.insert(patches.end(), curPatch.begin(), curPatch.end());
+    // Update numBlocks
+    totalNumBlocks += curNumBlocks;
 }
 
 std::vector<std::pair<int, int>> InternViTRunner::getAllSupportedAspectRatios(
@@ -252,7 +255,6 @@ std::tuple<int, int> InternViTRunner::getResizedImageSize(int const height, int 
 void InternViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
     std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
 {
-    std::vector<half> patches;
     int64_t totalNumBlocks = 0;
 
     for (auto const& imageBuffer : imageBuffers)
@@ -265,15 +267,15 @@ void InternViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::Im
                 auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW, mConfig.minImageTiles, mConfig.maxImageTiles);
                 auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
-                formatPatch(resizedImage, patches, imageTokenLengths, numImage, totalNumBlocks);
+                formatPatch(resizedImage, imageTokenLengths, numImage, totalNumBlocks, false, stream);
 
                 auto thumbnailImage
-                    = rt::imageUtils::resizeImage(image, mConfig.blockImageSizeW, mConfig.blockImageSizeH, true);
-                formatPatch(thumbnailImage, patches, imageTokenLengths, numImage, totalNumBlocks);
+                    = rt::imageUtils::resizeImage(image, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
+                formatPatch(thumbnailImage, imageTokenLengths, numImage, totalNumBlocks, true, stream);
             }
             else
             {
-                formatPatch(image, patches, imageTokenLengths, numImage, totalNumBlocks);
+                formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
         }
         numImages.emplace_back(numImage);
@@ -286,8 +288,6 @@ void InternViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::Im
             + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
     }
 
-    CUDA_CHECK(cudaMemcpyAsync(
-        mVitInput.rawPointer(), patches.data(), patches.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
     mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
     mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
 }
@@ -295,7 +295,6 @@ void InternViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::Im
 void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
     std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
 {
-    std::vector<half> patches;
     int64_t totalNumBlocks = 0;
 
     for (auto const& prompt : request.prompts)
@@ -308,16 +307,15 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
                 auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW, mConfig.minImageTiles, mConfig.maxImageTiles);
                 auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
-                formatPatch(resizedImage, patches, imageTokenLengths, numImage, totalNumBlocks);
-
-                auto thumbnailImage
-                    = rt::imageUtils::resizeImage(image, mConfig.blockImageSizeW, mConfig.blockImageSizeH, true);
-                formatPatch(thumbnailImage, patches, imageTokenLengths, numImage, totalNumBlocks);
+                formatPatch(resizedImage, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
             else
             {
-                formatPatch(image, patches, imageTokenLengths, numImage, totalNumBlocks);
+                formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
+            // Add thumbnail image by default
+            auto thumbnailImage = rt::imageUtils::resizeImage(image, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
+            formatPatch(thumbnailImage, imageTokenLengths, numImage, totalNumBlocks, true, stream);
         }
         numImages.emplace_back(numImage);
     }
@@ -342,13 +340,11 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
     int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), 0);
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
 
-    CUDA_CHECK(cudaMemcpyAsync(
-        mVitInput.rawPointer(), patches.data(), patches.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
     mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
     mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
 }
 
-std::string InternViTRunner::applyChatTemplate(std::string const& inputString, int const& numImages,
+std::string InternViTRunner::applyChatTemplate(std::string const& inputString, int64_t const& numImages,
     std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt)
 {
     // System prefix
@@ -358,9 +354,9 @@ std::string InternViTRunner::applyChatTemplate(std::string const& inputString, i
           "言模型。<|im_end|>\n<|im_start|>user\n";
 
     // Images
-    for (int i = 0; i < numImages; ++i)
+    for (int64_t i = 0; i < numImages; ++i)
     {
-        int imagePadLen = imageTokenLengths.at(totalImageIdx++);
+        int64_t imagePadLen = imageTokenLengths.at(totalImageIdx++);
 
         prompt += "<img>";
         for (int j = 0; j < imagePadLen; ++j)
@@ -432,10 +428,10 @@ std::string InternViTRunner::applyChatTemplateSystem(std::string const& systemPr
 }
 
 std::string InternViTRunner::applyChatTemplateUser(
-    std::string const& userPrompt, int const& numImage, bool addGenerationPrompt)
+    std::string const& userPrompt, int64_t const& numImage, bool addGenerationPrompt)
 {
     std::string prompt = "<|im_start|>user\n";
-    for (int i = 0; i < numImage; ++i)
+    for (int64_t i = 0; i < numImage; ++i)
     {
         prompt += "<img><IMG_CONTEXT></img>\n";
     }
@@ -576,13 +572,17 @@ void InternViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const
             + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
     }
 
-    std::vector<half> patches(totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW);
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    std::generate(patches.begin(), patches.end(), [&rng, &dist]() { return __float2half(dist(rng)); });
-    CUDA_CHECK(cudaMemcpyAsync(
-        mVitInput.rawPointer(), patches.data(), patches.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
     mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
     mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
+
+    half* patchesPtr;
+    int32_t patchesSize = totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW;
+    CUDA_CHECK(cudaMallocHost(&patchesPtr, patchesSize * sizeof(half)));
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    std::generate(patchesPtr, patchesPtr + patchesSize, [&rng, &dist]() { return __float2half(dist(rng)); });
+    CUDA_CHECK(cudaMemcpyAsync(
+        mVitInput.rawPointer(), patchesPtr, patchesSize * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaFreeHost(patchesPtr));
 
     // Init input ids
     std::uniform_int_distribution<std::mt19937::result_type> intDist(0, mConfig.vocabSize - 1);

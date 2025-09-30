@@ -219,7 +219,7 @@ void loadImages(std::vector<std::vector<std::string>> const& imagePaths,
             // Insert thumbnail image for some models
             if (useThumbnail && modelType == "internvl")
             {
-                auto thumbnailImage = rt::imageUtils::resizeImage(image, thumbnailW, thumbnailH, true);
+                auto thumbnailImage = rt::imageUtils::resizeImage(image, thumbnailW, thumbnailH);
                 imageBuffer.emplace_back(thumbnailImage);
             }
         }
