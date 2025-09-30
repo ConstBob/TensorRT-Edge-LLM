@@ -42,6 +42,7 @@ std::string formatEngineConfig(drivellm::rt::LLMEngineRunnerConfig const& config
 
     ss << std::boolalpha;
     ss << "LLMEngineRunnerConfig:" << "  enableReuseKVCache: " << config.enableReuseKVCache
+       << "  enableEagleSpecDecode: " << config.enableEagleSpecDecode
        << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
        << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
        << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
@@ -49,6 +50,11 @@ std::string formatEngineConfig(drivellm::rt::LLMEngineRunnerConfig const& config
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
        << "  maxSequenceLength: " << config.maxSequenceLength
        << "  maxSupportedLoraRank: " << config.maxSupportedLoraRank;
+    if (config.enableEagleSpecDecode)
+    {
+        ss << "  outputHiddenDim (For Eagle SpecDecode): " << config.outputHiddenDim;
+        ss << "  maxVerifyTreeSize (For Eagle SpecDecode): " << config.maxVerifyTreeSize;
+    }
     return ss.str();
 }
 
@@ -193,11 +199,34 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             stream);
 
     // Instantiate other GPU memory input that needed by the Engine execution.
-    this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT64);
-    CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
     this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     CUDA_CHECK(
         cudaMemsetAsync(mSequenceContextLengths.rawPointer(), 0, mSequenceContextLengths.getMemoryCapacity(), stream));
+
+    if (mConfig.enableEagleSpecDecode)
+    {
+        this->mSelectTokenIndices = rt::Tensor(
+            {mConfig.maxSupportedBatchSize * mConfig.maxVerifyTreeSize}, rt::DeviceType::kGPU, DataType::kINT64);
+        CUDA_CHECK(
+            cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mEagleBasePositionIds = rt::Tensor(
+            {mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        CUDA_CHECK(
+            cudaMemsetAsync(mEagleBasePositionIds.rawPointer(), 0, mEagleBasePositionIds.getMemoryCapacity(), stream));
+        int32_t const packedMaskSize = divUp(mConfig.maxVerifyTreeSize, 32);
+        this->mEagleBasePackedMask
+            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize, packedMaskSize},
+                rt::DeviceType::kGPU, DataType::kINT32);
+        CUDA_CHECK(
+            cudaMemsetAsync(mEagleBasePackedMask.rawPointer(), 0, mEagleBasePackedMask.getMemoryCapacity(), stream));
+    }
+    else
+    {
+        this->mSelectTokenIndices
+            = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT64);
+        CUDA_CHECK(
+            cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
+    }
 
     // Add the LoRA weights to the engine.
     if (isLoraWeightsSupported())
@@ -218,7 +247,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     // Initialize the dummy LoRA weights tensor as TensorRT does not support nullptr for binding, even when the LoRA
     // rank is 0.
-    mDummyLoraWeightsTensor = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mDummyTensor = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Reset the LoRA weights to zero tensors.
     if (!this->resetLoraWeights(stream))
@@ -253,7 +282,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_batch_size", "max_input_len", "max_seq_len", "max_lora_rank"};
+            = {"max_batch_size", "max_input_len", "max_seq_len", "max_lora_rank", "eagle_base", "max_decoding_tokens"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -270,8 +299,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.numKVHeads = configJson["num_key_value_heads"].get<int32_t>();
         mConfig.headDim = configJson["head_dim"].get<int32_t>();
 
-        auto const partialRotaryFactor = configJson["partial_rotary_factor"].get<float>();
-        mConfig.rotaryDim = static_cast<int32_t>(partialRotaryFactor * static_cast<float>(mConfig.headDim));
+        mConfig.rotaryDim = mConfig.headDim;
 
         mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
 
@@ -282,6 +310,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
         mConfig.maxSequenceLength = builderConfig["max_seq_len"].get<int32_t>();
         mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
+        mConfig.enableEagleSpecDecode = builderConfig["eagle_base"].get<bool>();
 
         // Validate configuration values - all must be positive except max_lora_rank
         std::vector<std::pair<std::string, int32_t>> positiveFields
@@ -297,6 +326,14 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
                 LOG_ERROR("initializeConfigFromJson(): Invalid %s: %d (must be positive)", fieldName.c_str(), value);
                 return false;
             }
+        }
+
+        // FIXME: Not a proper way to determine the output hidden dim.
+        // Hardcore output hidden_dim to 3 x model hidden_size which is default in eagle3.
+        if (mConfig.enableEagleSpecDecode)
+        {
+            mConfig.outputHiddenDim = configJson["hidden_size"].get<int32_t>() * 3;
+            mConfig.maxVerifyTreeSize = builderConfig["max_decoding_tokens"].get<int32_t>();
         }
 
         // Validate max_lora_rank separately (must be non-negative)
@@ -475,8 +512,8 @@ rt::LinearKVCache& LLMEngineRunner::getLinearKVCache()
     return mKVCache;
 }
 
-bool LLMEngineRunner::prefillStepInputValidation(
-    rt::Tensor const& inputIds, rt::Tensor const& contextLengths, rt::Tensor const& outputLogits)
+bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
+    rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates)
 {
     int32_t activeBatchSize = inputIds.getShape()[0];
     int32_t prefillSequenceLength = inputIds.getShape()[1];
@@ -487,7 +524,7 @@ bool LLMEngineRunner::prefillStepInputValidation(
     if (!checkInputsGPUTensor)
     {
         LOG_ERROR(
-            "executePrefill(): Invalid device type of I/O tensors. ContextLengths input should reside on CPU and "
+            "Invalid device type of I/O tensors. ContextLengths input should reside on CPU and "
             "the rest should reside on GPU.");
         return false;
     }
@@ -496,7 +533,7 @@ bool LLMEngineRunner::prefillStepInputValidation(
     if (!isBatchValid)
     {
         LOG_ERROR(
-            "executePrefill(): Invalid batchSize of the input tensors. Either batchSize is larger than "
+            "Invalid batchSize of the input tensors. Either batchSize is larger than "
             "maxSupportedBatchSize or batchSize is not consistent among the input tensors. "
             "Current inputIds shape: %s, contextLengths shape: %s, logits shape: %s",
             inputIds.getShape().formatString().c_str(), contextLengths.getShape().formatString().c_str(),
@@ -506,7 +543,7 @@ bool LLMEngineRunner::prefillStepInputValidation(
     if (prefillSequenceLength > mConfig.maxSupportedInputLength)
     {
         LOG_ERROR(
-            "executePrefill(): Invalid sequence length of the input tensors. Input sequence length (%d) is larger "
+            "Invalid sequence length of the input tensors. Input sequence length (%d) is larger "
             "than maxSupportedInputLength (%d). Current inputIds shape: %s.",
             prefillSequenceLength, mConfig.maxSupportedInputLength, inputIds.getShape().formatString().c_str());
         return false;
@@ -516,18 +553,38 @@ bool LLMEngineRunner::prefillStepInputValidation(
     if (!isLogitsShapeValid)
     {
         LOG_ERROR(
-            "executePrefill(): Invalid shape of the output logits tensor. The output logits tensor should have shape "
+            "Invalid shape of the output logits tensor. The output logits tensor should have shape "
             "[activeBatchSize, VocabSize]. Current logits shape is %s.",
             outputLogits.getShape().formatString().c_str());
         return false;
     }
+    if (mConfig.enableEagleSpecDecode)
+    {
+        bool const isHiddenStatesShapeValid = outputHiddenStates.has_value()
+            && outputHiddenStates.value().get().getShape().getNumDims() == 3
+            && outputHiddenStates.value().get().getShape()[0] == activeBatchSize
+            && outputHiddenStates.value().get().getShape()[1] == prefillSequenceLength
+            && outputHiddenStates.value().get().getShape()[2] == mConfig.outputHiddenDim;
+        if (!isHiddenStatesShapeValid)
+        {
+            LOG_ERROR(
+                "With SpecDecode enabled, the output hidden states tensor shall be valid and has shape "
+                "[activeBatchSize, %d, %d]. Current hidden states shape is %s.",
+                prefillSequenceLength, mConfig.outputHiddenDim,
+                outputHiddenStates.value().get().getShape().formatString().c_str());
+            return false;
+        }
+    }
+
     return true;
 }
 
 bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& hostContextLengths,
-    rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, cudaStream_t stream)
+    rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, OptionalOutputTensor outputHiddenStates,
+    cudaStream_t stream)
 {
-    bool const validateInputStatus = this->prefillStepInputValidation(inputIds, hostContextLengths, outputLogits);
+    bool const validateInputStatus
+        = this->prefillStepInputValidation(inputIds, hostContextLengths, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("executePrefill(): Prefill request not performed due to invalid input tensors.");
@@ -537,8 +594,16 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     // Verirify input tensorShape is valid.
     int32_t activeBatchSize = inputIds.getShape()[0];
 
-    // conduct preparation work for the engine execution.
-    mSelectTokenIndices.reshape({activeBatchSize, 1});
+    // conduct preparation work for the engine execution. Provide correct shapes for MISC input tensors.
+    if (mConfig.enableEagleSpecDecode)
+    {
+        // With EAGLE, shape semantics is different with the "last_token_ids" input to gather from hidden states.
+        mSelectTokenIndices.reshape({activeBatchSize});
+    }
+    else
+    {
+        mSelectTokenIndices.reshape({activeBatchSize, 1});
+    }
     mSequenceContextLengths.reshape({activeBatchSize});
 
     std::vector<int64_t> selectTokenIndicesHost(activeBatchSize, 0);
@@ -566,6 +631,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
         &= mContextExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mContextExecutionContext->setInputShape(
         lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
+    // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
     setEngineIOStatus
         &= mContextExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
     if (!multimodalEmbeddings.isEmpty())
@@ -581,6 +647,20 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
             kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().rawPointer());
         setEngineIOStatus &= mContextExecutionContext->setInputShape(
             kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    }
+    if (mConfig.enableEagleSpecDecode)
+    {
+        setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+            outputHiddenStatesName.c_str(), outputHiddenStates.value().get().rawPointer());
+        // Mask input and optional token pos-ids are not used, set to dummy data.
+        setEngineIOStatus
+            &= mContextExecutionContext->setTensorAddress(attentionMaskName.c_str(), mDummyTensor.rawPointer());
+        setEngineIOStatus &= mContextExecutionContext->setInputShape(
+            attentionMaskName.c_str(), Coords{activeBatchSize, 1, 1}.getTRTDims());
+        setEngineIOStatus
+            &= mContextExecutionContext->setTensorAddress(attentionPosIdName.c_str(), mDummyTensor.rawPointer());
+        setEngineIOStatus &= mContextExecutionContext->setInputShape(
+            attentionPosIdName.c_str(), Coords{activeBatchSize, 1}.getTRTDims());
     }
 
     // Engine output tensors.
@@ -603,7 +683,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
         return false;
     }
     // Prefill operation has completed, commit the new contents with KVCache.
-    mKVCache.commitPrefillRequest(mSequenceContextLengths, stream);
+    mKVCache.commitSequenceLength(mSequenceContextLengths, stream);
 
     LOG_DEBUG("executePrefill(): Prefill stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
@@ -724,7 +804,8 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     }
 
     // Completed decoding step, commit the KVCache length of this run.
-    mKVCache.commitDecodeRequest(stream);
+    constexpr int32_t kVANILLA_DECODE_INCREMENT{1};
+    mKVCache.commitSequenceLength(kVANILLA_DECODE_INCREMENT, stream);
     LOG_DEBUG("executeVanillaDecodingStep(): Decoding stage execution completed for request with batch size %d.",
         activeBatchSize);
     return true;
@@ -782,17 +863,16 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
         return false;
     }
 
-    Dims const outputHiddenStatesDim = mEngine->getTensorShape(outputHiddenStatesName.c_str());
-    int32_t const baseModelHiddenDim = outputHiddenStatesDim.d[2];
     bool const isOutputShapeValid = outputLogits.getShape()[0] == outputHiddenStates.getShape()[0]
-        && outputLogits.getShape()[1] == mConfig.vocabSize && outputHiddenStates.getShape()[1] == baseModelHiddenDim;
+        && outputLogits.getShape()[1] == mConfig.vocabSize
+        && outputHiddenStates.getShape()[1] == mConfig.outputHiddenDim;
     if (!isOutputShapeValid)
     {
         LOG_ERROR(
             "eagleBaseTreeDecodingStepInputValidation(): Invalid shape of the output tensors. Logits shape shall be "
             "[select-token-size, %d], hidden states shape shall be [select-token-size, %d], "
             "current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.vocabSize, baseModelHiddenDim, outputLogits.getShape().formatString().c_str(),
+            mConfig.vocabSize, mConfig.outputHiddenDim, outputLogits.getShape().formatString().c_str(),
             outputHiddenStates.getShape().formatString().c_str());
         return false;
     }
@@ -820,7 +900,7 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
 
     // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
     // indices, sequence context lengths.
-    mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize});
+    mSelectTokenIndices.reshape({baseTreeDecodingSize});
     mSequenceContextLengths.reshape({activeBatchSize});
     mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize});
     mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen});
@@ -1023,10 +1103,10 @@ bool LLMEngineRunner::resetLoraWeights(cudaStream_t stream)
     {
         nvinfer1::Dims zeroShape
             = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
-        resetStatus &= mContextExecutionContext->setTensorAddress(
-            loraWeightsTensorName.c_str(), mDummyLoraWeightsTensor.rawPointer());
-        resetStatus &= mGenerationExecutionContext->setTensorAddress(
-            loraWeightsTensorName.c_str(), mDummyLoraWeightsTensor.rawPointer());
+        resetStatus
+            &= mContextExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
+        resetStatus
+            &= mGenerationExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
         if (loraWeightsTensorName.find("lora_A") != std::string::npos)
         {
             zeroShape.d[1] = 0;
@@ -1176,10 +1256,9 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cuda
             }
             setLoraWeightsStatus &= mContextExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
             setLoraWeightsStatus &= mGenerationExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
-            mContextExecutionContext->setTensorAddress(
-                loraWeightsTensorName.c_str(), mDummyLoraWeightsTensor.rawPointer());
+            mContextExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
             setLoraWeightsStatus &= mGenerationExecutionContext->setTensorAddress(
-                loraWeightsTensorName.c_str(), mDummyLoraWeightsTensor.rawPointer());
+                loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
             LOG_DEBUG("switchLoraWeights(): LoRA weights tensor with name '%s' not found. Set shape to rank 0.",
                 loraWeightsTensorName.c_str());
         }

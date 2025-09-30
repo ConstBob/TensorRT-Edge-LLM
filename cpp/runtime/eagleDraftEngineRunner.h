@@ -52,7 +52,7 @@ public:
     EagleDraftEngineRunner(
         std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream);
 
-    ~EagleDraftEngineRunner();
+    ~EagleDraftEngineRunner() = default;
 
     // Get internal resources for the eagle draft engine.
     rt::Tensor& getRopeCosSinCacheTensor();

@@ -186,8 +186,8 @@ __device__ int32_t computeTokenDepth(int32_t tokenIdx, int8_t const* attentionMa
 
 // CUDA kernel for eagle accept algorithm - optimized for concurrent batch processing
 __global__ void eagleAcceptKernel(int32_t const* top1Tokens, int32_t const* tokenIds, int8_t const* attentionMask,
-    int32_t* acceptedTokenIds, int32_t* acceptedIndices, int32_t* acceptLength, int32_t batchSize, int32_t numTokens,
-    int32_t maxDepth)
+    int32_t* acceptedTokenIds, int32_t* acceptedLogitsIndices, int32_t* acceptLength, int32_t batchSize,
+    int32_t numTokens, int32_t maxDepth)
 {
     int32_t const batchIdx = blockIdx.x;
     int32_t const tid = threadIdx.x;
@@ -196,60 +196,62 @@ __global__ void eagleAcceptKernel(int32_t const* top1Tokens, int32_t const* toke
     if (batchIdx >= batchSize)
         return;
 
-    // Minimal shared memory usage - only for token depths and communication
+    // Optimized shared memory layout
     extern __shared__ char sharedMem[];
     int32_t* tokenDepths = reinterpret_cast<int32_t*>(sharedMem);
 
-    // Initialize output arrays for this batch
+    // Batch-specific pointers for better cache locality
+    int8_t const* batchAttentionMask = attentionMask + batchIdx * numTokens * numTokens;
+    int32_t const* batchTokenIds = tokenIds + batchIdx * numTokens;
+    int32_t const* batchTop1Tokens = top1Tokens + batchIdx * numTokens;
+
+    // Parallel initialization of output arrays
+    for (int32_t i = tid; i < maxDepth; i += blockSize)
+    {
+        acceptedTokenIds[batchIdx * maxDepth + i] = -1;
+        acceptedLogitsIndices[batchIdx * maxDepth + i] = -1;
+    }
     if (tid == 0)
     {
-        acceptLength[batchIdx] = 1; // First token is always accepted
-        for (int32_t i = 0; i < maxDepth; ++i)
-        {
-            acceptedTokenIds[batchIdx * maxDepth + i] = -1;
-            acceptedIndices[batchIdx * maxDepth + i] = -1;
-        }
-        // First token is always accepted
-        acceptedTokenIds[batchIdx * maxDepth + 0] = tokenIds[batchIdx * numTokens + 0];
-        acceptedIndices[batchIdx * maxDepth + 0] = 0;
+        acceptLength[batchIdx] = 0;
     }
 
-    // Precompute token depths for this batch using batch-specific attention mask
-    int8_t const* batchAttentionMask = attentionMask + batchIdx * numTokens * numTokens;
+    // Parallel computation of token depths with better memory access
     for (int32_t i = tid; i < numTokens; i += blockSize)
     {
         tokenDepths[i] = computeTokenDepth(i, batchAttentionMask, numTokens);
     }
     __syncthreads();
 
-    // Process this batch - each batch processes independently
-    int32_t currentDepth = 1;
+    // Process this batch - use warp-level operations where possible
+    int32_t currentDepth = 0;
     int32_t currentTokenIdx = 0;
-    int32_t expectedNextDepth = tokenDepths[0] + 1; // Next depth should be current token's depth + 1
+    int32_t expectedNextDepth = tokenDepths[0] + 1;
 
-    for (int32_t step = 0; step < maxDepth - 1; ++step)
+    for (int32_t step = 0; step < maxDepth && currentTokenIdx < numTokens; ++step)
     {
-        // All threads check the same condition since variables are the same for all
-        if (currentDepth >= maxDepth || currentTokenIdx >= numTokens - 1)
-            break;
+        // Step 1: Get precomputed top-1 token (broadcast to all threads)
+        int32_t selectedTokenId = batchTop1Tokens[currentTokenIdx];
 
-        // Step 1: Get precomputed top-1 token for current position
-        __shared__ int32_t selectedTokenId;
-        __shared__ int32_t nextTokenIdx;
-
+        // Step 2: Accept the selected token (single thread writes)
         if (tid == 0)
         {
-            // Use precomputed top-1 token instead of computing argmax
-            int32_t top1Idx = batchIdx * numTokens + currentTokenIdx;
-            selectedTokenId = top1Tokens[top1Idx];
-            nextTokenIdx = -1;
+            acceptedTokenIds[batchIdx * maxDepth + currentDepth] = selectedTokenId;
+            acceptedLogitsIndices[batchIdx * maxDepth + currentDepth] = currentTokenIdx;
+            acceptLength[batchIdx] = currentDepth + 1;
+            currentDepth++;
+        }
+
+        // Step 3: Parallel tree search with block-level reduction
+        __shared__ int32_t nextTokenIdx;
+        if (tid == 0)
+        {
+            nextTokenIdx = numTokens; // Initialize to invalid value
         }
         __syncthreads();
 
-        // Step 2: Find which token in the tree matches the selected token and is at the correct depth
-        // Use parallel search across all threads
-        int32_t const* batchTokenIds = tokenIds + batchIdx * numTokens;
-        for (int32_t checkIdx = tid + 1; checkIdx < numTokens; checkIdx += blockSize)
+        // Each thread checks different tokens in parallel
+        for (int32_t checkIdx = 1 + tid; checkIdx < numTokens; checkIdx += blockSize)
         {
             if (batchTokenIds[checkIdx] == selectedTokenId && tokenDepths[checkIdx] == expectedNextDepth)
             {
@@ -257,55 +259,32 @@ __global__ void eagleAcceptKernel(int32_t const* top1Tokens, int32_t const* toke
                 int32_t maskOffset = batchIdx * numTokens * numTokens + checkIdx * numTokens + currentTokenIdx;
                 if (attentionMask[maskOffset] == 1)
                 {
-                    // Found a valid next token - use atomic to ensure only first match is taken
-                    atomicCAS(&nextTokenIdx, -1, checkIdx);
+                    // Found a valid next token - use atomic to get the minimum index for deterministic behavior
+                    atomicMin(&nextTokenIdx, checkIdx);
                 }
             }
         }
         __syncthreads();
 
-        // Step 3: Update results if valid token found
-        // Use shared memory to communicate updated values to all threads
-        __shared__ int32_t newCurrentDepth;
-        __shared__ int32_t newCurrentTokenIdx;
-        __shared__ int32_t newExpectedNextDepth;
-
-        if (tid == 0)
+        // Step 4: Update for next iteration (all threads participate)
+        if (nextTokenIdx < numTokens)
         {
-            if (nextTokenIdx != -1)
-            {
-                acceptedTokenIds[batchIdx * maxDepth + currentDepth] = selectedTokenId;
-                acceptedIndices[batchIdx * maxDepth + currentDepth] = nextTokenIdx;
-                acceptLength[batchIdx] = currentDepth + 1;
-                newCurrentTokenIdx = nextTokenIdx;
-                newCurrentDepth = currentDepth + 1;
-                newExpectedNextDepth = expectedNextDepth + 1;
-            }
-            else
-            {
-                // Signal no update
-                newCurrentDepth = currentDepth;
-                newCurrentTokenIdx = currentTokenIdx;
-                newExpectedNextDepth = expectedNextDepth;
-            }
+            // Found valid next token in tree, continue from there
+            currentTokenIdx = nextTokenIdx;
+            expectedNextDepth++;
         }
-        __syncthreads();
-
-        // All threads update their local variables
-        currentDepth = newCurrentDepth;
-        currentTokenIdx = newCurrentTokenIdx;
-        expectedNextDepth = newExpectedNextDepth;
-
-        // Break out of loop if no valid token found
-        if (nextTokenIdx == -1)
+        else
+        {
+            // No valid next token found in tree, stop here
             break;
+        }
     }
 }
 
 // Optimized kernel launcher function using workspace and two-stage approach
 void launchEagleAcceptKernel(float const* logits, int32_t const* tokenIds, int8_t const* attentionMask,
-    int32_t* acceptedTokenIds, int32_t* acceptedIndices, int32_t* acceptLength, int32_t batchSize, int32_t numTokens,
-    int32_t vocabSize, int32_t maxDepth, void* workspace, size_t workspaceSize, cudaStream_t stream)
+    int32_t* acceptedTokenIds, int32_t* acceptedLogitsIndices, int32_t* acceptLength, int32_t batchSize,
+    int32_t numTokens, int32_t vocabSize, int32_t maxDepth, void* workspace, size_t workspaceSize, cudaStream_t stream)
 {
     constexpr int32_t blockSize = 256;
 
@@ -336,42 +315,43 @@ void launchEagleAcceptKernel(float const* logits, int32_t const* tokenIds, int8_
     sharedMemSizeStage2 = alignSharedMem(sharedMemSizeStage2);
 
     eagleAcceptKernel<<<gridSizeStage2, blockSizeStage2, sharedMemSizeStage2, stream>>>(ws.top1Tokens, tokenIds,
-        attentionMask, acceptedTokenIds, acceptedIndices, acceptLength, batchSize, numTokens, maxDepth);
+        attentionMask, acceptedTokenIds, acceptedLogitsIndices, acceptLength, batchSize, numTokens, maxDepth);
 }
 
 } // namespace
 
 void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tensor const& attentionMask,
-    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedIndices, rt::Tensor& acceptLength, int32_t maxDepth,
-    void* workspace, size_t workspaceSize, cudaStream_t stream)
+    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength, void* workspace,
+    size_t workspaceSize, cudaStream_t stream)
 {
     // Validate input shapes
     auto const logitsShape = logits.getShape();
     auto const tokenIdsShape = tokenIds.getShape();
     auto const maskShape = attentionMask.getShape();
     auto const acceptedTokenIdsShape = acceptedTokenIds.getShape();
-    auto const acceptedIndicesShape = acceptedIndices.getShape();
+    auto const acceptedLogitsIndicesShape = acceptedLogitsIndices.getShape();
     auto const acceptLengthShape = acceptLength.getShape();
 
-    check::check(logitsShape.getNumDims() == 3, "logits must be 3D tensor [batch_size, num_tokens, vocab_size]");
+    check::check(logitsShape.getNumDims() == 2, "logits must be 2D tensor [batch_size * num_tokens, vocab_size]");
     check::check(tokenIdsShape.getNumDims() == 2, "tokenIds must be 2D tensor [batch_size, num_tokens]");
     check::check(maskShape.getNumDims() == 3, "attentionMask must be 3D tensor [batch_size, num_tokens, num_tokens]");
     check::check(acceptedTokenIdsShape.getNumDims() == 2, "acceptedTokenIds must be 2D tensor [batch_size, max_depth]");
-    check::check(acceptedIndicesShape.getNumDims() == 2, "acceptedIndices must be 2D tensor [batch_size, max_depth]");
+    check::check(acceptedLogitsIndicesShape.getNumDims() == 2,
+        "acceptedLogitsIndices must be 2D tensor [batch_size, max_depth]");
     check::check(acceptLengthShape.getNumDims() == 1, "acceptLength must be 1D tensor [batch_size]");
 
-    int32_t const batchSize = logitsShape[0];
-    int32_t const numTokens = logitsShape[1];
-    int32_t const vocabSize = logitsShape[2];
+    int32_t const batchSize = tokenIdsShape[0];
+    int32_t const numTokens = tokenIdsShape[1];
+    int32_t const vocabSize = logitsShape[1];
+    int32_t const maxDepth = acceptedTokenIdsShape[1];
 
-    check::check(
-        tokenIdsShape[0] == batchSize && tokenIdsShape[1] == numTokens, "tokenIds must be [batch_size, num_tokens]");
+    check::check(logitsShape[0] == batchSize * numTokens, "logits must be [batch_size * num_tokens, vocab_size]");
     check::check(maskShape[0] == batchSize && maskShape[1] == numTokens && maskShape[2] == numTokens,
         "attentionMask must be [batch_size, num_tokens, num_tokens]");
     check::check(acceptedTokenIdsShape[0] == batchSize && acceptedTokenIdsShape[1] == maxDepth,
         "acceptedTokenIds must be [batch_size, max_depth]");
-    check::check(acceptedIndicesShape[0] == batchSize && acceptedIndicesShape[1] == maxDepth,
-        "acceptedIndices must be [batch_size, max_depth]");
+    check::check(acceptedLogitsIndicesShape[0] == batchSize && acceptedLogitsIndicesShape[1] == maxDepth,
+        "acceptedLogitsIndices must be [batch_size, max_depth]");
     check::check(acceptLengthShape[0] == batchSize, "acceptLength length must match batch_size");
 
     // Validate data types
@@ -379,7 +359,8 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
     check::check(tokenIds.getDataType() == nvinfer1::DataType::kINT32, "tokenIds must be INT32");
     check::check(attentionMask.getDataType() == nvinfer1::DataType::kINT8, "attentionMask must be INT8");
     check::check(acceptedTokenIds.getDataType() == nvinfer1::DataType::kINT32, "acceptedTokenIds must be INT32");
-    check::check(acceptedIndices.getDataType() == nvinfer1::DataType::kINT32, "acceptedIndices must be INT32");
+    check::check(
+        acceptedLogitsIndices.getDataType() == nvinfer1::DataType::kINT32, "acceptedLogitsIndices must be INT32");
     check::check(acceptLength.getDataType() == nvinfer1::DataType::kINT32, "acceptLength must be INT32");
 
     // Validate device types - all tensors must be on GPU
@@ -387,7 +368,8 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
     check::check(tokenIds.getDeviceType() == rt::DeviceType::kGPU, "tokenIds must be on GPU device");
     check::check(attentionMask.getDeviceType() == rt::DeviceType::kGPU, "attentionMask must be on GPU device");
     check::check(acceptedTokenIds.getDeviceType() == rt::DeviceType::kGPU, "acceptedTokenIds must be on GPU device");
-    check::check(acceptedIndices.getDeviceType() == rt::DeviceType::kGPU, "acceptedIndices must be on GPU device");
+    check::check(
+        acceptedLogitsIndices.getDeviceType() == rt::DeviceType::kGPU, "acceptedLogitsIndices must be on GPU device");
     check::check(acceptLength.getDeviceType() == rt::DeviceType::kGPU, "acceptLength must be on GPU device");
     check::check(maxDepth > 0 && maxDepth <= numTokens, "maxDepth must be positive and <= numTokens");
 
@@ -396,7 +378,7 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
     int32_t const* tokenIdsPtr = tokenIds.dataPointer<int32_t>();
     int8_t const* attentionMaskPtr = attentionMask.dataPointer<int8_t>();
     int32_t* acceptedTokenIdsPtr = acceptedTokenIds.dataPointer<int32_t>();
-    int32_t* acceptedIndicesPtr = acceptedIndices.dataPointer<int32_t>();
+    int32_t* acceptedLogitsIndicesPtr = acceptedLogitsIndices.dataPointer<int32_t>();
     int32_t* acceptLengthPtr = acceptLength.dataPointer<int32_t>();
 
     // Validate workspace size
@@ -408,7 +390,7 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
     }
 
     // Launch kernel
-    launchEagleAcceptKernel(logitsPtr, tokenIdsPtr, attentionMaskPtr, acceptedTokenIdsPtr, acceptedIndicesPtr,
+    launchEagleAcceptKernel(logitsPtr, tokenIdsPtr, attentionMaskPtr, acceptedTokenIdsPtr, acceptedLogitsIndicesPtr,
         acceptLengthPtr, batchSize, numTokens, vocabSize, maxDepth, workspace, workspaceSize, stream);
 }
 

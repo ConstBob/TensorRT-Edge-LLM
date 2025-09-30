@@ -191,7 +191,7 @@ void assembleIntermediateData(rt::Tensor const& cuLogProbs, rt::Tensor const& se
 //     draftScoreTable [GPU, Float]: Cumulative scores of the selected tokens, shape [batch, draftTopK, draftTopK].
 void computeCuScoresAndTranslateToken(rt::Tensor const& selectedIndices, rt::Tensor const& logProbs,
     rt::Tensor const& intermediateScores, rt::Tensor const& vocabMappingTable, rt::Tensor& draftIdTable,
-    rt::Tensor& draftScoreTable, cudaStream_t stream);
+    rt::Tensor& draftScoreTable, int32_t const draftTopK, cudaStream_t stream);
 
 // The kernel will update the draft tree full tables with the new ids and scores.
 // Inputs:

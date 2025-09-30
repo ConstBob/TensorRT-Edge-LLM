@@ -359,11 +359,13 @@ bool LLMInferenceRuntime::handleRequest(
     // Profile all sampling operations as one stage
     std::vector<int32_t> generatedToken;
     // Prefill profiling session
+    // For non-spec decode, we don't need to output hidden states.
+    LLMEngineRunner::OptionalOutputTensor outputHiddenStates{std::nullopt};
     {
         TIME_STAGE(metrics::StageNames::kLLM_PREFILL, stream);
 
         bool prefillStatus = mLLMEngineRunner->executePrefillStep(
-            mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
+            mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, outputHiddenStates, stream);
         if (!prefillStatus)
         {
             LOG_ERROR(
@@ -533,8 +535,9 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     // Execute prefill step to initialize the KVCache data.
     rt::Tensor emptyTensor{};
     rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
+    LLMEngineRunner::OptionalOutputTensor outputHiddenStates{std::nullopt};
     bool prefillStatus = mLLMEngineRunner->executePrefillStep(
-        mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, stream);
+        mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, outputHiddenStates, stream);
     if (!prefillStatus)
     {
         LOG_ERROR("LLMInferenceRuntime(): Failed to execute prefill step.");

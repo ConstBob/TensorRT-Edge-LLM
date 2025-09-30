@@ -79,7 +79,7 @@ void TestPrepareEagleDraftProposalInput(
         = rt::Tensor({batchSize, paddedDraftTreeSize, packedTreeMaskLen}, rt::DeviceType::kGPU, DataType::kINT32);
     auto tensorPositionIndicesDevice
         = rt::Tensor({batchSize, paddedDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto selectTokenIndicesDevice = rt::Tensor({batchSize, selectTokenLength}, rt::DeviceType::kGPU, DataType::kINT64);
+    auto selectTokenIndicesDevice = rt::Tensor({batchSize * selectTokenLength}, rt::DeviceType::kGPU, DataType::kINT64);
     auto sequenceContextLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
 
     // Call kernel
@@ -142,9 +142,10 @@ void TestPrepareEagleDraftProposalInput(
 
 TEST(PrepareEagle, PrepareEagleDraftProposalInput)
 {
+    // Constrains batch size to 1 for now.
     TestPrepareEagleDraftProposalInput(1, 32, 8);
-    TestPrepareEagleDraftProposalInput(2, 60, 10);
-    TestPrepareEagleDraftProposalInput(4, 100, 12);
+    TestPrepareEagleDraftProposalInput(1, 60, 10);
+    TestPrepareEagleDraftProposalInput(1, 100, 12);
 }
 
 void TestPrepareEaglePrefillInput(int32_t const batchSize, int32_t const sequenceLength)
@@ -448,7 +449,9 @@ void TestEagleBaseCommitKVCache(KVCacheParameters const& cacheParams, int32_t co
     rt::Tensor kvCacheLengthsDevice({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     rt::Tensor acceptedIndicesDevice({batchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
     rt::Tensor acceptLengthsDevice({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    rt::Tensor hiddenStateDevice({batchSize, draftTreeSize, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    // WAR for the current implementation. Need to modify when enable multi-batch for eagle3.
+    rt::Tensor hiddenStateDevice({batchSize * draftTreeSize, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
 
     CUDA_CHECK(cudaMemcpyAsync(acceptedIndicesDevice.rawPointer(), acceptedIndices.data(),
         acceptedIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
@@ -525,7 +528,8 @@ void TestEagleBaseCommitKVCache(KVCacheParameters const& cacheParams, int32_t co
 
 TEST(EagleBaseCommitKVCache, BasicTest)
 {
+    // Constrains batch size to 1 for now.
     TestEagleBaseCommitKVCache({8, 1, 4096, 4, 128}, 6, 60, 256);
-    TestEagleBaseCommitKVCache({3, 2, 4096, 4, 128}, 6, 24, 256);
-    TestEagleBaseCommitKVCache({3, 4, 4096, 8, 128}, 4, 16, 128);
+    TestEagleBaseCommitKVCache({3, 1, 4096, 4, 128}, 6, 24, 256);
+    TestEagleBaseCommitKVCache({3, 1, 4096, 8, 128}, 4, 16, 128);
 }

@@ -58,7 +58,7 @@ static constexpr int32_t kRUNTIME_BATCH_SIZE{1};
 
 std::string const inputIdsName{"input_ids"};
 std::string const contextLengthsName{"context_lengths"};
-std::string const selectTokenIndicesName{"select_token_indices"};
+std::string const selectTokenIndicesName{"last_token_ids"};
 std::string const logitsName{"logits"};
 std::string const ropeCosSinName{"rope_rotary_cos_sin"};
 std::string const baseModelHiddenStatesName{"hidden_states_input"};
@@ -83,15 +83,26 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+
     mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
     mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mContextExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, stream);
+    setOptimizationProfileStatus
+        &= mGenerationExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_GENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
 
     this->initializeConfigFromEngine();
 
     // Instantiate the KVCache instance of the EngineRunner.
     this->mLinearKVCache
         = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, kRUNTIME_BATCH_SIZE,
-                                mConfig.maxSupportedInputLength, mConfig.numKVHeads, mConfig.headDim},
+                                mConfig.kvCacheCapacityLength, mConfig.numKVHeads, mConfig.headDim},
             stream);
 
     // By design for tree attention kernel we use, the tree mask will be packed into in32_t values where each bit
@@ -198,8 +209,8 @@ void EagleDraftEngineRunner::initializeConfigFromEngine()
         = mEngine->getProfileShape(inputIdsName.c_str(), kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
     Dims const maxInputGenIdsShape = mEngine->getProfileShape(
         inputIdsName.c_str(), kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
-    mConfig.maxSupportedInputLength = maxInputGenIdsShape.d[1];
-    mConfig.maxDraftTreeSize = maxInputCtxIdsShape.d[1];
+    mConfig.maxSupportedInputLength = maxInputCtxIdsShape.d[1];
+    mConfig.maxDraftTreeSize = maxInputGenIdsShape.d[1];
 
     Dims const logitsDim = mEngine->getTensorShape(logitsName.c_str());
     Dims const baseHiddenStatesDim = mEngine->getTensorShape(baseModelHiddenStatesName.c_str());
@@ -356,8 +367,8 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
 
     // attention-pos-id and attention-mask are unused during the execution. We set the dummy input tensor with zero
     // shape.
-    rt::Coords const emptyPosIdShape{kRUNTIME_BATCH_SIZE, 0};
-    rt::Coords const emptyMaskShape{kRUNTIME_BATCH_SIZE, 0, 1};
+    rt::Coords const emptyPosIdShape{kRUNTIME_BATCH_SIZE, 1};
+    rt::Coords const emptyMaskShape{kRUNTIME_BATCH_SIZE, 1, 1};
     setEngineIOStatus
         &= mContextExecutionContext->setTensorAddress(attentionPosIdName.c_str(), mDummyInput.rawPointer());
     setEngineIOStatus
@@ -387,7 +398,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
         return false;
     }
     // In prefill step. commit all KVCache generated during the execution.
-    mLinearKVCache.commitPrefillRequest(mSequenceContextLengths, stream);
+    mLinearKVCache.commitSequenceLength(mSequenceContextLengths, stream);
 
     LOG_DEBUG("Prefill stage execution completed for request with batch size %d.", kRUNTIME_BATCH_SIZE);
     return true;
@@ -744,7 +755,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     }
 
     // Commit the KVCache for accepted tokens.
-    mLinearKVCache.commitDecodeRequest(acceptedTokenNum, stream);
+    mLinearKVCache.commitSequenceLength(acceptedTokenNum, stream);
 
     LOG_DEBUG("Accept decode token stage execution completed for request with batch size");
     return true;
@@ -756,7 +767,7 @@ bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
     // TODO: Unify the semantics to always pass full KVCache shape.
     Dims const kvCacheDimPrefillIn = {5, {activeBatchSize, 2, mConfig.numKVHeads, 0, mConfig.headDim}};
     Dims const kvCacheDimDecodeIn
-        = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxDraftTreeSize, mConfig.headDim}};
+        = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.kvCacheCapacityLength, mConfig.headDim}};
     bool status{true};
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
     {

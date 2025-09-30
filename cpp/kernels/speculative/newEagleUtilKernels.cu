@@ -20,7 +20,7 @@
 
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
-#include <cfloat>
+#include <cmath>
 
 using namespace nvinfer1;
 
@@ -180,7 +180,7 @@ __global__ void initializeDraftTreeFullTablesKernel(int32_t const* selectedIndic
             int32_t const selectedOffset = batchIdx * draftTopK + i - 1;
             int32_t const draftTokenId = selectedIndices[selectedOffset];
             float const logProbVal = logProbs[selectedOffset];
-            int32_t const baseTokenId = vocabMappingTable[draftTokenId];
+            int32_t const baseTokenId = draftTokenId + vocabMappingTable[draftTokenId];
             draftIdFullTable[tableOffset] = baseTokenId;
             draftScoreFullTable[tableOffset] = logProbVal;
             draftParentFullTable[tableOffset] = 0;
@@ -189,7 +189,8 @@ __global__ void initializeDraftTreeFullTablesKernel(int32_t const* selectedIndic
         {
             // Empty initialize the rest of the table, clear garbage data to reduce confusion.
             draftIdFullTable[tableOffset] = 0;
-            draftScoreFullTable[tableOffset] = -FLT_MAX;
+            // -INFINITY from cmath to indicate infinity float value.
+            draftScoreFullTable[tableOffset] = -INFINITY;
             draftParentFullTable[tableOffset] = kEMPTY_NODE_PREDECESSOR;
         }
     }
@@ -373,7 +374,7 @@ __global__ void computeCuScoresAndTranslateTokenKernel(int32_t const* selectedIn
     for (int32_t i = tIdx; i < draftTopK * draftTopK; i += blockSize)
     {
         int32_t const draftTokenIds = selectedIndices[batchIdx * draftTopK * draftTopK + i];
-        int32_t const baseTokenIds = vocabMappingTable[draftTokenIds];
+        int32_t const baseTokenIds = vocabMappingTable[draftTokenIds] + draftTokenIds;
         int32_t const tableOffset = batchIdx * draftTopK * draftTopK + i;
         draftIdTable[tableOffset] = baseTokenIds;
 
@@ -436,8 +437,8 @@ __global__ void constructVerificationDraftTreeKernel(int32_t const* draftIdFullT
     // Root token won't attend to any other token.
     while (parentIter != kROOT_NODE_PREDECESSOR)
     {
-        numParents += 1;
         parentIndices[numParents] = parentIter;
+        numParents += 1;
         parentIter = draftParentFullTable[fullTableCTAOffset + parentIter];
     }
 
@@ -514,7 +515,7 @@ void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor
 
     uint32_t const batchSize = draftTreeMask.getShape()[0];
     int32_t const paddedDraftTreeSize = draftTreeMask.getShape()[1];
-    int32_t const selectTokenLength = selectTokenIndices.getShape()[1];
+    int32_t const selectTokenLength = selectTokenIndices.getShape()[0];
 
     check::check(tensorPositionIndices.getShape()[1] == paddedDraftTreeSize,
         "Select token indices shall have shape [batch, padded-draft-tree-size].");
@@ -732,8 +733,8 @@ void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndi
     check::check(kvCacheBufferShape.getNumDims() == 6,
         "kvCacheBuffer should be 6D tensor [num-layers, batch, 2, num-heads, max-seq-len, hidden-size-per-head].");
     check::check(kvCacheLengthsShape.getNumDims() == 1, "kvCacheLengths should be 1D tensor [batch].");
-    check::check(hiddenStateShape.getNumDims() == 3,
-        "hiddenState should be 3D tensor [batch, draft-tree-size, base-hidden-dim].");
+    check::check(
+        hiddenStateShape.getNumDims() == 2, "hiddenState should be 2D tensor [batch * num-tokens, base-hidden-dim].");
 
     uint32_t const batchSize = acceptIndicesShape[0];
     int32_t const maxDepth = acceptIndicesShape[1];
@@ -783,8 +784,8 @@ void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndi
     }
 
     // Assemble Hidden State
-    int32_t const numTokens = hiddenStateShape[1];
-    int32_t const hiddenDim = hiddenStateShape[2];
+    int32_t const numTokens = hiddenStateShape[0];
+    int32_t const hiddenDim = hiddenStateShape[1];
     check::check(hiddenDim % vecSize == 0, "hiddenDim must be divisible by vecSize.");
 
     uint32_t const dimPerBlock = threadsPerBlock * vecSize;
@@ -848,11 +849,10 @@ void assembleInitialDraftTreeInput(rt::Tensor const& draftIdFullTable, rt::Tenso
     int32_t const draftHiddenDim = static_cast<int32_t>(draftHiddenStatesOutput.getShape()[1]);
     int32_t const paddedDraftTreeSize = static_cast<int32_t>(inputIds.getShape()[1]);
     check::check(
-        draftHiddenStatesOutput.getShape()[0] == batchSize, "Output hidden only map to last committed token here.");
-    check::check(draftHiddenStatesInput.getShape()[0] == batchSize * paddedDraftTreeSize,
-        "For next round of drafting, place draftTopK candidates.");
-    check::check(draftTreeLength.getShape()[0] == batchSize && draftTreeLength.getShape()[1] == paddedDraftTreeSize
-            && draftTreeLength.getShape()[2] == paddedDraftTreeSize,
+        draftHiddenStatesOutput.getShape()[0] == batchSize, "OutputHidden only contains last committed token.");
+    check::check(draftHiddenStatesInput.getShape()[1] == paddedDraftTreeSize, "Use padded draft tree size for inputs.");
+    check::check(draftTreeMask.getShape()[0] == batchSize && draftTreeMask.getShape()[1] == paddedDraftTreeSize
+            && draftTreeMask.getShape()[2] == paddedDraftTreeSize,
         "Draft tree length shall have shape [batch, padded-draft-tree-size, padded-draft-tree-size].");
 
     dim3 blockDim1{128};
@@ -899,8 +899,8 @@ void assembleDraftTreeInput(rt::Tensor const& draftIdTable, rt::Tensor const& dr
     check::check(selectedIndices.getShape()[1] == draftTopK, "Check selected indices dimension.");
     check::check(inputIds.getShape()[0] == batchSize, "Check input ids dimension.");
     check::check(inputIds.getShape()[1] == paddedDraftTreeSize, "Check input ids dimension.");
-    check::check(draftHiddenStatesInput.getShape()[0] == batchSize * paddedDraftTreeSize,
-        "Check draft hidden states input dimension.");
+    check::check(
+        draftHiddenStatesInput.getShape()[1] == paddedDraftTreeSize, "Check draft hidden states input dimension.");
 
     dim3 blockDim1{32};
     dim3 gridDim1{static_cast<uint32_t>(batchSize)};

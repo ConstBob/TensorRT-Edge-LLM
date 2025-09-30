@@ -111,7 +111,7 @@ void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, 
         reuseKVCacheLengths.getMemoryCapacity(), cudaMemcpyHostToDevice, stream));
 }
 
-void LinearKVCache::commitPrefillRequest(rt::Tensor const& newContextLengths, cudaStream_t stream)
+void LinearKVCache::commitSequenceLength(rt::Tensor const& newContextLengths, cudaStream_t stream)
 {
     check::check(newContextLengths.getDataType() == DataType::kINT32,
         "The newContextLengths tensor shall have data type of int32_t.");
@@ -123,14 +123,7 @@ void LinearKVCache::commitPrefillRequest(rt::Tensor const& newContextLengths, cu
     kernel::incrementLengthTensor(mDeviceKVCacheLengths, newContextLengths, stream);
 }
 
-void LinearKVCache::commitDecodeRequest(cudaStream_t stream)
-{
-    constexpr int32_t kDECODE_INCREMENT{1};
-    kernel::incrementLengthTensor(mDeviceKVCacheLengths, kDECODE_INCREMENT, stream);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void LinearKVCache::commitDecodeRequest(int32_t increment, cudaStream_t stream)
+void LinearKVCache::commitSequenceLength(int32_t increment, cudaStream_t stream)
 {
     kernel::incrementLengthTensor(mDeviceKVCacheLengths, increment, stream);
     CUDA_CHECK(cudaGetLastError());

@@ -404,9 +404,16 @@ __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, 
 
             if (outputValues != nullptr)
             {
-                auto logProb = logf(expLogit);
-                auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
-                outputValues[batchIdx * topK + ki] = normalizedProb;
+                if (returnLogProbs)
+                {
+                    auto logProb = logf(expLogit);
+                    auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                    outputValues[batchIdx * topK + ki] = normalizedProb;
+                }
+                else
+                {
+                    outputValues[batchIdx * topK + ki] = expLogit;
+                }
             }
 
             if (outputTValues != nullptr)
@@ -917,13 +924,6 @@ void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* top
     if (topK <= 0 || topK > vocabSize)
     {
         return;
-    }
-
-    // Validate that topKValues is not nullptr when returnLogProbs is true, or null when returnLogProbs is false
-    if ((returnLogProbs && topKValues == nullptr) || (!returnLogProbs && topKValues != nullptr))
-    {
-        throw std::invalid_argument(
-            "topKValues must be non-null when returnLogProbs is true, or null when returnLogProbs is false");
     }
 
     constexpr int32_t BLOCK_SIZE = 256;
