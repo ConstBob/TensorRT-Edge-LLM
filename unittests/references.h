@@ -54,7 +54,7 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
     int32_t rotaryDim, int32_t kvCacheCapacity, int32_t rotaryEmbeddingMaxPositions,
     int32_t originalMaxPositionEmbeddings);
 
-void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int64_t> const& mropePositionIds,
+void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int32_t> const& mropePositionIds,
     float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize);
 
 // Embedding lookup reference functions
@@ -104,3 +104,12 @@ struct EagleAcceptResult
 EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<int32_t> const& tokenIds,
     std::vector<int8_t> const& attentionMask, int32_t batchSize, int32_t numTokens, int32_t vocabSize,
     int32_t maxDepth);
+
+// Image utility reference functions
+void transposeToPatchQwenReference(std::vector<half> const& originalImage, std::vector<half>& patch,
+    int32_t const inputOffset, int32_t const T, int32_t const height, int32_t const width, int32_t const channels,
+    int32_t const temporalPatchSize, int32_t const patchSize, int32_t const mergeSize);
+
+void transposeToPatchInternVLReference(std::vector<half> const& originalImage, std::vector<half>& patch,
+    int32_t const inputOffset, int32_t const height, int32_t const width, int32_t const channels,
+    int32_t const blockSizeH, int32_t const blockSizeW);

@@ -29,7 +29,7 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
     float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t maxPositionEmbeddings,
     int32_t originalMaxPositionEmbeddings, cudaStream_t stream);
 
-void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryDim,
+void initializeMRopeCosSin(float* cosSinCache, int32_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryDim,
     int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, cudaStream_t stream);
 
 } // namespace kernel

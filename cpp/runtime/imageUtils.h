@@ -38,7 +38,6 @@ public:
     int32_t width;
     int32_t height;
     int32_t channels;
-    bool isThumbnail; // TODO: Clean old API
 
     ImageData(rt::Tensor&& data, bool thumbnail = false);
 
@@ -49,7 +48,7 @@ ImageData loadImageFromFile(std::string const& path);
 
 ImageData loadImageFromMemory(unsigned char const* data, size_t size);
 
-ImageData resizeImage(ImageData const& image, int newWidth, int newHeight, bool isThumbnail = false);
+ImageData resizeImage(ImageData const& image, int newWidth, int newHeight);
 
 } // namespace imageUtils
 } // namespace rt

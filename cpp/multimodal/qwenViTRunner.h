@@ -28,27 +28,27 @@ namespace rt
 
 struct QwenViTConfig
 {
-    int64_t maxHW{0};
-    int64_t minHW{0};
-    int64_t inputDim{0};
-    int64_t vitPosEmbDim{0};
-    int64_t outHiddenSize{0};
-    int64_t vocabSize;
-    int64_t visionStartTokenId;
+    int32_t maxHW{0};
+    int32_t minHW{0};
+    int32_t inputDim{0};
+    int32_t vitPosEmbDim{0};
+    int32_t outHiddenSize{0};
+    int32_t vocabSize;
+    int32_t visionStartTokenId;
     int32_t visionTokenId;
     int32_t imageTokenId;
     int32_t videoTokenId;
     float mropeTheta;
-    int64_t patchSize;
-    int64_t temporalPatchSize;
-    int64_t mergeSize;
-    int64_t windowSize; // window attention size used by Qwen2.5-VL
-    std::vector<double> imageMean{0.48145466, 0.4578275, 0.40821073};
-    std::vector<double> imageStd{0.26862954, 0.26130258, 0.27577711};
+    int32_t patchSize;
+    int32_t temporalPatchSize;
+    int32_t mergeSize;
+    int32_t windowSize; // window attention size used by Qwen2.5-VL
+    std::vector<float> imageMean{0.48145466, 0.4578275, 0.40821073};
+    std::vector<float> imageStd{0.26862954, 0.26130258, 0.27577711};
 
     // Resize configuration. TODO: add to json config
-    int64_t minPixels{128 * 28 * 28};
-    int64_t maxPixels{512 * 28 * 28};
+    int32_t minPixels{128 * 28 * 28};
+    int32_t maxPixels{512 * 28 * 28};
 };
 
 class QwenViTRunner : public MultimodalRunner
@@ -93,7 +93,7 @@ private:
         std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer);
 
     // TODO: Clean Old API
-    std::string applyChatTemplate(std::string const& inputString, int const& numImage,
+    std::string applyChatTemplate(std::string const& inputString, int64_t const& numImage,
         std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true);
 
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
@@ -102,39 +102,36 @@ private:
 
     std::string applyChatTemplateSystem(std::string const& systemPrompt);
 
-    std::string applyChatTemplateUser(std::string const& userPrompt, int const& numImage, bool addGenerationPrompt);
+    std::string applyChatTemplateUser(std::string const& userPrompt, int64_t const& numImage, bool addGenerationPrompt);
 
     // QwenVL-specific methods
-    void getWindowIndex(std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<half>& windowAttentionMask,
-        std::vector<int64_t>& windowIndex, std::vector<int64_t>& reverseWindowIndex, int const curHW);
+    void getWindowIndex(std::vector<std::vector<int32_t>> const& imageGridTHWs, int const curHW, cudaStream_t stream);
 
-    void initRotaryEmbedding(
-        int numPos, int dim, float theta, std::vector<std::vector<float>>& sinusoidInp, float scale = 1.0f);
+    void formatPatch(rt::imageUtils::ImageData const& image, std::vector<std::vector<int32_t>>& imageGridTHWs,
+        std::vector<int64_t>& imageTokenLengths, std::vector<int32_t>& cuSeqlens, cudaStream_t stream);
 
-    void formatPatch(rt::imageUtils::ImageData const& image, std::vector<half>& patches,
-        std::vector<std::vector<int64_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths,
-        int64_t& totalSeqLength);
+    void computeRotaryPosEmb(
+        std::vector<std::vector<int32_t>> const& imageGridTHWs, int32_t const totalSeqLength, cudaStream_t stream);
 
-    void computeRotaryPosEmb(std::vector<std::vector<int64_t>> const& imageGridTHWs, std::vector<float>& rotaryPosEmb);
-
-    void getRopeIdx(std::vector<int64_t>& mropePositionIds, std::vector<std::vector<int32_t>> const& batchInputIds,
-        std::vector<std::vector<int64_t>> const& imageGridTHWs, int const maxPositionEmbeddings);
+    void getRopeIdx(std::vector<std::vector<int32_t>> const& batchInputIds,
+        std::vector<std::vector<int32_t>> const& imageGridTHWs, int32_t* mropePositionIdsPtr,
+        int const maxPositionEmbeddings);
 
     // TODO: Clean Old API
     void generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
-        std::vector<std::vector<int64_t>> const& imageGridTHWs, void* cosSinCacheDevice,
+        std::vector<std::vector<int32_t>> const& imageGridTHWs, void* cosSinCacheDevice,
         int const maxPositionEmbeddings, int const rotaryDim, cudaStream_t stream);
 
     void generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
-        std::vector<std::vector<int64_t>> const& imageGridTHWs, rt::Tensor& ropeRotaryCosSinDevice,
+        std::vector<std::vector<int32_t>> const& imageGridTHWs, rt::Tensor& ropeRotaryCosSinDevice,
         cudaStream_t stream);
 
     // TODO: Clean Old API
     void imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-        std::vector<std::vector<int64_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths,
+        std::vector<std::vector<int32_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 
-    void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int64_t>>& imageGridTHWs,
+    void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& imageGridTHWs,
         std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 
     QwenViTConfig mConfig{};

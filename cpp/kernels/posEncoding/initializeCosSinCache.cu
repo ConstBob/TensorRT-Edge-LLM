@@ -218,7 +218,7 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
 
 template <int32_t RotaryDim>
 __global__ void initializeMRopeCosSinKernel(
-    float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryEmbeddingMaxPositions)
+    float* cosSinCache, int32_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryEmbeddingMaxPositions)
 {
     // In this kernel, each warp compute 4 "position" of the cos/sin cache, and loop until max position.
     // Each CTA will be assigned 4 warps so it proceeds 16 positions in an iteration.
@@ -272,7 +272,7 @@ __global__ void initializeMRopeCosSinKernel(
     }
 }
 
-void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryDim,
+void initializeMRopeCosSin(float* cosSinCache, int32_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryDim,
     int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, cudaStream_t stream)
 {
     // Each CTA get assigned 128 threads.

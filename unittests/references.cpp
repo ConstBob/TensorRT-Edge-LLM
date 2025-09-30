@@ -503,7 +503,7 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
     return;
 }
 
-void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int64_t> const& mropePositionIds,
+void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int32_t> const& mropePositionIds,
     float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize)
 {
     // mropePositionIds: (bs, 3, maxPositionEmbeddings)
@@ -944,4 +944,95 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
     result.acceptedLogitsIndices = std::move(reshapedLogitsIndices);
 
     return result;
+}
+
+void transposeToPatchQwenReference(std::vector<half> const& originalImage, std::vector<half>& patch,
+    int32_t const inputOffset, int32_t const T, int32_t const height, int32_t const width, int32_t const channels,
+    int32_t const temporalPatchSize, int32_t const patchSize, int32_t const mergeSize)
+{
+    assert(originalImage.size() == T * height * width * channels);
+    assert(patch.size() == T * height * width * channels);
+
+    int const gridT = T / temporalPatchSize;
+    int const gridH = height / (mergeSize * patchSize);
+    int const gridW = width / (mergeSize * patchSize);
+
+    for (int gt = 0; gt < gridT; ++gt)
+    {
+        for (int gh = 0; gh < gridH; ++gh)
+        {
+            for (int gw = 0; gw < gridW; ++gw)
+            {
+                for (int mergeH = 0; mergeH < mergeSize; ++mergeH)
+                {
+                    for (int mergeW = 0; mergeW < mergeSize; ++mergeW)
+                    {
+                        for (int c = 0; c < channels; ++c)
+                        {
+                            for (int t = 0; t < temporalPatchSize; ++t)
+                            {
+                                for (int patchH = 0; patchH < patchSize; ++patchH)
+                                {
+                                    for (int patchW = 0; patchW < patchSize; ++patchW)
+                                    {
+                                        // src dimensions: (T, H, W, C) => (gridT, temporalPatchSize, gridH, mergeSize,
+                                        // patchSize, gridW, mergeSize, patchSize, C)
+                                        int originalT = gt * temporalPatchSize + t;
+                                        int originalH = gh * mergeSize * patchSize + mergeH * patchSize + patchH;
+                                        int originalW = gw * mergeSize * patchSize + mergeW * patchSize + patchW;
+                                        half value = originalImage[originalT * height * width * channels
+                                            + originalH * width * channels + originalW * channels + c];
+
+                                        // dst dimensions: (gridT, gridH, gridW, mergeSize, mergeSize) x (channels,
+                                        // temporalPatchSize, patchSize, patchSize)
+                                        int dstHW = gt * gridH * gridW * mergeSize * mergeSize
+                                            + gh * gridW * mergeSize * mergeSize + gw * mergeSize * mergeSize
+                                            + mergeH * mergeSize + mergeW;
+                                        int dstDim = c * temporalPatchSize * patchSize * patchSize
+                                            + t * patchSize * patchSize + patchH * patchSize + patchW;
+                                        patch[dstHW * channels * temporalPatchSize * patchSize * patchSize + dstDim]
+                                            = value;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void transposeToPatchInternVLReference(std::vector<half> const& originalImage, std::vector<half>& patch,
+    int32_t const inputOffset, int32_t const height, int32_t const width, int32_t const channels,
+    int32_t const blockSizeH, int32_t const blockSizeW)
+{
+    assert(originalImage.size() == height * width * channels);
+    assert(patch.size() == height * width * channels);
+
+    for (int gridH = 0; gridH < height / blockSizeH; ++gridH)
+    {
+        for (int gridW = 0; gridW < width / blockSizeW; ++gridW)
+        {
+            for (int blockH = 0; blockH < blockSizeH; ++blockH)
+            {
+                for (int blockW = 0; blockW < blockSizeW; ++blockW)
+                {
+                    for (int c = 0; c < channels; ++c)
+                    {
+                        // src dimensions: (H, W, C) => (gridH, blockSizeH, gridW, blockSizeW, C)
+                        int originalH = gridH * blockSizeH + blockH;
+                        int originalW = gridW * blockSizeW + blockW;
+                        half value = originalImage[originalH * width * channels + originalW * channels + c];
+
+                        // dst dimensions: (gridH*gridW, C, blockSizeH, blockSizeW)
+                        int dstNumBlocks = gridH * (width / blockSizeW) + gridW;
+                        patch[dstNumBlocks * channels * blockSizeH * blockSizeW + c * blockSizeH * blockSizeW
+                            + blockH * blockSizeW + blockW]
+                            = value;
+                    }
+                }
+            }
+        }
+    }
 }

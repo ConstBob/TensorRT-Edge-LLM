@@ -29,22 +29,22 @@ namespace rt
 
 struct InternViTConfig
 {
-    int64_t maxNumBlocks{0};
-    int64_t minNumBlocks{0};
-    int64_t numChannels{0};
-    int64_t outHiddenSize{0};
-    int64_t vocabSize;
-    int64_t patchSizeH;
-    int64_t patchSizeW;
-    int64_t blockImageSizeH;
-    int64_t blockImageSizeW;
+    int32_t maxNumBlocks{0};
+    int32_t minNumBlocks{0};
+    int32_t numChannels{0};
+    int32_t outHiddenSize{0};
+    int32_t vocabSize;
+    int32_t patchSizeH;
+    int32_t patchSizeW;
+    int32_t blockImageSizeH;
+    int32_t blockImageSizeW;
     int32_t imageTokenId;
-    std::vector<double> imageMean{0.485, 0.456, 0.406};
-    std::vector<double> imageStd{0.229, 0.224, 0.225};
+    std::vector<float> imageMean{0.485, 0.456, 0.406};
+    std::vector<float> imageStd{0.229, 0.224, 0.225};
 
     // Resize configuration. TODO: add to json config
-    int64_t minImageTiles{1};
-    int64_t maxImageTiles{6};
+    int32_t minImageTiles{1};
+    int32_t maxImageTiles{6};
 };
 
 class InternViTRunner : public MultimodalRunner
@@ -93,7 +93,7 @@ private:
         std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer);
 
     // TODO: Clean Old API
-    std::string applyChatTemplate(std::string const& inputString, int const& numImages,
+    std::string applyChatTemplate(std::string const& inputString, int64_t const& numImages,
         std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true);
 
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
@@ -102,11 +102,11 @@ private:
 
     std::string applyChatTemplateSystem(std::string const& systemPrompt);
 
-    std::string applyChatTemplateUser(std::string const& userPrompt, int const& numImage, bool addGenerationPrompt);
+    std::string applyChatTemplateUser(std::string const& userPrompt, int64_t const& numImage, bool addGenerationPrompt);
 
     // InternVL-specific methods
-    void formatPatch(rt::imageUtils::ImageData const& image, std::vector<half>& patches,
-        std::vector<int64_t>& imageTokenLengths, int64_t& numImages, int64_t& totalNumBlocks);
+    void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
+        int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
 
     // TODO: Clean Old API
     void imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
