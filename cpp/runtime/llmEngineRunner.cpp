@@ -973,8 +973,8 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
     return true;
 }
 
-bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
-    rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
+bool LLMEngineRunner::captureVanillaDecodingCudaGraph(rt::Tensor const& inputIds, rt::Tensor& outputLogits,
+    std::string const& loraWeightsPath, rt::Tensor const& multimodalEmbeddings, cudaStream_t stream)
 {
     size_t const hashValue = hashDecodingInput(inputIds, outputLogits, loraWeightsPath);
     if (mCudaGraphs.find(hashValue) != mCudaGraphs.end())
@@ -1036,6 +1036,14 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+    if (!multimodalEmbeddings.isEmpty())
+    {
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
+        auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
+    }
     if (mConfig.enableReuseKVCache)
     {
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(

@@ -437,14 +437,16 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     {
         mInputIds.reshape({batchSize, 1});
         mOutputLogits.reshape({batchSize, mEngineConfig.vocabSize});
+        rt::Tensor emptyTensor{};
+        rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-            mInputIds, mOutputLogits, mEmptyLoraWeightsName, stream);
+            mInputIds, mOutputLogits, mEmptyLoraWeightsName, multimodalEmbeddings, stream);
         if (mEngineConfig.maxSupportedLoraRank > 0)
         {
             for (auto const& loraWeightsName : mLLMEngineRunner->getAvailableLoraWeights())
             {
                 captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-                    mInputIds, mOutputLogits, loraWeightsName, stream);
+                    mInputIds, mOutputLogits, loraWeightsName, multimodalEmbeddings, stream);
             }
         }
     }
