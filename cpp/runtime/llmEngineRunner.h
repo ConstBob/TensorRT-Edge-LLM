@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <unordered_map>
 
 namespace drivellm

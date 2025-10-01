@@ -36,6 +36,15 @@
 using namespace drivellm;
 using Json = nlohmann::json;
 
+// Struct to hold sampling parameters (-1 means not specified)
+struct SamplingArgs
+{
+    int32_t batchSize{-1};
+    float temperature{-1.0f};
+    float topP{-1.0f};
+    int64_t topK{-1};
+};
+
 struct LLMInferenceArgs
 {
     std::string engineDir;
@@ -47,6 +56,7 @@ struct LLMInferenceArgs
     bool dumpProfile{false};
     int32_t warmup{0};
     bool dumpOutput{false};
+    SamplingArgs samplingArgs;
 };
 
 void printUsage(char const* programName)
@@ -55,7 +65,7 @@ void printUsage(char const* programName)
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
-                 "[--dumpOutput]"
+                 "[--dumpOutput] [--batchSize=<number>] [--temperature=<float>] [--topP=<float>] [--topK=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
@@ -67,6 +77,10 @@ void printUsage(char const* programName)
     std::cerr << "  --warmup                  Number of warmup runs using the first request (default: 0)" << std::endl;
     std::cerr << "  --debug                   Enable debug logging" << std::endl;
     std::cerr << "  --dumpOutput              Dump inference output to console" << std::endl;
+    std::cerr << "  --batchSize               Override batch size from input file" << std::endl;
+    std::cerr << "  --temperature             Override temperature value from input file" << std::endl;
+    std::cerr << "  --topP                    Override top_p value from input file" << std::endl;
+    std::cerr << "  --topK                    Override top_k value from input file" << std::endl;
 }
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
@@ -75,7 +89,9 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"engineDir", required_argument, 0, 902}, {"multimodalEngineDir", required_argument, 0, 903},
         {"outputFile", required_argument, 0, 904}, {"debug", no_argument, 0, 905}, {"dumpProfile", no_argument, 0, 906},
         {"profileOutputFile", required_argument, 0, 907}, {"warmup", required_argument, 0, 908},
-        {"dumpOutput", no_argument, 0, 909}, {0, 0, 0, 0}};
+        {"dumpOutput", no_argument, 0, 909}, {"batchSize", required_argument, 0, 910},
+        {"temperature", required_argument, 0, 911}, {"topP", required_argument, 0, 912},
+        {"topK", required_argument, 0, 913}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -106,6 +122,70 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             }
             break;
         case 909: args.dumpOutput = true; break;
+        case 910:
+            try
+            {
+                args.samplingArgs.batchSize = std::stoi(optarg);
+                if (args.samplingArgs.batchSize <= 0)
+                {
+                    LOG_ERROR("Invalid batch size value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid batch size value: %s", optarg);
+                return false;
+            }
+            break;
+        case 911:
+            try
+            {
+                args.samplingArgs.temperature = std::stof(optarg);
+                if (args.samplingArgs.temperature < 0.0f)
+                {
+                    LOG_ERROR("Invalid temperature value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid temperature value: %s", optarg);
+                return false;
+            }
+            break;
+        case 912:
+            try
+            {
+                args.samplingArgs.topP = std::stof(optarg);
+                if (args.samplingArgs.topP < 0.0f || args.samplingArgs.topP > 1.0f)
+                {
+                    LOG_ERROR("Invalid top_p value: %s (must be between 0.0 and 1.0)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid top_p value: %s", optarg);
+                return false;
+            }
+            break;
+        case 913:
+            try
+            {
+                args.samplingArgs.topK = std::stoll(optarg);
+                if (args.samplingArgs.topK <= 0)
+                {
+                    LOG_ERROR("Invalid top_k value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid top_k value: %s", optarg);
+                return false;
+            }
+            break;
         default: return false;
         }
     }
@@ -154,6 +234,26 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Warmup runs: %d", args.warmup);
     }
 
+    if (args.samplingArgs.batchSize != -1)
+    {
+        LOG_INFO("Batch size override: %d", args.samplingArgs.batchSize);
+    }
+
+    if (args.samplingArgs.temperature != -1.0f)
+    {
+        LOG_INFO("Temperature override: %f", args.samplingArgs.temperature);
+    }
+
+    if (args.samplingArgs.topP != -1.0f)
+    {
+        LOG_INFO("Top-p override: %f", args.samplingArgs.topP);
+    }
+
+    if (args.samplingArgs.topK != -1)
+    {
+        LOG_INFO("Top-k override: %lld", args.samplingArgs.topK);
+    }
+
     if (args.debug)
     {
         gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
@@ -167,7 +267,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 }
 
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseInputFile(
-    std::filesystem::path const& inputFilePath)
+    std::filesystem::path const& inputFilePath, SamplingArgs const& samplingArgs = SamplingArgs{})
 {
     std::vector<rt::LLMGenerationRequest> requests;
 
@@ -190,10 +290,11 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     }
 
     // Extract global parameters
-    int batchSize = inputData.value("batch_size", 1);
-    float temperature = inputData.value("temperature", 1.0f);
-    float topP = inputData.value("top_p", 0.8f);
-    int64_t topK = inputData.value("top_k", 50);
+    int batchSize = (samplingArgs.batchSize != -1) ? samplingArgs.batchSize : inputData.value("batch_size", 1);
+    float temperature
+        = (samplingArgs.temperature != -1.0f) ? samplingArgs.temperature : inputData.value("temperature", 1.0f);
+    float topP = (samplingArgs.topP != -1.0f) ? samplingArgs.topP : inputData.value("top_p", 0.8f);
+    int64_t topK = (samplingArgs.topK != -1) ? samplingArgs.topK : inputData.value("top_k", 50);
     int64_t maxGenerateLength = inputData.value("max_generate_length", 256);
     std::string defaultSystemPrompt = inputData.value("default_system_prompt", "");
     std::unordered_map<std::string, std::string> loraWeightsMap;
@@ -312,7 +413,7 @@ int main(int argc, char* argv[])
     std::vector<rt::LLMGenerationRequest> requests;
     try
     {
-        std::tie(loraWeightsMap, requests) = parseInputFile(args.inputFile);
+        std::tie(loraWeightsMap, requests) = parseInputFile(args.inputFile, args.samplingArgs);
         LOG_INFO("Successfully parsed %zu LoRA weights from input file.", loraWeightsMap.size());
         LOG_INFO("Successfully parsed %zu requests from input file.", requests.size());
     }
