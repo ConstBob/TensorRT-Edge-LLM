@@ -344,15 +344,11 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    // Capture CUDA graph and execute the graph for text only input.
-    // TODO: Enable CUDA graph capture for multimodal inputs.
-    if (args.multimodalEngineDir.empty())
+    // Capture CUDA graph and execute the graph
+    bool const captureStatus = llmInferenceRuntime->captureDecodingCUDAGraph(stream);
+    if (!captureStatus)
     {
-        bool const captureStatus = llmInferenceRuntime->captureDecodingCUDAGraph(stream);
-        if (!captureStatus)
-        {
-            LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
-        }
+        LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
     }
 
     // Perform warmup runs if requested

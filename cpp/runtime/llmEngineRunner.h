@@ -129,11 +129,12 @@ public:
     //!     inputIds [GPU]: The input token_ids for the batch of new requests.
     //!     outputLogits [GPU]: The output logits for the batch of requests.
     //!     loraWeightsName: The name to the LoRA weights. Empty string if no LoRA weights.
+    //!     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings for the batch of requests.
     //!     stream: The CUDA stream to execute the decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
-    bool captureVanillaDecodingCudaGraph(
-        rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsName, cudaStream_t stream);
+    bool captureVanillaDecodingCudaGraph(rt::Tensor const& inputIds, rt::Tensor& outputLogits,
+        std::string const& loraWeightsName, rt::Tensor const& multimodalEmbeddings, cudaStream_t stream);
 
     //! API entry to switch the LoRA weights of the LLM engine.
     //! Inputs:
