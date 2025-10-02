@@ -45,9 +45,8 @@ std::set<int32_t> getCombinedAllowedTokensRef(
 
 std::vector<std::pair<float, int32_t>> getTopKElementsRef(std::vector<float> const& logits, int32_t topK);
 
-// Unified reference function that handles all cases
-std::vector<std::pair<float, int32_t>> returnAllTopKReference(
-    std::vector<float> const& input, int32_t topK, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs);
+// Returns top-K indices and raw values only
+std::vector<std::pair<float, int32_t>> returnAllTopKReference(std::vector<float> const& input, int32_t topK);
 
 void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<float>& longCosSinCache,
     std::vector<float> const& shortFactor, std::vector<float> const& longFactor, float rotaryBaseFrequency,

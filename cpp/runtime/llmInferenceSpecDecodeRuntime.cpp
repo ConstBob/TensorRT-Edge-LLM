@@ -72,7 +72,7 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(
     int32_t const maxDraftTreeSize = std::max(mDraftEngineConfig.maxDraftTreeSize, mDraftingConfig.verifyTreeSize);
     int32_t const draftTopK = mDraftingConfig.draftingTopK;
     int32_t const maxSamplingSize = std::max(maxDraftTreeSize, draftTopK * draftTopK);
-    int32_t const draftFullTableLength = 1 + draftTopK + mDraftingConfig.draftingStep * draftTopK * draftTopK;
+    int32_t const draftFullTableLength = 1 + draftTopK + (mDraftingConfig.draftingStep - 1) * draftTopK * draftTopK;
 
     LOG_DEBUG(
         "maxDraftTreeSize: %d, maxSamplingSize: %d, draftFullTableLength: %d to set up the SpecDecode inference "
@@ -96,9 +96,9 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(
         mBaseHiddenStatesOutput = rt::Tensor(
             {kRUNTIME_BATCH_SIZE, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.outputHiddenDim},
             rt::DeviceType::kGPU, DataType::kHALF);
-        mDraftHiddenStatesInput
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, maxDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim},
-                rt::DeviceType::kGPU, DataType::kHALF);
+        mDraftHiddenStatesInput = rt::Tensor(
+            {kRUNTIME_BATCH_SIZE, mBaseEngineConfig.maxSupportedInputLength, mDraftEngineConfig.draftModelHiddenDim},
+            rt::DeviceType::kGPU, DataType::kHALF);
         mDraftHiddenStatesOutput = rt::Tensor({kRUNTIME_BATCH_SIZE, draftTopK, mDraftEngineConfig.draftModelHiddenDim},
             rt::DeviceType::kGPU, DataType::kHALF);
         mDraftTokenIdsFullTable
@@ -408,8 +408,7 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
     mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
     selectAllTopKFromLogits(mLogitsOutput.dataPointer<float>(), mSamplingScores.dataPointer<float>(),
         mSamplingIndices.dataPointer<int32_t>(), kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelVocabSize, draftTopK,
-        mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream,
-        true /*return logprobs*/, false /*normalize logprobs*/, true /*softmax already computed*/);
+        mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream);
 
     // Initialize data structures to describe the whole draft tree.
     kernel::initializeDraftTreeTables(mSamplingIndices, mSamplingScores, mDraftTreeRootTokenId, mDraftVocabMappingTable,
@@ -435,7 +434,7 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
     mLogitsOutput.reshape({draftTopK, mDraftEngineConfig.draftModelVocabSize});
     mDraftHiddenStatesOutput.reshape({draftTopK, mDraftEngineConfig.draftModelHiddenDim});
 
-    for (int32_t round = 0; round < mDraftingConfig.draftingStep; round++)
+    for (int32_t round = 0; round < mDraftingConfig.draftingStep - 1; round++)
     {
         if (round == 0)
         {
@@ -452,8 +451,7 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
             mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
             selectAllTopKFromLogits(mDraftTokenScoresTable.dataPointer<float>(), mSamplingScores.dataPointer<float>(),
                 mSamplingIndices.dataPointer<int32_t>(), kRUNTIME_BATCH_SIZE, draftTopK * draftTopK, draftTopK,
-                mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream,
-                false /* No need to log again */, false, true /*Scores are already (log) probabilities*/);
+                mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream);
             kernel::assembleDraftTreeInput(mDraftTokenIdsTable, mDraftHiddenStatesOutput, mSamplingIndices, mIdsInput,
                 mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, draftTopK, round, context.stream);
             kernel::assembleIntermediateData(mSamplingScores, mSamplingIndices, mDraftTokenIntermediateScores,
@@ -475,8 +473,7 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
         selectAllTopKFromLogits(mLogitsOutput.dataPointer<float>(), mSamplingScores.dataPointer<float>(),
             mSamplingIndices.dataPointer<int32_t>(), kRUNTIME_BATCH_SIZE * draftTopK,
             mDraftEngineConfig.draftModelVocabSize, draftTopK, mSamplingWorkspace.rawPointer(),
-            mSamplingWorkspace.getMemoryCapacity(), context.stream, true /*return logprobs*/,
-            false /*normalize logprobs*/, true /*softmax already computed*/);
+            mSamplingWorkspace.getMemoryCapacity(), context.stream);
 
         // Update the draft tree tables with the new topK results. translate draft vocab token towards full vocab size.
         kernel::computeCuScoresAndTranslateToken(mSamplingIndices, mSamplingScores, mDraftTokenIntermediateScores,
@@ -494,7 +491,7 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
     selectAllTopKFromLogits(mDraftTokenScoreFullTable.dataPointer<float>(), nullptr,
         mSamplingIndices.dataPointer<int32_t>(), kRUNTIME_BATCH_SIZE, fullDraftTableSize,
         mDraftingConfig.verifyTreeSize, mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(),
-        context.stream, false, false, false);
+        context.stream);
 
     mIdsInput.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize});
     mDraftTreeMask.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});

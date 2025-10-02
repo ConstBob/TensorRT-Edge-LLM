@@ -354,106 +354,19 @@ std::vector<std::pair<float, int32_t>> getTopKElementsRef(std::vector<float> con
     return logitPairs;
 }
 
-// Unified reference function that handles all cases
-std::vector<std::pair<float, int32_t>> returnAllTopKReference(
-    std::vector<float> const& input, int32_t topK, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs)
+// Returns top-K indices and raw values
+std::vector<std::pair<float, int32_t>> returnAllTopKReference(std::vector<float> const& input, int32_t topK)
 {
-    // First get the top-k elements from the entire vocabulary
+    // Get the top-k elements from the entire vocabulary
     auto topKElements = getTopKElementsRef(input, topK);
 
+    // Return raw values and indices
     std::vector<std::pair<float, int32_t>> result;
-
-    if (!returnLogProbs)
+    for (auto const& element : topKElements)
     {
-        // Return raw values (either logits or probabilities)
-        for (auto const& element : topKElements)
-        {
-            int32_t idx = element.second;
-            float value = input[idx];
-            result.emplace_back(value, idx);
-        }
-        return result;
-    }
-
-    // Return log probabilities
-    if (inputHasProbs)
-    {
-        // Input is already probabilities
-        if (normalizeLogProbs)
-        {
-            // Normalize over top-k only
-            std::vector<float> topKProbs;
-            for (auto const& element : topKElements)
-            {
-                topKProbs.push_back(input[element.second]);
-            }
-
-            // Normalize the top-k probabilities
-            float sum = 0.0f;
-            for (float prob : topKProbs)
-            {
-                sum += prob;
-            }
-
-            for (size_t i = 0; i < topKElements.size(); ++i)
-            {
-                int32_t idx = topKElements[i].second;
-                float normalizedProb = topKProbs[i] / sum;
-                float logProb = std::log(normalizedProb);
-                result.emplace_back(logProb, idx);
-            }
-        }
-        else
-        {
-            // Just take log of original probabilities
-            for (auto const& element : topKElements)
-            {
-                int32_t idx = element.second;
-                float prob = input[idx];
-                float logProb = std::log(prob);
-                result.emplace_back(logProb, idx);
-            }
-        }
-    }
-    else
-    {
-        // Input is logits
-        // Find max logit among the top-k elements for numerical stability
-        float maxLogit = -std::numeric_limits<float>::infinity();
-        for (auto const& element : topKElements)
-        {
-            maxLogit = std::max(maxLogit, element.first);
-        }
-
-        if (normalizeLogProbs)
-        {
-            // Compute sum of exp(logit - maxLogit) for normalization
-            float sum = 0.0f;
-            for (auto const& element : topKElements)
-            {
-                sum += std::exp(element.first - maxLogit);
-            }
-
-            for (auto const& element : topKElements)
-            {
-                int32_t idx = element.second;
-                float logit = element.first;
-                float expLogit = std::exp(logit - maxLogit);
-                float logProb = std::log(expLogit) - std::log(sum);
-                result.emplace_back(logProb, idx);
-            }
-        }
-        else
-        {
-            // Just output log(exp(value - maxLogit)) = value - maxLogit
-            for (auto const& element : topKElements)
-            {
-                int32_t idx = element.second;
-                float logit = element.first;
-                float logProb = logit - maxLogit;
-                result.emplace_back(logProb, idx);
-            }
-        }
+        int32_t idx = element.second;
+        float value = input[idx];
+        result.emplace_back(value, idx);
     }
 
     return result;

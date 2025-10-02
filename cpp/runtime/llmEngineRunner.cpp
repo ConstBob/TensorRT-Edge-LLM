@@ -266,7 +266,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
     {
         // Define required fields for main config
         std::vector<std::string> const requiredConfigFields = {"num_hidden_layers", "num_key_value_heads", "head_dim",
-            "vocab_size", "partial_rotary_factor", "builder_config", "enable_reuse_kv_cache"};
+            "vocab_size", "builder_config", "enable_reuse_kv_cache"};
 
         // Validate required fields exist in main config
         for (auto const& field : requiredConfigFields)
