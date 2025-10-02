@@ -84,10 +84,11 @@ void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, S
     void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
 
 // Select all top-K elements with workspace (FP32 only)
-// TODO: The definition of logits will be formalized in the next release
+// Returns topK indices and raw values from input (no transformations applied)
+// Boolean parameters are kept for API compatibility but are ignored
 void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* topKIndices, int32_t batchSize,
     int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream,
-    bool returnLogProbs = false, bool normalizeLogProbs = true, bool inputHasProbs = false);
+    bool returnLogProbs = false, bool normalizeLogProbs = false, bool inputHasProbs = false);
 
 // ========================================================================
 // WORKSPACE SIZE CALCULATION

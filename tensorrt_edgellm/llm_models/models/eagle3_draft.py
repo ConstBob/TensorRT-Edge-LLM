@@ -116,7 +116,7 @@ class Eagle3DraftModel(nn.Module):
         # RMS normalization layer
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.softmax = nn.Softmax(dim=-1)
+        self.log_softmax = nn.LogSoftmax(dim=-1)
 
         # Language model head for token prediction
         self.lm_head = nn.Linear(config.hidden_size,
@@ -222,7 +222,7 @@ class Eagle3DraftModel(nn.Module):
         hidden_states_normed = self.norm(hidden_states)
         logits = self.lm_head(hidden_states_normed)
         logits = logits.to(torch.float32)
-        logits = self.softmax(logits)
+        logits = self.log_softmax(logits)
 
         return logits, hidden_states, present_key_values
 

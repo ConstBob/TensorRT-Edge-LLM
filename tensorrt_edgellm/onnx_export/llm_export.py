@@ -548,7 +548,8 @@ def export_draft_model(draft_model_dir: str,
                          use_prompt_tuning=use_prompt_tuning)
 
     # Save draft model configuration
-    draft_config = export_llm_config(draft_model.config, 'eagle_draft')
+    draft_config = export_llm_config(draft_model.config, 'eagle_draft',
+                                     enable_reuse_kv_cache)
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, 'w') as f:
         json.dump(draft_config, f, indent=2)

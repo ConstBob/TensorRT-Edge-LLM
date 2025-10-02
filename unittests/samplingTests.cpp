@@ -165,14 +165,15 @@ protected:
         return allValid;
     }
 
-    // Simplified validate selectAllTopK results (FP32 only)
-    bool validateSelectAllTopKResults(std::vector<int32_t> const& gpuIndices,
-        std::vector<std::vector<float>> const& hostInput, int topK, int batchSize)
+    // Validate selectAllTopK results - checks indices and raw values (FP32 only)
+    bool validateSelectAllTopKResults(std::vector<int32_t> const& gpuIndices, std::vector<float> const& gpuValues,
+        std::vector<std::vector<float>> const& hostInput, int topK, int batchSize, bool checkValues)
     {
         bool allValid = true;
         for (int b = 0; b < batchSize; ++b)
         {
-            auto expectedResults = returnAllTopKReference(hostInput[b], topK, false, false, false);
+            // Get expected top-K elements (just raw values, no transformation)
+            auto expectedResults = returnAllTopKReference(hostInput[b], topK);
 
             // Check that we got the right number of elements
             int expectedSize = std::min(topK, static_cast<int>(hostInput[b].size()));
@@ -184,7 +185,7 @@ protected:
                 continue;
             }
 
-            // Check that GPU indices match expected indices
+            // Check that GPU indices match expected indices and values match
             for (int k = 0; k < expectedSize; ++k)
             {
                 if (b * topK + k >= static_cast<int>(gpuIndices.size()))
@@ -220,6 +221,21 @@ protected:
                     std::cout << "Index " << gpuIdx << " not found in expected top-K results at batch " << b
                               << " position " << k << std::endl;
                     allValid = false;
+                }
+
+                // Check values if requested
+                if (checkValues && !gpuValues.empty())
+                {
+                    float gpuValue = gpuValues[b * topK + k];
+                    float expectedValue = hostInput[b][gpuIdx];
+                    float relativeError = std::abs(gpuValue - expectedValue) / (std::abs(expectedValue) + 1e-6f);
+
+                    if (relativeError > 1e-5f)
+                    {
+                        std::cout << "Value mismatch at batch " << b << " position " << k << ": GPU=" << gpuValue
+                                  << ", expected=" << expectedValue << std::endl;
+                        allValid = false;
+                    }
                 }
             }
         }
@@ -339,7 +355,7 @@ protected:
     }
 };
 
-// Unified returnAllTopK tests (accuracy only)
+// SelectAllTopK tests - simplified to only test raw value return functionality
 class ReturnAllTopKTests : public SamplingTest
 {
 protected:
@@ -349,76 +365,45 @@ protected:
         int batchSize;
         int vocabSize;
         int topK;
-        bool returnLogProbs;
-        bool normalizeLogProbs;
-        bool inputHasProbs;
         bool accuracyPassed;
         std::string errorMessage;
     };
 
-    TestResult runReturnAllTopKAccuracyTest(
-        int batchSize, int vocabSize, int topK, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs)
+    TestResult runReturnAllTopKAccuracyTest(int batchSize, int vocabSize, int topK, bool testValues)
     {
         TestResult result;
         result.methodName = "SelectAllTopK";
         result.batchSize = batchSize;
         result.vocabSize = vocabSize;
         result.topK = topK;
-        result.returnLogProbs = returnLogProbs;
-        result.normalizeLogProbs = normalizeLogProbs;
-        result.inputHasProbs = inputHasProbs;
         result.accuracyPassed = true;
         result.errorMessage = "";
 
-        // Allocate device memory directly instead of using Thrust
+        // Allocate device memory
         float* dInput;
         float* dTopKValues = nullptr;
         int32_t* dTopKIndices;
         CUDA_CHECK(cudaMalloc(&dInput, batchSize * vocabSize * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * topK * sizeof(int32_t)));
 
-        std::vector<std::vector<float>> hostLogits;
-        std::vector<std::vector<float>> hostProbs;
-        std::vector<float> flatHostProbs;
-
-        // Generate test data
-        generateTestLogits(dInput, hostLogits, batchSize, vocabSize);
-
-        if (inputHasProbs)
-        {
-            // Convert logits to probabilities
-            hostProbs.resize(batchSize);
-            flatHostProbs.resize(batchSize * vocabSize);
-
-            for (int b = 0; b < batchSize; ++b)
-            {
-                hostProbs[b].resize(vocabSize);
-                auto probs = softmaxRef(hostLogits[b]);
-
-                for (int v = 0; v < vocabSize; ++v)
-                {
-                    hostProbs[b][v] = probs[v];
-                    flatHostProbs[b * vocabSize + v] = hostProbs[b][v];
-                }
-            }
-
-            // Copy probabilities to device memory
-            CUDA_CHECK(cudaMemcpy(
-                dInput, flatHostProbs.data(), batchSize * vocabSize * sizeof(float), cudaMemcpyHostToDevice));
-        }
-
-        if (returnLogProbs)
+        // Always test with values when requested
+        if (testValues)
         {
             CUDA_CHECK(cudaMalloc(&dTopKValues, batchSize * topK * sizeof(float)));
         }
 
-        // Run accuracy test
+        std::vector<std::vector<float>> hostLogits;
+
+        // Generate test data (logits/raw values)
+        generateTestLogits(dInput, hostLogits, batchSize, vocabSize);
+
+        // Run test - boolean parameters are ignored, defaults are all false
         size_t workspaceSize = getSelectAllTopKWorkspaceSize(batchSize, vocabSize, topK);
         void* workspace;
         CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
-        selectAllTopKFromLogits(dInput, returnLogProbs ? dTopKValues : nullptr, dTopKIndices, batchSize, vocabSize,
-            topK, workspace, workspaceSize, 0, returnLogProbs, normalizeLogProbs, inputHasProbs);
+        selectAllTopKFromLogits(
+            dInput, dTopKValues, dTopKIndices, batchSize, vocabSize, topK, workspace, workspaceSize, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy results back to host
@@ -426,8 +411,16 @@ protected:
         CUDA_CHECK(
             cudaMemcpy(gpuIndices.data(), dTopKIndices, batchSize * topK * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
-        std::vector<std::vector<float>>& hostInput = inputHasProbs ? hostProbs : hostLogits;
-        bool validationPassed = validateSelectAllTopKResults(gpuIndices, hostInput, topK, batchSize);
+        std::vector<float> gpuValues;
+        if (testValues)
+        {
+            gpuValues.resize(batchSize * topK);
+            CUDA_CHECK(
+                cudaMemcpy(gpuValues.data(), dTopKValues, batchSize * topK * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+
+        bool validationPassed
+            = validateSelectAllTopKResults(gpuIndices, gpuValues, hostLogits, topK, batchSize, testValues);
 
         // Set result based on validation
         result.accuracyPassed = validationPassed;
@@ -438,10 +431,7 @@ protected:
 
         // Single Google Test assertion for comprehensive validation
         EXPECT_TRUE(validationPassed) << "SelectAllTopK validation failed for batchSize=" << batchSize
-                                      << ", vocabSize=" << vocabSize << ", topK=" << topK
-                                      << ", returnLogProbs=" << returnLogProbs
-                                      << ", normalizeLogProbs=" << normalizeLogProbs
-                                      << ", inputHasProbs=" << inputHasProbs;
+                                      << ", vocabSize=" << vocabSize << ", topK=" << topK;
 
         CUDA_CHECK(cudaFree(workspace));
         CUDA_CHECK(cudaFree(dInput));
@@ -547,59 +537,36 @@ TEST_F(SamplingTestSuites, SamplingAccuracy)
     }
 }
 
-// SelectAllTopK tests
+// SelectAllTopK tests - simplified to only test returning indices and raw values
 TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracy)
 {
     std::vector<ReturnAllTopKTests::TestResult> accuracyResults;
 
-    // Test configurations using booleans
-    struct TopKConfig
-    {
-        int topK;
-        bool returnLogProbs;
-        bool normalizeLogProbs;
-        bool inputHasProbs;
-    };
-
-    std::vector<TopKConfig> configs = {
-        {10, false, false, false}, // NoLogProbs_Logits
-        {10, false, false, true},  // NoLogProbs_Probs
-        {10, true, false, false},  // LogProbs_NonNorm_Logits
-        {10, true, true, false},   // LogProbs_Norm_Logits
-        {10, true, false, true},   // LogProbs_NonNorm_Probs
-        {10, true, true, true},    // LogProbs_Norm_Probs
-        {5, false, false, false},  // NoLogProbs_Logits_TopK5
-        {20, false, false, false}, // NoLogProbs_Logits_TopK20
-        {5, true, false, false},   // LogProbs_NonNorm_Logits_TopK5
-        {20, true, false, false},  // LogProbs_NonNorm_Logits_TopK20
-    };
+    // Simplified test configurations - just test different topK values and batch sizes
+    // Boolean parameters are no longer tested as they are ignored
+    std::vector<int> topKValues = {5, 10, 20};
 
     // Run accuracy tests with small vocab size
     for (int batchSize : {1, 4})
     {
-        for (auto const& config : configs)
+        for (int topK : topKValues)
         {
-            auto result = runReturnAllTopKAccuracyTest(batchSize, ACCURACY_VOCAB_SIZE, config.topK,
-                config.returnLogProbs, config.normalizeLogProbs, config.inputHasProbs);
+            // Test with values
+            auto result = runReturnAllTopKAccuracyTest(batchSize, ACCURACY_VOCAB_SIZE, topK, true);
             accuracyResults.push_back(result);
         }
     }
 
     // Print accuracy results table
-    std::cout << "\nSelectAllTopK Accuracy Results (FP32 only):" << std::endl;
-    std::cout << "Batch | TopK | ReturnLogProbs | NormalizeLogProbs | InputHasProbs | AccVocabSize | Accuracy"
-              << std::endl;
-    std::cout << "------|------|----------------|-------------------|---------------|--------------|----------"
-              << std::endl;
+    std::cout << "\nSelectAllTopK Accuracy Results (FP32 only - Raw Values):" << std::endl;
+    std::cout << "Batch | TopK | AccVocabSize | Accuracy" << std::endl;
+    std::cout << "------|------|--------------|----------" << std::endl;
 
     bool allAccuracyTestsPassed = true;
     std::vector<std::string> accuracyErrorMessages;
 
     for (auto const& result : accuracyResults)
     {
-        std::string returnLogProbsStr = result.returnLogProbs ? "true" : "false";
-        std::string normalizeLogProbsStr = result.normalizeLogProbs ? "true" : "false";
-        std::string inputHasProbsStr = result.inputHasProbs ? "true" : "false";
         std::string accuracyStr = result.accuracyPassed ? "PASS" : "FAIL";
 
         if (!result.accuracyPassed)
@@ -608,10 +575,8 @@ TEST_F(ReturnAllTopKTests, SelectAllTopKAccuracy)
             accuracyErrorMessages.push_back(result.errorMessage);
         }
 
-        std::cout << std::setw(5) << result.batchSize << " | " << std::setw(4) << result.topK << " | " << std::setw(14)
-                  << returnLogProbsStr << " | " << std::setw(17) << normalizeLogProbsStr << " | " << std::setw(13)
-                  << inputHasProbsStr << " | " << std::setw(12) << result.vocabSize << " | " << std::setw(8)
-                  << accuracyStr << std::endl;
+        std::cout << std::setw(5) << result.batchSize << " | " << std::setw(4) << result.topK << " | " << std::setw(12)
+                  << result.vocabSize << " | " << std::setw(8) << accuracyStr << std::endl;
     }
 
     // Print summary
