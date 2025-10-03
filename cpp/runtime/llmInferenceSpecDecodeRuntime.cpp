@@ -21,6 +21,7 @@
 #include "common/logger.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/newEagleUtilKernels.h"
+#include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <fstream>
 #include <functional>
@@ -278,6 +279,10 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         context.generationRound += 1;
     }
 
+    // Record Eagle metrics
+    mPrefillMetrics.recordRun(0, prefillContextLength); // For Eagle, no reused tokens during prefill
+    mEagleGenerationMetrics.recordRun(context.generationRound, context.currentGenerateLength);
+
     // Save output ids and decoded texts to response.
     response.outputIds.clear();
     response.outputTexts.clear();
@@ -296,6 +301,8 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 
 bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceContext& context)
 {
+    TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
+
     // Prepare the inputs for prefill stage execution.
     int32_t const inputIdsLength = static_cast<int32_t>(context.tokenIds.size());
     if (inputIdsLength > mBaseEngineConfig.maxSupportedInputLength)
@@ -351,6 +358,8 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
 
 bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceContext& context)
 {
+    TIME_STAGE(metrics::StageNames::kEAGLE_DRAFT_PREFILL, context.stream);
+
     // Implement the draft prefill execution logic, prepare the input ids and hidden states inputs for the
     // eagle draft engine. The formulation of the feature "vector" is F_n = F(H_n, Token_{n+1}), therefore we
     // need to trim out the first token of the sequence from the token_ids input.
@@ -391,6 +400,8 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
 
 bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContext& context)
 {
+    TIME_STAGE(metrics::StageNames::kEAGLE_CONSTRUCT_DRAFT_TREE, context.stream);
+
     // Core logic for eagle speculative decoding, construct the draft tree in an auto-regressive manner./
     // Inputs: Logits (mLogitsOutput) and draft hidden states (mDraftHiddenStatesOutput) from draft prefill
     // or draft model accept decoding operation.
@@ -504,6 +515,8 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
 
 bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInferenceContext& context)
 {
+    TIME_STAGE(metrics::StageNames::kEAGLE_BASE_VERIFICATION, context.stream);
+
     // This function will consume idsInput and draftTreeMask. Use base model to verify the draft tree.
     // We need to collect the logits and hidden states (for further drafting step).
     check::check(

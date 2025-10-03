@@ -16,6 +16,8 @@
  */
 
 #include "common/tensor.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
 #include "runtime/eagleDraftEngineRunner.h"
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -59,6 +61,18 @@ public:
     ~LLMInferenceSpecDecodeRuntime() = default;
 
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
+
+    //! Get LLM prefill stage metrics
+    metrics::LLMPrefillMetrics const& getPrefillMetrics() const
+    {
+        return mPrefillMetrics;
+    }
+
+    //! Get Eagle generation stage metrics
+    metrics::EagleGenerationMetrics const& getEagleGenerationMetrics() const
+    {
+        return mEagleGenerationMetrics;
+    }
 
 private:
     EagleDraftingConfig mDraftingConfig;
@@ -128,6 +142,10 @@ private:
 
     // Helper function to load draft vocab mapping table from file. To be removed by SafeTensor loader.
     bool loadDraftVocabMappingTable(std::filesystem::path const& draftVocPath, cudaStream_t stream);
+
+    // Stage-specific metrics
+    metrics::LLMPrefillMetrics mPrefillMetrics;
+    metrics::EagleGenerationMetrics mEagleGenerationMetrics;
 };
 
 } // namespace rt
