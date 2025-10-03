@@ -31,6 +31,9 @@ namespace StageNames
 inline std::string const kLLM_PREFILL = "llm_prefill";
 inline std::string const kLLM_GENERATION = "llm_generation";
 inline std::string const kMULTIMODAL_PROCESSING = "multimodal_processing";
+inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";
+inline std::string const kEAGLE_CONSTRUCT_DRAFT_TREE = "eagle_construct_draft_tree";
+inline std::string const kEAGLE_BASE_VERIFICATION = "eagle_base_verification";
 } // namespace StageNames
 
 //! Base class for all performance metrics
@@ -44,9 +47,6 @@ public:
     {
         return totalRuns;
     }
-
-    //! Reset all metrics data
-    virtual void reset() = 0;
 
 protected:
     int64_t totalRuns{0};
@@ -65,13 +65,6 @@ public:
         reusedTokens += reused;
         computedTokens += computed;
     }
-
-    void reset() override
-    {
-        totalRuns = 0;
-        reusedTokens = 0;
-        computedTokens = 0;
-    }
 };
 
 //! LLM Generation stage metrics
@@ -84,12 +77,6 @@ public:
     {
         totalRuns++;
         generatedTokens += generated;
-    }
-
-    void reset() override
-    {
-        totalRuns = 0;
-        generatedTokens = 0;
     }
 };
 
@@ -106,12 +93,20 @@ public:
         totalImages += imageCount;
         totalImageTokens += imageTokens;
     }
+};
 
-    void reset() override
+//! Eagle Generation stage metrics
+class EagleGenerationMetrics : public BaseMetrics
+{
+public:
+    int64_t totalIterations{0};
+    int64_t totalGeneratedTokens{0};
+
+    void recordRun(int64_t iterations, int64_t generatedTokens)
     {
-        totalRuns = 0;
-        totalImages = 0;
-        totalImageTokens = 0;
+        totalRuns++;
+        totalIterations += iterations;
+        totalGeneratedTokens += generatedTokens;
     }
 };
 

@@ -18,6 +18,8 @@
 #pragma once
 
 #include "profiling/metrics.h"
+#include <nlohmann/json.hpp>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -36,12 +38,38 @@ struct StatisticalAnalysis
     static StatisticalAnalysis calculate(std::vector<float> const& data);
 };
 
-//! Print comprehensive performance summary
-void printSummary(drivellm::metrics::LLMPrefillMetrics const& prefillMetrics,
-    drivellm::metrics::LLMGenerationMetrics const& generationMetrics,
-    drivellm::metrics::MultimodalMetrics const& multimodalMetrics, size_t peakGpuMemoryBytes = 0);
+//! Output prefill stage summary to ostream
+void outputPrefillProfile(std::ostream& output, drivellm::metrics::LLMPrefillMetrics const& prefillMetrics);
 
-//! Generate JSON summary
-std::string getJsonSummary(drivellm::metrics::LLMPrefillMetrics const& prefillMetrics,
-    drivellm::metrics::LLMGenerationMetrics const& generationMetrics,
-    drivellm::metrics::MultimodalMetrics const& multimodalMetrics, size_t peakGpuMemoryBytes = 0);
+//! Output generation stage summary (naive decoding) to ostream
+void outputGenerationProfile(std::ostream& output, drivellm::metrics::LLMGenerationMetrics const& generationMetrics);
+
+//! Output Eagle generation stage summary to ostream
+void outputEagleGenerationProfile(
+    std::ostream& output, drivellm::metrics::EagleGenerationMetrics const& eagleGenerationMetrics);
+
+//! Output multimodal processing summary to ostream
+void outputMultimodalProfile(std::ostream& output, drivellm::metrics::MultimodalMetrics const& multimodalMetrics);
+
+//! Output memory usage summary to ostream
+void outputMemoryProfile(std::ostream& output, size_t peakGpuMemoryBytes);
+
+//! Add JSON for prefill stage to existing json object
+void addJsonPrefillSummary(nlohmann::json& summary, drivellm::metrics::LLMPrefillMetrics const& prefillMetrics);
+
+//! Add JSON for generation stage (naive decoding) to existing json object
+void addJsonGenerationSummary(
+    nlohmann::json& summary, drivellm::metrics::LLMGenerationMetrics const& generationMetrics);
+
+//! Add JSON for Eagle generation stage to existing json object
+void addJsonEagleGenerationSummary(
+    nlohmann::json& summary, drivellm::metrics::EagleGenerationMetrics const& eagleGenerationMetrics);
+
+//! Add JSON for multimodal processing to existing json object
+void addJsonMultimodalSummary(nlohmann::json& summary, drivellm::metrics::MultimodalMetrics const& multimodalMetrics);
+
+//! Add JSON for all timing stages to existing json object
+void addJsonTimingStages(nlohmann::json& summary);
+
+//! Add JSON for memory usage to existing json object
+void addJsonMemorySummary(nlohmann::json& summary, size_t peakGpuMemoryBytes);

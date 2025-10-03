@@ -123,6 +123,66 @@ float getMultimodalAverageTimePerToken(metrics::MultimodalMetrics const& multimo
     return 0.0f;
 }
 
+//! Utility function for calculating Eagle overall tokens per second (excluding base model prefill)
+float getEagleOverallTokensPerSecond(metrics::EagleGenerationMetrics const& eagleGenerationMetrics)
+{
+    if (eagleGenerationMetrics.totalGeneratedTokens <= 0)
+    {
+        return 0.0f;
+    }
+
+    // Calculate total time for all Eagle stages except base prefill
+    float totalTimeMs = 0.0f;
+
+    auto draftPrefillData = gTimer.getTimingData(metrics::StageNames::kEAGLE_DRAFT_PREFILL);
+    if (draftPrefillData)
+    {
+        totalTimeMs += draftPrefillData->getTotalGpuTimeMs();
+    }
+
+    auto constructDraftTreeData = gTimer.getTimingData(metrics::StageNames::kEAGLE_CONSTRUCT_DRAFT_TREE);
+    if (constructDraftTreeData)
+    {
+        totalTimeMs += constructDraftTreeData->getTotalGpuTimeMs();
+    }
+
+    auto baseVerificationData = gTimer.getTimingData(metrics::StageNames::kEAGLE_BASE_VERIFICATION);
+    if (baseVerificationData)
+    {
+        totalTimeMs += baseVerificationData->getTotalGpuTimeMs();
+    }
+
+    if (totalTimeMs > 0.0f)
+    {
+        return static_cast<float>(eagleGenerationMetrics.totalGeneratedTokens) / (totalTimeMs / 1000.0f);
+    }
+    return 0.0f;
+}
+
+//! Utility function for calculating Eagle average acceptance rate
+float getEagleAverageAcceptanceRate(metrics::EagleGenerationMetrics const& eagleGenerationMetrics)
+{
+    if (eagleGenerationMetrics.totalIterations <= 0)
+    {
+        return 0.0f;
+    }
+
+    return static_cast<float>(eagleGenerationMetrics.totalGeneratedTokens)
+        / static_cast<float>(eagleGenerationMetrics.totalIterations);
+}
+
+//! Helper function to append timing data for a stage to an ostream
+void appendStageTimingData(std::ostream& summary, std::string const& stageName, std::string const& displayName)
+{
+    auto timingData = gTimer.getTimingData(stageName);
+    if (timingData && timingData->getTotalRuns() > 0)
+    {
+        summary << displayName << " - Total Runs: " << timingData->getTotalRuns() << ", Total GPU Time: " << std::fixed
+                << std::setprecision(2) << timingData->getTotalGpuTimeMs()
+                << " ms, Average: " << timingData->getAverageTimeMs() << " ms" << std::endl;
+    }
+}
+
 } // anonymous namespace
 
 StatisticalAnalysis StatisticalAnalysis::calculate(std::vector<float> const& data)
@@ -163,101 +223,140 @@ StatisticalAnalysis StatisticalAnalysis::calculate(std::vector<float> const& dat
     return stats;
 }
 
-void printSummary(metrics::LLMPrefillMetrics const& prefillMetrics,
-    metrics::LLMGenerationMetrics const& generationMetrics, metrics::MultimodalMetrics const& multimodalMetrics,
-    size_t peakGpuMemoryBytes)
+void outputPrefillProfile(std::ostream& output, metrics::LLMPrefillMetrics const& prefillMetrics)
 {
-    std::ostringstream summary;
-    summary << "\n=== Performance Summary ===\n";
-
-    // LLM Prefill metrics
     if (prefillMetrics.getTotalRuns() > 0)
     {
-        auto timingData = gTimer.getTimingData(metrics::StageNames::kLLM_PREFILL);
-        summary << "=== LLM Prefill ===\n";
-        summary << "Total Runs: " << prefillMetrics.getTotalRuns() << "\n";
-        summary << "Reused Tokens: " << prefillMetrics.reusedTokens << "\n";
-        summary << "Computed Tokens: " << prefillMetrics.computedTokens << "\n";
-        summary << "Tokens/Second: " << std::fixed << std::setprecision(1) << getPrefillTokensPerSecond(prefillMetrics)
-                << "\n";
-        summary << "Average Time per Token: " << std::fixed << std::setprecision(4)
-                << getPrefillAverageTimePerToken(prefillMetrics) << " ms\n";
-        if (timingData)
-        {
-            summary << "Total GPU Time: " << std::fixed << std::setprecision(2) << timingData->getTotalGpuTimeMs()
-                    << " ms\n";
-            summary << "Average Time per Run: " << std::fixed << std::setprecision(2) << timingData->getAverageTimeMs()
-                    << " ms\n";
-        }
-        summary << "\n";
+        output << "=== LLM Prefill ===" << std::endl;
+        output << "Reused Tokens: " << prefillMetrics.reusedTokens << std::endl;
+        output << "Computed Tokens: " << prefillMetrics.computedTokens << std::endl;
+        output << "Tokens/Second: " << std::fixed << std::setprecision(1) << getPrefillTokensPerSecond(prefillMetrics)
+               << std::endl;
+        output << "Average Time per Token: " << std::fixed << std::setprecision(4)
+               << getPrefillAverageTimePerToken(prefillMetrics) << " ms" << std::endl;
+        appendStageTimingData(output, metrics::StageNames::kLLM_PREFILL, "LLM Prefill");
     }
+}
 
-    // LLM Generation metrics
+void outputGenerationProfile(std::ostream& output, metrics::LLMGenerationMetrics const& generationMetrics)
+{
+    output << "=== LLM Generation (Excluding sampling after prefill) ===" << std::endl;
+
     if (generationMetrics.getTotalRuns() > 0)
     {
-        auto timingData = gTimer.getTimingData(metrics::StageNames::kLLM_GENERATION);
-        summary << "=== LLM Generation (Excluding sampling after prefill) ===\n";
-        summary << "Total Runs: " << generationMetrics.getTotalRuns() << "\n";
-        summary << "Generated Tokens: " << generationMetrics.generatedTokens << "\n";
-        summary << "Tokens/Second: " << std::fixed << std::setprecision(1)
-                << getGenerationTokensPerSecond(generationMetrics) << "\n";
-        summary << "Average Time per Token: " << std::fixed << std::setprecision(4)
-                << getGenerationAverageTimePerToken(generationMetrics) << " ms\n";
-        if (timingData)
-        {
-            summary << "Total GPU Time: " << std::fixed << std::setprecision(2) << timingData->getTotalGpuTimeMs()
-                    << " ms\n";
-            summary << "Average Time per Run: " << std::fixed << std::setprecision(2) << timingData->getAverageTimeMs()
-                    << " ms\n";
-        }
-        summary << "\n";
+        output << "Generated Tokens: " << generationMetrics.generatedTokens << std::endl;
+        output << "Average Tokens per Run: " << std::fixed << std::setprecision(2)
+               << static_cast<float>(generationMetrics.generatedTokens) / generationMetrics.getTotalRuns() << std::endl;
+        output << "Tokens/Second: " << std::fixed << std::setprecision(1)
+               << getGenerationTokensPerSecond(generationMetrics) << std::endl;
+        output << "Average Time per Token: " << std::fixed << std::setprecision(4)
+               << getGenerationAverageTimePerToken(generationMetrics) << " ms" << std::endl;
+        appendStageTimingData(output, metrics::StageNames::kLLM_GENERATION, "LLM Generation");
     }
     else
     {
-        summary << "=== LLM Generation (Excluding sampling after prefill) ===\n";
-        summary << "max_generate_length = 1, the model only runs the prefill stage.\n";
-        summary << "\n";
+        output << "max_generate_length = 1, the model only runs the prefill stage." << std::endl;
     }
-
-    // Multimodal metrics
-    if (multimodalMetrics.getTotalRuns() > 0)
-    {
-        auto timingData = gTimer.getTimingData(metrics::StageNames::kMULTIMODAL_PROCESSING);
-        summary << "=== Multimodal Processing ===\n";
-        summary << "Total Runs: " << multimodalMetrics.getTotalRuns() << "\n";
-        summary << "Total Image Tokens: " << multimodalMetrics.totalImageTokens << "\n";
-        summary << "Average Time per Token: " << std::fixed << std::setprecision(4)
-                << getMultimodalAverageTimePerToken(multimodalMetrics) << " ms\n";
-        if (timingData)
-        {
-            summary << "Total GPU Time: " << std::fixed << std::setprecision(2) << timingData->getTotalGpuTimeMs()
-                    << " ms\n";
-            summary << "Average Time per Run: " << std::fixed << std::setprecision(2) << timingData->getAverageTimeMs()
-                    << " ms\n";
-        }
-        summary << "\n";
-    }
-
-    // Add peak GPU memory information if provided
-    if (peakGpuMemoryBytes > 0)
-    {
-        summary << "=== Memory Usage ===\n";
-        summary << "Peak GPU Memory: " << std::fixed << std::setprecision(2) << toMB(peakGpuMemoryBytes) << " MB ("
-                << peakGpuMemoryBytes << " bytes)\n";
-        summary << "\n";
-    }
-
-    summary << "=====================================";
-    LOG_INFO("%s", summary.str().c_str());
 }
 
-std::string getJsonSummary(metrics::LLMPrefillMetrics const& prefillMetrics,
-    metrics::LLMGenerationMetrics const& generationMetrics, metrics::MultimodalMetrics const& multimodalMetrics,
-    size_t peakGpuMemoryBytes)
+void outputEagleGenerationProfile(std::ostream& output, metrics::EagleGenerationMetrics const& eagleGenerationMetrics)
 {
-    nlohmann::json summary;
+    if (eagleGenerationMetrics.getTotalRuns() > 0)
+    {
+        output << "=== Eagle Generation ===" << std::endl;
+        output << "Total Iterations: " << eagleGenerationMetrics.totalIterations << std::endl;
+        output << "Total Generated Tokens: " << eagleGenerationMetrics.totalGeneratedTokens << std::endl;
+        output << "Average Tokens per Run: " << std::fixed << std::setprecision(2)
+               << static_cast<float>(eagleGenerationMetrics.totalGeneratedTokens)
+                / eagleGenerationMetrics.getTotalRuns()
+               << std::endl;
+        output << "Average Acceptance Rate: " << std::fixed << std::setprecision(2)
+               << getEagleAverageAcceptanceRate(eagleGenerationMetrics) << std::endl;
+        output << "Overall Tokens/Second (excluding base prefill): " << std::fixed << std::setprecision(1)
+               << getEagleOverallTokensPerSecond(eagleGenerationMetrics) << std::endl;
 
-    // Consolidated stages with all timing and metrics data
+        // Individual Eagle stage timing
+        appendStageTimingData(output, metrics::StageNames::kEAGLE_DRAFT_PREFILL, "Draft Model Prefill");
+        appendStageTimingData(output, metrics::StageNames::kEAGLE_CONSTRUCT_DRAFT_TREE, "Construct Draft Tree");
+        appendStageTimingData(output, metrics::StageNames::kEAGLE_BASE_VERIFICATION, "Base Model Verification");
+    }
+}
+
+void outputMultimodalProfile(std::ostream& output, metrics::MultimodalMetrics const& multimodalMetrics)
+{
+    if (multimodalMetrics.getTotalRuns() > 0)
+    {
+        output << "=== Multimodal Processing ===" << std::endl;
+        output << "Total Image Tokens: " << multimodalMetrics.totalImageTokens << std::endl;
+        output << "Average Time per Token: " << std::fixed << std::setprecision(4)
+               << getMultimodalAverageTimePerToken(multimodalMetrics) << " ms" << std::endl;
+        appendStageTimingData(output, metrics::StageNames::kMULTIMODAL_PROCESSING, "Multimodal Processing");
+    }
+}
+
+void outputMemoryProfile(std::ostream& output, size_t peakGpuMemoryBytes)
+{
+    if (peakGpuMemoryBytes > 0)
+    {
+        output << "=== Memory Usage ===" << std::endl;
+        output << "Peak GPU Memory: " << std::fixed << std::setprecision(2) << toMB(peakGpuMemoryBytes) << " MB ("
+               << peakGpuMemoryBytes << " bytes)" << std::endl;
+    }
+}
+
+void addJsonPrefillSummary(nlohmann::json& summary, metrics::LLMPrefillMetrics const& prefillMetrics)
+{
+    if (prefillMetrics.getTotalRuns() > 0)
+    {
+        summary["prefill"] = {{"total_runs", prefillMetrics.getTotalRuns()},
+            {"reused_tokens", prefillMetrics.reusedTokens}, {"computed_tokens", prefillMetrics.computedTokens},
+            {"tokens_per_second", getPrefillTokensPerSecond(prefillMetrics)},
+            {"average_time_per_token_ms", getPrefillAverageTimePerToken(prefillMetrics)}};
+    }
+}
+
+void addJsonGenerationSummary(nlohmann::json& summary, metrics::LLMGenerationMetrics const& generationMetrics)
+{
+    if (generationMetrics.getTotalRuns() > 0)
+    {
+        summary["generation"] = {{"total_runs", generationMetrics.getTotalRuns()},
+            {"generated_tokens", generationMetrics.generatedTokens},
+            {"average_tokens_per_run",
+                static_cast<float>(generationMetrics.generatedTokens) / generationMetrics.getTotalRuns()},
+            {"tokens_per_second", getGenerationTokensPerSecond(generationMetrics)},
+            {"average_time_per_token_ms", getGenerationAverageTimePerToken(generationMetrics)}};
+    }
+}
+
+void addJsonEagleGenerationSummary(
+    nlohmann::json& summary, metrics::EagleGenerationMetrics const& eagleGenerationMetrics)
+{
+    if (eagleGenerationMetrics.getTotalRuns() > 0)
+    {
+        summary["eagle_generation"] = {{"total_runs", eagleGenerationMetrics.getTotalRuns()},
+            {"total_iterations", eagleGenerationMetrics.totalIterations},
+            {"total_generated_tokens", eagleGenerationMetrics.totalGeneratedTokens},
+            {"average_tokens_per_run",
+                static_cast<float>(eagleGenerationMetrics.totalGeneratedTokens)
+                    / eagleGenerationMetrics.getTotalRuns()},
+            {"average_acceptance_rate", getEagleAverageAcceptanceRate(eagleGenerationMetrics)},
+            {"overall_tokens_per_second_excluding_base_prefill",
+                getEagleOverallTokensPerSecond(eagleGenerationMetrics)}};
+    }
+}
+
+void addJsonMultimodalSummary(nlohmann::json& summary, metrics::MultimodalMetrics const& multimodalMetrics)
+{
+    if (multimodalMetrics.getTotalRuns() > 0)
+    {
+        summary["multimodal"] = {{"total_runs", multimodalMetrics.getTotalRuns()},
+            {"total_images", multimodalMetrics.totalImages}, {"total_image_tokens", multimodalMetrics.totalImageTokens},
+            {"average_time_per_token_ms", getMultimodalAverageTimePerToken(multimodalMetrics)}};
+    }
+}
+
+void addJsonTimingStages(nlohmann::json& summary)
+{
     summary["stages"] = nlohmann::json::array();
     for (auto const& [stageId, timingData] : gTimer.getAllTimingData())
     {
@@ -277,35 +376,15 @@ std::string getJsonSummary(metrics::LLMPrefillMetrics const& prefillMetrics,
             {"mean_ms", gpuStats.mean}, {"median_ms", gpuStats.median}, {"p95_ms", gpuStats.p95},
             {"p99_ms", gpuStats.p99}, {"stddev_ms", gpuStats.stddev}};
 
-        // Add stage-specific metrics data
-        if (stageId == metrics::StageNames::kLLM_PREFILL)
-        {
-            stageJson["reused_tokens"] = prefillMetrics.reusedTokens;
-            stageJson["computed_tokens"] = prefillMetrics.computedTokens;
-            stageJson["tokens_per_second"] = getPrefillTokensPerSecond(prefillMetrics);
-            stageJson["average_time_per_token_ms"] = getPrefillAverageTimePerToken(prefillMetrics);
-        }
-        else if (stageId == metrics::StageNames::kLLM_GENERATION)
-        {
-            stageJson["generated_tokens"] = generationMetrics.generatedTokens;
-            stageJson["tokens_per_second"] = getGenerationTokensPerSecond(generationMetrics);
-            stageJson["average_time_per_token_ms"] = getGenerationAverageTimePerToken(generationMetrics);
-        }
-        else if (stageId == metrics::StageNames::kMULTIMODAL_PROCESSING)
-        {
-            stageJson["total_image_tokens"] = multimodalMetrics.totalImageTokens;
-            stageJson["average_time_per_token_ms"] = getMultimodalAverageTimePerToken(multimodalMetrics);
-        }
-
         summary["stages"].push_back(stageJson);
     }
+}
 
-    // Add peak GPU memory information if provided
+void addJsonMemorySummary(nlohmann::json& summary, size_t peakGpuMemoryBytes)
+{
     if (peakGpuMemoryBytes > 0)
     {
         summary["peak_gpu_memory_bytes"] = peakGpuMemoryBytes;
         summary["peak_gpu_memory_mb"] = toMB(peakGpuMemoryBytes);
     }
-
-    return summary.dump(2);
 }
