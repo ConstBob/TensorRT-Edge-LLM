@@ -73,3 +73,8 @@ void addJsonTimingStages(nlohmann::json& summary);
 
 //! Add JSON for memory usage to existing json object
 void addJsonMemorySummary(nlohmann::json& summary, size_t peakGpuMemoryBytes);
+
+//! Check string for invalid UTF-8 sequences
+//! Returns original string if valid, or error message if invalid UTF-8 detected
+//! Logs the full original text when invalid UTF-8 is found
+std::string sanitizeUtf8ForJson(std::string const& input);

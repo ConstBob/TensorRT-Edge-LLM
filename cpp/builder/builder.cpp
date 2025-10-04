@@ -508,7 +508,7 @@ bool LLMBuilder::setupEagleProfiles(
     bool result = true;
 
     int const maxTokens
-        = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTokensPerStep : mBuilderConfig.maxDecodingTokens;
+        = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
 
     // Input IDs
     result &= setOptimizationProfile(contextProfile, "input_ids", createDims({1, 1}),

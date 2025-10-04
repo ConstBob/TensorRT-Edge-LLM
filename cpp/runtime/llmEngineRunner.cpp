@@ -42,10 +42,10 @@ std::string formatEngineConfig(drivellm::rt::LLMEngineRunnerConfig const& config
 
     ss << std::boolalpha;
     ss << "LLMEngineRunnerConfig:" << "  enableReuseKVCache: " << config.enableReuseKVCache
-       << "  enableEagleSpecDecode: " << config.enableEagleSpecDecode
+       << "  enableEagleSpecDecode: " << config.enableEagleSpecDecode << "  isVlm: " << config.isVlm
        << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
        << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
-       << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
+       << "  hiddenSize: " << config.hiddenSize << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
        << "  minSupportedInputLength: " << config.minSupportedInputLength
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
        << "  maxSequenceLength: " << config.maxSequenceLength
@@ -101,34 +101,9 @@ std::string const outputHiddenStatesName{"hidden_states"};
 LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
-    LOG_INFO("Initializing LLMEngineRunner from engine file: %s", enginePath.string().c_str());
-    LOG_INFO("Using config file %s", configPath.string().c_str());
+    LOG_INFO("Loading config file %s", configPath.string().c_str());
 
-    mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-
-    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-    if (mmapReader->getData() == nullptr)
-    {
-        LOG_ERROR("LLMEngineRunner(): Failed to use MMap to read engine from file path: %s", enginePath.string());
-        throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
-    }
-    mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-    mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
-    mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
-
-    bool setOptimizationProfileStatus{true};
-    setOptimizationProfileStatus
-        &= mContextExecutionContext->setOptimizationProfileAsync(kCONTEXT_PROFILE_INDEX, stream);
-    setOptimizationProfileStatus
-        &= mGenerationExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
-    if (!setOptimizationProfileStatus)
-    {
-        LOG_ERROR("Failed to set optimization profile to the engine");
-        throw std::runtime_error("Failed to set optimization profile to the engine");
-    }
-
-    // Initialize persistent Rope CosSinCache buffers if they are not dependent on input context.
+    // Parse configuration from JSON file
     Json configJson;
     std::ifstream configFileStream(configPath);
     if (!configFileStream.is_open())
@@ -153,6 +128,32 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         throw std::runtime_error("Failed to initialize LLMEngineRunner from config file: " + configPath.string());
     }
 
+    // Load the engine after config loading succeeds
+    LOG_INFO("Loading engine file: %s", enginePath.string().c_str());
+    mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
+
+    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
+    if (mmapReader->getData() == nullptr)
+    {
+        LOG_ERROR("LLMEngineRunner(): Failed to use MMap to read engine from file path: %s", enginePath.string());
+        throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
+    }
+    mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+    mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
+    mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
+
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mContextExecutionContext->setOptimizationProfileAsync(kCONTEXT_PROFILE_INDEX, stream);
+    setOptimizationProfileStatus
+        &= mGenerationExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
     if (!this->validateConfigFromEngine())
     {
         LOG_ERROR("Failed to match config file %s with engine file: %s", configPath.string().c_str(),
@@ -162,7 +163,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     }
 
     auto ropeConfig = collectBaseRopeConfig(configJson);
-    if (ropeConfig.type != RopeType::kMRope)
+    mConfig.ropeType = ropeConfig.type;
+    if (mConfig.ropeType != RopeType::kMRope)
     {
         LOG_DEBUG("LLMEngineRunner(): Initialize persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
@@ -245,9 +247,34 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         }
     }
 
-    // Initialize the dummy LoRA weights tensor as TensorRT does not support nullptr for binding, even when the LoRA
-    // rank is 0.
-    mDummyTensor = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    // Initialize the dummy tensor as TensorRT does not support nullptr for binding
+    // Calculate maximum memory requirements across all use cases:
+    // 1. Multimodal embeddings: {1, hiddenSize}
+    // 2. Attention mask: {maxSupportedBatchSize, 1, 1}
+    // 3. Attention position IDs: {maxSupportedBatchSize, 1}
+    // 4. LoRA weights: zero shape.
+    int64_t maxDummyElements = std::max({
+        static_cast<int64_t>(mConfig.hiddenSize),            // multimodal embeddings
+        static_cast<int64_t>(mConfig.maxSupportedBatchSize), // attention mask/pos IDs
+    });
+    mDummyTensor = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    // Initialize dummy tensor memory to zero
+    CUDA_CHECK(cudaMemsetAsync(mDummyTensor.rawPointer(), 0, mDummyTensor.getMemoryCapacity(), stream));
+
+    // Set multimodal embeddings to dummy tensor for generation contexts if VLM is enabled
+    if (mConfig.isVlm)
+    {
+        bool setMultimodalStatus{true};
+        setMultimodalStatus &= mGenerationExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), mDummyTensor.rawPointer());
+        setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
+            multimodalEmbeddingsName.c_str(), rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
+        if (!setMultimodalStatus)
+        {
+            LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
+            throw std::runtime_error("Failed to set multimodal embeddings dummy tensor for generation context");
+        }
+    }
 
     // Reset the LoRA weights to zero tensors.
     if (!this->resetLoraWeights(stream))
@@ -282,7 +309,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_batch_size", "max_input_len", "max_seq_len", "max_lora_rank", "eagle_base", "max_decoding_tokens"};
+            = {"max_batch_size", "max_input_len", "max_seq_len", "max_lora_rank", "eagle_base", "is_vlm"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -298,13 +325,13 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.numDecoderLayers = configJson["num_hidden_layers"].get<int32_t>();
         mConfig.numKVHeads = configJson["num_key_value_heads"].get<int32_t>();
         mConfig.headDim = configJson["head_dim"].get<int32_t>();
-
         mConfig.rotaryDim = mConfig.headDim;
-
+        mConfig.hiddenSize = configJson["hidden_size"].get<int32_t>();
         mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
-
         mConfig.enableReuseKVCache = configJson["enable_reuse_kv_cache"].get<bool>();
 
+        // Extract builder_config values
+        mConfig.isVlm = builderConfig["is_vlm"].get<bool>();
         mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
         mConfig.minSupportedInputLength = 1; // TODO: Change this to min input length
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
@@ -315,9 +342,9 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         // Validate configuration values - all must be positive except max_lora_rank
         std::vector<std::pair<std::string, int32_t>> positiveFields
             = {{"num_decoder_layers", mConfig.numDecoderLayers}, {"num_key_value_heads", mConfig.numKVHeads},
-                {"head_dim", mConfig.headDim}, {"rotary_dim", mConfig.rotaryDim}, {"vocab_size", mConfig.vocabSize},
-                {"max_batch_size", mConfig.maxSupportedBatchSize}, {"max_input_len", mConfig.maxSupportedInputLength},
-                {"max_seq_len", mConfig.maxSequenceLength}};
+                {"head_dim", mConfig.headDim}, {"rotary_dim", mConfig.rotaryDim}, {"hidden_size", mConfig.hiddenSize},
+                {"vocab_size", mConfig.vocabSize}, {"max_batch_size", mConfig.maxSupportedBatchSize},
+                {"max_input_len", mConfig.maxSupportedInputLength}, {"max_seq_len", mConfig.maxSequenceLength}};
 
         for (auto const& [fieldName, value] : positiveFields)
         {
@@ -329,11 +356,20 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         }
 
         // FIXME: Not a proper way to determine the output hidden dim.
-        // Hardcore output hidden_dim to 3 x model hidden_size which is default in eagle3.
+        // Hardcode output hidden_dim to 3 x model hidden_size which is default in eagle3.
         if (mConfig.enableEagleSpecDecode)
         {
             mConfig.outputHiddenDim = configJson["hidden_size"].get<int32_t>() * 3;
-            mConfig.maxVerifyTreeSize = builderConfig["max_decoding_tokens"].get<int32_t>();
+
+            // maxVerifyTreeSize is only required when eagle_base is true
+            if (!builderConfig.contains("max_verify_tree_size"))
+            {
+                LOG_ERROR(
+                    "initializeConfigFromJson(): Missing required field 'max_verify_tree_size' in builder_config for "
+                    "Eagle base model");
+                return false;
+            }
+            mConfig.maxVerifyTreeSize = builderConfig["max_verify_tree_size"].get<int32_t>();
         }
 
         // Validate max_lora_rank separately (must be non-negative)
@@ -373,7 +409,13 @@ bool LLMEngineRunner::validateConfigFromEngine()
         return tensorDim.nbDims == 1 && bindingName.find("kvcache_start_index") != std::string::npos;
     };
 
+    // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
+    auto identifyMultimodalEmbeddingsBinding = [](std::string const& bindingName, Dims const& tensorDim) {
+        return tensorDim.nbDims == 2 && bindingName == multimodalEmbeddingsName;
+    };
+
     int32_t nbKVCacheInputs{0};
+    bool foundMultimodalEmbeddingsInput{false};
     int32_t numIOBindings = mEngine->getNbIOTensors();
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
@@ -412,7 +454,30 @@ bool LLMEngineRunner::validateConfigFromEngine()
                 return false;
             }
         }
+        if (identifyMultimodalEmbeddingsBinding(bindingName, tensorDim))
+        {
+            foundMultimodalEmbeddingsInput = true;
+            if (mConfig.hiddenSize != tensorDim.d[1])
+            {
+                LOG_ERROR("hiddenSize is not consistent. From engine multimodal embeddings: %d, from config: %d",
+                    tensorDim.d[1], mConfig.hiddenSize);
+                return false;
+            }
+            if (!mConfig.isVlm)
+            {
+                LOG_ERROR("VLM is not enabled but multimodal embeddings input image_embeds found in engine");
+                return false;
+            }
+        }
     }
+    // Validate hiddenSize from multimodal embeddings if VLM is enabled
+    if (mConfig.isVlm && !foundMultimodalEmbeddingsInput)
+    {
+        LOG_ERROR("VLM is enabled but multimodal embeddings input (%s) not found in engine",
+            multimodalEmbeddingsName.c_str());
+        return false;
+    }
+
     if (nbKVCacheInputs != mConfig.numDecoderLayers)
     {
         LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,
@@ -513,7 +578,8 @@ rt::LinearKVCache& LLMEngineRunner::getLinearKVCache()
 }
 
 bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
-    rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates)
+    rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates,
+    rt::OptionalInputTensor multimodalEmbeddings)
 {
     int32_t activeBatchSize = inputIds.getShape()[0];
     int32_t prefillSequenceLength = inputIds.getShape()[1];
@@ -548,6 +614,22 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
             prefillSequenceLength, mConfig.maxSupportedInputLength, inputIds.getShape().formatString().c_str());
         return false;
     }
+
+    // Validate multimodal embeddings based on is_vlm flag
+    bool const isMultimodalEmbeddingsValid
+        = (mConfig.isVlm && multimodalEmbeddings.has_value()
+              && multimodalEmbeddings.value().get().getShape().getNumDims() == 2
+              && multimodalEmbeddings.value().get().getShape()[1] == mConfig.hiddenSize)
+        || (!mConfig.isVlm && !multimodalEmbeddings.has_value());
+    if (!isMultimodalEmbeddingsValid)
+    {
+        LOG_ERROR("Invalid multimodal embeddings. VLM=%s, provided=%s, expected shape=[*, %d]. Current shape: %s",
+            mConfig.isVlm ? "true" : "false", multimodalEmbeddings.has_value() ? "true" : "false", mConfig.hiddenSize,
+            multimodalEmbeddings.has_value() ? multimodalEmbeddings.value().get().getShape().formatString().c_str()
+                                             : "None");
+        return false;
+    }
+
     bool const isLogitsShapeValid
         = outputLogits.getShape().getNumDims() == 2 && outputLogits.getShape()[1] == mConfig.vocabSize;
     if (!isLogitsShapeValid)
@@ -580,11 +662,11 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
 }
 
 bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& hostContextLengths,
-    rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, OptionalOutputTensor outputHiddenStates,
+    rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
     cudaStream_t stream)
 {
-    bool const validateInputStatus
-        = this->prefillStepInputValidation(inputIds, hostContextLengths, outputLogits, outputHiddenStates);
+    bool const validateInputStatus = this->prefillStepInputValidation(
+        inputIds, hostContextLengths, outputLogits, outputHiddenStates, multimodalEmbeddings);
     if (!validateInputStatus)
     {
         LOG_ERROR("executePrefill(): Prefill request not performed due to invalid input tensors.");
@@ -594,17 +676,23 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     // Verirify input tensorShape is valid.
     int32_t activeBatchSize = inputIds.getShape()[0];
 
+    bool reshapeStatus{true};
     // conduct preparation work for the engine execution. Provide correct shapes for MISC input tensors.
     if (mConfig.enableEagleSpecDecode)
     {
         // With EAGLE, shape semantics is different with the "last_token_ids" input to gather from hidden states.
-        mSelectTokenIndices.reshape({activeBatchSize});
+        reshapeStatus &= mSelectTokenIndices.reshape({activeBatchSize});
     }
     else
     {
-        mSelectTokenIndices.reshape({activeBatchSize, 1});
+        reshapeStatus &= mSelectTokenIndices.reshape({activeBatchSize, 1});
     }
-    mSequenceContextLengths.reshape({activeBatchSize});
+    reshapeStatus &= mSequenceContextLengths.reshape({activeBatchSize});
+    if (!reshapeStatus)
+    {
+        LOG_ERROR("Failed to reshape select token indices and sequence context lengths for prefill step.");
+        return false;
+    }
 
     std::vector<int64_t> selectTokenIndicesHost(activeBatchSize, 0);
     int32_t const* contextLengthsData = hostContextLengths.dataPointer<int32_t>();
@@ -634,12 +722,13 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
     setEngineIOStatus
         &= mContextExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
-    if (!multimodalEmbeddings.isEmpty())
+    if (multimodalEmbeddings.has_value())
     {
+        rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
         setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
+            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
         setEngineIOStatus &= mContextExecutionContext->setInputShape(
-            multimodalEmbeddingsName.c_str(), multimodalEmbeddings.getShape().getTRTDims());
+            multimodalEmbeddingsName.c_str(), multimodalEmbeddingsTensor.getShape().getTRTDims());
     }
     if (mConfig.enableReuseKVCache)
     {
@@ -723,7 +812,7 @@ bool LLMEngineRunner::vanlliaDecodingStepInputValidation(rt::Tensor const& input
 }
 
 bool LLMEngineRunner::executeVanillaDecodingStep(
-    rt::Tensor const& inputIds, rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, cudaStream_t stream)
+    rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream)
 {
     bool const validateInputStatus = this->vanlliaDecodingStepInputValidation(inputIds, outputLogits);
     if (!validateInputStatus)
@@ -768,14 +857,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
             lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
             ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
-        if (!multimodalEmbeddings.isEmpty())
-        {
-            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-                multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
-            auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
-            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-                multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
-        }
+
         if (mConfig.enableReuseKVCache)
         {
             setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
@@ -881,8 +963,8 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
 }
 
 bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputIds,
-    rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits,
-    rt::Tensor& outputHiddenStates, cudaStream_t stream)
+    rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+    cudaStream_t stream)
 {
     bool const validateInputStatus = this->eagleBaseTreeDecodingStepInputValidation(
         baseTreeDecodingInputIds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
@@ -935,14 +1017,6 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
         attentionPosIdName.c_str(), mEagleBasePositionIds.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         attentionPosIdName.c_str(), mEagleBasePositionIds.getShape().getTRTDims());
-    if (!multimodalEmbeddings.isEmpty())
-    {
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
-        auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
-    }
     // Bind the output tensor into the engine.
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
@@ -973,8 +1047,8 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
     return true;
 }
 
-bool LLMEngineRunner::captureVanillaDecodingCudaGraph(rt::Tensor const& inputIds, rt::Tensor& outputLogits,
-    std::string const& loraWeightsPath, rt::Tensor const& multimodalEmbeddings, cudaStream_t stream)
+bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
+    rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
 {
     size_t const hashValue = hashDecodingInput(inputIds, outputLogits, loraWeightsPath);
     if (mCudaGraphs.find(hashValue) != mCudaGraphs.end())
@@ -1016,6 +1090,11 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(rt::Tensor const& inputIds
     // Set sequence context length input for decoding step.
     mSelectTokenIndices.reshape({activeBatchSize, 1});
     mSequenceContextLengths.reshape({activeBatchSize});
+    // Need to reshape the mPosEncCosSinCache for MROPE.
+    if (mConfig.ropeType == RopeType::kMRope)
+    {
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
+    }
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
     CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), mKVCache.getKVCacheLengths().rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
@@ -1036,14 +1115,6 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(rt::Tensor const& inputIds
         lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
-    if (!multimodalEmbeddings.isEmpty())
-    {
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddings.rawPointer()));
-        auto multimodalEmbeddingsDim = multimodalEmbeddings.getShape()[1];
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            multimodalEmbeddingsName.c_str(), {2, {1, multimodalEmbeddingsDim}});
-    }
     if (mConfig.enableReuseKVCache)
     {
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(

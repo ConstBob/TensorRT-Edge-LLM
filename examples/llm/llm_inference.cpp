@@ -494,11 +494,7 @@ int main(int argc, char* argv[])
 
     if (args.eagleArgs.enabled)
     {
-        // Eagle mode - disable multimodal and LoRA for now
-        if (!args.multimodalEngineDir.empty())
-        {
-            LOG_WARNING("Eagle mode does not support multimodal engines. Ignoring --multimodalEngineDir.");
-        }
+        // Eagle mode - LoRA is not supported
         if (!loraWeightsMap.empty())
         {
             LOG_WARNING("Eagle mode does not support LoRA weights. Ignoring LoRA weights.");
@@ -508,8 +504,8 @@ int main(int argc, char* argv[])
             args.eagleArgs.draftTopK, args.eagleArgs.draftStep, args.eagleArgs.verifyTreeSize};
         try
         {
-            eagleInferenceRuntime
-                = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(args.engineDir, draftingConfig, stream);
+            eagleInferenceRuntime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+                args.engineDir, args.multimodalEngineDir, draftingConfig, stream);
         }
         catch (std::exception const& e)
         {
@@ -532,12 +528,15 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Capture CUDA graph and execute the graph for text only input.
+    // Capture CUDA graph for decoding in standard mode with text-only input.
     // TODO: Enable CUDA graph capture for multimodal inputs.
-    // Eagle mode does not support CUDA graph capture
-    if (!args.eagleArgs.enabled && args.multimodalEngineDir.empty())
+    // Note: Eagle mode does not use CUDA graph capture
+    if (!args.eagleArgs.enabled)
     {
-        LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
+        if (!llmInferenceRuntime->captureDecodingCUDAGraph(stream))
+        {
+            LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
+        }
     }
 
     // Perform warmup runs if requested
@@ -632,18 +631,14 @@ int main(int argc, char* argv[])
             LOG_ERROR("*** FAILED *** Request %zu failed to process!", requestIdx);
         }
 
-        // Add to JSON output
+        // Add to JSON output with UTF-8 validation on output text
         for (size_t batchIdx = 0; batchIdx < request.prompts.size(); ++batchIdx)
         {
             nlohmann::json responseJson;
-            if (requestStatus)
-            {
-                responseJson["output_text"] = response.outputTexts[batchIdx];
-            }
-            else
-            {
-                responseJson["output_text"] = errorMessage;
-            }
+            std::string outputText = requestStatus ? response.outputTexts[batchIdx] : errorMessage;
+            // Validate UTF-8 for output text (inputs are always valid)
+            // If invalid UTF-8 detected, error message is returned and original text is logged
+            responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
             responseJson["request_idx"] = requestIdx;
             responseJson["system_prompt"] = request.prompts[batchIdx].systemPrompt;
             responseJson["user_prompt"] = request.prompts[batchIdx].userPrompt;
@@ -679,8 +674,10 @@ int main(int argc, char* argv[])
             // Eagle runtime with detailed metrics
             auto prefillMetrics = eagleInferenceRuntime->getPrefillMetrics();
             auto eagleGenerationMetrics = eagleInferenceRuntime->getEagleGenerationMetrics();
+            auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
             outputPrefillProfile(profileOutput, prefillMetrics);
             outputEagleGenerationProfile(profileOutput, eagleGenerationMetrics);
+            outputMultimodalProfile(profileOutput, multimodalMetrics);
             outputMemoryProfile(profileOutput, peakMemoryBytes);
         }
         else
@@ -707,10 +704,12 @@ int main(int argc, char* argv[])
                 // Eagle runtime with detailed metrics
                 auto prefillMetrics = eagleInferenceRuntime->getPrefillMetrics();
                 auto eagleGenerationMetrics = eagleInferenceRuntime->getEagleGenerationMetrics();
+                auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
 
                 // Add high-level metrics
                 addJsonPrefillSummary(profileJson, prefillMetrics);
                 addJsonEagleGenerationSummary(profileJson, eagleGenerationMetrics);
+                addJsonMultimodalSummary(profileJson, multimodalMetrics);
 
                 // Add detailed timing stages
                 addJsonTimingStages(profileJson);

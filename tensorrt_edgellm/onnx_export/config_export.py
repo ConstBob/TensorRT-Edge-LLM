@@ -111,6 +111,19 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         raise KeyError("Required field 'draft_vocab_size' not found in config")
     draft_config["draft_vocab_size"] = config_dict["draft_vocab_size"]
 
+    # Add base model configuration fields
+    # The target_hidden_size from the model config represents the base model's hidden dimension
+    if "target_hidden_size" in config_dict:
+        # Use target_hidden_size * 3 as the base model hidden dimension (as per llm_export.py logic)
+        draft_config[
+            "base_model_hidden_size"] = config_dict["target_hidden_size"] * 3
+    else:
+        # Fallback: assume base model hidden size is 3x draft model (Eagle3 default)
+        draft_config["base_model_hidden_size"] = config_dict["hidden_size"] * 3
+        print(
+            f"Warning: target_hidden_size not found, using default 3x draft hidden size: {draft_config['base_model_hidden_size']}"
+        )
+
     # Set model_type for draft
     draft_config["model_type"] = f"eagle3_draft"
 

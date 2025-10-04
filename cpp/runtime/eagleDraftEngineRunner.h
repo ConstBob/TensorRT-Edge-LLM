@@ -19,29 +19,34 @@
 
 #include "common/tensor.h"
 #include "runtime/linearKVCache.h"
-
-#include <NvInfer.h>
+#include "runtime/llmRuntimeUtils.h"
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <memory>
+#include <nlohmann/json.hpp>
+#include <optional>
 
 namespace drivellm
 {
 namespace rt
 {
+using Json = nlohmann::json;
 
 struct EagleDraftEngineRunnerConfig
 {
+    RopeType ropeType{RopeType::kDefault};
     int32_t numDecoderLayers{};
     int32_t numKVHeads{};
     int32_t headDim{};
+    int32_t rotaryDim{};
     int32_t maxSupportedInputLength{};
     int32_t kvCacheCapacityLength{};
     int32_t draftModelVocabSize{};
     int32_t maxDraftTreeSize{};
     int32_t baseModelHiddenDim{};
     int32_t draftModelHiddenDim{};
+    bool isVlm{false};
 };
 
 // Disable clang-format to explicitly format the class interface documentation.
@@ -69,13 +74,14 @@ public:
     //          denote hidden states corresponding to token_ids of [1 ~ N-1].
     //     draftModelHiddenStates [GPU, Float16]: The input [1, N, draft-Hidden-input-dim] is unused in the prefill step,
     //          but it is required by the engine execution. The input shall be set to all zeros to ensure correctness.
+    //     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings.
     //     stream: The CUDA stream to execute the prefill step.
     // Outputs:
     //     outputLogits [GPU, Float16]: The output logits with shape [1, draft-Vocab-Size].
     //     outputHiddenStates [GPU]: The output hidden states with shape [1, draft-hidden-dim].
     bool executeEaglePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& baseModelHiddenStates,
-        rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-        cudaStream_t stream);
+        rt::Tensor const& draftModelHiddenStates, rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits,
+        rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
     // API entry to execute the draft proposal step for the eagle draft engine. The API will takes a draft tree of
     // input_token_ids and hidden-states from the draft model. DraftTreeMask denote the relationship between the draft
@@ -137,16 +143,20 @@ private:
     rt::Tensor mDraftTreePositionIds{};
     // (GPU, Int32) to store the packed tree mask to indicate the attention relationship between the draft tree nodes.
     rt::Tensor mPackedTreeMask{};
-    // (GPU, Int32) to store a GPU buffer as dummy input for the engine when shape is set to zero. TensorRT doesn't
+    // (GPU, Half) to store a GPU buffer as dummy tensor for unused input tensors. TensorRT doesn't
     // allow binding address to be nullptr.
-    rt::Tensor mDummyInput{};
+    rt::Tensor mDummyTensor{};
+
+    //! Initialize the configuration from the JSON file.
+    bool initializeConfigFromJson(Json const& configJson);
+
+    //! Validate the configuration from the engine.
+    bool validateConfigFromEngine();
 
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
-    void initializeConfigFromEngine();
-
     bool prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& baseModelHiddenStates,
-        rt::Tensor const& draftModelHiddenStates, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
+        rt::Tensor const& draftModelHiddenStates, rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
 
     bool draftProposalStepInputValidation(rt::Tensor const& draftTreeInputIds, rt::Tensor const& baseModelHiddenStates,
         rt::Tensor const& draftModelHiddenStates, rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask,
