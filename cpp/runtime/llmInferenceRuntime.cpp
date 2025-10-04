@@ -354,13 +354,13 @@ bool LLMInferenceRuntime::handleRequest(
 
     // Use empty tensor for when no multimodal runner is available.
     // All other data input used by prefill step is already set up in setUpForPrefillExecution().
-    rt::Tensor emptyTensor{};
-    rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
+    rt::OptionalInputTensor multimodalEmbeddings
+        = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
     // Profile all sampling operations as one stage
     std::vector<int32_t> generatedToken;
     // Prefill profiling session
     // For non-spec decode, we don't need to output hidden states.
-    LLMEngineRunner::OptionalOutputTensor outputHiddenStates{std::nullopt};
+    rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
     {
         TIME_STAGE(metrics::StageNames::kLLM_PREFILL, stream);
 
@@ -390,8 +390,7 @@ bool LLMInferenceRuntime::handleRequest(
             CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), generatedToken.data(), activeBatchSize * sizeof(int32_t),
                 cudaMemcpyHostToDevice, stream));
 
-            bool decodingStatus
-                = mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, multimodalEmbeddings, mOutputLogits, stream);
+            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, mOutputLogits, stream);
             if (!decodingStatus)
             {
                 LOG_ERROR("LLMInferenceRuntime(): Failed to execute decoding step.");
@@ -437,16 +436,14 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     {
         mInputIds.reshape({batchSize, 1});
         mOutputLogits.reshape({batchSize, mEngineConfig.vocabSize});
-        rt::Tensor emptyTensor{};
-        rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-            mInputIds, mOutputLogits, mEmptyLoraWeightsName, multimodalEmbeddings, stream);
+            mInputIds, mOutputLogits, mEmptyLoraWeightsName, stream);
         if (mEngineConfig.maxSupportedLoraRank > 0)
         {
             for (auto const& loraWeightsName : mLLMEngineRunner->getAvailableLoraWeights())
             {
                 captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-                    mInputIds, mOutputLogits, loraWeightsName, multimodalEmbeddings, stream);
+                    mInputIds, mOutputLogits, loraWeightsName, stream);
             }
         }
     }
@@ -535,9 +532,9 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     }
 
     // Execute prefill step to initialize the KVCache data.
-    rt::Tensor emptyTensor{};
-    rt::Tensor& multimodalEmbeddings = mMultimodalRunner ? mMultimodalRunner->getOutputEmbedding() : emptyTensor;
-    LLMEngineRunner::OptionalOutputTensor outputHiddenStates{std::nullopt};
+    rt::OptionalInputTensor multimodalEmbeddings
+        = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+    rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
     bool prefillStatus = mLLMEngineRunner->executePrefillStep(
         mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, outputHiddenStates, stream);
     if (!prefillStatus)

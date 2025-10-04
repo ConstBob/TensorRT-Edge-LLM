@@ -16,11 +16,11 @@
  */
 
 #include "llmInferenceSpecDecodeRuntime.h"
-
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/newEagleUtilKernels.h"
+#include "multimodal/multimodalRunner.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <fstream>
@@ -34,8 +34,8 @@ namespace drivellm
 namespace rt
 {
 
-LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(
-    std::string const& engineDir, EagleDraftingConfig const& draftingConfig, cudaStream_t stream)
+LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& engineDir,
+    std::string const& multimodalEngineDir, EagleDraftingConfig const& draftingConfig, cudaStream_t stream)
 {
     mDraftingConfig = draftingConfig;
 
@@ -68,6 +68,27 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(
     }
     LOG_INFO("EagleDraftEngineRunner successfully initialized.");
     mDraftEngineConfig = mDraftEngineRunner->getDraftEngineConfig();
+
+    // Validate drafting configuration against engine capabilities
+    // maxDraftTreeSize controls the maximum input length to draft proposal step
+    int32_t const requiredDraftInputSize = mDraftingConfig.draftingStep * mDraftingConfig.draftingTopK;
+    if (requiredDraftInputSize > mDraftEngineConfig.maxDraftTreeSize)
+    {
+        LOG_ERROR(
+            "Drafting config requires %d draft input tokens (draftingStep=%d * draftingTopK=%d) but engine supports "
+            "max %d draft tree size",
+            requiredDraftInputSize, mDraftingConfig.draftingStep, mDraftingConfig.draftingTopK,
+            mDraftEngineConfig.maxDraftTreeSize);
+        throw std::runtime_error("Drafting configuration exceeds engine draft tree size capability");
+    }
+
+    // Validate that verifyTreeSize doesn't exceed the maximum draft tree size
+    if (mDraftingConfig.verifyTreeSize > mDraftEngineConfig.maxDraftTreeSize)
+    {
+        LOG_ERROR("Drafting config verifyTreeSize (%d) exceeds engine maxDraftTreeSize (%d)",
+            mDraftingConfig.verifyTreeSize, mDraftEngineConfig.maxDraftTreeSize);
+        throw std::runtime_error("Verify tree size exceeds engine maximum draft tree size");
+    }
 
     // Allocate runtime tensors till max supported size.
     int32_t const maxDraftTreeSize = std::max(mDraftEngineConfig.maxDraftTreeSize, mDraftingConfig.verifyTreeSize);
@@ -155,6 +176,21 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(
         throw std::runtime_error("Failed to load tokenizer from model directory: " + engineDir);
     }
     LOG_INFO("Tokenizer successfully loaded from model directory: %s", engineDir.c_str());
+
+    // Optional: Setup multimodal engine runner
+    if (!multimodalEngineDir.empty())
+    {
+        try
+        {
+            mMultimodalRunner = MultimodalRunner::create(multimodalEngineDir, stream);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to initialize MultimodalRunner: %s", e.what());
+            throw std::runtime_error("Failed to initialize MultimodalRunner: " + std::string(e.what()));
+        }
+        LOG_INFO("MultimodalRunner successfully loaded and initialized multimodal engine.");
+    }
 }
 
 // TODO: Remove the loading function from d2t.bin and unify it to use SafeTensor loader.
@@ -200,19 +236,40 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return false;
     }
 
+    // Preprocess user prompts and encode them.
     LLMGenerationRequest::Prompt const& prompt = request.prompts[0];
-    std::string const inputText = prompt.systemPrompt + prompt.userPrompt;
-    // set tokenizer to ignore special tokens for debugging with python
-    std::vector<int32_t> const tokenizedInputIds = mTokenizer->encode(inputText, false);
-    if (tokenizedInputIds.empty())
+    std::vector<std::vector<int32_t>> batchedInputIds;
+    if (!mMultimodalRunner)
     {
-        LOG_ERROR("Failed to tokenize input text: %s", inputText.c_str());
-        return false;
+        std::string const inputText = prompt.systemPrompt + prompt.userPrompt;
+        batchedInputIds.emplace_back(mTokenizer->encode(inputText, false));
+        if (batchedInputIds[0].empty())
+        {
+            LOG_ERROR("Failed to tokenize input text: %s", inputText.c_str());
+            return false;
+        }
     }
+    else
+    {
+        if (!mMultimodalRunner->preprocess(
+                request, batchedInputIds, mTokenizer.get(), mBaseEngineRunner->getRopeCosSinCacheTensor(), stream))
+        {
+            LOG_ERROR(
+                "LLMInferenceRuntime(): Multimodal input request processing failed. This request cannot be handled.");
+            return false;
+        }
+
+        if (!mMultimodalRunner->infer(stream))
+        {
+            LOG_ERROR("LLMInferenceRuntime(): Multimodal inference failed. This request cannot be handled.");
+            return false;
+        }
+    }
+
     // The boundary case for KVCache is not handled, during execution we need to write drafting KVCache.
     // Workaround the issue by enforce max input sequence length smaller than (KVCacheCapacity - 100)
     constexpr int32_t kDRAFT_KVCACHE_RESERVE_LENGTH{100};
-    int32_t const prefillContextLength = tokenizedInputIds.size();
+    int32_t const prefillContextLength = batchedInputIds[0].size();
     int32_t const kvCacheCapacity
         = std::max(mBaseEngineConfig.maxSequenceLength, mDraftEngineConfig.kvCacheCapacityLength);
     int32_t maxGenerateLength = request.maxGenerateLength;
@@ -225,7 +282,12 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
             maxGenerateLength);
     }
 
-    SpecDecodeInferenceContext context{tokenizedInputIds, 0, maxGenerateLength, 0, stream};
+    // Use empty tensor for when no multimodal runner is available.
+    // All other data input used by prefill step is already set up in setUpForPrefillExecution().
+    rt::OptionalInputTensor multimodalEmbeddings
+        = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+
+    SpecDecodeInferenceContext context{batchedInputIds[0], multimodalEmbeddings, 0, maxGenerateLength, 0, stream};
     auto checkGenerateEndStatus = [this](SpecDecodeInferenceContext& context) {
         bool flag = (context.currentGenerateLength >= context.maxGenerateLength)
             || (context.tokenIds.back() == mTokenizer->getEosId());
@@ -330,7 +392,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     mBaseEngineRunner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengthsTensor, context.stream);
 
     bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(mIdsInput, mContextLengthsInput,
-        multimodalEmbeddings, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
+        context.multimodalEmbeddings, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
     if (!prefillSuccess)
     {
         LOG_ERROR("Failed to execute prefill step for base model.");
@@ -387,7 +449,7 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
         cudaMemcpyHostToDevice, context.stream));
 
     bool const prefillSuccess = mDraftEngineRunner->executeEaglePrefillStep(mIdsInput, mBaseHiddenStatesOutput,
-        mDraftHiddenStatesInput, mLogitsOutput, mDraftHiddenStatesOutput, context.stream);
+        mDraftHiddenStatesInput, context.multimodalEmbeddings, mLogitsOutput, mDraftHiddenStatesOutput, context.stream);
     if (!prefillSuccess)
     {
         LOG_ERROR("Failed to execute prefill step for draft model.");
@@ -529,10 +591,8 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     mLogitsOutput.reshape({mDraftingConfig.verifyTreeSize, mBaseEngineConfig.vocabSize});
     mBaseHiddenStatesOutput.reshape({mDraftingConfig.verifyTreeSize, mBaseEngineConfig.outputHiddenDim});
 
-    // No need to pass in multimodal embeddings.
-    rt::Tensor const multimodalEmbeddings{};
     bool const verifySuccess = mBaseEngineRunner->executeEagleBaseTreeDecodingStep(
-        mIdsInput, mDraftTreeMask, multimodalEmbeddings, mLogitsOutput, mBaseHiddenStatesOutput, context.stream);
+        mIdsInput, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, context.stream);
     if (!verifySuccess)
     {
         LOG_ERROR("Failed to execute base tree verification step for base model.");

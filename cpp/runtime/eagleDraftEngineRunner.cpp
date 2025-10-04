@@ -23,9 +23,9 @@
 #include "kernels/speculative/newEagleUtilKernels.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <fstream>
-#include <nlohmann/json.hpp>
+#include <sstream>
+#include <stdexcept>
 
-using Json = nlohmann::json;
 using namespace nvinfer1;
 
 namespace
@@ -36,11 +36,12 @@ std::string formatEngineConfig(drivellm::rt::EagleDraftEngineRunnerConfig const&
     ss << std::boolalpha;
     ss << "EagleDraftEngineRunnerConfig:"
        << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
-       << "  headDim: " << config.headDim << "  maxSupportedInputLength: " << config.maxSupportedInputLength
+       << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
+       << "  maxSupportedInputLength: " << config.maxSupportedInputLength
        << "  kvCacheCapacityLength: " << config.kvCacheCapacityLength
        << "  draftModelVocabSize: " << config.draftModelVocabSize << "  maxDraftTreeSize: " << config.maxDraftTreeSize
        << "  baseModelHiddenDim: " << config.baseModelHiddenDim
-       << "  draftModelHiddenDim: " << config.draftModelHiddenDim;
+       << "  draftModelHiddenDim: " << config.draftModelHiddenDim << "  isVlm: " << config.isVlm;
     return ss.str();
 }
 
@@ -66,13 +67,41 @@ std::string const draftModelHiddenStatesName{"hidden_states_from_draft"};
 std::string const outputHiddenStatesName{"hidden_states"};
 std::string const attentionMaskName{"attention_mask"};
 std::string const attentionPosIdName{"attention_pos_id"};
+std::string const multimodalEmbeddingsName{"image_embeds"};
 
 EagleDraftEngineRunner::EagleDraftEngineRunner(
     std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream)
 {
-    LOG_INFO("Initializing EagleDraftEngineRunner from engine file: %s", enginePath.string().c_str());
-    LOG_INFO("Using config file %s", configPath.string().c_str());
+    LOG_INFO("Loading eagle draft config file: %s", configPath.string().c_str());
 
+    // Parse and validate configuration from JSON file first to fail fast if config is invalid
+    Json configJson;
+    std::ifstream configFileStream(configPath);
+    if (!configFileStream.is_open())
+    {
+        LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
+        throw std::runtime_error("Failed to open config file: " + configPath.string());
+    }
+    try
+    {
+        configJson = Json::parse(configFileStream);
+        configFileStream.close();
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse config file with error: %s", e.what());
+        throw std::runtime_error("Failed to parse config file: " + configPath.string());
+    }
+
+    if (!this->initializeConfigFromJson(configJson))
+    {
+        LOG_ERROR("Failed to initialize EagleDraftEngineRunner from config file: %s", configPath.string().c_str());
+        throw std::runtime_error(
+            "Failed to initialize EagleDraftEngineRunner from config file: " + configPath.string());
+    }
+
+    LOG_INFO("Loading eagle draft engine file: %s", enginePath.string().c_str());
+    // Load the engine after config loading succeeds
     auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
     if (mmapReader->getData() == nullptr)
     {
@@ -97,7 +126,13 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    this->initializeConfigFromEngine();
+    if (!this->validateConfigFromEngine())
+    {
+        LOG_ERROR("Failed to match config file %s with engine file: %s", configPath.string().c_str(),
+            enginePath.string().c_str());
+        throw std::runtime_error(
+            "Failed to match config file " + configPath.string() + " with engine file: " + enginePath.string());
+    }
 
     // Instantiate the KVCache instance of the EngineRunner.
     this->mLinearKVCache
@@ -118,28 +153,24 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         = rt::Tensor({kRUNTIME_BATCH_SIZE, mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
     this->mPackedTreeMask = rt::Tensor(
         {kRUNTIME_BATCH_SIZE, mConfig.maxDraftTreeSize, packedTreeMaskLen}, rt::DeviceType::kGPU, DataType::kINT32);
-    this->mDummyInput = rt::Tensor({1}, rt::DeviceType::kGPU, DataType::kINT32);
 
-    Json configJson;
-    std::ifstream configFileStream(configPath);
-    if (!configFileStream.is_open())
-    {
-        LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
-        throw std::runtime_error("Failed to open config file: " + configPath.string());
-    }
-    try
-    {
-        configJson = Json::parse(configFileStream);
-        configFileStream.close();
-    }
-    catch (Json::parse_error const& e)
-    {
-        LOG_ERROR("Failed to parse config file with error: %s", e.what());
-        throw std::runtime_error("Failed to parse config file: " + configPath.string());
-    }
+    // Initialize the dummy tensor for unused input tensors as TensorRT does not support nullptr for binding.
+    // Calculate maximum memory requirements across all use cases:
+    // 1. Multimodal embeddings: {1, baseModelHiddenDim/3}
+    // 2. Attention mask: {kRUNTIME_BATCH_SIZE, 1, 1}
+    // 3. Attention position IDs: {kRUNTIME_BATCH_SIZE, 1}
+    int64_t maxDummyElements = std::max({
+        static_cast<int64_t>(mConfig.baseModelHiddenDim / 3), // multimodal embeddings
+        static_cast<int64_t>(kRUNTIME_BATCH_SIZE * 1 * 1),    // attention mask
+        static_cast<int64_t>(kRUNTIME_BATCH_SIZE * 1)         // attention position IDs
+    });
+    this->mDummyTensor = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, DataType::kHALF);
+    // Initialize dummy tensor memory to zero
+    CUDA_CHECK(cudaMemsetAsync(mDummyTensor.rawPointer(), 0, mDummyTensor.getMemoryCapacity(), stream));
 
     auto ropeConfig = collectBaseRopeConfig(configJson);
-    if (ropeConfig.type != RopeType::kMRope)
+    mConfig.ropeType = ropeConfig.type;
+    if (mConfig.ropeType != RopeType::kMRope)
     {
         LOG_DEBUG("Initialize persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
@@ -174,19 +205,138 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         throw std::runtime_error("Failed to bind engine input tensors.");
     }
 
+    // Set multimodal embeddings to dummy tensor for generation contexts if VLM is enabled
+    if (mConfig.isVlm)
+    {
+        bool setMultimodalStatus{true};
+        int64_t multimodalEmbeddingsHiddenSize = mConfig.baseModelHiddenDim / 3;
+        setMultimodalStatus &= mGenerationExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), mDummyTensor.rawPointer());
+        setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
+            multimodalEmbeddingsName.c_str(), rt::Coords{1, multimodalEmbeddingsHiddenSize}.getTRTDims());
+        if (!setMultimodalStatus)
+        {
+            LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
+            throw std::runtime_error("Failed to set multimodal embeddings dummy tensor for generation context");
+        }
+    }
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void EagleDraftEngineRunner::initializeConfigFromEngine()
+bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
 {
-    // Obtain number of decoder layers from the engine.
-    // Each decoder layer has one input and one output KVCache binding
-    // with layout [B, 2, Hkv, Smax, D]
+    try
+    {
+        // Define required fields for main config
+        std::vector<std::string> const requiredConfigFields = {"num_hidden_layers", "num_key_value_heads", "head_dim",
+            "hidden_size", "base_model_hidden_size", "draft_vocab_size", "builder_config"};
+
+        // Validate required fields exist in main config
+        for (auto const& field : requiredConfigFields)
+        {
+            if (!configJson.contains(field))
+            {
+                LOG_ERROR("initializeConfigFromJson(): Missing required field '%s' in config", field.c_str());
+                return false;
+            }
+        }
+
+        auto const& builderConfig = configJson["builder_config"];
+
+        // Define required fields for builder_config
+        std::vector<std::string> const requiredBuilderConfigFields
+            = {"max_input_len", "max_seq_len", "eagle_draft", "max_draft_tree_size", "is_vlm"};
+
+        // Validate required fields exist in builder_config
+        for (auto const& field : requiredBuilderConfigFields)
+        {
+            if (!builderConfig.contains(field))
+            {
+                LOG_ERROR("initializeConfigFromJson(): Missing required field '%s' in builder_config", field.c_str());
+                return false;
+            }
+        }
+
+        // Validate this is actually an Eagle draft model
+        if (!builderConfig["eagle_draft"].get<bool>())
+        {
+            LOG_ERROR("initializeConfigFromJson(): Config indicates this is not an Eagle draft model");
+            return false;
+        }
+
+        // Extract values with proper type checking
+        mConfig.numDecoderLayers = configJson["num_hidden_layers"].get<int32_t>();
+        mConfig.numKVHeads = configJson["num_key_value_heads"].get<int32_t>();
+        mConfig.headDim = configJson["head_dim"].get<int32_t>();
+        mConfig.rotaryDim = mConfig.headDim;
+        mConfig.draftModelHiddenDim = configJson["hidden_size"].get<int32_t>();
+        mConfig.baseModelHiddenDim = configJson["base_model_hidden_size"].get<int32_t>();
+        mConfig.draftModelVocabSize = configJson["draft_vocab_size"].get<int32_t>();
+
+        // Extract builder_config values
+        mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
+        mConfig.kvCacheCapacityLength = builderConfig["max_seq_len"].get<int32_t>();
+        mConfig.maxDraftTreeSize = builderConfig["max_draft_tree_size"].get<int32_t>();
+        mConfig.isVlm = builderConfig["is_vlm"].get<bool>();
+
+        // Validate configuration values - all must be positive except numDecoderLayers (can be 1 for draft)
+        if (mConfig.numDecoderLayers < 1)
+        {
+            LOG_ERROR("initializeConfigFromJson(): Invalid num_decoder_layers: %d (must be >= 1 for draft models)",
+                mConfig.numDecoderLayers);
+            return false;
+        }
+
+        std::vector<std::pair<std::string, int32_t>> positiveFields = {{"num_key_value_heads", mConfig.numKVHeads},
+            {"head_dim", mConfig.headDim}, {"base_model_hidden_dim", mConfig.baseModelHiddenDim},
+            {"draft_model_hidden_dim", mConfig.draftModelHiddenDim},
+            {"draft_model_vocab_size", mConfig.draftModelVocabSize}, {"max_input_len", mConfig.maxSupportedInputLength},
+            {"kv_cache_capacity_length", mConfig.kvCacheCapacityLength},
+            {"max_draft_tree_size", mConfig.maxDraftTreeSize}};
+
+        for (auto const& [fieldName, value] : positiveFields)
+        {
+            if (value <= 0)
+            {
+                LOG_ERROR("initializeConfigFromJson(): Invalid %s: %d (must be positive)", fieldName.c_str(), value);
+                return false;
+            }
+        }
+
+        if (mConfig.maxSupportedInputLength > mConfig.kvCacheCapacityLength)
+        {
+            LOG_ERROR(
+                "initializeConfigFromJson(): Invalid configuration: max_input_len (%d) cannot be greater than "
+                "max_seq_len (%d)",
+                mConfig.maxSupportedInputLength, mConfig.kvCacheCapacityLength);
+            return false;
+        }
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("initializeConfigFromJson(): Unexpected error while parsing config: %s", e.what());
+        return false;
+    }
+
+    LOG_INFO("initializeConfigFromJson(): Loaded EagleDraftEngineRunner with config: %s",
+        formatEngineConfig(mConfig).c_str());
+    return true;
+}
+
+bool EagleDraftEngineRunner::validateConfigFromEngine()
+{
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
         return tensorDim.nbDims == 5 && bindingName.find("present_key_values") != std::string::npos;
     };
 
+    // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
+    auto identifyMultimodalEmbeddingsBinding = [](std::string const& bindingName, Dims const& tensorDim) {
+        return tensorDim.nbDims == 2 && bindingName == multimodalEmbeddingsName;
+    };
+
     int32_t nbKVCacheInputs{0};
+    bool foundMultimodalEmbeddingsInput{false};
     int32_t numIOBindings = mEngine->getNbIOTensors();
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
@@ -194,32 +344,98 @@ void EagleDraftEngineRunner::initializeConfigFromEngine()
         Dims const tensorDim = mEngine->getTensorShape(bindingName.c_str());
         if (identifyKVCacheBinding(bindingName, tensorDim))
         {
-            if (nbKVCacheInputs == 0)
+            if (mConfig.numKVHeads != tensorDim.d[2])
             {
-                mConfig.numKVHeads = tensorDim.d[2];
-                mConfig.kvCacheCapacityLength = tensorDim.d[3];
-                mConfig.headDim = tensorDim.d[4];
+                LOG_ERROR("numKVHeads is not consistent. From engine: %d, from config: %d", tensorDim.d[2],
+                    mConfig.numKVHeads);
+                return false;
+            }
+            if (mConfig.kvCacheCapacityLength != tensorDim.d[3])
+            {
+                LOG_ERROR("kvCacheCapacityLength is not consistent. From engine: %d, from config: %d", tensorDim.d[3],
+                    mConfig.kvCacheCapacityLength);
+                return false;
+            }
+            if (mConfig.headDim != tensorDim.d[4])
+            {
+                LOG_ERROR(
+                    "headDim is not consistent. From engine: %d, from config: %d", tensorDim.d[4], mConfig.headDim);
+                return false;
             }
             ++nbKVCacheInputs;
         }
+        if (identifyMultimodalEmbeddingsBinding(bindingName, tensorDim))
+        {
+            foundMultimodalEmbeddingsInput = true;
+            // For Eagle draft models, multimodal embeddings should match base model hidden dim / 3
+            int64_t expectedMultimodalHiddenSize = mConfig.baseModelHiddenDim / 3;
+            if (expectedMultimodalHiddenSize != tensorDim.d[1])
+            {
+                LOG_ERROR("multimodal embeddings hidden size is not consistent. From engine: %d, expected: %d",
+                    tensorDim.d[1], expectedMultimodalHiddenSize);
+                return false;
+            }
+            if (!mConfig.isVlm)
+            {
+                LOG_ERROR("VLM is not enabled but multimodal embeddings input image_embeds found in engine");
+                return false;
+            }
+        }
     }
-    mConfig.numDecoderLayers = nbKVCacheInputs;
 
-    Dims const maxInputCtxIdsShape
+    // Validate VLM configuration
+    if (mConfig.isVlm && !foundMultimodalEmbeddingsInput)
+    {
+        LOG_ERROR("VLM is enabled but multimodal embeddings input (%s) not found in engine",
+            multimodalEmbeddingsName.c_str());
+        return false;
+    }
+
+    if (nbKVCacheInputs != mConfig.numDecoderLayers)
+    {
+        LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,
+            mConfig.numDecoderLayers);
+        return false;
+    }
+
+    // Validate input shapes from optimization profiles
+    Dims const maxInputCtxShape
         = mEngine->getProfileShape(inputIdsName.c_str(), kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
-    Dims const maxInputGenIdsShape = mEngine->getProfileShape(
+    Dims const maxInputGenShape = mEngine->getProfileShape(
         inputIdsName.c_str(), kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
-    mConfig.maxSupportedInputLength = maxInputCtxIdsShape.d[1];
-    mConfig.maxDraftTreeSize = maxInputGenIdsShape.d[1];
 
+    if (mConfig.maxSupportedInputLength != maxInputCtxShape.d[1])
+    {
+        LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d", maxInputCtxShape.d[1],
+            mConfig.maxSupportedInputLength);
+        return false;
+    }
+    if (mConfig.maxDraftTreeSize != maxInputGenShape.d[1])
+    {
+        LOG_ERROR("maxDraftTreeSize is not consistent. From engine: %d, from config: %d", maxInputGenShape.d[1],
+            mConfig.maxDraftTreeSize);
+        return false;
+    }
+
+    // Validate vocab size from the engine.
     Dims const logitsDim = mEngine->getTensorShape(logitsName.c_str());
-    Dims const baseHiddenStatesDim = mEngine->getTensorShape(baseModelHiddenStatesName.c_str());
-    Dims const draftHiddenStatesDim = mEngine->getTensorShape(draftModelHiddenStatesName.c_str());
-    mConfig.draftModelVocabSize = logitsDim.d[1];
-    mConfig.baseModelHiddenDim = baseHiddenStatesDim.d[2];
-    mConfig.draftModelHiddenDim = draftHiddenStatesDim.d[2];
+    if (mConfig.draftModelVocabSize != logitsDim.d[1])
+    {
+        LOG_ERROR("draftModelVocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[1],
+            mConfig.draftModelVocabSize);
+        return false;
+    }
 
-    LOG_INFO("Loaded EagleDraftEngineRunner with config: %s", formatEngineConfig(mConfig).c_str());
+    // Validate rotary dim from the engine.
+    Dims const ropeCosSinCacheDim = mEngine->getTensorShape(ropeCosSinName.c_str());
+    if (mConfig.rotaryDim != ropeCosSinCacheDim.d[2])
+    {
+        LOG_ERROR("rotaryDim is not consistent. From engine: %d, from config: %d", ropeCosSinCacheDim.d[2],
+            mConfig.rotaryDim);
+        return false;
+    }
+
+    return true;
 }
 
 rt::EagleDraftEngineRunnerConfig EagleDraftEngineRunner::getDraftEngineConfig() const
@@ -238,8 +454,8 @@ rt::LinearKVCache& EagleDraftEngineRunner::getLinearKVCache()
 }
 
 bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds,
-    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor const& outputLogits,
-    rt::Tensor const& outputHiddenStates)
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+    rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
     bool const checkInputsGPUTensor = inputIds.getDeviceType() == rt::DeviceType::kGPU
         && baseModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
@@ -306,6 +522,23 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
         return false;
     }
 
+    // Validate multimodal embeddings based on is_vlm flag
+    int64_t multimodalEmbeddingsHiddenSize = mConfig.baseModelHiddenDim / 3;
+    bool const isMultimodalEmbeddingsValid
+        = (mConfig.isVlm && multimodalEmbeddings.has_value()
+              && multimodalEmbeddings.value().get().getShape().getNumDims() == 2
+              && multimodalEmbeddings.value().get().getShape()[1] == multimodalEmbeddingsHiddenSize)
+        || (!mConfig.isVlm && !multimodalEmbeddings.has_value());
+    if (!isMultimodalEmbeddingsValid)
+    {
+        LOG_ERROR("Invalid multimodal embeddings. VLM=%s, provided=%s, expected shape=[*, %d]. Current shape: %s",
+            mConfig.isVlm ? "true" : "false", multimodalEmbeddings.has_value() ? "true" : "false",
+            multimodalEmbeddingsHiddenSize,
+            multimodalEmbeddings.has_value() ? multimodalEmbeddings.value().get().getShape().formatString().c_str()
+                                             : "None");
+        return false;
+    }
+
     bool const isOutputShapeValid = outputLogits.getShape()[0] == kRUNTIME_BATCH_SIZE
         && outputLogits.getShape()[1] == mConfig.draftModelVocabSize
         && outputHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE
@@ -323,11 +556,12 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
 }
 
 bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
-    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits,
-    rt::Tensor& outputHiddenStates, cudaStream_t stream)
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+    rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+    cudaStream_t stream)
 {
-    bool const validateInputStatus = this->prefillStepInputValidation(
-        inputIds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+    bool const validateInputStatus = this->prefillStepInputValidation(inputIds, baseModelHiddenStates,
+        draftModelHiddenStates, multimodalEmbeddings, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Prefill request not performed due to invalid input tensors.");
@@ -365,18 +599,28 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     setEngineIOStatus &= mContextExecutionContext->setInputShape(
         selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
 
-    // attention-pos-id and attention-mask are unused during the execution. We set the dummy input tensor with zero
+    // attention-pos-id and attention-mask are unused during the execution. We set the dummy tensor with zero
     // shape.
     rt::Coords const emptyPosIdShape{kRUNTIME_BATCH_SIZE, 1};
     rt::Coords const emptyMaskShape{kRUNTIME_BATCH_SIZE, 1, 1};
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(attentionPosIdName.c_str(), mDummyInput.rawPointer());
+        &= mContextExecutionContext->setTensorAddress(attentionPosIdName.c_str(), mDummyTensor.rawPointer());
     setEngineIOStatus
         &= mContextExecutionContext->setInputShape(attentionPosIdName.c_str(), emptyPosIdShape.getTRTDims());
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(attentionMaskName.c_str(), mDummyInput.rawPointer());
+        &= mContextExecutionContext->setTensorAddress(attentionMaskName.c_str(), mDummyTensor.rawPointer());
     setEngineIOStatus
         &= mContextExecutionContext->setInputShape(attentionMaskName.c_str(), emptyMaskShape.getTRTDims());
+
+    // Bind the optional multimodal embeddings tensor into the engine.
+    if (multimodalEmbeddings.has_value())
+    {
+        rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
+        setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
+        setEngineIOStatus &= mContextExecutionContext->setInputShape(
+            multimodalEmbeddingsName.c_str(), multimodalEmbeddingsTensor.getShape().getTRTDims());
+    }
 
     // Bind the output tensor into the engine.
     setEngineIOStatus &= mContextExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());

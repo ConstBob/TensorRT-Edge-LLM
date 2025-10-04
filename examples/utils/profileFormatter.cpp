@@ -388,3 +388,26 @@ void addJsonMemorySummary(nlohmann::json& summary, size_t peakGpuMemoryBytes)
         summary["peak_gpu_memory_mb"] = toMB(peakGpuMemoryBytes);
     }
 }
+
+std::string sanitizeUtf8ForJson(std::string const& input)
+{
+    // Use nlohmann::json's built-in UTF-8 validation by attempting to serialize to JSON
+    // UTF-8 validation happens during dump(), not during assignment
+    try
+    {
+        nlohmann::json testJson = input;
+        // Actually call dump() to trigger UTF-8 validation
+        testJson.dump();
+        // If successful, the string is valid UTF-8
+        return input;
+    }
+    catch (std::exception const& e)
+    {
+        // Catch any other exceptions
+        LOG_WARNING("Error validating string for JSON: %s", e.what());
+        LOG_WARNING("Original text (full): %s", input.c_str());
+
+        // Return error message
+        return "[ERROR: Invalid UTF-8 character detected in the output response. Check logs for original text.]";
+    }
+}

@@ -16,6 +16,7 @@
  */
 
 #include "common/tensor.h"
+#include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include "runtime/eagleDraftEngineRunner.h"
@@ -33,6 +34,7 @@ namespace rt
 struct SpecDecodeInferenceContext
 {
     std::vector<int32_t> tokenIds;
+    rt::OptionalInputTensor multimodalEmbeddings;
     int32_t generationRound;
     int32_t maxGenerateLength;
     int32_t currentGenerateLength;
@@ -55,8 +57,8 @@ static constexpr int32_t kRUNTIME_BATCH_SIZE{1};
 class LLMInferenceSpecDecodeRuntime
 {
 public:
-    LLMInferenceSpecDecodeRuntime(
-        std::string const& engineDir, EagleDraftingConfig const& draftingConfig, cudaStream_t stream);
+    LLMInferenceSpecDecodeRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
+        EagleDraftingConfig const& draftingConfig, cudaStream_t stream);
 
     ~LLMInferenceSpecDecodeRuntime() = default;
 
@@ -74,6 +76,12 @@ public:
         return mEagleGenerationMetrics;
     }
 
+    //! Get multimodal metrics (returns empty metrics if no multimodal runner)
+    metrics::MultimodalMetrics getMultimodalMetrics() const
+    {
+        return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
+    }
+
 private:
     EagleDraftingConfig mDraftingConfig;
     LLMEngineRunnerConfig mBaseEngineConfig;
@@ -81,6 +89,7 @@ private:
 
     std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;
     std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;
+    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;
 
     // Pre-define key runtime GPU tensors and initialize them during construction.

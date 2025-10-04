@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include "runtime/linearKVCache.h"
+#include "runtime/llmRuntimeUtils.h"
 
 #include <NvInferRuntime.h>
 #include <cuda_runtime.h>
@@ -38,17 +39,19 @@ struct LLMEngineRunnerConfig
     bool enableReuseKVCache{true};
     bool useContextDependentRope{false};
     bool enableEagleSpecDecode{false};
+    bool isVlm{false};
+    RopeType ropeType{RopeType::kDefault};
     int32_t numDecoderLayers{};
     int32_t numKVHeads{};
     int32_t headDim{};
     int32_t rotaryDim{};
+    int32_t hiddenSize{};
     int32_t maxSupportedBatchSize{};
     int32_t minSupportedInputLength{};
     int32_t maxSupportedInputLength{};
     int32_t maxSequenceLength{};
     int32_t vocabSize{};
     int32_t maxSupportedLoraRank{};
-    // Attributes that only used with spec-decode
     int32_t outputHiddenDim{};
     int32_t maxVerifyTreeSize{};
 };
@@ -65,9 +68,6 @@ struct LLMEngineRunnerConfig
 class LLMEngineRunner
 {
 public:
-    using OptionalInputTensor = std::optional<std::reference_wrapper<rt::Tensor const>>;
-    using OptionalOutputTensor = std::optional<std::reference_wrapper<rt::Tensor>>;
-
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
@@ -94,21 +94,19 @@ public:
     //! Returns:
     //!     True if the prefill step is successful, false otherwise.
     bool executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
-        rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits, OptionalOutputTensor outputHiddenStates,
-        cudaStream_t stream);
+        rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits,
+        rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream);
 
     //! API entry to execute one vanilla decoding engine action for a batched request. The API will perform decoding
     //!     operations fill the KVCache of the new generated tokens and produce the output logits. The decoding
     //!     operation shall be performed after the prefill step is completed.
     //! Inputs:
     //!     inputIds [GPU]: The input token_ids for the batch of new requests.
-    //!     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings for the batch of requests.
     //!     outputLogits [GPU]: The output logits for the batch of requests.
     //!     stream: The CUDA stream to execute the decoding step.
     //! Returns:
     //!     True if the decoding step is successful, false otherwise.
-    bool executeVanillaDecodingStep(rt::Tensor const& inputIds, rt::Tensor const& multimodalEmbeddings,
-        rt::Tensor& outputLogits, cudaStream_t stream);
+    bool executeVanillaDecodingStep(rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream);
 
     //! API entry to execute eagle base tree decoding step. The API will takes a draft tree of input_token_ids.
     //!     baseTreeDecodingMask denote the relationship between the draft tree nodes.
@@ -121,8 +119,8 @@ public:
     //!     outputLogits [GPU, Float16]: The output logits with shape [topK, base-Vocab-Size].
     //!     outputHiddenStates [GPU]: The output hidden states with shape [topK, base-hidden-dim].
     bool executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputIds,
-        rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& multimodalEmbeddings, rt::Tensor& outputLogits,
-        rt::Tensor& outputHiddenStates, cudaStream_t stream);
+        rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+        cudaStream_t stream);
 
     //! API entry to capture the CUDA graph for the decoding step. If CUDA graph capture is successful, later
     //!     call to executeVanillaDecodingStep() will always launch the captured CUDA graph.
@@ -130,12 +128,11 @@ public:
     //!     inputIds [GPU]: The input token_ids for the batch of new requests.
     //!     outputLogits [GPU]: The output logits for the batch of requests.
     //!     loraWeightsName: The name to the LoRA weights. Empty string if no LoRA weights.
-    //!     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings for the batch of requests.
     //!     stream: The CUDA stream to execute the decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
-    bool captureVanillaDecodingCudaGraph(rt::Tensor const& inputIds, rt::Tensor& outputLogits,
-        std::string const& loraWeightsName, rt::Tensor const& multimodalEmbeddings, cudaStream_t stream);
+    bool captureVanillaDecodingCudaGraph(
+        rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsName, cudaStream_t stream);
 
     //! API entry to switch the LoRA weights of the LLM engine.
     //! Inputs:
@@ -208,7 +205,8 @@ private:
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
     bool prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
-        rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates);
+        rt::Tensor const& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
+        rt::OptionalInputTensor multimodalEmbeddings);
 
     bool vanlliaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
 

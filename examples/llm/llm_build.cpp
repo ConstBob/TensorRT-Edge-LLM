@@ -40,8 +40,8 @@ struct LLMBuildArgs
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
     bool eagleDraft{false};
     bool eagleBase{false};
-    int64_t maxDecodingTokens{60};
-    int64_t maxDraftTokensPerStep{60};
+    int64_t maxVerifyTreeSize{60};
+    int64_t maxDraftTreeSize{60};
     bool isVlm{false};
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
@@ -52,8 +52,8 @@ void printUsage(char const* programName)
     std::cerr << "Usage: " << programName
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxSeqLen <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
-                 "[--eagleDraft] [--eagleBase] [--maxDecodingTokens <int>] "
-                 "[--maxDraftTokensPerStep <int>] [--vlm] [--minImageTokens <int>] [--maxImageTokens <int>]"
+                 "[--eagleDraft] [--eagleBase] [--maxVerifyTreeSize <int>] "
+                 "[--maxDraftTreeSize <int>] [--vlm] [--minImageTokens <int>] [--maxImageTokens <int>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -71,8 +71,12 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --eagleDraft              Enable Eagle draft mode" << std::endl;
     std::cerr << "  --eagleBase               Enable Eagle base mode" << std::endl;
-    std::cerr << "  --maxDecodingTokens       Maximum decoding tokens for Eagle. Default = 60" << std::endl;
-    std::cerr << "  --maxDraftTokensPerStep   Maximum draft tokens per step for Eagle. Default = 60" << std::endl;
+    std::cerr << "  --maxVerifyTreeSize       Maximum input_ids tokens passed into Eagle base model for tree "
+                 "verification. Default = 60"
+              << std::endl;
+    std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens passed into Eagle draft model for draft "
+                 "generation. Default = 60"
+              << std::endl;
     std::cerr << "  --vlm                     Enable VLM mode" << std::endl;
     std::cerr << "  --minImageTokens          Minimum image tokens for VLM. Default = 4" << std::endl;
     std::cerr << "  --maxImageTokens          Maximum image tokens for VLM. Default = 1024" << std::endl << std::endl;
@@ -85,7 +89,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"maxSeqLen", required_argument, 0, 705}, {"debug", no_argument, 0, 706},
         {"maxBatchSize", required_argument, 0, 707}, {"maxLoraRank", required_argument, 0, 708},
         {"eagleDraft", no_argument, 0, 709}, {"eagleBase", no_argument, 0, 710},
-        {"maxDecodingTokens", required_argument, 0, 711}, {"maxDraftTokensPerStep", required_argument, 0, 712},
+        {"maxVerifyTreeSize", required_argument, 0, 711}, {"maxDraftTreeSize", required_argument, 0, 712},
         {"vlm", no_argument, 0, 713}, {"minImageTokens", required_argument, 0, 714},
         {"maxImageTokens", required_argument, 0, 715}, {0, 0, 0, 0}};
 
@@ -147,13 +151,13 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         case 711:
             if (optarg)
             {
-                args.maxDecodingTokens = std::stoi(optarg);
+                args.maxVerifyTreeSize = std::stoi(optarg);
             }
             break;
         case 712:
             if (optarg)
             {
-                args.maxDraftTokensPerStep = std::stoi(optarg);
+                args.maxDraftTreeSize = std::stoi(optarg);
             }
             break;
         case 713: args.isVlm = true; break;
@@ -217,8 +221,8 @@ int main(int argc, char** argv)
     config.maxLoraRank = args.maxLoraRank;
     config.eagleDraft = args.eagleDraft;
     config.eagleBase = args.eagleBase;
-    config.maxDecodingTokens = args.maxDecodingTokens;
-    config.maxDraftTokensPerStep = args.maxDraftTokensPerStep;
+    config.maxVerifyTreeSize = args.maxVerifyTreeSize;
+    config.maxDraftTreeSize = args.maxDraftTreeSize;
     config.isVlm = args.isVlm;
     config.minImageTokens = args.minImageTokens;
     config.maxImageTokens = args.maxImageTokens;
