@@ -776,19 +776,19 @@ bool LLMBuilder::copyTokenizerFiles()
 
 bool LLMBuilder::copyEagleFiles()
 {
-    // Copy d2t.safetensors for Eagle3 draft models
+    // Copy d2t.bin for Eagle3 draft models
     if (mBuilderConfig.eagleDraft)
     {
-        std::string d2tPath = mOnnxDir.string() + "/d2t.safetensors";
-        std::string targetD2tPath = mEngineDir.string() + "/d2t.safetensors";
+        std::string d2tPath = mOnnxDir.string() + "/d2t.bin";
+        std::string targetD2tPath = mEngineDir.string() + "/d2t.bin";
 
         if (file_io::copyFile(d2tPath, targetD2tPath))
         {
-            LOG_INFO("Copied d2t.safetensors to %s", targetD2tPath.c_str());
+            LOG_INFO("Copied d2t.bin to %s", targetD2tPath.c_str());
         }
         else
         {
-            LOG_WARNING("Failed to copy d2t.safetensors to %s", targetD2tPath.c_str());
+            LOG_WARNING("Failed to copy d2t.bin to %s", targetD2tPath.c_str());
             return false;
         }
     }

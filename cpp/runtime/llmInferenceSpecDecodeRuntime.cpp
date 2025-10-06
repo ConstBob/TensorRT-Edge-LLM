@@ -16,10 +16,8 @@
  */
 
 #include "llmInferenceSpecDecodeRuntime.h"
-#include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
-#include "common/safetensorsUtils.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/newEagleUtilKernels.h"
 #include "multimodal/multimodalRunner.h"
@@ -162,19 +160,13 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     LOG_INFO("Runtime tensors successfully allocated.");
 
     // Load conversion table from draft model vocab to base model vocab.
-    std::vector<rt::Tensor> d2tTensors;
-    if (!safetensors::loadSafetensors(std::filesystem::path(engineDir) / "d2t.safetensors", d2tTensors, stream))
+    bool const draftVocabMappingTableLoaded
+        = loadDraftVocabMappingTable(std::filesystem::path(engineDir) / "d2t.bin", stream);
+    if (!draftVocabMappingTableLoaded)
     {
-        LOG_ERROR("Failed to load d2t.safetensors from model directory: %s", engineDir.c_str());
-        throw std::runtime_error("Failed to load d2t.safetensors from model directory: " + engineDir);
+        LOG_ERROR("Failed to load draft vocab mapping table from model directory: %s", engineDir.c_str());
+        throw std::runtime_error("Failed to load draft vocab mapping table from model directory: " + engineDir);
     }
-
-    // Check we have exactly one tensor and use it
-    check::check(d2tTensors.size() == 1, "d2t.safetensors should contain exactly one tensor");
-    check::check(d2tTensors[0].getShape().getNumDims() == 1, "d2t tensor should be 1D");
-    check::check(d2tTensors[0].getShape()[0] == mDraftEngineConfig.draftModelVocabSize,
-        "d2t tensor length should match draft vocab size");
-    mDraftVocabMappingTable = std::move(d2tTensors[0]);
 
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
     LOG_INFO("Start loading tokenizer from model directory: %s", engineDir.c_str());
@@ -199,6 +191,39 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
         }
         LOG_INFO("MultimodalRunner successfully loaded and initialized multimodal engine.");
     }
+}
+
+// TODO: Remove the loading function from d2t.bin and unify it to use SafeTensor loader.
+bool LLMInferenceSpecDecodeRuntime::loadDraftVocabMappingTable(
+    std::filesystem::path const& draftVocPath, cudaStream_t stream)
+{
+    std::ifstream fin(draftVocPath, std::ios::binary);
+    if (!fin)
+    {
+        LOG_ERROR("Failed to open d2t.bin in path %s, it must be provided for Eagle3.", draftVocPath.c_str());
+        return false;
+    }
+    fin.seekg(0, std::ios::end);
+    std::streamsize fileSize = fin.tellg();
+    int32_t const draftVocabByteSize = mDraftEngineConfig.draftModelVocabSize * sizeof(int32_t);
+    if (static_cast<int32_t>(fileSize) != draftVocabByteSize)
+    {
+        LOG_ERROR(
+            "d2t.bin file size mismatch. Got: %d, Expected: %d", static_cast<int32_t>(fileSize), draftVocabByteSize);
+        return false;
+    }
+    std::vector<int32_t> draftVocHost(mDraftEngineConfig.draftModelVocabSize);
+    fin.seekg(0, std::ios::beg);
+    fin.read(reinterpret_cast<char*>(draftVocHost.data()), draftVocabByteSize);
+    if (!fin)
+    {
+        LOG_ERROR("Failed to read d2t.bin in path %s", draftVocPath.c_str());
+        return false;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(
+        mDraftVocabMappingTable.rawPointer(), draftVocHost.data(), draftVocabByteSize, cudaMemcpyHostToDevice, stream));
+    LOG_INFO("Draft vocab mapping table successfully loaded from model directory: %s", draftVocPath.c_str());
+    return true;
 }
 
 bool LLMInferenceSpecDecodeRuntime::handleRequest(

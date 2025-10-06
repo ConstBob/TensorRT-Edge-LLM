@@ -36,6 +36,7 @@ import time
 from typing import Any, Dict, Optional
 
 import modelopt.torch.opt as mto
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -79,17 +80,12 @@ def save_tokenizer_to_output_dir(model_dir: str, output_dir: str) -> None:
 
 
 def save_d2t_for_eagle3_draft(draft_model: nn.Module, output_dir: str) -> None:
-    """Save d2t.safetensors for Eagle3 draft model."""
-    from safetensors.torch import save_file
-
+    """Save d2t.bin for Eagle3 draft model."""
     d2t_tensor = draft_model.d2t
-    # Convert to int32 and move to CPU if needed
-    d2t_tensor_int32 = d2t_tensor.cpu().to(torch.int32)
-
-    # Save as safetensors with key 'd2t'
-    d2t_path = os.path.join(output_dir, "d2t.safetensors")
-    save_file({"d2t": d2t_tensor_int32}, d2t_path)
-    print(f"Saved d2t.safetensors to {output_dir}")
+    d2t_path = os.path.join(output_dir, "d2t.bin")
+    with open(d2t_path, 'wb') as f:
+        f.write(d2t_tensor.cpu().numpy().astype(np.int32).tobytes())
+    print(f"Saved d2t.bin to {output_dir}")
 
 
 def create_dummy_inputs(model: nn.Module, enable_reuse_kv_cache: bool,
