@@ -321,7 +321,7 @@ private:
     bool copyTokenizerFiles();
 
     //! Copy Eagle-specific files to the engine directory.
-    //! Copies d2t.bin file for Eagle3 draft models.
+    //! Copies d2t.safetensors file for Eagle3 draft models.
     //! @return true if copying was successful, false otherwise
     bool copyEagleFiles();
 

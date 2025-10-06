@@ -138,7 +138,7 @@ builder.build();
 - `model.onnx`: ONNX model file
 - `config.json`: Model configuration
 - `tokenizer_config.json`, `tokenizer.json`: For non-draft models
-- `d2t.bin`: For Eagle3 draft models
+- `d2t.safetensors`: For Eagle3 draft models
 
 ### Config.json Example
 
@@ -161,7 +161,7 @@ builder.build();
 - `llm.engine` / `eagle_base.engine` / `eagle_draft.engine`
 - `config.json` (with builder config)
 - `tokenizer_config.json`, `tokenizer.json`
-- `d2t.bin` (Eagle3 draft)
+- `d2t.safetensors` (Eagle3 draft)
 
 ### Visual Engines
 - `visual.engine`
