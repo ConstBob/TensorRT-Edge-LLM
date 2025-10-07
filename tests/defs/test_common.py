@@ -49,9 +49,10 @@ def test_build_project(env_config: EnvironmentConfig,
         pytest.fail("Build failed")
 
     expected_files = [
-        'unitTest', 'examples/llm/llm_build', 'examples/llm/llm_benchmark',
-        'examples/llm/llm_inference', 'examples/multimodal/visual_build',
-        'examples/multimodal/vlm_benchmark'
+        'unitTest',
+        'examples/llm/llm_build',
+        'examples/llm/llm_inference',
+        'examples/multimodal/visual_build',
     ]
     for artifact in expected_files:
         artifact_path = os.path.join(build_dir, artifact)

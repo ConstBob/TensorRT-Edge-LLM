@@ -150,16 +150,6 @@ bool QwenViTRunner::allocateBuffer()
     return true;
 }
 
-std::vector<EngineInputDesc> QwenViTRunner::getComputedEmbeddings()
-{
-    std::vector<EngineInputDesc> extraInputs;
-
-    extraInputs.emplace_back(EngineInputDesc{"image_embeds", mOutputEmbedding.rawPointer(),
-        mOutputEmbedding.rawPointer(), mOutputEmbedding.getTRTDims(), {2, {1, mConfig.outHiddenSize}}});
-
-    return extraInputs;
-}
-
 void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
     std::vector<std::vector<int32_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths,
     std::vector<int32_t>& cuSeqlens, cudaStream_t stream)
@@ -287,64 +277,6 @@ std::tuple<int, int> QwenViTRunner::getResizedImageSize(
     }
 
     return {hBar, wBar};
-}
-
-void QwenViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-    std::vector<std::vector<int32_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths,
-    std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
-{
-    std::vector<int32_t> cuSeqlens{0};
-
-    for (auto const& imageBuffer : imageBuffers)
-    {
-        numImages.emplace_back(imageBuffer.size());
-        for (auto const& image : imageBuffer)
-        {
-            if (doResize)
-            {
-                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width,
-                    mConfig.patchSize * mConfig.mergeSize, mConfig.minPixels, mConfig.maxPixels);
-                auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
-                formatPatch(resizedImage, imageGridTHWs, imageTokenLengths, cuSeqlens, stream);
-            }
-            else
-            {
-                formatPatch(image, imageGridTHWs, imageTokenLengths, cuSeqlens, stream);
-            }
-        }
-    }
-
-    int32_t totalSeqLength = cuSeqlens.back();
-    if (totalSeqLength < mConfig.minHW || totalSeqLength > mConfig.maxHW)
-    {
-        throw std::runtime_error("totalSeqLength " + std::to_string(totalSeqLength) + " exceeds the limitation, max = "
-            + std::to_string(mConfig.maxHW) + ", min = " + std::to_string(mConfig.minHW) + " of VIT engine.");
-    }
-
-    // Reshape tensors
-    mVitInput.reshape({totalSeqLength, mConfig.inputDim});
-    mAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
-    mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim});
-    mOutputEmbedding.reshape({totalSeqLength / 4, mConfig.outHiddenSize});
-
-    // Compute attention mask
-    auto cuSeqlensDevice = rt::Tensor({cuSeqlens.size()}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    CUDA_CHECK(cudaMemcpyAsync(cuSeqlensDevice.rawPointer(), cuSeqlens.data(), cuSeqlens.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice, stream));
-    kernel::initAttentionMaskQwenViT(cuSeqlensDevice, mAttentionMask, stream);
-
-    // Compute rotary position embeddings
-    computeRotaryPosEmb(imageGridTHWs, totalSeqLength, stream);
-
-    // For Qwen2.5-VL, compute additional inputs
-    if (mModelType == "qwen2_5_vl")
-    {
-        mWindowAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
-        mWindowIndex.reshape({totalSeqLength / 4});
-        mReverseWindowIndex.reshape({totalSeqLength / 4});
-
-        getWindowIndex(imageGridTHWs, totalSeqLength, stream);
-    }
 }
 
 void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
@@ -487,28 +419,6 @@ void QwenViTRunner::getRopeIdx(std::vector<std::vector<int32_t>> const& batchInp
 }
 
 void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
-    std::vector<std::vector<int32_t>> const& imageGridTHWs, void* cosSinCacheDevice, int const maxPositionEmbeddings,
-    int const rotaryDim, cudaStream_t stream)
-{
-    // Get [T, H, W] information for each token position
-    // mropePositionIds: (bs, 3, maxPositionEmbeddings)
-    int32_t mropePositionIdsSize = batchInputIds.size() * 3 * maxPositionEmbeddings;
-    int32_t* mropePositionIdsPtr;
-    CUDA_CHECK(cudaMallocHost(&mropePositionIdsPtr, mropePositionIdsSize * sizeof(int32_t)));
-    getRopeIdx(batchInputIds, imageGridTHWs, mropePositionIdsPtr, maxPositionEmbeddings);
-
-    auto mropePositionIdsDevice = rt::Tensor({mropePositionIdsSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    CUDA_CHECK(cudaMemcpyAsync(mropePositionIdsDevice.rawPointer(), mropePositionIdsPtr,
-        mropePositionIdsSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaFreeHost(mropePositionIdsPtr));
-
-    // Initialize mrope cosSinCacheDevice
-    kernel::initializeMRopeCosSin(reinterpret_cast<float*>(cosSinCacheDevice),
-        reinterpret_cast<int32_t*>(mropePositionIdsDevice.rawPointer()), mConfig.mropeTheta, rotaryDim,
-        maxPositionEmbeddings, batchInputIds.size(), stream);
-}
-
-void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
     std::vector<std::vector<int32_t>> const& imageGridTHWs, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     auto ropeRotaryCosSinDim = ropeRotaryCosSinDevice.getShape();
@@ -532,65 +442,6 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     kernel::initializeMRopeCosSin(reinterpret_cast<float*>(const_cast<void*>(ropeRotaryCosSinDevice.rawPointer())),
         reinterpret_cast<int32_t*>(mropePositionIdsDevice.rawPointer()), mConfig.mropeTheta, rotaryDim,
         maxPositionEmbeddings, batchInputIds.size(), stream);
-}
-
-std::string QwenViTRunner::applyChatTemplate(std::string const& inputString, int64_t const& numImage,
-    std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt)
-{
-    // System prefix
-    std::string prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
-
-    // Images
-    for (int64_t i = 0; i < numImage; ++i)
-    {
-        int64_t imagePadLen = imageTokenLengths.at(totalImageIdx++);
-
-        prompt += "<|vision_start|>";
-        for (int j = 0; j < imagePadLen; ++j)
-        {
-            prompt += "<|image_pad|>";
-        }
-
-        prompt += "<|vision_end|>";
-    }
-
-    prompt += inputString;
-    prompt += "<|im_end|>\n";
-
-    if (addGenerationPrompt)
-    {
-        prompt += "<|im_start|>assistant\n";
-    }
-
-    return prompt;
-}
-
-void QwenViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds,
-    std::vector<int32_t>& batchInputLengths, std::vector<std::string> const& inputStrings,
-    std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
-    drivellm::tokenizer::Tokenizer* tokenizer)
-{
-    int totalImageIdx = 0;
-    // Image token id will start from vocabSize and increment for each image token position
-    int32_t imageTokenId = mConfig.vocabSize;
-
-    for (size_t i = 0; i < inputStrings.size(); ++i)
-    {
-        std::string prompt = applyChatTemplate(inputStrings[i], numImages[i], imageTokenLengths, totalImageIdx);
-        std::vector<int32_t> ids = tokenizer->encode(prompt);
-
-        // replace vis tokens
-        for (size_t j = 0; j < ids.size(); ++j)
-        {
-            if (ids[j] == mConfig.visionTokenId || ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
-            {
-                ids[j] = imageTokenId;
-                ++imageTokenId;
-            }
-        }
-        batchInputLengths.emplace_back(static_cast<int32_t>(ids.size()));
-        batchInputIds.emplace_back(std::move(ids));
-    }
 }
 
 void QwenViTRunner::getWindowIndex(
@@ -665,27 +516,6 @@ void QwenViTRunner::getWindowIndex(
     CUDA_CHECK(cudaMemcpyAsync(cuWindowSeqlensDevice.rawPointer(), cuWindowSeqlens.data(),
         cuWindowSeqlens.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     kernel::initAttentionMaskQwenViT(cuWindowSeqlensDevice, mWindowAttentionMask, stream);
-}
-
-void QwenViTRunner::preprocess(std::vector<std::string> const& inputStrings,
-    std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-    std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer, int const maxSupportedInputLength,
-    bool enableDynamicShape, void* ropeRotaryCosSinDevice, int const maxPositionEmbeddings, int const rotaryDim,
-    cudaStream_t stream)
-{
-    std::vector<std::vector<int32_t>> imageGridTHWs;
-    std::vector<int64_t> imageTokenLengths;
-    std::vector<int64_t> numImages;
-    imagePreprocess(imageBuffers, imageGridTHWs, imageTokenLengths, numImages, false, stream);
-
-    std::vector<std::vector<int32_t>> batchInputIds;
-    std::vector<int32_t> batchInputLengths;
-    textPreprocess(batchInputIds, batchInputLengths, inputStrings, numImages, imageTokenLengths, tokenizer);
-
-    generateMropeParams(batchInputIds, imageGridTHWs, ropeRotaryCosSinDevice, maxPositionEmbeddings, rotaryDim, stream);
-
-    flattenBatch(inputIds, contextLengths, batchInputIds, batchInputLengths, tokenizer->getPadId(),
-        maxSupportedInputLength, enableDynamicShape);
 }
 
 std::string QwenViTRunner::applyChatTemplateSystem(std::string const& systemPrompt)

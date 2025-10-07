@@ -130,17 +130,6 @@ bool InternViTRunner::allocateBuffer()
     return true;
 }
 
-std::vector<EngineInputDesc> InternViTRunner::getComputedEmbeddings()
-{
-    std::vector<EngineInputDesc> extraInputs;
-
-    extraInputs.emplace_back(
-        EngineInputDesc{"image_embeds", mOutputEmbedding.rawPointer(), mOutputEmbedding.rawPointer(),
-            {2, {mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}}, {2, {1, mConfig.outHiddenSize}}});
-
-    return extraInputs;
-}
-
 void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
     int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream)
 {
@@ -252,46 +241,6 @@ std::tuple<int, int> InternViTRunner::getResizedImageSize(int const height, int 
     return {bestRatio.second * targetTileHeight, bestRatio.first * targetTileWidth};
 }
 
-void InternViTRunner::imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
-{
-    int64_t totalNumBlocks = 0;
-
-    for (auto const& imageBuffer : imageBuffers)
-    {
-        int64_t numImage{0};
-        for (auto const& image : imageBuffer)
-        {
-            if (doResize)
-            {
-                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width,
-                    mConfig.blockImageSizeH, mConfig.blockImageSizeW, mConfig.minImageTiles, mConfig.maxImageTiles);
-                auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
-                formatPatch(resizedImage, imageTokenLengths, numImage, totalNumBlocks, false, stream);
-
-                auto thumbnailImage
-                    = rt::imageUtils::resizeImage(image, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
-                formatPatch(thumbnailImage, imageTokenLengths, numImage, totalNumBlocks, true, stream);
-            }
-            else
-            {
-                formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
-            }
-        }
-        numImages.emplace_back(numImage);
-    }
-
-    if (totalNumBlocks < mConfig.minNumBlocks || totalNumBlocks > mConfig.maxNumBlocks)
-    {
-        throw std::runtime_error("totalNumBlocks " + std::to_string(totalNumBlocks)
-            + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
-            + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
-    }
-
-    mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
-    mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
-}
-
 void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
     std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
 {
@@ -342,84 +291,6 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 
     mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
     mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
-}
-
-std::string InternViTRunner::applyChatTemplate(std::string const& inputString, int64_t const& numImages,
-    std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt)
-{
-    // System prefix
-    std::string prompt
-        = "<|im_start|>"
-          "system\n你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语"
-          "言模型。<|im_end|>\n<|im_start|>user\n";
-
-    // Images
-    for (int64_t i = 0; i < numImages; ++i)
-    {
-        int64_t imagePadLen = imageTokenLengths.at(totalImageIdx++);
-
-        prompt += "<img>";
-        for (int j = 0; j < imagePadLen; ++j)
-        {
-            prompt += "<IMG_CONTEXT>";
-        }
-
-        prompt += "</img>\n";
-    }
-
-    prompt += inputString;
-    prompt += "<|im_end|>\n";
-
-    if (addGenerationPrompt)
-    {
-        prompt += "<|im_start|>assistant\n";
-    }
-    return prompt;
-}
-
-void InternViTRunner::textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds,
-    std::vector<int32_t>& batchInputLengths, std::vector<std::string> const& inputStrings,
-    std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
-    drivellm::tokenizer::Tokenizer* tokenizer)
-{
-    int totalImageIdx = 0;
-    int32_t imageTokenId = mConfig.vocabSize;
-
-    for (size_t i = 0; i < inputStrings.size(); ++i)
-    {
-        std::string prompt = applyChatTemplate(inputStrings[i], numImages[i], imageTokenLengths, totalImageIdx);
-        std::vector<int32_t> ids = tokenizer->encode(prompt);
-
-        // replace vis tokens
-        for (size_t j = 0; j < ids.size(); ++j)
-        {
-            if (ids[j] == mConfig.imageTokenId)
-            {
-                ids[j] = imageTokenId;
-                ++imageTokenId;
-            }
-        }
-        batchInputLengths.emplace_back(static_cast<int32_t>(ids.size()));
-        batchInputIds.emplace_back(std::move(ids));
-    }
-}
-
-void InternViTRunner::preprocess(std::vector<std::string> const& inputStrings,
-    std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-    std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer, int const maxSupportedInputLength,
-    bool enableDynamicShape, void* ropeRotaryCosSinDevice [[maybe_unused]],
-    int const maxPositionEmbeddings [[maybe_unused]], int const rotaryDim [[maybe_unused]], cudaStream_t stream)
-{
-    std::vector<int64_t> imageTokenLengths;
-    std::vector<int64_t> numImages;
-    imagePreprocess(imageBuffers, imageTokenLengths, numImages, false, stream);
-
-    std::vector<std::vector<int32_t>> batchInputIds;
-    std::vector<int32_t> batchInputLengths;
-    textPreprocess(batchInputIds, batchInputLengths, inputStrings, numImages, imageTokenLengths, tokenizer);
-
-    flattenBatch(inputIds, contextLengths, batchInputIds, batchInputLengths, tokenizer->getPadId(),
-        maxSupportedInputLength, enableDynamicShape);
 }
 
 std::string InternViTRunner::applyChatTemplateSystem(std::string const& systemPrompt)

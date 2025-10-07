@@ -57,16 +57,6 @@ public:
     QwenViTRunner(std::string const& engineDir, cudaStream_t stream);
     ~QwenViTRunner() = default;
 
-    // TODO: Clean Old API
-    void preprocess(std::vector<std::string> const& inputStrings,
-        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-        std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer,
-        int const maxSupportedInputLength, bool enableDynamicShape, void* ropeRotaryCosSinDevice,
-        int const maxPositionEmbeddings, int const rotaryDim, cudaStream_t stream) override;
-
-    // TODO: Clean Old API
-    std::vector<EngineInputDesc> getComputedEmbeddings() override;
-
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
@@ -87,15 +77,6 @@ public:
         int const minPixels, int const maxPixels, int const maxRatio = 200);
 
 private:
-    // TODO: Clean Old API
-    void textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths,
-        std::vector<std::string> const& inputStrings, std::vector<int64_t> const& numImages,
-        std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer);
-
-    // TODO: Clean Old API
-    std::string applyChatTemplate(std::string const& inputString, int64_t const& numImage,
-        std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true);
-
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         drivellm::tokenizer::Tokenizer* tokenizer);
@@ -117,19 +98,9 @@ private:
         std::vector<std::vector<int32_t>> const& imageGridTHWs, int32_t* mropePositionIdsPtr,
         int const maxPositionEmbeddings);
 
-    // TODO: Clean Old API
-    void generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
-        std::vector<std::vector<int32_t>> const& imageGridTHWs, void* cosSinCacheDevice,
-        int const maxPositionEmbeddings, int const rotaryDim, cudaStream_t stream);
-
     void generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
         std::vector<std::vector<int32_t>> const& imageGridTHWs, rt::Tensor& ropeRotaryCosSinDevice,
         cudaStream_t stream);
-
-    // TODO: Clean Old API
-    void imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-        std::vector<std::vector<int32_t>>& imageGridTHWs, std::vector<int64_t>& imageTokenLengths,
-        std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& imageGridTHWs,
         std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
