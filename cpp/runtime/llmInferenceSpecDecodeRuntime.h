@@ -149,9 +149,6 @@ private:
     // token of the accepted sequence.
     bool runDraftModelAcceptToken(SpecDecodeInferenceContext& context);
 
-    // Helper function to load draft vocab mapping table from file. To be removed by SafeTensor loader.
-    bool loadDraftVocabMappingTable(std::filesystem::path const& draftVocPath, cudaStream_t stream);
-
     // Stage-specific metrics
     metrics::LLMPrefillMetrics mPrefillMetrics;
     metrics::EagleGenerationMetrics mEagleGenerationMetrics;
