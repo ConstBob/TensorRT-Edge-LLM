@@ -25,9 +25,6 @@ file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
-file(GLOB_RECURSE DECODER_CPP_SRCS "decoder/*.cpp")
-file(GLOB_RECURSE EAGLE_CPP_SRCS "eagle/*.cpp")
-file(GLOB_RECURSE ENGINE_CPP_SRCS "engine/*.cpp")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
 file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
@@ -40,9 +37,6 @@ add_library(
   edgellmCore STATIC
   ${COMMON_CPP_SRCS}
   ${COMMON_CU_SRCS}
-  ${DECODER_CPP_SRCS}
-  ${EAGLE_CPP_SRCS}
-  ${ENGINE_CPP_SRCS}
   ${KERNELS_CPP_SRCS}
   ${KERNELS_CU_SRCS}
   ${SAMPLER_CU_SRCS}

@@ -118,14 +118,8 @@ def executable_files(env_config):
     build_dir = env_config.build_dir
     return {
         'llm_build': f"{build_dir}/examples/llm/llm_build",
-        'llm_chat': f"{build_dir}/examples/llm/llm_chat",
-        'llm_benchmark': f"{build_dir}/examples/llm/llm_benchmark",
-        'llm_accuracy': f"{build_dir}/examples/llm/llm_accuracy",
         'llm_inference': f"{build_dir}/examples/llm/llm_inference",
         'visual_build': f"{build_dir}/examples/multimodal/visual_build",
-        'vlm_chat': f"{build_dir}/examples/multimodal/vlm_chat",
-        'vlm_benchmark': f"{build_dir}/examples/multimodal/vlm_benchmark",
-        'vlm_accuracy': f"{build_dir}/examples/multimodal/vlm_accuracy",
         'unit_test': f"{build_dir}/unitTest"
     }
 

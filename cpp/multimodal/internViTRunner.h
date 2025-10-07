@@ -53,17 +53,6 @@ public:
     InternViTRunner(std::string const& engineDir, cudaStream_t stream);
     ~InternViTRunner() = default;
 
-    // TODO: Clean Old API
-    void preprocess(std::vector<std::string> const& inputStrings,
-        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-        std::vector<int32_t>& contextLengths, drivellm::tokenizer::Tokenizer* tokenizer,
-        int const maxSupportedInputLength, bool enableDynamicShape, void* ropeRotaryCosSinDevice [[maybe_unused]],
-        int const maxPositionEmbeddings [[maybe_unused]], int const rotaryDim [[maybe_unused]],
-        cudaStream_t stream) override;
-
-    // TODO: Clean Old API
-    std::vector<EngineInputDesc> getComputedEmbeddings() override;
-
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
@@ -87,15 +76,6 @@ public:
         int const minImageTiles = 1, int const maxImageTiles = 12);
 
 private:
-    // TODO: Clean Old API
-    void textPreprocess(std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths,
-        std::vector<std::string> const& inputStrings, std::vector<int64_t> const& numImages,
-        std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer);
-
-    // TODO: Clean Old API
-    std::string applyChatTemplate(std::string const& inputString, int64_t const& numImages,
-        std::vector<int64_t> const& imageTokenLengths, int& totalImageIdx, bool addGenerationPrompt = true);
-
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         drivellm::tokenizer::Tokenizer* tokenizer);
@@ -107,10 +87,6 @@ private:
     // InternVL-specific methods
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
         int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
-
-    // TODO: Clean Old API
-    void imagePreprocess(std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers,
-        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);

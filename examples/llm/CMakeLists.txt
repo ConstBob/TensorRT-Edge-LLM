@@ -16,29 +16,6 @@ target_include_directories(llm_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                              ${COMMON_INCLUDE_DIRS})
 add_cross_build_link_options(llm_build)
 
-add_executable(llm_chat llm_chat.cpp)
-target_link_libraries(llm_chat PRIVATE edgellmCore edgellmTokenizer
-                                       exampleUtils commonLibraryExt)
-target_include_directories(llm_chat PRIVATE ${COMMON_INCLUDE_DIRS}
-                                            ${CMAKE_SOURCE_DIR}/examples/utils)
-add_cross_build_link_options(llm_chat)
-
-add_executable(llm_benchmark llm_benchmark.cpp)
-target_link_libraries(llm_benchmark PRIVATE edgellmCore edgellmTokenizer
-                                            exampleUtils commonLibraryExt)
-target_include_directories(
-  llm_benchmark PRIVATE ${COMMON_INCLUDE_DIRS}
-                        ${CMAKE_SOURCE_DIR}/examples/utils)
-add_cross_build_link_options(llm_benchmark)
-
-add_executable(llm_accuracy llm_accuracy.cpp)
-target_link_libraries(llm_accuracy PRIVATE edgellmCore edgellmTokenizer
-                                           exampleUtils commonLibraryExt)
-target_include_directories(
-  llm_accuracy PRIVATE ${COMMON_INCLUDE_DIRS}
-                       ${CMAKE_SOURCE_DIR}/examples/utils)
-add_cross_build_link_options(llm_accuracy)
-
 add_executable(llm_inference llm_inference.cpp)
 target_link_libraries(llm_inference PRIVATE edgellmCore edgellmTokenizer
                                             exampleUtils commonLibraryExt)
