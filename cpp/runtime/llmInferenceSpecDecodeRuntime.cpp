@@ -493,7 +493,7 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
         mDraftHiddenStatesInput.rawPointer(), 0, mDraftHiddenStatesInput.getMemoryCapacity(), context.stream));
 
     // Construct input tensors to feed into the eagle draft engine. With current implementation, for simplicity, we
-    // will use padded input amd only collect results from indices we need.
+    // will use padded input and only collect results from indices we need.
     int32_t const paddedDraftTreeSize = mDraftingConfig.draftingStep * draftTopK;
     mIdsInput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
     mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, mBaseEngineConfig.outputHiddenDim});
@@ -662,6 +662,98 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInference
     // No need to do sampling, directly produce logits (mLogitsOutput) and hidden states (mDraftHiddenStatesOutput) for
     // the next step.
     return true;
+}
+
+bool LLMInferenceSpecDecodeRuntime::captureDraftProposalCudaGraph(cudaStream_t stream)
+{
+    bool captureStatus{true};
+
+    int32_t const draftTopK = mDraftingConfig.draftingTopK;
+    mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
+    mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
+    int32_t const paddedDraftTreeSize = mDraftingConfig.draftingStep * draftTopK;
+    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
+    mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, mBaseEngineConfig.outputHiddenDim});
+    mDraftHiddenStatesInput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
+    mDraftTreeSize.reshape({kRUNTIME_BATCH_SIZE});
+    mDraftTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, paddedDraftTreeSize});
+    mLogitsOutput.reshape({draftTopK, mDraftEngineConfig.draftModelVocabSize});
+    mDraftHiddenStatesOutput.reshape({draftTopK, mDraftEngineConfig.draftModelHiddenDim});
+
+    // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
+    captureStatus &= mDraftEngineRunner->captureEagleDraftProposalCudaGraph(mIdsInput, mBaseHiddenStatesOutput,
+        mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, mLogitsOutput, mDraftHiddenStatesOutput, stream);
+
+    if (captureStatus)
+    {
+        LOG_INFO("LLMInferenceSpecDecodeRuntime(): Successfully captured the draft proposal CUDA graph.");
+    }
+    else
+    {
+        LOG_WARNING("LLMInferenceSpecDecodeRuntime(): Failed to capture the draft proposal CUDA graph.");
+    }
+
+    return captureStatus;
+}
+
+bool LLMInferenceSpecDecodeRuntime::captureDraftAcceptDecodeTokenCudaGraph(cudaStream_t stream)
+{
+    bool captureStatus{true};
+
+    int32_t const draftingStep = mDraftingConfig.draftingStep;
+
+    mLogitsOutput.reshape({kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelVocabSize});
+    mDraftHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelHiddenDim});
+
+    // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
+    for (int32_t acceptLength = 1; acceptLength <= draftingStep + 1; acceptLength++)
+    {
+        mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, acceptLength, mBaseEngineConfig.outputHiddenDim});
+        mIdsInput.reshape({kRUNTIME_BATCH_SIZE, acceptLength});
+        mDraftHiddenStatesInput.reshape({kRUNTIME_BATCH_SIZE, acceptLength, mDraftEngineConfig.draftModelHiddenDim});
+
+        captureStatus &= mDraftEngineRunner->captureEagleAcceptDecodeTokenCudaGraph(mIdsInput, mBaseHiddenStatesOutput,
+            mDraftHiddenStatesInput, mLogitsOutput, mDraftHiddenStatesOutput, stream);
+    }
+
+    if (captureStatus)
+    {
+        LOG_INFO(
+            "LLMInferenceSpecDecodeRuntime(): Successfully captured the draft accept decode token CUDA "
+            "graph.");
+    }
+    else
+    {
+        LOG_WARNING("LLMInferenceSpecDecodeRuntime(): Failed to capture the draft accept decode token CUDA graph.");
+    }
+
+    return captureStatus;
+}
+
+bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_t stream)
+{
+    bool captureStatus{true};
+
+    mLogitsOutput.reshape({mDraftingConfig.verifyTreeSize, mBaseEngineConfig.vocabSize});
+    mBaseHiddenStatesOutput.reshape({mDraftingConfig.verifyTreeSize, mBaseEngineConfig.outputHiddenDim});
+
+    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize});
+    mDraftTreeMask.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});
+
+    // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
+    captureStatus &= mBaseEngineRunner->captureEagleBaseTreeDecodingCudaGraph(
+        mIdsInput, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, stream);
+
+    if (captureStatus)
+    {
+        LOG_INFO("LLMInferenceSpecDecodeRuntime(): Successfully captured the base model verification CUDA graph.");
+    }
+    else
+    {
+        LOG_WARNING("LLMInferenceSpecDecodeRuntime(): Failed to capture the base model verification CUDA graph.");
+    }
+
+    return captureStatus;
 }
 
 } // namespace rt

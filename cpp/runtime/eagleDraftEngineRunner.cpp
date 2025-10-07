@@ -18,6 +18,7 @@
 #include "runtime/eagleDraftEngineRunner.h"
 
 #include "common/cudaUtils.h"
+#include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
 #include "kernels/speculative/newEagleUtilKernels.h"
@@ -26,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 
+using namespace drivellm;
 using namespace nvinfer1;
 
 namespace
@@ -43,6 +45,53 @@ std::string formatEngineConfig(drivellm::rt::EagleDraftEngineRunnerConfig const&
        << "  baseModelHiddenDim: " << config.baseModelHiddenDim
        << "  draftModelHiddenDim: " << config.draftModelHiddenDim << "  isVlm: " << config.isVlm;
     return ss.str();
+}
+
+size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputIds, rt::Tensor const& baseModelHiddenStates,
+    rt::Tensor const& draftModelHiddenStates, rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask,
+    rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+{
+    int64_t const activeBatchSize = draftTreeInputIds.getShape()[0];
+    int64_t const paddedDraftTreeSize = draftTreeInputIds.getShape()[1];
+    int64_t const selectTokenSize = outputLogits.getShape()[0];
+    uintptr_t const inputIdsAddr = reinterpret_cast<uintptr_t>(draftTreeInputIds.rawPointer());
+    uintptr_t const baseModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(baseModelHiddenStates.rawPointer());
+    uintptr_t const draftModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(draftModelHiddenStates.rawPointer());
+    uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
+    uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
+
+    size_t hashValue = 0;
+    hash_utils::hashCombine(hashValue, activeBatchSize);
+    hash_utils::hashCombine(hashValue, paddedDraftTreeSize);
+    hash_utils::hashCombine(hashValue, selectTokenSize);
+    hash_utils::hashCombine(hashValue, inputIdsAddr);
+    hash_utils::hashCombine(hashValue, baseModelHiddenStatesAddr);
+    hash_utils::hashCombine(hashValue, draftModelHiddenStatesAddr);
+    hash_utils::hashCombine(hashValue, outputLogitsAddr);
+    hash_utils::hashCombine(hashValue, outputHiddenStatesAddr);
+    return hashValue;
+}
+
+size_t hashAcceptDecodeTokenInput(rt::Tensor const& acceptedTokens, rt::Tensor const& baseModelHiddenStates,
+    rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+{
+    int64_t const activeBatchSize = acceptedTokens.getShape()[0];
+    int64_t const inputIdsLength = acceptedTokens.getShape()[1];
+    uintptr_t const acceptedTokensAddr = reinterpret_cast<uintptr_t>(acceptedTokens.rawPointer());
+    uintptr_t const baseModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(baseModelHiddenStates.rawPointer());
+    uintptr_t const draftModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(draftModelHiddenStates.rawPointer());
+    uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
+    uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
+
+    size_t hashValue = 0;
+    hash_utils::hashCombine(hashValue, activeBatchSize);
+    hash_utils::hashCombine(hashValue, inputIdsLength);
+    hash_utils::hashCombine(hashValue, acceptedTokensAddr);
+    hash_utils::hashCombine(hashValue, baseModelHiddenStatesAddr);
+    hash_utils::hashCombine(hashValue, draftModelHiddenStatesAddr);
+    hash_utils::hashCombine(hashValue, outputLogitsAddr);
+    hash_utils::hashCombine(hashValue, outputHiddenStatesAddr);
+    return hashValue;
 }
 
 } // namespace
@@ -144,8 +193,6 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // represents the relationship between two
     int32_t const packedTreeMaskLen = static_cast<int64_t>(divUp(mConfig.maxDraftTreeSize, 32));
     // Instantiate other GPU memory input that needed by the Engine execution.
-    this->mPosEncCosSinCache = rt::Tensor(
-        {kRUNTIME_BATCH_SIZE, mConfig.kvCacheCapacityLength, mConfig.headDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
     this->mSelectTokenIndices
         = rt::Tensor({kRUNTIME_BATCH_SIZE * mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT64);
     this->mSequenceContextLengths = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kGPU, DataType::kINT32);
@@ -174,7 +221,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     {
         LOG_DEBUG("Initialize persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
-            = rt::Tensor({1, mConfig.kvCacheCapacityLength, mConfig.headDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            = rt::Tensor({1, mConfig.kvCacheCapacityLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
         bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
         if (!initRopeStatus)
         {
@@ -184,10 +231,13 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     }
     else
     {
+        this->mPosEncCosSinCache = rt::Tensor({kRUNTIME_BATCH_SIZE, mConfig.kvCacheCapacityLength, mConfig.rotaryDim},
+            rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
     }
 
     // Currently we always run batch size of 1, we can pre-bind inputs tensor.
+    // To support multi batch, mPosEncCosSinCache shape to match what it will be during execution for MRope (multimodal)
     bool setEngineIOStatus{true};
     setEngineIOStatus
         &= mContextExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
@@ -222,6 +272,20 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+EagleDraftEngineRunner::~EagleDraftEngineRunner()
+{
+    for (auto& [hashValue, graphPair] : mDraftProposalCudaGraphs)
+    {
+        CUDA_CHECK(cudaGraphDestroy(graphPair.first));
+        CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
+    }
+    for (auto& [hashValue, graphPair] : mAcceptDecodeTokenCudaGraphs)
+    {
+        CUDA_CHECK(cudaGraphDestroy(graphPair.first));
+        CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
+    }
 }
 
 bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
@@ -770,6 +834,124 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
     kernel::prepareEagleDraftProposalInputs(draftTreeMask, draftTreeLength, sequenceStartIndex, mPackedTreeMask,
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
+    size_t const hashValue = hashDraftProposalInput(draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates,
+        draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
+    if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
+    {
+        LOG_DEBUG("executeEagleDraftProposalStep(): Use pre-captured CUDA graph for draft proposal step.");
+        cudaGraphExec_t graphExec = mDraftProposalCudaGraphs[hashValue].second;
+        CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
+    }
+    else
+    {
+        LOG_INFO("executeEagleDraftProposalStep(): Draft proposal step CUDA graph not captured.");
+        // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
+        // initialization.
+        bool setEngineIOStatus{true};
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            inputIdsName.c_str(), const_cast<void*>(draftTreeInputIds.rawPointer()));
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            inputIdsName.c_str(), draftTreeInputIds.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            baseModelHiddenStatesName.c_str(), const_cast<void*>(baseModelHiddenStates.rawPointer()));
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            baseModelHiddenStatesName.c_str(), baseModelHiddenStates.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            draftModelHiddenStatesName.c_str(), const_cast<void*>(draftModelHiddenStates.rawPointer()));
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            draftModelHiddenStatesName.c_str(), draftModelHiddenStates.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            selectTokenIndicesName.c_str(), mSelectTokenIndices.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
+        // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mPackedTreeMask.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            attentionMaskName.c_str(), mPackedTreeMask.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            attentionPosIdName.c_str(), mDraftTreePositionIds.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            attentionPosIdName.c_str(), mDraftTreePositionIds.getShape().getTRTDims());
+
+        // Bind the output tensor into the engine.
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
+
+        if (!setEngineIOStatus)
+        {
+            LOG_ERROR("Failed to bind engine input and output tensors.");
+            return false;
+        }
+
+        // launch the engine execution.
+        bool executeStatus{true};
+        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+        if (!executeStatus)
+        {
+            LOG_ERROR("Failed on TensorRT draft proposal stage enqueueV3() call.");
+            return false;
+        }
+    }
+
+    // Note in the draft token proposal step we explicitly don't commit the KVCache since we process the "whole tree" in
+    // these steps.
+    return true;
+}
+
+bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const& draftTreeInputIds,
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+    rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor& outputLogits,
+    rt::Tensor& outputHiddenStates, cudaStream_t stream)
+{
+    size_t const hashValue = hashDraftProposalInput(draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates,
+        draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
+    if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
+    {
+        LOG_INFO("Draft proposal CUDA graph already captured.");
+        return true;
+    }
+
+    // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
+    int32_t const activeBatchSize = draftTreeInputIds.getShape()[0];
+    constexpr int32_t simulateCacheLength{128};
+    std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
+    rt::Tensor const reuseKVCacheLengthsTensor(
+        reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+
+    mLinearKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
+
+    // Validate the input tensors.
+    bool const validateInputStatus = this->draftProposalStepInputValidation(draftTreeInputIds, baseModelHiddenStates,
+        draftModelHiddenStates, draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
+    if (!validateInputStatus)
+    {
+        LOG_ERROR("Draft proposal request not performed due to invalid input tensors.");
+        return false;
+    }
+
+    int32_t const paddedDraftTreeSize = static_cast<int32_t>(draftTreeInputIds.getShape()[1]);
+    int32_t const selectTokenSize = static_cast<int32_t>(outputLogits.getShape()[0]);
+    int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(paddedDraftTreeSize, 32));
+
+    // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
+    // sequence context lengths.
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * selectTokenSize});
+    mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
+    mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
+    mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, packedTreeMaskLen});
+    // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
+    // token" in the sequence.
+    rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
+    kernel::prepareEagleDraftProposalInputs(draftTreeMask, draftTreeLength, sequenceStartIndex, mPackedTreeMask,
+        mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
+
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
     bool setEngineIOStatus{true};
@@ -814,7 +996,8 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
         return false;
     }
 
-    // launch the engine execution.
+    // launch the engine execution. This will trigger the shape machine of TensorRT engine to avoid cudaGraph capture.
+    // error.
     bool executeStatus{true};
     executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
     if (!executeStatus)
@@ -822,10 +1005,29 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
         LOG_ERROR("Failed on TensorRT draft proposal stage enqueueV3() call.");
         return false;
     }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Note in the draft token proposal step we explicitly don't commit the KVCache since we process the "whole tree" in
-    // these steps.
-    LOG_DEBUG("Draft proposal stage execution completed for request with batch size");
+    cudaGraph_t graph;
+    cudaGraphExec_t graphExec;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
+    mDraftProposalCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
+
+    if (!executeStatus)
+    {
+        LOG_WARNING(
+            "captureEagleDraftProposalCudaGraph(): Failed on TensorRT engine enqueueV3() call during CUDA graph "
+            "capture.");
+        return false;
+    }
+    else
+    {
+        LOG_DEBUG("captureEagleDraftProposalCudaGraph(): CUDA graph captured successfully for input shape %s.",
+            draftTreeInputIds.getShape().formatString().c_str());
+    }
+
     return true;
 }
 
@@ -945,8 +1147,112 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, mPackedTreeMask, mDraftTreePositionIds,
         mSelectTokenIndices, mSequenceContextLengths, acceptedTokenNum, stream);
 
-    // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
-    // initialization.
+    size_t const hashValue = hashAcceptDecodeTokenInput(
+        acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+    if (mAcceptDecodeTokenCudaGraphs.find(hashValue) != mAcceptDecodeTokenCudaGraphs.end())
+    {
+        LOG_DEBUG(
+            "executeEagleAcceptDecodeTokenStep(): Use pre-captured CUDA graph for draft accept decode token step.");
+        cudaGraphExec_t graphExec = mAcceptDecodeTokenCudaGraphs[hashValue].second;
+        CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
+    }
+    else
+    {
+        LOG_INFO("executeEagleAcceptDecodeTokenStep(): Draft accept decode token step CUDA graph not captured.");
+        // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
+        // initialization.
+        bool setEngineIOStatus{true};
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            inputIdsName.c_str(), const_cast<void*>(acceptedTokens.rawPointer()));
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), acceptedTokens.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            baseModelHiddenStatesName.c_str(), const_cast<void*>(baseModelHiddenStates.rawPointer()));
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            baseModelHiddenStatesName.c_str(), baseModelHiddenStates.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            draftModelHiddenStatesName.c_str(), const_cast<void*>(draftModelHiddenStates.rawPointer()));
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            draftModelHiddenStatesName.c_str(), draftModelHiddenStates.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            selectTokenIndicesName.c_str(), mSelectTokenIndices.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
+        // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mPackedTreeMask.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            attentionMaskName.c_str(), mPackedTreeMask.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            attentionPosIdName.c_str(), mDraftTreePositionIds.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            attentionPosIdName.c_str(), mDraftTreePositionIds.getShape().getTRTDims());
+
+        // Bind the output tensor into the engine.
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
+
+        if (!setEngineIOStatus)
+        {
+            LOG_ERROR("Failed to bind engine input and output tensors.");
+            return false;
+        }
+
+        // launch the engine execution.
+        bool executeStatus{true};
+        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+        if (!executeStatus)
+        {
+            LOG_ERROR("Failed on TensorRT accept decode token stage enqueueV3() call.");
+            return false;
+        }
+    }
+
+    // Commit the KVCache for accepted tokens.
+    mLinearKVCache.commitSequenceLength(acceptedTokenNum, stream);
+
+    LOG_DEBUG("Accept decode token stage execution completed for request with batch size");
+    return true;
+}
+
+bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor const& acceptedTokens,
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits,
+    rt::Tensor& outputHiddenStates, cudaStream_t stream)
+{
+    size_t const hashValue = hashAcceptDecodeTokenInput(
+        acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+    if (mAcceptDecodeTokenCudaGraphs.find(hashValue) != mAcceptDecodeTokenCudaGraphs.end())
+    {
+        LOG_INFO("Draft accept decode token CUDA graph already captured.");
+        return true;
+    }
+    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(
+        acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+    if (!validateInputStatus)
+    {
+        LOG_ERROR("Accept decode token request not performed due to invalid input tensors.");
+        return false;
+    }
+
+    int32_t const acceptedTokenNum = static_cast<int32_t>(acceptedTokens.getShape()[1]);
+    int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(acceptedTokenNum, 32));
+    constexpr int32_t kACCEPT_DECODE_SELECT_TOKEN_LENGTH{1};
+
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kACCEPT_DECODE_SELECT_TOKEN_LENGTH});
+    mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
+    mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum});
+    mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum, packedTreeMaskLen});
+
+    rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
+    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, mPackedTreeMask, mDraftTreePositionIds,
+        mSelectTokenIndices, mSequenceContextLengths, acceptedTokenNum, stream);
+
     bool setEngineIOStatus{true};
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         inputIdsName.c_str(), const_cast<void*>(acceptedTokens.rawPointer()));
@@ -968,7 +1274,6 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
         selectTokenIndicesName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
-    // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
     setEngineIOStatus
         &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mPackedTreeMask.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -989,7 +1294,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
         return false;
     }
 
-    // launch the engine execution.
+    // launch the engine execution. This will trigger the shape machine of TensorRT engine to avoid cudaGraph capture.
     bool executeStatus{true};
     executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
     if (!executeStatus)
@@ -998,10 +1303,29 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
         return false;
     }
 
-    // Commit the KVCache for accepted tokens.
-    mLinearKVCache.commitSequenceLength(acceptedTokenNum, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    LOG_DEBUG("Accept decode token stage execution completed for request with batch size");
+    cudaGraph_t graph;
+    cudaGraphExec_t graphExec;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
+    mAcceptDecodeTokenCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
+
+    if (!executeStatus)
+    {
+        LOG_WARNING(
+            "captureEagleAcceptDecodeTokenCudaGraph(): Failed on TensorRT engine enqueueV3() call during CUDA graph "
+            "capture.");
+        return false;
+    }
+    else
+    {
+        LOG_DEBUG("captureEagleAcceptDecodeTokenCudaGraph(): CUDA graph captured successfully for input shape %s.",
+            acceptedTokens.getShape().formatString().c_str());
+    }
+
     return true;
 }
 

@@ -26,11 +26,14 @@
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <unordered_map>
 
 namespace drivellm
 {
 namespace rt
 {
+using Json = nlohmann::json;
+
 using Json = nlohmann::json;
 
 struct EagleDraftEngineRunnerConfig
@@ -57,7 +60,7 @@ public:
     EagleDraftEngineRunner(
         std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream);
 
-    ~EagleDraftEngineRunner() = default;
+    ~EagleDraftEngineRunner();
 
     // Get internal resources for the eagle draft engine.
     rt::Tensor& getRopeCosSinCacheTensor();
@@ -95,6 +98,8 @@ public:
     //          draft proposal step, but it is required by the engine execution. The input shall be set to all zeros to ensure correctness.
     //     draftTreeLength [GPU, Int32]: Denote the "real" length of the draft tree with shape [1]
     //     draftTreeMask [GPU, Int32]: Denote the relationship between the draft tree nodes with shape [1, padded-draft-Tree-Size, padded-draft-Tree-Size].
+    //     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings value is not used in draft proposal step,
+    //          but required to set the tensor address and shape.
     //     stream: The CUDA stream to execute the draft proposal step.
     // Outputs:
     //     outputLogits [GPU, Float16]: The output logits with shape [topK, draft-Vocab-Size].
@@ -120,8 +125,43 @@ public:
     //     outputHiddenStates [GPU]: The output hidden states with shape [1, draft-hidden-dim].
     // Note: This API will "commit" the KVCache for the accepted tokens.
     bool executeEagleAcceptDecodeTokenStep(rt::Tensor const& acceptedTokens, rt::Tensor const& baseModelHiddenStates,
-        rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-        cudaStream_t stream);
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits,
+        rt::Tensor& outputHiddenStates, cudaStream_t stream);
+
+    // API entry to capture the CUDA graph for the draft proposal step. The API will capture the CUDA graph for the
+    // draft proposal step. Inputs:
+    //     draftTreeInputIds [GPU, Int32]: Input token_ids for the draft model with shape [1, padded-draft-Tree-Size].
+    //     draftModelHiddenStates [GPU, Float16]: Hidden states input from draft model with shape [1, padded-draft-Tree-Size, draft-Hidden-Dim],
+    //          denote hidden states corresponding to token_ids of [1 ~ draft-Tree-Size].
+    //     baseModelHiddenStates [GPU, Float16]: The input [1, padded-draft-Tree-Size, base-Hidden-Dim] is unused in the
+    //          draft proposal step, but it is required by the engine execution. The input shall be set to all zeros to ensure correctness.
+    //     draftTreeLength [GPU, Int32]: Denote the "real" length of the draft tree with shape [1]
+    //     draftTreeMask [GPU, Int32]: Denote the relationship between the draft tree nodes with shape [1, padded-draft-Tree-Size, padded-draft-Tree-Size].
+    //     outputLogits [GPU, Float16]: The output logits with shape [topK, draft-Vocab-Size].
+    //     outputHiddenStates [GPU]: The output hidden states with shape [topK, draft-hidden-dim].
+    //     stream: The CUDA stream to capture the CUDA graph. The API will capture the CUDA graph for the draft proposal step.
+    // Returns:
+    //     True if the CUDA graph is captured successfully, false otherwise.
+    bool captureEagleDraftProposalCudaGraph(rt::Tensor const& draftTreeInputIds, rt::Tensor const& baseModelHiddenStates,
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask,
+        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
+
+    // API entry for capturing the CUDA graph for the accept decode token step. The functionality is similar to the
+    // draft proposal step where this API will operates based on the previous committed KVCache. Output logits and
+    // hidden-states will be collected from the last accepted token. 
+    // Inputs:
+    //     acceptedTokens [GPU, Int32]: The accepted tokens with shape [1, N_accepted].
+    //     baseModelHiddenStates [GPU, Float16]: Hidden states input from base model with shape [1, N_accepted, base-Hidden-Dim].
+    //     draftModelHiddenStates [GPU, Float16]: The input [1, N_accepted, draft-Hidden-Dim] is unused in the accept decode token step,
+    //          but it is required by the engine execution. The input shall be set to all zeros to ensure correctness.
+    //     outputLogits [GPU, Float16]: The output logits with shape [1, draft-Vocab-Size].
+    //     outputHiddenStates [GPU]: The output hidden states with shape [1, draft-hidden-dim].
+    //     stream: The CUDA stream to capture the CUDA graph. The API will capture the CUDA graph for the accept decode token step.
+    // Returns:
+    //     True if the CUDA graph is captured successfully, false otherwise.
+    bool captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor const& acceptedTokens, rt::Tensor const& baseModelHiddenStates,
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, 
+        rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
 private:
     EagleDraftEngineRunnerConfig mConfig{};
@@ -130,6 +170,9 @@ private:
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext;
+
+    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mDraftProposalCudaGraphs{};
+    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mAcceptDecodeTokenCudaGraphs{};
 
     rt::LinearKVCache mLinearKVCache{};
 

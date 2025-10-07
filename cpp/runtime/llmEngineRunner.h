@@ -152,6 +152,23 @@ public:
     //!     The LoRA weights names.
     std::vector<std::string> getAvailableLoraWeights() const;
 
+    //! API entry to capture the CUDA graph for the base model tree decoding step. If CUDA graph capture is successful,
+    //! later
+    //!     call to executeEagleBaseTreeDecodingStep() will always launch the captured CUDA graph.
+    //! Inputs:
+    //!     baseTreeDecodingInputIds [GPU, Int32]: Input token_ids for the base model with shape [1, Tree-Size].
+    //!     baseTreeDecodingMask [GPU, Int32]: Denote the relationship between the base tree nodes with shape
+    //!         [1, Tree-Size, Tree-Size].
+    //!     outputLogits [GPU, Float16]: The output logits with shape [topK, base-Vocab-Size].
+    //!     outputHiddenStates [GPU]: The output hidden states with shape [topK, base-hidden-dim].
+    //!     stream: The CUDA stream to capture the CUDA graph. The API will capture the CUDA graph for the base tree
+    //!     decoding step.
+    //! Returns:
+    //!     True if the CUDA graph capture is successful, false otherwise.
+    bool captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputIds,
+        rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+        cudaStream_t stream);
+
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
@@ -160,6 +177,10 @@ private:
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
     //! which denote the input/output shapes and other execution properties like LoRA weights.
     std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
+
+    //! Holds the CUDA graph captured for the base model verification step. Each CUDA graph is associated with a unique
+    //! hash value which denote the input/output shapes and other execution properties.
+    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mBaseTreeDecodingCudaGraphs;
 
     //! Holds the LoRA weights for the LLM engine.
     std::unordered_map<std::string, std::vector<rt::Tensor>> mLoraWeights{};
