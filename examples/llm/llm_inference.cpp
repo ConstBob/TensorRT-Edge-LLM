@@ -512,6 +512,29 @@ int main(int argc, char* argv[])
             LOG_ERROR("Failed to initialize LLMInferenceSpecDecodeRuntime: %s", e.what());
             return EXIT_FAILURE;
         }
+
+        bool const draftProposalCaptureStatus = eagleInferenceRuntime->captureDraftProposalCudaGraph(stream);
+        if (!draftProposalCaptureStatus)
+        {
+            LOG_WARNING(
+                "Failed to capture CUDA graph for draft proposal usage, proceeding with normal engine execution.");
+        }
+
+        bool const draftAcceptCaptureStatus = eagleInferenceRuntime->captureDraftAcceptDecodeTokenCudaGraph(stream);
+        if (!draftAcceptCaptureStatus)
+        {
+            LOG_WARNING(
+                "Failed to capture CUDA graph for draft accept decode token usage, proceeding with normal engine "
+                "execution.");
+        }
+
+        bool const baseCaptureStatus = eagleInferenceRuntime->captureBaseVerificationCudaGraph(stream);
+        if (!baseCaptureStatus)
+        {
+            LOG_WARNING(
+                "Failed to capture CUDA graph for base model verification usage, proceeding with normal engine "
+                "execution.");
+        }
     }
     else
     {

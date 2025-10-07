@@ -61,6 +61,11 @@ public:
         EagleDraftingConfig const& draftingConfig, cudaStream_t stream);
 
     ~LLMInferenceSpecDecodeRuntime() = default;
+    bool captureDraftProposalCudaGraph(cudaStream_t stream);
+
+    bool captureDraftAcceptDecodeTokenCudaGraph(cudaStream_t stream);
+
+    bool captureBaseVerificationCudaGraph(cudaStream_t stream);
 
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
 
