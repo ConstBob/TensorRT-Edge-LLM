@@ -20,6 +20,7 @@
 #include "profileFormatter.h"
 #include "profiling/timer.h"
 #include "runtime/llmInferenceRuntime.h"
+#include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <filesystem>
 #include <fstream>
@@ -36,6 +37,45 @@
 using namespace drivellm;
 using Json = nlohmann::json;
 
+// Enum for command line option IDs (using traditional enum for C library compatibility)
+enum OptionId : int
+{
+    INPUT_FILE = 901,
+    ENGINE_DIR = 902,
+    MULTIMODAL_ENGINE_DIR = 903,
+    OUTPUT_FILE = 904,
+    DEBUG = 905,
+    DUMP_PROFILE = 906,
+    PROFILE_OUTPUT_FILE = 907,
+    WARMUP = 908,
+    DUMP_OUTPUT = 909,
+    EAGLE = 910,
+    EAGLE_DRAFT_TOP_K = 911,
+    EAGLE_DRAFT_STEP = 912,
+    EAGLE_VERIFY_TREE_SIZE = 913,
+    BATCH_SIZE = 914,
+    MAX_GENERATE_LENGTH = 915
+};
+
+// Struct to hold Eagle-specific arguments for speculative decoding
+struct EagleArgs
+{
+    bool enabled{false};
+
+    // Number of tokens selected per drafting step from the draft model's output distribution.
+    // This controls the branching factor at each level of the draft tree.
+    int32_t draftTopK{10};
+
+    // Number of drafting steps to perform with the draft model.
+    // Each step extends the draft tree by one more level.
+    int32_t draftStep{6};
+
+    // Number of tokens to select from the complete draft tree for base model verification.
+    // The total draft tree size is: 1 + draftTopK + (draftStep - 1) * draftTopK * draftTopK
+    // This parameter should be <= total draft tree size for optimal performance.
+    int32_t verifyTreeSize{60};
+};
+
 struct LLMInferenceArgs
 {
     std::string engineDir;
@@ -47,6 +87,11 @@ struct LLMInferenceArgs
     bool dumpProfile{false};
     int32_t warmup{0};
     bool dumpOutput{false};
+    // Override parameters (only batchSize and maxGenerateLength can be overridden via CLI)
+    // For other sampling parameters (temperature, top_p, top_k), please specify them in the input JSON file
+    int32_t batchSize{-1};         // -1 means use value from input file
+    int64_t maxGenerateLength{-1}; // -1 means use value from input file
+    EagleArgs eagleArgs;
 };
 
 void printUsage(char const* programName)
@@ -55,7 +100,9 @@ void printUsage(char const* programName)
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
-                 "[--dumpOutput]"
+                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--eagle] "
+                 "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
+                 "[--eagleVerifyTreeSize=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
@@ -67,29 +114,48 @@ void printUsage(char const* programName)
     std::cerr << "  --warmup                  Number of warmup runs using the first request (default: 0)" << std::endl;
     std::cerr << "  --debug                   Enable debug logging" << std::endl;
     std::cerr << "  --dumpOutput              Dump inference output to console" << std::endl;
+    std::cerr << "  --batchSize               Override batch size from input file" << std::endl;
+    std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
+    std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
+    std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
+    std::cerr << "  --eagle                   Enable Eagle speculative decoding mode" << std::endl;
+    std::cerr << "  --eagleDraftTopK          Number of tokens selected per drafting step (default: 10)" << std::endl;
+    std::cerr << "                            Controls branching factor at each draft tree level" << std::endl;
+    std::cerr << "  --eagleDraftStep          Number of drafting steps to perform (default: 6)" << std::endl;
+    std::cerr << "                            Each step extends the draft tree by one more level" << std::endl;
+    std::cerr << "  --eagleVerifyTreeSize     Number of tokens for base model verification (default: 60)" << std::endl;
+    std::cerr << "                            Total draft tree size: 1 + topK + (step-1) * topK^2" << std::endl;
 }
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
-    static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, 901},
-        {"engineDir", required_argument, 0, 902}, {"multimodalEngineDir", required_argument, 0, 903},
-        {"outputFile", required_argument, 0, 904}, {"debug", no_argument, 0, 905}, {"dumpProfile", no_argument, 0, 906},
-        {"profileOutputFile", required_argument, 0, 907}, {"warmup", required_argument, 0, 908},
-        {"dumpOutput", no_argument, 0, 909}, {0, 0, 0, 0}};
+    static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, OptionId::INPUT_FILE},
+        {"engineDir", required_argument, 0, OptionId::ENGINE_DIR},
+        {"multimodalEngineDir", required_argument, 0, OptionId::MULTIMODAL_ENGINE_DIR},
+        {"outputFile", required_argument, 0, OptionId::OUTPUT_FILE}, {"debug", no_argument, 0, OptionId::DEBUG},
+        {"dumpProfile", no_argument, 0, OptionId::DUMP_PROFILE},
+        {"profileOutputFile", required_argument, 0, OptionId::PROFILE_OUTPUT_FILE},
+        {"warmup", required_argument, 0, OptionId::WARMUP}, {"dumpOutput", no_argument, 0, OptionId::DUMP_OUTPUT},
+        {"eagle", no_argument, 0, OptionId::EAGLE},
+        {"eagleDraftTopK", required_argument, 0, OptionId::EAGLE_DRAFT_TOP_K},
+        {"eagleDraftStep", required_argument, 0, OptionId::EAGLE_DRAFT_STEP},
+        {"eagleVerifyTreeSize", required_argument, 0, OptionId::EAGLE_VERIFY_TREE_SIZE},
+        {"batchSize", required_argument, 0, OptionId::BATCH_SIZE},
+        {"maxGenerateLength", required_argument, 0, OptionId::MAX_GENERATE_LENGTH}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
     {
         switch (opt)
         {
-        case 901: args.inputFile = optarg; break;
-        case 902: args.engineDir = optarg; break;
-        case 903: args.multimodalEngineDir = optarg; break;
-        case 904: args.outputFile = optarg; break;
-        case 905: args.debug = true; break;
-        case 906: args.dumpProfile = true; break;
-        case 907: args.profileOutputFile = optarg; break;
-        case 908:
+        case OptionId::INPUT_FILE: args.inputFile = optarg; break;
+        case OptionId::ENGINE_DIR: args.engineDir = optarg; break;
+        case OptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
+        case OptionId::OUTPUT_FILE: args.outputFile = optarg; break;
+        case OptionId::DEBUG: args.debug = true; break;
+        case OptionId::DUMP_PROFILE: args.dumpProfile = true; break;
+        case OptionId::PROFILE_OUTPUT_FILE: args.profileOutputFile = optarg; break;
+        case OptionId::WARMUP:
             try
             {
                 args.warmup = std::stoi(optarg);
@@ -105,7 +171,88 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 909: args.dumpOutput = true; break;
+        case OptionId::DUMP_OUTPUT: args.dumpOutput = true; break;
+        case OptionId::EAGLE: args.eagleArgs.enabled = true; break;
+        case OptionId::EAGLE_DRAFT_TOP_K:
+            try
+            {
+                args.eagleArgs.draftTopK = std::stoi(optarg);
+                if (args.eagleArgs.draftTopK <= 0)
+                {
+                    LOG_ERROR("Invalid eagleDraftTopK value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid eagleDraftTopK value: %s", optarg);
+                return false;
+            }
+            break;
+        case OptionId::EAGLE_DRAFT_STEP:
+            try
+            {
+                args.eagleArgs.draftStep = std::stoi(optarg);
+                if (args.eagleArgs.draftStep <= 0)
+                {
+                    LOG_ERROR("Invalid eagleDraftStep value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid eagleDraftStep value: %s", optarg);
+                return false;
+            }
+            break;
+        case OptionId::EAGLE_VERIFY_TREE_SIZE:
+            try
+            {
+                args.eagleArgs.verifyTreeSize = std::stoi(optarg);
+                if (args.eagleArgs.verifyTreeSize <= 0)
+                {
+                    LOG_ERROR("Invalid eagleVerifyTreeSize value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid eagleVerifyTreeSize value: %s", optarg);
+                return false;
+            }
+            break;
+        case OptionId::BATCH_SIZE:
+            try
+            {
+                args.batchSize = std::stoi(optarg);
+                if (args.batchSize <= 0)
+                {
+                    LOG_ERROR("Invalid batchSize value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid batchSize value: %s", optarg);
+                return false;
+            }
+            break;
+        case OptionId::MAX_GENERATE_LENGTH:
+            try
+            {
+                args.maxGenerateLength = std::stoll(optarg);
+                if (args.maxGenerateLength <= 0)
+                {
+                    LOG_ERROR("Invalid maxGenerateLength value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid maxGenerateLength value: %s", optarg);
+                return false;
+            }
+            break;
         default: return false;
         }
     }
@@ -154,6 +301,14 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Warmup runs: %d", args.warmup);
     }
 
+    if (args.eagleArgs.enabled)
+    {
+        LOG_INFO("Eagle mode enabled");
+        LOG_INFO("Eagle draft topK: %d", args.eagleArgs.draftTopK);
+        LOG_INFO("Eagle draft step: %d", args.eagleArgs.draftStep);
+        LOG_INFO("Eagle verify tree size: %d", args.eagleArgs.verifyTreeSize);
+    }
+
     if (args.debug)
     {
         gLogger.setLevel(nvinfer1::ILogger::Severity::kVERBOSE);
@@ -167,7 +322,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 }
 
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseInputFile(
-    std::filesystem::path const& inputFilePath)
+    std::filesystem::path const& inputFilePath, int32_t batchSizeOverride = -1, int64_t maxGenerateLengthOverride = -1)
 {
     std::vector<rt::LLMGenerationRequest> requests;
 
@@ -190,11 +345,12 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     }
 
     // Extract global parameters
-    int batchSize = inputData.value("batch_size", 1);
+    int batchSize = (batchSizeOverride != -1) ? batchSizeOverride : inputData.value("batch_size", 1);
     float temperature = inputData.value("temperature", 1.0f);
     float topP = inputData.value("top_p", 0.8f);
     int64_t topK = inputData.value("top_k", 50);
-    int64_t maxGenerateLength = inputData.value("max_generate_length", 256);
+    int64_t maxGenerateLength
+        = (maxGenerateLengthOverride != -1) ? maxGenerateLengthOverride : inputData.value("max_generate_length", 256);
     std::string defaultSystemPrompt = inputData.value("default_system_prompt", "");
     std::unordered_map<std::string, std::string> loraWeightsMap;
     if (inputData.contains("available_lora_weights") && inputData["available_lora_weights"].is_object())
@@ -312,7 +468,7 @@ int main(int argc, char* argv[])
     std::vector<rt::LLMGenerationRequest> requests;
     try
     {
-        std::tie(loraWeightsMap, requests) = parseInputFile(args.inputFile);
+        std::tie(loraWeightsMap, requests) = parseInputFile(args.inputFile, args.batchSize, args.maxGenerateLength);
         LOG_INFO("Successfully parsed %zu LoRA weights from input file.", loraWeightsMap.size());
         LOG_INFO("Successfully parsed %zu requests from input file.", requests.size());
     }
@@ -330,25 +486,80 @@ int main(int argc, char* argv[])
     bool profilerEnabled = args.dumpProfile;
     MemoryMonitor memoryMonitor;
 
+    // Create runtime based on mode
     std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
+    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> eagleInferenceRuntime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    try
+
+    if (args.eagleArgs.enabled)
     {
-        llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(
-            args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+        // Eagle mode - LoRA is not supported
+        if (!loraWeightsMap.empty())
+        {
+            LOG_WARNING("Eagle mode does not support LoRA weights. Ignoring LoRA weights.");
+        }
+
+        rt::EagleDraftingConfig draftingConfig{
+            args.eagleArgs.draftTopK, args.eagleArgs.draftStep, args.eagleArgs.verifyTreeSize};
+        try
+        {
+            eagleInferenceRuntime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+                args.engineDir, args.multimodalEngineDir, draftingConfig, stream);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to initialize LLMInferenceSpecDecodeRuntime: %s", e.what());
+            return EXIT_FAILURE;
+        }
+
+        bool const draftProposalCaptureStatus = eagleInferenceRuntime->captureDraftProposalCudaGraph(stream);
+        if (!draftProposalCaptureStatus)
+        {
+            LOG_WARNING(
+                "Failed to capture CUDA graph for draft proposal usage, proceeding with normal engine execution.");
+        }
+
+        bool const draftAcceptCaptureStatus = eagleInferenceRuntime->captureDraftAcceptDecodeTokenCudaGraph(stream);
+        if (!draftAcceptCaptureStatus)
+        {
+            LOG_WARNING(
+                "Failed to capture CUDA graph for draft accept decode token usage, proceeding with normal engine "
+                "execution.");
+        }
+
+        bool const baseCaptureStatus = eagleInferenceRuntime->captureBaseVerificationCudaGraph(stream);
+        if (!baseCaptureStatus)
+        {
+            LOG_WARNING(
+                "Failed to capture CUDA graph for base model verification usage, proceeding with normal engine "
+                "execution.");
+        }
     }
-    catch (std::exception const& e)
+    else
     {
-        LOG_ERROR("Failed to initialize LLMInferenceRuntime: %s", e.what());
-        return EXIT_FAILURE;
+        // Standard mode
+        try
+        {
+            llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(
+                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to initialize LLMInferenceRuntime: %s", e.what());
+            return EXIT_FAILURE;
+        }
     }
 
-    // Capture CUDA graph and execute the graph
-    bool const captureStatus = llmInferenceRuntime->captureDecodingCUDAGraph(stream);
-    if (!captureStatus)
+    // Capture CUDA graph for decoding in standard mode with text-only input.
+    // TODO: Enable CUDA graph capture for multimodal inputs.
+    // Note: Eagle mode does not use CUDA graph capture
+    if (!args.eagleArgs.enabled)
     {
-        LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
+        if (!llmInferenceRuntime->captureDecodingCUDAGraph(stream))
+        {
+            LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
+        }
     }
 
     // Perform warmup runs if requested
@@ -362,7 +573,17 @@ int main(int argc, char* argv[])
         for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
         {
             rt::LLMGenerationResponse warmupResponse;
-            if (!llmInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream))
+            bool requestStatus = false;
+            if (args.eagleArgs.enabled)
+            {
+                requestStatus = eagleInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
+            }
+            else
+            {
+                requestStatus = llmInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
+            }
+
+            if (!requestStatus)
             {
                 LOG_ERROR("Warmup run %d/%d failed", warmupRun + 1, args.warmup);
                 return EXIT_FAILURE;
@@ -403,7 +624,15 @@ int main(int argc, char* argv[])
                 100.0 * (requestIdx + 1) / requests.size());
         }
 
-        bool requestStatus = llmInferenceRuntime->handleRequest(request, response, stream);
+        bool requestStatus = false;
+        if (args.eagleArgs.enabled)
+        {
+            requestStatus = eagleInferenceRuntime->handleRequest(request, response, stream);
+        }
+        else
+        {
+            requestStatus = llmInferenceRuntime->handleRequest(request, response, stream);
+        }
 
         if (requestStatus)
         {
@@ -425,18 +654,14 @@ int main(int argc, char* argv[])
             LOG_ERROR("*** FAILED *** Request %zu failed to process!", requestIdx);
         }
 
-        // Add to JSON output
+        // Add to JSON output with UTF-8 validation on output text
         for (size_t batchIdx = 0; batchIdx < request.prompts.size(); ++batchIdx)
         {
             nlohmann::json responseJson;
-            if (requestStatus)
-            {
-                responseJson["output_text"] = response.outputTexts[batchIdx];
-            }
-            else
-            {
-                responseJson["output_text"] = errorMessage;
-            }
+            std::string outputText = requestStatus ? response.outputTexts[batchIdx] : errorMessage;
+            // Validate UTF-8 for output text (inputs are always valid)
+            // If invalid UTF-8 detected, error message is returned and original text is logged
+            responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
             responseJson["request_idx"] = requestIdx;
             responseJson["system_prompt"] = request.prompts[batchIdx].systemPrompt;
             responseJson["user_prompt"] = request.prompts[batchIdx].userPrompt;
@@ -464,9 +689,30 @@ int main(int argc, char* argv[])
     size_t peakMemoryBytes = profilerEnabled ? memoryMonitor.getPeakMemory() : 0;
     if (args.dumpProfile)
     {
-        auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
-        printSummary(llmInferenceRuntime->getPrefillMetrics(), llmInferenceRuntime->getGenerationMetrics(),
-            multimodalMetrics, peakMemoryBytes);
+        std::ostringstream profileOutput;
+        profileOutput << std::endl;
+        profileOutput << "=== Performance Summary ===" << std::endl;
+        if (args.eagleArgs.enabled)
+        {
+            // Eagle runtime with detailed metrics
+            auto prefillMetrics = eagleInferenceRuntime->getPrefillMetrics();
+            auto eagleGenerationMetrics = eagleInferenceRuntime->getEagleGenerationMetrics();
+            auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
+            outputPrefillProfile(profileOutput, prefillMetrics);
+            outputEagleGenerationProfile(profileOutput, eagleGenerationMetrics);
+            outputMultimodalProfile(profileOutput, multimodalMetrics);
+            outputMemoryProfile(profileOutput, peakMemoryBytes);
+        }
+        else
+        {
+            auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
+            outputPrefillProfile(profileOutput, llmInferenceRuntime->getPrefillMetrics());
+            outputGenerationProfile(profileOutput, llmInferenceRuntime->getGenerationMetrics());
+            outputMultimodalProfile(profileOutput, multimodalMetrics);
+            outputMemoryProfile(profileOutput, peakMemoryBytes);
+        }
+        profileOutput << "=====================================" << std::endl;
+        LOG_INFO("%s", profileOutput.str().c_str());
     }
 
     // Export profile to JSON file
@@ -474,13 +720,46 @@ int main(int argc, char* argv[])
     {
         try
         {
-            auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
-            std::string profileJson = getJsonSummary(llmInferenceRuntime->getPrefillMetrics(),
-                llmInferenceRuntime->getGenerationMetrics(), multimodalMetrics, peakMemoryBytes);
+            nlohmann::json profileJson;
+
+            if (args.eagleArgs.enabled)
+            {
+                // Eagle runtime with detailed metrics
+                auto prefillMetrics = eagleInferenceRuntime->getPrefillMetrics();
+                auto eagleGenerationMetrics = eagleInferenceRuntime->getEagleGenerationMetrics();
+                auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
+
+                // Add high-level metrics
+                addJsonPrefillSummary(profileJson, prefillMetrics);
+                addJsonEagleGenerationSummary(profileJson, eagleGenerationMetrics);
+                addJsonMultimodalSummary(profileJson, multimodalMetrics);
+
+                // Add detailed timing stages
+                addJsonTimingStages(profileJson);
+
+                // Add memory usage
+                addJsonMemorySummary(profileJson, peakMemoryBytes);
+            }
+            else
+            {
+                auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
+
+                // Add high-level metrics
+                addJsonPrefillSummary(profileJson, llmInferenceRuntime->getPrefillMetrics());
+                addJsonGenerationSummary(profileJson, llmInferenceRuntime->getGenerationMetrics());
+                addJsonMultimodalSummary(profileJson, multimodalMetrics);
+
+                // Add detailed timing stages
+                addJsonTimingStages(profileJson);
+
+                // Add memory usage
+                addJsonMemorySummary(profileJson, peakMemoryBytes);
+            }
+
             std::ofstream profileFile(args.profileOutputFile);
             if (profileFile.is_open())
             {
-                profileFile << profileJson;
+                profileFile << profileJson.dump(2); // Pretty print with 2 space indentation
                 profileFile.close();
                 LOG_INFO("Profile data exported to: %s", args.profileOutputFile.c_str());
             }

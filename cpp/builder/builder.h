@@ -37,17 +37,17 @@ namespace builder
 //! for Large Language Models, including standard LLMs, Eagle models, and Vision-Language Models.
 struct LLMBuilderConfig
 {
-    int64_t maxInputLen{128};          //!< Maximum input sequence length for the model
-    bool isVlm{false};                 //!< Whether this is a Vision-Language Model (VLM)
-    int64_t minImageTokens{4};         //!< Minimum number of image tokens (VLM only)
-    int64_t maxImageTokens{1024};      //!< Maximum number of image tokens (VLM only)
-    bool eagleDraft{false};            //!< Whether this is an Eagle draft model
-    bool eagleBase{false};             //!< Whether this is an Eagle base model
-    int64_t maxBatchSize{4};           //!< Maximum batch size for inference
-    int64_t maxLoraRank{0};            //!< Maximum LoRA rank (0 = no LoRA support)
-    int64_t maxSeqLen{4096};           //!< Maximum sequence length for the model
-    int64_t maxDecodingTokens{60};     //!< Maximum number of decoding tokens per step (Eagle)
-    int64_t maxDraftTokensPerStep{60}; //!< Maximum number of draft tokens per step (Eagle draft)
+    int64_t maxInputLen{128};      //!< Maximum input sequence length for the model
+    bool isVlm{false};             //!< Whether this is a Vision-Language Model (VLM)
+    int64_t minImageTokens{4};     //!< Minimum number of image tokens (VLM only)
+    int64_t maxImageTokens{1024};  //!< Maximum number of image tokens (VLM only)
+    bool eagleDraft{false};        //!< Whether this is an Eagle draft model
+    bool eagleBase{false};         //!< Whether this is an Eagle base model
+    int64_t maxBatchSize{4};       //!< Maximum batch size for inference
+    int64_t maxLoraRank{0};        //!< Maximum LoRA rank (0 = no LoRA support)
+    int64_t maxSeqLen{4096};       //!< Maximum sequence length for the model
+    int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
+    int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -66,8 +66,15 @@ struct LLMBuilderConfig
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_seq_len"] = maxSeqLen;
-        json["max_decoding_tokens"] = maxDecodingTokens;
-        json["max_draft_tokens_per_step"] = maxDraftTokensPerStep;
+        // Only include Eagle-specific fields when Eagle is enabled
+        if (eagleBase)
+        {
+            json["max_verify_tree_size"] = maxVerifyTreeSize;
+        }
+        if (eagleDraft)
+        {
+            json["max_draft_tree_size"] = maxDraftTreeSize;
+        }
         return json;
     }
 
@@ -113,13 +120,13 @@ struct LLMBuilderConfig
         {
             config.maxSeqLen = json["max_seq_len"];
         }
-        if (json.contains("max_decoding_tokens"))
+        if (json.contains("max_verify_tree_size"))
         {
-            config.maxDecodingTokens = json["max_decoding_tokens"];
+            config.maxVerifyTreeSize = json["max_verify_tree_size"];
         }
-        if (json.contains("max_draft_tokens_per_step"))
+        if (json.contains("max_draft_tree_size"))
         {
-            config.maxDraftTokensPerStep = json["max_draft_tokens_per_step"];
+            config.maxDraftTreeSize = json["max_draft_tree_size"];
         }
         return config;
     }
@@ -142,8 +149,15 @@ struct LLMBuilderConfig
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxSeqLen: " << maxSeqLen << "\n";
-        oss << "  maxDecodingTokens: " << maxDecodingTokens << "\n";
-        oss << "  maxDraftTokensPerStep: " << maxDraftTokensPerStep << "\n";
+        // Only show Eagle-specific fields when Eagle is enabled
+        if (eagleBase)
+        {
+            oss << "  maxVerifyTreeSize: " << maxVerifyTreeSize << "\n";
+        }
+        if (eagleDraft)
+        {
+            oss << "  maxDraftTreeSize: " << maxDraftTreeSize << "\n";
+        }
         return oss.str();
     }
 };
@@ -307,7 +321,7 @@ private:
     bool copyTokenizerFiles();
 
     //! Copy Eagle-specific files to the engine directory.
-    //! Copies d2t.bin file for Eagle3 draft models.
+    //! Copies d2t.safetensors file for Eagle3 draft models.
     //! @return true if copying was successful, false otherwise
     bool copyEagleFiles();
 

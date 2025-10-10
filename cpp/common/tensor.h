@@ -22,12 +22,13 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <functional>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 
 namespace drivellm
 {
@@ -237,6 +238,10 @@ std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape);
 //! Format the tensor object as a string for debugging purpose.
 std::string formatString(Tensor const& tensor);
 } // namespace utils
+
+//! Optional input and output tensor types.
+using OptionalInputTensor = std::optional<std::reference_wrapper<rt::Tensor const>>;
+using OptionalOutputTensor = std::optional<std::reference_wrapper<rt::Tensor>>;
 
 } // namespace rt
 } // namespace drivellm

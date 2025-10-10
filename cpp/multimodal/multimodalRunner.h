@@ -19,7 +19,6 @@
 
 #include "common/tensor.h"
 #include "common/trtUtils.h"
-#include "engine/llm_engine.h"
 #include "profiling/metrics.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -49,15 +48,6 @@ public:
     // Static factory method to create appropriate MultimodalRunner instance
     static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, cudaStream_t stream);
 
-    // Preprocess all inputs for multimodal runner and LLM runner
-    // TODO: Clean Old API
-    virtual void preprocess(std::vector<std::string> const& inputStrings,
-        std::vector<std::vector<rt::imageUtils::ImageData>> const& imageBuffers, std::vector<int32_t>& inputIds,
-        std::vector<int32_t>& contextLengths, tokenizer::Tokenizer* tokenizer, int const maxSupportedInputLength,
-        bool enableDynamicShape, void* ropeRotaryCosSinDevice, int const maxPositionEmbeddings, int const rotaryDim,
-        cudaStream_t stream)
-        = 0;
-
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
         = 0;
@@ -68,9 +58,6 @@ public:
 
     // Multimodal inference
     virtual bool infer(cudaStream_t stream) = 0;
-
-    // TODO: Clean Old API. Get multimodal output embeddings. Used to setup extra inputs for LLM.
-    virtual std::vector<EngineInputDesc> getComputedEmbeddings() = 0;
 
     // Get multimodal output embeddings.
     virtual rt::Tensor& getOutputEmbedding();
@@ -101,11 +88,6 @@ public:
     }
 
 protected:
-    // TODO: Clean Old API. Flatten batch inputs ids to 1D array with padding and initialize context lengths
-    virtual void flattenBatch(std::vector<int32_t>& inputIds, std::vector<int32_t>& contextLengths,
-        std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int32_t>& batchInputLengths, int32_t const padId,
-        int const maxSupportedInputLength, bool enableDynamicShape);
-
     // Common members
     std::string mModelType;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;

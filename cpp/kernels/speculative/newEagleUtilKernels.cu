@@ -280,7 +280,7 @@ __global__ void initializeDraftTreeInputKernel(int32_t const* tokenIdsTable, int
     // Update tree length from this round.
     if (tIdx == 0)
     {
-        draftTreeLength[batchIdx] = round * draftTopK;
+        draftTreeLength[batchIdx] += draftTopK;
     }
 }
 
@@ -452,10 +452,12 @@ __global__ void constructVerificationDraftTreeKernel(int32_t const* draftIdFullT
     int32_t attendIter{1};
     // Reset parent iterator to match from the first predecessor.
     parentIter = 0;
-    while (countIter >= 0)
+    while (countIter > 0)
     {
         countIter -= 1;
-        if (countIter == parentIndices[parentIter])
+        // Compare the full table index at this verification position with the parent index
+        int32_t const fullTableIdxAtCount = selectedIndices[verifyTreeCTAOffset + countIter];
+        if (fullTableIdxAtCount == parentIndices[parentIter])
         {
             attendedIndices[attendIter] = countIter;
             attendIter += 1;

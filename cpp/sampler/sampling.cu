@@ -327,11 +327,11 @@ struct topk2MaxOpFunctor
     }
 };
 
-// Stage 2 kernel for returnAllTopK that matches the old sampler's approach (FP32 only)
+// Stage 2 kernel for returnAllTopK - returns indices and raw values only (no transformations)
 template <int BLOCK_SIZE>
 __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, float* topKTmpValBuf,
-    int32_t* outputIndices, float* outputValues, float* outputTValues, int32_t batchSize, int32_t vocabSize,
-    int32_t topK, int32_t blocksPerBeam, bool returnLogProbs, bool normalizeLogProbs, bool inputHasProbs)
+    int32_t* outputIndices, float* outputValues, int32_t batchSize, int32_t vocabSize, int32_t topK,
+    int32_t blocksPerBeam)
 {
     auto const tid = static_cast<int32_t>(threadIdx.x);
     auto const batchIdx = static_cast<int32_t>(blockIdx.x);
@@ -345,17 +345,13 @@ __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, 
     typedef cub::BlockReduce<TopK_2, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
     extern __shared__ char array[];
-    __shared__ float sSum;
     float* sVal = topKTmpValBuf + batchIdx * stride;
     auto* sId = reinterpret_cast<int32_t*>(array);
-    if (tid == 0)
-    {
-        sSum = 0.0f;
-    }
+    auto sValSelected = reinterpret_cast<float*>(sId + topK);
+
     TopK_2 partial;
 
-    auto sVal2 = reinterpret_cast<float*>(sId + topK);
-    float maxLogit;
+    // Iteratively find top-K elements by max value
     for (int32_t ite = 0; ite < topK; ite++)
     {
         partial.init();
@@ -369,30 +365,19 @@ __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, 
 
         if (tid == 0)
         {
-            if (ite == 0)
-            {
-                maxLogit = total.value;
-            }
             sId[ite] = total.index;
-            sVal[total.index] = -FLT_MAX;
-
-            // when cumLogProbs are computed, topKTmpValBuf (logits_buf_) are
-            // already pre-processed by softmax_kernel
-            if (!inputHasProbs)
-            {
-                total.value = __expf(total.value - maxLogit);
-            }
-            sVal2[ite] = total.value;
-            sSum += total.value;
+            sValSelected[ite] = total.value; // Store original value
+            sVal[total.index] = -FLT_MAX;    // Mask out selected element for next iteration
         }
         __syncthreads();
     }
 
+    // Write outputs - return indices and original values only
     if (tid == 0)
     {
         for (int32_t ki = 0; ki < topK; ki++)
         {
-            auto expLogit = sVal2[ki];
+            auto originalValue = sValSelected[ki];
             auto idx = sId[ki];
 
             if (outputIndices != nullptr)
@@ -404,21 +389,8 @@ __global__ void topKStage2ReturnAllTopK(int32_t const* __restrict topKTmpIdBuf, 
 
             if (outputValues != nullptr)
             {
-                if (returnLogProbs)
-                {
-                    auto logProb = logf(expLogit);
-                    auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
-                    outputValues[batchIdx * topK + ki] = normalizedProb;
-                }
-                else
-                {
-                    outputValues[batchIdx * topK + ki] = expLogit;
-                }
-            }
-
-            if (outputTValues != nullptr)
-            {
-                outputTValues[batchIdx * topK + ki] = expLogit;
+                // Return original raw value from input (no transformation)
+                outputValues[batchIdx * topK + ki] = originalValue;
             }
         }
     }
@@ -916,7 +888,9 @@ void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, S
     }
 }
 
-// selectAllTopK function with automatic workspace allocation fallback (FP32 only)
+// selectAllTopK function - returns topK indices and raw values only (FP32 only)
+// Boolean parameters (returnLogProbs, normalizeLogProbs, inputHasProbs) are kept for API compatibility but ignored
+// This function simply finds the top-K elements and returns their indices and original values
 void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* topKIndices, int32_t batchSize,
     int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream, bool returnLogProbs,
     bool normalizeLogProbs, bool inputHasProbs)
@@ -933,24 +907,23 @@ void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* top
     SamplingWorkspace ws;
     ws.setupWorkspaceForTopK(workspace, workspaceSize, batchSize, vocabSize, topK);
 
-    // Create sampling parameters with temperature = 1.0 (no modification of input values)
+    // Create sampling parameters with temperature = 1.0 (no scaling applied to values)
     SamplingParams params(batchSize, vocabSize, 1.0f, topK);
 
-    // Stage 1: Find top-K elements using existing kernel
+    // Stage 1: Find top-K elements (temperature=1.0 means no value transformation)
     dim3 grid1(batchSize * BLOCKS_PER_BEAM);
     dim3 block1(BLOCK_SIZE);
 
     topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM>
         <<<grid1, block1, 0, stream>>>(input, ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
 
-    // Stage 2: Second top-K selection from 8*K results (matches old sampler for returnAllTopK)
+    // Stage 2: Select final top-K from 8*K candidates and return indices + raw values
     dim3 grid2(batchSize);
     dim3 block2(BLOCK_SIZE);
     size_t sharedMemSize = topK * sizeof(int32_t) + topK * sizeof(float);
 
-    topKStage2ReturnAllTopK<BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(ws.topkIndices, ws.topkValues,
-        topKIndices, topKValues, returnLogProbs ? ws.topkTempLogits : nullptr, batchSize, vocabSize, topK,
-        BLOCKS_PER_BEAM, returnLogProbs, normalizeLogProbs, inputHasProbs);
+    topKStage2ReturnAllTopK<BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(
+        ws.topkIndices, ws.topkValues, topKIndices, topKValues, batchSize, vocabSize, topK, BLOCKS_PER_BEAM);
 }
 
 } // namespace drivellm

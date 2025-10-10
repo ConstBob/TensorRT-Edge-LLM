@@ -21,41 +21,11 @@
 #include "stringUtils.h"
 #include <NvInfer.h>
 #include <dlfcn.h>
-#include <filesystem>
-#include <fstream>
 #include <memory>
-#include <numeric>
 #include <stdexcept>
-#include <vector>
 
 namespace drivellm
 {
-
-inline std::int64_t volume(nvinfer1::Dims const& dims)
-{
-
-    return dims.nbDims < 0 ? -1
-        : dims.nbDims == 0 ? 0
-                           : std::accumulate(dims.d, dims.d + dims.nbDims, std::int64_t{1}, std::multiplies<>{});
-}
-
-struct EngineInputDesc
-{
-    std::string name;
-    void* deviceBufferForContext;
-    void* deviceBufferForDecode;
-    nvinfer1::Dims contextDims;
-    nvinfer1::Dims generationDims;
-    EngineInputDesc(std::string const name, void* deviceBufferForContext, void* deviceBufferForDecode,
-        nvinfer1::Dims const contextDims, nvinfer1::Dims const generationDims)
-        : name(name)
-        , deviceBufferForContext(deviceBufferForContext)
-        , deviceBufferForDecode(deviceBufferForDecode)
-        , contextDims(contextDims)
-        , generationDims(generationDims)
-    {
-    }
-};
 
 // Define a custom deleter type to handle the noexcept attribute
 struct DlDeleter
@@ -91,16 +61,5 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
     }
     return handle;
 }
-
-struct TensorInfo
-{
-    void* data;
-    nvinfer1::Dims dims;
-    TensorInfo(void* data, nvinfer1::Dims const dims)
-        : data(data)
-        , dims(dims)
-    {
-    }
-};
 
 } // namespace drivellm
