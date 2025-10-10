@@ -4,12 +4,22 @@
 
 ### 1. Environment Setup
 ```bash
-export LLM_SDK_DIR=$(pwd)                    # Required: Project root
-export ONNX_DIR=/path/to/onnx/models         # Required: ONNX model directory
-export ENGINE_DIR=/path/to/engine/outputs    # Required for pipeline tests
-export TORCH_DIR=/path/to/pytorch/models     # Required for export tests
-export TRT_PACKAGE_DIR=/path/to/tensorrt     # Optional: TensorRT installation
+export LLM_SDK_DIR=$(pwd)                           # Required: Project root
+export ONNX_DIR=/path/to/onnx/models                # Required: ONNX model directory
+export ENGINE_DIR=/path/to/engine/outputs           # Required for pipeline tests
+export LLM_MODELS_DIR=/path/to/pytorch/models       # Required for export tests (LLM torch models)
+export EDGELLM_DATA_DIR=/path/to/datasets           # Required for datasets and draft models
+export TRT_PACKAGE_DIR=/path/to/tensorrt            # Optional: TensorRT installation
 ```
+
+**Default Paths:**
+- `LLM_MODELS_DIR` defaults to:
+  - `/scratch.trt_llm_data/llm-models`
+  - `/home/scratch.trt_llm_data/llm-models` (fallback)
+- `EDGELLM_DATA_DIR` defaults to:
+  - `/scratch.edge_llm_cache`
+  - `/home/edge_llm_cache` (fallback)
+  - `/home/scratch.edge_llm_cache` (fallback)
 
 ### 2. Install Dependencies
 ```bash
@@ -77,6 +87,12 @@ ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additi
 
 **Export:**
 - `lora` - Enable LoRA support
+- `eagle` - Enable EAGLE (speculative decoding) model export
+- `draftfp16`, `draftfp8`, `draftnvfp4` - Draft model precision for EAGLE
+- `draftlmfp16`, `draftlmfp8` - Draft model LM head precision (optional, defaults to fp16)
+
+> **Note:** For detailed information on EAGLE model export with draft and base model support, 
+> see [EAGLE_EXPORT_README.md](./EAGLE_EXPORT_README.md)
 
 ### Examples
 ```bash
@@ -88,6 +104,12 @@ Qwen2.5-VL-3B-Instruct-int4_awq-mxsl4096-mxbs1-mxil2048-mnit128-mxit2048-mxlr32
 
 # Benchmark test with FP8
 Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048-bs1-isl2048-osl128
+
+# EAGLE export with FP16 base and draft
+Qwen2.5-7B-Instruct-fp16-mxsl8192-eagle-draftfp16
+
+# EAGLE export with mixed precision
+Qwen2.5-7B-Instruct-fp8-lmfp8-mxsl8192-eagle-draftnvfp4-draftlmfp8
 ```
 
 ## Directory Structure
@@ -105,7 +127,7 @@ tests/
 │   └── utils/              # Utility functions
 │       ├── command_execution.py
 │       ├── command_generation.py
-│       └── accuracy_utils.py
+│       └── accuracy.py
 ├── test_lists/             # Test configuration files
 ├── test_cases/             # Test input/reference data
 └── conftest.py            # Pytest configuration
@@ -114,23 +136,33 @@ tests/
 ### Model Directory Structure
 **ONNX Models (`ONNX_DIR/`):**
 ```
-ModelName-Precision-LmHeadPrecision-MaxSeqLen/
-├── llm/                    # LLM ONNX files
+{ModelName}/
+├── llm-{precision}-{lm_head_precision}-{max_seq_len}/
 │   ├── model.onnx
 │   ├── config.json
 │   ├── tokenizer.json
-│   └── lora_model.onnx    # (if LoRA enabled)
-└── visual-{precision}/     # VLM visual models
-    ├── model.onnx
-    └── config.json
+│   └── lora_model.onnx         # (if LoRA enabled)
+├── draft-{precision}-{lm_head_precision}-{max_seq_len}/  # EAGLE draft model
+│   ├── model.onnx
+│   ├── config.json
+│   └── tokenizer.json
+├── visual-{precision}/          # VLM visual models
+│   ├── model.onnx
+│   └── config.json
+├── lora_weights/                # Processed LoRA weights (if LoRA enabled)
+│   └── lora_0.safetensors
+├── quantized/                   # Quantized base model checkpoints
+│   └── quantized-{precision}-{lm_head_precision}-{max_seq_len}/
+└── quantized-draft/             # Quantized draft model checkpoints
+    └── quantized-{precision}-{lm_head_precision}-{max_seq_len}/
 ```
 
 **Engine Output (`ENGINE_DIR/`):**
 ```
-ModelName-Precision-LmHeadPrecision-MaxSeqLen/
-├── llm-mxil{N}-mxbs{N}-mxlr{N}/
+{ModelName}/
+├── llm-{precision}-{lm_head_precision}-{max_seq_len}-mxil{N}-mxbs{N}-mxlr{N}/
 │   └── llm.engine
-└── visual-{precision}/
+└── visual-{visual_precision}-mnit{N}-mxit{N}/  # VLM only
     └── visual.engine
 ```
 
@@ -196,7 +228,7 @@ tests:
 ### 2. Ensure Model Files
 Place model files in correct `ONNX_DIR` structure:
 ```
-ONNX_DIR/MyModel-fp16-fp16-4096/llm/model.onnx
+ONNX_DIR/MyModel/llm-fp16-fp16-4096/model.onnx
 ```
 
 ### 3. Test Locally
