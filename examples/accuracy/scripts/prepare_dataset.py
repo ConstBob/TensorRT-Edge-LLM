@@ -143,10 +143,10 @@ def main():
     parser.add_argument(
         "--num_shot",
         type=int,
-        default=0,
+        default=5,
         required=False,
         help=
-        "Number of examples to include for few-shot learning (0 = zero-shot). Currently only supported for MMLU dataset."
+        "Number of examples to include for few-shot learning (0 = zero-shot). Currently only supported for MMLU dataset. Default is 5."
     )
 
     parser.add_argument(
@@ -270,11 +270,10 @@ def main():
                                    top_k=args.top_k,
                                    max_generate_length=max_generate_length,
                                    default_system_prompt=default_system_prompt)
-            convert_mmlu_pro_dataset(
-                config=config,
-                dataset_name_or_dir=dataset_path,
-                output_dir=args.output_dir,
-                num_shot=args.num_shot)  # Zero-shot as requested
+            convert_mmlu_pro_dataset(config=config,
+                                     dataset_name_or_dir=dataset_path,
+                                     output_dir=args.output_dir,
+                                     num_shot=args.num_shot)
 
         elif args.dataset == "MMMU":
             # Create config for MMMU
