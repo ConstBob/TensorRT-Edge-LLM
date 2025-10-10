@@ -24,7 +24,7 @@ Usage:
     python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output
     
     # Quantize with different quantization for LM head
-    python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization int4_awq
+    python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization fp8
 """
 
 import argparse
@@ -55,7 +55,7 @@ def main() -> None:
     parser.add_argument("--quantization",
                         type=str,
                         required=False,
-                        choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
+                        choices=["fp8", "int4_awq", "nvfp4"],
                         default=None,
                         help="Quantization method to use")
     parser.add_argument("--dtype",
@@ -69,12 +69,15 @@ def main() -> None:
                         required=False,
                         default="cnn_dailymail",
                         help="Dataset name or path for calibration data")
-    parser.add_argument("--lm_head_quantization",
-                        type=str,
-                        required=False,
-                        choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
-                        default=None,
-                        help="Quantization method for language model head")
+    parser.add_argument(
+        "--lm_head_quantization",
+        type=str,
+        required=False,
+        choices=["fp8"],
+        default=None,
+        help=
+        "Quantization method for language model head (only fp8 is currently supported)"
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -85,10 +88,6 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if args.quantization == "mxfp8" or args.lm_head_quantization == "mxfp8":
-            print(
-                "Warning: MXFP8 quantization is not currently supported for TensorRT Edge-LLM. This will be supported in the future."
-            )
         quantize_and_save_llm(model_dir=args.model_dir,
                               output_dir=args.output_dir,
                               quantization=args.quantization,
