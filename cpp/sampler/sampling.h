@@ -17,7 +17,8 @@
 
 #pragma once
 
-#include <common/logger.h>
+#include "common/logger.h"
+#include "common/tensor.h"
 #include <cstdint>
 #include <stdexcept>
 
@@ -75,29 +76,48 @@ struct SamplingParams
 // Forward declaration for internal workspace structure
 struct SamplingWorkspace;
 
-// ========================================================================
-// MAIN SAMPLING FUNCTIONS
-// ========================================================================
+// Main sampling function for top-K and top-P sampling from logits.
+// Inputs:
+//     logits [GPU, Float]: Input logits tensor with shape [batch-size, vocab-size].
+//     params: Sampling parameters including batch size, vocab size, temperature, top-K, and top-P values.
+//     workspace [GPU, Int8]: Workspace buffer for intermediate computations.
+//     stream: The CUDA stream to execute the kernel.
+//     philoxSeed: Random seed for sampling (default: 42).
+//     philoxOffset: Random offset for sampling (default: 0).
+// Outputs:
+//     selectedIndices [GPU, Int32]: Selected token indices with shape [batch-size].
+void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIndices, SamplingParams const& params,
+    rt::Tensor& workspace, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
 
-// Main sampling function with workspace (FP32 only)
-void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, SamplingParams const& params,
-    void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
+// Select all top-K elements from input tensor.
+// Returns topK indices and raw values from input (no transformations applied).
+// Inputs:
+//     input [GPU, Float]: Input tensor with shape [batch-size, vocab-size].
+//     topK: Number of top elements to select.
+//     workspace [GPU, Int8]: Workspace buffer for intermediate computations.
+//     stream: The CUDA stream to execute the kernel.
+// Outputs:
+//     topKValues [GPU, Float]: Optional top-K values with shape [batch-size, top-K]. Can be std::nullopt if values not
+//     needed. topKIndices [GPU, Int32]: Top-K indices with shape [batch-size, top-K].
+void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues, rt::Tensor& topKIndices, int32_t topK,
+    rt::Tensor& workspace, cudaStream_t stream);
 
-// Select all top-K elements with workspace (FP32 only)
-// Returns topK indices and raw values from input (no transformations applied)
-// Boolean parameters are kept for API compatibility but are ignored
-void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* topKIndices, int32_t batchSize,
-    int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream,
-    bool returnLogProbs = false, bool normalizeLogProbs = false, bool inputHasProbs = false);
-
-// ========================================================================
-// WORKSPACE SIZE CALCULATION
-// ========================================================================
-
-// Get workspace size for sampling (FP32 only)
+// Get workspace size for sampling (FP32 only).
+// Inputs:
+//     batchSize: Batch size for sampling.
+//     vocabSize: Vocabulary size.
+//     params: Sampling parameters.
+// Returns:
+//     Required workspace size in bytes.
 size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, SamplingParams const& params);
 
-// Get workspace size for selectAllTopK (FP32 only)
+// Get workspace size for selectAllTopK (FP32 only).
+// Inputs:
+//     batchSize: Batch size for selection.
+//     vocabSize: Vocabulary size.
+//     topK: Number of top elements to select.
+// Returns:
+//     Required workspace size in bytes.
 size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK);
 
 } // namespace drivellm
