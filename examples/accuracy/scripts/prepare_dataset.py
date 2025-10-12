@@ -71,7 +71,7 @@ DEFAULT_MAX_GENERATE_LENGTHS = {
     "MATH500": 512,
     "MMLU": 1,
     "MMLU_Pro": 1,
-    "MMMU": 5,
+    "MMMU": 20,
     "MMMU_Pro": 1,
     "MMStar": 512,
     "MTBench": 512
