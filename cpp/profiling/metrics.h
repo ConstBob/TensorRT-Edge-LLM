@@ -22,6 +22,12 @@
 
 namespace drivellm
 {
+
+//! Global profiling control flag accessors (defined in timer.cpp)
+//! When false, no profiling data (metrics or timing) will be recorded
+bool getProfilingEnabled();
+void setProfilingEnabled(bool enabled);
+
 namespace metrics
 {
 
@@ -61,6 +67,10 @@ public:
 
     void recordRun(int64_t reused, int64_t computed)
     {
+        if (!getProfilingEnabled())
+        {
+            return;
+        }
         totalRuns++;
         reusedTokens += reused;
         computedTokens += computed;
@@ -75,6 +85,10 @@ public:
 
     void recordRun(int64_t generated)
     {
+        if (!getProfilingEnabled())
+        {
+            return;
+        }
         totalRuns++;
         generatedTokens += generated;
     }
@@ -89,6 +103,10 @@ public:
 
     void recordRun(int64_t imageCount, int64_t imageTokens)
     {
+        if (!getProfilingEnabled())
+        {
+            return;
+        }
         totalRuns++;
         totalImages += imageCount;
         totalImageTokens += imageTokens;
@@ -104,6 +122,10 @@ public:
 
     void recordRun(int64_t iterations, int64_t generatedTokens)
     {
+        if (!getProfilingEnabled())
+        {
+            return;
+        }
         totalRuns++;
         totalIterations += iterations;
         totalGeneratedTokens += generatedTokens;
