@@ -30,6 +30,13 @@
 
 namespace drivellm
 {
+
+//! Global profiling control flag
+//! When false, no profiling data (metrics or timing) will be recorded
+//! This is useful to exclude warmup runs from benchmark statistics
+bool getProfilingEnabled();
+void setProfilingEnabled(bool enabled);
+
 namespace timer
 {
 
@@ -205,15 +212,11 @@ public:
     Timer() = default;
     ~Timer() = default;
 
-    //! Start/stop timing
-    void startTiming();
-    void stopTiming();
-
     //! Reset all timing data
     void reset();
 
     //! Start timing stage with automatic cleanup
-    TimerSession startStage(std::string const& stageId, cudaStream_t stream = 0);
+    TimerSession startStage(std::string const& stageId, cudaStream_t stream);
 
     //! Get timing data for a stage (triggers deferred calculation if needed)
     std::optional<StageTimingData> getTimingData(std::string const& stageId) const;
@@ -222,7 +225,6 @@ public:
     std::unordered_map<std::string, StageTimingData> const& getAllTimingData() const;
 
 private:
-    bool mTimingActive{false};
     mutable std::unordered_map<std::string, StageTimingData> mTimingData;
 
     // Simple timer management - one timer per stage
