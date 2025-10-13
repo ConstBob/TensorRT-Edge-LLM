@@ -229,6 +229,8 @@ def get_llm_quant_config(
 
         if lm_head_quantization == "fp8":
             quant_cfg["quant_cfg"].update(FP8_LM_HEAD_CONFIG["quant_cfg"])
+        elif lm_head_quantization == "nvfp4":
+            quant_cfg["quant_cfg"].update(NVFP4_LM_HEAD_CONFIG["quant_cfg"])
 
     # Disable visual model
     quant_cfg["quant_cfg"].update(DISABLE_VISUAL_CONFIG["quant_cfg"])
@@ -260,7 +262,7 @@ def quantize_llm(
         AssertionError: If quantization method is not supported
     """
     assert quantization in ["fp8", "int4_awq", "nvfp4"]
-    assert lm_head_quantization in [None, "fp8"]
+    assert lm_head_quantization in [None, "fp8", "nvfp4"]
 
     # Get calibration dataloader
     if "int4" in quantization:
@@ -304,7 +306,7 @@ def quantize_draft(
         AssertionError: If quantization method is not supported
     """
     assert quantization in ["fp8", "int4_awq", "nvfp4"]
-    assert lm_head_quantization in [None, "fp8"]
+    assert lm_head_quantization in [None, "fp8", "nvfp4"]
 
     # Get calibration dataloader
     if "int4" in quantization:
@@ -342,7 +344,7 @@ def quantize_and_save_llm(model_dir: str,
         quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4")
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
-        lm_head_quantization: Optional separate quantization for language model head (only "fp8" is currently supported)
+        lm_head_quantization: Optional separate quantization for language model head (only "fp8" and "nvfp4" is currently supported)
         device: Device to use for model loading and quantization ("cuda", "cpu")
         
     Raises:
@@ -407,7 +409,7 @@ def quantize_and_save_draft(
         device: Device to use for model loading and quantization ("cuda", "cpu")
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
-        lm_head_quantization: Optional separate quantization for language model head (only "fp8" is currently supported)
+        lm_head_quantization: Optional separate quantization for language model head (only "fp8" and "nvfp4" is currently supported)
         
     Raises:
         ValueError: If model loading fails or quantization parameters are invalid

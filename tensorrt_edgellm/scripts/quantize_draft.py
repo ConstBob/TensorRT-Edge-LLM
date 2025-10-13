@@ -80,7 +80,7 @@ def main() -> None:
         "--lm_head_quantization",
         type=str,
         required=False,
-        choices=["fp8"],
+        choices=["fp8", "nvfp4"],
         default=None,
         help=
         "Quantization method for language model head (only fp8 is currently supported)"
