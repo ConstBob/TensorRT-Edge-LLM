@@ -16,6 +16,7 @@
  */
 
 #include "qwenViTRunner.h"
+#include "common/bindingNames.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "profiling/timer.h"
@@ -96,13 +97,15 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& configPath)
 
     // Get config from engine shapes
     // TODO: use json config to get the shapes
-    nvinfer1::Dims const inputShapeMax = mVisualEngine->getProfileShape("input", 0, nvinfer1::OptProfileSelector::kMAX);
-    nvinfer1::Dims const inputShapeMin = mVisualEngine->getProfileShape("input", 0, nvinfer1::OptProfileSelector::kMIN);
+    nvinfer1::Dims const inputShapeMax
+        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMAX);
+    nvinfer1::Dims const inputShapeMin
+        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMIN);
     mConfig.maxHW = inputShapeMax.d[0];
     mConfig.minHW = inputShapeMin.d[0];
-    mConfig.inputDim = mContext->getTensorShape("input").d[1];
-    mConfig.vitPosEmbDim = mContext->getTensorShape("rotary_pos_emb").d[1];
-    mConfig.outHiddenSize = mVisualEngine->getTensorShape("output").d[1];
+    mConfig.inputDim = mContext->getTensorShape(binding_names::kVisualInput).d[1];
+    mConfig.vitPosEmbDim = mContext->getTensorShape(binding_names::kRotaryPosEmb).d[1];
+    mConfig.outHiddenSize = mVisualEngine->getTensorShape(binding_names::kVisualOutput).d[1];
 
     return true;
 }
@@ -116,31 +119,32 @@ bool QwenViTRunner::allocateBuffer()
 {
     bool setTensorAddressStatus{true};
     mVitInput = rt::Tensor({mConfig.maxHW, mConfig.inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    setTensorAddressStatus &= mContext->setTensorAddress("input", mVitInput.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
 
     mAttentionMask = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    setTensorAddressStatus &= mContext->setTensorAddress("attention_mask", mAttentionMask.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kAttentionMask, mAttentionMask.rawPointer());
 
     mRotaryPosEmb = rt::Tensor({mConfig.maxHW, mConfig.vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    setTensorAddressStatus &= mContext->setTensorAddress("rotary_pos_emb", mRotaryPosEmb.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kRotaryPosEmb, mRotaryPosEmb.rawPointer());
 
     // In Qwen2-VL, VIT input mHW is always 4*numImageTokens because it equals to spatial_merge_size ** 2.
     mOutputEmbedding
         = rt::Tensor({mConfig.maxHW / 4, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    setTensorAddressStatus &= mContext->setTensorAddress("output", mOutputEmbedding.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
 
     if (mModelType == "qwen2_5_vl")
     {
         mWindowAttentionMask
             = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
         setTensorAddressStatus
-            &= mContext->setTensorAddress("window_attention_mask", mWindowAttentionMask.rawPointer());
+            &= mContext->setTensorAddress(binding_names::kWindowAttentionMask, mWindowAttentionMask.rawPointer());
 
         mWindowIndex = rt::Tensor({mConfig.maxHW / 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-        setTensorAddressStatus &= mContext->setTensorAddress("window_index", mWindowIndex.rawPointer());
+        setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kWindowIndex, mWindowIndex.rawPointer());
 
         mReverseWindowIndex = rt::Tensor({mConfig.maxHW / 4}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-        setTensorAddressStatus &= mContext->setTensorAddress("reverse_window_index", mReverseWindowIndex.rawPointer());
+        setTensorAddressStatus
+            &= mContext->setTensorAddress(binding_names::kReverseWindowIndex, mReverseWindowIndex.rawPointer());
     }
     if (!setTensorAddressStatus)
     {
@@ -638,16 +642,19 @@ bool QwenViTRunner::infer(cudaStream_t stream)
         TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
 
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mContext->setInputShape("input", mVitInput.getShape().getTRTDims());
-        setEngineIOStatus &= mContext->setInputShape("attention_mask", mAttentionMask.getShape().getTRTDims());
-        setEngineIOStatus &= mContext->setInputShape("rotary_pos_emb", mRotaryPosEmb.getShape().getTRTDims());
+        setEngineIOStatus &= mContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mContext->setInputShape(binding_names::kAttentionMask, mAttentionMask.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mContext->setInputShape(binding_names::kRotaryPosEmb, mRotaryPosEmb.getShape().getTRTDims());
         if (mModelType == "qwen2_5_vl")
         {
+            setEngineIOStatus &= mContext->setInputShape(
+                binding_names::kWindowAttentionMask, mWindowAttentionMask.getShape().getTRTDims());
             setEngineIOStatus
-                &= mContext->setInputShape("window_attention_mask", mWindowAttentionMask.getShape().getTRTDims());
-            setEngineIOStatus &= mContext->setInputShape("window_index", mWindowIndex.getShape().getTRTDims());
-            setEngineIOStatus
-                &= mContext->setInputShape("reverse_window_index", mReverseWindowIndex.getShape().getTRTDims());
+                &= mContext->setInputShape(binding_names::kWindowIndex, mWindowIndex.getShape().getTRTDims());
+            setEngineIOStatus &= mContext->setInputShape(
+                binding_names::kReverseWindowIndex, mReverseWindowIndex.getShape().getTRTDims());
         }
 
         if (!setEngineIOStatus)
