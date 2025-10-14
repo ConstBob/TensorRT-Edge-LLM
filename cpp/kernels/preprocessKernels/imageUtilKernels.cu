@@ -243,8 +243,14 @@ __global__ void initMaskToMinKernel(half* attentionMask, int32_t const totalElem
 {
     int32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= totalElements)
+    {
         return;
-    attentionMask[tid] = -CUDART_MAX_NORMAL_FP16;
+    }
+
+    // Mask used to disable attention between "patches". Use -20000.0F to avoid data overflow in
+    // TensorRT which could produce NaN output if we supply -MAX_FLOAT_FP16 mask values.
+    half const disabledMaskValue{-20000.0F};
+    attentionMask[tid] = disabledMaskValue;
 }
 
 __global__ void initAttentionMaskKernel(
@@ -283,7 +289,7 @@ void initAttentionMaskQwenViT(rt::Tensor const& cuSeqlens, rt::Tensor& attention
     int32_t const curHW = attentionMask.getShape()[1];
     int32_t const totalElements = curHW * curHW;
 
-    // Initialize attention mask to -CUDART_MAX_NORMAL_FP16, cannot directly use cudamemset
+    // Initialize attention mask to small value to indicate "disabled" attention.
     uint32_t const initBlockSize = 256;
     uint32_t const initGridSize = (totalElements + initBlockSize - 1) / initBlockSize;
     initMaskToMinKernel<<<initGridSize, initBlockSize, 0, stream>>>(attentionMask.dataPointer<half>(), totalElements);
