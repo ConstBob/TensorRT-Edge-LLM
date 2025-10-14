@@ -250,7 +250,8 @@ void TestInitAttentionMaskQwenViT(int32_t const curHW, int32_t const blockSize =
         cuSeqlens.push_back(currentPos);
     }
 
-    std::vector<half> attentionMaskRef(curHW * curHW, -CUDART_MAX_NORMAL_FP16);
+    half const disabledMaskValue{-20000.0F};
+    std::vector<half> attentionMaskRef(curHW * curHW, disabledMaskValue);
     for (size_t s = 1; s < cuSeqlens.size(); ++s)
     {
         for (int i = cuSeqlens[s - 1]; i < cuSeqlens[s]; ++i)
@@ -307,7 +308,8 @@ void BenchmarkInitAttentionMaskQwenViT(int32_t const curHW, int32_t const blockS
     CUDA_CHECK(cudaMemcpyAsync(cuSeqlensDevice.rawPointer(), cuSeqlens.data(), cuSeqlensSize * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
 
-    std::vector<half> attentionMask(curHW * curHW, -CUDART_MAX_NORMAL_FP16);
+    half const disabledMaskValue{-20000.0F};
+    std::vector<half> attentionMask(curHW * curHW, disabledMaskValue);
     rt::Tensor attentionMaskDevice({1, curHW, curHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     auto launchGPU = [&]() { kernel::initAttentionMaskQwenViT(cuSeqlensDevice, attentionMaskDevice, stream); };
