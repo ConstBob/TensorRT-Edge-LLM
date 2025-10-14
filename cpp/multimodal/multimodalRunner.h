@@ -108,18 +108,6 @@ public:
     virtual rt::Tensor& getOutputEmbedding();
 
     /*!
-     * @brief Initialize random inputs for benchmarking
-     * @param inputIds Output input token IDs
-     * @param batchSize Batch size
-     * @param imageTokenLength Number of image tokens
-     * @param inputLength Total input length
-     * @param stream CUDA stream
-     */
-    virtual void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
-        int const inputLength, cudaStream_t stream)
-        = 0;
-
-    /*!
      * @brief Validate and fill configuration from file
      * @param configPath Path to configuration file
      * @return True on success, false on failure
@@ -128,7 +116,7 @@ public:
 
     //! @brief Allocate device buffers
     //! @return True on success, false on failure
-    virtual bool allocateBuffer() = 0;
+    virtual bool allocateBuffer(cudaStream_t stream) = 0;
 
     //! @brief Get configuration pointer
     //! @return Pointer to configuration structure
