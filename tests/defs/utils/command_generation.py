@@ -206,6 +206,10 @@ def generate_inference_commands(
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
 
+    # Add batch size override if specified
+    if config.batch_size is not None:
+        cmd.append(f"--batchSize={config.batch_size}")
+
     commands.append((cmd, 900))
     return commands
 

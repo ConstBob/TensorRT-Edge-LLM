@@ -17,25 +17,34 @@
 
 #pragma once
 
-#include <common/logger.h>
+#include "common/logger.h"
+#include "common/tensor.h"
 #include <cstdint>
 #include <stdexcept>
 
 namespace drivellm
 {
 
-// Structure to hold sampling parameters
+/*! \brief Structure to hold sampling parameters
+ */
 struct SamplingParams
 {
-    int32_t batchSize;
-    int32_t vocabSize;
-    float temperature;
-    int32_t topK;
-    float topP;
-    bool useTopK;
-    bool useTopP;
+    int32_t batchSize; //!< Number of samples in the batch
+    int32_t vocabSize; //!< Size of the vocabulary
+    float temperature; //!< Temperature parameter for sampling (higher = more random)
+    int32_t topK;      //!< Top-K sampling parameter (0 = disabled)
+    float topP;        //!< Top-P (nucleus) sampling parameter (1.0 = disabled)
+    bool useTopK;      //!< Flag indicating if top-K sampling is enabled
+    bool useTopP;      //!< Flag indicating if top-P sampling is enabled
 
-    // Constructor with default values
+    /*! \brief Constructor with default values
+     *  \param batchSize_ Number of samples in the batch
+     *  \param vocabSize_ Size of the vocabulary
+     *  \param temperature_ Temperature parameter (default: 1.0f)
+     *  \param topK_ Top-K parameter (default: 0, disabled)
+     *  \param topP_ Top-P parameter (default: 1.0f, disabled)
+     *  \throws std::invalid_argument if neither topK nor topP is set, or if temperature is invalid
+     */
     SamplingParams(
         int32_t batchSize_, int32_t vocabSize_, float temperature_ = 1.0f, int32_t topK_ = 0, float topP_ = 1.0f)
         : batchSize(batchSize_)
@@ -72,32 +81,72 @@ struct SamplingParams
     }
 };
 
-// Forward declaration for internal workspace structure
+/*! \brief Forward declaration for internal workspace structure
+ */
 struct SamplingWorkspace;
 
-// ========================================================================
-// MAIN SAMPLING FUNCTIONS
-// ========================================================================
+/*!
+ * \brief Main sampling function for top-K and top-P sampling from logits.
+ *
+ * Performs token sampling using top-K and/or top-P (nucleus) sampling strategies
+ * on the input logits. The function applies temperature scaling and returns the
+ * selected token indices for each batch element.
+ *
+ * \param[in] logits Input logits tensor [GPU, Float] with shape [batch-size, vocab-size]
+ * \param[out] selectedIndices Selected token indices [GPU, Int32] with shape [batch-size]
+ * \param[in] params Sampling parameters including batch size, vocab size, temperature, top-K, and top-P values
+ * \param[in,out] workspace Workspace buffer [GPU, Int8] for intermediate computations
+ * \param[in] stream CUDA stream to execute the kernel
+ * \param[in] philoxSeed Random seed for sampling (default: 42)
+ * \param[in] philoxOffset Random offset for sampling (default: 0)
+ */
+void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIndices, SamplingParams const& params,
+    rt::Tensor& workspace, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
 
-// Main sampling function with workspace (FP32 only)
-void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, SamplingParams const& params,
-    void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
+/*!
+ * \brief Select all top-K elements from input tensor.
+ *
+ * Returns topK indices and raw values from input with no transformations applied.
+ * This function identifies the K largest elements in each batch and returns their
+ * indices and optionally their values.
+ *
+ * \param[in] input Input tensor [GPU, Float] with shape [batch-size, vocab-size]
+ * \param[out] topKValues Optional top-K values [GPU, Float] with shape [batch-size, top-K]. Can be std::nullopt if
+ * values not needed
+ * \param[out] topKIndices Top-K indices [GPU, Int32] with shape [batch-size, top-K]
+ * \param[in] topK Number of top elements to select
+ * \param[in,out] workspace Workspace buffer [GPU, Int8] for intermediate computations
+ * \param[in] stream CUDA stream to execute the kernel
+ */
+void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues, rt::Tensor& topKIndices, int32_t topK,
+    rt::Tensor& workspace, cudaStream_t stream);
 
-// Select all top-K elements with workspace (FP32 only)
-// Returns topK indices and raw values from input (no transformations applied)
-// Boolean parameters are kept for API compatibility but are ignored
-void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* topKIndices, int32_t batchSize,
-    int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream,
-    bool returnLogProbs = false, bool normalizeLogProbs = false, bool inputHasProbs = false);
-
-// ========================================================================
-// WORKSPACE SIZE CALCULATION
-// ========================================================================
-
-// Get workspace size for sampling (FP32 only)
+/*!
+ * \brief Get workspace size required for top-K/top-P sampling (FP32 only).
+ *
+ * Calculates the amount of GPU memory needed for intermediate computations
+ * during the sampling operation. The workspace must be allocated before
+ * calling topKtopPSamplingFromLogits().
+ *
+ * \param[in] batchSize Batch size for sampling
+ * \param[in] vocabSize Vocabulary size
+ * \param[in] params Sampling parameters
+ * \return Required workspace size in bytes
+ */
 size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, SamplingParams const& params);
 
-// Get workspace size for selectAllTopK (FP32 only)
+/*!
+ * \brief Get workspace size required for selectAllTopK operation (FP32 only).
+ *
+ * Calculates the amount of GPU memory needed for intermediate computations
+ * during the top-K selection operation. The workspace must be allocated before
+ * calling selectAllTopK().
+ *
+ * \param[in] batchSize Batch size for selection
+ * \param[in] vocabSize Vocabulary size
+ * \param[in] topK Number of top elements to select
+ * \return Required workspace size in bytes
+ */
 size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK);
 
 } // namespace drivellm

@@ -24,44 +24,48 @@ namespace drivellm
 namespace kernel
 {
 
-//! Increment the lengthTensor by increment for each entry.
-//! Inputs:
-//! - lengthTensor: The tensor to be incremented.
-//! - increment: The increment value.
-//! - stream: The CUDA stream to be used.
-//! @note LengthTensor shall reside on GPU and have data type of int32_t.
+//! \brief Increment the lengthTensor by increment for each entry
+//!
+//! \param[in,out] lengthTensor The tensor to be incremented
+//! \param[in] increment The increment value
+//! \param[in] stream The CUDA stream to be used
+//! \note LengthTensor shall reside on GPU and have data type of int32_t.
 void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStream_t stream);
 
-//! Increment the lengthTensor by the newLengthTensor for each entry.
-//! Inputs:
-//! - lengthTensor: The tensor to be incremented.
-//! - newIncrementTensor: The tensor to be used as increment value.
-//! - stream: The CUDA stream to be used.
-//! @note LengthTensor and newIncrementTensor shall reside on GPU, have equal length, and have data type of int32_t.
+//! \brief Increment the lengthTensor by the newIncrementTensor for each entry
+//!
+//! \param[in,out] lengthTensor The tensor to be incremented
+//! \param[in] newIncrementTensor The tensor to be used as increment value
+//! \param[in] stream The CUDA stream to be used
+//! \note LengthTensor and newIncrementTensor shall reside on GPU, have equal length, and have data type of int32_t.
 void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrementTensor, cudaStream_t stream);
 
-//! Helper function to instantiate the KVCache from a pre-computed KVCache tensor. Used to support KVCache reuse across
-//! multiple inference requests to speedup prefill step.
-//! Inputs:
-//! - KVCacheBuffer: The KVCache buffer to be instantiated layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads,
-//! maxSequenceLength, headDim].
-//! - srcKVCacheTensor: The pre-computed KVCache tensor. layout: [numDecoderLayers, 2, numKVHeads, sequenceLength,
-//! headDim].
-//! - batchIdx: The batch index of the KVCache to be instantiated.
-//! - stream: The CUDA stream to be used.
+//! \brief Instantiate the KVCache from a pre-computed KVCache tensor
+//!
+//! Helper function to instantiate the KVCache from a pre-computed KVCache tensor.
+//! Used to support KVCache reuse across multiple inference requests to speedup prefill step.
+//!
+//! \param[in,out] dstKVCacheBuffer The KVCache buffer to be instantiated.
+//!                                  Layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+//! \param[in] srcKVCacheTensor The pre-computed KVCache tensor.
+//!                              Layout: [numDecoderLayers, 2, numKVHeads, sequenceLength, headDim]
+//! \param[in] batchIdx The batch index of the KVCache to be instantiated
+//! \param[in] stream The CUDA stream to be used
 void instantiateKVCacheFromTensor(
     rt::Tensor& dstKVCacheBuffer, rt::Tensor const& srcKVCacheTensor, int32_t batchIdx, cudaStream_t stream);
 
-//! Helper function to save the KVCache into a tensor. Used to support KVCache reuse across multiple inference requests
-//! to speedup prefill step. SequenceLength of dstKVCacheTensor must be saved from the srcKVCacheBuffer.
-//! Inputs:
-//! - dstKVCacheTensor: The KVCache tensor to be saved. layout: [numDecoderLayers, 2, numKVHeads, sequenceLength,
-//! headDim].
-//! - srcKVCacheBuffer: The KVCache buffer to be saved. layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads,
-//! maxSequenceLength, headDim].
-//! headDim].
-//! - batchIdx: The batch index of the KVCache to be saved.
-//! - stream: The CUDA stream to be used.
+//! \brief Save the KVCache into a tensor
+//!
+//! Helper function to save the KVCache into a tensor. Used to support KVCache reuse across multiple
+//! inference requests to speedup prefill step. SequenceLength of dstKVCacheTensor must be saved from
+//! the srcKVCacheBuffer.
+//!
+//! \param[out] dstKVCacheTensor The KVCache tensor to be saved.
+//!                               Layout: [numDecoderLayers, 2, numKVHeads, sequenceLength, headDim]
+//! \param[in] srcKVCacheBuffer The KVCache buffer to be saved.
+//!                              Layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+//! \param[in] batchIdx The batch index of the KVCache to be saved
+//! \param[in] stream The CUDA stream to be used
 void saveKVCacheIntoTensor(
     rt::Tensor& dstKVCacheTensor, rt::Tensor const& srcKVCacheBuffer, int32_t batchIdx, cudaStream_t stream);
 
