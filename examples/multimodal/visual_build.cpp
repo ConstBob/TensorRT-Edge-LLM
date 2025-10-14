@@ -35,13 +35,14 @@ struct ViTBuildArgs
     bool debug{false};
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
+    int64_t maxImageTokensPerImage{512};
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] <--onnxDir str> <--engineDir str> [--debug]"
-                 "[--minImageTokens int] [--maxImageTokens int]"
+                 "[--minImageTokens int] [--maxImageTokens int] [--maxImageTokensPerImage int]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help               Display this help message" << std::endl;
@@ -54,13 +55,15 @@ void printUsage(char const* programName)
     std::cerr << "  --debug              Use debug mode, which outputs tensors." << std::endl;
     std::cerr << "  --minImageTokens     Minimum image tokens. Default = 4" << std::endl;
     std::cerr << "  --maxImageTokens     Maximum image tokens. Default = 1024" << std::endl;
+    std::cerr << "  --maxImageTokensPerImage     Maximum image tokens per image. Default = 512" << std::endl;
 }
 
 bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
 {
     static struct option vitOptions[] = {{"help", no_argument, 0, 601}, {"onnxDir", required_argument, 0, 602},
         {"engineDir", required_argument, 0, 603}, {"debug", no_argument, 0, 604},
-        {"minImageTokens", required_argument, 0, 605}, {"maxImageTokens", required_argument, 0, 606}, {0, 0, 0, 0}};
+        {"minImageTokens", required_argument, 0, 605}, {"maxImageTokens", required_argument, 0, 606},
+        {"maxImageTokensPerImage", required_argument, 0, 607}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", vitOptions, nullptr)) != -1)
@@ -101,6 +104,12 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
             if (optarg)
             {
                 args.maxImageTokens = std::stoi(optarg);
+            }
+            break;
+        case 607:
+            if (optarg)
+            {
+                args.maxImageTokensPerImage = std::stoi(optarg);
             }
             break;
         default: LOG_ERROR("ERROR: Invalid Argument %c is %s", opt, optarg); return false;
@@ -144,9 +153,19 @@ int main(int argc, char** argv)
     configFile.close();
 
     // Create VisualBuilderConfig from args
+    if (args.maxImageTokensPerImage < args.minImageTokens || args.maxImageTokensPerImage > args.maxImageTokens)
+    {
+        LOG_ERROR(
+            "maxImageTokensPerImage must be greater than or equal to minImageTokens and less than or equal to "
+            "maxImageTokens."
+            "minImageTokens: %d, maxImageTokens: %d, maxImageTokensPerImage: %d",
+            args.minImageTokens, args.maxImageTokens, args.maxImageTokensPerImage);
+        return EXIT_FAILURE;
+    }
     builder::VisualBuilderConfig config;
     config.minImageTokens = args.minImageTokens;
     config.maxImageTokens = args.maxImageTokens;
+    config.maxImageTokensPerImage = args.maxImageTokensPerImage;
 
     // Create and run the builder
     builder::VisualBuilder visualBuilder(args.onnxDir, args.engineDir, config);

@@ -182,7 +182,8 @@ def generate_build_commands(
             f"--onnxDir={config.get_visual_onnx_dir(config.visual_precision)}",
             f"--engineDir={config.get_visual_engine_dir()}",
             f"--minImageTokens={config.min_image_tokens}",
-            f"--maxImageTokens={config.max_image_tokens}"
+            f"--maxImageTokens={config.max_image_tokens}",
+            f"--maxImageTokensPerImage={config.max_image_tokens_per_image}"
         ])
 
         commands.append((visual_cmd, 900))

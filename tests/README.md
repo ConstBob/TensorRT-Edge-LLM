@@ -78,7 +78,7 @@ ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additi
 ### Task-Specific Parameters
 **Build/Inference:**
 - `mxlr64` - Max LoRA rank (optional)
-- `mnit128`, `mxit1024` - Min/max image tokens (VLM only)
+- `mnit128`, `mxit1024`, `mxpiit512` - Min/max image tokens (VLM only)
 - `vitfp8` - Visual precision (VLM only)
 
 **Benchmark:**
@@ -100,7 +100,7 @@ ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additi
 Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs1-mxil2048
 
 # VLM with INT4 AWQ and LoRA
-Qwen2.5-VL-3B-Instruct-int4_awq-mxsl4096-mxbs1-mxil2048-mnit128-mxit2048-mxlr32
+Qwen2.5-VL-3B-Instruct-int4_awq-mxsl4096-mxbs1-mxil2048-mnit128-mxit2048-mxpiit512-mxlr32
 
 # Benchmark test with FP8
 Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048-bs1-isl2048-osl128
@@ -162,7 +162,7 @@ tests/
 {ModelName}/
 ├── llm-{precision}-{lm_head_precision}-{max_seq_len}-mxil{N}-mxbs{N}-mxlr{N}/
 │   └── llm.engine
-└── visual-{visual_precision}-mnit{N}-mxit{N}/  # VLM only
+└── visual-{visual_precision}-mnit{N}-mxit{N}-mxpiit{N}/  # VLM only
     └── visual.engine
 ```
 

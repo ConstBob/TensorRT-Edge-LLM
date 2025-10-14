@@ -13,11 +13,11 @@ tests:
   # MMLU accuracy tests for LLM
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mmlu_0-bs4]
   # VLM tests with NVFP4 + FP8 lm_head
-  - tests/defs/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288]
-  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-vlm_basic]
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792]
+  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-vlm_basic]
   # VLM tests with NVFP4 + FP8 lm_head + FP8 ViT
-  - tests/defs/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-vitfp8]
-  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-vitfp8-vlm_basic]
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-vitfp8]
+  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-vitfp8-vlm_basic]
   # MMMU accuracy tests for VLM
-  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mmmu-bs2]
-  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mmmu-bs2-vitfp8]
+  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-mmmu-bs2]
+  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-nvfp4-lmfp8-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-mmmu-bs2-vitfp8]

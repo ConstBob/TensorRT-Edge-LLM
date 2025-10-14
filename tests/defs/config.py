@@ -92,6 +92,7 @@ class TestConfig:
     # VLM specific build parameters
     min_image_tokens: Optional[int] = None
     max_image_tokens: Optional[int] = None
+    max_image_tokens_per_image: Optional[int] = None
 
     # Inference parameters
     test_case: Optional[str] = None
@@ -147,6 +148,9 @@ class TestConfig:
                       {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
                       {ModelType.VLM}),
         ParameterSpec("max_image_tokens", "mxit",
+                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {ModelType.VLM}),
+        ParameterSpec("max_image_tokens_per_image", "mxpiit",
                       {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
                       {ModelType.VLM}),
         ParameterSpec("visual_precision",
@@ -262,6 +266,8 @@ class TestConfig:
                 parsed_params['min_image_tokens'] = int(part[4:])
             elif part.startswith('mxit'):
                 parsed_params['max_image_tokens'] = int(part[4:])
+            elif part.startswith('mxpiit'):
+                parsed_params['max_image_tokens_per_image'] = int(part[6:])
             elif part.startswith('mxlr'):
                 parsed_params['max_lora_rank'] = int(part[4:])
             # For benchmark parameters
@@ -513,7 +519,7 @@ class TestConfig:
         """Get visual engine directory"""
         return os.path.join(
             self.get_engine_base_dir(),
-            f"visual-{self.visual_precision}-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}"
+            f"visual-{self.visual_precision}-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}-mxpiit{self.max_image_tokens_per_image}"
         )
 
     def get_test_case_file(self) -> str:

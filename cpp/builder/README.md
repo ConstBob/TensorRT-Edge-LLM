@@ -34,6 +34,7 @@ struct LLMBuilderConfig {
 struct VisualBuilderConfig {
     int64_t minImageTokens{4};      //!< Minimum number of image tokens
     int64_t maxImageTokens{1024};   //!< Maximum number of image tokens
+    int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image, used for preprocessing
 };
 ```
 
