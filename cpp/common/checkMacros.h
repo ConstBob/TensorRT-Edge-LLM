@@ -30,6 +30,13 @@ namespace drivellm
 namespace check
 {
 
+/*!
+ * @brief Check condition and throw exception if false
+ *
+ * @param condition Condition to check
+ * @param errorMsg Error message to include in exception
+ * @throw std::runtime_error if condition is false
+ */
 inline void check(bool condition, std::string errorMsg)
 {
     if (!condition)
@@ -38,6 +45,15 @@ inline void check(bool condition, std::string errorMsg)
     }
 }
 
+/*!
+ * @brief Internal helper to check CUDA runtime errors
+ *
+ * @param result CUDA error code
+ * @param func Function name string
+ * @param file Source file name
+ * @param line Source line number
+ * @throw std::runtime_error if CUDA error occurred
+ */
 inline void _checkCuda(cudaError_t result, char const* const func, [[maybe_unused]] char const* const file,
     [[maybe_unused]] int const line)
 {
@@ -47,6 +63,15 @@ inline void _checkCuda(cudaError_t result, char const* const func, [[maybe_unuse
     }
 }
 
+/*!
+ * @brief Internal helper to check CUDA driver API errors
+ *
+ * @param result CUDA driver error code
+ * @param func Function name string
+ * @param file Source file name
+ * @param line Source line number
+ * @throw std::runtime_error if CUDA driver error occurred
+ */
 inline void _checkCudaDriver(
     CUresult result, char const* const func, [[maybe_unused]] char const* const file, [[maybe_unused]] int const line)
 {
@@ -63,8 +88,11 @@ inline void _checkCudaDriver(
 
 } // namespace check
 
-/*
- * Macros compliant with TensorRT coding conventions
+/*!
+ * @brief Check CUDA runtime API calls
+ *
+ * Wraps CUDA runtime API calls and throws exception on error.
+ * Usage: CUDA_CHECK(cudaMalloc(&ptr, size));
  */
 #define CUDA_CHECK(stat)                                                                                               \
     do                                                                                                                 \
@@ -72,6 +100,12 @@ inline void _checkCudaDriver(
         drivellm::check::_checkCuda((stat), #stat, __FILE__, __LINE__);                                                \
     } while (0)
 
+/*!
+ * @brief Check CUDA driver API calls
+ *
+ * Wraps CUDA driver API calls and throws exception on error.
+ * Usage: CUDA_DRIVER_CHECK(cuMemAlloc(&dptr, size));
+ */
 #define CUDA_DRIVER_CHECK(stat)                                                                                        \
     do                                                                                                                 \
     {                                                                                                                  \

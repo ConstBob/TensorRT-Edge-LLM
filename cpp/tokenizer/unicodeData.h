@@ -51,19 +51,34 @@ namespace drivellm
 namespace tokenizer
 {
 
+/*!
+ * @brief NFD (Normalization Form Decomposition) range structure
+ *
+ * Represents a range of codepoints and their NFD mappings.
+ */
 struct rangeNfd
 {
-    uint32_t first;
-    uint32_t last;
-    uint32_t nfd;
+    uint32_t first; //!< First codepoint in range
+    uint32_t last;  //!< Last codepoint in range
+    uint32_t nfd;   //!< NFD mapping value
 };
 
+//! Maximum number of Unicode codepoints
 static uint32_t const MAX_CODEPOINTS = 0x110000;
 
+//! @brief Unicode ranges with flags for codepoint properties
 extern std::vector<std::pair<uint32_t, uint16_t>> const unicodeRangesFlags;
+
+//! @brief Set of whitespace codepoints
 extern std::unordered_set<uint32_t> const unicodeSetWhitespace;
+
+//! @brief Mapping from codepoints to their lowercase equivalents
 extern std::unordered_map<uint32_t, uint32_t> const unicodeMapLowercase;
+
+//! @brief Mapping from codepoints to their uppercase equivalents
 extern std::unordered_map<uint32_t, uint32_t> const unicodeMapUppercase;
+
+//! @brief NFD normalization ranges
 extern std::vector<rangeNfd> const unicodeRangesNfd;
 
 } // namespace tokenizer

@@ -30,66 +30,74 @@ namespace drivellm
 namespace rt
 {
 
-// LLM Generation Request/Response types
+/*! \brief LLM Generation Request structure
+ */
 struct LLMGenerationRequest
 {
+    /*! \brief Prompt structure containing system prompt, user prompt, and optional images
+     */
     struct Prompt
     {
-        std::string systemPrompt;
-        std::string userPrompt;
-        std::vector<rt::imageUtils::ImageData> imageBuffers;
+        std::string systemPrompt;                            //!< System prompt text
+        std::string userPrompt;                              //!< User prompt text
+        std::vector<rt::imageUtils::ImageData> imageBuffers; //!< Optional image data for multimodal inputs
     };
-    std::vector<Prompt> prompts;
-    float temperature;
-    float topP;
-    int64_t topK;
-    int64_t maxGenerateLength;        // Max length of the generated tokens.
-    std::string loraWeightsName = ""; // Name of the LoRA weights. Default to empty string for no LoRA weights.
+    std::vector<Prompt> prompts;      //!< Vector of prompts for batched requests
+    float temperature;                //!< Temperature parameter for sampling
+    float topP;                       //!< Top-p (nucleus) sampling parameter
+    int64_t topK;                     //!< Top-k sampling parameter
+    int64_t maxGenerateLength;        //!< Max length of the generated tokens
+    std::string loraWeightsName = ""; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
 };
 
+/*! \brief LLM Generation Response structure
+ */
 struct LLMGenerationResponse
 {
-    std::vector<std::vector<int32_t>> outputIds;
-    std::vector<std::string> outputTexts;
+    std::vector<std::vector<int32_t>> outputIds; //!< Generated token IDs for each request in the batch
+    std::vector<std::string> outputTexts;        //!< Generated text strings for each request in the batch
 };
 
+/*! \brief RoPE (Rotary Position Embedding) type enumeration
+ */
 enum class RopeType
 {
-    // Default 1-D RoPE that specified by the original paper.
-    kDefault,
-    // Dynamic RoPE type used by InternVL-3.
-    kDynamic,
-    // Long RoPE type used by Phi-4.
-    kLongRope,
-    // MRope type used by Qwen2-VL
-    kMRope,
+    kDefault,  //!< Default 1-D RoPE that specified by the original paper
+    kDynamic,  //!< Dynamic RoPE type used by InternVL-3
+    kLongRope, //!< Long RoPE type used by Phi-4
+    kMRope,    //!< MRope type used by Qwen2-VL
 };
 
+/*! \brief Common configuration structure for RoPE (Rotary Position Embedding)
+ *
+ *  Instantiate the RopeConfig with common default values.
+ */
 struct RopeCommonConfig
 {
-    RopeType type{};
-    // Instantiate the RopeConfig with common default values.
-    float rotaryScale{1.0F};
-    float rotaryTheta{100000.0F};
-    int32_t maxPositionEmbeddings{32768};
+    RopeType type{};                      //!< Type of RoPE to use
+    float rotaryScale{1.0F};              //!< Scaling factor for rotary embeddings
+    float rotaryTheta{100000.0F};         //!< Base frequency for rotary embeddings
+    int32_t maxPositionEmbeddings{32768}; //!< Maximum position embeddings supported
 };
 
-// Collect basic rope configuration from the model config.
-// Input:
-//     config [JSON]: The model config file supplied with the model.
-// Output:
-//     The parsed rope configuration. Default values are used if certain fields are not
-//     specified in the model config.
+/*! \brief Collect basic rope configuration from the model config
+ *
+ *  The parsed rope configuration. Default values are used if certain fields are not
+ *  specified in the model config.
+ *
+ *  \param config [JSON] The model config file supplied with the model
+ *  \return The parsed rope configuration
+ */
 RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config);
 
-// Initialize the rope cos/sin cache tensor for persistent type of RoPE (default, longrope)
-// Input:
-//     cosSinCache [GPU]: The tensor to store the rope cos/sin cache.
-//     config [RopeCommonConfig]: The basic rope configuration.
-//     modelConfig [JSON]: Model config json that can supply additional information for the rope initialization.
-//     stream [CUDA stream]: The stream to execute the initialization.
-// Returns:
-//     True if the initialization is successful, false otherwise.
+/*! \brief Initialize the rope cos/sin cache tensor for persistent type of RoPE (default, longrope)
+ *
+ *  \param cosSinCache [GPU] The tensor to store the rope cos/sin cache
+ *  \param config [RopeCommonConfig] The basic rope configuration
+ *  \param modelConfig [JSON] Model config json that can supply additional information for the rope initialization
+ *  \param stream [CUDA stream] The stream to execute the initialization
+ *  \return True if the initialization is successful, false otherwise
+ */
 bool initializeRopeCosSinCache(
     rt::Tensor& cosSinCache, RopeCommonConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream);
 

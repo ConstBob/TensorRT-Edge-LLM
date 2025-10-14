@@ -70,7 +70,6 @@ size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens);
  * @param acceptedTokenIds Output accepted token IDs with shape [batch_size, max_depth] (INT32, GPU)
  * @param acceptedLogitsIndices Output corresponding logits indices with shape [batch_size, max_depth] (INT32, GPU)
  * @param acceptLength Output tensor with accept lengths for each batch with shape [batch_size] (INT32, GPU)
- * @param maxDepth Maximum number of tokens to accept
  * @param workspace Workspace buffer for temporary allocations
  * @param workspaceSize Size of workspace buffer in bytes
  * @param stream CUDA stream for execution
