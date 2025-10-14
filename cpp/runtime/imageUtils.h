@@ -29,25 +29,54 @@ namespace rt
 namespace imageUtils
 {
 
-// ImageData is a shared pointer to a rt::Tensor, used to manage stbi loaded images
-// The tensor is expected to have shape [height, width, channels] and channels is 3 for RGB image
+/*!
+ * @brief Image data container
+ *
+ * Wraps image tensor loaded with stbi. Expected shape: [height, width, channels].
+ * Channels is typically 3 for RGB images.
+ */
 class ImageData
 {
 public:
-    std::shared_ptr<rt::Tensor> buffer;
-    int32_t width;
-    int32_t height;
-    int32_t channels;
+    std::shared_ptr<rt::Tensor> buffer; //!< Image data buffer
+    int32_t width;                      //!< Image width
+    int32_t height;                     //!< Image height
+    int32_t channels;                   //!< Number of channels (e.g., 3 for RGB)
 
+    /*!
+     * @brief Construct image data
+     * @param data Image tensor
+     * @param thumbnail Whether this is a thumbnail
+     */
     ImageData(rt::Tensor&& data, bool thumbnail = false);
 
+    //! @brief Get raw image data pointer
+    //! @return Pointer to image data
     unsigned char* data() const;
 };
 
+/*!
+ * @brief Load image from file
+ * @param path Path to image file
+ * @return Loaded image data
+ */
 ImageData loadImageFromFile(std::string const& path);
 
+/*!
+ * @brief Load image from memory
+ * @param data Pointer to image data in memory
+ * @param size Size of image data in bytes
+ * @return Loaded image data
+ */
 ImageData loadImageFromMemory(unsigned char const* data, size_t size);
 
+/*!
+ * @brief Resize image
+ * @param image Source image
+ * @param newWidth Target width
+ * @param newHeight Target height
+ * @return Resized image
+ */
 ImageData resizeImage(ImageData const& image, int newWidth, int newHeight);
 
 } // namespace imageUtils

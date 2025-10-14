@@ -27,7 +27,8 @@ class RemoteConfig:
 class EnvironmentConfig:
     """Configuration for test environment paths and directories"""
     llm_sdk_dir: str
-    torch_dir: Optional[str]
+    llm_models_dir: Optional[str]
+    edgellm_data_dir: Optional[str]
     onnx_dir: str
     engine_dir: Optional[str]
     build_dir: str
@@ -49,8 +50,33 @@ class EnvironmentConfig:
             raise ValueError("ONNX_DIR environment variable is required. "
                              "Please set it to the directory for ONNX models.")
 
+        # LLM models directory with default fallback
+        llm_models_dir = os.environ.get('LLM_MODELS_DIR')
+        if not llm_models_dir:
+            # Try default paths
+            default_paths = [
+                '/scratch.trt_llm_data/llm-models',
+                '/home/scratch.trt_llm_data/llm-models'
+            ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    llm_models_dir = path
+                    break
+
+        # EdgeLLM data directory with default fallback
+        edgellm_data_dir = os.environ.get('EDGELLM_DATA_DIR')
+        if not edgellm_data_dir:
+            # Try default paths
+            default_paths = [
+                '/scratch.edge_llm_cache', '/home/edge_llm_cache',
+                '/home/scratch.edge_llm_cache'
+            ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    edgellm_data_dir = path
+                    break
+
         # Optional directories - will be validated when needed
-        torch_dir = os.environ.get('TORCH_DIR')
         engine_dir = os.environ.get('ENGINE_DIR')
         trt_package_dir = os.environ.get('TRT_PACKAGE_DIR')
 
@@ -58,7 +84,8 @@ class EnvironmentConfig:
         test_log_dir = os.environ.get('TEST_LOG_DIR', 'logs')
 
         return cls(llm_sdk_dir=llm_sdk_dir,
-                   torch_dir=torch_dir,
+                   llm_models_dir=llm_models_dir,
+                   edgellm_data_dir=edgellm_data_dir,
                    onnx_dir=onnx_dir,
                    engine_dir=engine_dir,
                    build_dir=build_dir,
@@ -67,10 +94,12 @@ class EnvironmentConfig:
 
     def validate_for_export_tests(self):
         """Validate that required directories are set for export tests"""
-        if not self.torch_dir:
+        if not self.llm_models_dir:
             raise ValueError(
-                "TORCH_DIR environment variable is required for export tests. "
-                "Please set it to the directory containing torch models.")
+                "LLM_MODELS_DIR environment variable is required for export tests. "
+                "Please set it to the directory containing LLM torch models, or ensure one of the default paths exists: "
+                "/scratch.trt_llm_data/llm-models, /home/scratch.trt_llm_data/llm-models"
+            )
 
     def validate_for_pipeline_tests(self):
         """Validate that required directories are set for pipeline tests"""

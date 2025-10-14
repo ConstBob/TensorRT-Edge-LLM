@@ -216,8 +216,6 @@ def get_llm_quant_config(
         quant_cfg = mtq.INT4_AWQ_CFG.copy()
     elif quantization == "nvfp4":
         quant_cfg = mtq.NVFP4_DEFAULT_CFG.copy()
-    elif quantization == "mxfp8":
-        quant_cfg = mtq.MXFP8_DEFAULT_CFG.copy()
     else:
         raise ValueError(f"Unsupported quantization: {quantization}")
 
@@ -231,12 +229,8 @@ def get_llm_quant_config(
 
         if lm_head_quantization == "fp8":
             quant_cfg["quant_cfg"].update(FP8_LM_HEAD_CONFIG["quant_cfg"])
-        elif lm_head_quantization == "int4_awq":
-            quant_cfg["quant_cfg"].update(INT4_AWQ_LM_HEAD_CONFIG["quant_cfg"])
         elif lm_head_quantization == "nvfp4":
             quant_cfg["quant_cfg"].update(NVFP4_LM_HEAD_CONFIG["quant_cfg"])
-        elif lm_head_quantization == "mxfp8":
-            quant_cfg["quant_cfg"].update(MXFP8_LM_HEAD_CONFIG["quant_cfg"])
 
     # Disable visual model
     quant_cfg["quant_cfg"].update(DISABLE_VISUAL_CONFIG["quant_cfg"])
@@ -267,8 +261,8 @@ def quantize_llm(
     Raises:
         AssertionError: If quantization method is not supported
     """
-    assert quantization in ["fp8", "int4_awq", "nvfp4", "mxfp8"]
-    assert lm_head_quantization in [None, "fp8", "int4_awq", "nvfp4", "mxfp8"]
+    assert quantization in ["fp8", "int4_awq", "nvfp4"]
+    assert lm_head_quantization in [None, "fp8", "nvfp4"]
 
     # Get calibration dataloader
     if "int4" in quantization:
@@ -311,8 +305,8 @@ def quantize_draft(
     Raises:
         AssertionError: If quantization method is not supported
     """
-    assert quantization in ["fp8", "int4_awq", "nvfp4", "mxfp8"]
-    assert lm_head_quantization in [None, "fp8", "int4_awq", "nvfp4", "mxfp8"]
+    assert quantization in ["fp8", "int4_awq", "nvfp4"]
+    assert lm_head_quantization in [None, "fp8", "nvfp4"]
 
     # Get calibration dataloader
     if "int4" in quantization:
@@ -347,10 +341,10 @@ def quantize_and_save_llm(model_dir: str,
     Args:
         model_dir: Directory containing the input HuggingFace model
         output_dir: Directory to save the quantized model
-        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "mxfp8")
+        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4")
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
-        lm_head_quantization: Optional separate quantization for language model head
+        lm_head_quantization: Optional separate quantization for language model head (only "fp8" and "nvfp4" is currently supported)
         device: Device to use for model loading and quantization ("cuda", "cpu")
         
     Raises:
@@ -359,10 +353,6 @@ def quantize_and_save_llm(model_dir: str,
     start_time = time.time()
     # Load model and tokenizer
     model, tokenizer = load_hf_model(model_dir, dtype, device)
-    if lm_head_quantization == "int4_awq" and model.config.vocab_size % 4 != 0:
-        raise ValueError(
-            f"Model vocabulary size {model.config.vocab_size} is not divisible by 4. This model's lm_head cannot be quantized to int4_awq. Please use a different quantization method for lm_head."
-        )
 
     if is_quantized(model):
         print(f"Model is already quantized, skipping quantization.")
@@ -415,11 +405,11 @@ def quantize_and_save_draft(
         base_model_dir: Directory containing the base HuggingFace model
         draft_model_dir: Directory containing the EAGLE draft model
         output_dir: Directory to save the quantized model
-        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "mxfp8")
+        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4")
         device: Device to use for model loading and quantization ("cuda", "cpu")
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
-        lm_head_quantization: Optional separate quantization for language model head
+        lm_head_quantization: Optional separate quantization for language model head (only "fp8" and "nvfp4" is currently supported)
         
     Raises:
         ValueError: If model loading fails or quantization parameters are invalid
@@ -437,10 +427,6 @@ def quantize_and_save_draft(
                                           use_prompt_tuning,
                                           max_position_embeddings, dtype,
                                           device, enable_reuse_kv_cache)
-    if lm_head_quantization == "int4_awq" and draft_model.config.draft_vocab_size % 4 != 0:
-        raise ValueError(
-            f"Model vocabulary size {draft_model.config.draft_vocab_size} is not divisible by 4. This model's lm_head cannot be quantized to int4_awq. Please use a different quantization method for lm_head."
-        )
 
     if is_quantized(draft_model):
         print(f"Draft Model is already quantized, skipping quantization.")

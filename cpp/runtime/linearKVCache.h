@@ -35,29 +35,51 @@ namespace rt
 class LinearKVCache
 {
 public:
+    /*!
+     * @brief Configuration for KV cache
+     *
+     * Defines the dimensions and capacity of the KV cache.
+     */
     struct CacheConfig
     {
-        int32_t numDecoderLayers{};
-        int32_t maxBatchSize{};
-        int32_t maxSequenceLength{};
-        int32_t numKVHeads{};
-        int32_t headDim{};
+        int32_t numDecoderLayers{};  //!< Number of decoder layers
+        int32_t maxBatchSize{};      //!< Maximum batch size
+        int32_t maxSequenceLength{}; //!< Maximum sequence length
+        int32_t numKVHeads{};        //!< Number of key-value heads
+        int32_t headDim{};           //!< Head dimension
     };
 
-    // Only support half precision for now.
-    using KVCacheType = half;
-    static constexpr nvinfer1::DataType KVCacheTypeTRT{nvinfer1::DataType::kHALF};
+    using KVCacheType = half; //!< KV cache data type (half precision)
+    static constexpr nvinfer1::DataType KVCacheTypeTRT{nvinfer1::DataType::kHALF}; //!< TensorRT data type
 
-    //! Initialize the KVCache with the given config.
-    //! @param config The config for the KVCache instance. Once allocated, the device memory won't be reallocated.
+    //! @brief Default constructor
     LinearKVCache() = default;
+
+    /*!
+     * @brief Construct and initialize KV cache
+     *
+     * Allocates device memory for KV cache. Once allocated, memory won't be reallocated.
+     *
+     * @param config Cache configuration
+     * @param stream CUDA stream for allocation
+     */
     LinearKVCache(CacheConfig const& config, cudaStream_t stream);
+
+    //! @brief Destructor
     ~LinearKVCache();
 
-    // Delete copy construction and assignments to avoid accidental large data copy.
+    //! @brief Deleted copy constructor to avoid large data copy
     LinearKVCache(LinearKVCache const&) = delete;
+
+    //! @brief Deleted copy assignment to avoid large data copy
+    //! @return Reference to this
     LinearKVCache& operator=(LinearKVCache const&) = delete;
+
+    //! @brief Move constructor
     LinearKVCache(LinearKVCache&&) noexcept;
+
+    //! @brief Move assignment operator
+    //! @return Reference to this
     LinearKVCache& operator=(LinearKVCache&&) noexcept;
 
     //! Get the KVCache for the given decoder layer.
@@ -79,28 +101,27 @@ public:
     void commitSequenceLength(rt::Tensor const& newContextLengths, cudaStream_t stream);
 
     //! Commit the KVCache buffer for a decode request, increment the KVCache lengths by 1 for active sequences.
+    //! @param increment The amount to increment sequence lengths (typically 1 for decode step)
     //! @param stream The stream is used to perform GPU memory operations.
     void commitSequenceLength(int32_t increment, cudaStream_t stream);
 
-    //! Get the KVCache lengths for active sequences.
+    //! @brief Get KV cache lengths for active sequences
+    //! @return Reference to KV cache lengths tensor
     rt::Tensor& getKVCacheLengths();
 
-    //! Get the KVCache config.
+    //! @brief Get KV cache configuration
+    //! @return Cache configuration
     CacheConfig getConfig() const;
 
-    //! Get the active batch size.
+    //! @brief Get active batch size
+    //! @return Number of active sequences
     int32_t getActiveBatchSize() const;
 
 private:
-    // Config parameters of the KVCache instance.
-    CacheConfig mConfig{};
-
-    // Runtime parameters of the KVCache instance.
-    int32_t mActiveBatchSize{};
-    rt::Tensor mDeviceKVCacheLengths{};
-
-    // KVCache memory buffer.
-    KVCacheType* mDeviceKVCache{nullptr};
+    CacheConfig mConfig{};                //!< Cache configuration
+    int32_t mActiveBatchSize{};           //!< Active batch size
+    rt::Tensor mDeviceKVCacheLengths{};   //!< KV cache lengths on device
+    KVCacheType* mDeviceKVCache{nullptr}; //!< KV cache memory buffer
 };
 
 } // namespace rt

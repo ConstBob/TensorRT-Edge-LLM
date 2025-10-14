@@ -30,17 +30,29 @@
 
 namespace drivellm
 {
+
+//! Global profiling control flag
+//! When false, no profiling data (metrics or timing) will be recorded
+//! This is useful to exclude warmup runs from benchmark statistics
+bool getProfilingEnabled();
+void setProfilingEnabled(bool enabled);
+
 namespace timer
 {
 
-//! Lazy timer pair for CUDA event-based timing
+/*!
+ * @brief CUDA event pair for timing
+ *
+ * Lazy-initialized timer pair using CUDA events.
+ */
 struct TimerPair
 {
-    cudaEvent_t gpuStart{nullptr};
-    cudaEvent_t gpuEnd{nullptr};
-    bool hasStarted{false};
-    bool isInitialized{false};
+    cudaEvent_t gpuStart{nullptr}; //!< Start event
+    cudaEvent_t gpuEnd{nullptr};   //!< End event
+    bool hasStarted{false};        //!< Whether timing has started
+    bool isInitialized{false};     //!< Whether events are initialized
 
+    //! @brief Initialize CUDA events
     void initialize()
     {
         if (!isInitialized)
@@ -51,6 +63,7 @@ struct TimerPair
         }
     }
 
+    //! @brief Destructor - destroys CUDA events
     ~TimerPair()
     {
         if (isInitialized)
@@ -66,10 +79,16 @@ struct TimerPair
         }
     }
 
+    //! @brief Default constructor
     TimerPair() = default;
+
+    //! @brief Deleted copy constructor
     TimerPair(TimerPair const&) = delete;
+
+    //! @brief Deleted copy assignment
     TimerPair& operator=(TimerPair const&) = delete;
 
+    //! @brief Move constructor
     TimerPair(TimerPair&& other) noexcept
         : gpuStart(other.gpuStart)
         , gpuEnd(other.gpuEnd)
@@ -82,6 +101,7 @@ struct TimerPair
         other.isInitialized = false;
     }
 
+    //! @brief Move assignment operator
     TimerPair& operator=(TimerPair&& other) noexcept
     {
         if (this != &other)
@@ -112,22 +132,30 @@ struct TimerPair
     }
 };
 
-//! RAII session for automatic timing cleanup.
+/*!
+ * @brief RAII timer session for automatic cleanup
+ *
+ * Automatically stops timing when session goes out of scope.
+ */
 class TimerSession
 {
 public:
+    //! @brief Construct active session with callback
+    //! @param onEnd Callback to execute on destruction
     TimerSession(std::function<void()> onEnd)
         : mOnEnd(std::move(onEnd))
         , mActive(true)
     {
     }
 
+    //! @brief Construct inactive session
     TimerSession(std::nullptr_t)
         : mOnEnd(nullptr)
         , mActive(false)
     {
     }
 
+    //! @brief Destructor - executes callback if active
     ~TimerSession()
     {
         if (mActive && mOnEnd)
@@ -136,9 +164,13 @@ public:
         }
     }
 
+    //! @brief Deleted copy constructor
     TimerSession(TimerSession const&) = delete;
+
+    //! @brief Deleted copy assignment
     TimerSession& operator=(TimerSession const&) = delete;
 
+    //! @brief Move constructor
     TimerSession(TimerSession&& other) noexcept
         : mOnEnd(std::move(other.mOnEnd))
         , mActive(other.mActive)
@@ -146,6 +178,7 @@ public:
         other.mActive = false;
     }
 
+    //! @brief Move assignment operator
     TimerSession& operator=(TimerSession&& other) noexcept
     {
         if (this != &other)
@@ -162,81 +195,117 @@ public:
     }
 
 private:
-    std::function<void()> mOnEnd;
-    bool mActive;
+    std::function<void()> mOnEnd; //!< Cleanup callback
+    bool mActive;                 //!< Whether session is active
 };
 
-//! Simplified stage timing data - stores raw measurements and calculates derived values on-demand
+/*!
+ * @brief Stage timing data
+ *
+ * Stores raw timing measurements and calculates derived values on-demand.
+ */
 struct StageTimingData
 {
-    std::vector<float> gpuTimesMs;
+    std::vector<float> gpuTimesMs; //!< GPU time measurements in milliseconds
 
+    //! @brief Add timing measurement
+    //! @param timeMs Time in milliseconds
     void addTiming(float timeMs)
     {
         gpuTimesMs.push_back(timeMs);
     }
 
+    //! @brief Reset all timing data
     void reset()
     {
         gpuTimesMs.clear();
     }
 
-    // On-demand calculations
+    //! @brief Calculate total GPU time
+    //! @return Total time in milliseconds
     float getTotalGpuTimeMs() const
     {
         return std::accumulate(gpuTimesMs.begin(), gpuTimesMs.end(), 0.0f);
     }
 
+    //! @brief Calculate average time per run
+    //! @return Average time in milliseconds
     float getAverageTimeMs() const
     {
         return gpuTimesMs.empty() ? 0.0f : getTotalGpuTimeMs() / gpuTimesMs.size();
     }
 
+    //! @brief Get total number of runs
+    //! @return Run count
     int64_t getTotalRuns() const
     {
         return static_cast<int64_t>(gpuTimesMs.size());
     }
 };
 
-//! Simple timer for CUDA timing with RAII and deferred calculation
+/*!
+ * @brief CUDA timer with RAII and deferred calculation
+ *
+ * Provides stage-based timing using CUDA events with automatic cleanup.
+ */
 class Timer
 {
 public:
+    //! @brief Default constructor
     Timer() = default;
+
+    //! @brief Destructor
     ~Timer() = default;
 
-    //! Start/stop timing
-    void startTiming();
-    void stopTiming();
-
-    //! Reset all timing data
+    //! @brief Reset all timing data
     void reset();
 
-    //! Start timing stage with automatic cleanup
-    TimerSession startStage(std::string const& stageId, cudaStream_t stream = 0);
+    /*!
+     * @brief Start timing a stage with automatic cleanup
+     * @param stageId Stage identifier
+     * @param stream CUDA stream (default: 0)
+     * @return RAII session that stops timing on destruction
+     */
+    TimerSession startStage(std::string const& stageId, cudaStream_t stream);
 
-    //! Get timing data for a stage (triggers deferred calculation if needed)
+    /*!
+     * @brief Get timing data for a stage
+     * @param stageId Stage identifier
+     * @return Timing data if available, nullopt otherwise
+     */
     std::optional<StageTimingData> getTimingData(std::string const& stageId) const;
 
-    //! Get all timing data (triggers deferred calculations if needed)
+    /*!
+     * @brief Get all timing data
+     * @return Map of stage IDs to timing data
+     */
     std::unordered_map<std::string, StageTimingData> const& getAllTimingData() const;
 
 private:
-    bool mTimingActive{false};
-    mutable std::unordered_map<std::string, StageTimingData> mTimingData;
+    mutable std::unordered_map<std::string, StageTimingData> mTimingData; //!< Timing data per stage
 
-    // Simple timer management - one timer per stage
-    mutable std::unordered_map<std::string, TimerPair> mTimers;
-    mutable std::unordered_map<std::string, std::vector<float>> mTimingResults;
-    mutable std::unordered_set<std::string> mPendingTimings;
+    mutable std::unordered_map<std::string, TimerPair> mTimers;                 //!< Timer pairs per stage
+    mutable std::unordered_map<std::string, std::vector<float>> mTimingResults; //!< Pending results
+    mutable std::unordered_set<std::string> mPendingTimings;                    //!< Stages with pending timings
 
+    //! @brief Start timer for stage
     void startTimer(std::string const& stageId, cudaStream_t stream);
+
+    //! @brief End timer for stage
     void endTimer(std::string const& stageId, cudaStream_t stream);
+
+    //! @brief Record timing measurement
     void recordTiming(std::string const& stageId) const;
+
+    //! @brief Handle stage completion
     void onStageComplete(std::string const& stageId);
 };
 
-//! Convenience macro for RAII-based timing
+/*!
+ * @brief Convenience macro for RAII-based stage timing
+ *
+ * Usage: TIME_STAGE("stage_name", stream);
+ */
 #define TIME_STAGE(stageId, stream) auto _session = drivellm::gTimer.startStage(stageId, stream)
 
 } // namespace timer

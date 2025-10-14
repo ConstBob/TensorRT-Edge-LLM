@@ -41,7 +41,6 @@ tensorrt-edgellm-export-llm \
 # EAGLE model (base)
 tensorrt-edgellm-export-llm \
   --model_dir /path/to/base_model \
-  --draft_model_dir /path/to/draft_model \
   --output_dir /path/to/output \
   --is_eagle_base
 
@@ -87,10 +86,10 @@ tensorrt-edgellm-quantize-llm [OPTIONS]
 - `--output_dir`: Output directory for quantized model
 
 **Optional Arguments:**
-- `--quantization`: Quantization method (`fp8`, `int4_awq`, `nvfp4`, `mxfp8`)
+- `--quantization`: Quantization method (`fp8`, `int4_awq`, `nvfp4`)
 - `--torch_dtype`: Model loading dtype (`fp16`, default: `fp16`)
 - `--dataset_dir`: Calibration dataset (default: `cnn_dailymail`)
-- `--lm_head_quantization`: LM head quantization method
+- `--lm_head_quantization`: LM head quantization method (only `fp8`  and `nvfp4` is currently supported)
 
 **Model Format:**
 Quantized models are saved in uncompressed [HuggingFace format](https://nvidia.github.io/TensorRT-Model-Optimizer/guides/2_save_load.html#modelopt-save-restore-using-huggingface-checkpointing-apis) for PyTorch compatibility. Note that compressed checkpoint cannot be loaded by HuggingFace `from_pretrained` function so `tensorrt-edgellm-export-llm` cannot support it. It will be supported in the future.
@@ -167,6 +166,5 @@ BUILD_CUDA_EXT=0 pip install -v gptqmodel --no-build-isolation
 
 - Only FP16 precision is currently supported, BF16 is not supported
 - MXFP8 quantization is not supported
-- When vocab_size is not a multiple of 4, the model cannot be quantized to int4_awq. Please use fp16 lm_head.
-
+- int4_awq quantization for lm_head are not currently supported. Please use fp8 or nvfp4 for lm_head quantization.
 
