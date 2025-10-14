@@ -259,3 +259,52 @@ drive_thor_ferrix:
   image: "ubuntu:24.04"
   extends: .device_test_template
   interruptible: true
+
+pages:
+  image: 
+    name: python:3.10-slim
+    entrypoint: ['/bin/bash']
+  stage: setup
+  tags:
+    - cpu-k8s
+  before_script:
+  - apt update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y wget make
+  - wget https://www.doxygen.nl/files/doxygen-1.14.0.linux.bin.tar.gz
+  - tar -xzf doxygen-1.14.0.linux.bin.tar.gz
+  - cd doxygen-1.14.0
+  - make install && cd ..
+  script:
+  - mkdir public
+  - cd docs
+  - pip install -r requirements.txt
+  - doxygen
+  - echo "Sphinx is building documentation now... "
+  - sphinx-build -M html ./source/ ./build --silent > doc_build.log 2>&1
+  - cp -r build/html/* ../public/
+  variables:
+    URL_SLUG: '$CI_COMMIT_REF_SLUG'
+  rules:
+  - if: $CI_COMMIT_BRANCH == "main"
+    when: manual # remove after parallel deployment is enabled
+  - if: $CI_COMMIT_BRANCH =~ /^release/
+    when: manual # remove after parallel deployment is enabled
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    when: never # remove after parallel deployment is enabled
+  - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
+    when: never
+  artifacts:
+    paths:
+    - public
+    - docs/doc_build.log
+    name: TensorRT_EdgeLLM_API_Reference
+    when: always
+    expire_in: 3 days
+  pages:
+    path_prefix: ${URL_SLUG}
+    expire_in: never
+  environment:
+    name: ${URL_SLUG}
+    url: https://tensorrt.gitlab-master-pages.nvidia.com/tensorrt-edgellm/tensorrt-edgellm/${URL_SLUG}
+  allow_failure: true
+  timeout: 3h

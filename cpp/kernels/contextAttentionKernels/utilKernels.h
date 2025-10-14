@@ -26,41 +26,39 @@ namespace drivellm
 namespace kernel
 {
 
-// Host-side wrapper that launches a lightweight CUDA kernel to build several prefix-sum
-// buffers needed by context-attention.
-//
-// Parameters
-// ----------
-// seqLenDev          : [in]  Device pointer – int32_t[B].  Actual token length of each request.
-// cuSeqLensDev       : [out] Device pointer – int32_t[B+1]. Exclusive prefix-sum of seqLenDev.
-//                       cuSeqLensDev[0] is set to 0 inside the kernel.
-// kvCacheStartIdxs   : [in]  Device pointer – int32_t[B].  Start index of KV cache for each request.
-// cuKvCacheLensDev   : [out] Device pointer – int32_t[B+1]. Exclusive prefix-sum of *kvCacheEndIdxs*.
-//                       cuKvCacheLensDev[0] is set to 0 inside the kernel.
-// kvCacheEndIdxsDev  : [out] Device pointer – int32_t[B].  Each element equals
-//                       kvCacheStartIdxs[i] + seqLenDev[i]. For invoking launchApplyRopeWriteContinuousQAndKVCache.
-// runtimeSeqLen      : Runtime sequence length(with padding).
-// B                  : Batch size.
-// stream             : CUDA stream used to launch the kernel. Should be the same stream that
-//                       later launches the FMHA-v2 kernel.
+//! \brief Host-side wrapper that launches a lightweight CUDA kernel to build several prefix-sum
+//! buffers needed by context-attention.
+//!
+//! \param[in]  seqLenDev         Device pointer – int32_t[B].  Actual token length of each request.
+//! \param[out] cuSeqLensDev      Device pointer – int32_t[B+1]. Exclusive prefix-sum of seqLenDev.
+//!                                cuSeqLensDev[0] is set to 0 inside the kernel.
+//! \param[in]  kvCacheStartIdxs  Device pointer – int32_t[B].  Start index of KV cache for each request.
+//! \param[out] cuKvCacheLensDev  Device pointer – int32_t[B+1]. Exclusive prefix-sum of kvCacheEndIdxs.
+//!                                cuKvCacheLensDev[0] is set to 0 inside the kernel.
+//! \param[out] kvCacheEndIdxsDev Device pointer – int32_t[B].  Each element equals
+//!                                kvCacheStartIdxs[i] + seqLenDev[i]. For invoking
+//!                                launchApplyRopeWriteContinuousQAndKVCache.
+//! \param[in]  runtimeSeqLen     Runtime sequence length(with padding).
+//! \param[in]  B                 Batch size.
+//! \param[in]  stream            CUDA stream used to launch the kernel. Should be the same stream that
+//!                                later launches the FMHA-v2 kernel.
 
 void calCuQCuKVSeqLensAndKVEndIdxs(int32_t const* seqLenDev, int32_t* cuSeqLensDev, int32_t const* kvCacheStartIdxs,
     int32_t* cuKvCacheLensDev, int32_t* kvCacheEndIdxsDev, int32_t runtimeSeqLen, int32_t B, cudaStream_t stream);
 
-// cvtKVCachelayoutXQAToFMHA
-// Converts an input tensor in [B, 2, H, S, D] into [B, S, 2, H, D].
-
-// Template parameter:
-//   T  – element type (e.g. float, half, bfloat16, etc.).
-
-// Parameters:
-//   src        Device pointer to the padded input tensor.
-//   dst        Device pointer to the destination compact tensor.
-//   B          Batch size.
-//   S          Maximum (padded) sequence length.
-//   H          Number of attention heads.
-//   D          Hidden dimension per head.
-//   stream     CUDA stream to launch the kernel on, shall be the same stream to launch FMHA-v2 kernel.
+//! \brief Converts KV cache layout from XQA format to FMHA format
+//!
+//! Converts an input tensor in [B, 2, H, S, D] into [B, S, 2, H, D].
+//!
+//! \tparam T Element type (e.g. float, half, bfloat16, etc.).
+//!
+//! \param[in] src    Device pointer to the padded input tensor.
+//! \param[out] dst   Device pointer to the destination compact tensor.
+//! \param[in] B      Batch size.
+//! \param[in] S      Maximum (padded) sequence length.
+//! \param[in] H      Number of attention heads.
+//! \param[in] D      Hidden dimension per head.
+//! \param[in] stream CUDA stream to launch the kernel on, shall be the same stream to launch FMHA-v2 kernel.
 
 template <typename T>
 void cvtKVCachelayoutXQAToFMHA(T const* src, T* dst, int32_t B, int32_t S, int32_t H, int32_t D, cudaStream_t stream);

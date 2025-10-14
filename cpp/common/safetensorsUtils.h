@@ -33,13 +33,28 @@ namespace rt
 namespace safetensors
 {
 
-// Save a vector of tensors to a safetensors file
-// Each tensor in the vector must have a unique name associated with it
+/*!
+ * @brief Save tensors to a safetensors file
+ *
+ * Each tensor in the vector must have a unique name associated with it.
+ *
+ * @param filePath Path to output safetensors file
+ * @param tensors Vector of tensors to save
+ * @param stream CUDA stream for async operations
+ * @return True on success, false on failure
+ */
 bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> const& tensors, cudaStream_t stream);
 
-// Load tensors from a safetensors file
-// Tensors are loaded into the provided vector, each tensor owns its memory
-// Returns true on success, false on failure
+/*!
+ * @brief Load tensors from a safetensors file
+ *
+ * Tensors are loaded into the provided vector. Each tensor owns its memory.
+ *
+ * @param filePath Path to input safetensors file
+ * @param tensors Output vector to store loaded tensors
+ * @param stream CUDA stream for async operations
+ * @return True on success, false on failure
+ */
 bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>& tensors, cudaStream_t stream);
 
 } // namespace safetensors
