@@ -77,19 +77,17 @@ size_t hashDecodingInput(rt::Tensor const& inputIds, rt::Tensor const& outputLog
     return hashValue;
 }
 
-size_t hashBaseTreeDecodingInput(rt::Tensor const& baseTreeDecodingInputIds, rt::Tensor const& baseTreeDecodingMask,
-    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+size_t hashBaseTreeDecodingInput(
+    rt::Tensor const& baseTreeDecodingInputIds, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
     int64_t const activeBatchSize = baseTreeDecodingInputIds.getShape()[0];
     uintptr_t const inputIdsAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingInputIds.rawPointer());
-    uintptr_t const maskAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingMask.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
     uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
 
     size_t hashValue = 0;
     hash_utils::hashCombine(hashValue, activeBatchSize);
     hash_utils::hashCombine(hashValue, inputIdsAddr);
-    hash_utils::hashCombine(hashValue, maskAddr);
     hash_utils::hashCombine(hashValue, outputLogitsAddr);
     hash_utils::hashCombine(hashValue, outputHiddenStatesAddr);
     return hashValue;
@@ -848,7 +846,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     size_t const graphHash = hashDecodingInput(inputIds, outputLogits, mActiveLoraWeightsName);
     if (mCudaGraphs.find(graphHash) != mCudaGraphs.end())
     {
-        LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for this decoding step.");
+        LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for vanilla decoding step.");
         cudaGraphExec_t graphExec = mCudaGraphs[graphHash].second;
         CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
     }
@@ -1005,51 +1003,63 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
     kernel::prepareEagleBaseTreeDecodingInputs(baseTreeDecodingMask, sequenceStartIndices, mEagleBasePackedMask,
         mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
-    // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
-    // initialization.
-    bool setEngineIOStatus{true};
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kInputIds, baseTreeDecodingInputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
-    // Bind the output tensor into the engine.
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
-
-    if (!setEngineIOStatus)
+    // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
+    size_t const graphHash = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, outputLogits, outputHiddenStates);
+    if (mBaseTreeDecodingCudaGraphs.find(graphHash) != mBaseTreeDecodingCudaGraphs.end())
     {
-        LOG_ERROR("executeEagleBaseTreeDecodingStep(): Failed to bind engine input and output tensors.");
-        return false;
+        LOG_DEBUG("executeEagleBaseTreeDecodingStep(): Use pre-captured CUDA graph for eagle base tree decoding step.");
+        cudaGraphExec_t graphExec = mBaseTreeDecodingCudaGraphs[graphHash].second;
+        CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
     }
-
-    // launch the engine execution.
-    bool executeStatus{true};
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
-    if (!executeStatus)
+    else
     {
-        LOG_ERROR(
-            "executeEagleBaseTreeDecodingStep(): Failed on TensorRT eagle base tree decoding stage enqueueV3() call.");
-        return false;
+        // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
+        // initialization.
+        bool setEngineIOStatus{true};
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kInputIds, baseTreeDecodingInputIds.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
+        // Bind the output tensor into the engine.
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+
+        if (!setEngineIOStatus)
+        {
+            LOG_ERROR("executeEagleBaseTreeDecodingStep(): Failed to bind engine input and output tensors.");
+            return false;
+        }
+
+        // launch the engine execution.
+        bool executeStatus{true};
+        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+        if (!executeStatus)
+        {
+            LOG_ERROR(
+                "executeEagleBaseTreeDecodingStep(): Failed on TensorRT eagle base tree decoding stage enqueueV3() "
+                "call.");
+            return false;
+        }
     }
 
     // Note in the base tree decoding step we explicitly don't commit the KVCache since we process the "whole tree" in
@@ -1189,8 +1199,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
     cudaStream_t stream)
 {
-    size_t const hashValue
-        = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
+    size_t const hashValue = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, outputLogits, outputHiddenStates);
     if (mBaseTreeDecodingCudaGraphs.find(hashValue) != mBaseTreeDecodingCudaGraphs.end())
     {
         LOG_INFO("captureEagleBaseTreeDecodingCudaGraph(): CUDA graph already captured for the input tensors.");

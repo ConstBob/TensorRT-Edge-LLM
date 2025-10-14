@@ -49,8 +49,7 @@ std::string formatEngineConfig(drivellm::rt::EagleDraftEngineRunnerConfig const&
 }
 
 size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputIds, rt::Tensor const& baseModelHiddenStates,
-    rt::Tensor const& draftModelHiddenStates, rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask,
-    rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+    rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
 {
     int64_t const activeBatchSize = draftTreeInputIds.getShape()[0];
     int64_t const paddedDraftTreeSize = draftTreeInputIds.getShape()[1];
@@ -823,8 +822,8 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
     kernel::prepareEagleDraftProposalInputs(draftTreeMask, draftTreeLength, sequenceStartIndex, mPackedTreeMask,
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
-    size_t const hashValue = hashDraftProposalInput(draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates,
-        draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
+    size_t const hashValue = hashDraftProposalInput(
+        draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
     if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
     {
         LOG_DEBUG("executeEagleDraftProposalStep(): Use pre-captured CUDA graph for draft proposal step.");
@@ -899,8 +898,8 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor& outputLogits,
     rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
-    size_t const hashValue = hashDraftProposalInput(draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates,
-        draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
+    size_t const hashValue = hashDraftProposalInput(
+        draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
     if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
     {
         LOG_INFO("Draft proposal CUDA graph already captured.");
@@ -1207,7 +1206,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     // Commit the KVCache for accepted tokens.
     mLinearKVCache.commitSequenceLength(acceptedTokenNum, stream);
 
-    LOG_DEBUG("Accept decode token stage execution completed for request with batch size");
+    LOG_DEBUG("Accept decode token stage execution completed for request with batch size %d.", kRUNTIME_BATCH_SIZE);
     return true;
 }
 
