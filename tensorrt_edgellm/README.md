@@ -41,7 +41,6 @@ tensorrt-edgellm-export-llm \
 # EAGLE model (base)
 tensorrt-edgellm-export-llm \
   --model_dir /path/to/base_model \
-  --draft_model_dir /path/to/draft_model \
   --output_dir /path/to/output \
   --is_eagle_base
 
