@@ -182,7 +182,8 @@ def generate_build_commands(
             f"--onnxDir={config.get_visual_onnx_dir(config.visual_precision)}",
             f"--engineDir={config.get_visual_engine_dir()}",
             f"--minImageTokens={config.min_image_tokens}",
-            f"--maxImageTokens={config.max_image_tokens}"
+            f"--maxImageTokens={config.max_image_tokens}",
+            f"--maxImageTokensPerImage={config.max_image_tokens_per_image}"
         ])
 
         commands.append((visual_cmd, 900))
@@ -205,6 +206,10 @@ def generate_inference_commands(
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
+
+    # Add batch size override if specified
+    if config.batch_size is not None:
+        cmd.append(f"--batchSize={config.batch_size}")
 
     commands.append((cmd, 900))
     return commands

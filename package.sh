@@ -7,7 +7,7 @@ TMP_DIR="driveos_llm_sdk-${VERSION}"
 mkdir -p $TMP_DIR
 
 # List the directories to include (space-separated)
-INCLUDE_DIRS="3rdParty cmake cpp examples export scripts CMakeLists.txt unittests README.md performance.md LICENSE release-notes.md"
+INCLUDE_DIRS="3rdParty cmake cpp examples scripts tensorrt_edgellm CMakeLists.txt unittests README.md LICENSE release-notes.md"
 
 # Use rsync to copy files while excluding the specified directory
 for dir in $INCLUDE_DIRS; do

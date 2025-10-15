@@ -23,7 +23,7 @@
 #include <exception>
 #include <thread>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 //! Get current GPU memory usage
 namespace

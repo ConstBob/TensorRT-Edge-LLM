@@ -32,7 +32,7 @@
 
 using namespace nvinfer1;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace plugins
 {
@@ -506,7 +506,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             alignedWorkspacePtr += (runtimeBatchSize) * sizeof(int32_t);
             alignedWorkspacePtr = alignDevicePtr(alignedWorkspacePtr);
         }
-        drivellm::kernel::calCuQCuKVSeqLensAndKVEndIdxs(seqLengthDevicePtr, cuQSeqLensDevicePtr, kvCacheStartIdxPtr,
+        trt_edgellm::kernel::calCuQCuKVSeqLensAndKVEndIdxs(seqLengthDevicePtr, cuQSeqLensDevicePtr, kvCacheStartIdxPtr,
             cuTotalKvCacheLensDevicePtr, kvCacheEndIdxsDevicePtr, runtimeSeqLen, runtimeBatchSize, stream);
 
         auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadKV,
@@ -524,15 +524,15 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             alignedWorkspacePtr += (runtimeBatchSize * runtimeSeqLen * mNumHeadQ * mNumElemPerHead * sizeof(half));
             alignedWorkspacePtr = alignDevicePtr(alignedWorkspacePtr);
             // q: [b, s, hq+hk+hv, d] -> [b, s, hq, d]
-            drivellm::kernel::launchApplyRopeWriteContinuousQAndKVCache(qkvDevicePtr, kvCacheDevicePtr,
+            trt_edgellm::kernel::launchApplyRopeWriteContinuousQAndKVCache(qkvDevicePtr, kvCacheDevicePtr,
                 posEncodingCosSinDevicePtr, qVecDevicePtr, kvCacheEndIdxsDevicePtr, runtimeSeqLen, totalProcessToken,
                 mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize,
                 cosSinCacheSeqLen, stream);
 
             half* kvCacheFMHADevicePtr = reinterpret_cast<half*>(alignedWorkspacePtr);
             // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
-            drivellm::kernel::cvtKVCachelayoutXQAToFMHA<half>(kvCacheDevicePtr, kvCacheFMHADevicePtr, runtimeBatchSize,
-                mKVCacheCapacity, mNumHeadKV, mNumElemPerHead, stream);
+            trt_edgellm::kernel::cvtKVCachelayoutXQAToFMHA<half>(kvCacheDevicePtr, kvCacheFMHADevicePtr,
+                runtimeBatchSize, mKVCacheCapacity, mNumHeadKV, mNumElemPerHead, stream);
 
             // Set device ptr for FMHA kernel.
             params.s_kv = mKVCacheCapacity;
@@ -543,9 +543,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         }
         else
         { // PACKED_QKV
-            drivellm::kernel::launchApplyRopeWriteKVContext(qkvDevicePtr, kvCacheDevicePtr, posEncodingCosSinDevicePtr,
-                runtimeSeqLen, totalProcessToken, mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim,
-                cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+            trt_edgellm::kernel::launchApplyRopeWriteKVContext(qkvDevicePtr, kvCacheDevicePtr,
+                posEncodingCosSinDevicePtr, runtimeSeqLen, totalProcessToken, mKVCacheCapacity, mNumHeadQ, mNumHeadKV,
+                mNumElemPerHead, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
             params.qkv_ptr = qkvDevicePtr;
             params.cu_kv_seqlens = cuQSeqLensDevicePtr;
             params.o_ptr = attentionResultDevicePtr;
@@ -563,14 +563,14 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         if (mEnableTreeAttention)
         {
 
-            drivellm::kernel::launchApplyRopeWriteKVTreeDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
+            trt_edgellm::kernel::launchApplyRopeWriteKVTreeDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
                 posEncodingCosSinDevicePtr, seqLengthDevicePtr, customSeqIndex, runtimeSeqLen, totalProcessToken,
                 mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize,
                 cosSinCacheSeqLen, stream);
         }
         else
         {
-            drivellm::kernel::launchApplyRopeWriteKVDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
+            trt_edgellm::kernel::launchApplyRopeWriteKVDecode(qkvDevicePtr, kvCacheDevicePtr, qVecDevicePtr,
                 posEncodingCosSinDevicePtr, seqLengthDevicePtr, runtimeSeqLen, totalProcessToken, mKVCacheCapacity,
                 mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
         }
@@ -724,4 +724,4 @@ nvinfer1::IPluginV2* AttentionPluginCreator::deserializePlugin(
 }
 
 } // namespace plugins
-} // namespace drivellm
+} // namespace trt_edgellm

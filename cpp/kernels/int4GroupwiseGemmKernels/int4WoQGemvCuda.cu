@@ -45,7 +45,7 @@
 #define WARP_SIZE 32
 #define MEM_ACCESS_SIZE 128
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -255,4 +255,4 @@ void gemv_forward_cuda_new(half* in_feats, int8_t* weights_device, half* scaling
 }
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -24,12 +24,18 @@
 #include <memory>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
-// Define a custom deleter type to handle the noexcept attribute
+/*!
+ * @brief Custom deleter for dynamic library handles
+ *
+ * Handles proper cleanup of dynamically loaded libraries using dlclose.
+ */
 struct DlDeleter
 {
+    //! @brief Delete operator for library handles
+    //! @param handle Library handle to close
     void operator()(void* handle) const noexcept
     {
         if (handle)
@@ -39,6 +45,14 @@ struct DlDeleter
     }
 };
 
+/*!
+ * @brief Load TensorRT Edge-LLM plugin library
+ *
+ * Loads the plugin library from the path specified by EDGELLM_PLUGIN_PATH
+ * environment variable. If not set, defaults to build/libNvInfer_edgellm_plugin.so.
+ *
+ * @return Unique pointer to library handle, or nullptr on failure
+ */
 inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
 {
     char const* pluginPath = std::getenv("EDGELLM_PLUGIN_PATH");
@@ -62,4 +76,4 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
     return handle;
 }
 
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -19,12 +19,19 @@
 
 #include <string>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace file_io
 {
 
+/*!
+ * @brief Copy a file from source to destination
+ *
+ * @param srcPath Source file path
+ * @param dstPath Destination file path
+ * @return True on success, false on failure
+ */
 bool copyFile(std::string const& srcPath, std::string const& dstPath);
 
 } // namespace file_io
-} // namespace drivellm
+} // namespace trt_edgellm

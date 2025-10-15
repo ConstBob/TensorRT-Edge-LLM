@@ -28,32 +28,37 @@
 #include <optional>
 #include <unordered_map>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
 using Json = nlohmann::json;
 
+/*!
+ * @brief Configuration structure for LLM engine runner
+ *
+ * Contains all runtime configuration parameters for the LLM engine.
+ */
 struct LLMEngineRunnerConfig
 {
-    bool enableReuseKVCache{true};
-    bool useContextDependentRope{false};
-    bool enableEagleSpecDecode{false};
-    bool isVlm{false};
-    RopeType ropeType{RopeType::kDefault};
-    int32_t numDecoderLayers{};
-    int32_t numKVHeads{};
-    int32_t headDim{};
-    int32_t rotaryDim{};
-    int32_t hiddenSize{};
-    int32_t maxSupportedBatchSize{};
-    int32_t minSupportedInputLength{};
-    int32_t maxSupportedInputLength{};
-    int32_t maxSequenceLength{};
-    int32_t vocabSize{};
-    int32_t maxSupportedLoraRank{};
-    int32_t outputHiddenDim{};
-    int32_t maxVerifyTreeSize{};
+    bool enableReuseKVCache{true};         //!< Enable KV cache reuse across requests
+    bool useContextDependentRope{false};   //!< Use context-dependent RoPE
+    bool enableEagleSpecDecode{false};     //!< Enable Eagle speculative decoding
+    bool isVlm{false};                     //!< Whether this is a Vision-Language Model
+    RopeType ropeType{RopeType::kDefault}; //!< Type of rotary position encoding
+    int32_t numDecoderLayers{};            //!< Number of decoder layers
+    int32_t numKVHeads{};                  //!< Number of key-value heads
+    int32_t headDim{};                     //!< Dimension of each attention head
+    int32_t rotaryDim{};                   //!< Rotary embedding dimension
+    int32_t hiddenSize{};                  //!< Model's hidden dimension
+    int32_t maxSupportedBatchSize{};       //!< Maximum supported batch size
+    int32_t minSupportedInputLength{};     //!< Minimum supported input length
+    int32_t maxSupportedInputLength{};     //!< Maximum supported input length
+    int32_t maxSequenceLength{};           //!< Maximum sequence length
+    int32_t vocabSize{};                   //!< Vocabulary size
+    int32_t maxSupportedLoraRank{};        //!< Maximum supported LoRA rank
+    int32_t outputHiddenDim{};             //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
+    int32_t maxVerifyTreeSize{};           //!< Maximum verification tree size for Eagle speculative decoding
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -68,9 +73,17 @@ struct LLMEngineRunnerConfig
 class LLMEngineRunner
 {
 public:
+    /*!
+     * @brief Construct LLM engine runner
+     * @param enginePath Path to TensorRT engine file
+     * @param configPath Path to model configuration file
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param stream CUDA stream for operations
+     */
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
+    //! @brief Destructor
     ~LLMEngineRunner();
 
     //! API entry to get the Rope CosSinCache tensor.
@@ -78,8 +91,12 @@ public:
     //! in advance when creating the LLMEngineRunner instance.
     rt::Tensor& getRopeCosSinCacheTensor();
 
+    //! @brief Get reference to the linear KV cache
+    //! @return Reference to LinearKVCache
     rt::LinearKVCache& getLinearKVCache();
 
+    //! @brief Get engine configuration
+    //! @return Engine configuration structure
     LLMEngineRunnerConfig getEngineConfig() const;
 
     //! API entry to execute one prefill engine action for a batched request. The API will clear existing KVCache for
@@ -170,10 +187,10 @@ public:
         cudaStream_t stream);
 
 private:
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
-    std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;
-    std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext;
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                             //!< TensorRT runtime
+    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                           //!< TensorRT engine
+    std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;    //!< Context execution context
+    std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext; //!< Generation execution context
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
     //! which denote the input/output shapes and other execution properties like LoRA weights.
     std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
@@ -184,9 +201,9 @@ private:
 
     //! Holds the LoRA weights for the LLM engine.
     std::unordered_map<std::string, std::vector<rt::Tensor>> mLoraWeights{};
-    std::string mActiveLoraWeightsName{};
+    std::string mActiveLoraWeightsName{}; //!< Name of currently active LoRA weights
 
-    LLMEngineRunnerConfig mConfig{};
+    LLMEngineRunnerConfig mConfig{}; //!< Engine configuration
 
     //! The Rope CosSinCache tensor that pre-computed prior to engine execution.
     //! The design is to produce better performance and accommodate complex context dependent rope.
@@ -216,37 +233,58 @@ private:
     //! The eagle base packed mask tensor to indicate the attention relationship between the base verify nodes.
     rt::Tensor mEagleBasePackedMask{};
 
-    //! Initialize the configuration from the JSON file.
+    /*!
+     * @brief Initialize configuration from JSON file
+     * @param configJson JSON configuration object
+     * @return True on success, false on failure
+     */
     bool initializeConfigFromJson(Json const& configJson);
 
-    //! Validate the configuration from the engine.
+    /*!
+     * @brief Validate configuration against engine
+     * @return True if valid, false otherwise
+     */
     bool validateConfigFromEngine();
 
-    //! The Function is used to bind the KVCache to the LLM engine for a new set of requests.
+    /*!
+     * @brief Bind KV cache to engine for new requests
+     * @param activeBatchSize Number of active sequences
+     * @return True on success, false on failure
+     */
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
+    //! @brief Validate inputs for prefill step
     bool prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
         rt::Tensor const& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
         rt::OptionalInputTensor multimodalEmbeddings);
 
+    //! @brief Validate inputs for vanilla decoding step
     bool vanlliaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
 
+    //! @brief Validate inputs for Eagle base tree decoding step
     bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputIds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
 
     //! The Function is used to add a LoRA weights to the LLM engine.
     bool addLoraWeights(std::string const& loraWeightsName, std::string const& loraWeightsPath, cudaStream_t stream);
 
-    //! The Function is used to reset the LoRA weights of the LLM engine to dummy tensors with rank 0.
+    /*!
+     * @brief Reset LoRA weights to dummy tensors with rank 0
+     * @param stream CUDA stream for operations
+     * @return True on success, false on failure
+     */
     bool resetLoraWeights(cudaStream_t stream);
 
-    //! The Function is used to get the tensor names of the LoRA weights of the LLM engine.
-    //! Returns:
-    //!     The tensor names of the LoRA weights.
+    /*!
+     * @brief Get tensor names of LoRA weights
+     * @return Vector of LoRA weight tensor names
+     */
     std::vector<std::string> getLoraWeightsTensorNames() const;
 
+    //! @brief Check if LoRA weights are supported
+    //! @return True if supported, false otherwise
     bool isLoraWeightsSupported() const;
 };
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -30,19 +30,31 @@
 #include "preTokenizer.h"
 #include "tokenEncoder.h"
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
 
+/*!
+ * @brief Type of text partition for tokenization
+ */
 typedef enum TEXT_PART_TYPE
 {
-    TEXT_PART_SPECIAL_TOKEN,
-    TEXT_PART_RAW_TEXT
+    TEXT_PART_SPECIAL_TOKEN, //!< Partition contains a special token
+    TEXT_PART_RAW_TEXT       //!< Partition contains raw text to be tokenized
 } TEXT_PART_TYPE;
 
+/*!
+ * @brief Text partition representation for tokenization
+ *
+ * Represents either a special token or a raw text segment to be tokenized.
+ */
 struct textPartition
 {
+    /*!
+     * @brief Constructor for special token partition
+     * @param _token Token ID for the special token
+     */
     textPartition(Rank _token)
         : type(TEXT_PART_SPECIAL_TOKEN)
         , token(_token)
@@ -52,6 +64,12 @@ struct textPartition
     {
     }
 
+    /*!
+     * @brief Constructor for raw text partition
+     * @param _rawText Reference to the raw text string
+     * @param _offset Offset into the raw text string
+     * @param _length Length of the text partition
+     */
     textPartition(std::string const& _rawText, int _offset, int _length)
         : type(TEXT_PART_RAW_TEXT)
         , token(-1)
@@ -64,14 +82,20 @@ struct textPartition
         assert(offset + length <= static_cast<int>(rawText.length()));
     }
 
-    const TEXT_PART_TYPE type;
-    Rank const token;
-    std::string const _dummy;
-    std::string const& rawText;
-    int const offset;
-    int const length;
+    const TEXT_PART_TYPE type;  //!< Type of partition (special token or raw text)
+    Rank const token;           //!< Token ID (valid when type is TEXT_PART_SPECIAL_TOKEN)
+    std::string const _dummy;   //!< Dummy string for special token partitions
+    std::string const& rawText; //!< Reference to raw text (valid when type is TEXT_PART_RAW_TEXT)
+    int const offset;           //!< Offset into rawText
+    int const length;           //!< Length of the partition
 };
 
+/*!
+ * @brief Tokenizer class for encoding and decoding text
+ *
+ * Provides tokenization functionality including pretokenization, encoding, and decoding.
+ * Supports loading from HuggingFace model directories.
+ */
 class Tokenizer
 {
 public:
@@ -108,23 +132,46 @@ public:
      */
     bool loadFromHF(std::filesystem::path const& modelDir);
 
-    // Accessors
+    /*!
+     * @brief Get total vocabulary size
+     * @return Number of tokens in vocabulary
+     */
     int getNumVocab() const noexcept
     {
         return mNumVocab;
     }
+
+    /*!
+     * @brief Get beginning-of-sequence token ID
+     * @return BOS token ID
+     */
     Rank getBosId() const noexcept
     {
         return mBosId;
     }
+
+    /*!
+     * @brief Get end-of-sequence token ID
+     * @return EOS token ID
+     */
     Rank getEosId() const noexcept
     {
         return mEosId;
     }
+
+    /*!
+     * @brief Get padding token ID
+     * @return PAD token ID (returns EOS if PAD is not set)
+     */
     Rank getPadId() const noexcept
     {
         return mPadId == -1 ? mEosId : mPadId;
     }
+
+    /*!
+     * @brief Get unknown token ID
+     * @return UNK token ID
+     */
     Rank getUnkId() const noexcept
     {
         return mUnkId;
@@ -185,7 +232,6 @@ protected:
     /**
      * @brief Load special tokens from tokenizer configuration
      * @param tokenizerConfig JSON tokenizer configuration
-     * @param configFile JSON config file data
      * @param specialTokens Output special tokens mapping
      * @return true if special tokens are extracted and processed successfully;
      *         false if extraction fails
@@ -214,24 +260,24 @@ protected:
     void appendEos(std::vector<Rank>& tokens) const noexcept;
 
     // Core components
-    std::unique_ptr<PreTokenizer> mPreTokenizer;
-    std::unique_ptr<TokenEncoder> mTokenEncoder;
+    std::unique_ptr<PreTokenizer> mPreTokenizer; //!< Pretokenizer for splitting input text
+    std::unique_ptr<TokenEncoder> mTokenEncoder; //!< Token encoder for encoding/decoding
 
     // Special token mappings for fast lookup
-    TokenToRanks mSpecialTokensEncoder;
-    std::unordered_map<Rank, std::string> mSpecialTokensDecoder;
+    TokenToRanks mSpecialTokensEncoder;                          //!< Special tokens encoder mapping
+    std::unordered_map<Rank, std::string> mSpecialTokensDecoder; //!< Special tokens decoder mapping
 
     // Configuration
-    int mNumVocab;
-    Rank mBosId;
-    Rank mEosId;
-    Rank mPadId;
-    Rank mUnkId;
-    Rank mImgContextId;
+    int mNumVocab;      //!< Total vocabulary size
+    Rank mBosId;        //!< Beginning-of-sequence token ID
+    Rank mEosId;        //!< End-of-sequence token ID
+    Rank mPadId;        //!< Padding token ID
+    Rank mUnkId;        //!< Unknown token ID
+    Rank mImgContextId; //!< Image context token ID
 
     // State
-    bool mInitialized;
+    bool mInitialized; //!< Whether tokenizer is initialized
 };
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -28,7 +28,7 @@
 #include "testUtils.h"
 
 using namespace nvinfer1;
-using namespace drivellm;
+using namespace trt_edgellm;
 
 void TestXQAAttentionDecodingAccuracy(
     int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t kvCacheCapacity)
@@ -84,8 +84,8 @@ void TestXQAAttentionDecodingAccuracy(
     thrust::device_vector<half> outDevice(outReference.size(), 0.0F);
     thrust::device_vector<int32_t> kvCacheLengthDevice(kvCacheLengths);
 
-    EXPECT_TRUE(drivellm::DecoderXQARunner::canImplement(numQHeads, numKVHeads, smVersion, DataType::kHALF));
-    drivellm::DecoderXQARunner runner(DataType::kHALF, batchSize, numQHeads, numKVHeads, headSize, smVersion);
+    EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(numQHeads, numKVHeads, smVersion, DataType::kHALF));
+    trt_edgellm::DecoderXQARunner runner(DataType::kHALF, batchSize, numQHeads, numKVHeads, headSize, smVersion);
     auto params = runner.initXQAParams();
     params.qInputPtr = thrust::raw_pointer_cast(qInputDevice.data());
     params.kvCache.data = thrust::raw_pointer_cast(kvInputDevice.data());

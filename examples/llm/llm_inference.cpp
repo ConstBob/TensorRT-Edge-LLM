@@ -18,6 +18,7 @@
 #include "common/trtUtils.h"
 #include "memoryMonitor.h"
 #include "profileFormatter.h"
+#include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
@@ -34,7 +35,7 @@
 #include <utility>
 #include <vector>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 using Json = nlohmann::json;
 
 // Enum for command line option IDs (using traditional enum for C library compatibility)
@@ -565,8 +566,8 @@ int main(int argc, char* argv[])
     // Perform warmup runs if requested
     if (args.warmup > 0)
     {
-        // Stop profiling for warmup runs
-        gTimer.stopTiming();
+        // Disable profiling for warmup runs
+        setProfilingEnabled(false);
         LOG_INFO("Starting warmup with %d runs using the first request...", args.warmup);
         auto& firstRequest = requests[0];
 
@@ -594,8 +595,7 @@ int main(int argc, char* argv[])
 
     if (profilerEnabled)
     {
-        // Start profiling for actual runs
-        gTimer.startTiming();
+        setProfilingEnabled(true);
         // Start memory monitoring for examples
         memoryMonitor.start();
     }
@@ -676,12 +676,10 @@ int main(int argc, char* argv[])
         LOG_ERROR("*** %zu REQUESTS FAILED ***", failedCount);
     }
 
-    // Stop timing after all benchmark runs complete
-    // Pending timings are automatically calculated when stopTiming() is called
     if (profilerEnabled)
     {
-        gTimer.stopTiming();
         // Stop memory monitoring for examples
+        setProfilingEnabled(false);
         memoryMonitor.stop();
     }
 

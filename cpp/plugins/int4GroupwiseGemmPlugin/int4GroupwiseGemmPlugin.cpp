@@ -27,7 +27,7 @@
 #include <iostream>
 
 using namespace nvinfer1;
-namespace drivellm
+namespace trt_edgellm
 {
 namespace plugins
 {
@@ -207,12 +207,12 @@ int32_t Int4GroupwsieGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
 
     if (M <= 6)
     {
-        drivellm::kernel::gemv_forward_cuda_new(
+        trt_edgellm::kernel::gemv_forward_cuda_new(
             gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
     }
     else
     {
-        drivellm::kernel::gemm_forward_cuda_new(
+        trt_edgellm::kernel::gemm_forward_cuda_new(
             gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
     }
     return 0;
@@ -321,4 +321,4 @@ nvinfer1::IPluginV2* Int4GroupwsieGemmPluginCreator::deserializePlugin(
 }
 
 } // namespace plugins
-} // namespace drivellm
+} // namespace trt_edgellm

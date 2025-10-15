@@ -29,7 +29,7 @@
 #include <set>
 #include <vector>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 class EagleAcceptTest : public ::testing::Test
 {

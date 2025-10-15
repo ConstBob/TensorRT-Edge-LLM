@@ -24,7 +24,7 @@
 
 using Json = nlohmann::json;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -625,4 +625,4 @@ void Tokenizer::appendEos(std::vector<Rank>& tokens) const noexcept
 }
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

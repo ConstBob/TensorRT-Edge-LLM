@@ -27,90 +27,135 @@
 #include <string>
 #include <unordered_map>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
 
+/*! \brief Structure to hold cached system prompt and its KV cache
+ */
 struct SystemPromptKVCache
 {
-    std::string systemPrompt;
-    std::vector<tokenizer::Rank> tokenizedPrompt;
-    rt::Tensor kvCacheContent;
+    std::string systemPrompt;                     //!< The system prompt text
+    std::vector<tokenizer::Rank> tokenizedPrompt; //!< Tokenized version of the system prompt
+    rt::Tensor kvCacheContent;                    //!< Cached KV cache content for the system prompt
 };
 
+/*! \brief LLM Inference Runtime for handling generation requests
+ */
 class LLMInferenceRuntime
 {
 public:
+    /*! \brief Construct an LLM Inference Runtime
+     *  \param engineDir Directory containing the LLM engine
+     *  \param multimodalEngineDir Directory containing the multimodal engine
+     *  \param loraWeightsMap Map of LoRA weights names to their paths
+     *  \param stream CUDA stream for initialization
+     */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+
+    /*! \brief Destructor
+     */
     ~LLMInferenceRuntime() = default;
 
+    /*! \brief Handle an LLM generation request
+     *  \param request The generation request containing prompt and generation parameters
+     *  \param response The generation response to be filled with output
+     *  \param stream CUDA stream for execution
+     *  \return True if request was handled successfully, false otherwise
+     */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
 
+    /*! \brief Capture CUDA graph for the decoding step to optimize performance
+     *  \param stream CUDA stream for graph capture
+     *  \return True if graph was captured successfully, false otherwise
+     */
     bool captureDecodingCUDAGraph(cudaStream_t stream);
 
-    //! Execute the prefill step generation of the KVCache for the prompt and save for later usage.
-    //! Input:
-    //! - prompt: The system prompt to generate the KVCache.
-    //! - loraWeightsName: The name of the LoRA weights.
-    //! - stream: The CUDA stream used for the generation.
-    //! Output:
-    //! - true if the KVCache is generated and saved successfully, false otherwise.
+    /*! \brief Execute the prefill step generation of the KVCache for the prompt and save for later usage
+     *
+     *  \param prompt The system prompt to generate the KVCache
+     *  \param loraWeightsName The name of the LoRA weights
+     *  \param stream The CUDA stream used for the generation
+     *  \return True if the KVCache is generated and saved successfully, false otherwise
+     */
     bool genAndSaveSystemPromptKVCache(
         std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream);
 
-    //! Get LLM prefill stage metrics
+    /*! \brief Get LLM prefill stage metrics
+     *  \return Reference to prefill metrics
+     */
     metrics::LLMPrefillMetrics const& getPrefillMetrics() const
     {
         return mPrefillMetrics;
     }
 
-    //! Get LLM generation stage metrics
+    /*! \brief Get LLM generation stage metrics
+     *  \return Reference to generation metrics
+     */
     metrics::LLMGenerationMetrics const& getGenerationMetrics() const
     {
         return mGenerationMetrics;
     }
 
-    //! Get multimodal metrics (returns empty metrics if no multimodal runner)
+    /*! \brief Get multimodal metrics (returns empty metrics if no multimodal runner)
+     *  \return Multimodal metrics, or empty metrics if no multimodal runner is available
+     */
     metrics::MultimodalMetrics getMultimodalMetrics() const
     {
         return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
     }
 
 private:
-    //! Helper structure to hold token counting results
+    /*! \brief Helper structure to hold token counting results
+     */
     struct TokenCountInfo
     {
-        int32_t totalReusedTokens{0};
-        int32_t totalComputedTokens{0};
+        int32_t totalReusedTokens{0};   //!< Number of tokens reused from KV cache
+        int32_t totalComputedTokens{0}; //!< Number of tokens that need computation
     };
 
-    //! Calculate token counts (reused vs computed) for performance tracking
+    //! Calculate token counts (reused vs computed) for performance tracking.
+    //! \param batchedInputIds Batched input token IDs
+    //! \param systemPrompts System prompts for each batch element
+    //! \param loraWeightsName Name of the LoRA weights being used
+    //! \return TokenCountInfo structure containing reused and computed token counts
     TokenCountInfo calculateTokenCounts(std::vector<std::vector<int32_t>> const& batchedInputIds,
         std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName) const;
-    std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};
-    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};
-    std::unordered_map<size_t, SystemPromptKVCache> mSystemPromptKVCache{};
 
-    rt::Tensor mSamplingWorkspace{};
-    rt::Tensor mInputIds{};
-    rt::Tensor mHostContextLengths{};
-    rt::Tensor mOutputLogits{};
-    rt::Tensor mSelectedIndices{};
-    std::string mEmptyLoraWeightsName{""};
+    std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};   //!< LLM engine runner instance
+    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner instance (optional)
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};    //!< Tokenizer instance
+    std::unordered_map<size_t, SystemPromptKVCache>
+        mSystemPromptKVCache{}; //!< Cache of system prompts and their KV caches
 
-    LLMEngineRunnerConfig mEngineConfig{};
+    rt::Tensor mSamplingWorkspace{};       //!< Workspace tensor for sampling operations
+    rt::Tensor mInputIds{};                //!< Input token IDs tensor
+    rt::Tensor mHostContextLengths{};      //!< Host tensor for context lengths
+    rt::Tensor mOutputLogits{};            //!< Output logits tensor
+    rt::Tensor mSelectedIndices{};         //!< Selected token indices tensor
+    std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
 
-    // Stage-specific metrics to store number of tokens
-    metrics::LLMPrefillMetrics mPrefillMetrics;
-    metrics::LLMGenerationMetrics mGenerationMetrics;
+    LLMEngineRunnerConfig mEngineConfig{}; //!< Engine configuration
 
+    metrics::LLMPrefillMetrics mPrefillMetrics; //!< Stage-specific metrics to store number of tokens in prefill
+    metrics::LLMGenerationMetrics
+        mGenerationMetrics; //!< Stage-specific metrics to store number of tokens in generation
+
+    //! Examine and validate the generation request.
+    //! \param request The generation request to examine
+    //! \return True if request is valid, false otherwise
     bool examineRequest(LLMGenerationRequest const& request);
 
+    //! Set up tensors and state for prefill execution.
+    //! \param batchedInputIds Batched input token IDs
+    //! \param systemPrompts System prompts for each batch element
+    //! \param loraWeightsName Name of the LoRA weights being used
+    //! \param stream CUDA stream for execution
+    //! \return True if setup was successful, false otherwise
     bool setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
         std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream);
 };
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

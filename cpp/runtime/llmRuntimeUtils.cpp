@@ -23,7 +23,7 @@
 #include <sstream>
 
 using namespace nvinfer1;
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -166,4 +166,4 @@ bool initializeRopeCosSinCache(
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -61,6 +61,10 @@ public:
 class RegexSplit : public PreTokenizer
 {
 public:
+    /*!
+     * @brief Constructor with regex pattern
+     * @param pattern Regex pattern for splitting text
+     */
     explicit RegexSplit(std::string const& pattern);
     ~RegexSplit() override = default;
 
@@ -70,6 +74,10 @@ public:
         return "RegexSplit";
     }
 
+    /*!
+     * @brief Get the regex pattern
+     * @return Reference to the pattern string
+     */
     std::string const& getPattern() const noexcept
     {
         return mPattern;
@@ -88,9 +96,13 @@ private:
 class Sequence : public PreTokenizer
 {
 public:
-    // Default constructor - creates empty sequence (acts as pass-through)
+    //! Default constructor - creates empty sequence (acts as pass-through)
     Sequence() = default;
 
+    /*!
+     * @brief Constructor with sequence of pretokenizer steps
+     * @param steps Vector of pretokenizer steps to apply in order
+     */
     explicit Sequence(std::vector<std::unique_ptr<PreTokenizer>> steps);
 
     ~Sequence() = default;
@@ -128,4 +140,4 @@ private:
 };
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

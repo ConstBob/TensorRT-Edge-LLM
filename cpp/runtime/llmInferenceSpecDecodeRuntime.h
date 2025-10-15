@@ -24,49 +24,84 @@
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
 
-// Data structure to hold execution context within spec-decode runtime to store
-// execution information and intermediate meta data.
+/*!
+ * @brief Execution context for speculative decode runtime
+ *
+ * Holds execution information and intermediate metadata during inference.
+ */
 struct SpecDecodeInferenceContext
 {
-    std::vector<int32_t> tokenIds;
-    rt::OptionalInputTensor multimodalEmbeddings;
-    int32_t generationRound;
-    int32_t maxGenerateLength;
-    int32_t currentGenerateLength;
-    cudaStream_t stream;
+    std::vector<int32_t> tokenIds;                //!< Token IDs
+    rt::OptionalInputTensor multimodalEmbeddings; //!< Optional multimodal embeddings
+    int32_t generationRound;                      //!< Current generation round
+    int32_t maxGenerateLength;                    //!< Maximum generation length
+    int32_t currentGenerateLength;                //!< Current generation length
+    cudaStream_t stream;                          //!< CUDA stream
 };
 
-// Drafting configuration we want to use to drive eagle3 spec-decoding.
-// draftingTopK: Tokens to select from one predecessor to build next level of draft tree.
-// draftingStep: Number of drafting steps to perform with the draft model.
-// verifyTreeSize: Number of tokens we collect for the base model to verify.
+/*!
+ * @brief Drafting configuration for Eagle speculative decoding
+ *
+ * Configuration parameters to drive Eagle spec-decoding.
+ */
 struct EagleDraftingConfig
 {
-    int32_t draftingTopK;
-    int32_t draftingStep;
-    int32_t verifyTreeSize;
+    int32_t draftingTopK;   //!< Tokens to select from one predecessor for next draft tree level
+    int32_t draftingStep;   //!< Number of drafting steps with draft model
+    int32_t verifyTreeSize; //!< Number of tokens for base model verification
 };
 
+//! Runtime batch size constant
 static constexpr int32_t kRUNTIME_BATCH_SIZE{1};
 
+/*!
+ * @brief LLM inference runtime with Eagle speculative decoding
+ *
+ * Manages inference pipeline using Eagle speculative decoding for improved throughput.
+ * Coordinates base model, draft model, and multimodal processing.
+ */
 class LLMInferenceSpecDecodeRuntime
 {
 public:
+    /*!
+     * @brief Construct speculative decode runtime
+     * @param engineDir Directory containing engine files
+     * @param multimodalEngineDir Directory containing multimodal engine files
+     * @param draftingConfig Eagle drafting configuration
+     * @param stream CUDA stream for operations
+     */
     LLMInferenceSpecDecodeRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         EagleDraftingConfig const& draftingConfig, cudaStream_t stream);
 
+    //! @brief Destructor
     ~LLMInferenceSpecDecodeRuntime() = default;
+    //! @brief Capture CUDA graph for draft proposal
+    //! @param stream CUDA stream
+    //! @return True on success, false on failure
     bool captureDraftProposalCudaGraph(cudaStream_t stream);
 
+    //! @brief Capture CUDA graph for draft accept decode token
+    //! @param stream CUDA stream
+    //! @return True on success, false on failure
     bool captureDraftAcceptDecodeTokenCudaGraph(cudaStream_t stream);
 
+    //! @brief Capture CUDA graph for base verification
+    //! @param stream CUDA stream
+    //! @return True on success, false on failure
     bool captureBaseVerificationCudaGraph(cudaStream_t stream);
 
+    /*!
+     * @brief Handle generation request
+     * @param request Generation request with prompts and parameters
+     * @param response Output response with generated tokens and text
+     * @param stream CUDA stream
+     * @return True on success, false on failure
+     */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
 
     //! Get LLM prefill stage metrics
@@ -88,14 +123,14 @@ public:
     }
 
 private:
-    EagleDraftingConfig mDraftingConfig;
-    LLMEngineRunnerConfig mBaseEngineConfig;
-    EagleDraftEngineRunnerConfig mDraftEngineConfig;
+    EagleDraftingConfig mDraftingConfig;             //!< Eagle drafting configuration
+    LLMEngineRunnerConfig mBaseEngineConfig;         //!< Base engine configuration
+    EagleDraftEngineRunnerConfig mDraftEngineConfig; //!< Draft engine configuration
 
-    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;
-    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;
-    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;
+    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;           //!< Base model engine runner
+    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;   //!< Draft model engine runner
+    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner (optional)
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;             //!< Tokenizer
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
     // [1] I/O Tensors to work with base and eagle draft engine.
@@ -160,4 +195,4 @@ private:
 };
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

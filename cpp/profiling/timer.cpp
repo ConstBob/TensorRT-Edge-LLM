@@ -21,27 +21,24 @@
 #include <cuda_runtime.h>
 #include <numeric>
 
-namespace drivellm
+namespace trt_edgellm
 {
+
+// Global profiling control flag implementation
+static bool gProfilingEnabled = false;
+
+bool getProfilingEnabled()
+{
+    return gProfilingEnabled;
+}
+
+void setProfilingEnabled(bool enabled)
+{
+    gProfilingEnabled = enabled;
+}
+
 namespace timer
 {
-
-void Timer::startTiming()
-{
-    mTimingActive = true;
-}
-
-void Timer::stopTiming()
-{
-    mTimingActive = false;
-
-    // Calculate all pending timings when stopping
-    for (auto const& stageId : mPendingTimings)
-    {
-        recordTiming(stageId);
-    }
-    mPendingTimings.clear();
-}
 
 void Timer::reset()
 {
@@ -53,7 +50,7 @@ void Timer::reset()
 
 TimerSession Timer::startStage(std::string const& stageId, cudaStream_t stream)
 {
-    if (!mTimingActive)
+    if (!getProfilingEnabled())
     {
         return TimerSession(nullptr);
     }
@@ -114,7 +111,7 @@ std::unordered_map<std::string, StageTimingData> const& Timer::getAllTimingData(
 
 void Timer::startTimer(std::string const& stageId, cudaStream_t stream)
 {
-    if (!mTimingActive)
+    if (!getProfilingEnabled())
     {
         return;
     }
@@ -141,7 +138,7 @@ void Timer::startTimer(std::string const& stageId, cudaStream_t stream)
 
 void Timer::endTimer(std::string const& stageId, cudaStream_t stream)
 {
-    if (!mTimingActive)
+    if (!getProfilingEnabled())
     {
         return;
     }
@@ -198,4 +195,4 @@ void Timer::onStageComplete(std::string const& stageId)
 }
 
 } // namespace timer
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -23,8 +23,8 @@
 #include "references.h"
 #include "testUtils.h"
 
-using namespace drivellm;
-using namespace drivellm::kernel;
+using namespace trt_edgellm;
+using namespace trt_edgellm::kernel;
 using namespace nvinfer1;
 
 void TestPrepareEagleDraftProposalInput(

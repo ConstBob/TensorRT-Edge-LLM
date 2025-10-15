@@ -20,9 +20,20 @@
 #include "common/checkMacros.h"
 #include <cuda_runtime.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
+/*!
+ * @brief Divide and round up utility function
+ *
+ * Computes ceiling division: (a + n - 1) / n
+ *
+ * @tparam T1 Type of dividend
+ * @tparam T2 Type of divisor
+ * @param a Dividend
+ * @param n Divisor
+ * @return Ceiling of a/n
+ */
 template <typename T1, typename T2>
 inline size_t divUp(const T1& a, const T2& n)
 {
@@ -31,6 +42,13 @@ inline size_t divUp(const T1& a, const T2& n)
     return (tmp_a + tmp_n - 1) / tmp_n;
 }
 
+/*!
+ * @brief Get CUDA compute capability version
+ *
+ * Returns the compute capability as an integer (e.g., 89 for SM 8.9).
+ *
+ * @return Compute capability version (major * 10 + minor)
+ */
 inline int getSMVersion()
 {
     int device{-1};
@@ -41,4 +59,4 @@ inline int getSMVersion()
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
     return sm_major * 10 + sm_minor;
 }
-} // namespace drivellm
+} // namespace trt_edgellm

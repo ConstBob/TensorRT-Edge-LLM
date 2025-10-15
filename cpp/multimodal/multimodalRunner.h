@@ -33,69 +33,117 @@
 #include <variant>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
 
+/*!
+ * @brief Base class for multimodal vision-language model runners
+ *
+ * Provides interface for vision encoder processing in VLMs.
+ * Subclasses implement specific VLM architectures (Qwen-VL, InternVL, etc.).
+ */
 class MultimodalRunner
 {
 public:
+    //! @brief Default constructor
     MultimodalRunner() = default;
+
+    /*!
+     * @brief Construct multimodal runner
+     * @param engineDir Directory containing engine files
+     * @param stream CUDA stream for operations
+     */
     MultimodalRunner(std::string const& engineDir, cudaStream_t stream);
+
+    //! @brief Virtual destructor
     virtual ~MultimodalRunner() = default;
 
-    // Static factory method to create appropriate MultimodalRunner instance
+    /*!
+     * @brief Create appropriate multimodal runner instance
+     *
+     * Factory method that detects model type and creates corresponding runner.
+     *
+     * @param multimodalEngineDir Directory containing multimodal engine files
+     * @param stream CUDA stream for operations
+     * @return Unique pointer to created runner
+     */
     static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, cudaStream_t stream);
 
+    /*!
+     * @brief Preprocess request with images and text
+     * @param request Generation request with prompts and images
+     * @param batchedInputIds Output batched input token IDs
+     * @param tokenizer Tokenizer instance
+     * @param ropeRotaryCosSinDevice RoPE cache tensor
+     * @param stream CUDA stream
+     * @return True on success, false on failure
+     */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
         = 0;
 
+    /*!
+     * @brief Preprocess system prompt
+     * @param systemPrompt System prompt text
+     * @param tokenizer Tokenizer instance
+     * @param ropeRotaryCosSinDevice RoPE cache tensor
+     * @param stream CUDA stream
+     * @return Preprocessed system prompt
+     */
     virtual std::string preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
         = 0;
 
-    // Multimodal inference
+    /*!
+     * @brief Run multimodal inference
+     * @param stream CUDA stream
+     * @return True on success, false on failure
+     */
     virtual bool infer(cudaStream_t stream) = 0;
 
-    // Get multimodal output embeddings.
+    //! @brief Get output embeddings from vision encoder
+    //! @return Reference to output embedding tensor
     virtual rt::Tensor& getOutputEmbedding();
 
-    // Initialize random inputs for benchmark purpose
-    virtual void initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
-        int const inputLength, cudaStream_t stream)
-        = 0;
-
-    // Parse and fill config from config file and engine
+    /*!
+     * @brief Validate and fill configuration from file
+     * @param configPath Path to configuration file
+     * @return True on success, false on failure
+     */
     virtual bool validateAndFillConfig(std::string const& configPath) = 0;
 
-    // Allocate device buffer
-    virtual bool allocateBuffer() = 0;
+    //! @brief Allocate device buffers
+    //! @return True on success, false on failure
+    virtual bool allocateBuffer(cudaStream_t stream) = 0;
 
+    //! @brief Get configuration pointer
+    //! @return Pointer to configuration structure
     virtual void* getConfig() = 0;
 
-    // Get model type at runtime
+    //! @brief Get model type
+    //! @return Model type string
     virtual std::string getModelType() const
     {
         return mModelType;
     }
 
-    //! Get multimodal metrics for this runner
+    //! @brief Get multimodal processing metrics
+    //! @return Multimodal metrics
     metrics::MultimodalMetrics const& getMultimodalMetrics() const
     {
         return mMultimodalMetrics;
     }
 
 protected:
-    // Common members
-    std::string mModelType;
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;
-    std::unique_ptr<nvinfer1::IExecutionContext> mContext;
-    rt::Tensor mOutputEmbedding;
-    metrics::MultimodalMetrics mMultimodalMetrics;
+    std::string mModelType;                                //!< Model type identifier
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;          //!< TensorRT runtime
+    std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;  //!< Visual encoder engine
+    std::unique_ptr<nvinfer1::IExecutionContext> mContext; //!< Execution context
+    rt::Tensor mOutputEmbedding;                           //!< Output embeddings
+    metrics::MultimodalMetrics mMultimodalMetrics;         //!< Performance metrics
 };
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

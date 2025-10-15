@@ -20,7 +20,7 @@
 #include "common/tensor.h"
 #include <cuda_runtime.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -84,4 +84,4 @@ void transposeToPatchInternVL(
     rt::Tensor const& originalImage, rt::Tensor& inputPatches, int32_t const inputOffset, cudaStream_t stream);
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

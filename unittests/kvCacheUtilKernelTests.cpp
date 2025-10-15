@@ -21,7 +21,7 @@
 #include "testUtils.h"
 #include <gtest/gtest.h>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 using namespace nvinfer1;
 
 struct KVCacheParameters

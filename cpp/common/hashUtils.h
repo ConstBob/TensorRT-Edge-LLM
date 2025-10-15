@@ -19,10 +19,20 @@
 
 #include <functional>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace hash_utils
 {
+/*!
+ * @brief Combine hash values using boost-style hash combination
+ *
+ * Combines a hash seed with the hash of a new value using the boost hash_combine
+ * algorithm. Useful for creating composite hash values.
+ *
+ * @tparam T Type of value to hash
+ * @param seed Hash seed to combine with (modified in-place)
+ * @param value Value to hash and combine
+ */
 template <typename T>
 inline void hashCombine(size_t& seed, T const& value)
 {
@@ -30,4 +40,4 @@ inline void hashCombine(size_t& seed, T const& value)
     seed ^= std::hash<T>()(value) + kDELTA + (seed << 6) + (seed >> 2);
 }
 } // namespace hash_utils
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -18,6 +18,7 @@
 // clang-format off
 #include "sampling.h"
 // clang-format on
+#include "common/checkMacros.h"
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -27,17 +28,13 @@
 #include <curand_kernel.h>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 // Define missing constants for half precision
 #ifndef HALF_FLT_MAX
 #define HALF_FLT_MAX 65504.0f
 #endif
-
-// ========================================================================
-// WORKSPACE MANAGEMENT STRUCTURE
-// ========================================================================
 
 // Internal workspace structure for memory management (FP32 only)
 struct SamplingWorkspace
@@ -600,10 +597,6 @@ __global__ void topKStage2Sampling(int32_t const* __restrict__ topKTmpIdBuf, flo
     }
 }
 
-// =======================================================================================
-// SOFTMAX KERNEL (Required for Top-P sampling)
-// =======================================================================================
-
 template <int BLOCK_SIZE>
 __global__ void softmaxKernel(
     float const* logits, float* probs, int32_t batchSize, int32_t vocabSize, float temperature)
@@ -663,10 +656,6 @@ __global__ void softmaxKernel(
         probs[offset + i] = prob;
     }
 }
-
-// =======================================================================================
-// TOP-P SAMPLING KERNELS (based on TensorRT-LLM implementation)
-// =======================================================================================
 
 // Initialize ID values and offsets for top-p sampling
 __global__ void topPInitialize(
@@ -805,23 +794,33 @@ __global__ void topPSampling(float const* sortedProbs, int32_t const* sortedIdVa
     }
 }
 
-// =======================================================================================
-// HOST WRAPPER FUNCTIONS
-// =======================================================================================
-
-// Updated sampling function with automatic workspace allocation fallback (FP32 only)
-void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, SamplingParams const& params,
-    void* workspace, size_t workspaceSize, cudaStream_t stream, uint64_t philoxSeed, uint64_t philoxOffset)
+// Updated sampling function with tensor-based interface (FP32 only)
+void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIndices, SamplingParams const& params,
+    rt::Tensor& workspace, cudaStream_t stream, uint64_t philoxSeed, uint64_t philoxOffset)
 {
-    assert(logits != nullptr && selectedIndices != nullptr);
-    assert(params.batchSize > 0 && params.vocabSize > 0);
+    // Validate input tensors
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU
+            && selectedIndices.getDeviceType() == rt::DeviceType::kGPU
+            && workspace.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check(logits.getDataType() == nvinfer1::DataType::kFLOAT
+            && selectedIndices.getDataType() == nvinfer1::DataType::kINT32
+            && workspace.getDataType() == nvinfer1::DataType::kINT8,
+        "Invalid tensor data types");
+
+    auto logitsShape = logits.getShape();
+    auto selectedIndicesShape = selectedIndices.getShape();
+    check::check(logitsShape.getNumDims() == 2 && selectedIndicesShape.getNumDims() == 1, "Invalid tensor dimensions");
+    check::check(logitsShape[0] == params.batchSize && logitsShape[1] == params.vocabSize,
+        "Logits tensor shape mismatch with parameters");
+    check::check(selectedIndicesShape[0] == params.batchSize, "Selected indices tensor shape mismatch with parameters");
 
     int const BLOCK_SIZE = 256;
     int const BLOCKS_PER_BEAM = 8;
 
     // Setup workspace partitioning
     SamplingWorkspace ws;
-    ws.setupWorkspace(workspace, workspaceSize, params);
+    ws.setupWorkspace(workspace.rawPointer(), workspace.getMemoryCapacity(), params);
 
     // Validate workspace buffers
     if (params.useTopK)
@@ -836,8 +835,8 @@ void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, S
         dim3 grid1(params.batchSize * BLOCKS_PER_BEAM);
         dim3 block1(BLOCK_SIZE);
 
-        topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM>
-            <<<grid1, block1, 0, stream>>>(logits, ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
+        topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM><<<grid1, block1, 0, stream>>>(
+            logits.dataPointer<float>(), ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
 
         // Stage 2: Sample from top-K elements
         dim3 grid2(params.batchSize);
@@ -845,7 +844,7 @@ void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, S
         size_t sharedMemSize = params.topK * sizeof(int32_t) + params.topK * sizeof(float);
 
         topKStage2Sampling<BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(
-            ws.topkIndices, ws.topkValues, selectedIndices, params, philoxSeed, philoxOffset);
+            ws.topkIndices, ws.topkValues, selectedIndices.dataPointer<int32_t>(), params, philoxSeed, philoxOffset);
     }
     else if (params.useTopP)
     {
@@ -855,7 +854,7 @@ void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, S
         int const SOFTMAX_BLOCK_SIZE = 256;
 
         softmaxKernel<SOFTMAX_BLOCK_SIZE><<<params.batchSize, SOFTMAX_BLOCK_SIZE, 0, stream>>>(
-            logits, ws.toppProbs, params.batchSize, params.vocabSize, params.temperature);
+            logits.dataPointer<float>(), ws.toppProbs, params.batchSize, params.vocabSize, params.temperature);
 
         // Stage 1: Initialize
         topPInitialize<<<32, 512, 0, stream>>>(
@@ -883,18 +882,43 @@ void topKtopPSamplingFromLogits(float const* logits, int32_t* selectedIndices, S
         int const SAMPLING_BLOCK_SIZE = 256;
 
         topPSampling<SAMPLING_BLOCK_SIZE><<<params.batchSize, SAMPLING_BLOCK_SIZE, 0, stream>>>(ws.toppSortedProbs,
-            ws.toppSortedIdVals, selectedIndices, ws.toppTopKIndices, ws.toppEarlyExitFlags, params.vocabSize,
-            philoxSeed, philoxOffset, params.topP, params.batchSize);
+            ws.toppSortedIdVals, selectedIndices.dataPointer<int32_t>(), ws.toppTopKIndices, ws.toppEarlyExitFlags,
+            params.vocabSize, philoxSeed, philoxOffset, params.topP, params.batchSize);
     }
 }
 
-// selectAllTopK function - returns topK indices and raw values only (FP32 only)
-// Boolean parameters (returnLogProbs, normalizeLogProbs, inputHasProbs) are kept for API compatibility but ignored
-// This function simply finds the top-K elements and returns their indices and original values
-void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* topKIndices, int32_t batchSize,
-    int32_t vocabSize, int32_t topK, void* workspace, size_t workspaceSize, cudaStream_t stream, bool returnLogProbs,
-    bool normalizeLogProbs, bool inputHasProbs)
+void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues, rt::Tensor& topKIndices, int32_t topK,
+    rt::Tensor& workspace, cudaStream_t stream)
 {
+    // Validate input tensors
+    check::check(input.getDeviceType() == rt::DeviceType::kGPU && topKIndices.getDeviceType() == rt::DeviceType::kGPU
+            && workspace.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check(input.getDataType() == nvinfer1::DataType::kFLOAT
+            && topKIndices.getDataType() == nvinfer1::DataType::kINT32
+            && workspace.getDataType() == nvinfer1::DataType::kINT8,
+        "Invalid tensor data types");
+
+    auto inputShape = input.getShape();
+    auto topKIndicesShape = topKIndices.getShape();
+    check::check(inputShape.getNumDims() == 2 && topKIndicesShape.getNumDims() == 2, "Invalid tensor dimensions");
+
+    int32_t batchSize = inputShape[0];
+    int32_t vocabSize = inputShape[1];
+
+    check::check(topKIndicesShape[0] == batchSize && topKIndicesShape[1] == topK, "TopK indices tensor shape mismatch");
+
+    if (topKValues.has_value())
+    {
+        rt::Tensor& topKValuesTensor = topKValues.value().get();
+        check::check(topKValuesTensor.getDeviceType() == rt::DeviceType::kGPU
+                && topKValuesTensor.getDataType() == nvinfer1::DataType::kFLOAT,
+            "TopK values tensor must be on GPU with float data type");
+        auto topKValuesShape = topKValuesTensor.getShape();
+        check::check(topKValuesShape.getNumDims() == 2 && topKValuesShape[0] == batchSize && topKValuesShape[1] == topK,
+            "TopK values tensor shape mismatch");
+    }
+
     if (topK <= 0 || topK > vocabSize)
     {
         return;
@@ -905,7 +929,7 @@ void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* top
 
     // Setup workspace partitioning
     SamplingWorkspace ws;
-    ws.setupWorkspaceForTopK(workspace, workspaceSize, batchSize, vocabSize, topK);
+    ws.setupWorkspaceForTopK(workspace.rawPointer(), workspace.getMemoryCapacity(), batchSize, vocabSize, topK);
 
     // Create sampling parameters with temperature = 1.0 (no scaling applied to values)
     SamplingParams params(batchSize, vocabSize, 1.0f, topK);
@@ -914,16 +938,17 @@ void selectAllTopKFromLogits(float const* input, float* topKValues, int32_t* top
     dim3 grid1(batchSize * BLOCKS_PER_BEAM);
     dim3 block1(BLOCK_SIZE);
 
-    topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM>
-        <<<grid1, block1, 0, stream>>>(input, ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
+    topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM><<<grid1, block1, 0, stream>>>(
+        input.dataPointer<float>(), ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
 
     // Stage 2: Select final top-K from 8*K candidates and return indices + raw values
     dim3 grid2(batchSize);
     dim3 block2(BLOCK_SIZE);
     size_t sharedMemSize = topK * sizeof(int32_t) + topK * sizeof(float);
 
-    topKStage2ReturnAllTopK<BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(
-        ws.topkIndices, ws.topkValues, topKIndices, topKValues, batchSize, vocabSize, topK, BLOCKS_PER_BEAM);
+    float* topKValuesPtr = topKValues.has_value() ? topKValues.value().get().dataPointer<float>() : nullptr;
+    topKStage2ReturnAllTopK<BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(ws.topkIndices, ws.topkValues,
+        topKIndices.dataPointer<int32_t>(), topKValuesPtr, batchSize, vocabSize, topK, BLOCKS_PER_BEAM);
 }
 
-} // namespace drivellm
+} // namespace trt_edgellm

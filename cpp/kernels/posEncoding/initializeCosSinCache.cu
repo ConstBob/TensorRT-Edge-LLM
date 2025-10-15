@@ -22,7 +22,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -301,4 +301,4 @@ void initializeMRopeCosSin(float* cosSinCache, int32_t* mropePositionIds, float 
 }
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm
