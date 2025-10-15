@@ -229,7 +229,7 @@ tensorrt-edgellm-quantize-llm \
 # Export to ONNX
 tensorrt-edgellm-export-llm \
     --model_dir ./quantized/qwen3-0.6b \
-    --output_dir ./onnx/qwen3-0.6b
+    --output_dir ./onnx_models/qwen3-0.6b
 ```
 
 ### Step 5: Build TensorRT Engine (on Thor device)
@@ -238,7 +238,7 @@ Transfer the ONNX files to your Thor device, then:
 
 ```bash
 ./build/examples/llm/llm_build \
-    --onnxDir ./onnx/qwen3-0.6b \
+    --onnxDir ./onnx_models/qwen3-0.6b \
     --engineDir ./engines/qwen3-0.6b \
     --maxBatchSize 1
 ```
@@ -493,6 +493,7 @@ Solution: Use smaller calibration dataset or run on CPU:
 ```bash
 tensorrt-edgellm-quantize-llm \
     --model_dir model_name \
+    --output_dir quantized/model_name \
     --quantization fp8 \
     --calib_size 128  # Reduce from default
 ```
