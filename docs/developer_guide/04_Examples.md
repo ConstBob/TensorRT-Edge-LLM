@@ -38,11 +38,27 @@ Builds TensorRT engines for LLMs (standard, EAGLE, VLM, LoRA).
   --engineDir engines/qwen3-4b \
   --maxBatchSize 1
 
+# Multimodal (VLM)
+./build/examples/llm/llm_build \
+  --onnxDir onnx_models/qwen2.5-vl-3b \
+  --engineDir engines/qwen2.5-vl-3b \
+  --maxBatchSize 1 \
+  --maxInputLen=1024 \
+  --maxSeqLen=4096 \
+  --vlm \
+  --minImageTokens 128 \
+  --maxImageTokens 512
+
 # EAGLE (speculative decoding)
 ./build/examples/llm/llm_build \
   --onnxDir onnx_models/model_eagle_base \
-  --engineDir engines/model_eagle_base \
+  --engineDir engines/model_eagle \
   --eagleBase
+
+./build/examples/llm/llm_build \
+  --onnxDir onnx_models/model_eagle_draft \
+  --engineDir engines/model_eagle \
+  --eagleDraft
 ```
 
 ### `visual_build` - [Source](../../examples/multimodal/visual_build.cpp)
@@ -51,10 +67,11 @@ Builds TensorRT engines for vision encoders (Qwen-VL, InternVL).
 
 ```bash
 ./build/examples/multimodal/visual_build \
-  --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx_qwen2 \
+  --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx \
   --engineDir visual_engines/qwen2.5-vl-3b \
   --minImageTokens 128 \
-  --maxImageTokens 512
+  --maxImageTokens 512 \
+  --maxImageTokensPerImage=512
 ```
 
 ---
@@ -74,8 +91,7 @@ Runs batch inference from JSON files. Supports standard, EAGLE, multimodal, and 
 
 # EAGLE (speculative decoding)
 ./build/examples/llm/llm_inference \
-  --engineDir engines/model_eagle_base \
-  --multimodalEngineDir engines/model_eagle_draft \
+  --engineDir engines/model_eagle \
   --inputFile input.json \
   --outputFile output.json \
   --eagle
@@ -123,10 +139,27 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_
 
 # 2. Build Engines (Thor device)
 ./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b --engineDir engines/qwen2.5-vl-3b --vlm
-./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx_qwen2 --engineDir visual_engines/qwen2.5-vl-3b
+./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-3b
 
 # 3. Run Inference (Thor device)
 ./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input.json --outputFile output.json
+```
+
+### Multimodal VLM with EAGLE Speculative Decoding (End-to-End)
+
+```bash
+# 1. Export (x86 host)
+tensorrt-edgellm-export-llm --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b_eagle_base --is_eagle_base
+tensorrt-edgellm-export-draft --base_model_dir Qwen/Qwen2.5-VL-3B-Instruct --draft_model_dir path/to/draft --output_dir onnx_models/qwen2.5-vl-3b_eagle_draft --use_prompt_tuning
+tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b/visual_enc_onnx
+
+# 2. Build Engines (Thor device)
+./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b_eagle_base --engineDir engines/qwen2.5-vl-3b_eagle --vlm --eagleBase
+./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b_eagle_draft --engineDir engines/qwen2.5-vl-3b_eagle --vlm --eagleDraft
+./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-3b
+
+# 3. Run Inference (Thor device)
+./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b_eagle --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input.json --outputFile output.json --eagle
 ```
 
 ---
