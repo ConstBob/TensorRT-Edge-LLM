@@ -46,7 +46,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -82,4 +82,4 @@ extern std::unordered_map<uint32_t, uint32_t> const unicodeMapUppercase;
 extern std::vector<rangeNfd> const unicodeRangesNfd;
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

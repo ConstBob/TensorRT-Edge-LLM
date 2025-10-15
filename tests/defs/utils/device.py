@@ -10,7 +10,7 @@ from pytest_helpers import run_command
 class DeviceConfig:
     arch: str
     cuda_version: Optional[str]
-    target: str  # orin, thor, n1, or x86
+    target: str
     compute_capability: Optional[int]
 
     @classmethod
@@ -37,7 +37,7 @@ class DeviceConfig:
     def _map_compute_cap_to_target(compute_cap: Optional[int]) -> str:
         """Map compute capability to target"""
         if compute_cap == 87:
-            return 'orin'
+            return 'jetson-orin'
         # Assume auto-thor uses CUDA 12.8 and compute cap 101
         elif compute_cap == 101:
             return 'auto-thor'
@@ -45,7 +45,7 @@ class DeviceConfig:
         elif compute_cap == 110:
             return 'jetson-thor'
         elif compute_cap == 121:
-            return 'n1'
+            return 'gb10'
         else:
             return 'x86'  # let cmake decide for x86 architectures
 

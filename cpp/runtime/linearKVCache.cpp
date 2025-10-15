@@ -25,7 +25,7 @@
 
 using namespace nvinfer1;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -145,4 +145,4 @@ int32_t LinearKVCache::getActiveBatchSize() const
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

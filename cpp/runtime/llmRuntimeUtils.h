@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -102,4 +102,4 @@ bool initializeRopeCosSinCache(
     rt::Tensor& cosSinCache, RopeCommonConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream);
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

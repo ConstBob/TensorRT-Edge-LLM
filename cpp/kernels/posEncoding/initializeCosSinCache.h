@@ -17,7 +17,7 @@
 
 #pragma once
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -76,4 +76,4 @@ void initializeMRopeCosSin(float* cosSinCache, int32_t* mropePositionIds, float 
     int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, cudaStream_t stream);
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

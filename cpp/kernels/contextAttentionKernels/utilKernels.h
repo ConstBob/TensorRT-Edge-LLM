@@ -21,7 +21,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -64,4 +64,4 @@ template <typename T>
 void cvtKVCachelayoutXQAToFMHA(T const* src, T* dst, int32_t B, int32_t S, int32_t H, int32_t D, cudaStream_t stream);
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

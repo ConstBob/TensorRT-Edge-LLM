@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -140,4 +140,4 @@ private:
 };
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

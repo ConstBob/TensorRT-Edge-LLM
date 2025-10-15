@@ -22,8 +22,8 @@
 #include <regex>
 #include <sstream>
 
-using namespace drivellm;
-using namespace drivellm::logger;
+using namespace trt_edgellm;
+using namespace trt_edgellm::logger;
 
 class LoggerTest : public ::testing::Test
 {

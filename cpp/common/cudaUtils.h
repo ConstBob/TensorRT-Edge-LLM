@@ -20,7 +20,7 @@
 #include "common/checkMacros.h"
 #include <cuda_runtime.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 /*!
@@ -59,4 +59,4 @@ inline int getSMVersion()
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
     return sm_major * 10 + sm_minor;
 }
-} // namespace drivellm
+} // namespace trt_edgellm

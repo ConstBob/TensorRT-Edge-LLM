@@ -32,7 +32,7 @@
 
 using namespace nvinfer1;
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 namespace
@@ -72,9 +72,9 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     // FIXME: Find a better approach to reserve sampling workspace to handle various request configurations.
     int32_t const defaultTopK = 100;
     float const defaultTopP = 0.9F;
-    drivellm::SamplingParams samplingParams(
+    trt_edgellm::SamplingParams samplingParams(
         mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize, 1.0f, defaultTopK, defaultTopP);
-    int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(drivellm::getTopKtopPSamplingWorkspaceSize(
+    int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(trt_edgellm::getTopKtopPSamplingWorkspaceSize(
         mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize, samplingParams));
 
     // Allocate workspace and activation tensors for LLM engine.
@@ -330,7 +330,7 @@ bool LLMInferenceRuntime::handleRequest(
 
     SamplingParams params(activeBatchSize, mEngineConfig.vocabSize, request.temperature, request.topK, request.topP);
     auto sampleTokens = [&]() {
-        drivellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
+        trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
         CUDA_CHECK(cudaMemcpyAsync(selectedTokenIdsHost.data(), mSelectedIndices.rawPointer(),
             activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -567,4 +567,4 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

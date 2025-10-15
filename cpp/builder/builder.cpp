@@ -31,9 +31,9 @@
 #include <iostream>
 #include <sstream>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace builder
 {
@@ -1115,4 +1115,4 @@ bool LLMBuilder::checkKVCacheReuse(nvinfer1::INetworkDefinition const* network)
 }
 
 } // namespace builder
-} // namespace drivellm
+} // namespace trt_edgellm

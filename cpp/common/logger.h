@@ -26,7 +26,7 @@
 #include <sstream>
 #include <string>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 namespace logger
@@ -302,16 +302,16 @@ inline logger::EdgeLLMLogger gLogger{};
 // Usage: LOG_DEBUG("Value: %d", value); LOG_INFO("Message: %s", msg);
 
 #define LOG_DEBUG(...)                                                                                                 \
-    gLogger.debug(format::fmtstr(__VA_ARGS__), drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    gLogger.debug(format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 #define LOG_INFO(...)                                                                                                  \
-    gLogger.info(format::fmtstr(__VA_ARGS__), drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    gLogger.info(format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 #define LOG_WARNING(...)                                                                                               \
-    gLogger.warning(format::fmtstr(__VA_ARGS__), drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    gLogger.warning(format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 #define LOG_ERROR(...)                                                                                                 \
-    gLogger.error(format::fmtstr(__VA_ARGS__), drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    gLogger.error(format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 // Conditional logging macros for performance-critical code
 #define LOG_DEBUG_IF(condition, ...)                                                                                   \
@@ -352,7 +352,7 @@ inline logger::EdgeLLMLogger gLogger{};
 
 // Function tracing macro for automatic entry/exit logging
 #define LOG_TRACE_FUNCTION()                                                                                           \
-    drivellm::logger::ScopedFunctionTracer gTracer(                                                                    \
-        gLogger, __FUNCTION__, drivellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    trt_edgellm::logger::ScopedFunctionTracer gTracer(                                                                 \
+        gLogger, __FUNCTION__, trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
-} // namespace drivellm
+} // namespace trt_edgellm

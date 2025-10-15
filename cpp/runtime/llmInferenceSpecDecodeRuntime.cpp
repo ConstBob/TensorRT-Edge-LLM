@@ -31,7 +31,7 @@
 
 using namespace nvinfer1;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -729,4 +729,4 @@ bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

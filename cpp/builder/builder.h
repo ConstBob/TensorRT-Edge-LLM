@@ -26,7 +26,7 @@
 
 using Json = nlohmann::json;
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 namespace builder
@@ -167,8 +167,9 @@ struct LLMBuilderConfig
 //! for visual encoders used in Vision-Language Models.
 struct VisualBuilderConfig
 {
-    int64_t minImageTokens{4};    //!< Minimum number of image tokens
-    int64_t maxImageTokens{1024}; //!< Maximum number of image tokens
+    int64_t minImageTokens{4};           //!< Minimum number of image tokens in a batch
+    int64_t maxImageTokens{1024};        //!< Maximum number of image tokens in a batch
+    int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image, used for preprocessing
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -177,6 +178,7 @@ struct VisualBuilderConfig
         Json json;
         json["min_image_tokens"] = minImageTokens;
         json["max_image_tokens"] = maxImageTokens;
+        json["max_image_tokens_per_image"] = maxImageTokensPerImage;
         return json;
     }
 
@@ -194,6 +196,10 @@ struct VisualBuilderConfig
         {
             config.maxImageTokens = json["max_image_tokens"];
         }
+        if (json.contains("max_image_tokens_per_image"))
+        {
+            config.maxImageTokensPerImage = json["max_image_tokens_per_image"];
+        }
         return config;
     }
 
@@ -205,6 +211,7 @@ struct VisualBuilderConfig
         oss << "VisualBuilderConfig:\n";
         oss << "  minImageTokens: " << minImageTokens << "\n";
         oss << "  maxImageTokens: " << maxImageTokens << "\n";
+        oss << "  maxImageTokensPerImage: " << maxImageTokensPerImage << "\n";
         return oss.str();
     }
 };
@@ -410,4 +417,4 @@ private:
 };
 
 } // namespace builder
-} // namespace drivellm
+} // namespace trt_edgellm

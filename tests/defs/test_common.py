@@ -28,7 +28,9 @@ def test_build_project(env_config: EnvironmentConfig,
         cmake_cmd.append(f'-DTRT_PACKAGE_DIR={env_config.trt_package_dir}')
     cmake_cmd.append(f'-DCUDA_VERSION={device_config.cuda_version}')
 
-    if device_config.target in ['orin', 'auto-thor', 'n1']:
+    if device_config.target in [
+            'jetson-orin', 'auto-thor', 'jetson-thor', 'gb10'
+    ]:
         cmake_cmd.append(f'-DEMBEDDED_TARGET={device_config.target}')
         cmake_cmd.append(
             '-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake')

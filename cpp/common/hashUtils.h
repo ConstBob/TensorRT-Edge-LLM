@@ -19,7 +19,7 @@
 
 #include <functional>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace hash_utils
 {
@@ -40,4 +40,4 @@ inline void hashCombine(size_t& seed, T const& value)
     seed ^= std::hash<T>()(value) + kDELTA + (seed << 6) + (seed >> 2);
 }
 } // namespace hash_utils
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <string>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 //! Global profiling control flag accessors (defined in timer.cpp)
@@ -170,4 +170,4 @@ public:
 };
 
 } // namespace metrics
-} // namespace drivellm
+} // namespace trt_edgellm

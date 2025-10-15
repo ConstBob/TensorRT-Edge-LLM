@@ -26,14 +26,14 @@
 #include <iostream>
 #include <string>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 struct LLMBuildArgs
 {
     bool help{false};
     std::string onnxDir;
     std::string engineDir;
-    int64_t maxInputLen{128};
+    int64_t maxInputLen{1024};
     int64_t maxSeqLen{4096};
     bool debug{false};
     int64_t maxBatchSize{4};

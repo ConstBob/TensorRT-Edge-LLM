@@ -30,7 +30,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -398,4 +398,4 @@ using OptionalInputTensor = std::optional<std::reference_wrapper<rt::Tensor cons
 using OptionalOutputTensor = std::optional<std::reference_wrapper<rt::Tensor>>;
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

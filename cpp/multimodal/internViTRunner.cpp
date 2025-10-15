@@ -30,7 +30,7 @@
 
 using Json = nlohmann::json;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -44,7 +44,7 @@ InternViTRunner::InternViTRunner(std::string const& engineDir, cudaStream_t stre
         LOG_ERROR("InternViTRunner::InternViTRunner(): Failed to validate and fill config");
         throw std::runtime_error("InternViTRunner::InternViTRunner(): Failed to validate and fill config");
     }
-    if (!allocateBuffer())
+    if (!allocateBuffer(stream))
     {
         LOG_ERROR("InternViTRunner::InternViTRunner(): Failed to allocate buffer");
         throw std::runtime_error("InternViTRunner::InternViTRunner(): Failed to allocate buffer");
@@ -91,6 +91,11 @@ bool InternViTRunner::validateAndFillConfig(std::string const& configPath)
     mConfig.blockImageSizeH = visionConfig["image_size"][0].get<int32_t>();
     mConfig.blockImageSizeW = visionConfig["image_size"][1].get<int32_t>();
 
+    auto builderConfig = jsonConfig["builder_config"];
+    // Min token per image is the same as min token per batch (minimum number of images = 1).
+    mConfig.minImageTokensPerImage = builderConfig["min_image_tokens"].get<int32_t>();
+    mConfig.maxImageTokensPerImage = builderConfig["max_image_tokens_per_image"].get<int32_t>();
+
     // Get config from engine shapes
     nvinfer1::Dims const inputShapeMax
         = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMAX);
@@ -108,7 +113,7 @@ void* InternViTRunner::getConfig()
     return &mConfig;
 }
 
-bool InternViTRunner::allocateBuffer()
+bool InternViTRunner::allocateBuffer(cudaStream_t stream)
 {
     bool setTensorAddressStatus{true};
     LOG_INFO(
@@ -130,6 +135,16 @@ bool InternViTRunner::allocateBuffer()
         LOG_ERROR("Failed to set tensor address to the engine");
         return false;
     }
+
+    // Copy image mean and std to device to be used in normalizeImage
+    auto channels = mConfig.imageMean.size();
+    mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    CUDA_CHECK(cudaMemcpyAsync(
+        mImageMean.rawPointer(), mConfig.imageMean.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        mImageStd.rawPointer(), mConfig.imageStd.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
+
     return true;
 }
 
@@ -157,6 +172,13 @@ void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     }
 
     int64_t curNumBlocks = (height / mConfig.blockImageSizeH) * (width / mConfig.blockImageSizeW);
+    if (totalNumBlocks + curNumBlocks > mConfig.maxNumBlocks)
+    {
+        throw std::runtime_error("totalNumBlocks " + std::to_string(totalNumBlocks) + " + curNumBlocks "
+            + std::to_string(curNumBlocks) + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
+            + " of VIT engine.");
+    }
+
     int64_t curTokenLength = curNumBlocks * 256;
     if (isThumbnail)
     {
@@ -177,13 +199,7 @@ void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     // Normalize image
     auto normalizedImageDevice
         = rt::Tensor({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    auto imageMeanDevice = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    auto imageStdDevice = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    CUDA_CHECK(cudaMemcpyAsync(imageMeanDevice.rawPointer(), mConfig.imageMean.data(),
-        mConfig.imageMean.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(imageStdDevice.rawPointer(), mConfig.imageStd.data(),
-        mConfig.imageStd.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-    kernel::normalizeImage(imageDevice, imageMeanDevice, imageStdDevice, normalizedImageDevice, stream);
+    kernel::normalizeImage(imageDevice, mImageMean, mImageStd, normalizedImageDevice, stream);
 
     // Transpose to patch
     int64_t offset = totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW;
@@ -193,13 +209,13 @@ void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     totalNumBlocks += curNumBlocks;
 }
 
-std::vector<std::pair<int, int>> InternViTRunner::getAllSupportedAspectRatios(
-    int const minImageTiles, int const maxImageTiles)
+std::vector<std::pair<int32_t, int32_t>> InternViTRunner::getAllSupportedAspectRatios(
+    int32_t const minImageTiles, int32_t const maxImageTiles)
 {
-    std::vector<std::pair<int, int>> aspectRatios;
-    for (int width = 1; width <= maxImageTiles; ++width)
+    std::vector<std::pair<int32_t, int32_t>> aspectRatios;
+    for (int32_t width = 1; width <= maxImageTiles; ++width)
     {
-        for (int height = 1; height <= maxImageTiles; ++height)
+        for (int32_t height = 1; height <= maxImageTiles; ++height)
         {
             if (width * height <= maxImageTiles && width * height >= minImageTiles)
             {
@@ -207,21 +223,24 @@ std::vector<std::pair<int, int>> InternViTRunner::getAllSupportedAspectRatios(
             }
         }
     }
-    std::sort(aspectRatios.begin(), aspectRatios.end(), [](std::pair<int, int> const& a, std::pair<int, int> const& b) {
-        return a.first * a.second < b.first * b.second;
-    });
+    std::sort(aspectRatios.begin(), aspectRatios.end(),
+        [](std::pair<int32_t, int32_t> const& a, std::pair<int32_t, int32_t> const& b) {
+            return a.first * a.second < b.first * b.second;
+        });
     return aspectRatios;
 }
 
-std::tuple<int, int> InternViTRunner::getResizedImageSize(int const height, int const width, int const targetTileHeight,
-    int const targetTileWidth, int const minImageTiles, int const maxImageTiles)
+std::tuple<int32_t, int32_t> InternViTRunner::getResizedImageSize(int32_t const height, int32_t const width)
 {
+    // -1 because we add a thumbnail image for each image
+    int32_t const minImageTiles = std::max(1, mConfig.minImageTokensPerImage / 256 - 1);
+    int32_t const maxImageTiles = std::max(1, mConfig.maxImageTokensPerImage / 256 - 1);
     auto targetRatios = getAllSupportedAspectRatios(minImageTiles, maxImageTiles);
     double const aspectRatio = static_cast<double>(width) / height;
-    int const area = width * height;
+    int64_t const area = width * height;
 
     double bestRatioDiff = HUGE_VAL;
-    std::pair<int, int> bestRatio = {1, 1};
+    std::pair<int32_t, int32_t> bestRatio = {1, 1};
     for (auto const& ratio : targetRatios)
     {
         double const targetAspectRatio = static_cast<double>(ratio.first) / ratio.second;
@@ -234,14 +253,14 @@ std::tuple<int, int> InternViTRunner::getResizedImageSize(int const height, int 
         }
         else if (ratioDiff == bestRatioDiff)
         {
-            if (area > 0.5 * targetTileHeight * targetTileWidth * ratio.first * ratio.second)
+            if (area > 0.5 * mConfig.blockImageSizeH * mConfig.blockImageSizeW * ratio.first * ratio.second)
             {
                 bestRatio = ratio;
             }
         }
     }
     // return (height, width)
-    return {bestRatio.second * targetTileHeight, bestRatio.first * targetTileWidth};
+    return {bestRatio.second * mConfig.blockImageSizeH, bestRatio.first * mConfig.blockImageSizeW};
 }
 
 void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
@@ -256,8 +275,7 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         {
             if (doResize)
             {
-                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width,
-                    mConfig.blockImageSizeH, mConfig.blockImageSizeW, mConfig.minImageTiles, mConfig.maxImageTiles);
+                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
                 auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
                 formatPatch(resizedImage, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
@@ -321,7 +339,7 @@ std::string InternViTRunner::applyChatTemplateUser(
 
 void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImages,
-    std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer)
+    std::vector<int64_t> const& imageTokenLengths, trt_edgellm::tokenizer::Tokenizer* tokenizer)
 {
     if (numImages.size() != request.prompts.size())
     {
@@ -425,54 +443,5 @@ bool InternViTRunner::infer(cudaStream_t stream)
     return true;
 }
 
-void InternViTRunner::initRandomInputs(std::vector<int32_t>& inputIds, int const batchSize, int const imageTokenLength,
-    int const inputLength, cudaStream_t stream)
-{
-    std::random_device dev;
-    std::mt19937 rng(dev());
-
-    // Init visual inputs
-    // In InternVL3, each block generates 256 tokens, so totalNumBlocks is imageTokenLength/256
-    if (imageTokenLength % 256 != 0)
-    {
-        throw std::runtime_error("imageTokenLength " + std::to_string(imageTokenLength)
-            + " must be divisible by 256 for InternVL ViT model.");
-    }
-    int const totalNumBlocks = imageTokenLength / 256;
-    if (totalNumBlocks < mConfig.minNumBlocks || totalNumBlocks > mConfig.maxNumBlocks)
-    {
-        throw std::runtime_error("totalNumBlocks " + std::to_string(totalNumBlocks)
-            + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
-            + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
-    }
-
-    mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
-    mOutputEmbedding.reshape({totalNumBlocks * 256, mConfig.outHiddenSize});
-
-    half* patchesPtr;
-    int32_t patchesSize = totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW;
-    CUDA_CHECK(cudaMallocHost(&patchesPtr, patchesSize * sizeof(half)));
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    std::generate(patchesPtr, patchesPtr + patchesSize, [&rng, &dist]() { return __float2half(dist(rng)); });
-    CUDA_CHECK(cudaMemcpyAsync(
-        mVitInput.rawPointer(), patchesPtr, patchesSize * sizeof(half), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaFreeHost(patchesPtr));
-
-    // Init input ids
-    std::uniform_int_distribution<std::mt19937::result_type> intDist(0, mConfig.vocabSize - 1);
-    int32_t imageTokenId = mConfig.vocabSize;
-    for (int i = 0; i < batchSize; ++i)
-    {
-        auto beginIter = inputIds.begin() + i * inputLength;
-        std::generate(beginIter, beginIter + inputLength, [&rng, &intDist]() { return intDist(rng); });
-        // Replace image tokens at the beginning of each batch
-        for (int j = 0; j < imageTokenLength; ++j)
-        {
-            *(beginIter + j) = imageTokenId;
-            ++imageTokenId;
-        }
-    }
-}
-
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

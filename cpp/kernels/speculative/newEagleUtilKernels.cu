@@ -24,7 +24,7 @@
 
 using namespace nvinfer1;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -1070,4 +1070,4 @@ void constructVerificationDraftTree(rt::Tensor const& draftIdFullTable, rt::Tens
 }
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

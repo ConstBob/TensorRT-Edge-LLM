@@ -28,7 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 //! Global profiling control flag
@@ -306,11 +306,11 @@ private:
  *
  * Usage: TIME_STAGE("stage_name", stream);
  */
-#define TIME_STAGE(stageId, stream) auto _session = drivellm::gTimer.startStage(stageId, stream)
+#define TIME_STAGE(stageId, stream) auto _session = trt_edgellm::gTimer.startStage(stageId, stream)
 
 } // namespace timer
 
 //! Global timer instance
 inline timer::Timer gTimer;
 
-} // namespace drivellm
+} // namespace trt_edgellm
