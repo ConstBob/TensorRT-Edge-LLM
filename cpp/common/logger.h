@@ -32,23 +32,14 @@ namespace drivellm
 namespace logger
 {
 
-/*!
- * @brief Source code location information for automatic tracking
- *
- * Captures file, function, and line number information for logging.
- */
+// Source code location information for automatic tracking
 struct SourceLocation
 {
-    char const* file;     //!< Source file path
-    char const* function; //!< Function name
-    int32_t lineNumber;   //!< Line number
+    char const* file;     // Source file path
+    char const* function; // Function name
+    int32_t lineNumber;   // Line number
 
-    /*!
-     * @brief Constructor with manual location capture
-     * @param f Source file path
-     * @param func Function name
-     * @param l Line number
-     */
+    // Constructor with manual location capture
     SourceLocation(char const* f, char const* func, int32_t l)
         : file(f)
         , function(func)
@@ -72,11 +63,7 @@ public:
     EdgeLLMLogger() = default;
     ~EdgeLLMLogger() = default;
 
-    /*!
-     * @brief nvinfer1::ILogger interface implementation for TensorRT integration
-     * @param severity Log severity level
-     * @param msg Log message
-     */
+    // nvinfer1::ILogger interface implementation for TensorRT integration
     void log(nvinfer1::ILogger::Severity severity, char const* msg) noexcept override
     {
         // Create source location for external library messages
@@ -84,12 +71,7 @@ public:
         logWithLocation(severity, msg, extLoc);
     }
 
-    /*!
-     * @brief Core logging function with automatic location tracking and formatting
-     * @param level Log severity level
-     * @param msg Log message
-     * @param loc Source location information
-     */
+    // Core logging function with automatic location tracking and formatting
     void logWithLocation(nvinfer1::ILogger::Severity level, std::string const& msg, SourceLocation const& loc)
     {
         if (!shouldLog(level))
@@ -103,86 +85,49 @@ public:
         stream << formattedMsg << std::endl;
     }
 
-    /*!
-     * @brief Log debug message with location tracking
-     * @param msg Log message
-     * @param loc Source location information
-     */
+    // Convenience methods for different log levels with automatic location tracking
     void debug(std::string const& msg, SourceLocation const& loc)
     {
         logWithLocation(nvinfer1::ILogger::Severity::kVERBOSE, msg, loc);
     }
 
-    /*!
-     * @brief Log info message with location tracking
-     * @param msg Log message
-     * @param loc Source location information
-     */
     void info(std::string const& msg, SourceLocation const& loc)
     {
         logWithLocation(nvinfer1::ILogger::Severity::kINFO, msg, loc);
     }
 
-    /*!
-     * @brief Log warning message with location tracking
-     * @param msg Log message
-     * @param loc Source location information
-     */
     void warning(std::string const& msg, SourceLocation const& loc)
     {
         logWithLocation(nvinfer1::ILogger::Severity::kWARNING, msg, loc);
     }
 
-    /*!
-     * @brief Log error message with location tracking
-     * @param msg Log message
-     * @param loc Source location information
-     */
     void error(std::string const& msg, SourceLocation const& loc)
     {
         logWithLocation(nvinfer1::ILogger::Severity::kERROR, msg, loc);
     }
 
-    /*!
-     * @brief Set minimum logging level
-     * @param level Minimum severity level to log
-     */
+    // Logger configuration methods
+    // Set minimum logging level
     void setLevel(nvinfer1::ILogger::Severity level)
     {
         mMinLevel = level;
     }
 
-    /*!
-     * @brief Get current logging level
-     * @return Current minimum severity level
-     */
+    // Get current logging level
     nvinfer1::ILogger::Severity getLevel() const
     {
         return mMinLevel;
     }
 
-    /*!
-     * @brief Configure whether to show timestamps in log output
-     * @param show true to show timestamps, false to hide
-     */
+    // Display configuration
     void setShowTimestamp(bool show)
     {
         mShowTimestamp = show;
     }
-
-    /*!
-     * @brief Configure whether to show location info in log output
-     * @param show true to show location, false to hide
-     */
     void setShowLocation(bool show)
     {
         mShowLocation = show;
     }
-
-    /*!
-     * @brief Configure whether to show function names in log output
-     * @param show true to show function names, false to hide
-     */
     void setShowFunction(bool show)
     {
         mShowFunction = show;
@@ -257,21 +202,10 @@ private:
     }
 };
 
-/*!
- * @brief RAII-based function tracer for automatic entry/exit logging
- *
- * Creates automatic log messages when entering and exiting a scope.
- * Useful for tracing function execution flow.
- */
+// RAII-based function tracer for automatic entry/exit logging
 class ScopedFunctionTracer
 {
 public:
-    /*!
-     * @brief Constructor that logs function entry
-     * @param logger Logger instance to use
-     * @param funcName Name of the function being traced
-     * @param loc Source location information
-     */
     ScopedFunctionTracer(EdgeLLMLogger& logger, char const* funcName, SourceLocation const& loc)
         : mLogger(logger)
         , mFuncName(funcName)
@@ -279,10 +213,6 @@ public:
     {
         mLogger.debug("-> Entering " + mFuncName, mLoc);
     }
-
-    /*!
-     * @brief Destructor that logs function exit
-     */
     ~ScopedFunctionTracer()
     {
         mLogger.debug("<- Exiting " + mFuncName, mLoc);

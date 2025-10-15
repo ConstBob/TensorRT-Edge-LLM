@@ -91,25 +91,6 @@ float getPrefillAverageTimePerToken(metrics::LLMPrefillMetrics const& prefillMet
     return 0.0f;
 }
 
-//! Utility function for calculating prefill average tokens per run
-float getPrefillAverageTokensPerRun(metrics::LLMPrefillMetrics const& prefillMetrics)
-{
-    return static_cast<float>(prefillMetrics.reusedTokens + prefillMetrics.computedTokens)
-        / prefillMetrics.getTotalRuns();
-}
-
-//! Utility function for calculating prefill average time per token
-float getPrefillAverageTimePerRun(metrics::LLMPrefillMetrics const& prefillMetrics)
-{
-    auto timingData = gTimer.getTimingData(metrics::StageNames::kLLM_PREFILL);
-    if (!timingData || timingData->getAverageTimeMs() <= 0.0f)
-    {
-        return 0.0f;
-    }
-
-    return timingData->getAverageTimeMs();
-}
-
 //! Utility function for calculating generation average time per token
 float getGenerationAverageTimePerToken(metrics::LLMGenerationMetrics const& generationMetrics)
 {
@@ -249,10 +230,6 @@ void outputPrefillProfile(std::ostream& output, metrics::LLMPrefillMetrics const
         output << "=== LLM Prefill ===" << std::endl;
         output << "Reused Tokens: " << prefillMetrics.reusedTokens << std::endl;
         output << "Computed Tokens: " << prefillMetrics.computedTokens << std::endl;
-        output << "Average Tokens per Run: " << std::fixed << std::setprecision(2)
-               << getPrefillAverageTokensPerRun(prefillMetrics) << std::endl;
-        output << "Average Time per Run: " << std::fixed << std::setprecision(4)
-               << getPrefillAverageTimePerRun(prefillMetrics) << " ms" << std::endl;
         output << "Tokens/Second: " << std::fixed << std::setprecision(1) << getPrefillTokensPerSecond(prefillMetrics)
                << std::endl;
         output << "Average Time per Token: " << std::fixed << std::setprecision(4)
@@ -333,8 +310,6 @@ void addJsonPrefillSummary(nlohmann::json& summary, metrics::LLMPrefillMetrics c
     {
         summary["prefill"] = {{"total_runs", prefillMetrics.getTotalRuns()},
             {"reused_tokens", prefillMetrics.reusedTokens}, {"computed_tokens", prefillMetrics.computedTokens},
-            {"average_tokens_per_run", getPrefillAverageTokensPerRun(prefillMetrics)},
-            {"average_time_per_run_ms", getPrefillAverageTimePerRun(prefillMetrics)},
             {"tokens_per_second", getPrefillTokensPerSecond(prefillMetrics)},
             {"average_time_per_token_ms", getPrefillAverageTimePerToken(prefillMetrics)}};
     }

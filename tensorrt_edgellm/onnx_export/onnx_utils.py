@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import os
 import time
 
@@ -28,7 +27,6 @@ from modelopt.onnx.quantization.qdq_utils import (fp4qdq_to_2dq,
 
 from ..common import ONNX_OPSET_VERSION
 from ..llm_models.layers.int4_gemm_plugin import int4_dq_gemm_to_plugin
-from ..llm_models.models.llm_model import EdgeLLMModelForCausalLM
 
 
 def is_int4_awq_quantized(model: nn.Module) -> bool:
@@ -75,48 +73,6 @@ def is_fp8_quantized(model: nn.Module) -> bool:
     return False
 
 
-def untie_nvfp4_lm_head_initializer(model: onnx.ModelProto) -> onnx.ModelProto:
-    """Untie the weights of the nvFP4 quantized LM head from embed_tokens.weight.
-    """
-    LM_HEAD_WEIGHT_NAME = "lm_head.weight"
-    EMBED_TOKENS_WEIGHT_NAME = "embed_tokens.weight"
-
-    lmhead_weight_quantizer = None
-    for node in model.graph.node:
-        if node.name == "/lm_head/weight_quantizer/TRT_FP4QDQ":
-            lmhead_weight_quantizer = node
-            break
-    if lmhead_weight_quantizer is None:
-        raise ValueError(
-            "Target node '/lm_head/weight_quantizer/TRT_FP4QDQ' not found in model.graph.node"
-        )
-
-    # If tied to embed, create a duplicate initializer and rewire
-    if lmhead_weight_quantizer.input and EMBED_TOKENS_WEIGHT_NAME in lmhead_weight_quantizer.input[
-            0]:
-
-        # Find the initializer for embed_tokens.weight
-        embed_init = None
-        for init in model.graph.initializer:
-            if EMBED_TOKENS_WEIGHT_NAME in init.name:
-                embed_init = init
-                break
-        if embed_init is None:
-            raise ValueError(
-                "Initializer containing 'embed_tokens.weight' not found in model.graph.initializer, cannot untie lm_head weights"
-            )
-
-        print(
-            f"Untying lm_head weights from {lmhead_weight_quantizer.input[0]}, creating a duplicate initializer {LM_HEAD_WEIGHT_NAME}"
-        )
-        new_init = copy.deepcopy(embed_init)
-        new_init.name = LM_HEAD_WEIGHT_NAME
-        model.graph.initializer.append(new_init)
-        lmhead_weight_quantizer.input[0] = LM_HEAD_WEIGHT_NAME
-
-    return model
-
-
 def export_onnx(model, inputs, output_dir, input_names, output_names,
                 dynamic_axes):
     '''
@@ -148,14 +104,6 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
     onnx.shape_inference.infer_shapes_path(onnx_path)
     onnx_model = onnx.load(onnx_path)
     graph = None
-
-    # Since torch.onnx.export deduplicates weights, lm_head and embed_tokens can
-    # share the same ONNX initializer. To prevent quantization of lm_head (e.g. NVFP4)
-    # from affecting embed_tokens, we manually create a separate initializer.
-    # See: https://github.com/pytorch/pytorch/blob/v2.9.0-rc9/torch/csrc/jit/passes/onnx/deduplicate_initializers.cpp#L96
-    if isinstance(model, EdgeLLMModelForCausalLM) and is_fp4_quantized(
-            model.lm_head):
-        onnx_model = untie_nvfp4_lm_head_initializer(onnx_model)
     if is_fp4_quantized(model):
         print(
             "NVFP4 quantization detected in the model, compressing some weights to NVFP4"

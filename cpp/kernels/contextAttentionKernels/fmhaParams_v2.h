@@ -21,12 +21,8 @@
 #include <math.h>
 #include <stdint.h>
 
-//! \brief Parameters for ALiBi (Attention with Linear Biases) positional encoding
 struct AlibiParams
 {
-    //! \brief Rounds down an integer to the nearest power of two
-    //! \param x The input integer value
-    //! \return The largest power of two less than or equal to x
     constexpr static int round_down_to_power_two(int x)
     {
         x = x | (x >> 1);
@@ -38,23 +34,12 @@ struct AlibiParams
     }
 
     AlibiParams() = default;
-
-    //! \brief Constructor for ALiBi parameters
-    //! \param h Number of attention heads
-    //! \param scale_after_alibi Scaling factor to apply after ALiBi bias (default 1.0)
     AlibiParams(int h, float scale_after_alibi = 1.f)
         : scale_after_alibi(scale_after_alibi)
     {
         h_pow_2 = round_down_to_power_two(h);
         alibi_neg4_div_h = -4.0f / h_pow_2;
     }
-
-    //! \brief Constructor for ALiBi parameters with tensor parallelism support
-    //! \param h Number of attention heads per rank
-    //! \param s Sequence length per rank
-    //! \param tp_size Tensor parallelism size
-    //! \param rank Current rank in tensor parallel group
-    //! \param scale_after_alibi Scaling factor to apply after ALiBi bias (default 1.0)
     AlibiParams(int h, int s, int tp_size, int rank, float scale_after_alibi = 1.f)
         : AlibiParams(h * tp_size, scale_after_alibi)
     {
@@ -62,52 +47,50 @@ struct AlibiParams
         sequence_pos_offset = s * rank;
     }
 
-    int h_pow_2{};             //!< Number of heads rounded down to nearest power of two
-    float alibi_neg4_div_h{};  //!< ALiBi slope computation: -4.0 / h_pow_2
-    float scale_after_alibi{}; //!< Scaling factor to apply after ALiBi bias
-    //! Head index offset for tensor parallelism.
-    //! Could be simplified to `int rank` derive the others as `num_heads * rank, s * rank` at
-    //! runtime, but this makes assumptions about the layout downstream
-    //! (e.g. downstream may only split across the head dimension, so s would be the full sequence)
+    int h_pow_2{};
+    float alibi_neg4_div_h{};
+    float scale_after_alibi{};
+    // Could be simplified to `int rank` derive the others as `num_heads * rank, s * rank` at
+    // runtime, but this makes assumptions about the layout downstream
+    // (e.g. downstream may only split across the head dimension, so s would be the full sequence)
     int head_idx_offset = 0;
-    int sequence_pos_offset = 0; //!< Sequence position offset for tensor parallelism
+    int sequence_pos_offset = 0;
 };
 
-//! \brief TMA (Tensor Memory Accelerator) descriptor structure
+// TMA desc
 typedef struct alignas(64)
 {
-    uint64_t data[8]; //!< TMA descriptor data (64-byte aligned)
+    uint64_t data[8];
 } cudaTmaDesc;
 
-//! \brief Array structure for managing paged KV cache blocks
 struct KvBlockArray
 {
     using PtrType = int32_t;
 
-    int32_t mMaxSeqs;         //!< Current number of sequences
-    int32_t mMaxBlocksPerSeq; //!< Max number of blocks per sequence
-    int32_t mTokensPerBlock;  //!< Number of tokens per block. It must be power of 2.
-    //! Exponent of number of tokens with base 2.
-    //! E.g. for mTokensPerBlock 64, mTokensPerBlockLog2 equals to 6
+    // Current number of sequences
+    int32_t mMaxSeqs;
+    // Max number of blocks per sequence
+    int32_t mMaxBlocksPerSeq;
+    // Number of tokens. It must be power of 2.
+    int32_t mTokensPerBlock;
+    // Exponent of number of tokens with base 2.
+    // E.g. for mTokensPerBlock 64, mTokensPerBlockLog2 equals to 6
     int32_t mTokensPerBlockLog2;
-    //! Table maps logical block idx to the data pointer of k/v cache block pool.
-    //! Shape [B, W, 2, M], where 2 is table for K and V,
-    //! B is current number of sequences,
-    //! W is beam width,
-    //! M is Max number of blocks per sequence
+    // Table maps logical block idx to the data pointer of k/v cache block pool
+    // Shape [B, W, 2, M], where 2 is table for K and V,
+    // B is current number of sequences
+    // W is beam width
+    // M is Max number of blocks per sequence
 
-    int32_t mBytesPerBlock; //!< Size of KV cache blocks in bytes (H*D*T*sizeof(DataType))
-    void* mPoolPtr;         //!< Pointer to beginning of pool
-    PtrType* mBlockOffsets; //!< Pointer to block offsets
+    // Size of KV cache blocks in bytes (H*D*T*sizeof(DataType))
+    int32_t mBytesPerBlock;
+    // Pointer to beginning of pool.
+    void* mPoolPtr;
+    // Pointer to block offsets.
+    PtrType* mBlockOffsets;
 
     KvBlockArray() = default;
 
-    //! \brief Constructor for KV block array
-    //! \param batchSize Current number of sequences
-    //! \param maxBlocksPerSeq Maximum number of blocks per sequence
-    //! \param tokensPerBlock Number of tokens per block (must be power of 2)
-    //! \param bytesPerBlock Size of each KV cache block in bytes
-    //! \param poolPtr Pointer to the beginning of the memory pool
     KvBlockArray(
         int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, int32_t bytesPerBlock, void* poolPtr)
         : mMaxSeqs(batchSize)
@@ -122,132 +105,168 @@ struct KvBlockArray
     }
 };
 
-//! \brief Enumeration of context attention mask types
 enum class ContextAttentionMaskType
 {
-    PADDING = 0,               //!< Mask the padded tokens
-    CAUSAL,                    //!< Mask the padded tokens and all the tokens that come after in a sequence
-    SLIDING_OR_CHUNKED_CAUSAL, //!< Causal mask + attend to the specific sliding window or chunk
-    CUSTOM_MASK,               //!< The custom mask input
+    // Mask the padded tokens.
+    PADDING = 0,
+    // Mask the padded tokens and all the tokens that come after in a sequence.
+    CAUSAL,
+    // Causal mask + attend to the specific sliding window or chunk.
+    SLIDING_OR_CHUNKED_CAUSAL,
+    // The custom mask input.
+    CUSTOM_MASK,
 };
 
-//! \brief Enumeration of attention input layout types
 enum class AttentionInputLayout
 {
-    PACKED_QKV = 0,  //!< QKV are packed into [B, S, 3, H, D] layout
-    CONTIGUOUS_Q_KV, //!< Q has contiguous [Compact_S, H, D] layout, while KV has contiguous [Compact_S, 2, H, D] layout
-    //! Q has contiguous [B, S, H, D] layout, while paged KV layout are blocks of indices with shape
-    //! of [B, 2, Blocks_per_Seq], and the indice indicates the block distance to the pool ptr in
-    //! global memory
+    // QKV are packed into [B, S, 3, H, D] layout.
+    PACKED_QKV = 0,
+    // Q has contiguous [Compact_S, H, D] layout, while KV has contiguous [Compact_S, 2, H, D] layout.
+    CONTIGUOUS_Q_KV,
+    // Q has contiguous [B, S, H, D] layout, while paged KV layout are blocks of indices with shape
+    // of [B, 2, Blocks_per_Seq], and the indice indicates the block distance to the pool ptr in
+    // global memory.
     Q_PAGED_KV,
-    //! Q has [B, S, H, D] layout,
-    //! K has [B, S, H_kv, D] layout,
-    //! V has [B, S, H_kv, Dv] layout
+    // Q has [B, S, H, D] layout,
+    // K has [B, S, H_kv, D] layout,
+    // V has [B, S, H_kv, Dv] layout,
     SEPARATE_Q_K_V,
 };
 
-//! \brief Parameters for fused multi-head attention version 2
 struct FusedMultiheadAttentionParamsV2
 {
-    void* qkv_ptr;               //!< The packed QKV matrices
-    void* q_ptr;                 //!< The separate Q matrix
-    void* k_ptr;                 //!< The separate K matrix
-    void* v_ptr;                 //!< The separate V matrix
-    void* kv_ptr;                //!< The separate KV matrix (contiguous KV)
-    KvBlockArray paged_kv_cache; //!< The separate paged kv cache
-    void* packed_mask_ptr;       //!< The mask to implement drop-out
-    float* attention_sinks;      //!< The attention sinks (per head)
-    void* o_ptr;                 //!< The O matrix (output)
-    //! The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
+    // The packed QKV matrices.
+    void* qkv_ptr;
+    // The separate Q matrice.
+    void* q_ptr;
+    // The separate K matrice.
+    void* k_ptr;
+    // The separate V matrice.
+    void* v_ptr;
+    // The separate KV matrice (contiguous KV).
+    void* kv_ptr;
+    // The separate paged kv cache.
+    KvBlockArray paged_kv_cache;
+    // The mask to implement drop-out.
+    void* packed_mask_ptr;
+    // The attention sinks (per head).
+    float* attention_sinks;
+    // The O matrix (output).
+    void* o_ptr;
+    // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
     void* softmax_stats_ptr;
 
-    int64_t q_stride_in_bytes;             //!< The stride between rows of Q
-    int64_t k_stride_in_bytes;             //!< The stride between rows of K
-    int64_t v_stride_in_bytes;             //!< The stride between rows of V
-    int64_t packed_mask_stride_in_bytes;   //!< The stride between matrices of packed mask
-    int64_t o_stride_in_bytes;             //!< The stride between rows of O
-    int64_t softmax_stats_stride_in_bytes; //!< The stride between rows of softmax_stats_ptr
+    // The stride between rows of Q.
+    int64_t q_stride_in_bytes;
+    // The stride between rows of K.
+    int64_t k_stride_in_bytes;
+    // The stride between rows of V.
+    int64_t v_stride_in_bytes;
+    // The stride between matrices of packed mask.
+    int64_t packed_mask_stride_in_bytes;
+    // The stride between rows of O.
+    int64_t o_stride_in_bytes;
+    // The stride between rows of softmax_stats_ptr
+    int64_t softmax_stats_stride_in_bytes;
 
-    //! TMA descriptors on device.
-    //! Either q in packed qkv [B, S, 3, H, D] or separate q layout [B, S, H, D].
+    // tma descriptors on device.
+    // Either q in packed qkv [B, S, 3, H, D] of separate q layout [B, S, H, D].
     cudaTmaDesc tma_desc_q;
-    //! TMA descriptors for packed/contiguous/paged kv cache.
-    //! Kv in packed qkv layout: [B, S, 3, H, D]
-    //! Contiguous kv layout: [B, 2, H, S, D].
-    //! Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
+    // Tma descriptors for packed/contiguous/paged kv cache.
+    // Kv in packed qkv layout: [B, S, 3, H, D]
+    // Contiguous kv layout: [B, 2, H, S, D].
+    // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
     cudaTmaDesc tma_desc_k;
-    cudaTmaDesc tma_desc_v; //!< TMA descriptor for V
-    cudaTmaDesc tma_desc_o; //!< TMA descriptor for O
+    cudaTmaDesc tma_desc_v;
+    // Tma descriptor for o
+    cudaTmaDesc tma_desc_o;
 
-    int blocks_per_tma_load;      //!< TMA load of paged kv cache
-    int blocks_per_tma_load_log2; //!< Log2 of blocks per TMA load
+    // Tma load of paged kv cache.
+    int blocks_per_tma_load;
+    int blocks_per_tma_load_log2;
 
-    //! The dimensions. In ordinary multi-head attention (MHA), there are equal number of QKV heads.
-    //! b: batch size, h: number of query heads, h_kv: number of key/value heads,
-    //! h_q_per_kv: number of query heads per key/value head, s: sequence length,
-    //! s_kv: key/value sequence length, d: head dimension
+    // The dimensions. In ordinary multi-head attention (MHA), there are equal number of QKV heads
     int b, h, h_kv, h_q_per_kv, s, s_kv, d;
-    int dv = 0;                //!< The dimension of V. If unset, dv = d
-    int num_grouped_heads = 1; //!< The number of grouped heads in the seqlen dimension
-    //! Sliding Window Attention.
-    //! Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
+    // The dimension of V. If unset, dv = d.
+    int dv = 0;
+    // The number of grouped heads in the seqlen dimension.
+    int num_grouped_heads = 1;
+    // Sliding Window Attention
+    // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     int sliding_window_size = INT_MAX;
-    int log2_chunked_attention_size
-        = 0; //!< The chunked attention size in log2 (> 0 means that chunked attention is enabled)
-    //! The scaling factors for the kernel
+    // The chunked attention size in log2 (> 0 means that chunked attention is enabled).
+    int log2_chunked_attention_size = 0;
+    // The scaling factors for the kernel.
     uint32_t scale_bmm1, softcapping_scale_bmm1, scale_softmax, scale_bmm2;
 
-    uint32_t* scale_bmm1_d; //!< The scaling factors in the device memory (required by TRT-LLM + FP8 FMHA)
-    uint32_t* scale_bmm2_d; //!< The scaling factors in the device memory (required by TRT-LLM + FP8 FMHA)
+    // The scaling factors in the device memory (required by TRT-LLM + FP8 FMHA).
+    uint32_t* scale_bmm1_d;
+    uint32_t* scale_bmm2_d;
 
-    int* cu_q_seqlens;  //!< Array of length b+1 holding prefix sum of actual q sequence lengths
-    int* cu_kv_seqlens; //!< Array of length b+1 holding prefix sum of actual kv sequence lengths
-    //! Array of length b+1 holding prefix sum of actual mask sequence lengths.
-    //! It might not be the same as cu_q_seqlens as the mask seqlens will be padded.
+    // array of length b+1 holding prefix sum of actual q sequence lengths.
+    int* cu_q_seqlens;
+    // array of length b+1 holding prefix sum of actual kv sequence lengths.
+    int* cu_kv_seqlens;
+    // array of length b+1 holding prefix sum of actual mask sequence lengths.
+    // it might not be the same as cu_q_seqlens as the mask seqlens will be padded.
     int* cu_mask_rows;
 
-    bool has_alibi = false;     //!< If the kernel is using ALiBi or not
-    AlibiParams alibi_params{}; //!< ALiBi parameters
+    // If the kernel is using alibi or not
+    bool has_alibi = false;
+    AlibiParams alibi_params{};
 
-    uint32_t* tile_id_counter_ptr; //!< M tile id counter for dynamic scheduling
-    uint32_t num_tiles;            //!< Total number of tiles
-    uint32_t num_tiles_per_head;   //!< Number of tiles per head
-    bool use_balanced_scheduling;  //!< Whether to use balanced scheduling
+    // M tile id counter for dynamic scheduling
+    uint32_t* tile_id_counter_ptr;
+    uint32_t num_tiles;
+    uint32_t num_tiles_per_head;
+    bool use_balanced_scheduling;
 
-    bool is_s_padded = false; //!< Is input/output padded
+    // is input/output padded
+    bool is_s_padded = false;
 
-    //! \brief SAGE attention parameters
     struct SageAttention
     {
-        //! \brief Per-block quantization scales
         struct Scales
         {
-            int max_nblock; //!< ceil(max_seqlen / block_size)
-            float* scales;  //!< The scale of each block, layout: (B, H, max_nblock)
-        } q, k, v;          //!< Scales for Q, K, V
-    } sage;                 //!< SAGE attention configuration
+            // ceil(max_seqlen / block_size)
+            int max_nblock;
+            // The scale of each block, layout: (B, H, max_nblock)
+            float* scales;
+        } q, k, v;
+    } sage;
 };
 
-//! \brief Flags to control kernel choice and launch parameters
+// flags to control kernel choice
 struct LaunchParams
 {
-    //! Flags to control small batch kernel choice.
-    //! true: never unroll
+    // flags to control small batch kernel choice
+    // true: never unroll
     bool ignore_b1opt = false;
-    bool force_unroll = false;        //!< true: always unroll
-    bool force_fp32_acc = false;      //!< Use FP32 accumulation
-    bool interleaved = false;         //!< The C/32 format
-    bool use_tma = false;             //!< By default TMA is not used
-    int total_q_seqlen = 0;           //!< Total number of q tokens to set TMA descriptors
-    int total_kv_seqlen = 0;          //!< Total number of kv tokens to set TMA descriptors
-    bool flash_attention = false;     //!< If flash attention is used (only FP16)
-    bool warp_specialization = false; //!< If warp-specialized kernels are used (only SM90 HGMMA + TMA)
-    bool use_granular_tiling = false; //!< Granular tiling flash attention kernels
-    //! Causal masking or sliding_or_chunked_causal masking or dense(padding) mask
+    // true: always unroll
+    bool force_unroll = false;
+    // use fp32 accumulation
+    bool force_fp32_acc = false;
+    // the C/32 format
+    bool interleaved = false;
+    // by default TMA is not used.
+    bool use_tma = false;
+    // total number of q tokens to set tma descriptors
+    int total_q_seqlen = 0;
+    // total number of kv tokens to set tma descriptors
+    int total_kv_seqlen = 0;
+    // if flash attention is used (only FP16)
+    bool flash_attention = false;
+    // if warp_specialized kernels are used (only SM90 HGMMA + TMA)
+    bool warp_specialization = false;
+    // granular tiling flash attention kernels
+    bool use_granular_tiling = false;
+    // causal masking or sliding_or_chunked_causal masking or dense(padding) mask.
     ContextAttentionMaskType attention_mask_type = ContextAttentionMaskType::PADDING;
-    AttentionInputLayout attention_input_layout = AttentionInputLayout::PACKED_QKV; //!< The attention input layout
-    bool enable_attn_logit_softcapping
-        = false;                   //!< Enable attention logit softcapping (choose kernels with softcapping_scale_bmm1)
-    int multi_processor_count = 0; //!< Hardware properties to determine how to launch blocks
-    int device_l2_cache_size = 0;  //!< Device L2 cache size in bytes
+    // the attention input layout.
+    AttentionInputLayout attention_input_layout = AttentionInputLayout::PACKED_QKV;
+    // enable_attn_logit_softcapping (choose kernels with softcapping_scale_bmm1).
+    bool enable_attn_logit_softcapping = false;
+    // harward properties to determine how to launch blocks
+    int multi_processor_count = 0;
+    int device_l2_cache_size = 0;
 };

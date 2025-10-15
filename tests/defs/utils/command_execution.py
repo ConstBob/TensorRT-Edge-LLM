@@ -10,10 +10,11 @@ import os
 from typing import Any, Dict, Optional
 
 from conftest import EnvironmentConfig, RemoteConfig
-from pytest_helpers import check_file_exists, run_command, run_with_trt_env
+from pytest_helpers import (check_file_exists, get_file_content, run_command,
+                            run_with_trt_env)
 
 from ..config import ModelType, TaskType, TestConfig
-from .accuracy import check_accuracy_with_dataset
+from .accuracy import check_rouge_score
 from .command_generation import (generate_benchmark_commands,
                                  generate_build_commands,
                                  generate_inference_commands)
@@ -163,7 +164,7 @@ def execute_inference_test(
                 'test_type': TaskType.INFERENCE.value
             }
 
-    # Calculate metrics based on dataset type
+    # Calculate ROUGE score
     final_result = {
         'success': True,
         'error': None,
@@ -172,16 +173,14 @@ def execute_inference_test(
     }
 
     try:
-        # Pass file paths directly to the accuracy checker (runs on host only)
-        metrics_result = check_accuracy_with_dataset(
-            config.get_output_json_file(), config.get_test_case_file(),
-            config.test_case, logger)
-
-        # Merge metrics result into final result
-        final_result.update(metrics_result)
-
+        rouge_score = check_rouge_score(
+            get_file_content(config.get_output_json_file(), remote_config,
+                             logger),
+            # The test case file is not hosted on the remote server, so we pass None for remote_config
+            get_file_content(config.get_test_case_file(), None, logger))
+        final_result['rouge_score'] = rouge_score
     except Exception as e:
-        final_result['error'] = f"Failed to calculate metrics: {str(e)}"
+        final_result['error'] = f"Failed to calculate rouge score: {str(e)}"
         final_result['success'] = False
 
     return final_result

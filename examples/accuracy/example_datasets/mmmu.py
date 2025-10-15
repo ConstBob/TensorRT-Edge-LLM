@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ast
 import os
 import sys
 from typing import Any, Dict, List, Optional, Union
@@ -61,13 +60,18 @@ class MMMUDataset(EdgeLLMDataset):
             # MMMU_Pro vision does not have a question. The question is in the image.
             user_prompt = "Please answer the question in the image."
 
-        options_str = data["options"].strip("[]") if "options" in data else ""
-        if options_str:
-            options_list = ast.literal_eval(options_str)
+        # Add options if available
+        if "options" in data:
+            options_str = data["options"]
+            # parse the options_str to a list of strings
+            options_list = options_str.strip("[]").split(",")
+            options_list = [option.strip("' ") for option in options_list]
             for i, option in enumerate(options_list):
                 letter = chr(ord('A') + i)
                 user_prompt += f"\n{letter}. {option}"  # Space after letter
 
+        # Add instruction based on question type
+        if "options" in data:
             user_prompt += "\n\nAnswer with the option's letter from the given choices directly."
         else:
             user_prompt += "\n\nAnswer the question using a single word or phrase."

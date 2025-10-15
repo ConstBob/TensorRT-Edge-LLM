@@ -24,7 +24,7 @@ Usage:
     python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output
     
     # Quantize with different quantization for LM head
-    python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization fp8
+    python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization int4_awq
     
     # Quantize on CPU
     python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output --quantization fp8 --device cpu
@@ -62,7 +62,7 @@ def main() -> None:
     parser.add_argument("--quantization",
                         type=str,
                         required=False,
-                        choices=["fp8", "int4_awq", "nvfp4"],
+                        choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
                         default=None,
                         help="Quantization method to use")
     parser.add_argument("--dtype",
@@ -76,15 +76,12 @@ def main() -> None:
                         required=False,
                         default="cnn_dailymail",
                         help="Dataset name or path for calibration data")
-    parser.add_argument(
-        "--lm_head_quantization",
-        type=str,
-        required=False,
-        choices=["fp8", "nvfp4"],
-        default=None,
-        help=
-        "Quantization method for language model head (only fp8 is currently supported)"
-    )
+    parser.add_argument("--lm_head_quantization",
+                        type=str,
+                        required=False,
+                        choices=["fp8", "int4_awq", "nvfp4", "mxfp8"],
+                        default=None,
+                        help="Quantization method for language model head")
     parser.add_argument(
         "--device",
         type=str,
@@ -95,6 +92,10 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        if args.quantization == "mxfp8" or args.lm_head_quantization == "mxfp8":
+            print(
+                "Warning: MXFP8 quantization is not currently supported for TensorRT Edge-LLM. This will be supported in the future."
+            )
         quantize_and_save_draft(base_model_dir=args.base_model_dir,
                                 draft_model_dir=args.draft_model_dir,
                                 output_dir=args.output_dir,

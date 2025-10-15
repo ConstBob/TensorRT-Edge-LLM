@@ -18,7 +18,6 @@
 #include "common/trtUtils.h"
 #include "memoryMonitor.h"
 #include "profileFormatter.h"
-#include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
@@ -566,8 +565,8 @@ int main(int argc, char* argv[])
     // Perform warmup runs if requested
     if (args.warmup > 0)
     {
-        // Disable profiling for warmup runs
-        setProfilingEnabled(false);
+        // Stop profiling for warmup runs
+        gTimer.stopTiming();
         LOG_INFO("Starting warmup with %d runs using the first request...", args.warmup);
         auto& firstRequest = requests[0];
 
@@ -595,7 +594,8 @@ int main(int argc, char* argv[])
 
     if (profilerEnabled)
     {
-        setProfilingEnabled(true);
+        // Start profiling for actual runs
+        gTimer.startTiming();
         // Start memory monitoring for examples
         memoryMonitor.start();
     }
@@ -676,10 +676,12 @@ int main(int argc, char* argv[])
         LOG_ERROR("*** %zu REQUESTS FAILED ***", failedCount);
     }
 
+    // Stop timing after all benchmark runs complete
+    // Pending timings are automatically calculated when stopTiming() is called
     if (profilerEnabled)
     {
+        gTimer.stopTiming();
         // Stop memory monitoring for examples
-        setProfilingEnabled(false);
         memoryMonitor.stop();
     }
 

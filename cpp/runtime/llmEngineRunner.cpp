@@ -17,7 +17,6 @@
 
 #include "runtime/llmEngineRunner.h"
 
-#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/hashUtils.h"
@@ -77,17 +76,19 @@ size_t hashDecodingInput(rt::Tensor const& inputIds, rt::Tensor const& outputLog
     return hashValue;
 }
 
-size_t hashBaseTreeDecodingInput(
-    rt::Tensor const& baseTreeDecodingInputIds, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+size_t hashBaseTreeDecodingInput(rt::Tensor const& baseTreeDecodingInputIds, rt::Tensor const& baseTreeDecodingMask,
+    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
     int64_t const activeBatchSize = baseTreeDecodingInputIds.getShape()[0];
     uintptr_t const inputIdsAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingInputIds.rawPointer());
+    uintptr_t const maskAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingMask.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
     uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
 
     size_t hashValue = 0;
     hash_utils::hashCombine(hashValue, activeBatchSize);
     hash_utils::hashCombine(hashValue, inputIdsAddr);
+    hash_utils::hashCombine(hashValue, maskAddr);
     hash_utils::hashCombine(hashValue, outputLogitsAddr);
     hash_utils::hashCombine(hashValue, outputHiddenStatesAddr);
     return hashValue;
@@ -103,6 +104,18 @@ namespace rt
 //! Current implementation limits to two optimization profiles per LLM engine.
 static constexpr int32_t kCONTEXT_PROFILE_INDEX{0};
 static constexpr int32_t kGENERATION_PROFILE_INDEX{1};
+
+// Define the input/output tensor names so that we can modify them uniformly later.
+std::string const inputIdsName{"input_ids"};
+std::string const contextLengthsName{"context_lengths"};
+std::string const lastTokenIdsName{"last_token_ids"};
+std::string const logitsName{"logits"};
+std::string const ropeCosSinName{"rope_rotary_cos_sin"};
+std::string const multimodalEmbeddingsName{"image_embeds"};
+std::string const kvCacheStartIndexName{"kvcache_start_index"};
+std::string const attentionMaskName{"attention_mask"};
+std::string const attentionPosIdName{"attention_pos_id"};
+std::string const outputHiddenStatesName{"hidden_states"};
 
 LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
@@ -191,9 +204,9 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     }
     bool setRopeCosSinCacheStatus{true};
     setRopeCosSinCacheStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
+        &= mContextExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
     setRopeCosSinCacheStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
+        &= mGenerationExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
     if (!setRopeCosSinCacheStatus)
     {
         LOG_ERROR("Failed to set rope cos sin cache to the engine");
@@ -271,10 +284,10 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     if (mConfig.isVlm)
     {
         bool setMultimodalStatus{true};
-        setMultimodalStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
+        setMultimodalStatus &= mGenerationExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), mDummyTensor.rawPointer());
         setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kImageEmbeds, rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
+            multimodalEmbeddingsName.c_str(), rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
         if (!setMultimodalStatus)
         {
             LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
@@ -407,17 +420,17 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 bool LLMEngineRunner::validateConfigFromEngine()
 {
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPresentKeyValuesTemplate) != std::string::npos;
+        return tensorDim.nbDims == 5 && bindingName.find("present_key_values") != std::string::npos;
     };
 
     // If the engine comes with "kvcache_start_index" binding, it means the engine enables reuse KVCache.
     auto identifyReuseKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 1 && bindingName == binding_names::kKVCacheStartIndex;
+        return tensorDim.nbDims == 1 && bindingName.find("kvcache_start_index") != std::string::npos;
     };
 
     // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
     auto identifyMultimodalEmbeddingsBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 2 && bindingName == binding_names::kImageEmbeds;
+        return tensorDim.nbDims == 2 && bindingName == multimodalEmbeddingsName;
     };
 
     int32_t nbKVCacheInputs{0};
@@ -479,8 +492,8 @@ bool LLMEngineRunner::validateConfigFromEngine()
     // Validate hiddenSize from multimodal embeddings if VLM is enabled
     if (mConfig.isVlm && !foundMultimodalEmbeddingsInput)
     {
-        LOG_ERROR(
-            "VLM is enabled but multimodal embeddings input (%s) not found in engine", binding_names::kImageEmbeds);
+        LOG_ERROR("VLM is enabled but multimodal embeddings input (%s) not found in engine",
+            multimodalEmbeddingsName.c_str());
         return false;
     }
 
@@ -491,9 +504,9 @@ bool LLMEngineRunner::validateConfigFromEngine()
         return false;
     }
     Dims const minInputCtxShape
-        = mEngine->getProfileShape(binding_names::kInputIds, kCONTEXT_PROFILE_INDEX, OptProfileSelector::kMIN);
+        = mEngine->getProfileShape(inputIdsName.c_str(), kCONTEXT_PROFILE_INDEX, OptProfileSelector::kMIN);
     Dims const maxInputCtxShape
-        = mEngine->getProfileShape(binding_names::kInputIds, kCONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
+        = mEngine->getProfileShape(inputIdsName.c_str(), kCONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
     if (mConfig.minSupportedInputLength != minInputCtxShape.d[1])
     {
         LOG_ERROR("minSupportedInputLength is not consistent. From engine: %d, from config: %d", minInputCtxShape.d[1],
@@ -514,7 +527,7 @@ bool LLMEngineRunner::validateConfigFromEngine()
     }
 
     // Obtain vocab size from the engine.
-    Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
+    Dims const logitsDim = mEngine->getTensorShape(logitsName.c_str());
     if (mConfig.vocabSize != logitsDim.d[1])
     {
         LOG_ERROR("vocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[1], mConfig.vocabSize);
@@ -522,7 +535,7 @@ bool LLMEngineRunner::validateConfigFromEngine()
     }
 
     // Obtain rotary dim from the engine.
-    Dims const ropeCosSinCacheDim = mEngine->getTensorShape(binding_names::kRopeCosSin);
+    Dims const ropeCosSinCacheDim = mEngine->getTensorShape(ropeCosSinName.c_str());
     if (mConfig.rotaryDim != ropeCosSinCacheDim.d[2])
     {
         LOG_ERROR("rotaryDim is not consistent. From engine: %d, from config: %d", ropeCosSinCacheDim.d[2],
@@ -557,8 +570,8 @@ bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
     bool status{true};
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
     {
-        std::string const pastKeyValuesName = binding_names::formatKVCacheName(i, true);
-        std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
+        std::string const pastKeyValuesName = format::fmtstr("past_key_values.%d", i);
+        std::string const presentKeyValuesName = format::fmtstr("present_key_values.%d", i);
 
         rt::Tensor kvCacheBlock = mKVCache.getKVCacheForDecoderLayer(i);
         status &= mContextExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
@@ -718,53 +731,53 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
 
     bool setEngineIOStatus{true};
     // Engine input tensors.
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mContextExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+        &= mContextExecutionContext->setTensorAddress(inputIdsName.c_str(), const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        &= mContextExecutionContext->setInputShape(inputIdsName.c_str(), inputIds.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mContextExecutionContext->setTensorAddress(contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mContextExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+        lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mContextExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
     if (multimodalEmbeddings.has_value())
     {
         rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
         setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-            binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
+            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
         setEngineIOStatus &= mContextExecutionContext->setInputShape(
-            binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
+            multimodalEmbeddingsName.c_str(), multimodalEmbeddingsTensor.getShape().getTRTDims());
     }
     if (mConfig.enableReuseKVCache)
     {
         setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+            kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().rawPointer());
         setEngineIOStatus &= mContextExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+            kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().getShape().getTRTDims());
     }
     if (mConfig.enableEagleSpecDecode)
     {
         setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
+            outputHiddenStatesName.c_str(), outputHiddenStates.value().get().rawPointer());
         // Mask input and optional token pos-ids are not used, set to dummy data.
         setEngineIOStatus
-            &= mContextExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
+            &= mContextExecutionContext->setTensorAddress(attentionMaskName.c_str(), mDummyTensor.rawPointer());
         setEngineIOStatus &= mContextExecutionContext->setInputShape(
-            binding_names::kAttentionMask, Coords{activeBatchSize, 1, 1}.getTRTDims());
+            attentionMaskName.c_str(), Coords{activeBatchSize, 1, 1}.getTRTDims());
         setEngineIOStatus
-            &= mContextExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
+            &= mContextExecutionContext->setTensorAddress(attentionPosIdName.c_str(), mDummyTensor.rawPointer());
         setEngineIOStatus &= mContextExecutionContext->setInputShape(
-            binding_names::kAttentionPosId, Coords{activeBatchSize, 1}.getTRTDims());
+            attentionPosIdName.c_str(), Coords{activeBatchSize, 1}.getTRTDims());
     }
 
     // Engine output tensors.
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
     // Bind the KVCache IO to the engine.
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
@@ -846,7 +859,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     size_t const graphHash = hashDecodingInput(inputIds, outputLogits, mActiveLoraWeightsName);
     if (mCudaGraphs.find(graphHash) != mCudaGraphs.end())
     {
-        LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for vanilla decoding step.");
+        LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for this decoding step.");
         cudaGraphExec_t graphExec = mCudaGraphs[graphHash].second;
         CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
     }
@@ -855,30 +868,30 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         bool setEngineIOStatus{true};
         // Engine input tensors.
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
+            inputIdsName.c_str(), const_cast<void*>(inputIds.rawPointer()));
         setEngineIOStatus
-            &= mGenerationExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+            &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), inputIds.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+            contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+            contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+            lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+            lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+            ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
 
         if (mConfig.enableReuseKVCache)
         {
             setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-                binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+                kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().rawPointer());
             setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-                binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+                kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().getShape().getTRTDims());
         }
         // Engine output tensors.
         setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+            &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
 
         if (!setEngineIOStatus)
         {
@@ -1003,63 +1016,50 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
     kernel::prepareEagleBaseTreeDecodingInputs(baseTreeDecodingMask, sequenceStartIndices, mEagleBasePackedMask,
         mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
-    // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
-    size_t const graphHash = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, outputLogits, outputHiddenStates);
-    if (mBaseTreeDecodingCudaGraphs.find(graphHash) != mBaseTreeDecodingCudaGraphs.end())
+    // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
+    // initialization.
+    bool setEngineIOStatus{true};
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        inputIdsName.c_str(), const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        inputIdsName.c_str(), baseTreeDecodingInputIds.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mEagleBasePackedMask.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        attentionMaskName.c_str(), mEagleBasePackedMask.getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        attentionPosIdName.c_str(), mEagleBasePositionIds.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        attentionPosIdName.c_str(), mEagleBasePositionIds.getShape().getTRTDims());
+    // Bind the output tensor into the engine.
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
+
+    if (!setEngineIOStatus)
     {
-        LOG_DEBUG("executeEagleBaseTreeDecodingStep(): Use pre-captured CUDA graph for eagle base tree decoding step.");
-        cudaGraphExec_t graphExec = mBaseTreeDecodingCudaGraphs[graphHash].second;
-        CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
+        LOG_ERROR("executeEagleBaseTreeDecodingStep(): Failed to bind engine input and output tensors.");
+        return false;
     }
-    else
+
+    // launch the engine execution.
+    bool executeStatus{true};
+    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    if (!executeStatus)
     {
-        // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
-        // initialization.
-        bool setEngineIOStatus{true};
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kInputIds, baseTreeDecodingInputIds.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
-        // Bind the output tensor into the engine.
-        setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
-
-        if (!setEngineIOStatus)
-        {
-            LOG_ERROR("executeEagleBaseTreeDecodingStep(): Failed to bind engine input and output tensors.");
-            return false;
-        }
-
-        // launch the engine execution.
-        bool executeStatus{true};
-        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
-        if (!executeStatus)
-        {
-            LOG_ERROR(
-                "executeEagleBaseTreeDecodingStep(): Failed on TensorRT eagle base tree decoding stage enqueueV3() "
-                "call.");
-            return false;
-        }
+        LOG_ERROR(
+            "executeEagleBaseTreeDecodingStep(): Failed on TensorRT eagle base tree decoding stage enqueueV3() call.");
+        return false;
     }
 
     // Note in the base tree decoding step we explicitly don't commit the KVCache since we process the "whole tree" in
@@ -1126,30 +1126,29 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     // Set engine I/O using the same logic as executeVanillaDecodingStep().
     bool setEngineIOStatus{true};
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
+        inputIdsName.c_str(), const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mGenerationExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+        &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), inputIds.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+        contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+        ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
     if (mConfig.enableReuseKVCache)
     {
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+            kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+            kvCacheStartIndexName.c_str(), mKVCache.getKVCacheLengths().getShape().getTRTDims());
     }
 
     // Engine output tensors.
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
 
     // Bind the KVCache since we haven't executed the real prefill step.
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
@@ -1199,7 +1198,8 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
     cudaStream_t stream)
 {
-    size_t const hashValue = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, outputLogits, outputHiddenStates);
+    size_t const hashValue
+        = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
     if (mBaseTreeDecodingCudaGraphs.find(hashValue) != mBaseTreeDecodingCudaGraphs.end())
     {
         LOG_INFO("captureEagleBaseTreeDecodingCudaGraph(): CUDA graph already captured for the input tensors.");
@@ -1244,38 +1244,37 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     // initialization.
     bool setEngineIOStatus{true};
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
+        inputIdsName.c_str(), const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kInputIds, baseTreeDecodingInputIds.getShape().getTRTDims());
+        inputIdsName.c_str(), baseTreeDecodingInputIds.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+        contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setTensorAddress(lastTokenIdsName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        lastTokenIdsName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
 
     if (mConfig.ropeType == RopeType::kMRope)
     {
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
     }
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
+        ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mEagleBasePackedMask.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
+        attentionMaskName.c_str(), mEagleBasePackedMask.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
+        attentionPosIdName.c_str(), mEagleBasePositionIds.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
+        attentionPosIdName.c_str(), mEagleBasePositionIds.getShape().getTRTDims());
 
     // Bind the output tensor into the engine.
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+        outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
 
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
@@ -1340,11 +1339,11 @@ bool LLMEngineRunner::resetLoraWeights(cudaStream_t stream)
             &= mContextExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
         resetStatus
             &= mGenerationExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
-        if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
+        if (loraWeightsTensorName.find("lora_A") != std::string::npos)
         {
             zeroShape.d[1] = 0;
         }
-        else if (loraWeightsTensorName.find(binding_names::kLoraBPrefix) != std::string::npos)
+        else if (loraWeightsTensorName.find("lora_B") != std::string::npos)
         {
             zeroShape.d[0] = 0;
         }
@@ -1385,7 +1384,7 @@ bool LLMEngineRunner::addLoraWeights(
     // Validate the LoRA weights do not exceed the max LoRA rank
     for (auto const& tensor : tensors)
     {
-        if (tensor.getName().find(binding_names::kLoraAPrefix) != std::string::npos)
+        if (tensor.getName().find("lora_A") != std::string::npos)
         {
             if (tensor.getShape()[1] > mConfig.maxSupportedLoraRank)
             {
@@ -1394,7 +1393,7 @@ bool LLMEngineRunner::addLoraWeights(
                 return false;
             }
         }
-        else if (tensor.getName().find(binding_names::kLoraBPrefix) != std::string::npos)
+        else if (tensor.getName().find("lora_B") != std::string::npos)
         {
             if (tensor.getShape()[0] > mConfig.maxSupportedLoraRank)
             {
@@ -1420,7 +1419,7 @@ std::vector<std::string> LLMEngineRunner::getLoraWeightsTensorNames() const
     {
         char const* bindingName = mEngine->getIOTensorName(i);
         std::string bindingNameStr(bindingName);
-        if (binding_names::isLoraBinding(bindingNameStr))
+        if (bindingNameStr.find("lora_") != std::string::npos)
         {
             loraWeightsTensorNames.push_back(bindingNameStr);
         }
@@ -1479,11 +1478,11 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cuda
         {
             nvinfer1::Dims shape
                 = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
-            if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
+            if (loraWeightsTensorName.find("lora_A") != std::string::npos)
             {
                 shape.d[1] = 0;
             }
-            else if (loraWeightsTensorName.find(binding_names::kLoraBPrefix) != std::string::npos)
+            else if (loraWeightsTensorName.find("lora_B") != std::string::npos)
             {
                 shape.d[0] = 0;
             }

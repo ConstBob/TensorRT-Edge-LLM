@@ -15,6 +15,3 @@ data.tar
 internal/
 *.log
 .DS_Store/
-docs/cpp_docs/
-docs/build/
-docs/source/cpp_api/

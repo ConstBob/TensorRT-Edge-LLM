@@ -16,7 +16,6 @@
  */
 
 #include "builder.h"
-#include "common/bindingNames.h"
 #include "common/cudaUtils.h"
 #include "common/fileUtils.h"
 #include "common/logger.h"
@@ -449,19 +448,19 @@ bool LLMBuilder::setupCommonProfiles(
     bool result = true;
 
     // Context lengths
-    result &= setOptimizationProfile(contextProfile, binding_names::kContextLengths, createDims({1}),
+    result &= setOptimizationProfile(contextProfile, "context_lengths", createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kContextLengths, createDims({1}),
+    result &= setOptimizationProfile(generationProfile, "context_lengths", createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
     // Rope rotary cos sin
     int64_t profileMaxPositionEmbeddings
         = std::max(static_cast<int64_t>(mMaxPositionEmbeddings), mBuilderConfig.maxSeqLen);
-    result &= setOptimizationProfile(contextProfile, binding_names::kRopeCosSin,
+    result &= setOptimizationProfile(contextProfile, "rope_rotary_cos_sin",
         createDims({1, mBuilderConfig.maxSeqLen, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxSeqLen, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, profileMaxPositionEmbeddings, mRotaryDim}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kRopeCosSin,
+    result &= setOptimizationProfile(generationProfile, "rope_rotary_cos_sin",
         createDims({1, mBuilderConfig.maxSeqLen, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxSeqLen, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, profileMaxPositionEmbeddings, mRotaryDim}));
@@ -470,9 +469,9 @@ bool LLMBuilder::setupCommonProfiles(
     // As a future improvement, we should enable KVCache reuse feature by default and remove the if statement.
     if (mModelConfig["enable_reuse_kv_cache"].get<bool>())
     {
-        result &= setOptimizationProfile(contextProfile, binding_names::kKVCacheStartIndex, createDims({1}),
+        result &= setOptimizationProfile(contextProfile, "kvcache_start_index", createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-        result &= setOptimizationProfile(generationProfile, binding_names::kKVCacheStartIndex, createDims({1}),
+        result &= setOptimizationProfile(generationProfile, "kvcache_start_index", createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
     }
 
@@ -488,16 +487,16 @@ bool LLMBuilder::setupVanillaProfiles(
     bool result = true;
 
     // Input IDs - always dynamic
-    result &= setOptimizationProfile(contextProfile, binding_names::kInputIds, createDims({1, 1}),
+    result &= setOptimizationProfile(contextProfile, "input_ids", createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kInputIds, createDims({1, 1}),
+    result &= setOptimizationProfile(generationProfile, "input_ids", createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
 
     // Last token IDs
-    result &= setOptimizationProfile(contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+    result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+    result &= setOptimizationProfile(generationProfile, "last_token_ids", createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
 
     return result;
@@ -512,35 +511,34 @@ bool LLMBuilder::setupEagleProfiles(
         = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
 
     // Input IDs
-    result &= setOptimizationProfile(contextProfile, binding_names::kInputIds, createDims({1, 1}),
+    result &= setOptimizationProfile(contextProfile, "input_ids", createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kInputIds, createDims({1, 1}),
+    result &= setOptimizationProfile(generationProfile, "input_ids", createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
     // Last token IDs
-    result &= setOptimizationProfile(contextProfile, binding_names::kLastTokenIds, createDims({1}),
+    result &= setOptimizationProfile(contextProfile, "last_token_ids", createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kLastTokenIds, createDims({1}),
-        createDims({maxTokens / 2}), createDims({maxTokens}));
+    result &= setOptimizationProfile(
+        generationProfile, "last_token_ids", createDims({1}), createDims({maxTokens / 2}), createDims({maxTokens}));
 
     if (mBuilderConfig.eagleDraft)
     {
         // Hidden states from draft
-        result &= setOptimizationProfile(contextProfile, binding_names::kDraftModelHiddenStates,
-            createDims({1, 1, mHiddenSize}),
+        result &= setOptimizationProfile(contextProfile, "hidden_states_from_draft", createDims({1, 1, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
-        result &= setOptimizationProfile(generationProfile, binding_names::kDraftModelHiddenStates,
-            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+        result &= setOptimizationProfile(generationProfile, "hidden_states_from_draft", createDims({1, 1, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
 
         // Hidden states input
-        result &= setOptimizationProfile(contextProfile, binding_names::kBaseModelHiddenStates,
+        result &= setOptimizationProfile(contextProfile, "hidden_states_input",
             createDims({1, 1, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mTargetModelOutputHiddenDim}));
-        result &= setOptimizationProfile(generationProfile, binding_names::kBaseModelHiddenStates,
+        result &= setOptimizationProfile(generationProfile, "hidden_states_input",
             createDims({1, 1, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mTargetModelOutputHiddenDim}));
@@ -550,17 +548,17 @@ bool LLMBuilder::setupEagleProfiles(
     if (mBuilderConfig.eagleDraft || mBuilderConfig.eagleBase)
     {
         int32_t const attnMaskAlignSize = 32;
-        result &= setOptimizationProfile(contextProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+        result &= setOptimizationProfile(contextProfile, "attention_mask", createDims({1, 1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1, 1}), createDims({mBuilderConfig.maxBatchSize, 1, 1}));
-        result &= setOptimizationProfile(generationProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+        result &= setOptimizationProfile(generationProfile, "attention_mask", createDims({1, 1, 1}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens / 2,
                 static_cast<int64_t>(divUp(maxTokens / 2, attnMaskAlignSize) * attnMaskAlignSize)}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens,
                 static_cast<int64_t>(divUp(maxTokens, attnMaskAlignSize) * attnMaskAlignSize)}));
 
-        result &= setOptimizationProfile(contextProfile, binding_names::kAttentionPosId, createDims({1, 1}),
+        result &= setOptimizationProfile(contextProfile, "attention_pos_id", createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
-        result &= setOptimizationProfile(generationProfile, binding_names::kAttentionPosId, createDims({1, 1}),
+        result &= setOptimizationProfile(generationProfile, "attention_pos_id", createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens}));
     }
@@ -577,7 +575,7 @@ bool LLMBuilder::setupVLMProfiles(nvinfer1::IOptimizationProfile* contextProfile
     int32_t imageHiddenSize = 0;
     for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
     {
-        if (strcmp(network->getInput(idx)->getName(), binding_names::kImageEmbeds) == 0)
+        if (strcmp(network->getInput(idx)->getName(), "image_embeds") == 0)
         {
             imageHiddenSize = network->getInput(idx)->getDimensions().d[1];
             break;
@@ -592,10 +590,10 @@ bool LLMBuilder::setupVLMProfiles(nvinfer1::IOptimizationProfile* contextProfile
 
     int64_t optImageTokens = (mBuilderConfig.maxImageTokens + mBuilderConfig.minImageTokens) / 2;
 
-    result &= setOptimizationProfile(contextProfile, binding_names::kImageEmbeds,
+    result &= setOptimizationProfile(contextProfile, "image_embeds",
         createDims({mBuilderConfig.minImageTokens, imageHiddenSize}), createDims({optImageTokens, imageHiddenSize}),
         createDims({mBuilderConfig.maxImageTokens, imageHiddenSize}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kImageEmbeds, createDims({1, imageHiddenSize}),
+    result &= setOptimizationProfile(generationProfile, "image_embeds", createDims({1, imageHiddenSize}),
         createDims({1, imageHiddenSize}), createDims({1, imageHiddenSize}));
 
     if (!result)
@@ -625,7 +623,7 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile* contextProfil
         auto* input = network->getInput(i);
         std::string inputName = input->getName();
 
-        if (inputName.find(binding_names::kLoraAPrefix) != std::string::npos)
+        if (inputName.find("lora_A") != std::string::npos)
         {
             if (!findLoraWeights)
             {
@@ -646,7 +644,7 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile* contextProfil
                     createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
             }
         }
-        else if (inputName.find(binding_names::kLoraBPrefix) != std::string::npos)
+        else if (inputName.find("lora_B") != std::string::npos)
         {
             if (!findLoraWeights)
             {
@@ -702,9 +700,9 @@ bool LLMBuilder::setupKVCacheProfiles(
 
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
-        result &= setOptimizationProfile(contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
+        result &= setOptimizationProfile(contextProfile, format::fmtstr("past_key_values.%d", i).c_str(),
             minKVContextShape, optKVContextShape, maxKVContextShape);
-        result &= setOptimizationProfile(generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
+        result &= setOptimizationProfile(generationProfile, format::fmtstr("past_key_values.%d", i).c_str(),
             minKVGenerationShape, optKVGenerationShape, maxKVGenerationShape);
     }
 
@@ -998,11 +996,11 @@ bool VisualBuilder::setupQwenViTProfile(
     for (int32_t i = 0; i < network->getNbInputs(); ++i)
     {
         auto* input = network->getInput(i);
-        if (strcmp(input->getName(), binding_names::kVisualInput) == 0)
+        if (strcmp(input->getName(), "input") == 0)
         {
             inputDim = input->getDimensions().d[1];
         }
-        else if (strcmp(input->getName(), binding_names::kRotaryPosEmb) == 0)
+        else if (strcmp(input->getName(), "rotary_pos_emb") == 0)
         {
             ropeEmbedSize = input->getDimensions().d[1];
         }
@@ -1010,31 +1008,31 @@ bool VisualBuilder::setupQwenViTProfile(
 
     if (inputDim == 0)
     {
-        LOG_ERROR("Cannot infer inputDim. Do you have proper ONNX input: %s?", binding_names::kVisualInput);
+        LOG_ERROR("Cannot infer inputDim. Do you have proper ONNX input: input?");
         return false;
     }
 
     if (ropeEmbedSize == 0)
     {
-        LOG_ERROR("Cannot infer ropeEmbedSize. Do you have proper ONNX input: %s?", binding_names::kRotaryPosEmb);
+        LOG_ERROR("Cannot infer ropeEmbedSize. Do you have proper ONNX input: rotary_pos_emb?");
         return false;
     }
 
-    result &= setOptimizationProfile(profile, binding_names::kVisualInput, createDims({minHW, inputDim}),
-        createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
-    result &= setOptimizationProfile(profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
+    result &= setOptimizationProfile(
+        profile, "input", createDims({minHW, inputDim}), createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
+    result &= setOptimizationProfile(profile, "rotary_pos_emb", createDims({minHW, ropeEmbedSize}),
         createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
-    result &= setOptimizationProfile(profile, binding_names::kAttentionMask, createDims({1, minHW, minHW}),
+    result &= setOptimizationProfile(profile, "attention_mask", createDims({1, minHW, minHW}),
         createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
 
     if (mModelType == "qwen2_5_vl")
     {
-        result &= setOptimizationProfile(profile, binding_names::kWindowAttentionMask, createDims({1, minHW, minHW}),
+        result &= setOptimizationProfile(profile, "window_attention_mask", createDims({1, minHW, minHW}),
             createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
-        result &= setOptimizationProfile(profile, binding_names::kWindowIndex, createDims({minHW / 4}),
-            createDims({optHW / 4}), createDims({maxHW / 4}));
-        result &= setOptimizationProfile(profile, binding_names::kReverseWindowIndex, createDims({minHW / 4}),
-            createDims({optHW / 4}), createDims({maxHW / 4}));
+        result &= setOptimizationProfile(
+            profile, "window_index", createDims({minHW / 4}), createDims({optHW / 4}), createDims({maxHW / 4}));
+        result &= setOptimizationProfile(
+            profile, "reverse_window_index", createDims({minHW / 4}), createDims({optHW / 4}), createDims({maxHW / 4}));
     }
 
     if (!result)
@@ -1059,10 +1057,10 @@ bool VisualBuilder::setupInternViTProfile(nvinfer1::IOptimizationProfile* profil
     int64_t maxNumBlocks = mBuilderConfig.maxImageTokens / 256;
     int64_t optNumBlocks = (minNumBlocks + maxNumBlocks) / 2;
 
-    result &= setOptimizationProfile(profile, binding_names::kVisualInput,
-        createDims({minNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
-        createDims({optNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
-        createDims({maxNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}));
+    result
+        &= setOptimizationProfile(profile, "input", createDims({minNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
+            createDims({optNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
+            createDims({maxNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}));
 
     return result;
 }
@@ -1094,7 +1092,7 @@ bool LLMBuilder::checkKVCacheReuse(nvinfer1::INetworkDefinition const* network)
     bool enableReuseKVCache = false;
     for (int i = 0; i < network->getNbInputs(); ++i)
     {
-        if (strcmp(network->getInput(i)->getName(), binding_names::kKVCacheStartIndex) == 0)
+        if (strcmp(network->getInput(i)->getName(), "kvcache_start_index") == 0)
         {
             enableReuseKVCache = true;
             LOG_INFO("KV cache reuse is enabled.");

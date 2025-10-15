@@ -375,9 +375,11 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     }
 
     // Sampling from the Prefill stage logits using greedy Top1 sampling, only collect the top1 index.
-    mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, 1});
+    mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE});
     constexpr int32_t kSAMPLING_TOP_K = 1;
-    selectAllTopK(mLogitsOutput, std::nullopt, mSamplingIndices, kSAMPLING_TOP_K, mSamplingWorkspace, context.stream);
+    selectAllTopKFromLogits(mLogitsOutput.dataPointer<float>(), nullptr, mSamplingIndices.dataPointer<int32_t>(),
+        kRUNTIME_BATCH_SIZE, mBaseEngineConfig.vocabSize, kSAMPLING_TOP_K, mSamplingWorkspace.rawPointer(),
+        mSamplingWorkspace.getMemoryCapacity(), context.stream, false, false, false);
 
     // Pull the sampling indices from device to host.
     int32_t selectedTokenId;
@@ -452,8 +454,9 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
     int32_t const draftTopK = mDraftingConfig.draftingTopK;
     mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
     mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
-    selectAllTopK(
-        mLogitsOutput, std::ref(mSamplingScores), mSamplingIndices, draftTopK, mSamplingWorkspace, context.stream);
+    selectAllTopKFromLogits(mLogitsOutput.dataPointer<float>(), mSamplingScores.dataPointer<float>(),
+        mSamplingIndices.dataPointer<int32_t>(), kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelVocabSize, draftTopK,
+        mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream);
 
     // Initialize data structures to describe the whole draft tree.
     kernel::initializeDraftTreeTables(mSamplingIndices, mSamplingScores, mDraftTreeRootTokenId, mDraftVocabMappingTable,
@@ -494,8 +497,9 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
             // top draftTopK, assemble input tensors, and save intermediate information.
             mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
             mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
-            selectAllTopK(mDraftTokenScoresTable, std::ref(mSamplingScores), mSamplingIndices, draftTopK,
-                mSamplingWorkspace, context.stream);
+            selectAllTopKFromLogits(mDraftTokenScoresTable.dataPointer<float>(), mSamplingScores.dataPointer<float>(),
+                mSamplingIndices.dataPointer<int32_t>(), kRUNTIME_BATCH_SIZE, draftTopK * draftTopK, draftTopK,
+                mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream);
             kernel::assembleDraftTreeInput(mDraftTokenIdsTable, mDraftHiddenStatesOutput, mSamplingIndices, mIdsInput,
                 mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, draftTopK, round, context.stream);
             kernel::assembleIntermediateData(mSamplingScores, mSamplingIndices, mDraftTokenIntermediateScores,
@@ -512,16 +516,12 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
             return false;
         }
         // Collect TopK results from each lane of output logits.
-        // mLogitsOutput is already shaped as {draftTopK, vocabSize} which matches {kRUNTIME_BATCH_SIZE * draftTopK,
-        // vocabSize} since kRUNTIME_BATCH_SIZE = 1
-        mSamplingIndices.reshape({draftTopK, draftTopK});
-        mSamplingScores.reshape({draftTopK, draftTopK});
-        selectAllTopK(
-            mLogitsOutput, std::ref(mSamplingScores), mSamplingIndices, draftTopK, mSamplingWorkspace, context.stream);
-
-        // Reshape back to the expected format for subsequent kernel calls
         mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, draftTopK * draftTopK});
         mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK * draftTopK});
+        selectAllTopKFromLogits(mLogitsOutput.dataPointer<float>(), mSamplingScores.dataPointer<float>(),
+            mSamplingIndices.dataPointer<int32_t>(), kRUNTIME_BATCH_SIZE * draftTopK,
+            mDraftEngineConfig.draftModelVocabSize, draftTopK, mSamplingWorkspace.rawPointer(),
+            mSamplingWorkspace.getMemoryCapacity(), context.stream);
 
         // Update the draft tree tables with the new topK results. translate draft vocab token towards full vocab size.
         kernel::computeCuScoresAndTranslateToken(mSamplingIndices, mSamplingScores, mDraftTokenIntermediateScores,
@@ -535,8 +535,11 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
     // We have constructed the data structure for the draft table, now we need to pick the top candidates and produce
     // the verify tree and pass into the base model for verification.
     mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize});
-    selectAllTopK(mDraftTokenScoreFullTable, std::nullopt, mSamplingIndices, mDraftingConfig.verifyTreeSize,
-        mSamplingWorkspace, context.stream);
+    int64_t const fullDraftTableSize = mDraftTokenScoreFullTable.getShape()[1];
+    selectAllTopKFromLogits(mDraftTokenScoreFullTable.dataPointer<float>(), nullptr,
+        mSamplingIndices.dataPointer<int32_t>(), kRUNTIME_BATCH_SIZE, fullDraftTableSize,
+        mDraftingConfig.verifyTreeSize, mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(),
+        context.stream);
 
     mIdsInput.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize});
     mDraftTreeMask.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});

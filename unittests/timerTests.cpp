@@ -28,9 +28,9 @@ class TimerTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        // Reset timer and enable profiling
+        // Reset and start timing
         gTimer.reset();
-        setProfilingEnabled(true);
+        gTimer.startTiming();
 
         // Initialize CUDA for testing
         CUDA_CHECK(cudaStreamCreate(&stream));
@@ -38,7 +38,6 @@ protected:
 
     void TearDown() override
     {
-        setProfilingEnabled(false);
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
 
@@ -52,7 +51,7 @@ TEST_F(TimerTest, BasicStageProfile)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    // Pending timings are calculated lazily when getTimingData() is called
+    gTimer.stopTiming(); // Calculate pending timings
     auto timingData = gTimer.getTimingData("test_stage");
     ASSERT_TRUE(timingData.has_value());
     EXPECT_EQ(timingData->getTotalRuns(), 1);
@@ -78,7 +77,7 @@ TEST_F(TimerTest, MultipleStageTiming)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    // Pending timings are calculated lazily when getTimingData() is called
+    gTimer.stopTiming(); // Calculate pending timings
 
     // Verify stage1 has 2 runs
     auto stage1Data = gTimer.getTimingData("stage1");
@@ -103,7 +102,7 @@ TEST_F(TimerTest, TimerReset)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    // Pending timings are calculated lazily when getTimingData() is called
+    gTimer.stopTiming();
     auto timingData = gTimer.getTimingData("test_stage");
     ASSERT_TRUE(timingData.has_value());
     EXPECT_EQ(timingData->getTotalRuns(), 1);

@@ -24,13 +24,6 @@ namespace drivellm
 namespace file_io
 {
 
-/*!
- * @brief Copy a file from source to destination
- *
- * @param srcPath Source file path
- * @param dstPath Destination file path
- * @return True on success, false on failure
- */
 bool copyFile(std::string const& srcPath, std::string const& dstPath);
 
 } // namespace file_io

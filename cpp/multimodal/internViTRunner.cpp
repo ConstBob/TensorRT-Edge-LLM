@@ -16,7 +16,6 @@
  */
 
 #include "internViTRunner.h"
-#include "common/bindingNames.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
@@ -92,13 +91,11 @@ bool InternViTRunner::validateAndFillConfig(std::string const& configPath)
     mConfig.blockImageSizeW = visionConfig["image_size"][1].get<int32_t>();
 
     // Get config from engine shapes
-    nvinfer1::Dims const inputShapeMax
-        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMAX);
-    nvinfer1::Dims const inputShapeMin
-        = mVisualEngine->getProfileShape(binding_names::kVisualInput, 0, nvinfer1::OptProfileSelector::kMIN);
+    nvinfer1::Dims const inputShapeMax = mVisualEngine->getProfileShape("input", 0, nvinfer1::OptProfileSelector::kMAX);
+    nvinfer1::Dims const inputShapeMin = mVisualEngine->getProfileShape("input", 0, nvinfer1::OptProfileSelector::kMIN);
     mConfig.maxNumBlocks = inputShapeMax.d[0];
     mConfig.minNumBlocks = inputShapeMin.d[0];
-    mConfig.outHiddenSize = mVisualEngine->getTensorShape(binding_names::kVisualOutput).d[1];
+    mConfig.outHiddenSize = mVisualEngine->getTensorShape("output").d[1];
 
     return true;
 }
@@ -118,13 +115,13 @@ bool InternViTRunner::allocateBuffer()
     mVitInput
         = rt::Tensor({mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress("input", mVitInput.rawPointer());
     // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
     LOG_INFO("InternViTRunner::allocateBuffer() mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d",
         mConfig.maxNumBlocks * 256, mConfig.outHiddenSize);
     mOutputEmbedding = rt::Tensor(
         {mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
+    setTensorAddressStatus &= mContext->setTensorAddress("output", mOutputEmbedding.rawPointer());
     if (!setTensorAddressStatus)
     {
         LOG_ERROR("Failed to set tensor address to the engine");
@@ -406,7 +403,7 @@ bool InternViTRunner::infer(cudaStream_t stream)
         TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
 
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
+        setEngineIOStatus &= mContext->setInputShape("input", mVitInput.getShape().getTRTDims());
         if (!setEngineIOStatus)
         {
             LOG_ERROR("InternViTRunner::infer(): Failed to bind engine input tensors.");

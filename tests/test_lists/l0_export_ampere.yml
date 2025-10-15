@@ -4,5 +4,5 @@ tests:
   - tests/defs/test_package.py::test_package_import
   - tests/defs/test_package.py::test_command_line_tools
   - tests/defs/test_model_export.py::test_llm_model_export[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-lora]
-  - tests/defs/test_model_export.py::test_vlm_model_export[Qwen2.5-VL-3B-Instruct-fp16-mxsl8192-lora]
-  - tests/defs/test_model_export.py::test_vlm_model_export[Qwen2.5-VL-3B-Instruct-int4_awq-mxsl8192]
+  - tests/defs/test_model_export.py::test_vlm_model_export[Qwen2.5-VL-3B-Instruct-fp16-mxsl4096-lora]
+  - tests/defs/test_model_export.py::test_vlm_model_export[Qwen2.5-VL-3B-Instruct-int4_awq-mxsl4096]

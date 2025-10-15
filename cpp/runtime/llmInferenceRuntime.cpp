@@ -330,7 +330,9 @@ bool LLMInferenceRuntime::handleRequest(
 
     SamplingParams params(activeBatchSize, mEngineConfig.vocabSize, request.temperature, request.topK, request.topP);
     auto sampleTokens = [&]() {
-        drivellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
+        drivellm::topKtopPSamplingFromLogits(mOutputLogits.dataPointer<float>(),
+            mSelectedIndices.dataPointer<int32_t>(), params, mSamplingWorkspace.rawPointer(),
+            mSamplingWorkspace.getMemoryCapacity(), stream);
         CUDA_CHECK(cudaMemcpyAsync(selectedTokenIdsHost.data(), mSelectedIndices.rawPointer(),
             activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));

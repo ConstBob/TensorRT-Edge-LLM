@@ -16,7 +16,6 @@
  */
 
 #include "common/checkMacros.h"
-#include "common/tensor.h"
 #include "references.h"
 #include "sampler/sampling.h"
 #include "testUtils.h"
@@ -55,8 +54,7 @@ protected:
     }
 
     // Generate deterministic test logits (FP32 only)
-    void generateTestLogits(
-        rt::Tensor& logitsTensor, std::vector<std::vector<float>>& hostLogits, int batchSize, int vocabSize)
+    void generateTestLogits(float* dLogits, std::vector<std::vector<float>>& hostLogits, int batchSize, int vocabSize)
     {
         hostLogits.resize(batchSize);
         std::vector<float> flatHostLogits(batchSize * vocabSize);
@@ -109,8 +107,8 @@ protected:
         }
 
         // Copy host data to device memory
-        CUDA_CHECK(cudaMemcpy(logitsTensor.rawPointer(), flatHostLogits.data(), batchSize * vocabSize * sizeof(float),
-            cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(dLogits, flatHostLogits.data(), batchSize * vocabSize * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     // Validate sampling results (FP32 only)
@@ -311,26 +309,28 @@ protected:
         result.accuracyPassed = true;
         result.errorMessage = "";
 
-        // Create tensors for the test
-        rt::Tensor logitsTensor({batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor selectedIndicesTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        // Allocate device memory directly instead of using Thrust
+        float* dLogits;
+        int32_t* dSelectedIndices;
+        CUDA_CHECK(cudaMalloc(&dLogits, batchSize * vocabSize * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dSelectedIndices, batchSize * sizeof(int32_t)));
 
         std::vector<std::vector<float>> hostLogits;
-        generateTestLogits(logitsTensor, hostLogits, batchSize, vocabSize);
+        generateTestLogits(dLogits, hostLogits, batchSize, vocabSize);
 
         // Run accuracy test
         SamplingParams params(batchSize, vocabSize, temperature, topK, topP);
         size_t workspaceSize = getTopKtopPSamplingWorkspaceSize(batchSize, vocabSize, params);
-        rt::Tensor workspaceTensor(
-            {static_cast<int64_t>(workspaceSize)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+        void* workspace;
+        CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
-        topKtopPSamplingFromLogits(logitsTensor, selectedIndicesTensor, params, workspaceTensor, 0, TEST_SEED, 0);
+        topKtopPSamplingFromLogits(dLogits, dSelectedIndices, params, workspace, workspaceSize, 0, TEST_SEED, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy results back to host
         std::vector<int32_t> gpuResults(batchSize);
-        CUDA_CHECK(cudaMemcpy(gpuResults.data(), selectedIndicesTensor.rawPointer(), batchSize * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(
+            cudaMemcpy(gpuResults.data(), dSelectedIndices, batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
         // Run validation and get result
         bool validationPassed = validateSamplingResults(gpuResults, hostLogits, params);
@@ -346,6 +346,10 @@ protected:
         EXPECT_TRUE(validationPassed) << "Sampling validation failed for " << methodName
                                       << " with batchSize=" << batchSize << ", vocabSize=" << vocabSize
                                       << ", topK=" << topK << ", topP=" << topP << ", temperature=" << temperature;
+
+        CUDA_CHECK(cudaFree(workspace));
+        CUDA_CHECK(cudaFree(dLogits));
+        CUDA_CHECK(cudaFree(dSelectedIndices));
 
         return result;
     }
@@ -375,43 +379,44 @@ protected:
         result.accuracyPassed = true;
         result.errorMessage = "";
 
-        // Create tensors for the test
-        rt::Tensor inputTensor({batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor topKIndicesTensor({batchSize, topK}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-        rt::OptionalOutputTensor topKValuesOptional = std::nullopt;
-        rt::Tensor topKValuesTensor;
+        // Allocate device memory
+        float* dInput;
+        float* dTopKValues = nullptr;
+        int32_t* dTopKIndices;
+        CUDA_CHECK(cudaMalloc(&dInput, batchSize * vocabSize * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dTopKIndices, batchSize * topK * sizeof(int32_t)));
 
         // Always test with values when requested
         if (testValues)
         {
-            topKValuesTensor = rt::Tensor({batchSize, topK}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-            topKValuesOptional = std::ref(topKValuesTensor);
+            CUDA_CHECK(cudaMalloc(&dTopKValues, batchSize * topK * sizeof(float)));
         }
 
         std::vector<std::vector<float>> hostLogits;
 
         // Generate test data (logits/raw values)
-        generateTestLogits(inputTensor, hostLogits, batchSize, vocabSize);
+        generateTestLogits(dInput, hostLogits, batchSize, vocabSize);
 
-        // Run test
+        // Run test - boolean parameters are ignored, defaults are all false
         size_t workspaceSize = getSelectAllTopKWorkspaceSize(batchSize, vocabSize, topK);
-        rt::Tensor workspaceTensor(
-            {static_cast<int64_t>(workspaceSize)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+        void* workspace;
+        CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
-        selectAllTopK(inputTensor, topKValuesOptional, topKIndicesTensor, topK, workspaceTensor, 0);
+        selectAllTopKFromLogits(
+            dInput, dTopKValues, dTopKIndices, batchSize, vocabSize, topK, workspace, workspaceSize, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy results back to host
         std::vector<int32_t> gpuIndices(batchSize * topK);
-        CUDA_CHECK(cudaMemcpy(gpuIndices.data(), topKIndicesTensor.rawPointer(), batchSize * topK * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(
+            cudaMemcpy(gpuIndices.data(), dTopKIndices, batchSize * topK * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
         std::vector<float> gpuValues;
         if (testValues)
         {
             gpuValues.resize(batchSize * topK);
-            CUDA_CHECK(cudaMemcpy(gpuValues.data(), topKValuesTensor.rawPointer(), batchSize * topK * sizeof(float),
-                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(
+                cudaMemcpy(gpuValues.data(), dTopKValues, batchSize * topK * sizeof(float), cudaMemcpyDeviceToHost));
         }
 
         bool validationPassed
@@ -427,6 +432,14 @@ protected:
         // Single Google Test assertion for comprehensive validation
         EXPECT_TRUE(validationPassed) << "SelectAllTopK validation failed for batchSize=" << batchSize
                                       << ", vocabSize=" << vocabSize << ", topK=" << topK;
+
+        CUDA_CHECK(cudaFree(workspace));
+        CUDA_CHECK(cudaFree(dInput));
+        CUDA_CHECK(cudaFree(dTopKIndices));
+        if (dTopKValues != nullptr)
+        {
+            CUDA_CHECK(cudaFree(dTopKValues));
+        }
 
         return result;
     }

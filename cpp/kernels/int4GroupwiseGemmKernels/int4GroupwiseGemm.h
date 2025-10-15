@@ -25,41 +25,9 @@ namespace drivellm
 namespace kernel
 {
 
-/*!
- * @brief INT4 group-wise quantized GEMV (matrix-vector multiplication)
- *
- * Optimized for batch size 1~4 (M=1~4). Performs: out = in @ W_dequantized
- * where W is INT4 quantized with group-wise scaling factors.
- *
- * @param in_feats Input features [M, K] (Primarily optimized for M ~ [1, 4])
- * @param kernel INT4 quantized weight matrix [N/2, K] in int8 (packed int4 format)
- * @param scaling_factors Group-wise scales [K/group_size, N]
- * @param out_feats Output features [M, N]
- * @param m Batch size
- * @param n Output dimension
- * @param k Input dimension
- * @param group_size Quantization group size
- * @param stream CUDA stream
- */
 void gemv_forward_cuda_new(half* in_feats, int8_t* kernel, half* scaling_factors, half* out_feats, int m, int n, int k,
     int group_size, cudaStream_t stream);
 
-/*!
- * @brief INT4 group-wise quantized GEMM (matrix-matrix multiplication)
- *
- * Optimized for batch size > 1. Performs: out = in @ W_dequantized
- * where W is INT4 quantized with group-wise scaling factors.
- *
- * @param in_feats Input features [M, K]
- * @param kernel INT4 quantized weight matrix [N/2, K] in int8 (packed int4 format)
- * @param scaling_factors Group-wise scales [K/group_size, N]
- * @param out_feats Output features [M, N]
- * @param m Batch size
- * @param n Output dimension
- * @param k Input dimension
- * @param group_size Quantization group size
- * @param stream CUDA stream
- */
 void gemm_forward_cuda_new(half* in_feats, int8_t* kernel, half* scaling_factors, half* out_feats, int m, int n, int k,
     int group_size, cudaStream_t stream);
 } // namespace kernel

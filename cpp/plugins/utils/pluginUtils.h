@@ -28,17 +28,8 @@ namespace drivellm
 {
 namespace plugins
 {
-//! Device memory alignment requirement (128 bytes)
-constexpr int32_t kDEVICE_ALIGNMENT{128};
+constexpr int32_t kDEVICE_ALIGNMENT{128}; // Make sure all device pointers are aligned by 128.
 
-/*!
- * @brief Align device pointer to 128-byte boundary
- *
- * Ensures device pointers meet CUDA alignment requirements for optimal memory access.
- *
- * @param ptr Pointer to align
- * @return Aligned pointer
- */
 inline int8_t* alignDevicePtr(void* ptr)
 {
     // Convert the pointer to an integer
@@ -49,15 +40,8 @@ inline int8_t* alignDevicePtr(void* ptr)
     return reinterpret_cast<int8_t*>(aligned_addr);
 }
 
-/*!
- * @brief Convert C++ type to TensorRT PluginFieldType
- * @tparam T C++ type
- * @return Corresponding PluginFieldType
- */
 template <typename T>
 nvinfer1::PluginFieldType toFieldType();
-
-//! @cond INTERNAL
 #define SPECIALIZE_TO_FIELD_TYPE(T, type)                                                                              \
     template <>                                                                                                        \
     inline nvinfer1::PluginFieldType toFieldType<T>()                                                                  \
@@ -67,18 +51,7 @@ nvinfer1::PluginFieldType toFieldType();
 SPECIALIZE_TO_FIELD_TYPE(float, kFLOAT32)
 SPECIALIZE_TO_FIELD_TYPE(int32_t, kINT32)
 #undef SPECIALIZE_TO_FIELD_TYPE
-//! @endcond
 
-/*!
- * @brief Parse scalar field from plugin field collection
- *
- * Extracts a scalar value from TensorRT plugin field collection.
- *
- * @tparam T Field data type
- * @param fieldName Name of field to parse
- * @param fc Plugin field collection
- * @return Optional containing value if found, nullopt otherwise
- */
 template <typename T>
 inline std::optional<T> parsePluginScalarField(std::string const& fieldName, nvinfer1::PluginFieldCollection const* fc)
 {
@@ -96,37 +69,19 @@ inline std::optional<T> parsePluginScalarField(std::string const& fieldName, nvi
     return std::nullopt;
 }
 
-/*!
- * @brief Generic serializer template for plugin data
- *
- * Provides serialization/deserialization for plugin state.
- * Specialized for arithmetic and enum types.
- *
- * @tparam T Type to serialize
- * @tparam Enable SFINAE enabler
- */
 template <typename T, class Enable = void>
 struct Serializer
 {
 };
 
-//! @brief Serializer specialization for arithmetic and enum types
 template <typename T>
 struct Serializer<T, typename std::enable_if_t<std::is_arithmetic_v<T> || std::is_enum_v<T>>>
 {
-    //! @brief Serialize value to buffer
-    //! @param buffer Output buffer pointer (advanced after write)
-    //! @param value Value to serialize
     static void serialize(void** buffer, T const& value)
     {
         ::memcpy(*buffer, &value, sizeof(T));
         reinterpret_cast<char*&>(*buffer) += sizeof(T);
     }
-
-    //! @brief Deserialize value from buffer
-    //! @param buffer Input buffer pointer (advanced after read)
-    //! @param buffer_size Buffer size (decremented after read)
-    //! @param value Output value
     static void deserialize(void const** buffer, size_t* buffer_size, T* value)
     {
         assert(*buffer_size >= sizeof(T));
@@ -136,25 +91,12 @@ struct Serializer<T, typename std::enable_if_t<std::is_arithmetic_v<T> || std::i
     }
 };
 
-/*!
- * @brief Serialize a value to buffer
- * @tparam T Type to serialize
- * @param buffer Output buffer
- * @param value Value to serialize
- */
 template <typename T>
 inline void serializeValue(void** buffer, T const& value)
 {
     return Serializer<T>::serialize(buffer, value);
 }
 
-/*!
- * @brief Deserialize a value from buffer
- * @tparam T Type to deserialize
- * @param buffer Input buffer
- * @param buffer_size Buffer size
- * @param value Output value
- */
 template <typename T>
 inline void deserializeValue(void const** buffer, size_t* buffer_size, T* value)
 {

@@ -17,7 +17,6 @@
 
 #include "runtime/eagleDraftEngineRunner.h"
 
-#include "common/bindingNames.h"
 #include "common/cudaUtils.h"
 #include "common/hashUtils.h"
 #include "common/logger.h"
@@ -49,7 +48,8 @@ std::string formatEngineConfig(drivellm::rt::EagleDraftEngineRunnerConfig const&
 }
 
 size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputIds, rt::Tensor const& baseModelHiddenStates,
-    rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+    rt::Tensor const& draftModelHiddenStates, rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask,
+    rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
 {
     int64_t const activeBatchSize = draftTreeInputIds.getShape()[0];
     int64_t const paddedDraftTreeSize = draftTreeInputIds.getShape()[1];
@@ -105,6 +105,18 @@ static constexpr int32_t kDRAFT_MODEL_GENERATION_PROFILE_INDEX{1};
 
 // In the implementation, we only support batch size of 1 which will be further extended.
 static constexpr int32_t kRUNTIME_BATCH_SIZE{1};
+
+std::string const inputIdsName{"input_ids"};
+std::string const contextLengthsName{"context_lengths"};
+std::string const selectTokenIndicesName{"last_token_ids"};
+std::string const logitsName{"logits"};
+std::string const ropeCosSinName{"rope_rotary_cos_sin"};
+std::string const baseModelHiddenStatesName{"hidden_states_input"};
+std::string const draftModelHiddenStatesName{"hidden_states_from_draft"};
+std::string const outputHiddenStatesName{"hidden_states"};
+std::string const attentionMaskName{"attention_mask"};
+std::string const attentionPosIdName{"attention_pos_id"};
+std::string const multimodalEmbeddingsName{"image_embeds"};
 
 EagleDraftEngineRunner::EagleDraftEngineRunner(
     std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream)
@@ -228,13 +240,13 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // To support multi batch, mPosEncCosSinCache shape to match what it will be during execution for MRope (multimodal)
     bool setEngineIOStatus{true};
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+        &= mContextExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
+        &= mContextExecutionContext->setInputShape(ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setTensorAddress(ropeCosSinName.c_str(), mPosEncCosSinCache.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+        ropeCosSinName.c_str(), mPosEncCosSinCache.getShape().getTRTDims());
 
     setEngineIOStatus &= this->bindKVCacheToEngine(kRUNTIME_BATCH_SIZE);
     if (!setEngineIOStatus)
@@ -248,10 +260,10 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     {
         bool setMultimodalStatus{true};
         int64_t multimodalEmbeddingsHiddenSize = mConfig.baseModelHiddenDim / 3;
-        setMultimodalStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
+        setMultimodalStatus &= mGenerationExecutionContext->setTensorAddress(
+            multimodalEmbeddingsName.c_str(), mDummyTensor.rawPointer());
         setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kImageEmbeds, rt::Coords{1, multimodalEmbeddingsHiddenSize}.getTRTDims());
+            multimodalEmbeddingsName.c_str(), rt::Coords{1, multimodalEmbeddingsHiddenSize}.getTRTDims());
         if (!setMultimodalStatus)
         {
             LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
@@ -379,12 +391,12 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
 bool EagleDraftEngineRunner::validateConfigFromEngine()
 {
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPresentKeyValuesTemplate) != std::string::npos;
+        return tensorDim.nbDims == 5 && bindingName.find("present_key_values") != std::string::npos;
     };
 
     // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
     auto identifyMultimodalEmbeddingsBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 2 && bindingName == binding_names::kImageEmbeds;
+        return tensorDim.nbDims == 2 && bindingName == multimodalEmbeddingsName;
     };
 
     int32_t nbKVCacheInputs{0};
@@ -438,8 +450,8 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     // Validate VLM configuration
     if (mConfig.isVlm && !foundMultimodalEmbeddingsInput)
     {
-        LOG_ERROR(
-            "VLM is enabled but multimodal embeddings input (%s) not found in engine", binding_names::kImageEmbeds);
+        LOG_ERROR("VLM is enabled but multimodal embeddings input (%s) not found in engine",
+            multimodalEmbeddingsName.c_str());
         return false;
     }
 
@@ -451,10 +463,10 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     }
 
     // Validate input shapes from optimization profiles
-    Dims const maxInputCtxShape = mEngine->getProfileShape(
-        binding_names::kInputIds, kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
+    Dims const maxInputCtxShape
+        = mEngine->getProfileShape(inputIdsName.c_str(), kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
     Dims const maxInputGenShape = mEngine->getProfileShape(
-        binding_names::kInputIds, kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
+        inputIdsName.c_str(), kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
 
     if (mConfig.maxSupportedInputLength != maxInputCtxShape.d[1])
     {
@@ -470,7 +482,7 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     }
 
     // Validate vocab size from the engine.
-    Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
+    Dims const logitsDim = mEngine->getTensorShape(logitsName.c_str());
     if (mConfig.draftModelVocabSize != logitsDim.d[1])
     {
         LOG_ERROR("draftModelVocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[1],
@@ -479,7 +491,7 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     }
 
     // Validate rotary dim from the engine.
-    Dims const ropeCosSinCacheDim = mEngine->getTensorShape(binding_names::kRopeCosSin);
+    Dims const ropeCosSinCacheDim = mEngine->getTensorShape(ropeCosSinName.c_str());
     if (mConfig.rotaryDim != ropeCosSinCacheDim.d[2])
     {
         LOG_ERROR("rotaryDim is not consistent. From engine: %d, from config: %d", ropeCosSinCacheDim.d[2],
@@ -630,54 +642,54 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
     bool setEngineIOStatus{true};
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mContextExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-        binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-        binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+        &= mContextExecutionContext->setTensorAddress(inputIdsName.c_str(), const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        &= mContextExecutionContext->setInputShape(inputIdsName.c_str(), inputIds.getShape().getTRTDims());
+    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+        baseModelHiddenStatesName.c_str(), const_cast<void*>(baseModelHiddenStates.rawPointer()));
     setEngineIOStatus &= mContextExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        baseModelHiddenStatesName.c_str(), baseModelHiddenStates.getShape().getTRTDims());
+    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+        draftModelHiddenStatesName.c_str(), const_cast<void*>(draftModelHiddenStates.rawPointer()));
+    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+        draftModelHiddenStatesName.c_str(), draftModelHiddenStates.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mContextExecutionContext->setTensorAddress(contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mContextExecutionContext->setTensorAddress(selectTokenIndicesName.c_str(), mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+        selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
 
     // attention-pos-id and attention-mask are unused during the execution. We set the dummy tensor with zero
     // shape.
     rt::Coords const emptyPosIdShape{kRUNTIME_BATCH_SIZE, 1};
     rt::Coords const emptyMaskShape{kRUNTIME_BATCH_SIZE, 1, 1};
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
+        &= mContextExecutionContext->setTensorAddress(attentionPosIdName.c_str(), mDummyTensor.rawPointer());
     setEngineIOStatus
-        &= mContextExecutionContext->setInputShape(binding_names::kAttentionPosId, emptyPosIdShape.getTRTDims());
+        &= mContextExecutionContext->setInputShape(attentionPosIdName.c_str(), emptyPosIdShape.getTRTDims());
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
+        &= mContextExecutionContext->setTensorAddress(attentionMaskName.c_str(), mDummyTensor.rawPointer());
     setEngineIOStatus
-        &= mContextExecutionContext->setInputShape(binding_names::kAttentionMask, emptyMaskShape.getTRTDims());
+        &= mContextExecutionContext->setInputShape(attentionMaskName.c_str(), emptyMaskShape.getTRTDims());
 
     // Bind the optional multimodal embeddings tensor into the engine.
     if (multimodalEmbeddings.has_value())
     {
         rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
         setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-            binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
+            multimodalEmbeddingsName.c_str(), const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
         setEngineIOStatus &= mContextExecutionContext->setInputShape(
-            binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
+            multimodalEmbeddingsName.c_str(), multimodalEmbeddingsTensor.getShape().getTRTDims());
     }
 
     // Bind the output tensor into the engine.
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
+    setEngineIOStatus
+        &= mContextExecutionContext->setTensorAddress(outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
 
     if (!setEngineIOStatus)
     {
@@ -822,8 +834,8 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
     kernel::prepareEagleDraftProposalInputs(draftTreeMask, draftTreeLength, sequenceStartIndex, mPackedTreeMask,
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
-    size_t const hashValue = hashDraftProposalInput(
-        draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+    size_t const hashValue = hashDraftProposalInput(draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates,
+        draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
     if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
     {
         LOG_DEBUG("executeEagleDraftProposalStep(): Use pre-captured CUDA graph for draft proposal step.");
@@ -837,40 +849,40 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
         // initialization.
         bool setEngineIOStatus{true};
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kInputIds, const_cast<void*>(draftTreeInputIds.rawPointer()));
+            inputIdsName.c_str(), const_cast<void*>(draftTreeInputIds.rawPointer()));
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kInputIds, draftTreeInputIds.getShape().getTRTDims());
+            inputIdsName.c_str(), draftTreeInputIds.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
+            baseModelHiddenStatesName.c_str(), const_cast<void*>(baseModelHiddenStates.rawPointer()));
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
+            baseModelHiddenStatesName.c_str(), baseModelHiddenStates.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
+            draftModelHiddenStatesName.c_str(), const_cast<void*>(draftModelHiddenStates.rawPointer()));
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
+            draftModelHiddenStatesName.c_str(), draftModelHiddenStates.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+            contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+            contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+            selectTokenIndicesName.c_str(), mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+            selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
         // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mPackedTreeMask.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
+            attentionMaskName.c_str(), mPackedTreeMask.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
+            attentionPosIdName.c_str(), mDraftTreePositionIds.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kAttentionPosId, mDraftTreePositionIds.getShape().getTRTDims());
+            attentionPosIdName.c_str(), mDraftTreePositionIds.getShape().getTRTDims());
 
         // Bind the output tensor into the engine.
         setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+            &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+            outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
 
         if (!setEngineIOStatus)
         {
@@ -898,8 +910,8 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor& outputLogits,
     rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
-    size_t const hashValue = hashDraftProposalInput(
-        draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+    size_t const hashValue = hashDraftProposalInput(draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates,
+        draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
     if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
     {
         LOG_INFO("Draft proposal CUDA graph already captured.");
@@ -944,40 +956,39 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     // initialization.
     bool setEngineIOStatus{true};
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(draftTreeInputIds.rawPointer()));
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kInputIds, draftTreeInputIds.getShape().getTRTDims());
+        inputIdsName.c_str(), const_cast<void*>(draftTreeInputIds.rawPointer()));
+    setEngineIOStatus
+        &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), draftTreeInputIds.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
+        baseModelHiddenStatesName.c_str(), const_cast<void*>(baseModelHiddenStates.rawPointer()));
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
+        baseModelHiddenStatesName.c_str(), baseModelHiddenStates.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
+        draftModelHiddenStatesName.c_str(), const_cast<void*>(draftModelHiddenStates.rawPointer()));
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
+        draftModelHiddenStatesName.c_str(), draftModelHiddenStates.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+        contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        selectTokenIndicesName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
     // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
+        &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mPackedTreeMask.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
+        attentionMaskName.c_str(), mPackedTreeMask.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
+        attentionPosIdName.c_str(), mDraftTreePositionIds.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionPosId, mDraftTreePositionIds.getShape().getTRTDims());
+        attentionPosIdName.c_str(), mDraftTreePositionIds.getShape().getTRTDims());
 
     // Bind the output tensor into the engine.
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+        outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
 
     if (!setEngineIOStatus)
     {
@@ -1152,40 +1163,40 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
         // initialization.
         bool setEngineIOStatus{true};
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kInputIds, const_cast<void*>(acceptedTokens.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kInputIds, acceptedTokens.getShape().getTRTDims());
+            inputIdsName.c_str(), const_cast<void*>(acceptedTokens.rawPointer()));
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), acceptedTokens.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
+            baseModelHiddenStatesName.c_str(), const_cast<void*>(baseModelHiddenStates.rawPointer()));
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
+            baseModelHiddenStatesName.c_str(), baseModelHiddenStates.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
+            draftModelHiddenStatesName.c_str(), const_cast<void*>(draftModelHiddenStates.rawPointer()));
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
+            draftModelHiddenStatesName.c_str(), draftModelHiddenStates.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+            contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+            contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+            selectTokenIndicesName.c_str(), mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+            selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
         // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
+        setEngineIOStatus
+            &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mPackedTreeMask.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
+            attentionMaskName.c_str(), mPackedTreeMask.getShape().getTRTDims());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
+            attentionPosIdName.c_str(), mDraftTreePositionIds.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kAttentionPosId, mDraftTreePositionIds.getShape().getTRTDims());
+            attentionPosIdName.c_str(), mDraftTreePositionIds.getShape().getTRTDims());
 
         // Bind the output tensor into the engine.
         setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+            &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+            outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
 
         if (!setEngineIOStatus)
         {
@@ -1206,7 +1217,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     // Commit the KVCache for accepted tokens.
     mLinearKVCache.commitSequenceLength(acceptedTokenNum, stream);
 
-    LOG_DEBUG("Accept decode token stage execution completed for request with batch size %d.", kRUNTIME_BATCH_SIZE);
+    LOG_DEBUG("Accept decode token stage execution completed for request with batch size");
     return true;
 }
 
@@ -1244,39 +1255,38 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
 
     bool setEngineIOStatus{true};
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(acceptedTokens.rawPointer()));
+        inputIdsName.c_str(), const_cast<void*>(acceptedTokens.rawPointer()));
     setEngineIOStatus
-        &= mGenerationExecutionContext->setInputShape(binding_names::kInputIds, acceptedTokens.getShape().getTRTDims());
+        &= mGenerationExecutionContext->setInputShape(inputIdsName.c_str(), acceptedTokens.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
+        baseModelHiddenStatesName.c_str(), const_cast<void*>(baseModelHiddenStates.rawPointer()));
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
+        baseModelHiddenStatesName.c_str(), baseModelHiddenStates.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
+        draftModelHiddenStatesName.c_str(), const_cast<void*>(draftModelHiddenStates.rawPointer()));
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
+        draftModelHiddenStatesName.c_str(), draftModelHiddenStates.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+        contextLengthsName.c_str(), mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+        contextLengthsName.c_str(), mSequenceContextLengths.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        selectTokenIndicesName.c_str(), mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        selectTokenIndicesName.c_str(), mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
+        &= mGenerationExecutionContext->setTensorAddress(attentionMaskName.c_str(), mPackedTreeMask.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
+        attentionMaskName.c_str(), mPackedTreeMask.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
+        attentionPosIdName.c_str(), mDraftTreePositionIds.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionPosId, mDraftTreePositionIds.getShape().getTRTDims());
+        attentionPosIdName.c_str(), mDraftTreePositionIds.getShape().getTRTDims());
 
     // Bind the output tensor into the engine.
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(logitsName.c_str(), outputLogits.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+        outputHiddenStatesName.c_str(), outputHiddenStates.rawPointer());
 
     if (!setEngineIOStatus)
     {
@@ -1329,8 +1339,8 @@ bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
     bool status{true};
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
     {
-        std::string const pastKeyValuesName = binding_names::formatKVCacheName(i, true);
-        std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
+        std::string const pastKeyValuesName = format::fmtstr("past_key_values.%d", i);
+        std::string const presentKeyValuesName = format::fmtstr("present_key_values.%d", i);
 
         rt::Tensor kvCacheBlock = mLinearKVCache.getKVCacheForDecoderLayer(i);
         status &= mContextExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());

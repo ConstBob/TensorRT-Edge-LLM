@@ -71,7 +71,7 @@ DEFAULT_MAX_GENERATE_LENGTHS = {
     "MATH500": 512,
     "MMLU": 1,
     "MMLU_Pro": 1,
-    "MMMU": 20,
+    "MMMU": 5,
     "MMMU_Pro": 1,
     "MMStar": 512,
     "MTBench": 512
@@ -143,10 +143,10 @@ def main():
     parser.add_argument(
         "--num_shot",
         type=int,
-        default=5,
+        default=0,
         required=False,
         help=
-        "Number of examples to include for few-shot learning (0 = zero-shot). Currently only supported for MMLU dataset. Default is 5."
+        "Number of examples to include for few-shot learning (0 = zero-shot). Currently only supported for MMLU dataset."
     )
 
     parser.add_argument(
@@ -270,10 +270,11 @@ def main():
                                    top_k=args.top_k,
                                    max_generate_length=max_generate_length,
                                    default_system_prompt=default_system_prompt)
-            convert_mmlu_pro_dataset(config=config,
-                                     dataset_name_or_dir=dataset_path,
-                                     output_dir=args.output_dir,
-                                     num_shot=args.num_shot)
+            convert_mmlu_pro_dataset(
+                config=config,
+                dataset_name_or_dir=dataset_path,
+                output_dir=args.output_dir,
+                num_shot=args.num_shot)  # Zero-shot as requested
 
         elif args.dataset == "MMMU":
             # Create config for MMMU

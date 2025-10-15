@@ -26,59 +26,31 @@ namespace drivellm
 namespace file_io
 {
 
-/*!
- * @brief Memory-mapped file reader
- *
- * Provides efficient file reading using memory mapping (mmap).
- * The file contents are mapped directly into memory without copying.
- */
 class MmapReader
 {
 public:
-    //! @brief Default constructor
     MmapReader();
 
-    /*!
-     * @brief Construct and load file
-     * @param fp Path to file to load
-     */
     explicit MmapReader(std::filesystem::path const& fp);
 
-    //! @brief Deleted copy constructor
     MmapReader(MmapReader const&) = delete;
-
-    //! @brief Deleted copy assignment operator
-    //! @return Reference to this
     MmapReader& operator=(MmapReader const&) = delete;
 
-    //! @brief Destructor
     ~MmapReader();
 
-    //! @brief Release mapped memory
     void release();
 
-    /*!
-     * @brief Load and memory-map a file
-     * @param fp Path to file to load
-     * @return True on success, false on failure
-     */
     bool loadFile(std::filesystem::path const& fp);
 
-    //! @brief Get mapped data as byte array
-    //! @return Const pointer to byte data
     int8_t const* getByteData() const noexcept;
 
-    //! @brief Get mapped data as void pointer
-    //! @return Const pointer to data
     void const* getData() const noexcept;
 
-    //! @brief Get size of mapped data
-    //! @return Size in bytes
     size_t getSize() const noexcept;
 
 private:
-    void* mData;   //!< Pointer to mapped memory
-    size_t mBytes; //!< Size of mapped data in bytes
+    void* mData;
+    size_t mBytes;
 };
 
 } // namespace file_io

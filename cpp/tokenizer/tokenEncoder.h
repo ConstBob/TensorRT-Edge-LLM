@@ -39,20 +39,13 @@ using RanksToToken = std::unordered_map<Rank, std::string>;
 class TokenEncoder
 {
 public:
-    /*!
-     * @brief Token encoder algorithm type
-     */
     enum Type
     {
-        BPE,           //!< Byte Pair Encoding
-        SENTENCEPIECE, //!< SentencePiece encoding (unimplemented)
-        WORDPIECE      //!< WordPiece encoding (unimplemented)
+        BPE,
+        SENTENCEPIECE, // Unimplemented
+        WORDPIECE      // Unimplemented
     };
 
-    /*!
-     * @brief Constructor for token encoder
-     * @param type Encoder algorithm type (default: BPE)
-     */
     TokenEncoder(Type type = BPE);
     ~TokenEncoder() = default;
 
@@ -84,43 +77,17 @@ public:
      */
     bool decode(std::vector<Rank> const& tokens, std::string& output, bool skipSpecialTokens = false) const;
 
-    /*!
-     * @brief Get encoder type
-     * @return Encoder algorithm type
-     */
+    // Accessors
     Type getType() const noexcept
     {
         return mType;
     }
-
-    /*!
-     * @brief Get vocabulary size
-     * @return Total number of tokens in vocabulary
-     */
     size_t getVocabSize() const noexcept
     {
         return mVocabSize;
     }
-
-    /*!
-     * @brief Check if token exists in vocabulary
-     * @param token Token string to check
-     * @return true if token exists, false otherwise
-     */
     bool hasToken(std::string const& token) const;
-
-    /*!
-     * @brief Get token rank from token string
-     * @param token Token string
-     * @return Token rank/ID
-     */
     Rank getTokenRank(std::string const& token) const;
-
-    /*!
-     * @brief Get token string from rank
-     * @param rank Token rank/ID
-     * @return Token string
-     */
     std::string getRankToken(Rank rank) const;
 
 private:

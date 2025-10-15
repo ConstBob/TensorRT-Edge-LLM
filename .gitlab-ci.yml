@@ -48,8 +48,6 @@ workflow:
   script:
     - echo "Pipeline start time:$(date)"
     - mkdir -p $TEST_LOG_DIR $ENGINE_DIR
-    - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/*
-    - chmod -R 777 $TEST_LOG_DIR
     - echo "Installing dependencies"
     - export DEBIAN_FRONTEND=noninteractive
     - apt update -qq >/dev/null 2>&1
@@ -61,8 +59,6 @@ workflow:
     - git submodule update --init --recursive
     - echo "Installing pytest dependencies"
     - pip3 install -q -r tests/requirements.txt
-    - echo "Installing accuracy dependencies"
-    - pip3 install -q -r examples/accuracy/requirements.txt
     - echo "Setting up test environment"
     - echo "Running L0 pipeline tests with pytest. Time:$(date)"
     - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
@@ -74,8 +70,6 @@ workflow:
   script:
     - echo "Pipeline start time:$(date)"
     - mkdir -p $TEST_LOG_DIR
-    - rm -rf $TEST_LOG_DIR/*
-    - chmod -R 777 $TEST_LOG_DIR
     - echo "Installing dependencies"
     - export DEBIAN_FRONTEND=noninteractive
     - apt update -qq >/dev/null 2>&1
@@ -97,8 +91,6 @@ workflow:
     - echo "Installing pytest dependencies in a virtual environment"
     - python3 -m venv venv && source venv/bin/activate
     - pip3 install -q -r tests/requirements.txt
-    - echo "Installing accuracy dependencies"
-    - pip3 install -q -r examples/accuracy/requirements.txt
     - echo "Setup complete. Running L0 pipeline tests on device with pytest. Time:$(date)"
     - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=192.168.55.1 --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
     - if [ $? -ne 0 ]; then echo "Error occurred during testing"; exit 1; fi

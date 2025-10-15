@@ -117,7 +117,5 @@ void cvtKVCachelayoutXQAToFMHA(T const* src, T* dst, int32_t B, int32_t S, int32
 } // namespace kernel
 } // namespace drivellm
 
-/// @cond EXCLUDE_FROM_DOCS
 template void drivellm::kernel::cvtKVCachelayoutXQAToFMHA<half>(
     half const*, half*, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
-/// @endcond
