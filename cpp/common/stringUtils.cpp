@@ -22,7 +22,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace format
 {
@@ -68,4 +68,4 @@ std::string fmtstr(char const* format, ...)
 }
 
 } // namespace format
-} // namespace drivellm
+} // namespace trt_edgellm

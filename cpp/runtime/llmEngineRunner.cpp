@@ -32,12 +32,12 @@
 #include <sstream>
 #include <string>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 using namespace nvinfer1;
 
 namespace
 {
-std::string formatEngineConfig(drivellm::rt::LLMEngineRunnerConfig const& config)
+std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& config)
 {
     std::stringstream ss;
 
@@ -95,7 +95,7 @@ size_t hashBaseTreeDecodingInput(
 
 } // namespace
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -1528,4 +1528,4 @@ bool LLMEngineRunner::isLoraWeightsSupported() const
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

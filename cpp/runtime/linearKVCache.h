@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <cuda_fp16.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -125,4 +125,4 @@ private:
 };
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

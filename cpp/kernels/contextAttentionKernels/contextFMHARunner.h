@@ -20,7 +20,7 @@
 #include "fmhaParams_v2.h"
 
 #include <NvInferRuntime.h>
-namespace drivellm
+namespace trt_edgellm
 {
 
 /*!
@@ -103,4 +103,4 @@ private:
     LaunchParams mLaunchParams; //!< Kernel launch parameters
 };
 
-} // namespace drivellm
+} // namespace trt_edgellm

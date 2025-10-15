@@ -20,7 +20,7 @@
 #include "common/tensor.h"
 #include <cuda_runtime.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -45,4 +45,4 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
     rt::Tensor const& imageEmbeds, rt::Tensor& output, cudaStream_t stream = 0);
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

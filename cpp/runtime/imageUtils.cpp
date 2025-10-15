@@ -24,7 +24,7 @@
 #include <stb_image.h>
 #include <stb_image_resize2.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -131,4 +131,4 @@ ImageData resizeImage(ImageData const& image, int newWidth, int newHeight)
 
 } // namespace imageUtils
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

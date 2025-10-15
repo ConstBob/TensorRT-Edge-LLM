@@ -28,7 +28,7 @@
 #include <vector>
 
 using namespace nvinfer1;
-using namespace drivellm;
+using namespace trt_edgellm;
 
 using XQADataType = xqa::kernels::Data_type;
 

@@ -21,7 +21,7 @@
 #include <cuda_fp16.h>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -276,4 +276,4 @@ void saveKVCacheIntoTensor(
     }
 }
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

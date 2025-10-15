@@ -24,7 +24,7 @@
 
 #include "common/logger.h"
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -142,4 +142,4 @@ private:
 };
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

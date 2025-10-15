@@ -28,7 +28,7 @@
 #include <curand_kernel.h>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 // Define missing constants for half precision
@@ -951,4 +951,4 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
         topKIndices.dataPointer<int32_t>(), topKValuesPtr, batchSize, vocabSize, topK, BLOCKS_PER_BEAM);
 }
 
-} // namespace drivellm
+} // namespace trt_edgellm

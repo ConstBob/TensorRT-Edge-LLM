@@ -30,7 +30,7 @@
 
 using Json = nlohmann::json;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -339,7 +339,7 @@ std::string InternViTRunner::applyChatTemplateUser(
 
 void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImages,
-    std::vector<int64_t> const& imageTokenLengths, drivellm::tokenizer::Tokenizer* tokenizer)
+    std::vector<int64_t> const& imageTokenLengths, trt_edgellm::tokenizer::Tokenizer* tokenizer)
 {
     if (numImages.size() != request.prompts.size())
     {
@@ -444,4 +444,4 @@ bool InternViTRunner::infer(cudaStream_t stream)
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

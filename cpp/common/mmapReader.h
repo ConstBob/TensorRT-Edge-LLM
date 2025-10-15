@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <filesystem>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace file_io
 {
@@ -82,4 +82,4 @@ private:
 };
 
 } // namespace file_io
-} // namespace drivellm
+} // namespace trt_edgellm

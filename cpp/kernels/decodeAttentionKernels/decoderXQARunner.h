@@ -19,7 +19,7 @@
 
 #include <NvInferRuntime.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 //! \brief Launch parameters for XQA (eXtended Query Attention) kernel
@@ -122,4 +122,4 @@ private:
     int32_t mSmVersion; //!< CUDA SM version
 };
 
-} // namespace drivellm
+} // namespace trt_edgellm

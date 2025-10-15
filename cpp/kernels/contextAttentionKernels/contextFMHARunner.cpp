@@ -28,7 +28,7 @@
 #include <unordered_map>
 
 using namespace nvinfer1;
-using namespace drivellm;
+using namespace trt_edgellm;
 
 using FMHADataType = fmha_v2::Data_type;
 

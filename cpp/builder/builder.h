@@ -26,7 +26,7 @@
 
 using Json = nlohmann::json;
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 namespace builder
@@ -417,4 +417,4 @@ private:
 };
 
 } // namespace builder
-} // namespace drivellm
+} // namespace trt_edgellm

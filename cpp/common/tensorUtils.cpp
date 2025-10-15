@@ -26,7 +26,7 @@
 
 using namespace nvinfer1;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -309,4 +309,4 @@ std::string formatString(Tensor const& tensor)
 
 } // namespace utils
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -21,7 +21,7 @@
 #include <cuda_fp16.h>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -119,7 +119,7 @@ private:
     //! \param[in] tokenizer Tokenizer for text processing
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
-        drivellm::tokenizer::Tokenizer* tokenizer);
+        trt_edgellm::tokenizer::Tokenizer* tokenizer);
 
     //! \brief Apply Qwen-VL chat template to system prompt
     //! \param[in] systemPrompt System prompt string
@@ -195,4 +195,4 @@ private:
 };
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

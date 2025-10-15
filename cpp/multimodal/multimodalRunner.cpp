@@ -27,7 +27,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -100,4 +100,4 @@ rt::Tensor& MultimodalRunner::getOutputEmbedding()
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

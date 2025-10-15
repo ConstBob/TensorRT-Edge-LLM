@@ -26,7 +26,7 @@
 #include <random>
 #include <vector>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 TEST(SafetensorsUtilsTest, FloatTensors)
 {
@@ -599,8 +599,8 @@ TEST(SafetensorsUtilsTest, SafetensorsLoadingFromFile)
     std::string testFile = "../unittests/resources/test_safetensors.safetensors";
 
     // Load the file using the unified interface
-    std::vector<drivellm::rt::Tensor> tensors;
-    EXPECT_TRUE(drivellm::rt::safetensors::loadSafetensors(testFile, tensors, stream));
+    std::vector<trt_edgellm::rt::Tensor> tensors;
+    EXPECT_TRUE(trt_edgellm::rt::safetensors::loadSafetensors(testFile, tensors, stream));
 
     // Verify we got the expected number of tensors
     EXPECT_EQ(tensors.size(), 2);

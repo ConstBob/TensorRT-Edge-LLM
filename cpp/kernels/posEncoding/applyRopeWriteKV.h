@@ -21,7 +21,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -156,4 +156,4 @@ void launchApplyRopeWriteKVTreeDecode(half* qkv, half* kvCache, half* qOut, floa
     int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream);
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -39,7 +39,7 @@
 #include "dequantize.cuh"
 #include <cuda_pipeline_primitives.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -502,4 +502,4 @@ void gemm_forward_cuda_new(half* in_feats, int8_t* weights_device, half* scaling
 }
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

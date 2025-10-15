@@ -45,7 +45,7 @@
 #include "tokenizerUtils.h"
 #include "unicodeData.h"
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -506,4 +506,4 @@ codepointFlags unicodeCptFlags(uint32_t const cp)
 }
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

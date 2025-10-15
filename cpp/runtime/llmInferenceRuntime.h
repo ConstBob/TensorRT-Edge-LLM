@@ -27,7 +27,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -158,4 +158,4 @@ private:
         std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream);
 };
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

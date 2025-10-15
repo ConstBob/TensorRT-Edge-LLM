@@ -28,12 +28,12 @@
 #include <sstream>
 #include <stdexcept>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 using namespace nvinfer1;
 
 namespace
 {
-std::string formatEngineConfig(drivellm::rt::EagleDraftEngineRunnerConfig const& config)
+std::string formatEngineConfig(trt_edgellm::rt::EagleDraftEngineRunnerConfig const& config)
 {
     std::stringstream ss;
     ss << std::boolalpha;
@@ -96,7 +96,7 @@ size_t hashAcceptDecodeTokenInput(rt::Tensor const& acceptedTokens, rt::Tensor c
 
 } // namespace
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -1346,4 +1346,4 @@ bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

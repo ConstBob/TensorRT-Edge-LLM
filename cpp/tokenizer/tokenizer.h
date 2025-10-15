@@ -30,7 +30,7 @@
 #include "preTokenizer.h"
 #include "tokenEncoder.h"
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -280,4 +280,4 @@ protected:
 };
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

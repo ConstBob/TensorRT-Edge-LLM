@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -59,4 +59,4 @@ bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>&
 
 } // namespace safetensors
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -19,7 +19,7 @@
 
 #include <string>
 
-namespace drivellm
+namespace trt_edgellm
 {
 /*!
  * @namespace binding_names
@@ -274,4 +274,4 @@ inline bool isKVCacheBinding(std::string const& bindingName)
 /*! @} */
 
 } // namespace binding_names
-} // namespace drivellm
+} // namespace trt_edgellm

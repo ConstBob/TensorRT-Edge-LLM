@@ -26,7 +26,7 @@
 #include <iostream>
 #include <string>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 struct LLMBuildArgs
 {

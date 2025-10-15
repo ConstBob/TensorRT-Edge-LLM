@@ -20,7 +20,7 @@
 #include "common/tensor.h"
 #include <cuda_runtime.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -83,4 +83,4 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
     size_t workspaceSize, cudaStream_t stream);
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm
