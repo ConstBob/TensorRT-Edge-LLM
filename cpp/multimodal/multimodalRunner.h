@@ -33,7 +33,7 @@
 #include <variant>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -146,4 +146,4 @@ protected:
 };
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

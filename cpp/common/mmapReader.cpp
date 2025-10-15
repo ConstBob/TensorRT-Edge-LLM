@@ -28,7 +28,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-namespace drivellm
+namespace trt_edgellm
 {
 
 namespace file_io
@@ -125,4 +125,4 @@ size_t MmapReader::getSize() const noexcept
 }
 
 } // namespace file_io
-} // namespace drivellm
+} // namespace trt_edgellm

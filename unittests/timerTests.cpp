@@ -22,7 +22,7 @@
 #include <gtest/gtest.h>
 #include <thread>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 class TimerTest : public ::testing::Test
 {
 protected:

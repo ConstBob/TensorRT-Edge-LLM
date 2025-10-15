@@ -20,7 +20,7 @@
 #include "common/tensor.h"
 #include <cstdint>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -222,4 +222,4 @@ void constructVerificationDraftTree(rt::Tensor const& draftIdFullTable, rt::Tens
 // clang-format on
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

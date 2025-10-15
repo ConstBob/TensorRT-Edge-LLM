@@ -21,7 +21,7 @@
 #include <cuda_runtime.h>
 #include <numeric>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 // Global profiling control flag implementation
@@ -195,4 +195,4 @@ void Timer::onStageComplete(std::string const& stageId)
 }
 
 } // namespace timer
-} // namespace drivellm
+} // namespace trt_edgellm

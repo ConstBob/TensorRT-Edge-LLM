@@ -21,7 +21,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -147,4 +147,4 @@ struct DVec<half>
 };
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

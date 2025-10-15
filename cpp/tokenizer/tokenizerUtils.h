@@ -52,7 +52,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -238,4 +238,4 @@ codepointFlags unicodeCptFlags(uint32_t const cp);
 //! @}
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

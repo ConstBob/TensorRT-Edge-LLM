@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 /*! \brief Structure to hold sampling parameters
@@ -149,4 +149,4 @@ size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, Sa
  */
 size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK);
 
-} // namespace drivellm
+} // namespace trt_edgellm

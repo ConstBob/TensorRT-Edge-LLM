@@ -42,7 +42,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -118,4 +118,4 @@ __inline__ __device__ void dequantize_s4_to_fp16x2(half2 const& source, uint4* r
 }
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

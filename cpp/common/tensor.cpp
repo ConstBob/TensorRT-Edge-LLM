@@ -22,7 +22,7 @@
 
 using namespace nvinfer1;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -325,4 +325,4 @@ void Tensor::releaseResource()
 }
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

@@ -25,7 +25,7 @@
 #include "common/tensor.h"
 #include "testUtils.h"
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 TEST(TensorTest, Coords)
 {

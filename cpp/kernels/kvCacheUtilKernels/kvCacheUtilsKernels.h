@@ -19,7 +19,7 @@
 
 #include "common/tensor.h"
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -70,4 +70,4 @@ void saveKVCacheIntoTensor(
     rt::Tensor& dstKVCacheTensor, rt::Tensor const& srcKVCacheBuffer, int32_t batchIdx, cudaStream_t stream);
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

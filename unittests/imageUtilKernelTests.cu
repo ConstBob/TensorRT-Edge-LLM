@@ -23,7 +23,7 @@
 #include "references.h"
 #include "testUtils.h"
 
-using namespace drivellm;
+using namespace trt_edgellm;
 using namespace nvinfer1;
 
 void TestNormalizeImage(int32_t const batch, int32_t const height, int32_t const width, int32_t const channels = 3)

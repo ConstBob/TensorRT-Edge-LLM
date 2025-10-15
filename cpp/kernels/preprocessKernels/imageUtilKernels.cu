@@ -23,7 +23,7 @@
 
 using namespace nvinfer1;
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace kernel
 {
@@ -343,4 +343,4 @@ void initRotaryPosEmbQwenViT(rt::Tensor const& posIds, rt::Tensor& rotaryPosEmb,
 }
 
 } // namespace kernel
-} // namespace drivellm
+} // namespace trt_edgellm

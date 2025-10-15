@@ -46,7 +46,7 @@
 
 #include "unicodeData.h"
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -7078,4 +7078,4 @@ std::vector<rangeNfd> const unicodeRangesNfd = {
 };
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

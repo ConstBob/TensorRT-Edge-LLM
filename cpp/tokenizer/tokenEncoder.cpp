@@ -21,7 +21,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -278,4 +278,4 @@ std::string TokenEncoder::getTypeString(Type type) const
 }
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

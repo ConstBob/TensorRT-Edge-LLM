@@ -25,8 +25,8 @@
 #include "references.h"
 #include "testUtils.h"
 
-using namespace drivellm;
-using namespace drivellm::kernel;
+using namespace trt_edgellm;
+using namespace trt_edgellm::kernel;
 
 struct AttnParams
 {

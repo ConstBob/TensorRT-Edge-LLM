@@ -32,7 +32,7 @@
 #include <sstream>
 #include <vector>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 // Test configuration
 int32_t const ACCURACY_BATCH_SIZE = 4;

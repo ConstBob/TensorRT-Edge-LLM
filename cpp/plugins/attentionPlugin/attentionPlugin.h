@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace plugins
 {
@@ -239,4 +239,4 @@ private:
 };
 
 } // namespace plugins
-} // namespace drivellm
+} // namespace trt_edgellm

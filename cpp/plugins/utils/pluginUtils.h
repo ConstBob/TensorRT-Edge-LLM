@@ -24,7 +24,7 @@
 #include <optional>
 #include <string>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace plugins
 {
@@ -162,4 +162,4 @@ inline void deserializeValue(void const** buffer, size_t* buffer_size, T* value)
 }
 
 } // namespace plugins
-} // namespace drivellm
+} // namespace trt_edgellm

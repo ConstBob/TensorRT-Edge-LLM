@@ -35,7 +35,7 @@
 #include <utility>
 #include <vector>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 using Json = nlohmann::json;
 
 // Enum for command line option IDs (using traditional enum for C library compatibility)

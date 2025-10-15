@@ -31,7 +31,7 @@
 #include <sstream>
 #include <thread>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 namespace
 {

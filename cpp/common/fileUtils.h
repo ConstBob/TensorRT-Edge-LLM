@@ -19,7 +19,7 @@
 
 #include <string>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace file_io
 {
@@ -34,4 +34,4 @@ namespace file_io
 bool copyFile(std::string const& srcPath, std::string const& dstPath);
 
 } // namespace file_io
-} // namespace drivellm
+} // namespace trt_edgellm

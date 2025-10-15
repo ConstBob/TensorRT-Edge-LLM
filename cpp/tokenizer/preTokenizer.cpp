@@ -21,7 +21,7 @@
 #include <iterator>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace tokenizer
 {
@@ -172,4 +172,4 @@ PreTokenizer const* Sequence::getStep(size_t index) const noexcept
 }
 
 } // namespace tokenizer
-} // namespace drivellm
+} // namespace trt_edgellm

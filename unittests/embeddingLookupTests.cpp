@@ -30,7 +30,7 @@
 #include <iostream>
 #include <vector>
 
-using namespace drivellm;
+using namespace trt_edgellm;
 
 // Debug flag for detailed error reporting
 static constexpr bool DEBUG_MODE = false;

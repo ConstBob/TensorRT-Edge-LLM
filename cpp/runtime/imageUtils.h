@@ -22,7 +22,7 @@
 #include <memory>
 #include <string>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -81,4 +81,4 @@ ImageData resizeImage(ImageData const& image, int newWidth, int newHeight);
 
 } // namespace imageUtils
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

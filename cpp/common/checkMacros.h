@@ -24,7 +24,7 @@
 
 #include "stringUtils.h"
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 namespace check
@@ -97,7 +97,7 @@ inline void _checkCudaDriver(
 #define CUDA_CHECK(stat)                                                                                               \
     do                                                                                                                 \
     {                                                                                                                  \
-        drivellm::check::_checkCuda((stat), #stat, __FILE__, __LINE__);                                                \
+        trt_edgellm::check::_checkCuda((stat), #stat, __FILE__, __LINE__);                                             \
     } while (0)
 
 /*!
@@ -109,7 +109,7 @@ inline void _checkCudaDriver(
 #define CUDA_DRIVER_CHECK(stat)                                                                                        \
     do                                                                                                                 \
     {                                                                                                                  \
-        drivellm::check::_checkCudaDriver((stat), #stat, __FILE__, __LINE__);                                          \
+        trt_edgellm::check::_checkCudaDriver((stat), #stat, __FILE__, __LINE__);                                       \
     } while (0)
 
-} // namespace drivellm
+} // namespace trt_edgellm

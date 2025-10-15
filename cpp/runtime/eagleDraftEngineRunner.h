@@ -28,7 +28,7 @@
 #include <optional>
 #include <unordered_map>
 
-namespace drivellm
+namespace trt_edgellm
 {
 namespace rt
 {
@@ -269,4 +269,4 @@ private:
 // clang-format on
 
 } // namespace rt
-} // namespace drivellm
+} // namespace trt_edgellm

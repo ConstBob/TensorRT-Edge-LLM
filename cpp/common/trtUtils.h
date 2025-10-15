@@ -24,7 +24,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace drivellm
+namespace trt_edgellm
 {
 
 /*!
@@ -76,4 +76,4 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
     return handle;
 }
 
-} // namespace drivellm
+} // namespace trt_edgellm
