@@ -98,7 +98,7 @@ float getPrefillAverageTokensPerRun(metrics::LLMPrefillMetrics const& prefillMet
         / prefillMetrics.getTotalRuns();
 }
 
-//! Utility function for calculating prefill average time per token
+//! Utility function for calculating prefill average time per run
 float getPrefillAverageTimePerRun(metrics::LLMPrefillMetrics const& prefillMetrics)
 {
     auto timingData = gTimer.getTimingData(metrics::StageNames::kLLM_PREFILL);

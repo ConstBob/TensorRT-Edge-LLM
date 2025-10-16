@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
+#include "eagleUtilKernels.h"
 #include "kernels/common/vectorizedTypes.cuh"
-#include "newEagleUtilKernels.h"
 
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
