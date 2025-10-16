@@ -48,7 +48,6 @@ public:
     MmapReader(MmapReader const&) = delete;
 
     //! @brief Deleted copy assignment operator
-    //! @return Reference to this
     MmapReader& operator=(MmapReader const&) = delete;
 
     //! @brief Destructor

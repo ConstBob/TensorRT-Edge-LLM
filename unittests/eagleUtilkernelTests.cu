@@ -19,7 +19,7 @@
 #include <random>
 
 #include "common/cudaUtils.h"
-#include "kernels/speculative/newEagleUtilKernels.h"
+#include "kernels/speculative/eagleUtilKernels.h"
 #include "references.h"
 #include "testUtils.h"
 

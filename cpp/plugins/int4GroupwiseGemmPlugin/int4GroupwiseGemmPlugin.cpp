@@ -43,12 +43,12 @@ constexpr int32_t kGROUP_SIZE{128};
 } // namespace
 
 // Static class fields initialization
-PluginFieldCollection Int4GroupwsieGemmPluginCreator::mFieldCollection{};
-std::vector<PluginField> Int4GroupwsieGemmPluginCreator::mPluginAttributes;
+PluginFieldCollection Int4GroupwiseGemmPluginCreator::mFieldCollection{};
+std::vector<PluginField> Int4GroupwiseGemmPluginCreator::mPluginAttributes;
 
-REGISTER_TENSORRT_PLUGIN(Int4GroupwsieGemmPluginCreator);
+REGISTER_TENSORRT_PLUGIN(Int4GroupwiseGemmPluginCreator);
 
-Int4GroupwsieGemmPlugin::Int4GroupwsieGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize)
+Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize)
     : mLayerName(name)
     , mGemmN(N)
     , mGemmK(K)
@@ -56,7 +56,7 @@ Int4GroupwsieGemmPlugin::Int4GroupwsieGemmPlugin(std::string const& name, int32_
 {
 }
 
-Int4GroupwsieGemmPlugin::Int4GroupwsieGemmPlugin(std::string const& name, void const* data, size_t length)
+Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, void const* data, size_t length)
     : mLayerName(name)
 {
     deserializeValue(&data, &length, &mGemmN);
@@ -64,40 +64,40 @@ Int4GroupwsieGemmPlugin::Int4GroupwsieGemmPlugin(std::string const& name, void c
     deserializeValue(&data, &length, &mGroupSize);
 }
 
-Int4GroupwsieGemmPlugin::~Int4GroupwsieGemmPlugin() {}
+Int4GroupwiseGemmPlugin::~Int4GroupwiseGemmPlugin() {}
 
-IPluginV2DynamicExt* Int4GroupwsieGemmPlugin::clone() const noexcept
+IPluginV2DynamicExt* Int4GroupwiseGemmPlugin::clone() const noexcept
 {
-    Int4GroupwsieGemmPlugin* plugin = new Int4GroupwsieGemmPlugin(mLayerName, mGemmN, mGemmK, mGroupSize);
+    Int4GroupwiseGemmPlugin* plugin = new Int4GroupwiseGemmPlugin(mLayerName, mGemmN, mGemmK, mGroupSize);
     return plugin;
 }
 
-char const* Int4GroupwsieGemmPlugin::getPluginType() const noexcept
+char const* Int4GroupwiseGemmPlugin::getPluginType() const noexcept
 {
     return kINT4_GEMM_PLUGIN_NAME;
 }
 
-char const* Int4GroupwsieGemmPlugin::getPluginNamespace() const noexcept
+char const* Int4GroupwiseGemmPlugin::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
-void Int4GroupwsieGemmPlugin::setPluginNamespace(char const* pluginNamespace) noexcept
+void Int4GroupwiseGemmPlugin::setPluginNamespace(char const* pluginNamespace) noexcept
 {
     mNamespace = std::string(pluginNamespace);
 }
 
-char const* Int4GroupwsieGemmPlugin::getPluginVersion() const noexcept
+char const* Int4GroupwiseGemmPlugin::getPluginVersion() const noexcept
 {
     return kINT4_GEMM_PLUGIN_VERSION;
 }
 
-int32_t Int4GroupwsieGemmPlugin::getNbOutputs() const noexcept
+int32_t Int4GroupwiseGemmPlugin::getNbOutputs() const noexcept
 {
     return 1;
 }
 
-bool Int4GroupwsieGemmPlugin::supportsFormatCombination(
+bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
     int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     // input 0: Fp16 activation tensor, input 1: packed int4 weights in type int8, input2: Fp16 scale values.
@@ -160,13 +160,13 @@ bool Int4GroupwsieGemmPlugin::supportsFormatCombination(
 }
 
 // IPluginV2Ext Methods
-DataType Int4GroupwsieGemmPlugin::getOutputDataType([[maybe_unused]] int32_t index,
+DataType Int4GroupwiseGemmPlugin::getOutputDataType([[maybe_unused]] int32_t index,
     [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
     return DataType::kHALF;
 }
 
-DimsExprs Int4GroupwsieGemmPlugin::getOutputDimensions([[maybe_unused]] int32_t outputIndex,
+DimsExprs Int4GroupwiseGemmPlugin::getOutputDimensions([[maybe_unused]] int32_t outputIndex,
     nvinfer1::DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     // Output[0] is attention result, has shape [B, S. Hq, D]. Refers to QKV shape [B, S, Hq+Hk+Hv,D]
@@ -179,21 +179,21 @@ DimsExprs Int4GroupwsieGemmPlugin::getOutputDimensions([[maybe_unused]] int32_t 
     return output;
 }
 
-void Int4GroupwsieGemmPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in,
+void Int4GroupwiseGemmPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in,
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
 }
 
 // TODO: extend the worksapce calculation to a more generalized form.
-size_t Int4GroupwsieGemmPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
+size_t Int4GroupwiseGemmPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
     [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
     return 0;
 }
 
-int32_t Int4GroupwsieGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
+int32_t Int4GroupwiseGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
     [[maybe_unused]] void* workspace, cudaStream_t stream) noexcept
 {
@@ -218,31 +218,31 @@ int32_t Int4GroupwsieGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     return 0;
 }
 
-size_t Int4GroupwsieGemmPlugin::getSerializationSize() const noexcept
+size_t Int4GroupwiseGemmPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mGemmN) + sizeof(mGemmK) + sizeof(mGroupSize);
 }
 
-void Int4GroupwsieGemmPlugin::serialize(void* buffer) const noexcept
+void Int4GroupwiseGemmPlugin::serialize(void* buffer) const noexcept
 {
     serializeValue(&buffer, mGemmN);
     serializeValue(&buffer, mGemmK);
     serializeValue(&buffer, mGroupSize);
 }
 
-int32_t Int4GroupwsieGemmPlugin::initialize() noexcept
+int32_t Int4GroupwiseGemmPlugin::initialize() noexcept
 {
     return 0;
 }
 
-void Int4GroupwsieGemmPlugin::terminate() noexcept {}
+void Int4GroupwiseGemmPlugin::terminate() noexcept {}
 
-void Int4GroupwsieGemmPlugin::destroy() noexcept
+void Int4GroupwiseGemmPlugin::destroy() noexcept
 {
     delete this;
 }
 
-Int4GroupwsieGemmPluginCreator::Int4GroupwsieGemmPluginCreator()
+Int4GroupwiseGemmPluginCreator::Int4GroupwiseGemmPluginCreator()
 {
     static std::mutex sMutex;
     std::lock_guard<std::mutex> lock(sMutex);
@@ -256,32 +256,32 @@ Int4GroupwsieGemmPluginCreator::Int4GroupwsieGemmPluginCreator()
     mFieldCollection.fields = mPluginAttributes.data();
 }
 
-char const* Int4GroupwsieGemmPluginCreator::getPluginName() const noexcept
+char const* Int4GroupwiseGemmPluginCreator::getPluginName() const noexcept
 {
     return kINT4_GEMM_PLUGIN_NAME;
 }
 
-nvinfer1::PluginFieldCollection const* Int4GroupwsieGemmPluginCreator::getFieldNames() noexcept
+nvinfer1::PluginFieldCollection const* Int4GroupwiseGemmPluginCreator::getFieldNames() noexcept
 {
     return &mFieldCollection;
 }
 
-void Int4GroupwsieGemmPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
+void Int4GroupwiseGemmPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
 {
     mNamespace = libNamespace;
 }
 
-char const* Int4GroupwsieGemmPluginCreator::getPluginNamespace() const noexcept
+char const* Int4GroupwiseGemmPluginCreator::getPluginNamespace() const noexcept
 {
     return mNamespace.c_str();
 }
 
-char const* Int4GroupwsieGemmPluginCreator::getPluginVersion() const noexcept
+char const* Int4GroupwiseGemmPluginCreator::getPluginVersion() const noexcept
 {
     return kINT4_GEMM_PLUGIN_VERSION;
 }
 
-nvinfer1::IPluginV2* Int4GroupwsieGemmPluginCreator::createPlugin(
+nvinfer1::IPluginV2* Int4GroupwiseGemmPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
 {
     try
@@ -297,8 +297,8 @@ nvinfer1::IPluginV2* Int4GroupwsieGemmPluginCreator::createPlugin(
             return nullptr;
         }
 
-        Int4GroupwsieGemmPlugin* plugin
-            = new Int4GroupwsieGemmPlugin(std::string(name), gemmN.value(), gemmK.value(), groupSize.value());
+        Int4GroupwiseGemmPlugin* plugin
+            = new Int4GroupwiseGemmPlugin(std::string(name), gemmN.value(), gemmK.value(), groupSize.value());
         return plugin;
     }
     catch (std::exception const& e)
@@ -307,12 +307,12 @@ nvinfer1::IPluginV2* Int4GroupwsieGemmPluginCreator::createPlugin(
     return nullptr;
 }
 
-nvinfer1::IPluginV2* Int4GroupwsieGemmPluginCreator::deserializePlugin(
+nvinfer1::IPluginV2* Int4GroupwiseGemmPluginCreator::deserializePlugin(
     char const* name, void const* serialData, size_t serialLength) noexcept
 {
     try
     {
-        return new Int4GroupwsieGemmPlugin(name, serialData, serialLength);
+        return new Int4GroupwiseGemmPlugin(name, serialData, serialLength);
     }
     catch (std::exception const& e)
     {

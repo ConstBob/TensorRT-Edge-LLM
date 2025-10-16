@@ -34,8 +34,6 @@ namespace rt
 {
 using Json = nlohmann::json;
 
-using Json = nlohmann::json;
-
 /*! \brief Configuration structure for the Eagle Draft Engine Runner
  */
 struct EagleDraftEngineRunnerConfig
@@ -200,7 +198,7 @@ private:
 
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;  //!< TensorRT runtime instance
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;  //!< TensorRT engine instance
-    std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;  //!< TensorRT execution context for context phase
+    std::unique_ptr<nvinfer1::IExecutionContext> mPrefillExecutionContext;  //!< TensorRT execution context for context phase
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext;  //!< TensorRT execution context for generation phase
 
     std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mDraftProposalCudaGraphs{};  //!< Map of CUDA graphs for draft proposal step indexed by configuration hash
