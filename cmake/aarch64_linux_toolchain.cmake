@@ -34,9 +34,20 @@ set(CMAKE_CUDA_FLAGS
     CACHE STRING "" FORCE)
 
 # Specify the architecture for CUDA
+macro(set_ifndef var val)
+  if(NOT DEFINED ${var})
+    set(${var} ${val})
+  endif()
+  message(STATUS "Configurable variable ${var} set to ${${var}}")
+endmacro()
+
 if("${EMBEDDED_TARGET}" STREQUAL "auto-thor")
-  set(CMAKE_CUDA_ARCHITECTURES 101)
-  set(CUDA_VERSION 12.8)
+  set_ifndef(CUDA_VERSION 13.0)
+  if(CUDA_VERSION VERSION_LESS 13.0)
+    set(CMAKE_CUDA_ARCHITECTURES 101)
+  else()
+    set(CMAKE_CUDA_ARCHITECTURES 110)
+  endif()
   set(CUDA_DIR
       /usr/local/cuda/targets/aarch64-linux
       CACHE STRING "CUDA toolkit dir")
@@ -45,20 +56,20 @@ if("${EMBEDDED_TARGET}" STREQUAL "auto-thor")
       CACHE STRING "CUDA toolkit target dir")
   message(STATUS "Using CUDA toolkit dir: ${CUDA_DIR}")
 elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-thor")
+  set_ifndef(CUDA_VERSION 13.0)
   set(CMAKE_CUDA_ARCHITECTURES 110)
-  set(CUDA_VERSION 13.0)
   set(CUDA_DIR
       /usr/local/cuda/targets/sbsa-linux
       CACHE STRING "CUDA toolkit dir")
 elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-orin")
+  set_ifndef(CUDA_VERSION 12.6)
   set(CMAKE_CUDA_ARCHITECTURES 87)
-  set(CUDA_VERSION 12.6)
   set(CUDA_DIR
       /usr/local/cuda/targets/aarch64-linux
       CACHE STRING "CUDA toolkit dir")
 elseif("${EMBEDDED_TARGET}" STREQUAL "gb10")
+  set_ifndef(CUDA_VERSION 13.0)
   set(CMAKE_CUDA_ARCHITECTURES 121)
-  set(CUDA_VERSION 13.0)
   set(CUDA_DIR
       /usr/local/cuda/targets/sbsa-linux
       CACHE STRING "CUDA toolkit dir")
