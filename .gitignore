@@ -18,3 +18,5 @@ internal/
 docs/cpp_docs/
 docs/build/
 docs/source/cpp_api/
+docs/source/cpp_api.rst
+docs/source/python_api.rst
