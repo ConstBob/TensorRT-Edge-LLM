@@ -33,7 +33,7 @@ namespace kernel
 //! \param[out] cuSeqLensDev      Device pointer – int32_t[B+1]. Exclusive prefix-sum of seqLenDev.
 //!                                cuSeqLensDev[0] is set to 0 inside the kernel.
 //! \param[in]  kvCacheStartIdxs  Device pointer – int32_t[B].  Start index of KV cache for each request.
-//! \param[out] cuKvCacheLensDev  Device pointer – int32_t[B+1]. Exclusive prefix-sum of kvCacheEndIdxs.
+//! \param[out] cuKvCacheLensDev  Device pointer – int32_t[B+1]. Exclusive prefix-sum of kvCacheEndIdxsDev.
 //!                                cuKvCacheLensDev[0] is set to 0 inside the kernel.
 //! \param[out] kvCacheEndIdxsDev Device pointer – int32_t[B].  Each element equals
 //!                                kvCacheStartIdxs[i] + seqLenDev[i]. For invoking

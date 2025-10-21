@@ -189,7 +189,7 @@ public:
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                             //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                           //!< TensorRT engine
-    std::unique_ptr<nvinfer1::IExecutionContext> mContextExecutionContext;    //!< Context execution context
+    std::unique_ptr<nvinfer1::IExecutionContext> mPrefillExecutionContext;    //!< Context execution context
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext; //!< Generation execution context
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
     //! which denote the input/output shapes and other execution properties like LoRA weights.
@@ -259,7 +259,7 @@ private:
         rt::OptionalInputTensor multimodalEmbeddings);
 
     //! @brief Validate inputs for vanilla decoding step
-    bool vanlliaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
+    bool vanillaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);
 
     //! @brief Validate inputs for Eagle base tree decoding step
     bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputIds,
