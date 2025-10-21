@@ -13,7 +13,9 @@ workflow:
       when: never
     # Run for non-draft MRs
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - when: never
+    # Run for main/release branches
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release/
 
 .export_onnx_template:
   script:
@@ -132,6 +134,8 @@ pre_commit_checks:
     - deactivate
     - echo "Pipeline end time:$(date)"
   interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 cache_cleanup:
   stage: setup
@@ -148,6 +152,8 @@ cache_cleanup:
     - ls -la "$CACHE_BASE_DIR" || echo "Directory is empty or inaccessible"
     - echo "Pipeline end time:$(date)"
   interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Model export for Ampere (fp16 or int4)
 ampere_model_export:
@@ -164,6 +170,8 @@ ampere_model_export:
   image: "$IMAGE"
   extends: .export_onnx_template
   interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Model export for Blackwell/Thor (fp8 or fp4)
 blackwell_model_export:
@@ -180,6 +188,8 @@ blackwell_model_export:
   image: "$IMAGE"
   extends: .export_onnx_template
   interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Building and testing with A30 Linux
 a30:
@@ -200,6 +210,8 @@ a30:
   image: "$IMAGE"
   extends: .x86_test_template
   interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Building and testing with RTX5080 Linux
 rtx5080:
@@ -220,6 +232,8 @@ rtx5080:
     image: "$IMAGE"
     extends: .x86_test_template
     interruptible: true
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Building and testing with Jetson Orin
 jetson_orin:
@@ -239,6 +253,8 @@ jetson_orin:
   image: "ubuntu:24.04"
   extends: .device_test_template
   interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 
 # Building and testing with Drive Thor
@@ -259,6 +275,8 @@ drive_thor_ferrix:
   image: "ubuntu:24.04"
   extends: .device_test_template
   interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 pages:
   image: 
@@ -283,16 +301,13 @@ pages:
   - sphinx-build -M html ./source/ ./build --silent > doc_build.log 2>&1
   - cp -r build/html/* ../public/
   variables:
-    URL_SLUG: '$CI_COMMIT_REF_SLUG'
+    ENV_NAME: $CI_COMMIT_REF_NAME
+    URL_SLUG: $CI_COMMIT_REF_SLUG
   rules:
   - if: $CI_COMMIT_BRANCH == "main"
-    when: manual # remove after parallel deployment is enabled
+    variables:
+      URL_SLUG: ""
   - if: $CI_COMMIT_BRANCH =~ /^release/
-    when: manual # remove after parallel deployment is enabled
-  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    when: never # remove after parallel deployment is enabled
-  - if: $CI_MERGE_REQUEST_TITLE =~ /^(\[Draft\]|\(Draft\)|Draft:)/
-    when: never
   artifacts:
     paths:
     - public
@@ -304,7 +319,16 @@ pages:
     path_prefix: ${URL_SLUG}
     expire_in: never
   environment:
-    name: ${URL_SLUG}
-    url: https://tensorrt.gitlab-master-pages.nvidia.com/tensorrt-edgellm/tensorrt-edgellm/${URL_SLUG}
+    name: ${ENV_NAME}
+    url: $CI_PAGES_URL/${URL_SLUG}
   allow_failure: true
   timeout: 3h
+
+merge_request_pages_preview:
+  stage: setup
+  trigger:
+    include:
+      - local: .gitlab/ci/pages-merge-request.yml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    

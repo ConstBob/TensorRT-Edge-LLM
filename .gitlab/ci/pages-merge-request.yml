@@ -1,0 +1,52 @@
+# - Builds documentation for merge requests. Will expire after 1 week.
+# - This is a downstream job triggered by the merge_request_pages_preview
+#   job in the .gitlab-ci.yml file.
+# - This needs to be in its own file, because the Gitlab version we use 
+#   does not allow two pages jobs in the same file.
+# - It needed to be separated from the main pages job as Gitlab doesn't
+#   allow dynamic expiration time using env variables. 
+stages:
+  - setup
+
+pages:
+  image: 
+    name: python:3.10-slim
+    entrypoint: ['/bin/bash']
+  stage: setup
+  tags:
+    - cpu-k8s
+  before_script:
+  - apt update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y wget make
+  - wget https://www.doxygen.nl/files/doxygen-1.14.0.linux.bin.tar.gz
+  - tar -xzf doxygen-1.14.0.linux.bin.tar.gz
+  - cd doxygen-1.14.0
+  - make install && cd ..
+  script:
+  - mkdir public
+  - cd docs
+  - pip install -r requirements.txt
+  - doxygen
+  - echo "Sphinx is building documentation now... "
+  - sphinx-build -M html ./source/ ./build --silent > doc_build.log 2>&1
+  - cp -r build/html/* ../public/
+  variables:
+    ENV_NAME: merge-requests/$CI_COMMIT_REF_NAME
+    URL_SLUG: $CI_COMMIT_REF_SLUG
+  artifacts:
+    paths:
+    - public
+    - docs/doc_build.log
+    name: TensorRT_EdgeLLM_API_Reference_MR
+    when: always
+    expire_in: 3 days
+  pages:
+    path_prefix: ${URL_SLUG}
+    expire_in: 1 week
+  environment:
+    name: ${ENV_NAME}
+    url: $CI_PAGES_URL/${URL_SLUG}
+  allow_failure: true
+  timeout: 3h
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
