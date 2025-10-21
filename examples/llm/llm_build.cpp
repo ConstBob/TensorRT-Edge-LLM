@@ -28,6 +28,26 @@
 
 using namespace trt_edgellm;
 
+// Enum for command line option IDs (using traditional enum for C library compatibility)
+enum LLMBuildOptionId : int
+{
+    HELP = 701,
+    ONNX_DIR = 702,
+    ENGINE_DIR = 703,
+    MAX_INPUT_LEN = 704,
+    MAX_SEQ_LEN = 705,
+    DEBUG = 706,
+    MAX_BATCH_SIZE = 707,
+    MAX_LORA_RANK = 708,
+    EAGLE_DRAFT = 709,
+    EAGLE_BASE = 710,
+    MAX_VERIFY_TREE_SIZE = 711,
+    MAX_DRAFT_TREE_SIZE = 712,
+    VLM = 713,
+    MIN_IMAGE_TOKENS = 714,
+    MAX_IMAGE_TOKENS = 715
+};
+
 struct LLMBuildArgs
 {
     bool help{false};
@@ -84,22 +104,29 @@ void printUsage(char const* programName)
 
 bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
 {
-    static struct option buildOptions[] = {{"help", no_argument, 0, 701}, {"onnxDir", required_argument, 0, 702},
-        {"engineDir", required_argument, 0, 703}, {"maxInputLen", required_argument, 0, 704},
-        {"maxSeqLen", required_argument, 0, 705}, {"debug", no_argument, 0, 706},
-        {"maxBatchSize", required_argument, 0, 707}, {"maxLoraRank", required_argument, 0, 708},
-        {"eagleDraft", no_argument, 0, 709}, {"eagleBase", no_argument, 0, 710},
-        {"maxVerifyTreeSize", required_argument, 0, 711}, {"maxDraftTreeSize", required_argument, 0, 712},
-        {"vlm", no_argument, 0, 713}, {"minImageTokens", required_argument, 0, 714},
-        {"maxImageTokens", required_argument, 0, 715}, {0, 0, 0, 0}};
+    static struct option buildOptions[] = {{"help", no_argument, 0, LLMBuildOptionId::HELP},
+        {"onnxDir", required_argument, 0, LLMBuildOptionId::ONNX_DIR},
+        {"engineDir", required_argument, 0, LLMBuildOptionId::ENGINE_DIR},
+        {"maxInputLen", required_argument, 0, LLMBuildOptionId::MAX_INPUT_LEN},
+        {"maxSeqLen", required_argument, 0, LLMBuildOptionId::MAX_SEQ_LEN},
+        {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
+        {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
+        {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
+        {"eagleDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT},
+        {"eagleBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE},
+        {"maxVerifyTreeSize", required_argument, 0, LLMBuildOptionId::MAX_VERIFY_TREE_SIZE},
+        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE},
+        {"vlm", no_argument, 0, LLMBuildOptionId::VLM},
+        {"minImageTokens", required_argument, 0, LLMBuildOptionId::MIN_IMAGE_TOKENS},
+        {"maxImageTokens", required_argument, 0, LLMBuildOptionId::MAX_IMAGE_TOKENS}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", buildOptions, nullptr)) != -1)
     {
         switch (opt)
         {
-        case 701: args.help = true; return true;
-        case 702:
+        case LLMBuildOptionId::HELP: args.help = true; return true;
+        case LLMBuildOptionId::ONNX_DIR:
             if (optarg)
             {
                 args.onnxDir = optarg;
@@ -110,7 +137,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 703:
+        case LLMBuildOptionId::ENGINE_DIR:
             if (optarg)
             {
                 args.engineDir = optarg;
@@ -121,53 +148,53 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 704:
+        case LLMBuildOptionId::MAX_INPUT_LEN:
             if (optarg)
             {
                 args.maxInputLen = std::stoi(optarg);
             }
             break;
-        case 705:
+        case LLMBuildOptionId::MAX_SEQ_LEN:
             if (optarg)
             {
                 args.maxSeqLen = std::stoi(optarg);
             }
             break;
-        case 706: args.debug = true; break;
-        case 707:
+        case LLMBuildOptionId::DEBUG: args.debug = true; break;
+        case LLMBuildOptionId::MAX_BATCH_SIZE:
             if (optarg)
             {
                 args.maxBatchSize = std::stoi(optarg);
             }
             break;
-        case 708:
+        case LLMBuildOptionId::MAX_LORA_RANK:
             if (optarg)
             {
                 args.maxLoraRank = std::stoi(optarg);
             }
             break;
-        case 709: args.eagleDraft = true; break;
-        case 710: args.eagleBase = true; break;
-        case 711:
+        case LLMBuildOptionId::EAGLE_DRAFT: args.eagleDraft = true; break;
+        case LLMBuildOptionId::EAGLE_BASE: args.eagleBase = true; break;
+        case LLMBuildOptionId::MAX_VERIFY_TREE_SIZE:
             if (optarg)
             {
                 args.maxVerifyTreeSize = std::stoi(optarg);
             }
             break;
-        case 712:
+        case LLMBuildOptionId::MAX_DRAFT_TREE_SIZE:
             if (optarg)
             {
                 args.maxDraftTreeSize = std::stoi(optarg);
             }
             break;
-        case 713: args.isVlm = true; break;
-        case 714:
+        case LLMBuildOptionId::VLM: args.isVlm = true; break;
+        case LLMBuildOptionId::MIN_IMAGE_TOKENS:
             if (optarg)
             {
                 args.minImageTokens = std::stoi(optarg);
             }
             break;
-        case 715:
+        case LLMBuildOptionId::MAX_IMAGE_TOKENS:
             if (optarg)
             {
                 args.maxImageTokens = std::stoi(optarg);
