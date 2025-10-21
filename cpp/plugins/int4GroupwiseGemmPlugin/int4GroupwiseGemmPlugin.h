@@ -31,7 +31,7 @@ namespace plugins
  * Implements efficient INT4 quantized matrix multiplication with group-wise quantization.
  * Used for quantized weight matrix multiplications in LLM inference.
  */
-class Int4GroupwsieGemmPlugin : public nvinfer1::IPluginV2DynamicExt
+class Int4GroupwiseGemmPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
     /*!
@@ -41,7 +41,7 @@ public:
      * @param K Input dimension (rows in weight matrix)
      * @param groupSize Quantization group size
      */
-    Int4GroupwsieGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize);
+    Int4GroupwiseGemmPlugin(std::string const& name, int32_t N, int32_t K, int32_t groupSize);
 
     /*!
      * @brief Construct from serialized data
@@ -49,16 +49,16 @@ public:
      * @param data Serialized plugin data
      * @param length Size of serialized data
      */
-    Int4GroupwsieGemmPlugin(std::string const& name, void const* data, size_t length);
+    Int4GroupwiseGemmPlugin(std::string const& name, void const* data, size_t length);
 
     //! @brief Deleted default constructor
-    Int4GroupwsieGemmPlugin() = delete;
+    Int4GroupwiseGemmPlugin() = delete;
 
     //! @brief Deleted copy constructor
-    Int4GroupwsieGemmPlugin(Int4GroupwsieGemmPlugin const&) = delete;
+    Int4GroupwiseGemmPlugin(Int4GroupwiseGemmPlugin const&) = delete;
 
     //! @brief Destructor
-    ~Int4GroupwsieGemmPlugin() override;
+    ~Int4GroupwiseGemmPlugin() override;
 
     // IPluginV2DynamicExt Methods
     //! @brief Clone the plugin for use in another network
@@ -167,18 +167,18 @@ protected:
 };
 
 /*!
- * @brief Factory for creating Int4GroupwsieGemmPlugin instances
+ * @brief Factory for creating Int4GroupwiseGemmPlugin instances
  *
  * Handles plugin registration and creation in TensorRT.
  */
-class Int4GroupwsieGemmPluginCreator : public nvinfer1::IPluginCreator
+class Int4GroupwiseGemmPluginCreator : public nvinfer1::IPluginCreator
 {
 public:
     //! @brief Constructor
-    Int4GroupwsieGemmPluginCreator();
+    Int4GroupwiseGemmPluginCreator();
 
     //! @brief Destructor
-    ~Int4GroupwsieGemmPluginCreator() override = default;
+    ~Int4GroupwiseGemmPluginCreator() override = default;
 
     //! @brief Get plugin name
     //! @return Plugin name string

@@ -76,7 +76,7 @@ def main() -> None:
         choices=["fp8", "nvfp4"],
         default=None,
         help=
-        "Quantization method for language model head (only fp8 and nvfp4 is currently supported)"
+        "Quantization method for language model head (only fp8 and nvfp4 are currently supported)"
     )
     parser.add_argument(
         "--device",

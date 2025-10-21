@@ -43,7 +43,7 @@ def main() -> None:
     Main function that parses command line arguments and quantizes the model.
     
     This function sets up argument parsing for the quantization script and calls
-    the quantize_and_save_llm or quantize_and_save_draft function with the provided parameters.
+    the quantize_and_save_draft function with the provided parameters.
     """
     parser = argparse.ArgumentParser(
         description="Quantize a EAGLE3 draft model using NVIDIA ModelOpt")
@@ -83,7 +83,7 @@ def main() -> None:
         choices=["fp8", "nvfp4"],
         default=None,
         help=
-        "Quantization method for language model head (only fp8 is currently supported)"
+        "Quantization method for language model head (only fp8 and nvfp4 are currently supported)"
     )
     parser.add_argument(
         "--device",

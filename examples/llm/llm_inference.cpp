@@ -550,13 +550,6 @@ int main(int argc, char* argv[])
             LOG_ERROR("Failed to initialize LLMInferenceRuntime: %s", e.what());
             return EXIT_FAILURE;
         }
-    }
-
-    // Capture CUDA graph for decoding in standard mode with text-only input.
-    // TODO: Enable CUDA graph capture for multimodal inputs.
-    // Note: Eagle mode does not use CUDA graph capture
-    if (!args.eagleArgs.enabled)
-    {
         if (!llmInferenceRuntime->captureDecodingCUDAGraph(stream))
         {
             LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");

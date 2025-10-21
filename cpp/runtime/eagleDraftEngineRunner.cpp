@@ -22,7 +22,7 @@
 #include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
-#include "kernels/speculative/newEagleUtilKernels.h"
+#include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <fstream>
 #include <sstream>
@@ -150,11 +150,11 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
-    mContextExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
+    mPrefillExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
     mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus
-        &= mContextExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, stream);
+        &= mPrefillExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, stream);
     setOptimizationProfileStatus
         &= mGenerationExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_GENERATION_PROFILE_INDEX, stream);
     if (!setOptimizationProfileStatus)
@@ -228,8 +228,8 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // To support multi batch, mPosEncCosSinCache shape to match what it will be during execution for MRope (multimodal)
     bool setEngineIOStatus{true};
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+        &= mPrefillExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
+    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
     setEngineIOStatus
         &= mGenerationExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
@@ -630,25 +630,25 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
     bool setEngineIOStatus{true};
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mContextExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+        &= mPrefillExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
         binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
         binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
         binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mContextExecutionContext->setInputShape(
+        &= mPrefillExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
     // attention-pos-id and attention-mask are unused during the execution. We set the dummy tensor with zero
@@ -656,27 +656,27 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     rt::Coords const emptyPosIdShape{kRUNTIME_BATCH_SIZE, 1};
     rt::Coords const emptyMaskShape{kRUNTIME_BATCH_SIZE, 1, 1};
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
+        &= mPrefillExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
     setEngineIOStatus
-        &= mContextExecutionContext->setInputShape(binding_names::kAttentionPosId, emptyPosIdShape.getTRTDims());
+        &= mPrefillExecutionContext->setInputShape(binding_names::kAttentionPosId, emptyPosIdShape.getTRTDims());
     setEngineIOStatus
-        &= mContextExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
+        &= mPrefillExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
     setEngineIOStatus
-        &= mContextExecutionContext->setInputShape(binding_names::kAttentionMask, emptyMaskShape.getTRTDims());
+        &= mPrefillExecutionContext->setInputShape(binding_names::kAttentionMask, emptyMaskShape.getTRTDims());
 
     // Bind the optional multimodal embeddings tensor into the engine.
     if (multimodalEmbeddings.has_value())
     {
         rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
-        setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
             binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
-        setEngineIOStatus &= mContextExecutionContext->setInputShape(
+        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
             binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
     }
 
     // Bind the output tensor into the engine.
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    setEngineIOStatus &= mContextExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
         binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
     if (!setEngineIOStatus)
@@ -687,7 +687,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
 
     // launch the engine execution.
     bool executeStatus{true};
-    executeStatus &= mContextExecutionContext->enqueueV3(stream);
+    executeStatus &= mPrefillExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
         LOG_ERROR("Failed on TensorRT prefill stage enqueueV3() call.");
@@ -1333,13 +1333,13 @@ bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
         std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
 
         rt::Tensor kvCacheBlock = mLinearKVCache.getKVCacheForDecoderLayer(i);
-        status &= mContextExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mContextExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
+        status &= mPrefillExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
+        status &= mPrefillExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status &= mGenerationExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status
             &= mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
 
-        status &= mContextExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimPrefillIn);
+        status &= mPrefillExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimPrefillIn);
         status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimDecodeIn);
     }
     return status;

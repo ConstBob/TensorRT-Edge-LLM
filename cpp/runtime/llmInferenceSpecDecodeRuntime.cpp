@@ -21,7 +21,7 @@
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
-#include "kernels/speculative/newEagleUtilKernels.h"
+#include "kernels/speculative/eagleUtilKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"

@@ -98,7 +98,7 @@ float getPrefillAverageTokensPerRun(metrics::LLMPrefillMetrics const& prefillMet
         / prefillMetrics.getTotalRuns();
 }
 
-//! Utility function for calculating prefill average time per token
+//! Utility function for calculating prefill average time per run
 float getPrefillAverageTimePerRun(metrics::LLMPrefillMetrics const& prefillMetrics)
 {
     auto timingData = gTimer.getTimingData(metrics::StageNames::kLLM_PREFILL);
@@ -414,6 +414,30 @@ void addJsonMemorySummary(nlohmann::json& summary, size_t peakGpuMemoryBytes)
     }
 }
 
+/**
+ * @brief Sanitize a string to ensure it contains valid UTF-8 before JSON serialization
+ *
+ * This function detects and replaces invalid UTF-8 sequences that would cause nlohmann::json to fail.
+ *
+ * UTF-8 Encoding Patterns (what we're looking for):
+ *   - 1-byte (ASCII):  0xxxxxxx              (0x00-0x7F)
+ *   - 2-byte sequence: 110xxxxx 10xxxxxx     (0xC0-0xDF followed by 0x80-0xBF)
+ *   - 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx  (0xE0-0xEF followed by 2× 0x80-0xBF)
+ *   - 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx  (0xF0-0xF7 followed by 3× 0x80-0xBF)
+ *
+ * Invalid patterns we detect and replace:
+ *   1. Invalid start bytes: Any byte that doesn't match the patterns above (e.g., 0xFF, 0xC0, 0xF8-0xFF)
+ *   2. Incomplete sequences: Start of multi-byte sequence without enough continuation bytes
+ *      Example: "\xF0\x9F\x98" (3 bytes) when 4 bytes are needed for emoji
+ *   3. Invalid continuation bytes: Multi-byte sequence where continuation bytes don't match 10xxxxxx pattern
+ *
+ * Replacement: All invalid/incomplete sequences are replaced with U+FFFD (�)
+ *   - UTF-8 encoding: 0xEF 0xBF 0xBD
+ *   - This is the standard Unicode replacement character for invalid/unknown characters
+ *
+ * @param input String that may contain invalid UTF-8 (e.g., from tokenizer decode)
+ * @return String with valid UTF-8, safe for JSON serialization
+ */
 std::string sanitizeUtf8ForJson(std::string const& input)
 {
     // Use nlohmann::json's built-in UTF-8 validation by attempting to serialize to JSON
@@ -423,16 +447,86 @@ std::string sanitizeUtf8ForJson(std::string const& input)
         nlohmann::json testJson = input;
         // Actually call dump() to trigger UTF-8 validation
         testJson.dump();
-        // If successful, the string is valid UTF-8
+        // If successful, the string is valid UTF-8, return as-is
         return input;
     }
     catch (std::exception const& e)
     {
-        // Catch any other exceptions
-        LOG_WARNING("Error validating string for JSON: %s", e.what());
-        LOG_WARNING("Original text (full): %s", input.c_str());
+        // Invalid UTF-8 detected - perform byte-by-byte sanitization
+        LOG_WARNING("Invalid UTF-8 detected in output: %s", e.what());
 
-        // Return error message
-        return "[ERROR: Invalid UTF-8 character detected in the output response. Check logs for original text.]";
+        std::string sanitized;
+        sanitized.reserve(input.size());
+
+        size_t i = 0;
+        size_t len = input.length();
+
+        while (i < len)
+        {
+            unsigned char c = static_cast<unsigned char>(input[i]);
+
+            // Determine expected UTF-8 sequence length based on first byte pattern
+            int64_t seqLen = 0;
+            if ((c & 0b10000000) == 0b00000000)
+            {
+                seqLen = 1; // ASCII: 0xxxxxxx (0x00-0x7F)
+            }
+            else if ((c & 0b11100000) == 0b11000000)
+            {
+                seqLen = 2; // 2-byte: 110xxxxx (0xC0-0xDF)
+            }
+            else if ((c & 0b11110000) == 0b11100000)
+            {
+                seqLen = 3; // 3-byte: 1110xxxx (0xE0-0xEF)
+            }
+            else if ((c & 0b11111000) == 0b11110000)
+            {
+                seqLen = 4; // 4-byte: 11110xxx (0xF0-0xF7)
+            }
+            else
+            {
+                // Invalid start byte (e.g., 0xFF, 0xF8-0xFF, or continuation byte in wrong position)
+                sanitized += "\xEF\xBF\xBD"; // Replace with U+FFFD (�)
+                i++;
+                continue;
+            }
+
+            // Check if we have enough remaining bytes for the complete sequence
+            if (i + seqLen > len)
+            {
+                // Incomplete sequence at end (e.g., "\xF0\x9F\x98" missing 4th byte for emoji)
+                LOG_WARNING("Incomplete UTF-8 sequence at position %zu (need %ld bytes, have %zu)", i, seqLen, len - i);
+                sanitized += "\xEF\xBF\xBD"; // Replace with U+FFFD (�)
+                break;
+            }
+
+            // Validate that all continuation bytes match the pattern 10xxxxxx (0x80-0xBF)
+            bool validSequence = true;
+            for (int64_t j = 1; j < seqLen; j++)
+            {
+                unsigned char cont = static_cast<unsigned char>(input[i + j]);
+                if ((cont & 0b11000000) != 0b10000000) // Must be 10xxxxxx
+                {
+                    validSequence = false;
+                    break;
+                }
+            }
+
+            if (validSequence)
+            {
+                // Valid UTF-8 sequence - copy it to output
+                sanitized.append(input, i, seqLen);
+                i += seqLen;
+            }
+            else
+            {
+                // Invalid continuation bytes - replace with U+FFFD (�)
+                sanitized += "\xEF\xBF\xBD";
+                i++;
+            }
+        }
+
+        LOG_WARNING("Sanitized output from %zu to %zu bytes", input.size(), sanitized.size());
+        return sanitized;
     }
 }
