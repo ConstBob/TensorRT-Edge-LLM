@@ -39,7 +39,7 @@ using namespace trt_edgellm;
 using Json = nlohmann::json;
 
 // Enum for command line option IDs (using traditional enum for C library compatibility)
-enum OptionId : int
+enum LLMInferenceOptionId : int
 {
     INPUT_FILE = 901,
     ENGINE_DIR = 902,
@@ -130,33 +130,35 @@ void printUsage(char const* programName)
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
-    static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, OptionId::INPUT_FILE},
-        {"engineDir", required_argument, 0, OptionId::ENGINE_DIR},
-        {"multimodalEngineDir", required_argument, 0, OptionId::MULTIMODAL_ENGINE_DIR},
-        {"outputFile", required_argument, 0, OptionId::OUTPUT_FILE}, {"debug", no_argument, 0, OptionId::DEBUG},
-        {"dumpProfile", no_argument, 0, OptionId::DUMP_PROFILE},
-        {"profileOutputFile", required_argument, 0, OptionId::PROFILE_OUTPUT_FILE},
-        {"warmup", required_argument, 0, OptionId::WARMUP}, {"dumpOutput", no_argument, 0, OptionId::DUMP_OUTPUT},
-        {"eagle", no_argument, 0, OptionId::EAGLE},
-        {"eagleDraftTopK", required_argument, 0, OptionId::EAGLE_DRAFT_TOP_K},
-        {"eagleDraftStep", required_argument, 0, OptionId::EAGLE_DRAFT_STEP},
-        {"eagleVerifyTreeSize", required_argument, 0, OptionId::EAGLE_VERIFY_TREE_SIZE},
-        {"batchSize", required_argument, 0, OptionId::BATCH_SIZE},
-        {"maxGenerateLength", required_argument, 0, OptionId::MAX_GENERATE_LENGTH}, {0, 0, 0, 0}};
+    static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, LLMInferenceOptionId::INPUT_FILE},
+        {"engineDir", required_argument, 0, LLMInferenceOptionId::ENGINE_DIR},
+        {"multimodalEngineDir", required_argument, 0, LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR},
+        {"outputFile", required_argument, 0, LLMInferenceOptionId::OUTPUT_FILE},
+        {"debug", no_argument, 0, LLMInferenceOptionId::DEBUG},
+        {"dumpProfile", no_argument, 0, LLMInferenceOptionId::DUMP_PROFILE},
+        {"profileOutputFile", required_argument, 0, LLMInferenceOptionId::PROFILE_OUTPUT_FILE},
+        {"warmup", required_argument, 0, LLMInferenceOptionId::WARMUP},
+        {"dumpOutput", no_argument, 0, LLMInferenceOptionId::DUMP_OUTPUT},
+        {"eagle", no_argument, 0, LLMInferenceOptionId::EAGLE},
+        {"eagleDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K},
+        {"eagleDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP},
+        {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
+        {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
+        {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
     {
         switch (opt)
         {
-        case OptionId::INPUT_FILE: args.inputFile = optarg; break;
-        case OptionId::ENGINE_DIR: args.engineDir = optarg; break;
-        case OptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
-        case OptionId::OUTPUT_FILE: args.outputFile = optarg; break;
-        case OptionId::DEBUG: args.debug = true; break;
-        case OptionId::DUMP_PROFILE: args.dumpProfile = true; break;
-        case OptionId::PROFILE_OUTPUT_FILE: args.profileOutputFile = optarg; break;
-        case OptionId::WARMUP:
+        case LLMInferenceOptionId::INPUT_FILE: args.inputFile = optarg; break;
+        case LLMInferenceOptionId::ENGINE_DIR: args.engineDir = optarg; break;
+        case LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
+        case LLMInferenceOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
+        case LLMInferenceOptionId::DEBUG: args.debug = true; break;
+        case LLMInferenceOptionId::DUMP_PROFILE: args.dumpProfile = true; break;
+        case LLMInferenceOptionId::PROFILE_OUTPUT_FILE: args.profileOutputFile = optarg; break;
+        case LLMInferenceOptionId::WARMUP:
             try
             {
                 args.warmup = std::stoi(optarg);
@@ -172,9 +174,9 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case OptionId::DUMP_OUTPUT: args.dumpOutput = true; break;
-        case OptionId::EAGLE: args.eagleArgs.enabled = true; break;
-        case OptionId::EAGLE_DRAFT_TOP_K:
+        case LLMInferenceOptionId::DUMP_OUTPUT: args.dumpOutput = true; break;
+        case LLMInferenceOptionId::EAGLE: args.eagleArgs.enabled = true; break;
+        case LLMInferenceOptionId::EAGLE_DRAFT_TOP_K:
             try
             {
                 args.eagleArgs.draftTopK = std::stoi(optarg);
@@ -190,7 +192,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case OptionId::EAGLE_DRAFT_STEP:
+        case LLMInferenceOptionId::EAGLE_DRAFT_STEP:
             try
             {
                 args.eagleArgs.draftStep = std::stoi(optarg);
@@ -206,7 +208,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case OptionId::EAGLE_VERIFY_TREE_SIZE:
+        case LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE:
             try
             {
                 args.eagleArgs.verifyTreeSize = std::stoi(optarg);
@@ -222,7 +224,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case OptionId::BATCH_SIZE:
+        case LLMInferenceOptionId::BATCH_SIZE:
             try
             {
                 args.batchSize = std::stoi(optarg);
@@ -238,7 +240,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case OptionId::MAX_GENERATE_LENGTH:
+        case LLMInferenceOptionId::MAX_GENERATE_LENGTH:
             try
             {
                 args.maxGenerateLength = std::stoll(optarg);

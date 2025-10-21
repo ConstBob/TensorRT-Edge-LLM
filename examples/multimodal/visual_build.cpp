@@ -27,6 +27,18 @@
 
 using namespace trt_edgellm;
 
+// Enum for command line option IDs (using traditional enum for C library compatibility)
+enum VLMBuildOptionId : int
+{
+    HELP = 601,
+    ONNX_DIR = 602,
+    ENGINE_DIR = 603,
+    DEBUG = 604,
+    MIN_IMAGE_TOKENS = 605,
+    MAX_IMAGE_TOKENS = 606,
+    MAX_IMAGE_TOKENS_PER_IMAGE = 607
+};
+
 struct ViTBuildArgs
 {
     std::string onnxDir;
@@ -60,18 +72,21 @@ void printUsage(char const* programName)
 
 bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
 {
-    static struct option vitOptions[] = {{"help", no_argument, 0, 601}, {"onnxDir", required_argument, 0, 602},
-        {"engineDir", required_argument, 0, 603}, {"debug", no_argument, 0, 604},
-        {"minImageTokens", required_argument, 0, 605}, {"maxImageTokens", required_argument, 0, 606},
-        {"maxImageTokensPerImage", required_argument, 0, 607}, {0, 0, 0, 0}};
+    static struct option vitOptions[] = {{"help", no_argument, 0, VLMBuildOptionId::HELP},
+        {"onnxDir", required_argument, 0, VLMBuildOptionId::ONNX_DIR},
+        {"engineDir", required_argument, 0, VLMBuildOptionId::ENGINE_DIR},
+        {"debug", no_argument, 0, VLMBuildOptionId::DEBUG},
+        {"minImageTokens", required_argument, 0, VLMBuildOptionId::MIN_IMAGE_TOKENS},
+        {"maxImageTokens", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS},
+        {"maxImageTokensPerImage", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS_PER_IMAGE}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", vitOptions, nullptr)) != -1)
     {
         switch (opt)
         {
-        case 601: args.help = true; return true;
-        case 602:
+        case VLMBuildOptionId::HELP: args.help = true; return true;
+        case VLMBuildOptionId::ONNX_DIR:
             if (optarg)
             {
                 args.onnxDir = optarg;
@@ -82,7 +97,7 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 603:
+        case VLMBuildOptionId::ENGINE_DIR:
             if (optarg)
             {
                 args.engineDir = optarg;
@@ -93,20 +108,20 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case 604: args.debug = true; break;
-        case 605:
+        case VLMBuildOptionId::DEBUG: args.debug = true; break;
+        case VLMBuildOptionId::MIN_IMAGE_TOKENS:
             if (optarg)
             {
                 args.minImageTokens = std::stoi(optarg);
             }
             break;
-        case 606:
+        case VLMBuildOptionId::MAX_IMAGE_TOKENS:
             if (optarg)
             {
                 args.maxImageTokens = std::stoi(optarg);
             }
             break;
-        case 607:
+        case VLMBuildOptionId::MAX_IMAGE_TOKENS_PER_IMAGE:
             if (optarg)
             {
                 args.maxImageTokensPerImage = std::stoi(optarg);
