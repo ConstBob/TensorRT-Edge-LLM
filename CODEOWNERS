@@ -1,5 +1,34 @@
-# Folder ownership to enforce code review rule.
+############################################################
+# CODEOWNERS for TensorRT Edge-LLM.
+#
+# This is the internal owner file that maps to NVIDIA SSO IDs.
+#
+############################################################
 
-/cpp/* @fans
-/export/* @luxiaoz
-/examples/* @luxiaoz @sgai @amberl
+# == C++/CUDA runtime & kernel components ==
+/cpp/ @fans
+/cpp/common/ @fkaster
+/cpp/kernels/ @fans @ruochengj
+/cpp/multimodal/ @amberl
+/cpp/plugins/ @fans @ruochengj
+/cpp/profiling/ @luxiaoz @amberl
+/cpp/runtime/ @fans @amberl @fkaster
+/cpp/sampler/ @luxiaoz
+/cpp/tokenizer/ @amberl @kchemudupati
+
+# == Build system ==
+**/CMakeLists.txt @fans @luxiaoz
+/cmake/ @fans @mahu
+
+# == Automation tests ==
+/tests/ @luxiaoz @mahu
+
+# == Kernel source we bring from other projects ==
+/kernelSrcs/ @fans @ruochengj
+
+# == Python frontend ==
+/tensorrt_edgellm/ @luxiaoz
+/tensorrt_edgellm/quantization/ @luxiaoz @ruochengj
+
+# == Documentation ==
+/docs/ @luxiaoz @ffriedmann
