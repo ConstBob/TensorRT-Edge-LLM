@@ -32,13 +32,12 @@ namespace kernel
 constexpr int32_t kROOT_NODE_PREDECESSOR{-1};
 constexpr int32_t kEMPTY_NODE_PREDECESSOR{-5};
 
-__global__ void prepareEaglePrefillInputKernel(
-    int32_t* sequenceContextLengths, int64_t* selectTokenIndices, int32_t sequenceLength)
+__global__ void prepareEaglePrefillInputKernel(int64_t* selectTokenIndices, int32_t const* sequenceContextLengths)
 {
     int32_t const batchIdx = blockIdx.x;
     if (threadIdx.x == 0)
     {
-        sequenceContextLengths[batchIdx] = sequenceLength;
+        int32_t const sequenceLength = sequenceContextLengths[batchIdx];
         selectTokenIndices[batchIdx] = sequenceLength - 1;
     }
 }
@@ -126,10 +125,12 @@ __global__ void assembleDraftTreeDescKernel(int8_t const* draftTreeMask, int32_t
 
 __global__ void assembleCasualTreeAndSelectIndicesKernel(int32_t const* sequenceStartIndices, int32_t* packedTreeMasks,
     int32_t* tensorPositionIndices, int64_t* selectTokenIndices, int32_t* sequenceContextLengths,
-    int32_t const acceptedTokenNum)
+    int32_t const* acceptedTokenNums, int32_t const maxAcceptedTokenNum)
 {
     int32_t const batchIdx = blockIdx.x;
     int32_t const tokenIdx = threadIdx.x;
+
+    int32_t const acceptedTokenNum = acceptedTokenNums[batchIdx];
 
     // 32 should be sufficient for accepted tokens from base model.
     int32_t packedTreeMask{0};
@@ -140,11 +141,11 @@ __global__ void assembleCasualTreeAndSelectIndicesKernel(int32_t const* sequence
             packedTreeMask |= (1 << i);
         }
 
-        // Packed tree mask shall have layout of [batch, accepted-token-num, divup(accepted-token-num, 32)].
+        // Packed tree mask shall have layout of [batch, max-accepted-token-num, divup(max-accepted-token-num, 32)].
         // Here the accepted token num should be strictly smaller than 32.
-        // tensor position indices have layout of [batch, accepted-token-num], the offset will be identical to packed
-        // tree mask.
-        int32_t const packedTreeMaskOffset = batchIdx * acceptedTokenNum + tokenIdx;
+        // tensor position indices have layout of [batch, max-accepted-token-num], the offset will be identical to
+        // packed tree mask.
+        int32_t const packedTreeMaskOffset = batchIdx * maxAcceptedTokenNum + tokenIdx;
         packedTreeMasks[packedTreeMaskOffset] = packedTreeMask;
         tensorPositionIndices[packedTreeMaskOffset] = sequenceStartIndices[batchIdx] + tokenIdx;
     }
@@ -477,22 +478,22 @@ __global__ void constructVerificationDraftTreeKernel(int32_t const* draftIdFullT
     }
 }
 
-void prepareEaglePrefillInputs(rt::Tensor& sequenceContextLengths, rt::Tensor& selectTokenIndices,
-    int32_t const sequenceLength, cudaStream_t stream)
+void prepareEaglePrefillInputs(
+    rt::Tensor const& sequenceContextLengths, rt::Tensor& selectTokenIndices, cudaStream_t stream)
 {
-    check::check(sequenceContextLengths.getDeviceType() == rt::DeviceType::kGPU
-            && selectTokenIndices.getDeviceType() == rt::DeviceType::kGPU,
+    check::check(selectTokenIndices.getDeviceType() == rt::DeviceType::kGPU
+            && sequenceContextLengths.getDeviceType() == rt::DeviceType::kGPU,
         "Device type shall all be GPU for the input tensors.");
-    check::check(sequenceContextLengths.getDataType() == DataType::kINT32
-            && selectTokenIndices.getDataType() == DataType::kINT64,
-        "Context-length input shall be INT32 and select-token-indices shall be INT64.");
+    check::check(selectTokenIndices.getDataType() == DataType::kINT64
+            && sequenceContextLengths.getDataType() == DataType::kINT32,
+        "Select-token-indices shall be INT64 and sequence-context-lengths shall be INT32.");
     uint32_t const batchSize = sequenceContextLengths.getShape()[0];
 
     // Assign one warp for each batch.
     dim3 const blockDim{32};
     dim3 const gridDim{batchSize};
     prepareEaglePrefillInputKernel<<<gridDim, blockDim, 0, stream>>>(
-        sequenceContextLengths.dataPointer<int32_t>(), selectTokenIndices.dataPointer<int64_t>(), sequenceLength);
+        selectTokenIndices.dataPointer<int64_t>(), sequenceContextLengths.dataPointer<int32_t>());
 }
 
 void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor const& draftTreeLength,
@@ -517,10 +518,11 @@ void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor
 
     uint32_t const batchSize = draftTreeMask.getShape()[0];
     int32_t const paddedDraftTreeSize = draftTreeMask.getShape()[1];
-    int32_t const selectTokenLength = selectTokenIndices.getShape()[0];
+    // Support both 1D [batch*length] and 2D [batch, length] tensors by using total volume
+    int32_t const selectTokenLength = selectTokenIndices.getShape().volume() / batchSize;
 
     check::check(tensorPositionIndices.getShape()[1] == paddedDraftTreeSize,
-        "Select token indices shall have shape [batch, padded-draft-tree-size].");
+        "Tensor position indices shall have shape [batch, padded-draft-tree-size].");
 
     // Round up block size to multiple of warp
     uint32_t const blocksize = divUp(paddedDraftTreeSize, 32) * 32;
@@ -539,26 +541,36 @@ void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor
         selectTokenIndices.dataPointer<int64_t>(), selectTokenLength, paddedDraftTreeSize);
 }
 
-void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices, rt::Tensor& packedTreeMask,
-    rt::Tensor& tensorPositionIndices, rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths,
-    int32_t const acceptedTokenNum, cudaStream_t stream)
+void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices, rt::Tensor const& acceptedTokenNums,
+    rt::Tensor& packedTreeMask, rt::Tensor& tensorPositionIndices, rt::Tensor& selectTokenIndices,
+    rt::Tensor& sequenceContextLengths, cudaStream_t stream)
 {
     check::check(sequenceStartIndices.getDeviceType() == rt::DeviceType::kGPU
             && packedTreeMask.getDeviceType() == rt::DeviceType::kGPU
             && tensorPositionIndices.getDeviceType() == rt::DeviceType::kGPU
-            && selectTokenIndices.getDeviceType() == rt::DeviceType::kGPU,
+            && selectTokenIndices.getDeviceType() == rt::DeviceType::kGPU
+            && acceptedTokenNums.getDeviceType() == rt::DeviceType::kGPU,
         "Device type shall all be GPU for these tensors.");
     check::check(sequenceStartIndices.getDataType() == DataType::kINT32
             && packedTreeMask.getDataType() == DataType::kINT32
             && tensorPositionIndices.getDataType() == DataType::kINT32
-            && selectTokenIndices.getDataType() == DataType::kINT64,
-        "Data type shall all be INT32 for these tensors.");
-    check::check(packedTreeMask.getShape()[1] == acceptedTokenNum && acceptedTokenNum < 32,
-        "Current kernel implementation support accepted token <= 32 per batch. "
-        "Packed tree mask shall have shape [batch, accepted-token-num, 1].");
+            && selectTokenIndices.getDataType() == DataType::kINT64
+            && acceptedTokenNums.getDataType() == DataType::kINT32,
+        "Data type validation failed.");
     uint32_t const batchSize = sequenceStartIndices.getShape()[0];
-    // Round up block size to multiple of warp size.
-    uint32_t const blocksize = divUp(acceptedTokenNum, 32) * 32;
+    int32_t const maxAcceptedTokenNum = packedTreeMask.getShape()[1];
+    check::check(maxAcceptedTokenNum < 32,
+        "Current kernel implementation support accepted token <= 32 per batch. "
+        "Packed tree mask shall have shape [batch, max-accepted-token-num, 1].");
+    check::check(acceptedTokenNums.getShape()[0] == batchSize,
+        "acceptedTokenNums batch size should match sequenceStartIndices.");
+
+    // Round up block size to multiple of warp size. Use max to handle all batches.
+    // Note: This uses maxAcceptedTokenNum for uniform block size across all batches.
+    // Threads with threadIdx.x >= acceptedTokenNum (per-batch) will early-exit.
+    // Trade-off: Simplifies launch configuration but may launch idle threads for batches
+    // with fewer accepted tokens. Since maxAcceptedTokenNum < 32, overhead is minimal.
+    uint32_t const blocksize = divUp(maxAcceptedTokenNum, 32) * 32;
     // Perform casual tree mask packing and tensor position indices.
     dim3 const blockDim{blocksize};
     dim3 const gridDim{batchSize};
@@ -566,7 +578,7 @@ void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices,
     assembleCasualTreeAndSelectIndicesKernel<<<gridDim, blockDim, 0, stream>>>(
         sequenceStartIndices.dataPointer<int32_t>(), packedTreeMask.dataPointer<int32_t>(),
         tensorPositionIndices.dataPointer<int32_t>(), selectTokenIndices.dataPointer<int64_t>(),
-        sequenceContextLengths.dataPointer<int32_t>(), acceptedTokenNum);
+        sequenceContextLengths.dataPointer<int32_t>(), acceptedTokenNums.dataPointer<int32_t>(), maxAcceptedTokenNum);
 }
 
 void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& sequenceStartIndices,
@@ -697,7 +709,7 @@ __global__ void eagleBaseAssembleHiddenStateKernel(int32_t const* acceptedIndice
         int32_t const acceptedIdx = acceptedIndices[batchIdx * maxDepth + i];
         if (acceptedIdx >= 0 && acceptedIdx < numTokens)
         {
-            int32_t const srcOffset = hiddenStateOffset + acceptedIdx * hiddenDim + dimIdx * DVec<half>::vec_size;
+            int32_t const srcOffset = hiddenStateOffset + acceptedIdx * hiddenDim + startIdx;
             tempBuffer[i].load(hiddenState + srcOffset);
         }
     }
@@ -705,7 +717,7 @@ __global__ void eagleBaseAssembleHiddenStateKernel(int32_t const* acceptedIndice
     // PHASE 2: Write from local temp buffer to final positions
     for (int32_t i = 1; i < actualAcceptLength; ++i)
     {
-        int32_t const dstOffset = hiddenStateOffset + i * hiddenDim + dimIdx * DVec<half>::vec_size;
+        int32_t const dstOffset = hiddenStateOffset + i * hiddenDim + startIdx;
         tempBuffer[i].store(hiddenState + dstOffset);
     }
 }
@@ -736,7 +748,7 @@ void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndi
         "kvCacheBuffer should be 6D tensor [num-layers, batch, 2, num-heads, max-seq-len, hidden-size-per-head].");
     check::check(kvCacheLengthsShape.getNumDims() == 1, "kvCacheLengths should be 1D tensor [batch].");
     check::check(
-        hiddenStateShape.getNumDims() == 2, "hiddenState should be 2D tensor [batch * num-tokens, base-hidden-dim].");
+        hiddenStateShape.getNumDims() == 3, "hiddenState should be 3D tensor [batch, num-tokens, base-hidden-dim].");
 
     uint32_t const batchSize = acceptIndicesShape[0];
     int32_t const maxDepth = acceptIndicesShape[1];
@@ -786,8 +798,9 @@ void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndi
     }
 
     // Assemble Hidden State
-    int32_t const numTokens = hiddenStateShape[0];
-    int32_t const hiddenDim = hiddenStateShape[1];
+    check::check(hiddenStateShape[0] == batchSize, "hiddenState batch size should match acceptedIndices.");
+    int32_t const numTokens = hiddenStateShape[1];
+    int32_t const hiddenDim = hiddenStateShape[2];
     check::check(hiddenDim % vecSize == 0, "hiddenDim must be divisible by vecSize.");
 
     uint32_t const dimPerBlock = threadsPerBlock * vecSize;

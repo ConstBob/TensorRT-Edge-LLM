@@ -579,6 +579,11 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // accepted).
     rt::Tensor const& kvCacheLengths = mBaseEngineRunner->getLinearKVCache().getKVCacheLengths();
     rt::Tensor kvCacheTensor = mBaseEngineRunner->getLinearKVCache().getKVCacheBuffer();
+    // Temporarily reshape hiddenState from 2D [verifyTreeSize, hiddenDim] to 3D [batch, verifyTreeSize, hiddenDim]
+    // for kernel compatibility (kernel expects 3D, but base engine outputs 2D)
+    check::check(kRUNTIME_BATCH_SIZE == 1, "kRUNTIME_BATCH_SIZE must equal 1 for single-batch reshape operation");
+    mBaseHiddenStatesOutput.reshape(
+        {kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize, mBaseEngineConfig.outputHiddenDim});
     kernel::eagleBaseCommitKVCacheAndAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, kvCacheTensor, mBaseHiddenStatesOutput, context.stream);
     mBaseEngineRunner->getLinearKVCache().commitSequenceLength(mAcceptLength, context.stream);

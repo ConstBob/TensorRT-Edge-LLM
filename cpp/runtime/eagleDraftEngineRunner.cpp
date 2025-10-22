@@ -188,6 +188,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         = rt::Tensor({kRUNTIME_BATCH_SIZE, mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
     this->mPackedTreeMask = rt::Tensor(
         {kRUNTIME_BATCH_SIZE, mConfig.maxDraftTreeSize, packedTreeMaskLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    this->mAcceptedTokenNums = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kGPU, DataType::kINT32);
 
     // Initialize the dummy tensor for unused input tensors as TensorRT does not support nullptr for binding.
     // Calculate maximum memory requirements across all use cases:
@@ -624,8 +625,12 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     int32_t const inputSequenceLength = static_cast<int32_t>(inputIds.getShape()[1]);
     constexpr int32_t kCONTEXT_SELECT_TOKEN_LENGTH{1};
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kCONTEXT_SELECT_TOKEN_LENGTH});
-    kernel::prepareEaglePrefillInputs(mSequenceContextLengths, mSelectTokenIndices, inputSequenceLength, stream);
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kCONTEXT_SELECT_TOKEN_LENGTH}); // 1D tensor for TRT engine
+
+    // Directly populate sequenceContextLengths on GPU to avoid redundant copying
+    CUDA_CHECK(cudaMemcpyAsync(
+        mSequenceContextLengths.rawPointer(), &inputSequenceLength, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    kernel::prepareEaglePrefillInputs(mSequenceContextLengths, mSelectTokenIndices, stream);
 
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
@@ -812,7 +817,7 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * selectTokenSize});
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * selectTokenSize}); // 1D tensor for TRT engine
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
     mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
     mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, packedTreeMaskLen});
@@ -930,7 +935,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * selectTokenSize});
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * selectTokenSize}); // 1D tensor for TRT engine
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
     mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
     mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, packedTreeMaskLen});
@@ -1126,15 +1131,19 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kACCEPT_DECODE_SELECT_TOKEN_LENGTH});
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 1D tensor for TRT engine
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
     mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum});
     mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum, packedTreeMaskLen});
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
-    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, mPackedTreeMask, mDraftTreePositionIds,
-        mSelectTokenIndices, mSequenceContextLengths, acceptedTokenNum, stream);
+
+    // Copy accepted token num to pre-allocated GPU tensor
+    CUDA_CHECK(cudaMemcpyAsync(
+        mAcceptedTokenNums.rawPointer(), &acceptedTokenNum, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, mAcceptedTokenNums, mPackedTreeMask,
+        mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
     size_t const hashValue = hashAcceptDecodeTokenInput(
         acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
@@ -1233,14 +1242,18 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(acceptedTokenNum, 32));
     constexpr int32_t kACCEPT_DECODE_SELECT_TOKEN_LENGTH{1};
 
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kACCEPT_DECODE_SELECT_TOKEN_LENGTH});
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 1D tensor for TRT engine
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
     mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum});
     mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum, packedTreeMaskLen});
 
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
-    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, mPackedTreeMask, mDraftTreePositionIds,
-        mSelectTokenIndices, mSequenceContextLengths, acceptedTokenNum, stream);
+
+    // Copy accepted token num to pre-allocated GPU tensor
+    CUDA_CHECK(cudaMemcpyAsync(
+        mAcceptedTokenNums.rawPointer(), &acceptedTokenNum, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, mAcceptedTokenNums, mPackedTreeMask,
+        mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
     bool setEngineIOStatus{true};
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
