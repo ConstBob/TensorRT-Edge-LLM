@@ -211,6 +211,7 @@ private:
     rt::Tensor mSequenceContextLengths{};  //!< (GPU, Int32) to store the sequence context lengths input that will be used by the TensorRT Engine
     rt::Tensor mDraftTreePositionIds{};  //!< (GPU, Int32) to store the draft tree position ids within the sequence that used by positional encoding
     rt::Tensor mPackedTreeMask{};  //!< (GPU, Int32) to store the packed tree mask to indicate the attention relationship between the draft tree nodes
+    rt::Tensor mAcceptedTokenNums{};  //!< (GPU, Int32) to store accepted token numbers for batch sequences
     //! (GPU, Half) to store a GPU buffer as dummy tensor for unused input tensors. TensorRT doesn't
     //! allow binding address to be nullptr.
     rt::Tensor mDummyTensor{};

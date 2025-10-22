@@ -30,13 +30,12 @@ namespace kernel
 
 // The kernel will prepare required inputs to execute the eagle prefill step.
 // Inputs:
-//     sequenceLength: Sequence length of the prefill input.
+//     sequenceContextLengths [GPU, Int32]: The sequence context lengths input fed into TRT engine, shape [batch].
 //     stream: The CUDA stream to execute the kernel.
 // Outputs:
-//     sequenceContextLengths [GPU, Int32]: The sequence context lengths input fed into TRT engine.
-//     selectTokenIndices [GPU, Int32]: Denote the position to gather the hidden states and logits output.
-void prepareEaglePrefillInputs(
-    rt::Tensor& sequenceContextLengths, rt::Tensor& selectTokenIndices, int32_t const sequenceLength, cudaStream_t stream);
+//     selectTokenIndices [GPU, Int64]: Denote the position to gather the hidden states and logits output, shape [batch].
+void prepareEaglePrefillInputs(rt::Tensor const& sequenceContextLengths,
+    rt::Tensor& selectTokenIndices,  cudaStream_t stream);
 
 // The kernel will prepare required inputs to execute the eagle draft proposal step.
 // In detail, the kernel will prepare packed draft tree mask, compute token positional indices, and prepare other
@@ -60,17 +59,17 @@ void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor
 // Since we reuse the logic of tree attention, instead of draft tree mask, we will prepare casual mask and corresponding
 // position indices of each accepted token.
 // Inputs:
-//     sequenceStartIndices [GPU, Int32]: The start indices of the first accepted token.
+//     sequenceStartIndices [GPU, Int32]: The start indices of the first accepted token, shape [batch].
+//     acceptedTokenNums [GPU, Int32]: Number of accepted tokens for each batch, shape [batch].
 //     stream: The CUDA stream to execute the kernel.
 // Outputs:
 //     packedTreeMask [GPU, Int32]: Packed casual tree mask where each flag takes 1 bit.
 //     tensorPositionIndices [GPU, Int32]: Positional indices of accepted tokens among the sequence.
 //     selectTokenIndices [GPU, Int64]: Denote the position (always the last one) to gather the hidden states and logits.
 //     sequenceContextLengths [GPU, Int32]: The sequence context lengths input fed into TRT engine.
-//     acceptedTokenNum: Number of accepted tokens.
-void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices, rt::Tensor& packedTreeMask,
+void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices, rt::Tensor const& acceptedTokenNums, rt::Tensor& packedTreeMask,
     rt::Tensor& tensorPositionIndices, rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths,
-    int32_t const acceptedTokenNum, cudaStream_t stream);
+    cudaStream_t stream);
 
 // The kernel will prepare required inputs to execute the eagle draft proposal step.
 // In detail, the kernel will prepare packed draft tree mask, compute token positional indices, and prepare other
