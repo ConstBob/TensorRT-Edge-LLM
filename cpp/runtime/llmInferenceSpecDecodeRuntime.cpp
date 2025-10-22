@@ -18,21 +18,37 @@
 #include "llmInferenceSpecDecodeRuntime.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
+#include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
+#include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
+#include <algorithm>
 #include <fstream>
 #include <functional>
+#include <string>
 #include <vector>
 
 using namespace nvinfer1;
 
 namespace trt_edgellm
 {
+
+namespace
+{
+// Left a utility function here in case we want to move to a better hashing method.
+size_t hashSystemPrompt(std::string const& systemPrompt)
+{
+    size_t hashValue = 0;
+    hash_utils::hashCombine(hashValue, systemPrompt);
+    return hashValue;
+}
+} // namespace
+
 namespace rt
 {
 
@@ -185,6 +201,12 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     }
     LOG_INFO("Tokenizer successfully loaded from model directory: %s", engineDir.c_str());
 
+    // Check we have exactly one mImStartTokenId and use it
+    // TODO: Remove this implicit usage of <|im_start|> to allow generalization.
+    std::vector<int32_t> imStartTokenIdVec = mTokenizer->encode("<|im_start|>", false);
+    check::check(imStartTokenIdVec.size() == 1, "imStartTokenIdVec should contain exactly one token");
+    mImStartTokenId = imStartTokenIdVec[0];
+
     // Optional: Setup multimodal engine runner
     if (!multimodalEngineDir.empty())
     {
@@ -211,14 +233,22 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return false;
     }
 
+    // Use empty tensor for when no multimodal runner is available.
+    // All other data input used by prefill step is already set up in setUpForPrefillExecution().
+    rt::OptionalInputTensor multimodalEmbeddings
+        = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+    int32_t maxGenerateLength = request.maxGenerateLength;
+    SpecDecodeInferenceContext context{{}, {}, {}, multimodalEmbeddings, 0, maxGenerateLength, 0, stream};
     // Preprocess user prompts and encode them.
-    LLMGenerationRequest::Prompt const& prompt = request.prompts[0];
     std::vector<std::vector<int32_t>> batchedInputIds;
     if (!mMultimodalRunner)
     {
+        auto const& prompt = request.prompts[0];
+        context.systemPrompt = std::move(prompt.systemPrompt);
+
         std::string const inputText = prompt.systemPrompt + prompt.userPrompt;
-        batchedInputIds.emplace_back(mTokenizer->encode(inputText, false));
-        if (batchedInputIds[0].empty())
+        context.rawBatchedInputIds.emplace_back(mTokenizer->encode(inputText, false));
+        if (context.rawBatchedInputIds[0].empty())
         {
             LOG_ERROR("Failed to tokenize input text: %s", inputText.c_str());
             return false;
@@ -226,17 +256,22 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     }
     else
     {
-        if (!mMultimodalRunner->preprocess(
-                request, batchedInputIds, mTokenizer.get(), mBaseEngineRunner->getRopeCosSinCacheTensor(), stream))
+        // TODO: apply chat template for system prompt
+        context.systemPrompt = mMultimodalRunner->preprocessSystemPrompt(
+            request.prompts[0].systemPrompt, mTokenizer.get(), mBaseEngineRunner->getRopeCosSinCacheTensor(), stream);
+
+        if (!mMultimodalRunner->preprocess(request, context.rawBatchedInputIds, mTokenizer.get(),
+                mBaseEngineRunner->getRopeCosSinCacheTensor(), stream))
         {
             LOG_ERROR(
-                "LLMInferenceRuntime(): Multimodal input request processing failed. This request cannot be handled.");
+                "Multimodal input request processing failed. This request cannot be "
+                "handled.");
             return false;
         }
 
         if (!mMultimodalRunner->infer(stream))
         {
-            LOG_ERROR("LLMInferenceRuntime(): Multimodal inference failed. This request cannot be handled.");
+            LOG_ERROR("Multimodal inference failed. This request cannot be handled.");
             return false;
         }
     }
@@ -244,31 +279,48 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     // The boundary case for KVCache is not handled, during execution we need to write drafting KVCache.
     // Workaround the issue by enforce max input sequence length smaller than (KVCacheCapacity - 100)
     constexpr int32_t kDRAFT_KVCACHE_RESERVE_LENGTH{100};
-    int32_t const prefillContextLength = batchedInputIds[0].size();
+    int32_t const perfillTokenLength = context.rawBatchedInputIds[0].size();
     int32_t const kvCacheCapacity
         = std::max(mBaseEngineConfig.maxSequenceLength, mDraftEngineConfig.kvCacheCapacityLength);
-    int32_t maxGenerateLength = request.maxGenerateLength;
-    if (prefillContextLength + request.maxGenerateLength > (kvCacheCapacity - kDRAFT_KVCACHE_RESERVE_LENGTH))
+    if (perfillTokenLength + request.maxGenerateLength > (kvCacheCapacity - kDRAFT_KVCACHE_RESERVE_LENGTH))
     {
-        maxGenerateLength = kvCacheCapacity - prefillContextLength - kDRAFT_KVCACHE_RESERVE_LENGTH;
+        maxGenerateLength = kvCacheCapacity - perfillTokenLength - kDRAFT_KVCACHE_RESERVE_LENGTH;
         LOG_WARNING(
             "With Eagle3, we need to write drafting KVCache which constrain us on sequence generation."
             "Reduce max Generation length to %d",
             maxGenerateLength);
     }
 
-    // Use empty tensor for when no multimodal runner is available.
-    // All other data input used by prefill step is already set up in setUpForPrefillExecution().
-    rt::OptionalInputTensor multimodalEmbeddings
-        = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+    // In production, the system-prompt KV cache is saved during warm-up.
+    // We disable profiling here to make benchmarking closer to production inference result.
+    bool profilingEnabled = getProfilingEnabled();
+    if (profilingEnabled)
+    {
+        setProfilingEnabled(false);
+    }
 
-    SpecDecodeInferenceContext context{batchedInputIds[0], multimodalEmbeddings, 0, maxGenerateLength, 0, stream};
-    auto checkGenerateEndStatus = [this](SpecDecodeInferenceContext& context) {
-        bool flag = (context.currentGenerateLength >= context.maxGenerateLength)
-            || (context.tokenIds.back() == mTokenizer->getEosId());
-        return flag;
-    };
+    // Generate system prompt KVCache for each sequence
+    bool const saveCacheStatus = genAndSaveSystemPromptKVCache(context);
+    if (!saveCacheStatus)
+    {
+        LOG_WARNING("Failed to save system prompt KVCache. May be KVCache reuse feature is not enabled in the engine.");
+    }
 
+    if (profilingEnabled)
+    {
+        setProfilingEnabled(true);
+    }
+
+    // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
+    // preparation, reset the KVCache state, and apply reused prefix KVCache if available.
+    if (!setUpForPrefillExecution(context))
+    {
+        LOG_ERROR("Prefill execution setup failed. This request cannot be handled.");
+        return false;
+    }
+
+    // The context length excluding the reused KVCache length.
+    int32_t computedTokenLength = context.tokenIds.size();
     // Prefill from the base model and run spec-decode inference.
     bool const prefillStatus = runBaseModelPrefill(context);
     if (!prefillStatus)
@@ -276,6 +328,12 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         LOG_ERROR("Failed to execute prefill step for base model.");
         return false;
     }
+
+    auto checkGenerateEndStatus = [this](SpecDecodeInferenceContext& context) {
+        bool flag = (context.currentGenerateLength >= context.maxGenerateLength)
+            || (context.tokenIds.back() == mTokenizer->getEosId());
+        return flag;
+    };
     while (!checkGenerateEndStatus(context))
     {
         if (context.generationRound == 0)
@@ -317,7 +375,8 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     }
 
     // Record Eagle metrics
-    mPrefillMetrics.recordRun(0, prefillContextLength); // For Eagle, no reused tokens during prefill
+    int32_t reusedTokenLength = perfillTokenLength - computedTokenLength;
+    mPrefillMetrics.recordRun(reusedTokenLength, computedTokenLength);
     mEagleGenerationMetrics.recordRun(context.generationRound, context.currentGenerateLength);
 
     // Save output ids and decoded texts to response.
@@ -329,7 +388,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         LOG_INFO("Acception_rate: %f newLen: %d iterNum: %d\n", acception_rate, context.currentGenerateLength,
             context.generationRound);
 
-        response.outputIds.emplace_back(context.tokenIds.begin() + prefillContextLength, context.tokenIds.end());
+        response.outputIds.emplace_back(context.tokenIds.begin() + computedTokenLength, context.tokenIds.end());
         response.outputTexts.emplace_back(mTokenizer->decode(response.outputIds[i], true));
     }
 
@@ -353,18 +412,11 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, inputIdsLength, mBaseEngineConfig.outputHiddenDim});
     mLogitsOutput.reshape({kRUNTIME_BATCH_SIZE, mBaseEngineConfig.vocabSize});
 
-    // Currently leave the multimodal embeddings empty.
-    rt::Tensor multimodalEmbeddings{};
     // Setup the input tensors. ContextLen input is on CPU.
     int32_t* ctxLenData = mContextLengthsInput.dataPointer<int32_t>();
     ctxLenData[0] = inputIdsLength;
     CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), context.tokenIds.data(), inputIdsLength * sizeof(int32_t),
         cudaMemcpyHostToDevice, context.stream));
-
-    // Reset status of the KVCache for the new sequence.
-    std::vector<int32_t> reuseKVCacheLengths{0};
-    rt::Tensor const reuseKVCacheLengthsTensor{reuseKVCacheLengths.data(), {1}, DeviceType::kCPU, DataType::kINT32};
-    mBaseEngineRunner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengthsTensor, context.stream);
 
     bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(mIdsInput, mContextLengthsInput,
         context.multimodalEmbeddings, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
@@ -401,11 +453,6 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
     int32_t const inputIdsLength = static_cast<int32_t>(context.tokenIds.size()) - 1;
     check::check(mBaseHiddenStatesOutput.getShape()[1] == inputIdsLength,
         "BaseHiddenStatesOutput shall match with inputIdsLength");
-
-    // Reset status of the draft engine KVCache for the new sequence.
-    std::vector<int32_t> reuseKVCacheLengths{0};
-    rt::Tensor const reuseKVCacheLengthsTensor{reuseKVCacheLengths.data(), {1}, DeviceType::kCPU, DataType::kINT32};
-    mDraftEngineRunner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengthsTensor, context.stream);
 
     // Prepare input and output tensors.
     mIdsInput.reshape({kRUNTIME_BATCH_SIZE, inputIdsLength});
@@ -663,11 +710,11 @@ bool LLMInferenceSpecDecodeRuntime::captureDraftProposalCudaGraph(cudaStream_t s
 
     if (captureStatus)
     {
-        LOG_INFO("LLMInferenceSpecDecodeRuntime(): Successfully captured the draft proposal CUDA graph.");
+        LOG_INFO("Successfully captured the draft proposal CUDA graph.");
     }
     else
     {
-        LOG_WARNING("LLMInferenceSpecDecodeRuntime(): Failed to capture the draft proposal CUDA graph.");
+        LOG_WARNING("Failed to capture the draft proposal CUDA graph.");
     }
 
     return captureStatus;
@@ -696,12 +743,12 @@ bool LLMInferenceSpecDecodeRuntime::captureDraftAcceptDecodeTokenCudaGraph(cudaS
     if (captureStatus)
     {
         LOG_INFO(
-            "LLMInferenceSpecDecodeRuntime(): Successfully captured the draft accept decode token CUDA "
+            "Successfully captured the draft accept decode token CUDA "
             "graph.");
     }
     else
     {
-        LOG_WARNING("LLMInferenceSpecDecodeRuntime(): Failed to capture the draft accept decode token CUDA graph.");
+        LOG_WARNING("Failed to capture the draft accept decode token CUDA graph.");
     }
 
     return captureStatus;
@@ -723,14 +770,210 @@ bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_
 
     if (captureStatus)
     {
-        LOG_INFO("LLMInferenceSpecDecodeRuntime(): Successfully captured the base model verification CUDA graph.");
+        LOG_INFO("Successfully captured the base model verification CUDA graph.");
     }
     else
     {
-        LOG_WARNING("LLMInferenceSpecDecodeRuntime(): Failed to capture the base model verification CUDA graph.");
+        LOG_WARNING("Failed to capture the base model verification CUDA graph.");
     }
 
     return captureStatus;
+}
+
+bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInferenceContext& context)
+{
+    std::vector<std::vector<int32_t>> const& batchedInputIds = context.rawBatchedInputIds;
+    std::vector<std::vector<int32_t>> processedInputIds;
+    std::vector<int32_t> processedIdsLengths;
+
+    rt::LinearKVCache& linearKVCacheBase = mBaseEngineRunner->getLinearKVCache();
+    rt::LinearKVCache& linearKVCacheDraft = mDraftEngineRunner->getLinearKVCache();
+    rt::Tensor kvCacheBufferBase = linearKVCacheBase.getKVCacheBuffer();
+    rt::Tensor kvCacheBufferDraft = linearKVCacheDraft.getKVCacheBuffer();
+
+    // Record the length of the reused KVCache for each sequence.
+    rt::Tensor reuseKVCacheLengths = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kCPU, DataType::kINT32);
+    int32_t* reuseKVCacheLengthsData = reuseKVCacheLengths.dataPointer<int32_t>();
+
+    // Search if the system prompt has been cached. If there are cached system prompts, insert
+    // the pre-computed KVCache and remove the contents from inputIds.
+    for (int32_t i = 0; i < kRUNTIME_BATCH_SIZE; ++i)
+    {
+        auto promptHash = hashSystemPrompt(context.systemPrompt);
+        if (mSystemPromptKVCacheBase.find(promptHash) != mSystemPromptKVCacheBase.end())
+        {
+            auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptHash];
+            auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[promptHash];
+            auto const& kvCacheContentBase = precachedKVCacheBase.kvCacheContent;
+            auto const& kvCacheContentDraft = precachedKVCacheDraft.kvCacheContent;
+            kernel::instantiateKVCacheFromTensor(kvCacheBufferBase, kvCacheContentBase, i, context.stream);
+            kernel::instantiateKVCacheFromTensor(kvCacheBufferDraft, kvCacheContentDraft, i, context.stream);
+
+            int32_t reuseLength = static_cast<int32_t>(kvCacheContentBase.getShape()[3]);
+            // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
+            check::check(
+                reuseLength < batchedInputIds[i].size(), "The reuse length shall not exceed the input length.");
+            reuseKVCacheLengthsData[i] = reuseLength;
+            processedInputIds.emplace_back(batchedInputIds[i].begin() + reuseLength, batchedInputIds[i].end());
+            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size() - reuseLength));
+
+            bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
+                precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
+            if (!matchIds)
+            {
+                LOG_WARNING(
+                    "Though system prompt strings are matched, token_ids are not perfectly aligned."
+                    "This may generate incorrect result, please check your system prompt design.");
+            }
+        }
+        else
+        {
+            processedInputIds.emplace_back(batchedInputIds[i]);
+            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size()));
+            reuseKVCacheLengthsData[i] = 0;
+        }
+    }
+
+    // Pack inputIds, instantiate input data for prefill step, and reset the KVCache state.
+    int32_t const maxInputLength = *std::max_element(processedIdsLengths.begin(), processedIdsLengths.end());
+    if (maxInputLength > mBaseEngineConfig.maxSupportedInputLength)
+    {
+        LOG_ERROR(
+            "The max input length (%d) exceeds the max supported input length (%d) of "
+            "the LLM "
+            "Engine.",
+            maxInputLength, mBaseEngineConfig.maxSupportedInputLength);
+        return false;
+    }
+
+    // The LLM Engine could also have minSupportedInputLength constraint.
+    int32_t const packedInputLength = std::max(maxInputLength, mBaseEngineConfig.minSupportedInputLength);
+
+    if (!context.tokenIds.empty())
+    {
+        context.tokenIds.clear();
+    }
+    // Pad each sequence to the max length of this batch.
+    // TODO: Support multi-batch input for eagle.
+    // TODO: Implement remove input padding for better efficiency until multi-batch.
+    context.tokenIds.resize(packedInputLength, mTokenizer->getPadId());
+    std::copy(processedInputIds[0].begin(), processedInputIds[0].end(), context.tokenIds.begin());
+
+    linearKVCacheBase.resetForNewSequences(reuseKVCacheLengths, context.stream);
+    linearKVCacheDraft.resetForNewSequences(reuseKVCacheLengths, context.stream);
+
+    return true;
+}
+
+bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context)
+{
+    // TODO: Enable the system prompt KVCache feature by default and remove this check.
+    check::check(mBaseEngineConfig.enableReuseKVCache == mDraftEngineConfig.enableReuseKVCache,
+        "The system prompt KVCache feature is not same for base and draft model.");
+
+    if (!mBaseEngineConfig.enableReuseKVCache)
+    {
+        LOG_ERROR(
+            "The system prompt KVCache feature is not enabled in the base and draft "
+            "engine.");
+        return false;
+    }
+
+    std::string const prompt = context.systemPrompt;
+    // hash the prompt if check if the prompt cache already exists.
+    size_t const promptHash = hashSystemPrompt(prompt);
+    if (mSystemPromptKVCacheBase.find(promptHash) != mSystemPromptKVCacheBase.end()
+        && mSystemPromptKVCacheDraft.find(promptHash) != mSystemPromptKVCacheDraft.end())
+    {
+        LOG_DEBUG("The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
+        return true;
+    }
+
+    auto tokenizedPrompt = mTokenizer->encode(prompt, true);
+    int32_t const promptIdsLength = tokenizedPrompt.size();
+
+    if (promptIdsLength > mBaseEngineConfig.maxSupportedInputLength
+        || promptIdsLength > mDraftEngineConfig.maxSupportedInputLength)
+    {
+        LOG_ERROR(
+            "The prompt length (%d) exceeds the max supported input length of the LLM "
+            "BaseEngine(%d) or DraftEngine(%d).",
+            promptIdsLength, mBaseEngineConfig.maxSupportedInputLength, mDraftEngineConfig.maxSupportedInputLength);
+        return false;
+    }
+
+    if (!setUpForPrefillExecution(context))
+    {
+        LOG_ERROR(
+            "Prefill execution setup failed. Cannot generate the KVCache for this "
+            "prompt.");
+        return false;
+    }
+
+    bool prefillStatus = runBaseModelPrefill(context);
+    if (!prefillStatus)
+    {
+        LOG_ERROR(
+            "Failed to execute prefill step. Cannot generate the base model KVCache "
+            "for this prompt.");
+        return false;
+    }
+
+    // During the generation of persistent system prompt KVCache, we already know the ground-truth of next token(the
+    // first token of the user prompt, <|im_start|>). So set it explicitly.
+    check::check(context.tokenIds.size() != 0, "The token IDs should not be empty at this point.");
+    context.tokenIds.back() = mImStartTokenId;
+
+    // Tokens produced during system KV-cache reuse prefill do not count as generated tokens.
+    // Only tokens generated from user-prompt prefill are counted.
+    context.currentGenerateLength -= 1;
+
+    bool draftPrefillStatus = runDraftModelPrefill(context);
+    if (!draftPrefillStatus)
+    {
+        LOG_ERROR(
+            "Failed to execute prefill step. Cannot generate the draft model KVCache "
+            "for this prompt.");
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+
+    // Copy out the KVCache content from the prefill step.
+    auto& linearKVCacheBase = mBaseEngineRunner->getLinearKVCache();
+    auto& linearKVCacheDraft = mDraftEngineRunner->getLinearKVCache();
+    auto cacheConfigBase = linearKVCacheBase.getConfig();
+    auto cacheConfigDraft = linearKVCacheDraft.getConfig();
+    auto kvCacheBufferBase = linearKVCacheBase.getKVCacheBuffer();
+    auto kvCacheBufferDraft = linearKVCacheDraft.getKVCacheBuffer();
+    rt::Coords savedKVCacheShapeBase{
+        cacheConfigBase.numDecoderLayers, 2, cacheConfigBase.numKVHeads, promptIdsLength, cacheConfigBase.headDim};
+    rt::Coords savedKVCacheShapeDraft{
+        cacheConfigDraft.numDecoderLayers, 2, cacheConfigDraft.numKVHeads, promptIdsLength, cacheConfigDraft.headDim};
+
+    SystemPromptKVCache savedKVCacheBase;
+    SystemPromptKVCache savedKVCacheDraft;
+    savedKVCacheBase.systemPrompt = prompt;
+    savedKVCacheBase.tokenizedPrompt = tokenizedPrompt;
+    savedKVCacheBase.kvCacheContent
+        = rt::Tensor(savedKVCacheShapeBase, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT);
+    savedKVCacheDraft.systemPrompt = prompt;
+    savedKVCacheDraft.tokenizedPrompt = tokenizedPrompt;
+    savedKVCacheDraft.kvCacheContent
+        = rt::Tensor(savedKVCacheShapeDraft, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT);
+
+    // We only process one sequence at a time.
+    constexpr int32_t CACHE_BATCH_IDX{0};
+    kernel::saveKVCacheIntoTensor(savedKVCacheBase.kvCacheContent, kvCacheBufferBase, CACHE_BATCH_IDX, context.stream);
+    kernel::saveKVCacheIntoTensor(
+        savedKVCacheDraft.kvCacheContent, kvCacheBufferDraft, CACHE_BATCH_IDX, context.stream);
+
+    mSystemPromptKVCacheBase.insert({promptHash, std::move(savedKVCacheBase)});
+    mSystemPromptKVCacheDraft.insert({promptHash, std::move(savedKVCacheDraft)});
+
+    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+    LOG_DEBUG("The KVCache is saved for the prompt: {%s}", prompt.c_str());
+
+    return true;
 }
 
 } // namespace rt

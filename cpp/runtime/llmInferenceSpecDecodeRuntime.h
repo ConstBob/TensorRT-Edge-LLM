@@ -23,12 +23,24 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <vector>
 
 namespace trt_edgellm
 {
+namespace
+{
+/*! \brief Structure to hold cached system prompt and its KV cache
+ */
+struct SystemPromptKVCache
+{
+    std::string systemPrompt;                     //!< The system prompt text
+    std::vector<tokenizer::Rank> tokenizedPrompt; //!< Tokenized version of the system prompt
+    rt::Tensor kvCacheContent;                    //!< Cached KV cache content for the system prompt
+};
+} // namespace
+
 namespace rt
 {
-
 /*!
  * @brief Execution context for speculative decode runtime
  *
@@ -36,12 +48,15 @@ namespace rt
  */
 struct SpecDecodeInferenceContext
 {
-    std::vector<int32_t> tokenIds;                //!< Token IDs
-    rt::OptionalInputTensor multimodalEmbeddings; //!< Optional multimodal embeddings
-    int32_t generationRound;                      //!< Current generation round
-    int32_t maxGenerateLength;                    //!< Maximum generation length
-    int32_t currentGenerateLength;                //!< Current generation length
-    cudaStream_t stream;                          //!< CUDA stream
+    std::string systemPrompt;                             //!< System Prompts
+    std::vector<std::vector<int32_t>> rawBatchedInputIds; //!< Original token IDs before preprocessing (includes padding
+                                                          //!< and removal of reused system IDs)
+    std::vector<int32_t> tokenIds;                        //!< Token IDs passed to the prefill stage
+    rt::OptionalInputTensor multimodalEmbeddings;         //!< Optional multimodal embeddings
+    int32_t generationRound;                              //!< Current generation round
+    int32_t maxGenerateLength;                            //!< Maximum generation length
+    int32_t currentGenerateLength;                        //!< Current generation length
+    cudaStream_t stream;                                  //!< CUDA stream
 };
 
 /*!
@@ -127,10 +142,13 @@ private:
     LLMEngineRunnerConfig mBaseEngineConfig;         //!< Base engine configuration
     EagleDraftEngineRunnerConfig mDraftEngineConfig; //!< Draft engine configuration
 
-    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;           //!< Base model engine runner
-    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;   //!< Draft model engine runner
-    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner (optional)
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;             //!< Tokenizer
+    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;                       //!< Base model engine runner
+    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;               //!< Draft model engine runner
+    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr};             //!< Multimodal runner (optional)
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;                         //!< Tokenizer
+    std::unordered_map<size_t, SystemPromptKVCache> mSystemPromptKVCacheBase; //!< System prompt KVCache for base model
+    std::unordered_map<size_t, SystemPromptKVCache>
+        mSystemPromptKVCacheDraft; //!< System prompt KVCache for draft model
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
     // [1] I/O Tensors to work with base and eagle draft engine.
@@ -170,6 +188,10 @@ private:
     rt::Tensor mAcceptedTokenIndices;
     rt::Tensor mAcceptLength;
 
+    // [5] Special tokens for reuse KV cache.
+    // TODO: Remove this to allow generalization.
+    int32_t mImStartTokenId;
+
     // Key functions to drive the spec-decode runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     bool runBaseModelPrefill(SpecDecodeInferenceContext& context);
@@ -188,6 +210,13 @@ private:
     // Consume the selected tokens and base model hidden state, produce the draft hidden states and logits for the last
     // token of the accepted sequence.
     bool runDraftModelAcceptToken(SpecDecodeInferenceContext& context);
+
+    // Consume system prompt, produce the hash table of system prompt KVCache if kv cache reuse is enabled.
+    bool genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context);
+
+    // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
+    // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.
+    bool setUpForPrefillExecution(SpecDecodeInferenceContext& context);
 
     // Stage-specific metrics
     metrics::LLMPrefillMetrics mPrefillMetrics;

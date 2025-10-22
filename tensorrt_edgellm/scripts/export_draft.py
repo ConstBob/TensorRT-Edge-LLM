@@ -73,11 +73,11 @@ def main() -> None:
         help=
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
-    parser.add_argument("--enable_reuse_kv_cache",
-                        action="store_true",
+    parser.add_argument("--disable_reuse_kv_cache",
                         required=False,
-                        default=False,
-                        help="Whether to reuse KV cache for system prompts")
+                        dest="enable_reuse_kv_cache",
+                        action="store_false",
+                        help="Disable reusing KV cache for system prompts.")
 
     args = parser.parse_args()
 

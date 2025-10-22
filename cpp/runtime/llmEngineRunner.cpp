@@ -104,6 +104,9 @@ namespace rt
 static constexpr int32_t kCONTEXT_PROFILE_INDEX{0};
 static constexpr int32_t kGENERATION_PROFILE_INDEX{1};
 
+// In the implementation, we only support batch size of 1 which will be further extended.
+static constexpr int32_t kRUNTIME_BATCH_SIZE{1};
+
 LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
@@ -259,9 +262,10 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // 2. Attention mask: {maxSupportedBatchSize, 1, 1}
     // 3. Attention position IDs: {maxSupportedBatchSize, 1}
     // 4. LoRA weights: zero shape.
+    // 5. KV cache start index: {maxSupportedBatchSize}
     int64_t maxDummyElements = std::max({
         static_cast<int64_t>(mConfig.hiddenSize),            // multimodal embeddings
-        static_cast<int64_t>(mConfig.maxSupportedBatchSize), // attention mask/pos IDs
+        static_cast<int64_t>(mConfig.maxSupportedBatchSize), // attention mask/pos IDs/KV cache start index
     });
     mDummyTensor = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     // Initialize dummy tensor memory to zero
@@ -279,6 +283,20 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         {
             LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
             throw std::runtime_error("Failed to set multimodal embeddings dummy tensor for generation context");
+        }
+    }
+    // Set kv cache start index to dummy tensor for generation contexts if reuse KV cache is enabled
+    if (mConfig.enableReuseKVCache)
+    {
+        bool setReuseKVCacheStatus{true};
+        setReuseKVCacheStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setReuseKVCacheStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, rt::Coords{kRUNTIME_BATCH_SIZE}.getTRTDims());
+        if (!setReuseKVCacheStatus)
+        {
+            LOG_ERROR("Failed to set reuse KV cache start index to the engine");
+            throw std::runtime_error("Failed to set reuse KV cache start index to the engine");
         }
     }
 
@@ -422,6 +440,7 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
     int32_t nbKVCacheInputs{0};
     bool foundMultimodalEmbeddingsInput{false};
+    bool foundReuseKVCacheInput{false};
     int32_t numIOBindings = mEngine->getNbIOTensors();
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
@@ -450,16 +469,6 @@ bool LLMEngineRunner::validateConfigFromEngine()
             }
             ++nbKVCacheInputs;
         }
-        if (identifyReuseKVCacheBinding(bindingName, tensorDim))
-        {
-            if (!mConfig.enableReuseKVCache)
-            {
-                LOG_ERROR(
-                    "Enable reuse KVCache is not consistent. Identified reuse KVCache binding, but enableReuseKVCache "
-                    "is false from config");
-                return false;
-            }
-        }
         if (identifyMultimodalEmbeddingsBinding(bindingName, tensorDim))
         {
             foundMultimodalEmbeddingsInput = true;
@@ -475,6 +484,10 @@ bool LLMEngineRunner::validateConfigFromEngine()
                 return false;
             }
         }
+        if (identifyReuseKVCacheBinding(bindingName, tensorDim))
+        {
+            foundReuseKVCacheInput = true;
+        }
     }
     // Validate hiddenSize from multimodal embeddings if VLM is enabled
     if (mConfig.isVlm && !foundMultimodalEmbeddingsInput)
@@ -483,7 +496,11 @@ bool LLMEngineRunner::validateConfigFromEngine()
             "VLM is enabled but multimodal embeddings input (%s) not found in engine", binding_names::kImageEmbeds);
         return false;
     }
-
+    if (foundReuseKVCacheInput != mConfig.enableReuseKVCache)
+    {
+        LOG_ERROR("enable_reuse_kv_cache is inconsistent between the engine and the config.");
+        return false;
+    }
     if (nbKVCacheInputs != mConfig.numDecoderLayers)
     {
         LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,

@@ -195,10 +195,12 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // 1. Multimodal embeddings: {1, baseModelHiddenDim/3}
     // 2. Attention mask: {kRUNTIME_BATCH_SIZE, 1, 1}
     // 3. Attention position IDs: {kRUNTIME_BATCH_SIZE, 1}
+    // 4. KV cache start index: {kRUNTIME_BATCH_SIZE}
     int64_t maxDummyElements = std::max({
         static_cast<int64_t>(mConfig.baseModelHiddenDim / 3), // multimodal embeddings
         static_cast<int64_t>(kRUNTIME_BATCH_SIZE * 1 * 1),    // attention mask
-        static_cast<int64_t>(kRUNTIME_BATCH_SIZE * 1)         // attention position IDs
+        static_cast<int64_t>(kRUNTIME_BATCH_SIZE * 1),        // attention position IDs
+        static_cast<int64_t>(kRUNTIME_BATCH_SIZE)             // KV cache start index
     });
     this->mDummyTensor = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, DataType::kHALF);
     // Initialize dummy tensor memory to zero
@@ -260,6 +262,21 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         }
     }
 
+    // Set kv cache start index to dummy tensor for generation contexts if reuse KV cache is enabled
+    if (mConfig.enableReuseKVCache)
+    {
+        bool setReuseKVCacheStatus{true};
+        setReuseKVCacheStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setReuseKVCacheStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, rt::Coords{kRUNTIME_BATCH_SIZE}.getTRTDims());
+        if (!setReuseKVCacheStatus)
+        {
+            LOG_ERROR("Failed to set reuse KV cache start index to the draft engine");
+            throw std::runtime_error("Failed to set reuse KV cache start index to the draft engine");
+        }
+    }
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
@@ -283,7 +300,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
     {
         // Define required fields for main config
         std::vector<std::string> const requiredConfigFields = {"num_hidden_layers", "num_key_value_heads", "head_dim",
-            "hidden_size", "base_model_hidden_size", "draft_vocab_size", "builder_config"};
+            "hidden_size", "base_model_hidden_size", "draft_vocab_size", "builder_config", "enable_reuse_kv_cache"};
 
         // Validate required fields exist in main config
         for (auto const& field : requiredConfigFields)
@@ -326,6 +343,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.draftModelHiddenDim = configJson["hidden_size"].get<int32_t>();
         mConfig.baseModelHiddenDim = configJson["base_model_hidden_size"].get<int32_t>();
         mConfig.draftModelVocabSize = configJson["draft_vocab_size"].get<int32_t>();
+        mConfig.enableReuseKVCache = configJson["enable_reuse_kv_cache"].get<bool>();
 
         // Extract builder_config values
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
@@ -388,8 +406,14 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
         return tensorDim.nbDims == 2 && bindingName == binding_names::kImageEmbeds;
     };
 
+    // If the engine comes with "kvcache_start_index" binding, it means the engine enables reuse KVCache.
+    auto identifyReuseKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
+        return tensorDim.nbDims == 1 && bindingName == binding_names::kKVCacheStartIndex;
+    };
+
     int32_t nbKVCacheInputs{0};
     bool foundMultimodalEmbeddingsInput{false};
+    bool foundReuseKVCacheInput{false};
     int32_t numIOBindings = mEngine->getNbIOTensors();
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
@@ -434,6 +458,10 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
                 return false;
             }
         }
+        if (identifyReuseKVCacheBinding(bindingName, tensorDim))
+        {
+            foundReuseKVCacheInput = true;
+        }
     }
 
     // Validate VLM configuration
@@ -443,7 +471,11 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
             "VLM is enabled but multimodal embeddings input (%s) not found in engine", binding_names::kImageEmbeds);
         return false;
     }
-
+    if (foundReuseKVCacheInput != mConfig.enableReuseKVCache)
+    {
+        LOG_ERROR("enable_reuse_kv_cache is inconsistent between the engine and the config.");
+        return false;
+    }
     if (nbKVCacheInputs != mConfig.numDecoderLayers)
     {
         LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,
@@ -677,6 +709,13 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
             binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
         setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
             binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
+    }
+    if (mConfig.enableReuseKVCache)
+    {
+        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
     }
 
     // Bind the output tensor into the engine.
