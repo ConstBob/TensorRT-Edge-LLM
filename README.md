@@ -41,7 +41,8 @@ TensorRT Edge-LLM is NVIDIA's production-ready C++ inference runtime for Large L
 
 ## Quick Start
 
-Get started with TensorRT Edge-LLM in ~15 minutes. For complete installation and usage instructions, see the [**Developer Guide**](docs/developer_guide/01_Getting_Started.md).
+Get started with TensorRT Edge-LLM in ~15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](docs/source/developer_guide/01.2_Quick_Start_Guide.md).
+
 
 ### 1. Install Python Export Tools (x86 host)
 
@@ -103,13 +104,17 @@ make -j$(nproc)
 
 Complete documentation for installation, usage, and deployment:
 
-- **[Getting Started](docs/developer_guide/01_Getting_Started.md)** - Installation and quick start
-- **[Supported Models](docs/developer_guide/02_Supported_Models.md)** - Complete model compatibility matrix
-- **[Key Components](docs/developer_guide/03_Key_Components.md)** - System architecture overview
-  - [Python Export Pipeline](docs/developer_guide/03.1_Python_Export_Pipeline.md)
-  - [Engine Builder](docs/developer_guide/03.2_Engine_Builder.md)
-  - [C++ Runtime](docs/developer_guide/03.3_C++_Runtime.md)
-- **[Examples](docs/developer_guide/04_Examples.md)** - Working code examples
+- **[Overview](docs/source/developer_guide/01.1_Overview.md)** - What is TensorRT Edge-LLM and key features
+- **[Quick Start Guide](docs/source/developer_guide/01.2_Quick_Start_Guide.md)** - Get started in ~15 minutes
+- **[Installation](docs/source/developer_guide/01.3_Installation.md)** - Detailed installation instructions
+- **[Supported Models](docs/source/developer_guide/02_Supported_Models.md)** - Complete model compatibility matrix
+- **[Python Export Pipeline](docs/source/developer_guide/03.1_Python_Export_Pipeline.md)** - Model export and quantization
+- **[Engine Builder](docs/source/developer_guide/03.2_Engine_Builder.md)** - Building TensorRT engines
+- **[C++ Runtime Overview](docs/source/developer_guide/04.1_C++_Runtime_Overview.md)** - Runtime system architecture
+  - [LLM Inference Runtime](docs/source/developer_guide/04.2_LLM_Inference_Runtime.md)
+  - [LLM SpecDecode Runtime](docs/source/developer_guide/04.3_LLM_Inference_SpecDecode_Runtime.md)
+  - [Advanced Runtime Features](docs/source/developer_guide/04.4_Advanced_Runtime_Features.md)
+- **[Examples](docs/source/developer_guide/05_Examples.md)** - Working code examples
 
 ### Additional Resources
 
@@ -164,7 +169,7 @@ Follow our [GitHub repository](https://github.com/NVIDIA/TensorRT-Edge-LLM) for 
 
 ## Support
 
-- **Documentation**: [Developer Guide](docs/developer_guide/01_Getting_Started.md)
+- **Documentation**: [Developer Guide](docs/source/developer_guide/01.1_Overview.md)
 - **Issues**: [GitHub Issues](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/NVIDIA/TensorRT-Edge-LLM/discussions)
 - **Forums**: [NVIDIA Developer Forums](https://forums.developer.nvidia.com/)
