@@ -50,6 +50,7 @@ struct EagleDraftEngineRunnerConfig
     int32_t baseModelHiddenDim{};          //!< Hidden dimension of the base model
     int32_t draftModelHiddenDim{};         //!< Hidden dimension of the draft model
     bool isVlm{false};                     //!< Flag indicating if this is a vision-language model
+    bool enableReuseKVCache{true};         //!< Enable KV cache reuse across requests
 };
 
 // Disable clang-format to explicitly format the class interface documentation.
