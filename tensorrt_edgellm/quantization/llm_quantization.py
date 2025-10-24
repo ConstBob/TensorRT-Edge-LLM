@@ -200,7 +200,7 @@ def get_llm_quant_config(
     Get quantization configuration for LLM models.
     
     Args:
-        quantization: Quantization method ("fp8", "int4_awq", "nvfp4")
+        quantization: Quantization method ("fp8", "int4_awq", "nvfp4", "int8_sq")
         lm_head_quantization: Optional LM head quantization method
         
     Returns:
@@ -216,6 +216,8 @@ def get_llm_quant_config(
         quant_cfg = mtq.INT4_AWQ_CFG.copy()
     elif quantization == "nvfp4":
         quant_cfg = mtq.NVFP4_DEFAULT_CFG.copy()
+    elif quantization == "int8_sq":
+        quant_cfg = mtq.INT8_SMOOTHQUANT_CFG.copy()
     else:
         raise ValueError(f"Unsupported quantization: {quantization}")
 
@@ -261,7 +263,7 @@ def quantize_llm(
     Raises:
         AssertionError: If quantization method is not supported
     """
-    assert quantization in ["fp8", "int4_awq", "nvfp4"]
+    assert quantization in ["fp8", "int4_awq", "nvfp4", "int8_sq"]
     assert lm_head_quantization in [None, "fp8", "nvfp4"]
 
     # Get calibration dataloader
@@ -295,7 +297,7 @@ def quantize_draft(
         base_model: Based model which is used to generate inputs for the draft model.
         draft_model: The draft model to quantize
         tokenizer: Tokenizer for text processing
-        quantization: Quantization method ("fp8", "int4_awq", "nvfp4")
+        quantization: Quantization method ("fp8", "int4_awq", "nvfp4", "int8_sq")
         dataset_dir: Dataset for calibration
         lm_head_quantization: Optional LM head quantization method
         
@@ -305,7 +307,7 @@ def quantize_draft(
     Raises:
         AssertionError: If quantization method is not supported
     """
-    assert quantization in ["fp8", "int4_awq", "nvfp4"]
+    assert quantization in ["fp8", "int4_awq", "nvfp4", "int8_sq"]
     assert lm_head_quantization in [None, "fp8", "nvfp4"]
 
     # Get calibration dataloader
@@ -341,7 +343,7 @@ def quantize_and_save_llm(model_dir: str,
     Args:
         model_dir: Directory containing the input HuggingFace model
         output_dir: Directory to save the quantized model
-        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4")
+        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "int8_sq")
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
         lm_head_quantization: Optional separate quantization for language model head (only "fp8" and "nvfp4" is currently supported)
@@ -405,7 +407,7 @@ def quantize_and_save_draft(
         base_model_dir: Directory containing the base HuggingFace model
         draft_model_dir: Directory containing the EAGLE draft model
         output_dir: Directory to save the quantized model
-        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4")
+        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "int8_sq")
         device: Device to use for model loading and quantization ("cuda", "cpu")
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data

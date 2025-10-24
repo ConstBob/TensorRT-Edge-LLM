@@ -231,8 +231,8 @@ class EdgeLLMAttention(nn.Module):
         dtype = qkv.dtype
 
         # Convert to FP16 for plugin compatibility
-        if qkv.dtype != torch.float16:
-            qkv = qkv.to(torch.float16)
+        # For int8 quantization, we always need to explicitly convert to FP16
+        qkv = qkv.to(torch.float16)
         if past_key_value.dtype != torch.float16:
             past_key_value = past_key_value.to(torch.float16)
 

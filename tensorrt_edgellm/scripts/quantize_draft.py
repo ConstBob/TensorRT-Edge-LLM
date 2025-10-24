@@ -62,7 +62,7 @@ def main() -> None:
     parser.add_argument("--quantization",
                         type=str,
                         required=False,
-                        choices=["fp8", "int4_awq", "nvfp4"],
+                        choices=["fp8", "int4_awq", "nvfp4", "int8_sq"],
                         default=None,
                         help="Quantization method to use")
     parser.add_argument("--dtype",

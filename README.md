@@ -11,7 +11,7 @@ TensorRT Edge-LLM is NVIDIA's production-ready C++ inference runtime for Large L
 ### Key Features
 
 - **🚀 High Performance**: Optimized CUDA kernels and TensorRT integration for maximum throughput
-- **💾 Memory Efficient**: Advanced quantization support (FP8, INT4, NVFP4) with intelligent KV-cache management
+- **💾 Memory Efficient**: Advanced quantization support (FP8, INT8, INT4, NVFP4) with intelligent KV-cache management
 - **🔄 Production Ready**: C++-only runtime with zero Python dependencies for deployment
 - **🎯 Edge Optimized**: Purpose-built for NVIDIA Jetson and DRIVE platforms
 - **🔧 Flexible**: LoRA adapters, EAGLE speculative decoding, and multimodal models
@@ -21,8 +21,8 @@ TensorRT Edge-LLM is NVIDIA's production-ready C++ inference runtime for Large L
 
 | Platform | Architecture | Supported Precisions |
 |----------|--------------|---------------------|
-| **Jetson Thor** | Blackwell (SM100+) | FP16, FP8, INT4, NVFP4 |
-| **DRIVE Thor** | Blackwell (SM100+) | FP16, FP8, INT4, NVFP4 |
+| **Jetson Thor** | Blackwell (SM100+) | FP16, FP8, INT8, INT4, NVFP4 |
+| **DRIVE Thor** | Blackwell (SM100+) | FP16, FP8, INT8, INT4, NVFP4 |
 
 ### Supported Models
 
@@ -35,7 +35,7 @@ TensorRT Edge-LLM is NVIDIA's production-ready C++ inference runtime for Large L
 - Qwen2/2.5-VL (2B-7B)
 - InternVL3 (1B-2B)
 
-**Quantization Support:** FP16, FP8, INT4 (AWQ/GPTQ), NVFP4
+**Quantization Support:** FP16, FP8, INT8 (SmoothQuant), INT4 (AWQ/GPTQ), NVFP4
 
 ---
 
