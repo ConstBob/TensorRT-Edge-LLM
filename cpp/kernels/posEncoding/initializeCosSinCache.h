@@ -72,8 +72,8 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
  * @param batchSize Batch size
  * @param stream CUDA stream
  */
-void initializeMRopeCosSin(float* cosSinCache, int32_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryDim,
-    int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, cudaStream_t stream);
+void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

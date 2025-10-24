@@ -85,16 +85,15 @@ bool InternViTRunner::validateAndFillConfig(std::string const& configPath)
     mConfig.vocabSize = textConfig["vocab_size"].get<int32_t>();
 
     auto visionConfig = jsonConfig["vision_config"];
-    mConfig.numChannels = visionConfig["num_channels"].get<int32_t>();
-    mConfig.patchSizeH = visionConfig["patch_size"][0].get<int32_t>();
-    mConfig.patchSizeW = visionConfig["patch_size"][1].get<int32_t>();
-    mConfig.blockImageSizeH = visionConfig["image_size"][0].get<int32_t>();
-    mConfig.blockImageSizeW = visionConfig["image_size"][1].get<int32_t>();
+    mConfig.numChannels = visionConfig["num_channels"].get<int64_t>();
+    mConfig.patchSizeH = visionConfig["patch_size"][0].get<int64_t>();
+    mConfig.patchSizeW = visionConfig["patch_size"][1].get<int64_t>();
+    mConfig.blockImageSizeH = visionConfig["image_size"][0].get<int64_t>();
+    mConfig.blockImageSizeW = visionConfig["image_size"][1].get<int64_t>();
 
     auto builderConfig = jsonConfig["builder_config"];
-    // Min token per image is the same as min token per batch (minimum number of images = 1).
-    mConfig.minImageTokensPerImage = builderConfig["min_image_tokens"].get<int32_t>();
-    mConfig.maxImageTokensPerImage = builderConfig["max_image_tokens_per_image"].get<int32_t>();
+    mConfig.minImageTokensPerImage = builderConfig["min_image_tokens"].get<int64_t>();
+    mConfig.maxImageTokensPerImage = builderConfig["max_image_tokens_per_image"].get<int64_t>();
 
     // Get config from engine shapes
     nvinfer1::Dims const inputShapeMax
@@ -151,9 +150,9 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
 void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
     int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream)
 {
-    int height = image.height;
-    int width = image.width;
-    int channels = image.channels;
+    int64_t height = image.height;
+    int64_t width = image.width;
+    int64_t channels = image.channels;
     unsigned char* imageData = image.data(); // In hwc order
 
     if (channels != mConfig.numChannels)
@@ -209,13 +208,13 @@ void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     totalNumBlocks += curNumBlocks;
 }
 
-std::vector<std::pair<int32_t, int32_t>> InternViTRunner::getAllSupportedAspectRatios(
-    int32_t const minImageTiles, int32_t const maxImageTiles)
+std::vector<std::pair<int64_t, int64_t>> InternViTRunner::getAllSupportedAspectRatios(
+    int64_t const minImageTiles, int64_t const maxImageTiles)
 {
-    std::vector<std::pair<int32_t, int32_t>> aspectRatios;
-    for (int32_t width = 1; width <= maxImageTiles; ++width)
+    std::vector<std::pair<int64_t, int64_t>> aspectRatios;
+    for (int64_t width = 1; width <= maxImageTiles; ++width)
     {
-        for (int32_t height = 1; height <= maxImageTiles; ++height)
+        for (int64_t height = 1; height <= maxImageTiles; ++height)
         {
             if (width * height <= maxImageTiles && width * height >= minImageTiles)
             {
@@ -224,23 +223,23 @@ std::vector<std::pair<int32_t, int32_t>> InternViTRunner::getAllSupportedAspectR
         }
     }
     std::sort(aspectRatios.begin(), aspectRatios.end(),
-        [](std::pair<int32_t, int32_t> const& a, std::pair<int32_t, int32_t> const& b) {
+        [](std::pair<int64_t, int64_t> const& a, std::pair<int64_t, int64_t> const& b) {
             return a.first * a.second < b.first * b.second;
         });
     return aspectRatios;
 }
 
-std::tuple<int32_t, int32_t> InternViTRunner::getResizedImageSize(int32_t const height, int32_t const width)
+std::tuple<int64_t, int64_t> InternViTRunner::getResizedImageSize(int64_t const height, int64_t const width)
 {
     // -1 because we add a thumbnail image for each image
-    int32_t const minImageTiles = std::max(1, mConfig.minImageTokensPerImage / 256 - 1);
-    int32_t const maxImageTiles = std::max(1, mConfig.maxImageTokensPerImage / 256 - 1);
+    int64_t const minImageTiles = std::max(int64_t(1), mConfig.minImageTokensPerImage / 256 - 1);
+    int64_t const maxImageTiles = std::max(int64_t(1), mConfig.maxImageTokensPerImage / 256 - 1);
     auto targetRatios = getAllSupportedAspectRatios(minImageTiles, maxImageTiles);
     double const aspectRatio = static_cast<double>(width) / height;
     int64_t const area = width * height;
 
     double bestRatioDiff = HUGE_VAL;
-    std::pair<int32_t, int32_t> bestRatio = {1, 1};
+    std::pair<int64_t, int64_t> bestRatio = {1, 1};
     for (auto const& ratio : targetRatios)
     {
         double const targetAspectRatio = static_cast<double>(ratio.first) / ratio.second;
@@ -307,7 +306,7 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
     int64_t totalImageTokens = totalNumBlocks * 256;
 
     // Record performance data
-    int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), 0);
+    int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), int64_t(0));
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
 
     mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
@@ -349,7 +348,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         throw std::runtime_error(errorMsg);
     }
 
-    int imageIndex = 0;
+    int64_t imageIndex = 0;
     // Image token id will start from vocabSize and increment for each image token position
     int32_t imageTokenId = mConfig.vocabSize;
 
@@ -367,7 +366,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             if (ids[j] == mConfig.imageTokenId)
             {
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
-                for (int k = 0; k < numImageTokens; ++k)
+                for (int64_t k = 0; k < numImageTokens; ++k)
                 {
                     newIds.push_back(imageTokenId);
                     ++imageTokenId;

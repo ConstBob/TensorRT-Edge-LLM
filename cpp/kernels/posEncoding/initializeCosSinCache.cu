@@ -218,7 +218,7 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
 
 template <int32_t RotaryDim>
 __global__ void initializeMRopeCosSinKernel(
-    float* cosSinCache, int32_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryEmbeddingMaxPositions)
+    float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryEmbeddingMaxPositions)
 {
     // In this kernel, each warp compute 4 "position" of the cos/sin cache, and loop until max position.
     // Each CTA will be assigned 4 warps so it proceeds 16 positions in an iteration.
@@ -259,7 +259,7 @@ __global__ void initializeMRopeCosSinKernel(
             // Each iteration i processes 8 dims, for i in range [0 ~ 8). Group i by [2, 3, 3].
             // Selects mropePositionIds at [bs, j, posIdx] for group j = 0, 1, 2.
             int32_t j = (i < 2) ? 0 : (i < 5) ? 1 : 2;
-            int mropePosIdx = mropePositionIds[batchPositionIdsOffset + j * rotaryEmbeddingMaxPositions + posIdx];
+            int64_t mropePosIdx = mropePositionIds[batchPositionIdsOffset + j * rotaryEmbeddingMaxPositions + posIdx];
 
             float invFreq = mropePosIdx / ropeConstants[i];
             float cosVal = cos(invFreq);
@@ -272,8 +272,8 @@ __global__ void initializeMRopeCosSinKernel(
     }
 }
 
-void initializeMRopeCosSin(float* cosSinCache, int32_t* mropePositionIds, float rotaryBaseFrequency, int32_t rotaryDim,
-    int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, cudaStream_t stream)
+void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, cudaStream_t stream)
 {
     // Each CTA get assigned 128 threads.
     dim3 block(8, 16);
@@ -292,7 +292,7 @@ void initializeMRopeCosSin(float* cosSinCache, int32_t* mropePositionIds, float 
     int32_t maxBlockPerSM{};
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, kernelPtr, 128, 0));
 
-    int32_t const numBlocks = std::min(maxBlockPerSM * numSMs, rotaryEmbeddingMaxPositions / 16);
+    int64_t const numBlocks = std::min(static_cast<int64_t>(maxBlockPerSM * numSMs), rotaryEmbeddingMaxPositions / 16);
     dim3 grid(numBlocks, batchSize);
 
     void* kernelArgs[] = {reinterpret_cast<void*>(&cosSinCache), reinterpret_cast<void*>(&mropePositionIds),

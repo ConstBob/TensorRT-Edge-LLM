@@ -109,7 +109,7 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
     return ImageData(std::move(buffer));
 }
 
-ImageData resizeImage(ImageData const& image, int newWidth, int newHeight)
+ImageData resizeImage(ImageData const& image, int64_t newWidth, int64_t newHeight)
 {
     if (newWidth <= 0 || newHeight <= 0)
     {

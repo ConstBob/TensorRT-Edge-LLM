@@ -51,12 +51,12 @@ void normalizeImage(rt::Tensor const& originalImage, rt::Tensor const& mean, rt:
 //         curSeqLength = gridT * gridH * gridW * mergeSize * mergeSize
 //         totalSeqLength = sum(curSeqLength) over all images
 //         inputDim = channels * temporalPatchSize * patchSize * patchSize
-void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int32_t const inputOffset,
-    int32_t const temporalPatchSize, int32_t const patchSize, int32_t const mergeSize, cudaStream_t stream);
+void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
+    int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, cudaStream_t stream);
 
 // The kernel will initialize the attention mask for Qwen2-VL and Qwen2.5-VL VIT
 // Inputs:
-//     cuSeqlens [GPU, Int32]: Cumulative sequence lengths [num]
+//     cuSeqlens [GPU, Int64]: Cumulative sequence lengths [num]
 //     stream: CUDA stream for execution
 // Outputs:
 //     attentionMask [GPU, Half]: Attention mask tensor [1, curHW, curHW]
@@ -64,7 +64,7 @@ void initAttentionMaskQwenViT(rt::Tensor const& cuSeqlens, rt::Tensor& attention
 
 // The kernel will initialize the rotary position embeddings for Qwen2-VL and Qwen2.5-VL VIT
 // Inputs:
-//     posIds [GPU, Int32]: [totalSeqLength*2]
+//     posIds [GPU, Int64]: [totalSeqLength*2]
 //     stream: CUDA stream for execution
 // Outputs:
 //     rotaryPosEmb [GPU, Float]: Rotary position embeddings tensor [totalSeqLength, vitPosEmbDim]
@@ -81,7 +81,7 @@ void initRotaryPosEmbQwenViT(rt::Tensor const& posIds, rt::Tensor& rotaryPosEmb,
 //         curNumBlocks = blockH * blockW
 //         totalNumBlocks = sum(curNumBlocks) over all images
 void transposeToPatchInternVL(
-    rt::Tensor const& originalImage, rt::Tensor& inputPatches, int32_t const inputOffset, cudaStream_t stream);
+    rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm
