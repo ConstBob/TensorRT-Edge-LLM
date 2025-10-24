@@ -71,7 +71,7 @@ ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additi
 
 ### Core Parameters
 - **Model**: `Qwen2.5-0.5B-Instruct`, `InternVL3-1B-hf`
-- **Precision**: `fp16`, `fp8`, `int4_awq`, `nvfp4`, `int4_gptq`
+- **Precision**: `fp16`, `fp8`, `int8_sq`, `int4_awq`, `nvfp4`, `int4_gptq`
 - **LM Head**: `lmfp16`, `lmfp8`, `lmint4_awq`, `lmnvfp4` (optional, defaults to fp16)
 - **Engine Config**: `mxsl4096` (max seq len), `mxbs1` (max batch), `mxil2048` (max input len)
 
