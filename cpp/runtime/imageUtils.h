@@ -39,9 +39,9 @@ class ImageData
 {
 public:
     std::shared_ptr<rt::Tensor> buffer; //!< Image data buffer
-    int32_t width;                      //!< Image width
-    int32_t height;                     //!< Image height
-    int32_t channels;                   //!< Number of channels (e.g., 3 for RGB)
+    int64_t width;                      //!< Image width
+    int64_t height;                     //!< Image height
+    int64_t channels;                   //!< Number of channels (e.g., 3 for RGB)
 
     /*!
      * @brief Construct image data
@@ -77,7 +77,7 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size);
  * @param newHeight Target height
  * @return Resized image
  */
-ImageData resizeImage(ImageData const& image, int newWidth, int newHeight);
+ImageData resizeImage(ImageData const& image, int64_t newWidth, int64_t newHeight);
 
 } // namespace imageUtils
 } // namespace rt
