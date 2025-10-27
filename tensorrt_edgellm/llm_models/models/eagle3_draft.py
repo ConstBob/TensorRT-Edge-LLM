@@ -35,6 +35,7 @@ from transformers import AutoConfig
 from transformers.models.llama.modeling_llama import (LlamaRMSNorm,
                                                       LlamaRotaryEmbedding)
 
+from ..layers.gather_nd import custom_gather_nd
 from ..layers.layers import EdgeLLMDecoderLayer, PromptTuningEmbedding
 
 
@@ -215,10 +216,8 @@ class Eagle3DraftModel(nn.Module):
             )
             present_key_values += (present_key_value, )
 
-        # TODO: EAGLE Draft model uses an implicit remove_padding here to flatten the hidden states
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        # Extract last token hidden states, normalize, and compute logits
-        hidden_states = hidden_states[last_token_ids, :]
+        # Extract last token hidden states using custom_gather_nd to support batch dimensions
+        hidden_states = custom_gather_nd(hidden_states, last_token_ids, 1)
         hidden_states_normed = self.norm(hidden_states)
         logits = self.lm_head(hidden_states_normed)
         logits = logits.to(torch.float32)

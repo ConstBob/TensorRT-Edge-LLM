@@ -518,11 +518,11 @@ bool LLMBuilder::setupEagleProfiles(
     result &= setOptimizationProfile(generationProfile, binding_names::kInputIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
-    // Last token IDs
-    result &= setOptimizationProfile(contextProfile, binding_names::kLastTokenIds, createDims({1}),
-        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-    result &= setOptimizationProfile(generationProfile, binding_names::kLastTokenIds, createDims({1}),
-        createDims({maxTokens / 2}), createDims({maxTokens}));
+    // Last token IDs - 2D shape [batch_size, num_selected_tokens]
+    result &= setOptimizationProfile(contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+    result &= setOptimizationProfile(generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
     if (mBuilderConfig.eagleDraft)
     {

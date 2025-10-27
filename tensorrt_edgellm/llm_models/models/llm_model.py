@@ -296,13 +296,9 @@ class EdgeLLMModelForCausalLM(nn.Module):
         )
 
         # Extract last token hidden states and compute logits
-        if not self.is_eagle_base:
-            last_hidden_state_gathered = custom_gather_nd(
-                hidden_states, last_token_ids, 1)
-        else:
-            # TODO: EAGLE Draft model uses an implicit remove_padding here to flatten the hidden states
-            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-            last_hidden_state_gathered = hidden_states[last_token_ids, :]
+        # Use custom_gather_nd for all models to support batch dimensions
+        last_hidden_state_gathered = custom_gather_nd(hidden_states,
+                                                      last_token_ids, 1)
 
         logits = self.lm_head(last_hidden_state_gathered)
         logits = logits.to(torch.float32)
