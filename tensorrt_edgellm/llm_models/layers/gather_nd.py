@@ -42,17 +42,25 @@ def symbolic_gather_nd(
     Symbolic function for ONNX export.
     
     This function defines how to convert to ONNX GatherND.
+    For ONNX GatherND with batch_dims=1, indices must have shape:
+    [batch_size, num_indices, num_index_dims]
+    where num_index_dims is the number of dimensions to index (1 for selecting along seq_len).
     
     Args:
         g: ONNX graph being built
         value: Input tensor
-        indices: Indices tensor with dtype int64
+        indices: Indices tensor with dtype int64, shape [batch_size, num_indices]
         batch_dims: Number of batch dimensions (default: 1)
         
     Returns:
         ONNX GatherND operation
     """
-    return g.op("GatherND", value, indices, batch_dims_i=batch_dims)
+    # ONNX GatherND requires indices to have an extra dimension for the number of axes to index
+    # indices shape: [batch_size, num_indices] -> [batch_size, num_indices, 1]
+    unsqueeze_axes = g.op("Constant",
+                          value_t=torch.tensor([-1], dtype=torch.int64))
+    indices_expanded = g.op("Unsqueeze", indices, unsqueeze_axes)
+    return g.op("GatherND", value, indices_expanded, batch_dims_i=batch_dims)
 
 
 @torch.library.custom_op("trt::gather_nd", mutates_args=())

@@ -531,10 +531,11 @@ bool LLMEngineRunner::validateConfigFromEngine()
     }
 
     // Obtain vocab size from the engine.
+    // Logits shape is [batch_size, num_tokens/num_selected_tokens, vocab_size] for both EAGLE and vanilla models
     Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
-    if (mConfig.vocabSize != logitsDim.d[1])
+    if (mConfig.vocabSize != logitsDim.d[2])
     {
-        LOG_ERROR("vocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[1], mConfig.vocabSize);
+        LOG_ERROR("vocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[2], mConfig.vocabSize);
         return false;
     }
 
@@ -706,15 +707,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
 
     bool reshapeStatus{true};
     // conduct preparation work for the engine execution. Provide correct shapes for MISC input tensors.
-    if (mConfig.enableEagleSpecDecode)
-    {
-        // With EAGLE, shape semantics is different with the "last_token_ids" input to gather from hidden states.
-        reshapeStatus &= mSelectTokenIndices.reshape({activeBatchSize});
-    }
-    else
-    {
-        reshapeStatus &= mSelectTokenIndices.reshape({activeBatchSize, 1});
-    }
+    // All models (EAGLE and vanilla) now use 2D shape [batch_size, num_tokens] for last_token_ids
+    reshapeStatus &= mSelectTokenIndices.reshape({activeBatchSize, 1});
     reshapeStatus &= mSequenceContextLengths.reshape({activeBatchSize});
     if (!reshapeStatus)
     {
@@ -1010,7 +1004,7 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
 
     // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
     // indices, sequence context lengths.
-    mSelectTokenIndices.reshape({baseTreeDecodingSize});
+    mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
     mSequenceContextLengths.reshape({activeBatchSize});
     mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize});
     mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen});
@@ -1247,7 +1241,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     // indices, sequence context lengths.
     int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputIds.getShape()[1]);
     int32_t const packedBaseTreeDecodingMaskLen = static_cast<int32_t>(divUp(baseTreeDecodingSize, 32));
-    mSelectTokenIndices.reshape({baseTreeDecodingSize});
+    mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
     mSequenceContextLengths.reshape({activeBatchSize});
     mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize});
     mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen});

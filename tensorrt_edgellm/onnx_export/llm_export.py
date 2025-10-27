@@ -152,8 +152,9 @@ def create_dummy_inputs(model: nn.Module, enable_reuse_kv_cache: bool,
                                     dtype=torch.int64,
                                     device=device)
     else:
+        # For EAGLE models, maintain batch dimension for proper GatherND support
         num_selected_tokens = 2
-        last_token_ids = torch.full([batch_size * num_selected_tokens],
+        last_token_ids = torch.full([batch_size, num_selected_tokens],
                                     seq_len - 1,
                                     dtype=torch.int64,
                                     device=device)
@@ -359,6 +360,14 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
             for i in range(num_layers)
         }
 
+        # Define dynamic axes for last_token_ids based on model type
+        if is_eagle_base or is_eagle_draft:
+            # EAGLE models: (batch_size, num_selected_tokens)
+            last_token_ids_axes = {0: "batch_size", 1: "num_selected_tokens"}
+        else:
+            # Standard models: (batch_size, 1)
+            last_token_ids_axes = {0: "batch_size"}
+
         dynamic_axes = {
             "input_ids": {
                 0: "batch_size",
@@ -371,9 +380,7 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
             "context_lengths": {
                 0: "batch_size"
             },
-            "last_token_ids": {
-                0: "indices_len"
-            },
+            "last_token_ids": last_token_ids_axes,
             **present_key_values_shapes
         }
 
@@ -407,6 +414,21 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
 
         if use_prompt_tuning:
             dynamic_axes["image_embeds"] = {0: "image_token_len"}
+
+        # Add dynamic axes for outputs
+        if is_eagle_base or is_eagle_draft:
+            # EAGLE models: logits shape (batch_size, num_selected_tokens, vocab_size)
+            dynamic_axes["logits"] = {
+                0: "batch_size",
+                1: "num_selected_tokens"
+            }
+            # EAGLE models hidden_states shape
+            # Eagle base: (batch_size, seq_len, 3*hidden_dim)
+            # Eagle draft: (batch_size, seq_len, hidden_dim)
+            dynamic_axes["hidden_states"] = {0: "batch_size", 1: "seq_len"}
+        else:
+            # Standard models: logits shape (batch_size, num_tokens, vocab_size)
+            dynamic_axes["logits"] = {0: "batch_size", 1: "num_tokens"}
 
         # Register ONNX symbolic functions
         register_attention_plugin_onnx_symbolic_functions()

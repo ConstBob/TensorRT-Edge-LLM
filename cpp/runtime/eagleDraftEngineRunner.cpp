@@ -503,10 +503,11 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     }
 
     // Validate vocab size from the engine.
+    // Logits shape is [batch_size, num_selected_tokens, vocab_size] for EAGLE draft model
     Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
-    if (mConfig.draftModelVocabSize != logitsDim.d[1])
+    if (mConfig.draftModelVocabSize != logitsDim.d[2])
     {
-        LOG_ERROR("draftModelVocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[1],
+        LOG_ERROR("draftModelVocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[2],
             mConfig.draftModelVocabSize);
         return false;
     }
@@ -657,7 +658,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     int32_t const inputSequenceLength = static_cast<int32_t>(inputIds.getShape()[1]);
     constexpr int32_t kCONTEXT_SELECT_TOKEN_LENGTH{1};
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kCONTEXT_SELECT_TOKEN_LENGTH}); // 1D tensor for TRT engine
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE, kCONTEXT_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
 
     // Directly populate sequenceContextLengths on GPU to avoid redundant copying
     CUDA_CHECK(cudaMemcpyAsync(
@@ -856,7 +857,7 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * selectTokenSize}); // 1D tensor for TRT engine
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE, selectTokenSize}); // 2D tensor [batch, num_tokens]
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
     mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
     mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, packedTreeMaskLen});
@@ -974,7 +975,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * selectTokenSize}); // 1D tensor for TRT engine
+    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE, selectTokenSize}); // 2D tensor [batch, num_tokens]
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
     mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
     mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, packedTreeMaskLen});
@@ -1170,7 +1171,8 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 1D tensor for TRT engine
+    mSelectTokenIndices.reshape(
+        {kRUNTIME_BATCH_SIZE, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
     mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum});
     mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum, packedTreeMaskLen});
@@ -1281,7 +1283,8 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(acceptedTokenNum, 32));
     constexpr int32_t kACCEPT_DECODE_SELECT_TOKEN_LENGTH{1};
 
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE * kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 1D tensor for TRT engine
+    mSelectTokenIndices.reshape(
+        {kRUNTIME_BATCH_SIZE, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
     mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
     mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum});
     mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum, packedTreeMaskLen});
