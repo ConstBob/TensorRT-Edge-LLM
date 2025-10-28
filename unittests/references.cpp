@@ -949,3 +949,169 @@ void transposeToPatchInternVLReference(std::vector<half> const& originalImage, s
         }
     }
 }
+
+// Helper functions for GEMM and GEMV unit tests
+static inline size_t idx4(int i, int j, int k, int t, int A, int B, int C, int Tlast)
+{
+    // shape: [A, B, C, Tlast]
+    return ((((size_t) i * B + j) * C + k) * Tlast) + t;
+}
+static inline size_t idx3(int i, int j, int k, int A, int B, int C)
+{
+    // shape: [A, B, C]
+    return ((size_t) i * B + j) * C + k;
+}
+
+static inline size_t idx2(int i0, int i1, int dim1)
+{
+    return static_cast<size_t>(i0) * dim1 + i1;
+}
+
+// C++ implementation for https://github.com/mit-han-lab/llm-awq/blob/main/awq/quantize/qmodule.py#L26
+void awqPackReference(int16_t const* kernel_KxN, // [K_in, N_in], row-major
+    int N_in, int K_in,
+    int16_t* out_Ndiv4xK // [N_in/4, K_in], row-major
+)
+{
+    // Python constants
+    int const interleave = 4;
+    int const kstride = 64;
+
+    // After Python's: unpacked_kernel = (kernel + 8).T
+    // So our working dims become:
+    // N = K_in, K = N_in
+    int const N = K_in;
+    int const K = N_in;
+
+    // A = (kernel + 8).T  -> uint8 [K, N]
+    std::vector<int16_t> A((size_t) K * N);
+    for (int k_in = 0; k_in < K_in; ++k_in)
+    {
+        for (int n_in = 0; n_in < N_in; ++n_in)
+        {
+            int16_t v = kernel_KxN[idx2(k_in, n_in, N_in)] + 8; // shift to nibble
+            // transpose: (N_in, K_in) -> (K_in, N_in) == (N, K)
+            A[idx2(n_in, k_in, N)] = v;
+        }
+    }
+    // Step 1: reshape(N, K//32, 32) -> reshape(...,4,4,2) -> transpose(..., 1,0,2) inside that block
+    // Mapping within each 32-lane chunk:
+    //   index_in  t  = ((i0*4 + i1) * 2 + i2)
+    //   index_out t' = ((i1*4 + i0) * 2 + i2)
+    std::vector<int16_t> B((size_t) K * N);
+    int const K32 = K / 32;
+    for (int n = 0; n < N; ++n)
+    {
+        size_t const in_row = (size_t) n * K;
+        size_t const out_row = (size_t) n * K;
+
+        for (int b = 0; b < K32; ++b)
+        {
+            size_t const in_blk = in_row + (size_t) b * 32;
+            size_t const out_blk = out_row + (size_t) b * 32;
+
+            // Inside each 32-lane block, map offset o -> o' as:
+            //   decompose o in (4,4,2): a=o//8, b4=(o//2)%4, c=o%2
+            //   o' = ((b4*4)+a)*2 + c
+            for (int o = 0; o < 32; ++o)
+            {
+                int const a = o >> 3;          // 0..3
+                int const b4 = (o >> 1) & 0x3; // 0..3
+                int const c = o & 1;           // 0..1
+                int const o2 = (((b4 << 2) | a) << 1) | c;
+
+                B[out_blk + o2] = A[in_blk + o];
+            }
+        }
+    }
+    // Step 2: reorder each 8 within each block of 32:
+    // Python: reshape(...,4,8) -> reshape(...,4,4,2).transpose(0,1,2,4,3)
+    // This is exactly: within each group of 8, [0,1,2,3,4,5,6,7] -> [0,2,4,6,1,3,5,7]
+    static int const REORDER8[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    std::vector<int16_t> C((size_t) K * N);
+    for (int n = 0; n < N; ++n)
+    {
+        for (int q = 0; q < K32; ++q)
+        {
+            int base = q * 32;
+            for (int g = 0; g < 4; ++g)
+            { // 4 groups of 8 within 32
+                int gbase = base + g * 8;
+                for (int j = 0; j < 8; ++j)
+                {
+                    int in_idx = gbase + j;
+                    int out_idx = gbase + REORDER8[j];
+                    C[idx2(n, out_idx, K)] = B[idx2(n, in_idx, K)];
+                }
+            }
+        }
+    }
+    // Step 3: interleave every 4 rows (first dim), pack along that dimension
+    // Python: x.reshape(N//4, 4, K//64, 64)
+    //         x = x.transpose(0,2,1,3) -> (N//4, K//64, 4, 64)
+    //         pack last-4 into a uint16: [lane0|lane1<<4|lane2<<8|lane3<<12]
+    int const Ng = K / 4;  // N4 = N_in / 4
+    int const Kg = N / 64; // K64 = K_in / 64
+
+    // Step 3.1: transpose (0,2,1,3) → B[Ng, Kg, interleave, kstride] ---
+    std::vector<int16_t> D(static_cast<size_t>(Ng) * Kg * interleave * kstride);
+    for (int ng = 0; ng < Ng; ++ng)
+    {
+        for (int ks = 0; ks < Kg; ++ks)
+        {
+            for (int j = 0; j < interleave; ++j)
+            {
+                for (int i = 0; i < kstride; ++i)
+                {
+                    D[idx4(ng, ks, j, i, 0, Kg, interleave, kstride)]
+                        = C[idx4(ng, j, ks, i, 0, interleave, Kg, kstride)];
+                }
+            }
+        }
+    }
+    // Step 3.2: view as [Ng, Kg, kstride, interleave] and pack last-4 nibbles ---
+    // No data move for the view; we just compute using the view's (ip, jp) mapping.
+    //
+    // For fixed (ng, ks, ip), the 4 lanes correspond to jp = 0..3, where
+    //   L = ip*interleave + jp         (linear within the (kstride, interleave) view)
+    //   j = L / kstride,  i = L % kstride    (indices in B's (..., interleave, kstride))
+    //
+    // Then final flatten (ks, ip) → out column k_out = ks*kstride + ip.
+    for (int i = 0; i < Ng; ++i)
+    {
+        for (int j = 0; j < Kg; ++j)
+        {
+            for (int k = 0; k < kstride; ++k)
+            {
+                size_t const base4 = idx4(i, j, k, 0, Ng, Kg, kstride, /*Tlast=*/4);
+
+                // Do shifts in uint16_t (well-defined), then cast back to int16_t.
+                uint16_t const a0 = static_cast<uint16_t>(D[base4 + 0]);
+                uint16_t const a1 = static_cast<uint16_t>(D[base4 + 1]);
+                uint16_t const a2 = static_cast<uint16_t>(D[base4 + 2]);
+                uint16_t const a3 = static_cast<uint16_t>(D[base4 + 3]);
+
+                uint16_t const packed = static_cast<uint16_t>((a0) | (static_cast<uint16_t>(a1) << 4)
+                    | (static_cast<uint16_t>(a2) << 8) | (static_cast<uint16_t>(a3) << 12));
+
+                out_Ndiv4xK[idx3(i, j, k, Ng, Kg, kstride)] = static_cast<int16_t>(packed);
+            }
+        }
+    }
+}
+
+void scaledWeightsReference(
+    int16_t const* kernel_KxN, half const* scales_KdivGxN, int K, int N, int group_size, std::vector<half>& out_KxN)
+{
+    out_KxN.resize(static_cast<size_t>(K) * N);
+    for (int k = 0; k < K; ++k)
+    {
+        int srow = k / group_size; // (K//G, N)
+        for (int n = 0; n < N; ++n)
+        {
+            float w = static_cast<float>(kernel_KxN[idx2(k, n, N)]);
+            float sf = __half2float(scales_KdivGxN[idx2(srow, n, N)]);
+            out_KxN[idx2(k, n, N)] = __float2half(w * sf);
+        }
+    }
+}

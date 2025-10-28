@@ -112,3 +112,9 @@ void transposeToPatchQwenReference(std::vector<half> const& originalImage, std::
 void transposeToPatchInternVLReference(std::vector<half> const& originalImage, std::vector<half>& patch,
     int32_t const inputOffset, int32_t const height, int32_t const width, int32_t const channels,
     int32_t const blockSizeH, int32_t const blockSizeW);
+
+// GEMM weight packing and weight scale reference function for int4-WOQ kernel
+void awqPackReference(int16_t const* kernel_KxN, int N_in, int K_in, int16_t* out_Ndiv4xK);
+
+void scaledWeightsReference(
+    int16_t const* kernel_KxN, half const* scales_KdivGxN, int K, int N, int group_size, std::vector<half>& out_KxN);
