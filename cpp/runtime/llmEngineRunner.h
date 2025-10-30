@@ -187,9 +187,10 @@ public:
         cudaStream_t stream);
 
 private:
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                             //!< TensorRT runtime
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                           //!< TensorRT engine
-    std::unique_ptr<nvinfer1::IExecutionContext> mPrefillExecutionContext;    //!< Context execution context
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                          //!< TensorRT runtime
+    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                        //!< TensorRT engine
+    rt::Tensor mExecContextMemory{};                                       //!< Device memory for the execution contexts
+    std::unique_ptr<nvinfer1::IExecutionContext> mPrefillExecutionContext; //!< Prefill execution context
     std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext; //!< Generation execution context
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
     //! which denote the input/output shapes and other execution properties like LoRA weights.

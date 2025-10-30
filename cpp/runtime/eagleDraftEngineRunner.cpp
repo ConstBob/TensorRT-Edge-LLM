@@ -150,8 +150,22 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
-    mPrefillExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
-    mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(mEngine->createExecutionContext());
+    int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
+    // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
+    mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+
+    mPrefillExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+        mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
+    mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+        mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
+
+    // The prefill and generation contexts of the LLM engine execute serially, can therefore share a single device
+    // memory block.
+    mPrefillExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
+    mGenerationExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
+    LOG_INFO("Allocated a shared device memory of %zu bytes for the prefill and generation contexts.",
+        execContextMemoryInBytes);
+
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus
         &= mPrefillExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, stream);
