@@ -20,7 +20,7 @@ classifiers = [
 requires-python = ">=3.8"
 dependencies = [
     "torch~=2.8.0",
-    "transformers==4.55.2",
+    "transformers==4.57.1",
     "nvidia-modelopt[torch]==0.35.0",
     "nvidia-modelopt[onnx]==0.35.0",
     "onnx==1.18.0",

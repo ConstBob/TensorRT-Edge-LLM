@@ -26,6 +26,28 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+def enable_huggingface_checkpointing_patch() -> None:
+    from modelopt.torch.opt.plugins.huggingface import (
+        _LIBRARY_CLASSES_FOR_PATCHING, _PATCHED_CLASSES,
+        patch_pretrained_methods)
+    """Enables automatic save/restore of ModelOpt state with HuggingFace checkpointing APIs.
+    This is adapted from TensorRT Model Optimizer: https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/0.37.0/modelopt/torch/opt/plugins/huggingface.py#L127
+    Edge-LLM finds that _from_config() should not be patched.
+
+    """
+    for name, (classes, methods_list) in _LIBRARY_CLASSES_FOR_PATCHING.items():
+        for cls, patch_methods in zip(classes, methods_list):
+            if cls in _PATCHED_CLASSES:
+                continue
+            patch_methods = [
+                method for method in patch_methods
+                if method[0] != "_from_config"
+            ]  # Edge-LLM finds that _from_config() should not be patched.
+            patch_pretrained_methods(cls, patch_methods)
+            _PATCHED_CLASSES.add(cls)
+        print(f"ModelOpt save/restore enabled for `{name}` library.")
+
+
 def quantize_model(
     model: torch.nn.Module,
     quant_config: Dict[str, Any],
