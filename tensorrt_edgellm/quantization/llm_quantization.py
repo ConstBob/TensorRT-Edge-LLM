@@ -24,7 +24,6 @@ import os
 import time
 from typing import Any, Dict, Optional, Union
 
-import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 import torch
 from datasets import load_dataset
@@ -36,9 +35,10 @@ from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
 
 from ..llm_models.model_utils import load_eagle3_draft_model, load_hf_model
 from ..llm_models.models.eagle3_draft import Eagle3DraftModel
-from .quantization_utils import quantize_draft_model, quantize_model
+from .quantization_utils import (enable_huggingface_checkpointing_patch,
+                                 quantize_draft_model, quantize_model)
 
-mto.enable_huggingface_checkpointing()
+enable_huggingface_checkpointing_patch()
 
 # Quantization configuration constants
 # FP8 quantization configuration for language model head.

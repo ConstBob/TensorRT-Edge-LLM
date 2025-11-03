@@ -141,7 +141,8 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
                           input_names=input_names,
                           output_names=output_names,
                           opset_version=ONNX_OPSET_VERSION,
-                          do_constant_folding=True)
+                          do_constant_folding=True,
+                          dynamo=False)
     t1 = time.time()
     print(f"ONNX export completed in {t1 - t0}s. Apply post-processing...")
     # Post-processing

@@ -35,11 +35,13 @@ import shutil
 import time
 from typing import Any, Dict, Optional
 
-import modelopt.torch.opt as mto
 import torch
 import torch.nn as nn
 
-mto.enable_huggingface_checkpointing()
+from ..quantization.quantization_utils import \
+    enable_huggingface_checkpointing_patch
+
+enable_huggingface_checkpointing_patch()
 
 from ..llm_models.layers.attention_plugin import \
     register_attention_plugin_onnx_symbolic_functions
