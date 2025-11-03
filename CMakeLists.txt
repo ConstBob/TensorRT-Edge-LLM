@@ -143,6 +143,9 @@ if(BUILD_UNIT_TESTS)
   add_executable(unitTest ${UNIT_TESTS_SRCS})
   target_include_directories(unitTest PRIVATE ${COMMON_INCLUDE_DIRS}
                                               ${CMAKE_SOURCE_DIR})
+  # Define project root path for tests to access resources
+  target_compile_definitions(unitTest
+                             PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore
                                          ${CUDART_LIB} ${CUDA_DRIVER_LIB})
   add_cross_build_link_options(unitTest)

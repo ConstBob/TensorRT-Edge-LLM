@@ -596,7 +596,7 @@ TEST(SafetensorsUtilsTest, SafetensorsLoadingFromFile)
 {
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    std::string testFile = "../unittests/resources/test_safetensors.safetensors";
+    std::string testFile = std::string(PROJECT_ROOT_DIR) + "/unittests/resources/test_safetensors.safetensors";
 
     // Load the file using the unified interface
     std::vector<trt_edgellm::rt::Tensor> tensors;
