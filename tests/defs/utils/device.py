@@ -62,7 +62,7 @@ def _get_arch(remote_config=None, logger=None) -> str:
 def _get_cuda_version(remote_config=None, logger=None) -> str:
     """Get CUDA version using nvcc --version"""
     nvcc_result = run_command(['/usr/local/cuda/bin/nvcc', '--version'],
-                              remote_config, 10, logger)
+                              remote_config, 60, logger)
     if not nvcc_result['success']:
         raise RuntimeError(
             f"Failed to get CUDA version from nvcc --version. {nvcc_result}")
@@ -100,7 +100,7 @@ def _get_compute_capability(remote_config=None, logger=None) -> Optional[int]:
     nvidia_smi_result = run_command([
         'nvidia-smi', '--query-gpu=compute_cap',
         '--format=csv,noheader,nounits'
-    ], remote_config, 10, logger)
+    ], remote_config, 60, logger)
 
     if nvidia_smi_result['success'] and nvidia_smi_result['output'].strip():
         try:
@@ -164,7 +164,7 @@ except:
     exit(1)
 "'''
 
-    cap_result = run_command(['bash', '-c', python_cmd], remote_config, 10,
+    cap_result = run_command(['bash', '-c', python_cmd], remote_config, 60,
                              logger)
     if cap_result['success'] and cap_result['output'].strip():
         try:

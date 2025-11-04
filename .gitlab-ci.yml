@@ -58,7 +58,9 @@ workflow:
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
     - export LLM_SDK_DIR=$(pwd)
-    - git submodule update --init --recursive
+    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - echo "Installing pytest dependencies"
     - pip3 install -q -r tests/requirements.txt
     - echo "Installing accuracy dependencies"
@@ -86,7 +88,9 @@ workflow:
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_init.sh
     - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
     - export LLM_SDK_DIR=$(pwd)
-    - git submodule update --init --recursive
+    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - export REMOTE_WORKSPACE=/home/$BOARD_USER/tensorrt-edge-llm
     - export ENGINE_DIR=$REMOTE_WORKSPACE/engines
     - echo "Creating remote directories and syncing repo from host to board"

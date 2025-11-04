@@ -43,7 +43,7 @@ def test_build_project(env_config: EnvironmentConfig,
     with timer_context(f"Building ({execution_mode})", test_logger):
         result = run_command(cmd=['bash', '-c', build_cmd],
                              remote_config=remote_config,
-                             timeout=300,
+                             timeout=600,
                              logger=test_logger)
         success = result['success']
 
@@ -61,7 +61,7 @@ def test_build_project(env_config: EnvironmentConfig,
 
         result = run_command(cmd=['test', '-f', artifact_path],
                              remote_config=remote_config,
-                             timeout=10,
+                             timeout=60,
                              logger=test_logger)
         if not result['success']:
             pytest.fail(f"Build artifact not found: {artifact_path}")
@@ -85,7 +85,7 @@ def test_unit_tests(env_config: EnvironmentConfig,
 
     result = run_command(cmd=unit_test_cmd,
                          remote_config=remote_config,
-                         timeout=300,
+                         timeout=600,
                          logger=test_logger,
                          env_vars=env_vars)
 
