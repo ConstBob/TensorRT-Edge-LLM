@@ -102,6 +102,9 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
 
     mNumVocab = static_cast<int>(mTokenEncoder->getVocabSize());
 
+    // Pre-initialize Unicode lookup tables to avoid first-call latency during encode
+    unicodeCptFlags(0);
+
     mInitialized = true;
     LOG_INFO("Successfully loaded tokenizer from %s (vocab_size=%d)", modelDir.c_str(), mNumVocab);
     return true;
