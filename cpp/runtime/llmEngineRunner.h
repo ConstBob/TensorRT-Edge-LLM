@@ -277,6 +277,12 @@ private:
     bool resetLoraWeights(cudaStream_t stream);
 
     /*!
+     * @brief Get maximum dimension required for LoRA weights across all LoRA bindings
+     * @return Maximum dimension (k for LoRA A, n for LoRA B), or 0 if no LoRA bindings
+     */
+    int32_t getMaxLoraWeightsDimension() const;
+
+    /*!
      * @brief Get tensor names of LoRA weights
      * @return Vector of LoRA weight tensor names
      */

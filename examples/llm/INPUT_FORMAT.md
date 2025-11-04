@@ -18,12 +18,17 @@ The JSON file must contain the following top-level structure:
     "top_k": <integer>,
     "max_generate_length": <integer>,
     "default_system_prompt": "<string>",
+    "available_lora_weights": {  // optional. Only needed for LoRA engines.
+        "<name1>": "<path1>",
+        "<name2>": "<path2>",
+        ...
+    },
     "messages": [
         {
             "user": "<string>",
             "system": "<string>",  // optional
             "images": ["<path1>", "<path2>", ...],  // optional
-            "lora_weights": "<string>" // optional. Only needed for LoRA engines.
+            "lora_weights": "<name>" // optional. Reference to a name in available_lora_weights.
         }
     ]
 }
@@ -35,6 +40,7 @@ LoRA enables fine-tuned model inference using adapter weights. Requirements:
 - TensorRT engine built with LoRA support
 - LoRA weights in `.safetensors` format
 - Different LoRA weights within the same batch is not supported. LoRA weights within the same batch should be the same.
+- LoRA weights must be registered in `available_lora_weights` and referenced by name in messages
 
 ## Global Parameters
 
@@ -50,6 +56,7 @@ LoRA enables fine-tuned model inference using adapter weights. Requirements:
 - **`top_k`** (integer, default: 50): Top-k sampling parameter
 - **`max_generate_length`** (integer, default: 256): Maximum number of tokens to generate
 - **`default_system_prompt`** (string, default: ""): Default system prompt applied to all messages unless overridden
+- **`available_lora_weights`** (object): Dictionary mapping LoRA weight names to file paths. Only needed for LoRA-enabled engines
 
 ## Message Objects
 
@@ -63,7 +70,7 @@ Each message in the `messages` array can contain:
 
 - **`system`** (string): System prompt specific to this message. If not provided, uses `default_system_prompt`
 - **`images`** (array of strings): List of image file paths for multimodal inputs
-- **`lora_weights`** (string): Path to LoRA (Low-Rank Adaptation) weights file for fine-tuned model inference. Only used with LoRA-enabled engines
+- **`lora_weights`** (string): Name reference to a LoRA weight defined in `available_lora_weights`. Only used with LoRA-enabled engines
 
 ## Examples
 
@@ -129,10 +136,14 @@ Each message in the `messages` array can contain:
     "top_k": 50,
     "max_generate_length": 256,
     "default_system_prompt": "You are a helpful assistant.",
+    "available_lora_weights": {
+        "adapter1": "/path/to/lora_weights.safetensors",
+        "adapter2": "/path/to/another_adapter.safetensors"
+    },
     "messages": [
         {
             "user": "Your prompt here",
-            "lora_weights": "/path/to/lora_weights.safetensors"
+            "lora_weights": "adapter1"
         },
         {
             "user": "Another prompt with images",
@@ -140,7 +151,7 @@ Each message in the `messages` array can contain:
                 "image1.jpg", 
                 "image2.jpg"
             ],
-            "lora_weights": "/path/to/another_adapter.safetensors" // This will error out if batch_size = 2.
+            "lora_weights": "adapter2" // This will error out if batch_size = 2.
         }
     ]
 }
@@ -151,12 +162,13 @@ Each message in the `messages` array can contain:
 1. **Batching**: Messages are processed in batches according to the `batch_size` parameter
 2. **System Prompts**: Each message can have its own system prompt, or it will use the default
 3. **Image Loading**: Images are loaded from the specified file paths during processing
-4. **LoRA Weights**: When specified, LoRA adapter weights are loaded and applied per batch for fine-tuned inference
+4. **LoRA Weights**: When specified, LoRA adapter weights are loaded and applied per batch for fine-tuned inference. LoRA weights must first be defined in `available_lora_weights` and then referenced by name in messages
 5. **Error Handling**: The tool will throw errors if:
    - The JSON file cannot be parsed
    - A message is missing the required `user` field
    - The `messages` field is not an array
    - LoRA weights are not the same for different prompts inside the same expected batch
+   - A referenced LoRA weight name is not defined in `available_lora_weights`
 
 ## Notes
 

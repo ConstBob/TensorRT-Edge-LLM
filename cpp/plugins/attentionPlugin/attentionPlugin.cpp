@@ -342,22 +342,7 @@ void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTe
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    int32_t currentOptionalInputIdx = 4;
-
-    if (mEnableReuseKVCache)
-    {
-        mKvCacheStartIdxInputIdx = currentOptionalInputIdx;
-        currentOptionalInputIdx++;
-    }
-
-    if (mEnableTreeAttention)
-    {
-        mAttentionMaskInputIdx = currentOptionalInputIdx;
-        currentOptionalInputIdx++;
-
-        mAttentionPosIdInputIdx = currentOptionalInputIdx;
-        currentOptionalInputIdx++;
-    }
+    return; // No need to configure anything.
 }
 
 // TODO: extend the workspace calculation to a more generalized form.
@@ -365,30 +350,37 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
     [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
-    // We may want to reserve workspace here, need to determine more details after implementing the runners.
-    // For FMHA kernel we need a buffer to store prefix sum of context lengths.
-    // For GQA kernel we need to reserve a buffer space to store the Q tensor after rope transformation.
+    // TensorRT will supply max profile shape for each input/output tensor across all optimization profiles.
+    // We will request workspace to keep intermediate tensors under prefill/decode phase executions.
+    // Obtain max supported batch size from the input tensor shapes.
+    constexpr int32_t kQKV_INPUT_IDX{0};
+    constexpr int32_t kQKV_BATCH_DIM_IDX{0};
+    PluginTensorDesc const& qkvInputDesc = inputs[kQKV_INPUT_IDX];
+    int32_t const maxBatchSize = static_cast<int32_t>(qkvInputDesc.dims.d[kQKV_BATCH_DIM_IDX]);
 
+    // We use half precisions for now.
+    int32_t const nbBytesPerData{2};
     int32_t workspaceSize = 0;
-    constexpr int32_t nbBytesPerData{2};
 
-    workspaceSize += (mMaxBatchSize + 1) * sizeof(int32_t); // nbBytesCuQSeqLens
+    workspaceSize += (maxBatchSize + 1) * sizeof(int32_t); // nbBytesCuQSeqLens
 
     // The workspace will be used to store the Q tensor. For eagle mode, maxDecodingTokens means the number of Q tensor.
-    // Set maxDecodingTokens to 128, which means the max value supported is 128. Please change it if need more.
+    // The token length we obtain from the QKV shape will be maxSupported prefill sequence length.
+    // Set maxDecodingTokens to 128 per batch, which should be sufficient for current implementation.
     constexpr int32_t maxDecodingTokens = 128;
+
     // Add alignment to ensure we have enough device space at worst scenrio.
     // TODO: more detailed workspace size calculation
     workspaceSize
-        += nbBytesPerData * mMaxBatchSize * mNumHeadQ * mNumElemPerHead * maxDecodingTokens; // nbBytesQTensor for XQA
+        += nbBytesPerData * maxBatchSize * mNumHeadQ * mNumElemPerHead * maxDecodingTokens; // nbBytesQTensor for XQA
 
     if (mEnableReuseKVCache)
     {
-        workspaceSize += (mMaxBatchSize + 1) * sizeof(int32_t); // nbBytesCuTotalKvCacheLens
-        workspaceSize += mMaxBatchSize * sizeof(int32_t);       // nbBytesCuKvCacheEndIdxs
-        workspaceSize += nbBytesPerData * mMaxBatchSize * mNumHeadQ * mNumElemPerHead
+        workspaceSize += (maxBatchSize + 1) * sizeof(int32_t); // nbBytesCuTotalKvCacheLens
+        workspaceSize += maxBatchSize * sizeof(int32_t);       // nbBytesCuKvCacheEndIdxs
+        workspaceSize += nbBytesPerData * maxBatchSize * mNumHeadQ * mNumElemPerHead
             * mKVCacheCapacity; // nbBytesQTensor for FMHA
-        workspaceSize += nbBytesPerData * mMaxBatchSize * mKVCacheCapacity * 2 * mNumHeadKV
+        workspaceSize += nbBytesPerData * maxBatchSize * mKVCacheCapacity * 2 * mNumHeadKV
             * mNumElemPerHead; // nbBytesKVCacheCompact
     }
 
@@ -449,9 +441,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t const rotaryDim = static_cast<int32_t>(posEncodingCosSinDesc.dims.d[kCOS_SIN_ROTARY_DIM_IDX]);
 
     // Check the runtime batch size and input context length are valid for execution.
-    check::check(runtimeBatchSize < mMaxBatchSize,
+    check::check(runtimeBatchSize <= mMaxBatchSize,
         "Runtime batchsize exceed max batch size. This will overflow device data buffer");
-    check::check(runtimeSeqLen < mKVCacheCapacity,
+    check::check(runtimeSeqLen <= mKVCacheCapacity,
         "Runtime sequence length exceed max total context lengths. This will overflow KVCache buffer");
     check::check(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == runtimeBatchSize,
         "cosSinCacheBatchSize must be 1 or runtimeBatchSize");

@@ -62,8 +62,10 @@ namespace tokenizer
  * @{
  */
 
+/// \cond INTERNAL
 //! Regex pattern for special characters that need escaping
 static std::regex const specialChars{R"([[\^$.|?*+(){}])"};
+/// \endcond
 
 /*!
  * @brief Reverse token-to-rank mapping
@@ -110,7 +112,7 @@ bool validateFileSize(std::filesystem::path const& filePath, size_t maxSizeBytes
 struct codepointFlags
 {
     //! @brief Category flag constants
-    enum
+    enum CategoryFlags
     {
         UNDEFINED = 0x0001,       //!< Undefined category
         NUMBER = 0x0002,          //!< Number category (\\p{N})
@@ -160,6 +162,7 @@ struct codepointFlags
     }
 };
 
+/// \cond INTERNAL
 // Unicode category mappings
 //! @brief Map from regex patterns to category flags
 static std::map<std::string, int> const kUatEnum = {
@@ -182,6 +185,7 @@ static std::map<int, std::string> const kUcatMap = {
     {codepointFlags::PUNCTUATION,
         "\x21-\x23\x25-\x2A\x2C-\x2F\x3A-\x3B\x3F-\x40\\\x5B-\\\x5D\x5F\\\x7B\\\x7D"}, // !-#%-*,-/:-;?-@\[-\]_\{\}
 };
+/// \endcond
 
 /*!
  * @brief Collapse Unicode categories in regex

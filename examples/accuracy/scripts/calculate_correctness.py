@@ -117,15 +117,27 @@ def main():
     with open(args.answers_file, 'r', encoding='utf-8') as f:
         answers_data = json.load(f)
 
-    # Extract predictions and answers
+    # Error message to skip
+    error_message = "TensorRT Edge LLM cannot handle this request. Fails."
+
+    # Extract predictions and answers, filtering out error messages
     predictions = []
     answers = []
     subjects = []
+    skipped_count = 0
+    total_count = 0
 
-    for response in predictions_data["responses"]:
-        predictions.append(response["output_text"])
+    for response, message in zip(predictions_data["responses"],
+                                 answers_data["messages"]):
+        total_count += 1
+        output_text = response["output_text"]
 
-    for message in answers_data["messages"]:
+        # Skip entries with error messages
+        if output_text == error_message:
+            skipped_count += 1
+            continue
+
+        predictions.append(output_text)
         answers.append(message["answer"])
         # Extract subject if available
         if "subject" in message:
@@ -136,13 +148,29 @@ def main():
     # Calculate overall correctness
     assert len(predictions) == len(
         answers), "Predictions and answers must have the same length"
+
+    # Report skipped entries
+    if skipped_count > 0:
+        print(
+            f"Skipped {skipped_count}/{total_count} entries with error messages"
+        )
+
+    if len(predictions) == 0:
+        print("No valid predictions to evaluate (all entries were errors)")
+        return {
+            'overall_accuracy': 0.0,
+            'subject_accuracy': {},
+            'skipped_count': skipped_count,
+            'total_count': total_count
+        }
+
     overall_correctness = calculate_correctness(predictions, answers)
 
     print("Correctness Results:")
-    total_count = len(predictions)
-    correct_count = int(overall_correctness * total_count)
+    valid_count = len(predictions)
+    correct_count = int(overall_correctness * valid_count)
     print(
-        f"Overall Accuracy: {overall_correctness:.4f} ({overall_correctness*100:.2f}%) - {correct_count}/{total_count} correct"
+        f"Overall Accuracy: {overall_correctness:.4f} ({overall_correctness*100:.2f}%) - {correct_count}/{valid_count} correct"
     )
 
     # Calculate subject-specific accuracy if subjects are available
@@ -162,7 +190,10 @@ def main():
 
     return {
         'overall_accuracy': overall_correctness,
-        'subject_accuracy': subject_accuracy if valid_subjects else {}
+        'subject_accuracy': subject_accuracy if valid_subjects else {},
+        'skipped_count': skipped_count,
+        'total_count': total_count,
+        'valid_count': valid_count
     }
 
 

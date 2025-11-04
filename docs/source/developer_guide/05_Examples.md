@@ -4,7 +4,7 @@
 
 ---
 
-> **Code Location:** [`examples/`](../../examples/) | **Build:** [`examples/llm/`](../../examples/llm/), [`examples/multimodal/`](../../examples/multimodal/)
+> **Code Location:** `examples/` | **Build:** `examples/llm/`, `examples/multimodal/`
 
 ## Table of Contents
 
@@ -19,7 +19,7 @@
 
 ## Overview
 
-C++ examples for building engines and running inference. All examples include detailed README files and source code in [`examples/`](../../examples/).
+C++ examples for building engines and running inference. All examples include detailed README files and source code in `examples/`.
 
 ---
 
@@ -33,7 +33,7 @@ ONNX Models → [Build Examples] → TensorRT Engines → [Inference Examples] �
 
 ## Build Examples
 
-### `llm_build` - [Source](../../examples/llm/llm_build.cpp)
+### `llm_build` - Source: `examples/llm/llm_build.cpp`
 
 Builds TensorRT engines for LLMs (standard, EAGLE, VLM, LoRA).
 
@@ -67,7 +67,7 @@ Builds TensorRT engines for LLMs (standard, EAGLE, VLM, LoRA).
   --eagleDraft
 ```
 
-### `visual_build` - [Source](../../examples/multimodal/visual_build.cpp)
+### `visual_build` - Source: `examples/multimodal/visual_build.cpp`
 
 Builds TensorRT engines for vision encoders (Qwen-VL, InternVL).
 
@@ -84,7 +84,7 @@ Builds TensorRT engines for vision encoders (Qwen-VL, InternVL).
 
 ## Inference Examples
 
-### `llm_inference` - [Source](../../examples/llm/llm_inference.cpp)
+### `llm_inference` - Source: `examples/llm/llm_inference.cpp`
 
 Runs batch inference from JSON files. Supports standard, EAGLE, multimodal, and LoRA modes.
 
@@ -155,17 +155,17 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_
 
 ```bash
 # 1. Export (x86 host)
-tensorrt-edgellm-export-llm --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b_eagle_base --is_eagle_base
-tensorrt-edgellm-export-draft --base_model_dir Qwen/Qwen2.5-VL-3B-Instruct --draft_model_dir path/to/draft --output_dir onnx_models/qwen2.5-vl-3b_eagle_draft --use_prompt_tuning
-tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b/visual_enc_onnx
+tensorrt-edgellm-export-llm --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_dir onnx_models/qwen2.5-vl-7b_eagle_base --is_eagle_base
+tensorrt-edgellm-export-draft --base_model_dir Qwen/Qwen2.5-VL-7B-Instruct --draft_model_dir path/to/draft --output_dir onnx_models/qwen2.5-vl-7b_eagle_draft --use_prompt_tuning
+tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_dir onnx_models/qwen2.5-vl-7b/visual_enc_onnx
 
 # 2. Build Engines (Thor device)
-./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b_eagle_base --engineDir engines/qwen2.5-vl-3b_eagle --vlm --eagleBase
-./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b_eagle_draft --engineDir engines/qwen2.5-vl-3b_eagle --vlm --eagleDraft
-./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-3b
+./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-7b_eagle_base --engineDir engines/qwen2.5-vl-7b_eagle --vlm --eagleBase
+./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-7b_eagle_draft --engineDir engines/qwen2.5-vl-7b_eagle --vlm --eagleDraft
+./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-7b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-7b
 
 # 3. Run Inference (Thor device)
-./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b_eagle --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input.json --outputFile output.json --eagle
+./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-7b_eagle --multimodalEngineDir visual_engines/qwen2.5-vl-7b --inputFile input.json --outputFile output.json --eagle
 ```
 
 ---
@@ -197,8 +197,12 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_
 | `--dumpProfile` | Enable profiling |
 | `--profileOutputFile` | Profile output path |
 
-**Note:** Sampling parameters (temperature, top_p, top_k) go in the input JSON. See [`examples/llm/INPUT_FORMAT.md`](../../examples/llm/INPUT_FORMAT.md).
+**Note:** Sampling parameters (temperature, top_p, top_k) go in the input JSON. Refer to `examples/llm/INPUT_FORMAT.md`.
 
 ---
 
-**See also:** [Overview](01.1_Overview.md) | [Quick Start Guide](01.2_Quick_Start_Guide.md) | [Supported Models](02_Supported_Models.md)
+## Additional Resources
+
+- [Overview](01.1_Overview.md)
+- [Quick Start Guide](01.2_Quick_Start_Guide.md)
+- [Supported Models](02_Supported_Models.md)

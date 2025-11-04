@@ -1,4 +1,28 @@
 # Release Notes
+## 0.3.0
+- Refactored the vanilla decoding and EAGLE3 runtime to use consumer-producer design with `Tensor` class to manage all runtime memory
+- Refactored and added unit tests for eagle utility and sampling kernels
+- Refactored the example to use `llm_inference` as the only entry point for running inference
+- Used json format for all the inputs and outputs for `llm_inference`
+- Refactored the benchmark and include the performance metrics in `llm_inference` 
+- Refactored engine builder and moved `builder` module into `cpp` folder
+- Refactored the Python package to use `tensorrt-edgellm-quantize-llm`, `tensorrt-edgellm-export-llm`, etc. to export the model instead of native script and add `pip` support for Python
+- Implemented torch custom op for AttentionPlugin instead of using onnx_graphsurgeon
+- Bumped `nvidia-modelopt` and `transformers` package for various bug fixes
+- Improved EAGLE3 acceptance rate and performance
+- Added Qwen3 dense model support
+- Added nvfp4&fp8 lm_head quantization, int4_gptq checkpoint support
+- Added formal accuracy benchmark processes in `examples/accuracy` folder
+- Added and refactored `tests` folder to run end-to-end pipeline tests
+- Added `kernelSrcs` folder with `fmha` and `xqa` kernel cubin generation logic
+- Improved all documentations and added developer's guide
+- Added doxygen generated API docs and unified doc into `docs` folder
+- Added safetensorUtils to read and write to safeTensor for debugging, LoRA weights and d2t weights loading
+- Removed merged and static LoRA support
+- Removed EAGLE2 support
+- Removed all legacy code
+- Removed dummy value benchmark script
+
 ## 0.2.0
 - Added formal CUDA13.0 support
 - Refactored SM120 and SM121 support

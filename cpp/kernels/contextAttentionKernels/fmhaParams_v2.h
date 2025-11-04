@@ -74,10 +74,14 @@ struct AlibiParams
 };
 
 //! \brief TMA (Tensor Memory Accelerator) descriptor structure
+//!
+//! An opaque 64-byte aligned structure used for TensorRT Memory Accelerator descriptors
+//! \cond INTERNAL
 typedef struct alignas(64)
 {
-    uint64_t data[8]; //!< TMA descriptor data (64-byte aligned)
+    uint64_t data[8];
 } cudaTmaDesc;
+//! \endcond
 
 //! \brief Array structure for managing paged KV cache blocks
 struct KvBlockArray

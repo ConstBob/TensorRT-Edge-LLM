@@ -54,29 +54,27 @@ ImageData loadImageFromFile(std::string const& path)
     int width{0}, height{0}, channels{0};
     // Only support RGB images
     int desiredChannels = 3;
-    unsigned char* data = stbi_load(path.c_str(), &width, &height, &channels, desiredChannels);
-    if (data == nullptr)
+    unsigned char* imageData = stbi_load(path.c_str(), &width, &height, &channels, desiredChannels);
+    if (imageData == nullptr)
     {
         throw std::runtime_error("Failed to load image: " + path + " - " + std::string(stbi_failure_reason()));
     }
 
-    // stbi_load uses malloc, so we need to allocate pinned memory for the image data.
-    // The extra burden of copying is minor.
-    unsigned char* pinnedData;
+    rt::Tensor imgTensor{};
+    // Need to handle the logic where space allocation for image tensor failed. We need to free the image data and
+    // throw an exception.
     try
     {
-        CUDA_CHECK(cudaMallocHost(&pinnedData, width * height * channels));
-        memcpy(pinnedData, data, width * height * channels);
-        stbi_image_free(data);
+        imgTensor = rt::Tensor({height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
     }
     catch (std::exception const& e)
     {
-        stbi_image_free(data);
-        throw std::runtime_error("Failed to copy image data to pinned memory: " + path + " - " + std::string(e.what()));
+        stbi_image_free(imageData);
+        throw std::runtime_error("Failed to allocate space for image tensor: " + std::string(e.what()));
     }
-
-    auto buffer = rt::Tensor(pinnedData, {height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
-    return ImageData(std::move(buffer));
+    memcpy(imgTensor.dataPointer<unsigned char>(), imageData, width * height * channels);
+    stbi_image_free(imageData);
+    return ImageData(std::move(imgTensor));
 }
 
 ImageData loadImageFromMemory(unsigned char const* data, size_t size)
@@ -90,23 +88,21 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
         throw std::runtime_error("Failed to load image from memory: " + std::string(stbi_failure_reason()));
     }
 
-    // stbi_load uses malloc, so we need to allocate pinned memory for the image data.
-    // The extra burden of copying is minor.
-    unsigned char* pinnedData;
+    rt::Tensor imgTensor{};
+    // Need to handle the logic where space allocation for image tensor failed. We need to free the image data and
+    // throw an exception.
     try
     {
-        CUDA_CHECK(cudaMallocHost(&pinnedData, width * height * channels));
-        memcpy(pinnedData, imageData, width * height * channels);
-        stbi_image_free(imageData);
+        imgTensor = rt::Tensor({height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
     }
     catch (std::exception const& e)
     {
         stbi_image_free(imageData);
-        throw std::runtime_error("Failed to copy image data to pinned memory: " + std::string(e.what()));
+        throw std::runtime_error("Failed to allocate space for image tensor: " + std::string(e.what()));
     }
-
-    auto buffer = rt::Tensor(pinnedData, {height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
-    return ImageData(std::move(buffer));
+    memcpy(imgTensor.dataPointer<unsigned char>(), imageData, width * height * channels);
+    stbi_image_free(imageData);
+    return ImageData(std::move(imgTensor));
 }
 
 ImageData resizeImage(ImageData const& image, int64_t newWidth, int64_t newHeight)
@@ -117,16 +113,15 @@ ImageData resizeImage(ImageData const& image, int64_t newWidth, int64_t newHeigh
     }
 
     // Allocate memory for resized image
-    unsigned char* resizedData;
-    CUDA_CHECK(cudaMallocHost(&resizedData, newWidth * newHeight * image.channels));
+    rt::Tensor resizedTensor
+        = rt::Tensor({newHeight, newWidth, image.channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
 
-    // Resize the image
-    stbir_resize_uint8_linear(
-        image.data(), image.width, image.height, 0, resizedData, newWidth, newHeight, 0, STBIR_RGB);
-
-    auto buffer = rt::Tensor(
-        resizedData, {newHeight, newWidth, image.channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
-    return ImageData(std::move(buffer));
+    // Resize the image, default strides for src/dst images to zero.
+    constexpr int32_t kINPUT_STRIDE_BYTES{0};
+    constexpr int32_t kOUTPUT_STRIDE_BYTES{0};
+    stbir_resize_uint8_linear(image.data(), image.width, image.height, kINPUT_STRIDE_BYTES,
+        resizedTensor.dataPointer<unsigned char>(), newWidth, newHeight, kOUTPUT_STRIDE_BYTES, STBIR_RGB);
+    return ImageData(std::move(resizedTensor));
 }
 
 } // namespace imageUtils

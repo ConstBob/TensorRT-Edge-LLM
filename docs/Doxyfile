@@ -48,7 +48,7 @@ PROJECT_NAME           = "TensorRT Edge-LLM"
 # could be handy for archiving the generated documentation or if some version
 # control system is used.
 
-PROJECT_NUMBER         = "1.0.0"
+PROJECT_NUMBER         = "0.3.0"
 
 # Using the PROJECT_BRIEF tag one can provide an optional one line description
 # for a project that appears at the top of each page and should give viewers a
@@ -1113,7 +1113,8 @@ EXCLUDE_SYMLINKS       = NO
 # Note that the wildcards are matched against the file with absolute path, so to
 # exclude all test directories for example use the pattern */test/*
 
-EXCLUDE_PATTERNS       = */cubin/*
+EXCLUDE_PATTERNS       = */cubin/* \
+                         */dequantize.cuh
 
 # The EXCLUDE_SYMBOLS tag can be used to specify one or more symbol names
 # (namespaces, classes, functions, etc.) that should be excluded from the
@@ -1121,7 +1122,8 @@ EXCLUDE_PATTERNS       = */cubin/*
 # wildcard * is used, a substring. Examples: ANamespace, AClass,
 # ANamespace::AClass, ANamespace::*Test
 
-EXCLUDE_SYMBOLS        =
+EXCLUDE_SYMBOLS        = *::detail \
+                         *::internal
 
 # The EXAMPLE_PATH tag can be used to specify one or more files or directories
 # that contain example code fragments that are included (see the \include
@@ -2493,7 +2495,16 @@ INCLUDE_FILE_PATTERNS  =
 # recursively expanded use the := operator instead of the = operator.
 # This tag requires that the tag ENABLE_PREPROCESSING is set to YES.
 
-PREDEFINED             =
+PREDEFINED             = __device__= \
+                         __host__= \
+                         __global__= \
+                         __inline__= \
+                         __forceinline__= \
+                         __shared__= \
+                         __constant__= \
+                         __restrict__= \
+                         alignas(x)= \
+                         DOXYGEN_SHOULD_SKIP_THIS
 
 # If the MACRO_EXPANSION and EXPAND_ONLY_PREDEF tags are set to YES then this
 # tag can be used to specify a list of macro names that should be expanded. The

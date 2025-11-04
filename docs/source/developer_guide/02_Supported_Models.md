@@ -4,18 +4,18 @@
 
 ---
 
-> **Code Location:** [`tensorrt_edgellm/`](../../tensorrt_edgellm/) (export), [`cpp/`](../../cpp/) (runtime)
+> **Code Location:** `tensorrt_edgellm/` (export), `cpp/` (runtime)
 
 ## Table of Contents
 
-- [LLM Models](#llm-models)
-- [VLM Models](#vlm-models)
+- [Large Language Models (LLMs)](#large-language-models-llms)
+- [Vision-Language Models (VLMs)](#vision-language-models-vlms)
 - [Precision Support](#precision-support)
 - [Platform Compatibility](#platform-compatibility)
 
 ---
 
-## LLM Models
+## Large Language Models (LLMs)
 
 ### Llama Family
 
@@ -53,7 +53,7 @@
 
 ---
 
-## VLM Models
+## Vision-Language Models (VLMs)
 
 | Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
 |-------|-----------|------|-----|------|-------|
@@ -98,4 +98,8 @@
 
 ---
 
-**See also:** [Overview](01.1_Overview.md) | [Quick Start Guide](01.2_Quick_Start_Guide.md) | [Examples](05_Examples.md)
+## Additional Resources
+
+- [Overview](01.1_Overview.md)
+- [Quick Start Guide](01.2_Quick_Start_Guide.md)
+- [Examples](05_Examples.md)

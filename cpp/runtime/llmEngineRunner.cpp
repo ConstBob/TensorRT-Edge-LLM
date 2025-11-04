@@ -37,6 +37,9 @@ using namespace nvinfer1;
 
 namespace
 {
+//! Dummy dimension for LoRA weights when no LoRA is active (use 1 instead of 0 to avoid zero-shape issues)
+constexpr int32_t kEMPTY_LORA_RANK = 1;
+
 std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& config)
 {
     std::stringstream ss;
@@ -275,11 +278,12 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // 1. Multimodal embeddings: {1, hiddenSize}
     // 2. Attention mask: {maxSupportedBatchSize, 1, 1}
     // 3. Attention position IDs: {maxSupportedBatchSize, 1}
-    // 4. LoRA weights: zero shape.
+    // 4. LoRA weights: max dimension across all adapters
     // 5. KV cache start index: {maxSupportedBatchSize}
     int64_t maxDummyElements = std::max({
         static_cast<int64_t>(mConfig.hiddenSize),            // multimodal embeddings
         static_cast<int64_t>(mConfig.maxSupportedBatchSize), // attention mask/pos IDs/KV cache start index
+        static_cast<int64_t>(getMaxLoraWeightsDimension() * kEMPTY_LORA_RANK), // LoRA weights
     });
     mDummyTensor = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     // Initialize dummy tensor memory to zero
@@ -1359,22 +1363,28 @@ bool LLMEngineRunner::resetLoraWeights(cudaStream_t stream)
     bool resetStatus{true};
     for (auto const& loraWeightsTensorName : getLoraWeightsTensorNames())
     {
-        nvinfer1::Dims zeroShape
+        nvinfer1::Dims emptyLoraShape
             = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+
+        // Use dummy tensor as zero tensor for LoRA weights
         resetStatus
             &= mPrefillExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
         resetStatus
             &= mGenerationExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
+
+        // Set shape to kEMPTY_LORA_RANK and assign zero value tensor to disable LoRA
         if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
         {
-            zeroShape.d[1] = 0;
+            // LoRA A has shape [k, rank], set rank to kEMPTY_LORA_RANK
+            emptyLoraShape.d[1] = kEMPTY_LORA_RANK;
         }
         else if (loraWeightsTensorName.find(binding_names::kLoraBPrefix) != std::string::npos)
         {
-            zeroShape.d[0] = 0;
+            // LoRA B has shape [rank, n], set rank to kEMPTY_LORA_RANK
+            emptyLoraShape.d[0] = kEMPTY_LORA_RANK;
         }
-        resetStatus &= mPrefillExecutionContext->setInputShape(loraWeightsTensorName.c_str(), zeroShape);
-        resetStatus &= mGenerationExecutionContext->setInputShape(loraWeightsTensorName.c_str(), zeroShape);
+        resetStatus &= mPrefillExecutionContext->setInputShape(loraWeightsTensorName.c_str(), emptyLoraShape);
+        resetStatus &= mGenerationExecutionContext->setInputShape(loraWeightsTensorName.c_str(), emptyLoraShape);
         if (!resetStatus)
         {
             LOG_ERROR("Failed to reset LoRA weights: %s", loraWeightsTensorName.c_str());
@@ -1502,23 +1512,29 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cuda
         }
         else
         {
+            // Tensor not found in this LoRA adapter, use dummy tensor as zero tensor with shape kEMPTY_LORA_RANK
             nvinfer1::Dims shape
                 = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
             if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
             {
-                shape.d[1] = 0;
+                // LoRA A has shape [k, rank], set rank to kEMPTY_LORA_RANK
+                shape.d[1] = kEMPTY_LORA_RANK;
             }
             else if (loraWeightsTensorName.find(binding_names::kLoraBPrefix) != std::string::npos)
             {
-                shape.d[0] = 0;
+                // LoRA B has shape [rank, n], set rank to kEMPTY_LORA_RANK
+                shape.d[0] = kEMPTY_LORA_RANK;
             }
             setLoraWeightsStatus &= mPrefillExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
             setLoraWeightsStatus &= mGenerationExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
-            mPrefillExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
+            setLoraWeightsStatus
+                &= mPrefillExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
             setLoraWeightsStatus &= mGenerationExecutionContext->setTensorAddress(
                 loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
-            LOG_DEBUG("switchLoraWeights(): LoRA weights tensor with name '%s' not found. Set shape to rank 0.",
-                loraWeightsTensorName.c_str());
+            LOG_DEBUG(
+                "LoRA weights tensor with name '%s' not found. Set shape to rank %d with zero "
+                "tensor.",
+                loraWeightsTensorName.c_str(), kEMPTY_LORA_RANK);
         }
         if (!setLoraWeightsStatus)
         {
@@ -1550,6 +1566,36 @@ std::vector<std::string> LLMEngineRunner::getAvailableLoraWeights() const
 bool LLMEngineRunner::isLoraWeightsSupported() const
 {
     return mConfig.maxSupportedLoraRank > 0;
+}
+
+int32_t LLMEngineRunner::getMaxLoraWeightsDimension() const
+{
+    if (!isLoraWeightsSupported())
+    {
+        return 0;
+    }
+
+    int32_t maxDim = 0;
+
+    // Query engine profile shapes for all LoRA weight tensors
+    for (auto const& loraWeightsTensorName : getLoraWeightsTensorNames())
+    {
+        nvinfer1::Dims maxShape
+            = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+
+        if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
+        {
+            // LoRA A has shape [k, rank], we want max k
+            maxDim = std::max(maxDim, static_cast<int32_t>(maxShape.d[0]));
+        }
+        else if (loraWeightsTensorName.find(binding_names::kLoraBPrefix) != std::string::npos)
+        {
+            // LoRA B has shape [rank, n], we want max n
+            maxDim = std::max(maxDim, static_cast<int32_t>(maxShape.d[1]));
+        }
+    }
+
+    return maxDim;
 }
 
 } // namespace rt
