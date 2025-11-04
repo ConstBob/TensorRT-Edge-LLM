@@ -25,7 +25,8 @@ class PackageTester:
             required_functions = [
                 "quantize_and_save_llm", "quantize_and_save_draft",
                 "export_llm_model", "export_draft_model", "visual_export",
-                "insert_lora_and_save", "process_lora_weights_and_save"
+                "insert_lora_and_save", "process_lora_weights_and_save",
+                "reduce_vocab_size"
             ]
             for func_name in required_functions:
                 if not hasattr(tensorrt_edgellm, func_name):
@@ -47,7 +48,7 @@ class PackageTester:
         tools = [
             "tensorrt-edgellm-quantize-llm", "tensorrt-edgellm-export-llm",
             "tensorrt-edgellm-export-visual", "tensorrt-edgellm-insert-lora",
-            "tensorrt-edgellm-process-lora"
+            "tensorrt-edgellm-process-lora", "tensorrt-edgellm-reduce-vocab"
         ]
 
         for tool in tools:
