@@ -295,7 +295,7 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
 {
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;
-    std::vector<int32_t> allowedSMVersions{80, 86, 87, 89, 101, 120, 121};
+    std::vector<int32_t> allowedSMVersions{80, 86, 87, 89, 100, 101, 120, 121};
     bool const checkSMVersion
         = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion) != allowedSMVersions.end();
 

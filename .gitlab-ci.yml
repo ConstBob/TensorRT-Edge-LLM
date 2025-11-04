@@ -239,6 +239,28 @@ rtx5080:
     rules:
       - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
+# Building and testing with B100 Linux
+b100:
+    stage: test
+    needs:
+      - blackwell_model_export
+    variables:
+      CUDA_VERSION: "12.9"
+      IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+      TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/b100"
+      PRIORITY: l0_pipeline_b100
+      ONNX_DIR: "$PIPELINE_CACHE_DIR/blackwell_model_export/onnx"
+      TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+      ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+      TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
+    tags:
+      - b100-edgellm-nvks
+    image: "$IMAGE"
+    extends: .x86_test_template
+    interruptible: true
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 # Building and testing with Jetson Orin
 jetson_orin:
   stage: test

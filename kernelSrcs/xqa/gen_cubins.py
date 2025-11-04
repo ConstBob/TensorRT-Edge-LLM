@@ -111,6 +111,7 @@ constexpr int32_t kSM_86 = 86;
 constexpr int32_t kSM_87 = 87;
 constexpr int32_t kSM_89 = 89;
 constexpr int32_t kSM_90 = 90;
+constexpr int32_t kSM_100 = 100;
 constexpr int32_t kSM_101 = 101;
 constexpr int32_t kSM_120 = 120;
 constexpr int32_t kSM_121 = 121;
@@ -453,7 +454,7 @@ if __name__ == "__main__":
         arch_options = [120, 121]
         cubin_dir = "../../cpp/kernels/decodeAttentionKernels/cubin_sm12x/"
     else:
-        arch_options = [80, 86, 87, 89, 101]
+        arch_options = [80, 86, 87, 89, 100, 101]
         cubin_dir = "../../cpp/kernels/decodeAttentionKernels/cubin/"
 
     if os.path.exists(cubin_dir):

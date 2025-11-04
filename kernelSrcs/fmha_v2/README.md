@@ -12,14 +12,14 @@ git apply gen_fmha_cubin.patch
 cd cpp/kernels/fmha_v2
 ```
 
-### 1.1. Generate cubins for SM 80, 86, 87, 89, 101
+### 1.1. Generate cubins for SM 80, 86, 87, 89, 100, 101
 
 These architectures can be compiled with a **CUDA 12.8** Toolkit.
 
 **Steps:**
 ```bash
 # 1) Generate the arch–specific .cu sources & headers
-export GENERATE_EDGE_LLM=1 GENERATE_CUBIN=1 
+export GENERATE_EDGE_LLM=1 GENERATE_CUBIN=1 ENABLE_SM100=1
 python3 setup.py
 
 # 2) Build the cubins (old BERT parameter layout)

@@ -115,6 +115,30 @@ extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_5_m_8_sp
 extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_89_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_89_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_89_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_101_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_101_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_101_cubin[];
@@ -147,6 +171,8 @@ extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_
 extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_87_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_89_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_89_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_100_cubin[];
+extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_100_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_101_cubin[];
 extern unsigned long long xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_101_cubin[];
 
@@ -246,6 +272,30 @@ extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_s
 extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_89_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_89_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_89_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_101_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_101_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_101_cubin_len;
@@ -278,6 +328,8 @@ extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1
 extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_87_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_89_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_89_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_100_cubin_len;
+extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_100_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_101_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_101_cubin_len;
 
@@ -388,6 +440,7 @@ extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_
 extern uint32_t xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_121_cubin_len;
 extern uint32_t xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_121_cubin_len;
 
+
 enum Data_type
 {
     DATA_TYPE_BOOL,
@@ -406,6 +459,7 @@ constexpr int32_t kSM_86 = 86;
 constexpr int32_t kSM_87 = 87;
 constexpr int32_t kSM_89 = 89;
 constexpr int32_t kSM_90 = 90;
+constexpr int32_t kSM_100 = 100;
 constexpr int32_t kSM_101 = 101;
 constexpr int32_t kSM_120 = 120;
 constexpr int32_t kSM_121 = 121;
@@ -522,6 +576,30 @@ static const struct XQAKernelMetaInfo
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 6, 8, 0, false, false, kSM_89, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_89_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_89_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 7, 8, 0, false, false, kSM_89, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_89_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_89_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 8, 8, 0, false, false, kSM_89, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_89_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_89_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 1, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 2, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 3, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 4, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 5, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 6, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 7, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 8, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 1, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 2, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 3, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 4, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 5, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 6, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 7, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 8, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 1, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 2, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 3, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 4, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_4_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 5, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_5_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 6, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_6_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 7, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_7_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 32, 1, 8, 8, 0, false, false, kSM_100, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin, xqa_kernel_dt_fp16_d_32_beam_1_kvt_fp16_nqpkv_8_m_8_spec_dec_0_sm_100_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 1, 8, 0, false, false, kSM_101, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_101_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_1_m_8_spec_dec_0_sm_101_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 2, 8, 0, false, false, kSM_101, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_101_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_2_m_8_spec_dec_0_sm_101_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 3, 8, 0, false, false, kSM_101, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_101_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_3_m_8_spec_dec_0_sm_101_cubin_len, "kernel_mha"},
@@ -554,6 +632,8 @@ static const struct XQAKernelMetaInfo
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 0, 32, 0, false, true, kSM_87, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_87_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_87_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 0, 32, 0, false, true, kSM_89, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_89_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_89_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 0, 32, 0, false, true, kSM_89, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_89_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_89_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 0, 32, 0, false, true, kSM_100, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_100_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_100_cubin_len, "kernel_mha"},
+{ DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 0, 32, 0, false, true, kSM_100, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_100_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_100_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 0, 32, 0, false, true, kSM_101, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_101_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_101_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 0, 32, 0, false, true, kSM_101, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_101_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_101_cubin_len, "kernel_mha"},
 
@@ -610,7 +690,6 @@ static const struct XQAKernelMetaInfo
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 0, 32, 0, false, true, kSM_120, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_120_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_120_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 128, 1, 0, 32, 0, false, true, kSM_121, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_121_cubin, xqa_kernel_dt_fp16_d_128_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_121_cubin_len, "kernel_mha"},
 { DATA_TYPE_FP16, DATA_TYPE_FP16, 64, 1, 0, 32, 0, false, true, kSM_121, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_121_cubin, xqa_kernel_dt_fp16_d_64_beam_1_kvt_fp16_nqpkv_0_m_32_spec_dec_1_sm_121_cubin_len, "kernel_mha"}
-
 };
 
 // clang-format on
