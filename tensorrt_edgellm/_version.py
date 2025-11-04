@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 # Manual base version - change this when you want to bump the version
-BASE_VERSION: str = "0.2.0"
+BASE_VERSION: str = "0.3.0.0"
 
 
 def get_git_info() -> Tuple[Optional[str], str, str]:
@@ -74,10 +74,10 @@ def get_version() -> str:
     commit_hash, commit_count, date_str = get_git_info()
 
     if commit_hash:
-        # Development version: 0.2.0.dev{commit_count}+{commit_hash}.d{date}
+        # Development version: 0.3.0.0.dev{commit_count}+{commit_hash}.d{date}
         return f"{BASE_VERSION}.dev{commit_count}+{commit_hash}.d{date_str}"
     else:
-        # Fallback version: 0.2.0.dev0+d{date}
+        # Fallback version: 0.3.0.0.dev0+d{date}
         return f"{BASE_VERSION}.dev0+d{date_str}"
 
 

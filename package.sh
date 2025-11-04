@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Define the output archive name
-VERSION="0.2.0.0"
-OUTPUT_FILE="driveos_llm_sdk-${VERSION}.tar.gz"
-TMP_DIR="driveos_llm_sdk-${VERSION}"
+VERSION="0.3.0.0"
+OUTPUT_FILE="tensorrt_edge_llm-${VERSION}.tar.gz"
+TMP_DIR="tensorrt_edge_llm-${VERSION}"
 mkdir -p $TMP_DIR
 
 # List the directories to include (space-separated)
-INCLUDE_DIRS="3rdParty cmake cpp examples scripts tensorrt_edgellm CMakeLists.txt unittests README.md LICENSE release-notes.md"
+INCLUDE_DIRS="3rdParty cmake cpp docs examples tensorrt_edgellm CMakeLists.txt unittests README.md LICENSE CHANGELOG.md requirements.txt pyproject.toml"
 
 # Use rsync to copy files while excluding the specified directory
 for dir in $INCLUDE_DIRS; do

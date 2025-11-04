@@ -181,13 +181,6 @@ protected:
     int32_t mSMVersion; //!< CUDA SM version
 
     int32_t mEnableReuseKVCache{}; //!< Whether to use persistent KV cache reuse
-
-    //! \name Optional inputs for persistent KV cache and tree attention
-    //! @{
-    int32_t mKvCacheStartIdxInputIdx{-1}; //!< Input index for KV cache start indices
-    int32_t mAttentionMaskInputIdx{-1};   //!< Input index for attention mask (tree attention)
-    int32_t mAttentionPosIdInputIdx{-1};  //!< Input index for attention position IDs
-    //! @}
 };
 
 //! \brief Factory class for creating AttentionPlugin instances

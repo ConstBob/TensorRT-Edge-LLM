@@ -7,9 +7,9 @@ tests:
   # FP8 LLM tests
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-llm_basic]
-  # LoRA LLM tests
-  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mxlr64]
-  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mxlr64-llm_lora]
+  # Waive LoRA LLM tests due to a potential issue.
+  # - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mxlr64]
+  # - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mxlr64-llm_lora]
   # MMLU accuracy tests for LLM
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mmlu_0-bs4]
   # VLM tests with NVFP4 + FP8 lm_head

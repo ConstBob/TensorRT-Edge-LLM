@@ -35,6 +35,7 @@ namespace rt
 class LinearKVCache
 {
 public:
+    //! \cond INTERNAL
     /*!
      * @brief Configuration for KV cache
      *
@@ -48,6 +49,7 @@ public:
         int32_t numKVHeads{};        //!< Number of key-value heads
         int32_t headDim{};           //!< Head dimension
     };
+    //! \endcond
 
     using KVCacheType = half; //!< KV cache data type (half precision)
     static constexpr nvinfer1::DataType KVCacheTypeTRT{nvinfer1::DataType::kHALF}; //!< TensorRT data type

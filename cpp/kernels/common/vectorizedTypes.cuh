@@ -58,6 +58,7 @@ struct DVec
     inline void store(T* ptr) const;
 };
 
+//! \cond INTERNAL
 /*!
  * @brief Vectorization specialization for float[8]
  *
@@ -102,7 +103,9 @@ struct DVec<float>
         *(reinterpret_cast<float4*>(ptr + 4)) = data[1];
     }
 };
+//! \endcond
 
+//! \cond INTERNAL
 /*!
  * @brief Vectorization specialization for half[8]
  *
@@ -145,6 +148,7 @@ struct DVec<half>
         *(reinterpret_cast<uint4*>(ptr)) = data;
     }
 };
+//! \endcond
 
 } // namespace kernel
 } // namespace trt_edgellm

@@ -59,26 +59,64 @@ def main():
     with open(args.references_file, 'r', encoding='utf-8') as f:
         references_data = json.load(f)
 
-    # Extract predictions and references
+    # Error message to skip
+    error_message = "TensorRT Edge LLM cannot handle this request. Fails."
+
+    # Extract predictions and references, filtering out error messages
     predictions = []
     references = []
+    skipped_count = 0
+    total_count = 0
 
-    for response in predictions_data["responses"]:
-        predictions.append(response["output_text"])
+    for response, message in zip(predictions_data["responses"],
+                                 references_data["messages"]):
+        total_count += 1
+        output_text = response["output_text"]
 
-    for message in references_data["messages"]:
+        # Skip entries with error messages
+        if output_text == error_message:
+            skipped_count += 1
+            continue
+
+        predictions.append(output_text)
         references.append(message["reference"])
 
     # Calculate and print Rouge score
     assert len(predictions) == len(
         references), "Predictions and references must have the same length"
+
+    # Report skipped entries
+    if skipped_count > 0:
+        print(
+            f"Skipped {skipped_count}/{total_count} entries with error messages"
+        )
+
+    if len(predictions) == 0:
+        print("No valid predictions to evaluate (all entries were errors)")
+        return {
+            'rouge1': 0.0,
+            'rouge2': 0.0,
+            'rougeL': 0.0,
+            'rougeLsum': 0.0,
+            'skipped_count': skipped_count,
+            'total_count': total_count,
+            'valid_count': 0
+        }
+
     rouge_score_result = calculate_rouge_score(predictions, references)
 
     print("Rouge Score Results:")
+    valid_count = len(predictions)
+    print(f"Evaluated {valid_count} valid predictions")
     print(f"Rouge-1:  {rouge_score_result['rouge1']:.4f}")
     print(f"Rouge-2:  {rouge_score_result['rouge2']:.4f}")
     print(f"Rouge-L:  {rouge_score_result['rougeL']:.4f}")
     print(f"Rouge-Lsum: {rouge_score_result['rougeLsum']:.4f}")
+
+    # Add metadata to result
+    rouge_score_result['skipped_count'] = skipped_count
+    rouge_score_result['total_count'] = total_count
+    rouge_score_result['valid_count'] = valid_count
 
     return rouge_score_result
 

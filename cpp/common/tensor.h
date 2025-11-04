@@ -376,7 +376,7 @@ private:
 namespace utils
 {
 //! @brief Get size in bytes of a TensorRT data type
-//! @param dataType TensorRT data type
+//! @param dataType TensorRT data type (nvinfer1::DataType)
 //! @return Size in bytes
 size_t getTypeSize(nvinfer1::DataType dataType);
 

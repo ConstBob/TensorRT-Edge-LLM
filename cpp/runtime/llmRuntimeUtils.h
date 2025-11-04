@@ -34,6 +34,7 @@ namespace rt
  */
 struct LLMGenerationRequest
 {
+    //! \cond INTERNAL
     /*! \brief Prompt structure containing system prompt, user prompt, and optional images
      */
     struct Prompt
@@ -42,6 +43,7 @@ struct LLMGenerationRequest
         std::string userPrompt;                              //!< User prompt text
         std::vector<rt::imageUtils::ImageData> imageBuffers; //!< Optional image data for multimodal inputs
     };
+    //! \endcond
     std::vector<Prompt> prompts;      //!< Vector of prompts for batched requests
     float temperature;                //!< Temperature parameter for sampling
     float topP;                       //!< Top-p (nucleus) sampling parameter

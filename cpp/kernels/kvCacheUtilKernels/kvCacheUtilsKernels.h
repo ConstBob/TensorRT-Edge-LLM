@@ -24,18 +24,22 @@ namespace trt_edgellm
 namespace kernel
 {
 
-//! \brief Increment the lengthTensor by increment for each entry
+//! \brief Increment the lengthTensor by a scalar increment for each entry
+//!
+//! This overload increments all elements by a constant value.
 //!
 //! \param[in,out] lengthTensor The tensor to be incremented
-//! \param[in] increment The increment value
+//! \param[in] increment The scalar increment value
 //! \param[in] stream The CUDA stream to be used
 //! \note LengthTensor shall reside on GPU and have data type of int32_t.
 void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStream_t stream);
 
-//! \brief Increment the lengthTensor by the newIncrementTensor for each entry
+//! \brief Increment the lengthTensor by element-wise values from another tensor
+//!
+//! This overload increments each element by the corresponding value in newIncrementTensor.
 //!
 //! \param[in,out] lengthTensor The tensor to be incremented
-//! \param[in] newIncrementTensor The tensor to be used as increment value
+//! \param[in] newIncrementTensor The tensor containing per-element increment values
 //! \param[in] stream The CUDA stream to be used
 //! \note LengthTensor and newIncrementTensor shall reside on GPU, have equal length, and have data type of int32_t.
 void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrementTensor, cudaStream_t stream);

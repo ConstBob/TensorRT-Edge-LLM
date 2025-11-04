@@ -25,6 +25,7 @@ namespace trt_edgellm
 //! \brief Launch parameters for XQA (eXtended Query Attention) kernel
 struct XQALaunchParams
 {
+    //! \cond INTERNAL
     //! \brief KV cache structure
     struct KVCache
     {
@@ -32,6 +33,7 @@ struct XQALaunchParams
         int32_t const* sequence_lengths = nullptr; //!< Sequence lengths for each request
         uint32_t capacity = 0;                     //!< Cache capacity
     };
+    //! \endcond
 
     //! Device memory pointers to launch XQA kernel
     void* output = nullptr;          //!< Output tensor
