@@ -103,6 +103,12 @@ Example Usage:
             input_dir="path/to/adapter",
             output_dir="path/to/output"
         )
+        # Reduce vocabulary
+        reduce_vocab_size(
+            model_dir="path/to/model",
+            output_dir="path/to/output",
+            reduced_vocab_size=30000
+        )
 """
 
 from .onnx_export.llm_export import export_draft_model, export_llm_model
@@ -111,6 +117,7 @@ from .onnx_export.lora import (insert_lora_and_save,
 from .onnx_export.visual_export import visual_export
 from .quantization.llm_quantization import (quantize_and_save_draft,
                                             quantize_and_save_llm)
+from .vocab_reduction.vocab_reduction import reduce_vocab_size
 
 try:
     from ._version import __version__
@@ -128,4 +135,5 @@ __all__ = [
     "visual_export",
     "insert_lora_and_save",
     "process_lora_weights_and_save",
+    "reduce_vocab_size",
 ]
