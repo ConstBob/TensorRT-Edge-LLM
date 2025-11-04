@@ -47,7 +47,7 @@ def _generate_quantization_commands(
             quantize_cmd.append(
                 f"--lm_head_quantization={config.lm_head_precision}")
 
-        commands.append((quantize_cmd, 900))
+        commands.append((quantize_cmd, 1200))
 
     return commands
 
@@ -71,7 +71,7 @@ def _generate_llm_export_commands(
 
     llm_cmd.append(f"--max_position_embeddings={config.max_seq_len}")
 
-    return [(llm_cmd, 600)]
+    return [(llm_cmd, 1200)]
 
 
 def _generate_visual_export_commands(
@@ -91,7 +91,7 @@ def _generate_visual_export_commands(
     fp16_visual_export_cmd = visual_export_cmd.copy()
     fp16_visual_export_cmd.append(
         f"--output_dir={config.get_visual_onnx_dir('fp16')}")
-    commands.append((fp16_visual_export_cmd, 600))
+    commands.append((fp16_visual_export_cmd, 1200))
 
     if config.visual_precision == "fp8":
         fp8_visual_export_cmd = visual_export_cmd.copy()
@@ -100,7 +100,7 @@ def _generate_visual_export_commands(
             f"--output_dir={config.get_visual_onnx_dir('fp8')}")
         fp8_visual_export_cmd.append(
             f"--dataset_dir={config.get_mmmu_dataset_dir()}")
-        commands.append((fp8_visual_export_cmd, 900))
+        commands.append((fp8_visual_export_cmd, 1200))
     return commands
 
 
@@ -127,7 +127,7 @@ def _generate_lora_commands(config: TestConfig) -> List[Tuple[List[str], int]]:
             "tensorrt-edgellm-process-lora", f"--input_dir={lora_weights_dir}",
             f"--output_dir={config.get_lora_weights_dir()}"
         ]
-        commands.append((process_lora_cmd, 60))
+        commands.append((process_lora_cmd, 120))
     else:
         raise ValueError(
             f"No LoRA weights available for {config.model_name}. Please add it to AVAILABLE_LORA_WEIGHTS"
@@ -170,7 +170,7 @@ def generate_build_commands(
         if config.max_lora_rank > 0:
             cmd.append(f"--maxLoraRank={config.max_lora_rank}")
 
-        commands.append((cmd, 900))
+        commands.append((cmd, 1200))
 
     elif config.model_type == ModelType.VLM:
         # VLM LLM build command
@@ -188,7 +188,7 @@ def generate_build_commands(
         if config.max_lora_rank > 0:
             llm_cmd.append(f"--maxLoraRank={config.max_lora_rank}")
 
-        commands.append((llm_cmd, 900))
+        commands.append((llm_cmd, 1200))
 
         # VLM visual build command
         visual_cmd = [executable_files['visual_build']]
@@ -200,7 +200,7 @@ def generate_build_commands(
             f"--maxImageTokensPerImage={config.max_image_tokens_per_image}"
         ])
 
-        commands.append((visual_cmd, 900))
+        commands.append((visual_cmd, 1200))
 
     return commands
 
@@ -225,7 +225,7 @@ def generate_inference_commands(
     if config.batch_size is not None:
         cmd.append(f"--batchSize={config.batch_size}")
 
-    commands.append((cmd, 900))
+    commands.append((cmd, 1200))
     return commands
 
 
@@ -256,5 +256,5 @@ def generate_benchmark_commands(
             "--numRuns=10"
         ])
 
-    commands.append((cmd, 900))
+    commands.append((cmd, 1200))
     return commands

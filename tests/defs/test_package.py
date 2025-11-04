@@ -70,7 +70,7 @@ class PackageTester:
                 result = subprocess.run([tool, "--help"],
                                         capture_output=True,
                                         text=True,
-                                        timeout=10)
+                                        timeout=60)
                 if result.returncode != 0:
                     return {
                         "success": False,

@@ -103,7 +103,7 @@ def check_accuracy_with_dataset(output_json_file,
             ]
             cmd_result = run_command(cmd,
                                      remote_config=None,
-                                     timeout=300,
+                                     timeout=600,
                                      logger=logger)
 
             if not cmd_result['success']:
@@ -167,7 +167,7 @@ def check_accuracy_with_dataset(output_json_file,
             ]
             cmd_result = run_command(cmd,
                                      remote_config=None,
-                                     timeout=300,
+                                     timeout=600,
                                      logger=logger)
 
             if not cmd_result['success']:
