@@ -6,7 +6,7 @@ The xqa source is from [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) co
 
 ## 1. Generating Kernel Binaries (CUBINs)
 
-### 1.1. Generate cubins for SM 80, 86, 87, 89, 101
+### 1.1. Generate cubins for SM 80, 86, 87, 89, 100, 101
 
 These architectures can be compiled with a **CUDA 12.8** Toolkit.
 
