@@ -11,9 +11,9 @@
 /cpp/kernels/ @fans @ruochengj
 /cpp/multimodal/ @amberl
 /cpp/plugins/ @fans @ruochengj
-/cpp/profiling/ @luxiaoz @amberl
+/cpp/profiling/ @luxiaoz @amberl @ruochengj
 /cpp/runtime/ @fans @amberl @fkaster
-/cpp/sampler/ @luxiaoz
+/cpp/sampler/ @luxiaoz @fans @fkaster
 /cpp/tokenizer/ @amberl @kchemudupati
 
 # == Build system ==
@@ -21,14 +21,14 @@
 /cmake/ @fans @mahu
 
 # == Automation tests ==
-/tests/ @luxiaoz @mahu
+/tests/ @luxiaoz @mahu @amberl
 
 # == Kernel source we bring from other projects ==
 /kernelSrcs/ @fans @ruochengj
 
 # == Python frontend ==
-/tensorrt_edgellm/ @luxiaoz
-/tensorrt_edgellm/quantization/ @luxiaoz @ruochengj
+/tensorrt_edgellm/ @luxiaoz @ruochengj @amberl
+/tensorrt_edgellm/quantization/ @luxiaoz @ruochengj @amberl
 
 # == Documentation ==
-/docs/ @luxiaoz @ffriedmann
+/docs/ @luxiaoz @ffriedmann @kchemudupati
