@@ -154,7 +154,9 @@ __device__ __inline__ void global_to_share_one_stage_A_T2(half* src, half* dst, 
         if constexpr (STAGES > 1)
         {
             uint32_t addr = cast_smem_ptr_to_uint(dst_ptr);
-            cp_async_cg_A(addr, src_ptr, local_mask & (ld_row + cta_offset_m < global_nrows));
+            cp_async_cg_A(addr, src_ptr,
+                local_mask & (ld_row + cta_offset_m < global_nrows)
+                    & (reinterpret_cast<half*>(src_ptr) < (src + global_nrows * global_ncols)));
         }
         else
         {
@@ -165,8 +167,8 @@ __device__ __inline__ void global_to_share_one_stage_A_T2(half* src, half* dst, 
 }
 
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS, int STAGES>
-__device__ __inline__ void global_to_share_one_stage_B_T2(half* src, half* dst, int global_ncols, int cta_offset_m,
-    int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
+__device__ __inline__ void global_to_share_one_stage_B_T2(half* src, half* dst, int src_size, int global_ncols,
+    int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
 {
     constexpr int threads_needed = (CTA_N / kInterleave * CTA_K) / PACK_SIZE / SHARED_K_ITERS;
     constexpr int threads_used = threads_needed < CTA_SIZE ? threads_needed : CTA_SIZE;
@@ -191,7 +193,7 @@ __device__ __inline__ void global_to_share_one_stage_B_T2(half* src, half* dst, 
         if constexpr (STAGES > 1)
         {
             uint32_t addr = cast_smem_ptr_to_uint(dst_ptr);
-            cp_async_cg_A(addr, src_ptr, local_mask);
+            cp_async_cg_A(addr, src_ptr, local_mask & (reinterpret_cast<half*>(src_ptr) < (src + src_size)));
         }
         else
         {
@@ -202,8 +204,8 @@ __device__ __inline__ void global_to_share_one_stage_B_T2(half* src, half* dst, 
 }
 
 template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int STAGES, int G>
-__device__ __inline__ void global_to_share_one_stage_scales_T2(half* src, half* dst, int global_ncols, int cta_offset_m,
-    int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
+__device__ __inline__ void global_to_share_one_stage_scales_T2(half* src, half* dst, int src_size, int global_ncols,
+    int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
 {
     constexpr int threads_needed = CTA_N / PACK_SIZE / 1;
     constexpr int threads_used = threads_needed < CTA_SIZE ? threads_needed : CTA_SIZE;
@@ -216,7 +218,7 @@ __device__ __inline__ void global_to_share_one_stage_scales_T2(half* src, half* 
     if (STAGES > 1)
     {
         uint32_t addr = cast_smem_ptr_to_uint(dst_ptr);
-        cp_async_cg_A(addr, src_ptr, local_mask);
+        cp_async_cg_A(addr, src_ptr, local_mask & (reinterpret_cast<half*>(src_ptr) < (src + src_size)));
     }
     else
     {
@@ -335,10 +337,10 @@ __global__ void gemm_w4a16_T2(
         global_to_share_one_stage_A_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, 1, STAGES>(
             A, A_shared + k_0_0_ld * kSmemSizeAPerStage, M, K, cta_offset_m, cta_offset_n, k_0_0_ld, 0, true);
         global_to_share_one_stage_B_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, 1, STAGES>(
-            B, B_shared + k_0_0_ld * kSmemSizeBPerStage, K, cta_offset_m, cta_offset_n, k_0_0_ld, 0, true);
+            B, B_shared + k_0_0_ld * kSmemSizeBPerStage, N / 4 * K, K, cta_offset_m, cta_offset_n, k_0_0_ld, 0, true);
         global_to_share_one_stage_scales_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, STAGES, G>(scales,
-            scales_shared + (k_0_0_ld / scales_load_interval) * CTA_N, N, cta_offset_m, cta_offset_n, k_0_0_ld, 0,
-            k_0_0_ld < gemm_iters && k_0_0_ld % scales_load_interval == 0);
+            scales_shared + (k_0_0_ld / scales_load_interval) * CTA_N, K / G * N, N, cta_offset_m, cta_offset_n,
+            k_0_0_ld, 0, k_0_0_ld < gemm_iters && k_0_0_ld % scales_load_interval == 0);
         if constexpr (STAGES > 1)
             __pipeline_commit();
     }
@@ -423,8 +425,8 @@ __global__ void gemm_w4a16_T2(
                     A_shared + ld_stage * kSmemSizeAPerStage, M, K, cta_offset_m, cta_offset_n, k_0_0_ld, iter_k,
                     k_0_0_ld < gemm_iters);
                 global_to_share_one_stage_B_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(B,
-                    B_shared + ld_stage * kSmemSizeBPerStage, K, cta_offset_m, cta_offset_n, k_0_0_ld, iter_k,
-                    k_0_0_ld < gemm_iters);
+                    B_shared + ld_stage * kSmemSizeBPerStage, N / 4 * K, K, cta_offset_m, cta_offset_n, k_0_0_ld,
+                    iter_k, k_0_0_ld < gemm_iters);
             }
 
             if (iter_k == WARP_K / INTRIN_K - 2)
@@ -437,11 +439,11 @@ __global__ void gemm_w4a16_T2(
                     A_shared + ld_stage * kSmemSizeAPerStage, M, K, cta_offset_m, cta_offset_n, k_0_0_ld, iter_k + 1,
                     k_0_0_ld < gemm_iters);
                 global_to_share_one_stage_B_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(B,
-                    B_shared + ld_stage * kSmemSizeBPerStage, K, cta_offset_m, cta_offset_n, k_0_0_ld, iter_k + 1,
-                    k_0_0_ld < gemm_iters);
+                    B_shared + ld_stage * kSmemSizeBPerStage, N / 4 * K, K, cta_offset_m, cta_offset_n, k_0_0_ld,
+                    iter_k + 1, k_0_0_ld < gemm_iters);
                 global_to_share_one_stage_scales_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, STAGES, G>(scales,
-                    scales_shared + (ld_stage / scales_load_interval) * CTA_N, N, cta_offset_m, cta_offset_n, k_0_0_ld,
-                    iter_k, k_0_0_ld < gemm_iters && k_0_0_ld % scales_load_interval == 0);
+                    scales_shared + (ld_stage / scales_load_interval) * CTA_N, K / G * N, N, cta_offset_m, cta_offset_n,
+                    k_0_0_ld, iter_k, k_0_0_ld < gemm_iters && k_0_0_ld % scales_load_interval == 0);
                 if constexpr (STAGES > 1)
                 {
                     __pipeline_commit();
