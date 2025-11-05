@@ -52,6 +52,7 @@ from ..llm_models.layers.int4_gemm_plugin import (
     replace_torch_quant_linear_with_plugin)
 from ..llm_models.model_utils import (is_gptq_model, load_eagle3_draft_model,
                                       load_llm_model)
+from .chat_template import process_chat_template
 from .config_export import export_llm_config
 from .onnx_utils import export_onnx
 
@@ -513,6 +514,9 @@ def export_llm_model(model_dir: str,
 
     # Save tokenizer files
     save_tokenizer_to_output_dir(model_dir, output_dir)
+
+    # Process and save chat template
+    process_chat_template(model_dir, output_dir)
 
     end_time = time.time()
     print(
