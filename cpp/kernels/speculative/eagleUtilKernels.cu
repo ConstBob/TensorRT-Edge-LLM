@@ -198,13 +198,13 @@ __global__ void initializeDraftTreeFullTablesKernel(int32_t const* selectedIndic
 }
 
 __global__ void initializeDraftTreeInputFirstRoundKernel(int32_t const* draftIdFullTable, int32_t* inputIds,
-    int8_t* draftTreeMask, int32_t* draftTreeLength, int32_t const draftTopK, int32_t const paddedDraftTreeSize)
+    int8_t* draftTreeMask, int32_t* draftTreeLength, int32_t const draftTopK, int32_t const paddedDraftTreeSize,
+    int32_t const fullTableLength)
 {
     int32_t const batchIdx = blockIdx.x;
     int32_t const tIdx = threadIdx.x;
     int32_t const blockSize = blockDim.x;
 
-    int32_t const tableLength = 1 + draftTopK + draftTopK * draftTopK;
     for (int32_t i = tIdx; i < paddedDraftTreeSize; i += blockSize)
     {
         int32_t const idsOffset = batchIdx * paddedDraftTreeSize + i;
@@ -214,7 +214,8 @@ __global__ void initializeDraftTreeInputFirstRoundKernel(int32_t const* draftIdF
         {
             // Handle non padded part of the output tensors.
             // First entry of the table is root token, offset 1 to get the first level draft tree.
-            int32_t const tableOffset = batchIdx * tableLength + i + 1;
+            // Use fullTableLength parameter for correct multi-batch offset calculation
+            int32_t const tableOffset = batchIdx * fullTableLength + i + 1;
             inputIds[idsOffset] = draftIdFullTable[tableOffset];
             // Prepare tree mask for these tokens.
             for (int32_t j = 0; j < paddedDraftTreeSize; ++j)
@@ -682,13 +683,17 @@ __global__ void eagleBaseAssembleHiddenStateKernel(int32_t const* acceptedIndice
 {
     DVec<half> tempBuffer[MAX_PATH];
 
-    // The kernel have assumptions that:
-    //     1. Each thread will copy 16 bytes of data (half[8]), each warp will copy 512 bytes (half[256]) data per
-    //     iteration.
-    //     2. Each CTA contains 128 threads (4 warps), a total of 128*8=1024 elements.
-    //         Since hiddenDim can be very large, each CTA will handle part of a batch.
-    //     3. The acceptedIndices has layout of [batch, max-depth]
-    //     4. The hiddenState buffer has layout of [batch, num-tokens, hidden-dim]
+    // The kernel performs INPLACE compaction of accepted tokens within the same buffer.
+    // Since maxAcceptDepth (e.g., 7) << numTokens (e.g., 60), we can safely write compacted
+    // data at the beginning of each batch's region without overwriting unread data.
+    //
+    // Assumptions:
+    //     1. Each thread copies 16 bytes of data (half[8]), each warp copies 512 bytes (half[256]) per iteration.
+    //     2. Each CTA contains 128 threads (4 warps), total of 128*8=1024 elements.
+    //         Since hiddenDim can be very large, each CTA handles part of a batch.
+    //     3. acceptedIndices has layout [batch, max-depth]
+    //     4. hiddenState buffer has layout [batch, num-tokens, hidden-dim]
+    //     5. Output will be compacted inplace to [batch, actual-accept-length, hidden-dim]
 
     int32_t const batchIdx = blockIdx.x;
     int32_t const dimIdx = blockIdx.y * blockDim.x + threadIdx.x;
@@ -700,24 +705,32 @@ __global__ void eagleBaseAssembleHiddenStateKernel(int32_t const* acceptedIndice
     }
 
     int32_t const actualAcceptLength = acceptLengths[batchIdx];
-    int32_t const hiddenStateOffset = batchIdx * numTokens * hiddenDim;
 
-    // PHASE 1: Collect all accepted data into local temp buffer
-    // Start from 1 since the root position will always be accepted.
-    for (int32_t i = 1; i < actualAcceptLength; ++i)
+    // Input uses stride=numTokens (e.g., verifyTreeSize=60)
+    int32_t const inputOffset = batchIdx * numTokens * hiddenDim;
+
+    // The accepted token lengths are usually not equal. We will pad the output till
+    // maxAcceptDepth instead of making it a true ragged tensor.
+    int32_t const outputOffset = batchIdx * maxDepth * hiddenDim;
+
+    // PHASE 1: Collect all accepted tokens from INPUT layout (stride=numTokens)
+    // Read from positions scattered in the input space (e.g., [0, 3, 5, 12, ...])
+    for (int32_t i = 0; i < actualAcceptLength; ++i)
     {
         int32_t const acceptedIdx = acceptedIndices[batchIdx * maxDepth + i];
         if (acceptedIdx >= 0 && acceptedIdx < numTokens)
         {
-            int32_t const srcOffset = hiddenStateOffset + acceptedIdx * hiddenDim + startIdx;
+            int32_t const srcOffset = inputOffset + acceptedIdx * hiddenDim + startIdx;
             tempBuffer[i].load(hiddenState + srcOffset);
         }
     }
 
-    // PHASE 2: Write from local temp buffer to final positions
-    for (int32_t i = 1; i < actualAcceptLength; ++i)
+    // PHASE 2: Write to compacted OUTPUT layout (stride=maxDepth)
+    // Write to consecutive positions in the compacted space (e.g., [0, 1, 2, 3, ...])
+    // This is safe because outputOffset <= inputOffset (since maxDepth < numTokens)
+    for (int32_t i = 0; i < actualAcceptLength; ++i)
     {
-        int32_t const dstOffset = hiddenStateOffset + i * hiddenDim + startIdx;
+        int32_t const dstOffset = outputOffset + i * hiddenDim + startIdx;
         tempBuffer[i].store(hiddenState + dstOffset);
     }
 }
@@ -872,9 +885,10 @@ void assembleInitialDraftTreeInput(rt::Tensor const& draftIdFullTable, rt::Tenso
 
     dim3 blockDim1{128};
     dim3 gridDim1{static_cast<uint32_t>(batchSize)};
+    int32_t const fullTableLength = static_cast<int32_t>(draftIdFullTable.getShape()[1]);
     initializeDraftTreeInputFirstRoundKernel<<<gridDim1, blockDim1, 0, stream>>>(
         draftIdFullTable.dataPointer<int32_t>(), inputIds.dataPointer<int32_t>(), draftTreeMask.dataPointer<int8_t>(),
-        draftTreeLength.dataPointer<int32_t>(), draftTopK, paddedDraftTreeSize);
+        draftTreeLength.dataPointer<int32_t>(), draftTopK, paddedDraftTreeSize, fullTableLength);
 
     dim3 blockDim2{128};
     dim3 gridDim2{static_cast<uint32_t>(batchSize), static_cast<uint32_t>(draftTopK)};

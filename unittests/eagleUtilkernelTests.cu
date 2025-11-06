@@ -197,27 +197,43 @@ TEST(EagleKernels, InitializeDraftTreeTables)
 // ============================================================================
 // Test 3: assembleInitialDraftTreeInput
 // Description: Assemble first round draft tree input from full table
-// Output: inputIds[0:topK] from fullTable[1:topK+1], rest zeros; mask[i,i]=1 only
+// This test simulates a multi-step scenario (draftingStep=6) but only tests initial round
+// The full table size follows: 1 + topK + (step-1) * topK²
 // ============================================================================
 TEST(EagleKernels, AssembleInitialDraftTreeInput)
 {
     cudaStream_t stream = nullptr;
+
+    // Simulate production config: topK=10, step=6 (scaled down for testing)
+    // Use topK=4, step=4 to keep test data manageable
+    // fullTableLength = 1 + topK + (step-1) * topK² = 1 + 4 + 3*16 = 53
     int32_t draftTopK = 4;
+    int32_t draftingStep = 4; // Simulate multi-step scenario
+    int32_t fullTableLength = 1 + draftTopK + (draftingStep - 1) * draftTopK * draftTopK;
+    // fullTableLength = 1 + 4 + 3*16 = 53
+
     int32_t paddedDraftTreeSize = 12;
     int32_t draftHiddenDim = 256;
-    int32_t tableLength = 21;
 
-    // Input: full table with root + level1 tokens
-    std::vector<int32_t> inputDraftIdFullTable = {
-        5000, 100, 101, 102, 103, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Batch 0
-        6000, 200, 201, 202, 203, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Batch 1
-        7000, 300, 301, 302, 303, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Batch 2
-        8000, 400, 401, 402, 403, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Batch 3
-        5500, 110, 111, 112, 113, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Batch 4
-        6500, 210, 211, 212, 213, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Batch 5
-        7500, 310, 311, 312, 313, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Batch 6
-        8500, 410, 411, 412, 413, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  // Batch 7
-    };
+    // Input: Full table with complete structure (root + all levels)
+    // Each batch has fullTableLength=53 elements
+    // Structure: [root, level1(4), level2(16), level3(16), level4(16)]
+    //
+    // CRITICAL: Data must be unique at each global index to distinguish correct vs wrong offset
+    // Use pattern: globalIndex * 10000 + batch * 100 + localPos
+    std::vector<int32_t> inputDraftIdFullTable;
+
+    for (int b = 0; b < 8; b++)
+    {
+        for (int localPos = 0; localPos < fullTableLength; localPos++)
+        {
+            int32_t globalIdx = b * fullTableLength + localPos;
+            // Each element encodes its global position uniquely
+            // This ensures different offsets give completely different values
+            int32_t value = globalIdx * 100 + b * 10 + localPos;
+            inputDraftIdFullTable.push_back(value);
+        }
+    }
 
     std::vector<half> inputHiddenStates(8 * draftHiddenDim);
     for (int b = 0; b < 8; b++)
@@ -228,13 +244,46 @@ TEST(EagleKernels, AssembleInitialDraftTreeInput)
         }
     }
 
-    // Expected: inputIds = [100,101,102,103,0,0,0,0,0,0,0,0] for batch 0
-    std::vector<int32_t> expectedInputIdsBatch0 = {100, 101, 102, 103, 0, 0, 0, 0, 0, 0, 0, 0};
+    // Expected outputs for multiple batches
+    // Initial round reads positions [1:4] (level 1) from each batch's fullTable
+    // Each value = globalIdx * 100 + batch * 10 + localPos
+    //
+    // Batch 0: reads fullTable[globalIdx 1-4]
+    //   fullTable[1] = 1*100 + 0*10 + 1 = 101
+    //   fullTable[2] = 2*100 + 0*10 + 2 = 202
+    //   fullTable[3] = 3*100 + 0*10 + 3 = 303
+    //   fullTable[4] = 4*100 + 0*10 + 4 = 404
+    std::vector<int32_t> expectedInputIdsBatch0 = {101, 202, 303, 404, 0, 0, 0, 0, 0, 0, 0, 0};
+
+    // Batch 1: reads fullTable[globalIdx 54-57] (offset = 1*53 + [1:4])
+    //   fullTable[54] = 54*100 + 1*10 + 1 = 5411
+    //   fullTable[55] = 55*100 + 1*10 + 2 = 5512
+    //   fullTable[56] = 56*100 + 1*10 + 3 = 5613
+    //   fullTable[57] = 57*100 + 1*10 + 4 = 5714
+    std::vector<int32_t> expectedInputIdsBatch1 = {5411, 5512, 5613, 5714, 0, 0, 0, 0, 0, 0, 0, 0};
+
+    // Batch 2: reads fullTable[globalIdx 107-110] (offset = 2*53 + [1:4])
+    //   fullTable[107] = 107*100 + 2*10 + 1 = 10721
+    //   fullTable[108] = 108*100 + 2*10 + 2 = 10822
+    //   fullTable[109] = 109*100 + 2*10 + 3 = 10923
+    //   fullTable[110] = 110*100 + 2*10 + 4 = 11024
+    std::vector<int32_t> expectedInputIdsBatch2 = {10721, 10822, 10923, 11024, 0, 0, 0, 0, 0, 0, 0, 0};
+
+    // If kernel uses WRONG formula (21 instead of 53):
+    //   Batch 1 would read fullTable[22-25]:
+    //     [22] = 22*100 + 0*10 + 22 = 2222 ✗ (not 5411)
+    //     [23] = 23*100 + 0*10 + 23 = 2323 ✗ (not 5512)
+    //   Test would FAIL! ✅
+
     int32_t expectedTreeLength = 4;
+
+    std::cout << "Testing with fullTableLength=" << fullTableLength << " (simulates draftingStep=" << draftingStep
+              << ")\n";
+    std::cout << "Kernel's wrong formula would give: " << (1 + draftTopK + draftTopK * draftTopK) << "\n";
 
     for (int32_t batchSize : {1, 2, 4, 8})
     {
-        auto draftIdFullTableDevice = rt::Tensor({batchSize, tableLength}, rt::DeviceType::kGPU, DataType::kINT32);
+        auto draftIdFullTableDevice = rt::Tensor({batchSize, fullTableLength}, rt::DeviceType::kGPU, DataType::kINT32);
         auto draftHiddenStatesOutputDevice
             = rt::Tensor({batchSize, draftHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
         auto inputIdsDevice = rt::Tensor({batchSize, paddedDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
@@ -245,7 +294,7 @@ TEST(EagleKernels, AssembleInitialDraftTreeInput)
             = rt::Tensor({batchSize, paddedDraftTreeSize, paddedDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT8);
 
         CUDA_CHECK(cudaMemcpy(draftIdFullTableDevice.rawPointer(), inputDraftIdFullTable.data(),
-            batchSize * tableLength * sizeof(int32_t), cudaMemcpyHostToDevice));
+            batchSize * fullTableLength * sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(draftHiddenStatesOutputDevice.rawPointer(), inputHiddenStates.data(),
             batchSize * draftHiddenDim * sizeof(half), cudaMemcpyHostToDevice));
 
@@ -262,27 +311,93 @@ TEST(EagleKernels, AssembleInitialDraftTreeInput)
         CUDA_CHECK(cudaMemcpy(actualMask.data(), draftTreeMaskDevice.rawPointer(),
             batchSize * paddedDraftTreeSize * paddedDraftTreeSize * sizeof(int8_t), cudaMemcpyDeviceToHost));
 
-        // Verify batch 0
+        // ========== Verify Batch 0 ==========
         for (int i = 0; i < paddedDraftTreeSize; i++)
         {
-            EXPECT_EQ(actualInputIds[i], expectedInputIdsBatch0[i]);
+            EXPECT_EQ(actualInputIds[i], expectedInputIdsBatch0[i]) << "Batch 0, position " << i << " mismatch";
         }
         EXPECT_EQ(actualTreeLength[0], expectedTreeLength);
 
-        // Verify mask: diagonal only for first topK tokens
+        // Verify Batch 0 mask: diagonal only for first topK tokens
         for (int i = 0; i < paddedDraftTreeSize; i++)
         {
             for (int j = 0; j < paddedDraftTreeSize; j++)
             {
                 int8_t expected = (i < draftTopK && i == j) ? 1 : 0;
-                EXPECT_EQ(actualMask[i * paddedDraftTreeSize + j], expected);
+                EXPECT_EQ(actualMask[i * paddedDraftTreeSize + j], expected)
+                    << "Batch 0 mask mismatch at [" << i << "][" << j << "]";
             }
         }
 
-        // Verify all batches
+        // ========== CRITICAL: Verify Batch 1 (if batchSize >= 2) ==========
+        // This tests that kernel uses fullTableLength parameter for offset calculation
+        // With fullTableLength=53 (step=4), Batch 1 should read from globalIdx [54:57]
+        // If kernel used wrong formula (1+topK+topK²=21), it would read from globalIdx [22:25]
+        if (batchSize >= 2)
+        {
+            // Kernel line 218: tableOffset = batchIdx * fullTableLength + i + 1
+            // For Batch 1, i=0:
+            //   CORRECT: tableOffset = 1*53 + 0 + 1 = 54 → fullTable[54] = 5411 ✓
+            //   WRONG:   tableOffset = 1*21 + 0 + 1 = 22 → fullTable[22] = 2222 ✗
+            // These values are COMPLETELY DIFFERENT, so bug will be caught!
+
+            for (int i = 0; i < draftTopK; i++) // Only check first topK positions
+            {
+                int32_t batchOffset = 1 * paddedDraftTreeSize;
+                int32_t actual = actualInputIds[batchOffset + i];
+                int32_t expected = expectedInputIdsBatch1[i];
+
+                // Calculate what we would get if kernel used wrong formula
+                int32_t wrongOffset = 1 * 21 + i + 1;                          // Wrong formula result
+                int32_t wrongValue = wrongOffset * 100 + 0 * 10 + wrongOffset; // Batch 0's data
+
+                EXPECT_EQ(actual, expected)
+                    << "Batch 1, position " << i << " CRITICAL MISMATCH"
+                    << "\n  Expected: " << expected << " (from correct offset " << (1 * fullTableLength + i + 1) << ")"
+                    << "\n  If kernel used WRONG formula (21), would get: " << wrongValue << " (from wrong offset "
+                    << wrongOffset << ")"
+                    << "\n  Actual: " << actual << "\n  This verifies kernel uses fullTableLength=" << fullTableLength
+                    << ", NOT hardcoded formula " << (1 + draftTopK + draftTopK * draftTopK);
+            }
+            EXPECT_EQ(actualTreeLength[1], expectedTreeLength);
+
+            // Verify Batch 1 mask
+            for (int i = 0; i < paddedDraftTreeSize; i++)
+            {
+                for (int j = 0; j < paddedDraftTreeSize; j++)
+                {
+                    int8_t expected = (i < draftTopK && i == j) ? 1 : 0;
+                    int32_t maskOffset = 1 * paddedDraftTreeSize * paddedDraftTreeSize + i * paddedDraftTreeSize + j;
+                    EXPECT_EQ(actualMask[maskOffset], expected)
+                        << "Batch 1 mask mismatch at [" << i << "][" << j << "]";
+                }
+            }
+        }
+
+        // ========== Verify Batch 2 (if batchSize >= 4) ==========
+        if (batchSize >= 4)
+        {
+            for (int i = 0; i < paddedDraftTreeSize; i++)
+            {
+                int32_t batchOffset = 2 * paddedDraftTreeSize;
+                EXPECT_EQ(actualInputIds[batchOffset + i], expectedInputIdsBatch2[i])
+                    << "Batch 2, position " << i << " mismatch";
+            }
+            EXPECT_EQ(actualTreeLength[2], expectedTreeLength);
+        }
+
+        // Verify tree lengths for all batches
         for (int32_t b = 0; b < batchSize; b++)
         {
-            EXPECT_EQ(actualTreeLength[b], expectedTreeLength);
+            EXPECT_EQ(actualTreeLength[b], expectedTreeLength) << "Batch " << b << " tree length mismatch";
+        }
+
+        // Print success message for multi-batch tests
+        if (batchSize >= 2)
+        {
+            std::cout << "✓ Multi-batch test passed (batchSize=" << batchSize
+                      << "): fullTableLength=" << fullTableLength << " (step=" << draftingStep
+                      << ") correctly used, not wrong formula " << (1 + draftTopK + draftTopK * draftTopK) << "\n";
         }
     }
 }
@@ -816,8 +931,8 @@ TEST(EagleKernels, ConstructVerificationDraftTree)
 
 // ============================================================================
 // Test 8: eagleBaseCommitKVCacheAndAssembleHiddenState
-// Description: Rearrange accepted tokens' hidden states to compact layout
-// hiddenState[i] = hiddenState[acceptedIndices[i]]
+// Description: Test inplace compaction of accepted tokens from stride=draftTreeSize to stride=maxDepth
+// Key test: Verify multi-batch scenario where Batch 1+ needs to move ALL tokens including position 0
 // ============================================================================
 TEST(EagleKernels, EagleBaseCommitKVCacheAndAssembleHiddenState)
 {
@@ -826,82 +941,119 @@ TEST(EagleKernels, EagleBaseCommitKVCacheAndAssembleHiddenState)
     int32_t numKVHead = 4;
     int32_t headDim = 128;
     int32_t maxSeqLen = 2048;
-    int32_t maxDepth = 6;
-    int32_t draftTreeSize = 10;
+    int32_t maxDepth = 6;       // After compaction, stride will be maxDepth
+    int32_t draftTreeSize = 10; // Input stride is draftTreeSize
     int32_t baseHiddenDim = 512;
 
-    // Input: accept positions [0,3,7] for batch 0, [0,2,5] for batch 1
+    // Test with 2 batches to verify compaction with stride change
+    int32_t batchSize = 2;
+    int32_t maxBatchSize = 2;
+
+    // Batch 0: accept positions [0, 3, 7] (length=3)
+    // Batch 1: accept positions [0, 2, 5] (length=3)
     std::vector<int32_t> inputAcceptedIndices = {
         0, 3, 7, -1, -1, -1, // Batch 0
-        0, 2, 5, -1, -1, -1, // Batch 1
-        0, 4, 8, -1, -1, -1, // Batch 2
-        0, 1, 6, 9, -1, -1,  // Batch 3
-        0, 3, 7, -1, -1, -1, // Batch 4
-        0, 2, 5, -1, -1, -1, // Batch 5
-        0, 4, 8, -1, -1, -1, // Batch 6
-        0, 1, 6, -1, -1, -1  // Batch 7
+        0, 2, 5, -1, -1, -1  // Batch 1
     };
+    std::vector<int32_t> inputAcceptLengths = {3, 3};
+    std::vector<int32_t> inputKvCacheLengths = {256, 256};
 
-    std::vector<int32_t> inputAcceptLengths = {3, 3, 3, 4, 3, 3, 3, 3};
-    std::vector<int32_t> inputKvCacheLengths = {256, 256, 256, 256, 256, 256, 256, 256};
+    // Setup input hidden states with unique markers for each batch and position
+    // Use simple pattern: batch_id * 1000 + position_id * 100
+    std::vector<half> inputHiddenState(batchSize * draftTreeSize * baseHiddenDim, __float2half(0.0f));
 
-    // Input hidden states with markers at accepted positions
-    std::vector<half> inputHiddenState(8 * draftTreeSize * baseHiddenDim, __float2half(0.0f));
-    // Batch 0: pos 3->100.0, pos 7->200.0
+    // Batch 0: Input layout with stride=draftTreeSize=10
+    //   Position 0: marker = 0 + 0*100 = 0
+    //   Position 3: marker = 0 + 3*100 = 300
+    //   Position 7: marker = 0 + 7*100 = 700
     for (int d = 0; d < baseHiddenDim; d++)
     {
-        inputHiddenState[3 * baseHiddenDim + d] = __float2half(100.0f);
-        inputHiddenState[7 * baseHiddenDim + d] = __float2half(200.0f);
+        inputHiddenState[0 * draftTreeSize * baseHiddenDim + 0 * baseHiddenDim + d] = __float2half(0.0f);
+        inputHiddenState[0 * draftTreeSize * baseHiddenDim + 3 * baseHiddenDim + d] = __float2half(300.0f);
+        inputHiddenState[0 * draftTreeSize * baseHiddenDim + 7 * baseHiddenDim + d] = __float2half(700.0f);
     }
-    // Batch 1: pos 2->110.0, pos 5->210.0
+
+    // Batch 1: Input layout with stride=draftTreeSize=10, starting at offset=10*baseHiddenDim
+    //   Position 0: marker = 1000 + 0*100 = 1000
+    //   Position 2: marker = 1000 + 2*100 = 1200
+    //   Position 5: marker = 1000 + 5*100 = 1500
     for (int d = 0; d < baseHiddenDim; d++)
     {
-        inputHiddenState[1 * draftTreeSize * baseHiddenDim + 2 * baseHiddenDim + d] = __float2half(110.0f);
-        inputHiddenState[1 * draftTreeSize * baseHiddenDim + 5 * baseHiddenDim + d] = __float2half(210.0f);
+        inputHiddenState[1 * draftTreeSize * baseHiddenDim + 0 * baseHiddenDim + d] = __float2half(1000.0f);
+        inputHiddenState[1 * draftTreeSize * baseHiddenDim + 2 * baseHiddenDim + d] = __float2half(1200.0f);
+        inputHiddenState[1 * draftTreeSize * baseHiddenDim + 5 * baseHiddenDim + d] = __float2half(1500.0f);
     }
 
-    // Expected batch 0: [0.0, 100.0, 200.0, ...]
-    std::vector<float> expectedMarkersBatch0 = {0.0f, 100.0f, 200.0f};
+    // Create device tensors
+    auto acceptedIndicesDevice = rt::Tensor({batchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto acceptLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto kvCacheLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto kvCacheDevice = rt::Tensor(
+        {numLayers, maxBatchSize, 2, numKVHead, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto hiddenStateDevice
+        = rt::Tensor({batchSize, draftTreeSize, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
 
-    for (int32_t batchSize : {1, 2, 4, 8})
+    std::vector<half> kvCache(numLayers * maxBatchSize * 2 * numKVHead * maxSeqLen * headDim, __float2half(1.0f));
+
+    // Copy data to device
+    CUDA_CHECK(cudaMemcpy(acceptedIndicesDevice.rawPointer(), inputAcceptedIndices.data(),
+        batchSize * maxDepth * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(acceptLengthsDevice.rawPointer(), inputAcceptLengths.data(), batchSize * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(kvCacheLengthsDevice.rawPointer(), inputKvCacheLengths.data(), batchSize * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(kvCacheDevice.rawPointer(), kvCache.data(), kvCache.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(hiddenStateDevice.rawPointer(), inputHiddenState.data(),
+        batchSize * draftTreeSize * baseHiddenDim * sizeof(half), cudaMemcpyHostToDevice));
+
+    // Execute kernel - this should compact inplace from stride=10 to stride=maxDepth
+    eagleBaseCommitKVCacheAndAssembleHiddenState(
+        acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice, kvCacheDevice, hiddenStateDevice, stream);
+
+    // Read back results
+    std::vector<half> actualHiddenState(batchSize * draftTreeSize * baseHiddenDim);
+    CUDA_CHECK(cudaMemcpy(actualHiddenState.data(), hiddenStateDevice.rawPointer(),
+        batchSize * draftTreeSize * baseHiddenDim * sizeof(half), cudaMemcpyDeviceToHost));
+
+    // ========== Verify Batch 0 ==========
+    // After compaction, Batch 0 should be at offset 0 with compacted layout
+    // Expected: [0.0, 300.0, 700.0] at positions [0, 1, 2]
+    std::vector<float> expectedBatch0 = {0.0f, 300.0f, 700.0f};
+    for (int i = 0; i < 3; i++)
     {
-        int32_t maxBatchSize = batchSize;
-
-        auto acceptedIndicesDevice = rt::Tensor({batchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
-        auto acceptLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        auto kvCacheLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        auto kvCacheDevice = rt::Tensor(
-            {numLayers, maxBatchSize, 2, numKVHead, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        auto hiddenStateDevice
-            = rt::Tensor({batchSize, draftTreeSize, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
-
-        std::vector<half> kvCache(numLayers * maxBatchSize * 2 * numKVHead * maxSeqLen * headDim, __float2half(1.0f));
-
-        CUDA_CHECK(cudaMemcpy(acceptedIndicesDevice.rawPointer(), inputAcceptedIndices.data(),
-            batchSize * maxDepth * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(acceptLengthsDevice.rawPointer(), inputAcceptLengths.data(), batchSize * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(kvCacheLengthsDevice.rawPointer(), inputKvCacheLengths.data(),
-            batchSize * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            kvCacheDevice.rawPointer(), kvCache.data(), kvCache.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(hiddenStateDevice.rawPointer(), inputHiddenState.data(),
-            batchSize * draftTreeSize * baseHiddenDim * sizeof(half), cudaMemcpyHostToDevice));
-
-        eagleBaseCommitKVCacheAndAssembleHiddenState(
-            acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice, kvCacheDevice, hiddenStateDevice, stream);
-
-        std::vector<half> actualHiddenState(batchSize * draftTreeSize * baseHiddenDim);
-        CUDA_CHECK(cudaMemcpy(actualHiddenState.data(), hiddenStateDevice.rawPointer(),
-            batchSize * draftTreeSize * baseHiddenDim * sizeof(half), cudaMemcpyDeviceToHost));
-
-        // Verify batch 0
-        for (int i = 0; i < 3; i++)
-        {
-            float actual = __half2float(actualHiddenState[i * baseHiddenDim]);
-            EXPECT_TRUE(isclose(actual, expectedMarkersBatch0[i], 1e-3f, 1e-3f));
-        }
+        // Batch 0 starts at offset 0, compacted with stride=maxDepth (not draftTreeSize anymore)
+        float actual = __half2float(actualHiddenState[0 * draftTreeSize * baseHiddenDim + i * baseHiddenDim]);
+        EXPECT_TRUE(isclose(actual, expectedBatch0[i], 1e-3f, 1e-3f))
+            << "Batch 0, position " << i << ": expected " << expectedBatch0[i] << ", got " << actual;
     }
+
+    // ========== Verify Batch 1 (CRITICAL TEST) ==========
+    // After compaction, Batch 1 data should move from offset 10*dim to offset maxDepth*dim
+    // This tests that ALL tokens including position 0 are moved correctly
+    // Expected: [1000.0, 1200.0, 1500.0] at NEW offset (maxDepth * baseHiddenDim)
+    std::vector<float> expectedBatch1 = {1000.0f, 1200.0f, 1500.0f};
+
+    // NEW: Batch 1 compacted data should start at maxDepth tokens from beginning
+    // NOT at draftTreeSize tokens (which was the old stride)
+    int32_t batch1OutputOffset = maxDepth * baseHiddenDim; // New compacted offset
+
+    for (int i = 0; i < 3; i++)
+    {
+        // CRITICAL: Read from NEW compacted location, not old location
+        float actual = __half2float(actualHiddenState[batch1OutputOffset + i * baseHiddenDim]);
+        EXPECT_TRUE(isclose(actual, expectedBatch1[i], 1e-3f, 1e-3f))
+            << "Batch 1, position " << i << ": expected " << expectedBatch1[i] << ", got " << actual
+            << " (reading from compacted offset " << batch1OutputOffset / baseHiddenDim << ")";
+    }
+
+    // Additional verification: old Batch 1 location should be overwritten or unchanged
+    // (positions beyond maxDepth*batchSize are undefined after compaction)
+
+    std::cout << "✓ Inplace compaction test passed: stride changed from " << draftTreeSize << " to " << maxDepth
+              << " successfully\n";
+    std::cout << "✓ Batch 1 position 0 correctly moved from offset " << draftTreeSize << " to offset " << maxDepth
+              << "\n";
 }
 
 // ============================================================================

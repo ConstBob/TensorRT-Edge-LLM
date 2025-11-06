@@ -53,7 +53,7 @@ size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputIds, rt::Tensor co
 {
     int64_t const activeBatchSize = draftTreeInputIds.getShape()[0];
     int64_t const paddedDraftTreeSize = draftTreeInputIds.getShape()[1];
-    int64_t const selectTokenSize = outputLogits.getShape()[0];
+    int64_t const selectTokenSize = outputLogits.getShape()[1];
     uintptr_t const inputIdsAddr = reinterpret_cast<uintptr_t>(draftTreeInputIds.rawPointer());
     uintptr_t const baseModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(baseModelHiddenStates.rawPointer());
     uintptr_t const draftModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(draftModelHiddenStates.rawPointer());
@@ -102,9 +102,6 @@ namespace rt
 {
 static constexpr int32_t kDRAFT_MODEL_CONTEXT_PROFILE_INDEX{0};
 static constexpr int32_t kDRAFT_MODEL_GENERATION_PROFILE_INDEX{1};
-
-// In the implementation, we only support batch size of 1 which will be further extended.
-static constexpr int32_t kRUNTIME_BATCH_SIZE{1};
 
 EagleDraftEngineRunner::EagleDraftEngineRunner(
     std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream)
@@ -187,7 +184,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
 
     // Instantiate the KVCache instance of the EngineRunner.
     this->mLinearKVCache
-        = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, kRUNTIME_BATCH_SIZE,
+        = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
                                 mConfig.kvCacheCapacityLength, mConfig.numKVHeads, mConfig.headDim},
             stream);
 
@@ -195,26 +192,27 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // represents the relationship between two
     int32_t const packedTreeMaskLen = static_cast<int64_t>(divUp(mConfig.maxDraftTreeSize, 32));
     // Instantiate other GPU memory input that needed by the Engine execution.
+    // last_token_ids is 2D [batch_size, num_selected_tokens] to match the frontend model export (commit 106a3623d)
     this->mSelectTokenIndices
-        = rt::Tensor({kRUNTIME_BATCH_SIZE * mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT64);
-    this->mSequenceContextLengths = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kGPU, DataType::kINT32);
+        = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT64);
+    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     this->mDraftTreePositionIds
-        = rt::Tensor({kRUNTIME_BATCH_SIZE, mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    this->mPackedTreeMask = rt::Tensor(
-        {kRUNTIME_BATCH_SIZE, mConfig.maxDraftTreeSize, packedTreeMaskLen}, rt::DeviceType::kGPU, DataType::kINT32);
-    this->mAcceptedTokenNums = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kGPU, DataType::kINT32);
+        = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    this->mPackedTreeMask = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxDraftTreeSize, packedTreeMaskLen},
+        rt::DeviceType::kGPU, DataType::kINT32);
+    this->mAcceptedTokenNums = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
 
     // Initialize the dummy tensor for unused input tensors as TensorRT does not support nullptr for binding.
     // Calculate maximum memory requirements across all use cases:
     // 1. Multimodal embeddings: {1, baseModelHiddenDim/3}
-    // 2. Attention mask: {kRUNTIME_BATCH_SIZE, 1, 1}
-    // 3. Attention position IDs: {kRUNTIME_BATCH_SIZE, 1}
-    // 4. KV cache start index: {kRUNTIME_BATCH_SIZE}
+    // 2. Attention mask: {maxSupportedBatchSize, 1, 1}
+    // 3. Attention position IDs: {maxSupportedBatchSize, 1}
+    // 4. KV cache start index: {maxSupportedBatchSize}
     int64_t maxDummyElements = std::max({
-        static_cast<int64_t>(mConfig.baseModelHiddenDim / 3), // multimodal embeddings
-        static_cast<int64_t>(kRUNTIME_BATCH_SIZE * 1 * 1),    // attention mask
-        static_cast<int64_t>(kRUNTIME_BATCH_SIZE * 1),        // attention position IDs
-        static_cast<int64_t>(kRUNTIME_BATCH_SIZE)             // KV cache start index
+        static_cast<int64_t>(mConfig.baseModelHiddenDim / 3),        // multimodal embeddings
+        static_cast<int64_t>(mConfig.maxSupportedBatchSize * 1 * 1), // attention mask
+        static_cast<int64_t>(mConfig.maxSupportedBatchSize * 1),     // attention position IDs
+        static_cast<int64_t>(mConfig.maxSupportedBatchSize)          // KV cache start index
     });
     this->mDummyTensor = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, DataType::kHALF);
     // Initialize dummy tensor memory to zero
@@ -222,9 +220,12 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
 
     auto ropeConfig = collectBaseRopeConfig(configJson);
     mConfig.ropeType = ropeConfig.type;
+
     if (mConfig.ropeType != RopeType::kMRope)
     {
-        LOG_DEBUG("Initialize persistent Rope CosSinCache.");
+        // For non-MRope (Default Rope): allocate with batch_size=1
+        // AttentionPlugin will handle broadcasting via the independent rope_batch_size axis
+        LOG_DEBUG("Initialize 1D persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
             = rt::Tensor({1, mConfig.kvCacheCapacityLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
         bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
@@ -236,13 +237,14 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     }
     else
     {
-        this->mPosEncCosSinCache = rt::Tensor({kRUNTIME_BATCH_SIZE, mConfig.kvCacheCapacityLength, mConfig.rotaryDim},
-            rt::DeviceType::kGPU, DataType::kFLOAT);
+        this->mPosEncCosSinCache
+            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim},
+                rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
     }
 
-    // Currently we always run batch size of 1, we can pre-bind inputs tensor.
-    // To support multi batch, mPosEncCosSinCache shape to match what it will be during execution for MRope (multimodal)
+    // Multi-batch support: Initialize with max supported batch size from config
+    // mPosEncCosSinCache shape will match the max batch size for MRope (multimodal)
     bool setEngineIOStatus{true};
     setEngineIOStatus
         &= mPrefillExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
@@ -253,7 +255,6 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
-    setEngineIOStatus &= this->bindKVCacheToEngine(kRUNTIME_BATCH_SIZE);
     if (!setEngineIOStatus)
     {
         LOG_ERROR("Failed to bind engine input tensors.");
@@ -273,21 +274,6 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         {
             LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
             throw std::runtime_error("Failed to set multimodal embeddings dummy tensor for generation context");
-        }
-    }
-
-    // Set kv cache start index to dummy tensor for generation contexts if reuse KV cache is enabled
-    if (mConfig.enableReuseKVCache)
-    {
-        bool setReuseKVCacheStatus{true};
-        setReuseKVCacheStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
-        setReuseKVCacheStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, rt::Coords{kRUNTIME_BATCH_SIZE}.getTRTDims());
-        if (!setReuseKVCacheStatus)
-        {
-            LOG_ERROR("Failed to set reuse KV cache start index to the draft engine");
-            throw std::runtime_error("Failed to set reuse KV cache start index to the draft engine");
         }
     }
 
@@ -330,7 +316,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_input_len", "max_seq_len", "eagle_draft", "max_draft_tree_size", "is_vlm"};
+            = {"max_batch_size", "max_input_len", "max_seq_len", "eagle_draft", "max_draft_tree_size", "is_vlm"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -360,6 +346,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.enableReuseKVCache = configJson["enable_reuse_kv_cache"].get<bool>();
 
         // Extract builder_config values
+        mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
         mConfig.kvCacheCapacityLength = builderConfig["max_seq_len"].get<int32_t>();
         mConfig.maxDraftTreeSize = builderConfig["max_draft_tree_size"].get<int32_t>();
@@ -503,6 +490,15 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     Dims const maxInputGenShape = mEngine->getProfileShape(
         binding_names::kInputIds, kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
 
+    // Validate and potentially override maxSupportedBatchSize from engine's actual max profile
+    int32_t const engineMaxBatchSize = maxInputCtxShape.d[0];
+    if (mConfig.maxSupportedBatchSize != engineMaxBatchSize)
+    {
+        LOG_ERROR("maxSupportedBatchSize mismatch! Config is %d, engine's max optimization profile is %d.",
+            mConfig.maxSupportedBatchSize, engineMaxBatchSize);
+        return false;
+    }
+
     if (mConfig.maxSupportedInputLength != maxInputCtxShape.d[1])
     {
         LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d", maxInputCtxShape.d[1],
@@ -554,42 +550,47 @@ rt::LinearKVCache& EagleDraftEngineRunner::getLinearKVCache()
 }
 
 bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds,
-    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths,
     rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
     bool const checkInputsGPUTensor = inputIds.getDeviceType() == rt::DeviceType::kGPU
         && baseModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
         && draftModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
+        && contextLengths.getDeviceType() == rt::DeviceType::kCPU
         && outputLogits.getDeviceType() == rt::DeviceType::kGPU
         && outputHiddenStates.getDeviceType() == rt::DeviceType::kGPU;
     if (!checkInputsGPUTensor)
     {
-        LOG_ERROR("Invalid device type of I/O tensors. All inputs and outputs shall reside on GPU.");
+        LOG_ERROR("Invalid device type of I/O tensors. contextLengths should be on CPU, others on GPU.");
         return false;
     }
 
     bool const isInputTypeValid = inputIds.getDataType() == DataType::kINT32
         && baseModelHiddenStates.getDataType() == DataType::kHALF
-        && draftModelHiddenStates.getDataType() == DataType::kHALF && outputLogits.getDataType() == DataType::kFLOAT
-        && outputHiddenStates.getDataType() == DataType::kHALF;
+        && draftModelHiddenStates.getDataType() == DataType::kHALF && contextLengths.getDataType() == DataType::kINT32
+        && outputLogits.getDataType() == DataType::kFLOAT && outputHiddenStates.getDataType() == DataType::kHALF;
     if (!isInputTypeValid)
     {
         LOG_ERROR(
-            "Invalid data type of I/O tensors. Inputs shall be INT32, base model hidden states shall be FLOAT16, "
-            "draft model hidden states shall be FLOAT16, output logits shall be FLOAT32, output hidden states shall be "
-            "FLOAT16.");
+            "Invalid data type of I/O tensors. Inputs shall be INT32, contextLengths shall be INT32, "
+            "base model hidden states shall be FLOAT16, draft model hidden states shall be FLOAT16, "
+            "output logits shall be FLOAT32, output hidden states shall be FLOAT16.");
         return false;
     }
 
-    bool const isBatchValid = inputIds.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && baseModelHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && draftModelHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE;
+    // Validate batch size consistency and bounds
+    int32_t const batchSize = inputIds.getShape()[0];
+    bool const isBatchValid = batchSize > 0 && batchSize <= mConfig.maxSupportedBatchSize
+        && baseModelHiddenStates.getShape()[0] == batchSize && draftModelHiddenStates.getShape()[0] == batchSize
+        && contextLengths.getShape()[0] == batchSize;
     if (!isBatchValid)
     {
         LOG_ERROR(
-            "Invalid batch size of the input tensors. Batch size shall be 1, "
+            "Invalid batch size of the input tensors. Batch size shall be in range [1, %d] and consistent across "
+            "tensors, "
             "current inputIds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
-            inputIds.getShape().formatString().c_str(), baseModelHiddenStates.getShape().formatString().c_str(),
+            mConfig.maxSupportedBatchSize, inputIds.getShape().formatString().c_str(),
+            baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
@@ -639,29 +640,29 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
         return false;
     }
 
-    bool const isOutputShapeValid = outputLogits.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && outputLogits.getShape()[1] == mConfig.draftModelVocabSize
-        && outputHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE
+    bool const isOutputShapeValid = outputLogits.getShape()[0] == batchSize
+        && outputLogits.getShape()[1] == mConfig.draftModelVocabSize && outputHiddenStates.getShape()[0] == batchSize
         && outputHiddenStates.getShape()[1] == mConfig.draftModelHiddenDim;
     if (!isOutputShapeValid)
     {
         LOG_ERROR(
-            "Invalid shape of the output tensors. Logits shape shall be [1, %d], hidden states shape shall be [1, %d], "
+            "Invalid shape of the output tensors. Logits shape shall be [%d, %d], hidden states shape shall be [%d, "
+            "%d], "
             "current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString().c_str(),
-            outputHiddenStates.getShape().formatString().c_str());
+            batchSize, mConfig.draftModelVocabSize, batchSize, mConfig.draftModelHiddenDim,
+            outputLogits.getShape().formatString().c_str(), outputHiddenStates.getShape().formatString().c_str());
         return false;
     }
     return true;
 }
 
 bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
-    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths,
     rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
     cudaStream_t stream)
 {
     bool const validateInputStatus = this->prefillStepInputValidation(inputIds, baseModelHiddenStates,
-        draftModelHiddenStates, multimodalEmbeddings, outputLogits, outputHiddenStates);
+        draftModelHiddenStates, contextLengths, multimodalEmbeddings, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Prefill request not performed due to invalid input tensors.");
@@ -669,14 +670,16 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     }
 
     // Prepare the input for the engine execution.
+    int32_t const activeBatchSize = static_cast<int32_t>(inputIds.getShape()[0]);
     int32_t const inputSequenceLength = static_cast<int32_t>(inputIds.getShape()[1]);
     constexpr int32_t kCONTEXT_SELECT_TOKEN_LENGTH{1};
-    mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE, kCONTEXT_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
+    mSequenceContextLengths.reshape({activeBatchSize});
+    mSelectTokenIndices.reshape({activeBatchSize, kCONTEXT_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
 
-    // Directly populate sequenceContextLengths on GPU to avoid redundant copying
-    CUDA_CHECK(cudaMemcpyAsync(
-        mSequenceContextLengths.rawPointer(), &inputSequenceLength, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    // Copy per-batch context lengths.
+    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), contextLengths.rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
     kernel::prepareEaglePrefillInputs(mSequenceContextLengths, mSelectTokenIndices, stream);
 
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
@@ -703,10 +706,23 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
+    // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
+    // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
+    if (mConfig.ropeType == RopeType::kMRope)
+    {
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+    }
+
+    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
+    // Update KV cache shapes to match activeBatchSize (critical for dynamic batching)
+    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
     // attention-pos-id and attention-mask are unused during the execution. We set the dummy tensor with zero
     // shape.
-    rt::Coords const emptyPosIdShape{kRUNTIME_BATCH_SIZE, 1};
-    rt::Coords const emptyMaskShape{kRUNTIME_BATCH_SIZE, 1, 1};
+    rt::Coords const emptyPosIdShape{activeBatchSize, 1};
+    rt::Coords const emptyMaskShape{activeBatchSize, 1, 1};
     setEngineIOStatus
         &= mPrefillExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
     setEngineIOStatus
@@ -755,7 +771,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     // In prefill step. commit all KVCache generated during the execution.
     mLinearKVCache.commitSequenceLength(mSequenceContextLengths, stream);
 
-    LOG_DEBUG("Prefill stage execution completed for request with batch size %d.", kRUNTIME_BATCH_SIZE);
+    LOG_DEBUG("Prefill stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
 }
 
@@ -789,18 +805,20 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
             "draft tree length shall be INT32, draft tree mask shall be INT8, output logits shall be FLOAT32.");
         return false;
     }
-    // Validate shapes of the input tensors.
-    bool const isBatchValid = draftTreeInputIds.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && baseModelHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && draftModelHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && draftTreeLength.getShape()[0] == kRUNTIME_BATCH_SIZE && draftTreeMask.getShape()[0] == kRUNTIME_BATCH_SIZE;
+    // Validate batch size consistency and bounds
+    int32_t const batchSize = draftTreeInputIds.getShape()[0];
+    bool const isBatchValid = batchSize > 0 && batchSize <= mConfig.maxSupportedBatchSize
+        && baseModelHiddenStates.getShape()[0] == batchSize && draftModelHiddenStates.getShape()[0] == batchSize
+        && draftTreeLength.getShape()[0] == batchSize && draftTreeMask.getShape()[0] == batchSize;
     if (!isBatchValid)
     {
         LOG_ERROR(
-            "Invalid batch size of the input tensors. Batch size shall be 1, current draft tree input ids shape: %s, "
-            "base model hidden states shape: %s, draft model hidden states shape: %s, draft tree length shape: %s, "
-            "draft tree mask shape: %s",
-            draftTreeInputIds.getShape().formatString().c_str(),
+            "Invalid batch size of the input tensors. Batch size shall be in range [1, %d] and consistent across "
+            "tensors, "
+            "current draft tree input ids shape: %s, base model hidden states shape: %s, draft model hidden states "
+            "shape: %s, "
+            "draft tree length shape: %s, draft tree mask shape: %s",
+            mConfig.maxSupportedBatchSize, draftTreeInputIds.getShape().formatString().c_str(),
             baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str(), draftTreeLength.getShape().formatString().c_str(),
             draftTreeMask.getShape().formatString().c_str());
@@ -836,16 +854,19 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
         return false;
     }
 
-    bool const isOutputShapeValid = outputLogits.getShape()[0] == outputHiddenStates.getShape()[0]
-        && outputLogits.getShape()[1] == mConfig.draftModelVocabSize
-        && outputHiddenStates.getShape()[1] == mConfig.draftModelHiddenDim;
+    // Output tensors must be 3D: [batch_size, num_tokens, vocab_size/hidden_dim]
+    bool const isOutputShapeValid = outputLogits.getShape()[0] == batchSize
+        && outputLogits.getShape()[0] == outputHiddenStates.getShape()[0]
+        && outputLogits.getShape()[1] == outputHiddenStates.getShape()[1]
+        && outputLogits.getShape()[2] == mConfig.draftModelVocabSize
+        && outputHiddenStates.getShape()[2] == mConfig.draftModelHiddenDim;
     if (!isOutputShapeValid)
     {
         LOG_ERROR(
-            "Invalid shape of the output tensors. Logits shape shall be [select-token-size, %d], hidden states shape "
-            "shall be [select-token-size, %d], current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString().c_str(),
-            outputHiddenStates.getShape().formatString().c_str());
+            "Invalid shape of the output tensors. Logits shape shall be [%d, num_tokens, %d], hidden states shape "
+            "shall be [%d, num_tokens, %d], current outputLogits shape: %s, outputHiddenStates shape: %s",
+            batchSize, mConfig.draftModelVocabSize, batchSize, mConfig.draftModelHiddenDim,
+            outputLogits.getShape().formatString().c_str(), outputHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -865,16 +886,18 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
         return false;
     }
 
+    int32_t const activeBatchSize = static_cast<int32_t>(draftTreeInputIds.getShape()[0]);
     int32_t const paddedDraftTreeSize = static_cast<int32_t>(draftTreeInputIds.getShape()[1]);
-    int32_t const selectTokenSize = static_cast<int32_t>(outputLogits.getShape()[0]);
+    // outputLogits is now 3D: [batch_size, num_tokens, vocab_size]
+    int32_t const selectTokenSize = static_cast<int32_t>(outputLogits.getShape()[1]);
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(paddedDraftTreeSize, 32));
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE, selectTokenSize}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
-    mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
-    mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, packedTreeMaskLen});
+    mSelectTokenIndices.reshape({activeBatchSize, selectTokenSize}); // 2D tensor [batch, num_tokens]
+    mSequenceContextLengths.reshape({activeBatchSize});
+    mDraftTreePositionIds.reshape({activeBatchSize, paddedDraftTreeSize});
+    mPackedTreeMask.reshape({activeBatchSize, paddedDraftTreeSize, packedTreeMaskLen});
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
@@ -915,6 +938,29 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
             binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+
+        // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
+        // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
+        if (mConfig.ropeType == RopeType::kMRope)
+        {
+            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+        }
+
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
+        // Update KV cache shapes to match activeBatchSize for generation context
+        setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
+        // Update KV cache start index shape if reuse KV cache is enabled
+        if (mConfig.enableReuseKVCache)
+        {
+            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+                binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+                binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
+        }
+
         // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
             binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
@@ -984,15 +1030,16 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     }
 
     int32_t const paddedDraftTreeSize = static_cast<int32_t>(draftTreeInputIds.getShape()[1]);
-    int32_t const selectTokenSize = static_cast<int32_t>(outputLogits.getShape()[0]);
+    // outputLogits is now 3D: [batch_size, num_tokens, vocab_size]
+    int32_t const selectTokenSize = static_cast<int32_t>(outputLogits.getShape()[1]);
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(paddedDraftTreeSize, 32));
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({kRUNTIME_BATCH_SIZE, selectTokenSize}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
-    mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
-    mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, packedTreeMaskLen});
+    mSelectTokenIndices.reshape({activeBatchSize, selectTokenSize}); // 2D tensor [batch, num_tokens]
+    mSequenceContextLengths.reshape({activeBatchSize});
+    mDraftTreePositionIds.reshape({activeBatchSize, paddedDraftTreeSize});
+    mPackedTreeMask.reshape({activeBatchSize, paddedDraftTreeSize, packedTreeMaskLen});
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
@@ -1002,6 +1049,18 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
     bool setEngineIOStatus{true};
+
+    // Update KV cache shapes to match activeBatchSize for CUDA graph capture
+    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
+    // Update KV cache start index shape if reuse KV cache is enabled
+    if (mConfig.enableReuseKVCache)
+    {
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
+    }
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(draftTreeInputIds.rawPointer()));
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1022,6 +1081,17 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
         binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+
+    // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
+    // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
+    if (mConfig.ropeType == RopeType::kMRope)
+    {
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+    }
+
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
     // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
     setEngineIOStatus
         &= mGenerationExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
@@ -1080,8 +1150,8 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
 }
 
 bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor const& acceptedTokens,
-    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor const& outputLogits,
-    rt::Tensor const& outputHiddenStates)
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+    rt::Tensor const& acceptedTokenNums, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
     // All input tensors shall reside on GPU.
     bool const checkInputsGPUTensor = acceptedTokens.getDeviceType() == rt::DeviceType::kGPU
@@ -1108,16 +1178,30 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
         return false;
     }
 
-    bool const isBatchValid = acceptedTokens.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && baseModelHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && draftModelHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE;
+    // Validate batch size consistency and bounds
+    int32_t const batchSize = acceptedTokens.getShape()[0];
+    bool const isBatchValid = batchSize > 0 && batchSize <= mConfig.maxSupportedBatchSize
+        && baseModelHiddenStates.getShape()[0] == batchSize && draftModelHiddenStates.getShape()[0] == batchSize;
     if (!isBatchValid)
     {
         LOG_ERROR(
-            "Invalid batch size of the input tensors. Batch size shall be 1, current accepted tokens shape: %s, base "
-            "model hidden states shape: %s, draft model hidden states shape: %s",
-            acceptedTokens.getShape().formatString().c_str(), baseModelHiddenStates.getShape().formatString().c_str(),
+            "Invalid batch size of the input tensors. Batch size shall be in range [1, %d] and consistent across "
+            "tensors, "
+            "current accepted tokens shape: %s, base model hidden states shape: %s, draft model hidden states shape: "
+            "%s",
+            mConfig.maxSupportedBatchSize, acceptedTokens.getShape().formatString().c_str(),
+            baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
+        return false;
+    }
+
+    // Validate acceptedTokenNums tensor
+    bool const isAcceptedTokenNumsValid = acceptedTokenNums.getDeviceType() == rt::DeviceType::kGPU
+        && acceptedTokenNums.getDataType() == DataType::kINT32 && acceptedTokenNums.getShape()[0] == batchSize;
+    if (!isAcceptedTokenNumsValid)
+    {
+        LOG_ERROR("Invalid acceptedTokenNums tensor. Must be GPU INT32 with shape [%d], got shape: %s", batchSize,
+            acceptedTokenNums.getShape().formatString().c_str());
         return false;
     }
 
@@ -1150,17 +1234,17 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
     }
 
     // When accept committed tokens, we only need to collect the logits and hidden states from the "last" token.
-    bool const isOutputShapeValid = outputLogits.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && outputHiddenStates.getShape()[0] == kRUNTIME_BATCH_SIZE
-        && outputLogits.getShape()[1] == mConfig.draftModelVocabSize
+    bool const isOutputShapeValid = outputLogits.getShape()[0] == batchSize
+        && outputHiddenStates.getShape()[0] == batchSize && outputLogits.getShape()[1] == mConfig.draftModelVocabSize
         && outputHiddenStates.getShape()[1] == mConfig.draftModelHiddenDim;
     if (!isOutputShapeValid)
     {
         LOG_ERROR(
-            "Invalid shape of the output tensors. Logits shape shall be [1, %d], hidden states shape shall be [1, %d], "
+            "Invalid shape of the output tensors. Logits shape shall be [%d, %d], hidden states shape shall be [%d, "
+            "%d], "
             "current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.draftModelVocabSize, mConfig.draftModelHiddenDim, outputLogits.getShape().formatString().c_str(),
-            outputHiddenStates.getShape().formatString().c_str());
+            batchSize, mConfig.draftModelVocabSize, batchSize, mConfig.draftModelHiddenDim,
+            outputLogits.getShape().formatString().c_str(), outputHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
@@ -1168,36 +1252,35 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
 }
 
 bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const& acceptedTokens,
-    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits,
-    rt::Tensor& outputHiddenStates, cudaStream_t stream)
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+    rt::Tensor const& acceptedTokenNums, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
-    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(
-        acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(acceptedTokens, baseModelHiddenStates,
+        draftModelHiddenStates, acceptedTokenNums, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Accept decode token request not performed due to invalid input tensors.");
         return false;
     }
 
+    int32_t const activeBatchSize = static_cast<int32_t>(acceptedTokens.getShape()[0]);
     int32_t const acceptedTokenNum = static_cast<int32_t>(acceptedTokens.getShape()[1]);
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(acceptedTokenNum, 32));
     constexpr int32_t kACCEPT_DECODE_SELECT_TOKEN_LENGTH{1};
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape(
-        {kRUNTIME_BATCH_SIZE, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
-    mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum});
-    mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum, packedTreeMaskLen});
+    mSelectTokenIndices.reshape({activeBatchSize, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
+    mSequenceContextLengths.reshape({activeBatchSize});
+    mDraftTreePositionIds.reshape({activeBatchSize, acceptedTokenNum});
+    mPackedTreeMask.reshape({activeBatchSize, acceptedTokenNum, packedTreeMaskLen});
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
 
-    // Copy accepted token num to pre-allocated GPU tensor
-    CUDA_CHECK(cudaMemcpyAsync(
-        mAcceptedTokenNums.rawPointer(), &acceptedTokenNum, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, mAcceptedTokenNums, mPackedTreeMask,
+    // Use the provided acceptedTokenNums directly (already on GPU from base model verification)
+    // This contains per-batch actual accept counts, NOT the padded length
+    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, acceptedTokenNums, mPackedTreeMask,
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
     size_t const hashValue = hashAcceptDecodeTokenInput(
@@ -1235,6 +1318,29 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
             binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+
+        // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
+        // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
+        if (mConfig.ropeType == RopeType::kMRope)
+        {
+            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+        }
+
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
+        // Update KV cache shapes to match activeBatchSize for generation context
+        setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
+        // Update KV cache start index shape if reuse KV cache is enabled
+        if (mConfig.enableReuseKVCache)
+        {
+            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+                binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+                binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
+        }
+
         // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
             binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
@@ -1268,15 +1374,15 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     }
 
     // Commit the KVCache for accepted tokens.
-    mLinearKVCache.commitSequenceLength(acceptedTokenNum, stream);
+    mLinearKVCache.commitSequenceLength(acceptedTokenNums, stream);
 
-    LOG_DEBUG("Accept decode token stage execution completed for request with batch size %d.", kRUNTIME_BATCH_SIZE);
+    LOG_DEBUG("Accept decode token stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
 }
 
 bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor const& acceptedTokens,
-    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits,
-    rt::Tensor& outputHiddenStates, cudaStream_t stream)
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+    rt::Tensor const& acceptedTokenNums, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
     size_t const hashValue = hashAcceptDecodeTokenInput(
         acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
@@ -1285,33 +1391,52 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
         LOG_INFO("Draft accept decode token CUDA graph already captured.");
         return true;
     }
-    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(
-        acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(acceptedTokens, baseModelHiddenStates,
+        draftModelHiddenStates, acceptedTokenNums, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Accept decode token request not performed due to invalid input tensors.");
         return false;
     }
 
+    int32_t const activeBatchSize = static_cast<int32_t>(acceptedTokens.getShape()[0]);
     int32_t const acceptedTokenNum = static_cast<int32_t>(acceptedTokens.getShape()[1]);
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(acceptedTokenNum, 32));
     constexpr int32_t kACCEPT_DECODE_SELECT_TOKEN_LENGTH{1};
 
-    mSelectTokenIndices.reshape(
-        {kRUNTIME_BATCH_SIZE, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({kRUNTIME_BATCH_SIZE});
-    mDraftTreePositionIds.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum});
-    mPackedTreeMask.reshape({kRUNTIME_BATCH_SIZE, acceptedTokenNum, packedTreeMaskLen});
+    // Reset KV cache for the activeBatchSize to ensure sequenceStartIndex has correct batch dimension
+    constexpr int32_t simulateCacheLength{128};
+    std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
+    rt::Tensor const reuseKVCacheLengthsTensor(
+        reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+    mLinearKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
+
+    mSelectTokenIndices.reshape({activeBatchSize, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
+    mSequenceContextLengths.reshape({activeBatchSize});
+    mDraftTreePositionIds.reshape({activeBatchSize, acceptedTokenNum});
+    mPackedTreeMask.reshape({activeBatchSize, acceptedTokenNum, packedTreeMaskLen});
 
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
 
-    // Copy accepted token num to pre-allocated GPU tensor
-    CUDA_CHECK(cudaMemcpyAsync(
-        mAcceptedTokenNums.rawPointer(), &acceptedTokenNum, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, mAcceptedTokenNums, mPackedTreeMask,
+    // Use the provided acceptedTokenNums directly (already on GPU from base model verification)
+    // This contains per-batch actual accept counts, NOT the padded length
+    kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, acceptedTokenNums, mPackedTreeMask,
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
     bool setEngineIOStatus{true};
+
+    // Update KV cache shapes to match activeBatchSize for CUDA graph capture
+    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
+    // Update KV cache start index shape if reuse KV cache is enabled
+    if (mConfig.enableReuseKVCache)
+    {
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
+    }
+
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(acceptedTokens.rawPointer()));
     setEngineIOStatus
@@ -1332,6 +1457,17 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
         binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+
+    // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
+    // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
+    if (mConfig.ropeType == RopeType::kMRope)
+    {
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+    }
+
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
     setEngineIOStatus
         &= mGenerationExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1407,7 +1543,6 @@ bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
         status &= mGenerationExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status
             &= mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-
         status &= mPrefillExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimPrefillIn);
         status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimDecodeIn);
     }

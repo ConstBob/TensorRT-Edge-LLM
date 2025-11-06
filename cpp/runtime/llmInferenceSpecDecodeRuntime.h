@@ -45,18 +45,34 @@ namespace rt
  * @brief Execution context for speculative decode runtime
  *
  * Holds execution information and intermediate metadata during inference.
+ * Supports multi-batch inference with independent sequence tracking.
  */
 struct SpecDecodeInferenceContext
 {
-    std::string systemPrompt;                             //!< System Prompts
+    std::vector<std::string> systemPrompts;               //!< System prompts for each sequence in batch
     std::vector<std::vector<int32_t>> rawBatchedInputIds; //!< Original token IDs before preprocessing (includes padding
                                                           //!< and removal of reused system IDs)
-    std::vector<int32_t> tokenIds;                        //!< Token IDs passed to the prefill stage
-    rt::OptionalInputTensor multimodalEmbeddings;         //!< Optional multimodal embeddings
-    int32_t generationRound;                              //!< Current generation round
-    int32_t maxGenerateLength;                            //!< Maximum generation length
-    int32_t currentGenerateLength;                        //!< Current generation length
-    cudaStream_t stream;                                  //!< CUDA stream
+    std::vector<std::vector<int32_t>> tokenIds;           //!< Token IDs for each sequence: [batch_size][seq_length]
+    std::vector<int32_t> currentGenerateLengths;          //!< Current generation length for each sequence: [batch_size]
+    std::vector<int32_t> promptLengths;           //!< Prompt length (after reuse) for each sequence: [batch_size]
+    std::vector<bool> finishedStates;             //!< Finished state for each sequence: [batch_size]
+    std::vector<int32_t> actualIterations;        //!< Actual iterations run for each sequence: [batch_size]
+    rt::OptionalInputTensor multimodalEmbeddings; //!< Optional multimodal embeddings
+    int32_t generationRound;                      //!< Current generation round (shared across all batches)
+    int32_t maxGenerateLength;                    //!< Maximum generation length
+    int32_t activeBatchSize;                      //!< Current active batch size
+    int32_t currentBatchIndex;                    //!< Current batch index being processed (for system prompt KVCache)
+    cudaStream_t stream;                          //!< CUDA stream
+
+    /*!
+     * @brief Initialize the context with given parameters
+     * @param batchSize Active batch size
+     * @param maxGenLength Maximum generation length
+     * @param multimodal Optional multimodal embeddings
+     * @param cudaStream CUDA stream for operations
+     */
+    void initialize(
+        int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal, cudaStream_t cudaStream);
 };
 
 /*!
@@ -70,9 +86,6 @@ struct EagleDraftingConfig
     int32_t draftingStep;   //!< Number of drafting steps with draft model
     int32_t verifyTreeSize; //!< Number of tokens for base model verification
 };
-
-//! Runtime batch size constant
-static constexpr int32_t kRUNTIME_BATCH_SIZE{1};
 
 /*!
  * @brief LLM inference runtime with Eagle speculative decoding
@@ -138,6 +151,7 @@ public:
     }
 
 private:
+    int32_t mMaxRuntimeBatchSize{1};                 //!< Maximum runtime batch size
     EagleDraftingConfig mDraftingConfig;             //!< Eagle drafting configuration
     LLMEngineRunnerConfig mBaseEngineConfig;         //!< Base engine configuration
     EagleDraftEngineRunnerConfig mDraftEngineConfig; //!< Draft engine configuration
