@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "common/tensor.h"
+
 #include <NvInferRuntime.h>
 #include <cassert>
 #include <cstdint>
@@ -31,23 +33,10 @@ namespace plugins
 //! Device memory alignment requirement (128 bytes)
 constexpr int32_t kDEVICE_ALIGNMENT{128};
 
-/*!
- * @brief Align device pointer to 128-byte boundary
- *
- * Ensures device pointers meet CUDA alignment requirements for optimal memory access.
- *
- * @param ptr Pointer to align
- * @return Aligned pointer
- */
-inline int8_t* alignDevicePtr(void* ptr)
-{
-    // Convert the pointer to an integer
-    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-    uintptr_t aligned_addr = (addr + kDEVICE_ALIGNMENT - 1) & ~static_cast<uintptr_t>(kDEVICE_ALIGNMENT - 1);
-
-    // Convert the aligned address back to a pointer
-    return reinterpret_cast<int8_t*>(aligned_addr);
-}
+//! @brief Align device pointer to device alignment.
+//! @param ptr Device pointer that might not be aligned to device alignment.
+//! @return Aligned device pointer
+void* alignDevicePtr(void* ptr);
 
 /*!
  * @brief Convert C++ type to TensorRT PluginFieldType
@@ -160,6 +149,21 @@ inline void deserializeValue(void const** buffer, size_t* buffer_size, T* value)
 {
     return Serializer<T>::deserialize(buffer, buffer_size, value);
 }
+
+//! @brief Accumulate workspace size for a given shape and data type. Device alignment will be applied automatically.
+//! @param currentSize Current workspace size
+//! @param shape Tensor shape
+//! @param dataType Tensor data type
+//! @return Accumulated workspace size that aligned to device alignment.
+size_t accumulateWorkspaceSize(size_t currentSize, rt::Coords const& shape, nvinfer1::DataType dataType);
+
+//! @brief Given a contiguous workspace, assign (non-owned) tensor with specified shape and data type from the start of
+//! workspace. After assignment, the workspace pointer will shift the size of tensor and align to device alignment.
+//! @param workspace The contiguous workspace pointer
+//! @param shape Requested Tensor shape
+//! @param dataType Requested Tensor data type
+//! @return Assigned tensor
+rt::Tensor assignTensorFromWorkspace(void*& workspace, rt::Coords const& shape, nvinfer1::DataType dataType);
 
 } // namespace plugins
 } // namespace trt_edgellm
