@@ -43,6 +43,7 @@ struct EagleDraftEngineRunnerConfig
     int32_t numKVHeads{};                  //!< Number of key-value heads
     int32_t headDim{};                     //!< Dimension of each attention head
     int32_t rotaryDim{};                   //!< Dimension of rotary positional encoding
+    int32_t maxSupportedBatchSize{};       //!< Maximum supported batch size
     int32_t maxSupportedInputLength{};     //!< Maximum supported input sequence length
     int32_t kvCacheCapacityLength{};       //!< Capacity length for key-value cache
     int32_t draftModelVocabSize{};         //!< Vocabulary size of the draft model
@@ -92,21 +93,22 @@ public:
      *  By definition, eagle operates on feature level with formulation of f_n = F_proj(f_{n}, token_{n+1}). 
      *  The API will takes hidden states input from base model and token_ids of [1 ~ N] as input, output logits 
      *  and (draft) hidden states for the "last entry" to be used in following draft proposal step. 
-     *  Currently, we only support batch size of 1.
+     *  Multi-batch is supported - each batch can have different actual sequence length (with padding).
      * 
-     *  \param inputIds [GPU, Int32] Input token_ids for the draft model with shape [1, N] denoting the token_ids of [1 ~N]
-     *  \param baseModelHiddenStates [GPU, Float16] Hidden states input from base model with shape [1, N, base-Hidden-dim],
+     *  \param inputIds [GPU, Int32] Input token_ids for the draft model with shape [batch_size, N_padded] denoting the token_ids of [1 ~N]
+     *  \param baseModelHiddenStates [GPU, Float16] Hidden states input from base model with shape [batch_size, N_padded, base-Hidden-dim],
      *                               denote hidden states corresponding to token_ids of [1 ~ N-1]
-     *  \param draftModelHiddenStates [GPU, Float16] The input [1, N, draft-Hidden-input-dim] is unused in the prefill step,
+     *  \param draftModelHiddenStates [GPU, Float16] The input [batch_size, N_padded, draft-Hidden-input-dim] is unused in the prefill step,
      *                                but it is required by the engine execution. The input shall be set to all zeros to ensure correctness
+     *  \param contextLengths [CPU, Int32] The actual sequence length for each batch with shape [batch_size] (including the +1 token from base prefill)
      *  \param multimodalEmbeddings [GPU] Optional. The multimodal embeddings
-     *  \param outputLogits [GPU, Float16] The output logits with shape [1, draft-Vocab-Size]
-     *  \param outputHiddenStates [GPU] The output hidden states with shape [1, draft-hidden-dim]
+     *  \param outputLogits [GPU, Float16] The output logits with shape [batch_size, draft-Vocab-Size]
+     *  \param outputHiddenStates [GPU] The output hidden states with shape [batch_size, draft-hidden-dim]
      *  \param stream The CUDA stream to execute the prefill step
      *  \return True if execution was successful, false otherwise
      */
     bool executeEaglePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& baseModelHiddenStates,
-        rt::Tensor const& draftModelHiddenStates, rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits,
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths, rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits,
         rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
     /*! \brief API entry to execute the draft proposal step for the eagle draft engine
@@ -141,19 +143,20 @@ public:
      *  The functionality is similar to the prefill step where this API will operates based on the previous 
      *  committed KVCache. Output logits and hidden-states will be collected from the last accepted token.
      * 
-     *  \param acceptedTokens [GPU, Int32] The accepted tokens with shape [1, N_accepted]
-     *  \param baseModelHiddenStates [GPU, Float16] Hidden states input from base model with shape [1, N_accepted, base-Hidden-Dim]
-     *  \param draftModelHiddenStates [GPU, Float16] The input [1, N_accepted, draft-Hidden-Dim] is unused in the accept decode token step,
+     *  \param acceptedTokens [GPU, Int32] The accepted tokens with shape [batch_size, N_accepted_padded] where N_accepted_padded is the maximum accepted length across all batches
+     *  \param baseModelHiddenStates [GPU, Float16] Hidden states input from base model with shape [batch_size, N_accepted_padded, base-Hidden-Dim]
+     *  \param draftModelHiddenStates [GPU, Float16] The input [batch_size, N_accepted_padded, draft-Hidden-Dim] is unused in the accept decode token step,
      *                                but it is required by the engine execution. The input shall be set to all zeros to ensure correctness
-     *  \param outputLogits [GPU, Float16] The output logits with shape [1, draft-Vocab-Size]
-     *  \param outputHiddenStates [GPU] The output hidden states with shape [1, draft-hidden-dim]
+     *  \param acceptedTokenNums [GPU, Int32] The actual number of accepted tokens for each batch with shape [batch_size], used to handle variable-length acceptance per sequence
+     *  \param outputLogits [GPU, Float16] The output logits with shape [batch_size, draft-Vocab-Size]
+     *  \param outputHiddenStates [GPU] The output hidden states with shape [batch_size, draft-hidden-dim]
      *  \param stream The CUDA stream to execute the accept decode token step
      *  \return True if execution was successful, false otherwise
      * 
      *  \note This API will "commit" the KVCache for the accepted tokens.
      */
     bool executeEagleAcceptDecodeTokenStep(rt::Tensor const& acceptedTokens, rt::Tensor const& baseModelHiddenStates,
-        rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits,
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor const& acceptedTokenNums, rt::Tensor& outputLogits,
         rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
     /*! \brief API entry to capture the CUDA graph for the draft proposal step
@@ -181,17 +184,18 @@ public:
      *  The functionality is similar to the draft proposal step where this API will operates based on the 
      *  previous committed KVCache. Output logits and hidden-states will be collected from the last accepted token.
      * 
-     *  \param acceptedTokens [GPU, Int32] The accepted tokens with shape [1, N_accepted]
-     *  \param baseModelHiddenStates [GPU, Float16] Hidden states input from base model with shape [1, N_accepted, base-Hidden-Dim]
-     *  \param draftModelHiddenStates [GPU, Float16] The input [1, N_accepted, draft-Hidden-Dim] is unused in the accept decode token step,
+     *  \param acceptedTokens [GPU, Int32] The accepted tokens with shape [batch_size, N_accepted_padded] where N_accepted_padded is the maximum accepted length across all batches
+     *  \param baseModelHiddenStates [GPU, Float16] Hidden states input from base model with shape [batch_size, N_accepted_padded, base-Hidden-Dim]
+     *  \param draftModelHiddenStates [GPU, Float16] The input [batch_size, N_accepted_padded, draft-Hidden-Dim] is unused in the accept decode token step,
      *                                but it is required by the engine execution. The input shall be set to all zeros to ensure correctness
-     *  \param outputLogits [GPU, Float16] The output logits with shape [1, draft-Vocab-Size]
-     *  \param outputHiddenStates [GPU] The output hidden states with shape [1, draft-hidden-dim]
+     *  \param acceptedTokenNums [GPU, Int32] The actual number of accepted tokens for each batch with shape [batch_size], used to handle variable-length acceptance per sequence
+     *  \param outputLogits [GPU, Float16] The output logits with shape [batch_size, draft-Vocab-Size]
+     *  \param outputHiddenStates [GPU] The output hidden states with shape [batch_size, draft-hidden-dim]
      *  \param stream The CUDA stream to capture the CUDA graph. The API will capture the CUDA graph for the accept decode token step
      *  \return True if the CUDA graph is captured successfully, false otherwise
      */
     bool captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor const& acceptedTokens, rt::Tensor const& baseModelHiddenStates,
-        rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, 
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor const& acceptedTokenNums, rt::Tensor& outputLogits, 
         rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
 private:
@@ -236,12 +240,13 @@ private:
     //! \param inputIds Input token IDs tensor
     //! \param baseModelHiddenStates Base model hidden states tensor
     //! \param draftModelHiddenStates Draft model hidden states tensor
+    //! \param contextLengths Context lengths for each batch (actual lengths)
     //! \param multimodalEmbeddings Optional multimodal embeddings
     //! \param outputLogits Output logits tensor
     //! \param outputHiddenStates Output hidden states tensor
     //! \return True if validation passed, false otherwise
     bool prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& baseModelHiddenStates,
-        rt::Tensor const& draftModelHiddenStates, rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths, rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
 
     //! Validate input parameters for the draft proposal step.
     //! \param draftTreeInputIds Draft tree input IDs tensor
@@ -257,14 +262,16 @@ private:
         rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
 
     //! Validate input parameters for the accept decode token step.
-    //! \param acceptedTokens Accepted tokens tensor
-    //! \param baseModelHiddenStates Base model hidden states tensor
-    //! \param draftModelHiddenStates Draft model hidden states tensor
-    //! \param outputLogits Output logits tensor
-    //! \param outputHiddenStates Output hidden states tensor
+    //! \param acceptedTokens Accepted tokens tensor [batch_size, N_accepted_padded]
+    //! \param baseModelHiddenStates Base model hidden states tensor [batch_size, N_accepted_padded, base-Hidden-Dim]
+    //! \param draftModelHiddenStates Draft model hidden states tensor [batch_size, N_accepted_padded, draft-Hidden-Dim]
+    //! \param acceptedTokenNums Actual number of accepted tokens per batch [batch_size]
+    //! \param outputLogits Output logits tensor [batch_size, draft-Vocab-Size]
+    //! \param outputHiddenStates Output hidden states tensor [batch_size, draft-hidden-dim]
     //! \return True if validation passed, false otherwise
     bool acceptDecodeTokenStepInputValidation(rt::Tensor const& acceptedTokens, rt::Tensor const& baseModelHiddenStates,
-        rt::Tensor const& draftModelHiddenStates, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor const& acceptedTokenNums, rt::Tensor const& outputLogits, 
+        rt::Tensor const& outputHiddenStates);
 };
 
 // clang-format on

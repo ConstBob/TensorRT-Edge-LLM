@@ -52,6 +52,23 @@ size_t hashSystemPrompt(std::string const& systemPrompt)
 namespace rt
 {
 
+void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _maxGenerateLength,
+    rt::OptionalInputTensor const& _mutimodalEmbeddings, cudaStream_t _stream)
+{
+    systemPrompts.resize(_activeBatchSize);
+    rawBatchedInputIds.reserve(_activeBatchSize);
+    tokenIds.resize(_activeBatchSize);
+    currentGenerateLengths.resize(_activeBatchSize, 0);
+    promptLengths.resize(_activeBatchSize, 0);
+    finishedStates.resize(_activeBatchSize, false);
+    actualIterations.resize(_activeBatchSize, 0);
+    multimodalEmbeddings = _mutimodalEmbeddings;
+    generationRound = 0;
+    maxGenerateLength = _maxGenerateLength;
+    activeBatchSize = _activeBatchSize;
+    stream = _stream;
+}
+
 LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& engineDir,
     std::string const& multimodalEngineDir, EagleDraftingConfig const& draftingConfig, cudaStream_t stream)
 {
@@ -87,6 +104,12 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     LOG_INFO("EagleDraftEngineRunner successfully initialized.");
     mDraftEngineConfig = mDraftEngineRunner->getDraftEngineConfig();
 
+    // Set runtime batch size to the minimum of base and draft engine's maxSupportedBatchSize
+    // This ensures CUDA graph capture and tensor allocation work for both engines
+    mMaxRuntimeBatchSize = std::min(mBaseEngineConfig.maxSupportedBatchSize, mDraftEngineConfig.maxSupportedBatchSize);
+    LOG_INFO("Runtime batch size set to: %d (base engine max: %d, draft engine max: %d)", mMaxRuntimeBatchSize,
+        mBaseEngineConfig.maxSupportedBatchSize, mDraftEngineConfig.maxSupportedBatchSize);
+
     // Validate drafting configuration against engine capabilities
     // maxDraftTreeSize controls the maximum input length to draft proposal step
     int32_t const requiredDraftInputSize = mDraftingConfig.draftingStep * mDraftingConfig.draftingTopK;
@@ -111,53 +134,61 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     // Allocate runtime tensors till max supported size.
     int32_t const maxDraftTreeSize = std::max(mDraftEngineConfig.maxDraftTreeSize, mDraftingConfig.verifyTreeSize);
     int32_t const draftTopK = mDraftingConfig.draftingTopK;
-    int32_t const maxSamplingSize = std::max(maxDraftTreeSize, draftTopK * draftTopK);
+    // maxSamplingSize needs to account for batch dimension: max of (batchSize * verifyTreeSize) or (batchSize *
+    // draftTopK * draftTopK)
+    int32_t const maxSamplingSize
+        = std::max(mMaxRuntimeBatchSize * maxDraftTreeSize, mMaxRuntimeBatchSize * draftTopK * draftTopK);
     int32_t const draftFullTableLength = 1 + draftTopK + (mDraftingConfig.draftingStep - 1) * draftTopK * draftTopK;
 
     LOG_DEBUG(
         "maxDraftTreeSize: %d, maxSamplingSize: %d, draftFullTableLength: %d to set up the SpecDecode inference "
         "runtime",
         maxDraftTreeSize, maxSamplingSize, draftFullTableLength);
-    // Reserve enough workspace for sampling, the size can be further optimized.
+    // Reserve enough workspace for sampling, accounting for batch dimension in draft proposal stage
+    // In draft proposal loop, we process (batchSize * draftTopK) rows, each doing topK selection
     int32_t const maxSamplingWorkspaceSize
-        = std::max(getSelectAllTopKWorkspaceSize(kRUNTIME_BATCH_SIZE, mBaseEngineConfig.vocabSize, 1),
-            getSelectAllTopKWorkspaceSize(draftTopK, mDraftEngineConfig.draftModelVocabSize, draftTopK));
+        = std::max(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.vocabSize, 1),
+            getSelectAllTopKWorkspaceSize(
+                mMaxRuntimeBatchSize * draftTopK, mDraftEngineConfig.draftModelVocabSize, draftTopK));
 
     try
     {
         mIdsInput = rt::Tensor(
-            {kRUNTIME_BATCH_SIZE, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kGPU, DataType::kINT32);
-        mContextLengthsInput = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kCPU, DataType::kINT32);
-        mLogitsOutput
-            = rt::Tensor({maxDraftTreeSize, mBaseEngineConfig.vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mDraftTreeSize = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kGPU, DataType::kINT32);
+            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kGPU, DataType::kINT32);
+        mContextLengthsInput = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+        // Allocate mLogitsOutput with max capacity to support both draft (smaller vocab) and base (larger vocab)
+        // operations Max size needed: batch_size * verify_tree_size * base_vocab_size for base verification
+        int32_t const maxLogitsSize = mMaxRuntimeBatchSize * maxDraftTreeSize;
+        int32_t const maxVocabSize = std::max(mBaseEngineConfig.vocabSize, mDraftEngineConfig.draftModelVocabSize);
+        mLogitsOutput = rt::Tensor({maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+        mDraftTreeSize = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
         mDraftTreeMask = rt::Tensor(
-            {kRUNTIME_BATCH_SIZE, maxDraftTreeSize, maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT8);
+            {mMaxRuntimeBatchSize, maxDraftTreeSize, maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT8);
         mBaseHiddenStatesOutput = rt::Tensor(
-            {kRUNTIME_BATCH_SIZE, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.outputHiddenDim},
+            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.outputHiddenDim},
             rt::DeviceType::kGPU, DataType::kHALF);
         mDraftHiddenStatesInput = rt::Tensor(
-            {kRUNTIME_BATCH_SIZE, mBaseEngineConfig.maxSupportedInputLength, mDraftEngineConfig.draftModelHiddenDim},
+            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mDraftEngineConfig.draftModelHiddenDim},
             rt::DeviceType::kGPU, DataType::kHALF);
-        mDraftHiddenStatesOutput = rt::Tensor({kRUNTIME_BATCH_SIZE, draftTopK, mDraftEngineConfig.draftModelHiddenDim},
+        mDraftHiddenStatesOutput = rt::Tensor({mMaxRuntimeBatchSize, draftTopK, mDraftEngineConfig.draftModelHiddenDim},
             rt::DeviceType::kGPU, DataType::kHALF);
         mDraftTokenIdsFullTable
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kINT32);
+            = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kINT32);
         mDraftTokenScoreFullTable
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kFLOAT);
         mDraftTokenPredecessorFullTable
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kINT32);
+            = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kINT32);
         mDraftVocabMappingTable = rt::Tensor(
-            {kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelVocabSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        mDraftTreeRootTokenId = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kGPU, DataType::kINT32);
+            {mMaxRuntimeBatchSize, mDraftEngineConfig.draftModelVocabSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        mDraftTreeRootTokenId = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
         mDraftTokenIdsTable
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, draftTopK * draftTopK}, rt::DeviceType::kGPU, DataType::kINT32);
+            = rt::Tensor({mMaxRuntimeBatchSize, draftTopK * draftTopK}, rt::DeviceType::kGPU, DataType::kINT32);
         mDraftTokenScoresTable
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, draftTopK * draftTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            = rt::Tensor({mMaxRuntimeBatchSize, draftTopK * draftTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
         mDraftTokenIntermediateScores
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, draftTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            = rt::Tensor({mMaxRuntimeBatchSize, draftTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
         mDraftTokenIntermediateParents
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, draftTopK}, rt::DeviceType::kGPU, DataType::kINT32);
+            = rt::Tensor({mMaxRuntimeBatchSize, draftTopK}, rt::DeviceType::kGPU, DataType::kINT32);
         mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8);
         mSamplingIndices = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32);
         mSamplingScores = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
@@ -165,10 +196,10 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
         // DraftModel prefill/accept-decode-token will also produce one layer of draft tree, so the max accepted
         // depth should be drafting step + 1.
         int32_t const maxAcceptDepth = mDraftingConfig.draftingStep + 1;
-        mAcceptedTokenIds = rt::Tensor({kRUNTIME_BATCH_SIZE, maxAcceptDepth}, rt::DeviceType::kGPU, DataType::kINT32);
+        mAcceptedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, maxAcceptDepth}, rt::DeviceType::kGPU, DataType::kINT32);
         mAcceptedTokenIndices
-            = rt::Tensor({kRUNTIME_BATCH_SIZE, maxAcceptDepth}, rt::DeviceType::kGPU, DataType::kINT32);
-        mAcceptLength = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kGPU, DataType::kINT32);
+            = rt::Tensor({mMaxRuntimeBatchSize, maxAcceptDepth}, rt::DeviceType::kGPU, DataType::kINT32);
+        mAcceptLength = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     }
     catch (std::exception const& e)
     {
@@ -226,10 +257,18 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
 bool LLMInferenceSpecDecodeRuntime::handleRequest(
     LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
 {
-    if (request.prompts.size() != kRUNTIME_BATCH_SIZE)
+    int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
+
+    if (activeBatchSize == 0)
     {
-        LOG_ERROR("Only %d batch size is supported by current implementation. Supplied batch size: %zu",
-            kRUNTIME_BATCH_SIZE, request.prompts.size());
+        LOG_ERROR("Empty request with no prompts");
+        return false;
+    }
+
+    if (activeBatchSize > mMaxRuntimeBatchSize)
+    {
+        LOG_ERROR(
+            "Requested batch size %d exceeds maximum supported batch size %d", activeBatchSize, mMaxRuntimeBatchSize);
         return false;
     }
 
@@ -238,34 +277,44 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
     int32_t maxGenerateLength = request.maxGenerateLength;
-    SpecDecodeInferenceContext context{{}, {}, {}, multimodalEmbeddings, 0, maxGenerateLength, 0, stream};
+
+    // Initialize context for multi-batch
+    SpecDecodeInferenceContext context;
+    context.initialize(activeBatchSize, maxGenerateLength, multimodalEmbeddings, stream);
+
     // Preprocess user prompts and encode them.
     std::vector<std::vector<int32_t>> batchedInputIds;
     if (!mMultimodalRunner)
     {
-        auto const& prompt = request.prompts[0];
-        context.systemPrompt = std::move(prompt.systemPrompt);
-
-        std::string const inputText = prompt.systemPrompt + prompt.userPrompt;
-        context.rawBatchedInputIds.emplace_back(mTokenizer->encode(inputText, false));
-        if (context.rawBatchedInputIds[0].empty())
+        // Process each prompt in the batch
+        for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            LOG_ERROR("Failed to tokenize input text: %s", inputText.c_str());
-            return false;
+            auto const& prompt = request.prompts[i];
+            context.systemPrompts[i] = prompt.systemPrompt;
+
+            std::string const inputText = context.systemPrompts[i] + prompt.userPrompt;
+            context.rawBatchedInputIds.emplace_back(mTokenizer->encode(inputText, false));
+            if (context.rawBatchedInputIds[i].empty())
+            {
+                LOG_ERROR("Failed to tokenize input text for batch %d", i);
+                return false;
+            }
         }
     }
     else
     {
-        // TODO: apply chat template for system prompt
-        context.systemPrompt = mMultimodalRunner->preprocessSystemPrompt(
-            request.prompts[0].systemPrompt, mTokenizer.get(), mBaseEngineRunner->getRopeCosSinCacheTensor(), stream);
+        // Process system prompts for all batches
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            // TODO: apply chat template for system prompt
+            context.systemPrompts[i] = mMultimodalRunner->preprocessSystemPrompt(request.prompts[i].systemPrompt,
+                mTokenizer.get(), mBaseEngineRunner->getRopeCosSinCacheTensor(), stream);
+        }
 
         if (!mMultimodalRunner->preprocess(request, context.rawBatchedInputIds, mTokenizer.get(),
                 mBaseEngineRunner->getRopeCosSinCacheTensor(), stream))
         {
-            LOG_ERROR(
-                "Multimodal input request processing failed. This request cannot be "
-                "handled.");
+            LOG_ERROR("Multimodal input request processing failed. This request cannot be handled.");
             return false;
         }
 
@@ -299,11 +348,18 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         setProfilingEnabled(false);
     }
 
-    // Generate system prompt KVCache for each sequence
-    bool const saveCacheStatus = genAndSaveSystemPromptKVCache(context);
-    if (!saveCacheStatus)
+    // Generate system prompt KVCache for each sequence in the batch
+    for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        LOG_WARNING("Failed to save system prompt KVCache. May be KVCache reuse feature is not enabled in the engine.");
+        context.currentBatchIndex = i;
+        bool const saveCacheStatus = genAndSaveSystemPromptKVCache(context);
+        if (!saveCacheStatus)
+        {
+            LOG_WARNING(
+                "Failed to save system prompt KVCache for batch %d. "
+                "May be KVCache reuse feature is not enabled in the engine.",
+                i);
+        }
     }
 
     if (profilingEnabled)
@@ -319,8 +375,6 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return false;
     }
 
-    // The context length excluding the reused KVCache length.
-    int32_t computedTokenLength = context.tokenIds.size();
     // Prefill from the base model and run spec-decode inference.
     bool const prefillStatus = runBaseModelPrefill(context);
     if (!prefillStatus)
@@ -329,16 +383,48 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return false;
     }
 
-    auto checkGenerateEndStatus = [this](SpecDecodeInferenceContext& context) {
-        bool flag = (context.currentGenerateLength >= context.maxGenerateLength)
-            || (context.tokenIds.back() == mTokenizer->getEosId());
-        return flag;
+    // Lambda to check if all batches are finished
+    auto checkAllFinished = [&]() {
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            if (!context.finishedStates[i])
+                return false;
+        }
+        return true;
     };
-    while (!checkGenerateEndStatus(context))
+
+    // Lambda to update finish states based on EOS and max_length
+    auto updateFinishStates = [&]() {
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            if (context.finishedStates[i])
+                continue;
+
+            // Check EOS
+            if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
+            {
+                context.finishedStates[i] = true;
+                LOG_DEBUG("Batch %d finished, reason: EOS", i);
+                continue;
+            }
+            // Check max length
+            if (context.currentGenerateLengths[i] >= context.maxGenerateLength)
+            {
+                context.finishedStates[i] = true;
+                LOG_DEBUG(
+                    "Batch %d finished, total tokens=%d, reason: max_length", i, context.currentGenerateLengths[i]);
+                continue;
+            }
+        }
+    };
+
+    // Check if any batch finished immediately after prefill
+    updateFinishStates();
+
+    while (!checkAllFinished())
     {
         if (context.generationRound == 0)
         {
-            // Run draft model prefill.
             bool const draftPrefillStatus = runDraftModelPrefill(context);
             if (!draftPrefillStatus)
             {
@@ -356,7 +442,6 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
             }
         }
 
-        // Produce draft tree for Eagle decoding.
         bool const draftTreeConstructionStatus = constructDraftTree(context);
         if (!draftTreeConstructionStatus)
         {
@@ -364,31 +449,64 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
             return false;
         }
 
-        // Run base model verification.
         bool const baseModelVerificationStatus = runBaseModelVerification(context);
         if (!baseModelVerificationStatus)
         {
             LOG_ERROR("Failed to verify token draft tree with base model.");
             return false;
         }
+
+        // Update iterations and check finish conditions
+        updateFinishStates();
+
         context.generationRound += 1;
     }
 
-    // Record Eagle metrics
-    int32_t reusedTokenLength = perfillTokenLength - computedTokenLength;
-    mPrefillMetrics.recordRun(reusedTokenLength, computedTokenLength);
-    mEagleGenerationMetrics.recordRun(context.generationRound, context.currentGenerateLength);
+    // Record Eagle metrics - accumulate across all batches
+    int32_t totalReusedTokens = 0;
+    int32_t totalComputedTokens = 0;
+    int32_t totalGeneratedTokens = 0;
+    int32_t totalIterations = 0;
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        int32_t rawPromptLength = static_cast<int32_t>(context.rawBatchedInputIds[i].size());
+        int32_t computedLength = context.promptLengths[i];
+        totalReusedTokens += (rawPromptLength - computedLength);
+        totalComputedTokens += computedLength;
+        totalGeneratedTokens += context.currentGenerateLengths[i];
+        totalIterations += context.actualIterations[i];
+    }
+    mPrefillMetrics.recordRun(totalReusedTokens, totalComputedTokens);
+    mEagleGenerationMetrics.recordRun(totalIterations, totalGeneratedTokens);
 
     // Save output ids and decoded texts to response.
     response.outputIds.clear();
     response.outputTexts.clear();
-    for (int32_t i = 0; i < kRUNTIME_BATCH_SIZE; ++i)
+    for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        auto const acception_rate = (float) context.currentGenerateLength / context.generationRound;
-        LOG_INFO("Acception_rate: %f newLen: %d iterNum: %d\n", acception_rate, context.currentGenerateLength,
-            context.generationRound);
+        // Log acceptance metrics for this batch using its actual iterations
+        // actualIterations[i] tracks how many rounds this specific sequence participated in before finishing
+        // Note: Prefill generates 1 token but is not counted as an iteration.
+        // To calculate true acceptance rate (tokens accepted per verification round), we need to:
+        // 1. Subtract the 1 prefill token from currentGenerateLengths
+        // 2. Divide by actualIterations (which counts verification rounds only)
+        int32_t const verificationTokens = context.currentGenerateLengths[i] > 0
+            ? context.currentGenerateLengths[i] - 1 // Subtract the 1 prefill token
+            : 0;
+        float const acceptanceRate = context.actualIterations[i] > 0
+            ? static_cast<float>(verificationTokens) / static_cast<float>(context.actualIterations[i])
+            : 0.0f;
+        LOG_INFO("Batch %d - Acceptance rate: %.3f, Generated tokens: %d, Iterations: %d", i, acceptanceRate,
+            context.currentGenerateLengths[i], context.actualIterations[i]);
 
-        response.outputIds.emplace_back(context.tokenIds.begin() + computedTokenLength, context.tokenIds.end());
+        // Extract only the generated tokens (skip prompt and padding)
+        // Generated tokens are the last currentGenerateLengths[i] tokens in the vector
+        int32_t const genLength = context.currentGenerateLengths[i];
+        int32_t const totalLength = static_cast<int32_t>(context.tokenIds[i].size());
+
+        response.outputIds.emplace_back(
+            context.tokenIds[i].begin() + (totalLength - genLength), context.tokenIds[i].end());
+
         response.outputTexts.emplace_back(mTokenizer->decode(response.outputIds[i], true));
     }
 
@@ -399,24 +517,35 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
 {
     TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
 
+    int32_t const activeBatchSize = context.activeBatchSize;
+
     // Prepare the inputs for prefill stage execution.
-    int32_t const inputIdsLength = static_cast<int32_t>(context.tokenIds.size());
+    // All sequences in the batch should have the same padded length
+    int32_t const inputIdsLength = static_cast<int32_t>(context.tokenIds[0].size());
     if (inputIdsLength > mBaseEngineConfig.maxSupportedInputLength)
     {
         LOG_ERROR("Input ids length %d is greater than the max supported input length %d", inputIdsLength,
             mBaseEngineConfig.maxSupportedInputLength);
         return false;
     }
-    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, inputIdsLength});
-    mContextLengthsInput.reshape({kRUNTIME_BATCH_SIZE});
-    mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, inputIdsLength, mBaseEngineConfig.outputHiddenDim});
-    mLogitsOutput.reshape({kRUNTIME_BATCH_SIZE, mBaseEngineConfig.vocabSize});
+
+    mIdsInput.reshape({activeBatchSize, inputIdsLength});
+    mContextLengthsInput.reshape({activeBatchSize});
+    mBaseHiddenStatesOutput.reshape({activeBatchSize, inputIdsLength, mBaseEngineConfig.outputHiddenDim});
+    mLogitsOutput.reshape({activeBatchSize, mBaseEngineConfig.vocabSize});
 
     // Setup the input tensors. ContextLen input is on CPU.
     int32_t* ctxLenData = mContextLengthsInput.dataPointer<int32_t>();
-    ctxLenData[0] = inputIdsLength;
-    CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), context.tokenIds.data(), inputIdsLength * sizeof(int32_t),
-        cudaMemcpyHostToDevice, context.stream));
+    int32_t* idsInputData = mIdsInput.dataPointer<int32_t>();
+
+    // Pack all sequences into the input tensor
+    // Use actual prompt length (not padded length) for context_lengths to ensure we select the last real token
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        ctxLenData[i] = context.promptLengths[i]; // Use actual prompt length instead of padded length
+        CUDA_CHECK(cudaMemcpyAsync(idsInputData + i * inputIdsLength, context.tokenIds[i].data(),
+            inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    }
 
     bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(mIdsInput, mContextLengthsInput,
         context.multimodalEmbeddings, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
@@ -426,19 +555,27 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
         return false;
     }
 
-    // Sampling from the Prefill stage logits using greedy Top1 sampling, only collect the top1 index.
-    mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, 1});
+    // Sampling from the Prefill stage logits using greedy Top1 sampling for each sequence，only collect the top1 index.
+    mSamplingIndices.reshape({activeBatchSize, 1});
     constexpr int32_t kSAMPLING_TOP_K = 1;
     selectAllTopK(mLogitsOutput, std::nullopt, mSamplingIndices, kSAMPLING_TOP_K, mSamplingWorkspace, context.stream);
 
-    // Pull the sampling indices from device to host.
-    int32_t selectedTokenId;
-    CUDA_CHECK(cudaMemcpyAsync(
-        &selectedTokenId, mSamplingIndices.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
+    // Pull the sampling indices from device to host for all sequences
+    std::vector<int32_t> selectedTokenIds(activeBatchSize);
+    CUDA_CHECK(cudaMemcpyAsync(selectedTokenIds.data(), mSamplingIndices.rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
-    context.tokenIds.push_back(selectedTokenId);
-    context.currentGenerateLength += 1;
+    // Update tokenIds and generation length for each sequence
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        if (!context.finishedStates[i])
+        {
+            context.tokenIds[i].push_back(selectedTokenIds[i]);
+            context.currentGenerateLengths[i] += 1;
+        }
+    }
+
     // The base prefill function produce output logits and (concatenated) hiddenStates for next step to use.
     return true;
 }
@@ -447,29 +584,42 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
 {
     TIME_STAGE(metrics::StageNames::kEAGLE_DRAFT_PREFILL, context.stream);
 
+    int32_t const activeBatchSize = context.activeBatchSize;
+
     // Implement the draft prefill execution logic, prepare the input ids and hidden states inputs for the
     // eagle draft engine. The formulation of the feature "vector" is F_n = F(H_n, Token_{n+1}), therefore we
     // need to trim out the first token of the sequence from the token_ids input.
-    int32_t const inputIdsLength = static_cast<int32_t>(context.tokenIds.size()) - 1;
-    check::check(mBaseHiddenStatesOutput.getShape()[1] == inputIdsLength,
-        "BaseHiddenStatesOutput shall match with inputIdsLength");
+    // All sequences should have the same padded length
+    // After base prefill: context.tokenIds has N+1 tokens, mBaseHiddenStatesOutput has N hidden states
+    int32_t const inputIdsLength = static_cast<int32_t>(context.tokenIds[0].size()) - 1;
+    check::check(mBaseHiddenStatesOutput.getShape()[0] == activeBatchSize
+            && mBaseHiddenStatesOutput.getShape()[1] == inputIdsLength,
+        "BaseHiddenStatesOutput shape [batch, seq_len, hidden_dim] shall match with [activeBatchSize, inputIdsLength, "
+        "hidden_dim]");
 
     // Prepare input and output tensors.
-    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, inputIdsLength});
-    mDraftHiddenStatesInput.reshape({kRUNTIME_BATCH_SIZE, inputIdsLength, mDraftEngineConfig.draftModelHiddenDim});
-    mLogitsOutput.reshape({kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelVocabSize});
-    mDraftHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelHiddenDim});
+    mIdsInput.reshape({activeBatchSize, inputIdsLength});
+    mDraftHiddenStatesInput.reshape({activeBatchSize, inputIdsLength, mDraftEngineConfig.draftModelHiddenDim});
+    mLogitsOutput.reshape({activeBatchSize, mDraftEngineConfig.draftModelVocabSize});
+    mDraftHiddenStatesOutput.reshape({activeBatchSize, mDraftEngineConfig.draftModelHiddenDim});
 
     // Clear garbage data in the draft hidden inputs.
     CUDA_CHECK(cudaMemsetAsync(
         mDraftHiddenStatesInput.rawPointer(), 0, mDraftHiddenStatesInput.getMemoryCapacity(), context.stream));
-    // Shift the data pointer by 1 to start from the second token.
-    int32_t const* inputIdsData = context.tokenIds.data() + 1;
-    CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), inputIdsData, inputIdsLength * sizeof(int32_t),
-        cudaMemcpyHostToDevice, context.stream));
+
+    // Copy input IDs for each batch
+    int32_t* idsInputData = mIdsInput.dataPointer<int32_t>();
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        // Shift the data pointer by 1 to start from the second token for each batch
+        int32_t const* inputIdsData = context.tokenIds[i].data() + 1;
+        CUDA_CHECK(cudaMemcpyAsync(idsInputData + i * inputIdsLength, inputIdsData, inputIdsLength * sizeof(int32_t),
+            cudaMemcpyHostToDevice, context.stream));
+    }
 
     bool const prefillSuccess = mDraftEngineRunner->executeEaglePrefillStep(mIdsInput, mBaseHiddenStatesOutput,
-        mDraftHiddenStatesInput, context.multimodalEmbeddings, mLogitsOutput, mDraftHiddenStatesOutput, context.stream);
+        mDraftHiddenStatesInput, mContextLengthsInput, context.multimodalEmbeddings, mLogitsOutput,
+        mDraftHiddenStatesOutput, context.stream);
     if (!prefillSuccess)
     {
         LOG_ERROR("Failed to execute prefill step for draft model.");
@@ -484,21 +634,39 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
 {
     TIME_STAGE(metrics::StageNames::kEAGLE_CONSTRUCT_DRAFT_TREE, context.stream);
 
+    int32_t const activeBatchSize = context.activeBatchSize;
+
     // Core logic for eagle speculative decoding, construct the draft tree in an auto-regressive manner./
     // Inputs: Logits (mLogitsOutput) and draft hidden states (mDraftHiddenStatesOutput) from draft prefill
     // or draft model accept decoding operation.
     // Construct the draft tree table with multiple round of drafting. The descriptions of the draft tree are
     // stored in mDraftTokenIdsTable, mDraftTokenScoreTable, mDraftTokenPredecessorTable.
 
-    // Record root token (last committed token selected by base model) id for the draft tree.
-    int32_t const rootTokenId = context.tokenIds.back();
-    CUDA_CHECK(cudaMemcpyAsync(
-        mDraftTreeRootTokenId.rawPointer(), &rootTokenId, sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+    // Reshape draft tree tensors to match activeBatchSize for dynamic batching
+    int32_t const draftTopK = mDraftingConfig.draftingTopK;
+    int32_t const draftFullTableLength = static_cast<int32_t>(mDraftTokenIdsFullTable.getShape()[1]);
+    mDraftTokenIdsFullTable.reshape({activeBatchSize, draftFullTableLength});
+    mDraftTokenScoreFullTable.reshape({activeBatchSize, draftFullTableLength});
+    mDraftTokenPredecessorFullTable.reshape({activeBatchSize, draftFullTableLength});
+    mDraftTreeRootTokenId.reshape({activeBatchSize});
+    mDraftVocabMappingTable.reshape({activeBatchSize, mDraftEngineConfig.draftModelVocabSize});
+    mDraftTokenIdsTable.reshape({activeBatchSize, draftTopK * draftTopK});
+    mDraftTokenScoresTable.reshape({activeBatchSize, draftTopK * draftTopK});
+    mDraftTokenIntermediateScores.reshape({activeBatchSize, draftTopK});
+    mDraftTokenIntermediateParents.reshape({activeBatchSize, draftTopK});
+
+    // Record root token (last committed token selected by base model) id for the draft tree for each batch.
+    std::vector<int32_t> rootTokenIds(activeBatchSize);
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        rootTokenIds[i] = context.tokenIds[i].back();
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mDraftTreeRootTokenId.rawPointer(), rootTokenIds.data(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
     // Sampling from the logits output, collect draftTopK tokens as first level under "root".
-    int32_t const draftTopK = mDraftingConfig.draftingTopK;
-    mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
-    mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
+    mSamplingIndices.reshape({activeBatchSize, draftTopK});
+    mSamplingScores.reshape({activeBatchSize, draftTopK});
     selectAllTopK(
         mLogitsOutput, std::ref(mSamplingScores), mSamplingIndices, draftTopK, mSamplingWorkspace, context.stream);
 
@@ -514,17 +682,18 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
     // Construct input tensors to feed into the eagle draft engine. With current implementation, for simplicity, we
     // will use padded input and only collect results from indices we need.
     int32_t const paddedDraftTreeSize = mDraftingConfig.draftingStep * draftTopK;
-    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
-    mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, mBaseEngineConfig.outputHiddenDim});
-    mDraftHiddenStatesInput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
-    mDraftTreeSize.reshape({kRUNTIME_BATCH_SIZE});
-    mDraftTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, paddedDraftTreeSize});
+    mIdsInput.reshape({activeBatchSize, paddedDraftTreeSize});
+    mBaseHiddenStatesOutput.reshape({activeBatchSize, paddedDraftTreeSize, mBaseEngineConfig.outputHiddenDim});
+    mDraftHiddenStatesInput.reshape({activeBatchSize, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
+    mDraftTreeSize.reshape({activeBatchSize});
+    mDraftTreeMask.reshape({activeBatchSize, paddedDraftTreeSize, paddedDraftTreeSize});
     // Assemble the initial draft tree input here since we need to copy out the data in draftHiddenStatesOutput prior to
     // reshaping it.
     kernel::assembleInitialDraftTreeInput(mDraftTokenIdsFullTable, mDraftHiddenStatesOutput, mIdsInput,
         mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, draftTopK, context.stream);
-    mLogitsOutput.reshape({draftTopK, mDraftEngineConfig.draftModelVocabSize});
-    mDraftHiddenStatesOutput.reshape({draftTopK, mDraftEngineConfig.draftModelHiddenDim});
+    // Output tensors must be 3D: [batch_size, num_tokens, vocab_size/hidden_dim] for draft proposal
+    mLogitsOutput.reshape({activeBatchSize, draftTopK, mDraftEngineConfig.draftModelVocabSize});
+    mDraftHiddenStatesOutput.reshape({activeBatchSize, draftTopK, mDraftEngineConfig.draftModelHiddenDim});
 
     for (int32_t round = 0; round < mDraftingConfig.draftingStep - 1; round++)
     {
@@ -539,8 +708,8 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
         {
             // Last round of drafting produce draftTopK x draftTopK candidate token for the layer, we need to pick the
             // top draftTopK, assemble input tensors, and save intermediate information.
-            mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
-            mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
+            mSamplingIndices.reshape({activeBatchSize, draftTopK});
+            mSamplingScores.reshape({activeBatchSize, draftTopK});
             selectAllTopK(mDraftTokenScoresTable, std::ref(mSamplingScores), mSamplingIndices, draftTopK,
                 mSamplingWorkspace, context.stream);
             kernel::assembleDraftTreeInput(mDraftTokenIdsTable, mDraftHiddenStatesOutput, mSamplingIndices, mIdsInput,
@@ -548,6 +717,10 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
             kernel::assembleIntermediateData(mSamplingScores, mSamplingIndices, mDraftTokenIntermediateScores,
                 mDraftTokenIntermediateParents, draftTopK, round, context.stream);
         }
+
+        // Ensure output tensors are 3D before calling draft proposal
+        mLogitsOutput.reshape({activeBatchSize, draftTopK, mDraftEngineConfig.draftModelVocabSize});
+        mDraftHiddenStatesOutput.reshape({activeBatchSize, draftTopK, mDraftEngineConfig.draftModelHiddenDim});
 
         // Invoke the eagle draft engine to produce the new round of logits and hidden states.
         bool const draftProposalStatus = mDraftEngineRunner->executeEagleDraftProposalStep(mIdsInput,
@@ -559,16 +732,19 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
             return false;
         }
         // Collect TopK results from each lane of output logits.
-        // mLogitsOutput is already shaped as {draftTopK, vocabSize} which matches {kRUNTIME_BATCH_SIZE * draftTopK,
-        // vocabSize} since kRUNTIME_BATCH_SIZE = 1
-        mSamplingIndices.reshape({draftTopK, draftTopK});
-        mSamplingScores.reshape({draftTopK, draftTopK});
+        // mLogitsOutput is now 3D: {activeBatchSize, draftTopK, vocabSize}
+        // Reshape to 2D for selectAllTopK: {activeBatchSize * draftTopK, vocabSize}
+        mLogitsOutput.reshape({activeBatchSize * draftTopK, mDraftEngineConfig.draftModelVocabSize});
+        mDraftHiddenStatesOutput.reshape({activeBatchSize * draftTopK, mDraftEngineConfig.draftModelHiddenDim});
+        mSamplingIndices.reshape({activeBatchSize * draftTopK, draftTopK});
+        mSamplingScores.reshape({activeBatchSize * draftTopK, draftTopK});
         selectAllTopK(
             mLogitsOutput, std::ref(mSamplingScores), mSamplingIndices, draftTopK, mSamplingWorkspace, context.stream);
 
-        // Reshape back to the expected format for subsequent kernel calls
-        mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, draftTopK * draftTopK});
-        mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK * draftTopK});
+        // Reshape sampling indices/scores back to the expected format for subsequent kernel calls
+        // Note: mDraftHiddenStatesOutput stays in 2D format for assembleDraftTreeInput in next round
+        mSamplingIndices.reshape({activeBatchSize, draftTopK * draftTopK});
+        mSamplingScores.reshape({activeBatchSize, draftTopK * draftTopK});
 
         // Update the draft tree tables with the new topK results. translate draft vocab token towards full vocab size.
         kernel::computeCuScoresAndTranslateToken(mSamplingIndices, mSamplingScores, mDraftTokenIntermediateScores,
@@ -581,12 +757,12 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
 
     // We have constructed the data structure for the draft table, now we need to pick the top candidates and produce
     // the verify tree and pass into the base model for verification.
-    mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize});
+    mSamplingIndices.reshape({activeBatchSize, mDraftingConfig.verifyTreeSize});
     selectAllTopK(mDraftTokenScoreFullTable, std::nullopt, mSamplingIndices, mDraftingConfig.verifyTreeSize,
         mSamplingWorkspace, context.stream);
 
-    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize});
-    mDraftTreeMask.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});
+    mIdsInput.reshape({activeBatchSize, mDraftingConfig.verifyTreeSize});
+    mDraftTreeMask.reshape({activeBatchSize, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});
     kernel::constructVerificationDraftTree(mDraftTokenIdsFullTable, mDraftTokenPredecessorFullTable, mSamplingIndices,
         mIdsInput, mDraftTreeMask, context.stream);
 
@@ -598,17 +774,22 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
 {
     TIME_STAGE(metrics::StageNames::kEAGLE_BASE_VERIFICATION, context.stream);
 
+    int32_t const activeBatchSize = context.activeBatchSize;
+
     // This function will consume idsInput and draftTreeMask. Use base model to verify the draft tree.
     // We need to collect the logits and hidden states (for further drafting step).
     check::check(
-        mIdsInput.getShape()[0] == kRUNTIME_BATCH_SIZE && mIdsInput.getShape()[1] == mDraftingConfig.verifyTreeSize,
+        mIdsInput.getShape()[0] == activeBatchSize && mIdsInput.getShape()[1] == mDraftingConfig.verifyTreeSize,
         "IdsInput shall have shape [batch_size, verify_tree_size]");
-    check::check(mDraftTreeMask.getShape()[0] == kRUNTIME_BATCH_SIZE
+    check::check(mDraftTreeMask.getShape()[0] == activeBatchSize
             && mDraftTreeMask.getShape()[1] == mDraftingConfig.verifyTreeSize
             && mDraftTreeMask.getShape()[2] == mDraftingConfig.verifyTreeSize,
         "DraftTreeMask shall have shape [batch_size, verify_tree_size, verify_tree_size]");
-    mLogitsOutput.reshape({mDraftingConfig.verifyTreeSize, mBaseEngineConfig.vocabSize});
-    mBaseHiddenStatesOutput.reshape({mDraftingConfig.verifyTreeSize, mBaseEngineConfig.outputHiddenDim});
+
+    // Engine expects 2D tensors: [batch_size * verify_tree_size, vocab_size/hidden_dim]
+    int32_t const selectTokenSize = activeBatchSize * mDraftingConfig.verifyTreeSize;
+    mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.vocabSize});
+    mBaseHiddenStatesOutput.reshape({selectTokenSize, mBaseEngineConfig.outputHiddenDim});
 
     bool const verifySuccess = mBaseEngineRunner->executeEagleBaseTreeDecodingStep(
         mIdsInput, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, context.stream);
@@ -617,6 +798,13 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
         LOG_ERROR("Failed to execute base tree verification step for base model.");
         return false;
     }
+
+    // Reshape accepted token tensors to match activeBatchSize for dynamic batching
+    int32_t const maxAcceptDepth = mDraftingConfig.draftingStep + 1;
+    mAcceptedTokenIds.reshape({activeBatchSize, maxAcceptDepth});
+    mAcceptedTokenIndices.reshape({activeBatchSize, maxAcceptDepth});
+    mAcceptLength.reshape({activeBatchSize});
+
     // Collected accepted token ids and indices. Use sampling workspace for eagle accept process.
     kernel::eagleAccept(mLogitsOutput, mIdsInput, mDraftTreeMask, mAcceptedTokenIds, mAcceptedTokenIndices,
         mAcceptLength, mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream);
@@ -626,58 +814,99 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // accepted).
     rt::Tensor const& kvCacheLengths = mBaseEngineRunner->getLinearKVCache().getKVCacheLengths();
     rt::Tensor kvCacheTensor = mBaseEngineRunner->getLinearKVCache().getKVCacheBuffer();
-    // Temporarily reshape hiddenState from 2D [verifyTreeSize, hiddenDim] to 3D [batch, verifyTreeSize, hiddenDim]
-    // for kernel compatibility (kernel expects 3D, but base engine outputs 2D)
-    check::check(kRUNTIME_BATCH_SIZE == 1, "kRUNTIME_BATCH_SIZE must equal 1 for single-batch reshape operation");
+
+    // Reshape input hidden states from 2D [batch*verify_tree_size, hidden_dim] to 3D [batch, verify_tree_size,
+    // hidden_dim]
     mBaseHiddenStatesOutput.reshape(
-        {kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize, mBaseEngineConfig.outputHiddenDim});
+        {activeBatchSize, mDraftingConfig.verifyTreeSize, mBaseEngineConfig.outputHiddenDim});
+
+    // INPLACE update: The kernel will update accepted tokens directly within the same buffer.
+    //
+    // Memory layout transformation (inplace):
+    //   Before: [Batch0: Token0...Token59][Batch1: Token0...Token59]...  =(stride=60 per batch)
+    //   After:  [Batch0: SelectedToken0...SelectedToken6][Batch1: SelectedToken0...SelectedToken6]... (Select and pad
+    //   to stride=maxAcceptDepth 7)
     kernel::eagleBaseCommitKVCacheAndAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, kvCacheTensor, mBaseHiddenStatesOutput, context.stream);
+
     mBaseEngineRunner->getLinearKVCache().commitSequenceLength(mAcceptLength, context.stream);
 
-    int32_t acceptLength;
-    std::vector<int32_t> acceptedTokenIds(mAcceptedTokenIds.getShape().volume());
-    // Pull collected results from device to host record the selected tokens.
-    CUDA_CHECK(cudaMemcpyAsync(
-        &acceptLength, mAcceptLength.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
+    // Reshape to reflect the compacted layout [batch, maxAcceptDepth, hiddenDim]
+    mBaseHiddenStatesOutput.reshape({activeBatchSize, maxAcceptDepth, mBaseEngineConfig.outputHiddenDim});
+
+    // Pull collected results from device to host for all batches
+    std::vector<int32_t> acceptLengths(activeBatchSize);
+    std::vector<int32_t> acceptedTokenIds(activeBatchSize * maxAcceptDepth);
+
+    CUDA_CHECK(cudaMemcpyAsync(acceptLengths.data(), mAcceptLength.rawPointer(), activeBatchSize * sizeof(int32_t),
+        cudaMemcpyDeviceToHost, context.stream));
     CUDA_CHECK(cudaMemcpyAsync(acceptedTokenIds.data(), mAcceptedTokenIds.rawPointer(),
-        mAcceptedTokenIds.getShape().volume() * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
+        activeBatchSize * maxAcceptDepth * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
-    for (int32_t i = 0; i < acceptLength; i++)
+    // Update tokenIds and check for EOS for each batch
+    for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
     {
-        context.tokenIds.push_back(acceptedTokenIds[i]);
-    }
-    context.currentGenerateLength += acceptLength;
+        if (context.finishedStates[batchIdx])
+            continue;
 
-    // Produce base model hidden states for the next step. Reshape to accepted length.
-    // FIXME: Perform the reshape but model input and output for hidden states have different semantics.
-    // The function produce hidden states (mBaseHiddenStatesOutput) and input ids (attached in inference context).
-    mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, acceptLength, mBaseEngineConfig.outputHiddenDim});
+        int32_t const acceptLength = acceptLengths[batchIdx];
+        // update iterations for each batch
+        if (acceptLength > 0)
+        {
+            context.actualIterations[batchIdx] += 1;
+        }
+        for (int32_t i = 0; i < acceptLength; i++)
+        {
+            int32_t const token = acceptedTokenIds[batchIdx * maxAcceptDepth + i];
+            context.tokenIds[batchIdx].push_back(token);
+            context.currentGenerateLengths[batchIdx]++;
+
+            if (token == mTokenizer->getEosId())
+            {
+                context.finishedStates[batchIdx] = true;
+                LOG_DEBUG("Batch %d encountered EOS (token %d) at generation round %d", batchIdx, token,
+                    context.generationRound);
+                break;
+            }
+        }
+    }
+
+    // Produce base model hidden states for the next step
+    // Note: Hidden states shape is already set by the kernel
     return true;
 }
 
 bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInferenceContext& context)
 {
+    int32_t const activeBatchSize = context.activeBatchSize;
+
     // Base model verifiction function is responsible for producing the output with correct shape.
+    // Shape is [activeBatchSize, accepted_length, hidden_dim]
     int64_t const inputIdsLength = mBaseHiddenStatesOutput.getShape()[1];
 
     // Prepare input and output tensors.
-    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, inputIdsLength});
-    mDraftHiddenStatesInput.reshape({kRUNTIME_BATCH_SIZE, inputIdsLength, mDraftEngineConfig.draftModelHiddenDim});
-    mLogitsOutput.reshape({kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelVocabSize});
-    mDraftHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelHiddenDim});
+    mIdsInput.reshape({activeBatchSize, inputIdsLength});
+    mDraftHiddenStatesInput.reshape({activeBatchSize, inputIdsLength, mDraftEngineConfig.draftModelHiddenDim});
+    mLogitsOutput.reshape({activeBatchSize, mDraftEngineConfig.draftModelVocabSize});
+    mDraftHiddenStatesOutput.reshape({activeBatchSize, mDraftEngineConfig.draftModelHiddenDim});
 
     // Clear garbage data in the draft hidden inputs.
     CUDA_CHECK(cudaMemsetAsync(
         mDraftHiddenStatesInput.rawPointer(), 0, mDraftHiddenStatesInput.getMemoryCapacity(), context.stream));
 
-    // Prepare the IdsInput, we need to copy from mAcceptedTokenIds.
-    CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), mAcceptedTokenIds.rawPointer(), inputIdsLength * sizeof(int32_t),
-        cudaMemcpyDeviceToDevice, context.stream));
+    // Prepare the IdsInput, we need to copy from mAcceptedTokenIds for each batch.
+    // mAcceptedTokenIds is [activeBatchSize, maxAcceptDepth], we copy the first inputIdsLength tokens
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<int32_t*>(mIdsInput.rawPointer()) + i * inputIdsLength,
+            static_cast<int32_t*>(mAcceptedTokenIds.rawPointer()) + i * mAcceptedTokenIds.getShape()[1],
+            inputIdsLength * sizeof(int32_t), cudaMemcpyDeviceToDevice, context.stream));
+    }
 
-    bool const acceptTokenSuccess = mDraftEngineRunner->executeEagleAcceptDecodeTokenStep(mIdsInput,
-        mBaseHiddenStatesOutput, mDraftHiddenStatesInput, mLogitsOutput, mDraftHiddenStatesOutput, context.stream);
+    bool const acceptTokenSuccess
+        = mDraftEngineRunner->executeEagleAcceptDecodeTokenStep(mIdsInput, mBaseHiddenStatesOutput,
+            mDraftHiddenStatesInput, mAcceptLength, mLogitsOutput, mDraftHiddenStatesOutput, context.stream);
     if (!acceptTokenSuccess)
     {
         LOG_ERROR("Failed to execute accept token step for draft model.");
@@ -691,30 +920,36 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInference
 bool LLMInferenceSpecDecodeRuntime::captureDraftProposalCudaGraph(cudaStream_t stream)
 {
     bool captureStatus{true};
-
     int32_t const draftTopK = mDraftingConfig.draftingTopK;
-    mSamplingIndices.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
-    mSamplingScores.reshape({kRUNTIME_BATCH_SIZE, draftTopK});
     int32_t const paddedDraftTreeSize = mDraftingConfig.draftingStep * draftTopK;
-    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize});
-    mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, mBaseEngineConfig.outputHiddenDim});
-    mDraftHiddenStatesInput.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
-    mDraftTreeSize.reshape({kRUNTIME_BATCH_SIZE});
-    mDraftTreeMask.reshape({kRUNTIME_BATCH_SIZE, paddedDraftTreeSize, paddedDraftTreeSize});
-    mLogitsOutput.reshape({draftTopK, mDraftEngineConfig.draftModelVocabSize});
-    mDraftHiddenStatesOutput.reshape({draftTopK, mDraftEngineConfig.draftModelHiddenDim});
 
-    // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
-    captureStatus &= mDraftEngineRunner->captureEagleDraftProposalCudaGraph(mIdsInput, mBaseHiddenStatesOutput,
-        mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, mLogitsOutput, mDraftHiddenStatesOutput, stream);
+    // Capture CUDA graph for all supported batch sizes
+    for (int32_t batchSize = 1; batchSize <= mMaxRuntimeBatchSize; ++batchSize)
+    {
+        mSamplingIndices.reshape({batchSize, draftTopK});
+        mSamplingScores.reshape({batchSize, draftTopK});
+        mIdsInput.reshape({batchSize, paddedDraftTreeSize});
+        mBaseHiddenStatesOutput.reshape({batchSize, paddedDraftTreeSize, mBaseEngineConfig.outputHiddenDim});
+        mDraftHiddenStatesInput.reshape({batchSize, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
+        mDraftTreeSize.reshape({batchSize});
+        mDraftTreeMask.reshape({batchSize, paddedDraftTreeSize, paddedDraftTreeSize});
+        // Output tensors must be 3D: [batch_size, num_tokens, vocab_size/hidden_dim] not 2D
+        mLogitsOutput.reshape({batchSize, draftTopK, mDraftEngineConfig.draftModelVocabSize});
+        mDraftHiddenStatesOutput.reshape({batchSize, draftTopK, mDraftEngineConfig.draftModelHiddenDim});
+
+        // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
+        captureStatus &= mDraftEngineRunner->captureEagleDraftProposalCudaGraph(mIdsInput, mBaseHiddenStatesOutput,
+            mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, mLogitsOutput, mDraftHiddenStatesOutput, stream);
+    }
 
     if (captureStatus)
     {
-        LOG_INFO("Successfully captured the draft proposal CUDA graph.");
+        LOG_INFO(
+            "Successfully captured the draft proposal CUDA graph for all batch sizes (1-%d).", mMaxRuntimeBatchSize);
     }
     else
     {
-        LOG_WARNING("Failed to capture the draft proposal CUDA graph.");
+        LOG_WARNING("Failed to capture the draft proposal CUDA graph for some batch sizes.");
     }
 
     return captureStatus;
@@ -723,32 +958,45 @@ bool LLMInferenceSpecDecodeRuntime::captureDraftProposalCudaGraph(cudaStream_t s
 bool LLMInferenceSpecDecodeRuntime::captureDraftAcceptDecodeTokenCudaGraph(cudaStream_t stream)
 {
     bool captureStatus{true};
-
     int32_t const draftingStep = mDraftingConfig.draftingStep;
 
-    mLogitsOutput.reshape({kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelVocabSize});
-    mDraftHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, mDraftEngineConfig.draftModelHiddenDim});
-
-    // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
-    for (int32_t acceptLength = 1; acceptLength <= draftingStep + 1; acceptLength++)
+    // Capture CUDA graph for all supported batch sizes and accept lengths
+    for (int32_t batchSize = 1; batchSize <= mMaxRuntimeBatchSize; ++batchSize)
     {
-        mBaseHiddenStatesOutput.reshape({kRUNTIME_BATCH_SIZE, acceptLength, mBaseEngineConfig.outputHiddenDim});
-        mIdsInput.reshape({kRUNTIME_BATCH_SIZE, acceptLength});
-        mDraftHiddenStatesInput.reshape({kRUNTIME_BATCH_SIZE, acceptLength, mDraftEngineConfig.draftModelHiddenDim});
+        mLogitsOutput.reshape({batchSize, mDraftEngineConfig.draftModelVocabSize});
+        mDraftHiddenStatesOutput.reshape({batchSize, mDraftEngineConfig.draftModelHiddenDim});
 
-        captureStatus &= mDraftEngineRunner->captureEagleAcceptDecodeTokenCudaGraph(mIdsInput, mBaseHiddenStatesOutput,
-            mDraftHiddenStatesInput, mLogitsOutput, mDraftHiddenStatesOutput, stream);
+        // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
+        // TODO: consider using a single capture for max accept lengths.
+        for (int32_t acceptLength = 1; acceptLength <= draftingStep + 1; acceptLength++)
+        {
+            mBaseHiddenStatesOutput.reshape({batchSize, acceptLength, mBaseEngineConfig.outputHiddenDim});
+            mIdsInput.reshape({batchSize, acceptLength});
+            mDraftHiddenStatesInput.reshape({batchSize, acceptLength, mDraftEngineConfig.draftModelHiddenDim});
+
+            // Create a temporary acceptLength tensor for CUDA graph capture
+            // All batches use the same acceptLength during graph capture
+            mAcceptLength.reshape({batchSize});
+            std::vector<int32_t> acceptLengthsVec(batchSize, acceptLength);
+            CUDA_CHECK(cudaMemcpyAsync(mAcceptLength.rawPointer(), acceptLengthsVec.data(), batchSize * sizeof(int32_t),
+                cudaMemcpyHostToDevice, stream));
+
+            captureStatus
+                &= mDraftEngineRunner->captureEagleAcceptDecodeTokenCudaGraph(mIdsInput, mBaseHiddenStatesOutput,
+                    mDraftHiddenStatesInput, mAcceptLength, mLogitsOutput, mDraftHiddenStatesOutput, stream);
+        }
     }
 
     if (captureStatus)
     {
         LOG_INFO(
-            "Successfully captured the draft accept decode token CUDA "
-            "graph.");
+            "Successfully captured the draft accept decode token CUDA graph for all batch sizes (1-%d) and accept "
+            "lengths (1-%d).",
+            mMaxRuntimeBatchSize, draftingStep + 1);
     }
     else
     {
-        LOG_WARNING("Failed to capture the draft accept decode token CUDA graph.");
+        LOG_WARNING("Failed to capture the draft accept decode token CUDA graph for some combinations.");
     }
 
     return captureStatus;
@@ -758,23 +1006,30 @@ bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_
 {
     bool captureStatus{true};
 
-    mLogitsOutput.reshape({mDraftingConfig.verifyTreeSize, mBaseEngineConfig.vocabSize});
-    mBaseHiddenStatesOutput.reshape({mDraftingConfig.verifyTreeSize, mBaseEngineConfig.outputHiddenDim});
+    // Capture CUDA graph for all supported batch sizes
+    for (int32_t batchSize = 1; batchSize <= mMaxRuntimeBatchSize; ++batchSize)
+    {
+        // Engine expects 2D tensors: [batch_size * verify_tree_size, vocab_size/hidden_dim]
+        int32_t const selectTokenSize = batchSize * mDraftingConfig.verifyTreeSize;
+        mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.vocabSize});
+        mBaseHiddenStatesOutput.reshape({selectTokenSize, mBaseEngineConfig.outputHiddenDim});
 
-    mIdsInput.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize});
-    mDraftTreeMask.reshape({kRUNTIME_BATCH_SIZE, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});
+        mIdsInput.reshape({batchSize, mDraftingConfig.verifyTreeSize});
+        mDraftTreeMask.reshape({batchSize, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});
 
-    // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
-    captureStatus &= mBaseEngineRunner->captureEagleBaseTreeDecodingCudaGraph(
-        mIdsInput, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, stream);
+        // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
+        captureStatus &= mBaseEngineRunner->captureEagleBaseTreeDecodingCudaGraph(
+            mIdsInput, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, stream);
+    }
 
     if (captureStatus)
     {
-        LOG_INFO("Successfully captured the base model verification CUDA graph.");
+        LOG_INFO("Successfully captured the base model verification CUDA graph for all batch sizes (1-%d).",
+            mMaxRuntimeBatchSize);
     }
     else
     {
-        LOG_WARNING("Failed to capture the base model verification CUDA graph.");
+        LOG_WARNING("Failed to capture the base model verification CUDA graph for some batch sizes.");
     }
 
     return captureStatus;
@@ -782,6 +1037,7 @@ bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_
 
 bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInferenceContext& context)
 {
+    int32_t const activeBatchSize = context.activeBatchSize;
     std::vector<std::vector<int32_t>> const& batchedInputIds = context.rawBatchedInputIds;
     std::vector<std::vector<int32_t>> processedInputIds;
     std::vector<int32_t> processedIdsLengths;
@@ -792,14 +1048,18 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     rt::Tensor kvCacheBufferDraft = linearKVCacheDraft.getKVCacheBuffer();
 
     // Record the length of the reused KVCache for each sequence.
-    rt::Tensor reuseKVCacheLengths = rt::Tensor({kRUNTIME_BATCH_SIZE}, rt::DeviceType::kCPU, DataType::kINT32);
+    // Use activeBatchSize (actual request size)
+    rt::Tensor reuseKVCacheLengths = rt::Tensor({activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
     int32_t* reuseKVCacheLengthsData = reuseKVCacheLengths.dataPointer<int32_t>();
+
+    // Initialize reuse lengths to 0 for all active sequences
+    std::fill(reuseKVCacheLengthsData, reuseKVCacheLengthsData + activeBatchSize, 0);
 
     // Search if the system prompt has been cached. If there are cached system prompts, insert
     // the pre-computed KVCache and remove the contents from inputIds.
-    for (int32_t i = 0; i < kRUNTIME_BATCH_SIZE; ++i)
+    for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        auto promptHash = hashSystemPrompt(context.systemPrompt);
+        auto promptHash = hashSystemPrompt(context.systemPrompts[i]);
         if (mSystemPromptKVCacheBase.find(promptHash) != mSystemPromptKVCacheBase.end())
         {
             auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptHash];
@@ -838,10 +1098,7 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     int32_t const maxInputLength = *std::max_element(processedIdsLengths.begin(), processedIdsLengths.end());
     if (maxInputLength > mBaseEngineConfig.maxSupportedInputLength)
     {
-        LOG_ERROR(
-            "The max input length (%d) exceeds the max supported input length (%d) of "
-            "the LLM "
-            "Engine.",
+        LOG_ERROR("The max input length (%d) exceeds the max supported input length (%d) of the LLM Engine.",
             maxInputLength, mBaseEngineConfig.maxSupportedInputLength);
         return false;
     }
@@ -849,15 +1106,22 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     // The LLM Engine could also have minSupportedInputLength constraint.
     int32_t const packedInputLength = std::max(maxInputLength, mBaseEngineConfig.minSupportedInputLength);
 
-    if (!context.tokenIds.empty())
+    // Initialize tokenIds for each sequence in the batch
+    context.tokenIds.clear();
+    context.tokenIds.resize(activeBatchSize);
+
+    // Save the actual prompt lengths (before padding) for each batch
+    for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        context.tokenIds.clear();
+        context.promptLengths[i] = processedIdsLengths[i];
     }
-    // Pad each sequence to the max length of this batch.
-    // TODO: Support multi-batch input for eagle.
-    // TODO: Implement remove input padding for better efficiency until multi-batch.
-    context.tokenIds.resize(packedInputLength, mTokenizer->getPadId());
-    std::copy(processedInputIds[0].begin(), processedInputIds[0].end(), context.tokenIds.begin());
+
+    // Pad each sequence to the max length of this batch
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        context.tokenIds[i].resize(packedInputLength, mTokenizer->getPadId());
+        std::copy(processedInputIds[i].begin(), processedInputIds[i].end(), context.tokenIds[i].begin());
+    }
 
     linearKVCacheBase.resetForNewSequences(reuseKVCacheLengths, context.stream);
     linearKVCacheDraft.resetForNewSequences(reuseKVCacheLengths, context.stream);
@@ -867,20 +1131,18 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
 
 bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context)
 {
-    // TODO: Enable the system prompt KVCache feature by default and remove this check.
     check::check(mBaseEngineConfig.enableReuseKVCache == mDraftEngineConfig.enableReuseKVCache,
         "The system prompt KVCache feature is not same for base and draft model.");
 
     if (!mBaseEngineConfig.enableReuseKVCache)
     {
-        LOG_ERROR(
-            "The system prompt KVCache feature is not enabled in the base and draft "
-            "engine.");
+        LOG_DEBUG("System prompt KVCache feature is not enabled in the engine.");
         return false;
     }
 
-    std::string const prompt = context.systemPrompt;
-    // hash the prompt if check if the prompt cache already exists.
+    // Check if cache already exists
+    int32_t const batchIdx = context.currentBatchIndex;
+    std::string const prompt = context.systemPrompts[batchIdx];
     size_t const promptHash = hashSystemPrompt(prompt);
     if (mSystemPromptKVCacheBase.find(promptHash) != mSystemPromptKVCacheBase.end()
         && mSystemPromptKVCacheDraft.find(promptHash) != mSystemPromptKVCacheDraft.end())
@@ -890,55 +1152,67 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     }
 
     auto tokenizedPrompt = mTokenizer->encode(prompt, true);
-    int32_t const promptIdsLength = tokenizedPrompt.size();
+    int32_t const promptIdsLength = static_cast<int32_t>(tokenizedPrompt.size());
 
     if (promptIdsLength > mBaseEngineConfig.maxSupportedInputLength
         || promptIdsLength > mDraftEngineConfig.maxSupportedInputLength)
     {
-        LOG_ERROR(
-            "The prompt length (%d) exceeds the max supported input length of the LLM "
-            "BaseEngine(%d) or DraftEngine(%d).",
-            promptIdsLength, mBaseEngineConfig.maxSupportedInputLength, mDraftEngineConfig.maxSupportedInputLength);
+        LOG_ERROR("System prompt length (%d) exceeds max supported input length (base=%d, draft=%d)", promptIdsLength,
+            mBaseEngineConfig.maxSupportedInputLength, mDraftEngineConfig.maxSupportedInputLength);
         return false;
     }
 
-    if (!setUpForPrefillExecution(context))
+    // Create a temporary single-batch context for system prompt KVCache generation
+    // Reuse the existing prefill functions which will use runtime member tensors (mIdsInput, mLogitsOutput, etc.)
+    SpecDecodeInferenceContext tempContext;
+    tempContext.systemPrompts.resize(1);
+    tempContext.systemPrompts[0] = prompt;
+    tempContext.rawBatchedInputIds.emplace_back(tokenizedPrompt);
+    tempContext.tokenIds.resize(1);
+    tempContext.tokenIds[0] = tokenizedPrompt;
+    tempContext.currentGenerateLengths.resize(1, 0);
+    tempContext.promptLengths.resize(1, 0);
+    tempContext.finishedStates.resize(1, false);
+    tempContext.multimodalEmbeddings = context.multimodalEmbeddings;
+    tempContext.generationRound = 0;
+    tempContext.maxGenerateLength = 0; // Not generating, just caching
+    tempContext.activeBatchSize = 1;
+    tempContext.currentBatchIndex = 0;
+    tempContext.stream = context.stream;
+
+    // Setup for prefill execution: handles KV cache reset and applies any reused system prompt cache
+    if (!setUpForPrefillExecution(tempContext))
     {
-        LOG_ERROR(
-            "Prefill execution setup failed. Cannot generate the KVCache for this "
-            "prompt.");
+        LOG_ERROR("Prefill execution setup failed for system prompt KVCache generation.");
         return false;
     }
 
-    bool prefillStatus = runBaseModelPrefill(context);
+    // Run base model prefill (reuses mIdsInput, mLogitsOutput, mBaseHiddenStatesOutput)
+    bool prefillStatus = runBaseModelPrefill(tempContext);
     if (!prefillStatus)
     {
-        LOG_ERROR(
-            "Failed to execute prefill step. Cannot generate the base model KVCache "
-            "for this prompt.");
+        LOG_ERROR("Failed to execute base model prefill for system prompt KVCache generation.");
         return false;
     }
 
-    // During the generation of persistent system prompt KVCache, we already know the ground-truth of next token(the
-    // first token of the user prompt, <|im_start|>). So set it explicitly.
-    check::check(context.tokenIds.size() != 0, "The token IDs should not be empty at this point.");
-    context.tokenIds.back() = mImStartTokenId;
+    // During system prompt KVCache generation, we know the next token is <|im_start|> (first token of user prompt)
+    // Set it explicitly to avoid sampling randomness
+    check::check(!tempContext.tokenIds[0].empty(), "Token IDs should not be empty at this point.");
+    tempContext.tokenIds[0].back() = mImStartTokenId;
 
-    // Tokens produced during system KV-cache reuse prefill do not count as generated tokens.
-    // Only tokens generated from user-prompt prefill are counted.
-    context.currentGenerateLength -= 1;
+    // Tokens produced during system KV-cache reuse prefill do not count as generated tokens
+    tempContext.currentGenerateLengths[0] -= 1;
 
-    bool draftPrefillStatus = runDraftModelPrefill(context);
+    // Run draft model prefill (reuses mIdsInput, mLogitsOutput, mDraftHiddenStatesInput, mDraftHiddenStatesOutput)
+    bool draftPrefillStatus = runDraftModelPrefill(tempContext);
     if (!draftPrefillStatus)
     {
-        LOG_ERROR(
-            "Failed to execute prefill step. Cannot generate the draft model KVCache "
-            "for this prompt.");
+        LOG_ERROR("Failed to execute draft model prefill for system prompt KVCache generation.");
         return false;
     }
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
-    // Copy out the KVCache content from the prefill step.
+    // Copy out the KVCache content from the prefill step
     auto& linearKVCacheBase = mBaseEngineRunner->getLinearKVCache();
     auto& linearKVCacheDraft = mDraftEngineRunner->getLinearKVCache();
     auto cacheConfigBase = linearKVCacheBase.getConfig();
@@ -961,7 +1235,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     savedKVCacheDraft.kvCacheContent
         = rt::Tensor(savedKVCacheShapeDraft, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT);
 
-    // We only process one sequence at a time.
+    // We only process one sequence at a time
     constexpr int32_t CACHE_BATCH_IDX{0};
     kernel::saveKVCacheIntoTensor(savedKVCacheBase.kvCacheContent, kvCacheBufferBase, CACHE_BATCH_IDX, context.stream);
     kernel::saveKVCacheIntoTensor(
@@ -971,7 +1245,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     mSystemPromptKVCacheDraft.insert({promptHash, std::move(savedKVCacheDraft)});
 
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
-    LOG_DEBUG("The KVCache is saved for the prompt: {%s}", prompt.c_str());
+    LOG_DEBUG("System prompt KVCache saved for batch %d: {%s}", batchIdx, prompt.c_str());
 
     return true;
 }
