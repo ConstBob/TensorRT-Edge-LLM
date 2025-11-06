@@ -5,6 +5,8 @@ variables:
   PIPELINE_CACHE_DIR: "$CACHE_BASE_DIR/$CI_PIPELINE_ID"
   TORCH_DIR: "/scratch.trt_llm_data/llm-models"
   TRT_VERSION: "10.13.3.9"
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar" # Defines the location of the analysis task cache
+  GIT_DEPTH: "0" # Tells git to fetch all the branches of the project, required by the analysis task
 
 workflow:
   rules:
@@ -115,6 +117,72 @@ workflow:
 stages:
 - setup
 - test
+- get-binaries
+- build-sonar
+- sonarqube-vulnerability-report
+
+get-binaries:
+  stage: get-binaries
+  image: gcc
+  
+  cache:
+    policy: pull-push
+    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+
+  artifacts:
+    paths:
+      - sonar-scanner/
+    expire_in: 1 hour
+      
+  script:
+    # Download sonar-scanner
+    - if [ ! -d sonar-scanner ]; then
+        curl -sSLo ./sonar-scanner.zip 'https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.0.4584-linux-x64.zip' &&
+        unzip -o sonar-scanner.zip &&
+        mv sonar-scanner-6.2.0.4584-linux-x64 sonar-scanner;
+      fi
+    
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == 'release/1.0.0'
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+build-sonar:
+  stage: build-sonar
+  image: gcc
+  needs:
+    - get-binaries
+
+  
+  cache:
+    policy: pull-push
+    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+      
+  script: sonar-scanner/bin/sonar-scanner
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == 'release/1.0.0'
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+sonarqube-vulnerability-report:
+  stage: sonarqube-vulnerability-report
+  image: gcc
+  script:
+    - 'curl -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=${SONARQUBE_PROJECT_KEY}&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" -o gl-sast-sonar-report.json'
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == 'release/1.0.0'
+    - if: $CI_COMMIT_BRANCH == 'main'
+  artifacts:
+    expire_in: 4 days
+    reports:
+      sast: gl-sast-sonar-report.json
 
 # Pre-commit code quality checks
 pre_commit_checks:
@@ -175,6 +243,8 @@ ampere_model_export:
   extends: .export_onnx_template
   interruptible: true
   rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Model export for Blackwell/Thor (fp8 or fp4)
@@ -193,6 +263,8 @@ blackwell_model_export:
   extends: .export_onnx_template
   interruptible: true
   rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Building and testing with A30 Linux
@@ -215,6 +287,8 @@ a30:
   extends: .x86_test_template
   interruptible: true
   rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Building and testing with RTX5080 Linux
@@ -237,6 +311,8 @@ rtx5080:
     extends: .x86_test_template
     interruptible: true
     rules:
+      - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+        when: never
       - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Building and testing with B100 Linux
@@ -259,6 +335,8 @@ b100:
     extends: .x86_test_template
     interruptible: true
     rules:
+      - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+        when: never
       - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Building and testing with Jetson Orin
@@ -280,6 +358,8 @@ jetson_orin:
   extends: .device_test_template
   interruptible: true
   rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 
@@ -302,6 +382,8 @@ drive_thor_ferrix:
   extends: .device_test_template
   interruptible: true
   rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 pages:
@@ -357,4 +439,3 @@ merge_request_pages_preview:
       - local: .gitlab/ci/pages-merge-request.yml
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    
