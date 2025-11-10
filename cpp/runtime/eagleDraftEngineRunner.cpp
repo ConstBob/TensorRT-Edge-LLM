@@ -1133,7 +1133,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-    CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
+    CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
     mDraftProposalCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
 
     if (!executeStatus)
@@ -1508,7 +1508,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-    CUDA_CHECK(cudaGraphInstantiate(&graphExec, graph, 0));
+    CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
     mAcceptDecodeTokenCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
 
     if (!executeStatus)

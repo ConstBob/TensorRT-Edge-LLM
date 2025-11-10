@@ -59,4 +59,25 @@ inline int getSMVersion()
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
     return sm_major * 10 + sm_minor;
 }
+
+/*!
+ * @brief Instantiate a CUDA graph with handling CUDA version.
+ *
+ * This function wraps cudaGraphInstantiate and abstracts away the API difference
+ * between CUDA versions before and after 12.0. For CUDA < 12.0, it uses the legacy
+ * signature with extra arguments; for CUDA >= 12.0, it uses the simplified signature.
+ *
+ * @param exec Pointer to the cudaGraphExec_t to be created.
+ * @param graph The cudaGraph_t to instantiate.
+ * @return cudaError_t indicating success or failure of the instantiation.
+ */
+inline cudaError_t instantiateCudaGraph(cudaGraphExec_t* exec, cudaGraph_t graph)
+{
+#if CUDA_VERSION < 12000
+    return cudaGraphInstantiate(exec, graph, nullptr, nullptr, 0);
+#else
+    return cudaGraphInstantiate(exec, graph, 0);
+#endif
+}
+
 } // namespace trt_edgellm

@@ -269,7 +269,7 @@ __global__ void initAttentionMaskKernel(
         for (auto j = start + tidy; j < end; j += 16)
         {
             auto const posIdx = i * curHW + j;
-            attentionMask[posIdx] = CUDART_ZERO_FP16;
+            attentionMask[posIdx] = __float2half(0.0f);
         }
     }
 }
