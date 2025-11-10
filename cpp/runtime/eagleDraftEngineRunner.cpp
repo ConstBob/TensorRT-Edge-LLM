@@ -659,7 +659,7 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
 bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths,
     rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-    cudaStream_t stream)
+    rt::Tensor const& baseRopeCosSinCache, cudaStream_t stream)
 {
     bool const validateInputStatus = this->prefillStepInputValidation(inputIds, baseModelHiddenStates,
         draftModelHiddenStates, contextLengths, multimodalEmbeddings, outputLogits, outputHiddenStates);
@@ -710,6 +710,9 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
     if (mConfig.ropeType == RopeType::kMRope)
     {
+        // Copy MRoPE cosine/sine cache tensor from the base model
+        CUDA_CHECK(cudaMemcpyAsync(mPosEncCosSinCache.rawPointer(), baseRopeCosSinCache.rawPointer(),
+            baseRopeCosSinCache.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
     }
 
