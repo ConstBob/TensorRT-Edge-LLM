@@ -109,7 +109,7 @@ public:
      */
     bool executeEaglePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& baseModelHiddenStates,
         rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths, rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits,
-        rt::Tensor& outputHiddenStates, cudaStream_t stream);
+        rt::Tensor& outputHiddenStates, rt::Tensor const& baseRopeCosSinCache, cudaStream_t stream);
 
     /*! \brief API entry to execute the draft proposal step for the eagle draft engine
      * 
