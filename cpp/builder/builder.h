@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "multimodal/modelTypes.h"
 #include <NvInfer.h>
 #include <filesystem>
 #include <memory>
@@ -372,7 +373,7 @@ private:
     std::filesystem::path mOnnxDir;     //!< Directory containing ONNX model files
     std::filesystem::path mEngineDir;   //!< Directory for saving built engine
     VisualBuilderConfig mBuilderConfig; //!< Build configuration
-    std::string mModelType;             //!< Model type inferred from config.json
+    multimodal::ModelType mModelType;   //!< Model type inferred from config.json
 
     //! Parse the model configuration from config.json.
     //! Extracts model type and dimensions needed for optimization profile setup.

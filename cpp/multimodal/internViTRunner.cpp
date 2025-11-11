@@ -38,8 +38,7 @@ namespace rt
 InternViTRunner::InternViTRunner(std::string const& engineDir, cudaStream_t stream)
     : MultimodalRunner(engineDir, stream)
 {
-    std::string configPath = engineDir + "/config.json";
-    if (!validateAndFillConfig(configPath))
+    if (!validateAndFillConfig(engineDir))
     {
         LOG_ERROR("InternViTRunner::InternViTRunner(): Failed to validate and fill config");
         throw std::runtime_error("InternViTRunner::InternViTRunner(): Failed to validate and fill config");
@@ -51,10 +50,11 @@ InternViTRunner::InternViTRunner(std::string const& engineDir, cudaStream_t stre
     }
 }
 
-bool InternViTRunner::validateAndFillConfig(std::string const& configPath)
+bool InternViTRunner::validateAndFillConfig(std::string const& engineDir)
 {
     Json jsonConfig;
 
+    std::string configPath = engineDir + "/config.json";
     std::ifstream configFileStream(configPath);
     if (!configFileStream.is_open())
     {
@@ -73,10 +73,11 @@ bool InternViTRunner::validateAndFillConfig(std::string const& configPath)
         return false;
     }
 
-    mModelType = jsonConfig["model_type"].get<std::string>();
-    if (mModelType != "internvl")
+    std::string modelTypeStr = jsonConfig["model_type"].get<std::string>();
+    mModelType = multimodal::stringToModelType(modelTypeStr);
+    if (mModelType != multimodal::ModelType::INTERNVL)
     {
-        LOG_ERROR("InternViTRunner::validateAndFillConfig(): Invalid model type: %s", mModelType.c_str());
+        LOG_ERROR("InternViTRunner::validateAndFillConfig(): Invalid model type: %s", modelTypeStr.c_str());
         return false;
     }
 

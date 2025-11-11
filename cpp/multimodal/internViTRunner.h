@@ -85,9 +85,9 @@ public:
     bool infer(cudaStream_t stream) override;
 
     //! \brief Validate and load configuration from JSON file
-    //! \param[in] configPath Path to configuration file
+    //! \param[in] engineDir Path to engine directory
     //! \return True if configuration is valid and loaded successfully, false otherwise
-    bool validateAndFillConfig(std::string const& configPath) override;
+    bool validateAndFillConfig(std::string const& engineDir) override;
 
     //! \brief Allocate buffers for inference
     //! \return True if allocation succeeded, false otherwise

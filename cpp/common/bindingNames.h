@@ -208,6 +208,27 @@ inline constexpr char const* kWindowIndex = "window_index";
  */
 inline constexpr char const* kReverseWindowIndex = "reverse_window_index";
 
+/*!
+ * @brief Fast position embeddings index tensor for Qwen3-VL vision model
+ *
+ * Shape: [4, sequence_length] (INT64)
+ */
+inline constexpr char const* kFastPosEmbIdx = "fast_pos_embed_idx";
+
+/*!
+ * @brief Fast position embeddings weight tensor for Qwen3-VL vision model
+ *
+ * Shape: [4, sequence_length] (FLOAT16)
+ */
+inline constexpr char const* kFastPosEmbWeight = "fast_pos_embed_weight";
+
+/*!
+ * @brief Deepstack features tensor for Qwen3-VL vision model
+ *
+ * Shape: [num_image_tokens, hidden_size] (FLOAT16)
+ */
+inline constexpr char const* kDeepstackFeatures = "deepstack_features";
+
 /*! @} */
 
 /*! @name LoRA (Low-Rank Adaptation) Bindings

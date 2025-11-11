@@ -113,6 +113,10 @@ void transposeToPatchInternVLReference(std::vector<half> const& originalImage, s
     int32_t const inputOffset, int32_t const height, int32_t const width, int32_t const channels,
     int32_t const blockSizeH, int32_t const blockSizeW);
 
+void fastPosEmbedInterpolateReference(std::vector<std::vector<int64_t>> const& imageGridTHWs,
+    std::vector<int64_t> const& cuSeqlens, std::vector<int64_t>& fastPosEmbedIdx, std::vector<half>& fastPosEmbedWeight,
+    int64_t const mergeSize, int64_t const numGridPerSide);
+
 // GEMM weight packing and weight scale reference function for int4-WOQ kernel
 void awqPackReference(int16_t const* kernel_KxN, int N_in, int K_in, int16_t* out_Ndiv4xK);
 

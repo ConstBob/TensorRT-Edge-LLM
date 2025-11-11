@@ -1115,3 +1115,61 @@ void scaledWeightsReference(
         }
     }
 }
+
+void fastPosEmbedInterpolateReference(std::vector<std::vector<int64_t>> const& imageGridTHWs,
+    std::vector<int64_t> const& cuSeqlens, std::vector<int64_t>& fastPosEmbedIdx, std::vector<half>& fastPosEmbedWeight,
+    int64_t const mergeSize, int64_t const numGridPerSide)
+{
+    int64_t totalSeqLength = cuSeqlens.back();
+
+    for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+    {
+        int64_t startIdx = cuSeqlens[i];
+        auto grid = imageGridTHWs[i];
+        int64_t T = grid[0], H = grid[1], W = grid[2];
+        int64_t llmGridH = H / mergeSize;
+        int64_t llmGridW = W / mergeSize;
+        float lineSpaceH = static_cast<float>(numGridPerSide - 1) / (H - 1);
+        float lineSpaceW = static_cast<float>(numGridPerSide - 1) / (W - 1);
+
+        for (int64_t h = 0; h < llmGridH; ++h)
+        {
+            for (int64_t w = 0; w < llmGridW; ++w)
+            {
+                for (int64_t m = 0; m < mergeSize; ++m)
+                {
+                    for (int64_t n = 0; n < mergeSize; ++n)
+                    {
+                        float hIdx = lineSpaceH * (h * mergeSize + m);
+                        float wIdx = lineSpaceW * (w * mergeSize + n);
+
+                        int64_t hIdxFloor = static_cast<int64_t>(hIdx);
+                        int64_t wIdxFloor = static_cast<int64_t>(wIdx);
+                        int64_t hIdxCeil = std::min(hIdxFloor + 1, (numGridPerSide - 1));
+                        int64_t wIdxCeil = std::min(wIdxFloor + 1, (numGridPerSide - 1));
+
+                        float dh = hIdx - hIdxFloor;
+                        float dw = wIdx - wIdxFloor;
+
+                        int64_t baseH = hIdxFloor * numGridPerSide;
+                        int64_t baseHCeil = hIdxCeil * numGridPerSide;
+
+                        int64_t targetIdx = startIdx + h * llmGridW * mergeSize * mergeSize + w * mergeSize * mergeSize
+                            + m * mergeSize + n;
+
+                        // Compute indices and weights in standard order
+                        fastPosEmbedIdx[0 * totalSeqLength + targetIdx] = baseH + wIdxFloor;
+                        fastPosEmbedIdx[1 * totalSeqLength + targetIdx] = baseH + wIdxCeil;
+                        fastPosEmbedIdx[2 * totalSeqLength + targetIdx] = baseHCeil + wIdxFloor;
+                        fastPosEmbedIdx[3 * totalSeqLength + targetIdx] = baseHCeil + wIdxCeil;
+
+                        fastPosEmbedWeight[0 * totalSeqLength + targetIdx] = __float2half((1 - dh) * (1 - dw));
+                        fastPosEmbedWeight[1 * totalSeqLength + targetIdx] = __float2half((1 - dh) * dw);
+                        fastPosEmbedWeight[2 * totalSeqLength + targetIdx] = __float2half(dh * (1 - dw));
+                        fastPosEmbedWeight[3 * totalSeqLength + targetIdx] = __float2half(dh * dw);
+                    }
+                }
+            }
+        }
+    }
+}
