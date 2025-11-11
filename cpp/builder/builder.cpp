@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <unordered_set>
 
 using namespace trt_edgellm;
 
@@ -935,16 +936,16 @@ bool VisualBuilder::parseConfig()
         return false;
     }
 
-    mModelType = mModelConfig["vision_config"]["model_type"].get<std::string>();
+    std::string modelTypeStr = mModelConfig["vision_config"]["model_type"].get<std::string>();
+    mModelType = multimodal::stringToModelType(modelTypeStr);
 
-    if (mModelType != "qwen2_vl" && mModelType != "qwen2_5_vl" && mModelType != "internvl_vision")
+    if (mModelType == multimodal::ModelType::UNKNOWN)
     {
-        LOG_ERROR("Currently only Qwen2-VL, Qwen2.5-VL and InternVL are supported for VLM. You provided: %s",
-            mModelType.c_str());
+        LOG_ERROR("Unsupported model type: %s", modelTypeStr.c_str());
         return false;
     }
 
-    if (mModelType == "internvl_vision")
+    if (mModelType == multimodal::ModelType::INTERNVL)
     {
         mNumChannels = mModelConfig["vision_config"]["num_channels"].get<int64_t>();
         mImageSizeH = mModelConfig["vision_config"]["image_size"][0].get<int64_t>();
@@ -960,11 +961,12 @@ bool VisualBuilder::setupVisualOptimizationProfile(
     auto* visualProfile = builder->createOptimizationProfile();
     bool result = true;
 
-    if (mModelType == "qwen2_vl" || mModelType == "qwen2_5_vl")
+    if (mModelType == multimodal::ModelType::QWEN2_VL || mModelType == multimodal::ModelType::QWEN2_5_VL
+        || mModelType == multimodal::ModelType::QWEN3_VL)
     {
         result = setupQwenViTProfile(visualProfile, network);
     }
-    else if (mModelType == "internvl_vision")
+    else if (mModelType == multimodal::ModelType::INTERNVL)
     {
         result = setupInternViTProfile(visualProfile);
     }
@@ -986,7 +988,7 @@ bool VisualBuilder::setupQwenViTProfile(
 {
     bool result = true;
 
-    // In Qwen2-VL, HW is always 4ximageTokens because it equals to spatial_merge_size ** 2.
+    // In Qwen-VL, HW is always 4ximageTokens because it equals to spatial_merge_size ** 2.
     int64_t minHW = mBuilderConfig.minImageTokens * 4;
     int64_t maxHW = mBuilderConfig.maxImageTokens * 4;
     int64_t optHW = (mBuilderConfig.minImageTokens + mBuilderConfig.maxImageTokens) / 2 * 4;
@@ -1020,6 +1022,7 @@ bool VisualBuilder::setupQwenViTProfile(
         return false;
     }
 
+    // Base inputs
     result &= setOptimizationProfile(profile, binding_names::kVisualInput, createDims({minHW, inputDim}),
         createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
     result &= setOptimizationProfile(profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
@@ -1027,7 +1030,8 @@ bool VisualBuilder::setupQwenViTProfile(
     result &= setOptimizationProfile(profile, binding_names::kAttentionMask, createDims({1, minHW, minHW}),
         createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
 
-    if (mModelType == "qwen2_5_vl")
+    // Additional inputs
+    if (mModelType == multimodal::ModelType::QWEN2_5_VL)
     {
         result &= setOptimizationProfile(profile, binding_names::kWindowAttentionMask, createDims({1, minHW, minHW}),
             createDims({1, optHW, optHW}), createDims({1, maxHW, maxHW}));
@@ -1035,6 +1039,13 @@ bool VisualBuilder::setupQwenViTProfile(
             createDims({optHW / 4}), createDims({maxHW / 4}));
         result &= setOptimizationProfile(profile, binding_names::kReverseWindowIndex, createDims({minHW / 4}),
             createDims({optHW / 4}), createDims({maxHW / 4}));
+    }
+    else if (mModelType == multimodal::ModelType::QWEN3_VL)
+    {
+        result &= setOptimizationProfile(profile, binding_names::kFastPosEmbIdx, createDims({4, minHW}),
+            createDims({4, optHW}), createDims({4, maxHW}));
+        result &= setOptimizationProfile(profile, binding_names::kFastPosEmbWeight, createDims({4, minHW}),
+            createDims({4, optHW}), createDims({4, maxHW}));
     }
 
     if (!result)
@@ -1086,6 +1097,20 @@ bool VisualBuilder::copyConfig()
     targetConfigFile.close();
 
     LOG_INFO("Copied config.json with builder config to %s", targetConfigPath.c_str());
+
+    // Copy preprocessor config if exists
+    std::string preprocessorConfigPath = mOnnxDir.string() + "/preprocessor_config.json";
+    if (std::filesystem::exists(preprocessorConfigPath))
+    {
+        std::string targetPreprocessorConfigPath = mEngineDir.string() + "/preprocessor_config.json";
+        std::filesystem::copy(preprocessorConfigPath, targetPreprocessorConfigPath);
+        LOG_INFO("Copied preprocessor config to %s", targetPreprocessorConfigPath.c_str());
+    }
+    else
+    {
+        LOG_WARNING("No preprocessor config found.");
+    }
+
     return true;
 }
 

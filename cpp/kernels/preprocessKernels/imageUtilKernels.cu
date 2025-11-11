@@ -342,5 +342,80 @@ void initRotaryPosEmbQwenViT(rt::Tensor const& posIds, rt::Tensor& rotaryPosEmb,
         rotaryPosEmb.dataPointer<float>(), totalSeqLength, vitPosEmbDim, rotaryBaseFrequency, scale);
 }
 
+__global__ void initFastPosEmbedQwenViTKernel(int64_t* fastPosEmbedIdx, half* fastPosEmbedWeight,
+    int64_t const llmGridH, int64_t const llmGridW, int64_t const mergeSize, int64_t const numGridPerSide,
+    float const lineSpaceH, float const lineSpaceW, int64_t const startIdx, int64_t const totalSeqLength)
+{
+    // Each CTA get assigned 256 threads. Each thread processes one position in grid
+    //     [llmGridH, llmGridW, mergeSize, mergeSize]
+    // Each position needs to generate 4 indices and 4 weights
+    // fastPosEmbedIdx: [4, totalSeqLength]
+    // fastPosEmbedWeight: [4, totalSeqLength]
+    auto const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    auto const totalElements = llmGridH * llmGridW * mergeSize * mergeSize;
+    if (tid >= totalElements)
+        return;
+
+    auto const llmGridHIdx = tid / (llmGridW * mergeSize * mergeSize);
+    auto const llmGridWIdx = (tid % (llmGridW * mergeSize * mergeSize)) / (mergeSize * mergeSize);
+    auto const mergeHIdx = (tid % (mergeSize * mergeSize)) / mergeSize;
+    auto const mergeWIdx = tid % mergeSize;
+
+    float const hIdx = lineSpaceH * (llmGridHIdx * mergeSize + mergeHIdx);
+    float const wIdx = lineSpaceW * (llmGridWIdx * mergeSize + mergeWIdx);
+
+    int64_t const hIdxFloor = static_cast<int64_t>(hIdx);
+    int64_t const wIdxFloor = static_cast<int64_t>(wIdx);
+    int64_t const hIdxCeil = std::min(hIdxFloor + 1, (numGridPerSide - 1));
+    int64_t const wIdxCeil = std::min(wIdxFloor + 1, (numGridPerSide - 1));
+
+    float const dh = hIdx - hIdxFloor;
+    float const dw = wIdx - wIdxFloor;
+
+    int64_t const baseH = hIdxFloor * numGridPerSide;
+    int64_t const baseHCeil = hIdxCeil * numGridPerSide;
+
+    int64_t const targetIdx = startIdx + tid;
+
+    fastPosEmbedIdx[0 * totalSeqLength + targetIdx] = baseH + wIdxFloor;
+    fastPosEmbedIdx[1 * totalSeqLength + targetIdx] = baseH + wIdxCeil;
+    fastPosEmbedIdx[2 * totalSeqLength + targetIdx] = baseHCeil + wIdxFloor;
+    fastPosEmbedIdx[3 * totalSeqLength + targetIdx] = baseHCeil + wIdxCeil;
+    fastPosEmbedWeight[0 * totalSeqLength + targetIdx] = __float2half((1 - dh) * (1 - dw));
+    fastPosEmbedWeight[1 * totalSeqLength + targetIdx] = __float2half((1 - dh) * dw);
+    fastPosEmbedWeight[2 * totalSeqLength + targetIdx] = __float2half(dh * (1 - dw));
+    fastPosEmbedWeight[3 * totalSeqLength + targetIdx] = __float2half(dh * dw);
+}
+
+void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight, int64_t const H,
+    int64_t const W, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx, cudaStream_t stream)
+{
+    check::check(fastPosEmbedIdx.getDeviceType() == rt::DeviceType::kGPU
+            && fastPosEmbedWeight.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(
+        fastPosEmbedIdx.getDataType() == DataType::kINT64 && fastPosEmbedWeight.getDataType() == DataType::kHALF,
+        "Data type check failed for the input tensors.");
+    check::check(fastPosEmbedIdx.getShape().getNumDims() == 2 && fastPosEmbedIdx.getShape()[0] == 4,
+        "Fast position embeddings index shapes shall be [4, totalSeqLength].");
+    check::check(fastPosEmbedWeight.getShape().getNumDims() == 2 && fastPosEmbedWeight.getShape()[0] == 4,
+        "Fast position embeddings weight shapes shall be [4, totalSeqLength].");
+
+    int64_t const totalSeqLength = fastPosEmbedIdx.getShape()[1];
+    check::check(totalSeqLength == fastPosEmbedWeight.getShape()[1], "Total sequence length mismatch.");
+
+    int64_t const llmGridH = H / mergeSize;
+    int64_t const llmGridW = W / mergeSize;
+    float const lineSpaceH = static_cast<float>(numGridPerSide - 1) / (H - 1);
+    float const lineSpaceW = static_cast<float>(numGridPerSide - 1) / (W - 1);
+
+    uint32_t const blockSize = 256;
+    uint32_t const gridSize = (H * W + blockSize - 1) / blockSize;
+
+    initFastPosEmbedQwenViTKernel<<<gridSize, blockSize, 0, stream>>>(fastPosEmbedIdx.dataPointer<int64_t>(),
+        fastPosEmbedWeight.dataPointer<half>(), llmGridH, llmGridW, mergeSize, numGridPerSide, lineSpaceH, lineSpaceW,
+        startIdx, totalSeqLength);
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

@@ -539,3 +539,66 @@ TEST(TransposeToPatchInternVL, Benchmark)
     BenchmarkTransposeToPatchInternVL(448, 448);
     BenchmarkTransposeToPatchInternVL(896, 896);
 }
+
+void TestInitFastPosEmbedQwenViT(int64_t const mergeSize = 2, int64_t const numGridPerSide = 48)
+{
+    cudaStream_t stream{nullptr};
+
+    std::vector<std::vector<int64_t>> imageGridTHWs{{1, 36, 54}, {1, 8, 10}, {1, 32, 20}};
+    std::vector<int64_t> cuSeqlens{0};
+    for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+    {
+        cuSeqlens.push_back(cuSeqlens.back() + imageGridTHWs[i][0] * imageGridTHWs[i][1] * imageGridTHWs[i][2]);
+    }
+    int64_t totalSeqLength = cuSeqlens.back();
+
+    // CPU reference implementation (from fastPosEmbedInterpolate)
+    std::vector<int64_t> fastPosEmbedIdxRef(4 * totalSeqLength);
+    std::vector<half> fastPosEmbedWeightRef(4 * totalSeqLength);
+    fastPosEmbedInterpolateReference(
+        imageGridTHWs, cuSeqlens, fastPosEmbedIdxRef, fastPosEmbedWeightRef, mergeSize, numGridPerSide);
+
+    // GPU tensors
+    rt::Tensor fastPosEmbedIdxDevice({4, totalSeqLength}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    rt::Tensor fastPosEmbedWeightDevice({4, totalSeqLength}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    // Call CUDA kernel
+    for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+    {
+        kernel::initFastPosEmbedQwenViT(fastPosEmbedIdxDevice, fastPosEmbedWeightDevice, imageGridTHWs[i][1],
+            imageGridTHWs[i][2], mergeSize, numGridPerSide, cuSeqlens[i], stream);
+    }
+
+    // Copy results back to host
+    std::vector<int64_t> fastPosEmbedIdxHost(4 * totalSeqLength);
+    std::vector<half> fastPosEmbedWeightHost(4 * totalSeqLength);
+    CUDA_CHECK(cudaMemcpyAsync(fastPosEmbedIdxHost.data(), fastPosEmbedIdxDevice.rawPointer(),
+        fastPosEmbedIdxHost.size() * sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(fastPosEmbedWeightHost.data(), fastPosEmbedWeightDevice.rawPointer(),
+        fastPosEmbedWeightHost.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Compare indices
+    for (int32_t i = 0; i < 4 * totalSeqLength; ++i)
+    {
+        ASSERT_EQ(fastPosEmbedIdxHost[i], fastPosEmbedIdxRef[i])
+            << "Mismatch at index " << i << ": got " << fastPosEmbedIdxHost[i] << ", expected "
+            << fastPosEmbedIdxRef[i];
+    }
+
+    // Compare weights
+    for (int32_t i = 0; i < 4 * totalSeqLength; ++i)
+    {
+        ASSERT_TRUE(isclose(fastPosEmbedWeightHost[i], fastPosEmbedWeightRef[i], 1e-5, 1e-5))
+            << "Mismatch at weight index " << i << ": got " << __half2float(fastPosEmbedWeightHost[i]) << ", expected "
+            << __half2float(fastPosEmbedWeightRef[i]);
+    }
+
+    std::cout << "InitFastPosEmbedQwenViT Accuracy: totalSeqLength=" << totalSeqLength << ", mergeSize=" << mergeSize
+              << ", numGridPerSide=" << numGridPerSide << ", numGrids=" << imageGridTHWs.size() << std::endl;
+}
+
+TEST(InitFastPosEmbedQwenViT, Accuracy)
+{
+    TestInitFastPosEmbedQwenViT();
+}

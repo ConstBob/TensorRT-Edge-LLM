@@ -21,6 +21,7 @@ This module provides functions to export visual components of multimodal models
 
 import json
 import os
+import shutil
 from typing import Optional
 
 import torch
@@ -34,6 +35,8 @@ from tensorrt_edgellm.visual_models.qwen2_5_vl_model import (
     Qwen2_5_VisionTransformerPretrainedModelPatch, export_qwen2_5_vl_visual)
 from tensorrt_edgellm.visual_models.qwen2_vl_model import (
     Qwen2VisionTransformerPretrainedModelPatch, export_qwen2_vl_visual)
+from tensorrt_edgellm.visual_models.qwen3_vl_model import (
+    Qwen3VLVisionModelPatch, export_qwen3_vl_visual)
 
 from .config_export import export_vision_config
 
@@ -130,6 +133,27 @@ def visual_export(model_dir: str,
         # Export using the wrapper's export function
         export_qwen2_5_vl_visual(wrapped_model, output_dir, torch_dtype)
 
+    elif model_type == 'qwen3_vl':
+        print(f"Exporting Qwen3-VL visual model from {model_dir}")
+        # Create Qwen3-VL wrapper model
+        wrapped_model = Qwen3VLVisionModelPatch._from_config(
+            model.visual.config,
+            torch_dtype=torch_dtype,
+        )
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  min_pixels=128 * 28 * 28,
+                                                  max_pixels=2048 * 28 * 28,
+                                                  trust_remote_code=True)
+        wrapped_model.load_state_dict(model.visual.state_dict())
+        wrapped_model.eval().to(device)
+        # Apply quantization to wrapped model if requested
+        if quantization == "fp8":
+            wrapped_model = quantize_visual(wrapped_model, quantization,
+                                            processor, dataset_dir)
+
+        # Export using the wrapper's export function
+        export_qwen3_vl_visual(wrapped_model, output_dir, torch_dtype)
+
     elif model_type == 'internvl':
         print(f"Exporting InternVL3 visual model from {model_dir}")
         # Create InternVL3 wrapper model
@@ -153,6 +177,11 @@ def visual_export(model_dir: str,
     config_dict = export_vision_config(model.config)
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=2)
+
+    # Export processor configuration to JSON if exists
+    if os.path.exists(os.path.join(model_dir, "preprocessor_config.json")):
+        shutil.copy(os.path.join(model_dir, "preprocessor_config.json"),
+                    os.path.join(output_dir, "preprocessor_config.json"))
 
     print(
         f"Visual export completed for {model_type} with dtype={dtype}, quantization={quantization}, device={device}"

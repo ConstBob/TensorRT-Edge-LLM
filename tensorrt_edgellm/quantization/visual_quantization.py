@@ -24,6 +24,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
     Qwen2_5_VisionTransformerPretrainedModel
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
 from ..visual_models.internvl3_model import InternVLVisionModel
 from .quantization_utils import quantize_model
@@ -85,9 +86,11 @@ def get_visual_calib_dataloader(
                           remove_columns=dataset.column_names)
     dataset.set_format(type="torch", columns=dataset.column_names)
 
-    if isinstance(model,
-                  Qwen2_5_VisionTransformerPretrainedModel) or isinstance(
-                      model, Qwen2VisionTransformerPretrainedModel):
+    if isinstance(model, (
+            Qwen3VLVisionModel,
+            Qwen2_5_VisionTransformerPretrainedModel,
+            Qwen2VisionTransformerPretrainedModel,
+    )):
         # Initialize additional inputs for model
         class QwenViTDataset(Dataset):
 
@@ -143,6 +146,11 @@ def get_visual_calib_dataloader(
                     inputs["window_attention_mask"] = window_attention_mask
                     inputs["window_index"] = window_index
                     inputs["reverse_window_index"] = reverse_window_index
+                elif isinstance(self.model, Qwen3VLVisionModel):
+                    fast_pos_embed_idx, fast_pos_embed_weight = self.model.fast_pos_embed_interpolate_optimized(
+                        grid_thw)
+                    inputs["fast_pos_embed_idx"] = fast_pos_embed_idx
+                    inputs["fast_pos_embed_weight"] = fast_pos_embed_weight
 
                 return inputs
 
@@ -170,7 +178,7 @@ def get_visual_calib_dataloader(
 
 def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
     assert isinstance(
-        model, (Qwen2_5_VisionTransformerPretrainedModel,
+        model, (Qwen3VLVisionModel, Qwen2_5_VisionTransformerPretrainedModel,
                 Qwen2VisionTransformerPretrainedModel,
                 InternVLVisionModel)), f"Invalid model type {type(model)}"
     assert precision in [

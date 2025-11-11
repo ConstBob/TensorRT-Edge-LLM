@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 #include "common/trtUtils.h"
+#include "modelTypes.h"
 #include "profiling/metrics.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -109,10 +110,10 @@ public:
 
     /*!
      * @brief Validate and fill configuration from file
-     * @param configPath Path to configuration file
+     * @param engineDir Path to engine directory
      * @return True on success, false on failure
      */
-    virtual bool validateAndFillConfig(std::string const& configPath) = 0;
+    virtual bool validateAndFillConfig(std::string const& engineDir) = 0;
 
     //! @brief Allocate device buffers
     //! @return True on success, false on failure
@@ -123,8 +124,8 @@ public:
     virtual void* getConfig() = 0;
 
     //! @brief Get model type
-    //! @return Model type string
-    virtual std::string getModelType() const
+    //! @return Model type enum
+    virtual multimodal::ModelType getModelType() const
     {
         return mModelType;
     }
@@ -137,7 +138,7 @@ public:
     }
 
 protected:
-    std::string mModelType;                                //!< Model type identifier
+    multimodal::ModelType mModelType;                      //!< Model type identifier
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;          //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;  //!< Visual encoder engine
     std::unique_ptr<nvinfer1::IExecutionContext> mContext; //!< Execution context

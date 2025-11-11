@@ -83,5 +83,20 @@ void initRotaryPosEmbQwenViT(rt::Tensor const& posIds, rt::Tensor& rotaryPosEmb,
 void transposeToPatchInternVL(
     rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset, cudaStream_t stream);
 
+// The kernel will initialize the fast position embeddings for Qwen2.5-VL VIT
+// Inputs
+//     H: Height of the image
+//     W: Width of the image
+//     mergeSize: Merge size for the vision transformer
+//     numGridPerSide: Number of grid per side for the vision transformer
+//     startIdx: Start index for the image
+//     stream: CUDA stream for execution
+// Outputs:
+//     fastPosEmbedIdx [GPU, Int64]: Fast position embeddings index tensor [4, totalSeqLength]
+//     fastPosEmbedWeight [GPU, Half]: Fast position embeddings weight tensor [4, totalSeqLength]
+void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight, int64_t const H,
+    int64_t const W, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx,
+    cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

@@ -76,19 +76,21 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
         throw std::runtime_error("Failed to parse config file: " + std::string(e.what()));
     }
 
-    std::string modelType = jsonConfig["model_type"].get<std::string>();
+    std::string modelTypeStr = jsonConfig["model_type"].get<std::string>();
+    multimodal::ModelType modelType = multimodal::stringToModelType(modelTypeStr);
 
-    if (modelType == "qwen2_vl" || modelType == "qwen2_5_vl")
+    if (modelType == multimodal::ModelType::QWEN2_VL || modelType == multimodal::ModelType::QWEN2_5_VL
+        || modelType == multimodal::ModelType::QWEN3_VL)
     {
         multimodalRunner = std::make_unique<QwenViTRunner>(multimodalEngineDir, stream);
     }
-    else if (modelType == "internvl")
+    else if (modelType == multimodal::ModelType::INTERNVL)
     {
         multimodalRunner = std::make_unique<InternViTRunner>(multimodalEngineDir, stream);
     }
     else
     {
-        throw std::runtime_error("Unsupported model type: " + modelType);
+        throw std::runtime_error("Unsupported model type: " + modelTypeStr);
     }
 
     return multimodalRunner;
