@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "common/tensor.h"
+
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
@@ -26,42 +28,36 @@ namespace trt_edgellm
 namespace kernel
 {
 
-//! \brief Host-side wrapper that launches a lightweight CUDA kernel to build several prefix-sum
-//! buffers needed by context-attention.
+//! \brief Host-side wrapper that launches a lightweight CUDA kernel to compute prefix-sum of sequence lengths
+//! and KV cache end indices.
 //!
-//! \param[in]  seqLenDev         Device pointer – int32_t[B].  Actual token length of each request.
-//! \param[out] cuSeqLensDev      Device pointer – int32_t[B+1]. Exclusive prefix-sum of seqLenDev.
-//!                                cuSeqLensDev[0] is set to 0 inside the kernel.
-//! \param[in]  kvCacheStartIdxs  Device pointer – int32_t[B].  Start index of KV cache for each request.
-//! \param[out] cuKvCacheLensDev  Device pointer – int32_t[B+1]. Exclusive prefix-sum of kvCacheEndIdxsDev.
-//!                                cuKvCacheLensDev[0] is set to 0 inside the kernel.
-//! \param[out] kvCacheEndIdxsDev Device pointer – int32_t[B].  Each element equals
-//!                                kvCacheStartIdxs[i] + seqLenDev[i]. For invoking
-//!                                launchApplyRopeWriteContinuousQAndKVCache.
-//! \param[in]  runtimeSeqLen     Runtime sequence length(with padding).
-//! \param[in]  B                 Batch size.
-//! \param[in]  stream            CUDA stream used to launch the kernel. Should be the same stream that
-//!                                later launches the FMHA-v2 kernel.
+//! \param[in]  inputSeqLen       int32_t tensor with shape [B].  Actual token length of each request.
+//! \param[in]  kvCacheStartIndices int32_t tensor with shape [B].  Start index of KV cache for each request.
+//!                                (optional, pass in empty tensor to indicate zero start indices)
+//! \param[out] cuQSeqLens        int32_t tensor with shape [B+1]. Exclusive prefix-sum of inputSeqLen.
+//! \param[out] cuKVSeqLens       int32_t tensor with shape [B+1]. Exclusive prefix-sum of (kvCacheStartIndices[i] +
+//!                                inputSeqLen[i]). If kvCacheStartIndices is empty, this will be exclusive prefix-sum
+//!                                of inputSeqLen.
+//! \param[out] kvCacheEndIdxs    int32_t tensor with shape [B].  Each element equals
+//!                                kvCacheStartIndices[i] + runtimeSeqLen (Here we use padding to ease later kernel
+//!                                launch).
+//! \param[in]  runtimeSeqLen     Runtime sequence length (equals to the maximum of inputSeqLen).
+//! \param[in]  stream            CUDA stream used to launch the kernel.
+//! \note kvCacheStartIndices is optional. If it is not provided, kvStartIndices will be assumed to be 0.
+void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
+    rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs, int32_t const runtimeSeqLen,
+    cudaStream_t stream);
 
-void calCuQCuKVSeqLensAndKVEndIdxs(int32_t const* seqLenDev, int32_t* cuSeqLensDev, int32_t const* kvCacheStartIdxs,
-    int32_t* cuKvCacheLensDev, int32_t* kvCacheEndIdxsDev, int32_t runtimeSeqLen, int32_t B, cudaStream_t stream);
-
-//! \brief Converts KV cache layout from XQA format to FMHA format
+//! \brief Converts KV cache layout from BHSD layout to BSHD layout for attention computation.
 //!
 //! Converts an input tensor in [B, 2, H, S, D] into [B, S, 2, H, D].
 //!
 //! \tparam T Element type (e.g. float, half, bfloat16, etc.).
 //!
-//! \param[in] src    Device pointer to the padded input tensor.
-//! \param[out] dst   Device pointer to the destination compact tensor.
-//! \param[in] B      Batch size.
-//! \param[in] S      Maximum (padded) sequence length.
-//! \param[in] H      Number of attention heads.
-//! \param[in] D      Hidden dimension per head.
-//! \param[in] stream CUDA stream to launch the kernel on, shall be the same stream to launch FMHA-v2 kernel.
-
-template <typename T>
-void cvtKVCachelayoutXQAToFMHA(T const* src, T* dst, int32_t B, int32_t S, int32_t H, int32_t D, cudaStream_t stream);
+//! \param[in] src    Source tensor with shape [B, 2, H, S, D].
+//! \param[out] dst   Destination tensor with shape [B, S, 2, H, D].
+//! \param[in] stream CUDA stream to launch the kernel on
+void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

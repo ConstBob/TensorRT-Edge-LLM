@@ -16,6 +16,7 @@
  */
 
 #include "applyRopeWriteKV.h"
+#include "common/checkMacros.h"
 #include "kernels/common/vectorizedTypes.cuh"
 
 #include <cstdint>
@@ -188,70 +189,134 @@ __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSi
     }
 }
 
-void launchApplyRopeWriteKV(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
-    int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens,
-    int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim,
-    int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream)
+void launchApplyRopeWriteKV(rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor const& cosSinCache,
+    rt::OptionalInputTensor kvCacheEndLens, rt::OptionalInputTensor tokenPosIds, rt::OptionalOutputTensor qOut,
+    cudaStream_t stream)
 {
-    constexpr uint32_t vecSize = DVec<half>::vec_size;
-    constexpr uint32_t threadsPerBlock = 128;
+    // QKV has layout of [B, S, H_q + H_k + H_v, D]
+    // CosSinCache always in layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
+    // KVCache has layout of [B, 2, H_kv, S_cache_capacity, D]
+    constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
+    constexpr uint32_t kTHREADS_PER_CTA = 128;
 
-    // How many tokens can be processed by each CTA.
-    uint32_t const tokenPerBlock = threadsPerBlock * vecSize / headDim;
+    // Collect runtime and shape information from the input / output tensors.
+    // Static cast to uint32_t since we know the shape is always positive and within the range of uint32_t.
+    // We use uint32_t in CUDA kernel to save register usage.
+    uint32_t const runtimeBatchSize = static_cast<uint32_t>(qkv.getShape()[0]);
+    uint32_t const runtimeSeqLen = static_cast<uint32_t>(qkv.getShape()[1]);
+    uint32_t const numTotalHeads = static_cast<uint32_t>(qkv.getShape()[2]);
+    uint32_t const headDim = static_cast<uint32_t>(qkv.getShape()[3]);
+    uint32_t const numKVHeads = static_cast<uint32_t>(kvCache.getShape()[2]);
+    uint32_t const kvCacheCapacity = static_cast<uint32_t>(kvCache.getShape()[3]);
+    uint32_t const numQHeads = numTotalHeads - 2 * numKVHeads;
+    uint32_t const totalNumTokens = runtimeBatchSize * runtimeSeqLen;
 
-    uint32_t const bDimX = headDim / vecSize;
-    uint32_t const bDimY = tokenPerBlock;
-    uint32_t const gDimX = (totalNumTokens + tokenPerBlock - 1) / tokenPerBlock;
-    uint32_t const gDimY = numQHead + numKVHead;
+    uint32_t const cosSinCacheBatchSize = static_cast<uint32_t>(cosSinCache.getShape()[0]);
+    uint32_t const cosSinCacheSeqLen = static_cast<uint32_t>(cosSinCache.getShape()[1]);
+    uint32_t const rotaryDim = static_cast<uint32_t>(cosSinCache.getShape()[2]);
+
+    // Device pointers for required input / output tensors.
+    half* qkvPtr = qkv.dataPointer<half>();
+    half* kvCachePtr = kvCache.dataPointer<half>();
+    float const* cosSinCachePtr = cosSinCache.dataPointer<float>();
+
+    // Device pointers for optional input / output tensors.
+    int32_t const* kvCacheEndLensPtr
+        = kvCacheEndLens.has_value() ? kvCacheEndLens.value().get().dataPointer<int32_t>() : nullptr;
+    int32_t const* tokenPosIdsPtr
+        = tokenPosIds.has_value() ? tokenPosIds.value().get().dataPointer<int32_t>() : nullptr;
+    half* qOutPtr = qOut.has_value() ? qOut.value().get().dataPointer<half>() : nullptr;
+
+    // Collect kernel launch parameters and invoke the kernel.
+    // Each CTA will process either Q or KV (together) head of multiple tokens.
+    uint32_t const tokenPerCTA = kTHREADS_PER_CTA * kVEC_SIZE / headDim;
+    uint32_t const bDimX = headDim / kVEC_SIZE;
+    uint32_t const bDimY = tokenPerCTA;
+    uint32_t const gDimX = (totalNumTokens + tokenPerCTA - 1) / tokenPerCTA;
+    uint32_t const gDimY = numQHeads + numKVHeads;
 
     dim3 grid(gDimX, gDimY);
     dim3 block(bDimX, bDimY);
-
-    applyRopeWriteKV<half><<<grid, block, 0, stream>>>(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds,
-        qSeqLen, totalNumTokens, kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize,
-        cosSinCacheSeqLen);
+    applyRopeWriteKV<half><<<grid, block, 0, stream>>>(qkvPtr, kvCachePtr, qOutPtr, cosSinCachePtr, kvCacheEndLensPtr,
+        tokenPosIdsPtr, runtimeSeqLen, totalNumTokens, kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim,
+        cosSinCacheBatchSize, cosSinCacheSeqLen);
 }
 
-void launchApplyRopeWriteKVContext(half* qkv, half* kvCache, float const* cosSinCache, int32_t qSeqLen,
-    int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim,
-    uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream)
+void launchApplyRopeWriteKVPackedQKV(
+    rt::Tensor const& cosSinCache, rt::Tensor& qkv, rt::Tensor& kvCache, cudaStream_t stream)
 {
-    // For current context phase design, we always write to KVCache from start and inplace update QKV.
-    half* qOut = nullptr;
-    int32_t* kvCacheEndLens = nullptr;
-    int32_t* tokenPosIds = nullptr;
-    launchApplyRopeWriteKV(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds, qSeqLen, totalNumTokens,
-        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+    // Handle case where the QKV can be packed into a single tensor. This happens when there are no existing KVCache
+    // values. We will overwrite QKV directly and instantiate the KVCache. Later attention kernel can directly perform
+    // on the packed QKV tensor.
+    // We don't need QOut, kvCacheEndLens, and tokenPosIds.
+    rt::OptionalInputTensor kvCacheEndLens{std::nullopt};
+    rt::OptionalInputTensor tokenPosIds{std::nullopt};
+    rt::OptionalOutputTensor qOut{std::nullopt};
+
+    // Perform necessary consistent checks to ensure the kernel is launched correctly.
+    check::check(qkv.getShape()[0] == kvCache.getShape()[0], "QKV and KVCache shall have the same batch size");
+    check::check(qkv.getShape()[3] == kvCache.getShape()[4], "QKV and KVCache shall have the same head dimension");
+    check::check(cosSinCache.getShape()[0] == 1 || cosSinCache.getShape()[0] == qkv.getShape()[0],
+        "CosSinCache shall have batch size 1 or equal to runtime batch size");
+
+    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, stream);
 }
 
-void launchApplyRopeWriteContinuousQAndKVCache(half* qkv, half* kvCache, float const* cosSinCache, half* qOut,
-    int32_t const* kvCacheEndLens, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
-    cudaStream_t stream)
+void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
+    rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, cudaStream_t stream)
 {
+    // Handle case where there are existing KVCache values. Thus, we are unable to use packed QKV tensor for attention
+    // computation. Here we will write write to a dedicated Q tensor and KVCache. Since there are existing KVCache
+    // values, we need the kvCacheEndLens to indicate where to write in the KVCache. From the end position, we will
+    // write runtimeSeqLen tokens "forward".
 
-    int32_t* tokenPosIds = nullptr;
-    launchApplyRopeWriteKV(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds, qSeqLen, totalNumTokens,
-        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+    // Position to compute rope is same as position to write KVCache.
+    rt::OptionalInputTensor tokenPosIds{std::nullopt};
+
+    // Perform necessary consistent checks to ensure the kernel is launched correctly.
+    int64_t const batchSize = qkv.getShape()[0];
+    int64_t const headDim = qkv.getShape()[3];
+    int64_t const numQHeads = qOut.getShape()[2];
+    int64_t const numKVHeads = kvCache.getShape()[2];
+
+    check::check(kvCacheEndLens.getShape()[0] == batchSize && kvCache.getShape()[0] == batchSize
+            && qOut.getShape()[0] == batchSize,
+        "All Input tensors shall have consistent batch size.");
+    check::check(kvCache.getShape()[4] == headDim && qOut.getShape()[3] == headDim,
+        "Head dimension shall be consistent between QKV/KVCache/QOut.");
+    check::check(qkv.getShape()[2] == numQHeads + numKVHeads * 2, "QKV shall have consistent number of Q/K/V heads.");
+    check::check(
+        qkv.getShape()[1] == qOut.getShape()[1], "Runtime sequence length shall be consistent between QKV/QOut.");
+    check::check(cosSinCache.getShape()[0] == 1 || cosSinCache.getShape()[0] == batchSize,
+        "CosSinCache shall have batch size 1 or equal to runtime batch size");
+
+    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, stream);
 }
 
-void launchApplyRopeWriteKVDecode(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
-    int32_t const* kvCacheEndLens, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
-    cudaStream_t stream)
+void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
+    rt::Tensor const& tokenPosIds, rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, cudaStream_t stream)
 {
-    int32_t* tokenPosIds = nullptr;
-    launchApplyRopeWriteKV(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds, qSeqLen, totalNumTokens,
-        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
-}
+    // Special case where we need to perform tree attention for speculative decoding. The mapping between rope positions
+    // are no longer consistent with the position to write KVCache. Thus we need the tokenPosIds to indicate the
+    // position of token within sequence. Perform necessary consistent checks to ensure kernel launch correctly.
+    int64_t const batchSize = qkv.getShape()[0];
+    int64_t const headDim = qkv.getShape()[3];
+    int64_t const numQHeads = qOut.getShape()[2];
+    int64_t const numKVHeads = kvCache.getShape()[2];
+    int64_t const runtimeSeqLen = qkv.getShape()[1];
 
-void launchApplyRopeWriteKVTreeDecode(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
-    int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens,
-    int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim,
-    int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream)
-{
-    launchApplyRopeWriteKV(qkv, kvCache, qOut, cosSinCache, kvCacheEndLens, tokenPosIds, qSeqLen, totalNumTokens,
-        kvCacheCapacity, numQHead, numKVHead, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+    check::check(kvCacheEndLens.getShape()[0] == batchSize && kvCache.getShape()[0] == batchSize
+            && qOut.getShape()[0] == batchSize && tokenPosIds.getShape()[0] == batchSize,
+        "All Input tensors shall have consistent batch size.");
+    check::check(kvCache.getShape()[4] == headDim && qOut.getShape()[3] == headDim,
+        "Head dimension shall be consistent between QKV/KVCache/QOut.");
+    check::check(qkv.getShape()[2] == numQHeads + numKVHeads * 2, "QKV shall have consistent number of Q/K/V heads.");
+    check::check(qOut.getShape()[1] == runtimeSeqLen && tokenPosIds.getShape()[1] == runtimeSeqLen,
+        "QKV/QOut/tokenPosIds shall have consistent sequence length.");
+    check::check(cosSinCache.getShape()[0] == 1 || cosSinCache.getShape()[0] == qkv.getShape()[0],
+        "CosSinCache shall have batch size 1 or equal to runtime batch size");
+
+    launchApplyRopeWriteKV(qkv, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, qOut, stream);
 }
 
 } // namespace kernel

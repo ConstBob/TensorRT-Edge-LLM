@@ -161,9 +161,21 @@ Tensor::Tensor(void* data, Coords const& shape, DeviceType deviceType, nvinfer1:
     mDeviceType = deviceType;
     mDataType = dataType;
     ownMemory = false;
-    mStrides = utils::computeStrides(shape);
-    this->data = data;
-    memoryCapacity = shape.volume() * utils::getTypeSize(dataType);
+
+    // Allow construction of a non-owned tensor with zero volume.
+    // The data pointer won't be granted to the tensor object since no access is needed for zero-volume tensors.
+    if (shape.volume() != 0)
+    {
+        mStrides = utils::computeStrides(shape);
+        this->data = data;
+        memoryCapacity = shape.volume() * utils::getTypeSize(dataType);
+    }
+    else
+    {
+        this->data = nullptr;
+        memoryCapacity = 0;
+        mStrides = {};
+    }
     mName = name;
 }
 
@@ -271,7 +283,7 @@ Dims Tensor::getTRTDims() const noexcept
 
 bool Tensor::isEmpty() const noexcept
 {
-    return data == nullptr;
+    return mShape.volume() == 0;
 }
 
 void* Tensor::rawPointer() noexcept
