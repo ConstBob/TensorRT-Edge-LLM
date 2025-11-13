@@ -17,45 +17,46 @@
 
 #include "utilKernels.h"
 
+#include "common/checkMacros.h"
+
 namespace trt_edgellm
 {
 namespace kernel
 {
 
-__global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* seqLenDev, int32_t* cuSeqLensDev,
-    int32_t const* kvCacheStartIdxs, int32_t* cuKvCacheLensDev, int32_t* kvCacheEndIdxsDev, int32_t runtimeSeqLen,
-    int32_t B)
+__global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, int32_t const* kvCacheStartIndices,
+    int32_t* cuQSeqlen, int32_t* cuKVSeqLens, int32_t* kvCacheEndIndices, int32_t runtimeSeqLen, int32_t batchSize)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0)
     {
-        cuSeqLensDev[0] = 0;
-        if (kvCacheStartIdxs != nullptr)
-        {
-            cuKvCacheLensDev[0] = 0;
-        }
+        cuQSeqlen[0] = 0;
+        cuKVSeqLens[0] = 0;
 
         int32_t runningCuSeqLen = 0;
         int32_t runningCuKvCacheLen = 0;
-        for (int32_t i = 0; i < B; ++i)
+        for (int32_t i = 0; i < batchSize; ++i)
         {
-            runningCuSeqLen += seqLenDev[i];
-            cuSeqLensDev[i + 1] = runningCuSeqLen;
+            runningCuSeqLen += inputSeqLen[i];
+            cuQSeqlen[i + 1] = runningCuSeqLen;
 
-            if (kvCacheStartIdxs != nullptr)
+            int32_t kvCacheStartIdx = 0;
+            if (kvCacheStartIndices != nullptr)
             {
-                runningCuKvCacheLen += (kvCacheStartIdxs[i] + seqLenDev[i]);
-                cuKvCacheLensDev[i + 1] = runningCuKvCacheLen;
-                // To keep semantic consistency with the packed QKV layout for RoPE, use runtimeSeqLen here.
-                kvCacheEndIdxsDev[i] = kvCacheStartIdxs[i] + runtimeSeqLen;
+                kvCacheStartIdx = kvCacheStartIndices[i];
             }
+
+            runningCuKvCacheLen += (kvCacheStartIdx + inputSeqLen[i]);
+            cuKVSeqLens[i + 1] = runningCuKvCacheLen;
+            // To keep semantic consistency with the packed QKV layout for RoPE, use runtimeSeqLen here.
+            kvCacheEndIndices[i] = kvCacheStartIdx + runtimeSeqLen;
         }
     }
 }
 
 // ===== kernel: produce [B, S, 2, H, D] (FMHA expected padded layout) =====
 template <typename T>
-__global__ void cvtKVCachelayoutXQAToFMHAKernel(T const* __restrict__ src, // [B, 2, H, S, D]
-    T* __restrict__ dst,                                                   // [B, S, 2, H, D]
+__global__ void cvtKVLayoutBHSDToBSHDKernel(T const* __restrict__ src, // [B, 2, H, S, D]
+    T* __restrict__ dst,                                               // [B, S, 2, H, D]
     int32_t B, int32_t S, int32_t H, int32_t D)
 {
     // Thread mapping identical to paddedLayoutToCompactKernel but without cuSeqLens.
@@ -87,18 +88,50 @@ __global__ void cvtKVCachelayoutXQAToFMHAKernel(T const* __restrict__ src, // [B
     dst[dstIdx] = src[srcIdx];
 }
 
-// ---------- convenience launcher ----------
-
-void calCuQCuKVSeqLensAndKVEndIdxs(int32_t const* seqLenDev, int32_t* cuSeqLensDev, int32_t const* kvCacheStartIdxs,
-    int32_t* cuKvCacheLensDev, int32_t* cuKvCacheEndIdxsDev, int32_t runtimeSeqLen, int32_t B, cudaStream_t stream)
+void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
+    rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs, int32_t const runtimeSeqLen,
+    cudaStream_t stream)
 {
-    calCuQCuKVSeqLensAndKVEndIdxsKernel<<<1, 1, 0, stream>>>(
-        seqLenDev, cuSeqLensDev, kvCacheStartIdxs, cuKvCacheLensDev, cuKvCacheEndIdxsDev, runtimeSeqLen, B);
+    int32_t const runtimeBatchSize = static_cast<int32_t>(inputSeqLen.getShape()[0]);
+
+    // Perform necessary shape checks.
+    check::check(cuQSeqLens.getShape()[0] == (runtimeBatchSize + 1), "cuQSeqLens shall have shape [B+1].");
+    check::check(cuKVSeqLens.getShape()[0] == (runtimeBatchSize + 1), "cuKVSeqLens shall have shape [B+1].");
+    check::check(kvCacheEndIdxs.getShape()[0] == runtimeBatchSize, "kvCacheEndIdxs shall have shape [B].");
+
+    if (!kvCacheStartIndices.isEmpty())
+    {
+        check::check(
+            kvCacheStartIndices.getShape()[0] == runtimeBatchSize, "KVCacheStartIndices tensor shall have shape [B].");
+    }
+    else
+    {
+        // We rely on this nullptr behavior to indicate whether kvCacheStartIndices is available in the kernel.
+        check::check(kvCacheStartIndices.rawPointer() == nullptr,
+            "KVCacheStartIndices tensor shall be nullptr when it is empty.");
+    }
+
+    calCuQCuKVSeqLensAndKVEndIdxsKernel<<<1, 1, 0, stream>>>(inputSeqLen.dataPointer<int32_t>(),
+        kvCacheStartIndices.dataPointer<int32_t>(), cuQSeqLens.dataPointer<int32_t>(),
+        cuKVSeqLens.dataPointer<int32_t>(), kvCacheEndIdxs.dataPointer<int32_t>(), runtimeSeqLen, runtimeBatchSize);
 }
 
-template <typename T>
-void cvtKVCachelayoutXQAToFMHA(T const* src, T* dst, int32_t B, int32_t S, int32_t H, int32_t D, cudaStream_t stream)
+void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, cudaStream_t stream)
 {
+    rt::Coords srcShape = src.getShape();
+    int32_t const B = static_cast<int32_t>(srcShape[0]);
+    int32_t const H = static_cast<int32_t>(srcShape[2]);
+    int32_t const S = static_cast<int32_t>(srcShape[3]);
+    int32_t const D = static_cast<int32_t>(srcShape[4]);
+
+    // Perform necessary shape checks.
+    rt::Coords dstShape = dst.getShape();
+    check::check(src.getDataType() == nvinfer1::DataType::kHALF && dst.getDataType() == nvinfer1::DataType::kHALF,
+        "Restrict input and output data types to FP16 for now.");
+    check::check(srcShape[1] == 2 && dstShape[2] == 2, "Source and destination tensors separate KV respectively.");
+    check::check(dstShape[0] == B && dstShape[1] == S && dstShape[3] == H && dstShape[4] == D,
+        "Destination tensor shall have consistent shape of [B, S, 2, H, D].");
+
     // Block config with safe thread count (≤ 1024)
     uint32_t const tx = (D >= 256) ? 256 : (D >= 128 ? 128 : 64);
     uint32_t const ty = 4; // token dimension per block
@@ -111,13 +144,9 @@ void cvtKVCachelayoutXQAToFMHA(T const* src, T* dst, int32_t B, int32_t S, int32
         (S + ty - 1) / ty,                                  // y : token dim
         hpTilesPerBatch * B);                               // z : (batch, headPair)
 
-    cvtKVCachelayoutXQAToFMHAKernel<<<grid, block, 0, stream>>>(src, dst, B, S, H, D);
+    cvtKVLayoutBHSDToBSHDKernel<half>
+        <<<grid, block, 0, stream>>>(src.dataPointer<half>(), dst.dataPointer<half>(), B, S, H, D);
 }
 
 } // namespace kernel
 } // namespace trt_edgellm
-
-/// @cond EXCLUDE_FROM_DOCS
-template void trt_edgellm::kernel::cvtKVCachelayoutXQAToFMHA<half>(
-    half const*, half*, int32_t, int32_t, int32_t, int32_t, cudaStream_t);
-/// @endcond

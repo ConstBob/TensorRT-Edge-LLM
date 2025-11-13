@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "common/tensor.h"
+
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -26,134 +28,43 @@ namespace trt_edgellm
 namespace kernel
 {
 
-/*!
- * @brief Apply RoPE and write KV cache (general version)
- *
- * Applies rotary position encoding to Q/K and writes K/V to cache with custom position IDs.
- *
- * @param qkv Input QKV tensor
- * @param kvCache KV cache buffer
- * @param qOut Output Q tensor with RoPE applied
- * @param cosSinCache Precomputed cos/sin cache
- * @param kvCacheEndLens KV cache end lengths per batch
- * @param tokenPosIds Token position IDs
- * @param qSeqLen Query sequence length
- * @param totalNumTokens Total number of tokens
- * @param kvCacheCapacity KV cache capacity
- * @param numQHead Number of query heads
- * @param numKVHead Number of KV heads
- * @param headDim Head dimension
- * @param rotaryDim Rotary dimension
- * @param cosSinCacheBatchSize Cos/sin cache batch size
- * @param cosSinCacheSeqLen Cos/sin cache sequence length
- * @param stream CUDA stream
- */
-void launchApplyRopeWriteKV(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
-    int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens,
-    int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim,
-    int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream);
+//! @brief Launch kernel to handle case where KVCache is empty. We will instantiate the KVCache and overwrite the QKV
+//! tensor directly.
+//! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
+//! @param[in,out] qkv FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq + Hk + Hv, headDim], the tensor
+//! will perform inplace update.
+//! @param[out] kvCache FP16 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
+//! from the start positions.
+//! @param[in] stream CUDA stream to launch the kernel
+void launchApplyRopeWriteKVPackedQKV(
+    rt::Tensor const& cosSinCache, rt::Tensor& qkv, rt::Tensor& kvCache, cudaStream_t stream);
 
-/*!
- * @brief Apply RoPE and write KV cache (context/prefill phase)
- *
- * Optimized for context/prefill phase where QKV are contiguous.
- *
- * @param qkv Input QKV tensor
- * @param kvCache KV cache buffer
- * @param cosSinCache Precomputed cos/sin cache
- * @param qSeqLen Query sequence length
- * @param totalNumTokens Total number of tokens
- * @param kvCacheCapacity KV cache capacity
- * @param numQHead Number of query heads
- * @param numKVHead Number of KV heads
- * @param headDim Head dimension
- * @param rotaryDim Rotary dimension
- * @param cosSinCacheBatchSize Cos/sin cache batch size
- * @param cosSinCacheSeqLen Cos/sin cache sequence length
- * @param stream CUDA stream
- */
-void launchApplyRopeWriteKVContext(half* qkv, half* kvCache, float const* cosSinCache, int32_t qSeqLen,
-    int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim,
-    uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream);
+//! @brief Launch the kernel to handle case where KVCache is not empty. We will write to a dedicated Q tensor and
+//! KVCache.
+//! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
+//! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], the end position of KVCache after writing.
+//! @param[in] qkv FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq + Hk + Hv, headDim]
+//! @param[out] kvCache FP16 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
+//! from the end position.
+//! @param[out] qOut FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim], the output Q tensor.
+//! @param[in] stream CUDA stream to launch the kernel
+//! @note We won't overwrite QKV tensor in this case but we use Tensor& signature to reduce duplicate code.
+void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
+    rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, cudaStream_t stream);
 
-/*!
- * @brief Apply RoPE and write continuous Q and KV cache
- *
- * Writes both Q (with RoPE) and KV to contiguous output tensors.
- *
- * @param qkv Input QKV tensor
- * @param kvCache KV cache buffer
- * @param cosSinCache Precomputed cos/sin cache
- * @param qOut Output Q tensor
- * @param kvCacheEndLens KV cache end lengths
- * @param qSeqLen Query sequence length
- * @param totalNumTokens Total number of tokens
- * @param kvCacheCapacity KV cache capacity
- * @param numQHead Number of query heads
- * @param numKVHead Number of KV heads
- * @param headDim Head dimension
- * @param rotaryDim Rotary dimension
- * @param cosSinCacheBatchSize Cos/sin cache batch size
- * @param cosSinCacheSeqLen Cos/sin cache sequence length
- * @param stream CUDA stream
- */
-void launchApplyRopeWriteContinuousQAndKVCache(half* qkv, half* kvCache, float const* cosSinCache, half* qOut,
-    int32_t const* kvCacheEndLens, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
-    cudaStream_t stream);
-
-/*!
- * @brief Apply RoPE and write KV cache (decode phase)
- *
- * Optimized for decode phase where query length is typically 1.
- *
- * @param qkv Input QKV tensor
- * @param kvCache KV cache buffer
- * @param qOut Output Q tensor
- * @param cosSinCache Precomputed cos/sin cache
- * @param kvCacheEndLens KV cache end lengths
- * @param qSeqLen Query sequence length
- * @param totalNumTokens Total number of tokens
- * @param kvCacheCapacity KV cache capacity
- * @param numQHead Number of query heads
- * @param numKVHead Number of KV heads
- * @param headDim Head dimension
- * @param rotaryDim Rotary dimension
- * @param cosSinCacheBatchSize Cos/sin cache batch size
- * @param cosSinCacheSeqLen Cos/sin cache sequence length
- * @param stream CUDA stream
- */
-void launchApplyRopeWriteKVDecode(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
-    int32_t const* kvCacheEndLens, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
-    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
-    cudaStream_t stream);
-
-/*!
- * @brief Apply RoPE and write KV cache (tree decode for speculative)
- *
- * Specialized for tree attention in speculative decoding (Eagle).
- *
- * @param qkv Input QKV tensor
- * @param kvCache KV cache buffer
- * @param qOut Output Q tensor
- * @param cosSinCache Precomputed cos/sin cache
- * @param kvCacheEndLens KV cache end lengths
- * @param tokenPosIds Token position IDs for tree nodes
- * @param qSeqLen Query sequence length
- * @param totalNumTokens Total number of tokens
- * @param kvCacheCapacity KV cache capacity
- * @param numQHead Number of query heads
- * @param numKVHead Number of KV heads
- * @param headDim Head dimension
- * @param rotaryDim Rotary dimension
- * @param cosSinCacheBatchSize Cos/sin cache batch size
- * @param cosSinCacheSeqLen Cos/sin cache sequence length
- * @param stream CUDA stream
- */
-void launchApplyRopeWriteKVTreeDecode(half* qkv, half* kvCache, half* qOut, float const* cosSinCache,
-    int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, int32_t qSeqLen, int32_t totalNumTokens,
-    int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim,
-    int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, cudaStream_t stream);
+//! @brief Launch the kernel when we are performing tree attention for speculative decoding.
+//! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
+//! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], the end position of KVCache after writing.
+//! @param[in] tokenPosIds INT32 type tensor with layout of [batchSize, runtimeSeqLen], the position of token within
+//! sequence.
+//! @param[in] qkv FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq + Hk + Hv, headDim]
+//! @param[out] kvCache FP16 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
+//! from the end position.
+//! @param[out] qOut FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim], the output Q tensor.
+//! @param[in] stream CUDA stream to launch the kernel
+//! @note We won't overwrite QKV tensor in this case but we use Tensor& signature to reduce duplicate code.
+void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
+    rt::Tensor const& tokenPosIds, rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

@@ -425,11 +425,16 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     }
 
     // Construct non-owned tensor objects from I/O data pointers and shapes.
+    // QKV inputs in the graph will be in shape [B, S, (Hq + Hk + Hv) x D], for convenience,
+    // we will use shape of [B, S, Hq + Hk + Hv, D] to represent the tensor.
     PluginTensorDesc const& qkvInputDesc = inputDesc[kIN_QKV_IDX];
-    rt::Tensor qkvInputTensor(
-        const_cast<void*>(inputs[kIN_QKV_IDX]), rt::Coords{qkvInputDesc.dims}, rt::DeviceType::kGPU, qkvInputDesc.type);
-    int32_t const runtimeBatchSize = static_cast<int32_t>(qkvInputTensor.getShape()[0]);
-    int32_t const runtimeSeqLen = static_cast<int32_t>(qkvInputTensor.getShape()[1]);
+    int32_t const runtimeBatchSize = static_cast<int32_t>(qkvInputDesc.dims.d[0]);
+    int32_t const runtimeSeqLen = static_cast<int32_t>(qkvInputDesc.dims.d[1]);
+    check::check(qkvInputDesc.dims.d[2] == (mNumHeadQ + mNumHeadKV + mNumHeadKV) * mNumElemPerHead,
+        "QKV input shape shall be consistent.");
+    rt::Tensor qkvInputTensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
+        rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumHeadQ + mNumHeadKV + mNumHeadKV, mNumElemPerHead},
+        rt::DeviceType::kGPU, qkvInputDesc.type);
 
     PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
     rt::Tensor const contextLengthTensor(const_cast<void*>(inputs[kIN_CONTEXT_LENGTH_IDX]),
@@ -438,9 +443,6 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     PluginTensorDesc const& posEncodingCosSinDesc = inputDesc[kIN_ROPE_COS_SIN_IDX];
     rt::Tensor const ropeCosSinTensor(const_cast<void*>(inputs[kIN_ROPE_COS_SIN_IDX]),
         rt::Coords{posEncodingCosSinDesc.dims}, rt::DeviceType::kGPU, posEncodingCosSinDesc.type);
-    uint32_t const cosSinCacheBatchSize = static_cast<uint32_t>(ropeCosSinTensor.getShape()[0]);
-    uint32_t const cosSinCacheSeqLen = static_cast<uint32_t>(ropeCosSinTensor.getShape()[1]);
-    uint32_t const rotaryDim = static_cast<uint32_t>(ropeCosSinTensor.getShape()[2]);
 
     PluginTensorDesc const& attentionOutputDesc = outputDesc[kOUT_ATTENTION_IDX];
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
@@ -484,30 +486,19 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
     if (isPrefillPhase)
     {
-        // At Context phase. Do 1. Apply rope and write KVCache. 2. Dispatch FMHA runner.
-        // RoPE kernel now only handle padded input sequence, we treat all "tokens" in the
-        // padded input as processing targets.
-        // TODO: Explore non-padded input format.
-        int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
         AttentionInputLayout attentionInputLayout
             = mEnableReuseKVCache ? AttentionInputLayout::CONTIGUOUS_Q_KV : AttentionInputLayout::PACKED_QKV;
 
         rt::Tensor cuQSeqLensTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
 
-        rt::Tensor cuTotalKvCacheLensTensor{};
-        rt::Tensor kvCacheEndIdxsTensor{};
-        if (mEnableReuseKVCache)
-        {
-            cuTotalKvCacheLensTensor
-                = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
-            kvCacheEndIdxsTensor = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
-        }
+        rt::Tensor cuKVSeqLensTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
+        rt::Tensor kvCacheEndIdxsTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
 
-        kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor.dataPointer<int32_t>(),
-            cuQSeqLensTensor.dataPointer<int32_t>(), kvCacheStartIdxTensor.dataPointer<int32_t>(),
-            cuTotalKvCacheLensTensor.dataPointer<int32_t>(), kvCacheEndIdxsTensor.dataPointer<int32_t>(), runtimeSeqLen,
-            runtimeBatchSize, stream);
+        kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
+            cuKVSeqLensTensor, kvCacheEndIdxsTensor, runtimeSeqLen, stream);
 
         auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadKV,
             mNumElemPerHead, mSMVersion, attentionInputLayout);
@@ -520,35 +511,29 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
         if (attentionInputLayout == AttentionInputLayout::CONTIGUOUS_Q_KV)
         {
-            // Assign Q tensor to keep roped Q results with layout [B, Sq, Hq, D]
-            rt::Tensor qVecTensor = assignTensorFromWorkspace(
+            // Assign Q tensor to keep roped Q results with layout [B, Sq, Hq, D].
+            rt::Tensor qOutTensor = assignTensorFromWorkspace(
                 alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumElemPerHead}, DataType::kHALF);
             // q: [b, s, hq+hk+hv, d] -> [b, s, hq, d]
-            kernel::launchApplyRopeWriteContinuousQAndKVCache(qkvInputTensor.dataPointer<half>(),
-                kvCacheTensor.dataPointer<half>(), ropeCosSinTensor.dataPointer<float>(),
-                qVecTensor.dataPointer<half>(), kvCacheEndIdxsTensor.dataPointer<int32_t>(), runtimeSeqLen,
-                totalProcessToken, mKVCacheCapacity, mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim,
-                cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+            kernel::launchApplyRopeWriteKVContinuousQAndKVCache(
+                ropeCosSinTensor, kvCacheEndIdxsTensor, qkvInputTensor, kvCacheTensor, qOutTensor, stream);
 
-            rt::Tensor kvCacheFMHATensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                {runtimeBatchSize, runtimeSeqLen, 2, mNumHeadKV, mKVCacheCapacity, mNumElemPerHead}, DataType::kHALF);
+            rt::Tensor transposedKVTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                {runtimeBatchSize, mKVCacheCapacity, 2, mNumHeadKV, mNumElemPerHead}, DataType::kHALF);
             // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
-            kernel::cvtKVCachelayoutXQAToFMHA<half>(kvCacheTensor.dataPointer<half>(),
-                kvCacheFMHATensor.dataPointer<half>(), runtimeBatchSize, mKVCacheCapacity, mNumHeadKV, mNumElemPerHead,
-                stream);
+            kernel::cvtKVLayoutBHSDToBSHD(kvCacheTensor, transposedKVTensor, stream);
 
             // Set device ptr for FMHA kernel.
             params.s_kv = mKVCacheCapacity;
-            params.q_ptr = qVecTensor.dataPointer<half>();
-            params.kv_ptr = kvCacheFMHATensor.dataPointer<half>();
-            params.cu_kv_seqlens = cuTotalKvCacheLensTensor.dataPointer<int32_t>();
+            params.q_ptr = qOutTensor.dataPointer<half>();
+            params.kv_ptr = transposedKVTensor.dataPointer<half>();
+            params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
             params.o_ptr = attentionOutputTensor.dataPointer<half>();
         }
         else
         { // PACKED_QKV
-            kernel::launchApplyRopeWriteKVContext(qkvInputTensor.dataPointer<half>(), kvCacheTensor.dataPointer<half>(),
-                ropeCosSinTensor.dataPointer<float>(), runtimeSeqLen, totalProcessToken, mKVCacheCapacity, mNumHeadQ,
-                mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+            kernel::launchApplyRopeWriteKVPackedQKV(ropeCosSinTensor, qkvInputTensor, kvCacheTensor, stream);
+
             params.qkv_ptr = qkvInputTensor.dataPointer<half>();
             params.cu_kv_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
             params.o_ptr = attentionOutputTensor.dataPointer<half>();
@@ -559,33 +544,24 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     }
     else
     {
-        // Generation phase we first prepare Q vector and update KVCache.
-        // Currently we only supports generating one token per sequence.
-        rt::Tensor qVecTensor = assignTensorFromWorkspace(
+        rt::Tensor qOutTensor = assignTensorFromWorkspace(
             alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumElemPerHead}, DataType::kHALF);
-        int32_t const totalProcessToken = runtimeBatchSize * runtimeSeqLen;
         if (mEnableTreeAttention)
         {
-
-            kernel::launchApplyRopeWriteKVTreeDecode(qkvInputTensor.dataPointer<half>(),
-                kvCacheTensor.dataPointer<half>(), qVecTensor.dataPointer<half>(),
-                ropeCosSinTensor.dataPointer<float>(), contextLengthTensor.dataPointer<int32_t>(),
-                attentionPosIdTensor.dataPointer<int32_t>(), runtimeSeqLen, totalProcessToken, mKVCacheCapacity,
-                mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+            kernel::launchApplyRopeWriteKVTreeDecoding(ropeCosSinTensor, contextLengthTensor, attentionPosIdTensor,
+                qkvInputTensor, kvCacheTensor, qOutTensor, stream);
         }
         else
         {
-            kernel::launchApplyRopeWriteKVDecode(qkvInputTensor.dataPointer<half>(), kvCacheTensor.dataPointer<half>(),
-                qVecTensor.dataPointer<half>(), ropeCosSinTensor.dataPointer<float>(),
-                contextLengthTensor.dataPointer<int32_t>(), runtimeSeqLen, totalProcessToken, mKVCacheCapacity,
-                mNumHeadQ, mNumHeadKV, mNumElemPerHead, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, stream);
+            kernel::launchApplyRopeWriteKVContinuousQAndKVCache(
+                ropeCosSinTensor, contextLengthTensor, qkvInputTensor, kvCacheTensor, qOutTensor, stream);
         }
-        // Prepare GQA runner parameter to dispatch kernel
+        // Prepare Decoding attention runner parameter to dispatch kernel
         auto xqaRunner
             = DecoderXQARunner(mDataType, runtimeBatchSize, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mSMVersion);
         XQALaunchParams params = xqaRunner.initXQAParams();
         params.output = attentionOutputTensor.dataPointer<half>();
-        params.qInputPtr = qVecTensor.dataPointer<half>();
+        params.qInputPtr = qOutTensor.dataPointer<half>();
         params.kvCache.data = kvCacheTensor.dataPointer<half>();
         params.kvCache.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
         params.kvCache.capacity = mKVCacheCapacity;
