@@ -70,10 +70,11 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
  * @param rotaryDim Rotary dimension
  * @param rotaryEmbeddingMaxPositions Maximum positions
  * @param batchSize Batch size
+ * @param interleaved Whether to use interleaved MRoPE
  * @param stream CUDA stream
  */
 void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
-    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, cudaStream_t stream);
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

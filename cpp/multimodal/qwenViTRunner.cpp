@@ -199,9 +199,10 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
 
         for (int64_t i = 0; i < mConfig.numDeepstackFeatures; ++i)
         {
-            mDeepstackFeatures.emplace_back(rt::Tensor(
-                {mConfig.maxHW / 4, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF));
-            std::string deepstackFeatureName = std::string(binding_names::kDeepstackFeatures) + "." + std::to_string(i);
+            // Set tensor name to match the engine binding name.
+            std::string const deepstackFeatureName = binding_names::formatDeepstackFeaturesName(i);
+            mDeepstackFeatures.emplace_back(rt::Tensor({mConfig.maxHW / 4, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
+                nvinfer1::DataType::kHALF, deepstackFeatureName));
             setTensorAddressStatus
                 &= mContext->setTensorAddress(deepstackFeatureName.c_str(), mDeepstackFeatures.back().rawPointer());
         }
@@ -535,9 +536,10 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
 
     // Initialize mrope cosSinCacheDevice
     ropeRotaryCosSinDevice.reshape({batchInputIds.size(), maxPositionEmbeddings, rotaryDim});
+    bool interleaved = mModelType == multimodal::ModelType::QWEN3_VL;
     kernel::initializeMRopeCosSin(reinterpret_cast<float*>(const_cast<void*>(ropeRotaryCosSinDevice.rawPointer())),
         reinterpret_cast<int64_t*>(mropePositionIdsDevice.rawPointer()), mConfig.mropeTheta, rotaryDim,
-        maxPositionEmbeddings, batchInputIds.size(), stream);
+        maxPositionEmbeddings, batchInputIds.size(), interleaved, stream);
 }
 
 void QwenViTRunner::getWindowIndex(
@@ -616,6 +618,10 @@ void QwenViTRunner::getWindowIndex(
 
 std::string QwenViTRunner::applyChatTemplateSystem(std::string const& systemPrompt)
 {
+    if (systemPrompt.empty())
+    {
+        return "";
+    }
     return "<|im_start|>system\n" + systemPrompt + "<|im_end|>\n";
 }
 
@@ -772,6 +778,23 @@ bool QwenViTRunner::infer(cudaStream_t stream)
     }
 
     return true;
+}
+
+rt::OptionalInputTensors QwenViTRunner::getExtraVisualFeatures()
+{
+    if (mModelType != multimodal::ModelType::QWEN3_VL)
+    {
+        return {};
+    }
+
+    // Build vector of references to individual tensors
+    std::vector<std::reference_wrapper<rt::Tensor const>> refs;
+    refs.reserve(mDeepstackFeatures.size());
+    for (auto const& tensor : mDeepstackFeatures)
+    {
+        refs.emplace_back(std::cref(tensor));
+    }
+    return refs;
 }
 
 } // namespace rt

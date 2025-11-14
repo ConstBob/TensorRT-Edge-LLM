@@ -227,7 +227,7 @@ inline constexpr char const* kFastPosEmbWeight = "fast_pos_embed_weight";
  *
  * Shape: [num_image_tokens, hidden_size] (FLOAT16)
  */
-inline constexpr char const* kDeepstackFeatures = "deepstack_features";
+inline constexpr char const* kDeepstackFeaturesTemplate = "deepstack_features";
 
 /*! @} */
 
@@ -290,6 +290,17 @@ inline bool isKVCacheBinding(std::string const& bindingName)
 {
     return bindingName.find(kPastKeyValuesTemplate) != std::string::npos
         || bindingName.find(kPresentKeyValuesTemplate) != std::string::npos;
+}
+
+/*!
+ * @brief Format deepstack features binding name for a specific layer
+ *
+ * @param layerIdx The layer index
+ * @return Formatted binding name like "deepstack_features.0"
+ */
+inline std::string formatDeepstackFeaturesName(int32_t layerIdx)
+{
+    return std::string(kDeepstackFeaturesTemplate) + "." + std::to_string(layerIdx);
 }
 
 /*! @} */

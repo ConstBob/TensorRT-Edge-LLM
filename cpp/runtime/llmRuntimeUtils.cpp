@@ -56,6 +56,10 @@ RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config)
     if (ropeScalingIt != config.end())
     {
         auto ropeTypeIt = ropeScalingIt->find("type");
+        if (ropeTypeIt == ropeScalingIt->end())
+        {
+            ropeTypeIt = ropeScalingIt->find("rope_type");
+        }
         auto mropeSectionIt = ropeScalingIt->find("mrope_section");
         if (ropeTypeIt != ropeScalingIt->end())
         {
@@ -78,6 +82,13 @@ RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config)
             {
                 ropeConfig.type = RopeType::kLongRope;
             }
+        }
+        else
+        {
+            LOG_WARNING(
+                "rope_type is not specified in the model config, using default rope type. This could misalign with the "
+                "model configuration, please check the config file to ensure the correctness");
+            ropeConfig.type = RopeType::kDefault;
         }
     }
     else

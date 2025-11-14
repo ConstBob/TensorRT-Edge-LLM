@@ -295,6 +295,17 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             &= mGenerationExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
         setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
             binding_names::kImageEmbeds, rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
+
+        // Set deepstack features if exists.
+        for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
+        {
+            std::string deepstackFeatureName = binding_names::formatDeepstackFeaturesName(idx);
+            setMultimodalStatus &= mGenerationExecutionContext->setTensorAddress(
+                deepstackFeatureName.c_str(), mDummyTensor.rawPointer());
+            setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
+                deepstackFeatureName.c_str(), rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
+        }
+
         if (!setMultimodalStatus)
         {
             LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
@@ -462,6 +473,12 @@ bool LLMEngineRunner::validateConfigFromEngine()
         return tensorDim.nbDims == 2 && bindingName == binding_names::kImageEmbeds;
     };
 
+    // If the engine comes with deepstack features binding, it means the engine is Qwen3-VL.
+    auto identifyDeepstackFeaturesBinding = [](std::string const& bindingName, Dims const& tensorDim) {
+        return tensorDim.nbDims == 2
+            && bindingName.find(binding_names::kDeepstackFeaturesTemplate) != std::string::npos;
+    };
+
     int32_t nbKVCacheInputs{0};
     bool foundMultimodalEmbeddingsInput{false};
     bool foundReuseKVCacheInput{false};
@@ -507,6 +524,22 @@ bool LLMEngineRunner::validateConfigFromEngine()
                 LOG_ERROR("VLM is not enabled but multimodal embeddings input image_embeds found in engine");
                 return false;
             }
+        }
+        if (identifyDeepstackFeaturesBinding(bindingName, tensorDim))
+        {
+            if (mConfig.hiddenSize != tensorDim.d[1])
+            {
+                LOG_ERROR("hiddenSize is not consistent. From engine multimodal embeddings: %d, from config: %d",
+                    tensorDim.d[1], mConfig.hiddenSize);
+                return false;
+            }
+            if (!mConfig.isVlm)
+            {
+                LOG_ERROR("VLM is not enabled but deepstack features input found in engine");
+                return false;
+            }
+            LOG_DEBUG("validateConfigFromEngine(): Found deepstack features binding: %s", bindingName.c_str());
+            ++mConfig.numDeepstackFeatures;
         }
         if (identifyReuseKVCacheBinding(bindingName, tensorDim))
         {
@@ -636,7 +669,7 @@ rt::LinearKVCache& LLMEngineRunner::getLinearKVCache()
 
 bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
     rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates,
-    rt::OptionalInputTensor multimodalEmbeddings)
+    rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors)
 {
     int32_t activeBatchSize = inputIds.getShape()[0];
     int32_t prefillSequenceLength = inputIds.getShape()[1];
@@ -687,6 +720,35 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
         return false;
     }
 
+    // Validate extra input tensors, e.g. deepstack features for Qwen3-VL
+    int32_t deepstackFeaturesCount{0};
+    for (auto const& tensorRef : extraInputTensors)
+    {
+        rt::Tensor const& tensor = tensorRef.get();
+        std::string const tensorName = tensor.getName();
+
+        // Deepstack features
+        if (tensorName.find(binding_names::kDeepstackFeaturesTemplate) != std::string::npos)
+        {
+            bool const isTensorValid = tensor.getDeviceType() == rt::DeviceType::kGPU
+                && tensor.getShape().getNumDims() == 2 && tensor.getShape()[1] == mConfig.hiddenSize;
+            if (!isTensorValid)
+            {
+                LOG_ERROR(
+                    "Invalid deepstack feature '%s'. Expected device type: GPU, shape: [*, %d]. Current shape: %s",
+                    tensorName.c_str(), mConfig.hiddenSize, tensor.getShape().formatString().c_str());
+                return false;
+            }
+            ++deepstackFeaturesCount;
+        }
+    }
+    if (deepstackFeaturesCount != mConfig.numDeepstackFeatures)
+    {
+        LOG_ERROR("Invalid deepstack features count. Expected %d, got %d", mConfig.numDeepstackFeatures,
+            deepstackFeaturesCount);
+        return false;
+    }
+
     bool const isLogitsShapeValid
         = outputLogits.getShape().getNumDims() == 2 && outputLogits.getShape()[1] == mConfig.vocabSize;
     if (!isLogitsShapeValid)
@@ -719,11 +781,11 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
 }
 
 bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& hostContextLengths,
-    rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
-    cudaStream_t stream)
+    rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors, rt::Tensor& outputLogits,
+    rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream)
 {
     bool const validateInputStatus = this->prefillStepInputValidation(
-        inputIds, hostContextLengths, outputLogits, outputHiddenStates, multimodalEmbeddings);
+        inputIds, hostContextLengths, outputLogits, outputHiddenStates, multimodalEmbeddings, extraInputTensors);
     if (!validateInputStatus)
     {
         LOG_ERROR("executePrefill(): Prefill request not performed due to invalid input tensors.");
@@ -785,6 +847,18 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
             binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
         setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
             binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
+    }
+    if (!extraInputTensors.empty())
+    {
+        for (auto const& tensorRef : extraInputTensors)
+        {
+            // Bind the extra input tensor to the engine according to its name.
+            rt::Tensor const& tensor = tensorRef.get();
+            setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+                tensor.getName().c_str(), const_cast<void*>(tensor.rawPointer()));
+            setEngineIOStatus
+                &= mPrefillExecutionContext->setInputShape(tensor.getName().c_str(), tensor.getShape().getTRTDims());
+        }
     }
     if (mConfig.enableReuseKVCache)
     {

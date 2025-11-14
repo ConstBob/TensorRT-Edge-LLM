@@ -316,6 +316,10 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 
 std::string InternViTRunner::applyChatTemplateSystem(std::string const& systemPrompt)
 {
+    if (systemPrompt.empty())
+    {
+        return "";
+    }
     return "<|im_start|>system\n" + systemPrompt + "<|im_end|>\n";
 }
 

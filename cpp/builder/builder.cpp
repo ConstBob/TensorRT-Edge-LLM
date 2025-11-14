@@ -599,6 +599,23 @@ bool LLMBuilder::setupVLMProfiles(nvinfer1::IOptimizationProfile* contextProfile
     result &= setOptimizationProfile(generationProfile, binding_names::kImageEmbeds, createDims({1, imageHiddenSize}),
         createDims({1, imageHiddenSize}), createDims({1, imageHiddenSize}));
 
+    if (mModelConfig["model"].get<std::string>() == "qwen3vltext")
+    {
+        for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
+        {
+            std::string const inputName = network->getInput(idx)->getName();
+            if (inputName.find(binding_names::kDeepstackFeaturesTemplate) != std::string::npos)
+            {
+                result &= setOptimizationProfile(contextProfile, inputName.c_str(),
+                    createDims({mBuilderConfig.minImageTokens, imageHiddenSize}),
+                    createDims({optImageTokens, imageHiddenSize}),
+                    createDims({mBuilderConfig.maxImageTokens, imageHiddenSize}));
+                result &= setOptimizationProfile(generationProfile, inputName.c_str(), createDims({1, imageHiddenSize}),
+                    createDims({1, imageHiddenSize}), createDims({1, imageHiddenSize}));
+            }
+        }
+    }
+
     if (!result)
     {
         LOG_ERROR("Failed to setup optimization profiles at setupVLMProfiles().");

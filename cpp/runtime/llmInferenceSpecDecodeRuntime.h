@@ -58,6 +58,7 @@ struct SpecDecodeInferenceContext
     std::vector<bool> finishedStates;             //!< Finished state for each sequence: [batch_size]
     std::vector<int32_t> actualIterations;        //!< Actual iterations run for each sequence: [batch_size]
     rt::OptionalInputTensor multimodalEmbeddings; //!< Optional multimodal embeddings
+    rt::OptionalInputTensors extraInputTensors;   //!< Extra input tensors (e.g., deepstack features)
     int32_t generationRound;                      //!< Current generation round (shared across all batches)
     int32_t maxGenerateLength;                    //!< Maximum generation length
     int32_t activeBatchSize;                      //!< Current active batch size
@@ -69,10 +70,11 @@ struct SpecDecodeInferenceContext
      * @param batchSize Active batch size
      * @param maxGenLength Maximum generation length
      * @param multimodal Optional multimodal embeddings
+     * @param extraInputTensors Extra input tensors (e.g., deepstack features)
      * @param cudaStream CUDA stream for operations
      */
-    void initialize(
-        int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal, cudaStream_t cudaStream);
+    void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal,
+        rt::OptionalInputTensors const& extraInputTensors, cudaStream_t cudaStream);
 };
 
 /*!

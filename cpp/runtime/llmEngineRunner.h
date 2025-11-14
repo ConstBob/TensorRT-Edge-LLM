@@ -59,6 +59,7 @@ struct LLMEngineRunnerConfig
     int32_t maxSupportedLoraRank{};        //!< Maximum supported LoRA rank
     int32_t outputHiddenDim{};             //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
     int32_t maxVerifyTreeSize{};           //!< Maximum verification tree size for Eagle speculative decoding
+    int32_t numDeepstackFeatures{};        //!< Number of deepstack features for Qwen3-VL
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -106,13 +107,14 @@ public:
     //!     inputIds [GPU]: The input token_ids for the batch of new requests.
     //!     contextLengths [CPU]: The context lengths for each sequence in the batch.
     //!     multimodalEmbeddings [GPU]: Optional. The multimodal embeddings for the batch of requests.
+    //!     extraInputTensors [GPU]: Optional. Extra input tensors (e.g., deepstack features for Qwen3-VL).
     //!     outputLogits [GPU]: The output logits for the batch of requests..
     //!     stream: The CUDA stream to execute the prefill stp.
     //! Returns:
     //!     True if the prefill step is successful, false otherwise.
     bool executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
-        rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits,
-        rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream);
+        rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors,
+        rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream);
 
     //! API entry to execute one vanilla decoding engine action for a batched request. The API will perform decoding
     //!     operations fill the KVCache of the new generated tokens and produce the output logits. The decoding
@@ -257,7 +259,7 @@ private:
     //! @brief Validate inputs for prefill step
     bool prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
         rt::Tensor const& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
-        rt::OptionalInputTensor multimodalEmbeddings);
+        rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors);
 
     //! @brief Validate inputs for vanilla decoding step
     bool vanillaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits);

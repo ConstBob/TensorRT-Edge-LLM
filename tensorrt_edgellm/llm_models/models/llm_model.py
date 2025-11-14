@@ -30,7 +30,8 @@ import torch
 from torch import nn
 
 from ..layers.gather_nd import custom_gather_nd
-from ..layers.layers import EdgeLLMDecoderLayer, PromptTuningEmbedding
+from ..layers.layers import (EdgeLLMDecoderLayer, PromptTuningEmbedding,
+                             Qwen3VLDeepStackProcess)
 
 
 class EdgeLLMModel(nn.Module):
@@ -110,6 +111,7 @@ class EdgeLLMModel(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         image_embeds: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         output_hidden_states: bool = False,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Optional[Tuple[
             torch.Tensor, ...]]]:
@@ -127,6 +129,7 @@ class EdgeLLMModel(nn.Module):
             input_ids: Input token IDs of shape (batch_size, seq_len), optional (used for standard models and prompt tuning)
             image_embeds: Image embeddings tensor of shape (image_token_len, hidden_size), optional (used with prompt tuning)
             inputs_embeds: Input embeddings tensor of shape (batch_size, seq_len, hidden_size), optional (legacy support)
+            deepstack_visual_embeds: List of deepstack visual embeddings tensors, each with shape (visual_seqlen, hidden_size), optional (used with deepstack processing)
             output_hidden_states: Whether to output hidden states from all layers
             
         Returns:
@@ -170,6 +173,16 @@ class EdgeLLMModel(nn.Module):
             )
 
             present_key_values += (present_key_value, )
+
+            if deepstack_visual_embeds is not None and idx in range(
+                    len(deepstack_visual_embeds)):
+                assert self.config.model_type == "qwen3_vl_text", "Qwen3VLTextModel is required for deepstack processing"
+                hidden_states = Qwen3VLDeepStackProcess(
+                    self.embed_tokens.num_embeddings)(
+                        input_ids,
+                        hidden_states,
+                        deepstack_visual_embeds[idx],
+                    )
 
         # Apply final normalization
         hidden_states = self.norm(hidden_states)
@@ -254,6 +267,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
         kvcache_start_index: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         image_embeds: Optional[torch.Tensor] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]], Tuple[
             torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor]]:
@@ -272,7 +286,8 @@ class EdgeLLMModelForCausalLM(nn.Module):
             input_ids: Input token IDs of shape (batch_size, seq_len), optional (used for standard models and prompt tuning)
             image_embeds: Image embeddings tensor of shape (image_token_len, hidden_size), optional (used with prompt tuning)
             inputs_embeds: Input embeddings tensor of shape (batch_size, seq_len, hidden_size), optional (legacy support)
-            
+            deepstack_visual_embeds: List of deepstack visual embeddings tensors, each with shape (visual_seqlen, hidden_size), optional (used with deepstack processing)
+
         Returns:
             Union[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]], Tuple[torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor]]: Model outputs
                 - For standard models: (logits, past_key_values)
@@ -292,6 +307,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
             output_hidden_states=output_hidden_states,
             input_ids=input_ids,
             image_embeds=image_embeds,
+            deepstack_visual_embeds=deepstack_visual_embeds,
             inputs_embeds=inputs_embeds,
         )
 

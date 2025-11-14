@@ -354,6 +354,9 @@ bool LLMInferenceRuntime::handleRequest(
     // All other data input used by prefill step is already set up in setUpForPrefillExecution().
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+    rt::OptionalInputTensors extraVisualFeatures
+        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+
     // Profile all sampling operations as one stage
     std::vector<int32_t> generatedToken;
     // Prefill profiling session
@@ -362,8 +365,8 @@ bool LLMInferenceRuntime::handleRequest(
     {
         TIME_STAGE(metrics::StageNames::kLLM_PREFILL, stream);
 
-        bool prefillStatus = mLLMEngineRunner->executePrefillStep(
-            mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, outputHiddenStates, stream);
+        bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings,
+            extraVisualFeatures, mOutputLogits, outputHiddenStates, stream);
         if (!prefillStatus)
         {
             LOG_ERROR(
@@ -491,6 +494,12 @@ LLMInferenceRuntime::TokenCountInfo LLMInferenceRuntime::calculateTokenCounts(
 bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream)
 {
+    if (prompt.empty())
+    {
+        LOG_DEBUG("LLMInferenceRuntime(): The prompt is empty. Skip saving system prompt KVCache.");
+        return true;
+    }
+
     // TODO: Enable the system prompt KVCache feature by default and remove this check.
     if (!mEngineConfig.enableReuseKVCache)
     {
@@ -532,9 +541,12 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     // Execute prefill step to initialize the KVCache data.
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+    rt::OptionalInputTensors extraVisualFeatures
+        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+
     rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
-    bool prefillStatus = mLLMEngineRunner->executePrefillStep(
-        mInputIds, mHostContextLengths, multimodalEmbeddings, mOutputLogits, outputHiddenStates, stream);
+    bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings,
+        extraVisualFeatures, mOutputLogits, outputHiddenStates, stream);
     if (!prefillStatus)
     {
         LOG_ERROR("LLMInferenceRuntime(): Failed to execute prefill step.");

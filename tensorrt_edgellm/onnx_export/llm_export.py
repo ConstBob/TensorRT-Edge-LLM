@@ -198,6 +198,15 @@ def create_dummy_inputs(model: nn.Module, enable_reuse_kv_cache: bool,
                                    device=device)
         base_inputs['image_embeds'] = image_embeds
 
+    if model_config.model_type == "qwen3_vl_text":
+        deepstack_visual_embeds = [
+            torch.randn(image_token_len,
+                        hidden_size,
+                        dtype=torch.float16,
+                        device=device) for _ in range(3)
+        ]
+        base_inputs['deepstack_visual_embeds'] = deepstack_visual_embeds
+
     # Create position_ids and attention_mask for all models
     position_ids = torch.arange(seq_len, dtype=torch.int32,
                                 device=device).unsqueeze(0).expand(
@@ -313,6 +322,9 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         if use_prompt_tuning:
             base_inputs.append(dummy_inputs['image_embeds'])
 
+        if model_config.model_type == "qwen3_vl_text":
+            base_inputs.append(dummy_inputs['deepstack_visual_embeds'])
+
         inputs = tuple(base_inputs)
 
         # Create input names
@@ -336,6 +348,9 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
 
         if use_prompt_tuning:
             input_names.append('image_embeds')
+
+        if model_config.model_type == "qwen3_vl_text":
+            input_names += [f'deepstack_features.{i}' for i in range(3)]
 
         # Create output names
         if is_eagle_base or is_eagle_draft:
@@ -417,6 +432,14 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
 
         if use_prompt_tuning:
             dynamic_axes["image_embeds"] = {0: "image_token_len"}
+
+        if model_config.model_type == "qwen3_vl_text":
+            dynamic_axes.update({
+                f"deepstack_features.{i}": {
+                    0: "image_token_len"
+                }
+                for i in range(3)
+            })
 
         # Add dynamic axes for outputs
         if is_eagle_base or is_eagle_draft:
