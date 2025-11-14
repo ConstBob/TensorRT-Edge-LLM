@@ -7,9 +7,9 @@
 
 # == C++/CUDA runtime & kernel components ==
 /cpp/ @fans
-/cpp/common/ @fkaster
+/cpp/common/ @fkaster @fans
 /cpp/kernels/ @fans @ruochengj
-/cpp/multimodal/ @amberl
+/cpp/multimodal/ @amberl @ruochengj
 /cpp/plugins/ @fans @ruochengj
 /cpp/profiling/ @luxiaoz @amberl @ruochengj
 /cpp/runtime/ @fans @amberl @fkaster
