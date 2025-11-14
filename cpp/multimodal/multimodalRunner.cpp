@@ -101,5 +101,10 @@ rt::Tensor& MultimodalRunner::getOutputEmbedding()
     return mOutputEmbedding;
 }
 
+rt::OptionalInputTensors MultimodalRunner::getExtraVisualFeatures()
+{
+    return {};
+}
+
 } // namespace rt
 } // namespace trt_edgellm

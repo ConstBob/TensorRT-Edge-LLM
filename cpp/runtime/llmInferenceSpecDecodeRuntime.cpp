@@ -53,7 +53,8 @@ namespace rt
 {
 
 void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _maxGenerateLength,
-    rt::OptionalInputTensor const& _mutimodalEmbeddings, cudaStream_t _stream)
+    rt::OptionalInputTensor const& _mutimodalEmbeddings, rt::OptionalInputTensors const& _extraInputTensors,
+    cudaStream_t _stream)
 {
     systemPrompts.resize(_activeBatchSize);
     rawBatchedInputIds.reserve(_activeBatchSize);
@@ -63,6 +64,7 @@ void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _m
     finishedStates.resize(_activeBatchSize, false);
     actualIterations.resize(_activeBatchSize, 0);
     multimodalEmbeddings = _mutimodalEmbeddings;
+    extraInputTensors = _extraInputTensors;
     generationRound = 0;
     maxGenerateLength = _maxGenerateLength;
     activeBatchSize = _activeBatchSize;
@@ -276,11 +278,14 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     // All other data input used by prefill step is already set up in setUpForPrefillExecution().
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+    rt::OptionalInputTensors extraInputTensors
+        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+
     int32_t maxGenerateLength = request.maxGenerateLength;
 
     // Initialize context for multi-batch
     SpecDecodeInferenceContext context;
-    context.initialize(activeBatchSize, maxGenerateLength, multimodalEmbeddings, stream);
+    context.initialize(activeBatchSize, maxGenerateLength, multimodalEmbeddings, extraInputTensors, stream);
 
     // Preprocess user prompts and encode them.
     std::vector<std::vector<int32_t>> batchedInputIds;
@@ -547,8 +552,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
             inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
     }
 
-    bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(mIdsInput, mContextLengthsInput,
-        context.multimodalEmbeddings, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
+    bool const prefillSuccess
+        = mBaseEngineRunner->executePrefillStep(mIdsInput, mContextLengthsInput, context.multimodalEmbeddings,
+            context.extraInputTensors, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
     if (!prefillSuccess)
     {
         LOG_ERROR("Failed to execute prefill step for base model.");

@@ -417,7 +417,8 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
 }
 
 void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int64_t> const& mropePositionIds,
-    float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize)
+    float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize,
+    bool interleaved)
 {
     // mropePositionIds: (bs, 3, maxPositionEmbeddings)
     // mropeRotaryCosSin: (bs, maxPositionEmbeddings, rotaryDim)
@@ -440,20 +441,39 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
         }
     }
 
-    std::vector<int> mRopeSections{0, 16, 40, 64}; // cumsum of {16, 24, 24}
+    int32_t sinOffset = rotaryDim / 2;
     for (int b = 0; b < batchSize; ++b)
     {
-        for (int sec = 0; sec < 3; ++sec)
+        for (int i = 0; i < rotaryEmbeddingMaxPositions; ++i)
         {
-            for (int i = 0; i < rotaryEmbeddingMaxPositions; ++i)
+            if (interleaved)
             {
-                int pos = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
-                for (int j = mRopeSections[sec]; j < mRopeSections[sec + 1]; ++j)
+                // Interleaved format: [THWTHWHTHW...TTTT] Qwen3-VL
+                //     mrope section is [24, 20, 20]
+                //     [THWTHWHTHW...TTTT] has 20 groups of THW and 4 additional T
+                for (int j = 0; j < (rotaryDim / 2); ++j)
                 {
+                    int sec = (j >= 60) ? 0 : (j % 3);
+                    int pos
+                        = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
                     int cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
-                    int32_t sinOffset = rotaryDim / 2;
                     mropeRotaryCosSin[cosDstIdx] = cosOri[pos][j];
                     mropeRotaryCosSin[cosDstIdx + sinOffset] = sinOri[pos][j];
+                }
+            }
+            else
+            {
+                std::vector<int> mRopeSections{0, 16, 40, 64}; // cumsum of {16, 24, 24}
+                for (int sec = 0; sec < 3; ++sec)
+                {
+                    int pos
+                        = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
+                    for (int j = mRopeSections[sec]; j < mRopeSections[sec + 1]; ++j)
+                    {
+                        int cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
+                        mropeRotaryCosSin[cosDstIdx] = cosOri[pos][j];
+                        mropeRotaryCosSin[cosDstIdx + sinOffset] = sinOri[pos][j];
+                    }
                 }
             }
         }

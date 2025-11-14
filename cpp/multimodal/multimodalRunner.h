@@ -108,6 +108,10 @@ public:
     //! @return Reference to output embedding tensor
     virtual rt::Tensor& getOutputEmbedding();
 
+    //! @brief Get extra visual features
+    //! @return Optional input tensors vector (e.g. deepstack features for Qwen3-VL)
+    virtual rt::OptionalInputTensors getExtraVisualFeatures();
+
     /*!
      * @brief Validate and fill configuration from file
      * @param engineDir Path to engine directory

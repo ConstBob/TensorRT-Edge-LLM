@@ -103,6 +103,10 @@ public:
     //! \return Pointer to QwenViTConfig
     void* getConfig() override;
 
+    //! \brief Get extra visual features
+    //! \return Optional input tensors vector (e.g. deepstack features for Qwen3-VL)
+    rt::OptionalInputTensors getExtraVisualFeatures() override;
+
 private:
     //! \brief Calculate resized image dimensions based on dynamic resolution constraints
     //! \param[in] height Input image height

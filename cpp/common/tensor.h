@@ -397,5 +397,8 @@ using OptionalInputTensor = std::optional<std::reference_wrapper<rt::Tensor cons
 //! @brief Optional output tensor type wrapper
 using OptionalOutputTensor = std::optional<std::reference_wrapper<rt::Tensor>>;
 
+//! @brief Optional input tensors type wrapper (e.g. deepstack features for Qwen3-VL)
+using OptionalInputTensors = std::vector<std::reference_wrapper<rt::Tensor const>>;
+
 } // namespace rt
 } // namespace trt_edgellm
