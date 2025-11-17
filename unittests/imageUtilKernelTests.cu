@@ -258,7 +258,7 @@ void TestInitAttentionMaskQwenViT(int32_t const curHW, int32_t const blockSize =
         {
             for (int64_t j = cuSeqlens[s - 1]; j < cuSeqlens[s]; ++j)
             {
-                attentionMaskRef[i * curHW + j] = CUDART_ZERO_FP16;
+                attentionMaskRef[i * curHW + j] = __float2half(0.0f);
             }
         }
     }
