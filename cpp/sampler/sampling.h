@@ -93,7 +93,7 @@ struct SamplingWorkspace;
  * selected token indices for each batch element.
  *
  * \param[in] logits Input logits tensor [GPU, Float] with shape [batch-size, vocab-size]
- * \param[out] selectedIndices Selected token indices [GPU, Int32] with shape [batch-size]
+ * \param[out] selectedIndices Selected token indices [GPU, Int32] with shape [batch-size, 1]
  * \param[in] params Sampling parameters including batch size, vocab size, temperature, top-K, and top-P values
  * \param[in,out] workspace Workspace buffer [GPU, Int8] for intermediate computations
  * \param[in] stream CUDA stream to execute the kernel

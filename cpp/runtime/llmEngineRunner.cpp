@@ -235,6 +235,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             {mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize}, rt::DeviceType::kGPU, DataType::kINT64);
         CUDA_CHECK(
             cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mHostSelectTokenIndices = rt::Tensor(
+            {mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize}, rt::DeviceType::kCPU, DataType::kINT64);
         this->mEagleBasePositionIds = rt::Tensor(
             {mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
         CUDA_CHECK(
@@ -252,6 +254,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT64);
         CUDA_CHECK(
             cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
+        this->mHostSelectTokenIndices
+            = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU, DataType::kINT64);
     }
 
     // Add the LoRA weights to the engine.
@@ -806,13 +810,14 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
         return false;
     }
 
-    std::vector<int64_t> selectTokenIndicesHost(activeBatchSize, 0);
+    mHostSelectTokenIndices.reshape({activeBatchSize, 1});
+    int64_t* selectTokenIndicesData = mHostSelectTokenIndices.dataPointer<int64_t>();
     int32_t const* contextLengthsData = hostContextLengths.dataPointer<int32_t>();
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        selectTokenIndicesHost[i] = contextLengthsData[i] - 1;
+        selectTokenIndicesData[i] = static_cast<int64_t>(contextLengthsData[i] - 1);
     }
-    CUDA_CHECK(cudaMemcpyAsync(mSelectTokenIndices.rawPointer(), selectTokenIndicesHost.data(),
+    CUDA_CHECK(cudaMemcpyAsync(mSelectTokenIndices.rawPointer(), mHostSelectTokenIndices.rawPointer(),
         activeBatchSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), hostContextLengths.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));

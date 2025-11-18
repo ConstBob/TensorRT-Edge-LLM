@@ -84,10 +84,16 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8);
         mInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
             rt::DeviceType::kGPU, DataType::kINT32);
+        mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
+            rt::DeviceType::kCPU, DataType::kINT32);
         mOutputLogits = rt::Tensor(
             {mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32);
+        mHostSelectedTokenIds
+            = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
         mHostContextLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+        mHostReuseKVCacheLengths
+            = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
     }
     catch (std::exception const& e)
     {
@@ -146,15 +152,14 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
 {
     std::vector<std::vector<int32_t>> processedInputIds;
     std::vector<int32_t> processedIdsLengths;
-    std::vector<int32_t> packedInputIds;
     int32_t const activeBatchSize = static_cast<int32_t>(batchedInputIds.size());
 
     rt::LinearKVCache& linearKVCache = mLLMEngineRunner->getLinearKVCache();
     rt::Tensor kvCacheBuffer = linearKVCache.getKVCacheBuffer();
 
-    // Record the length of the reused KVCache for each sequence.
-    rt::Tensor reuseKVCacheLengths = rt::Tensor({activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-    int32_t* reuseKVCacheLengthsData = reuseKVCacheLengths.dataPointer<int32_t>();
+    // Record the length of the reused KVCache for each sequence using pre-allocated tensor
+    mHostReuseKVCacheLengths.reshape({activeBatchSize});
+    int32_t* reuseKVCacheLengthsData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
 
     // Search if the system prompt has been cached. If there are cached system prompts, insert
     // the pre-computed KVCache and remove the contents from inputIds.
@@ -204,21 +209,25 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
 
     // The LLM Engine could also have minSupportedInputLength constraint.
     int32_t const packedInputLength = std::max(maxInputLength, mEngineConfig.minSupportedInputLength);
-    packedInputIds.resize(activeBatchSize * packedInputLength, mTokenizer->getPadId());
+
+    // Reshape and fill the pre-allocated pinned host tensor with pad tokens
+    mHostPackedInputIds.reshape({activeBatchSize, packedInputLength});
+    int32_t* packedInputIdsData = mHostPackedInputIds.dataPointer<int32_t>();
+    std::fill(packedInputIdsData, packedInputIdsData + activeBatchSize * packedInputLength, mTokenizer->getPadId());
+
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         // Pad each sequence to the max length of this batch.
         // TODO: Implement remove input padding for better efficiency until multi-batch.
-        std::copy(
-            processedInputIds[i].begin(), processedInputIds[i].end(), packedInputIds.begin() + i * packedInputLength);
+        std::copy(processedInputIds[i].begin(), processedInputIds[i].end(), packedInputIdsData + i * packedInputLength);
     }
 
-    linearKVCache.resetForNewSequences(reuseKVCacheLengths, stream);
+    linearKVCache.resetForNewSequences(mHostReuseKVCacheLengths, stream);
     mInputIds.reshape({activeBatchSize, packedInputLength});
     mHostContextLengths.reshape({activeBatchSize});
     mOutputLogits.reshape({activeBatchSize, mEngineConfig.vocabSize});
 
-    CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), packedInputIds.data(),
+    CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), mHostPackedInputIds.rawPointer(),
         activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     memcpy(mHostContextLengths.dataPointer<int32_t>(), processedIdsLengths.data(), activeBatchSize * sizeof(int32_t));
 
@@ -325,21 +334,22 @@ bool LLMInferenceRuntime::handleRequest(
     int32_t generationIter{0};
     std::vector<std::vector<int32_t>> outputIds(activeBatchSize);
     std::vector<bool> finishedStates(activeBatchSize, false);
-    std::vector<int32_t> selectedTokenIdsHost(activeBatchSize, 0);
-    mSelectedIndices.reshape({activeBatchSize});
+    mSelectedIndices.reshape({activeBatchSize, 1});
+    mHostSelectedTokenIds.reshape({activeBatchSize});
+    int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
 
     SamplingParams params(activeBatchSize, mEngineConfig.vocabSize, request.temperature, request.topK, request.topP);
     auto sampleTokens = [&]() {
         trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
-        CUDA_CHECK(cudaMemcpyAsync(selectedTokenIdsHost.data(), mSelectedIndices.rawPointer(),
+        CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mSelectedIndices.rawPointer(),
             activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
             if (!finishedStates[i])
             {
-                outputIds[i].push_back(selectedTokenIdsHost[i]);
-                finishedStates[i] = selectedTokenIdsHost[i] == mTokenizer->getEosId();
+                outputIds[i].push_back(hostSelectedTokenIdsData[i]);
+                finishedStates[i] = hostSelectedTokenIdsData[i] == mTokenizer->getEosId();
                 if (finishedStates[i])
                 {
                     unFinishedBatchNum--;
@@ -347,7 +357,6 @@ bool LLMInferenceRuntime::handleRequest(
             }
         }
         ++generationIter;
-        return selectedTokenIdsHost;
     };
 
     // Use empty tensor for when no multimodal runner is available.
@@ -358,7 +367,6 @@ bool LLMInferenceRuntime::handleRequest(
         = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
 
     // Profile all sampling operations as one stage
-    std::vector<int32_t> generatedToken;
     // Prefill profiling session
     // For non-spec decode, we don't need to output hidden states.
     rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
@@ -373,7 +381,7 @@ bool LLMInferenceRuntime::handleRequest(
                 "LLMInferenceRuntime(): Failed to execute prefill step. Cannot generate the KVCache for this prompt.");
             return false;
         }
-        generatedToken = sampleTokens();
+        sampleTokens();
     }
 
     // Record prefill metrics
@@ -388,17 +396,15 @@ bool LLMInferenceRuntime::handleRequest(
 
         while (unFinishedBatchNum > 0 && generationIter < maxGenerationLength)
         {
-            CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), generatedToken.data(), activeBatchSize * sizeof(int32_t),
-                cudaMemcpyHostToDevice, stream));
-
-            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mInputIds, mOutputLogits, stream);
+            // Use the selected token indices as the input token indices for the decoding step.
+            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mSelectedIndices, mOutputLogits, stream);
             if (!decodingStatus)
             {
                 LOG_ERROR("LLMInferenceRuntime(): Failed to execute decoding step.");
                 return false;
             }
 
-            generatedToken = sampleTokens();
+            sampleTokens();
         }
     }
 
@@ -435,16 +441,16 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     // Capture the CUDA graph for all available batch sizes.
     for (int32_t batchSize = minSupportedBatchSize; batchSize <= maxSupportedBatchSize; ++batchSize)
     {
-        mInputIds.reshape({batchSize, 1});
+        mSelectedIndices.reshape({batchSize, 1});
         mOutputLogits.reshape({batchSize, mEngineConfig.vocabSize});
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-            mInputIds, mOutputLogits, mEmptyLoraWeightsName, stream);
+            mSelectedIndices, mOutputLogits, mEmptyLoraWeightsName, stream);
         if (mEngineConfig.maxSupportedLoraRank > 0)
         {
             for (auto const& loraWeightsName : mLLMEngineRunner->getAvailableLoraWeights())
             {
                 captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-                    mInputIds, mOutputLogits, loraWeightsName, stream);
+                    mSelectedIndices, mOutputLogits, loraWeightsName, stream);
             }
         }
     }
@@ -552,7 +558,6 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
         LOG_ERROR("LLMInferenceRuntime(): Failed to execute prefill step.");
         return false;
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Copy out the KVCache content from the prefill step.
     auto& linearKVCache = mLLMEngineRunner->getLinearKVCache();

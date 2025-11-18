@@ -810,10 +810,11 @@ void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIn
 
     auto logitsShape = logits.getShape();
     auto selectedIndicesShape = selectedIndices.getShape();
-    check::check(logitsShape.getNumDims() == 2 && selectedIndicesShape.getNumDims() == 1, "Invalid tensor dimensions");
+    check::check(logitsShape.getNumDims() == 2 && selectedIndicesShape.getNumDims() == 2, "Invalid tensor dimensions");
     check::check(logitsShape[0] == params.batchSize && logitsShape[1] == params.vocabSize,
         "Logits tensor shape mismatch with parameters");
-    check::check(selectedIndicesShape[0] == params.batchSize, "Selected indices tensor shape mismatch with parameters");
+    check::check(selectedIndicesShape[0] == params.batchSize && selectedIndicesShape[1] == 1,
+        "Selected indices tensor shape mismatch with parameters");
 
     int const BLOCK_SIZE = 256;
     int const BLOCKS_PER_BEAM = 8;

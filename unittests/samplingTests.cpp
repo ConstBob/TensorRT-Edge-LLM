@@ -313,7 +313,7 @@ protected:
 
         // Create tensors for the test
         rt::Tensor logitsTensor({batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor selectedIndicesTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+        rt::Tensor selectedIndicesTensor({batchSize, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
 
         std::vector<std::vector<float>> hostLogits;
         generateTestLogits(logitsTensor, hostLogits, batchSize, vocabSize);
