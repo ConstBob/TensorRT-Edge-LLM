@@ -25,6 +25,9 @@ Usage:
 
     # Disable reusing KV cache for system prompts
     python export_llm.py --model_dir /path/to/model --output_dir /path/to/output --disable_reuse_kv_cache
+    
+    # Export with reduced vocabulary
+    python export_llm.py --model_dir /path/to/model --output_dir /path/to/output --reduced_vocab_dir /path/to/reduced_vocab
 """
 
 import argparse
@@ -75,6 +78,14 @@ def main() -> None:
                         required=False,
                         action='store_true',
                         help="Whether to export the base model")
+    parser.add_argument(
+        "--reduced_vocab_dir",
+        type=str,
+        required=False,
+        default=None,
+        help=
+        "Path to directory containing vocab_map.safetensors for vocabulary reduction (optional)"
+    )
 
     args = parser.parse_args()
 
@@ -85,7 +96,8 @@ def main() -> None:
                          max_position_embeddings=args.max_position_embeddings,
                          device=args.device,
                          enable_reuse_kv_cache=args.enable_reuse_kv_cache,
-                         is_eagle_base=args.is_eagle_base)
+                         is_eagle_base=args.is_eagle_base,
+                         reduced_vocab_dir=args.reduced_vocab_dir)
 
         print("LLM model export completed successfully!")
 

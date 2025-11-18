@@ -32,6 +32,7 @@ from torch import nn
 from ..layers.gather_nd import custom_gather_nd
 from ..layers.layers import (EdgeLLMDecoderLayer, PromptTuningEmbedding,
                              Qwen3VLDeepStackProcess)
+from ..layers.reduced_lm_head import reduce_lm_head
 
 
 class EdgeLLMModel(nn.Module):
@@ -213,7 +214,9 @@ class EdgeLLMModelForCausalLM(nn.Module):
                  is_eagle_base: bool = False,
                  use_prompt_tuning: bool = False,
                  max_position_embeddings: int = 4096,
-                 enable_reuse_kv_cache: bool = True) -> None:
+                 enable_reuse_kv_cache: bool = True,
+                 reduced_vocab_size: Optional[int] = None,
+                 vocab_map: Optional[torch.Tensor] = None) -> None:
         """
         Initialize the EdgeLLM model for causal LM.
         
@@ -223,6 +226,8 @@ class EdgeLLMModelForCausalLM(nn.Module):
             use_prompt_tuning: Whether to enable prompt tuning support
             max_position_embeddings: Maximum positional embedding length to use for model initialization
             enable_reuse_kv_cache: Whether to enable persistent KV cache
+            reduced_vocab_size: Size of the reduced vocabulary (optional)
+            vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
         """
         super().__init__()
 
@@ -247,8 +252,20 @@ class EdgeLLMModelForCausalLM(nn.Module):
         self.model = EdgeLLMModel(language_model, is_eagle_base,
                                   use_prompt_tuning, enable_reuse_kv_cache)
 
-        # Keep the original lm_head
-        self.lm_head = hf_model.lm_head
+        # Handle lm_head with optional vocabulary reduction
+        if reduced_vocab_size is not None and vocab_map is not None:
+            # Reduce the vocabulary size of lm_head
+            print(
+                f"Reducing vocabulary size from {hf_model.lm_head.out_features} "
+                f"to {reduced_vocab_size}")
+            assert vocab_map.shape[
+                0] == reduced_vocab_size, f"vocab_map size {vocab_map.shape[0]} does not match reduced_vocab_size {reduced_vocab_size}"
+            self.lm_head = reduce_lm_head(hf_model.lm_head, reduced_vocab_size,
+                                          vocab_map)
+        else:
+            # Keep the original lm_head
+            self.lm_head = hf_model.lm_head
+
         self.is_eagle_base = is_eagle_base
 
     @property

@@ -142,9 +142,15 @@ def load_hf_model(
     return model, tokenizer
 
 
-def load_llm_model(model_dir: str, dtype: str, max_position_embeddings: int,
-                   device: str, enable_reuse_kv_cache: bool,
-                   is_eagle_base: bool) -> tuple[nn.Module, bool]:
+def load_llm_model(
+        model_dir: str,
+        dtype: str,
+        max_position_embeddings: int,
+        device: str,
+        enable_reuse_kv_cache: bool,
+        is_eagle_base: bool,
+        reduced_vocab_size: Optional[int] = None,
+        vocab_map: Optional[torch.Tensor] = None) -> tuple[nn.Module, bool]:
     """
     Load a language model (standard or EAGLE base).
     
@@ -155,6 +161,8 @@ def load_llm_model(model_dir: str, dtype: str, max_position_embeddings: int,
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
         enable_reuse_kv_cache: Whether to enable persistent KV cache
         is_eagle_base: Whether this is an EAGLE3 base model
+        reduced_vocab_size: Size of the reduced vocabulary (optional)
+        vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
         
     Returns:
         tuple: (model, use_prompt_tuning)
@@ -174,7 +182,8 @@ def load_llm_model(model_dir: str, dtype: str, max_position_embeddings: int,
     edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
                                          use_prompt_tuning,
                                          max_position_embeddings,
-                                         enable_reuse_kv_cache)
+                                         enable_reuse_kv_cache,
+                                         reduced_vocab_size, vocab_map)
 
     del model
     gc.collect()
@@ -255,3 +264,45 @@ def load_tensor_by_candidate_keys(model_dir: str, keys_candidate: List[str],
                     return tensor.to(device)  # move to desired device
 
     return None
+
+
+def load_reduced_vocab_map(reduced_vocab_dir: str,
+                           device: str) -> Tuple[int, torch.Tensor]:
+    """
+    Load the reduced vocabulary map from a directory.
+    
+    The directory should contain a vocab_map.safetensors file with a 'vocab_map' tensor.
+    
+    Args:
+        reduced_vocab_dir: Directory containing vocab_map.safetensors
+        device: Device to load the tensor on
+        
+    Returns:
+        Tuple of (reduced_vocab_size, vocab_map)
+        
+    Raises:
+        FileNotFoundError: If vocab_map.safetensors is not found
+        KeyError: If 'vocab_map' key is not found in the file
+    """
+    reduced_vocab_dir = Path(reduced_vocab_dir)
+    vocab_map_file = reduced_vocab_dir / "vocab_map.safetensors"
+
+    if not vocab_map_file.exists():
+        raise FileNotFoundError(
+            f"vocab_map.safetensors not found in {reduced_vocab_dir}")
+
+    print(f"Loading vocab_map from {vocab_map_file}")
+
+    with safe_open(vocab_map_file, framework="pt", device="cpu") as f:
+        if "vocab_map" not in f.keys():
+            raise KeyError(
+                f"'vocab_map' key not found in {vocab_map_file}. Available keys: {list(f.keys())}"
+            )
+        vocab_map = f.get_tensor("vocab_map")
+
+    vocab_map = vocab_map.to(device)
+    reduced_vocab_size = vocab_map.shape[0]
+
+    print(f"Loaded vocab_map with reduced_vocab_size={reduced_vocab_size}")
+
+    return reduced_vocab_size, vocab_map

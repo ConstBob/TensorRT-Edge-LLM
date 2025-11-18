@@ -43,7 +43,7 @@ def main() -> None:
     
     This function sets up argument parsing for the vocabulary reduction script,
     loads the model tokenizer and config, processes the dataset, and saves the
-    token mapping and vocabulary information.
+    vocabulary mapping and vocabulary information.
     """
     parser = argparse.ArgumentParser(
         description="Reduce vocabulary size based on token frequency analysis")
@@ -57,7 +57,7 @@ def main() -> None:
         "--output_dir",
         type=str,
         required=True,
-        help="Path to save the token mapping and vocabulary info")
+        help="Path to save the vocabulary mapping and vocabulary info")
     parser.add_argument(
         "--reduced_vocab_size",
         type=int,
@@ -118,20 +118,20 @@ def main() -> None:
         print(f"Using {len(dataset)} samples for vocabulary analysis")
 
         # Reduce vocabulary
-        print("Analyzing token frequencies and reducing vocabulary...")
-        token_map = reduce_vocab_size(
+        print("Analyzing vocabulary frequencies and reducing vocabulary...")
+        vocab_map = reduce_vocab_size(
             tokenizer=tokenizer,
             config=config,
             dataset=dataset,
             reduced_vocab_size=args.reduced_vocab_size)
 
-        # Get actual reduced vocabulary size from token_map
-        actual_reduced_vocab_size = len(token_map)
+        # Get actual reduced vocabulary size from vocab_map
+        actual_reduced_vocab_size = len(vocab_map)
 
-        # Save token map as safetensors
-        token_map_path = os.path.join(args.output_dir, "token_map.safetensors")
-        print(f"Saving token map to {token_map_path}...")
-        save_file({"token_map": token_map}, str(token_map_path))
+        # Save vocabulary map as safetensors
+        vocab_map_path = os.path.join(args.output_dir, "vocab_map.safetensors")
+        print(f"Saving vocabulary map to {vocab_map_path}...")
+        save_file({"vocab_map": vocab_map}, str(vocab_map_path))
 
         # Save vocabulary info as JSON
         vocab_info = {
@@ -146,7 +146,7 @@ def main() -> None:
         print("Vocabulary reduction completed successfully!")
         print(f"Output files saved to: {args.output_dir}")
         print(
-            f"  - token_map.safetensors: Token mapping tensor [{actual_reduced_vocab_size}]"
+            f"  - vocab_map.safetensors: Vocabulary mapping tensor [{actual_reduced_vocab_size}]"
         )
         print(f"  - reduced_vocab.json: Vocabulary size information")
 

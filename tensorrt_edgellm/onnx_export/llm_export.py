@@ -51,7 +51,7 @@ from ..llm_models.layers.int4_gemm_plugin import (
     register_int4_gemm_plugin_onnx_symbolic_functions,
     replace_torch_quant_linear_with_plugin)
 from ..llm_models.model_utils import (is_gptq_model, load_eagle3_draft_model,
-                                      load_llm_model)
+                                      load_llm_model, load_reduced_vocab_map)
 from .chat_template import process_chat_template
 from .config_export import export_llm_config
 from .onnx_utils import export_onnx
@@ -473,7 +473,8 @@ def export_llm_model(model_dir: str,
                      max_position_embeddings: int = 4096,
                      device: str = "cuda",
                      enable_reuse_kv_cache: bool = True,
-                     is_eagle_base: bool = False) -> None:
+                     is_eagle_base: bool = False,
+                     reduced_vocab_dir: Optional[str] = None) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -487,6 +488,7 @@ def export_llm_model(model_dir: str,
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
         enable_reuse_kv_cache: Whether to enable persistent KV cache for system prompts
         is_eagle_base: Whether the model is an EAGLE3 base model (vs standard LLM)
+        reduced_vocab_dir: Directory containing vocab_map.safetensors for vocabulary reduction (optional)
     """
     start_time = time.time()
 
@@ -498,6 +500,14 @@ def export_llm_model(model_dir: str,
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
+    # Load reduced vocabulary map if provided
+    reduced_vocab_size = None
+    vocab_map = None
+    if reduced_vocab_dir is not None:
+        print(f"Loading reduced vocabulary from {reduced_vocab_dir}")
+        reduced_vocab_size, vocab_map = load_reduced_vocab_map(
+            reduced_vocab_dir, device)
+
     # Load model
     model, use_prompt_tuning = load_llm_model(
         model_dir,
@@ -505,7 +515,9 @@ def export_llm_model(model_dir: str,
         max_position_embeddings=max_position_embeddings,
         device=device,
         enable_reuse_kv_cache=enable_reuse_kv_cache,
-        is_eagle_base=is_eagle_base)
+        is_eagle_base=is_eagle_base,
+        reduced_vocab_size=reduced_vocab_size,
+        vocab_map=vocab_map)
 
     model = replace_torch_quant_linear_with_int4_plugin(model)
 
@@ -530,6 +542,12 @@ def export_llm_model(model_dir: str,
     model_type = 'eagle3_base' if is_eagle_base else 'llm'
     model_config = export_llm_config(model.config, model_type,
                                      enable_reuse_kv_cache)
+
+    # Add reduced_vocab_size to config if vocabulary reduction is used
+    if reduced_vocab_size is not None:
+        model_config['reduced_vocab_size'] = reduced_vocab_size
+        print(f"Added reduced_vocab_size={reduced_vocab_size} to config")
+
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, 'w') as f:
         json.dump(model_config, f, indent=2)
@@ -540,6 +558,19 @@ def export_llm_model(model_dir: str,
 
     # Process and save chat template
     process_chat_template(model_dir, output_dir)
+
+    # Copy vocab_map.safetensors to output directory if reduced_vocab_dir is provided
+    if reduced_vocab_dir is not None:
+        vocab_map_src = os.path.join(reduced_vocab_dir,
+                                     "vocab_map.safetensors")
+        vocab_map_dst = os.path.join(output_dir, "vocab_map.safetensors")
+        if os.path.exists(vocab_map_src):
+            shutil.copy2(vocab_map_src, vocab_map_dst)
+            print(f"Copied vocab_map.safetensors to {output_dir}")
+        else:
+            print(
+                f"Warning: vocab_map.safetensors not found in {reduced_vocab_dir}"
+            )
 
     end_time = time.time()
     print(

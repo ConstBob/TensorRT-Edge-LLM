@@ -42,9 +42,9 @@ def reduce_vocab_size(tokenizer: AutoTokenizer, config: AutoConfig,
         reduced_vocab_size: Target vocabulary size (must be < config.vocab_size)
         
     Returns:
-        token_map: torch.Tensor of shape (reduced_vocab_size,) mapping 
+        vocab_map: torch.Tensor of shape (reduced_vocab_size,) mapping 
                    reduced token IDs to original token IDs (int32)
-                   i.e., token_map[i] = original_token_id
+                   i.e., vocab_map[i] = original_token_id
             
     Raises:
         ValueError: If reduced_vocab_size >= config.vocab_size
