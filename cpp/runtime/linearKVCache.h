@@ -43,11 +43,11 @@ public:
      */
     struct CacheConfig
     {
-        int32_t numDecoderLayers{};  //!< Number of decoder layers
-        int32_t maxBatchSize{};      //!< Maximum batch size
-        int32_t maxSequenceLength{}; //!< Maximum sequence length
-        int32_t numKVHeads{};        //!< Number of key-value heads
-        int32_t headDim{};           //!< Head dimension
+        int64_t numDecoderLayers{};  //!< Number of decoder layers
+        int64_t maxBatchSize{};      //!< Maximum batch size
+        int64_t maxSequenceLength{}; //!< Maximum sequence length
+        int64_t numKVHeads{};        //!< Number of key-value heads
+        int64_t headDim{};           //!< Head dimension
     };
     //! \endcond
 
