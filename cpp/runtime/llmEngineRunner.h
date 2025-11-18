@@ -215,6 +215,7 @@ private:
     //! The select token indices tensor is used to select indices from hidden states to pass to
     //! the LM head of LLM model. Enforce to be int64_t to align with ONNX Gather-ND specification.
     rt::Tensor mSelectTokenIndices{};
+    rt::Tensor mHostSelectTokenIndices{}; //!< Host tensor for select token indices (pinned memory)
 
     //! The tensor has different meaning for prefill and decoding phase due to implementation of
     //! the AttentionPlugin. Used as LLM engine input.

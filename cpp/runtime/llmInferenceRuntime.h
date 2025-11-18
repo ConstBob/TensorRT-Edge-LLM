@@ -132,9 +132,12 @@ private:
 
     rt::Tensor mSamplingWorkspace{};       //!< Workspace tensor for sampling operations
     rt::Tensor mInputIds{};                //!< Input token IDs tensor
+    rt::Tensor mHostPackedInputIds{};      //!< Host tensor for packed input IDs
     rt::Tensor mHostContextLengths{};      //!< Host tensor for context lengths
     rt::Tensor mOutputLogits{};            //!< Output logits tensor
     rt::Tensor mSelectedIndices{};         //!< Selected token indices tensor
+    rt::Tensor mHostSelectedTokenIds{};    //!< Host tensor for selected token IDs
+    rt::Tensor mHostReuseKVCacheLengths{}; //!< Reuse KV cache lengths for prefill
     std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
 
     LLMEngineRunnerConfig mEngineConfig{}; //!< Engine configuration
