@@ -33,7 +33,8 @@ using namespace trt_edgellm;
 void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
     int32_t kvSequenceLength, int32_t qSequenceLength)
 {
-    int32_t const smVersion = getSMVersion();
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
 
     std::vector<int32_t> kvCacheLength(batchSize, kvSequenceLength);
     std::vector<half> qInput;

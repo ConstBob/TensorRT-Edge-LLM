@@ -167,3 +167,12 @@ public:
 private:
     F func_; // The stored function (e.g., a lambda)
 };
+
+// Workaround for CUDA12/13 Thor re-numbering. The kernels themselves have version compatibility.
+inline void applyThorSMRenumberWAR(int32_t& smVersion)
+{
+    if (smVersion == 110)
+    {
+        smVersion = 101;
+    }
+}
