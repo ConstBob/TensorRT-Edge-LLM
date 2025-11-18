@@ -33,7 +33,8 @@ using namespace trt_edgellm;
 void TestXQAAttentionDecodingAccuracy(
     int32_t batchSize, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t kvCacheCapacity)
 {
-    int32_t const smVersion = getSMVersion();
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
     // Decoding attention length always set qSequenceLength to 1
     constexpr int qSequenceLength = 1;
 
