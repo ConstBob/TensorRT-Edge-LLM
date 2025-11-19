@@ -118,6 +118,10 @@ void fastPosEmbedInterpolateReference(std::vector<std::vector<int64_t>> const& i
     std::vector<int64_t> const& cuSeqlens, std::vector<int64_t>& fastPosEmbedIdx, std::vector<half>& fastPosEmbedWeight,
     int64_t const mergeSize, int64_t const numGridPerSide);
 
+void initRotaryPosEmbQwenViTReference(std::vector<float>& rotaryPosEmb,
+    std::vector<std::vector<int64_t>> const& imageGridTHWs, int64_t const totalSeqLength, int64_t const vitPosEmbDim,
+    int64_t const mergeSize, float const rotaryBaseFrequency, float const scale);
+
 // GEMM weight packing and weight scale reference function for int4-WOQ kernel
 void awqPackReference(int16_t const* kernel_KxN, int N_in, int K_in, int16_t* out_Ndiv4xK);
 

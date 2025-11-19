@@ -67,10 +67,13 @@ public:
      * Factory method that detects model type and creates corresponding runner.
      *
      * @param multimodalEngineDir Directory containing multimodal engine files
+     * @param llmMaxBatchSize Maximum batch size from LLM engine
+     * @param llmMaxPositionEmbeddings Maximum position embeddings from LLM engine
      * @param stream CUDA stream for operations
      * @return Unique pointer to created runner
      */
-    static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, cudaStream_t stream);
+    static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, int32_t llmMaxBatchSize,
+        int64_t llmMaxPositionEmbeddings, cudaStream_t stream);
 
     /*!
      * @brief Preprocess request with images and text

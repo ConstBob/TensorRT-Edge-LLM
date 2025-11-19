@@ -301,45 +301,62 @@ void initAttentionMaskQwenViT(rt::Tensor const& cuSeqlens, rt::Tensor& attention
         cuSeqlens.dataPointer<int64_t>(), attentionMask.dataPointer<half>(), cuSeqlensSize, curHW);
 }
 
-__global__ void initRotaryPosEmbQwenKernel(int64_t const* posIds, float* rotaryPosEmb, int64_t const totalSeqLength,
-    int64_t const vitPosEmbDim, float const rotaryBaseFrequency, float const scale)
+__global__ void initRotaryPosEmbQwenKernel(float* rotaryPosEmb, int64_t const T, int64_t const H, int64_t const W,
+    int64_t const mergeSize, int64_t const startIdx, int64_t const vitPosEmbDim, float const rotaryBaseFrequency,
+    float const scale)
 {
     // Each CTA get assigned 256 threads. Each thread processes one element
-    // posIds: [totalSeqLength*2]
-    // rotaryPosEmb: [totalSeqLength*2, vitPosEmbDim/2]
+    // rotaryPosEmb: [totalSeqLength, vitPosEmbDim]
+    //     [T, (llmGridH, llmGridW, mergeSize, mergeSize), (2, vitPosEmbDim/2)]
+    //     where llmGridH = H / mergeSize, llmGridW = W / mergeSize and position ids is duplicated for T
     auto const tid = blockIdx.x * blockDim.x + threadIdx.x;
-    auto const totalElements = totalSeqLength * vitPosEmbDim;
+    auto const totalElements = T * H * W * vitPosEmbDim;
     if (tid >= totalElements)
         return;
 
-    auto const posIdx = tid / (vitPosEmbDim / 2);
+    auto const hwIdx = (tid % (H * W * vitPosEmbDim)) / (vitPosEmbDim);
+    auto const hOrWPos = (tid % (vitPosEmbDim)) / (vitPosEmbDim / 2);
     auto const dimIdx = tid % (vitPosEmbDim / 2);
 
-    float invFreq = posIds[posIdx] * scale / pow(rotaryBaseFrequency, 2 * dimIdx / (float) vitPosEmbDim);
-    rotaryPosEmb[tid] = invFreq;
+    int64_t const llmGridH = H / mergeSize;
+    int64_t const llmGridW = W / mergeSize;
+    auto const llmGridHIdx = hwIdx / (llmGridW * mergeSize * mergeSize);
+    auto const llmGridWIdx = (hwIdx % (llmGridW * mergeSize * mergeSize)) / (mergeSize * mergeSize);
+    auto const mergeHIdx = (hwIdx % (mergeSize * mergeSize)) / mergeSize;
+    auto const mergeWIdx = hwIdx % mergeSize;
+
+    auto const originalHIdx = llmGridHIdx * mergeSize + mergeHIdx;
+    auto const originalWIdx = llmGridWIdx * mergeSize + mergeWIdx;
+    // 0: H, 1: W
+    auto const posId = (hOrWPos == 0) ? originalHIdx : originalWIdx;
+
+    float invFreq = posId * scale / pow(rotaryBaseFrequency, 2 * dimIdx / (float) vitPosEmbDim);
+    rotaryPosEmb[startIdx * vitPosEmbDim + tid] = invFreq;
 }
 
-void initRotaryPosEmbQwenViT(rt::Tensor const& posIds, rt::Tensor& rotaryPosEmb, float const rotaryBaseFrequency,
-    float const scale, cudaStream_t stream)
+void initRotaryPosEmbQwenViT(rt::Tensor& rotaryPosEmb, std::vector<int64_t> const& gridTHW, int64_t const mergeSize,
+    int64_t const startIdx, float const rotaryBaseFrequency, float const scale, cudaStream_t stream)
 {
-    check::check(posIds.getDeviceType() == rt::DeviceType::kGPU && rotaryPosEmb.getDeviceType() == rt::DeviceType::kGPU,
-        "Device type shall all be GPU for these tensors.");
-    check::check(posIds.getDataType() == DataType::kINT64 && rotaryPosEmb.getDataType() == DataType::kFLOAT,
-        "Data type check failed for the input tensors.");
-    check::check(posIds.getShape().getNumDims() == 1, "Pos ids shape shall be [totalSeqLength*2].");
+    check::check(rotaryPosEmb.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall be GPU for the rotary position embeddings tensor.");
+    check::check(rotaryPosEmb.getDataType() == DataType::kFLOAT,
+        "Data type shall be float for the rotary position embeddings tensor.");
     check::check(rotaryPosEmb.getShape().getNumDims() == 2,
         "Rotary position embeddings shape shall be [totalSeqLength, vitPosEmbDim].");
 
-    int64_t const totalSeqLength = rotaryPosEmb.getShape()[0];
+    check::check(gridTHW.size() == 3, "gridTHW must have exactly 3 elements [T, H, W]");
+    int64_t const T = gridTHW[0];
+    int64_t const H = gridTHW[1];
+    int64_t const W = gridTHW[2];
+
     int64_t const vitPosEmbDim = rotaryPosEmb.getShape()[1];
-    int64_t const totalElements = totalSeqLength * vitPosEmbDim;
-    check::check(totalSeqLength == posIds.getShape()[0] / 2, "Total sequence length mismatch.");
+    int64_t const totalElements = T * H * W * vitPosEmbDim;
 
     uint32_t const blockSize = 256;
     uint32_t const gridSize = (totalElements + blockSize - 1) / blockSize;
 
-    initRotaryPosEmbQwenKernel<<<gridSize, blockSize, 0, stream>>>(posIds.dataPointer<int64_t>(),
-        rotaryPosEmb.dataPointer<float>(), totalSeqLength, vitPosEmbDim, rotaryBaseFrequency, scale);
+    initRotaryPosEmbQwenKernel<<<gridSize, blockSize, 0, stream>>>(
+        rotaryPosEmb.dataPointer<float>(), T, H, W, mergeSize, startIdx, vitPosEmbDim, rotaryBaseFrequency, scale);
 }
 
 __global__ void initFastPosEmbedQwenViTKernel(int64_t* fastPosEmbedIdx, half* fastPosEmbedWeight,
@@ -387,8 +404,9 @@ __global__ void initFastPosEmbedQwenViTKernel(int64_t* fastPosEmbedIdx, half* fa
     fastPosEmbedWeight[3 * totalSeqLength + targetIdx] = __float2half(dh * dw);
 }
 
-void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight, int64_t const H,
-    int64_t const W, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx, cudaStream_t stream)
+void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight,
+    std::vector<int64_t> const& gridTHW, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx,
+    cudaStream_t stream)
 {
     check::check(fastPosEmbedIdx.getDeviceType() == rt::DeviceType::kGPU
             && fastPosEmbedWeight.getDeviceType() == rt::DeviceType::kGPU,
@@ -404,6 +422,9 @@ void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmb
     int64_t const totalSeqLength = fastPosEmbedIdx.getShape()[1];
     check::check(totalSeqLength == fastPosEmbedWeight.getShape()[1], "Total sequence length mismatch.");
 
+    check::check(gridTHW.size() == 3, "gridTHW must have exactly 3 elements [T, H, W]");
+    int64_t const H = gridTHW[1];
+    int64_t const W = gridTHW[2];
     int64_t const llmGridH = H / mergeSize;
     int64_t const llmGridW = W / mergeSize;
     float const lineSpaceH = static_cast<float>(numGridPerSide - 1) / (H - 1);
