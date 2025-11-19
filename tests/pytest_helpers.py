@@ -64,7 +64,8 @@ def run_command(cmd: List[str],
 
     try:
         result = subprocess.run(final_cmd,
-                                capture_output=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
                                 text=True,
                                 timeout=timeout,
                                 env=local_env)
@@ -81,30 +82,19 @@ def run_command(cmd: List[str],
                 logger.error(
                     f"Command failed (code {result.returncode}): {cmd_display}"
                 )
-            # Log stdout if present and non-empty
+            # Log all output (stdout + stderr merged) in chronological order
             if result.stdout and result.stdout.strip():
                 logger.info("Command output:")
                 for line in result.stdout.strip().split('\n'):
                     if line.strip():
                         logger.info(f"  {line}")
-            # Log stderr if present (even for successful commands, stderr might contain warnings)
-            if result.stderr and result.stderr.strip():
-                logger.info("Command stderr:")
-                for line in result.stderr.strip().split('\n'):
-                    if line.strip():
-                        logger.info(f"  {line}")
 
         return {
-            'success':
-            success,
-            'returncode':
-            result.returncode,
-            'output':
-            result.stdout or '',
-            'error':
-            result.stderr or '',
-            'combined_output':
-            f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+            'success': success,
+            'returncode': result.returncode,
+            'output': result.stdout or '',
+            'error': '',
+            'combined_output': result.stdout or ''
         }
 
     except subprocess.TimeoutExpired:

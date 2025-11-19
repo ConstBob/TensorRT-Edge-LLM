@@ -311,7 +311,11 @@ _test_config_cache = {}
 def _get_test_list_file(priority):
     """Get test configuration with caching"""
     if priority not in _test_config_cache:
-        config_file = f"tests/test_lists/{priority}.yml"
+        if priority.endswith(('.yml', '.yaml')):
+            config_file = priority
+        else:
+            config_file = f"tests/test_lists/{priority}.yml"
+
         try:
             with open(config_file, 'r') as f:
                 _test_config_cache[priority] = yaml.safe_load(f)

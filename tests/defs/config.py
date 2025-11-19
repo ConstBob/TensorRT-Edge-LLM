@@ -28,6 +28,53 @@ from conftest import EnvironmentConfig
 from valid_precisions import (VALID_LLM_PRECISIONS, VALID_LM_HEAD_PRECISIONS,
                               VALID_VISUAL_PRECISIONS)
 
+# Global configuration constants
+DEFAULT_SEARCH_DEPTH = 3
+
+
+def _find_directory(root_dir: str,
+                    target_name: str,
+                    max_depth: Optional[int] = None) -> Optional[str]:
+    """
+    Search for a directory with the given name or path 
+    
+    Args:
+        root_dir: Root directory to start searching from
+        target_name: Target directory name or relative path to find (e.g., "model" or "parent/model")
+        max_depth: Maximum search depth (None for unlimited, 1 for immediate children only)
+    
+    Returns:
+        Full path to the first matching directory found, or None if not found
+    """
+    if not os.path.exists(root_dir):
+        return None
+
+    def _search(current_dir: str, current_depth: int) -> Optional[str]:
+        if max_depth is not None and current_depth > max_depth:
+            return None
+
+        try:
+            entries = os.listdir(current_dir)
+        except PermissionError:
+            return None
+
+        candidate_path = os.path.join(current_dir, target_name)
+        if os.path.isdir(candidate_path):
+            return candidate_path
+
+        if max_depth is None or current_depth < max_depth:
+            for entry in entries:
+                entry_path = os.path.join(current_dir, entry)
+
+                if os.path.isdir(entry_path):
+                    result = _search(entry_path, current_depth + 1)
+                    if result:
+                        return result
+
+        return None
+
+    return _search(root_dir, 0)
+
 
 class ModelType(enum.Enum):
     """Supported model types"""
@@ -80,7 +127,9 @@ class TestConfig:
     lm_head_precision: Optional[str] = None
     visual_precision: Optional[str] = None
 
-    # EAGLE draft model precision settings
+    # EAGLE draft model settings
+    draft_model_name: Optional[str] = None
+    draft_model_id: Optional[str] = None
     draft_llm_precision: Optional[str] = None
     draft_lm_head_precision: Optional[str] = None
 
@@ -97,11 +146,22 @@ class TestConfig:
     # Export LoRA parameters
     lora: Optional[bool] = None
 
+    # Export KV cache reuse parameter
+    disable_reuse_kv_cache: Optional[bool] = None
+
     # Engine build parameters
     max_batch_size: Optional[int] = None
     max_input_len: Optional[int] = None
     max_seq_len: Optional[int] = None
     max_lora_rank: Optional[int] = None
+
+    # EAGLE specific build parameters
+    max_verify_tree_size: Optional[int] = None
+    max_draft_tree_size: Optional[int] = None
+
+    # EAGLE inference parameters
+    eagle_draft_top_k: Optional[int] = None
+    eagle_draft_step: Optional[int] = None
 
     # VLM specific build parameters
     min_image_tokens: Optional[int] = None
@@ -144,16 +204,47 @@ class TestConfig:
         ParameterSpec("lora",
                       "", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
+        ParameterSpec("disable_reuse_kv_cache",
+                      "drkv",
+                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
         ParameterSpec("is_eagle",
-                      "eagle", {TaskType.EXPORT},
+                      "eagle",
+                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("draft_model_id",
+                      "",
+                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_llm_precision",
-                      "draft", {TaskType.EXPORT},
+                      "",
+                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_lm_head_precision",
-                      "draftlm", {TaskType.EXPORT},
+                      "",
+                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("max_verify_tree_size",
+                      "mvts",
+                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("max_draft_tree_size",
+                      "mdts",
+                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("eagle_draft_top_k",
+                      "edtk", {TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("eagle_draft_step",
+                      "edst", {TaskType.INFERENCE, TaskType.BENCHMARK},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
@@ -251,27 +342,53 @@ class TestConfig:
         # Parse remaining parameters
         parsed_params = {}
 
-        for part in remaining_parts:
+        i = 0
+        while i < len(remaining_parts):
+            part = remaining_parts[i]
+
             # For engine identification
             if part.startswith('mxsl'):
                 parsed_params['max_seq_len'] = int(part[4:])
             elif part == "lora":
                 parsed_params['lora'] = True
+            elif part == "drkv":
+                parsed_params['disable_reuse_kv_cache'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
-            elif part.startswith('draftlm'):
-                draft_lm_precision = part[7:]
-                if draft_lm_precision not in VALID_LM_HEAD_PRECISIONS:
-                    raise ValueError(
-                        f"Invalid draft LM head precision: {draft_lm_precision}"
-                    )
-                parsed_params['draft_lm_head_precision'] = draft_lm_precision
-            elif part.startswith('draft'):
-                draft_precision = part[5:]
-                if draft_precision not in VALID_LLM_PRECISIONS:
-                    raise ValueError(
-                        f"Invalid draft precision: {draft_precision}")
-                parsed_params['draft_llm_precision'] = draft_precision
+                # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
+                # Next part should be draft_model_id
+                if i + 1 < len(remaining_parts):
+                    i += 1
+                    parsed_params['draft_model_id'] = remaining_parts[i]
+
+                    # Next part should be draft_llm_precision
+                    if i + 1 < len(remaining_parts):
+                        i += 1
+                        draft_precision = remaining_parts[i]
+
+                        # Check if it starts with 'lm' - this would be draft lm_head
+                        if draft_precision.startswith('lm'):
+                            raise ValueError(
+                                f"Missing draft precision after draft_model_id in: {param_str}"
+                            )
+
+                        # Validate draft precision
+                        if draft_precision not in VALID_LLM_PRECISIONS:
+                            raise ValueError(
+                                f"Invalid draft precision: {draft_precision}")
+                        parsed_params['draft_llm_precision'] = draft_precision
+
+                        # Check for optional draft lm_head precision
+                        if i + 1 < len(remaining_parts) and remaining_parts[
+                                i + 1].startswith('lm'):
+                            i += 1
+                            draft_lm_precision = remaining_parts[i][2:]
+                            if draft_lm_precision not in VALID_LM_HEAD_PRECISIONS:
+                                raise ValueError(
+                                    f"Invalid draft LM head precision: {draft_lm_precision}"
+                                )
+                            parsed_params[
+                                'draft_lm_head_precision'] = draft_lm_precision
             elif part.startswith('mxbs'):
                 parsed_params['max_batch_size'] = int(part[4:])
             elif part.startswith('mxil'):
@@ -302,9 +419,20 @@ class TestConfig:
                 else:
                     raise ValueError(
                         f"Invalid visual precision: {visual_precision}")
+            # For EAGLE parameters
+            elif part.startswith('mvts'):
+                parsed_params['max_verify_tree_size'] = int(part[4:])
+            elif part.startswith('mdts'):
+                parsed_params['max_draft_tree_size'] = int(part[4:])
+            elif part.startswith('edtk'):
+                parsed_params['eagle_draft_top_k'] = int(part[4:])
+            elif part.startswith('edst'):
+                parsed_params['eagle_draft_step'] = int(part[4:])
             # For inference parameters
             else:
                 parsed_params['test_case'] = part
+
+            i += 1
 
         if not visual_precision and model_type == ModelType.VLM:
             parsed_params['visual_precision'] = "fp16"
@@ -341,9 +469,10 @@ class TestConfig:
             if self.task_type == TaskType.EXPORT:
                 if self.lora is None:
                     self.lora = False
+                if self.disable_reuse_kv_cache is None:
+                    self.disable_reuse_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
-                # Set default draft model lm_head precision if draft model precision is set
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
             else:  # Runtime tasks
@@ -351,6 +480,20 @@ class TestConfig:
                     self.max_lora_rank = 0
                 if self.lora is None:
                     self.lora = self.max_lora_rank > 0
+                if self.disable_reuse_kv_cache is None:
+                    self.disable_reuse_kv_cache = False
+                if self.is_eagle is None:
+                    self.is_eagle = False
+                if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
+                    self.draft_lm_head_precision = "fp16"
+                if self.eagle_draft_top_k is None:
+                    self.eagle_draft_top_k = 10
+                if self.eagle_draft_step is None:
+                    self.eagle_draft_step = 6
+                if self.max_verify_tree_size is None:
+                    self.max_verify_tree_size = 60
+                if self.max_draft_tree_size is None:
+                    self.max_draft_tree_size = 60
 
         missing_params = []
         invalid_params = []
@@ -399,82 +542,123 @@ class TestConfig:
     # Unified path generation methods
     def get_onnx_model_id(self) -> str:
         """Generate unique model identifier"""
-        return f"{self.llm_precision}-{self.lm_head_precision}-{self.max_seq_len}"
+        model_id = f"{self.llm_precision}-{self.lm_head_precision}-{self.max_seq_len}"
+        if self.disable_reuse_kv_cache:
+            model_id += "-drkv"
+        return model_id
 
     def get_engine_id(self) -> str:
         """Generate unique engine identifier"""
         llm_engine_id = f"{self.get_onnx_model_id()}-mxil{self.max_input_len}-mxbs{self.max_batch_size}-mxlr{self.max_lora_rank}"
         if self.model_type == ModelType.VLM:
             llm_engine_id += f"-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}"
+        if self.is_eagle:
+            if self.max_verify_tree_size is not None:
+                llm_engine_id += f"-mvts{self.max_verify_tree_size}"
+            if self.max_draft_tree_size is not None:
+                llm_engine_id += f"-mdts{self.max_draft_tree_size}"
         return llm_engine_id
 
     def get_torch_model_dir(self) -> str:
         """
-        Get torch model directory path using model name mapping.
+        Get torch model directory path using dynamic search.
+        
+        Searches for the model directory under llm_models_dir.
         
         Raises:
-            ValueError: If llm_models_dir is not set or model name is not supported
+            ValueError: If llm_models_dir is not set or model directory is not found
         """
 
-        # Model name to base directory mapping
-        # Maps logical model names to their actual directory names in llm_models_dir.
-        # You need to adjust this map to match the actual directory names in your llm_models_dir.
-        MODEL_NAME_TO_BASE_DIR_MAP = {
-            "Qwen2.5-0.5B-Instruct":
-            f"{self.llm_models_dir}/Qwen2.5-0.5B-Instruct",
-            "Qwen2.5-1.5B-Instruct":
-            f"{self.llm_models_dir}/Qwen2.5-1.5B-Instruct",
-            "Qwen2.5-3B-Instruct":
-            f"{self.llm_models_dir}/Qwen2.5-3B-Instruct",
-            "Qwen2.5-7B-Instruct":
-            f"{self.llm_models_dir}/Qwen2.5-7B-Instruct",
-            "Qwen2.5-VL-3B-Instruct":
-            f"{self.llm_models_dir}/Qwen2.5-VL-3B-Instruct",
-            "Qwen2.5-VL-7B-Instruct":
-            f"{self.llm_models_dir}/Qwen2.5-VL-7B-Instruct",
-            "InternVL3-1B": f"{self.llm_models_dir}/InternVL3-1B-hf",
-            "InternVL3-2B": f"{self.llm_models_dir}/InternVL3-2B-hf",
-            "Llama-3.1-8B-Instruct":
-            f"{self.llm_models_dir}/llama-3.1-model/Llama-3.1-8B-Instruct",
-            "Llama-3.2-1B":
-            f"{self.llm_models_dir}/llama-3.2-models/Llama-3.2-1B",
-            "Llama-3.2-3B":
-            f"{self.llm_models_dir}/llama-3.2-models/Llama-3.2-3B",
-            "Qwen3-0.6B": f"{self.llm_models_dir}/Qwen3/Qwen3-0.6B",
-            "Qwen3-8B": f"{self.llm_models_dir}/Qwen3/Qwen3-8B",
-            # Add more mappings as needed
+        # Models in llm_models_dir
+        LLM_MODELS_DIR_MAP = {
+            "Qwen2.5-0.5B-Instruct": "Qwen2.5-0.5B-Instruct",
+            "Qwen2.5-1.5B-Instruct": "Qwen2.5-1.5B-Instruct",
+            "Qwen2.5-3B-Instruct": "Qwen2.5-3B-Instruct",
+            "Qwen2.5-7B-Instruct": "Qwen2.5-7B-Instruct",
+            "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-3B-Instruct",
+            "Qwen2.5-VL-7B-Instruct": "Qwen2.5-VL-7B-Instruct",
+            "InternVL3-1B": "InternVL3-1B-hf",
+            "InternVL3-2B": "InternVL3-2B-hf",
+            "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+            "Llama-3.2-1B": "llama-3.2-models/Llama-3.2-1B",
+            "Llama-3.2-3B": "llama-3.2-models/Llama-3.2-3B",
+            "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
+            "Qwen3-8B": "Qwen3/Qwen3-8B",
         }
-        if self.model_name not in MODEL_NAME_TO_BASE_DIR_MAP:
+
+        # GPTQ models in edgellm_data_dir
+        GPTQ_MODELS_DIR_MAP = {
+            "Qwen2.5-7B-Instruct-GPTQ-Int4": "Qwen2.5-7B-Instruct-GPTQ-Int4",
+            "InternVL3-1B-GPTQ-Int4": "InternVL3-1B-hf-GPTQ-Int4",
+        }
+
+        # Determine search directory and model path
+        if self.model_name in GPTQ_MODELS_DIR_MAP:
+            search_dir = self.edgellm_data_dir
+            model_dir_name = GPTQ_MODELS_DIR_MAP[self.model_name]
+        elif self.model_name in LLM_MODELS_DIR_MAP:
+            search_dir = self.llm_models_dir
+            model_dir_name = LLM_MODELS_DIR_MAP[self.model_name]
+        else:
+            all_models = list(LLM_MODELS_DIR_MAP.keys()) + list(
+                GPTQ_MODELS_DIR_MAP.keys())
+            raise ValueError(f"Unsupported model name: '{self.model_name}'. "
+                             f"Supported models: {', '.join(all_models)}")
+
+        model_dir = _find_directory(search_dir, model_dir_name,
+                                    DEFAULT_SEARCH_DEPTH)
+        if not model_dir:
             raise ValueError(
-                f"Unsupported model name: '{self.model_name}'. "
-                f"Supported models: {', '.join(MODEL_NAME_TO_BASE_DIR_MAP.keys())}"
+                f"Model directory not found: '{model_dir_name}' under {search_dir} with search depth {DEFAULT_SEARCH_DEPTH}"
             )
-        model_dir_name = MODEL_NAME_TO_BASE_DIR_MAP[self.model_name]
-        if not os.path.exists(model_dir_name):
-            raise ValueError(f"Model directory not found: '{model_dir_name}'")
-        return model_dir_name
+        return model_dir
 
     def get_draft_model_dir(self) -> str:
-        """Get draft model directory"""
-        # You need to adjust this map to match the actual directory names in your directories.
-        # In our folder, the draft model is stored in the eagle_models folder.
-        MODEL_NAME_TO_DRAFT_DIR_MAP = {
-            "Qwen2.5-VL-7B-Instruct":
-            f"{self.edgellm_data_dir}/eagle_models/qwen2.5-vl-7b-eagle3-v1",
-            "Llama-3.1-8B-Instruct":
-            f"{self.edgellm_data_dir}/eagle_models/EAGLE3-LLaMA3.1-Instruct-8B",
-            "Qwen3-8B": f"{self.llm_models_dir}/Qwen3/qwen3_8b_eagle3",
+        """
+        Get draft model directory using draft_model_id.
+        Supports multiple draft models per base model.
+        """
+        # base_model -> draft_id -> draft_model_path
+        MODEL_NAME_TO_DRAFT_MODELS_MAP = {
+            "Qwen2.5-VL-7B-Instruct": {
+                "v1": "qwen2.5-vl-7b-eagle3-v1",
+                "v2": "qwen2.5-vl-7b-eagle3-v2",
+                "sgl": "qwen2.5-vl-7b-eagle3-sgl",
+            },
+            "Llama-3.1-8B-Instruct": {
+                "eagle3": "EAGLE3-LLaMA3.1-Instruct-8B",
+            },
+            "Qwen3-8B": {
+                "eagle3": "Qwen3/qwen3_8b_eagle3",
+            },
             # Add more mappings as needed
         }
-        if self.model_name not in MODEL_NAME_TO_DRAFT_DIR_MAP:
+
+        if self.model_name not in MODEL_NAME_TO_DRAFT_MODELS_MAP:
             raise ValueError(
-                f"Unsupported model name: '{self.model_name}'. "
-                f"Supported models: {', '.join(MODEL_NAME_TO_DRAFT_DIR_MAP.keys())}"
+                f"Unsupported base model for EAGLE: '{self.model_name}'. "
+                f"Supported models: {', '.join(MODEL_NAME_TO_DRAFT_MODELS_MAP.keys())}"
             )
-        model_dir_name = MODEL_NAME_TO_DRAFT_DIR_MAP[self.model_name]
-        if not os.path.exists(model_dir_name):
-            raise ValueError(f"Model directory not found: '{model_dir_name}'")
-        return model_dir_name
+
+        draft_models = MODEL_NAME_TO_DRAFT_MODELS_MAP[self.model_name]
+
+        if not self.draft_model_id:
+            raise ValueError(
+                f"draft_model_id not set. Available draft models for {self.model_name}: "
+                f"{', '.join(draft_models.keys())}")
+
+        if self.draft_model_id not in draft_models:
+            raise ValueError(
+                f"Unsupported draft_model_id '{self.draft_model_id}' for {self.model_name}. "
+                f"Available: {', '.join(draft_models.keys())}")
+
+        model_dir_name = draft_models[self.draft_model_id]
+        model_dir = _find_directory(self.edgellm_data_dir, model_dir_name, 5)
+        if not model_dir:
+            raise ValueError(
+                f"Draft model directory not found: '{model_dir_name}' under "
+                f"{self.edgellm_data_dir} with search depth 5")
+        return model_dir
 
     def get_onnx_base_dir(self) -> str:
         """Get ONNX model base directory"""
@@ -490,16 +674,22 @@ class TestConfig:
 
     def get_llm_onnx_dir(self) -> str:
         """Get LLM ONNX model directory"""
+        prefix = "llm-base" if self.is_eagle else "llm"
         return os.path.join(self.get_onnx_base_dir(),
-                            f"llm-{self.get_onnx_model_id()}")
+                            f"{prefix}-{self.get_onnx_model_id()}")
 
     def get_draft_onnx_model_id(self) -> str:
-        """Generate unique draft model identifier"""
+        """Generate unique draft model identifier including draft_model_id"""
+        if self.draft_model_id is None:
+            raise ValueError("draft_model_id not set")
         if self.draft_llm_precision is None:
             raise ValueError("draft_llm_precision not set")
         if self.draft_lm_head_precision is None:
             raise ValueError("draft_lm_head_precision not set")
-        return f"{self.draft_llm_precision}-{self.draft_lm_head_precision}-{self.max_seq_len}"
+        draft_id = f"{self.draft_model_id}-{self.draft_llm_precision}-{self.draft_lm_head_precision}-{self.max_seq_len}"
+        if self.disable_reuse_kv_cache:
+            draft_id += "-drkv"
+        return draft_id
 
     def get_draft_onnx_dir(self) -> str:
         """Get draft model ONNX directory"""
@@ -510,7 +700,11 @@ class TestConfig:
         """Get quantized draft model directory (for export)"""
         if self.draft_llm_precision == "fp16":
             return self.get_draft_model_dir()
-        quantized_name = f"quantized-{self.draft_llm_precision}-{self.draft_lm_head_precision}-{self.max_seq_len}"
+        if self.draft_model_id is None:
+            raise ValueError("draft_model_id not set")
+        quantized_name = f"quantized-{self.draft_model_id}-{self.draft_llm_precision}-{self.draft_lm_head_precision}-{self.max_seq_len}"
+        if self.disable_reuse_kv_cache:
+            quantized_name += "-drkv"
         return os.path.join(self.get_onnx_base_dir(), "quantized-draft",
                             quantized_name)
 
@@ -526,8 +720,19 @@ class TestConfig:
         if self.task_type == TaskType.EXPORT:
             raise ValueError(
                 "LLM engine directory not available for export tasks")
+
+        if self.is_eagle:
+            if self.draft_model_id is None:
+                raise ValueError("draft_model_id not set for EAGLE engine")
+            if self.draft_llm_precision is None:
+                raise ValueError(
+                    "draft_llm_precision not set for EAGLE engine")
+            prefix = f"llm-eagle-{self.draft_model_id}-{self.draft_llm_precision}"
+        else:
+            prefix = "llm"
+
         return os.path.join(self.get_engine_base_dir(),
-                            f"llm-{self.get_engine_id()}")
+                            f"{prefix}-{self.get_engine_id()}")
 
     def get_visual_engine_dir(self) -> str:
         """Get visual engine directory"""
@@ -620,9 +825,11 @@ class TestConfig:
         """Get quantized model directory (for export)"""
         if self.llm_precision == "fp16":
             return self.get_torch_model_dir()
-        quantized_name = f"quantized-{self.llm_precision}-{self.lm_head_precision}-{self.max_seq_len}"
-        return os.path.join(self.get_onnx_base_dir(), "quantized",
-                            quantized_name)
+        prefix = "quantized-base" if self.is_eagle else "quantized"
+        quantized_name = f"{self.llm_precision}-{self.lm_head_precision}-{self.max_seq_len}"
+        if self.disable_reuse_kv_cache:
+            quantized_name += "-drkv"
+        return os.path.join(self.get_onnx_base_dir(), prefix, quantized_name)
 
     def get_cnn_dailymail_dataset_dir(self) -> str:
         """Get CNN DailyMail dataset directory for LLM quantization calibration"""
