@@ -267,6 +267,23 @@ blackwell_model_export:
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
+blackwell_eagle_model_export:
+  stage: test
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    TEST_CACHE_DIR: "$PIPELINE_CACHE_DIR/blackwell_model_export"
+    PRIORITY: l0_eagle_export_blackwell
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends: .export_onnx_template
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 # Building and testing with A30 Linux
 a30:
   stage: test
@@ -320,6 +337,7 @@ b100:
     stage: test
     needs:
       - blackwell_model_export
+      - blackwell_eagle_model_export
     variables:
       CUDA_VERSION: "12.9"
       IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION

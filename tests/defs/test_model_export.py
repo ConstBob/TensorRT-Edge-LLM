@@ -49,6 +49,13 @@ def validate_export_result(config: TestConfig) -> None:
                 raise FileNotFoundError(
                     f"Visual ONNX model not found: {fp8_visual_onnx_dir}")
 
+    if config.is_eagle:
+        draft_onnx_dir = config.get_draft_onnx_dir()
+        draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
+        if not os.path.exists(draft_onnx):
+            raise FileNotFoundError(
+                f"Draft ONNX model not found: {draft_onnx}")
+
 
 class TestModelExport:
     """Unified test suite for model export"""
@@ -61,18 +68,52 @@ class TestModelExport:
         config = TestConfig.from_param_string(test_param, model_type,
                                               TaskType.EXPORT, env_config)
 
-        # Simple validation
+        # Validate pre-existing models
         torch_dir = config.get_torch_model_dir()
         if not os.path.exists(torch_dir):
             raise FileNotFoundError(f"Torch model not found: {torch_dir}")
 
+        if config.is_eagle:
+            draft_torch_dir = config.get_draft_model_dir()
+            if not os.path.exists(draft_torch_dir):
+                raise FileNotFoundError(
+                    f"Draft model not found: {draft_torch_dir}")
+
+        # Create output directories
         llm_onnx_dir = config.get_llm_onnx_dir()
+        print(f"Creating output directory: {llm_onnx_dir}")
         os.makedirs(llm_onnx_dir, exist_ok=True)
 
         # Create quantized model directory if needed
-        if config.llm_precision != "fp16":
+        if config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
             quantized_model_dir = config.get_quantized_model_dir()
             os.makedirs(quantized_model_dir, exist_ok=True)
+
+        if config.is_eagle:
+            draft_onnx_dir = config.get_draft_onnx_dir()
+            os.makedirs(draft_onnx_dir, exist_ok=True)
+
+            if config.draft_llm_precision and config.draft_llm_precision != "fp16":
+                quantized_draft_dir = config.get_quantized_draft_model_dir()
+                os.makedirs(quantized_draft_dir, exist_ok=True)
+
+        # Install gptqmodel for GPTQ models (required dependencies are in tests/requirements.txt)
+        if config.llm_precision == "int4_gptq":
+            from pytest_helpers import run_command
+
+            # Install gptqmodel 4.2.5 (stable version that works with GPTQ models)
+            install_gptq_cmd = [
+                "bash", "-c",
+                "BUILD_CUDA_EXT=0 pip install -v gptqmodel==4.2.5 --no-build-isolation"
+            ]
+            result = run_command(install_gptq_cmd,
+                                 timeout=300,
+                                 remote_config=None,
+                                 logger=test_logger)
+            if not result['success']:
+                pytest.fail(
+                    f"Failed to install gptqmodel: {result.get('error', 'Unknown error')}"
+                )
 
         commands = generate_export_commands(config)
 
