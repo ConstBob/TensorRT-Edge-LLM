@@ -345,38 +345,33 @@ TEST(InitAttentionMaskQwen, Benchmark)
     BenchmarkInitAttentionMaskQwenViT(4096);
 }
 
-void TestInitRotaryPosEmbQwenViT(int32_t const totalSeqLength, int32_t const vitPosEmbDim = 40,
+void TestInitRotaryPosEmbQwenViT(int32_t const vitPosEmbDim = 40, int32_t const mergeSize = 2,
     float const rotaryBaseFrequency = 10000.0f, float const scale = 1.0f)
 {
     cudaStream_t stream{nullptr};
 
-    std::vector<int64_t> posIds(totalSeqLength * 2);
-    int64_t maxGridSize = static_cast<int64_t>(std::sqrt(totalSeqLength));
-    uniformIntInitialization<int64_t>(posIds, 0, maxGridSize - 1);
-
-    std::vector<std::vector<float>> rotaryPosEmbFull(maxGridSize, std::vector<float>(vitPosEmbDim / 2));
-    for (int i = 0; i < maxGridSize; ++i)
+    std::vector<std::vector<int64_t>> imageGridTHWs{{1, 36, 54}, {1, 8, 10}, {1, 32, 20}};
+    std::vector<int64_t> cuSeqlens{0};
+    for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
     {
-        for (int j = 0; j < (vitPosEmbDim / 2); ++j)
-        {
-            float value = i * scale / pow(rotaryBaseFrequency, (static_cast<float>(j * 2) / vitPosEmbDim));
-            rotaryPosEmbFull[i][j] = value;
-        }
+        cuSeqlens.push_back(cuSeqlens.back() + imageGridTHWs[i][0] * imageGridTHWs[i][1] * imageGridTHWs[i][2]);
     }
+    int64_t totalSeqLength = cuSeqlens.back();
+
+    // CPU reference
     std::vector<float> rotaryPosEmb(totalSeqLength * vitPosEmbDim);
-    for (size_t i = 0; i < posIds.size(); ++i)
+    initRotaryPosEmbQwenViTReference(
+        rotaryPosEmb, imageGridTHWs, totalSeqLength, vitPosEmbDim, mergeSize, rotaryBaseFrequency, scale);
+
+    // GPU kernel
+    rt::Tensor rotaryPosEmbDevice({totalSeqLength, vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
     {
-        auto const& emb = rotaryPosEmbFull[posIds[i]];
-        std::copy(emb.begin(), emb.end(), rotaryPosEmb.begin() + i * (vitPosEmbDim / 2));
+        kernel::initRotaryPosEmbQwenViT(
+            rotaryPosEmbDevice, imageGridTHWs[i], mergeSize, cuSeqlens[i], rotaryBaseFrequency, scale, stream);
     }
 
-    rt::Tensor posIdsDevice({totalSeqLength * 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-    CUDA_CHECK(cudaMemcpyAsync(
-        posIdsDevice.rawPointer(), posIds.data(), posIds.size() * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-    rt::Tensor rotaryPosEmbDevice({totalSeqLength, vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-
-    kernel::initRotaryPosEmbQwenViT(posIdsDevice, rotaryPosEmbDevice, rotaryBaseFrequency, scale, stream);
-
+    // Compare data
     std::vector<float> rotaryPosEmbHost(totalSeqLength * vitPosEmbDim);
     CUDA_CHECK(cudaMemcpyAsync(rotaryPosEmbHost.data(), rotaryPosEmbDevice.rawPointer(),
         rotaryPosEmbHost.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
@@ -393,25 +388,22 @@ void TestInitRotaryPosEmbQwenViT(int32_t const totalSeqLength, int32_t const vit
 
 TEST(InitRotaryPosEmbQwen, Accuracy)
 {
-    TestInitRotaryPosEmbQwenViT(1024, 40);
-    TestInitRotaryPosEmbQwenViT(2048, 40);
+    TestInitRotaryPosEmbQwenViT();
 }
 
-void BenchmarkInitRotaryPosEmbQwenViT(int32_t const totalSeqLength, int32_t const vitPosEmbDim = 40)
+void BenchmarkInitRotaryPosEmbQwenViT(int32_t const vitPosEmbDim = 40, int32_t const mergeSize = 2,
+    float const rotaryBaseFrequency = 10000.0f, float const scale = 1.0f)
 {
     cudaStream_t stream{nullptr};
 
-    std::vector<int64_t> posIds(totalSeqLength * 2);
-    int64_t maxGridSize = static_cast<int64_t>(std::sqrt(totalSeqLength));
-    uniformIntInitialization<int64_t>(posIds, 0, maxGridSize);
-
-    rt::Tensor posIdsDevice({totalSeqLength * 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-    CUDA_CHECK(cudaMemcpyAsync(
-        posIdsDevice.rawPointer(), posIds.data(), posIds.size() * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-    std::vector<float> rotaryPosEmb(totalSeqLength * vitPosEmbDim);
+    std::vector<int64_t> imageGridTHW{1, 32, 32};
+    int64_t totalSeqLength = imageGridTHW[0] * imageGridTHW[1] * imageGridTHW[2];
     rt::Tensor rotaryPosEmbDevice({totalSeqLength, vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
 
-    auto launch = [&]() { kernel::initRotaryPosEmbQwenViT(posIdsDevice, rotaryPosEmbDevice, 10000.0f, 1.0f, stream); };
+    auto launch = [&]() {
+        kernel::initRotaryPosEmbQwenViT(
+            rotaryPosEmbDevice, imageGridTHW, mergeSize, 0, rotaryBaseFrequency, scale, stream);
+    };
 
     constexpr int32_t numWarmup = 10;
     for (int32_t i = 0; i < numWarmup; i++)
@@ -440,8 +432,7 @@ void BenchmarkInitRotaryPosEmbQwenViT(int32_t const totalSeqLength, int32_t cons
 
 TEST(InitRotaryPosEmbQwen, Benchmark)
 {
-    BenchmarkInitRotaryPosEmbQwenViT(1024, 40);
-    BenchmarkInitRotaryPosEmbQwenViT(2048, 40);
+    BenchmarkInitRotaryPosEmbQwenViT();
 }
 
 void TestTransposeToPatchInternVL(int32_t const height, int32_t const width, int32_t const channels = 3,
@@ -565,8 +556,8 @@ void TestInitFastPosEmbedQwenViT(int64_t const mergeSize = 2, int64_t const numG
     // Call CUDA kernel
     for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
     {
-        kernel::initFastPosEmbedQwenViT(fastPosEmbedIdxDevice, fastPosEmbedWeightDevice, imageGridTHWs[i][1],
-            imageGridTHWs[i][2], mergeSize, numGridPerSide, cuSeqlens[i], stream);
+        kernel::initFastPosEmbedQwenViT(fastPosEmbedIdxDevice, fastPosEmbedWeightDevice, imageGridTHWs[i], mergeSize,
+            numGridPerSide, cuSeqlens[i], stream);
     }
 
     // Copy results back to host

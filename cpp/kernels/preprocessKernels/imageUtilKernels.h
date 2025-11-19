@@ -62,14 +62,18 @@ void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputP
 //     attentionMask [GPU, Half]: Attention mask tensor [1, curHW, curHW]
 void initAttentionMaskQwenViT(rt::Tensor const& cuSeqlens, rt::Tensor& attentionMask, cudaStream_t stream);
 
-// The kernel will initialize the rotary position embeddings for Qwen2-VL and Qwen2.5-VL VIT
+// The kernel will initialize the rotary position embeddings for Qwen2.5-VL VIT
 // Inputs:
-//     posIds [GPU, Int64]: [totalSeqLength*2]
+//     gridTHW: Image grid dimensions [T, H, W] (Temporal, Height, Width)
+//     mergeSize: Merge size for the vision transformer
+//     startIdx: Start index for the current image
+//     rotaryBaseFrequency: Rotary base frequency
+//     scale: Scale for the rotary position embeddings
 //     stream: CUDA stream for execution
 // Outputs:
 //     rotaryPosEmb [GPU, Float]: Rotary position embeddings tensor [totalSeqLength, vitPosEmbDim]
-void initRotaryPosEmbQwenViT(rt::Tensor const& posIds, rt::Tensor& rotaryPosEmb, float const rotaryBaseFrequency,
-    float const scale, cudaStream_t stream);
+void initRotaryPosEmbQwenViT(rt::Tensor& rotaryPosEmb, std::vector<int64_t> const& gridTHW, int64_t const mergeSize,
+    int64_t const startIdx, float const rotaryBaseFrequency, float const scale, cudaStream_t stream);
 
 // The kernel will transpose image data to patch format for InternVL VIT
 // Inputs:
@@ -83,10 +87,9 @@ void initRotaryPosEmbQwenViT(rt::Tensor const& posIds, rt::Tensor& rotaryPosEmb,
 void transposeToPatchInternVL(
     rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset, cudaStream_t stream);
 
-// The kernel will initialize the fast position embeddings for Qwen2.5-VL VIT
+// The kernel will initialize the fast position embeddings for Qwen3-VL VIT
 // Inputs
-//     H: Height of the image
-//     W: Width of the image
+//     gridTHW: Image grid dimensions [T, H, W] (only H and W are used)
 //     mergeSize: Merge size for the vision transformer
 //     numGridPerSide: Number of grid per side for the vision transformer
 //     startIdx: Start index for the image
@@ -94,8 +97,8 @@ void transposeToPatchInternVL(
 // Outputs:
 //     fastPosEmbedIdx [GPU, Int64]: Fast position embeddings index tensor [4, totalSeqLength]
 //     fastPosEmbedWeight [GPU, Half]: Fast position embeddings weight tensor [4, totalSeqLength]
-void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight, int64_t const H,
-    int64_t const W, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx,
+void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmbedWeight,
+    std::vector<int64_t> const& gridTHW, int64_t const mergeSize, int64_t const numGridPerSide, int64_t const startIdx,
     cudaStream_t stream);
 
 } // namespace kernel

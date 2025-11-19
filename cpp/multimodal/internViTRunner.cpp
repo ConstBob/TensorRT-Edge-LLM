@@ -145,6 +145,18 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
     CUDA_CHECK(cudaMemcpyAsync(
         mImageStd.rawPointer(), mConfig.imageStd.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
 
+    // Pre-allocate temporary image buffers for preprocessing
+    int64_t const maxImagePixels = mVitInput.getShape().volume();
+    mImageDevice = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    mNormalizedImageDevice = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    // Set max image size to 1xmaxImagePixelsxchannels, will reshape to actual image size in resizeImage
+    rt::Tensor resizeBuffer({1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
+    // Thumbnail image has fixed size: blockImageSizeH x blockImageSizeW x channels)
+    rt::Tensor thumbnailBuffer(
+        {mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+    mThumbnailImageHost = rt::imageUtils::ImageData(std::move(thumbnailBuffer));
+
     return true;
 }
 
@@ -191,19 +203,20 @@ void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
         ++numImages;
     }
 
-    // Copy image to device.
-    auto imageDevice = rt::Tensor({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    CUDA_CHECK(cudaMemcpyAsync(imageDevice.rawPointer(), imageData, height * width * channels * sizeof(unsigned char),
+    // Reshape pre-allocated temporary buffers to current image dimensions
+    mImageDevice.reshape({1, height, width, channels});
+    mNormalizedImageDevice.reshape({1, height, width, channels});
+
+    // Copy image to device
+    CUDA_CHECK(cudaMemcpyAsync(mImageDevice.rawPointer(), imageData, height * width * channels * sizeof(unsigned char),
         cudaMemcpyHostToDevice, stream));
 
     // Normalize image
-    auto normalizedImageDevice
-        = rt::Tensor({1, height, width, channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    kernel::normalizeImage(imageDevice, mImageMean, mImageStd, normalizedImageDevice, stream);
+    kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
 
     // Transpose to patch
     int64_t offset = totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW;
-    kernel::transposeToPatchInternVL(normalizedImageDevice, mVitInput, offset, stream);
+    kernel::transposeToPatchInternVL(mNormalizedImageDevice, mVitInput, offset, stream);
 
     // Update numBlocks
     totalNumBlocks += curNumBlocks;
@@ -276,16 +289,16 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             if (doResize)
             {
                 auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
-                auto resizedImage = rt::imageUtils::resizeImage(image, resizedWidth, resizedHeight);
-                formatPatch(resizedImage, imageTokenLengths, numImage, totalNumBlocks, false, stream);
+                rt::imageUtils::resizeImage(image, mResizedImageHost, resizedWidth, resizedHeight);
+                formatPatch(mResizedImageHost, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
             else
             {
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
-            // Add thumbnail image by default
-            auto thumbnailImage = rt::imageUtils::resizeImage(image, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
-            formatPatch(thumbnailImage, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+            // Add thumbnail image by default (use separate buffer to avoid race condition)
+            rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
+            formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
         }
         numImages.emplace_back(numImage);
     }
@@ -436,7 +449,6 @@ bool InternViTRunner::infer(cudaStream_t stream)
         }
 
         bool enqueueStatus = mContext->enqueueV3(stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
         if (!enqueueStatus)
         {
             LOG_ERROR("InternViTRunner::infer(): Failed to enqueue engine.");

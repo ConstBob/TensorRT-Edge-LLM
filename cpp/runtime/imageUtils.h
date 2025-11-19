@@ -44,11 +44,15 @@ public:
     int64_t channels;                   //!< Number of channels (e.g., 3 for RGB)
 
     /*!
+     * @brief Default constructor (creates uninitialized ImageData)
+     */
+    ImageData() = default;
+
+    /*!
      * @brief Construct image data
      * @param data Image tensor
-     * @param thumbnail Whether this is a thumbnail
      */
-    ImageData(rt::Tensor&& data, bool thumbnail = false);
+    ImageData(rt::Tensor&& data);
 
     //! @brief Get raw image data pointer
     //! @return Pointer to image data
@@ -71,13 +75,13 @@ ImageData loadImageFromFile(std::string const& path);
 ImageData loadImageFromMemory(unsigned char const* data, size_t size);
 
 /*!
- * @brief Resize image
+ * @brief Resize image into pre-allocated buffer
  * @param image Source image
+ * @param resizedImage Output buffer (will be reshaped to target dimensions)
  * @param newWidth Target width
  * @param newHeight Target height
- * @return Resized image
  */
-ImageData resizeImage(ImageData const& image, int64_t newWidth, int64_t newHeight);
+void resizeImage(ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight);
 
 } // namespace imageUtils
 } // namespace rt

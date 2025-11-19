@@ -31,7 +31,7 @@ namespace rt
 namespace imageUtils
 {
 
-ImageData::ImageData(rt::Tensor&& data, bool thumbnail)
+ImageData::ImageData(rt::Tensor&& data)
 {
     check::check(data.getDataType() == nvinfer1::DataType::kUINT8, "Image data must be UINT8");
     check::check(data.getShape().getNumDims() == 3, "Image data must have 3 dimensions");
@@ -105,23 +105,23 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
     return ImageData(std::move(imgTensor));
 }
 
-ImageData resizeImage(ImageData const& image, int64_t newWidth, int64_t newHeight)
+void resizeImage(ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight)
 {
-    if (newWidth <= 0 || newHeight <= 0)
+    // Reshape pre-allocated buffer to target dimensions
+    bool success = resizedImage.buffer->reshape({newHeight, newWidth, image.channels});
+    if (!success)
     {
-        throw std::invalid_argument("New dimensions must be positive");
+        throw std::runtime_error("Failed to reshape resized image buffer");
     }
+    resizedImage.height = newHeight;
+    resizedImage.width = newWidth;
+    resizedImage.channels = image.channels;
 
-    // Allocate memory for resized image
-    rt::Tensor resizedTensor
-        = rt::Tensor({newHeight, newWidth, image.channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
-
-    // Resize the image, default strides for src/dst images to zero.
+    // Resize the image into the pre-allocated buffer
     constexpr int32_t kINPUT_STRIDE_BYTES{0};
     constexpr int32_t kOUTPUT_STRIDE_BYTES{0};
-    stbir_resize_uint8_linear(image.data(), image.width, image.height, kINPUT_STRIDE_BYTES,
-        resizedTensor.dataPointer<unsigned char>(), newWidth, newHeight, kOUTPUT_STRIDE_BYTES, STBIR_RGB);
-    return ImageData(std::move(resizedTensor));
+    stbir_resize_uint8_linear(image.data(), image.width, image.height, kINPUT_STRIDE_BYTES, resizedImage.data(),
+        newWidth, newHeight, kOUTPUT_STRIDE_BYTES, STBIR_RGB);
 }
 
 } // namespace imageUtils

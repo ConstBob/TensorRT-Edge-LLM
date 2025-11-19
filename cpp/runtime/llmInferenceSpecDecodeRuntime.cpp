@@ -245,7 +245,8 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     {
         try
         {
-            mMultimodalRunner = MultimodalRunner::create(multimodalEngineDir, stream);
+            mMultimodalRunner = MultimodalRunner::create(multimodalEngineDir, mBaseEngineConfig.maxSupportedBatchSize,
+                mBaseEngineConfig.maxSequenceLength, stream);
         }
         catch (std::exception const& e)
         {

@@ -53,7 +53,8 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     }
 }
 
-std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir, cudaStream_t stream)
+std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir,
+    int32_t llmMaxBatchSize, int64_t llmMaxPositionEmbeddings, cudaStream_t stream)
 {
     std::unique_ptr<MultimodalRunner> multimodalRunner;
 
@@ -82,7 +83,8 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     if (modelType == multimodal::ModelType::QWEN2_VL || modelType == multimodal::ModelType::QWEN2_5_VL
         || modelType == multimodal::ModelType::QWEN3_VL)
     {
-        multimodalRunner = std::make_unique<QwenViTRunner>(multimodalEngineDir, stream);
+        multimodalRunner
+            = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }
     else if (modelType == multimodal::ModelType::INTERNVL)
     {

@@ -116,7 +116,8 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     {
         try
         {
-            mMultimodalRunner = MultimodalRunner::create(multimodalEngineDir, stream);
+            mMultimodalRunner = MultimodalRunner::create(
+                multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSequenceLength, stream);
         }
         catch (std::exception const& e)
         {

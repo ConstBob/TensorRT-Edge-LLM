@@ -152,10 +152,14 @@ private:
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 
-    InternViTConfig mConfig; //!< InternViT configuration
-    rt::Tensor mVitInput{};  //!< Vision encoder input tensor
-    rt::Tensor mImageMean{}; //!< Image mean tensor
-    rt::Tensor mImageStd{};  //!< Image standard deviation tensor
+    InternViTConfig mConfig;                         //!< InternViT configuration
+    rt::Tensor mVitInput{};                          //!< Vision encoder input tensor
+    rt::Tensor mImageMean{};                         //!< Image mean tensor
+    rt::Tensor mImageStd{};                          //!< Image standard deviation tensor
+    rt::Tensor mImageDevice{};                       //!< Temporary image buffer for preprocessing
+    rt::Tensor mNormalizedImageDevice{};             //!< Temporary normalized image buffer
+    rt::imageUtils::ImageData mResizedImageHost{};   //!< Pre-allocated buffer for image resizing
+    rt::imageUtils::ImageData mThumbnailImageHost{}; //!< Pre-allocated buffer for thumbnail generation
 };
 
 } // namespace rt

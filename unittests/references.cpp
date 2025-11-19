@@ -1193,3 +1193,58 @@ void fastPosEmbedInterpolateReference(std::vector<std::vector<int64_t>> const& i
         }
     }
 }
+
+void initRotaryPosEmbQwenViTReference(std::vector<float>& rotaryPosEmb,
+    std::vector<std::vector<int64_t>> const& imageGridTHWs, int64_t const totalSeqLength, int64_t const vitPosEmbDim,
+    int64_t const mergeSize, float const rotaryBaseFrequency, float const scale)
+{
+    // Get position ids
+    std::vector<int64_t> posIds(totalSeqLength * 2);
+    int64_t posIdsOffset = 0;
+
+    for (auto const& grid : imageGridTHWs)
+    {
+        int64_t T = grid[0];
+        int64_t H = grid[1];
+        int64_t W = grid[2];
+
+        for (int64_t i = 0; i < H; ++i)
+        {
+            for (int64_t j = 0; j < W; ++j)
+            {
+                // (H, W) => (H / mergeSize, mergeSize, W / mergeSize, mergeSize)
+                // => (H / mergeSize, W / mergeSize, mergeSize, mergeSize)
+                int64_t dstHW = (i / mergeSize) * W * mergeSize + (j / mergeSize) * mergeSize * mergeSize
+                    + (i % mergeSize) * mergeSize + (j % mergeSize);
+
+                // duplicate for T
+                for (int64_t t = 0; t < T; ++t)
+                {
+                    int64_t baseIdx = t * H * W * 2 + dstHW * 2;
+                    posIds[posIdsOffset + baseIdx] = i;
+                    posIds[posIdsOffset + baseIdx + 1] = j;
+                }
+            }
+        }
+
+        posIdsOffset += T * H * W * 2;
+    }
+
+    int64_t maxGridSize = posIds.empty() ? 0 : *std::max_element(posIds.begin(), posIds.end());
+    std::vector<std::vector<float>> rotaryPosEmbFull(maxGridSize + 1, std::vector<float>(vitPosEmbDim / 2));
+    for (int64_t i = 0; i <= maxGridSize; ++i)
+    {
+        for (int j = 0; j < (vitPosEmbDim / 2); ++j)
+        {
+            float value = i * scale / pow(rotaryBaseFrequency, (static_cast<float>(j * 2) / vitPosEmbDim));
+            rotaryPosEmbFull[i][j] = value;
+        }
+    }
+
+    rotaryPosEmb.resize(totalSeqLength * vitPosEmbDim);
+    for (size_t i = 0; i < posIds.size(); ++i)
+    {
+        auto const& emb = rotaryPosEmbFull[posIds[i]];
+        std::copy(emb.begin(), emb.end(), rotaryPosEmb.begin() + i * (vitPosEmbDim / 2));
+    }
+}
