@@ -144,5 +144,13 @@ int32_t LinearKVCache::getActiveBatchSize() const
     return mActiveBatchSize;
 }
 
+void LinearKVCache::setActiveBatchSize(int32_t newActiveBatchSize)
+{
+    check::check(newActiveBatchSize >= 0 && newActiveBatchSize <= mConfig.maxBatchSize,
+        "Invalid active batch size: must be in range [0, maxBatchSize]");
+    mActiveBatchSize = newActiveBatchSize;
+    mDeviceKVCacheLengths.reshape({mActiveBatchSize});
+}
+
 } // namespace rt
 } // namespace trt_edgellm

@@ -22,10 +22,12 @@
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
+#include "kernels/speculative/batchEvictKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/timer.h"
+#include "runtime/llmRuntimeUtils.h"
 #include "sampler/sampling.h"
 #include <algorithm>
 #include <fstream>
@@ -47,6 +49,7 @@ size_t hashSystemPrompt(std::string const& systemPrompt)
     hash_utils::hashCombine(hashValue, systemPrompt);
     return hashValue;
 }
+
 } // namespace
 
 namespace rt
@@ -61,13 +64,30 @@ void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _m
     tokenIds.resize(_activeBatchSize);
     currentGenerateLengths.resize(_activeBatchSize, 0);
     promptLengths.resize(_activeBatchSize, 0);
-    finishedStates.resize(_activeBatchSize, false);
+    finishedStates.resize(_activeBatchSize, 0);
     actualIterations.resize(_activeBatchSize, 0);
+
+    // Initialize batch index mapping (identity mapping initially)
+    batchIndexMapping.resize(_activeBatchSize);
+    for (int32_t i = 0; i < _activeBatchSize; ++i)
+    {
+        batchIndexMapping[i] = i;
+    }
+
+    // Clear evicted batch storage
+    evictedTokenIds.clear();
+    evictedGenerateLengths.clear();
+    evictedActualIterations.clear();
+    evictedSystemPrompts.clear();
+    evictedRawBatchedInputIds.clear();
+    evictedPromptLengths.clear();
+
     multimodalEmbeddings = _mutimodalEmbeddings;
     extraInputTensors = _extraInputTensors;
     generationRound = 0;
     maxGenerateLength = _maxGenerateLength;
     activeBatchSize = _activeBatchSize;
+    originalBatchSize = _activeBatchSize; // Save original batch size
     stream = _stream;
 }
 
@@ -202,6 +222,9 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
         mAcceptedTokenIndices
             = rt::Tensor({mMaxRuntimeBatchSize, maxAcceptDepth}, rt::DeviceType::kGPU, DataType::kINT32);
         mAcceptLength = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+
+        // Allocate batch mapping tensor for batch eviction
+        mDeviceBatchMapping = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     }
     catch (std::exception const& e)
     {
@@ -391,32 +414,41 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 
     // Lambda to check if all batches are finished
     auto checkAllFinished = [&]() {
-        for (int32_t i = 0; i < activeBatchSize; ++i)
+        // Check if all batches have been evicted
+        if (context.activeBatchSize == 0)
+        {
+            return true;
+        }
+        for (int32_t i = 0; i < context.activeBatchSize; ++i)
         {
             if (!context.finishedStates[i])
+            {
                 return false;
+            }
         }
         return true;
     };
 
     // Lambda to update finish states based on EOS and max_length
     auto updateFinishStates = [&]() {
-        for (int32_t i = 0; i < activeBatchSize; ++i)
+        for (int32_t i = 0; i < context.activeBatchSize; ++i)
         {
             if (context.finishedStates[i])
+            {
                 continue;
+            }
 
             // Check EOS
             if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
             {
-                context.finishedStates[i] = true;
+                context.finishedStates[i] = 1;
                 LOG_DEBUG("Batch %d finished, reason: EOS", i);
                 continue;
             }
             // Check max length
             if (context.currentGenerateLengths[i] >= context.maxGenerateLength)
             {
-                context.finishedStates[i] = true;
+                context.finishedStates[i] = 1;
                 LOG_DEBUG(
                     "Batch %d finished, total tokens=%d, reason: max_length", i, context.currentGenerateLengths[i]);
                 continue;
@@ -465,55 +497,75 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         // Update iterations and check finish conditions
         updateFinishStates();
 
+        // Perform batch eviction if needed (after verification, before updating finish states)
+        bool const batchEvictStatus = performBatchEvict(context);
+        if (!batchEvictStatus)
+        {
+            LOG_ERROR("Failed to perform batch eviction.");
+            return false;
+        }
+
         context.generationRound += 1;
     }
 
-    // Record Eagle metrics - accumulate across all batches
+    if (context.activeBatchSize != 0)
+    {
+        LOG_ERROR("Eviction failure, there should be no active batch at the end of the inference. activeBatchSize: %d",
+            context.activeBatchSize);
+        return false;
+    }
+
+    // Record Eagle metrics - accumulate across all batches (active + evicted)
     int32_t totalReusedTokens = 0;
     int32_t totalComputedTokens = 0;
     int32_t totalGeneratedTokens = 0;
     int32_t totalIterations = 0;
-    for (int32_t i = 0; i < activeBatchSize; ++i)
+
+    // Accumulate from evicted batches
+    for (auto const& entry : context.evictedGenerateLengths)
     {
-        int32_t rawPromptLength = static_cast<int32_t>(context.rawBatchedInputIds[i].size());
-        int32_t computedLength = context.promptLengths[i];
+        int32_t originalIdx = entry.first;
+        int32_t rawPromptLength = static_cast<int32_t>(context.evictedRawBatchedInputIds.at(originalIdx).size());
+        int32_t computedLength = context.evictedPromptLengths.at(originalIdx);
         totalReusedTokens += (rawPromptLength - computedLength);
         totalComputedTokens += computedLength;
-        totalGeneratedTokens += context.currentGenerateLengths[i];
-        totalIterations += context.actualIterations[i];
+        totalGeneratedTokens += context.evictedGenerateLengths.at(originalIdx);
+        totalIterations += context.evictedActualIterations.at(originalIdx);
     }
+
     mPrefillMetrics.recordRun(totalReusedTokens, totalComputedTokens);
     mEagleGenerationMetrics.recordRun(totalIterations, totalGeneratedTokens);
 
     // Save output ids and decoded texts to response.
+    // Maintain original batch order using original batch indices
     response.outputIds.clear();
     response.outputTexts.clear();
-    for (int32_t i = 0; i < activeBatchSize; ++i)
+    response.outputIds.resize(context.originalBatchSize);
+    response.outputTexts.resize(context.originalBatchSize);
+
+    // Add outputs from evicted batches (using saved original indices)
+    for (auto const& entry : context.evictedGenerateLengths)
     {
-        // Log acceptance metrics for this batch using its actual iterations
-        // actualIterations[i] tracks how many rounds this specific sequence participated in before finishing
-        // Note: Prefill generates 1 token but is not counted as an iteration.
-        // To calculate true acceptance rate (tokens accepted per verification round), we need to:
-        // 1. Subtract the 1 prefill token from currentGenerateLengths
-        // 2. Divide by actualIterations (which counts verification rounds only)
-        int32_t const verificationTokens = context.currentGenerateLengths[i] > 0
-            ? context.currentGenerateLengths[i] - 1 // Subtract the 1 prefill token
-            : 0;
-        float const acceptanceRate = context.actualIterations[i] > 0
-            ? static_cast<float>(verificationTokens) / static_cast<float>(context.actualIterations[i])
+        int32_t originalIdx = entry.first;
+        int32_t genLength = entry.second;
+
+        // Log acceptance metrics for evicted batch
+        int32_t const verificationTokens = genLength > 0 ? genLength - 1 : 0;
+        float const acceptanceRate = context.evictedActualIterations.at(originalIdx) > 0
+            ? static_cast<float>(verificationTokens)
+                / static_cast<float>(context.evictedActualIterations.at(originalIdx))
             : 0.0f;
-        LOG_INFO("Batch %d - Acceptance rate: %.3f, Generated tokens: %d, Iterations: %d", i, acceptanceRate,
-            context.currentGenerateLengths[i], context.actualIterations[i]);
+        LOG_INFO("Batch (evicted, original idx %d) - Acceptance rate: %.3f, Generated tokens: %d, Iterations: %d",
+            originalIdx, acceptanceRate, genLength, context.evictedActualIterations.at(originalIdx));
 
-        // Extract only the generated tokens (skip prompt and padding)
-        // Generated tokens are the last currentGenerateLengths[i] tokens in the vector
-        int32_t const genLength = context.currentGenerateLengths[i];
-        int32_t const totalLength = static_cast<int32_t>(context.tokenIds[i].size());
+        // Extract generated tokens
+        auto const& evictedTokens = context.evictedTokenIds.at(originalIdx);
+        int32_t const totalLength = static_cast<int32_t>(evictedTokens.size());
 
-        response.outputIds.emplace_back(
-            context.tokenIds[i].begin() + (totalLength - genLength), context.tokenIds[i].end());
-
-        response.outputTexts.emplace_back(mTokenizer->decode(response.outputIds[i], true));
+        check::check(totalLength >= genLength, "Total length should be greater than or equal to generated length");
+        response.outputIds[originalIdx]
+            = std::vector<int32_t>(evictedTokens.begin() + (totalLength - genLength), evictedTokens.end());
+        response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
     }
 
     return true;
@@ -855,7 +907,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
     {
         if (context.finishedStates[batchIdx])
+        {
             continue;
+        }
 
         int32_t const acceptLength = acceptLengths[batchIdx];
         // update iterations for each batch
@@ -871,7 +925,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
 
             if (token == mTokenizer->getEosId())
             {
-                context.finishedStates[batchIdx] = true;
+                context.finishedStates[batchIdx] = 1;
                 LOG_DEBUG("Batch %d encountered EOS (token %d) at generation round %d", batchIdx, token,
                     context.generationRound);
                 break;
@@ -1179,7 +1233,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     tempContext.tokenIds[0] = tokenizedPrompt;
     tempContext.currentGenerateLengths.resize(1, 0);
     tempContext.promptLengths.resize(1, 0);
-    tempContext.finishedStates.resize(1, false);
+    tempContext.finishedStates.resize(1, 0);
     tempContext.multimodalEmbeddings = context.multimodalEmbeddings;
     tempContext.generationRound = 0;
     tempContext.maxGenerateLength = 0; // Not generating, just caching
@@ -1253,6 +1307,175 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
 
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
     LOG_DEBUG("System prompt KVCache saved for batch %d: {%s}", batchIdx, prompt.c_str());
+
+    return true;
+}
+
+bool LLMInferenceSpecDecodeRuntime::performBatchEvict(SpecDecodeInferenceContext& context)
+{
+    // Check if any batch has finished
+    bool hasFinishedBatch = false;
+    for (int32_t i = 0; i < context.activeBatchSize; ++i)
+    {
+        if (context.finishedStates[i])
+        {
+            hasFinishedBatch = true;
+            break;
+        }
+    }
+
+    if (!hasFinishedBatch)
+    {
+        return true;
+    }
+
+    int32_t const oldActiveBatch = context.activeBatchSize;
+
+    // Build batch mapping
+    std::vector<int32_t> batchMapping = buildBatchMapping(context.finishedStates);
+
+    // Calculate new active batch size
+    int32_t newActiveBatch = 0;
+    for (auto newIdx : batchMapping)
+    {
+        if (newIdx >= 0)
+        {
+            newActiveBatch = std::max(newActiveBatch, newIdx + 1);
+        }
+    }
+
+    // Log eviction details
+    std::vector<int32_t> evictedIndices;
+    for (int32_t i = 0; i < oldActiveBatch; ++i)
+    {
+        if (batchMapping[i] < 0)
+        {
+            evictedIndices.push_back(i);
+        }
+    }
+    // TODO: format the log message in a more readable way such as vector print.
+    LOG_DEBUG("Batch eviction: %d active batches to %d remaining (evicted %d batch(es): indices [%s])", oldActiveBatch,
+        newActiveBatch, static_cast<int32_t>(evictedIndices.size()),
+        [&evictedIndices]() {
+            std::string result;
+            for (size_t i = 0; i < evictedIndices.size(); ++i)
+            {
+                if (i > 0)
+                {
+                    result += ", ";
+                }
+                result += std::to_string(evictedIndices[i]);
+            }
+            return result;
+        }()
+            .c_str());
+
+    // Upload batch mapping to GPU
+    mDeviceBatchMapping.reshape({oldActiveBatch});
+    CUDA_CHECK(cudaMemcpyAsync(mDeviceBatchMapping.rawPointer(), batchMapping.data(), oldActiveBatch * sizeof(int32_t),
+        cudaMemcpyHostToDevice, context.stream));
+
+    // Compact Base KV Cache
+    auto& baseLinearKVCache = mBaseEngineRunner->getLinearKVCache();
+    rt::Tensor baseKVCacheBuffer = baseLinearKVCache.getKVCacheBuffer();
+    kernel::compactKVCache(mDeviceBatchMapping, baseKVCacheBuffer, baseLinearKVCache.getKVCacheLengths(),
+        oldActiveBatch, newActiveBatch, context.stream);
+    baseLinearKVCache.setActiveBatchSize(newActiveBatch);
+
+    // Compact Draft KV Cache
+    auto& draftLinearKVCache = mDraftEngineRunner->getLinearKVCache();
+    rt::Tensor draftKVCacheBuffer = draftLinearKVCache.getKVCacheBuffer();
+    kernel::compactKVCache(mDeviceBatchMapping, draftKVCacheBuffer, draftLinearKVCache.getKVCacheLengths(),
+        oldActiveBatch, newActiveBatch, context.stream);
+    draftLinearKVCache.setActiveBatchSize(newActiveBatch);
+
+    // Compact Draft Model's RoPE CosSin Cache if it's per-batch (MRope for multimodal)
+    rt::Tensor& draftRopeCache = mDraftEngineRunner->getRopeCosSinCacheTensor();
+    if (draftRopeCache.getShape().getNumDims() == 3 && draftRopeCache.getShape()[0] == oldActiveBatch
+        && newActiveBatch > 0)
+    {
+        kernel::compactTensorBatch(
+            draftRopeCache, mDeviceBatchMapping, draftRopeCache, oldActiveBatch, newActiveBatch, context.stream);
+        auto const seqLen = static_cast<int32_t>(draftRopeCache.getShape()[1]);
+        auto const rotaryDim = static_cast<int32_t>(draftRopeCache.getShape()[2]);
+        draftRopeCache.reshape({newActiveBatch, seqLen, rotaryDim});
+    }
+
+    // Compact Base Model's RoPE CosSin Cache if it's per-batch (MRope for multimodal)
+    rt::Tensor& baseRopeCache = mBaseEngineRunner->getRopeCosSinCacheTensor();
+    if (baseRopeCache.getShape().getNumDims() == 3 && baseRopeCache.getShape()[0] == oldActiveBatch
+        && newActiveBatch > 0)
+    {
+        kernel::compactTensorBatch(
+            baseRopeCache, mDeviceBatchMapping, baseRopeCache, oldActiveBatch, newActiveBatch, context.stream);
+        auto const seqLen = static_cast<int32_t>(baseRopeCache.getShape()[1]);
+        auto const rotaryDim = static_cast<int32_t>(baseRopeCache.getShape()[2]);
+        baseRopeCache.reshape({newActiveBatch, seqLen, rotaryDim});
+    }
+
+    // Compact cross-round GPU tensors that are read (not just written) in the next round
+
+    // 1. mBaseHiddenStatesOutput: read by runDraftModelAcceptToken in next round
+    //    Shape: [activeBatchSize, maxAcceptDepth, baseHiddenDim]
+    if (mBaseHiddenStatesOutput.getShape().getNumDims() == 3 && mBaseHiddenStatesOutput.getShape()[0] == oldActiveBatch
+        && newActiveBatch > 0)
+    {
+        kernel::compactTensorBatch(mBaseHiddenStatesOutput, mDeviceBatchMapping, mBaseHiddenStatesOutput,
+            oldActiveBatch, newActiveBatch, context.stream);
+        auto const dim1 = static_cast<int32_t>(mBaseHiddenStatesOutput.getShape()[1]);
+        auto const dim2 = static_cast<int32_t>(mBaseHiddenStatesOutput.getShape()[2]);
+        mBaseHiddenStatesOutput.reshape({newActiveBatch, dim1, dim2});
+    }
+
+    // 2. mAcceptedTokenIds: read by runDraftModelAcceptToken to prepare input IDs
+    //    Shape: [activeBatchSize, maxAcceptDepth]
+    if (mAcceptedTokenIds.getShape()[0] == oldActiveBatch && newActiveBatch > 0)
+    {
+        kernel::compactTensorBatch(
+            mAcceptedTokenIds, mDeviceBatchMapping, mAcceptedTokenIds, oldActiveBatch, newActiveBatch, context.stream);
+        auto const maxAcceptDepth = static_cast<int32_t>(mAcceptedTokenIds.getShape()[1]);
+        mAcceptedTokenIds.reshape({newActiveBatch, maxAcceptDepth});
+    }
+
+    // 3. mAcceptLength: read by runDraftModelAcceptToken to set per-batch accept counts
+    //    Shape: [activeBatchSize]
+    if (mAcceptLength.getShape()[0] == oldActiveBatch && newActiveBatch > 0)
+    {
+        kernel::compactTensorBatch(
+            mAcceptLength, mDeviceBatchMapping, mAcceptLength, oldActiveBatch, newActiveBatch, context.stream);
+        mAcceptLength.reshape({newActiveBatch});
+    }
+
+    // Compact CPU context
+    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+
+    // Save evicted batches' results before compacting (using original batch index)
+    for (size_t i = 0; i < batchMapping.size(); ++i)
+    {
+        if (batchMapping[i] < 0 && context.finishedStates[i])
+        {
+            // This batch is evicted and finished, save its results with original index
+            int32_t originalIdx = context.batchIndexMapping[i];
+            context.evictedTokenIds[originalIdx] = std::move(context.tokenIds[i]);
+            context.evictedGenerateLengths[originalIdx] = context.currentGenerateLengths[i];
+            context.evictedActualIterations[originalIdx] = context.actualIterations[i];
+            context.evictedSystemPrompts[originalIdx] = std::move(context.systemPrompts[i]);
+            context.evictedRawBatchedInputIds[originalIdx] = std::move(context.rawBatchedInputIds[i]);
+            context.evictedPromptLengths[originalIdx] = context.promptLengths[i];
+        }
+    }
+
+    rt::compactVector(batchMapping, context.finishedStates);
+    rt::compactVector(batchMapping, context.currentGenerateLengths);
+    rt::compactVector(batchMapping, context.actualIterations);
+    rt::compactVector(batchMapping, context.tokenIds);
+    rt::compactVector(batchMapping, context.systemPrompts);
+    rt::compactVector(batchMapping, context.rawBatchedInputIds);
+    rt::compactVector(batchMapping, context.promptLengths);
+    rt::compactVector(batchMapping, context.batchIndexMapping);
+
+    // Update active batch size
+    context.activeBatchSize = newActiveBatch;
 
     return true;
 }

@@ -19,9 +19,11 @@
 
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "common/stringUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include <ostream>
 #include <sstream>
+#include <stdexcept>
 
 using namespace nvinfer1;
 namespace trt_edgellm
@@ -247,6 +249,65 @@ bool initializeLongRopeCosSinCache(rt::Tensor& shortCosSinCache, rt::Tensor& lon
         return false;
     }
     return true;
+}
+
+//=============================================================================
+// CPU Vector Compaction Utility for Batch Eviction
+//=============================================================================
+
+template <typename T>
+void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec)
+{
+    // Validate that vector size matches batchMapping size
+    // In batch eviction, batchMapping[i] indicates where batch i should move to
+    if (vec.size() != batchMapping.size())
+    {
+        throw std::invalid_argument(
+            format::fmtstr("compactVector: vector size (%zu) does not match batchMapping size (%zu)", vec.size(),
+                batchMapping.size()));
+    }
+
+    std::vector<T> compacted;
+    compacted.reserve(vec.size());
+
+    for (size_t i = 0; i < vec.size(); ++i)
+    {
+        if (batchMapping[i] >= 0)
+        {
+            compacted.push_back(std::move(vec[i]));
+        }
+    }
+
+    vec = std::move(compacted);
+}
+
+template void compactVector<int8_t>(std::vector<int32_t> const&, std::vector<int8_t>&);
+template void compactVector<int32_t>(std::vector<int32_t> const&, std::vector<int32_t>&);
+template void compactVector<std::vector<int32_t>>(std::vector<int32_t> const&, std::vector<std::vector<int32_t>>&);
+template void compactVector<std::string>(std::vector<int32_t> const&, std::vector<std::string>&);
+
+// Build batch mapping from finished states
+// Returns a vector mapping old batch indices to new indices (-1 for evicted batches)
+std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates)
+{
+    int32_t const oldActiveBatch = static_cast<int32_t>(finishedStates.size());
+    std::vector<int32_t> mapping(oldActiveBatch);
+
+    int32_t newIdx = 0;
+    for (int32_t oldIdx = 0; oldIdx < oldActiveBatch; ++oldIdx)
+    {
+        if (!finishedStates[oldIdx])
+        {
+            mapping[oldIdx] = newIdx;
+            newIdx++;
+        }
+        else
+        {
+            mapping[oldIdx] = -1; // Mark for eviction
+        }
+    }
+
+    return mapping;
 }
 
 } // namespace rt

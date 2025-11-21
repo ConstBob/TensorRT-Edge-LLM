@@ -23,6 +23,7 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <unordered_map>
 #include <vector>
 
 namespace trt_edgellm
@@ -54,14 +55,25 @@ struct SpecDecodeInferenceContext
                                                           //!< and removal of reused system IDs)
     std::vector<std::vector<int32_t>> tokenIds;           //!< Token IDs for each sequence: [batch_size][seq_length]
     std::vector<int32_t> currentGenerateLengths;          //!< Current generation length for each sequence: [batch_size]
-    std::vector<int32_t> promptLengths;           //!< Prompt length (after reuse) for each sequence: [batch_size]
-    std::vector<bool> finishedStates;             //!< Finished state for each sequence: [batch_size]
-    std::vector<int32_t> actualIterations;        //!< Actual iterations run for each sequence: [batch_size]
+    std::vector<int32_t> promptLengths; //!< Prompt length (after reuse) for each sequence: [batch_size]
+    std::vector<int8_t> finishedStates; //!< Finished state for each sequence: [batch_size] (0=not finished, 1=finished)
+    std::vector<int32_t> actualIterations; //!< Actual iterations run for each sequence: [batch_size]
+
+    // Evicted batch results (saved before eviction for final output)
+    // Key: original batch index, Value: batch data
+    std::unordered_map<int32_t, std::vector<int32_t>> evictedTokenIds; //!< Token IDs of evicted batches
+    std::unordered_map<int32_t, int32_t> evictedGenerateLengths;       //!< Generation lengths of evicted batches
+    std::unordered_map<int32_t, int32_t> evictedActualIterations;      //!< Iterations of evicted batches
+    std::unordered_map<int32_t, std::string> evictedSystemPrompts;     //!< System prompts of evicted batches
+    std::unordered_map<int32_t, std::vector<int32_t>> evictedRawBatchedInputIds; //!< Raw input IDs of evicted batches
+    std::unordered_map<int32_t, int32_t> evictedPromptLengths;                   //!< Prompt lengths of evicted batches
+    std::vector<int32_t> batchIndexMapping;       //!< Maps current batch index to original index
     rt::OptionalInputTensor multimodalEmbeddings; //!< Optional multimodal embeddings
     rt::OptionalInputTensors extraInputTensors;   //!< Extra input tensors (e.g., deepstack features)
     int32_t generationRound;                      //!< Current generation round (shared across all batches)
     int32_t maxGenerateLength;                    //!< Maximum generation length
     int32_t activeBatchSize;                      //!< Current active batch size
+    int32_t originalBatchSize;                    //!< Original batch size (before any eviction)
     int32_t currentBatchIndex;                    //!< Current batch index being processed (for system prompt KVCache)
     cudaStream_t stream;                          //!< CUDA stream
 
@@ -204,7 +216,10 @@ private:
     rt::Tensor mAcceptedTokenIndices;
     rt::Tensor mAcceptLength;
 
-    // [5] Special tokens for reuse KV cache.
+    // [5] Batch eviction support tensors.
+    rt::Tensor mDeviceBatchMapping;
+
+    // [6] Special tokens for reuse KV cache.
     // TODO: Remove this to allow generalization.
     int32_t mImStartTokenId;
 
@@ -233,6 +248,12 @@ private:
     // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
     // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.
     bool setUpForPrefillExecution(SpecDecodeInferenceContext& context);
+
+    // Batch eviction support
+    //! @brief Perform batch eviction
+    //! @param context Inference context
+    //! @return True on success, false on failure
+    bool performBatchEvict(SpecDecodeInferenceContext& context);
 
     // Stage-specific metrics
     metrics::LLMPrefillMetrics mPrefillMetrics;
