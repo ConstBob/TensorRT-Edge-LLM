@@ -132,5 +132,30 @@ bool initializeLongRopeCosSinCache(rt::Tensor& shortCosSinCache, rt::Tensor& lon
  */
 std::string formatRopeConfig(RopeConfig const& config);
 
+/**
+ * @brief Compact CPU vector by removing evicted batches
+ *
+ * This utility function compacts a std::vector by removing elements at evicted batch indices.
+ * Used for batch eviction to remove finished sequences from CPU context vectors.
+ *
+ * @tparam T Element type
+ * @param batchMapping      [oldActiveBatch] CPU vector (const input), mapping[i] = newBatchIdx or -1 (evict)
+ * @param vec               Vector to compact (output, modified in-place)
+ */
+template <typename T>
+void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec);
+
+/**
+ * @brief Build batch mapping from finished states
+ *
+ * Creates a mapping vector that maps old batch indices to new batch indices.
+ * Finished batches are marked with -1 for eviction.
+ *
+ * @param finishedStates    [oldActiveBatch] CPU vector indicating which batches are finished (0=not finished,
+ * 1=finished)
+ * @return Vector mapping old batch indices to new indices (-1 for evicted batches)
+ */
+std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates);
+
 } // namespace rt
 } // namespace trt_edgellm

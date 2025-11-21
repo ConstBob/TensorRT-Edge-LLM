@@ -119,6 +119,10 @@ public:
     //! @return Number of active sequences
     int32_t getActiveBatchSize() const;
 
+    //! @brief Set active batch size (for batch eviction)
+    //! @param newActiveBatchSize New active batch size after eviction
+    void setActiveBatchSize(int32_t newActiveBatchSize);
+
 private:
     CacheConfig mConfig{};                //!< Cache configuration
     int32_t mActiveBatchSize{};           //!< Active batch size
