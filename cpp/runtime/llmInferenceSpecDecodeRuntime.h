@@ -58,6 +58,8 @@ struct SpecDecodeInferenceContext
     std::vector<int32_t> promptLengths; //!< Prompt length (after reuse) for each sequence: [batch_size]
     std::vector<int8_t> finishedStates; //!< Finished state for each sequence: [batch_size] (0=not finished, 1=finished)
     std::vector<int32_t> actualIterations; //!< Actual iterations run for each sequence: [batch_size]
+    int32_t packedInputLength; //!< Packed input length for batch processing (max of all sequences, considering engine
+                               //!< constraints)
 
     // Evicted batch results (saved before eviction for final output)
     // Key: original batch index, Value: batch data
