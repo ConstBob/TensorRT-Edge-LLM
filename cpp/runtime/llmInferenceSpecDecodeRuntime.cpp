@@ -578,8 +578,8 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     int32_t const activeBatchSize = context.activeBatchSize;
 
     // Prepare the inputs for prefill stage execution.
-    // All sequences in the batch should have the same padded length
-    int32_t const inputIdsLength = static_cast<int32_t>(context.tokenIds[0].size());
+    // Reuse packedInputLength from setup (already considers engine constraints)
+    int32_t const inputIdsLength = context.packedInputLength;
     if (inputIdsLength > mBaseEngineConfig.maxSupportedInputLength)
     {
         LOG_ERROR("Input ids length %d is greater than the max supported input length %d", inputIdsLength,
@@ -601,8 +601,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         ctxLenData[i] = context.promptLengths[i]; // Use actual prompt length instead of padded length
+        int32_t const batchTokenLength = static_cast<int32_t>(context.tokenIds[i].size());
         CUDA_CHECK(cudaMemcpyAsync(idsInputData + i * inputIdsLength, context.tokenIds[i].data(),
-            inputIdsLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+            batchTokenLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
     }
 
     bool const prefillSuccess
@@ -648,9 +649,10 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
     // Implement the draft prefill execution logic, prepare the input ids and hidden states inputs for the
     // eagle draft engine. The formulation of the feature "vector" is F_n = F(H_n, Token_{n+1}), therefore we
     // need to trim out the first token of the sequence from the token_ids input.
-    // All sequences should have the same padded length
-    // After base prefill: context.tokenIds has N+1 tokens, mBaseHiddenStatesOutput has N hidden states
-    int32_t const inputIdsLength = static_cast<int32_t>(context.tokenIds[0].size()) - 1;
+
+    // Draft Model Prefill Input Length should be the same as the base model prefill input length.
+    int32_t const inputIdsLength = context.packedInputLength;
+
     check::check(mBaseHiddenStatesOutput.getShape()[0] == activeBatchSize
             && mBaseHiddenStatesOutput.getShape()[1] == inputIdsLength,
         "BaseHiddenStatesOutput shape [batch, seq_len, hidden_dim] shall match with [activeBatchSize, inputIdsLength, "
@@ -666,13 +668,15 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
     CUDA_CHECK(cudaMemsetAsync(
         mDraftHiddenStatesInput.rawPointer(), 0, mDraftHiddenStatesInput.getMemoryCapacity(), context.stream));
 
-    // Copy input IDs for each batch
+    // Copy input IDs for each batch with padding if needed
     int32_t* idsInputData = mIdsInput.dataPointer<int32_t>();
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        // Shift the data pointer by 1 to start from the second token for each batch
-        int32_t const* inputIdsData = context.tokenIds[i].data() + 1;
-        CUDA_CHECK(cudaMemcpyAsync(idsInputData + i * inputIdsLength, inputIdsData, inputIdsLength * sizeof(int32_t),
+        int32_t const batchTokenLength = static_cast<int32_t>(context.tokenIds[i].size());
+        int32_t const batchInputLength = batchTokenLength - 1; // Skip first token
+        int32_t const* tokenIdsData = context.tokenIds[i].data() + 1;
+
+        CUDA_CHECK(cudaMemcpyAsync(idsInputData + i * inputIdsLength, tokenIdsData, batchInputLength * sizeof(int32_t),
             cudaMemcpyHostToDevice, context.stream));
     }
 
@@ -1100,9 +1104,6 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
 {
     int32_t const activeBatchSize = context.activeBatchSize;
     std::vector<std::vector<int32_t>> const& batchedInputIds = context.rawBatchedInputIds;
-    std::vector<std::vector<int32_t>> processedInputIds;
-    std::vector<int32_t> processedIdsLengths;
-
     rt::LinearKVCache& linearKVCacheBase = mBaseEngineRunner->getLinearKVCache();
     rt::LinearKVCache& linearKVCacheDraft = mDraftEngineRunner->getLinearKVCache();
     rt::Tensor kvCacheBufferBase = linearKVCacheBase.getKVCacheBuffer();
@@ -1116,8 +1117,13 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     // Initialize reuse lengths to 0 for all active sequences
     std::fill(reuseKVCacheLengthsData, reuseKVCacheLengthsData + activeBatchSize, 0);
 
+    // Initialize tokenIds and promptLengths for each sequence
+    context.tokenIds.clear();
+    context.tokenIds.resize(activeBatchSize);
+
     // Search if the system prompt has been cached. If there are cached system prompts, insert
-    // the pre-computed KVCache and remove the contents from inputIds.
+    // the pre-computed KVCache and remove the cached portion from inputIds.
+    // Directly populate context.tokenIds and context.promptLengths (no padding)
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         auto promptHash = hashSystemPrompt(context.systemPrompts[i]);
@@ -1135,8 +1141,10 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
             check::check(
                 reuseLength < batchedInputIds[i].size(), "The reuse length shall not exceed the input length.");
             reuseKVCacheLengthsData[i] = reuseLength;
-            processedInputIds.emplace_back(batchedInputIds[i].begin() + reuseLength, batchedInputIds[i].end());
-            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size() - reuseLength));
+
+            // Directly assign to context.tokenIds (skip reused portion)
+            context.tokenIds[i].assign(batchedInputIds[i].begin() + reuseLength, batchedInputIds[i].end());
+            context.promptLengths[i] = static_cast<int32_t>(batchedInputIds[i].size() - reuseLength);
 
             bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
                 precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
@@ -1149,14 +1157,15 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
         }
         else
         {
-            processedInputIds.emplace_back(batchedInputIds[i]);
-            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size()));
+            // Directly assign to context.tokenIds (full input)
+            context.tokenIds[i] = batchedInputIds[i];
+            context.promptLengths[i] = static_cast<int32_t>(batchedInputIds[i].size());
             reuseKVCacheLengthsData[i] = 0;
         }
     }
 
-    // Pack inputIds, instantiate input data for prefill step, and reset the KVCache state.
-    int32_t const maxInputLength = *std::max_element(processedIdsLengths.begin(), processedIdsLengths.end());
+    // Validate max input length
+    int32_t const maxInputLength = *std::max_element(context.promptLengths.begin(), context.promptLengths.end());
     if (maxInputLength > mBaseEngineConfig.maxSupportedInputLength)
     {
         LOG_ERROR("The max input length (%d) exceeds the max supported input length (%d) of the LLM Engine.",
@@ -1165,24 +1174,7 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     }
 
     // The LLM Engine could also have minSupportedInputLength constraint.
-    int32_t const packedInputLength = std::max(maxInputLength, mBaseEngineConfig.minSupportedInputLength);
-
-    // Initialize tokenIds for each sequence in the batch
-    context.tokenIds.clear();
-    context.tokenIds.resize(activeBatchSize);
-
-    // Save the actual prompt lengths (before padding) for each batch
-    for (int32_t i = 0; i < activeBatchSize; ++i)
-    {
-        context.promptLengths[i] = processedIdsLengths[i];
-    }
-
-    // Pad each sequence to the max length of this batch
-    for (int32_t i = 0; i < activeBatchSize; ++i)
-    {
-        context.tokenIds[i].resize(packedInputLength, mTokenizer->getPadId());
-        std::copy(processedInputIds[i].begin(), processedInputIds[i].end(), context.tokenIds[i].begin());
-    }
+    context.packedInputLength = std::max(maxInputLength, mBaseEngineConfig.minSupportedInputLength);
 
     linearKVCacheBase.resetForNewSequences(reuseKVCacheLengths, context.stream);
     linearKVCacheDraft.resetForNewSequences(reuseKVCacheLengths, context.stream);
