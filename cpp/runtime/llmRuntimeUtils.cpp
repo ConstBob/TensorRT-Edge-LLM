@@ -17,6 +17,7 @@
 
 #include "runtime/llmRuntimeUtils.h"
 
+#include "common/checkMacros.h"
 #include "common/logger.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include <ostream>
@@ -40,18 +41,23 @@ std::ostream& operator<<(std::ostream& os, RopeType const& type)
     return os;
 }
 
-std::string formatRopeConfig(RopeCommonConfig const& config)
+std::string formatRopeConfig(RopeConfig const& config)
 {
     std::stringstream ss;
     ss << "RopeConfig:"
        << "  type: " << config.type << "  rotaryScale: " << config.rotaryScale
        << "  rotaryTheta: " << config.rotaryTheta << "  maxPositionEmbeddings: " << config.maxPositionEmbeddings;
+    if (config.type == RopeType::kLongRope)
+    {
+        ss << "LongRopeConfig:"
+           << "  originalMaxPositionEmbeddings: " << config.longRope.value().originalMaxPositionEmbeddings;
+    }
     return ss.str();
 }
 
-RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config)
+RopeConfig collectRopeConfig(nlohmann::json const& config)
 {
-    RopeCommonConfig ropeConfig{};
+    RopeConfig ropeConfig{};
     auto ropeScalingIt = config.find("rope_scaling");
     if (ropeScalingIt != config.end())
     {
@@ -83,12 +89,29 @@ RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config)
                 ropeConfig.type = RopeType::kLongRope;
             }
         }
-        else
+
+        // Parse long rope scaling parameters when requested
+        if (ropeConfig.type == RopeType::kLongRope)
         {
-            LOG_WARNING(
-                "rope_type is not specified in the model config, using default rope type. This could misalign with the "
-                "model configuration, please check the config file to ensure the correctness");
-            ropeConfig.type = RopeType::kDefault;
+            LongRopeParams params{};
+            auto longFactorIt = ropeScalingIt->find("long_factor");
+            check::check((longFactorIt != ropeScalingIt->end() && longFactorIt->is_array()),
+                "rope_scaling.long_factor must be a non-empty array for longrope");
+            params.longFactor = longFactorIt->get<std::vector<float>>();
+
+            auto shortFactorIt = ropeScalingIt->find("short_factor");
+            check::check((shortFactorIt != ropeScalingIt->end() && shortFactorIt->is_array()),
+                "rope_scaling.short_factor must be a non-empty array for longrope");
+            params.shortFactor = shortFactorIt->get<std::vector<float>>();
+
+            check::check(params.longFactor.size() == params.shortFactor.size(),
+                "rope_scaling.long_factor size differs from short_factor size");
+
+            check::check(config.contains("original_max_position_embeddings"),
+                "original_max_position_embeddings is not specified in the model config");
+            params.originalMaxPositionEmbeddings = config["original_max_position_embeddings"].get<int32_t>();
+
+            ropeConfig.longRope = std::move(params);
         }
     }
     else
@@ -120,16 +143,21 @@ RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config)
             ropeConfig.maxPositionEmbeddings);
     }
 
-    LOG_INFO("Collected base rope config: %s", formatRopeConfig(ropeConfig).c_str());
+    LOG_INFO("Collected rope config: %s", formatRopeConfig(ropeConfig).c_str());
     return ropeConfig;
 }
 
 bool initializeRopeCosSinCache(
-    rt::Tensor& cosSinCache, RopeCommonConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream)
+    rt::Tensor& cosSinCache, RopeConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream)
 {
     if (config.type == RopeType::kMRope)
     {
         LOG_ERROR("MRope is context dependent rope type, which cannot be initialized with basic parameters.");
+        return false;
+    }
+    else if (config.type == RopeType::kLongRope)
+    {
+        LOG_ERROR("Please use initializeLongRopeCosSinCache instead.");
         return false;
     }
 
@@ -167,10 +195,55 @@ bool initializeRopeCosSinCache(
             return false;
         }
     }
-    else if (config.type == RopeType::kLongRope)
+    return true;
+}
+
+bool initializeLongRopeCosSinCache(rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config,
+    nlohmann::json const& modelConfig, cudaStream_t stream)
+{
+
+    if (config.type != RopeType::kLongRope)
     {
-        // TODO: Implement the initialization for longrope type here.
-        LOG_ERROR("Unimplemented LongRope type initialization.");
+        LOG_ERROR("This function is only used for initializing LongRope cos/sin cache.");
+        return false;
+    }
+
+    // Tensor shape: [1, maxLength, rotaryDim]
+    if (shortCosSinCache.getShape().getNumDims() != 3 || shortCosSinCache.getDataType() != DataType::kFLOAT
+        || longCosSinCache.getShape().getNumDims() != 3 || longCosSinCache.getDataType() != DataType::kFLOAT)
+    {
+        LOG_ERROR("Persistent RopeCosSinCache should be float tensor with dimensions: [1, maxLength, rotaryDim].");
+        return false;
+    }
+
+    int64_t ropeMaxLength = shortCosSinCache.getShape()[1];
+    int64_t rotaryDim = shortCosSinCache.getShape()[2];
+
+    // Validate long/short factors before creating tensors and launching the kernel
+    if (!config.longRope.has_value() || config.longRope->longFactor.empty() || config.longRope->shortFactor.empty())
+    {
+        LOG_ERROR("LongRope requires non-empty long_factor and short_factor arrays in rope_scaling.");
+        return false;
+    }
+
+    Coords shape{static_cast<int64_t>(config.longRope->longFactor.size())};
+
+    Tensor longFactorTensor(shape, DeviceType::kGPU, DataType::kFLOAT, "long_factor");
+    Tensor shortFactorTensor(shape, DeviceType::kGPU, DataType::kFLOAT, "short_factor");
+    CUDA_CHECK(cudaMemcpyAsync(longFactorTensor.rawPointer(), config.longRope->longFactor.data(),
+        longFactorTensor.getMemoryCapacity(), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(shortFactorTensor.rawPointer(), config.longRope->shortFactor.data(),
+        shortFactorTensor.getMemoryCapacity(), cudaMemcpyHostToDevice, stream));
+    try
+    {
+        kernel::initializeLongRopeCosSin(shortCosSinCache.dataPointer<float>(), longCosSinCache.dataPointer<float>(),
+            shortFactorTensor.dataPointer<float>(), longFactorTensor.dataPointer<float>(), config.rotaryTheta,
+            rotaryDim, ropeMaxLength, config.maxPositionEmbeddings, config.longRope->originalMaxPositionEmbeddings,
+            stream);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("CUDA kernel launch for initializeLongRopeCosSin failed: %s", e.what());
         return false;
     }
     return true;

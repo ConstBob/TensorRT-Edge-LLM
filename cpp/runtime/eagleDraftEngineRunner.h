@@ -38,20 +38,20 @@ using Json = nlohmann::json;
  */
 struct EagleDraftEngineRunnerConfig
 {
-    RopeType ropeType{RopeType::kDefault}; //!< Type of rotary positional encoding
-    int32_t numDecoderLayers{};            //!< Number of decoder layers in the draft model
-    int32_t numKVHeads{};                  //!< Number of key-value heads
-    int32_t headDim{};                     //!< Dimension of each attention head
-    int32_t rotaryDim{};                   //!< Dimension of rotary positional encoding
-    int32_t maxSupportedBatchSize{};       //!< Maximum supported batch size
-    int32_t maxSupportedInputLength{};     //!< Maximum supported input sequence length
-    int32_t kvCacheCapacityLength{};       //!< Capacity length for key-value cache
-    int32_t draftModelVocabSize{};         //!< Vocabulary size of the draft model
-    int32_t maxDraftTreeSize{};            //!< Maximum size of the draft tree
-    int32_t baseModelHiddenDim{};          //!< Hidden dimension of the base model
-    int32_t draftModelHiddenDim{};         //!< Hidden dimension of the draft model
-    bool isVlm{false};                     //!< Flag indicating if this is a vision-language model
-    bool enableReuseKVCache{true};         //!< Enable KV cache reuse across requests
+    RopeConfig ropeConfig{};           //!< RoPE configuration
+    int32_t numDecoderLayers{};        //!< Number of decoder layers in the draft model
+    int32_t numKVHeads{};              //!< Number of key-value heads
+    int32_t headDim{};                 //!< Dimension of each attention head
+    int32_t rotaryDim{};               //!< Dimension of rotary positional encoding
+    int32_t maxSupportedBatchSize{};   //!< Maximum supported batch size
+    int32_t maxSupportedInputLength{}; //!< Maximum supported input sequence length
+    int32_t kvCacheCapacityLength{};   //!< Capacity length for key-value cache
+    int32_t draftModelVocabSize{};     //!< Vocabulary size of the draft model
+    int32_t maxDraftTreeSize{};        //!< Maximum size of the draft tree
+    int32_t baseModelHiddenDim{};      //!< Hidden dimension of the base model
+    int32_t draftModelHiddenDim{};     //!< Hidden dimension of the draft model
+    bool isVlm{false};                 //!< Flag indicating if this is a vision-language model
+    bool enableReuseKVCache{true};     //!< Enable KV cache reuse across requests
 };
 
 // Disable clang-format to explicitly format the class interface documentation.

@@ -185,27 +185,59 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             "Failed to match config file " + configPath.string() + " with engine file: " + enginePath.string());
     }
 
-    auto ropeConfig = collectBaseRopeConfig(configJson);
-    mConfig.ropeType = ropeConfig.type;
-    if (mConfig.ropeType != RopeType::kMRope)
+    RopeConfig const& ropeConfig = mConfig.ropeConfig;
+    switch (ropeConfig.type)
     {
-        LOG_DEBUG("LLMEngineRunner(): Initialize persistent Rope CosSinCache.");
-        this->mPosEncCosSinCache
+    case RopeType::kLongRope:
+    {
+        LOG_DEBUG("Initialize long Rope CosSinCache.");
+        check::check(ropeConfig.longRope.has_value() && ropeConfig.longRope.value().originalMaxPositionEmbeddings != -1,
+            "longRope is not set correctly");
+
+        rt::Tensor shortCosSinCache
             = rt::Tensor({1, mConfig.maxSequenceLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
+        rt::Tensor longCosSinCache
+            = rt::Tensor({1, mConfig.maxSequenceLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+        bool const initRopeStatus
+            = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, configJson, stream);
         if (!initRopeStatus)
         {
-            LOG_ERROR("LLMEngineRunner(): Failed to initialize persistent Rope CosSinCache.");
-            throw std::runtime_error("Failed to initialize persistent Rope CosSinCache.");
+            LOG_ERROR("Failed to initialize long Rope CosSinCache.");
+            throw std::runtime_error("Failed to initialize long Rope CosSinCache.");
         }
+        if (mConfig.maxSequenceLength <= ropeConfig.longRope.value().originalMaxPositionEmbeddings)
+        {
+            mPosEncCosSinCache = std::move(shortCosSinCache);
+        }
+        else
+        {
+            mPosEncCosSinCache = std::move(longCosSinCache);
+        }
+        break;
     }
-    else
+    case RopeType::kMRope:
     {
         this->mPosEncCosSinCache
             = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim},
                 rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
+        break;
     }
+    default:
+    {
+        LOG_DEBUG("Initialize persistent Rope CosSinCache.");
+        this->mPosEncCosSinCache
+            = rt::Tensor({1, mConfig.maxSequenceLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
+        if (!initRopeStatus)
+        {
+            LOG_ERROR("Failed to initialize persistent Rope CosSinCache.");
+            throw std::runtime_error("Failed to initialize persistent Rope CosSinCache.");
+        }
+        break;
+    }
+    }
+    // Bind RopeCosSin cache
     bool setRopeCosSinCacheStatus{true};
     setRopeCosSinCacheStatus
         &= mPrefillExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
@@ -380,7 +412,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.numDecoderLayers = configJson["num_hidden_layers"].get<int32_t>();
         mConfig.numKVHeads = configJson["num_key_value_heads"].get<int32_t>();
         mConfig.headDim = configJson["head_dim"].get<int32_t>();
-        mConfig.rotaryDim = mConfig.headDim;
+        mConfig.rotaryDim = static_cast<int32_t>(mConfig.headDim * configJson.value("partial_rotary_factor", 1.0f));
         mConfig.hiddenSize = configJson["hidden_size"].get<int32_t>();
         mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
         mConfig.enableReuseKVCache = configJson["enable_reuse_kv_cache"].get<bool>();
@@ -393,6 +425,9 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.maxSequenceLength = builderConfig["max_seq_len"].get<int32_t>();
         mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
         mConfig.enableEagleSpecDecode = builderConfig["eagle_base"].get<bool>();
+
+        // Collect RoPE configuration
+        mConfig.ropeConfig = collectRopeConfig(configJson);
 
         // Validate configuration values - all must be positive except max_lora_rank
         std::vector<std::pair<std::string, int32_t>> positiveFields
@@ -839,7 +874,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
     // For MRope, the cache is initialized with maxBatchSize and does not need reshaping during prefill.
     // For non-MRope, the cache is fixed at {1, maxSeqLen, rotaryDim} and shared across all batches.
-    if (mConfig.ropeType == RopeType::kMRope)
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
     }
@@ -992,7 +1027,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
-        if (mConfig.ropeType == RopeType::kMRope)
+        if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
             mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
         }
@@ -1164,7 +1199,7 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
-        if (mConfig.ropeType == RopeType::kMRope)
+        if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
             mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
         }
@@ -1269,7 +1304,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     mSelectTokenIndices.reshape({activeBatchSize, 1});
     mSequenceContextLengths.reshape({activeBatchSize});
     // Need to reshape the mPosEncCosSinCache for MROPE.
-    if (mConfig.ropeType == RopeType::kMRope)
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
     }
@@ -1422,7 +1457,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
     // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
-    if (mConfig.ropeType == RopeType::kMRope)
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
     }

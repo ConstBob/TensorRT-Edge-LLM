@@ -41,25 +41,25 @@ using Json = nlohmann::json;
  */
 struct LLMEngineRunnerConfig
 {
-    bool enableReuseKVCache{true};         //!< Enable KV cache reuse across requests
-    bool useContextDependentRope{false};   //!< Use context-dependent RoPE
-    bool enableEagleSpecDecode{false};     //!< Enable Eagle speculative decoding
-    bool isVlm{false};                     //!< Whether this is a Vision-Language Model
-    RopeType ropeType{RopeType::kDefault}; //!< Type of rotary position encoding
-    int32_t numDecoderLayers{};            //!< Number of decoder layers
-    int32_t numKVHeads{};                  //!< Number of key-value heads
-    int32_t headDim{};                     //!< Dimension of each attention head
-    int32_t rotaryDim{};                   //!< Rotary embedding dimension
-    int32_t hiddenSize{};                  //!< Model's hidden dimension
-    int32_t maxSupportedBatchSize{};       //!< Maximum supported batch size
-    int32_t minSupportedInputLength{};     //!< Minimum supported input length
-    int32_t maxSupportedInputLength{};     //!< Maximum supported input length
-    int32_t maxSequenceLength{};           //!< Maximum sequence length
-    int32_t vocabSize{};                   //!< Vocabulary size
-    int32_t maxSupportedLoraRank{};        //!< Maximum supported LoRA rank
-    int32_t outputHiddenDim{};             //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
-    int32_t maxVerifyTreeSize{};           //!< Maximum verification tree size for Eagle speculative decoding
-    int32_t numDeepstackFeatures{};        //!< Number of deepstack features for Qwen3-VL
+    RopeConfig ropeConfig{};             //!< Type of rotary positional encoding
+    bool enableReuseKVCache{true};       //!< Enable KV cache reuse across requests
+    bool useContextDependentRope{false}; //!< Use context-dependent RoPE
+    bool enableEagleSpecDecode{false};   //!< Enable Eagle speculative decoding
+    bool isVlm{false};                   //!< Whether this is a Vision-Language Model
+    int32_t numDecoderLayers{};          //!< Number of decoder layers
+    int32_t numKVHeads{};                //!< Number of key-value heads
+    int32_t headDim{};                   //!< Dimension of each attention head
+    int32_t rotaryDim{};                 //!< Rotary embedding dimension
+    int32_t hiddenSize{};                //!< Model's hidden dimension
+    int32_t maxSupportedBatchSize{};     //!< Maximum supported batch size
+    int32_t minSupportedInputLength{};   //!< Minimum supported input length
+    int32_t maxSupportedInputLength{};   //!< Maximum supported input length
+    int32_t maxSequenceLength{};         //!< Maximum sequence length
+    int32_t vocabSize{};                 //!< Vocabulary size
+    int32_t maxSupportedLoraRank{};      //!< Maximum supported LoRA rank
+    int32_t outputHiddenDim{};           //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
+    int32_t maxVerifyTreeSize{};         //!< Maximum verification tree size for Eagle speculative decoding
+    int32_t numDeepstackFeatures{};      //!< Number of deepstack features for Qwen3-VL
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
