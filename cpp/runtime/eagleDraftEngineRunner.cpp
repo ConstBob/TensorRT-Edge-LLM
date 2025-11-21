@@ -218,17 +218,17 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyTensor.rawPointer(), 0, mDummyTensor.getMemoryCapacity(), stream));
 
-    auto ropeConfig = collectBaseRopeConfig(configJson);
-    mConfig.ropeType = ropeConfig.type;
+    mConfig.ropeConfig = collectRopeConfig(configJson);
 
-    if (mConfig.ropeType != RopeType::kMRope)
+    if (mConfig.ropeConfig.type != RopeType::kMRope)
     {
         // For non-MRope (Default Rope): allocate with batch_size=1
         // AttentionPlugin will handle broadcasting via the independent rope_batch_size axis
         LOG_DEBUG("Initialize 1D persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
             = rt::Tensor({1, mConfig.kvCacheCapacityLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
+        bool const initRopeStatus
+            = initializeRopeCosSinCache(mPosEncCosSinCache, mConfig.ropeConfig, configJson, stream);
         if (!initRopeStatus)
         {
             LOG_ERROR("Failed to initialize persistent Rope CosSinCache.");
@@ -708,7 +708,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
 
     // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
-    if (mConfig.ropeType == RopeType::kMRope)
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
         // Copy MRoPE cosine/sine cache tensor from the base model
         CUDA_CHECK(cudaMemcpyAsync(mPosEncCosSinCache.rawPointer(), baseRopeCosSinCache.rawPointer(),
@@ -944,7 +944,7 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
 
         // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
         // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
-        if (mConfig.ropeType == RopeType::kMRope)
+        if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
             mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
         }
@@ -1087,7 +1087,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
 
     // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
-    if (mConfig.ropeType == RopeType::kMRope)
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
     }
@@ -1324,7 +1324,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
 
         // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
         // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
-        if (mConfig.ropeType == RopeType::kMRope)
+        if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
             mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
         }
@@ -1463,7 +1463,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
 
     // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
-    if (mConfig.ropeType == RopeType::kMRope)
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
     }

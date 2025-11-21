@@ -30,6 +30,16 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
             raise KeyError(f"Required field '{field}' not found in config")
         llm_config[field] = config_dict[field]
 
+    # Handle LongRoPE (rope_scaling already validated in required_fields)
+    rope_scaling = config_dict["rope_scaling"]
+    if rope_scaling and rope_scaling.get("type", None) == "longrope":
+        if "original_max_position_embeddings" not in rope_scaling:
+            raise KeyError(
+                f"Required field 'original_max_position_embeddings' not found in config"
+            )
+        llm_config["original_max_position_embeddings"] = rope_scaling[
+            "original_max_position_embeddings"]
+
     # Handle head_dim
     if "head_dim" in config_dict:
         llm_config["head_dim"] = config_dict["head_dim"]

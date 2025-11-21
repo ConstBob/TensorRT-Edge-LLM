@@ -22,7 +22,9 @@
 
 #include <cstdint>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace trt_edgellm
@@ -70,38 +72,65 @@ enum class RopeType
     kMRope,    //!< MRope type used by Qwen2-VL
 };
 
-/*! \brief Common configuration structure for RoPE (Rotary Position Embedding)
- *
- *  Instantiate the RopeConfig with common default values.
- */
-struct RopeCommonConfig
+/*! \brief Long-Rope specific parameters */
+struct LongRopeParams
 {
-    RopeType type{};                      //!< Type of RoPE to use
-    float rotaryScale{1.0F};              //!< Scaling factor for rotary embeddings
-    float rotaryTheta{100000.0F};         //!< Base frequency for rotary embeddings
-    int32_t maxPositionEmbeddings{32768}; //!< Maximum position embeddings supported
+    int32_t originalMaxPositionEmbeddings{-1}; //!< Original maximum position embeddings from training
+    std::vector<float> longFactor;             //!< Long factor array for each rotary dimension
+    std::vector<float> shortFactor;            //!< Short factor array for each rotary dimension
 };
 
-/*! \brief Collect basic rope configuration from the model config
+/*! \brief RoPE configuration structure with optional Long-Rope parameters
  *
- *  The parsed rope configuration. Default values are used if certain fields are not
- *  specified in the model config.
+ *  Contains common RoPE fields and (optionally) Long-Rope specific parameters when type==kLongRope.
+ */
+struct RopeConfig
+{
+    RopeType type{RopeType::kDefault};        //!< Type of RoPE to use
+    float rotaryScale{1.0F};                  //!< Scaling factor for rotary embeddings
+    float rotaryTheta{100000.0F};             //!< Base frequency for rotary embeddings
+    int32_t maxPositionEmbeddings{32768};     //!< Maximum position embeddings supported
+    std::optional<LongRopeParams> longRope{}; //!< Long-Rope specific parameters
+};
+
+/*! \brief Collect rope configuration from the model config
+ *
+ *  Parses the common RoPE fields as well as LongRoPE-specific parameters when the
+ *  model requests the longrope variant. Default values are used if certain fields
+ *  are not specified in the model config.
  *
  *  \param config [JSON] The model config file supplied with the model
  *  \return The parsed rope configuration
  */
-RopeCommonConfig collectBaseRopeConfig(nlohmann::json const& config);
+RopeConfig collectRopeConfig(nlohmann::json const& config);
 
 /*! \brief Initialize the rope cos/sin cache tensor for persistent type of RoPE (default, longrope)
  *
  *  \param cosSinCache [GPU] The tensor to store the rope cos/sin cache
- *  \param config [RopeCommonConfig] The basic rope configuration
+ *  \param config [RopeConfig] The basic rope configuration
  *  \param modelConfig [JSON] Model config json that can supply additional information for the rope initialization
  *  \param stream [CUDA stream] The stream to execute the initialization
  *  \return True if the initialization is successful, false otherwise
  */
 bool initializeRopeCosSinCache(
-    rt::Tensor& cosSinCache, RopeCommonConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream);
+    rt::Tensor& cosSinCache, RopeConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream);
+
+/*! \brief Initialize the rope cos/sin cache tensor for long rope type
+ *
+ *  \param shortCosSinCache [GPU] The tensor to store the short rope cos/sin cache
+ *  \param longCosSinCache [GPU] The tensor to store the long rope cos/sin cache
+ *  \param config [RopeConfig] The rope configuration
+ *  \param modelConfig [JSON] Model config json that can supply additional information for the rope initialization
+ *  \param stream [CUDA stream] The stream to execute the initialization
+ *  \return True if the initialization is successful, false otherwise
+ */
+bool initializeLongRopeCosSinCache(rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config,
+    nlohmann::json const& modelConfig, cudaStream_t stream);
+
+/*!
+ * @brief Format rope configuration into string
+ */
+std::string formatRopeConfig(RopeConfig const& config);
 
 } // namespace rt
 } // namespace trt_edgellm
