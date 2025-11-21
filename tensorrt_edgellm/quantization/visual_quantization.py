@@ -188,15 +188,15 @@ def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
 
     quant_config = mtq.FP8_DEFAULT_CFG.copy()
 
-    # Enable FP8 MHA and FP8 GEMM
-    quant_config["quant_cfg"]["*[qkv]_bmm_quantizer"] = {
-        "num_bits": (4, 3),
-        "axis": None
-    }
-    quant_config["quant_cfg"]["*softmax_quantizer"] = {
-        "num_bits": (4, 3),
-        "axis": None
-    }
+    # (Optional) Uncomment the following lines to enable FP8 MHA for static shape VIT, dynamic shape FP8 MHA fusion is not supported in TensorRT yet.
+    # quant_config["quant_cfg"]["*[qkv]_bmm_quantizer"] = {
+    #     "num_bits": (4, 3),
+    #     "axis": None
+    # }
+    # quant_config["quant_cfg"]["*softmax_quantizer"] = {
+    #     "num_bits": (4, 3),
+    #     "axis": None
+    # }
 
     # Disable Conv to avoid accuracy degradation
     quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
