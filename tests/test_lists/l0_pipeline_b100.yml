@@ -27,3 +27,6 @@ tests:
   - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen2.5-VL-7B-Instruct-nvfp4-mxsl8192-eagle-v1-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512]
   - tests/defs/test_vlm_pipeline.py::test_inference[Qwen2.5-VL-7B-Instruct-nvfp4-mxsl8192-eagle-v1-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
   - tests/defs/test_vlm_pipeline.py::test_inference[Qwen2.5-VL-7B-Instruct-nvfp4-mxsl8192-eagle-v1-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512-mmmu-bs1]
+  # VLM tests with NVFP4 precision
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3-VL-4B-Instruct-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512]
+  - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-4B-Instruct-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]

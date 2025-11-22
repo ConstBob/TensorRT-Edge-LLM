@@ -584,6 +584,10 @@ class TestConfig:
             "Llama-3.2-3B": "llama-3.2-models/Llama-3.2-3B",
             "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
             "Qwen3-8B": "Qwen3/Qwen3-8B",
+            "Qwen3-4B-Instruct-2507": "Qwen3/Qwen3-4B-Instruct-2507",
+            "Qwen3-VL-2B-Instruct": "Qwen3/Qwen3-VL-2B-Instruct",
+            "Qwen3-VL-4B-Instruct": "Qwen3/Qwen3-VL-4B-Instruct",
+            "Qwen3-VL-8B-Instruct": "Qwen3/Qwen3-VL-8B-Instruct",
         }
 
         # GPTQ models in edgellm_data_dir
@@ -630,6 +634,9 @@ class TestConfig:
             },
             "Qwen3-8B": {
                 "eagle3": "Qwen3/qwen3_8b_eagle3",
+            },
+            "Qwen3-4B-Instruct-2507": {
+                "eagle3": "EAGLE3-Qwen3-4B-v2",
             },
             # Add more mappings as needed
         }
@@ -835,10 +842,24 @@ class TestConfig:
         """Get CNN DailyMail dataset directory for LLM quantization calibration"""
         if not self.llm_models_dir:
             raise ValueError("llm_models_dir not set")
-        return os.path.join(self.llm_models_dir, "datasets", "cnn_dailymail")
+        dataset_dir = _find_directory(
+            self.llm_models_dir, os.path.join("datasets", "cnn_dailymail"),
+            DEFAULT_SEARCH_DEPTH)
+        if not dataset_dir:
+            raise ValueError(
+                f"CNN DailyMail dataset directory not found under {self.llm_models_dir}"
+            )
+        return dataset_dir
 
     def get_mmmu_dataset_dir(self) -> str:
         """Get MMMU dataset directory for visual model quantization calibration"""
         if not self.llm_models_dir:
             raise ValueError("llm_models_dir not set")
-        return os.path.join(self.llm_models_dir, "datasets", "MMMU")
+        dataset_dir = _find_directory(self.llm_models_dir,
+                                      os.path.join("datasets", "MMMU"),
+                                      DEFAULT_SEARCH_DEPTH)
+        if not dataset_dir:
+            raise ValueError(
+                f"MMMU dataset directory not found under {self.llm_models_dir}"
+            )
+        return dataset_dir

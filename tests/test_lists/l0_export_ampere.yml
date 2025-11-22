@@ -8,3 +8,4 @@ tests:
   - tests/defs/test_model_export.py::test_vlm_model_export[Qwen2.5-VL-3B-Instruct-int4_awq-mxsl8192]
   - tests/defs/test_model_export.py::test_llm_model_export[Qwen3-0.6B-int8_sq-mxsl8192]
   - tests/defs/test_model_export.py::test_vlm_model_export[Qwen2.5-VL-7B-Instruct-nvfp4-mxsl8192-eagle-v1-nvfp4]
+  - tests/defs/test_model_export.py::test_vlm_model_export[Qwen3-VL-4B-Instruct-int4_awq-mxsl8192]
