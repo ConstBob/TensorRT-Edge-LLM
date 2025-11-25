@@ -225,6 +225,14 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
 
         // Allocate batch mapping tensor for batch eviction
         mDeviceBatchMapping = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+
+        mHostPackedTokenIds = rt::Tensor(
+            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kCPU, DataType::kINT32);
+        mHostSelectedTokenIds = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+        mHostAcceptLengths = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+        mHostAcceptedTokenIds = rt::Tensor(
+            {mMaxRuntimeBatchSize, mDraftingConfig.draftingStep + 1}, rt::DeviceType::kCPU, DataType::kINT32);
+        mHostReuseKVCacheLengths = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
     }
     catch (std::exception const& e)
     {
@@ -596,15 +604,20 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     int32_t* ctxLenData = mContextLengthsInput.dataPointer<int32_t>();
     int32_t* idsInputData = mIdsInput.dataPointer<int32_t>();
 
-    // Pack all sequences into the input tensor
+    // Pack all sequences into the host pinned memory first
+    mHostPackedTokenIds.reshape({activeBatchSize, inputIdsLength});
+    int32_t* hostPackedTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
+
     // Use actual prompt length (not padded length) for context_lengths to ensure we select the last real token
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         ctxLenData[i] = context.promptLengths[i]; // Use actual prompt length instead of padded length
         int32_t const batchTokenLength = static_cast<int32_t>(context.tokenIds[i].size());
-        CUDA_CHECK(cudaMemcpyAsync(idsInputData + i * inputIdsLength, context.tokenIds[i].data(),
-            batchTokenLength * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+        std::copy(context.tokenIds[i].begin(), context.tokenIds[i].end(), hostPackedTokenIdsData + i * inputIdsLength);
     }
+
+    CUDA_CHECK(cudaMemcpyAsync(idsInputData, hostPackedTokenIdsData, activeBatchSize * inputIdsLength * sizeof(int32_t),
+        cudaMemcpyHostToDevice, context.stream));
 
     bool const prefillSuccess
         = mBaseEngineRunner->executePrefillStep(mIdsInput, mContextLengthsInput, context.multimodalEmbeddings,
@@ -620,9 +633,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     constexpr int32_t kSAMPLING_TOP_K = 1;
     selectAllTopK(mLogitsOutput, std::nullopt, mSamplingIndices, kSAMPLING_TOP_K, mSamplingWorkspace, context.stream);
 
-    // Pull the sampling indices from device to host for all sequences
-    std::vector<int32_t> selectedTokenIds(activeBatchSize);
-    CUDA_CHECK(cudaMemcpyAsync(selectedTokenIds.data(), mSamplingIndices.rawPointer(),
+    mHostSelectedTokenIds.reshape({activeBatchSize});
+    int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
+    CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mSamplingIndices.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
@@ -631,7 +644,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     {
         if (!context.finishedStates[i])
         {
-            context.tokenIds[i].push_back(selectedTokenIds[i]);
+            context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
             context.currentGenerateLengths[i] += 1;
         }
     }
@@ -668,17 +681,21 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
     CUDA_CHECK(cudaMemsetAsync(
         mDraftHiddenStatesInput.rawPointer(), 0, mDraftHiddenStatesInput.getMemoryCapacity(), context.stream));
 
-    // Copy input IDs for each batch with padding if needed
+    // Copy input IDs for each batch to host pinned memory first (skip first token for draft model)
     int32_t* idsInputData = mIdsInput.dataPointer<int32_t>();
+    mHostPackedTokenIds.reshape({activeBatchSize, inputIdsLength});
+    int32_t* hostPackedTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
+
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         int32_t const batchTokenLength = static_cast<int32_t>(context.tokenIds[i].size());
         int32_t const batchInputLength = batchTokenLength - 1; // Skip first token
-        int32_t const* tokenIdsData = context.tokenIds[i].data() + 1;
-
-        CUDA_CHECK(cudaMemcpyAsync(idsInputData + i * inputIdsLength, tokenIdsData, batchInputLength * sizeof(int32_t),
-            cudaMemcpyHostToDevice, context.stream));
+        std::copy(
+            context.tokenIds[i].begin() + 1, context.tokenIds[i].end(), hostPackedTokenIdsData + i * inputIdsLength);
     }
+
+    CUDA_CHECK(cudaMemcpyAsync(idsInputData, hostPackedTokenIdsData, activeBatchSize * inputIdsLength * sizeof(int32_t),
+        cudaMemcpyHostToDevice, context.stream));
 
     bool const prefillSuccess = mDraftEngineRunner->executeEaglePrefillStep(mIdsInput, mBaseHiddenStatesOutput,
         mDraftHiddenStatesInput, mContextLengthsInput, context.multimodalEmbeddings, mLogitsOutput,
@@ -897,13 +914,15 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // Reshape to reflect the compacted layout [batch, maxAcceptDepth, hiddenDim]
     mBaseHiddenStatesOutput.reshape({activeBatchSize, maxAcceptDepth, mBaseEngineConfig.outputHiddenDim});
 
-    // Pull collected results from device to host for all batches
-    std::vector<int32_t> acceptLengths(activeBatchSize);
-    std::vector<int32_t> acceptedTokenIds(activeBatchSize * maxAcceptDepth);
+    // Pull collected results from device to host pinned memory for all batches
+    mHostAcceptLengths.reshape({activeBatchSize});
+    mHostAcceptedTokenIds.reshape({activeBatchSize, maxAcceptDepth});
+    int32_t* hostAcceptLengthsData = mHostAcceptLengths.dataPointer<int32_t>();
+    int32_t* hostAcceptedTokenIdsData = mHostAcceptedTokenIds.dataPointer<int32_t>();
 
-    CUDA_CHECK(cudaMemcpyAsync(acceptLengths.data(), mAcceptLength.rawPointer(), activeBatchSize * sizeof(int32_t),
+    CUDA_CHECK(cudaMemcpyAsync(hostAcceptLengthsData, mAcceptLength.rawPointer(), activeBatchSize * sizeof(int32_t),
         cudaMemcpyDeviceToHost, context.stream));
-    CUDA_CHECK(cudaMemcpyAsync(acceptedTokenIds.data(), mAcceptedTokenIds.rawPointer(),
+    CUDA_CHECK(cudaMemcpyAsync(hostAcceptedTokenIdsData, mAcceptedTokenIds.rawPointer(),
         activeBatchSize * maxAcceptDepth * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
@@ -915,7 +934,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
             continue;
         }
 
-        int32_t const acceptLength = acceptLengths[batchIdx];
+        int32_t const acceptLength = hostAcceptLengthsData[batchIdx];
         // update iterations for each batch
         if (acceptLength > 0)
         {
@@ -923,7 +942,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
         }
         for (int32_t i = 0; i < acceptLength; i++)
         {
-            int32_t const token = acceptedTokenIds[batchIdx * maxAcceptDepth + i];
+            int32_t const token = hostAcceptedTokenIdsData[batchIdx * maxAcceptDepth + i];
             context.tokenIds[batchIdx].push_back(token);
             context.currentGenerateLengths[batchIdx]++;
 
@@ -1109,10 +1128,10 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     rt::Tensor kvCacheBufferBase = linearKVCacheBase.getKVCacheBuffer();
     rt::Tensor kvCacheBufferDraft = linearKVCacheDraft.getKVCacheBuffer();
 
-    // Record the length of the reused KVCache for each sequence.
+    // Record the length of the reused KVCache for each sequence  using pre-allocated tensor.
     // Use activeBatchSize (actual request size)
-    rt::Tensor reuseKVCacheLengths = rt::Tensor({activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-    int32_t* reuseKVCacheLengthsData = reuseKVCacheLengths.dataPointer<int32_t>();
+    mHostReuseKVCacheLengths.reshape({activeBatchSize});
+    int32_t* reuseKVCacheLengthsData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
 
     // Initialize reuse lengths to 0 for all active sequences
     std::fill(reuseKVCacheLengthsData, reuseKVCacheLengthsData + activeBatchSize, 0);
@@ -1176,8 +1195,8 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     // The LLM Engine could also have minSupportedInputLength constraint.
     context.packedInputLength = std::max(maxInputLength, mBaseEngineConfig.minSupportedInputLength);
 
-    linearKVCacheBase.resetForNewSequences(reuseKVCacheLengths, context.stream);
-    linearKVCacheDraft.resetForNewSequences(reuseKVCacheLengths, context.stream);
+    linearKVCacheBase.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+    linearKVCacheDraft.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
 
     return true;
 }
