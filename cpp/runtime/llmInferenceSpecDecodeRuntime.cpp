@@ -1196,6 +1196,13 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     // Check if cache already exists
     int32_t const batchIdx = context.currentBatchIndex;
     std::string const prompt = context.systemPrompts[batchIdx];
+
+    if (prompt.empty())
+    {
+        LOG_DEBUG("The systemPrompt is empty. Skip saving system prompt KVCache.");
+        return true;
+    }
+
     size_t const promptHash = hashSystemPrompt(prompt);
     if (mSystemPromptKVCacheBase.find(promptHash) != mSystemPromptKVCacheBase.end()
         && mSystemPromptKVCacheDraft.find(promptHash) != mSystemPromptKVCacheDraft.end())
