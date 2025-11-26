@@ -1,0 +1,451 @@
+= API Design for TensorRT Edge-LLM
+Frederik Kaster <fkaster@nvidia.com>
+:description: Design principles we want to follow for the TensorRT Edge-LLM API, including areas 
+where we currently deviate
+
+== Motivation and Scope
+
+As we are planning to mature the TensorRT Edge-LLM library from the first 0.3 release to the first
+stable 1.0 release, we want to ensure that the public interface is maintainable for the long term.
+This is important because of the implicit guarantees provided by semantic versioning:
+breaking changes can only be introduced with a major version update, while minor version updates
+can only introduce backward-compatible changes (meaning that user code developed for version 1.2
+still must build with version 1.3, but not vice versa).
+
+Note that the public interface of the library may comprise several aspects, such as:
+
+. *source code* ("API stability"): will code compiled against an older version of the library still
+   compile against a newer version?
+
+. *compiled object code* ("ABI stability"): will object code linked against an older compiled version
+   of the library still link against a newer compiled version?
+
+. *configuration files*, e.g. in JSON format: will configuration files still be correctly parsed by
+   a newer library version?
+
+. *serialized engine files*: can correct inference still be performed with a newer library version
+   without need to rebuild the engine?
+
+. *caches*: can an older cache file still be correctly reused when running inference under a newer
+   version?
+
+In general, users will expect less stability as we go down this list. My proposal is to initially
+target stability for 1-3 (source code, object code, and configuration files), but not 5
+(cache files), which can usually be updated with minimum effort.
+
+Serialized engine files (4) deserve special discussion. Version compatibility for serialized engine
+(or plan) files is non-trivial to achieve, and users of the TensorRT Edge-LLM software can also
+recreate these files with moderate manual effort. However, this requires users to keep their
+original model weights, which may not always be the case. Also, the lack of engine compatibility
+between versions can be an obstacle to debugging, e.g. by checking if a bug can be reproduced under
+a newer or patched software version. Finally, in the automotive or embedded use case, having to
+rebuild and retransmit engines makes it more cumbersome to perform over-the-air updates, e.g. when
+patching a software vulnerability.
+
+Therefore, as a compromise, we may require engine compatibility
+only across patches, not minor versions.
+Note that this cannot be achieved by TensorRT Edge-LLM alone, but requires support by the
+underlying TensorRT software.
+
+Finally, note that not all parts of the software may necessarily have the same stability guarantees.
+It is common to mark parts of an API as experimental to warn users that they may be changed or
+removed in future releases without warning, such as the 
+https://en.cppreference.com/w/cpp/experimental/simd.html[SIMD library] in the STL or
+https://doc.rust-lang.org/book/appendix-07-nightly-rust.html[unstable features in Rust Nightly].
+
+== API Design Principles
+
+When designing a stable interface for TensorRT Edge-LLM, we want to be guided by a few basic
+principles:
+
+- **Clarity**: It should be easy to understand for users of TensorRT Edge-LLM how to use the
+  library, and developers making open-source contributions should find it easy to understand the
+  class architecture and find out which exact parts they need to change to adapt the software to
+  their needs.
+
+- **Modularity**: The different classes and functions should have a clear separation of
+  responsibilities, with ideally each class or function having a single clear purpose.
+
+- **Reusability**: Avoid copy/pasting identical or very similar code between multiple classes, which
+  makes it difficult to achieve good code coverage and ensure that bug fixes are applied
+  consistently - instead factor it out into shared helper functions.
+
+- **Extensibility**: Adding new features should ideally be achievable by adding new code, while
+  requiring only minimum modifications to existing code.
+
+- **Stability**: Ensure that user's code "continues to work" (API stability, ABI stability, file
+  format stability) as much as practicable as they upgrade to newer software versions, and respect
+  semantic versioning promises when introducing breaking changes.
+
+- **Security**: Consistently follow secure coding practices such as input validation.
+
+- **Minimalism**: Write the minimum amount of understandable code that achieves the desired
+  functionality and avoid "syntactic sugar" of limited usefulness.
+
+- **Least surprise**: Prefer standard syntax, which users and programmers may expect, and opt for
+  project-specific customizations only when they offer significant benefits.
+
+- **Usability**: Make it easy for users to integrate our library into larger software applications and
+  "play nicely" with the other parts of a complex pipeline.
+
+In addition to these language-agnostic principles, we should also follow C++ specific best
+practices, such as those detailed in the
+https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines[C++ Core Guidelines].
+
+== Suggested Improvements
+
+In the following, I list a series of observations where I believe the current API can be improved.
+I also map them to the core design principles listed above, so that they can serve as examples to 
+guide the future evolution of our software interface. This list is not exhaustive, and I have limited
+myself to those rules where I noticed concrete examples of current deviations in our code base.
+
+=== Clarity
+
+. *Clearly separate public API (for users) and internal helper classes (for developers)*:
+The code organization does not make it clear which header files are part of the public API and meant
+for library users to interact with, and which are for internal classes: add an `api/` top-level
+directory for publicly accessible classes and functions. For example, `builder.h` contains classes
+that should be publicly accessible, while most of the headers under `common/` should be treated as
+internal.
+
+. *Hierarchical namespace organization*:
+Namespaces should make it clear whether a class / function is meant for users (`trt_edgellm`) or
+developers (e.g. `trt_edgellm::impl`). The C++ API reference should also be clearly organized to
+show which functions are for internal use only (e.g. most users will have no reason to use `divUp()`
+or `hashCombine()`, and it should be made clear that the documentation for these functions is meant
+for developers only).
+
+. *Add references to original literature*:
+Where appropriate, add references to original literature introducing a certain algorithm, such as
+the EAGLE paper in the documentation for `EagleDraftEngineRunner`.
+
+. *Clearly explain differences and relationships between similarly-sounding APIs*:
+Extend Doxygen documentation to clarify the exact use case for member functions with similar names
+and input signatures, and clarify how they relate to each other (e.g.
+`LLMBuilderConfig::setupCommonProfiles()` vs. `LLMBuilderConfig::setupVanillaProfiles()` vs. `LLMBuilderConfig::setupLLMOptimizationProfiles()`). Note that this is relevant both for external
+APIs and internal helper functions.
+
+. *Document macros*:
+The logging macros (like `LOG_DEBUG`) are missing from the C++ API
+documentation, although these macros are how developers will interact with the loggers in practice.
+This makes the documentation of the Logger module confusing.
+
+. *Avoid magic numbers*:
+Provide justification for "magic" default values like `imageMean` and `imageStd` for
+`InternViTConfig`.
+
+. *Document "why", not just "what"*:
+Often the documentation is missing guidance on the purpose of a class or function.
+It should describe when and why would a user want to use this class, rather than simply stating what
+the class does.
+Some examples are `LLMInferenceRuntime` or the different methods of `LinearKVCache`.
+
+. *LLM friendly documentation*:
+In addition to external library users and internal library developers, the documentation should be
+written with LLMs in mind, by adding an llms.txt file, providing code usage examples etc. I expect
+that many engineers will use automatic code generation tools (like Cursor or Copilot) to integrate
+our library, and we should make it easy for them to succeed.
+
+. *Clearly mark input, output, and in/out arguments*:
+When passing buffers / pointers, clearly mark them as input, output, or input/output arguments.
+Concrete examples where this could be improved include multiple kernels in the kernel namespace,
+such as `launchApplyRopeWriteKV` or `launchApplyRopeWriteContinuousQAndKVCache`. Also pass input
+arguments as const-pointers (e.g. the `qkv` argument of `launchApplyRopeWriteKV`).
+
+. *Limit number of function parameters*:
+For interfaces with a large number of arguments
+(like `launchApplyRopeWriteKV`), group the arguments in a structure to avoid accidentally swapping
+the order of arguments and also allowing to verify preconditions. This also simplifies passing
+arguments between related functions, e.g. from `launchApplyRopeWriteKVContext` to
+`launchApplyRopeWriteKV`. Also note that automated code quality tools like SonarQube generally
+require 7 arguments or fewer.
+
+. *Consistently provide documentation*:
+Some kernels like the EAGLE util kernels are missing documentation, like
+`prepareEaglePrefillInputs()`. Ensure that meaningful documentation is provided
+for all non-trivial functions.
+
+. *Make documentation meaningful*:
+Avoid self-explanatory documentation (e.g. "construct the object") for a constructor - instead give
+explanations how the object can be used, valid / invalid configurations for the parameters, etc.
+Examples for possible improvements include most member functions of `InternViTRunner`.
+
+
+=== Modularity
+
+[start=13]
+. *Use class inheritance to group related functionality*:
+The `LLMBuilder` and `VisualBuilder` class are completely separate even though they share common
+interfaces like `LLMBuilder::build()` and `VisualBuilder::build()`. Use inheritance to derive from a
+common `AutoregressiveBuilder` base class, which can be extended with other model classes like
+VLA (vision/language/action) models. Same for `LLMBuilderConfig` vs. `VisualBuilderConfig`.
+
+. *Give each source file a single clearly defined purpose*:
+Ideally each header file should contain a single class definition: avoid cases like
+`builder/builder.h` that defines four separate classes / structures.
+
+. *Make configuration attributes orthogonal*:
+Ensure that configuration attributes are independent of each other. As an example,
+`LLMBuilderConfig::eagleBase` and `LLMBuilderConfig::eagleDraft` cannot both be true.
+Instead they are better combined into a suitable enum with values
+`kEAGLE_BASE`, `kEAGLE_DRAFT` or `kVANILLA`.
+
+=== Extensibility
+
+[start=16]
+. *Remove tight coupling to ONNX as an import file format*:
+The `LLMBuilder` constructor assumes ONNX as the only import path, by specifying that the model
+specification must be provided via an onnxDir path. Generalize to an `Importer` abstract base class,
+with `ONNXImporter` as the only initial implementation but allowing extensibility to other data
+formats (MLIR, direct Pytorch export etc.) Also remove references to ONNX from documentation of
+generic methods like `LLMBuilder::build()` (refer to "the model" instead of "the ONNX model").
+
+. *Use subclasses for model-specific data*:
+The `VisualBuilder` class currently includes private members that are specific for a particular
+model class and should be moved to an appropriate subclass, like 
+`VisualBuilder::setupQwenViTProfile()`, which is only relevant for Qwen models.
+
+. *Use subclasses for model-specific helper functions*:
+Move model-specific data serialization logic
+(e.g. the `max_verify_tree_size` field, which is only used by EAGLE) into a subclass specific helper
+function, rather than the common `LLMBuilderConfig::toJSON()` function. In other words, partition
+the serialization logic into a common base function, which serializes common fields, and a
+model-specific function that is called by the base function.
+
+. *Hierarchical organization of configuration files*:
+Use nested JSON keys to hierarchically separate common configuration information (relevant for all
+LLMs) and model-specific information, rather than a flat key layout:
+[,JSON]
+----
+{
+	"version": {
+		"major": 1,
+		"minor": 2
+	},
+	"max_input_len": 128,
+	"max_seq_len": 4096,
+	"eagle_draft" : {
+		"max_draft_tree_size": 60
+	},
+	"eagle_base": null,
+	"vlm": {
+		"min_image_tokens": 4,
+		"max_image_tokens": 1024
+	}
+} 
+----
+
+=== Reusability
+
+[start=20]
+. *Avoid reimplementing standard utilities*:
+For utility functions that duplicate the functionality of existing STL functions (like `fmtstr()`,
+which is similar to `std::format()`), explain the advantages of our homebrewn code (or eliminate it
+in favor of standard libraries).
+
+=== Stability
+
+[start=21]
+. *Decouple interface from implementation to ensure ABI stability*:
+The `LLMBuilder` and `VisualBuilder` classes expose private implementation data like attention head
+size etc., which limits ABI compatibility when these classes are extended. Instead there are two
+options:
+.. Use the Pimpl idiom to separate interface from implementation, like `nvinfer1::IBuilder` vs. 
+`nvinfer1::apiv::VBuilder` in TensorRT.
+.. Provide a C ABI at the module boundary, with an additional C++ wrapper.
+
+. *Versioning of serialization files*:
+Add versioning tags to serialization formats such as the JSON serialization of `LLMBuilderConfig`
+to achieve forward compatibility (or at least the chance to perform compatibility checks).
+
+. *Distinguish stable from experimental interfaces*:
+The documentation makes no distinction between stable APIs (which we commit to supporting for the
+long run) and experimental APIs, which could change without notice. (See, for example,
+https://en.cppreference.com/w/cpp/header/experimental.html[the experimental headers in the STL].)
+Marking certain APIs as experimental can be useful for very recent models that may not be in wide
+use and have only been requested by a single customer - thus allowing them to try out these models
+without committing ourselves to long-term support. By contrast, industry-standard models should be
+supported by stable APIs since it would not be realistic to force a breaking change on many users.
+This point is more subjective than the rest of my recommendations, and should be discussed based
+on customer requirements.
+
+. *Allow for schema evolution in configuration or serialization file formats*:
+All internal files should contain a version field that follows semantic versioning conventions, and
+major (=breaking) version changes in the file format are only allowed at major software version
+changes. File schemas should be explicitly defined using tools like
+https://json-schema.org/[JSON Schema] and stored in version control (see
+https://www.tencentcloud.com/techpedia/128023[this article] for concrete recommendations).
+Either have a 1:1 relationship between file format versions and software versions, or publish a
+compatibility matrix. When it is necessary to support older file versions in newer software,
+consider providing a transformation script that fills in default or null values for missing fields,
+instead of making the parsing and validation logic overly complex.
+
+=== Security
+
+[start=25]
+. *Perform serialization format validation*:
+Specify and document which JSON keys are mandatory, handle errors (currently missing keys are
+silently ignored), check for the presence of unknown keys, validate the serialization version etc. 
+`LLMBuilderConfig::fromJSON()` is an example for this.
+
+. *Avoid passing raw pointers*:
+APIs that return raw pointers (like `Sequence::getStep()`) are dangerous: at a minimum, they should
+clearly document lifetimes and invalidation (e.g. pointer will become invalid after `Sequence`
+object gets out of range). Consider using shared pointers instead.
+
+. *Avoid passing untyped pointers*:
+Avoid passing void* in favor of typed input arguments or return values, unlike
+`InternViTRunner::getConfig()`.
+
+. *Document non-deterministic behavior*:
+Document which methods are guaranteed deterministic (no allocation / deallocation, exceptions,
+concurrency etc.) and which ones can show non-deterministic behavior. In a safety-critical use case,
+non-deterministic methods need to be avoided or moved to a setup phase where failure or high latency
+does not have safety impact. For example, the preprocessor methods of `QwenViTRunner` perform
+allocation, which is non-deterministic unless a custom allocator is provided and should be marked
+as such. Another related important issue is numeric consistency (whether numerical results
+are expected to vary based on thread scheduling etc.)
+
+. *Prevent buffer overruns*:
+When passing buffers / arrays into functions like `launchApplyRopeWriteKV`, document the expected
+array size (in elements or bytes). Even better, use more modern language features such as ranges or
+spans.
+
+. *Handle null inputs explicitly*:
+When passing a raw pointer like tokenizer as input to methods
+like `InternViTRunner::preprocess()`, specify if `nullptr` is a valid input (and document how null
+inputs will be handled), else pass a reference. 
+
+. *Document and enforce preconditions*:
+Document constraints, invariants and valid ranges for data attributes, e.g. `InternViTConfig` must
+enforce that `maxNumBlocks >= minNumBlocks`. In order to enforce these constraints, attributes
+should be:
+.. private and accessed via setters, or better:
+.. constant and only initialized in the constructor, which checks that invariants hold.
+
+. *Document thread safety*:
+Document which methods can be called safely from multiple threads without need for synchronization,
+locks etc. Or if TensorRT Edge-LLM is only suitable for single-threaded operation, document this
+explicitly.
+
+=== Minimalism
+
+[start=33]
+. *Avoid extraneous conversion functions*:
+Consider removing functions like `LLMBuilderConfig::toString()` as extraneous, given that JSON is
+already a human-readable format and can be dumped to a string or output stream.
+
+=== Least Surprise
+
+[start=34]
+. *Standardized JSON syntax*:
+Consider using standard JSON parsing methods like `ns::to_json()` / `ns::from_json()` or type
+macros, rather than custom-written functions (see 
+https://json.nlohmann.me/features/arbitrary_types/[the library documentation]). 
+
+. *Enforce data consistency by avoiding passing arguments redundantly*:
+`MultimodalRunner` subclasses like `InternViTRunner` have three methods that take a CUDA stream as
+input argument (constructor, `preprocess()` and `infer()`). It is unclear if all these interfaces
+are supposed to use the same stream, or if different parts of the pipeline can use different
+streams. Either document explicitly that streams don't have to match, or rework the interfaces so 
+that the stream is only passed once.
+
+=== Usability
+
+[start=36]
+. *Granular error reporting*:
+Consider more granular error return types than `true` / `false` to
+inform callers about the reason why an error occurred, especially if it was a user error (which
+users can correct or at least recover from) or an internal error (which they should treat as fatal
+and file an issue against Edge LLM). For example, in `LLMBuilder::build()`, filesystem errors should
+be signaled differently from malformed configuration files or TensorRT build errors. If we opt
+for combining a C ABI with a C++ wrapper, then the wrapper could throw exceptions.
+
+. *Support non-standard output streams*:
+The `EdgeLLMLogger` class should have an API to accept a `std::ostream&` that can write logs, for example,
+into a specific file, rather than just `std::cerr` or `std::cout`.
+
+. *Throw custom exception types*:
+Prefer throwing library-specific exceptions (e.g. `EdgeLLMMissingFile`) over generic exceptions
+like `std::runtime_error`, for example, in `MultimodalRunner::create()`. This allows library users
+to handle TensorRT Edge-LLM errors separately from exceptions caused by other components in their
+system. See
+https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#re-exception-types[Core Guideline E.14].
+
+=== C++ Best Practices
+
+[start=39]
+. *No code in headers*:
+Avoid placing non-inline, non-trivial member function definitions in headers, such as
+`LLMBuilderConfig::toJson()`. Instead, move them to a *.cpp implementation file.
+See https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#rs-inline[Core Guideline SF.2].
+
+. *Mark return values as non-discardable*:
+Use `[[nodiscard]]` attribute to mark return values that users should not silently ignore, e.g.
+introduce an enum class `[[nodiscard]] ErrorCode` to return error codes. 
+
+. *Specify which functions can or cannot throw exceptions*:
+Mark member functions as `noexcept` if we do not expect an exception to be thrown because errors
+are signaled via return values (e.g. `LLMBuilder::build()`). Otherwise, document which exceptions
+may be thrown and under which circumstances.
+See https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#rf-noexcept [Core Guideline F.6].
+Class destructors are an important example of functions that are implicitly declared `noexcept`
+under C++ rules, but currently can actually throw (and cause `std::terminate` to be invoked).
+For example, `EagleDraftEngineRunner::~EagleDraftEngineRunner()` will call `std::terminate` if the
+`CUDA_CHECK` macro throws.
+
+. *Avoid top-level const specification when passing by value*:
+Avoid declaring by-value input parameters as constant, since it is an implementation detail,
+e.g. the `dataType` argument of the `ContextFMHARunner` constructor should not be declared const
+(see https://www.fluentcpp.com/2018/11/23/function-parameters-making-interfaces-easy-to-use/[this explanation]).
+
+. *Prefer return values over output arguments*:
+When passing input/output arguments like `batchedInputIds` to `InternViTRunner::preprocess()`,
+document how the inputs are being used. If they are not used (overwrite the vector with new token
+IDs), consider passing the information as a return value rather than an output argument unless it
+is important to reuse an existing buffer and avoid allocations for performance / predictability or
+to avoid exceptions. Use structures or tuples when returning multiple values. 
+See https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#rf-out[Core Guideline F.20]
+and https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines#rf-out-multi[F.21].
+
+. *Mark immutable inputs as constant*:
+Clarify which inputs can be passed as const-reference (or const-pointer), and if not, how they
+modify their input arguments. (For example, in `QwenViTRunner::preprocess()`, the tokenizer argument
+is currently marked as input argument but passed as a mutable pointer.)
+
+= Recommended Plan of Action
+
+For a rapidly evolving software product such as TensorRT Edge-LLM, it would be inappropriate to plan
+the API design far in advance like in the waterfall model. Instead, we want to follow an agile
+development methodology that allows adding new features and support for new models with minimum
+planning overhead. Even so, as our customer base matures and especially once we are preparing the
+first stable 1.0 release, we need to ensure that our interface remains extensible.
+
+For this, we recommend the following process:
+
+* Launch a one-off "cleanup" epic where we fix existing issues, such as the ones described above.
+Cleanup can be performed on main for small / local issues, but should be on a separate branch for
+changes that significantly reorganize the code base.
+
+* Create awareness among engineers about the design principles we want to follow, together with
+concrete examples from the cleanup project, via presentations or Confluence pages.
+(This should include external contributors once we open-source the code.)
+
+* Prepare project rules files for Cursor and Greptile where we summarize our design principles in a
+prompt-engineered format to help ensure that future MRs will abide by them and automated code
+analysis can catch most of the remaining issues.
+
+* Designate an API reviewer for all MRs that affect the API by adding, removing or modifying
+interfaces 
+
+* At every public release, perform a holistic review of all interface changes since the previous
+release against our design principles. Then perform a focused cleanup task to address all
+unjustified deviations from our API design principles, paying particular attention to poor
+interactions between different components.
+
+* Add automated compatibility tests between minor versions: e.g. for release 1.1, ensure that we
+can still consume serialization files with version 1.0.
+
+* Incorporate open-source tools such as https://sourceware.org/libabigail/[libabigail] or
+https://github.com/IBM/jsonsubschema[jsonsubschema] into our CI/CD pipelines (or at least release
+test plan) to automatically catch unwanted breaking changes.
