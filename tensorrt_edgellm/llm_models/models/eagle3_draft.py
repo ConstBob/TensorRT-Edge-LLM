@@ -376,7 +376,7 @@ class Eagle3DraftModel(nn.Module):
 
             load_embedding_weights(processed_state_dict, base_model_dir,
                                    device)
-            model.load_state_dict(processed_state_dict)
+            model.load_state_dict(processed_state_dict, strict=False)
 
         return model
 
