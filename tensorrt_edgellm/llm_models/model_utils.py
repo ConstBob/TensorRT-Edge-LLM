@@ -20,12 +20,17 @@ checking model types, and setting up quantization.
 """
 
 import gc
+import importlib.util
+import os
+import sys
+import types
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from modelopt.torch.quantization.utils import is_quantized_linear
+from peft import PeftModel
 from safetensors.torch import safe_open
 from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoTokenizer,
@@ -71,7 +76,10 @@ def set_dynamic_quant(model: nn.Module, dtype: str) -> None:
 def is_vlm(model_dir: str) -> bool:
     """Check if the model is a VLM."""
     cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    if "vision_config" in cfg:
+    cfg_dict = cfg.to_dict()
+    has_vision = "vision_config" in cfg_dict
+    has_phi4_vision = "image_embd_layer" in cfg_dict.get("embd_layer", {})
+    if (has_vision or has_phi4_vision):
         print("Set use_prompt_tuning to True")
         return True
     else:
@@ -84,6 +92,65 @@ def is_gptq_model(model: PreTrainedModel) -> bool:
     config = model.config.to_dict()
     quant_config = config.get("quantization_config", None)
     return quant_config and quant_config.get("quant_method") == "gptq"
+
+
+def _is_phi4mm_model(dir_path: str) -> bool:
+    try:
+        cfg = AutoConfig.from_pretrained(dir_path, trust_remote_code=True)
+    except Exception:
+        return False
+    model_type = str(getattr(cfg, "model_type", "")).lower()
+    if "phi4mm" in model_type:
+        return True
+    archs = getattr(cfg, "architectures", None)
+    return isinstance(archs, (list, tuple)) and any("phi4mm" in str(a).lower()
+                                                    for a in archs)
+
+
+def _load_phi4mm_war(model_dir: str):
+    """
+    Dynamically import local modeling_phi4mm.py as a synthetic package so that
+    relative imports work, then inject a no-op prepare_inputs_for_generation
+    on Phi4MMModel to satisfy PEFT checks during initialization.
+    """
+    package_name = "local_phi4mm"
+    if package_name not in sys.modules:
+        pkg = types.ModuleType(package_name)
+        pkg.__path__ = [model_dir]
+        sys.modules[package_name] = pkg
+
+    # Preload configuration module if present (support both relative and absolute imports)
+    cfg_path = os.path.join(model_dir, "configuration_phi4mm.py")
+    if os.path.exists(cfg_path):
+        cfg_name_local = f"{package_name}.configuration_phi4mm"
+        if cfg_name_local not in sys.modules:
+            cfg_spec = importlib.util.spec_from_file_location(
+                cfg_name_local, cfg_path)
+            cfg_mod = importlib.util.module_from_spec(cfg_spec)
+            sys.modules[cfg_name_local] = cfg_mod
+            sys.modules["configuration_phi4mm"] = cfg_mod
+            cfg_mod.__package__ = package_name
+            assert cfg_spec is not None and cfg_spec.loader is not None
+            cfg_spec.loader.exec_module(cfg_mod)
+
+    module_name = f"{package_name}.modeling_phi4mm"
+    mdl_path = os.path.join(model_dir, "modeling_phi4mm.py")
+    spec = importlib.util.spec_from_file_location(module_name, mdl_path)
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = package_name
+    sys.modules[module_name] = module
+    sys.modules["modeling_phi4mm"] = module
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(module)
+
+    # Inject no-op to avoid PEFT requiring this on the base model
+    if hasattr(module, "Phi4MMModel"):
+
+        def _fake_prepare_inputs_for_generation(self, *args, **kwargs):
+            pass
+
+        module.Phi4MMModel.prepare_inputs_for_generation = _fake_prepare_inputs_for_generation
+    return module
 
 
 def load_hf_model(
@@ -111,22 +178,44 @@ def load_hf_model(
         raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
 
-    # Try loading as AutoModelForCausalLM first
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
-    except Exception:
-        # If that fails, try AutoModelForImageTextToText
+    # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
+    # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
+    if _is_phi4mm_model(model_dir):
+        module = _load_phi4mm_war(model_dir)
+        model = module.Phi4MMForCausalLM.from_pretrained(
+            model_dir,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            _attn_implementation="eager").to(device)
+        # Only the vision modality is supported for now; by default, we merge the vision LoRA.
+        lora_dir = os.path.join(model_dir, "vision-lora")
+        if os.path.exists(lora_dir):
+            lora_model = PeftModel.from_pretrained(model,
+                                                   lora_dir,
+                                                   adapter_name="vision")
+            lora_model.set_adapter("vision")
+            print("Merging LoRA weights into base model...")
+            model = lora_model.merge_and_unload()
+
+    else:
+        # Try loading as AutoModelForCausalLM first
         try:
-            # TODO: Need a WAR to quantize only the language model.
-            # In VLMs, the model has both model.language_model and model.vision_model.
-            model = AutoModelForImageTextToText.from_pretrained(
-                model_dir, torch_dtype=torch_dtype,
-                trust_remote_code=True).to(device)
-        except Exception as e:
-            raise ValueError(
-                f"Could not load model from {model_dir}. Error: {e}")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_dir,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+                _attn_implementation="eager").to(device)
+        except Exception:
+            # If that fails, try AutoModelForImageTextToText
+            try:
+                # TODO: Need a WAR to quantize only the language model.
+                # In VLMs, the model has both model.language_model and model.vision_model.
+                model = AutoModelForImageTextToText.from_pretrained(
+                    model_dir, torch_dtype=torch_dtype,
+                    trust_remote_code=True).to(device)
+            except Exception as e:
+                raise ValueError(
+                    f"Could not load model from {model_dir}. Error: {e}")
     if not is_gptq_model(model):
         model.to(torch_dtype)
 

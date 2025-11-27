@@ -33,11 +33,11 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     # Handle LongRoPE (rope_scaling already validated in required_fields)
     rope_scaling = config_dict["rope_scaling"]
     if rope_scaling and rope_scaling.get("type", None) == "longrope":
-        if "original_max_position_embeddings" not in rope_scaling:
+        if "original_max_position_embeddings" not in config_dict:
             raise KeyError(
                 f"Required field 'original_max_position_embeddings' not found in config"
             )
-        llm_config["original_max_position_embeddings"] = rope_scaling[
+        llm_config["original_max_position_embeddings"] = config_dict[
             "original_max_position_embeddings"]
 
     # Handle head_dim
@@ -144,8 +144,12 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
     """Export vision configuration without modification."""
     config_dict = config.to_dict()
 
-    if "vision_config" not in config_dict:
-        raise KeyError("Required field 'vision_config' not found in config")
+    has_vision = "vision_config" in config_dict
+    has_phi4_vision = "image_embd_layer" in config_dict.get("embd_layer", {})
+    if not (has_vision or has_phi4_vision):
+        raise KeyError(
+            "Required field 'vision_config' or 'image_embd_layer' in 'embd_layer' not found in config"
+        )
 
     # Return the original config_dict as-is without any modification
     # Since MRoPE needs LLM config, ViTRunner will use the LLM config.

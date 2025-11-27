@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from fractions import Fraction
+
 import modelopt.torch.quantization as mtq
 import torch
 from datasets import (concatenate_datasets, get_dataset_config_names,
@@ -27,13 +30,44 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import \
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
 from ..visual_models.internvl3_model import InternVLVisionModel
+from ..visual_models.phi4mm_model import Phi4MMVisionModel
 from .quantization_utils import quantize_model
+
+
+def resize_image_to_nearest_multiple(image, multiple):
+    w, h = image.size
+    # Candidate unit counts around floor/round/ceil
+    w_div = w / multiple
+    h_div = h / multiple
+    w_candidates = {max(1, math.floor(w_div)), max(1, math.ceil(w_div))}
+    h_candidates = {max(1, math.floor(h_div)), max(1, math.ceil(h_div))}
+
+    orig_ratio = Fraction(w, h) if h else Fraction(1, 1)
+    best = None
+    best_cost = float("inf")
+    best_delta = float("inf")
+    for mu in w_candidates:
+        for nu in h_candidates:
+            ratio = Fraction(mu, nu)
+            cost = abs(ratio - orig_ratio)
+            new_w = mu * multiple
+            new_h = nu * multiple
+            delta = abs(new_w - w) + abs(new_h - h)
+            if cost < best_cost or (cost == best_cost and delta < best_delta):
+                best_cost = cost
+                best_delta = delta
+                best = (new_w, new_h)
+    new_w, new_h = best if best is not None else (w, h)
+    if (new_w, new_h) != (w, h):
+        image = image.resize((new_w, new_h), resample=Image.BICUBIC)
+    return image
 
 
 def get_visual_calib_dataloader(
     model,
     processor,
     dataset_dir="lmms-lab/MMMU",
+    block_size=448,
 ):
     # There are 2 possible dataset: lmms-lab/MMMU and MMMU/MMMU. The first one does not have any configs.
     # https://huggingface.co/datasets/lmms-lab/MMMU
@@ -73,12 +107,27 @@ def get_visual_calib_dataloader(
         image_inputs = []
         for (key, value) in data.items():
             if "image" in key and isinstance(value, Image.Image):
+                value = resize_image_to_nearest_multiple(value, block_size)
                 image_inputs.append(value.convert("RGB"))
         inputs = processor(images=image_inputs, )
         return {"pixel_values": inputs["pixel_values"]}
 
-    preprocess_fn = _preprocess_internvl if isinstance(
-        model, InternVLVisionModel) else _preprocess
+    def _preprocess_phi4mm(data, processor):
+        image_inputs = []
+        for (key, value) in data.items():
+            if "image" in key and isinstance(value, Image.Image):
+                value = resize_image_to_nearest_multiple(value, block_size)
+                image_inputs.append(value.convert("RGB"))
+        inputs = processor(images=image_inputs, )["input_image_embeds"][0].to(
+            model.dtype)
+        return {"pixel_values": inputs}
+
+    if isinstance(model, InternVLVisionModel):
+        preprocess_fn = _preprocess_internvl
+    elif isinstance(model, Phi4MMVisionModel):
+        preprocess_fn = _preprocess_phi4mm
+    else:
+        preprocess_fn = _preprocess
 
     dataset = dataset.map(preprocess_fn,
                           batched=False,
@@ -155,9 +204,10 @@ def get_visual_calib_dataloader(
                 return inputs
 
         dataset = QwenViTDataset(dataset, model)
-    elif isinstance(model, InternVLVisionModel):
+    elif isinstance(model, InternVLVisionModel) or isinstance(
+            model, Phi4MMVisionModel):
 
-        class InternVLDataset(Dataset):
+        class InternVLPhi4MMDataset(Dataset):
 
             def __init__(self, data, model):
                 self.data = data
@@ -171,7 +221,7 @@ def get_visual_calib_dataloader(
                 pixel_values = raw_data["pixel_values"].to(self.model.dtype)
                 return {"pixel_values": pixel_values}
 
-        dataset = InternVLDataset(dataset, model)
+        dataset = InternVLPhi4MMDataset(dataset, model)
 
     return dataset
 
@@ -179,8 +229,8 @@ def get_visual_calib_dataloader(
 def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
     assert isinstance(
         model, (Qwen3VLVisionModel, Qwen2_5_VisionTransformerPretrainedModel,
-                Qwen2VisionTransformerPretrainedModel,
-                InternVLVisionModel)), f"Invalid model type {type(model)}"
+                Qwen2VisionTransformerPretrainedModel, InternVLVisionModel,
+                Phi4MMVisionModel)), f"Invalid model type {type(model)}"
     assert precision in [
         "fp8"
     ], f"Only fp8(W8A8) is supported for visual model. You passed an unsupported precision: {precision}."
@@ -201,7 +251,22 @@ def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
     # Disable Conv to avoid accuracy degradation
     quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
     quant_config["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
-    data_loader = get_visual_calib_dataloader(model, processor, dataset_dir)
+    # Determine block size: prefer config.vision_config.image_size, fallback to vision_model.crop_size, else 448
+    block_size = 448
+    vision_cfg = getattr(getattr(model, "config", None), "vision_config", None)
+    if vision_cfg is not None and hasattr(vision_cfg, "image_size"):
+        # Get the block size of InternVL3
+        img_size = getattr(vision_cfg, "image_size", 448)
+        # image_size can be int or [H, W]; prefer the first dimension if list/tuple
+        block_size = int(img_size[0]) if isinstance(img_size,
+                                                    (list,
+                                                     tuple)) else int(img_size)
+    else:
+        # Get the block size of Phi-4MM
+        block_size = getattr(getattr(model, "vision_model", None), "crop_size",
+                             448)
+    data_loader = get_visual_calib_dataloader(model, processor, dataset_dir,
+                                              block_size)
     quantized_model = quantize_model(model, quant_config, data_loader)
     mtq.print_quant_summary(quantized_model)
     return quantized_model

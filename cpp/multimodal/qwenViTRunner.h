@@ -103,10 +103,6 @@ public:
     //! \return True if allocation succeeded, false otherwise
     bool allocateBuffer(cudaStream_t stream) override;
 
-    //! \brief Get pointer to configuration
-    //! \return Pointer to QwenViTConfig
-    void* getConfig() override;
-
     //! \brief Get extra visual features
     //! \return Optional input tensors vector (e.g. deepstack features for Qwen3-VL)
     rt::OptionalInputTensors getExtraVisualFeatures() override;

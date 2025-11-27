@@ -164,11 +164,6 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     return true;
 }
 
-void* QwenViTRunner::getConfig()
-{
-    return &mConfig;
-}
-
 bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
 {
     bool setTensorAddressStatus{true};

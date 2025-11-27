@@ -15,8 +15,10 @@
  * limitations under the License.
  */
 
+#include <cstdint>
 #include <gtest/gtest.h>
 #include <random>
+#include <vector>
 
 #include "common/cudaUtils.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
@@ -25,6 +27,158 @@
 
 using namespace trt_edgellm;
 using namespace nvinfer1;
+
+// Helper to build Phi-4MM batched inputs and golden output for postprocess kernel tests.
+// hwBlocks: vector of (hBlocks, wBlocks) per image
+static void BuildPhi4mmBatchedInputs(std::vector<std::pair<int32_t, int32_t>> const& hwBlocks, int32_t const hidden,
+    std::vector<half>& srcEmbeds,          // out: raw ViT tokens [sum((1+hb*wb)*256), hidden]
+    std::vector<half>& subGNHost,          // out: [hidden]
+    std::vector<half>& glbGNHost,          // out: [hidden]
+    std::vector<int32_t>& hBlocksHost,     // out: [numImages]
+    std::vector<int32_t>& wBlocksHost,     // out: [numImages]
+    std::vector<int64_t>& srcGlbStartHost, // out: [numImages]
+    std::vector<int64_t>& srcSubStartHost, // out: [numImages]
+    std::vector<int64_t>& dstOutStartHost, // out: [numImages]
+    std::vector<int64_t>& subOutLenHost,   // out: [numImages]
+    std::vector<half>& dstRef              // out: golden postprocessed output [totalOutTokens, hidden]
+)
+{
+    hBlocksHost.clear();
+    wBlocksHost.clear();
+    srcGlbStartHost.clear();
+    srcSubStartHost.clear();
+    dstOutStartHost.clear();
+    subOutLenHost.clear();
+
+    // Compute total raw tokens and total output tokens
+    int64_t totalRawTokens = 0;
+    int64_t totalOutTokens = 0;
+    for (auto const& hw : hwBlocks)
+    {
+        int32_t const hb = hw.first;
+        int32_t const wb = hw.second;
+        // raw tokens per image: 1 glb + hb*wb sub, each 256
+        totalRawTokens += (1LL + static_cast<int64_t>(hb) * wb) * 256LL;
+        // out tokens: sub grid (with newlines), 1 glb_GN, glb grid (with newlines)
+        int64_t const subLen = kernel::kTokensPerBlockPhi4 * hb * wb + kernel::kTokensPerSidePhi4 * hb;
+        int64_t const glbLen = kernel::kTokensPerSidePhi4 * (kernel::kTokensPerSidePhi4 + 1);
+        totalOutTokens += subLen + 1 + glbLen;
+    }
+
+    // Prepare buffers
+    srcEmbeds.resize(totalRawTokens * hidden);
+    subGNHost.resize(hidden);
+    glbGNHost.resize(hidden);
+    dstRef.resize(totalOutTokens * hidden);
+
+    // Deterministic content:
+    // - For src tokens: token t's vector is filled with value = float(t)
+    // - For subGN and glbGN: constant distinctive values
+    for (int32_t d = 0; d < hidden; ++d)
+    {
+        subGNHost[d] = __float2half(-1.234f);
+        glbGNHost[d] = __float2half(-2.345f);
+    }
+    // Fill src by token index
+    for (int64_t t = 0; t < totalRawTokens; ++t)
+    {
+        half v = __float2half(static_cast<float>(t));
+        int64_t base = t * hidden;
+        for (int32_t d = 0; d < hidden; ++d)
+        {
+            srcEmbeds[base + d] = v;
+        }
+    }
+
+    // Build index arrays and golden output
+    int64_t inStartTok = 0;
+    int64_t outStartTok = 0;
+    for (auto const& hw : hwBlocks)
+    {
+        int32_t const hb = hw.first;
+        int32_t const wb = hw.second;
+        hBlocksHost.push_back(hb);
+        wBlocksHost.push_back(wb);
+        srcGlbStartHost.push_back(inStartTok);
+        srcSubStartHost.push_back(inStartTok + 256);
+
+        // Sub segment
+        int64_t const rowsSub = kernel::kTokensPerSidePhi4 * hb;
+        int64_t const colsSub = kernel::kTokensPerSidePhi4 * wb;
+        int64_t const strideSub = colsSub + 1;
+        int64_t const subLen = rowsSub * strideSub;
+        subOutLenHost.push_back(subLen);
+        dstOutStartHost.push_back(outStartTok);
+
+        for (int64_t r = 0; r < rowsSub; ++r)
+        {
+            for (int64_t c = 0; c < strideSub; ++c)
+            {
+                int64_t const outTokIndex = outStartTok + r * strideSub + c;
+                half* dstPtr = &dstRef[outTokIndex * hidden];
+                if (c == colsSub)
+                {
+                    // newline: subGN
+                    for (int32_t d = 0; d < hidden; ++d)
+                        dstPtr[d] = subGNHost[d];
+                }
+                else
+                {
+                    // map to src sub token
+                    int64_t const bRow = r / kernel::kTokensPerSidePhi4;
+                    int64_t const pRow = r % kernel::kTokensPerSidePhi4;
+                    int64_t const bCol = c / kernel::kTokensPerSidePhi4;
+                    int64_t const pCol = c % kernel::kTokensPerSidePhi4;
+                    int64_t const blockId = bRow * wb + bCol;
+                    int64_t const patchId = pRow * kernel::kTokensPerSidePhi4 + pCol;
+                    int64_t const srcTokIndex
+                        = (inStartTok + kernel::kTokensPerBlockPhi4) + blockId * kernel::kTokensPerBlockPhi4 + patchId;
+                    half const* srcPtr = &srcEmbeds[srcTokIndex * hidden];
+                    for (int32_t d = 0; d < hidden; ++d)
+                        dstPtr[d] = srcPtr[d];
+                }
+            }
+        }
+        outStartTok += subLen;
+
+        // glb_GN single token
+        {
+            half* dstPtr = &dstRef[outStartTok * hidden];
+            for (int32_t d = 0; d < hidden; ++d)
+                dstPtr[d] = glbGNHost[d];
+            outStartTok += 1;
+        }
+
+        // Global kTokensPerSidePhi4 x kTokensPerSidePhi4 grid with newline at end of each row
+        int64_t const rowsGlb = kernel::kTokensPerSidePhi4;
+        int64_t const colsGlb = kernel::kTokensPerSidePhi4;
+        int64_t const strideGlb = colsGlb + 1;
+        for (int64_t r = 0; r < rowsGlb; ++r)
+        {
+            for (int64_t c = 0; c < strideGlb; ++c)
+            {
+                int64_t const outTokIndex = outStartTok + r * strideGlb + c;
+                half* dstPtr = &dstRef[outTokIndex * hidden];
+                if (c == colsGlb)
+                {
+                    for (int32_t d = 0; d < hidden; ++d)
+                        dstPtr[d] = subGNHost[d];
+                }
+                else
+                {
+                    int64_t const srcTokIndex = inStartTok + r * kernel::kTokensPerSidePhi4 + c;
+                    half const* srcPtr = &srcEmbeds[srcTokIndex * hidden];
+                    for (int32_t d = 0; d < hidden; ++d)
+                        dstPtr[d] = srcPtr[d];
+                }
+            }
+        }
+        outStartTok += rowsGlb * strideGlb;
+
+        // Advance raw pointer start
+        inStartTok += (1LL + static_cast<int64_t>(hb) * wb) * 256LL;
+    }
+}
 
 void TestNormalizeImage(int32_t const batch, int32_t const height, int32_t const width, int32_t const channels = 3)
 {
@@ -458,7 +612,7 @@ void TestTransposeToPatchInternVL(int32_t const height, int32_t const width, int
     int32_t const numBlocks = gridH * gridW;
     rt::Tensor inputPatchesDevice(
         {numBlocks, channels, blockSizeH, blockSizeW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    kernel::transposeToPatchInternVL(originalImageDevice, inputPatchesDevice, 0, stream);
+    kernel::transposeToPatchInternVLPhi4MM(originalImageDevice, inputPatchesDevice, 0, stream);
 
     std::vector<half> inputPatches(height * width * channels);
     CUDA_CHECK(cudaMemcpyAsync(inputPatches.data(), inputPatchesDevice.rawPointer(), inputPatches.size() * sizeof(half),
@@ -470,11 +624,11 @@ void TestTransposeToPatchInternVL(int32_t const height, int32_t const width, int
     {
         ASSERT_TRUE(isclose(inputPatches[i], inputPatchesRef[i], 1e-5, 1e-5));
     }
-    std::cout << "TransposeToPatchInternVL Accuracy: " << height << "x" << width << "x" << channels
+    std::cout << "transposeToPatchInternVLPhi4MM Accuracy: " << height << "x" << width << "x" << channels
               << ", blockSizeH=" << blockSizeH << ", blockSizeW=" << blockSizeW << std::endl;
 }
 
-TEST(TransposeToPatchInternVL, Accuracy)
+TEST(transposeToPatchInternVLPhi4MM, Accuracy)
 {
     TestTransposeToPatchInternVL(448, 448);
 }
@@ -497,7 +651,7 @@ void BenchmarkTransposeToPatchInternVL(int32_t const height, int32_t const width
     rt::Tensor inputPatchesDevice(
         {numBlocks, channels, blockSizeH, blockSizeW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-    auto launch = [&]() { kernel::transposeToPatchInternVL(originalImageDevice, inputPatchesDevice, 0, stream); };
+    auto launch = [&]() { kernel::transposeToPatchInternVLPhi4MM(originalImageDevice, inputPatchesDevice, 0, stream); };
 
     constexpr int32_t numWarmup = 10;
     for (int32_t i = 0; i < numWarmup; i++)
@@ -520,12 +674,12 @@ void BenchmarkTransposeToPatchInternVL(int32_t const height, int32_t const width
 
     float elapsedTime{0.0f};
     cudaEventElapsedTime(&elapsedTime, start, stop);
-    std::cout << "TransposeToPatchInternVL Benchmark: " << height << "x" << width << "x" << channels
+    std::cout << "transposeToPatchInternVLPhi4MM Benchmark: " << height << "x" << width << "x" << channels
               << ", blockSizeH=" << blockSizeH << ", blockSizeW=" << blockSizeW
               << ", time=" << elapsedTime / numBenchIter << " ms" << std::endl;
 }
 
-TEST(TransposeToPatchInternVL, Benchmark)
+TEST(transposeToPatchInternVLPhi4MM, Benchmark)
 {
     BenchmarkTransposeToPatchInternVL(448, 448);
     BenchmarkTransposeToPatchInternVL(896, 896);
@@ -592,4 +746,72 @@ void TestInitFastPosEmbedQwenViT(int64_t const mergeSize = 2, int64_t const numG
 TEST(InitFastPosEmbedQwenViT, Accuracy)
 {
     TestInitFastPosEmbedQwenViT();
+}
+TEST(phi4mmPostprocessVisionTokens, Accuracy)
+{
+    cudaStream_t stream{nullptr};
+    // Two images with different block grids
+    std::vector<std::pair<int32_t, int32_t>> hwBlocks{{2, 3}};
+    int32_t const hidden = 32;
+
+    std::vector<half> srcEmbeds, subGNHost, glbGNHost, dstRef;
+    std::vector<int32_t> hBlocksHost, wBlocksHost;
+    std::vector<int64_t> srcGlbStartHost, srcSubStartHost, dstOutStartHost, subOutLenHost;
+    BuildPhi4mmBatchedInputs(hwBlocks, hidden, srcEmbeds, subGNHost, glbGNHost, hBlocksHost, wBlocksHost,
+        srcGlbStartHost, srcSubStartHost, dstOutStartHost, subOutLenHost, dstRef);
+
+    int32_t const numImages = static_cast<int32_t>(hwBlocks.size());
+    int64_t const totalRawTokens = static_cast<int64_t>(srcEmbeds.size()) / hidden;
+    int64_t const totalOutTokens = static_cast<int64_t>(dstRef.size()) / hidden;
+
+    // Device tensors
+    rt::Tensor srcEmbedding({totalRawTokens, hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    CUDA_CHECK(cudaMemcpyAsync(
+        srcEmbedding.rawPointer(), srcEmbeds.data(), srcEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice, stream));
+    rt::Tensor dstEmbedding({totalOutTokens, hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor hBlocksDev({numImages}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor wBlocksDev({numImages}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor srcGlbStartDev({numImages}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    rt::Tensor srcSubStartDev({numImages}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    rt::Tensor dstOutStartDev({numImages}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    rt::Tensor subOutLenDev({numImages}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    CUDA_CHECK(cudaMemcpyAsync(
+        hBlocksDev.rawPointer(), hBlocksHost.data(), numImages * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        wBlocksDev.rawPointer(), wBlocksHost.data(), numImages * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(srcGlbStartDev.rawPointer(), srcGlbStartHost.data(), numImages * sizeof(int64_t),
+        cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(srcSubStartDev.rawPointer(), srcSubStartHost.data(), numImages * sizeof(int64_t),
+        cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dstOutStartDev.rawPointer(), dstOutStartHost.data(), numImages * sizeof(int64_t),
+        cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        subOutLenDev.rawPointer(), subOutLenHost.data(), numImages * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+
+    rt::Tensor subGNDev({hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor glbGNDev({hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    CUDA_CHECK(cudaMemcpyAsync(
+        subGNDev.rawPointer(), subGNHost.data(), hidden * sizeof(half), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        glbGNDev.rawPointer(), glbGNHost.data(), hidden * sizeof(half), cudaMemcpyHostToDevice, stream));
+
+    // Launch batched kernel
+    kernel::Phi4MMIndex indices{hBlocksDev.dataPointer<int32_t>(), wBlocksDev.dataPointer<int32_t>(),
+        srcGlbStartDev.dataPointer<int64_t>(), srcSubStartDev.dataPointer<int64_t>(),
+        dstOutStartDev.dataPointer<int64_t>(), subOutLenDev.dataPointer<int64_t>(), numImages, hidden, totalOutTokens};
+    kernel::Phi4MMGN gn{subGNDev.dataPointer<half>(), glbGNDev.dataPointer<half>()};
+    kernel::phi4mmPostprocessVisionTokens(srcEmbedding, dstEmbedding, indices, gn, totalOutTokens, stream);
+
+    // Copy back and compare
+    std::vector<half> dstHost(totalOutTokens * hidden);
+    CUDA_CHECK(cudaMemcpyAsync(
+        dstHost.data(), dstEmbedding.rawPointer(), dstHost.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    for (size_t i = 0; i < dstHost.size(); ++i)
+    {
+        ASSERT_TRUE(isclose(dstHost[i], dstRef[i], 1e-5f, 1e-5f)) << "Mismatch at index " << i;
+    }
+    std::cout << "phi4mmPostprocessVisionTokens Accuracy: numImages=" << numImages << ", hidden=" << hidden
+              << ", totalOutTokens=" << totalOutTokens << std::endl;
 }

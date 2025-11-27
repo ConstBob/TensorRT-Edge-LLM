@@ -174,29 +174,6 @@ class EdgeLLMAttention(nn.Module):
         """
         super().__init__()
 
-        # Copy projection layers from original attention module
-        self.q_proj = attention_module.q_proj
-        self.k_proj = attention_module.k_proj
-        self.v_proj = attention_module.v_proj
-        self.o_proj = attention_module.o_proj
-
-        # Qwen3 models have QK normalization layers
-        if hasattr(attention_module, 'q_norm'):
-            self.q_norm = attention_module.q_norm
-        else:
-            self.q_norm = None
-
-        if hasattr(attention_module, 'k_norm'):
-            self.k_norm = attention_module.k_norm
-        else:
-            self.k_norm = None
-
-        # Llama4 models have QK normalization layers
-        if hasattr(attention_module, 'qk_norm'):
-            self.qk_norm = attention_module.qk_norm
-        else:
-            self.qk_norm = None
-
         # Copy configuration attributes from the original attention module
         self.hidden_size: int = attention_module.config.hidden_size
         self.num_key_value_heads: int = attention_module.config.num_key_value_heads
@@ -210,6 +187,69 @@ class EdgeLLMAttention(nn.Module):
             self.head_dim: int = attention_module.config.head_dim
         else:
             self.head_dim: int = attention_module.config.hidden_size // self.num_attention_heads
+
+        # Copy projection layers from original attention module
+        if hasattr(attention_module, 'q_proj'):
+            assert hasattr(attention_module, 'k_proj') and hasattr(attention_module, 'v_proj'), \
+                "q_proj, k_proj, and v_proj must be present"
+            self.q_proj = attention_module.q_proj
+            self.k_proj = attention_module.k_proj
+            self.v_proj = attention_module.v_proj
+        elif hasattr(attention_module, 'qkv_proj'):
+            # For Phi4MM, split the qkv_proj into q_proj, k_proj, and v_proj to align with the other models.
+            q_dim = self.num_attention_heads * self.head_dim
+            kv_dim = self.num_key_value_heads * self.head_dim
+            device = attention_module.qkv_proj.weight.device
+            dtype = attention_module.qkv_proj.weight.dtype
+            has_bias = attention_module.qkv_proj.bias is not None
+
+            self.q_proj = nn.Linear(self.hidden_size,
+                                    q_dim,
+                                    bias=has_bias,
+                                    device=device,
+                                    dtype=dtype)
+            self.k_proj = nn.Linear(self.hidden_size,
+                                    kv_dim,
+                                    bias=has_bias,
+                                    device=device,
+                                    dtype=dtype)
+            self.v_proj = nn.Linear(self.hidden_size,
+                                    kv_dim,
+                                    bias=has_bias,
+                                    device=device,
+                                    dtype=dtype)
+
+            # copy weights (from fused -> split)
+            with torch.no_grad():
+                W = attention_module.qkv_proj.weight  # [q_dim+2*kv_dim, hidden_size]
+
+                # Validate fused layout and shapes
+                assert W.ndim == 2, f"qkv weight must be 2D, got {W.ndim}D"
+                assert W.shape[0] == q_dim + 2 * kv_dim and W.shape[1] == self.hidden_size, \
+                    f"Unexpected qkv shape {tuple(W.shape)}; expected {(q_dim + 2*kv_dim, self.hidden_size)}"
+                if attention_module.qkv_proj.bias is not None:
+                    b = attention_module.qkv_proj.bias
+                    assert b.ndim == 1 and b.numel() == q_dim + 2 * kv_dim, \
+                        f"Unexpected qkv bias shape {tuple(b.shape)}; expected {(q_dim + 2*kv_dim,)}"
+
+                self.q_proj.weight.copy_(W[:q_dim])
+                self.k_proj.weight.copy_(W[q_dim:q_dim + kv_dim])
+                self.v_proj.weight.copy_(W[q_dim + kv_dim:])
+
+                if attention_module.qkv_proj.bias is not None:
+                    b = attention_module.qkv_proj.bias  # [q_dim+2*kv_dim]
+                    self.q_proj.bias.copy_(b[:q_dim])
+                    self.k_proj.bias.copy_(b[q_dim:q_dim + kv_dim])
+                    self.v_proj.bias.copy_(b[q_dim + kv_dim:])
+
+        self.o_proj = attention_module.o_proj
+
+        # Qwen3 models have QK normalization layers
+        self.q_norm = getattr(attention_module, 'q_norm', None)
+        self.k_norm = getattr(attention_module, 'k_norm', None)
+
+        # Llama4 models have QK normalization layers
+        self.qk_norm = getattr(attention_module, 'qk_norm', None)
 
         # Maximum sequence length for positional embeddings
         self.max_position_embeddings: int = attention_module.config.max_position_embeddings
@@ -235,7 +275,7 @@ class EdgeLLMAttention(nn.Module):
         Args:
             hidden_states: Input hidden states of shape (batch_size, seq_len, hidden_size)
             past_key_value: Past key-value cache of shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
-            rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch_size, seq_len, head_dim)
+            rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch_size, seq_len, rotary_dim)
             context_lengths: Context length tensor of shape (batch_size,)
             kvcache_start_index: Start index of KV cache of shape (batch_size), optional
             attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
@@ -448,7 +488,10 @@ class EdgeLLMDecoderLayer(nn.Module):
         if isinstance(config_or_module, nn.Module):
             # Use existing components from base model
             decoder_layer = config_or_module
-            self.hidden_size: int = decoder_layer.hidden_size
+            if hasattr(decoder_layer, 'hidden_size'):
+                self.hidden_size: int = decoder_layer.hidden_size
+            else:
+                self.hidden_size: int = decoder_layer.self_attn.hidden_size
             self.mlp = decoder_layer.mlp
             self.input_layernorm = decoder_layer.input_layernorm.to(
                 torch_dtype)

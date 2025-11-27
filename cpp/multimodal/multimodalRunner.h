@@ -126,10 +126,6 @@ public:
     //! @return True on success, false on failure
     virtual bool allocateBuffer(cudaStream_t stream) = 0;
 
-    //! @brief Get configuration pointer
-    //! @return Pointer to configuration structure
-    virtual void* getConfig() = 0;
-
     //! @brief Get model type
     //! @return Model type enum
     virtual multimodal::ModelType getModelType() const

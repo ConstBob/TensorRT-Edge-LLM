@@ -232,8 +232,13 @@ class EdgeLLMModelForCausalLM(nn.Module):
         super().__init__()
 
         if use_prompt_tuning:
-            language_model = hf_model.language_model
-            self.config = hf_model.config.text_config
+            if hasattr(hf_model, 'language_model'):
+                language_model = hf_model.language_model
+                self.config = hf_model.config.text_config
+            else:
+                # Phi4MM uses the model.model attribute instead of language_model
+                language_model = hf_model.model
+                self.config = hf_model.config
             if hasattr(hf_model.config, "quantization_config"):
                 self.config.quantization_config = hf_model.config.quantization_config
         else:

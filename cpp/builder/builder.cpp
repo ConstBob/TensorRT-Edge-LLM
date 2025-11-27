@@ -30,7 +30,6 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include <unordered_set>
 
 using namespace trt_edgellm;
 
@@ -42,6 +41,11 @@ namespace builder
 namespace
 {
 //! Utility functions for TensorRT engine building
+//! JSON key names used in model configs
+constexpr char kVisionConfigKey[] = "vision_config";
+constexpr char kModelTypeKey[] = "model_type";
+constexpr char kEmbdLayerKey[] = "embd_layer";
+constexpr char kImageEmbdLayerKey[] = "image_embd_layer";
 
 //! Create TensorRT dimensions from a vector of shape values.
 //! @param shape Vector of dimension sizes
@@ -896,6 +900,34 @@ bool VisualBuilder::build()
             return false;
         }
         LOG_INFO("Created directory %s for saving Visual engine.", mEngineDir.string().c_str());
+        if (mModelType == multimodal::ModelType::PHI4MM)
+        {
+            // Copy Phi-4MM GN(Grid Newline) projection weights to engine directory for runtime loading
+            // GN serves as line separator
+            std::filesystem::path const src = mOnnxDir / "phi4mm_gn_proj.safetensors";
+            std::filesystem::path const dst = mEngineDir / "phi4mm_gn_proj.safetensors";
+            if (std::filesystem::exists(src))
+            {
+                std::error_code ec;
+                bool const copyStatus
+                    = std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+                if (!copyStatus)
+                {
+                    LOG_ERROR("Failed to copy %s to %s: %s", src.string().c_str(), dst.string().c_str(),
+                        ec.message().c_str());
+                    return false;
+                }
+                else
+                {
+                    LOG_INFO("Copied Phi4MM GN projection weights to %s", dst.string().c_str());
+                }
+            }
+            else
+            {
+                LOG_ERROR("Phi4MM GN projection weights not found at %s (skip copy)", src.string().c_str());
+                return false;
+            }
+        }
     }
 
     // Save engine
@@ -947,26 +979,55 @@ bool VisualBuilder::parseConfig()
     }
 
     // Read model type from vision_config.model_type
-    if (!mModelConfig.contains("vision_config") || !mModelConfig["vision_config"].contains("model_type"))
+    std::string modelTypeStr;
+    if (mModelConfig.contains(kVisionConfigKey) && mModelConfig[kVisionConfigKey].contains(kModelTypeKey))
     {
-        LOG_ERROR("vision_config.model_type not found in config.json");
+        modelTypeStr = mModelConfig[kVisionConfigKey][kModelTypeKey].get<std::string>();
+    }
+    // For Phi-4MM, the model type is at the top level
+    else if (mModelConfig.contains(kModelTypeKey))
+    {
+        modelTypeStr = mModelConfig[kModelTypeKey].get<std::string>();
+    }
+    else
+    {
+        LOG_ERROR(
+            "model_type not found in config.json (expected either vision_config.model_type or top-level model_type)");
         return false;
     }
 
-    std::string modelTypeStr = mModelConfig["vision_config"]["model_type"].get<std::string>();
     mModelType = multimodal::stringToModelType(modelTypeStr);
 
     if (mModelType == multimodal::ModelType::UNKNOWN)
     {
         LOG_ERROR("Unsupported model type: %s", modelTypeStr.c_str());
-        return false;
     }
 
     if (mModelType == multimodal::ModelType::INTERNVL)
     {
-        mNumChannels = mModelConfig["vision_config"]["num_channels"].get<int64_t>();
-        mImageSizeH = mModelConfig["vision_config"]["image_size"][0].get<int64_t>();
-        mImageSizeW = mModelConfig["vision_config"]["image_size"][1].get<int64_t>();
+        mNumChannels = mModelConfig[kVisionConfigKey]["num_channels"].get<int64_t>();
+        mImageSizeH = mModelConfig[kVisionConfigKey]["image_size"][0].get<int64_t>();
+        mImageSizeW = mModelConfig[kVisionConfigKey]["image_size"][1].get<int64_t>();
+    }
+
+    if (mModelType == multimodal::ModelType::PHI4MM)
+    {
+        // Default Phi-4MM vision input
+        mNumChannels = 3;
+        // Prefer HF config's crop_size if available
+        if (mModelConfig.contains(kEmbdLayerKey) && mModelConfig[kEmbdLayerKey].contains(kImageEmbdLayerKey)
+            && mModelConfig[kEmbdLayerKey][kImageEmbdLayerKey].contains("crop_size"))
+        {
+            int64_t const crop = mModelConfig[kEmbdLayerKey][kImageEmbdLayerKey]["crop_size"].get<int64_t>();
+            mImageSizeH = crop;
+            mImageSizeW = crop;
+        }
+        else
+        {
+            LOG_INFO("Phi-4MM crop_size not found in config.json; defaulting to 448x448.");
+            mImageSizeH = 448;
+            mImageSizeW = 448;
+        }
     }
 
     return true;
@@ -983,11 +1044,10 @@ bool VisualBuilder::setupVisualOptimizationProfile(
     {
         result = setupQwenViTProfile(visualProfile, network);
     }
-    else if (mModelType == multimodal::ModelType::INTERNVL)
+    else if (mModelType == multimodal::ModelType::INTERNVL || mModelType == multimodal::ModelType::PHI4MM)
     {
-        result = setupInternViTProfile(visualProfile);
+        result = setupInternPhi4ViTProfile(visualProfile);
     }
-
     if (!result)
     {
         LOG_ERROR("Failed to setup optimization profile");
@@ -1073,7 +1133,7 @@ bool VisualBuilder::setupQwenViTProfile(
     return result;
 }
 
-bool VisualBuilder::setupInternViTProfile(nvinfer1::IOptimizationProfile* profile)
+bool VisualBuilder::setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile* profile)
 {
     bool result = true;
 

@@ -31,6 +31,7 @@ enum class ModelType
     QWEN2_5_VL, //!< Qwen2.5-VL model
     QWEN3_VL,   //!< Qwen3-VL model
     INTERNVL,   //!< InternVL model
+    PHI4MM,     //!< Phi-4MM model
     UNKNOWN     //!< Unknown or unsupported model type
 };
 
@@ -47,6 +48,8 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::QWEN3_VL;
     if (modelTypeStr == "internvl" || modelTypeStr == "internvl_vision")
         return ModelType::INTERNVL;
+    if (modelTypeStr == "phi4mm")
+        return ModelType::PHI4MM;
     return ModelType::UNKNOWN;
 }
 
