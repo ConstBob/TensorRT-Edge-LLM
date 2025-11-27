@@ -20,9 +20,6 @@ Usage:
     # Quantize with FP8 quantization
     python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output --quantization fp8
     
-    # Quantize without quantization (default)
-    python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output
-    
     # Quantize with different quantization for LM head
     python quantize_draft.py --base_model_dir /path/to/base/model --draft_model_dir /path/to/draft/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization fp8
     
