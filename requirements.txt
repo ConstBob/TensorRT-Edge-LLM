@@ -5,7 +5,8 @@ nvidia-modelopt[onnx]==0.35.0
 onnx==1.18.0
 datasets==4.0.0
 tqdm~=4.67.1
-numpy~=2.3.0
+numpy~=2.2.6
 # For Phi-4MM model
 peft
 backoff
+
