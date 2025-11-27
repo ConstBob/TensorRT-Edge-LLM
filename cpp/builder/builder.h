@@ -396,11 +396,11 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupQwenViTProfile(nvinfer1::IOptimizationProfile* profile, nvinfer1::INetworkDefinition const* network);
 
-    //! Set up optimization profile for InternVL ViT models.
-    //! Configures inputs for InternVL visual encoders.
+    //! Set up optimization profile for InternVL or Phi4-MM ViT models.
+    //! Configures inputs for InternVL or Phi4-MM visual encoders.
     //! @param profile Optimization profile to configure
     //! @return true if setup was successful, false otherwise
-    bool setupInternViTProfile(nvinfer1::IOptimizationProfile* profile);
+    bool setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile* profile);
 
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config

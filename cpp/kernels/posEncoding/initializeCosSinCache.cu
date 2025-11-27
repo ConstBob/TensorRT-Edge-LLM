@@ -152,7 +152,7 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
     int32_t originalMaxPositionEmbeddings, cudaStream_t stream)
 {
     // rotaryEmbeddingMaxPositions: length of position embeddings
-    //     CosSinCache shape: [rotaryEmbeddingMaxPositions, rotaryDim]
+    //     shortCosSinCache/longCosSinCache shape: [1, rotaryEmbeddingMaxPositions, rotaryDim]
     // maxPositionEmbeddings: config.max_position_embeddings
     // originalMaxPositionEmbeddings: config.original_max_position_embeddings
 

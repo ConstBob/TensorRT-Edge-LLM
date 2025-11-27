@@ -131,6 +131,12 @@ def create_dummy_inputs(model: nn.Module, enable_reuse_kv_cache: bool,
         head_dim = model_config.head_dim
     else:
         head_dim = hidden_size // num_heads
+
+    # Determine rotary dimension from partial_rotary_factor if provided
+    partial_rotary_factor = getattr(model_config, 'partial_rotary_factor', 1.0)
+    rotary_dim = int(head_dim * float(partial_rotary_factor))
+    if rotary_dim <= 0 or rotary_dim > head_dim:
+        rotary_dim = head_dim
     max_position_embeddings = model_config.max_position_embeddings
 
     device = next(model.parameters()).device
@@ -162,10 +168,10 @@ def create_dummy_inputs(model: nn.Module, enable_reuse_kv_cache: bool,
                                     dtype=torch.int64,
                                     device=device)
 
-    # Create rope_rotary_cos_sin
+    # Create rope_rotary_cos_sin using rotary_dim
     rope_rotary_cos_sin = torch.randn(batch_size,
                                       max_position_embeddings,
-                                      head_dim,
+                                      rotary_dim,
                                       dtype=torch.float32,
                                       device=device)
 

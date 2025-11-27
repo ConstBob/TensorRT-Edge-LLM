@@ -25,12 +25,14 @@ import shutil
 from typing import Optional
 
 import torch
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoProcessor
 
 from tensorrt_edgellm.quantization.visual_quantization import quantize_visual
 # Import visual model wrappers
 from tensorrt_edgellm.visual_models.internvl3_model import (
     InternVLVisionModel, export_internvl3_visual)
+from tensorrt_edgellm.visual_models.phi4mm_model import (Phi4MMVisionModel,
+                                                         export_phi4mm_visual)
 from tensorrt_edgellm.visual_models.qwen2_5_vl_model import (
     Qwen2_5_VisionTransformerPretrainedModelPatch, export_qwen2_5_vl_visual)
 from tensorrt_edgellm.visual_models.qwen2_vl_model import (
@@ -38,6 +40,7 @@ from tensorrt_edgellm.visual_models.qwen2_vl_model import (
 from tensorrt_edgellm.visual_models.qwen3_vl_model import (
     Qwen3VLVisionModelPatch, export_qwen3_vl_visual)
 
+from ..llm_models.model_utils import load_hf_model
 from .config_export import export_vision_config
 
 
@@ -75,16 +78,17 @@ def visual_export(model_dir: str,
         "fp8", None
     ], f"Only fp8 or None is supported for quantization. You passed: {quantization}"
 
-    # Convert dtype string to torch dtype
-    # TODO: Add support for bf16
-    torch_dtype = torch.float16
-
     # Load the model and processor
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_dir, torch_dtype=torch_dtype, trust_remote_code=True)
+    try:
+        model, _ = load_hf_model(model_dir, dtype, device)
+    except Exception as e:
+        raise ValueError(f"Could not load model from {model_dir}. Error: {e}")
 
     # Get visual model from the multimodal model
     model_type = model.config.model_type
+    # Convert dtype string to torch dtype
+    # TODO: Add support for bf16
+    torch_dtype = torch.float16
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -170,6 +174,19 @@ def visual_export(model_dir: str,
         # Export using the wrapper's export function
         export_internvl3_visual(wrapped_model, output_dir, torch_dtype)
 
+    elif model_type == 'phi4mm':
+        print(f"Exporting Phi4MM visual model from {model_dir}")
+        # Create Phi4MM wrapper model
+        wrapped_model = Phi4MMVisionModel(model)
+        processor = AutoProcessor.from_pretrained(
+            model_dir, trust_remote_code=True).image_processor
+        wrapped_model.eval().to(device)
+
+        # Apply quantization to wrapped model if requested
+        if quantization == "fp8":
+            wrapped_model = quantize_visual(wrapped_model, quantization,
+                                            processor, dataset_dir)
+        export_phi4mm_visual(wrapped_model, output_dir, torch_dtype)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 

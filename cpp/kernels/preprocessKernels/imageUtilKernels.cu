@@ -16,8 +16,8 @@
  */
 
 #include "common/checkMacros.h"
-#include "common/stringUtils.h"
 #include "imageUtilKernels.h"
+#include "kernels/common/vectorizedTypes.cuh"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -173,13 +173,13 @@ void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputP
         inputPatches.dataPointer<half>(), T, H, W, C, temporalPatchSize, patchSize, mergeSize, inputOffset);
 }
 
-__global__ void transposeToPatchInternVLKernel(half const* originalImage, half* inputPatches, int64_t const inputOffset,
-    int64_t const height, int64_t const width, int64_t const channels, int64_t const blockImageSizeH,
-    int64_t const blockImageSizeW)
+__global__ void transposeToPatchInternVLPhi4MMKernel(half const* originalImage, half* inputPatches,
+    int64_t const inputOffset, int64_t const height, int64_t const width, int64_t const channels,
+    int64_t const blockImageSizeH, int64_t const blockImageSizeW)
 {
     // This is a naive implementation of 5D transpose.
     // Each CTA get assigned 256 threads. Each thread processes one element
-    // Original image format: [1,H, W, C]
+    // Original image format: [1, H, W, C]
     //      H = gridH * blockImageSizeH
     //      W = gridW * blockImageSizeW
     //      C = channels
@@ -212,7 +212,7 @@ __global__ void transposeToPatchInternVLKernel(half const* originalImage, half* 
     inputPatches[dstIdx] = originalImage[srcIdx];
 }
 
-void transposeToPatchInternVL(
+void transposeToPatchInternVLPhi4MM(
     rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset, cudaStream_t stream)
 {
     check::check(
@@ -235,11 +235,172 @@ void transposeToPatchInternVL(
     uint32_t const blockSize = 256;
     uint32_t const gridSize = (totalElements + blockSize - 1) / blockSize;
 
-    transposeToPatchInternVLKernel<<<gridSize, blockSize, 0, stream>>>(originalImage.dataPointer<half>(),
+    transposeToPatchInternVLPhi4MMKernel<<<gridSize, blockSize, 0, stream>>>(originalImage.dataPointer<half>(),
         inputPatches.dataPointer<half>(), inputOffset, height, width, channels, blockSizeH, blockSizeW);
 }
 
-__global__ void initMaskToMinKernel(half* attentionMask, int64_t const totalElements)
+// Phi4MM Pack All Batched Kernel
+namespace
+{
+// copyHiddenVec
+// Purpose:
+//   Efficiently copy one token vector of length `hidden` (FP16) from src → dst.
+//   Uses vectorized loads/stores (kernel::DVec<half>) to maximize memory
+//   throughput on the hidden dimension which is contiguous in memory.
+//
+// Execution model:
+//   - All threads in the CTA cooperate to copy one token:
+//       each thread handles chunks in a round-robin fashion with stride = blockDim.x.
+//   - Vector width V is chosen by DVec<half>::vec_size (typically 8 halves).
+//   - Tail elements (< V) are copied by thread 0 to avoid race conditions.
+//
+// Rationale:
+//   In all pack kernels below, we write tokens consecutively in the output,
+//   making writes coalesced. Reads are strided because different tokens are
+//   gathered, so vectorizing the hidden copy minimizes the cost of those reads.
+__device__ __forceinline__ void copyHiddenVec(
+    half const* __restrict__ src, half* __restrict__ dst, int32_t hidden, int32_t threadStride, int32_t threadIdxX)
+{
+    // Vectorized copy in chunks of 8 halves
+    constexpr int32_t V = kernel::DVec<half>::vec_size;
+    int32_t const numChunks = hidden / V;
+    for (int32_t chunk = threadIdxX; chunk < numChunks; chunk += threadStride)
+    {
+        kernel::DVec<half> vec;
+        vec.load(src + chunk * V);
+        vec.store(dst + chunk * V);
+    }
+    // Tail copy by thread 0
+    int32_t const tail = hidden % V;
+    if (threadIdxX == 0)
+    {
+        int32_t const base = numChunks * V;
+        for (int32_t i = 0; i < tail; ++i)
+        {
+            dst[base + i] = src[base + i];
+        }
+    }
+}
+
+// binarySearchImage
+// Purpose:
+//   Given a global output token index `tokenIdx` and an array `outStart` of size
+//   `numImages` where each element denotes the starting output token offset of
+//   an image, find the image index that owns `tokenIdx`.
+//
+// Contract/assumptions:
+//   - outStart is monotonically non-decreasing.
+//   - The i-th image covers output indices in [outStart[i], outStart[i+1]) for i < numImages-1,
+//     and [outStart[numImages-1], totalOutTokens) for the last image.
+//
+// Returns:
+//   The greatest index i such that outStart[i] <= tokenIdx.
+__device__ __forceinline__ int32_t binarySearchImage(
+    int64_t const* __restrict__ outStart, int32_t numImages, int64_t tokenIdx)
+{
+    int32_t lo = 0;
+    int32_t hi = numImages - 1;
+    int32_t ans = numImages - 1;
+    while (lo <= hi)
+    {
+        int32_t mid = lo + ((hi - lo) >> 1);
+        if (outStart[mid] <= tokenIdx)
+        {
+            ans = mid;
+            lo = mid + 1;
+        }
+        else
+        {
+            hi = mid - 1;
+        }
+    }
+    return ans;
+}
+} // namespace
+
+__global__ void phi4mmPostprocessVisionTokensKernel(
+    half const* __restrict__ src, half* __restrict__ dst, Phi4MMIndex idx, Phi4MMGN gn)
+{
+    int64_t tokenIdx = static_cast<int64_t>(blockIdx.x);
+    if (tokenIdx >= idx.totalOutTokens)
+    {
+        return;
+    }
+
+    int32_t const img = binarySearchImage(idx.dstOutStart, idx.numImages, tokenIdx);
+    int64_t const localIdx = tokenIdx - idx.dstOutStart[img];
+
+    int64_t const subLen = idx.subOutLen[img];
+
+    half* dstPtr = dst + tokenIdx * idx.hidden;
+
+    if (localIdx < subLen)
+    {
+        // sub segment
+        int32_t const wb = idx.wBlocks[img];
+        int64_t const cols = kTokensPerSidePhi4 * wb;
+        int64_t const strideOut = cols + 1;
+        int64_t const r = localIdx / strideOut;
+        int64_t const c = localIdx % strideOut;
+        if (c == cols)
+        {
+            copyHiddenVec(gn.subGN, dstPtr, idx.hidden, blockDim.x, threadIdx.x);
+            return;
+        }
+        int64_t const bRow = r / kTokensPerSidePhi4;
+        int64_t const pRow = r % kTokensPerSidePhi4;
+        int64_t const bCol = c / kTokensPerSidePhi4;
+        int64_t const pCol = c % kTokensPerSidePhi4;
+        int64_t const blockId = bRow * wb + bCol;
+        int64_t const patchId = pRow * kTokensPerSidePhi4 + pCol;
+        int64_t const srcTokIndex = idx.srcSubStart[img] + blockId * kTokensPerBlockPhi4 + patchId;
+        half const* srcPtr = src + srcTokIndex * idx.hidden;
+        copyHiddenVec(srcPtr, dstPtr, idx.hidden, blockDim.x, threadIdx.x);
+        return;
+    }
+    else if (localIdx == subLen)
+    {
+        // single glb_GN
+        copyHiddenVec(gn.glbGN, dstPtr, idx.hidden, blockDim.x, threadIdx.x);
+        return;
+    }
+    else
+    {
+        // glb segment
+        int64_t const idx2 = localIdx - (subLen + 1);
+        int64_t const cols = kTokensPerSidePhi4;
+        int64_t const strideOut = cols + 1;
+        int64_t const r = idx2 / strideOut;
+        int64_t const c = idx2 % strideOut;
+        if (c == cols)
+        {
+            copyHiddenVec(gn.subGN, dstPtr, idx.hidden, blockDim.x, threadIdx.x);
+            return;
+        }
+        int64_t const srcTokIndex = idx.srcGlbStart[img] + r * kTokensPerSidePhi4 + c;
+        half const* srcPtr = src + srcTokIndex * idx.hidden;
+        copyHiddenVec(srcPtr, dstPtr, idx.hidden, blockDim.x, threadIdx.x);
+        return;
+    }
+}
+
+void phi4mmPostprocessVisionTokens(rt::Tensor const& srcEmbedding, rt::Tensor& dstEmbedding, Phi4MMIndex const& indices,
+    Phi4MMGN const& gn, int64_t totalOutTokens, cudaStream_t stream)
+{
+    check::check(
+        srcEmbedding.getDeviceType() == rt::DeviceType::kGPU && dstEmbedding.getDeviceType() == rt::DeviceType::kGPU,
+        "phi4mmPostprocessVisionTokens(): All tensors must be on GPU.");
+    check::check(srcEmbedding.getDataType() == DataType::kHALF && dstEmbedding.getDataType() == DataType::kHALF,
+        "phi4mmPostprocessVisionTokens(): Embeddings and dstEmbedding must be FP16.");
+
+    int32_t const hidden = static_cast<int32_t>(srcEmbedding.getShape()[1]);
+    dim3 block(128);
+    dim3 grid(static_cast<uint32_t>(totalOutTokens));
+    phi4mmPostprocessVisionTokensKernel<<<grid, block, 0, stream>>>(
+        srcEmbedding.dataPointer<half>(), dstEmbedding.dataPointer<half>(), indices, gn);
+}
+
+__global__ void initMaskToMinKernel(half* attentionMask, int32_t const totalElements)
 {
     auto const tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= totalElements)

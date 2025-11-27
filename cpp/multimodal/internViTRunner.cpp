@@ -18,15 +18,14 @@
 #include "internViTRunner.h"
 #include "common/bindingNames.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
+#include "multimodal/imageUtils.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <numeric>
-#include <random>
 #include <stdexcept>
-#include <tuple>
 
 using Json = nlohmann::json;
 
@@ -108,11 +107,6 @@ bool InternViTRunner::validateAndFillConfig(std::string const& engineDir)
     return true;
 }
 
-void* InternViTRunner::getConfig()
-{
-    return &mConfig;
-}
-
 bool InternViTRunner::allocateBuffer(cudaStream_t stream)
 {
     bool setTensorAddressStatus{true};
@@ -124,9 +118,9 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
         = rt::Tensor({mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
-    // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
     LOG_INFO("InternViTRunner::allocateBuffer() mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d",
-        mConfig.maxNumBlocks * 256, mConfig.outHiddenSize);
+        mConfig.maxNumBlocks, mConfig.outHiddenSize);
+    // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
     mOutputEmbedding = rt::Tensor(
         {mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
@@ -137,7 +131,7 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
     }
 
     // Copy image mean and std to device to be used in normalizeImage
-    auto channels = mConfig.imageMean.size();
+    int64_t const channels = static_cast<int64_t>(mConfig.imageMean.size());
     mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
     mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
     CUDA_CHECK(cudaMemcpyAsync(
@@ -160,7 +154,7 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
     return true;
 }
 
-void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
+void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
     int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream)
 {
     int64_t height = image.height;
@@ -216,64 +210,10 @@ void InternViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
 
     // Transpose to patch
     int64_t offset = totalNumBlocks * mConfig.numChannels * mConfig.blockImageSizeH * mConfig.blockImageSizeW;
-    kernel::transposeToPatchInternVL(mNormalizedImageDevice, mVitInput, offset, stream);
+    kernel::transposeToPatchInternVLPhi4MM(mNormalizedImageDevice, mVitInput, offset, stream);
 
     // Update numBlocks
     totalNumBlocks += curNumBlocks;
-}
-
-std::vector<std::pair<int64_t, int64_t>> InternViTRunner::getAllSupportedAspectRatios(
-    int64_t const minImageTiles, int64_t const maxImageTiles)
-{
-    std::vector<std::pair<int64_t, int64_t>> aspectRatios;
-    for (int64_t width = 1; width <= maxImageTiles; ++width)
-    {
-        for (int64_t height = 1; height <= maxImageTiles; ++height)
-        {
-            if (width * height <= maxImageTiles && width * height >= minImageTiles)
-            {
-                aspectRatios.emplace_back(width, height);
-            }
-        }
-    }
-    std::sort(aspectRatios.begin(), aspectRatios.end(),
-        [](std::pair<int64_t, int64_t> const& a, std::pair<int64_t, int64_t> const& b) {
-            return a.first * a.second < b.first * b.second;
-        });
-    return aspectRatios;
-}
-
-std::tuple<int64_t, int64_t> InternViTRunner::getResizedImageSize(int64_t const height, int64_t const width)
-{
-    // -1 because we add a thumbnail image for each image
-    int64_t const minImageTiles = std::max(int64_t(1), mConfig.minImageTokensPerImage / 256 - 1);
-    int64_t const maxImageTiles = std::max(int64_t(1), mConfig.maxImageTokensPerImage / 256 - 1);
-    auto targetRatios = getAllSupportedAspectRatios(minImageTiles, maxImageTiles);
-    double const aspectRatio = static_cast<double>(width) / height;
-    int64_t const area = width * height;
-
-    double bestRatioDiff = HUGE_VAL;
-    std::pair<int64_t, int64_t> bestRatio = {1, 1};
-    for (auto const& ratio : targetRatios)
-    {
-        double const targetAspectRatio = static_cast<double>(ratio.first) / ratio.second;
-        double const ratioDiff = std::abs(aspectRatio - targetAspectRatio);
-
-        if (ratioDiff < bestRatioDiff)
-        {
-            bestRatioDiff = ratioDiff;
-            bestRatio = ratio;
-        }
-        else if (ratioDiff == bestRatioDiff)
-        {
-            if (area > 0.5 * mConfig.blockImageSizeH * mConfig.blockImageSizeW * ratio.first * ratio.second)
-            {
-                bestRatio = ratio;
-            }
-        }
-    }
-    // return (height, width)
-    return {bestRatio.second * mConfig.blockImageSizeH, bestRatio.first * mConfig.blockImageSizeW};
 }
 
 void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
@@ -288,7 +228,9 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         {
             if (doResize)
             {
-                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
+                auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
+                    image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
+                    mConfig.blockImageSizeH, mConfig.blockImageSizeW);
                 rt::imageUtils::resizeImage(image, mResizedImageHost, resizedWidth, resizedHeight);
                 formatPatch(mResizedImageHost, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
