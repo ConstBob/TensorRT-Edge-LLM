@@ -101,15 +101,13 @@ def visual_export(model_dir: str,
             model.visual.config,
             torch_dtype=torch_dtype,
         )
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  min_pixels=128 * 28 * 28,
-                                                  max_pixels=2048 * 28 * 28,
-                                                  trust_remote_code=True)
         wrapped_model.load_state_dict(model.visual.state_dict())
         wrapped_model.eval().to(device)
 
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
+            processor = AutoProcessor.from_pretrained(model_dir,
+                                                      trust_remote_code=True)
             wrapped_model = quantize_visual(wrapped_model, quantization,
                                             processor, dataset_dir)
 
@@ -123,14 +121,12 @@ def visual_export(model_dir: str,
             model.visual.config,
             torch_dtype=torch_dtype,
         )
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  min_pixels=128 * 28 * 28,
-                                                  max_pixels=2048 * 28 * 28,
-                                                  trust_remote_code=True)
         wrapped_model.load_state_dict(model.visual.state_dict())
         wrapped_model.eval().to(device)
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
+            processor = AutoProcessor.from_pretrained(model_dir,
+                                                      trust_remote_code=True)
             wrapped_model = quantize_visual(wrapped_model, quantization,
                                             processor, dataset_dir)
 
@@ -144,14 +140,12 @@ def visual_export(model_dir: str,
             model.visual.config,
             torch_dtype=torch_dtype,
         )
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  min_pixels=128 * 28 * 28,
-                                                  max_pixels=2048 * 28 * 28,
-                                                  trust_remote_code=True)
         wrapped_model.load_state_dict(model.visual.state_dict())
         wrapped_model.eval().to(device)
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
+            processor = AutoProcessor.from_pretrained(model_dir,
+                                                      trust_remote_code=True)
             wrapped_model = quantize_visual(wrapped_model, quantization,
                                             processor, dataset_dir)
 
@@ -162,12 +156,12 @@ def visual_export(model_dir: str,
         print(f"Exporting InternVL3 visual model from {model_dir}")
         # Create InternVL3 wrapper model
         wrapped_model = InternVLVisionModel(model)
-        processor = AutoProcessor.from_pretrained(
-            model_dir, trust_remote_code=True).image_processor
         wrapped_model.eval().to(device)
 
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
+            processor = AutoProcessor.from_pretrained(
+                model_dir, trust_remote_code=True).image_processor
             wrapped_model = quantize_visual(wrapped_model, quantization,
                                             processor, dataset_dir)
 
