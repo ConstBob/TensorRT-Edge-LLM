@@ -117,6 +117,97 @@ def untie_nvfp4_lm_head_initializer(model: onnx.ModelProto) -> onnx.ModelProto:
     return model
 
 
+def fix_model_int4_output_dtypes(
+        onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """Fix data types for model outputs.
+    In modelopt int4 post-processing, some Cast nodes are converted to FP16 instead of FP32 and hidden_states are converted to FP32 instead of FP16, so we need to fix them manually.
+    See: https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/0.37.0/modelopt/onnx/quantization/qdq_utils.py#L1050
+    
+    Ensures:
+    1. For cast->logits or cast->logsoftmax->logits patterns, both cast and logits are FP32
+    2. For hidden_states output, it is FP16
+    
+    Args:
+        onnx_model: The ONNX model to fix
+    
+    Returns:
+        The modified ONNX model
+    """
+    graph = onnx_model.graph
+
+    # Build a map from output name to producer node
+    output_to_node = {}
+    for node in graph.node:
+        for output in node.output:
+            output_to_node[output] = node
+
+    # Build a map from output name to graph output
+    graph_outputs = {output.name: output for output in graph.output}
+
+    # Helper to update Cast node's "to" attribute
+    def set_cast_dtype(node, dtype):
+        for attr in node.attribute:
+            if attr.name == "to":
+                attr.i = dtype
+                return
+
+    # Fix logits output to FP32
+    if "logits" in graph_outputs:
+        logits = graph_outputs["logits"]
+        producer = output_to_node.get(logits.name)
+
+        # Check for cast->logsoftmax->logits
+        if producer and producer.op_type == "LogSoftmax":
+            cast_node = output_to_node.get(producer.input[0])
+            if cast_node and cast_node.op_type == "Cast":
+                print("Found cast->logsoftmax->logits, ensuring FP32")
+                set_cast_dtype(cast_node, 1)
+        # Check for cast->logits
+        elif producer and producer.op_type == "Cast":
+            print("Found cast->logits, ensuring FP32")
+            set_cast_dtype(producer, 1)
+
+        # Set logits output type to FP32
+        logits.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+
+    # Fix hidden_states output to FP16
+    if "hidden_states" in graph_outputs:
+        hidden_states = graph_outputs["hidden_states"]
+        producer = output_to_node.get(hidden_states.name)
+
+        if hidden_states.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16:
+            print("hidden_states is already FP16")
+        else:
+            # If producer is Cast, just update it
+            if producer and producer.op_type == "Cast":
+                print("Updating existing Cast to FP16 for hidden_states")
+                set_cast_dtype(producer, 10)
+            else:
+                # Insert new Cast node
+                print("Inserting Cast to FP16 for hidden_states")
+                intermediate = f"{hidden_states.name}_pre_fp16"
+
+                # Rename producer's output
+                if producer:
+                    for i, out in enumerate(producer.output):
+                        if out == hidden_states.name:
+                            producer.output[i] = intermediate
+
+                # Add Cast node
+                cast = onnx.helper.make_node(
+                    "Cast",
+                    inputs=[intermediate],
+                    outputs=[hidden_states.name],
+                    to=10,
+                    name=f"{hidden_states.name}_cast_fp16")
+                graph.node.append(cast)
+
+            # Set hidden_states output type to FP16
+            hidden_states.type.tensor_type.elem_type = onnx.TensorProto.FLOAT16
+
+    return onnx_model
+
+
 def export_onnx(model, inputs, output_dir, input_names, output_names,
                 dynamic_axes):
     '''
@@ -172,6 +263,8 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
             "INT4 AWQ quantization detected in the model, compressing some weights to INT4 and inserting int4 gemm plugin"
         )
         onnx_model = quantize_weights_to_int4(onnx_model)
+        # Fix the Cast nodes and hidden_states output types for INT4 models
+        onnx_model = fix_model_int4_output_dtypes(onnx_model)
         graph = gs.import_onnx(onnx_model)
         graph = int4_dq_gemm_to_plugin(graph)
     if is_fp8_quantized(model):
