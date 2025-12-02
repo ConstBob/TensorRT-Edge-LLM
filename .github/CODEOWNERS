@@ -1,0 +1,18 @@
+#cpp code owners
+cpp/ @NVIDIA/tensorrt-edgellm-dev
+
+#python code owners
+tensorrt_edgellm/ @NVIDIA/tensorrt-edgellm-dev
+
+#cmake code owners
+CMakeLists.txt @NVIDIA/tensorrt-edgellm-dev
+cmake/ @NVIDIA/tensorrt-edgellm-dev
+
+#doc code owners
+docs/ @NVIDIA/tensorrt-edgellm-dev
+
+#examples code owners
+examples/ @NVIDIA/tensorrt-edgellm-dev
+
+#build/ops code owners
+.github/ @NVIDIA/tensorrt-edgellm-dev

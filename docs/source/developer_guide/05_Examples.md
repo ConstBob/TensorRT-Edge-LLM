@@ -21,6 +21,8 @@
 
 C++ examples for building engines and running inference. All examples include detailed README files and source code in `examples/`.
 
+> **⚠️ USER RESPONSIBILITY**: Users are responsible for composing meaningful and appropriate prompts for their use cases. The examples provided demonstrate technical usage patterns but do not guarantee output quality or appropriateness.
+
 ---
 
 ## Example Flow
