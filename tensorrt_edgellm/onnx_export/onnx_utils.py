@@ -241,23 +241,6 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
     onnx_model = onnx.load(onnx_path)
     graph = None
 
-    # Since torch.onnx.export deduplicates weights, lm_head and embed_tokens can
-    # share the same ONNX initializer. To prevent quantization of lm_head (e.g. NVFP4)
-    # from affecting embed_tokens, we manually create a separate initializer.
-    # See: https://github.com/pytorch/pytorch/blob/v2.9.0-rc9/torch/csrc/jit/passes/onnx/deduplicate_initializers.cpp#L96
-    if isinstance(model, EdgeLLMModelForCausalLM) and is_fp4_quantized(
-            model.lm_head):
-        onnx_model = untie_nvfp4_lm_head_initializer(onnx_model)
-    if is_fp4_quantized(model):
-        print(
-            "NVFP4 quantization detected in the model, compressing some weights to NVFP4"
-        )
-        onnx_model = fp4qdq_to_2dq(onnx_model)
-    if is_mxfp8_quantized(model):
-        print(
-            "MXFP8 quantization detected in the model, compressing some weights to MXFP8"
-        )
-        onnx_model = quantize_weights_to_mxfp8(onnx_model)
     if is_int4_awq_quantized(model):
         print(
             "INT4 AWQ quantization detected in the model, compressing some weights to INT4 and inserting int4 gemm plugin"
@@ -276,6 +259,24 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
         graph = fold_fp8_qdq_to_dq(graph)
     if graph is not None:
         onnx_model = gs.export_onnx(graph)
+
+    # Since torch.onnx.export deduplicates weights, lm_head and embed_tokens can
+    # share the same ONNX initializer. To prevent quantization of lm_head (e.g. NVFP4)
+    # from affecting embed_tokens, we manually create a separate initializer.
+    # See: https://github.com/pytorch/pytorch/blob/v2.9.0-rc9/torch/csrc/jit/passes/onnx/deduplicate_initializers.cpp#L96
+    if isinstance(model, EdgeLLMModelForCausalLM) and is_fp4_quantized(
+            model.lm_head):
+        onnx_model = untie_nvfp4_lm_head_initializer(onnx_model)
+    if is_fp4_quantized(model):
+        print(
+            "NVFP4 quantization detected in the model, compressing some weights to NVFP4"
+        )
+        onnx_model = fp4qdq_to_2dq(onnx_model)
+    if is_mxfp8_quantized(model):
+        print(
+            "MXFP8 quantization detected in the model, compressing some weights to MXFP8"
+        )
+        onnx_model = quantize_weights_to_mxfp8(onnx_model)
 
     print(
         "Removing all the files in the output directory except for .json files"
