@@ -221,7 +221,14 @@ private:
     // [5] Batch eviction support tensors.
     rt::Tensor mDeviceBatchMapping;
 
-    // [6] Special tokens for reuse KV cache.
+    // [6] Host pinned memory tensors for optimized CPU-GPU memory transfers
+    rt::Tensor mHostPackedTokenIds;      //!< Host pinned memory for packed token IDs
+    rt::Tensor mHostSelectedTokenIds;    //!< Host pinned memory for selected token IDs from sampling
+    rt::Tensor mHostAcceptLengths;       //!< Host pinned memory for accept lengths from verification
+    rt::Tensor mHostAcceptedTokenIds;    //!< Host pinned memory for accepted token IDs
+    rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
+
+    // [7] Special tokens for reuse KV cache.
     // TODO: Remove this to allow generalization.
     int32_t mImStartTokenId;
 
