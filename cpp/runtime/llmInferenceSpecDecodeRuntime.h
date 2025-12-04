@@ -228,10 +228,6 @@ private:
     rt::Tensor mHostAcceptedTokenIds;    //!< Host pinned memory for accepted token IDs
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
 
-    // [7] Special tokens for reuse KV cache.
-    // TODO: Remove this to allow generalization.
-    int32_t mImStartTokenId;
-
     // Key functions to drive the spec-decode runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     bool runBaseModelPrefill(SpecDecodeInferenceContext& context);

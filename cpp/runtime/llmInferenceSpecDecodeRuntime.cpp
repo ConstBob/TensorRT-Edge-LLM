@@ -265,12 +265,6 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     }
     LOG_INFO("Tokenizer successfully loaded from model directory: %s", engineDir.c_str());
 
-    // Check we have exactly one mImStartTokenId and use it
-    // TODO: Remove this implicit usage of <|im_start|> to allow generalization.
-    std::vector<int32_t> imStartTokenIdVec = mTokenizer->encode("<|im_start|>", false);
-    check::check(imStartTokenIdVec.size() == 1, "imStartTokenIdVec should contain exactly one token");
-    mImStartTokenId = imStartTokenIdVec[0];
-
     // Optional: Setup multimodal engine runner
     if (!multimodalEngineDir.empty())
     {
@@ -1157,13 +1151,16 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
 
             int32_t reuseLength = static_cast<int32_t>(kvCacheContentBase.getShape()[3]);
             // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
-            check::check(
-                reuseLength < batchedInputIds[i].size(), "The reuse length shall not exceed the input length.");
-            reuseKVCacheLengthsData[i] = reuseLength;
+            check::check(reuseLength > 0 && reuseLength < batchedInputIds[i].size(),
+                "The reuse length shall larger than 0 and not exceed the input length.");
+            // Reuse N-1 tokens from the cached prefix so the Nth token is treated as real input in prefill;
+            // this keeps the draft prefill boundary aligned with the true next-token position.
+            int32_t const effectiveReuseLength = reuseLength - 1;
+            reuseKVCacheLengthsData[i] = effectiveReuseLength;
 
-            // Directly assign to context.tokenIds (skip reused portion)
-            context.tokenIds[i].assign(batchedInputIds[i].begin() + reuseLength, batchedInputIds[i].end());
-            context.promptLengths[i] = static_cast<int32_t>(batchedInputIds[i].size() - reuseLength);
+            // Directly assign to context.tokenIds (skip only the reused portion, keep the next token for normal flow)
+            context.tokenIds[i].assign(batchedInputIds[i].begin() + effectiveReuseLength, batchedInputIds[i].end());
+            context.promptLengths[i] = static_cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
 
             bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
                 precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
@@ -1273,11 +1270,6 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
         LOG_ERROR("Failed to execute base model prefill for system prompt KVCache generation.");
         return false;
     }
-
-    // During system prompt KVCache generation, we know the next token is <|im_start|> (first token of user prompt)
-    // Set it explicitly to avoid sampling randomness
-    check::check(!tempContext.tokenIds[0].empty(), "Token IDs should not be empty at this point.");
-    tempContext.tokenIds[0].back() = mImStartTokenId;
 
     // Tokens produced during system KV-cache reuse prefill do not count as generated tokens
     tempContext.currentGenerateLengths[0] -= 1;

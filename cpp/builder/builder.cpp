@@ -904,27 +904,15 @@ bool VisualBuilder::build()
         {
             // Copy Phi-4MM GN(Grid Newline) projection weights to engine directory for runtime loading
             // GN serves as line separator
-            std::filesystem::path const src = mOnnxDir / "phi4mm_gn_proj.safetensors";
-            std::filesystem::path const dst = mEngineDir / "phi4mm_gn_proj.safetensors";
-            if (std::filesystem::exists(src))
+            std::string src = mOnnxDir.string() + "/phi4mm_gn_proj.safetensors";
+            std::string dst = mEngineDir.string() + "/phi4mm_gn_proj.safetensors";
+            if (file_io::copyFile(src, dst))
             {
-                std::error_code ec;
-                bool const copyStatus
-                    = std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
-                if (!copyStatus)
-                {
-                    LOG_ERROR("Failed to copy %s to %s: %s", src.string().c_str(), dst.string().c_str(),
-                        ec.message().c_str());
-                    return false;
-                }
-                else
-                {
-                    LOG_INFO("Copied Phi4MM GN projection weights to %s", dst.string().c_str());
-                }
+                LOG_INFO("Copied Phi4MM GN projection weights to %s", dst.c_str());
             }
             else
             {
-                LOG_ERROR("Phi4MM GN projection weights not found at %s (skip copy)", src.string().c_str());
+                LOG_ERROR("Failed to copy Phi4MM GN projection weights to %s", dst.c_str());
                 return false;
             }
         }
@@ -1180,7 +1168,8 @@ bool VisualBuilder::copyConfig()
     if (std::filesystem::exists(preprocessorConfigPath))
     {
         std::string targetPreprocessorConfigPath = mEngineDir.string() + "/preprocessor_config.json";
-        std::filesystem::copy(preprocessorConfigPath, targetPreprocessorConfigPath);
+        std::filesystem::copy(
+            preprocessorConfigPath, targetPreprocessorConfigPath, std::filesystem::copy_options::overwrite_existing);
         LOG_INFO("Copied preprocessor config to %s", targetPreprocessorConfigPath.c_str());
     }
     else
