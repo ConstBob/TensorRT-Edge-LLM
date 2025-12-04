@@ -15,6 +15,7 @@
 
 import argparse
 import json
+import re
 from collections import defaultdict
 
 
@@ -27,6 +28,31 @@ def clean_text(text):
         Cleaned text string.
     """
     return text.strip().strip("().,")
+
+
+def parse_multi_choice_response(text):
+    """
+    Parse multiple choice answer from text that may be in various formats.
+    Handles formats like "A. xxx", "A", "(A)", or just returns first letter if it's A-H.
+    
+    Args:
+        text: Input text string potentially containing a multiple choice answer.
+    Returns:
+        Single letter (A-H) if found, otherwise returns the original cleaned text.
+    """
+    text = text.strip()
+
+    # If text is already just a single letter A-H, return it
+    if len(text) == 1 and text in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+        return text
+
+    # Try to match pattern like "A." or "A)" or "(A)" at the start
+    match = re.match(r'^[\(]?([A-H])[\.\):\s]', text)
+    if match:
+        return match.group(1)
+
+    # If no match found, return the original text
+    return text
 
 
 def calculate_correctness(predictions, references):
@@ -49,6 +75,9 @@ def calculate_correctness(predictions, references):
         # Clean and normalize text for comparison
         pred_clean = clean_text(pred)
         ref_clean = clean_text(ref)
+        # Clean for multi-choice
+        if ref_clean in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+            pred_clean = parse_multi_choice_response(pred_clean)
         if pred_clean == ref_clean:
             correct_count += 1
 
@@ -77,6 +106,9 @@ def calculate_subject_accuracy(predictions, references, subjects):
         # Clean and normalize text for comparison
         pred_clean = clean_text(pred)
         ref_clean = clean_text(ref)
+        # Clean for multi-choice
+        if ref_clean in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+            pred_clean = parse_multi_choice_response(pred_clean)
         if pred_clean == ref_clean:
             subject_stats[subject]['correct'] += 1
 
