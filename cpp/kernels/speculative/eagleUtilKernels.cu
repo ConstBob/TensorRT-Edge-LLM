@@ -134,8 +134,11 @@ __global__ void assembleCasualTreeAndSelectIndicesKernel(int32_t const* sequence
 
     // 32 should be sufficient for accepted tokens from base model.
     int32_t packedTreeMask{0};
+    int32_t const packedTreeMaskOffset = batchIdx * maxAcceptedTokenNum + tokenIdx;
+
     if (tokenIdx < acceptedTokenNum)
     {
+        // Valid tokens: set causal mask and valid position
         for (int32_t i = 0; i <= tokenIdx; ++i)
         {
             packedTreeMask |= (1 << i);
@@ -145,14 +148,27 @@ __global__ void assembleCasualTreeAndSelectIndicesKernel(int32_t const* sequence
         // Here the accepted token num should be strictly smaller than 32.
         // tensor position indices have layout of [batch, max-accepted-token-num], the offset will be identical to
         // packed tree mask.
-        int32_t const packedTreeMaskOffset = batchIdx * maxAcceptedTokenNum + tokenIdx;
         packedTreeMasks[packedTreeMaskOffset] = packedTreeMask;
         tensorPositionIndices[packedTreeMaskOffset] = sequenceStartIndices[batchIdx] + tokenIdx;
+    }
+    else if (tokenIdx < maxAcceptedTokenNum)
+    {
+        // Padding tokens: set position to -1 to indicate padding, mask to 0 to prevent attention
+        // The -1 position ensures:
+        // 1. RoPE kernel won't write K/V to cache for padding tokens
+        // 2. Padding tokens won't contribute to attention computation
+        packedTreeMasks[packedTreeMaskOffset] = 0;
+        tensorPositionIndices[packedTreeMaskOffset] = -1;
     }
     if (threadIdx.x == 0)
     {
         selectTokenIndices[batchIdx] = acceptedTokenNum - 1;
-        sequenceContextLengths[batchIdx] = sequenceStartIndices[batchIdx] + acceptedTokenNum;
+        // Use maxAcceptedTokenNum (padded length) instead of acceptedTokenNum (actual length).
+        // This ensures the attention kernel computes the correct context K range:
+        //   cacheSeqLen = sequenceStartIndices + maxAcceptedTokenNum
+        //   actualQSeqLen = maxAcceptedTokenNum (qSeqLen passed to kernel)
+        //   Context K range = K[0 : cacheSeqLen - actualQSeqLen] = K[0 : sequenceStartIndices]
+        sequenceContextLengths[batchIdx] = sequenceStartIndices[batchIdx] + maxAcceptedTokenNum;
     }
 }
 

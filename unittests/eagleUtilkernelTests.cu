@@ -569,11 +569,13 @@ TEST(EagleKernels, PrepareEagleAcceptDecodeTokenInputs)
     std::vector<int32_t> expectedMaskBatch0 = {1, 3, 7, 15, 31};
     std::vector<int32_t> expectedPositionsBatch0 = {100, 101, 102, 103, 104};
     int64_t expectedSelectIndexBatch0 = 4; // Last token
-    int32_t expectedContextLenBatch0 = 105;
+    // Context length now uses maxAcceptedTokenNum (padded length) instead of actual acceptedTokenNum
+    // This is required for correct XQA attention context K range calculation with padding
+    int32_t expectedContextLenBatch0 = 100 + maxAcceptedTokenNum; // 108
 
     // Expected for batch 1: 3 tokens
     int64_t expectedSelectIndexBatch1 = 2;
-    int32_t expectedContextLenBatch1 = 203;
+    int32_t expectedContextLenBatch1 = 200 + maxAcceptedTokenNum; // 208
 
     for (int32_t batchSize : {1, 2, 4, 8})
     {
@@ -625,7 +627,8 @@ TEST(EagleKernels, PrepareEagleAcceptDecodeTokenInputs)
         for (int32_t b = 0; b < batchSize; b++)
         {
             EXPECT_EQ(actualSelectIndices[b], inputAcceptedTokenNums[b] - 1);
-            EXPECT_EQ(actualContextLengths[b], inputSequenceStartIndices[b] + inputAcceptedTokenNums[b]);
+            // Context length uses maxAcceptedTokenNum (padded length) for correct XQA attention range
+            EXPECT_EQ(actualContextLengths[b], inputSequenceStartIndices[b] + maxAcceptedTokenNum);
         }
     }
 }
