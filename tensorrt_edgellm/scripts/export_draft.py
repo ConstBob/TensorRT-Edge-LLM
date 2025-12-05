@@ -18,10 +18,10 @@ with support for EAGLE draft models.
 
 Usage:
     # EAGLE draft model export
-    python export_draft.py --draft_model_dir /path/to/draft_model --output_dir /path/to/output (--use_prompt_tuning)
+    python export_draft.py --draft_model_dir /path/to/draft_model --base_model_dir /path/to/base_model --output_dir /path/to/output (--use_prompt_tuning)
 
-    # Enable reusing KV cache for system prompts
-    python export_draft.py --draft_model_dir /path/to/draft_model --output_dir /path/to/output --enable_reuse_kv_cache
+    # Disable reusing KV cache for system prompts
+    python export_draft.py --draft_model_dir /path/to/draft_model --base_model_dir /path/to/base_model --output_dir /path/to/output --disable_reuse_kv_cache
 """
 
 import argparse

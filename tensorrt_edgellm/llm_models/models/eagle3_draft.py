@@ -130,6 +130,13 @@ class Eagle3DraftModel(nn.Module):
             if config.rope_scaling["type"] == "mrope":
                 config.rope_scaling["type"] = "default"
             config.rope_scaling["rope_type"] = config.rope_scaling["type"]
+        # Set default rope theta to 10000 if not specified
+        # See: https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py#L111
+        if config.rope_scaling is None and not hasattr(config, "rope_theta"):
+            print(
+                "Warning: rope_theta is not specified, setting default rope_theta to 10000 for EAGLE3 draft model"
+            )
+            config.rope_theta = 10000.0
         # We use the LlamaRotaryEmbedding for both Qwen2.5-VL and Llama because our quantization process only deals with text inputs.
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
