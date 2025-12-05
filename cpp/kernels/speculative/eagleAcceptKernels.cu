@@ -206,9 +206,11 @@ __global__ void eagleAcceptKernel(int32_t const* top1Tokens, int32_t const* toke
     int32_t const* batchTop1Tokens = top1Tokens + batchIdx * numTokens;
 
     // Parallel initialization of output arrays
+    // Use 0 for padding token IDs instead of -1 to avoid embedding lookup issues in draft model.
+    // The actual padding positions will be skipped based on acceptLength.
     for (int32_t i = tid; i < maxDepth; i += blockSize)
     {
-        acceptedTokenIds[batchIdx * maxDepth + i] = -1;
+        acceptedTokenIds[batchIdx * maxDepth + i] = 0;
         acceptedLogitsIndices[batchIdx * maxDepth + i] = -1;
     }
     if (tid == 0)

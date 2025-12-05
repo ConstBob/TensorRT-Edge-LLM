@@ -107,9 +107,16 @@ __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSi
     // Need to handle three scenarios: Context, vanllia decode, and tree attention.
     // Workaround: For vanllia decode use kvCacheEndLens to compute token positions.
     int32_t sinCosCachePos{};
+    bool const isPaddingToken = (tokenPosIds != nullptr && tokenPosIds[tokenIdx] == -1);
     if (tokenPosIds != nullptr)
     {
         sinCosCachePos = tokenPosIds[tokenIdx];
+        // For padding tokens (position = -1), use position 0 to avoid out-of-bounds access
+        // The actual computation for padding tokens will be skipped below
+        if (sinCosCachePos < 0)
+        {
+            sinCosCachePos = 0;
+        }
     }
     else
     {
@@ -142,7 +149,21 @@ __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSi
         int32_t const qHeadIdx = bIdy;
         T* qPTr = qkv + eleOffsetToken + qHeadIdx * headDim;
         DVec<T> qRoped;
-        qRoped = vecApplyRopeNonInterleave(qPTr, cosVec, sinVec, rotaryDim);
+
+        // For padding tokens, output zeros instead of RoPE-transformed values
+        if (isPaddingToken)
+        {
+            // Zero out the Q vector for padding tokens
+#pragma unroll
+            for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+            {
+                qRoped[i] = T(0);
+            }
+        }
+        else
+        {
+            qRoped = vecApplyRopeNonInterleave(qPTr, cosVec, sinVec, rotaryDim);
+        }
 
         if (qOut != nullptr)
         {
@@ -179,13 +200,18 @@ __global__ void applyRopeWriteKV(T* qkv, T* kvCache, T* qOut, float const* cosSi
             kRoped.store(qkv + srcKOffset + DVec<T>::vec_size * tIdx);
         }
 
-        // Save to KVCache which assume to have layout of [B, Hk + Hv, S, D]
-        int32_t cacheOffsetK = cacheOffsetSequence + kvHeadIdx * kvCacheCapacity * headDim + tokenIdxInCache * headDim
-            + DVec<T>::vec_size * tIdx;
-        int32_t cacheOffsetV = cacheOffsetSequence + (numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
-            + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
-        kRoped.store(kvCache + cacheOffsetK);
-        vSrc.store(kvCache + cacheOffsetV);
+        // Skip writing K/V to cache for padding tokens (position = -1)
+        // This ensures padding tokens don't corrupt valid cache entries
+        if (!isPaddingToken)
+        {
+            // Save to KVCache which assume to have layout of [B, Hk + Hv, S, D]
+            int32_t cacheOffsetK = cacheOffsetSequence + kvHeadIdx * kvCacheCapacity * headDim
+                + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
+            int32_t cacheOffsetV = cacheOffsetSequence + (numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
+                + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
+            kRoped.store(kvCache + cacheOffsetK);
+            vSrc.store(kvCache + cacheOffsetV);
+        }
     }
 }
 

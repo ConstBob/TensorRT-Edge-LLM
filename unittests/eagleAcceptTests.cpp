@@ -128,12 +128,13 @@ protected:
                     << testName << ": Logits index mismatch at batch " << b << " position " << i;
             }
 
-            // Check that unused positions are properly initialized to -1
+            // Check that unused positions are properly initialized to 0
+            // (Changed from -1 to 0 to avoid embedding lookup issues in draft model)
             for (int32_t i = hostAcceptLengths[b]; i < maxDepth; ++i)
             {
                 int32_t idx = b * maxDepth + i;
-                EXPECT_EQ(hostAcceptedTokenIds[idx], -1)
-                    << testName << ": Unused token ID position should be -1 at batch " << b << " position " << i;
+                EXPECT_EQ(hostAcceptedTokenIds[idx], 0)
+                    << testName << ": Unused token ID position should be 0 at batch " << b << " position " << i;
                 EXPECT_EQ(hostAcceptedLogitsIndices[idx], -1)
                     << testName << ": Unused logits index position should be -1 at batch " << b << " position " << i;
             }
@@ -234,7 +235,7 @@ TEST_F(EagleAcceptTest, MultiBatchSimple)
             EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 0], 0) << "Batch 1 logits index 0";
             EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 1], 1) << "Batch 1 logits index 1";
 
-            EXPECT_EQ(acceptedTokenIds[1 * 3 + 2], -1) << "Batch 1 unused token position should be -1";
+            EXPECT_EQ(acceptedTokenIds[1 * 3 + 2], 0) << "Batch 1 unused token position should be 0";
             EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 2], -1) << "Batch 1 unused logits index position should be -1";
         });
 }
@@ -450,7 +451,7 @@ TEST_F(EagleAcceptTest, MultiBatchAsymmetricTree)
             {
                 for (int32_t i = acceptLengths[b]; i < 5; ++i)
                 {
-                    EXPECT_EQ(acceptedTokenIds[b * 5 + i], -1)
+                    EXPECT_EQ(acceptedTokenIds[b * 5 + i], 0)
                         << "Batch " << b << " unused position " << i << " should be -1";
                     EXPECT_EQ(acceptedLogitsIndices[b * 5 + i], -1)
                         << "Batch " << b << " unused logits position " << i << " should be -1";
@@ -577,7 +578,7 @@ TEST_F(EagleAcceptTest, ComplexMultiBranchTree)
             EXPECT_EQ(acceptedLogitsIndices[2 * 4 + 1], 1) << "Batch 2 logits index 1";
             EXPECT_EQ(acceptedLogitsIndices[2 * 4 + 2], 2) << "Batch 2 logits index 2";
 
-            EXPECT_EQ(acceptedTokenIds[2 * 4 + 3], -1) << "Batch 2 unused token position should be -1";
+            EXPECT_EQ(acceptedTokenIds[2 * 4 + 3], 0) << "Batch 2 unused token position should be 0";
             EXPECT_EQ(acceptedLogitsIndices[2 * 4 + 3], -1) << "Batch 2 unused logits index position should be -1";
         });
 }
@@ -641,9 +642,9 @@ TEST_F(EagleAcceptTest, SingleBatchLogitTermination)
             EXPECT_EQ(acceptedLogitsIndices[1], 1) << "Second logits index";
             EXPECT_EQ(acceptedLogitsIndices[2], 2) << "Third logits index";
 
-            EXPECT_EQ(acceptedTokenIds[3], -1) << "Unused token position should be -1";
+            EXPECT_EQ(acceptedTokenIds[3], 0) << "Unused token position should be 0";
             EXPECT_EQ(acceptedLogitsIndices[3], -1) << "Unused logits index position should be -1";
-            EXPECT_EQ(acceptedTokenIds[4], -1) << "Unused token position should be -1";
+            EXPECT_EQ(acceptedTokenIds[4], 0) << "Unused token position should be 0";
             EXPECT_EQ(acceptedLogitsIndices[4], -1) << "Unused logits index position should be -1";
         });
 }
@@ -697,9 +698,9 @@ TEST_F(EagleAcceptTest, TokensNotInTree)
             EXPECT_EQ(acceptedTokenIds[0], 99) << "Should accept first predicted token (99)";
             EXPECT_EQ(acceptedLogitsIndices[0], 0) << "Should use logits[0]";
 
-            EXPECT_EQ(acceptedTokenIds[1], -1) << "Should not accept more tokens since 99 not in tree";
+            EXPECT_EQ(acceptedTokenIds[1], 0) << "Should not accept more tokens since 99 not in tree";
             EXPECT_EQ(acceptedLogitsIndices[1], -1) << "Should not use more logits";
-            EXPECT_EQ(acceptedTokenIds[2], -1) << "Should not accept more tokens";
+            EXPECT_EQ(acceptedTokenIds[2], 0) << "Should not accept more tokens";
             EXPECT_EQ(acceptedLogitsIndices[2], -1) << "Should not use more logits";
         });
 }
