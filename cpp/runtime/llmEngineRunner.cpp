@@ -45,7 +45,7 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& con
     std::stringstream ss;
 
     ss << std::boolalpha;
-    ss << "LLMEngineRunnerConfig:" << "  enableReuseKVCache: " << config.enableReuseKVCache
+    ss << "LLMEngineRunnerConfig:"
        << "  enableEagleSpecDecode: " << config.enableEagleSpecDecode << "  isVlm: " << config.isVlm
        << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
        << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
@@ -348,20 +348,6 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             throw std::runtime_error("Failed to set multimodal embeddings dummy tensor for generation context");
         }
     }
-    // Set kv cache start index to dummy tensor for generation contexts if reuse KV cache is enabled
-    if (mConfig.enableReuseKVCache)
-    {
-        bool setReuseKVCacheStatus{true};
-        setReuseKVCacheStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
-        setReuseKVCacheStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, rt::Coords{mConfig.maxSupportedBatchSize}.getTRTDims());
-        if (!setReuseKVCacheStatus)
-        {
-            LOG_ERROR("Failed to set reuse KV cache start index to the engine");
-            throw std::runtime_error("Failed to set reuse KV cache start index to the engine");
-        }
-    }
 
     // Reset the LoRA weights to zero tensors.
     if (!this->resetLoraWeights(stream))
@@ -379,8 +365,8 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
     try
     {
         // Define required fields for main config
-        std::vector<std::string> const requiredConfigFields = {"num_hidden_layers", "num_key_value_heads", "head_dim",
-            "vocab_size", "builder_config", "enable_reuse_kv_cache"};
+        std::vector<std::string> const requiredConfigFields
+            = {"num_hidden_layers", "num_key_value_heads", "head_dim", "vocab_size", "builder_config"};
 
         // Validate required fields exist in main config
         for (auto const& field : requiredConfigFields)
@@ -415,7 +401,6 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.rotaryDim = static_cast<int32_t>(mConfig.headDim * configJson.value("partial_rotary_factor", 1.0f));
         mConfig.hiddenSize = configJson["hidden_size"].get<int32_t>();
         mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
-        mConfig.enableReuseKVCache = configJson["enable_reuse_kv_cache"].get<bool>();
 
         // Extract builder_config values
         mConfig.isVlm = builderConfig["is_vlm"].get<bool>();
@@ -502,11 +487,6 @@ bool LLMEngineRunner::validateConfigFromEngine()
         return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPresentKeyValuesTemplate) != std::string::npos;
     };
 
-    // If the engine comes with "kvcache_start_index" binding, it means the engine enables reuse KVCache.
-    auto identifyReuseKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 1 && bindingName == binding_names::kKVCacheStartIndex;
-    };
-
     // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
     auto identifyMultimodalEmbeddingsBinding = [](std::string const& bindingName, Dims const& tensorDim) {
         return tensorDim.nbDims == 2 && bindingName == binding_names::kImageEmbeds;
@@ -520,7 +500,6 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
     int32_t nbKVCacheInputs{0};
     bool foundMultimodalEmbeddingsInput{false};
-    bool foundReuseKVCacheInput{false};
     int32_t numIOBindings = mEngine->getNbIOTensors();
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
@@ -580,21 +559,12 @@ bool LLMEngineRunner::validateConfigFromEngine()
             LOG_DEBUG("validateConfigFromEngine(): Found deepstack features binding: %s", bindingName.c_str());
             ++mConfig.numDeepstackFeatures;
         }
-        if (identifyReuseKVCacheBinding(bindingName, tensorDim))
-        {
-            foundReuseKVCacheInput = true;
-        }
     }
     // Validate hiddenSize from multimodal embeddings if VLM is enabled
     if (mConfig.isVlm && !foundMultimodalEmbeddingsInput)
     {
         LOG_ERROR(
             "VLM is enabled but multimodal embeddings input (%s) not found in engine", binding_names::kImageEmbeds);
-        return false;
-    }
-    if (foundReuseKVCacheInput != mConfig.enableReuseKVCache)
-    {
-        LOG_ERROR("enable_reuse_kv_cache is inconsistent between the engine and the config.");
         return false;
     }
     if (nbKVCacheInputs != mConfig.numDecoderLayers)
@@ -871,6 +841,24 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
         &= mPrefillExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
     setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+
+    // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
+    // Otherwise, we shall supply the KVCache lengths tensor to the engine.
+    if (mKVCache.getKVCacheAllEmpty())
+    {
+        setEngineIOStatus
+            &= mPrefillExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setEngineIOStatus
+            &= mPrefillExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
+    }
+    else
+    {
+        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    }
+
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
     // For MRope, the cache is initialized with maxBatchSize and does not need reshaping during prefill.
     // For non-MRope, the cache is fixed at {1, maxSeqLen, rotaryDim} and shared across all batches.
@@ -900,13 +888,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
                 &= mPrefillExecutionContext->setInputShape(tensor.getName().c_str(), tensor.getShape().getTRTDims());
         }
     }
-    if (mConfig.enableReuseKVCache)
-    {
-        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
-    }
+
     if (mConfig.enableEagleSpecDecode)
     {
         setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
@@ -1025,6 +1007,10 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
             binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
 
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
         if (mConfig.ropeConfig.type == RopeType::kMRope)
@@ -1038,13 +1024,6 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         // Update KV cache shapes to match activeBatchSize
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-        if (mConfig.enableReuseKVCache)
-        {
-            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-                binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-                binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
-        }
         // Engine output tensors.
         setEngineIOStatus
             &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
@@ -1197,6 +1176,10 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
             binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
 
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
         if (mConfig.ropeConfig.type == RopeType::kMRope)
@@ -1209,15 +1192,6 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
 
         // Update KV cache shapes to match activeBatchSize
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
-
-        // Update KV cache start index shape if reuse KV cache is enabled
-        if (mConfig.enableReuseKVCache)
-        {
-            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-                binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-                binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
-        }
 
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
             binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
@@ -1328,13 +1302,10 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
         binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-    if (mConfig.enableReuseKVCache)
-    {
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
-    }
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
 
     // Engine output tensors.
     setEngineIOStatus
@@ -1436,12 +1407,10 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     // Update KV cache shapes to match activeBatchSize for CUDA graph capture
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-    // Update KV cache start index shape if reuse KV cache is enabled
-    if (mConfig.enableReuseKVCache)
-    {
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
-    }
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
 
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));

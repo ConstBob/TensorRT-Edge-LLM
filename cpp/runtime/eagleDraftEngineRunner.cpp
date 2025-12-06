@@ -407,11 +407,6 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
         return tensorDim.nbDims == 2 && bindingName == binding_names::kImageEmbeds;
     };
 
-    // If the engine comes with "kvcache_start_index" binding, it means the engine enables reuse KVCache.
-    auto identifyReuseKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 1 && bindingName == binding_names::kKVCacheStartIndex;
-    };
-
     int32_t nbKVCacheInputs{0};
     bool foundMultimodalEmbeddingsInput{false};
     bool foundReuseKVCacheInput{false};
@@ -459,10 +454,6 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
                 return false;
             }
         }
-        if (identifyReuseKVCacheBinding(bindingName, tensorDim))
-        {
-            foundReuseKVCacheInput = true;
-        }
     }
 
     // Validate VLM configuration
@@ -470,11 +461,6 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     {
         LOG_ERROR(
             "VLM is enabled but multimodal embeddings input (%s) not found in engine", binding_names::kImageEmbeds);
-        return false;
-    }
-    if (foundReuseKVCacheInput != mConfig.enableReuseKVCache)
-    {
-        LOG_ERROR("enable_reuse_kv_cache is inconsistent between the engine and the config.");
         return false;
     }
     if (nbKVCacheInputs != mConfig.numDecoderLayers)
@@ -706,6 +692,23 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
+    // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
+    // Otherwise, we shall supply the KVCache lengths tensor to the engine.
+    if (!mLinearKVCache.getKVCacheAllEmpty())
+    {
+        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
+    }
+    else
+    {
+        setEngineIOStatus
+            &= mPrefillExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setEngineIOStatus
+            &= mPrefillExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
+    }
+
     // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
     if (mConfig.ropeConfig.type == RopeType::kMRope)
@@ -743,13 +746,6 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
             binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
         setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
             binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
-    }
-    if (mConfig.enableReuseKVCache)
-    {
-        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
     }
 
     // Bind the output tensor into the engine.
@@ -941,6 +937,10 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
             binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
 
         // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
         // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
@@ -954,15 +954,6 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
 
         // Update KV cache shapes to match activeBatchSize for generation context
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
-
-        // Update KV cache start index shape if reuse KV cache is enabled
-        if (mConfig.enableReuseKVCache)
-        {
-            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-                binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-                binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
-        }
 
         // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
@@ -1056,14 +1047,10 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     // Update KV cache shapes to match activeBatchSize for CUDA graph capture
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-    // Update KV cache start index shape if reuse KV cache is enabled
-    if (mConfig.enableReuseKVCache)
-    {
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
-    }
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(draftTreeInputIds.rawPointer()));
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1321,6 +1308,10 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
             binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
 
         // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
         // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
@@ -1334,15 +1325,6 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
 
         // Update KV cache shapes to match activeBatchSize for generation context
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
-
-        // Update KV cache start index shape if reuse KV cache is enabled
-        if (mConfig.enableReuseKVCache)
-        {
-            setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-                binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-            setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-                binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
-        }
 
         // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
         setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
@@ -1431,15 +1413,10 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     // Update KV cache shapes to match activeBatchSize for CUDA graph capture
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-    // Update KV cache start index shape if reuse KV cache is enabled
-    if (mConfig.enableReuseKVCache)
-    {
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, rt::Coords{activeBatchSize}.getTRTDims());
-    }
-
+    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
     setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(acceptedTokens.rawPointer()));
     setEngineIOStatus

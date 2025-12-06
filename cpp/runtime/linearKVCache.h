@@ -119,6 +119,10 @@ public:
     //! @return Number of active sequences
     int32_t getActiveBatchSize() const;
 
+    //! @brief Get flag to indicate if KVCache for all sequences are empty.
+    //! @return Flag to indicate if KVCache for all sequences are empty.
+    bool getKVCacheAllEmpty() const;
+
     //! @brief Set active batch size (for batch eviction)
     //! @param newActiveBatchSize New active batch size after eviction
     void setActiveBatchSize(int32_t newActiveBatchSize);
@@ -126,6 +130,7 @@ public:
 private:
     CacheConfig mConfig{};                //!< Cache configuration
     int32_t mActiveBatchSize{};           //!< Active batch size
+    bool mKVCacheAllEmpty{};              //!< Flag to indicate if KVCache for all sequences are empty.
     rt::Tensor mDeviceKVCacheLengths{};   //!< KV cache lengths on device
     KVCacheType* mDeviceKVCache{nullptr}; //!< KV cache memory buffer
 };

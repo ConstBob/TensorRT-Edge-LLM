@@ -40,10 +40,9 @@ public:
     //! \param[in] headSize Head dimension size
     //! \param[in] maxBatchSize Maximum batch size
     //! \param[in] kvCacheCapacity KV cache capacity (max tokens per context)
-    //! \param[in] isEagleMode Whether to enable tree attention for EAGLE speculative decoding
-    //! \param[in] enableReuseKVCache Whether to enable persistent KV cache reuse
+    //! \param[in] supportsSpecDecode Whether to support speculative decoding (Tree attention)
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t maxBatchSize, int32_t kvCacheCapacity, int32_t isEagleMode, int32_t enableReuseKVCache);
+        int32_t kvCacheCapacity, int32_t supportsSpecDecode);
 
     //! \brief Constructor for deserialization
     //! \param[in] name Plugin instance name
@@ -169,18 +168,20 @@ protected:
     int32_t mNumHeadKV{};
     //! Number of elements per head (head dimension)
     int32_t mNumElemPerHead{};
-    //! Runtime configuration: maximum batch size
-    int32_t mMaxBatchSize{};
+    //! KV cache capacity (max number of tokens per batch)
+    int32_t mKVCacheCapacity{};
     //! Whether to enable tree attention for EAGLE speculative decoding
     int32_t mEnableTreeAttention{};
-    //! KV cache capacity (max number of tokens per input context)
-    int32_t mKVCacheCapacity{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
 
-    int32_t mEnableReuseKVCache{}; //!< Whether to use persistent KV cache reuse
+    // Deprecated field of plugin that is no longer used. Keep them here to ensure
+    // backward compatibility of existing tensorrt engines. These fields will be serialized
+    // and deserialized but ignored for execution.
+    int32_t mEnableReuseKVCache{};
+    int32_t mMaxBatchSize{};
 };
 
 //! \brief Factory class for creating AttentionPlugin instances

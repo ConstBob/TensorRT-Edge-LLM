@@ -269,11 +269,15 @@ bool LLMInferenceRuntime::handleRequest(
             // TODO: apply chat template for system prompt
             batchSystemPrompts.emplace_back(std::move(request.prompts[i].systemPrompt));
         }
-        bool const saveCacheStatus = genAndSaveSystemPromptKVCache(batchSystemPrompts[i], loraWeightsName, stream);
-        if (!saveCacheStatus)
+        if (request.saveSystemPromptKVCache)
         {
-            LOG_WARNING(
-                "Failed to save system prompt KVCache. May be KVCache reuse feature is not enabled in the engine.");
+            bool const saveCacheStatus = genAndSaveSystemPromptKVCache(batchSystemPrompts[i], loraWeightsName, stream);
+            if (!saveCacheStatus)
+            {
+                LOG_WARNING(
+                    "Failed to save system prompt KVCache. Continue to handle the request without saving the system "
+                    "prompt KVCache.");
+            }
         }
     }
 
@@ -505,13 +509,6 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     {
         LOG_DEBUG("LLMInferenceRuntime(): The prompt is empty. Skip saving system prompt KVCache.");
         return true;
-    }
-
-    // TODO: Enable the system prompt KVCache feature by default and remove this check.
-    if (!mEngineConfig.enableReuseKVCache)
-    {
-        LOG_ERROR("LLMInferenceRuntime(): The system prompt KVCache feature is not enabled in the engine.");
-        return false;
     }
 
     // hash the prompt if check if the prompt cache already exists.

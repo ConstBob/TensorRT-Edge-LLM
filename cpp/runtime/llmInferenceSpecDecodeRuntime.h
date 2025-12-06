@@ -76,8 +76,8 @@ struct SpecDecodeInferenceContext
     int32_t maxGenerateLength;                    //!< Maximum generation length
     int32_t activeBatchSize;                      //!< Current active batch size
     int32_t originalBatchSize;                    //!< Original batch size (before any eviction)
-    int32_t currentBatchIndex;                    //!< Current batch index being processed (for system prompt KVCache)
-    cudaStream_t stream;                          //!< CUDA stream
+    int32_t genAndSaveSystemCacheIndex; //!< Batch index being processed for generating and saving system prompt KVCache
+    cudaStream_t stream;                //!< CUDA stream
 
     /*!
      * @brief Initialize the context with given parameters

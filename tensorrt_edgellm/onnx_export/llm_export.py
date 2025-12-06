@@ -409,7 +409,10 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         }
 
         if enable_reuse_kv_cache:
-            dynamic_axes.update({"kvcache_start_index": {0: "batch_size"}})
+            dynamic_axes.update(
+                {"kvcache_start_index": {
+                    0: "kvcache_start_batch_size"
+                }})
 
         if is_eagle_draft:
             dynamic_axes.update({

@@ -52,6 +52,8 @@ struct LLMGenerationRequest
     int64_t topK;                     //!< Top-k sampling parameter
     int64_t maxGenerateLength;        //!< Max length of the generated tokens
     std::string loraWeightsName = ""; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
+    bool saveSystemPromptKVCache{
+        false}; //!< Whether to save system prompt KV cache of this request to be used by later requests
 };
 
 /*! \brief LLM Generation Response structure

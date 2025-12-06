@@ -303,12 +303,6 @@ private:
     bool setupLoraProfiles(nvinfer1::IOptimizationProfile* contextProfile,
         nvinfer1::IOptimizationProfile* generationProfile, nvinfer1::INetworkDefinition const* network);
 
-    //! Verifies consistency of the KV cache reuse setting.
-    //! Checks if the 'enable_reuse_kv_cache' flag in the config matches the model structure.
-    //! @param network TensorRT network definition for KVCacheReuse input analysis
-    //! @return Returns true if the configuration is consistent with the model, false otherwise.
-    bool checkKVCacheReuse(nvinfer1::INetworkDefinition const* network);
-
     //! Set up optimization profiles for KV cache tensors.
     //! Configures dynamic shapes for key-value cache inputs across all layers.
     //! @param contextProfile Optimization profile for context processing
