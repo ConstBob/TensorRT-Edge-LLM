@@ -267,12 +267,6 @@ bool LLMBuilder::build()
     // Print network information
     LOG_DEBUG("%s", printNetworkInfo(network.get(), "LLM").c_str());
 
-    // Check if the enableReuseKVCache flag is consistent
-    if (!checkKVCacheReuse(network.get()))
-    {
-        return false;
-    }
-
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
     if (!config)
@@ -471,15 +465,12 @@ bool LLMBuilder::setupCommonProfiles(
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxSeqLen, mRotaryDim}),
         createDims({mBuilderConfig.maxBatchSize, profileMaxPositionEmbeddings, mRotaryDim}));
 
-    // If enable reuse KVCache, we need to add a profile for the KVCache start index.
-    // As a future improvement, we should enable KVCache reuse feature by default and remove the if statement.
-    if (mModelConfig["enable_reuse_kv_cache"].get<bool>())
-    {
-        result &= setOptimizationProfile(contextProfile, binding_names::kKVCacheStartIndex, createDims({1}),
-            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-        result &= setOptimizationProfile(generationProfile, binding_names::kKVCacheStartIndex, createDims({1}),
-            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
-    }
+    // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
+    // This can help distinguish the normal prefill and chunked prefill execution.
+    result &= setOptimizationProfile(contextProfile, binding_names::kKVCacheStartIndex, createDims({0}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    result &= setOptimizationProfile(generationProfile, binding_names::kKVCacheStartIndex, createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
     // KV cache profiles
     result &= setupKVCacheProfiles(contextProfile, generationProfile);
@@ -1177,31 +1168,6 @@ bool VisualBuilder::copyConfig()
         LOG_WARNING("No preprocessor config found.");
     }
 
-    return true;
-}
-
-bool LLMBuilder::checkKVCacheReuse(nvinfer1::INetworkDefinition const* network)
-{
-    bool enableReuseKVCache = false;
-    for (int i = 0; i < network->getNbInputs(); ++i)
-    {
-        if (strcmp(network->getInput(i)->getName(), binding_names::kKVCacheStartIndex) == 0)
-        {
-            enableReuseKVCache = true;
-            LOG_INFO("KV cache reuse is enabled.");
-            break;
-        }
-    }
-
-    if (mModelConfig["enable_reuse_kv_cache"].get<bool>() != enableReuseKVCache)
-    {
-        LOG_ERROR(
-            "Mismatch in 'enable_reuse_kv_cache' setting. Model config has it as '%s', but ONNX analysis indicates "
-            "'%s'.",
-            mModelConfig["enable_reuse_kv_cache"].get<bool>() ? "true" : "false",
-            enableReuseKVCache ? "true" : "false");
-        return false;
-    }
     return true;
 }
 

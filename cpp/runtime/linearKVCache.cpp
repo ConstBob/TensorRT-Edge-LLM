@@ -51,11 +51,13 @@ LinearKVCache::LinearKVCache(LinearKVCache&& other) noexcept
 {
     mConfig = other.mConfig;
     mActiveBatchSize = other.mActiveBatchSize;
+    mKVCacheAllEmpty = other.mKVCacheAllEmpty;
     mDeviceKVCache = other.mDeviceKVCache;
     mDeviceKVCacheLengths = std::move(other.mDeviceKVCacheLengths);
 
     other.mConfig = CacheConfig{};
     other.mActiveBatchSize = 0;
+    other.mKVCacheAllEmpty = true;
     other.mDeviceKVCache = nullptr;
 }
 
@@ -66,12 +68,14 @@ LinearKVCache& LinearKVCache::operator=(LinearKVCache&& other) noexcept
         // Release current KVCache memory.
         CUDA_CHECK(cudaFree(mDeviceKVCache));
         mConfig = other.mConfig;
+        mKVCacheAllEmpty = other.mKVCacheAllEmpty;
         mActiveBatchSize = other.mActiveBatchSize;
         mDeviceKVCache = other.mDeviceKVCache;
         mDeviceKVCacheLengths = std::move(other.mDeviceKVCacheLengths);
 
         other.mConfig = CacheConfig{};
         other.mActiveBatchSize = 0;
+        other.mKVCacheAllEmpty = true;
         other.mDeviceKVCache = nullptr;
     }
     return *this;
@@ -107,6 +111,19 @@ void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, 
 
     mActiveBatchSize = batchSize;
     mDeviceKVCacheLengths.reshape({mActiveBatchSize});
+
+    // If all reuseSequenceLengths are 0, then we can set flag mKVCacheAllEmpty to true.
+    int32_t const* reuseSequenceLengthsData = reuseKVCacheLengths.dataPointer<int32_t>();
+    bool allEmpty{true};
+    for (int32_t i = 0; i < batchSize; ++i)
+    {
+        if (reuseSequenceLengthsData[i] != 0)
+        {
+            allEmpty = false;
+            break;
+        }
+    }
+    mKVCacheAllEmpty = allEmpty;
     CUDA_CHECK(cudaMemcpyAsync(mDeviceKVCacheLengths.rawPointer(), reuseKVCacheLengths.rawPointer(),
         reuseKVCacheLengths.getMemoryCapacity(), cudaMemcpyHostToDevice, stream));
 }
@@ -121,12 +138,17 @@ void LinearKVCache::commitSequenceLength(rt::Tensor const& newContextLengths, cu
         "The newContextLengths tensor shall have the same batch size as the active batch size.");
 
     kernel::incrementLengthTensor(mDeviceKVCacheLengths, newContextLengths, stream);
+
+    // Set flag to false since we have committed a new sequence length.
+    mKVCacheAllEmpty = false;
 }
 
 void LinearKVCache::commitSequenceLength(int32_t increment, cudaStream_t stream)
 {
     kernel::incrementLengthTensor(mDeviceKVCacheLengths, increment, stream);
-    CUDA_CHECK(cudaGetLastError());
+
+    // Set flag to false since we have committed a new sequence length.
+    mKVCacheAllEmpty = false;
 }
 
 rt::Tensor& LinearKVCache::getKVCacheLengths()
@@ -142,6 +164,11 @@ LinearKVCache::CacheConfig LinearKVCache::getConfig() const
 int32_t LinearKVCache::getActiveBatchSize() const
 {
     return mActiveBatchSize;
+}
+
+bool LinearKVCache::getKVCacheAllEmpty() const
+{
+    return mKVCacheAllEmpty;
 }
 
 void LinearKVCache::setActiveBatchSize(int32_t newActiveBatchSize)

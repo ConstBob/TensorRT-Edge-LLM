@@ -380,16 +380,19 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     }
 
     // Generate system prompt KVCache for each sequence in the batch
-    for (int32_t i = 0; i < activeBatchSize; ++i)
+    if (request.saveSystemPromptKVCache)
     {
-        context.currentBatchIndex = i;
-        bool const saveCacheStatus = genAndSaveSystemPromptKVCache(context);
-        if (!saveCacheStatus)
+        for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            LOG_WARNING(
-                "Failed to save system prompt KVCache for batch %d. "
-                "May be KVCache reuse feature is not enabled in the engine.",
-                i);
+            context.genAndSaveSystemCacheIndex = i;
+            bool const saveCacheStatus = genAndSaveSystemPromptKVCache(context);
+            if (!saveCacheStatus)
+            {
+                LOG_WARNING(
+                    "Failed to save system prompt KVCache for batch %d. "
+                    "Continue to handle the request without saving the system prompt KVCache.",
+                    i);
+            }
         }
     }
 
@@ -1200,17 +1203,8 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
 
 bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context)
 {
-    check::check(mBaseEngineConfig.enableReuseKVCache == mDraftEngineConfig.enableReuseKVCache,
-        "The system prompt KVCache feature is not same for base and draft model.");
-
-    if (!mBaseEngineConfig.enableReuseKVCache)
-    {
-        LOG_DEBUG("System prompt KVCache feature is not enabled in the engine.");
-        return false;
-    }
-
     // Check if cache already exists
-    int32_t const batchIdx = context.currentBatchIndex;
+    int32_t const batchIdx = context.genAndSaveSystemCacheIndex;
     std::string const prompt = context.systemPrompts[batchIdx];
 
     if (prompt.empty())
@@ -1253,7 +1247,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     tempContext.generationRound = 0;
     tempContext.maxGenerateLength = 0; // Not generating, just caching
     tempContext.activeBatchSize = 1;
-    tempContext.currentBatchIndex = 0;
+    tempContext.genAndSaveSystemCacheIndex = 0;
     tempContext.stream = context.stream;
 
     // Setup for prefill execution: handles KV cache reset and applies any reused system prompt cache

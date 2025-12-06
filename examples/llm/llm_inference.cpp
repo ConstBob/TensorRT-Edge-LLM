@@ -394,6 +394,17 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 // Parse system prompt (use message-specific or default)
                 std::string systemPrompt = message.value("system", defaultSystemPrompt);
 
+                // Explicit query whether to save the system prompt KVCache of this message for later reuse.
+                // This logic has limitation that once one prompt sets saveSystemPromptKVCache to true, all prompts in
+                // the same batch will cache system prompt KVCache. Since long instruction cache saving is
+                // usually done during system setup, this limitation can be resolved by issuing single batch request at
+                // initialization stage for KVCache saving.
+                bool saveSystemPromptKVCache = message.value("save_system_prompt_kv_cache", false);
+                if (saveSystemPromptKVCache)
+                {
+                    request.saveSystemPromptKVCache = true;
+                }
+
                 // Parse user prompt
                 if (!message.contains("user"))
                 {

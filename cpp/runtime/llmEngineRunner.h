@@ -42,7 +42,6 @@ using Json = nlohmann::json;
 struct LLMEngineRunnerConfig
 {
     RopeConfig ropeConfig{};             //!< Type of rotary positional encoding
-    bool enableReuseKVCache{true};       //!< Enable KV cache reuse across requests
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
     bool enableEagleSpecDecode{false};   //!< Enable Eagle speculative decoding
     bool isVlm{false};                   //!< Whether this is a Vision-Language Model
