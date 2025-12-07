@@ -16,6 +16,7 @@
  */
 
 #include "llmInferenceSpecDecodeRuntime.h"
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/hashUtils.h"
@@ -255,6 +256,32 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     check::check(d2tTensors[0].getShape()[0] == mDraftEngineConfig.draftModelVocabSize,
         "d2t tensor length should match draft vocab size");
     mDraftVocabMappingTable = std::move(d2tTensors[0]);
+
+    // Optional: Load vocabulary mapping table if base model uses reduced vocabulary
+    if (mBaseEngineConfig.reducedVocabSize > 0)
+    {
+        LOG_INFO("Loading vocabulary mapping table for base model reduced vocab size: %d -> %d",
+            mBaseEngineConfig.reducedVocabSize, mBaseEngineConfig.vocabSize);
+        std::filesystem::path const vocabMapPath = std::filesystem::path(engineDir) / binding_names::kVocabMapFileName;
+
+        std::vector<rt::Tensor> vocabMapTensors;
+        if (!safetensors::loadSafetensors(vocabMapPath, vocabMapTensors, stream))
+        {
+            LOG_ERROR(
+                "Failed to load %s from model directory: %s", binding_names::kVocabMapFileName, engineDir.c_str());
+            throw std::runtime_error("Failed to load " + std::string(binding_names::kVocabMapFileName)
+                + " from model directory: " + engineDir);
+        }
+
+        // Check we have exactly one tensor and use it
+        check::check(vocabMapTensors.size() == 1,
+            std::string(binding_names::kVocabMapFileName) + " should contain exactly one tensor");
+        check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "vocab_map tensor should be 1D");
+        check::check(vocabMapTensors[0].getShape()[0] == mBaseEngineConfig.reducedVocabSize,
+            "vocab_map tensor length should match base model reduced vocab size");
+        mBaseVocabMappingTable = std::move(vocabMapTensors[0]);
+        LOG_INFO("Base model vocabulary mapping table successfully loaded.");
+    }
 
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
     LOG_INFO("Start loading tokenizer from model directory: %s", engineDir.c_str());
@@ -630,6 +657,12 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     constexpr int32_t kSAMPLING_TOP_K = 1;
     selectAllTopK(mLogitsOutput, std::nullopt, mSamplingIndices, kSAMPLING_TOP_K, mSamplingWorkspace, context.stream);
 
+    // Apply vocabulary mapping if base model uses reduced vocabulary
+    if (mBaseEngineConfig.reducedVocabSize > 0)
+    {
+        mapReducedVocabToFullVocab(mSamplingIndices, mBaseVocabMappingTable, context.stream);
+    }
+
     mHostSelectedTokenIds.reshape({activeBatchSize});
     int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
     CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mSamplingIndices.rawPointer(),
@@ -885,6 +918,12 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // Collected accepted token ids and indices. Use sampling workspace for eagle accept process.
     kernel::eagleAccept(mLogitsOutput, mIdsInput, mDraftTreeMask, mAcceptedTokenIds, mAcceptedTokenIndices,
         mAcceptLength, mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream);
+
+    // Apply vocabulary mapping if base model uses reduced vocabulary
+    if (mBaseEngineConfig.reducedVocabSize > 0)
+    {
+        mapReducedVocabToFullVocab(mAcceptedTokenIds, mBaseVocabMappingTable, context.stream);
+    }
 
     // Inplace update the KVCache and input hidden states from the accepted token indices.
     // Also commit KVCache to reflect the latest KVCache length (We can only do this after knowing how many tokens are

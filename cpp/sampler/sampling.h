@@ -149,4 +149,20 @@ size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, Sa
  */
 size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK);
 
+/*!
+ * \brief Map reduced vocabulary IDs to full vocabulary IDs using a lookup table (in-place).
+ *
+ * Performs in-place mapping from reduced vocabulary space to full vocabulary space
+ * using the provided mapping table: vocabIds[i] = vocabMappingTable[vocabIds[i]]
+ *
+ * The operation is performed in-place, modifying the input tensor directly.
+ *
+ * \param[in,out] vocabIds Tensor [GPU, Int32] containing reduced vocabulary IDs as input,
+ *                         will be overwritten with full vocabulary IDs as output
+ * \param[in] vocabMappingTable Lookup table [GPU, Int32] with shape [reduced_vocab_size] mapping reduced IDs to full
+ * IDs
+ * \param[in] stream CUDA stream to execute the kernel
+ */
+void mapReducedVocabToFullVocab(rt::Tensor& vocabIds, rt::Tensor const& vocabMappingTable, cudaStream_t stream);
+
 } // namespace trt_edgellm
