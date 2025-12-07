@@ -197,6 +197,7 @@ private:
     rt::Tensor mSamplingWorkspace;
     rt::Tensor mSamplingIndices;
     rt::Tensor mSamplingScores;
+    rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
 
     // [3] Data structures used during Draft tree constructions.
     // Data tables that store the data structure that can completely describe a multi-layer draft tree.

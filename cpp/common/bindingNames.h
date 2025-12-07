@@ -231,6 +231,26 @@ inline constexpr char const* kDeepstackFeaturesTemplate = "deepstack_features";
 
 /*! @} */
 
+/*! @name Vocabulary Mapping Configuration
+ * @{
+ */
+
+/*!
+ * @brief JSON configuration key for reduced vocabulary size
+ *
+ * Used to check if the model uses vocabulary reduction optimization
+ */
+inline constexpr char const* kReducedVocabSizeKey = "reduced_vocab_size";
+
+/*!
+ * @brief Vocabulary mapping file name
+ *
+ * SafeTensors file containing mapping between full and reduced vocabulary
+ */
+inline constexpr char const* kVocabMapFileName = "vocab_map.safetensors";
+
+/*! @} */
+
 /*! @name LoRA (Low-Rank Adaptation) Bindings
  * @{
  */

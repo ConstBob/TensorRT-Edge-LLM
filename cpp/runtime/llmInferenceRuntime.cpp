@@ -17,9 +17,11 @@
 
 #include "llmInferenceRuntime.h"
 
+#include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/hashUtils.h"
 #include "common/logger.h"
+#include "common/safetensorsUtils.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
@@ -109,6 +111,32 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     {
         LOG_ERROR("Failed to load tokenizer from model directory: %s", engineDir.c_str());
         throw std::runtime_error("Failed to load tokenizer from model directory: " + engineDir);
+    }
+
+    // Optional: Load vocabulary mapping table if reduced vocabulary is used
+    if (mEngineConfig.reducedVocabSize > 0)
+    {
+        LOG_INFO("Loading vocabulary mapping table for reduced vocab size: %d -> %d", mEngineConfig.reducedVocabSize,
+            mEngineConfig.vocabSize);
+        std::filesystem::path const vocabMapPath = std::filesystem::path(engineDir) / binding_names::kVocabMapFileName;
+
+        std::vector<rt::Tensor> vocabMapTensors;
+        if (!safetensors::loadSafetensors(vocabMapPath, vocabMapTensors, stream))
+        {
+            LOG_ERROR(
+                "Failed to load %s from model directory: %s", binding_names::kVocabMapFileName, engineDir.c_str());
+            throw std::runtime_error("Failed to load " + std::string(binding_names::kVocabMapFileName)
+                + " from model directory: " + engineDir);
+        }
+
+        // Check we have exactly one tensor and use it
+        check::check(vocabMapTensors.size() == 1,
+            std::string(binding_names::kVocabMapFileName) + " should contain exactly one tensor");
+        check::check(vocabMapTensors[0].getShape().getNumDims() == 1, "vocab_map tensor should be 1D");
+        check::check(vocabMapTensors[0].getShape()[0] == mEngineConfig.reducedVocabSize,
+            "vocab_map tensor length should match reduced vocab size");
+        mVocabMappingTable = std::move(vocabMapTensors[0]);
+        LOG_INFO("Vocabulary mapping table successfully loaded.");
     }
 
     // Optional: Setup multimodal engine runner
@@ -346,6 +374,11 @@ bool LLMInferenceRuntime::handleRequest(
     SamplingParams params(activeBatchSize, mEngineConfig.vocabSize, request.temperature, request.topK, request.topP);
     auto sampleTokens = [&]() {
         trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
+        // Apply vocabulary mapping if reduced vocabulary is used
+        if (mEngineConfig.reducedVocabSize > 0)
+        {
+            trt_edgellm::mapReducedVocabToFullVocab(mSelectedIndices, mVocabMappingTable, stream);
+        }
         CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mSelectedIndices.rawPointer(),
             activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));

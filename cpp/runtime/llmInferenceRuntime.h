@@ -138,6 +138,7 @@ private:
     rt::Tensor mSelectedIndices{};         //!< Selected token indices tensor
     rt::Tensor mHostSelectedTokenIds{};    //!< Host tensor for selected token IDs
     rt::Tensor mHostReuseKVCacheLengths{}; //!< Reuse KV cache lengths for prefill
+    rt::Tensor mVocabMappingTable{};       //!< Vocab mapping table for reduced vocab (empty if not used)
     std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
 
     LLMEngineRunnerConfig mEngineConfig{}; //!< Engine configuration

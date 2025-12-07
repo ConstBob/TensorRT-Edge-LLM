@@ -401,6 +401,8 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.rotaryDim = static_cast<int32_t>(mConfig.headDim * configJson.value("partial_rotary_factor", 1.0f));
         mConfig.hiddenSize = configJson["hidden_size"].get<int32_t>();
         mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
+        // Optional: reduced vocabulary size (0 if not present)
+        mConfig.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
 
         // Extract builder_config values
         mConfig.isVlm = builderConfig["is_vlm"].get<bool>();
@@ -602,9 +604,22 @@ bool LLMEngineRunner::validateConfigFromEngine()
     // Obtain vocab size from the engine.
     // Logits shape is [batch_size, num_tokens/num_selected_tokens, vocab_size] for both EAGLE and vanilla models
     Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
-    if (mConfig.vocabSize != logitsDim.d[2])
+    int32_t const expectedEngineVocabSize
+        = (mConfig.reducedVocabSize > 0) ? mConfig.reducedVocabSize : mConfig.vocabSize;
+    if (expectedEngineVocabSize != logitsDim.d[2])
     {
-        LOG_ERROR("vocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[2], mConfig.vocabSize);
+        if (mConfig.reducedVocabSize > 0)
+        {
+            LOG_ERROR(
+                "vocabSize is not consistent. Engine uses reduced vocabulary. From engine: %d, expected reduced vocab "
+                "size: %d (full vocab size: %d)",
+                logitsDim.d[2], mConfig.reducedVocabSize, mConfig.vocabSize);
+        }
+        else
+        {
+            LOG_ERROR(
+                "vocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[2], mConfig.vocabSize);
+        }
         return false;
     }
 

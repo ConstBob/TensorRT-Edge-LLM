@@ -327,6 +327,11 @@ private:
     //! @return true if copying was successful, false otherwise
     bool copyEagleFiles();
 
+    //! Copy vocabulary mapping files to the engine directory.
+    //! Copies vocab_map.safetensors file if reduced vocabulary is used.
+    //! @return true if copying was successful, false otherwise
+    bool copyVocabMappingFiles();
+
     // Model dimensions extracted from config.json
     int64_t mHiddenSize{0};                 //!< Hidden size of the model
     int64_t mNumKVHeads{0};                 //!< Number of key-value heads

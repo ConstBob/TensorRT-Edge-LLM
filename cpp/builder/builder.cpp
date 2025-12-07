@@ -344,6 +344,12 @@ bool LLMBuilder::build()
         return false;
     }
 
+    // Copy vocabulary mapping files
+    if (!copyVocabMappingFiles())
+    {
+        return false;
+    }
+
     return true;
 }
 
@@ -805,6 +811,29 @@ bool LLMBuilder::copyEagleFiles()
         {
             LOG_WARNING("Failed to copy d2t.safetensors to %s", targetD2tPath.c_str());
             return false;
+        }
+    }
+
+    return true;
+}
+
+bool LLMBuilder::copyVocabMappingFiles()
+{
+    // Copy vocab_map.safetensors if reduced vocabulary is used
+    if (mModelConfig.contains(binding_names::kReducedVocabSizeKey)
+        && mModelConfig[binding_names::kReducedVocabSizeKey].get<int32_t>() > 0)
+    {
+        std::string vocabMapPath = mOnnxDir.string() + "/" + binding_names::kVocabMapFileName;
+        std::string targetVocabMapPath = mEngineDir.string() + "/" + binding_names::kVocabMapFileName;
+
+        if (file_io::copyFile(vocabMapPath, targetVocabMapPath))
+        {
+            LOG_INFO("Copied %s to %s", binding_names::kVocabMapFileName, targetVocabMapPath.c_str());
+        }
+        else
+        {
+            LOG_WARNING("%s not found in %s. This is expected if reduced vocabulary is not used.",
+                binding_names::kVocabMapFileName, mOnnxDir.string().c_str());
         }
     }
 

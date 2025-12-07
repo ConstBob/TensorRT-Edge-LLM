@@ -952,4 +952,57 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
         topKIndices.dataPointer<int32_t>(), topKValuesPtr, batchSize, vocabSize, topK, BLOCKS_PER_BEAM);
 }
 
+// =======================================================================================
+// VOCABULARY MAPPING KERNEL
+// =======================================================================================
+
+/*!
+ * \brief CUDA kernel for mapping reduced vocabulary IDs to full vocabulary IDs (in-place)
+ *
+ * Each thread processes one element, performing a simple lookup operation:
+ * vocabIds[idx] = vocabMappingTable[vocabIds[idx]]
+ *
+ * The operation is performed in-place, reading and writing to the same memory location.
+ */
+__global__ void mapReducedVocabToFullVocabKernel(
+    int32_t* vocabIds, int32_t const* __restrict__ vocabMappingTable, int32_t totalElements)
+{
+    int32_t idx = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+
+    if (idx < totalElements)
+    {
+        // Read the reduced vocab ID, then overwrite with mapped full vocab ID
+        int32_t reducedId = vocabIds[idx];
+        vocabIds[idx] = vocabMappingTable[reducedId];
+    }
+}
+
+void mapReducedVocabToFullVocab(rt::Tensor& vocabIds, rt::Tensor const& vocabMappingTable, cudaStream_t stream)
+{
+    // Validate device types
+    check::check(
+        vocabIds.getDeviceType() == rt::DeviceType::kGPU && vocabMappingTable.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+
+    // Validate data types
+    check::check(vocabIds.getDataType() == nvinfer1::DataType::kINT32
+            && vocabMappingTable.getDataType() == nvinfer1::DataType::kINT32,
+        "All tensors must have INT32 data type");
+
+    // Calculate total number of elements
+    int32_t totalElements = static_cast<int32_t>(vocabIds.getShape().volume());
+
+    if (totalElements == 0)
+    {
+        return; // Nothing to map
+    }
+
+    // Launch kernel
+    constexpr int32_t BLOCK_SIZE = 256;
+    int32_t numBlocks = (totalElements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    mapReducedVocabToFullVocabKernel<<<numBlocks, BLOCK_SIZE, 0, stream>>>(
+        vocabIds.dataPointer<int32_t>(), vocabMappingTable.dataPointer<int32_t>(), totalElements);
+}
+
 } // namespace trt_edgellm
