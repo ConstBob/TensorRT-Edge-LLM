@@ -19,9 +19,6 @@ with support for EAGLE draft models.
 Usage:
     # EAGLE draft model export
     python export_draft.py --draft_model_dir /path/to/draft_model --base_model_dir /path/to/base_model --output_dir /path/to/output (--use_prompt_tuning)
-
-    # Disable reusing KV cache for system prompts
-    python export_draft.py --draft_model_dir /path/to/draft_model --base_model_dir /path/to/base_model --output_dir /path/to/output --disable_reuse_kv_cache
 """
 
 import argparse
@@ -60,12 +57,6 @@ def main() -> None:
         "Path to the base model directory. Used to copy weights from if the draft weights are incomplete."
     )
     parser.add_argument(
-        "--max_position_embeddings",
-        type=int,
-        required=False,
-        default=4096,
-        help="Maximum positional embedding length (default: 4096)")
-    parser.add_argument(
         "--device",
         type=str,
         required=False,
@@ -73,24 +64,16 @@ def main() -> None:
         help=
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
-    parser.add_argument("--disable_reuse_kv_cache",
-                        required=False,
-                        dest="enable_reuse_kv_cache",
-                        action="store_false",
-                        help="Disable reusing KV cache for system prompts.")
 
     args = parser.parse_args()
 
     try:
         # Export model(s)
-        export_draft_model(
-            draft_model_dir=args.draft_model_dir,
-            output_dir=args.output_dir,
-            use_prompt_tuning=args.use_prompt_tuning,
-            base_model_dir=args.base_model_dir,
-            max_position_embeddings=args.max_position_embeddings,
-            device=args.device,
-            enable_reuse_kv_cache=args.enable_reuse_kv_cache)
+        export_draft_model(draft_model_dir=args.draft_model_dir,
+                           output_dir=args.output_dir,
+                           use_prompt_tuning=args.use_prompt_tuning,
+                           base_model_dir=args.base_model_dir,
+                           device=args.device)
 
         print("EAGLE3 Draft model export completed successfully!")
 

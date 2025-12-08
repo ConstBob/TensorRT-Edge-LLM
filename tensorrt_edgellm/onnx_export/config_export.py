@@ -157,8 +157,7 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
     return config_dict
 
 
-def export_llm_config(config: Any, model_type: str,
-                      enable_reuse_kv_cache: bool) -> Dict[str, Any]:
+def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     """Export configuration based on model type and EAGLE version."""
     config_dict = config.to_dict()
 
@@ -182,8 +181,5 @@ def export_llm_config(config: Any, model_type: str,
 
     # Add model name to output
     output_config["model"] = model_name
-
-    # Add enable_reuse_kv_cache to output_config
-    output_config["enable_reuse_kv_cache"] = enable_reuse_kv_cache
 
     return output_config

@@ -396,7 +396,6 @@ bool LLMBuilder::parseConfig()
         mRotaryDim = mHeadSize;
     }
 
-    mMaxPositionEmbeddings = mModelConfig["max_position_embeddings"].get<int32_t>();
     mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
 
     return true;
@@ -460,16 +459,14 @@ bool LLMBuilder::setupCommonProfiles(
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
     // Rope rotary cos sin
-    int64_t profileMaxPositionEmbeddings
-        = std::max(static_cast<int64_t>(mMaxPositionEmbeddings), mBuilderConfig.maxSeqLen);
     result &= setOptimizationProfile(contextProfile, binding_names::kRopeCosSin,
-        createDims({1, mBuilderConfig.maxSeqLen, mRotaryDim}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxSeqLen, mRotaryDim}),
-        createDims({mBuilderConfig.maxBatchSize, profileMaxPositionEmbeddings, mRotaryDim}));
+        createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
     result &= setOptimizationProfile(generationProfile, binding_names::kRopeCosSin,
-        createDims({1, mBuilderConfig.maxSeqLen, mRotaryDim}),
-        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxSeqLen, mRotaryDim}),
-        createDims({mBuilderConfig.maxBatchSize, profileMaxPositionEmbeddings, mRotaryDim}));
+        createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
 
     // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
     // This can help distinguish the normal prefill and chunked prefill execution.
@@ -708,23 +705,19 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
 {
     bool result = true;
-
-    nvinfer1::Dims minKVContextShape = createDims({1, 2, mNumKVHeads, 0, mHeadSize});
-    nvinfer1::Dims optKVContextShape = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, 0, mHeadSize});
-    nvinfer1::Dims maxKVContextShape = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, 0, mHeadSize});
-
-    nvinfer1::Dims minKVGenerationShape = createDims({1, 2, mNumKVHeads, mBuilderConfig.maxSeqLen, mHeadSize});
-    nvinfer1::Dims optKVGenerationShape
-        = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxSeqLen, mHeadSize});
-    nvinfer1::Dims maxKVGenerationShape
-        = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxSeqLen, mHeadSize});
+    // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
+    nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, mHeadSize});
+    nvinfer1::Dims optKVCacheShape
+        = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+    nvinfer1::Dims maxKVCacheShape
+        = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
 
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
         result &= setOptimizationProfile(contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVContextShape, optKVContextShape, maxKVContextShape);
+            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
         result &= setOptimizationProfile(generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVGenerationShape, optKVGenerationShape, maxKVGenerationShape);
+            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
     }
 
     return result;

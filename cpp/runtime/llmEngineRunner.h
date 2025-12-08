@@ -53,7 +53,7 @@ struct LLMEngineRunnerConfig
     int32_t maxSupportedBatchSize{};     //!< Maximum supported batch size
     int32_t minSupportedInputLength{};   //!< Minimum supported input length
     int32_t maxSupportedInputLength{};   //!< Maximum supported input length
-    int32_t maxSequenceLength{};         //!< Maximum sequence length
+    int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity
     int32_t vocabSize{};                 //!< Vocabulary size
     int32_t reducedVocabSize{0};         //!< Reduced vocabulary size (0 if not using reduced vocab)
     int32_t maxSupportedLoraRank{};      //!< Maximum supported LoRA rank

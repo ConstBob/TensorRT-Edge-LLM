@@ -63,6 +63,12 @@ attention_plugin_schema = OpSchema(
             type_str="tensor(float)",
         ),
         OpSchema.FormalParameter(
+            name="kvcache_start_index",
+            description=
+            "KV cache start index tensor of shape [kv_cache_start_batch_size]",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
             name="attention_mask",
             description="Attention mask tensor (optional)",
             type_str="tensor(int32)",
@@ -83,7 +89,8 @@ attention_plugin_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="present_key_value",
-            description="Updated KV cache tensor",
+            description=
+            "Updated KV cache tensor with dynamic shape [batch_size, 2, num_kv_heads, present_kv_cache_len, head_size]",
             type_str="T",
         ),
     ],
@@ -114,21 +121,9 @@ attention_plugin_schema = OpSchema(
             required=True,
         ),
         OpSchema.Attribute(
-            name="kv_cache_capacity",
-            type=OpSchema.AttrType.INT,
-            description="Maximum capacity of KV cache",
-            required=True,
-        ),
-        OpSchema.Attribute(
             name="enable_tree_attention",
             type=OpSchema.AttrType.INT,
             description="Whether to enable tree attention (0 or 1)",
-            required=True,
-        ),
-        OpSchema.Attribute(
-            name="max_batch_size",
-            type=OpSchema.AttrType.INT,
-            description="Maximum batch size",
             required=True,
         ),
     ],
@@ -136,33 +131,29 @@ attention_plugin_schema = OpSchema(
 onnx.defs.register_schema(attention_plugin_schema)
 
 
-@symbolic_helper.parse_args("v", "v", "v", "v", "i", "i", "i", "b", "b", "i",
-                            "v", "v", "v")
+@symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i", "b", "i", "v",
+                            "v")
 def symbolic_attention_plugin(
     g: torch.onnx._internal.jit_utils.GraphContext,
     qkv: torch._C.Value,
     past_key_value: torch._C.Value,
     context_lengths: torch._C.Value,
     rope_rotary_cos_sin: torch._C.Value,
+    kvcache_start_index: torch._C.Value,
     num_q_heads: torch._C.Value,
     num_kv_heads: torch._C.Value,
-    kv_cache_capacity: torch._C.Value,
-    enable_reuse_kv_cache: torch._C.Value,
     enable_tree_attention: torch._C.Value,
     head_size: torch._C.Value,
-    kvcache_start_index: Optional[torch._C.Value] = None,
     attention_mask: Optional[torch._C.Value] = None,
     position_ids: Optional[torch._C.Value] = None,
 ):
     """Custom attention plugin operation for ONNX export."""
 
-    # Build inputs list - only include required inputs
-    inputs = [qkv, past_key_value, context_lengths, rope_rotary_cos_sin]
-    if enable_reuse_kv_cache:
-        assert kvcache_start_index is not None and kvcache_start_index.type(
-        ).kind(
-        ) != 'NoneType', "kvcache_start_index should be provided for persistent KV cache"
-        inputs.append(kvcache_start_index)
+    # Build inputs list - kvcache_start_index is now always required
+    inputs = [
+        qkv, past_key_value, context_lengths, rope_rotary_cos_sin,
+        kvcache_start_index
+    ]
     if enable_tree_attention:
         assert attention_mask is not None and attention_mask.type().kind(
         ) != 'NoneType', "attention_mask should be provided for tree attention"
@@ -179,20 +170,17 @@ def symbolic_attention_plugin(
         num_q_heads_i=num_q_heads,
         num_kv_heads_i=num_kv_heads,
         head_size_i=head_size,
-        kv_cache_capacity_i=kv_cache_capacity,
-        enable_reuse_kv_cache_i=1 if enable_reuse_kv_cache else 0,
         enable_tree_attention_i=1 if enable_tree_attention else 0,
-        max_batch_size_i=16,
         outputs=2)
 
     qkv_sizes = _get_tensor_sizes(qkv)
     attn_output_sizes = qkv_sizes[:-1] + [num_q_heads, head_size]
     attn_output.setType(qkv_type.with_sizes(attn_output_sizes))
-    present_key_value_sizes = _get_tensor_sizes(past_key_value)
-    # KV Cache output should have static length dimension with kv_cache_capacity
-    present_key_value_sizes[3] = kv_cache_capacity
-    present_key_value.setType(
-        past_key_value_type.with_sizes(present_key_value_sizes))
+
+    # KV Cache output has the same shape as input past_key_value except for dimension 3 (sequence length)
+    # Shape: [batch_size, 2, num_kv_heads, present_kv_cache_len (dynamic), head_size]
+    past_kv_sizes = _get_tensor_sizes(past_key_value)
+    present_key_value.setType(past_key_value_type.with_sizes(past_kv_sizes))
 
     return attn_output, present_key_value
 
@@ -203,13 +191,11 @@ def attention_plugin(
     past_key_value: torch.Tensor,
     context_lengths: torch.Tensor,
     rope_rotary_cos_sin: torch.Tensor,
+    kvcache_start_index: torch.Tensor,
     num_q_heads: int,
     num_kv_heads: int,
-    kv_cache_capacity: int,
-    enable_reuse_kv_cache: bool,
     enable_tree_attention: bool,
     head_size: int,
-    kvcache_start_index: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -222,23 +208,21 @@ def attention_plugin(
     
     Args:
         qkv: Concatenated QKV tensor of shape (batch_size, seq_len, num_q_heads * head_size + 2 * num_kv_heads * head_size)
-        past_key_value: KV cache tensor of shape (batch_size, 2, num_kv_heads, kv_cache_capacity, head_size)
+        past_key_value: KV cache tensor of shape (batch_size, 2, num_kv_heads, past_len, head_size)
         rope_rotary_cos_sin: RoPE tensor of shape (batch_size, seq_len, 2 * head_size) containing cos and sin values
         context_lengths: Context length tensor of shape (batch_size,) indicating current position in cache
+        kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size,), required
         num_q_heads: Number of query heads
         num_kv_heads: Number of key-value heads
-        kv_cache_capacity: Maximum capacity of KV cache
         enable_tree_attention: Whether to enable tree attention
-        enable_reuse_kv_cache: Whether to enable persistent KV cache
         head_size: Size of each attention head
-        kvcache_start_index: Start index of KV cache of shape (batch_size), optional
         attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
         position_ids: Position IDs tensor of shape (batch_size, seq_len), optional
         
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Attention output tensor and updated KV cache
             - Attention output: shape (batch_size, seq_len, num_q_heads * head_size)
-            - Updated KV cache: shape (batch_size, 2, num_kv_heads, kv_cache_capacity, head_size)
+            - Updated KV cache: shape (batch_size, 2, num_kv_heads, present_kv_cache_len, head_size) with dynamic shapes
         
     Raises:
         AssertionError: If enable_tree_attention is True but required tensors are missing
@@ -246,8 +230,6 @@ def attention_plugin(
     if enable_tree_attention:
         assert attention_mask is not None, "attention_mask should be provided for tree attention"
         assert position_ids is not None, "position_ids should be provided for tree attention"
-    if enable_reuse_kv_cache:
-        assert kvcache_start_index is not None, "kvcache_start_index should be provided for persistent KV cache"
 
     batch_size, seq_len, qkv_size = qkv.shape
     assert head_size * (

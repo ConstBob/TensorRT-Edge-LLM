@@ -38,11 +38,9 @@ public:
     //! \param[in] numQHeads Number of query heads
     //! \param[in] numKVHeads Number of key-value heads
     //! \param[in] headSize Head dimension size
-    //! \param[in] maxBatchSize Maximum batch size
-    //! \param[in] kvCacheCapacity KV cache capacity (max tokens per context)
     //! \param[in] supportsSpecDecode Whether to support speculative decoding (Tree attention)
-    AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t kvCacheCapacity, int32_t supportsSpecDecode);
+    AttentionPlugin(
+        std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t supportsSpecDecode);
 
     //! \brief Constructor for deserialization
     //! \param[in] name Plugin instance name
@@ -163,25 +161,17 @@ protected:
     std::string mNamespace; //!< Plugin namespace
 
     //! Number of query heads (specified by model, runtime constant)
-    int32_t mNumHeadQ{};
+    int32_t mNumQHeads{};
     //! Number of key-value heads (specified by model, runtime constant)
-    int32_t mNumHeadKV{};
+    int32_t mNumKVHeads{};
     //! Number of elements per head (head dimension)
-    int32_t mNumElemPerHead{};
-    //! KV cache capacity (max number of tokens per batch)
-    int32_t mKVCacheCapacity{};
+    int32_t mHeadSize{};
     //! Whether to enable tree attention for EAGLE speculative decoding
     int32_t mEnableTreeAttention{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
-
-    // Deprecated field of plugin that is no longer used. Keep them here to ensure
-    // backward compatibility of existing tensorrt engines. These fields will be serialized
-    // and deserialized but ignored for execution.
-    int32_t mEnableReuseKVCache{};
-    int32_t mMaxBatchSize{};
 };
 
 //! \brief Factory class for creating AttentionPlugin instances

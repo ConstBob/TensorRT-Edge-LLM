@@ -145,7 +145,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         try
         {
             mMultimodalRunner = MultimodalRunner::create(
-                multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSequenceLength, stream);
+                multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxKVCacheCapacity, stream);
         }
         catch (std::exception const& e)
         {
@@ -350,15 +350,14 @@ bool LLMInferenceRuntime::handleRequest(
 
     int32_t const maxInputIdsLength = mInputIds.getShape()[1];
     int32_t maxGenerationLength = request.maxGenerateLength;
-    if (maxInputIdsLength + maxGenerationLength > mEngineConfig.maxSequenceLength)
+    if (maxInputIdsLength + maxGenerationLength > mEngineConfig.maxKVCacheCapacity)
     {
-        maxGenerationLength = mEngineConfig.maxSequenceLength - maxInputIdsLength;
+        maxGenerationLength = mEngineConfig.maxKVCacheCapacity - maxInputIdsLength;
         LOG_WARNING(
-            "LLMInferenceRuntime(): With requested max generation length (%d), the total sequence length (%d) may "
-            "exceed the max sequence length (%d) of the LLM Engine."
-            "Reduce the generation length of this request to %d to avoid the truncation of the generated tokens.",
-            request.maxGenerateLength, maxInputIdsLength + request.maxGenerateLength, mEngineConfig.maxSequenceLength,
-            maxGenerationLength);
+            "The requested input length (%d) + max generation length (%d) = %d exceeds the max KV "
+            "cache capacity (%d). Reduce the generation length to %d to avoid the truncation of the generated tokens.",
+            maxInputIdsLength, maxGenerationLength, maxInputIdsLength + maxGenerationLength,
+            mEngineConfig.maxKVCacheCapacity, maxGenerationLength);
     }
 
     // Set up data structures to store the generated results during decoding.

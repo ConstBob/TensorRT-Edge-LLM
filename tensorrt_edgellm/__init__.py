@@ -64,17 +64,14 @@ Example Usage:
         export_llm_model(
             model_dir="path/to/model",
             output_dir="path/to/output",
-            max_position_embeddings=4096,
-            device="cuda",
-            enable_reuse_kv_cache=True
+            device="cuda"
         )
         
         # Export EAGLE base model to ONNX
         export_llm_model(
             model_dir="path/to/model",
             output_dir="path/to/output",
-            is_eagle_base=True,
-            enable_reuse_kv_cache=True
+            is_eagle_base=True
         )
         
         # Export EAGLE draft model to ONNX
@@ -82,8 +79,7 @@ Example Usage:
             draft_model_dir="path/to/draft_model",
             output_dir="path/to/output",
             base_model_dir="path/to/base_model",
-            use_prompt_tuning=False,
-            enable_reuse_kv_cache=False
+            use_prompt_tuning=False
         )
         
         # Export visual model to ONNX

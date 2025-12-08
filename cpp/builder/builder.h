@@ -38,15 +38,15 @@ namespace builder
 //! for Large Language Models, including standard LLMs, Eagle models, and Vision-Language Models.
 struct LLMBuilderConfig
 {
-    int64_t maxInputLen{128};      //!< Maximum input sequence length for the model
-    bool isVlm{false};             //!< Whether this is a Vision-Language Model (VLM)
-    int64_t minImageTokens{4};     //!< Minimum number of image tokens (VLM only)
-    int64_t maxImageTokens{1024};  //!< Maximum number of image tokens (VLM only)
-    bool eagleDraft{false};        //!< Whether this is an Eagle draft model
-    bool eagleBase{false};         //!< Whether this is an Eagle base model
-    int64_t maxBatchSize{4};       //!< Maximum batch size for inference
-    int64_t maxLoraRank{0};        //!< Maximum LoRA rank (0 = no LoRA support)
-    int64_t maxSeqLen{4096};       //!< Maximum sequence length for the model
+    int64_t maxInputLen{128};         //!< Maximum input sequence length for the model
+    bool isVlm{false};                //!< Whether this is a Vision-Language Model (VLM)
+    int64_t minImageTokens{4};        //!< Minimum number of image tokens (VLM only)
+    int64_t maxImageTokens{1024};     //!< Maximum number of image tokens (VLM only)
+    bool eagleDraft{false};           //!< Whether this is an Eagle draft model
+    bool eagleBase{false};            //!< Whether this is an Eagle base model
+    int64_t maxBatchSize{4};          //!< Maximum batch size for inference
+    int64_t maxLoraRank{0};           //!< Maximum LoRA rank (0 = no LoRA support)
+    int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
     int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
     int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
 
@@ -66,7 +66,7 @@ struct LLMBuilderConfig
         json["eagle_base"] = eagleBase;
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
-        json["max_seq_len"] = maxSeqLen;
+        json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         // Only include Eagle-specific fields when Eagle is enabled
         if (eagleBase)
         {
@@ -117,9 +117,9 @@ struct LLMBuilderConfig
         {
             config.maxLoraRank = json["max_lora_rank"];
         }
-        if (json.contains("max_seq_len"))
+        if (json.contains("max_kv_cache_capacity"))
         {
-            config.maxSeqLen = json["max_seq_len"];
+            config.maxKVCacheCapacity = json["max_kv_cache_capacity"];
         }
         if (json.contains("max_verify_tree_size"))
         {
@@ -149,7 +149,7 @@ struct LLMBuilderConfig
         oss << "  eagleBase: " << (eagleBase ? "true" : "false") << "\n";
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
-        oss << "  maxSeqLen: " << maxSeqLen << "\n";
+        oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
         // Only show Eagle-specific fields when Eagle is enabled
         if (eagleBase)
         {
@@ -338,7 +338,6 @@ private:
     int64_t mHeadSize{0};                   //!< Size of each attention head
     int64_t mRotaryDim{0};                  //!< Dimension for rotary position embeddings
     int32_t mNbKVCacheInputs{0};            //!< Number of KV cache inputs (layers)
-    int32_t mMaxPositionEmbeddings{0};      //!< Maximum position embeddings
     int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
     Json mModelConfig;                      //!< Parsed model configuration
 };

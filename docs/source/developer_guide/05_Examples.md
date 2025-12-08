@@ -52,7 +52,7 @@ Builds TensorRT engines for LLMs (standard, EAGLE, VLM, LoRA).
   --engineDir engines/qwen2.5-vl-3b \
   --maxBatchSize 1 \
   --maxInputLen=1024 \
-  --maxSeqLen=4096 \
+  --maxKVCacheCapacity=4096 \
   --vlm \
   --minImageTokens 128 \
   --maxImageTokens 512
@@ -182,7 +182,7 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_
 | `--engineDir` | Output engine directory | Required |
 | `--maxBatchSize` | Maximum batch size | 4 |
 | `--maxInputLen` | Maximum input length | 128 |
-| `--maxSeqLen` | Maximum sequence length | 4096 |
+| `--maxKVCacheCapacity` | Maximum KV-cache capacity | 4096 |
 | `--vlm` | VLM mode | false |
 | `--eagleBase/Draft` | EAGLE mode | false |
 | `--maxLoraRank` | LoRA rank (0=disabled) | 0 |
