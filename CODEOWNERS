@@ -22,6 +22,7 @@
 
 # == Automation tests ==
 /tests/ @luxiaoz @mahu @amberl
+/.gitlab/ @luxiaoz @mahu @amberl
 
 # == Kernel source we bring from other projects ==
 /kernelSrcs/ @fans @ruochengj
@@ -32,3 +33,4 @@
 
 # == Documentation ==
 /docs/ @luxiaoz @ffriedmann @kchemudupati
+/.github/ @luxiaoz @ffriedmann @kchemudupati

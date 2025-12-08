@@ -1,0 +1,70 @@
+# ==============================================================================
+# SONARQUBE JOBS
+# ==============================================================================
+
+get-binaries:
+  stage: get-binaries
+  image: gcc
+  
+  cache:
+    policy: pull-push
+    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+
+  artifacts:
+    paths:
+      - sonar-scanner/
+    expire_in: 1 hour
+      
+  script:
+    # Download sonar-scanner
+    - if [ ! -d sonar-scanner ]; then
+        curl -sSLo ./sonar-scanner.zip 'https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-6.2.0.4584-linux-x64.zip' &&
+        unzip -o sonar-scanner.zip &&
+        mv sonar-scanner-6.2.0.4584-linux-x64 sonar-scanner;
+      fi
+    
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH =~ /^release/
+    - if: $CI_COMMIT_BRANCH == 'main'
+    - if: $L1 == "true"
+
+build-sonar:
+  stage: build-sonar
+  image: gcc
+  needs:
+    - get-binaries
+
+  
+  cache:
+    policy: pull-push
+    key: "sonar-cache-$CI_COMMIT_REF_SLUG"
+    paths:
+      - "${SONAR_USER_HOME}/cache"
+      
+  script: sonar-scanner/bin/sonar-scanner
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH =~ /^release/
+    - if: $CI_COMMIT_BRANCH == 'main'
+    - if: $L1 == "true"
+
+sonarqube-vulnerability-report:
+  stage: sonarqube-vulnerability-report
+  image: gcc
+  script:
+    - 'curl -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=${SONARQUBE_PROJECT_KEY}&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" -o gl-sast-sonar-report.json'
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH =~ /^release/
+    - if: $CI_COMMIT_BRANCH == 'main'
+    - if: $L1 == "true"
+  artifacts:
+    expire_in: 4 days
+    reports:
+      sast: gl-sast-sonar-report.json
+
