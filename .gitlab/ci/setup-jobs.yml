@@ -1,0 +1,63 @@
+# ==============================================================================
+# SETUP JOBS
+# ==============================================================================
+
+# Pre-commit code quality checks
+pre_commit_checks:
+  stage: setup
+  variables:
+    CUDA_VERSION: "12.9"
+  tags:
+    - cpu-k8s
+  script:
+    - echo "Installing dependencies"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip python3-venv git >/dev/null 2>&1
+    - echo "Installing pre-commit hooks"
+    - python3 -m venv venv && source venv/bin/activate
+    - pip3 install -q pre-commit
+    - pre-commit install
+    - echo "Running pre-commit checks on all files"
+    - pre-commit run --all-files || (echo "❌ Pre-commit checks failed!" && echo "💡 To fix this locally, run:" && echo "   pip install pre-commit" && echo "   pre-commit install" && echo "   pre-commit run --all-files" && exit 1)
+    - echo "✅ Pre-commit checks passed!"
+    - deactivate
+    - echo "Pipeline end time:$(date)"
+  extends: .setup_common_rules
+  interruptible: true
+
+# Cache cleanup for L0 directory
+l0_cache_cleanup:
+  stage: setup
+  tags:
+    - a30-edgellm-nvks
+  script:
+    - echo "Pipeline start time:$(date)"
+    - echo "Starting cache cleanup for L0 directories older than 3 days in $EDGE_LLM_CACHE_DIR/L0"
+    - echo "Current contents in $EDGE_LLM_CACHE_DIR/L0:"
+    - ls -la "$EDGE_LLM_CACHE_DIR/L0" || echo "Directory is empty or inaccessible"
+    - echo "Removing directories older than 3 days..."
+    - find "$EDGE_LLM_CACHE_DIR/L0" -maxdepth 1 -type d -mtime +3 -not -path "$EDGE_LLM_CACHE_DIR/L0" -exec rm -rf {} \; -print
+    - echo "Cleanup completed. Remaining contents in $EDGE_LLM_CACHE_DIR/L0:"
+    - ls -la "$EDGE_LLM_CACHE_DIR/L0" || echo "Directory is empty or inaccessible"
+    - echo "Pipeline end time:$(date)"
+  extends: .l0_rules
+  interruptible: true
+
+# Cache cleanup for L1 directory
+l1_cache_cleanup:
+  stage: setup
+  tags:
+    - a30-edgellm-nvks
+  script:
+    - echo "Pipeline start time:$(date)"
+    - echo "Starting cache cleanup for L1 directories older than 7 days in $EDGE_LLM_CACHE_DIR/L1"
+    - echo "Current contents in $EDGE_LLM_CACHE_DIR/L1:"
+    - ls -la "$EDGE_LLM_CACHE_DIR/L1" || echo "Directory is empty or inaccessible"
+    - echo "Removing directories older than 7 days..."
+    - find "$EDGE_LLM_CACHE_DIR/L1" -maxdepth 1 -type d -mtime +7 -not -path "$EDGE_LLM_CACHE_DIR/L1" -exec rm -rf {} \; -print
+    - echo "Cleanup completed. Remaining contents in $EDGE_LLM_CACHE_DIR/L1:"
+    - ls -la "$EDGE_LLM_CACHE_DIR/L1" || echo "Directory is empty or inaccessible"
+    - echo "Pipeline end time:$(date)"
+  extends: .l1_rules
+  interruptible: true

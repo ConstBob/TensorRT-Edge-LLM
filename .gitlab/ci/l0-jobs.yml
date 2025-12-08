@@ -1,0 +1,177 @@
+# ==============================================================================
+# L0 TESTS - Merge Request Triggered
+# Cache Directory: /scratch.edge_llm_cache/L0/
+# ==============================================================================
+
+include:
+  - local: '.gitlab/ci/templates.yml'
+
+# Model export for Ampere (fp16 or int4)
+l0_ampere_model_export:
+  stage: l0_test
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/ampere_model_export"
+    PRIORITY: l0_export_ampere
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .export_onnx_template
+    - .l0_rules
+  interruptible: true
+
+# Model export for Blackwell/Thor (fp8 or fp4)
+l0_blackwell_model_export:
+  stage: l0_test
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/blackwell_model_export"
+    PRIORITY: l0_export_blackwell
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .export_onnx_template
+    - .l0_rules
+  interruptible: true
+
+l0_blackwell_eagle_model_export:
+  stage: l0_test
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/blackwell_model_export"
+    PRIORITY: l0_eagle_export_blackwell
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .export_onnx_template
+    - .l0_rules
+  interruptible: true
+
+# Building and testing with A30 Linux
+l0_a30:
+  stage: l0_test
+  needs:
+    - l0_ampere_model_export
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/a30"
+    PRIORITY: l0_pipeline_a30
+    ONNX_DIR: "$L0_CACHE_DIR/ampere_model_export/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .x86_test_template
+    - .l0_rules
+  interruptible: true
+
+# Building and testing with RTX5080 Linux
+l0_rtx5080:
+    stage: l0_test
+    needs:
+      - l0_blackwell_model_export
+    variables:
+      CUDA_VERSION: "12.9"
+      IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+      L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+      TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx5080"
+      PRIORITY: l0_pipeline_rtx5080
+      ONNX_DIR: "$L0_CACHE_DIR/blackwell_model_export/onnx"
+      TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+      ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+      TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
+    tags:
+      - rtx5080-edgellm-nvks
+    image: "$IMAGE"
+    extends:
+      - .x86_test_template
+      - .l0_rules
+    interruptible: true
+
+# Building and testing with B100 Linux
+l0_b100:
+    stage: l0_test
+    needs:
+      - l0_blackwell_model_export
+      - l0_blackwell_eagle_model_export
+    variables:
+      CUDA_VERSION: "12.9"
+      IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+      L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+      TEST_CACHE_DIR: "$L0_CACHE_DIR/b100"
+      PRIORITY: l0_pipeline_b100
+      ONNX_DIR: "$L0_CACHE_DIR/blackwell_model_export/onnx"
+      TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+      ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+      TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
+    tags:
+      - b100-edgellm-nvks
+    image: "$IMAGE"
+    extends:
+      - .x86_test_template
+      - .l0_rules
+    interruptible: true
+
+# Building and testing with Jetson Orin
+l0_jetson_orin:
+  stage: l0_test
+  needs:
+    - l0_ampere_model_export
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.9"
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/jetson_orin"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
+    PRIORITY: l0_pipeline_orin
+    ONNX_DIR: "$L0_CACHE_DIR/ampere_model_export/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - p3730-k8s
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l0_rules
+  interruptible: true
+
+# Building and testing with Drive Thor
+l0_drive_thor_ferrix:
+  stage: l0_test
+  needs:
+    - l0_blackwell_model_export
+  variables:
+    BOARD_USER: "tensorrt_user"
+    CUDA_VERSION: "12.8"
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_ferrix"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$CUDA_VERSION"
+    PRIORITY: l0_pipeline_thor_ferrix
+    ONNX_DIR: "$L0_CACHE_DIR/blackwell_model_export/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - thor_drive-nvks
+  image: "ubuntu:24.04"
+  extends:
+    - .device_test_template
+    - .l0_rules
+  interruptible: true

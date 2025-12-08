@@ -1,0 +1,135 @@
+# ==============================================================================
+# SHARED TEMPLATES
+# ==============================================================================
+
+# ==============================================================================
+# RULE TEMPLATES
+# ==============================================================================
+
+.l0_rules:
+  rules:
+    - if: $L1 == "true"
+      when: never
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+.l1_rules:
+  rules:
+    - if: $L1 == "true"
+
+.setup_common_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $L1 == "true"
+
+# ==============================================================================
+# SCRIPT TEMPLATES
+# ==============================================================================
+
+.sanity_python_check_template:
+  script:
+    - echo "Pipeline start time:$(date)"
+    - export LLM_SDK_DIR=$(pwd)
+    - echo "Installing TensorRT Edge-LLM in editable mode for sanity check"
+    - pip3 install -e .
+    - echo "✅ TensorRT Edge-LLM installation successful!"
+    - echo "Verifying installation..."
+    - python3 -c 'import tensorrt_edgellm; print(tensorrt_edgellm.__version__)'
+    - echo "Pipeline end time:$(date)"
+
+.export_onnx_template:
+  script:
+    - echo "Pipeline start time:$(date)"
+    - mkdir -p $ONNX_DIR $TEST_LOG_DIR
+    - echo "Installing dependencies"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip git curl >/dev/null 2>&1
+    - echo "Testing model export"
+    - ls /scratch.trt_llm_data
+    - export LLM_SDK_DIR=$(pwd)
+    - echo "Installing package dependencies"
+    - cd $LLM_SDK_DIR
+    - pip3 install -q build
+    - python3 -m build --wheel --outdir dist .
+    - pip3 install dist/*.whl
+    - echo "Installing pytest dependencies"
+    - pip3 install -q -r tests/requirements.txt
+    - echo "Setting up test environment"
+    - echo "Running export tests with pytest. Time:$(date)"
+    - python3 -m pytest tests --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - echo "Models exported to cache directory $ONNX_DIR"
+    - ls -la $ONNX_DIR
+    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
+    - echo "Pipeline end time:$(date)"
+  interruptible: true
+
+.x86_test_template:
+  script:
+    - echo "Pipeline start time:$(date)"
+    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR
+    - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/*
+    - chmod -R 777 $TEST_LOG_DIR
+    - echo "Installing dependencies"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip git >/dev/null 2>&1
+    - echo "Checking TRT x86_64 package"
+    - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
+    - echo "Using TensorRT x86_64 package directly from cache"
+    - export LLM_SDK_DIR=$(pwd)
+    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - echo "Installing pytest dependencies"
+    - pip3 install -q -r tests/requirements.txt
+    - echo "Installing accuracy dependencies"
+    - pip3 install -q -r examples/accuracy/requirements.txt
+    - echo "Setting up test environment"
+    - echo "Running pipeline tests with pytest. Time:$(date)"
+    - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
+    - ls -la $TEST_LOG_DIR
+    - echo "Pipeline end time:$(date)"
+  
+.device_test_template:
+  script:
+    - echo "Pipeline start time:$(date)"
+    - mkdir -p $TEST_LOG_DIR
+    - rm -rf $TEST_LOG_DIR/*
+    - chmod -R 777 $TEST_LOG_DIR
+    - echo "Installing dependencies"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq git openssh-client sshpass rsync python3 python3-pip python3-venv >/dev/null 2>&1
+    - echo "Copying password to device scripts"
+    - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
+    # clean up the packages in the board
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_init.sh
+    - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
+    - export LLM_SDK_DIR=$(pwd)
+    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - export REMOTE_WORKSPACE=/home/$BOARD_USER/tensorrt-edge-llm
+    - export ENGINE_DIR=$REMOTE_WORKSPACE/engines
+    - echo "Creating remote directories and syncing repo from host to board"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "mkdir -p $REMOTE_WORKSPACE $ENGINE_DIR"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@192.168.55.1:$REMOTE_WORKSPACE/
+    - echo "Setting file permissions to 755 to prevent permission issues"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "chmod -R 755 $REMOTE_WORKSPACE"
+    - echo "Installing pytest dependencies in a virtual environment"
+    - python3 -m venv venv && source venv/bin/activate
+    - pip3 install -q -r tests/requirements.txt
+    - echo "Installing accuracy dependencies"
+    - pip3 install -q -r examples/accuracy/requirements.txt
+    - echo "Setup complete. Running pipeline tests on device with pytest. Time:$(date)"
+    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=192.168.55.1 --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - if [ $? -ne 0 ]; then echo "Error occurred during testing"; exit 1; fi
+    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR. Cleaning up remote workspace."
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "rm -rf $REMOTE_WORKSPACE"
+    - ls -la $TEST_LOG_DIR
+    - deactivate
+    - echo "Pipeline end time:$(date)"
+
