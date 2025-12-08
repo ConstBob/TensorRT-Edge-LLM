@@ -41,7 +41,7 @@ std::string formatEngineConfig(trt_edgellm::rt::EagleDraftEngineRunnerConfig con
        << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
        << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
-       << "  kvCacheCapacityLength: " << config.kvCacheCapacityLength
+       << "  maxKVCacheCapacity: " << config.maxKVCacheCapacity
        << "  draftModelVocabSize: " << config.draftModelVocabSize << "  maxDraftTreeSize: " << config.maxDraftTreeSize
        << "  baseModelHiddenDim: " << config.baseModelHiddenDim
        << "  draftModelHiddenDim: " << config.draftModelHiddenDim << "  isVlm: " << config.isVlm;
@@ -100,7 +100,7 @@ namespace trt_edgellm
 {
 namespace rt
 {
-static constexpr int32_t kDRAFT_MODEL_CONTEXT_PROFILE_INDEX{0};
+static constexpr int32_t kDRAFT_MODEL_PREFILL_PROFILE_INDEX{0};
 static constexpr int32_t kDRAFT_MODEL_GENERATION_PROFILE_INDEX{1};
 
 EagleDraftEngineRunner::EagleDraftEngineRunner(
@@ -165,7 +165,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
 
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus
-        &= mPrefillExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, stream);
+        &= mPrefillExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_PREFILL_PROFILE_INDEX, stream);
     setOptimizationProfileStatus
         &= mGenerationExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_GENERATION_PROFILE_INDEX, stream);
     if (!setOptimizationProfileStatus)
@@ -185,7 +185,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // Instantiate the KVCache instance of the EngineRunner.
     this->mLinearKVCache
         = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
-                                mConfig.kvCacheCapacityLength, mConfig.numKVHeads, mConfig.headDim},
+                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim},
             stream);
 
     // By design for tree attention kernel we use, the tree mask will be packed into in32_t values where each bit
@@ -226,7 +226,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         // AttentionPlugin will handle broadcasting via the independent rope_batch_size axis
         LOG_DEBUG("Initialize 1D persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
-            = rt::Tensor({1, mConfig.kvCacheCapacityLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
         bool const initRopeStatus
             = initializeRopeCosSinCache(mPosEncCosSinCache, mConfig.ropeConfig, configJson, stream);
         if (!initRopeStatus)
@@ -238,7 +238,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     else
     {
         this->mPosEncCosSinCache
-            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim},
+            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
                 rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
     }
@@ -300,7 +300,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
     {
         // Define required fields for main config
         std::vector<std::string> const requiredConfigFields = {"num_hidden_layers", "num_key_value_heads", "head_dim",
-            "hidden_size", "base_model_hidden_size", "draft_vocab_size", "builder_config", "enable_reuse_kv_cache"};
+            "hidden_size", "base_model_hidden_size", "draft_vocab_size", "builder_config"};
 
         // Validate required fields exist in main config
         for (auto const& field : requiredConfigFields)
@@ -315,8 +315,8 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
         auto const& builderConfig = configJson["builder_config"];
 
         // Define required fields for builder_config
-        std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_batch_size", "max_input_len", "max_seq_len", "eagle_draft", "max_draft_tree_size", "is_vlm"};
+        std::vector<std::string> const requiredBuilderConfigFields = {
+            "max_batch_size", "max_input_len", "max_kv_cache_capacity", "eagle_draft", "max_draft_tree_size", "is_vlm"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -343,12 +343,11 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.draftModelHiddenDim = configJson["hidden_size"].get<int32_t>();
         mConfig.baseModelHiddenDim = configJson["base_model_hidden_size"].get<int32_t>();
         mConfig.draftModelVocabSize = configJson["draft_vocab_size"].get<int32_t>();
-        mConfig.enableReuseKVCache = configJson["enable_reuse_kv_cache"].get<bool>();
 
         // Extract builder_config values
         mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
-        mConfig.kvCacheCapacityLength = builderConfig["max_seq_len"].get<int32_t>();
+        mConfig.maxKVCacheCapacity = builderConfig["max_kv_cache_capacity"].get<int32_t>();
         mConfig.maxDraftTreeSize = builderConfig["max_draft_tree_size"].get<int32_t>();
         mConfig.isVlm = builderConfig["is_vlm"].get<bool>();
 
@@ -364,7 +363,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
             {"head_dim", mConfig.headDim}, {"base_model_hidden_dim", mConfig.baseModelHiddenDim},
             {"draft_model_hidden_dim", mConfig.draftModelHiddenDim},
             {"draft_model_vocab_size", mConfig.draftModelVocabSize}, {"max_input_len", mConfig.maxSupportedInputLength},
-            {"kv_cache_capacity_length", mConfig.kvCacheCapacityLength},
+            {"kv_cache_capacity_length", mConfig.maxKVCacheCapacity},
             {"max_draft_tree_size", mConfig.maxDraftTreeSize}};
 
         for (auto const& [fieldName, value] : positiveFields)
@@ -376,12 +375,12 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
             }
         }
 
-        if (mConfig.maxSupportedInputLength > mConfig.kvCacheCapacityLength)
+        if (mConfig.maxSupportedInputLength > mConfig.maxKVCacheCapacity)
         {
             LOG_ERROR(
                 "initializeConfigFromJson(): Invalid configuration: max_input_len (%d) cannot be greater than "
-                "max_seq_len (%d)",
-                mConfig.maxSupportedInputLength, mConfig.kvCacheCapacityLength);
+                "max_kv_cache_capacity (%d)",
+                mConfig.maxSupportedInputLength, mConfig.maxKVCacheCapacity);
             return false;
         }
     }
@@ -399,7 +398,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
 bool EagleDraftEngineRunner::validateConfigFromEngine()
 {
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPresentKeyValuesTemplate) != std::string::npos;
+        return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPastKeyValuesTemplate) != std::string::npos;
     };
 
     // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
@@ -409,30 +408,51 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
 
     int32_t nbKVCacheInputs{0};
     bool foundMultimodalEmbeddingsInput{false};
-    bool foundReuseKVCacheInput{false};
     int32_t numIOBindings = mEngine->getNbIOTensors();
+
+    // Lambda to validate KV cache dimensions against profile shape
+    auto validateKVCacheProfile = [&](Dims const& maxKVCacheShape, std::string const& profileName) -> bool {
+        if (mConfig.numKVHeads != maxKVCacheShape.d[2])
+        {
+            LOG_ERROR("numKVHeads is not consistent. From engine %s profile: %d, from config: %d", profileName.c_str(),
+                maxKVCacheShape.d[2], mConfig.numKVHeads);
+            return false;
+        }
+        if (mConfig.maxKVCacheCapacity != maxKVCacheShape.d[3])
+        {
+            LOG_ERROR("maxKVCacheCapacity is not consistent. From engine %s profile max: %d, from config: %d",
+                profileName.c_str(), maxKVCacheShape.d[3], mConfig.maxKVCacheCapacity);
+            return false;
+        }
+        if (mConfig.headDim != maxKVCacheShape.d[4])
+        {
+            LOG_ERROR("headDim is not consistent. From engine %s profile: %d, from config: %d", profileName.c_str(),
+                maxKVCacheShape.d[4], mConfig.headDim);
+            return false;
+        }
+        return true;
+    };
+
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
         std::string const bindingName = mEngine->getIOTensorName(i);
         Dims const tensorDim = mEngine->getTensorShape(bindingName.c_str());
+
         if (identifyKVCacheBinding(bindingName, tensorDim))
         {
-            if (mConfig.numKVHeads != tensorDim.d[2])
+            // Get max profile shapes for both prefill and generation profiles
+            Dims const maxKVCacheShapePrefill = mEngine->getProfileShape(
+                bindingName.c_str(), kDRAFT_MODEL_PREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+            Dims const maxKVCacheShapeGen = mEngine->getProfileShape(
+                bindingName.c_str(), kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
+
+            // Validate both profiles
+            if (!validateKVCacheProfile(maxKVCacheShapePrefill, "prefill"))
             {
-                LOG_ERROR("numKVHeads is not consistent. From engine: %d, from config: %d", tensorDim.d[2],
-                    mConfig.numKVHeads);
                 return false;
             }
-            if (mConfig.kvCacheCapacityLength != tensorDim.d[3])
+            if (!validateKVCacheProfile(maxKVCacheShapeGen, "generation"))
             {
-                LOG_ERROR("kvCacheCapacityLength is not consistent. From engine: %d, from config: %d", tensorDim.d[3],
-                    mConfig.kvCacheCapacityLength);
-                return false;
-            }
-            if (mConfig.headDim != tensorDim.d[4])
-            {
-                LOG_ERROR(
-                    "headDim is not consistent. From engine: %d, from config: %d", tensorDim.d[4], mConfig.headDim);
                 return false;
             }
             ++nbKVCacheInputs;
@@ -471,13 +491,13 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     }
 
     // Validate input shapes from optimization profiles
-    Dims const maxInputCtxShape = mEngine->getProfileShape(
-        binding_names::kInputIds, kDRAFT_MODEL_CONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
+    Dims const maxInputPrefillShape = mEngine->getProfileShape(
+        binding_names::kInputIds, kDRAFT_MODEL_PREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
     Dims const maxInputGenShape = mEngine->getProfileShape(
         binding_names::kInputIds, kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
 
     // Validate and potentially override maxSupportedBatchSize from engine's actual max profile
-    int32_t const engineMaxBatchSize = maxInputCtxShape.d[0];
+    int32_t const engineMaxBatchSize = maxInputPrefillShape.d[0];
     if (mConfig.maxSupportedBatchSize != engineMaxBatchSize)
     {
         LOG_ERROR("maxSupportedBatchSize mismatch! Config is %d, engine's max optimization profile is %d.",
@@ -485,10 +505,10 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
         return false;
     }
 
-    if (mConfig.maxSupportedInputLength != maxInputCtxShape.d[1])
+    if (mConfig.maxSupportedInputLength != maxInputPrefillShape.d[1])
     {
-        LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d", maxInputCtxShape.d[1],
-            mConfig.maxSupportedInputLength);
+        LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d",
+            maxInputPrefillShape.d[1], mConfig.maxSupportedInputLength);
         return false;
     }
     if (mConfig.maxDraftTreeSize != maxInputGenShape.d[1])
@@ -716,7 +736,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
         // Copy MRoPE cosine/sine cache tensor from the base model
         CUDA_CHECK(cudaMemcpyAsync(mPosEncCosSinCache.rawPointer(), baseRopeCosSinCache.rawPointer(),
             baseRopeCosSinCache.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
 
     setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
@@ -946,7 +966,7 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
         // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
         }
 
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1076,7 +1096,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
 
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1317,7 +1337,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
         // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
         }
 
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1442,7 +1462,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.kvCacheCapacityLength, mConfig.rotaryDim});
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
 
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1507,10 +1527,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
 bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
 {
     // Prepare special input binding shape for prefill stage KVCache input.
-    // TODO: Unify the semantics to always pass full KVCache shape.
-    Dims const kvCacheDimPrefillIn = {5, {activeBatchSize, 2, mConfig.numKVHeads, 0, mConfig.headDim}};
-    Dims const kvCacheDimDecodeIn
-        = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.kvCacheCapacityLength, mConfig.headDim}};
+    Dims const kvCacheDims = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
     bool status{true};
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
     {
@@ -1523,8 +1540,8 @@ bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
         status &= mGenerationExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status
             &= mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mPrefillExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimPrefillIn);
-        status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimDecodeIn);
+        status &= mPrefillExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
+        status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
     }
     return status;
 }

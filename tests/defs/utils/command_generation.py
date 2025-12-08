@@ -73,11 +73,6 @@ def _generate_llm_export_commands(
     if config.is_eagle:
         llm_cmd.append("--is_eagle_base")
 
-    llm_cmd.append(f"--max_position_embeddings={config.max_seq_len}")
-
-    if config.disable_reuse_kv_cache:
-        llm_cmd.append("--disable_reuse_kv_cache")
-
     return [(llm_cmd, 1200)]
 
 
@@ -206,15 +201,11 @@ def _generate_draft_export_commands(
     export_draft_cmd = [
         "tensorrt-edgellm-export-draft", f"--base_model_dir={base_model_dir}",
         f"--draft_model_dir={draft_model_dir}",
-        f"--output_dir={config.get_draft_onnx_dir()}",
-        f"--max_position_embeddings={config.max_seq_len}"
+        f"--output_dir={config.get_draft_onnx_dir()}"
     ]
 
     if config.model_type == ModelType.VLM:
         export_draft_cmd.append("--use_prompt_tuning")
-
-    if config.disable_reuse_kv_cache:
-        export_draft_cmd.append("--disable_reuse_kv_cache")
 
     commands.append((export_draft_cmd, 600))
 
@@ -257,7 +248,7 @@ def _generate_draft_build_commands(
         f"--onnxDir={config.get_draft_onnx_dir()}",
         f"--engineDir={config.get_llm_engine_dir()}",
         f"--maxInputLen={config.max_input_len}",
-        f"--maxSeqLen={config.max_seq_len}",
+        f"--maxKVCacheCapacity={config.max_seq_len}",
         f"--maxBatchSize={config.max_batch_size}", "--eagleDraft",
         f"--maxDraftTreeSize={config.max_draft_tree_size}"
     ])
@@ -284,7 +275,7 @@ def generate_build_commands(
             f"--onnxDir={config.get_llm_onnx_dir()}",
             f"--engineDir={config.get_llm_engine_dir()}",
             f"--maxInputLen={config.max_input_len}",
-            f"--maxSeqLen={config.max_seq_len}",
+            f"--maxKVCacheCapacity={config.max_seq_len}",
             f"--maxBatchSize={config.max_batch_size}"
         ])
 
@@ -304,7 +295,7 @@ def generate_build_commands(
             f"--onnxDir={config.get_llm_onnx_dir()}",
             f"--engineDir={config.get_llm_engine_dir()}",
             f"--maxInputLen={config.max_input_len}",
-            f"--maxSeqLen={config.max_seq_len}", "--vlm",
+            f"--maxKVCacheCapacity={config.max_seq_len}", "--vlm",
             f"--maxBatchSize={config.max_batch_size}",
             f"--minImageTokens={config.min_image_tokens}",
             f"--maxImageTokens={config.max_image_tokens}"

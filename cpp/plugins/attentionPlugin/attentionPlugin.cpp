@@ -141,28 +141,33 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
-AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t kvCacheCapacity, int32_t enableTreeAttention)
+AttentionPlugin::AttentionPlugin(
+    std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t enableTreeAttention)
     : mLayerName(name)
-    , mNumHeadQ(numQHeads)
-    , mNumHeadKV(numKVHeads)
-    , mNumElemPerHead(headSize)
-    , mKVCacheCapacity(kvCacheCapacity)
+    , mNumQHeads(numQHeads)
+    , mNumKVHeads(numKVHeads)
+    , mHeadSize(headSize)
     , mEnableTreeAttention(enableTreeAttention)
 {
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    bool canImplement = ContextFMHARunner::canImplement(mNumElemPerHead, mSMVersion, mDataType)
-        && DecoderXQARunner::canImplement(mNumHeadQ, mNumHeadKV, mSMVersion, mDataType);
-    if (!canImplement)
+    bool canImplementFMHA = ContextFMHARunner::canImplement(mHeadSize, mSMVersion, mDataType);
+    bool canImplementXQA = DecoderXQARunner::canImplement(mNumQHeads, mNumKVHeads, mSMVersion, mDataType);
+
+    if (!canImplementFMHA || !canImplementXQA)
     {
+        LOG_ERROR(
+            "Cannot implement AttentionPlugin configuration. FMHA: %s, XQA: %s, SM: %d, HeadSize: %d, NumQHeads: %d, "
+            "NumKVHeads: %d",
+            canImplementFMHA ? "supported" : "NOT supported", canImplementXQA ? "supported" : "NOT supported",
+            mSMVersion, mHeadSize, mNumQHeads, mNumKVHeads);
         throw std::runtime_error("Cannot implement the AttentionPlugin configuration.");
     }
 
     // Load FMHA and XQA kernels to device. The kernel code will only be loaded once if
     // multiple AttentionPlugin instances exist in the model.
-    // TODO: Fix me too pass spec-deocde support through plugin attributes.
+    // TODO: Fix me to pass spec-decode support through plugin attributes.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
     ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
     DecoderXQARunner::loadDecodeXQAKernels(mSMVersion, mDataType, useSpecDecode);
@@ -171,13 +176,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size_t length)
     : mLayerName(name)
 {
-    deserializeValue(&data, &length, &mMaxBatchSize);
-    deserializeValue(&data, &length, &mKVCacheCapacity);
-    deserializeValue(&data, &length, &mNumHeadQ);
-    deserializeValue(&data, &length, &mNumHeadKV);
-    deserializeValue(&data, &length, &mNumElemPerHead);
+    deserializeValue(&data, &length, &mNumQHeads);
+    deserializeValue(&data, &length, &mNumKVHeads);
+    deserializeValue(&data, &length, &mHeadSize);
     deserializeValue(&data, &length, &mEnableTreeAttention);
-    deserializeValue(&data, &length, &mEnableReuseKVCache);
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -192,8 +194,7 @@ AttentionPlugin::~AttentionPlugin() {}
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(
-        mLayerName, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mKVCacheCapacity, mEnableTreeAttention);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -248,7 +249,7 @@ bool AttentionPlugin::supportsFormatCombination(
         auto const tensorDim = tensorDesc.dims;
         if (status)
         {
-            status &= tensorDim.d[2] == (mNumHeadQ + mNumHeadKV + mNumHeadKV) * mNumElemPerHead;
+            status &= tensorDim.d[2] == (mNumQHeads + mNumKVHeads + mNumKVHeads) * mHeadSize;
         }
         return status;
     };
@@ -262,9 +263,8 @@ bool AttentionPlugin::supportsFormatCombination(
         {
             auto const tensorDim = tensorDesc.dims;
             status &= tensorDim.d[1] == 2; // Specify K and V
-            status &= tensorDim.d[2] == mNumHeadKV;
-            status &= tensorDim.d[3] == 0 || tensorDim.d[3] == mKVCacheCapacity;
-            status &= tensorDim.d[4] == mNumElemPerHead;
+            status &= tensorDim.d[2] == mNumKVHeads;
+            status &= tensorDim.d[4] == mHeadSize;
         }
         return status;
     };
@@ -282,7 +282,7 @@ bool AttentionPlugin::supportsFormatCombination(
         status &= tensorDesc.type == DataType::kFLOAT;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
         status &= tensorDesc.dims.nbDims == 3;
-        status &= tensorDesc.dims.d[2] <= mNumElemPerHead;
+        status &= tensorDesc.dims.d[2] <= mHeadSize;
         return status;
     };
     auto checkAttentionMask = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
@@ -316,8 +316,8 @@ bool AttentionPlugin::supportsFormatCombination(
         if (status)
         {
             auto const tensorDim = tensorDesc.dims;
-            status &= tensorDim.d[2] == mNumHeadQ;
-            status &= tensorDim.d[3] == mNumElemPerHead;
+            status &= tensorDim.d[2] == mNumQHeads;
+            status &= tensorDim.d[3] == mHeadSize;
         }
         return status;
     };
@@ -330,7 +330,7 @@ bool AttentionPlugin::supportsFormatCombination(
         LOG_ERROR(
             "Invalid number of inputs or outputs for the AttentionPlugin '%s'. Expected %d inputs and %d outputs, but "
             "got %d inputs and %d outputs.",
-            mLayerName.c_str(), expectedNbInputs, 2, nbInputs, nbOutputs);
+            mLayerName.c_str(), expectedNbInputs, kNUM_REQUIRED_OUTPUTS, nbInputs, nbOutputs);
         return false;
     }
 
@@ -381,18 +381,18 @@ DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::Di
         output.nbDims = 4;
         output.d[0] = inputs[0].d[0];
         output.d[1] = inputs[0].d[1];
-        output.d[2] = exprBuilder.constant(mNumHeadQ);
-        output.d[3] = exprBuilder.constant(mNumElemPerHead);
+        output.d[2] = exprBuilder.constant(mNumQHeads);
+        output.d[3] = exprBuilder.constant(mHeadSize);
     }
     else if (outputIndex == kOUT_KV_CACHE_IDX)
     {
-        // Output[1] is KVCache
+        // Output[1] is KVCache, same shape as input KV cache
         output.nbDims = 5;
         output.d[0] = inputs[1].d[0];
         output.d[1] = inputs[1].d[1];
-        output.d[2] = exprBuilder.constant(mNumHeadKV);
-        output.d[3] = exprBuilder.constant(mKVCacheCapacity);
-        output.d[4] = exprBuilder.constant(mNumElemPerHead);
+        output.d[2] = inputs[1].d[2];
+        output.d[3] = inputs[1].d[3];
+        output.d[4] = inputs[1].d[4];
     }
     return output;
 }
@@ -401,7 +401,7 @@ void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTe
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    return; // No need to configure anything.
+    return; // No need to configure anything since we will only use the runtime tensor shapes.
 }
 
 // TODO: extend the workspace calculation to a more generalized form.
@@ -417,6 +417,11 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     int64_t const maxBatchSize = qkvInputDesc.dims.d[0];
     int64_t const maxInputSeqLen = qkvInputDesc.dims.d[1];
 
+    // Obtain max KV cache capacity from the KV cache tensor shape.
+    // The KV cache tensor has shape [B, 2, num_kv_heads, capacity, head_dim]
+    PluginTensorDesc const& kvCacheDesc = inputs[kIN_KV_CACHE_IDX];
+    int64_t const maxKVCacheCapacity = kvCacheDesc.dims.d[3];
+
     // We use half precisions for now.
     int32_t const nbBytesPerData{2};
     int32_t workspaceSize = 0;
@@ -425,7 +430,7 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     workspaceSize = accumulateWorkspaceSize(workspaceSize, {maxBatchSize + 1}, DataType::kINT32);
     // The workspace will be used to store the Q tensor. For eagle mode, maxDecodingTokens means the number of Q tensor.
     workspaceSize = accumulateWorkspaceSize(
-        workspaceSize, {maxBatchSize, kMAX_EAGLE_DECODING_TOKENS, mNumHeadQ, mNumElemPerHead}, DataType::kHALF);
+        workspaceSize, {maxBatchSize, kMAX_EAGLE_DECODING_TOKENS, mNumQHeads, mHeadSize}, DataType::kHALF);
 
     // Always reserve workspace memory to prepare for chunked prefill decoding. The implementation should be further
     // optimized to avoid the workspace size overhead.
@@ -436,14 +441,15 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize}, DataType::kINT32);
     // Separate Q Tensor space to keep roped Q results.
     workspaceSize = accumulateWorkspaceSize(
-        workspaceSize, rt::Coords{maxBatchSize, maxInputSeqLen, mNumHeadQ, mNumElemPerHead}, DataType::kHALF);
+        workspaceSize, rt::Coords{maxBatchSize, maxInputSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
     // KV Tensor to store concated KV that include pre-cached KV and current KV.
-    workspaceSize = accumulateWorkspaceSize(workspaceSize,
-        rt::Coords{maxBatchSize, 2, mNumHeadKV, mKVCacheCapacity, mNumElemPerHead},
-        DataType::kHALF); // KVCacheCompact for FMHA.
+    workspaceSize = accumulateWorkspaceSize(
+        workspaceSize, rt::Coords{maxBatchSize, 2, mNumKVHeads, maxKVCacheCapacity, mHeadSize}, DataType::kHALF);
 
     // Request another alignment size to align the workspace pointer.
     workspaceSize += kDEVICE_ALIGNMENT;
+
+    LOG_DEBUG("AttentionPlugin workspace size: %zu bytes", workspaceSize);
     return workspaceSize;
 }
 
@@ -458,10 +464,10 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     PluginTensorDesc const& qkvInputDesc = inputDesc[kIN_QKV_IDX];
     int32_t const runtimeBatchSize = static_cast<int32_t>(qkvInputDesc.dims.d[0]);
     int32_t const runtimeSeqLen = static_cast<int32_t>(qkvInputDesc.dims.d[1]);
-    check::check(qkvInputDesc.dims.d[2] == (mNumHeadQ + mNumHeadKV + mNumHeadKV) * mNumElemPerHead,
+    check::check(qkvInputDesc.dims.d[2] == (mNumQHeads + mNumKVHeads + mNumKVHeads) * mHeadSize,
         "QKV input shape shall be consistent.");
     rt::Tensor qkvInputTensor(const_cast<void*>(inputs[kIN_QKV_IDX]),
-        rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumHeadQ + mNumHeadKV + mNumHeadKV, mNumElemPerHead},
+        rt::Coords{runtimeBatchSize, runtimeSeqLen, mNumQHeads + mNumKVHeads + mNumKVHeads, mHeadSize},
         rt::DeviceType::kGPU, qkvInputDesc.type);
 
     PluginTensorDesc const& contextLengthInputDesc = inputDesc[kIN_CONTEXT_LENGTH_IDX];
@@ -480,10 +486,14 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
         rt::DeviceType::kGPU, attentionOutputDesc.type);
 
-    // Construct the KVCache tensor from the output shape since we have workaround implementation from KVCache input.
-    PluginTensorDesc const& kvCacheOutputDesc = outputDesc[kOUT_KV_CACHE_IDX];
+    // Construct the KVCache tensor from the input KV cache descriptor.
+    // This allows KV cache from 0 to maxSeqLen and helps adjust the profile at runtime.
+    PluginTensorDesc const& kvCacheInputDesc = inputDesc[kIN_KV_CACHE_IDX];
     rt::Tensor kvCacheTensor(
-        outputs[kOUT_KV_CACHE_IDX], rt::Coords{kvCacheOutputDesc.dims}, rt::DeviceType::kGPU, kvCacheOutputDesc.type);
+        outputs[kOUT_KV_CACHE_IDX], rt::Coords{kvCacheInputDesc.dims}, rt::DeviceType::kGPU, kvCacheInputDesc.type);
+
+    // Extract KV cache capacity from the runtime tensor shape.
+    int32_t const kvCacheCapacity = static_cast<int32_t>(kvCacheInputDesc.dims.d[3]);
 
     // Optional Inputs that are not used with Tree Attention enabled.
     rt::Tensor attentionMaskTensor{};
@@ -537,8 +547,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         AttentionInputLayout attentionInputLayout = executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
             ? AttentionInputLayout::CONTIGUOUS_Q_KV
             : AttentionInputLayout::PACKED_QKV;
-        auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumHeadKV,
-            mNumElemPerHead, mSMVersion, attentionInputLayout);
+        auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
+            mHeadSize, mSMVersion, attentionInputLayout);
 
         // Prepare FMHA_v2 params to launch FMHA kernel
         FusedMultiheadAttentionParamsV2 params{};
@@ -550,18 +560,18 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         {
             // Assign Q tensor to keep roped Q results with layout [B, Sq, Hq, D].
             rt::Tensor qOutTensor = assignTensorFromWorkspace(
-                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumElemPerHead}, DataType::kHALF);
+                alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
             // q: [b, s, hq+hk+hv, d] -> [b, s, hq, d]
             kernel::launchApplyRopeWriteKVContinuousQAndKVCache(
                 ropeCosSinTensor, kvCacheEndIdxsTensor, qkvInputTensor, kvCacheTensor, qOutTensor, stream);
 
-            rt::Tensor transposedKVTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                {runtimeBatchSize, mKVCacheCapacity, 2, mNumHeadKV, mNumElemPerHead}, DataType::kHALF);
+            rt::Tensor transposedKVTensor = assignTensorFromWorkspace(
+                alignedWorkspacePtr, {runtimeBatchSize, kvCacheCapacity, 2, mNumKVHeads, mHeadSize}, DataType::kHALF);
             // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
             kernel::cvtKVLayoutBHSDToBSHD(kvCacheTensor, transposedKVTensor, stream);
 
             // Set device ptr for FMHA kernel.
-            params.s_kv = mKVCacheCapacity;
+            params.s_kv = kvCacheCapacity;
             params.q_ptr = qOutTensor.dataPointer<half>();
             params.kv_ptr = transposedKVTensor.dataPointer<half>();
             params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
@@ -582,7 +592,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     else
     {
         rt::Tensor qOutTensor = assignTensorFromWorkspace(
-            alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumHeadQ, mNumElemPerHead}, DataType::kHALF);
+            alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kHALF);
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
         {
             kernel::launchApplyRopeWriteKVTreeDecoding(ropeCosSinTensor, contextLengthTensor, attentionPosIdTensor,
@@ -594,14 +604,13 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                 ropeCosSinTensor, contextLengthTensor, qkvInputTensor, kvCacheTensor, qOutTensor, stream);
         }
         // Prepare Decoding attention runner parameter to dispatch kernel
-        auto xqaRunner
-            = DecoderXQARunner(mDataType, runtimeBatchSize, mNumHeadQ, mNumHeadKV, mNumElemPerHead, mSMVersion);
+        auto xqaRunner = DecoderXQARunner(mDataType, runtimeBatchSize, mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion);
         XQALaunchParams params = xqaRunner.initXQAParams();
         params.output = attentionOutputTensor.dataPointer<half>();
         params.qInputPtr = qOutTensor.dataPointer<half>();
         params.kvCache.data = kvCacheTensor.dataPointer<half>();
         params.kvCache.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
-        params.kvCache.capacity = mKVCacheCapacity;
+        params.kvCache.capacity = kvCacheCapacity;
         if (executionMode == AttentionExecutionMode::kTREE_DECODING)
         {
             // Execute tree attention decoding.
@@ -620,19 +629,15 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mMaxBatchSize) + sizeof(mKVCacheCapacity) + sizeof(mNumHeadQ) + sizeof(mNumHeadKV)
-        + sizeof(mNumElemPerHead) + sizeof(mEnableTreeAttention) + sizeof(mEnableReuseKVCache);
+    return sizeof(mNumQHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mEnableTreeAttention);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
 {
-    serializeValue(&buffer, mMaxBatchSize);
-    serializeValue(&buffer, mKVCacheCapacity);
-    serializeValue(&buffer, mNumHeadQ);
-    serializeValue(&buffer, mNumHeadKV);
-    serializeValue(&buffer, mNumElemPerHead);
+    serializeValue(&buffer, mNumQHeads);
+    serializeValue(&buffer, mNumKVHeads);
+    serializeValue(&buffer, mHeadSize);
     serializeValue(&buffer, mEnableTreeAttention);
-    serializeValue(&buffer, mEnableReuseKVCache);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -653,15 +658,10 @@ AttentionPluginCreator::AttentionPluginCreator()
     std::lock_guard<std::mutex> lock(sMutex);
 
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("max_batch_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("num_q_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
-
-    // Deprecated fields that are no longer used. Keep them here to suppress warning messages from existing ONNX models.
-    mPluginAttributes.emplace_back(PluginField("kv_cache_capacity", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("enable_reuse_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -696,29 +696,28 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
 {
     try
     {
-        std::optional<int32_t> kvCacheCapacity = parsePluginScalarField<int32_t>("kv_cache_capacity", fc);
         std::optional<int32_t> numQHeads = parsePluginScalarField<int32_t>("num_q_heads", fc);
         std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
-        // Make enable_tree_attention optional with default value 0 (disable by default)
         std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
-        int32_t enableTreeAttentionValue = enableTreeAttention.value_or(0);
 
         // Enforce Core parameters are specified.
-        bool checkRequiredFields
-            = kvCacheCapacity.has_value() && numQHeads.has_value() && headSize.has_value() && numKVHeads.has_value();
+        bool checkRequiredFields = numQHeads.has_value() && headSize.has_value() && numKVHeads.has_value()
+            && enableTreeAttention.has_value();
         if (!checkRequiredFields)
         {
+            LOG_ERROR("Missing required AttentionPlugin fields.");
             return nullptr;
         }
 
-        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
-            headSize.value(), kvCacheCapacity.value(), enableTreeAttentionValue);
+        AttentionPlugin* plugin = new AttentionPlugin(
+            std::string(name), numQHeads.value(), numKVHeads.value(), headSize.value(), enableTreeAttention.value());
 
         return plugin;
     }
     catch (std::exception const& e)
     {
+        LOG_ERROR("Failed to create AttentionPlugin: %s", e.what());
     }
     return nullptr;
 }
@@ -732,6 +731,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::deserializePlugin(
     }
     catch (std::exception const& e)
     {
+        LOG_ERROR("Failed to deserialize AttentionPlugin: %s", e.what());
     }
     return nullptr;
 }

@@ -298,7 +298,7 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
         try
         {
             mMultimodalRunner = MultimodalRunner::create(multimodalEngineDir, mBaseEngineConfig.maxSupportedBatchSize,
-                mBaseEngineConfig.maxSequenceLength, stream);
+                mBaseEngineConfig.maxKVCacheCapacity, stream);
         }
         catch (std::exception const& e)
         {
@@ -388,7 +388,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     constexpr int32_t kDRAFT_KVCACHE_RESERVE_LENGTH{100};
     int32_t const perfillTokenLength = context.rawBatchedInputIds[0].size();
     int32_t const kvCacheCapacity
-        = std::max(mBaseEngineConfig.maxSequenceLength, mDraftEngineConfig.kvCacheCapacityLength);
+        = std::max(mBaseEngineConfig.maxKVCacheCapacity, mDraftEngineConfig.maxKVCacheCapacity);
     if (perfillTokenLength + request.maxGenerateLength > (kvCacheCapacity - kDRAFT_KVCACHE_RESERVE_LENGTH))
     {
         maxGenerateLength = kvCacheCapacity - perfillTokenLength - kDRAFT_KVCACHE_RESERVE_LENGTH;

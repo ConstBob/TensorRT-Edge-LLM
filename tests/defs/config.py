@@ -146,9 +146,6 @@ class TestConfig:
     # Export LoRA parameters
     lora: Optional[bool] = None
 
-    # Export KV cache reuse parameter
-    disable_reuse_kv_cache: Optional[bool] = None
-
     # Engine build parameters
     max_batch_size: Optional[int] = None
     max_input_len: Optional[int] = None
@@ -183,15 +180,13 @@ class TestConfig:
     # Declarative parameter specifications
     _PARAMETER_SPECS = [
         # Core parameters for engine identification
-        ParameterSpec(
-            "max_seq_len", "mxsl", {
-                TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
-                TaskType.INFERENCE
-            }, {ModelType.LLM, ModelType.VLM}),
         ParameterSpec("max_batch_size", "mxbs",
                       {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM}),
         ParameterSpec("max_input_len", "mxil",
+                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {ModelType.LLM, ModelType.VLM}),
+        ParameterSpec("max_seq_len", "mxsl",
                       {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM}),
         ParameterSpec("max_lora_rank",
@@ -203,11 +198,6 @@ class TestConfig:
         # Export-specific parameters
         ParameterSpec("lora",
                       "", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
-                      is_required=False),
-        ParameterSpec("disable_reuse_kv_cache",
-                      "drkv",
-                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("is_eagle",
                       "eagle",
@@ -351,8 +341,6 @@ class TestConfig:
                 parsed_params['max_seq_len'] = int(part[4:])
             elif part == "lora":
                 parsed_params['lora'] = True
-            elif part == "drkv":
-                parsed_params['disable_reuse_kv_cache'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -469,8 +457,6 @@ class TestConfig:
             if self.task_type == TaskType.EXPORT:
                 if self.lora is None:
                     self.lora = False
-                if self.disable_reuse_kv_cache is None:
-                    self.disable_reuse_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
@@ -480,8 +466,6 @@ class TestConfig:
                     self.max_lora_rank = 0
                 if self.lora is None:
                     self.lora = self.max_lora_rank > 0
-                if self.disable_reuse_kv_cache is None:
-                    self.disable_reuse_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
@@ -542,9 +526,7 @@ class TestConfig:
     # Unified path generation methods
     def get_onnx_model_id(self) -> str:
         """Generate unique model identifier"""
-        model_id = f"{self.llm_precision}-{self.lm_head_precision}-{self.max_seq_len}"
-        if self.disable_reuse_kv_cache:
-            model_id += "-drkv"
+        model_id = f"{self.llm_precision}-{self.lm_head_precision}"
         return model_id
 
     def get_engine_id(self) -> str:
@@ -693,9 +675,7 @@ class TestConfig:
             raise ValueError("draft_llm_precision not set")
         if self.draft_lm_head_precision is None:
             raise ValueError("draft_lm_head_precision not set")
-        draft_id = f"{self.draft_model_id}-{self.draft_llm_precision}-{self.draft_lm_head_precision}-{self.max_seq_len}"
-        if self.disable_reuse_kv_cache:
-            draft_id += "-drkv"
+        draft_id = f"{self.draft_model_id}-{self.draft_llm_precision}-{self.draft_lm_head_precision}"
         return draft_id
 
     def get_draft_onnx_dir(self) -> str:
@@ -709,9 +689,7 @@ class TestConfig:
             return self.get_draft_model_dir()
         if self.draft_model_id is None:
             raise ValueError("draft_model_id not set")
-        quantized_name = f"quantized-{self.draft_model_id}-{self.draft_llm_precision}-{self.draft_lm_head_precision}-{self.max_seq_len}"
-        if self.disable_reuse_kv_cache:
-            quantized_name += "-drkv"
+        quantized_name = f"quantized-{self.draft_model_id}-{self.draft_llm_precision}-{self.draft_lm_head_precision}"
         return os.path.join(self.get_onnx_base_dir(), "quantized-draft",
                             quantized_name)
 
@@ -833,9 +811,7 @@ class TestConfig:
         if self.llm_precision == "fp16":
             return self.get_torch_model_dir()
         prefix = "quantized-base" if self.is_eagle else "quantized"
-        quantized_name = f"{self.llm_precision}-{self.lm_head_precision}-{self.max_seq_len}"
-        if self.disable_reuse_kv_cache:
-            quantized_name += "-drkv"
+        quantized_name = f"{self.llm_precision}-{self.lm_head_precision}"
         return os.path.join(self.get_onnx_base_dir(), prefix, quantized_name)
 
     def get_cnn_dailymail_dataset_dir(self) -> str:

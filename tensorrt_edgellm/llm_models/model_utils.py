@@ -232,29 +232,26 @@ def load_hf_model(
 
 
 def load_llm_model(
-        model_dir: str,
-        dtype: str,
-        max_position_embeddings: int,
-        device: str,
-        enable_reuse_kv_cache: bool,
-        is_eagle_base: bool,
-        reduced_vocab_size: Optional[int] = None,
-        vocab_map: Optional[torch.Tensor] = None) -> tuple[nn.Module, bool]:
+    model_dir: str,
+    dtype: str,
+    device: str,
+    is_eagle_base: bool,
+    reduced_vocab_size: Optional[int] = None,
+    vocab_map: Optional[torch.Tensor] = None
+) -> tuple[nn.Module, bool, AutoTokenizer]:
     """
     Load a language model (standard or EAGLE base).
     
     Args:
         model_dir: Directory containing the torch model
         dtype: Model dtype
-        max_position_embeddings: Maximum positional embedding length to use for model initialization
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
-        enable_reuse_kv_cache: Whether to enable persistent KV cache
         is_eagle_base: Whether this is an EAGLE3 base model
         reduced_vocab_size: Size of the reduced vocabulary (optional)
         vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
         
     Returns:
-        tuple: (model, use_prompt_tuning)
+        tuple: (model, use_prompt_tuning, tokenizer)
     """
     # Determine model type and print message
     if is_eagle_base:
@@ -262,31 +259,26 @@ def load_llm_model(
     else:
         print(f"Loading standard model from {model_dir}")
 
-    model, _ = load_hf_model(model_dir, dtype, device)
+    model, tokenizer = load_hf_model(model_dir, dtype, device)
     use_prompt_tuning = is_vlm(model_dir)
     set_dynamic_quant(model, dtype)
 
     # Create EdgeLLMModelForCausalLM wrapper.
-    # max_position_embeddings is set in EdgeLLMModelForCausalLM
     edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
-                                         use_prompt_tuning,
-                                         max_position_embeddings,
-                                         enable_reuse_kv_cache,
-                                         reduced_vocab_size, vocab_map)
+                                         use_prompt_tuning, reduced_vocab_size,
+                                         vocab_map)
 
     del model
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    return edge_model, use_prompt_tuning
+    return edge_model, use_prompt_tuning, tokenizer
 
 
 def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
-                            use_prompt_tuning: bool,
-                            max_position_embeddings: int, dtype: str,
-                            device: str,
-                            enable_reuse_kv_cache: bool) -> nn.Module:
+                            use_prompt_tuning: bool, dtype: str,
+                            device: str) -> nn.Module:
     """
     Load an EAGLE draft model with base model for weight copying.
     
@@ -294,10 +286,8 @@ def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
         draft_model_dir: Directory containing the draft model
         base_model_dir: Directory containing the base model 
         use_prompt_tuning: Whether the model uses prompt tuning
-        max_position_embeddings: Maximum positional embedding length to use for model initialization
         dtype: Model data type ("fp16")
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
-        enable_reuse_kv_cache: Whether to enable KV cache reuse
         
     Returns:
         nn.Module: Draft model
@@ -314,8 +304,6 @@ def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
         draft_model_dir=draft_model_dir,
         base_model_dir=base_model_dir,
         use_prompt_tuning=use_prompt_tuning,
-        max_position_embeddings=max_position_embeddings,
-        enable_reuse_kv_cache=enable_reuse_kv_cache,
         device=device).eval().to(device)
     if not is_gptq_model(draft_model):
         draft_model.to(torch_dtype)

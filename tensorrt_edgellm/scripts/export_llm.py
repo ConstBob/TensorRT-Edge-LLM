@@ -22,9 +22,6 @@ Usage:
     
     # EAGLE base model export
     python export_llm.py --model_dir /path/to/base_model --output_dir /path/to/output --is_eagle_base
-
-    # Disable reusing KV cache for system prompts
-    python export_llm.py --model_dir /path/to/model --output_dir /path/to/output --disable_reuse_kv_cache
     
     # Export with reduced vocabulary
     python export_llm.py --model_dir /path/to/model --output_dir /path/to/output --reduced_vocab_dir /path/to/reduced_vocab
@@ -56,12 +53,6 @@ def main() -> None:
                         required=True,
                         help="Path to save the exported ONNX model")
     parser.add_argument(
-        "--max_position_embeddings",
-        type=int,
-        required=False,
-        default=4096,
-        help="Maximum positional embedding length (default: 4096)")
-    parser.add_argument(
         "--device",
         type=str,
         required=False,
@@ -69,11 +60,6 @@ def main() -> None:
         help=
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
-    parser.add_argument("--disable_reuse_kv_cache",
-                        required=False,
-                        dest="enable_reuse_kv_cache",
-                        action="store_false",
-                        help="Disable reusing KV cache for system prompts.")
     parser.add_argument("--is_eagle_base",
                         required=False,
                         action='store_true',
@@ -93,9 +79,7 @@ def main() -> None:
         # Export model(s)
         export_llm_model(model_dir=args.model_dir,
                          output_dir=args.output_dir,
-                         max_position_embeddings=args.max_position_embeddings,
                          device=args.device,
-                         enable_reuse_kv_cache=args.enable_reuse_kv_cache,
                          is_eagle_base=args.is_eagle_base,
                          reduced_vocab_dir=args.reduced_vocab_dir)
 

@@ -137,12 +137,12 @@ tests/
 **ONNX Models (`ONNX_DIR/`):**
 ```
 {ModelName}/
-├── llm-{precision}-{lm_head_precision}-{max_seq_len}/
+├── llm-{precision}-{lm_head_precision}/
 │   ├── model.onnx
 │   ├── config.json
 │   ├── tokenizer.json
 │   └── lora_model.onnx         # (if LoRA enabled)
-├── draft-{precision}-{lm_head_precision}-{max_seq_len}/  # EAGLE draft model
+├── draft-{draft_id}-{precision}-{lm_head_precision}/  # EAGLE draft model
 │   ├── model.onnx
 │   ├── config.json
 │   └── tokenizer.json
@@ -152,15 +152,15 @@ tests/
 ├── lora_weights/                # Processed LoRA weights (if LoRA enabled)
 │   └── lora_0.safetensors
 ├── quantized/                   # Quantized base model checkpoints
-│   └── quantized-{precision}-{lm_head_precision}-{max_seq_len}/
+│   └── quantized-{precision}-{lm_head_precision}/
 └── quantized-draft/             # Quantized draft model checkpoints
-    └── quantized-{precision}-{lm_head_precision}-{max_seq_len}/
+    └── quantized-{draft_id}-{precision}-{lm_head_precision}/
 ```
 
 **Engine Output (`ENGINE_DIR/`):**
 ```
 {ModelName}/
-├── llm-{precision}-{lm_head_precision}-{max_seq_len}-mxil{N}-mxbs{N}-mxlr{N}/
+├── llm-{precision}-{lm_head_precision}-mxsl{N}-mxil{N}-mxbs{N}-mxlr{N}/
 │   └── llm.engine
 └── visual-{visual_precision}-mnit{N}-mxit{N}-mxpiit{N}/  # VLM only
     └── visual.engine

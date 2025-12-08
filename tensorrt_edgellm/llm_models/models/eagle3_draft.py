@@ -65,7 +65,6 @@ class Eagle3DraftModel(nn.Module):
         self,
         config: Any,
         use_prompt_tuning: bool = False,
-        enable_reuse_kv_cache: bool = False,
     ) -> None:
         """
         Initialize the EAGLE3 draft model.
@@ -73,7 +72,6 @@ class Eagle3DraftModel(nn.Module):
         Args:
             config: Model configuration object containing model parameters
             use_prompt_tuning: Whether to enable prompt tuning support
-            enable_reuse_kv_cache: Whether to enable persistent KV cache
         """
         super().__init__()
         self.config = config
@@ -107,10 +105,7 @@ class Eagle3DraftModel(nn.Module):
 
         # Decoder layers using our custom EdgeLLMDecoderLayer with config
         self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayer(config,
-                                index,
-                                eagle3_draft=True,
-                                enable_reuse_kv_cache=enable_reuse_kv_cache)
+            EdgeLLMDecoderLayer(config, index, eagle3_draft=True)
             for index in range(config.num_hidden_layers)
         ])
 
@@ -285,9 +280,7 @@ class Eagle3DraftModel(nn.Module):
         draft_model_dir: str,
         base_model_dir: Optional[str] = None,
         use_prompt_tuning: bool = False,
-        max_position_embeddings: int = 4096,
         device: str = "cuda",
-        enable_reuse_kv_cache: bool = False,
     ) -> "Eagle3DraftModel":
         """
         Load a pre-trained EAGLE3 draft model.
@@ -296,7 +289,6 @@ class Eagle3DraftModel(nn.Module):
             draft_model_dir: Path to the draft model directory
             base_model: Base model to copy weights from if needed
             use_prompt_tuning: Whether to enable prompt tuning support
-            max_position_embeddings: Maximum positional embedding length to use for model initialization
             device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
 
         Returns:
@@ -313,12 +305,6 @@ class Eagle3DraftModel(nn.Module):
             if hasattr(config, 'text_config'):
                 config = config.text_config
 
-        # Hard overwrite the config max_position_embeddings
-        print(
-            f"Setting draft model max_position_embeddings to {max_position_embeddings}"
-        )
-        config.max_position_embeddings = max_position_embeddings
-
         pytorch_bin_path = os.path.join(draft_model_dir, "pytorch_model.bin")
         safetensors_path = os.path.join(draft_model_dir, "model.safetensors")
         # TODO: Compatible with other formats of quantized weights
@@ -330,9 +316,7 @@ class Eagle3DraftModel(nn.Module):
             safetensors_path
         ), f"Model file not found at {pytorch_bin_path} or {safetensors_path} or {quantized_model_path}"
 
-        model = cls(config,
-                    use_prompt_tuning=use_prompt_tuning,
-                    enable_reuse_kv_cache=enable_reuse_kv_cache)
+        model = cls(config, use_prompt_tuning=use_prompt_tuning)
 
         if os.path.exists(quantized_model_path):
             # Load quantized model from modelopt

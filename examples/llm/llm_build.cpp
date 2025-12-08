@@ -35,7 +35,7 @@ enum LLMBuildOptionId : int
     ONNX_DIR = 702,
     ENGINE_DIR = 703,
     MAX_INPUT_LEN = 704,
-    MAX_SEQ_LEN = 705,
+    MAX_KV_CACHE_CAPACITY = 705,
     DEBUG = 706,
     MAX_BATCH_SIZE = 707,
     MAX_LORA_RANK = 708,
@@ -54,7 +54,7 @@ struct LLMBuildArgs
     std::string onnxDir;
     std::string engineDir;
     int64_t maxInputLen{1024};
-    int64_t maxSeqLen{4096};
+    int64_t maxKVCacheCapacity{4096};
     bool debug{false};
     int64_t maxBatchSize{4};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
@@ -71,7 +71,7 @@ void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
-                 "[--maxSeqLen <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
+                 "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  "[--eagleDraft] [--eagleBase] [--maxVerifyTreeSize <int>] "
                  "[--maxDraftTreeSize <int>] [--vlm] [--minImageTokens <int>] [--maxImageTokens <int>]"
               << std::endl;
@@ -82,7 +82,7 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --maxInputLen             Provide the maximum input length for the model. Default = 128"
               << std::endl;
-    std::cerr << "  --maxSeqLen               Provide the maximum output length for the model (including the input). "
+    std::cerr << "  --maxKVCacheCapacity      Provide the maximum KV cache capacity (sequence length). "
                  "Default = 4096"
               << std::endl;
     std::cerr << "  --maxBatchSize            Provide the maximum batch_size for builder. Default = 4" << std::endl;
@@ -108,7 +108,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"onnxDir", required_argument, 0, LLMBuildOptionId::ONNX_DIR},
         {"engineDir", required_argument, 0, LLMBuildOptionId::ENGINE_DIR},
         {"maxInputLen", required_argument, 0, LLMBuildOptionId::MAX_INPUT_LEN},
-        {"maxSeqLen", required_argument, 0, LLMBuildOptionId::MAX_SEQ_LEN},
+        {"maxKVCacheCapacity", required_argument, 0, LLMBuildOptionId::MAX_KV_CACHE_CAPACITY},
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
@@ -154,10 +154,10 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxInputLen = std::stoi(optarg);
             }
             break;
-        case LLMBuildOptionId::MAX_SEQ_LEN:
+        case LLMBuildOptionId::MAX_KV_CACHE_CAPACITY:
             if (optarg)
             {
-                args.maxSeqLen = std::stoi(optarg);
+                args.maxKVCacheCapacity = std::stoi(optarg);
             }
             break;
         case LLMBuildOptionId::DEBUG: args.debug = true; break;
@@ -243,7 +243,7 @@ int main(int argc, char** argv)
     // Create LLMBuilderConfig from args
     builder::LLMBuilderConfig config;
     config.maxInputLen = args.maxInputLen;
-    config.maxSeqLen = args.maxSeqLen;
+    config.maxKVCacheCapacity = args.maxKVCacheCapacity;
     config.maxBatchSize = args.maxBatchSize;
     config.maxLoraRank = args.maxLoraRank;
     config.eagleDraft = args.eagleDraft;

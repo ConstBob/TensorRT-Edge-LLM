@@ -52,7 +52,7 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& con
        << "  hiddenSize: " << config.hiddenSize << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
        << "  minSupportedInputLength: " << config.minSupportedInputLength
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
-       << "  maxSequenceLength: " << config.maxSequenceLength
+       << "  maxKVCacheCapacity: " << config.maxKVCacheCapacity
        << "  maxSupportedLoraRank: " << config.maxSupportedLoraRank;
     if (config.enableEagleSpecDecode)
     {
@@ -104,7 +104,7 @@ namespace rt
 {
 
 //! Current implementation limits to two optimization profiles per LLM engine.
-static constexpr int32_t kCONTEXT_PROFILE_INDEX{0};
+static constexpr int32_t kPREFILL_PROFILE_INDEX{0};
 static constexpr int32_t kGENERATION_PROFILE_INDEX{1};
 
 LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
@@ -168,7 +168,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus
-        &= mPrefillExecutionContext->setOptimizationProfileAsync(kCONTEXT_PROFILE_INDEX, stream);
+        &= mPrefillExecutionContext->setOptimizationProfileAsync(kPREFILL_PROFILE_INDEX, stream);
     setOptimizationProfileStatus
         &= mGenerationExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
     if (!setOptimizationProfileStatus)
@@ -195,9 +195,9 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             "longRope is not set correctly");
 
         rt::Tensor shortCosSinCache
-            = rt::Tensor({1, mConfig.maxSequenceLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
         rt::Tensor longCosSinCache
-            = rt::Tensor({1, mConfig.maxSequenceLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
         bool const initRopeStatus
             = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, configJson, stream);
         if (!initRopeStatus)
@@ -205,7 +205,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             LOG_ERROR("Failed to initialize long Rope CosSinCache.");
             throw std::runtime_error("Failed to initialize long Rope CosSinCache.");
         }
-        if (mConfig.maxSequenceLength <= ropeConfig.longRope.value().originalMaxPositionEmbeddings)
+        if (mConfig.maxKVCacheCapacity <= ropeConfig.longRope.value().originalMaxPositionEmbeddings)
         {
             mPosEncCosSinCache = std::move(shortCosSinCache);
         }
@@ -218,7 +218,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     case RopeType::kMRope:
     {
         this->mPosEncCosSinCache
-            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim},
+            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
                 rt::DeviceType::kGPU, DataType::kFLOAT);
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
         break;
@@ -227,7 +227,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     {
         LOG_DEBUG("Initialize persistent Rope CosSinCache.");
         this->mPosEncCosSinCache
-            = rt::Tensor({1, mConfig.maxSequenceLength, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
         bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
         if (!initRopeStatus)
         {
@@ -252,7 +252,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Instantiate the KVCache instance of the EngineRunner.
     this->mKVCache
         = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
-                                mConfig.maxSequenceLength, mConfig.numKVHeads, mConfig.headDim},
+                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim},
             stream);
 
     // Instantiate other GPU memory input that needed by the Engine execution.
@@ -382,7 +382,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_batch_size", "max_input_len", "max_seq_len", "max_lora_rank", "eagle_base", "is_vlm"};
+            = {"max_batch_size", "max_input_len", "max_kv_cache_capacity", "max_lora_rank", "eagle_base", "is_vlm"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -409,7 +409,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
         mConfig.minSupportedInputLength = 1; // TODO: Change this to min input length
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
-        mConfig.maxSequenceLength = builderConfig["max_seq_len"].get<int32_t>();
+        mConfig.maxKVCacheCapacity = builderConfig["max_kv_cache_capacity"].get<int32_t>();
         mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
         mConfig.enableEagleSpecDecode = builderConfig["eagle_base"].get<bool>();
 
@@ -417,11 +417,11 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.ropeConfig = collectRopeConfig(configJson);
 
         // Validate configuration values - all must be positive except max_lora_rank
-        std::vector<std::pair<std::string, int32_t>> positiveFields
-            = {{"num_decoder_layers", mConfig.numDecoderLayers}, {"num_key_value_heads", mConfig.numKVHeads},
-                {"head_dim", mConfig.headDim}, {"rotary_dim", mConfig.rotaryDim}, {"hidden_size", mConfig.hiddenSize},
-                {"vocab_size", mConfig.vocabSize}, {"max_batch_size", mConfig.maxSupportedBatchSize},
-                {"max_input_len", mConfig.maxSupportedInputLength}, {"max_seq_len", mConfig.maxSequenceLength}};
+        std::vector<std::pair<std::string, int32_t>> positiveFields = {{"num_decoder_layers", mConfig.numDecoderLayers},
+            {"num_key_value_heads", mConfig.numKVHeads}, {"head_dim", mConfig.headDim},
+            {"rotary_dim", mConfig.rotaryDim}, {"hidden_size", mConfig.hiddenSize}, {"vocab_size", mConfig.vocabSize},
+            {"max_batch_size", mConfig.maxSupportedBatchSize}, {"max_input_len", mConfig.maxSupportedInputLength},
+            {"max_kv_cache_capacity", mConfig.maxKVCacheCapacity}};
 
         for (auto const& [fieldName, value] : positiveFields)
         {
@@ -464,12 +464,12 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
                 mConfig.maxSupportedLoraRank);
             return false;
         }
-        if (mConfig.maxSupportedInputLength > mConfig.maxSequenceLength)
+        if (mConfig.maxSupportedInputLength > mConfig.maxKVCacheCapacity)
         {
             LOG_ERROR(
                 "initializeConfigFromJson(): Invalid configuration: max_input_len (%d) cannot be greater than "
-                "max_seq_len (%d)",
-                mConfig.maxSupportedInputLength, mConfig.maxSequenceLength);
+                "max_kv_cache_capacity (%d)",
+                mConfig.maxSupportedInputLength, mConfig.maxKVCacheCapacity);
             return false;
         }
     }
@@ -486,7 +486,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 bool LLMEngineRunner::validateConfigFromEngine()
 {
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPresentKeyValuesTemplate) != std::string::npos;
+        return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPastKeyValuesTemplate) != std::string::npos;
     };
 
     // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
@@ -503,6 +503,30 @@ bool LLMEngineRunner::validateConfigFromEngine()
     int32_t nbKVCacheInputs{0};
     bool foundMultimodalEmbeddingsInput{false};
     int32_t numIOBindings = mEngine->getNbIOTensors();
+
+    // Lambda to validate KV cache dimensions against profile shape
+    auto validateKVCacheProfile = [&](Dims const& maxKVCacheShape, std::string const& profileName) -> bool {
+        if (mConfig.numKVHeads != maxKVCacheShape.d[2])
+        {
+            LOG_ERROR("numKVHeads is not consistent. From engine %s profile: %d, from config: %d", profileName.c_str(),
+                maxKVCacheShape.d[2], mConfig.numKVHeads);
+            return false;
+        }
+        if (mConfig.maxKVCacheCapacity != maxKVCacheShape.d[3])
+        {
+            LOG_ERROR("maxKVCacheCapacity is not consistent. From engine %s profile max: %d, from config: %d",
+                profileName.c_str(), maxKVCacheShape.d[3], mConfig.maxKVCacheCapacity);
+            return false;
+        }
+        if (mConfig.headDim != maxKVCacheShape.d[4])
+        {
+            LOG_ERROR("headDim is not consistent. From engine %s profile: %d, from config: %d", profileName.c_str(),
+                maxKVCacheShape.d[4], mConfig.headDim);
+            return false;
+        }
+        return true;
+    };
+
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
         std::string const bindingName = mEngine->getIOTensorName(i);
@@ -510,22 +534,19 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
         if (identifyKVCacheBinding(bindingName, tensorDim))
         {
-            if (mConfig.numKVHeads != tensorDim.d[2])
+            // Get max profile shapes for both prefill and generation profiles
+            Dims const maxKVCacheShapePrefill
+                = mEngine->getProfileShape(bindingName.c_str(), kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+            Dims const maxKVCacheShapeGen
+                = mEngine->getProfileShape(bindingName.c_str(), kGENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
+
+            // Validate both profiles
+            if (!validateKVCacheProfile(maxKVCacheShapePrefill, "prefill"))
             {
-                LOG_ERROR("numKVHeads is not consistent. From engine: %d, from config: %d", tensorDim.d[2],
-                    mConfig.numKVHeads);
                 return false;
             }
-            if (mConfig.maxSequenceLength != tensorDim.d[3])
+            if (!validateKVCacheProfile(maxKVCacheShapeGen, "generation"))
             {
-                LOG_ERROR("maxSequenceLength is not consistent. From engine: %d, from config: %d", tensorDim.d[3],
-                    mConfig.maxSequenceLength);
-                return false;
-            }
-            if (mConfig.headDim != tensorDim.d[4])
-            {
-                LOG_ERROR(
-                    "headDim is not consistent. From engine: %d, from config: %d", tensorDim.d[4], mConfig.headDim);
                 return false;
             }
             ++nbKVCacheInputs;
@@ -575,25 +596,25 @@ bool LLMEngineRunner::validateConfigFromEngine()
             mConfig.numDecoderLayers);
         return false;
     }
-    Dims const minInputCtxShape
-        = mEngine->getProfileShape(binding_names::kInputIds, kCONTEXT_PROFILE_INDEX, OptProfileSelector::kMIN);
-    Dims const maxInputCtxShape
-        = mEngine->getProfileShape(binding_names::kInputIds, kCONTEXT_PROFILE_INDEX, OptProfileSelector::kMAX);
-    if (mConfig.minSupportedInputLength != minInputCtxShape.d[1])
+    Dims const minInputPrefillShape
+        = mEngine->getProfileShape(binding_names::kInputIds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMIN);
+    Dims const maxInputPrefillShape
+        = mEngine->getProfileShape(binding_names::kInputIds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+    if (mConfig.minSupportedInputLength != minInputPrefillShape.d[1])
     {
-        LOG_ERROR("minSupportedInputLength is not consistent. From engine: %d, from config: %d", minInputCtxShape.d[1],
-            mConfig.minSupportedInputLength);
+        LOG_ERROR("minSupportedInputLength is not consistent. From engine: %d, from config: %d",
+            minInputPrefillShape.d[1], mConfig.minSupportedInputLength);
         return false;
     }
-    if (mConfig.maxSupportedInputLength != maxInputCtxShape.d[1])
+    if (mConfig.maxSupportedInputLength != maxInputPrefillShape.d[1])
     {
-        LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d", maxInputCtxShape.d[1],
-            mConfig.maxSupportedInputLength);
+        LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d",
+            maxInputPrefillShape.d[1], mConfig.maxSupportedInputLength);
         return false;
     }
 
     // Validate and potentially override maxSupportedBatchSize from engine's actual max profile
-    int32_t const engineMaxBatchSize = maxInputCtxShape.d[0];
+    int32_t const engineMaxBatchSize = maxInputPrefillShape.d[0];
     if (mConfig.maxSupportedBatchSize != engineMaxBatchSize)
     {
         LOG_ERROR("maxSupportedBatchSize mismatch! Config is %d, engine's max optimization profile is %d.",
@@ -652,10 +673,7 @@ LLMEngineRunner::~LLMEngineRunner()
 bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
 {
     // Prepare special input binding shape for prefill stage KVCache input.
-    // TODO: Unify the semantics to always pass full KVCache shape.
-    Dims const kvCacheDimPrefillIn = {5, {activeBatchSize, 2, mConfig.numKVHeads, 0, mConfig.headDim}};
-    Dims const kvCacheDimDecodeIn
-        = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength, mConfig.headDim}};
+    Dims const kvCacheDims = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
     bool status{true};
     // Bind KV cache tensors to execution contexts
     for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
@@ -670,8 +688,8 @@ bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
         status
             &= mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
 
-        status &= mPrefillExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimPrefillIn);
-        status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDimDecodeIn);
+        status &= mPrefillExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
+        status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
     }
     return status;
 }
@@ -879,7 +897,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     // For non-MRope, the cache is fixed at {1, maxSeqLen, rotaryDim} and shared across all batches.
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
     setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
         binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
@@ -1030,7 +1048,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
+            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
         }
 
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1199,7 +1217,7 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
+            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
         }
 
         setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
@@ -1295,7 +1313,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     // Need to reshape the mPosEncCosSinCache for MROPE.
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
     CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), mKVCache.getKVCacheLengths().rawPointer(),
@@ -1443,7 +1461,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxSequenceLength, mConfig.rotaryDim});
+        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
 
     setEngineIOStatus &= mGenerationExecutionContext->setInputShape(

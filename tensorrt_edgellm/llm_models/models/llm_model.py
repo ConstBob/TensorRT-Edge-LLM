@@ -58,8 +58,7 @@ class EdgeLLMModel(nn.Module):
     def __init__(self,
                  hf_model: nn.Module,
                  is_eagle_base: bool = False,
-                 use_prompt_tuning: bool = False,
-                 enable_reuse_kv_cache: bool = True) -> None:
+                 use_prompt_tuning: bool = False) -> None:
         """
         Initialize the EdgeLLM model.
         
@@ -67,7 +66,6 @@ class EdgeLLMModel(nn.Module):
             hf_model: The original model (LlamaForCausalLM, Qwen2ForCausalLM, etc.)
             is_eagle_base: Whether this is an EAGLE3 base model
             use_prompt_tuning: Whether to enable prompt tuning support
-            enable_reuse_kv_cache: Whether to enable persistent KV cache
         """
         super().__init__()
 
@@ -85,10 +83,7 @@ class EdgeLLMModel(nn.Module):
 
         # Replace decoder layers with our custom ones
         self.layers = nn.ModuleList([
-            EdgeLLMDecoderLayer(hf_layer,
-                                self.torch_dtype,
-                                eagle3_draft=False,
-                                enable_reuse_kv_cache=enable_reuse_kv_cache)
+            EdgeLLMDecoderLayer(hf_layer, self.torch_dtype, eagle3_draft=False)
             for hf_layer in hf_model.layers
         ])
 
@@ -106,7 +101,7 @@ class EdgeLLMModel(nn.Module):
         past_key_values: Tuple[torch.FloatTensor, ...],
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
-        kvcache_start_index: Optional[torch.Tensor] = None,
+        kvcache_start_index: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
@@ -124,7 +119,7 @@ class EdgeLLMModel(nn.Module):
                            List of tensors, each with shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
             rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, head_dim)
             context_lengths: Context length tensor indicating current position in cache, shape (batch_size,)
-            kvcache_start_index: Start index of KV cache of shape (batch_size), optional
+            kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size, 1), required
             position_ids: Position IDs for positional encoding, shape (batch_size, seq_len), optional
             attention_mask: Attention mask for the decoder layers, shape (batch_size, seq_len, seq_len + past_len), optional
             input_ids: Input token IDs of shape (batch_size, seq_len), optional (used for standard models and prompt tuning)
@@ -213,8 +208,6 @@ class EdgeLLMModelForCausalLM(nn.Module):
                  hf_model: nn.Module,
                  is_eagle_base: bool = False,
                  use_prompt_tuning: bool = False,
-                 max_position_embeddings: int = 4096,
-                 enable_reuse_kv_cache: bool = True,
                  reduced_vocab_size: Optional[int] = None,
                  vocab_map: Optional[torch.Tensor] = None) -> None:
         """
@@ -224,8 +217,6 @@ class EdgeLLMModelForCausalLM(nn.Module):
             hf_model: The original model (LlamaForCausalLM, Qwen2ForCausalLM, etc.)
             is_eagle_base: Whether this is an EAGLE3 base model
             use_prompt_tuning: Whether to enable prompt tuning support
-            max_position_embeddings: Maximum positional embedding length to use for model initialization
-            enable_reuse_kv_cache: Whether to enable persistent KV cache
             reduced_vocab_size: Size of the reduced vocabulary (optional)
             vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
         """
@@ -246,16 +237,9 @@ class EdgeLLMModelForCausalLM(nn.Module):
             self.config = hf_model.config
         self.torch_dtype = hf_model.dtype
 
-        # Hard overwrite the config max_position_embeddings
-        print(
-            f"Setting model max_position_embeddings to {max_position_embeddings}"
-        )
-        self.config.max_position_embeddings = max_position_embeddings
-        language_model.config.max_position_embeddings = max_position_embeddings
-
         # Create EdgeLLMModel with the original model
         self.model = EdgeLLMModel(language_model, is_eagle_base,
-                                  use_prompt_tuning, enable_reuse_kv_cache)
+                                  use_prompt_tuning)
 
         # Handle lm_head with optional vocabulary reduction
         if reduced_vocab_size is not None and vocab_map is not None:
