@@ -33,7 +33,7 @@ from ...common import ONNX_OPSET_VERSION
 
 @symbolic_helper.parse_args("v", "v", "i")
 def symbolic_gather_nd(
-    g: torch.onnx._internal.jit_utils.GraphContext,
+    g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
     value: torch._C.Value,
     indices: torch._C.Value,
     batch_dims: int,

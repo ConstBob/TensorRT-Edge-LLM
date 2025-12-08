@@ -373,10 +373,7 @@ def quantize_and_save_llm(model_dir: str,
     tokenizer.save_pretrained(output_dir)
 
     # Save the quant config
-    quant_config = get_quant_config({
-        name: module
-        for name, module in model.named_modules()
-    })
+    quant_config = get_quant_config(model)
     with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
         json.dump(quant_config, f)
 
@@ -441,10 +438,7 @@ def quantize_and_save_draft(
         draft_model.save_pretrained(output_dir)
 
     # Save the quant config
-    quant_config = get_quant_config({
-        name: module
-        for name, module in draft_model.named_modules()
-    })
+    quant_config = get_quant_config(draft_model)
     with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
         json.dump(quant_config, f)
 

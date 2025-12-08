@@ -124,8 +124,8 @@ In the PR description, please consider addressing these points:
 
 [!IMPORTANT]
 For NVIDIA developers,  please submit feature or bug fixes to the dedicated branch specified in the nvbug
-**Keywords** field. For example, if a bug is reported on the release/0.3.0 branch, please submit the fix to
-`release/0.3.0` instead of the main branch.
+**Keywords** field. For example, if a bug is reported on the release/0.4.0 branch, please submit the fix to
+`release/0.4.0` instead of the main branch.
 
 Meanwhile, please add the "release blocker" label to any PRs that could potentially cause a release delay.
 

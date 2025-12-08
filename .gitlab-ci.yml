@@ -114,6 +114,17 @@ workflow:
     - deactivate
     - echo "Pipeline end time:$(date)"
 
+.sanity_python_check_template:
+  script:
+    - echo "Pipeline start time:$(date)"
+    - export LLM_SDK_DIR=$(pwd)
+    - echo "Installing TensorRT Edge-LLM in editable mode for sanity check"
+    - pip3 install -e .
+    - echo "✅ TensorRT Edge-LLM installation successful!"
+    - echo "Verifying installation..."
+    - python3 -c 'import tensorrt_edgellm; print(tensorrt_edgellm.__version__)'
+    - echo "Pipeline end time:$(date)"
+
 stages:
 - setup
 - test
@@ -282,6 +293,8 @@ blackwell_eagle_model_export:
   extends: .export_onnx_template
   interruptible: true
   rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 # Building and testing with A30 Linux
@@ -302,6 +315,22 @@ a30:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends: .x86_test_template
+  interruptible: true
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# Sanity Check with Ubuntu 22.04
+ubuntu22.04_sanity_python_install:
+  stage: test
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu22.04-cuda$CUDA_VERSION
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends: .sanity_python_check_template
   interruptible: true
   rules:
     - if: $CI_COMMIT_MESSAGE =~ /\[skip tests\]/

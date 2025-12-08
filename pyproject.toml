@@ -4,31 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tensorrt-edgellm"
-version = "0.3.0.0"
+version = "0.4.0.0"
 description = "A Python package for quantizing and exporting LLMs for edge deployment"
-readme = "tensorrt_edgellm/README.md"
-authors = [
-    {name = "NVIDIA", email = "TBD@nvidia.com"}
+readme = "README.md"
+keywords = [
+    "nvidia",
+    "tensorrt",
+    "deeplearning",
+    "inference",
+    "edge",
 ]
-maintainers = [
-    {name = "NVIDIA", email = "TBD@nvidia.com"}
-]
-keywords = ["TBD"]
 classifiers = [
-    "TBD"
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "torch~=2.8.0",
+    "torch~=2.9.1",
     "transformers==4.57.1",
-    "nvidia-modelopt[torch]==0.35.0",
-    "nvidia-modelopt[onnx]==0.35.0",
-    "onnx==1.18.0",
+    "nvidia-modelopt[torch]==0.39.0",
+    "nvidia-modelopt[onnx]==0.39.0",
+    "onnx==1.19.0",
     "datasets==4.0.0",
     "tqdm~=4.67.1",
     "numpy~=2.2.6",
-    "peft",
-    "backoff"
+    "peft~=0.18.0",
+    "backoff~=2.2.1"
 ]
 
 [project.optional-dependencies]

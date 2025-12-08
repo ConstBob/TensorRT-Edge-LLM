@@ -102,7 +102,7 @@ onnx.defs.register_schema(int4_gemm_plugin_schema)
 
 @symbolic_helper.parse_args("v", "v", "v", "i", "i", "i")
 def symbolic_int4_gemm_plugin(
-    g: torch.onnx._internal.jit_utils.GraphContext,
+    g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
     input: torch._C.Value,
     qweight: torch._C.Value,
     scales: torch._C.Value,
@@ -594,11 +594,13 @@ def int4_dq_gemm_to_plugin(graph: gs.Graph) -> gs.Graph:
 
         # Get the other input (this will be the plugin input)
         plugin_input = matmul_node.inputs[input_idx]
+        plugin_input.dtype = np.float16
 
         # Get the output of MatMul
         assert len(
             matmul_node.outputs) == 1, "MatMul should have exactly 1 output"
         matmul_output = matmul_node.outputs[0]
+        matmul_output.dtype = np.float16
 
         # Extract weights and scales from DequantizeLinear
         assert len(dequantize_node.inputs
@@ -617,7 +619,6 @@ def int4_dq_gemm_to_plugin(graph: gs.Graph) -> gs.Graph:
         gemm_k, gemm_n = weights_tensor.shape
         group_size = dequantize_node.attrs['block_size']
         weights_data = weights_tensor.values
-        assert weights_data.dtype.names is not None, "Weights should be a structured numpy array"
         scales_data = scales_tensor.values
         assert scales_data.shape[
             0] == gemm_k // group_size, "Scales should have shape [K/group_size, N]"
@@ -626,7 +627,7 @@ def int4_dq_gemm_to_plugin(graph: gs.Graph) -> gs.Graph:
         assert scales_data.dtype == np.float16, "Scales should be in float16 format"
 
         # Unpack the weights to int16 format (add 8 to convert from [-8,7] to [0,15] range)
-        unpacked_qweight = weights_data['int4'].astype(np.int16) + 8
+        unpacked_qweight = weights_data.astype(np.int16) + 8
         # Transpose to [gemm_n, gemm_k] for the packing function
         unpacked_qweight = unpacked_qweight.transpose(1, 0)
 
@@ -665,7 +666,23 @@ def int4_dq_gemm_to_plugin(graph: gs.Graph) -> gs.Graph:
                     inputs=[plugin_input, plugin_weights, plugin_scales],
                     outputs=[matmul_output],
                     attrs=gemm_attrs)
+    # Update Cast nodes around Add/Concat to fp16
+    # For inputs: if there's a Cast node, ensure it casts to fp16
+    # For the Add/Concat node itself: ensure inputs/outputs are fp16
+    # Do not remove any nodes
+    for node in [n for n in graph.nodes if n.op in ["Add", "Concat"]]:
+        # Update Cast nodes feeding into Add/Concat to cast to fp16
+        for inp in node.inputs:
+            inp.dtype = np.float16
+            # If input comes from a Cast node, update it to cast to fp16
+            if len(inp.inputs) == 1 and inp.inputs[0].op == "Cast":
+                cast_node = inp.inputs[0]
+                cast_node.attrs["to"] = onnx.TensorProto.FLOAT16
+
+        # Update outputs to fp16
+        for out in node.outputs:
+            out.dtype = np.float16
 
     # Clean up the graph and ensure topological ordering
-    graph.cleanup().toposort()
+    graph.cleanup().toposort().cleanup()
     return graph
