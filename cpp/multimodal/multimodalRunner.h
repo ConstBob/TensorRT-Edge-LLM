@@ -89,16 +89,16 @@ public:
         = 0;
 
     /*!
-     * @brief Preprocess system prompt
+     * @brief Used for KVCache saving where we need to conduct the tokenization of the system prompt and generate
+     * ND-Rope parameters for the system prompt.
      * @param systemPrompt System prompt text
      * @param tokenizer Tokenizer instance
      * @param ropeRotaryCosSinDevice RoPE cache tensor
      * @param stream CUDA stream
-     * @return Preprocessed system prompt
+     * @return True on success, false on failure
      */
-    virtual std::string preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
-        rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
-        = 0;
+    virtual bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+        rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
 
     /*!
      * @brief Run multimodal inference

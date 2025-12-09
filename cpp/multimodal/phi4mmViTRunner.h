@@ -65,15 +65,6 @@ public:
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
-    //! \brief Apply Phi-4MM chat template to system prompt (no RoPE changes)
-    //! \param[in] systemPrompt System prompt string
-    //! \param[in] tokenizer Tokenizer for text processing (unused)
-    //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache (unused)
-    //! \param[in] stream CUDA stream for execution (unused)
-    //! \return Formatted system prompt string
-    std::string preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
-        rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
-
     //! \brief Run inference on the vision encoder and perform HD postprocess
     //! \param[in] stream CUDA stream for execution
     //! \return True if inference succeeded, false otherwise
@@ -110,10 +101,6 @@ private:
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         tokenizer::Tokenizer* tokenizer);
 
-    //! \brief Apply Phi-4MM chat template to system prompt
-    std::string applyChatTemplateSystem(std::string const& systemPrompt);
-    //! \brief Apply Phi-4MM chat template to user prompt, inserting image placeholders
-    std::string applyChatTemplateUser(std::string const& userPrompt, int64_t const& numImage, bool addGenerationPrompt);
     //! \brief Copy and normalize one image, tile to blocks, and update token-length accounting
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
         int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);

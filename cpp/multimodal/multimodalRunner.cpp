@@ -113,5 +113,12 @@ rt::OptionalInputTensors MultimodalRunner::getExtraVisualFeatures()
     return {};
 }
 
+bool MultimodalRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+{
+    // Default implementation is to do nothing for system prompt preprocessing and ND-RoPE parameter generation.
+    return true;
+}
+
 } // namespace rt
 } // namespace trt_edgellm

@@ -753,35 +753,35 @@ class TestConfig:
             "vlm_lora":
             "tests/test_cases/vlm_lora.json",
             "mtbench":
-            f"{self.edgellm_data_dir}/datasets/MTBench/mtbench_eagle3.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MTBench/mtbench_eagle3.json",
             "mmmu":
-            f"{self.edgellm_data_dir}/datasets/MMMU/mmmu_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/mmmu/mmmu_dataset.json",
             "mmmu_pro_4":
-            f"{self.edgellm_data_dir}/datasets/MMMU_Pro_4/mmmu_pro_4_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MMMU_Pro_4/mmmu_pro_4_dataset.json",
             "mmmu_pro_10":
-            f"{self.edgellm_data_dir}/datasets/MMMU_Pro_10/mmmu_pro_10_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MMMU_Pro_10/mmmu_pro_10_dataset.json",
             "mmmu_pro_vision":
-            f"{self.edgellm_data_dir}/datasets/MMMU_Pro_vision/mmmu_pro_vision_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MMMU_Pro_vision/mmmu_pro_vision_dataset.json",
             "coco":
-            f"{self.edgellm_data_dir}/datasets/coco/dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/coco/dataset.json",
             "mmlu_0":
-            f"{self.edgellm_data_dir}/datasets/MMLU_zero_shot/mmlu_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MMLU_zero_shot/mmlu_dataset.json",
             "mmlu_5":
-            f"{self.edgellm_data_dir}/datasets/MMLU_five_shot/mmlu_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MMLU_five_shot/mmlu_dataset.json",
             "mmlu_pro":
-            f"{self.edgellm_data_dir}/datasets/MMLU_Pro/mmlu_pro_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MMLU_Pro/mmlu_pro_dataset.json",
             "mmstar":
-            f"{self.edgellm_data_dir}/datasets/MMStar/mmstar_reference.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MMStar/mmstar_reference.json",
             "aime":
-            f"{self.edgellm_data_dir}/datasets/AIME/aime_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/AIME/aime_dataset.json",
             "gsm8k":
-            f"{self.edgellm_data_dir}/datasets/GSM8K/gsm8k_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/GSM8K/gsm8k_dataset.json",
             "gsm8k_10":
-            f"{self.edgellm_data_dir}/datasets/GSM8K/gsm8k_dataset_10.json",
+            f"{self.edgellm_data_dir}/updated_datasets/GSM8K/gsm8k_dataset_10.json",
             "humaneval":
-            f"{self.edgellm_data_dir}/datasets/HumanEval/humaneval_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/HumanEval/humaneval_dataset.json",
             "math500":
-            f"{self.edgellm_data_dir}/datasets/MATH500/math500_dataset.json",
+            f"{self.edgellm_data_dir}/updated_datasets/MATH500/math500_dataset.json",
         }
 
         if self.test_case not in TEST_CASE_NAME_TO_PATH_MAP:
@@ -794,6 +794,25 @@ class TestConfig:
             raise ValueError(f"Test case file not found: '{test_case_path}'")
 
         return test_case_path
+
+    def get_chat_template_file(self) -> Optional[str]:
+        """
+        Get custom chat template file path for models that require it.
+        
+        Returns:
+            Path to chat template JSON file, or None if no custom template for this model
+        """
+        # Custom chat templates mapping: model_name -> template_filename
+        CUSTOM_CHAT_TEMPLATES = {
+            "Qwen3-0.6B": "qwen3_no_thinking.json",
+            "Qwen2.5-VL-7B-Instruct": "qwen2.5_vl_7b.json",
+        }
+
+        if self.model_name in CUSTOM_CHAT_TEMPLATES:
+            template_filename = CUSTOM_CHAT_TEMPLATES[self.model_name]
+            return f"tests/chat_templates/{template_filename}"
+
+        return None
 
     def get_output_json_file(self) -> str:
         """

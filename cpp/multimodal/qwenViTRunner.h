@@ -80,13 +80,13 @@ public:
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
-    //! \brief Preprocess system prompt for Qwen-VL chat template
+    //! \brief Encode the system prompt and generate ND-RoPE parameters for the system prompt for KVCache saving.
     //! \param[in] systemPrompt System prompt string
     //! \param[in] tokenizer Tokenizer for text processing
     //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
     //! \param[in] stream CUDA stream for execution
-    //! \return Formatted system prompt string
-    std::string preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+    //! \return True if preprocessing succeeded, false otherwise
+    bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
     //! \brief Run inference on the vision encoder
@@ -125,18 +125,6 @@ private:
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         trt_edgellm::tokenizer::Tokenizer* tokenizer);
-
-    //! \brief Apply Qwen-VL chat template to system prompt
-    //! \param[in] systemPrompt System prompt string
-    //! \return Formatted system prompt
-    std::string applyChatTemplateSystem(std::string const& systemPrompt);
-
-    //! \brief Apply Qwen-VL chat template to user prompt
-    //! \param[in] userPrompt User prompt string
-    //! \param[in] numImage Number of images in the prompt
-    //! \param[in] addGenerationPrompt Whether to add generation prompt
-    //! \return Formatted user prompt
-    std::string applyChatTemplateUser(std::string const& userPrompt, int64_t const& numImage, bool addGenerationPrompt);
 
     //! \brief Compute window indices for window attention (Qwen2.5-VL)
     //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)

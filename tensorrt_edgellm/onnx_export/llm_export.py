@@ -43,6 +43,8 @@ from ..quantization.quantization_utils import \
 
 enable_huggingface_checkpointing_patch()
 
+from ..chat_templates import (get_template_path, process_chat_template,
+                              validate_chat_template)
 from ..llm_models.layers.attention_plugin import \
     register_attention_plugin_onnx_symbolic_functions
 from ..llm_models.layers.gather_nd import \
@@ -50,9 +52,10 @@ from ..llm_models.layers.gather_nd import \
 from ..llm_models.layers.int4_gemm_plugin import (
     register_int4_gemm_plugin_onnx_symbolic_functions,
     replace_torch_quant_linear_with_plugin)
-from ..llm_models.model_utils import (is_gptq_model, load_eagle3_draft_model,
-                                      load_llm_model, load_reduced_vocab_map)
-from .chat_template import process_chat_template
+from ..llm_models.model_utils import (is_gptq_model,
+                                      is_incompatible_chat_template_model,
+                                      load_eagle3_draft_model, load_llm_model,
+                                      load_reduced_vocab_map)
 from .config_export import export_llm_config
 from .onnx_utils import export_onnx
 
@@ -454,7 +457,8 @@ def export_llm_model(model_dir: str,
                      output_dir: str,
                      device: str = "cuda",
                      is_eagle_base: bool = False,
-                     reduced_vocab_dir: Optional[str] = None) -> None:
+                     reduced_vocab_dir: Optional[str] = None,
+                     chat_template_path: Optional[str] = None) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -467,6 +471,7 @@ def export_llm_model(model_dir: str,
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
         is_eagle_base: Whether the model is an EAGLE3 base model (vs standard LLM)
         reduced_vocab_dir: Directory containing vocab_map.safetensors for vocabulary reduction (optional)
+        chat_template_path: Path to chat template JSON file. When provided, this template is validated and used instead of inferring from the model (optional)
     """
     start_time = time.time()
 
@@ -529,8 +534,40 @@ def export_llm_model(model_dir: str,
     tokenizer.save_pretrained(output_dir)
     print(f"Tokenizer saved to {output_dir}")
 
-    # Process and save chat template
-    process_chat_template(model_dir, output_dir)
+    # Check if model requires explicit chat template
+    is_incompatible, incompatible_model_type = is_incompatible_chat_template_model(
+        model_dir)
+
+    # Determine chat template source
+    if chat_template_path is not None:
+        # User provided a chat template
+        template_source = chat_template_path
+    elif is_incompatible:
+        # Use template from chat_templates/templates/
+        template_source = get_template_path(incompatible_model_type)
+        if template_source is None:
+            raise ValueError(
+                f"Model '{incompatible_model_type}' requires the --chat-template flag.\n"
+                f"This model type does not have a compatible chat template that can be "
+                f"automatically extracted from its tokenizer, and no template is available.\n"
+                f"Please provide a chat template JSON file using: --chat-template /path/to/template.json\n"
+                f"See docs/source/developer_guide/06_Chat_Template_Format.md for the required format."
+            )
+    else:
+        template_source = None
+
+    # Handle chat template
+    if template_source is not None:
+        # Validate and copy the template
+        print(f"Using chat template from: {template_source}")
+        validate_chat_template(template_source)
+        output_template_path = os.path.join(output_dir,
+                                            "processed_chat_template.json")
+        shutil.copy2(template_source, output_template_path)
+        print(f"Chat template saved to {output_template_path}")
+    else:
+        # Generate chat template from model
+        process_chat_template(model_dir, output_dir)
 
     # Copy vocab_map.safetensors to output directory if reduced_vocab_dir is provided
     if reduced_vocab_dir is not None:

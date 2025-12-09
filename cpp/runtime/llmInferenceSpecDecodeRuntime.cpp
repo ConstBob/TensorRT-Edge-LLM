@@ -312,11 +312,11 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
 bool LLMInferenceSpecDecodeRuntime::handleRequest(
     LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
 {
-    int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
+    int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
 
     if (activeBatchSize == 0)
     {
-        LOG_ERROR("Empty request with no prompts");
+        LOG_ERROR("Empty request with no requests");
         return false;
     }
 
@@ -342,16 +342,29 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 
     // Preprocess user prompts and encode them.
     std::vector<std::vector<int32_t>> batchedInputIds;
+
+    // Apply chat template for all requests (common for both multimodal and non-multimodal)
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        // Use cached formatted prompts if available, otherwise compute them
+        if (request.requests[i].formattedSystemPrompt.empty() || request.requests[i].formattedCompleteRequest.empty())
+        {
+            // Apply chat template to populate both formatted system prompt and full formatted prompt
+            mTokenizer->applyChatTemplate(request.requests[i], true);
+        }
+    }
+
     if (!mMultimodalRunner)
     {
-        // Process each prompt in the batch
+        // Process each request in the batch
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            auto const& prompt = request.prompts[i];
-            context.systemPrompts[i] = prompt.systemPrompt;
+            // Store the formatted system prompt for KV cache
+            context.systemPrompts[i] = request.requests[i].formattedSystemPrompt;
 
-            std::string const inputText = context.systemPrompts[i] + prompt.userPrompt;
-            context.rawBatchedInputIds.emplace_back(mTokenizer->encode(inputText, false));
+            // Use the cached full formatted prompt
+            context.rawBatchedInputIds.emplace_back(
+                mTokenizer->encode(request.requests[i].formattedCompleteRequest, false));
             if (context.rawBatchedInputIds[i].empty())
             {
                 LOG_ERROR("Failed to tokenize input text for batch %d", i);
@@ -361,14 +374,6 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     }
     else
     {
-        // Process system prompts for all batches
-        for (int32_t i = 0; i < activeBatchSize; ++i)
-        {
-            // TODO: apply chat template for system prompt
-            context.systemPrompts[i] = mMultimodalRunner->preprocessSystemPrompt(request.prompts[i].systemPrompt,
-                mTokenizer.get(), mBaseEngineRunner->getRopeCosSinCacheTensor(), stream);
-        }
-
         if (!mMultimodalRunner->preprocess(request, context.rawBatchedInputIds, mTokenizer.get(),
                 mBaseEngineRunner->getRopeCosSinCacheTensor(), stream))
         {

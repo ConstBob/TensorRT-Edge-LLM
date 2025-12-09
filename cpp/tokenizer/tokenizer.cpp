@@ -16,6 +16,7 @@
  */
 
 #include "tokenizer.h"
+#include "runtime/llmRuntimeUtils.h"
 #include "tokenizerUtils.h"
 #include <fstream>
 #include <iterator>
@@ -31,6 +32,9 @@ namespace tokenizer
 
 // File size limits for configuration files
 constexpr size_t MAX_CONFIG_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB limit for config files
+
+// Chat template role names
+constexpr char kRoleSystem[] = "system";
 
 Tokenizer::Tokenizer()
     : mNumVocab(0)
@@ -104,6 +108,16 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
 
     // Pre-initialize Unicode lookup tables to avoid first-call latency during encode
     unicodeCptFlags(0);
+
+    // Load chat template (required)
+    std::filesystem::path const chatTemplatePath = modelDir / "processed_chat_template.json";
+    if (!loadChatTemplate(chatTemplatePath))
+    {
+        LOG_ERROR(
+            "Please ensure processed_chat_template.json exists in the model/engine directory, and it follows the "
+            "format specified in the documentation.");
+        return false;
+    }
 
     mInitialized = true;
     LOG_INFO("Successfully loaded tokenizer from %s (vocab_size=%d)", modelDir.c_str(), mNumVocab);
@@ -625,6 +639,208 @@ void Tokenizer::appendEos(std::vector<Rank>& tokens) const noexcept
     {
         LOG_DEBUG("EOS ID is not set. Not appending EOS token.");
     }
+}
+
+bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
+{
+    if (!std::filesystem::exists(chatTemplateFile))
+    {
+        LOG_ERROR("Chat template file not found: %s", chatTemplateFile.c_str());
+        return false;
+    }
+
+    // Validate file size before reading
+    if (!validateFileSize(chatTemplateFile, MAX_CONFIG_FILE_SIZE_BYTES))
+    {
+        return false;
+    }
+
+    std::ifstream file(chatTemplateFile);
+    if (!file.is_open())
+    {
+        LOG_ERROR("Failed to open chat template file: %s", chatTemplateFile.c_str());
+        return false;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+
+    Json jsonData;
+    try
+    {
+        jsonData = Json::parse(content);
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse chat template JSON: %s", e.what());
+        return false;
+    }
+
+    try
+    {
+        // Parse model path
+        mChatTemplate.modelPath = jsonData.value("model_path", mChatTemplate.modelPath);
+
+        // Parse roles,  which should contains [system, user, assistant]
+        check::check(jsonData.contains("roles") && jsonData["roles"].is_object(),
+            "Roles-field is required in chat template. And Shall be a JSON object.");
+        for (auto const& [role, roleConfig] : jsonData["roles"].items())
+        {
+            ChatTemplateRole templateRole;
+            templateRole.prefix = roleConfig.value("prefix", "");
+            templateRole.suffix = roleConfig.value("suffix", "");
+            mChatTemplate.roles[role] = templateRole;
+        }
+
+        // Parse non-text content types place holder format string.
+        if (jsonData.contains("content_types") && jsonData["content_types"].is_object())
+        {
+            for (auto const& [contentType, contentConfig] : jsonData["content_types"].items())
+            {
+                ChatTemplateContentType templateContentType;
+                templateContentType.format = contentConfig.value("format", "");
+                if (templateContentType.format.empty())
+                {
+                    LOG_WARNING("Content type format is empty. Skip this content type: %s.", contentType.c_str());
+                    continue;
+                }
+                mChatTemplate.contentTypes[contentType] = templateContentType;
+            }
+        }
+
+        // Collect other fields from the chat template if exists.
+        mChatTemplate.generationPrompt = jsonData.value("generation_prompt", mChatTemplate.generationPrompt);
+        mChatTemplate.defaultSystemPrompt = jsonData.value("default_system_prompt", mChatTemplate.defaultSystemPrompt);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to parse chat template: %s", e.what());
+        return false;
+    }
+
+    LOG_INFO("Successfully loaded chat template from %s (for model: %s)", chatTemplateFile.c_str(),
+        mChatTemplate.modelPath.c_str());
+    return true;
+}
+
+bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& request, bool addGenerationPrompt) const
+{
+    if (request.messages.empty())
+    {
+        LOG_ERROR("Request shall contain at least one message. to proceed with execution.");
+        return false;
+    }
+
+    std::string formattedPrefixSystemPrompt{};
+    std::string formattedCompleteRequest{};
+
+    // Check if there's a given system message in the request. If not, we will use the default system prompt
+    // with priority order: 1) request.defaultSystemPrompt, 2) model's defaultSystemPrompt
+    std::string systemPromptToUse{};
+    auto const& leadMessage = request.messages.front();
+    if (leadMessage.role == kRoleSystem)
+    {
+        // User provided system message, verify the contents are all text, combine them and apply chat template.
+        std::string combinedSystemContent{};
+        for (auto const& content : leadMessage.contents)
+        {
+            if (content.type == "text")
+            {
+                combinedSystemContent += content.content;
+            }
+            else
+            {
+                LOG_WARNING("System message contents shall be all text. Find %s content type. Skip this content.",
+                    content.type.c_str());
+            }
+        }
+        systemPromptToUse = combinedSystemContent;
+    }
+    else if (!request.defaultSystemPrompt.empty())
+    {
+        systemPromptToUse = request.defaultSystemPrompt;
+    }
+    else if (!mChatTemplate.defaultSystemPrompt.empty())
+    {
+        systemPromptToUse = mChatTemplate.defaultSystemPrompt;
+    }
+
+    if (!systemPromptToUse.empty())
+    {
+        auto roleIt = mChatTemplate.roles.find(kRoleSystem);
+        if (roleIt != mChatTemplate.roles.end())
+        {
+            formattedPrefixSystemPrompt = roleIt->second.prefix + systemPromptToUse + roleIt->second.suffix;
+        }
+        else
+        {
+            LOG_WARNING("System role not found in chat template. Skip the format and use the raw content: %s.",
+                systemPromptToUse.c_str());
+            formattedPrefixSystemPrompt = systemPromptToUse;
+        }
+        formattedCompleteRequest += formattedPrefixSystemPrompt;
+    }
+
+    // Process each message
+    for (size_t i = 0; i < request.messages.size(); ++i)
+    {
+        // Get role configuration
+        auto const& message = request.messages[i];
+        auto roleIt = mChatTemplate.roles.find(message.role);
+        if (roleIt == mChatTemplate.roles.end())
+        {
+            LOG_WARNING("Unknown role: %s", message.role.c_str());
+            continue;
+        }
+        if (message.role == kRoleSystem && i == 0)
+        {
+            // Skip since we have already proceed it in the previous step.
+            continue;
+        }
+
+        auto const& role = roleIt->second;
+
+        // Build formatted message
+        std::string formattedMessage;
+        formattedMessage += role.prefix;
+
+        // Process content items
+        for (auto const& contentItem : message.contents)
+        {
+            if (contentItem.type == "text")
+            {
+                formattedMessage += contentItem.content;
+            }
+            else
+            {
+                // Get content type format
+                auto contentTypeIt = mChatTemplate.contentTypes.find(contentItem.type);
+                if (contentTypeIt != mChatTemplate.contentTypes.end())
+                {
+                    formattedMessage += contentTypeIt->second.format;
+                }
+                else
+                {
+                    LOG_WARNING("Unknown content type: %s", contentItem.type.c_str());
+                }
+            }
+        }
+
+        formattedMessage += role.suffix;
+        // Add current message to the complete request.
+        formattedCompleteRequest += formattedMessage;
+    }
+
+    // Add generation prompt if requested and available
+    if (addGenerationPrompt && !mChatTemplate.generationPrompt.empty())
+    {
+        formattedCompleteRequest += mChatTemplate.generationPrompt;
+    }
+
+    // Update the request with the formatted system prompt and complete request.
+    request.formattedSystemPrompt = formattedPrefixSystemPrompt;
+    request.formattedCompleteRequest = formattedCompleteRequest;
+    return true;
 }
 
 } // namespace tokenizer
