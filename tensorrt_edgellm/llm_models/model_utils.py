@@ -187,13 +187,24 @@ def _load_phi4mm_war(model_dir: str):
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
 
-    # Inject no-op to avoid PEFT requiring this on the base model
-    if hasattr(module, "Phi4MMModel"):
+    # WAR: Override Phi4MMForCausalLM.__init__ to prevent the model from being
+    # converted into a PEFT model, which modelopt and transformers cannot handle correctly.
+    # The LoRA weights have already been merged into the base model.
+    if (hasattr(module, "Phi4MMForCausalLM")
+            and hasattr(module, "Phi4MMModel")
+            and hasattr(module, "Phi4MMPreTrainedModel")):
 
-        def _fake_prepare_inputs_for_generation(self, *args, **kwargs):
-            pass
+        def _phi4mm_init_war(self, config):
+            module.Phi4MMPreTrainedModel.__init__(self, config)
+            self.model = module.Phi4MMModel(config)
+            self.vocab_size = config.vocab_size
+            self.lm_head = nn.Linear(config.hidden_size,
+                                     config.vocab_size,
+                                     bias=False)
+            self.post_init()
 
-        module.Phi4MMModel.prepare_inputs_for_generation = _fake_prepare_inputs_for_generation
+        module.Phi4MMForCausalLM.__init__ = _phi4mm_init_war
+
     return module
 
 
@@ -222,9 +233,10 @@ def load_hf_model(
         raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
 
-    # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
-    # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
     if _is_phi4mm_model(model_dir):
+        # Avoid converting the model into a PEFT-wrapped model, which ModelOpt and
+        # Transformers cannot currently handle correctly. LoRA weights will instead
+        # be merged directly into the base model.
         module = _load_phi4mm_war(model_dir)
         model = module.Phi4MMForCausalLM.from_pretrained(
             model_dir,

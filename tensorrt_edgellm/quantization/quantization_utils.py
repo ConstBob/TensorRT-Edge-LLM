@@ -82,7 +82,14 @@ def quantize_model(
                 model(**data)
             else:
                 data = data.to(model.device)
-                model(data)
+                kwargs = {}
+                if hasattr(model, "config") and "phi4mm" in getattr(
+                        model.config, "model_type", "").lower():
+                    # Have already merged the vision LoRA, so set input_mode=0 (LANGUAGE) during quantization
+                    kwargs["input_mode"] = 0
+                    # Work around a transformers version mismatch between Phi-4MM and Edge-LLM
+                    kwargs["use_cache"] = False
+                model(data, **kwargs)
 
     # Get quantization config and perform quantization
     mtq.quantize(model, quant_config, forward_loop=calibrate_loop)

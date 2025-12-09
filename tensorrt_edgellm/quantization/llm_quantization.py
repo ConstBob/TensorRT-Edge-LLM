@@ -140,6 +140,18 @@ DISABLE_VISUAL_CONFIG: Dict[str, Any] = {
     }
 }
 
+# Already merged the vision LoRA and audio is currently not supported, so disable them.
+DISABLE_Phi4MM_VISUAL_AUDIO_CONFIG: Dict[str, Any] = {
+    "quant_cfg": {
+        "*audio_embed.*": {
+            "enable": False
+        },
+        "*image_embed.*": {
+            "enable": False
+        },
+    }
+}
+
 
 def get_llm_calib_dataloader(
     tokenizer: AutoTokenizer,
@@ -237,6 +249,9 @@ def get_llm_quant_config(
     # Disable visual model
     quant_cfg["quant_cfg"].update(DISABLE_VISUAL_CONFIG["quant_cfg"])
 
+    # Disable vision and audio models in Phi-4MM
+    quant_cfg["quant_cfg"].update(
+        DISABLE_Phi4MM_VISUAL_AUDIO_CONFIG["quant_cfg"])
     return quant_cfg
 
 
