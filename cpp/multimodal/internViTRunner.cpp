@@ -221,10 +221,10 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 {
     int64_t totalNumBlocks = 0;
 
-    for (auto const& prompt : request.prompts)
+    for (auto const& req : request.requests)
     {
         int64_t numImage = 0;
-        for (auto const& image : prompt.imageBuffers)
+        for (auto const& image : req.imageBuffers)
         {
             if (doResize)
             {
@@ -269,41 +269,14 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
     mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
 }
 
-std::string InternViTRunner::applyChatTemplateSystem(std::string const& systemPrompt)
-{
-    if (systemPrompt.empty())
-    {
-        return "";
-    }
-    return "<|im_start|>system\n" + systemPrompt + "<|im_end|>\n";
-}
-
-std::string InternViTRunner::applyChatTemplateUser(
-    std::string const& userPrompt, int64_t const& numImage, bool addGenerationPrompt)
-{
-    std::string prompt = "<|im_start|>user\n";
-    for (int64_t i = 0; i < numImage; ++i)
-    {
-        prompt += "<img><IMG_CONTEXT></img>\n";
-    }
-    prompt += userPrompt + "<|im_end|>\n";
-
-    if (addGenerationPrompt)
-    {
-        prompt += "<|im_start|>assistant\n";
-    }
-
-    return prompt;
-}
-
 void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImages,
     std::vector<int64_t> const& imageTokenLengths, trt_edgellm::tokenizer::Tokenizer* tokenizer)
 {
-    if (numImages.size() != request.prompts.size())
+    if (numImages.size() != request.requests.size())
     {
-        std::string errorMsg = "InternViTRunner::textPreprocess() numImages.size() != request.prompts.size(), "
-            + std::to_string(numImages.size()) + " != " + std::to_string(request.prompts.size());
+        std::string errorMsg = "InternViTRunner::textPreprocess() numImages.size() != request.requests.size(), "
+            + std::to_string(numImages.size()) + " != " + std::to_string(request.requests.size());
         LOG_ERROR("%s", errorMsg.c_str());
         throw std::runtime_error(errorMsg);
     }
@@ -312,12 +285,10 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     // Image token id will start from vocabSize and increment for each image token position
     int32_t imageTokenId = mConfig.vocabSize;
 
-    for (size_t i = 0; i < request.prompts.size(); ++i)
+    for (size_t i = 0; i < request.requests.size(); ++i)
     {
-        // Direct concate to avoid extra copy
-        std::string prompt = applyChatTemplateSystem(request.prompts[i].systemPrompt)
-            + applyChatTemplateUser(request.prompts[i].userPrompt, numImages[i], true);
-        std::vector<int32_t> ids = tokenizer->encode(prompt);
+        // Use the cached full formatted prompt
+        std::vector<int32_t> ids = tokenizer->encode(request.requests[i].formattedCompleteRequest);
 
         // replace vis tokens
         std::vector<int32_t> newIds;
@@ -325,12 +296,18 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         {
             if (ids[j] == mConfig.imageTokenId)
             {
+                // Prepend <img> token
+                newIds.push_back(mConfig.imgStartTokenId);
+
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int64_t k = 0; k < numImageTokens; ++k)
                 {
                     newIds.push_back(imageTokenId);
                     ++imageTokenId;
                 }
+
+                // Append </img> token
+                newIds.push_back(mConfig.imgEndTokenId);
                 ++imageIndex;
             }
             else
@@ -361,12 +338,6 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
 
     return true;
-}
-
-std::string InternViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
-    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
-{
-    return applyChatTemplateSystem(systemPrompt);
 }
 
 bool InternViTRunner::infer(cudaStream_t stream)

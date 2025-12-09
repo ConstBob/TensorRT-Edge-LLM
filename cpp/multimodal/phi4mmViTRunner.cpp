@@ -300,11 +300,11 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
     int64_t totalNumBlocks = 0;
     int64_t totalHBlocks = 0;
 
-    for (auto const& prompt : request.prompts)
+    for (auto const& req : request.requests)
     {
         int64_t numImage = 0;
         std::vector<std::vector<int64_t>> blockGridHWPerBatch;
-        for (auto const& image : prompt.imageBuffers)
+        for (auto const& image : req.imageBuffers)
         {
             // Add thumbnail image by default
             imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
@@ -367,32 +367,14 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
     check::check(mOutputEmbedding.reshape({totalOutTokens, mConfig.outHiddenSize}), "mOutputEmbedding.reshape failed");
 }
 
-std::string Phi4MMViTRunner::applyChatTemplateUser(
-    std::string const& userPrompt, int64_t const& numImage, bool addGenerationPrompt)
-{
-    std::string prompt = "<|user|>";
-    for (int64_t i = 0; i < numImage; ++i)
-    {
-        prompt += "<|endoftext10|>";
-    }
-    prompt += userPrompt;
-
-    if (addGenerationPrompt)
-    {
-        prompt += "<|end|><|assistant|>";
-    }
-
-    return prompt;
-}
-
 void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, std::vector<int64_t> const& numImages,
     std::vector<int64_t> const& imageTokenLengths, tokenizer::Tokenizer* tokenizer)
 {
-    if (numImages.size() != request.prompts.size())
+    if (numImages.size() != request.requests.size())
     {
-        std::string errorMsg = "Phi4MMViTRunner::textPreprocess() numImages.size() != request.prompts.size(), "
-            + std::to_string(numImages.size()) + " != " + std::to_string(request.prompts.size());
+        std::string errorMsg = "Phi4MMViTRunner::textPreprocess() numImages.size() != request.requests.size(), "
+            + std::to_string(numImages.size()) + " != " + std::to_string(request.requests.size());
         LOG_ERROR("%s", errorMsg.c_str());
         throw std::runtime_error(errorMsg);
     }
@@ -401,11 +383,10 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
     int imageIndex = 0;
 
-    for (size_t i = 0; i < request.prompts.size(); ++i)
+    for (size_t i = 0; i < request.requests.size(); ++i)
     {
-        // Construct prompt: system + user
-        std::string prompt = applyChatTemplateUser(request.prompts[i].userPrompt, numImages[i], true);
-        std::vector<int32_t> ids = tokenizer->encode(prompt);
+        // Use the cached full formatted prompt
+        std::vector<int32_t> ids = tokenizer->encode(request.requests[i].formattedCompleteRequest);
 
         // Replace image placeholder tokens with sequential image token IDs
         std::vector<int32_t> newIds;
@@ -429,12 +410,6 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         }
         batchedInputIds.emplace_back(std::move(newIds));
     }
-}
-
-std::string Phi4MMViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
-    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
-{
-    return systemPrompt;
 }
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,

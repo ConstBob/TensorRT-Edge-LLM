@@ -25,6 +25,9 @@ Usage:
     
     # Export with reduced vocabulary
     python export_llm.py --model_dir /path/to/model --output_dir /path/to/output --reduced_vocab_dir /path/to/reduced_vocab
+    
+    # Export with a provided chat template (validates and copies the template instead of inferring from model)
+    python export_llm.py --model_dir /path/to/model --output_dir /path/to/output --chat-template /path/to/chat_template.json
 """
 
 import argparse
@@ -72,6 +75,15 @@ def main() -> None:
         help=
         "Path to directory containing vocab_map.safetensors for vocabulary reduction (optional)"
     )
+    parser.add_argument(
+        "--chat-template",
+        type=str,
+        required=False,
+        default=None,
+        dest="chat_template_path",
+        help=
+        "Path to chat template JSON file. When provided, validates and uses this template instead of inferring from the model (optional)"
+    )
 
     args = parser.parse_args()
 
@@ -81,7 +93,8 @@ def main() -> None:
                          output_dir=args.output_dir,
                          device=args.device,
                          is_eagle_base=args.is_eagle_base,
-                         reduced_vocab_dir=args.reduced_vocab_dir)
+                         reduced_vocab_dir=args.reduced_vocab_dir,
+                         chat_template_path=args.chat_template_path)
 
         print("LLM model export completed successfully!")
 

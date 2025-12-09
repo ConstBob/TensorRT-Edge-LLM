@@ -68,8 +68,8 @@ def main():
     skipped_count = 0
     total_count = 0
 
-    for response, message in zip(predictions_data["responses"],
-                                 references_data["messages"]):
+    for response, request in zip(predictions_data["responses"],
+                                 references_data["requests"]):
         total_count += 1
         output_text = response["output_text"]
 
@@ -79,7 +79,7 @@ def main():
             continue
 
         predictions.append(output_text)
-        references.append(message["reference"])
+        references.append(request["reference"])
 
     # Calculate and print Rouge score
     assert len(predictions) == len(

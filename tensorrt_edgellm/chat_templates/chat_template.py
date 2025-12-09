@@ -42,7 +42,9 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from transformers import AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer
+
+from ..llm_models.model_utils import is_vlm
 
 
 @dataclass
@@ -59,6 +61,12 @@ class SystemMessage(Message):
 
 @dataclass
 class UserMessage(Message):
+    role: str = "user"
+    content: str = '<placeholder_user_text>'
+
+
+@dataclass
+class MultimodalUserMessage(Message):
     role: str = "user"
     content: List[Dict[str, str]] = field(
         default_factory=lambda: [{
@@ -179,7 +187,7 @@ def _extract_content_pattern(tokenizer: Any, system_prompt: SystemMessage,
         Extracted pattern string or None if failed or tokenizer does not support multimodal content
     """
     # Create user message with the content type
-    user_with_content = UserMessage()
+    user_with_content = MultimodalUserMessage()
     if content_type == 'image':
         user_with_content.add_image_content(placeholder)
     elif content_type == 'video':
@@ -216,6 +224,73 @@ def _extract_content_pattern(tokenizer: Any, system_prompt: SystemMessage,
     return None
 
 
+def validate_chat_template(chat_template_path: str) -> Dict[str, Any]:
+    """
+    Validate that a chat template JSON file follows the required format.
+    
+    Args:
+        chat_template_path: Path to the chat template JSON file
+        
+    Raises:
+        ValueError: If the chat template is invalid
+        FileNotFoundError: If the chat template file doesn't exist
+    """
+    print(f"Validating chat template: {chat_template_path}")
+
+    if not os.path.exists(chat_template_path):
+        raise FileNotFoundError(
+            f"Chat template file not found: {chat_template_path}")
+
+    try:
+        with open(chat_template_path, 'r') as f:
+            template = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in chat template file: {e}")
+
+    def check_type(value, expected_type, field_name):
+        if not isinstance(value, expected_type):
+            raise ValueError(
+                f"'{field_name}' must be {expected_type.__name__}, got {type(value).__name__}"
+            )
+
+    def check_required_keys(data, keys, parent=""):
+        prefix = f"{parent}." if parent else ""
+        missing = [k for k in keys if k not in data]
+        if missing:
+            raise ValueError(
+                f"Missing required keys: {[prefix + k for k in missing]}")
+
+    # Validate roles
+    required_roles = ["system", "user", "assistant"]
+    check_required_keys(template, ["roles"])
+    check_type(template["roles"], dict, "roles")
+    check_required_keys(template["roles"], required_roles, "roles")
+
+    for role in required_roles:
+        role_data = template["roles"][role]
+        check_type(role_data, dict, f"roles.{role}")
+        check_required_keys(role_data, ["prefix", "suffix"], f"roles.{role}")
+        check_type(role_data["prefix"], str, f"roles.{role}.prefix")
+        check_type(role_data["suffix"], str, f"roles.{role}.suffix")
+
+    # Validate optional string fields
+    for field in ["generation_prompt", "default_system_prompt", "model_path"]:
+        if field in template:
+            check_type(template[field], str, field)
+
+    # Validate content_types if present
+    if "content_types" in template:
+        check_type(template["content_types"], dict, "content_types")
+        for content_type, content_data in template["content_types"].items():
+            check_type(content_data, dict, f"content_types.{content_type}")
+            check_required_keys(content_data, ["format"],
+                                f"content_types.{content_type}")
+            check_type(content_data["format"], str,
+                       f"content_types.{content_type}.format")
+
+    print("Chat template validation successful!")
+
+
 def process_chat_template(model_dir: str, output_dir: str) -> None:
     """
     Process the chat template from model's tokenizer and create a JSON file
@@ -233,23 +308,27 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     """
     print(f"Processing chat template from {model_dir}")
 
-    # Load tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_dir,
-                                                  trust_remote_code=True)
-    except Exception as e:
-        print(f"Warning: Failed to load tokenizer: {e}")
-        print("Skipping chat template processing")
+    tokenizer = None
+    loaders = [AutoProcessor, AutoTokenizer
+               ] if is_vlm(model_dir) else [AutoTokenizer, AutoProcessor]
+    for ldr in loaders:
+        try:
+            tokenizer = ldr.from_pretrained(model_dir, trust_remote_code=True)
+            if getattr(tokenizer, 'chat_template', None):
+                print(f"Successfully loaded chat template from {ldr.__name__}")
+                break
+            else:
+                print(f"{ldr.__name__} loaded but no chat template found")
+                tokenizer = None
+        except Exception as e:
+            print(f"Failed to load {ldr.__name__}: {e}")
+            tokenizer = None
+
+    if tokenizer is None:
+        print("Skipping chat template processing - no chat template available")
         return
 
-    # Check if tokenizer has chat template
-    if not hasattr(tokenizer, 'chat_template') or not tokenizer.chat_template:
-        print(
-            "Warning: No chat template found in tokenizer. Skipping chat template processing."
-        )
-        return
-
-    print("Found chat template in tokenizer, extracting patterns...")
+    print("Extracting patterns from chat template...")
 
     # Extract system role patterns (base case)
     system_prompt = SystemMessage()
@@ -261,7 +340,7 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     user_prompt = UserMessage()
     user_formatted = _format_messages(tokenizer, [system_prompt, user_prompt])
     user_prefix, user_suffix = _extract_prefix_suffix(
-        user_formatted[len(system_formatted):], user_prompt.content[0]['text'])
+        user_formatted[len(system_formatted):], user_prompt.content)
 
     # Extract assistant role patterns (compare with user case)
     assistant_prompt = AssistantMessage()
@@ -279,27 +358,36 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     # Build content types
     content_types = {}
 
-    # Get base text-only formatted message for comparison
-    user_text_only = UserMessage()
-    text_only_formatted = _format_messages(tokenizer,
-                                           [system_prompt, user_text_only])
-    placeholder_text = user_text_only.content[0]['text']
+    # Only extract multimodal patterns if this is a VLM model
+    if is_vlm(model_dir):
+        print("Detected VLM model, extracting multimodal content patterns...")
+        # Get base text-only formatted message for comparison
+        user_text_only = MultimodalUserMessage()
+        text_only_formatted = _format_messages(tokenizer,
+                                               [system_prompt, user_text_only])
+        placeholder_text = user_text_only.content[0]['text']
 
-    # Extract image pattern
-    image_pattern = _extract_content_pattern(tokenizer, system_prompt, 'image',
-                                             '<placeholder_image_path>',
-                                             text_only_formatted,
-                                             placeholder_text)
-    if image_pattern:
-        content_types['image'] = {'format': image_pattern}
+        # Extract image pattern
+        image_pattern = _extract_content_pattern(tokenizer, system_prompt,
+                                                 'image',
+                                                 '<placeholder_image_path>',
+                                                 text_only_formatted,
+                                                 placeholder_text)
+        if image_pattern:
+            content_types['image'] = {'format': image_pattern}
 
-    # Extract video pattern
-    video_pattern = _extract_content_pattern(tokenizer, system_prompt, 'video',
-                                             '<placeholder_video_path>',
-                                             text_only_formatted,
-                                             placeholder_text)
-    if video_pattern:
-        content_types['video'] = {'format': video_pattern}
+        # Extract video pattern
+        video_pattern = _extract_content_pattern(tokenizer, system_prompt,
+                                                 'video',
+                                                 '<placeholder_video_path>',
+                                                 text_only_formatted,
+                                                 placeholder_text)
+        if video_pattern:
+            content_types['video'] = {'format': video_pattern}
+    else:
+        print(
+            "Text-only LLM detected, skipping multimodal content pattern extraction"
+        )
 
     # Extract default system prompt by testing without system message
     user_only_prompt = UserMessage()

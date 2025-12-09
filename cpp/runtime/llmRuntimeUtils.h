@@ -32,26 +32,50 @@ namespace trt_edgellm
 namespace rt
 {
 
+/*!
+ * @brief Message with role and contents
+ */
+struct Message
+{
+    struct MessageContent
+    {
+        std::string type;    //!< Content type (text, image)
+        std::string content; //!< Text content when content type is text. Image data will be stored in corresponding
+                             //!< imageBuffers.
+    };
+    std::string role;                     //!< Message role (system, user, assistant)
+    std::vector<MessageContent> contents; //!< Contents of the message
+};
+
 /*! \brief LLM Generation Request structure
  */
 struct LLMGenerationRequest
 {
     //! \cond INTERNAL
-    /*! \brief Prompt structure containing system prompt, user prompt, and optional images
+    /*! \brief Request structure containing structured messages
      */
-    struct Prompt
+    struct Request
     {
-        std::string systemPrompt;                            //!< System prompt text
-        std::string userPrompt;                              //!< User prompt text
+        std::vector<Message> messages; //!< Structured messages (required - use chat template format)
         std::vector<rt::imageUtils::ImageData> imageBuffers; //!< Optional image data for multimodal inputs
+        std::string defaultSystemPrompt{""};
+        //!< Default system prompt to use if no system message is present in messages
+
+        // The following two fields are portal to bypass the tokenizer's chat template application during inference.
+        // If these fields are provided, the inference runtime will directly use them for inference. Otherwise, the
+        // tokenizer will apply the chat-template based on the messages and modify these two fields.
+        mutable std::string formattedSystemPrompt{
+            ""}; //!< Formatted prefix system prompt that can be used for KVCache saving.
+        mutable std::string formattedCompleteRequest{
+            ""}; //!< Formatted complete request (including prefix system prompt)
     };
     //! \endcond
-    std::vector<Prompt> prompts;      //!< Vector of prompts for batched requests
-    float temperature;                //!< Temperature parameter for sampling
-    float topP;                       //!< Top-p (nucleus) sampling parameter
-    int64_t topK;                     //!< Top-k sampling parameter
-    int64_t maxGenerateLength;        //!< Max length of the generated tokens
-    std::string loraWeightsName = ""; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
+    std::vector<Request> requests;   //!< Vector of requests for a batch
+    float temperature;               //!< Temperature parameter for sampling
+    float topP;                      //!< Top-p (nucleus) sampling parameter
+    int64_t topK;                    //!< Top-k sampling parameter
+    int64_t maxGenerateLength;       //!< Max length of the generated tokens
+    std::string loraWeightsName{""}; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
     bool saveSystemPromptKVCache{
         false}; //!< Whether to save system prompt KV cache of this request to be used by later requests
 };

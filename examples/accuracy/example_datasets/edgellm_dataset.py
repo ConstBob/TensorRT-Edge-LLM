@@ -160,8 +160,17 @@ class EdgeLLMDataset:
             "top_p": <float>, 
             "top_k": <int>,
             "max_generate_length": <int>,
-            "default_system_prompt": "<string>",
-            "messages": [...]
+            "requests": [
+                {
+                    "messages": [
+                        {"role": "system", "content": "<string>"},
+                        {"role": "user", "content": "<string or array>"}
+                    ],
+                    "answer": "<string>",  // optional
+                    "id": "<string>",      // optional
+                    "subject": "<string>"  // optional
+                }
+            ]
         }
         
         Args:
@@ -197,35 +206,49 @@ class EdgeLLMDataset:
                 except NotImplementedError:
                     image_paths = None
 
-                # Create message entry
-                message = {"user": user_prompt}
+                # Create request entry with messages array
+                request = {}
 
-                # Add system prompt if present
-                if system_prompt:
-                    message["system"] = system_prompt
+                # Build messages array in OpenAI format
+                messages = []
 
-                # Add images if present
+                # Add system message
+                system_content = system_prompt if system_prompt else self.default_system_prompt
+                messages.append({"role": "system", "content": system_content})
+
+                # Add user message with content
                 if image_paths:
-                    message["images"] = image_paths
+                    # Multimodal: content is array with images and text
+                    content = []
+                    for img_path in image_paths:
+                        content.append({"type": "image", "image": img_path})
+                    content.append({"type": "text", "text": user_prompt})
+                else:
+                    # Text-only: content is string
+                    content = user_prompt
+
+                messages.append({"role": "user", "content": content})
+
+                request["messages"] = messages
 
                 # Add reference answer if available
                 if answer:
-                    message["answer"] = answer
+                    request["answer"] = answer
 
                 # Add any additional metadata
                 if "id" in data_entry:
-                    message["id"] = data_entry["id"]
+                    request["id"] = data_entry["id"]
 
                 # Unified subject or category
                 if "subject" in data_entry:
-                    message["subject"] = data_entry["subject"]
+                    request["subject"] = data_entry["subject"]
                 elif "category" in data_entry:
-                    message["subject"] = data_entry["category"]
+                    request["subject"] = data_entry["category"]
 
                 if "question_type" in data_entry:
-                    message["question_type"] = data_entry["question_type"]
+                    request["question_type"] = data_entry["question_type"]
 
-                self.formatted_data.append(message)
+                self.formatted_data.append(request)
 
             except Exception as e:
                 print(f"Warning: Failed to process entry {idx}: {e}")
@@ -246,8 +269,7 @@ class EdgeLLMDataset:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "max_generate_length": self.max_generate_length,
-            "default_system_prompt": self.default_system_prompt,
-            "messages": self.formatted_data
+            "requests": self.formatted_data
         }
 
         # Save to JSON file with pretty formatting

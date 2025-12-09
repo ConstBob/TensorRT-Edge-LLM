@@ -115,6 +115,8 @@ Complete documentation for installation, usage, and deployment:
   - [LLM SpecDecode Runtime](docs/source/developer_guide/04.3_LLM_Inference_SpecDecode_Runtime.md)
   - [Advanced Runtime Features](docs/source/developer_guide/04.4_Advanced_Runtime_Features.md)
 - **[Examples](docs/source/developer_guide/05_Examples.md)** - Working code examples
+- **[Chat Template Format](docs/source/developer_guide/06_Chat_Template_Format.md)** - Chat template configuration
+
 
 ### Additional Resources
 

@@ -29,7 +29,6 @@
 #include "sampler/sampling.h"
 #include <fstream>
 #include <functional>
-#include <nlohmann/json.hpp>
 #include <string>
 
 using namespace nvinfer1;
@@ -158,11 +157,11 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
 
 bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
 {
-    int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
+    int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
 
     if (activeBatchSize == 0)
     {
-        LOG_ERROR("LLMInferenceRuntime(): The request is empty with no request prompts supplied.");
+        LOG_ERROR("LLMInferenceRuntime(): The request is empty with no requests supplied.");
         return false;
     }
 
@@ -171,6 +170,17 @@ bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
         LOG_ERROR("LLMInferenceRuntime(): The batched request size (%d) exceeds the max supported batch size (%d).",
             activeBatchSize, mEngineConfig.maxSupportedBatchSize);
         return false;
+    }
+
+    for (auto const& request : request.requests)
+    {
+        if (request.messages.empty())
+        {
+            LOG_ERROR(
+                "LLMInferenceRuntime(): There is an empty request in the batch. Skip this batch of requests. please "
+                "check the input data contents.");
+            return false;
+        }
     }
 
     return true;
@@ -282,23 +292,28 @@ bool LLMInferenceRuntime::handleRequest(
         return false;
     }
 
-    int32_t const activeBatchSize = static_cast<int32_t>(request.prompts.size());
+    int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
 
     // Preprocess system prompts and save KVCache for each sequence.
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        if (mMultimodalRunner)
+        // Use cached formatted prompts if available, otherwise compute them
+        if (request.requests[i].formattedSystemPrompt.empty() || request.requests[i].formattedCompleteRequest.empty())
         {
-            batchSystemPrompts.emplace_back(mMultimodalRunner->preprocessSystemPrompt(request.prompts[i].systemPrompt,
-                mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream));
+            // Apply chat template to populate both formatted system prompt and full formatted prompt
+            mTokenizer->applyChatTemplate(request.requests[i], true);
         }
-        else
-        {
-            // TODO: apply chat template for system prompt
-            batchSystemPrompts.emplace_back(std::move(request.prompts[i].systemPrompt));
-        }
+
+        batchSystemPrompts.emplace_back(request.requests[i].formattedSystemPrompt);
+
         if (request.saveSystemPromptKVCache)
         {
+            if (mMultimodalRunner)
+            {
+                // Use the already formatted system prompt (tokenizer already applied chat template)
+                mMultimodalRunner->preprocessSystemPrompt(
+                    batchSystemPrompts[i], mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream);
+            }
             bool const saveCacheStatus = genAndSaveSystemPromptKVCache(batchSystemPrompts[i], loraWeightsName, stream);
             if (!saveCacheStatus)
             {
@@ -314,10 +329,8 @@ bool LLMInferenceRuntime::handleRequest(
     {
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            // TODO: apply chat template for user prompt.
-            std::string userPrompt = request.prompts[i].userPrompt;
-            std::string inputText = batchSystemPrompts[i] + userPrompt;
-            batchedInputIds.emplace_back(mTokenizer->encode(inputText, true));
+            // Use the cached full formatted prompt
+            batchedInputIds.emplace_back(mTokenizer->encode(request.requests[i].formattedCompleteRequest, true));
         }
     }
     else

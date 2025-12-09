@@ -105,74 +105,53 @@ def main(args):
 
     print(f"Using sampling parameters: {sampling_params}")
 
-    # Process each message in the input file
-    print(f"Processing {len(data['messages'])} messages...")
+    # Process each request in the input file
+    print(f"Processing {len(data['requests'])} requests...")
 
-    for i, message in enumerate(data['messages']):
-        print(f"Processing message {i+1}/{len(data['messages'])}")
+    for i, request in enumerate(data['requests']):
+        print(f"Processing request {i+1}/{len(data['requests'])}")
+
+        # Get messages from request - already in OpenAI format
         conversation = []
-
-        # Add system message if available
-        if 'system' in message:
-            # Parse the system prompt to extract clean content
-            system_content = message['system']
-            conversation.append({
-                "role": "system",
-                "content": system_content.strip()
-            })
-        elif 'default_system_prompt' in data:
-            conversation.append({
-                "role": "system",
-                "content": data['default_system_prompt']
-            })
-
-        # Add user message with images if present
-        if 'user' in message:
-            user_content = message['user']
-            # Remove chat template tokens if present
-            if '<|im_end|>\n<|im_start|>assistant\n' in user_content:
-                user_content = user_content.replace(
-                    '<|im_end|>\n<|im_start|>assistant\n', '')
-
-            # Create user message content
-            if 'images' in message and message['images']:
-                # For multimodal messages, create content as a list
-                content = [{"type": "text", "text": user_content.strip()}]
-
-                # Add images to the content
-                for image_path in message['images']:
-                    base64_image = encode_image_to_base64(image_path)
-                    if base64_image:
-                        image_content = {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
-                        content.append(image_content)
-
-                conversation.append({"role": "user", "content": content})
+        for msg in request['messages']:
+            # Convert multimodal content if needed
+            if isinstance(msg.get('content'), list):
+                # Multimodal: need to convert image paths to base64 for vLLM
+                content = []
+                for item in msg['content']:
+                    if item['type'] == 'text':
+                        content.append(item)  # Use as-is
+                    elif item['type'] == 'image':
+                        # Encode image to base64 for vLLM
+                        base64_image = encode_image_to_base64(
+                            item.get('image'))
+                        if base64_image:
+                            content.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url":
+                                    f"data:image/jpeg;base64,{base64_image}"
+                                }
+                            })
+                conversation.append({"role": msg['role'], "content": content})
             else:
-                # For text-only messages, content is a string
-                conversation.append({
-                    "role": "user",
-                    "content": user_content.strip()
-                })
+                # Text-only: use message as-is (already in correct format)
+                conversation.append(msg)
+
         # Generate response using vLLM
         try:
             outputs = llm.chat([conversation], sampling_params, use_tqdm=False)
             if outputs and len(outputs) > 0 and len(outputs[0].outputs) > 0:
                 generated_text = outputs[0].outputs[0].text.strip()
-                message['reference'] = generated_text
+                request['reference'] = generated_text
                 print(
-                    f"Generated reference for message {i+1}: {generated_text}..."
-                )
+                    f"Generated reference for request {i+1}: {generated_text}")
             else:
-                print(f"Warning: No output generated for message {i+1}")
-                message['reference'] = ""
+                print(f"Warning: No output generated for request {i+1}")
+                request['reference'] = ""
         except Exception as e:
-            print(f"Error generating reference for message {i+1}: {e}")
-            message['reference'] = ""
+            print(f"Error generating reference for request {i+1}: {e}")
+            request['reference'] = ""
 
     # Save updated data to output file
     print(f"Saving results to: {output_file}")

@@ -364,10 +364,10 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     cuSeqlensData[0] = 0;
     int64_t cuSeqlensSize = 1;
 
-    for (auto const& prompt : request.prompts)
+    for (auto const& req : request.requests)
     {
         int64_t numImage = 0;
-        for (auto const& image : prompt.imageBuffers)
+        for (auto const& image : req.imageBuffers)
         {
             if (doResize)
             {
@@ -625,41 +625,14 @@ void QwenViTRunner::getWindowIndex(
     kernel::initAttentionMaskQwenViT(mCuWindowSeqlensDevice, mWindowAttentionMask, stream);
 }
 
-std::string QwenViTRunner::applyChatTemplateSystem(std::string const& systemPrompt)
-{
-    if (systemPrompt.empty())
-    {
-        return "";
-    }
-    return "<|im_start|>system\n" + systemPrompt + "<|im_end|>\n";
-}
-
-std::string QwenViTRunner::applyChatTemplateUser(
-    std::string const& userPrompt, int64_t const& numImage, bool addGenerationPrompt)
-{
-    std::string prompt = "<|im_start|>user\n";
-    for (int64_t i = 0; i < numImage; ++i)
-    {
-        prompt += "<|vision_start|><|image_pad|><|vision_end|>";
-    }
-    prompt += userPrompt + "<|im_end|>\n";
-
-    if (addGenerationPrompt)
-    {
-        prompt += "<|im_start|>assistant\n";
-    }
-
-    return prompt;
-}
-
 void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& numImages,
     std::vector<int64_t> const& imageTokenLengths, trt_edgellm::tokenizer::Tokenizer* tokenizer)
 {
-    if (numImages.size() != request.prompts.size())
+    if (numImages.size() != request.requests.size())
     {
-        std::string errorMsg = "QwenViTRunner::textPreprocess() numImages.size() != request.prompts.size(), "
-            + std::to_string(numImages.size()) + " != " + std::to_string(request.prompts.size());
+        std::string errorMsg = "QwenViTRunner::textPreprocess() numImages.size() != request.requests.size(), "
+            + std::to_string(numImages.size()) + " != " + std::to_string(request.requests.size());
         LOG_ERROR("%s", errorMsg.c_str());
         throw std::runtime_error(errorMsg);
     }
@@ -668,12 +641,10 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     // Image token id will start from vocabSize and increment for each image token position
     int32_t imageTokenId = mConfig.vocabSize;
 
-    for (size_t i = 0; i < request.prompts.size(); ++i)
+    for (size_t i = 0; i < request.requests.size(); ++i)
     {
-        // Direct concate to avoid extra copy
-        std::string prompt = applyChatTemplateSystem(request.prompts[i].systemPrompt)
-            + applyChatTemplateUser(request.prompts[i].userPrompt, numImages[i], true);
-        std::vector<int32_t> ids = tokenizer->encode(prompt);
+        // Use the cached full formatted prompt
+        std::vector<int32_t> ids = tokenizer->encode(request.requests[i].formattedCompleteRequest);
 
         // insert image tokens
         std::vector<int32_t> newIds;
@@ -721,18 +692,26 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     return true;
 }
 
-std::string QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
     rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
-    std::string prompt = applyChatTemplateSystem(systemPrompt);
-
-    std::vector<int32_t> ids = tokenizer->encode(prompt);
+    // systemPrompt is already formatted by tokenizer's applyChatTemplate
+    std::vector<int32_t> ids = tokenizer->encode(systemPrompt);
     std::vector<std::vector<int32_t>> batchedInputIds;
     batchedInputIds.emplace_back(std::move(ids));
     std::vector<std::vector<int64_t>> imageGridTHWs;
-    generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
 
-    return prompt;
+    try
+    {
+        generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("MRope parameter generation failed: %s", e.what());
+        return false;
+    }
+
+    return true;
 }
 
 bool QwenViTRunner::infer(cudaStream_t stream)

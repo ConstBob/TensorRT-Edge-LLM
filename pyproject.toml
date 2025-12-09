@@ -54,3 +54,4 @@ include = ["tensorrt_edgellm*"]
 
 [tool.setuptools.package-data]
 tensorrt_edgellm = ["README.md"]
+"tensorrt_edgellm.chat_templates" = ["templates/*.json"]
