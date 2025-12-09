@@ -151,28 +151,13 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
     mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
 
-    mPrefillExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
-        mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+    // Use single executionContext for both prefill and generation.
+    mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
 
-    // The prefill and generation contexts of the LLM engine execute serially, can therefore share a single device
-    // memory block.
-    mPrefillExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
-    mGenerationExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
+    mTRTExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
     LOG_INFO("Allocated a shared device memory of %zu bytes for the prefill and generation contexts.",
         execContextMemoryInBytes);
-
-    bool setOptimizationProfileStatus{true};
-    setOptimizationProfileStatus
-        &= mPrefillExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_PREFILL_PROFILE_INDEX, stream);
-    setOptimizationProfileStatus
-        &= mGenerationExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_GENERATION_PROFILE_INDEX, stream);
-    if (!setOptimizationProfileStatus)
-    {
-        LOG_ERROR("Failed to set optimization profile to the engine");
-        throw std::runtime_error("Failed to set optimization profile to the engine");
-    }
 
     if (!this->validateConfigFromEngine())
     {
@@ -247,13 +232,16 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     // mPosEncCosSinCache shape will match the max batch size for MRope (multimodal)
     bool setEngineIOStatus{true};
     setEngineIOStatus
-        &= mPrefillExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
+    // Initialize kKVCacheStartIndex to dummy tensor for both profiles to avoid "address not set" error
+    // when switching optimization profiles. The actual address will be set during runtime execution.
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
 
     if (!setEngineIOStatus)
     {
@@ -267,8 +255,8 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         bool setMultimodalStatus{true};
         int64_t multimodalEmbeddingsHiddenSize = mConfig.baseModelHiddenDim / 3;
         setMultimodalStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
-        setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
+        setMultimodalStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kImageEmbeds, rt::Coords{1, multimodalEmbeddingsHiddenSize}.getTRTDims());
         if (!setMultimodalStatus)
         {
@@ -667,6 +655,15 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
     rt::Tensor const& baseRopeCosSinCache, cudaStream_t stream)
 {
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mTRTExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_PREFILL_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
     bool const validateInputStatus = this->prefillStepInputValidation(inputIds, baseModelHiddenStates,
         draftModelHiddenStates, contextLengths, multimodalEmbeddings, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
@@ -691,43 +688,34 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
     bool setEngineIOStatus{true};
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mPrefillExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
     setEngineIOStatus
-        &= mPrefillExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
-    // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
-    // Otherwise, we shall supply the KVCache lengths tensor to the engine.
-    if (!mLinearKVCache.getKVCacheAllEmpty())
-    {
-        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
-    }
-    else
-    {
-        setEngineIOStatus
-            &= mPrefillExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
-        setEngineIOStatus
-            &= mPrefillExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
-    }
+    // Setup the KVCache start index tensor.
+    // Always use the KVCache lengths tensor with correct batch_size shape to satisfy TensorRT engine requirements.
+    // When KVCache is empty, the tensor contains zeros; otherwise it contains the actual cache lengths.
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
 
     // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
@@ -739,8 +727,8 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
 
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
     // Update KV cache shapes to match activeBatchSize (critical for dynamic batching)
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
@@ -750,28 +738,28 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     rt::Coords const emptyPosIdShape{activeBatchSize, 1};
     rt::Coords const emptyMaskShape{activeBatchSize, 1, 1};
     setEngineIOStatus
-        &= mPrefillExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
     setEngineIOStatus
-        &= mPrefillExecutionContext->setInputShape(binding_names::kAttentionPosId, emptyPosIdShape.getTRTDims());
+        &= mTRTExecutionContext->setInputShape(binding_names::kAttentionPosId, emptyPosIdShape.getTRTDims());
     setEngineIOStatus
-        &= mPrefillExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
     setEngineIOStatus
-        &= mPrefillExecutionContext->setInputShape(binding_names::kAttentionMask, emptyMaskShape.getTRTDims());
+        &= mTRTExecutionContext->setInputShape(binding_names::kAttentionMask, emptyMaskShape.getTRTDims());
 
     // Bind the optional multimodal embeddings tensor into the engine.
     if (multimodalEmbeddings.has_value())
     {
         rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
-        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
-        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
     }
 
     // Bind the output tensor into the engine.
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
     if (!setEngineIOStatus)
     {
@@ -781,7 +769,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
 
     // launch the engine execution.
     bool executeStatus{true};
-    executeStatus &= mPrefillExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
         LOG_ERROR("Failed on TensorRT prefill stage enqueueV3() call.");
@@ -933,33 +921,42 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
     }
     else
     {
+        bool setOptimizationProfileStatus{true};
+        setOptimizationProfileStatus
+            &= mTRTExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_GENERATION_PROFILE_INDEX, stream);
+        if (!setOptimizationProfileStatus)
+        {
+            LOG_ERROR("Failed to set optimization profile to the engine");
+            throw std::runtime_error("Failed to set optimization profile to the engine");
+        }
+
         LOG_INFO("executeEagleDraftProposalStep(): Draft proposal step CUDA graph not captured.");
         // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
         // initialization.
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kInputIds, const_cast<void*>(draftTreeInputIds.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kInputIds, draftTreeInputIds.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, draftTreeInputIds.getShape().getTRTDims());
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
 
         // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
@@ -969,26 +966,25 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
             mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
         }
 
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
         // Update KV cache shapes to match activeBatchSize for generation context
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
         // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionPosId, mDraftTreePositionIds.getShape().getTRTDims());
 
         // Bind the output tensor into the engine.
-        setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
         if (!setEngineIOStatus)
@@ -999,7 +995,7 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
 
         // launch the engine execution.
         bool executeStatus{true};
-        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+        executeStatus &= mTRTExecutionContext->enqueueV3(stream);
         if (!executeStatus)
         {
             LOG_ERROR("Failed on TensorRT draft proposal stage enqueueV3() call.");
@@ -1017,6 +1013,15 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor& outputLogits,
     rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mTRTExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_GENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
     size_t const hashValue = hashDraftProposalInput(
         draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
     if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
@@ -1067,30 +1072,30 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     // Update KV cache shapes to match activeBatchSize for CUDA graph capture
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(draftTreeInputIds.rawPointer()));
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kInputIds, draftTreeInputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, draftTreeInputIds.getShape().getTRTDims());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
 
     // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
@@ -1099,24 +1104,23 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
 
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
     // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kAttentionPosId, mDraftTreePositionIds.getShape().getTRTDims());
 
     // Bind the output tensor into the engine.
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
     if (!setEngineIOStatus)
     {
@@ -1127,7 +1131,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     // launch the engine execution. This will trigger the shape machine of TensorRT engine to avoid cudaGraph capture.
     // error.
     bool executeStatus{true};
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
         LOG_ERROR("Failed on TensorRT draft proposal stage enqueueV3() call.");
@@ -1138,7 +1142,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
     mDraftProposalCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
@@ -1304,33 +1308,42 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     }
     else
     {
+        bool setOptimizationProfileStatus{true};
+        setOptimizationProfileStatus
+            &= mTRTExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_GENERATION_PROFILE_INDEX, stream);
+        if (!setOptimizationProfileStatus)
+        {
+            LOG_ERROR("Failed to set optimization profile to the engine");
+            throw std::runtime_error("Failed to set optimization profile to the engine");
+        }
+
         LOG_INFO("executeEagleAcceptDecodeTokenStep(): Draft accept decode token step CUDA graph not captured.");
         // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
         // initialization.
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kInputIds, const_cast<void*>(acceptedTokens.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-            binding_names::kInputIds, acceptedTokens.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, acceptedTokens.getShape().getTRTDims());
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
 
         // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
@@ -1340,26 +1353,25 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
             mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
         }
 
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
         // Update KV cache shapes to match activeBatchSize for generation context
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
         // Differs from prefill step, draft proposal step needs to take real packed mask and position indices.
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionPosId, mDraftTreePositionIds.getShape().getTRTDims());
 
         // Bind the output tensor into the engine.
-        setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
         if (!setEngineIOStatus)
@@ -1370,7 +1382,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
 
         // launch the engine execution.
         bool executeStatus{true};
-        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+        executeStatus &= mTRTExecutionContext->enqueueV3(stream);
         if (!executeStatus)
         {
             LOG_ERROR("Failed on TensorRT accept decode token stage enqueueV3() call.");
@@ -1389,6 +1401,15 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
     rt::Tensor const& acceptedTokenNums, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mTRTExecutionContext->setOptimizationProfileAsync(kDRAFT_MODEL_GENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
     size_t const hashValue = hashAcceptDecodeTokenInput(
         acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
     if (mAcceptDecodeTokenCudaGraphs.find(hashValue) != mAcceptDecodeTokenCudaGraphs.end())
@@ -1433,30 +1454,30 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     // Update KV cache shapes to match activeBatchSize for CUDA graph capture
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(acceptedTokens.rawPointer()));
     setEngineIOStatus
-        &= mGenerationExecutionContext->setInputShape(binding_names::kInputIds, acceptedTokens.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, acceptedTokens.getShape().getTRTDims());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kBaseModelHiddenStates, baseModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kDraftModelHiddenStates, const_cast<void*>(draftModelHiddenStates.rawPointer()));
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kDraftModelHiddenStates, draftModelHiddenStates.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
 
     // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
@@ -1465,23 +1486,22 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
 
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mPackedTreeMask.rawPointer());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kAttentionMask, mPackedTreeMask.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDraftTreePositionIds.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kAttentionPosId, mDraftTreePositionIds.getShape().getTRTDims());
 
     // Bind the output tensor into the engine.
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
     if (!setEngineIOStatus)
     {
@@ -1491,7 +1511,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
 
     // launch the engine execution. This will trigger the shape machine of TensorRT engine to avoid cudaGraph capture.
     bool executeStatus{true};
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
         LOG_ERROR("Failed on TensorRT accept decode token stage enqueueV3() call.");
@@ -1503,7 +1523,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
     mAcceptDecodeTokenCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
@@ -1535,13 +1555,9 @@ bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
         std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
 
         rt::Tensor kvCacheBlock = mLinearKVCache.getKVCacheForDecoderLayer(i);
-        status &= mPrefillExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mPrefillExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mGenerationExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status
-            &= mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mPrefillExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
-        status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
+        status &= mTRTExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
+        status &= mTRTExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
+        status &= mTRTExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
     }
     return status;
 }

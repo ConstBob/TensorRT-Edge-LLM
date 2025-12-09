@@ -154,28 +154,13 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
     mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
 
-    mPrefillExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
-        mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    mGenerationExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+    // Use single executionContext for both prefill and generation.
+    mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
 
-    // The prefill and generation contexts of the LLM engine execute serially, can therefore share a single device
-    // memory block.
-    mPrefillExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
-    mGenerationExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
-    LOG_INFO("Allocated a shared device memory of %zu bytes for the prefill and generation contexts.",
-        execContextMemoryInBytes);
-
-    bool setOptimizationProfileStatus{true};
-    setOptimizationProfileStatus
-        &= mPrefillExecutionContext->setOptimizationProfileAsync(kPREFILL_PROFILE_INDEX, stream);
-    setOptimizationProfileStatus
-        &= mGenerationExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
-    if (!setOptimizationProfileStatus)
-    {
-        LOG_ERROR("Failed to set optimization profile to the engine");
-        throw std::runtime_error("Failed to set optimization profile to the engine");
-    }
+    mTRTExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
+    LOG_INFO(
+        "Allocated a device memory of %zu bytes for the prefill and generation context.", execContextMemoryInBytes);
 
     if (!this->validateConfigFromEngine())
     {
@@ -240,9 +225,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Bind RopeCosSin cache
     bool setRopeCosSinCacheStatus{true};
     setRopeCosSinCacheStatus
-        &= mPrefillExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
-    setRopeCosSinCacheStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
     if (!setRopeCosSinCacheStatus)
     {
         LOG_ERROR("Failed to set rope cos sin cache to the engine");
@@ -323,22 +306,37 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyTensor.rawPointer(), 0, mDummyTensor.getMemoryCapacity(), stream));
 
+    // Initialize kKVCacheStartIndex to dummy tensor for both profiles to avoid "address not set" error
+    // when switching optimization profiles. The actual address will be set during runtime execution.
+    {
+        bool setKVCacheStartIndexStatus{true};
+        setKVCacheStartIndexStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setKVCacheStartIndexStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
+        if (!setKVCacheStartIndexStatus)
+        {
+            LOG_ERROR("Failed to set kKVCacheStartIndex dummy tensor for initialization");
+            throw std::runtime_error("Failed to set kKVCacheStartIndex dummy tensor for initialization");
+        }
+    }
+
     // Set multimodal embeddings to dummy tensor for generation contexts if VLM is enabled
     if (mConfig.isVlm)
     {
         bool setMultimodalStatus{true};
         setMultimodalStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
-        setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
+        setMultimodalStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kImageEmbeds, rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
 
         // Set deepstack features if exists.
         for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
         {
             std::string deepstackFeatureName = binding_names::formatDeepstackFeaturesName(idx);
-            setMultimodalStatus &= mGenerationExecutionContext->setTensorAddress(
-                deepstackFeatureName.c_str(), mDummyTensor.rawPointer());
-            setMultimodalStatus &= mGenerationExecutionContext->setInputShape(
+            setMultimodalStatus
+                &= mTRTExecutionContext->setTensorAddress(deepstackFeatureName.c_str(), mDummyTensor.rawPointer());
+            setMultimodalStatus &= mTRTExecutionContext->setInputShape(
                 deepstackFeatureName.c_str(), rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
         }
 
@@ -348,7 +346,6 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             throw std::runtime_error("Failed to set multimodal embeddings dummy tensor for generation context");
         }
     }
-
     // Reset the LoRA weights to zero tensors.
     if (!this->resetLoraWeights(stream))
     {
@@ -682,14 +679,9 @@ bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
         std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
 
         rt::Tensor kvCacheBlock = mKVCache.getKVCacheForDecoderLayer(i);
-        status &= mPrefillExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mPrefillExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status &= mGenerationExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-        status
-            &= mGenerationExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
-
-        status &= mPrefillExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
-        status &= mGenerationExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
+        status &= mTRTExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
+        status &= mTRTExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
+        status &= mTRTExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
     }
     return status;
 }
@@ -826,6 +818,14 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors, rt::Tensor& outputLogits,
     rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream)
 {
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus &= mTRTExecutionContext->setOptimizationProfileAsync(kPREFILL_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
     bool const validateInputStatus = this->prefillStepInputValidation(
         inputIds, hostContextLengths, outputLogits, outputHiddenStates, multimodalEmbeddings, extraInputTensors);
     if (!validateInputStatus)
@@ -862,35 +862,26 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
 
     bool setEngineIOStatus{true};
     // Engine input tensors.
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mPrefillExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
     setEngineIOStatus
-        &= mPrefillExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
-    // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
-    // Otherwise, we shall supply the KVCache lengths tensor to the engine.
-    if (mKVCache.getKVCacheAllEmpty())
-    {
-        setEngineIOStatus
-            &= mPrefillExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
-        setEngineIOStatus
-            &= mPrefillExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
-    }
-    else
-    {
-        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
-    }
+    // Setup the KVCache start index tensor.
+    // Always use the KVCache lengths tensor with correct batch_size shape to satisfy TensorRT engine requirements.
+    // When KVCache is empty, the tensor contains zeros; otherwise it contains the actual cache lengths.
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
 
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
     // For MRope, the cache is initialized with maxBatchSize and does not need reshaping during prefill.
@@ -899,14 +890,14 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     {
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
-    setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
     if (multimodalEmbeddings.has_value())
     {
         rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
-        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
-        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
     }
     if (!extraInputTensors.empty())
@@ -915,30 +906,29 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
         {
             // Bind the extra input tensor to the engine according to its name.
             rt::Tensor const& tensor = tensorRef.get();
-            setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+            setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
                 tensor.getName().c_str(), const_cast<void*>(tensor.rawPointer()));
             setEngineIOStatus
-                &= mPrefillExecutionContext->setInputShape(tensor.getName().c_str(), tensor.getShape().getTRTDims());
+                &= mTRTExecutionContext->setInputShape(tensor.getName().c_str(), tensor.getShape().getTRTDims());
         }
     }
-
     if (mConfig.enableEagleSpecDecode)
     {
-        setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
         // Mask input and optional token pos-ids are not used, set to dummy data.
         setEngineIOStatus
-            &= mPrefillExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
-        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionMask, Coords{activeBatchSize, 1, 1}.getTRTDims());
         setEngineIOStatus
-            &= mPrefillExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
-        setEngineIOStatus &= mPrefillExecutionContext->setInputShape(
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionPosId, Coords{activeBatchSize, 1}.getTRTDims());
     }
 
     // Engine output tensors.
-    setEngineIOStatus &= mPrefillExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
     // Bind the KVCache IO to the engine.
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
@@ -950,7 +940,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
 
     // launch the engine execution.
     bool executeStatus{true};
-    executeStatus &= mPrefillExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
         LOG_ERROR("executePrefill(): Failed on TensorRT prefill stage enqueueV3() call.");
@@ -1026,23 +1016,32 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     }
     else
     {
+        bool setOptimizationProfileStatus{true};
+        setOptimizationProfileStatus
+            &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+        if (!setOptimizationProfileStatus)
+        {
+            LOG_ERROR("Failed to set optimization profile to the engine");
+            throw std::runtime_error("Failed to set optimization profile to the engine");
+        }
+
         bool setEngineIOStatus{true};
         // Engine input tensors.
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
         setEngineIOStatus
-            &= mGenerationExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+            &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
 
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
@@ -1051,15 +1050,14 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
             mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
         }
 
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
         // Update KV cache shapes to match activeBatchSize
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
         // Engine output tensors.
-        setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
 
         if (!setEngineIOStatus)
         {
@@ -1069,7 +1067,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
 
         // launch the engine execution.
         bool executeStatus{true};
-        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+        executeStatus &= mTRTExecutionContext->enqueueV3(stream);
         if (!executeStatus)
         {
             LOG_ERROR("executeVanillaDecodingStep(): Failed on TensorRT decode stage enqueueV3() call.");
@@ -1194,24 +1192,33 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
     }
     else
     {
+        bool setOptimizationProfileStatus{true};
+        setOptimizationProfileStatus
+            &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+        if (!setOptimizationProfileStatus)
+        {
+            LOG_ERROR("Failed to set optimization profile to the engine");
+            throw std::runtime_error("Failed to set optimization profile to the engine");
+        }
+
         // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
         // initialization.
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kInputIds, baseTreeDecodingInputIds.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
 
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
@@ -1220,24 +1227,23 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
             mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
         }
 
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
         // Update KV cache shapes to match activeBatchSize
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-            binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
         // Bind the output tensor into the engine.
-        setEngineIOStatus
-            &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-        setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
         if (!setEngineIOStatus)
@@ -1248,7 +1254,7 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
 
         // launch the engine execution.
         bool executeStatus{true};
-        executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+        executeStatus &= mTRTExecutionContext->enqueueV3(stream);
         if (!executeStatus)
         {
             LOG_ERROR(
@@ -1270,6 +1276,15 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
 bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
 {
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
     size_t const hashValue = hashDecodingInput(inputIds, outputLogits, loraWeightsPath);
     if (mCudaGraphs.find(hashValue) != mCudaGraphs.end())
     {
@@ -1321,28 +1336,27 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
 
     // Set engine I/O using the same logic as executeVanillaDecodingStep().
     bool setEngineIOStatus{true};
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
     setEngineIOStatus
-        &= mGenerationExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
     // Engine output tensors.
-    setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
 
     // Bind the KVCache since we haven't executed the real prefill step.
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
@@ -1354,7 +1368,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     }
 
     bool executeStatus{true};
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     if (!executeStatus)
     {
         LOG_ERROR("captureVanillaDecodingCudaGraph(): Failed on TensorRT engine enqueueV3() call.");
@@ -1366,7 +1380,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
     mCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
@@ -1392,6 +1406,15 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
     cudaStream_t stream)
 {
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
     size_t const hashValue = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, outputLogits, outputHiddenStates);
     if (mBaseTreeDecodingCudaGraphs.find(hashValue) != mBaseTreeDecodingCudaGraphs.end())
     {
@@ -1440,23 +1463,22 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     // Update KV cache shapes to match activeBatchSize for CUDA graph capture
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kInputIds, baseTreeDecodingInputIds.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
 
     // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
     if (mConfig.ropeConfig.type == RopeType::kMRope)
@@ -1464,22 +1486,21 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
         mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
     }
 
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
-        binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setInputShape(
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
 
     // Bind the output tensor into the engine.
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
     setEngineIOStatus
-        &= mGenerationExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    setEngineIOStatus &= mGenerationExecutionContext->setTensorAddress(
-        binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
@@ -1492,7 +1513,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     // launch the engine execution. This will trigger the shape machine of TensorRT engine to avoid cudaGraph capture.
     // error.
     bool executeStatus{true};
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
 
     if (!executeStatus)
     {
@@ -1507,7 +1528,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-    executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
     mBaseTreeDecodingCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
@@ -1542,10 +1563,7 @@ bool LLMEngineRunner::resetLoraWeights(cudaStream_t stream)
             = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
 
         // Use dummy tensor as zero tensor for LoRA weights
-        resetStatus
-            &= mPrefillExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
-        resetStatus
-            &= mGenerationExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
+        resetStatus &= mTRTExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
 
         // Set shape to kEMPTY_LORA_RANK and assign zero value tensor to disable LoRA
         if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
@@ -1558,8 +1576,7 @@ bool LLMEngineRunner::resetLoraWeights(cudaStream_t stream)
             // LoRA B has shape [rank, n], set rank to kEMPTY_LORA_RANK
             emptyLoraShape.d[0] = kEMPTY_LORA_RANK;
         }
-        resetStatus &= mPrefillExecutionContext->setInputShape(loraWeightsTensorName.c_str(), emptyLoraShape);
-        resetStatus &= mGenerationExecutionContext->setInputShape(loraWeightsTensorName.c_str(), emptyLoraShape);
+        resetStatus &= mTRTExecutionContext->setInputShape(loraWeightsTensorName.c_str(), emptyLoraShape);
         if (!resetStatus)
         {
             LOG_ERROR("Failed to reset LoRA weights: %s", loraWeightsTensorName.c_str());
@@ -1675,13 +1692,13 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cuda
         {
             // Found matching tensor, use its data
             setLoraWeightsStatus
-                &= mPrefillExecutionContext->setInputShape(loraWeightsTensorName.c_str(), loraTensorIt->getTRTDims());
-            setLoraWeightsStatus &= mGenerationExecutionContext->setInputShape(
-                loraWeightsTensorName.c_str(), loraTensorIt->getTRTDims());
-            setLoraWeightsStatus &= mPrefillExecutionContext->setTensorAddress(
-                loraWeightsTensorName.c_str(), loraTensorIt->rawPointer());
-            setLoraWeightsStatus &= mGenerationExecutionContext->setTensorAddress(
-                loraWeightsTensorName.c_str(), loraTensorIt->rawPointer());
+                &= mTRTExecutionContext->setInputShape(loraWeightsTensorName.c_str(), loraTensorIt->getTRTDims());
+            setLoraWeightsStatus
+                &= mTRTExecutionContext->setInputShape(loraWeightsTensorName.c_str(), loraTensorIt->getTRTDims());
+            setLoraWeightsStatus
+                &= mTRTExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), loraTensorIt->rawPointer());
+            setLoraWeightsStatus
+                &= mTRTExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), loraTensorIt->rawPointer());
             LOG_DEBUG("switchLoraWeights(): LoRA weights tensor with name '%s' found. Set shape to %s.",
                 loraWeightsTensorName.c_str(), loraTensorIt->getShape().formatString().c_str());
         }
@@ -1700,12 +1717,9 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cuda
                 // LoRA B has shape [rank, n], set rank to kEMPTY_LORA_RANK
                 shape.d[0] = kEMPTY_LORA_RANK;
             }
-            setLoraWeightsStatus &= mPrefillExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
-            setLoraWeightsStatus &= mGenerationExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
+            setLoraWeightsStatus &= mTRTExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
             setLoraWeightsStatus
-                &= mPrefillExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
-            setLoraWeightsStatus &= mGenerationExecutionContext->setTensorAddress(
-                loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
+                &= mTRTExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
             LOG_DEBUG(
                 "LoRA weights tensor with name '%s' not found. Set shape to rank %d with zero "
                 "tensor.",

@@ -189,11 +189,10 @@ public:
         cudaStream_t stream);
 
 private:
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                          //!< TensorRT runtime
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                        //!< TensorRT engine
-    rt::Tensor mExecContextMemory{};                                       //!< Device memory for the execution contexts
-    std::unique_ptr<nvinfer1::IExecutionContext> mPrefillExecutionContext; //!< Prefill execution context
-    std::unique_ptr<nvinfer1::IExecutionContext> mGenerationExecutionContext; //!< Generation execution context
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
+    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
+    rt::Tensor mExecContextMemory{};                                   //!< Device memory for the execution contexts
+    std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
     //! which denote the input/output shapes and other execution properties like LoRA weights.
     std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
@@ -251,7 +250,7 @@ private:
     bool validateConfigFromEngine();
 
     /*!
-     * @brief Bind KV cache to engine for new requests
+     * @brief Bind KV cache to engine for prefill and generation of new requests
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
      */
