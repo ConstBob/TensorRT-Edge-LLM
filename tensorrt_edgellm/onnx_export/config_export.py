@@ -15,6 +15,8 @@
 
 from typing import Any, Dict
 
+from ..version import __version__
+
 
 def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Export LLM configuration with required fields."""
@@ -151,6 +153,8 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
         raise KeyError(
             "Required field 'vision_config' or 'image_embd_layer' in 'embd_layer' not found in config"
         )
+    # Add TensorRT Edge-LLM version
+    config_dict['edgellm_version'] = __version__
 
     # Return the original config_dict as-is without any modification
     # Since MRoPE needs LLM config, ViTRunner will use the LLM config.
@@ -181,5 +185,8 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
 
     # Add model name to output
     output_config["model"] = model_name
+
+    # Add TensorRT Edge-LLM version
+    output_config['edgellm_version'] = __version__
 
     return output_config
