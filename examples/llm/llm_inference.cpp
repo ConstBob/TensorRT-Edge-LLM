@@ -23,6 +23,7 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "tokenizer/tokenizer.h"
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
@@ -327,7 +328,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseInputFile(
     std::filesystem::path const& inputFilePath, int32_t batchSizeOverride = -1, int64_t maxGenerateLengthOverride = -1)
 {
-    std::vector<rt::LLMGenerationRequest> requests;
+    std::vector<rt::LLMGenerationRequest> batchedRequests;
 
     Json inputData;
     std::ifstream inputFileStream(inputFilePath);
@@ -349,123 +350,229 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
 
     // Extract global parameters
     int batchSize = (batchSizeOverride != -1) ? batchSizeOverride : inputData.value("batch_size", 1);
+    if (batchSize <= 0)
+    {
+        LOG_ERROR("Invalid batch_size value: %d (must be positive)", batchSize);
+        throw std::runtime_error("Invalid batch_size value (must be positive)");
+    }
+
     float temperature = inputData.value("temperature", 1.0f);
     float topP = inputData.value("top_p", 0.8f);
     int64_t topK = inputData.value("top_k", 50);
     int64_t maxGenerateLength
         = (maxGenerateLengthOverride != -1) ? maxGenerateLengthOverride : inputData.value("max_generate_length", 256);
+    if (maxGenerateLength <= 0)
+    {
+        LOG_ERROR(
+            "Invalid max_generate_length value: %lld (must be positive)", static_cast<long long>(maxGenerateLength));
+        throw std::runtime_error("Invalid max_generate_length value (must be positive)");
+    }
+
     std::string defaultSystemPrompt = inputData.value("default_system_prompt", "");
+
     std::unordered_map<std::string, std::string> loraWeightsMap;
     if (inputData.contains("available_lora_weights") && inputData["available_lora_weights"].is_object())
     {
-        auto& availableLoraWeights = inputData["available_lora_weights"];
-        for (auto const& [loraWeightsName, loraWeightsPath] : availableLoraWeights.items())
+        auto const& availableLoraWeights = inputData["available_lora_weights"];
+        for (auto const& [loraName, loraPath] : availableLoraWeights.items())
         {
-            if (loraWeightsMap.find(loraWeightsName) != loraWeightsMap.end())
+            if (!loraPath.is_string())
             {
-                LOG_ERROR("LoRA weights %s already exists", loraWeightsName.c_str());
-                throw std::runtime_error("LoRA weights " + loraWeightsName + " already exists");
+                LOG_ERROR("LoRA weight path for '%s' must be a string", loraName.c_str());
+                throw std::runtime_error("LoRA weight path for '" + loraName + "' must be a string");
             }
-            loraWeightsMap[loraWeightsName] = loraWeightsPath.get<std::string>();
+            if (loraWeightsMap.find(loraName) != loraWeightsMap.end())
+            {
+                LOG_ERROR("Lora weights with name %s already exists", loraName.c_str());
+                throw std::runtime_error("Lora weights with name " + loraName + " already exists");
+            }
+            loraWeightsMap[loraName] = loraPath.get<std::string>();
+            LOG_INFO("Registered LoRA weights '%s' -> '%s'", loraName.c_str(), loraWeightsMap[loraName].c_str());
         }
     }
 
-    // Parse messages
-    if (inputData.contains("messages") && inputData["messages"].is_array())
+    // Parse requests and create batched requests
+    if (inputData.contains("requests") && inputData["requests"].is_array())
     {
-        auto& messages = inputData["messages"];
-        size_t numMessages = messages.size();
+        auto& requestsArray = inputData["requests"];
+        size_t numRequests = requestsArray.size();
 
-        // Process messages in batches according to batchSize
-        for (size_t startIdx = 0; startIdx < numMessages; startIdx += batchSize)
+        // Process requests in batches according to batchSize
+        for (size_t startIdx = 0; startIdx < numRequests; startIdx += batchSize)
         {
-            rt::LLMGenerationRequest request;
-            request.temperature = temperature;
-            request.topP = topP;
-            request.topK = topK;
-            request.maxGenerateLength = maxGenerateLength;
+            rt::LLMGenerationRequest batchRequest;
+            batchRequest.temperature = temperature;
+            batchRequest.topP = topP;
+            batchRequest.topK = topK;
+            batchRequest.maxGenerateLength = maxGenerateLength;
 
-            // Add messages to this batch (up to batchSize messages)
-            size_t endIdx = std::min(startIdx + batchSize, numMessages);
-            for (size_t messageIdx = startIdx; messageIdx < endIdx; ++messageIdx)
+            // Track LoRA weights for validation
+            std::string batchLoraWeightsName = "";
+            bool firstInBatch = true;
+
+            // Add requests to this batch (up to batchSize requests)
+            size_t endIdx = std::min(startIdx + batchSize, numRequests);
+            for (size_t requestIdx = startIdx; requestIdx < endIdx; ++requestIdx)
             {
-                auto const& message = messages[messageIdx];
+                auto const& requestItem = requestsArray[requestIdx];
 
-                // Parse system prompt (use message-specific or default)
-                std::string systemPrompt = message.value("system", defaultSystemPrompt);
+                // Each request must be an object with "messages" key
+                if (!requestItem.is_object())
+                {
+                    LOG_ERROR("Each request must be an object with 'messages' key");
+                    throw std::runtime_error("Each request must be an object with 'messages' key");
+                }
 
                 // Explicit query whether to save the system prompt KVCache of this message for later reuse.
                 // This logic has limitation that once one prompt sets saveSystemPromptKVCache to true, all prompts in
                 // the same batch will cache system prompt KVCache. Since long instruction cache saving is
                 // usually done during system setup, this limitation can be resolved by issuing single batch request at
                 // initialization stage for KVCache saving.
-                bool saveSystemPromptKVCache = message.value("save_system_prompt_kv_cache", false);
+                bool saveSystemPromptKVCache = requestItem.value("save_system_prompt_kv_cache", false);
                 if (saveSystemPromptKVCache)
                 {
-                    request.saveSystemPromptKVCache = true;
+                    batchRequest.saveSystemPromptKVCache = true;
                 }
 
-                // Parse user prompt
-                if (!message.contains("user"))
+                if (!requestItem.contains("messages") || !requestItem["messages"].is_array())
                 {
-                    LOG_ERROR("user prompt is not present");
-                    throw std::runtime_error("user prompt is not present");
+                    LOG_ERROR("Each request object must contain a 'messages' array");
+                    throw std::runtime_error("Each request object must contain a 'messages' array");
                 }
-                std::string userPrompt = message["user"];
 
-                // Create prompt
-                rt::LLMGenerationRequest::Prompt prompt;
-                prompt.systemPrompt = systemPrompt;
-                prompt.userPrompt = userPrompt;
-                if (message.contains("lora_weights"))
+                auto const& messagesArray = requestItem["messages"];
+
+                // Get per-conversation LoRA name if present
+                std::string requestLoraName = "";
+                if (requestItem.contains("lora_name") && !requestItem["lora_name"].is_null())
                 {
-                    if (messageIdx == startIdx)
+                    requestLoraName = requestItem["lora_name"].get<std::string>();
+
+                    // Validate that the LoRA name exists in available_lora_weights
+                    if (!requestLoraName.empty() && loraWeightsMap.find(requestLoraName) == loraWeightsMap.end())
                     {
-                        request.loraWeightsName = message["lora_weights"].get<std::string>();
+                        LOG_ERROR("LoRA name '%s' not found in available_lora_weights", requestLoraName.c_str());
+                        throw std::runtime_error(
+                            "LoRA name '" + requestLoraName + "' not found in available_lora_weights");
+                    }
+                }
+
+                // Validate that all requests in this batch use the same LoRA weights
+                if (firstInBatch)
+                {
+                    batchLoraWeightsName = requestLoraName;
+                    firstInBatch = false;
+                }
+                else
+                {
+                    if (requestLoraName != batchLoraWeightsName)
+                    {
+                        LOG_ERROR(
+                            "All requests within the same batch must use the same LoRA weights. Batch has %d requests.",
+                            static_cast<int>(endIdx - startIdx));
+                        throw std::runtime_error("Different LoRA weights within the same batch are not supported");
+                    }
+                }
+
+                // Parse messages into structured format
+                std::vector<rt::Message> chatMessages;
+                std::vector<rt::imageUtils::ImageData> imageBuffers;
+
+                for (auto const& messageJson : messagesArray)
+                {
+                    if (!messageJson.contains("role") || !messageJson.contains("content"))
+                    {
+                        LOG_ERROR("Each message must have 'role' and 'content' fields");
+                        throw std::runtime_error("Each message must have 'role' and 'content' fields");
+                    }
+
+                    rt::Message chatMsg;
+                    chatMsg.role = messageJson["role"].get<std::string>();
+
+                    auto const& contentJson = messageJson["content"];
+
+                    // Support both string (simple text) and array (multimodal) formats
+                    if (contentJson.is_string())
+                    {
+                        // Simple string format - treat as text content
+                        rt::Message::MessageContent msgContent;
+                        msgContent.type = "text";
+                        msgContent.content = contentJson.get<std::string>();
+                        chatMsg.contents.push_back(msgContent);
+                    }
+                    else if (contentJson.is_array())
+                    {
+                        // Array format - supports multimodal content
+                        for (auto const& contentItemJson : contentJson)
+                        {
+                            if (!contentItemJson.contains("type"))
+                            {
+                                LOG_ERROR("Each content item must have a 'type' field");
+                                throw std::runtime_error("Each content item must have a 'type' field");
+                            }
+
+                            rt::Message::MessageContent msgContent;
+                            msgContent.type = contentItemJson["type"].get<std::string>();
+
+                            // Based on type, extract the appropriate field
+                            if (msgContent.type == "text")
+                            {
+                                msgContent.content = contentItemJson["text"].get<std::string>();
+                            }
+                            else if (msgContent.type == "image")
+                            {
+                                msgContent.content = contentItemJson["image"].get<std::string>();
+                                // TODO: Need to consider multi-turn conversation, and whether to load all images.
+                                auto image = rt::imageUtils::loadImageFromFile(msgContent.content);
+                                if (image.buffer != nullptr)
+                                {
+                                    imageBuffers.push_back(std::move(image));
+                                }
+                            }
+                            else
+                            {
+                                LOG_ERROR("Content type must be 'text', 'image', but got: %s", msgContent.type.c_str());
+                                throw std::runtime_error(format::fmtstr(
+                                    "Content type must be 'text', 'image', but got: %s", msgContent.type.c_str()));
+                            }
+
+                            chatMsg.contents.push_back(msgContent);
+                        }
                     }
                     else
                     {
-                        if (request.loraWeightsName != message["lora_weights"].get<std::string>())
-                        {
-                            LOG_ERROR(
-                                "Multi-LoRA for the same batch is not supported. Please use the same LoRA weights for "
-                                "all messages in the same batch.");
-                            throw std::runtime_error(
-                                "Multi-LoRA for the same batch is not supported. Please use the same LoRA weights for "
-                                "all messages in the same batch.");
-                        }
+                        LOG_ERROR("Message content must be a string or an array");
+                        throw std::runtime_error("Message content must be a string or an array");
                     }
+
+                    chatMessages.push_back(chatMsg);
                 }
 
-                // Parse images if present
-                if (message.contains("images") && message["images"].is_array())
-                {
-                    std::vector<rt::imageUtils::ImageData> imageBuffer;
+                // Create prompt structure with structured messages
+                rt::LLMGenerationRequest::Request request;
+                request.messages = std::move(chatMessages);
+                request.imageBuffers = std::move(imageBuffers);
+                request.defaultSystemPrompt = defaultSystemPrompt;
 
-                    for (auto const& imagePath : message["images"])
-                    {
-                        auto image = rt::imageUtils::loadImageFromFile(imagePath.get<std::string>());
-                        imageBuffer.push_back(image);
-                    }
-
-                    if (!imageBuffer.empty())
-                    {
-                        prompt.imageBuffers = imageBuffer;
-                    }
-                }
-                request.prompts.push_back(prompt);
+                batchRequest.requests.push_back(std::move(request));
             }
 
-            requests.push_back(request);
+            // Set the LoRA weights name for this batch (all requests in this batch use the same LoRA weights)
+            if (!batchLoraWeightsName.empty())
+            {
+                batchRequest.loraWeightsName = batchLoraWeightsName;
+            }
+
+            batchedRequests.push_back(std::move(batchRequest));
         }
     }
     else
     {
-        LOG_ERROR("messages is not an array");
-        throw std::runtime_error("messages is not an array");
+        LOG_ERROR("'requests' array not found in input file");
+        throw std::runtime_error("'requests' array not found in input file");
     }
 
-    return std::make_pair(loraWeightsMap, requests);
+    return std::make_pair(std::move(loraWeightsMap), std::move(batchedRequests));
 }
 
 int main(int argc, char* argv[])
@@ -479,12 +586,13 @@ int main(int argc, char* argv[])
     auto pluginHandles = loadEdgellmPluginLib();
     // load input file and parse to requests
     std::unordered_map<std::string, std::string> loraWeightsMap;
-    std::vector<rt::LLMGenerationRequest> requests;
+    std::vector<rt::LLMGenerationRequest> batchedRequests;
     try
     {
-        std::tie(loraWeightsMap, requests) = parseInputFile(args.inputFile, args.batchSize, args.maxGenerateLength);
+        std::tie(loraWeightsMap, batchedRequests)
+            = parseInputFile(args.inputFile, args.batchSize, args.maxGenerateLength);
         LOG_INFO("Successfully parsed %zu LoRA weights from input file.", loraWeightsMap.size());
-        LOG_INFO("Successfully parsed %zu requests from input file.", requests.size());
+        LOG_INFO("Successfully parsed %zu batches of requests from input file.", batchedRequests.size());
     }
     catch (std::exception const& e)
     {
@@ -492,7 +600,7 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    if (requests.empty())
+    if (batchedRequests.empty())
     {
         LOG_ERROR("No valid requests found in input file.");
         return EXIT_FAILURE;
@@ -575,7 +683,7 @@ int main(int argc, char* argv[])
         // Disable profiling for warmup runs
         setProfilingEnabled(false);
         LOG_INFO("Starting warmup with %d runs using the first request...", args.warmup);
-        auto& firstRequest = requests[0];
+        auto& firstRequest = batchedRequests[0];
 
         for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
         {
@@ -616,18 +724,18 @@ int main(int argc, char* argv[])
     size_t failedCount = 0;
 
     // Process each request with progress indication
-    LOG_INFO("Processing %zu requests...", requests.size());
-    for (size_t requestIdx = 0; requestIdx < requests.size(); ++requestIdx)
+    LOG_INFO("Processing %zu batched requests...", batchedRequests.size());
+    for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
     {
-        auto& request = requests[requestIdx];
+        auto& request = batchedRequests[requestIdx];
         rt::LLMGenerationResponse response;
 
         // Show progress every 10% or every 100 requests, whichever is smaller
-        size_t progressInterval = std::max(size_t(1), std::min(requests.size() / 10, size_t(100)));
-        if ((requestIdx + 1) % progressInterval == 0 || requestIdx == 0 || requestIdx == requests.size() - 1)
+        size_t progressInterval = std::max(size_t(1), std::min(batchedRequests.size() / 10, size_t(100)));
+        if ((requestIdx + 1) % progressInterval == 0 || requestIdx == 0 || requestIdx == batchedRequests.size() - 1)
         {
-            LOG_INFO("Progress: %zu/%zu (%f%%)", requestIdx + 1, requests.size(),
-                100.0 * (requestIdx + 1) / requests.size());
+            LOG_INFO("Progress: %zu/%zu (%f%%)", requestIdx + 1, batchedRequests.size(),
+                100.0 * (requestIdx + 1) / batchedRequests.size());
         }
 
         bool requestStatus = false;
@@ -661,7 +769,7 @@ int main(int argc, char* argv[])
         }
 
         // Add to JSON output with UTF-8 validation on output text
-        for (size_t batchIdx = 0; batchIdx < request.prompts.size(); ++batchIdx)
+        for (size_t batchIdx = 0; batchIdx < request.requests.size(); ++batchIdx)
         {
             nlohmann::json responseJson;
             std::string outputText = requestStatus ? response.outputTexts[batchIdx] : errorMessage;
@@ -669,17 +777,45 @@ int main(int argc, char* argv[])
             // If invalid UTF-8 detected, error message is returned and original text is logged
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
             responseJson["request_idx"] = requestIdx;
-            responseJson["system_prompt"] = request.prompts[batchIdx].systemPrompt;
-            responseJson["user_prompt"] = request.prompts[batchIdx].userPrompt;
+            responseJson["batch_idx"] = batchIdx;
+            // Store messages for reference
+            nlohmann::json messagesJson = nlohmann::json::array();
+            for (auto const& msg : request.requests[batchIdx].messages)
+            {
+                nlohmann::json msgJson;
+                msgJson["role"] = msg.role;
+                msgJson["content"] = nlohmann::json::array();
+                for (auto const& content : msg.contents)
+                {
+                    nlohmann::json contentJson;
+                    contentJson["type"] = content.type;
+                    if (content.type == "text")
+                    {
+                        contentJson["text"] = content.content;
+                    }
+                    else if (content.type == "image")
+                    {
+                        contentJson["image"] = content.content;
+                    }
+                    else if (content.type == "video")
+                    {
+                        contentJson["video"] = content.content;
+                    }
+                    msgJson["content"].push_back(contentJson);
+                }
+                messagesJson.push_back(msgJson);
+            }
+            responseJson["messages"] = messagesJson;
             outputData["responses"].push_back(responseJson);
         }
     }
 
     // Final processing summary
-    LOG_INFO("Processing complete: %zu/%zu requests successful", requests.size() - failedCount, requests.size());
+    LOG_INFO("Processing complete: %zu/%zu batched requests successful", batchedRequests.size() - failedCount,
+        batchedRequests.size());
     if (failedCount > 0)
     {
-        LOG_ERROR("*** %zu REQUESTS FAILED ***", failedCount);
+        LOG_ERROR("*** %zu BATCHED REQUESTS FAILED ***", failedCount);
     }
 
     if (profilerEnabled)

@@ -94,17 +94,61 @@ def is_gptq_model(model: PreTrainedModel) -> bool:
     return quant_config and quant_config.get("quant_method") == "gptq"
 
 
-def _is_phi4mm_model(dir_path: str) -> bool:
+def _check_model_type(model_dir: str, model_identifier: str) -> bool:
+    """
+    Check if a model matches a given identifier by checking model_type and architectures.
+    
+    Args:
+        model_dir: Path to the model directory
+        model_identifier: String to match against model_type or architectures (case-insensitive)
+        
+    Returns:
+        True if model matches the identifier
+    """
     try:
-        cfg = AutoConfig.from_pretrained(dir_path, trust_remote_code=True)
+        cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     except Exception:
         return False
+
     model_type = str(getattr(cfg, "model_type", "")).lower()
-    if "phi4mm" in model_type:
+    if model_identifier in model_type:
         return True
-    archs = getattr(cfg, "architectures", None)
-    return isinstance(archs, (list, tuple)) and any("phi4mm" in str(a).lower()
-                                                    for a in archs)
+
+    archs = getattr(cfg, "architectures", []) or []
+    return any(model_identifier in str(a).lower() for a in archs)
+
+
+def _is_phi4mm_model(dir_path: str) -> bool:
+    """Check if the model is a Phi4MM model."""
+    return _check_model_type(dir_path, "phi4mm")
+
+
+# Models that require explicit chat template because auto-extraction fails
+INCOMPATIBLE_CHAT_TEMPLATE_MODELS = [
+    "phi4mm",  # Phi-4-multimodal: tokenizer lacks proper chat template
+]
+
+
+def is_incompatible_chat_template_model(model_dir: str) -> Tuple[bool, str]:
+    """
+    Check if the model requires an explicit chat template file.
+    
+    Some models have tokenizers that don't contain proper chat templates
+    or have incompatible formats that cannot be auto-extracted.
+    
+    Args:
+        model_dir: Path to the model directory
+        
+    Returns:
+        Tuple of (is_incompatible, model_identifier):
+            - is_incompatible: True if model requires explicit chat template
+            - model_identifier: String identifying the incompatible model type (empty if compatible)
+    """
+    for model_identifier in INCOMPATIBLE_CHAT_TEMPLATE_MODELS:
+        if _check_model_type(model_dir, model_identifier):
+            return True, model_identifier
+
+    return False, ""
 
 
 def _load_phi4mm_war(model_dir: str):

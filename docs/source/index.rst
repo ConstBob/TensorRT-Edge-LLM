@@ -47,6 +47,17 @@ with quantization and compile them into optimized TensorRT engines.
    developer_guide/03.1_Python_Export_Pipeline.md
    developer_guide/03.2_Engine_Builder.md
 
+Chat Template Configuration
+----------------------------
+
+Learn how to create and customize chat templates for formatting conversational messages for your models.
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Chat Template Configuration
+
+   developer_guide/06_Chat_Template_Format.md
+
 C++ Runtime
 -----------
 

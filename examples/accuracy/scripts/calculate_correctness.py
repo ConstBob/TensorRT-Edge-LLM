@@ -159,8 +159,8 @@ def main():
     skipped_count = 0
     total_count = 0
 
-    for response, message in zip(predictions_data["responses"],
-                                 answers_data["messages"]):
+    for response, request in zip(predictions_data["responses"],
+                                 answers_data["requests"]):
         total_count += 1
         output_text = response["output_text"]
 
@@ -170,10 +170,10 @@ def main():
             continue
 
         predictions.append(output_text)
-        answers.append(message["answer"])
+        answers.append(request["answer"])
         # Extract subject if available
-        if "subject" in message:
-            subjects.append(message["subject"])
+        if "subject" in request:
+            subjects.append(request["subject"])
         else:
             subjects.append(None)
 

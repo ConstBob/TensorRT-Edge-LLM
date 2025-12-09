@@ -766,7 +766,8 @@ bool LLMBuilder::copyTokenizerFiles()
         return true;
     }
 
-    std::vector<std::string> tokenizerFiles = {"tokenizer_config.json", "tokenizer.json"};
+    std::vector<std::string> tokenizerFiles
+        = {"tokenizer_config.json", "tokenizer.json", "processed_chat_template.json"};
     bool allSuccess = true;
 
     for (auto const& filename : tokenizerFiles)

@@ -28,12 +28,43 @@
 #include <vector>
 
 #include "preTokenizer.h"
+#include "runtime/llmRuntimeUtils.h"
 #include "tokenEncoder.h"
 
 namespace trt_edgellm
 {
 namespace tokenizer
 {
+
+/*!
+ * @brief Chat template role configuration
+ */
+struct ChatTemplateRole
+{
+    std::string prefix; //!< Prefix for this role
+    std::string suffix; //!< Suffix for this role
+};
+
+/*!
+ * @brief Chat template content type configuration
+ */
+struct ChatTemplateContentType
+{
+    std::string format; //!< Format string for this content type
+};
+
+/*!
+ * @brief Chat template configuration
+ */
+struct ChatTemplateConfig
+{
+    std::string modelPath;                                   //!< Model path or identifier
+    std::unordered_map<std::string, ChatTemplateRole> roles; //!< Role configurations (system, user, assistant)
+    std::unordered_map<std::string, ChatTemplateContentType>
+        contentTypes;                //!< Content type configurations (text, image, video)
+    std::string generationPrompt;    //!< Generation prompt string
+    std::string defaultSystemPrompt; //!< Default system prompt
+};
 
 /*!
  * @brief Type of text partition for tokenization
@@ -183,6 +214,31 @@ public:
      */
     bool isInitialized() const noexcept;
 
+    /**
+     * @brief Load chat template configuration from JSON file
+     * @param chatTemplateFile Path to the processed_chat_template.json file
+     * @return true if chat template is loaded successfully; false if file doesn't exist or parsing fails
+     */
+    bool loadChatTemplate(std::filesystem::path const& chatTemplateFile);
+
+    /**
+     * @brief Apply chat template to a request
+     * @param request Request object containing messages. The attributes formattedSystemPrompt and
+     * formattedCompleteRequest will be populated (mutable)
+     * @param addGenerationPrompt Whether to add generation prompt at the end
+     * @return true if chat template is applied successfully; false if encountered errors
+     */
+    bool applyChatTemplate(rt::LLMGenerationRequest::Request const& request, bool addGenerationPrompt = true) const;
+
+    /**
+     * @brief Get default system prompt from chat template
+     * @return Default system prompt string
+     */
+    std::string getDefaultSystemPrompt() const noexcept
+    {
+        return mChatTemplate.defaultSystemPrompt;
+    }
+
 protected:
     /**
      * @brief Parse tokenizer.json to extract configuration
@@ -274,6 +330,9 @@ protected:
     Rank mPadId;        //!< Padding token ID
     Rank mUnkId;        //!< Unknown token ID
     Rank mImgContextId; //!< Image context token ID
+
+    // Chat template
+    ChatTemplateConfig mChatTemplate; //!< Chat template configuration
 
     // State
     bool mInitialized; //!< Whether tokenizer is initialized

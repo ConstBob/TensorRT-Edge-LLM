@@ -4,7 +4,7 @@ This document describes the required format for the input JSON file used with th
 
 ## Overview
 
-The input JSON file contains configuration parameters and a list of messages to be processed by the LLM. The tool supports both text-only and multimodal (text + images) inputs.
+The input JSON file contains configuration parameters and a list of requests to be processed by the LLM. Each request is a conversation consisting of multiple messages with roles and content. The tool supports both text-only and multimodal (text + images) inputs, as well as multi-turn conversations.
 
 ## File Structure
 
@@ -17,64 +17,153 @@ The JSON file must contain the following top-level structure:
     "top_p": <float>,
     "top_k": <integer>,
     "max_generate_length": <integer>,
-    "default_system_prompt": "<string>",
+    "default_system_prompt": "<string>",  // optional
     "available_lora_weights": {  // optional. Only needed for LoRA engines.
-        "<name1>": "<path1>",
-        "<name2>": "<path2>",
+        "<lora_name>": "<path_to_safetensors_file>",
         ...
     },
-    "messages": [
+    "requests": [
         {
-            "user": "<string>",
-            "system": "<string>",  // optional
-            "images": ["<path1>", "<path2>", ...],  // optional
-            "lora_weights": "<name>" // optional. Reference to a name in available_lora_weights.
+            "messages": [
+                {
+                    "role": "<string>",  // "system", "user", or "assistant"
+                    "content": "<string>"  // Simple string for text-only messages
+                    // OR
+                    "content": [  // Array format for multimodal content
+                        {
+                            "type": "<string>",  // "text", "image", or "video"
+                            "text": "<string>",  // for type="text"
+                            "image": "<path>",   // for type="image"
+                            "video": "<path>"    // for type="video"
+                        }
+                    ]
+                }
+            ],
+            "lora_name": "<string>"  // optional. Name of LoRA weights from available_lora_weights.
         }
     ]
 }
 ```
 
+
 ## LoRA (Low-Rank Adaptation) Support
 
-LoRA enables fine-tuned model inference using adapter weights. Requirements:
+LoRA enables fine-tuned model inference using adapter weights. 
+
+### Defining Available LoRA Weights
+First, define all available LoRA adapters in the global `available_lora_weights` map:
+```json
+{
+    "available_lora_weights": {
+        "french_adapter": "/path/to/french_adapter.safetensors",
+        "spanish_adapter": "/path/to/spanish_adapter.safetensors",
+        "jailbreak_detector": "/path/to/jailbreak_detector.safetensors"
+    }
+}
+```
+
+### Per-Conversation LoRA Selection
+Then reference these adapters by name in each request:
+```json
+{
+    "available_lora_weights": {
+        "french_adapter": "/path/to/french_adapter.safetensors",
+        "spanish_adapter": "/path/to/spanish_adapter.safetensors"
+    },
+    "requests": [
+        {
+            "messages": [...],
+            "lora_name": "french_adapter"
+        },
+        {
+            "messages": [...],
+            "lora_name": "spanish_adapter"
+        }
+    ]
+}
+```
+
+### Requirements:
 - TensorRT engine built with LoRA support
 - LoRA weights in `.safetensors` format
-- Different LoRA weights within the same batch is not supported. LoRA weights within the same batch should be the same.
-- LoRA weights must be registered in `available_lora_weights` and referenced by name in messages
+- LoRA adapters must be defined in `available_lora_weights` before being referenced by `lora_name`
+- **Important:** All requests within the same batch must use the same LoRA weights. Different LoRA weights are only supported across different batches.
 
 ## Global Parameters
 
 ### Required Parameters
 
-- **`messages`** (array): A list of message objects to be processed. Each message represents a conversation turn.
+- **`requests`** (array of objects): A list of conversation requests. Each request is an object containing a `messages` array and optional per-conversation configuration.
 
 ### Optional Parameters
 
-- **`batch_size`** (integer, default: 1): Number of messages to process in a single batch
+- **`batch_size`** (integer, default: 1): Number of requests to process in a single batch
 - **`temperature`** (float, default: 1.0): Controls randomness in generation (0.0 = deterministic, higher = more random)
 - **`top_p`** (float, default: 0.8): Nucleus sampling parameter (0.0-1.0)
 - **`top_k`** (integer, default: 50): Top-k sampling parameter
 - **`max_generate_length`** (integer, default: 256): Maximum number of tokens to generate
-- **`default_system_prompt`** (string, default: ""): Default system prompt applied to all messages unless overridden
-- **`available_lora_weights`** (object): Dictionary mapping LoRA weight names to file paths. Only needed for LoRA-enabled engines
+- **`default_system_prompt`** (string, default: ""): Default system prompt to be used when a request doesn't include a system message. If not provided, the model's default system prompt from the chat template will be used
+- **`available_lora_weights`** (object, default: {}): Map of LoRA adapter names to their file paths. Only needed for LoRA-enabled engines
 
-## Message Objects
+## Request Structure
 
-Each message in the `messages` array can contain:
+Each request in the `requests` array is an object with the following fields:
 
 ### Required Fields
 
-- **`user`** (string): The user's input prompt or question
+- **`messages`** (array): An array of messages that form a conversation. This enables multi-turn conversations with context from previous exchanges.
 
 ### Optional Fields
 
-- **`system`** (string): System prompt specific to this message. If not provided, uses `default_system_prompt`
-- **`images`** (array of strings): List of image file paths for multimodal inputs
-- **`lora_weights`** (string): Name reference to a LoRA weight defined in `available_lora_weights`. Only used with LoRA-enabled engines
+- **`lora_name`** (string): Name of the LoRA adapter to use for this conversation, referencing an entry in the global `available_lora_weights` map. This allows different conversations to use different fine-tuned adapters. Note that all requests within the same batch must use the same LoRA weights.
+
+### Message Structure
+
+Each message object contains:
+
+#### Required Fields
+
+- **`role`** (string): The role of the message sender. Must be one of:
+  - `"system"`: System instructions or context
+  - `"user"`: User input or question
+  - `"assistant"`: Assistant's previous response (for multi-turn conversations)
+
+- **`content`** (string or array): The message content. Can be:
+  - **String format** (text-only, simpler): Direct text string
+  - **Array format** (multimodal): Array of content items for text, images, videos
+
+#### Content Formats
+
+**Simple String Format (Text-Only Messages):**
+
+For text-only messages, you can use a simple string:
+```json
+"content": "Your text message here"
+```
+
+**Array Format (Multimodal Messages):**
+
+For messages with images, videos, or mixed content, use an array of content items.
+
+Each content item has a `type` field and type-specific fields:
+
+**For text content:**
+- **`type`**: `"text"`
+- **`text`** (string): The text content
+
+**For image content:**
+- **`type`**: `"image"`
+- **`image`** (string): Path to the image file
+
+**For video content:**
+- **`type`**: `"video"`
+- **`video`** (string): Path to the video file
 
 ## Examples
 
-### Text-Only Input
+### Text-Only Input (Single Request)
+
+Using the simple string format for text-only messages:
 
 ```json
 {
@@ -83,19 +172,31 @@ Each message in the `messages` array can contain:
     "top_p": 0.8,
     "top_k": 50,
     "max_generate_length": 256,
-    "default_system_prompt": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-    "messages": [
+    "requests": [
         {
-            "user": "<|im_start|>user\nIntroduce NVIDIA and introduce the CEO of this company.<|im_end|>\n<|im_start|>assistant\n"
-        },
-        {
-            "user": "<|im_start|>user\nGive me a short introduction to large language model.<|im_end|>\n<|im_start|>assistant\n"
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "Introduce NVIDIA and introduce the CEO of this company."
+                }
+            ]
         }
     ]
 }
 ```
 
-### Multimodal Input
+**Note:** You can also use the array format for text-only messages if preferred:
+```json
+"content": [{"type": "text", "text": "Your message here"}]
+```
+
+### Multi-Turn Conversation
+
+Using simple string format for easy text conversations:
 
 ```json
 {
@@ -103,30 +204,35 @@ Each message in the `messages` array can contain:
     "temperature": 1.0,
     "top_p": 0.8,
     "top_k": 50,
-    "max_generate_length": 256,
-    "default_system_prompt": "You are a helpful assistant.",
-    "messages": [
+    "max_generate_length": 128,
+    "requests": [
         {
-            "user": "Describe this image.",
-            "images": [
-                "image.jpeg"
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "What is the capital of France?"
+                },
+                {
+                    "role": "assistant",
+                    "content": "The capital of France is Paris."
+                },
+                {
+                    "role": "user",
+                    "content": "What is the population of that city?"
+                }
             ]
-        },
-        {
-            "user": "Identify the similarities between these images.",
-            "images": [
-                "image1.jpeg",
-                "image2.jpeg"
-            ]
-        },
-        {
-            "user": "Give me a short introduction to large language model."
         }
     ]
 }
 ```
 
-### LoRA Input
+### Multimodal Input (Text + Images)
+
+For multimodal content, use the array format:
 
 ```json
 {
@@ -135,42 +241,153 @@ Each message in the `messages` array can contain:
     "top_p": 0.8,
     "top_k": 50,
     "max_generate_length": 256,
-    "default_system_prompt": "You are a helpful assistant.",
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "image1.jpeg"},
+                        {"type": "image", "image": "image2.jpeg"},
+                        {"type": "text", "text": "Compare these two images and identify the similarities."}
+                    ]
+                }
+            ]
+        }
+    ]
+}
+```
+
+### Batch Processing (Multiple Requests)
+
+You can mix string format (text-only) and array format (multimodal) in the same batch:
+
+```json
+{
+    "batch_size": 2,
+    "temperature": 1.0,
+    "top_p": 0.8,
+    "top_k": 50,
+    "max_generate_length": 256,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "What is machine learning?"
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "diagram.png"},
+                        {"type": "text", "text": "Explain this diagram."}
+                    ]
+                }
+            ]
+        }
+    ]
+}
+```
+
+### LoRA Input (Per-Conversation)
+
+The format allows you to specify different LoRA adapters for each conversation by referencing them by name:
+
+```json
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 0.8,
+    "top_k": 50,
+    "max_generate_length": 256,
     "available_lora_weights": {
-        "adapter1": "/path/to/lora_weights.safetensors",
-        "adapter2": "/path/to/another_adapter.safetensors"
+        "french_adapter": "/path/to/french_adapter.safetensors",
+        "spanish_adapter": "/path/to/spanish_adapter.safetensors"
     },
-    "messages": [
+    "requests": [
         {
-            "user": "Your prompt here",
-            "lora_weights": "adapter1"
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "Translate this text to French."
+                }
+            ],
+            "lora_name": "french_adapter"
         },
         {
-            "user": "Another prompt with images",
-            "images": [
-                "image1.jpg", 
-                "image2.jpg"
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": "Translate this text to Spanish."
+                }
             ],
-            "lora_weights": "adapter2" // This will error out if batch_size = 2.
+            "lora_name": "spanish_adapter"
         }
     ]
 }
 ```
+
+**Note:** The above example will naturally process each conversation in separate batches (assuming `batch_size` is 1) since they use different LoRA weights. If you manually group them into the same batch by setting `batch_size` to 2 or higher, **the program will error out** with the message: "Different LoRA weights within the same batch are not supported".
 
 ## Processing Behavior
 
-1. **Batching**: Messages are processed in batches according to the `batch_size` parameter
-2. **System Prompts**: Each message can have its own system prompt, or it will use the default
-3. **Image Loading**: Images are loaded from the specified file paths during processing
-4. **LoRA Weights**: When specified, LoRA adapter weights are loaded and applied per batch for fine-tuned inference. LoRA weights must first be defined in `available_lora_weights` and then referenced by name in messages
-5. **Error Handling**: The tool will throw errors if:
+1. **Chat Template Application**: The chat template (loaded from `processed_chat_template.json`) is automatically applied to format messages with the appropriate role prefixes/suffixes and special tokens
+2. **System Prompts**: System prompt fallback hierarchy:
+   - If a request includes a system message, it will be used
+   - Otherwise, the `default_system_prompt` (if specified) will be used
+   - If neither is provided, the model's default system prompt from the chat template will be used
+3. **Batching**: Requests are processed in batches according to the `batch_size` parameter
+4. **Multi-Turn Support**: Each request can contain multiple messages to support conversation context
+5. **Content Type Handling**: 
+   - Text content is directly inserted into the formatted output
+   - Image/video placeholders are formatted according to the chat template
+6. **Image Loading**: Images are loaded from the specified file paths during processing
+7. **LoRA Weights**: LoRA adapters are loaded once at initialization from `available_lora_weights`, then switched per batch based on `lora_name` references
+8. **Error Handling**: The tool will throw errors if:
    - The JSON file cannot be parsed
-   - A message is missing the required `user` field
-   - The `messages` field is not an array
-   - LoRA weights are not the same for different prompts inside the same expected batch
-   - A referenced LoRA weight name is not defined in `available_lora_weights`
+   - A message is missing the required `role` or `content` field
+   - A request object is missing the required `messages` field
+   - The `requests` field is not an array of objects
+   - Unknown content types are specified
+   - Different LoRA weights are specified for requests within the same batch
+   - A `lora_name` is referenced that is not defined in `available_lora_weights`
 
 ## Notes
 
-- Image paths should be relative to the working directory or absolute paths
-- For LLM models, system prompts and user prompts should follow the model's expected format (e.g., chat templates). For multimodal models, chat template for system prompts and user prompts will be handled in preprocessing.
+- Image and video paths should be relative to the working directory or absolute paths
+- The chat template automatically adds appropriate special tokens and formatting
+- Assistant messages in the middle of a conversation enable multi-turn interactions with context
+- The format follows OpenAI's chat completion API structure for better interoperability
+
+## Key Design Principles
+
+The input format is designed to:
+- **Follow OpenAI's chat completion API structure** for better interoperability
+- **Support multi-turn conversations** with full context from previous exchanges
+- **Enable per-conversation LoRA weights** for different fine-tuned adapters
+- **Handle multimodal inputs** (text, images, videos) in a unified way
+- **Maintain clear separation** between conversation requests and global parameters
