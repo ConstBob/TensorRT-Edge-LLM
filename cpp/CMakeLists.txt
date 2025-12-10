@@ -44,6 +44,7 @@ add_library(
   ${RUNTIME_CPP_SRCS}
   ${PROFILER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
+target_link_libraries(edgellmCore PRIVATE dl)
 
 # Generate tokenizer C++ static library
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
@@ -55,7 +56,7 @@ file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
 add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS} ${COMMON_CPP_SRCS})
 target_include_directories(edgellmBuilder PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                   ${COMMON_INCLUDE_DIRS})
-target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB})
+target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
 
 # Generate the TensorRT plugin shared libraries
 file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")
