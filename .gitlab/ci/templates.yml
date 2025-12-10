@@ -133,3 +133,26 @@
     - deactivate
     - echo "Pipeline end time:$(date)"
 
+.cross_build_template:
+  script:
+    - echo "Pipeline start time:$(date)"
+    - echo "Starting cross-build for target platform"
+    - echo "Checking TRT package"
+    - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT package not found at $TRT_PACKAGE_DIR"; exit 1; fi
+    - echo "Using TensorRT package from cache at $TRT_PACKAGE_DIR"
+    - echo "Updating git submodules"
+    - git submodule update --init --recursive
+    - echo "Creating build directory"
+    - mkdir -p build
+    - cd build
+    - echo "Running CMake configuration"
+    - cmake .. 
+        -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR 
+        -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake 
+        -DEMBEDDED_TARGET=$EMBEDDED_TARGET
+        -DCUDA_VERSION=$CUDA_VERSION
+    - echo "Building the project"
+    - make -j$(nproc)
+    - echo "Cross-build completed successfully"
+    - echo "Pipeline end time:$(date)"
+
