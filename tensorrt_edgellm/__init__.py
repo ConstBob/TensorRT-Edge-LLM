@@ -116,12 +116,9 @@ from .quantization.llm_quantization import (quantize_and_save_draft,
 from .vocab_reduction.vocab_reduction import reduce_vocab_size
 
 try:
-    from ._version import __version__
+    from .version import __version__
 except ImportError:
     __version__ = "unknown"
-
-__author__ = "NVIDIA"
-__email__ = "TBD@nvidia.com"
 
 __all__ = [
     "quantize_and_save_llm",

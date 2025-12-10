@@ -21,6 +21,7 @@
 #include "common/fileUtils.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
+#include "common/version.h"
 
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
@@ -372,6 +373,10 @@ bool LLMBuilder::parseConfig()
         LOG_ERROR("Failed to parse config file: %s", e.what());
         return false;
     }
+
+    // Check model version
+    std::string modelVersion = mModelConfig.value(binding_names::kEdgellmVersion, "");
+    version::checkVersion(modelVersion);
 
     mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
     mTargetModelOutputHiddenDim = mHiddenSize * 3;
@@ -979,6 +984,10 @@ bool VisualBuilder::parseConfig()
         LOG_ERROR("Failed to parse config file: %s", e.what());
         return false;
     }
+
+    // Check model version
+    std::string modelVersion = mModelConfig.value(binding_names::kEdgellmVersion, "");
+    version::checkVersion(modelVersion);
 
     // Read model type from vision_config.model_type
     std::string modelTypeStr;

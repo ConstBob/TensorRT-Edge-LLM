@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tensorrt-edgellm"
-version = "0.4.0.0"
+dynamic = ["version"]
 description = "A Python package for quantizing and exporting LLMs for edge deployment"
 readme = "README.md"
 keywords = [
@@ -55,3 +55,6 @@ include = ["tensorrt_edgellm*"]
 [tool.setuptools.package-data]
 tensorrt_edgellm = ["README.md"]
 "tensorrt_edgellm.chat_templates" = ["templates/*.json"]
+
+[tool.setuptools.dynamic]
+version = {attr = "tensorrt_edgellm.version.__version__"}

@@ -22,6 +22,7 @@
 #include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
+#include "common/version.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <fstream>
@@ -286,6 +287,10 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
 {
     try
     {
+        // Check model version
+        std::string modelVersion = configJson.value(binding_names::kEdgellmVersion, "");
+        version::checkVersion(modelVersion);
+
         // Define required fields for main config
         std::vector<std::string> const requiredConfigFields = {"num_hidden_layers", "num_key_value_heads", "head_dim",
             "hidden_size", "base_model_hidden_size", "draft_vocab_size", "builder_config"};

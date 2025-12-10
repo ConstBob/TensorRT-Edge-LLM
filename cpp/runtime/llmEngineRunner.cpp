@@ -25,6 +25,7 @@
 #include "common/mmapReader.h"
 #include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
+#include "common/version.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -361,6 +362,10 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 {
     try
     {
+        // Check model version
+        std::string modelVersion = configJson.value(binding_names::kEdgellmVersion, "");
+        version::checkVersion(modelVersion);
+
         // Define required fields for main config
         std::vector<std::string> const requiredConfigFields
             = {"num_hidden_layers", "num_key_value_heads", "head_dim", "vocab_size", "builder_config"};
