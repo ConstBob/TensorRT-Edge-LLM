@@ -271,6 +271,14 @@ inline constexpr char const* kLoraAPrefix = "lora_A";
  */
 inline constexpr char const* kLoraBPrefix = "lora_B";
 
+/*!
+ * @brief EDGELLM version
+ *
+ * Value: "major.minor.patch.build"
+ * Example: "0.4.0.0"
+ */
+inline constexpr char const* kEdgellmVersion = "edgellm_version";
+
 /*! @} */
 
 /*! @name Utility Functions
