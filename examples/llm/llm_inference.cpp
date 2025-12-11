@@ -19,6 +19,7 @@
 #include "memoryMonitor.h"
 #include "profileFormatter.h"
 #include "profiling/metrics.h"
+#include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
@@ -577,6 +578,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
 
 int main(int argc, char* argv[])
 {
+    NVTX_SCOPED_RANGE(nvtx_main, "llm_inference");
     LLMInferenceArgs args;
     if (!parseLLMInferenceArgs(args, argc, argv))
     {

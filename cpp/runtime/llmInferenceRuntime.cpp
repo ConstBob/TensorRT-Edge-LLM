@@ -25,6 +25,7 @@
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
+#include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
 #include <fstream>
@@ -189,6 +190,8 @@ bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
 bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
     std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream)
 {
+    NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
+
     std::vector<std::vector<int32_t>> processedInputIds;
     std::vector<int32_t> processedIdsLengths;
     int32_t const activeBatchSize = static_cast<int32_t>(batchedInputIds.size());
@@ -335,6 +338,8 @@ bool LLMInferenceRuntime::handleRequest(
     }
     else
     {
+        // Mark multimodal preprocessing and inference for NVTX profiling
+        NVTX_SCOPED_RANGE(nvtx_multimodal, "MULTIMODAL_PROCESSING", nvtx_colors::ORANGE);
         if (!mMultimodalRunner->preprocess(
                 request, batchedInputIds, mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
         {
@@ -422,6 +427,13 @@ bool LLMInferenceRuntime::handleRequest(
     rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
     {
         TIME_STAGE(metrics::StageNames::kLLM_PREFILL, stream);
+        // Enhanced NVTX range with detailed information
+        NVTX_SCOPED_RANGE(nvtx_prefill,
+            ("LLM_PREFILL[BS=" + std::to_string(activeBatchSize)
+                + ",Reused=" + std::to_string(tokenCount.totalReusedTokens)
+                + ",Computed=" + std::to_string(tokenCount.totalComputedTokens) + "]")
+                .c_str(),
+            nvtx_colors::BLUE);
 
         bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings,
             extraVisualFeatures, mOutputLogits, outputHiddenStates, stream);
@@ -443,9 +455,22 @@ bool LLMInferenceRuntime::handleRequest(
     // Profile entire generation phase like benchmark profiler
     {
         TIME_STAGE(metrics::StageNames::kLLM_GENERATION, stream);
+        // Enhanced NVTX range with batch size
+        NVTX_SCOPED_RANGE(nvtx_generation,
+            ("LLM_GENERATION[BS=" + std::to_string(activeBatchSize) + ",MaxLen=" + std::to_string(maxGenerationLength)
+                + "]")
+                .c_str(),
+            nvtx_colors::GREEN);
 
         while (unFinishedBatchNum > 0 && generationIter < maxGenerationLength)
         {
+            // Mark each decoding iteration with detailed info
+            NVTX_SCOPED_RANGE(iter_range,
+                ("Decode_Iter[" + std::to_string(generationIter) + "/" + std::to_string(maxGenerationLength)
+                    + ",Active=" + std::to_string(unFinishedBatchNum) + "]")
+                    .c_str(),
+                nvtx_colors::LIGHT_GREEN);
+
             // Use the selected token indices as the input token indices for the decoding step.
             bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mSelectedIndices, mOutputLogits, stream);
             if (!decodingStatus)

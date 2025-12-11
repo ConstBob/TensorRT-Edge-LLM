@@ -27,6 +27,7 @@
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "multimodal/multimodalRunner.h"
+#include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "sampler/sampling.h"
@@ -611,6 +612,8 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceContext& context)
 {
     TIME_STAGE(metrics::StageNames::kLLM_PREFILL, context.stream);
+    NVTX_SCOPED_RANGE(nvtx_base_prefill,
+        ("EAGLE_BASE_PREFILL[" + std::to_string(context.activeBatchSize) + "]").c_str(), nvtx_colors::BLUE);
 
     int32_t const activeBatchSize = context.activeBatchSize;
 
@@ -691,6 +694,11 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
 bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceContext& context)
 {
     TIME_STAGE(metrics::StageNames::kEAGLE_DRAFT_PREFILL, context.stream);
+    NVTX_SCOPED_RANGE(nvtx_draft_prefill,
+        ("EAGLE_DRAFT_PREFILL[R" + std::to_string(context.generationRound) + ","
+            + std::to_string(context.activeBatchSize) + "]")
+            .c_str(),
+        nvtx_colors::DARK_ORANGE);
 
     int32_t const activeBatchSize = context.activeBatchSize;
 
@@ -748,6 +756,11 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
 bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContext& context)
 {
     TIME_STAGE(metrics::StageNames::kEAGLE_CONSTRUCT_DRAFT_TREE, context.stream);
+    NVTX_SCOPED_RANGE(nvtx_construct_tree,
+        ("EAGLE_CONSTRUCT_TREE[R" + std::to_string(context.generationRound) + ","
+            + std::to_string(context.activeBatchSize) + "]")
+            .c_str(),
+        nvtx_colors::LIGHT_ORANGE);
 
     int32_t const activeBatchSize = context.activeBatchSize;
 
@@ -888,6 +901,11 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
 bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInferenceContext& context)
 {
     TIME_STAGE(metrics::StageNames::kEAGLE_BASE_VERIFICATION, context.stream);
+    NVTX_SCOPED_RANGE(nvtx_verify,
+        ("EAGLE_VERIFY[R" + std::to_string(context.generationRound) + "," + std::to_string(context.activeBatchSize)
+            + "]")
+            .c_str(),
+        nvtx_colors::MAGENTA);
 
     int32_t const activeBatchSize = context.activeBatchSize;
 
@@ -1004,6 +1022,12 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
 
 bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInferenceContext& context)
 {
+    NVTX_SCOPED_RANGE(nvtx_draft_accept,
+        ("EAGLE_DRAFT_ACCEPT[R" + std::to_string(context.generationRound) + ","
+            + std::to_string(context.activeBatchSize) + "]")
+            .c_str(),
+        nvtx_colors::YELLOW);
+
     int32_t const activeBatchSize = context.activeBatchSize;
 
     // Base model verifiction function is responsible for producing the output with correct shape.
@@ -1162,6 +1186,8 @@ bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_
 
 bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInferenceContext& context)
 {
+    NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
+
     int32_t const activeBatchSize = context.activeBatchSize;
     std::vector<std::vector<int32_t>> const& batchedInputIds = context.rawBatchedInputIds;
     rt::LinearKVCache& linearKVCacheBase = mBaseEngineRunner->getLinearKVCache();
