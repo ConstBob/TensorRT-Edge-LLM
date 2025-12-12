@@ -69,10 +69,10 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     LOG_INFO("LLMEngineRunner successfully loaded and initialized llm engine.");
 
     mEngineConfig = mLLMEngineRunner->getEngineConfig();
-    // Setup sampling workspace, use default topK=100 to reserve workspace.
-    // FIXME: Find a better approach to reserve sampling workspace to handle various request configurations.
-    int32_t const defaultTopK = 100;
-    float const defaultTopP = 0.9F;
+
+    // Use TopP sampling parameter to reserve max possible workspace size for sampling.
+    int32_t const defaultTopK{0};
+    float const defaultTopP{0.9F};
     trt_edgellm::SamplingParams samplingParams(
         mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize, 1.0f, defaultTopK, defaultTopP);
     int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(trt_edgellm::getTopKtopPSamplingWorkspaceSize(
