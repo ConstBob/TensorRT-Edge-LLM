@@ -554,6 +554,16 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 request.imageBuffers = std::move(imageBuffers);
                 request.defaultSystemPrompt = defaultSystemPrompt;
 
+                // Optionally read pre-formatted prompts. If provided, these will override the text input
+                // generated from messages during inference, bypassing the tokenizer's chat template application.
+                // This is useful when the user wants to provide pre-formatted prompts directly.
+                if (requestItem.contains("formatted_system_prompt")
+                    && requestItem.contains("formatted_complete_request"))
+                {
+                    request.formattedSystemPrompt = requestItem["formatted_system_prompt"].get<std::string>();
+                    request.formattedCompleteRequest = requestItem["formatted_complete_request"].get<std::string>();
+                }
+
                 batchRequest.requests.push_back(std::move(request));
             }
 
@@ -806,6 +816,9 @@ int main(int argc, char* argv[])
                 messagesJson.push_back(msgJson);
             }
             responseJson["messages"] = messagesJson;
+            // Store formatted prompts for reference
+            responseJson["formatted_system_prompt"] = request.requests[batchIdx].formattedSystemPrompt;
+            responseJson["formatted_complete_request"] = request.requests[batchIdx].formattedCompleteRequest;
             outputData["responses"].push_back(responseJson);
         }
     }
