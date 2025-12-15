@@ -175,11 +175,15 @@ bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
 
     for (auto const& request : request.requests)
     {
-        if (request.messages.empty())
+        if (request.messages.empty()
+            && (request.formattedSystemPrompt.empty() || request.formattedCompleteRequest.empty()))
         {
             LOG_ERROR(
-                "LLMInferenceRuntime(): There is an empty request in the batch. Skip this batch of requests. please "
-                "check the input data contents.");
+                "LLMInferenceRuntime(): There is an empty request in the batch. Either 'messages' or "
+                "'formatted_system_prompt' and 'formatted_complete_request' must be provided.Skip this batch of "
+                "LLMInferenceRuntime(): There is an empty request in the batch. Either 'messages' or "
+                "'formatted_system_prompt' and 'formatted_complete_request' must be provided. Skip this batch of "
+                "requests. Please check the input data contents.");
             return false;
         }
     }
@@ -305,6 +309,12 @@ bool LLMInferenceRuntime::handleRequest(
         {
             // Apply chat template to populate both formatted system prompt and full formatted prompt
             mTokenizer->applyChatTemplate(request.requests[i], true);
+        }
+        else
+        {
+            LOG_WARNING(
+                "LLMInferenceRuntime(): Pre-formatted prompts are provided. "
+                "Skipping chat template application for this request.");
         }
 
         batchSystemPrompts.emplace_back(request.requests[i].formattedSystemPrompt);
