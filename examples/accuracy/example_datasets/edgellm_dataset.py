@@ -148,8 +148,10 @@ class EdgeLLMDataset:
         """
         raise NotImplementedError("format_system_prompt is not implemented")
 
-    def process_and_save_dataset(self,
-                                 output_filename: Optional[str] = None) -> str:
+    def process_and_save_dataset(
+            self,
+            output_filename: Optional[str] = None,
+            overwrite_formatted_prompts: bool = True) -> str:
         """
         Process the entire dataset and save it as JSON file compatible with TensorRT Edge-LLM.
         
@@ -166,6 +168,8 @@ class EdgeLLMDataset:
                         {"role": "system", "content": "<string>"},
                         {"role": "user", "content": "<string or array>"}
                     ],
+                    "formatted_system_prompt": "<string>",  // optional
+                    "formatted_complete_request": "<string>",  // optional
                     "answer": "<string>",  // optional
                     "id": "<string>",      // optional
                     "subject": "<string>"  // optional
@@ -231,6 +235,11 @@ class EdgeLLMDataset:
 
                 request["messages"] = messages
 
+                if overwrite_formatted_prompts:
+                    if system_prompt:
+                        request["formatted_system_prompt"] = system_prompt
+                    request["formatted_complete_request"] = (system_prompt or
+                                                             "") + user_prompt
                 # Add reference answer if available
                 if answer:
                     request["answer"] = answer

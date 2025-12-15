@@ -156,7 +156,8 @@ def convert_mmlu_dataset(config: DatasetConfig,
                                         output_dir=output_dir)
 
     print(f"Processing MMLU dataset with config: {config}")
-    edge_llm_mmlu_dataset.process_and_save_dataset("mmlu_dataset.json")
+    edge_llm_mmlu_dataset.process_and_save_dataset(
+        "mmlu_dataset.json", overwrite_formatted_prompts=True)
 
     print(f"Successfully converted MMLU dataset to {output_dir}")
     return edge_llm_mmlu_dataset
