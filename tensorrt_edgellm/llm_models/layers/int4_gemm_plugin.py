@@ -673,11 +673,12 @@ def int4_dq_gemm_to_plugin(graph: gs.Graph) -> gs.Graph:
     for node in [n for n in graph.nodes if n.op in ["Add", "Concat"]]:
         # Update Cast nodes feeding into Add/Concat to cast to fp16
         for inp in node.inputs:
-            inp.dtype = np.float16
-            # If input comes from a Cast node, update it to cast to fp16
-            if len(inp.inputs) == 1 and inp.inputs[0].op == "Cast":
-                cast_node = inp.inputs[0]
-                cast_node.attrs["to"] = onnx.TensorProto.FLOAT16
+            if not isinstance(inp, gs.Constant):
+                inp.dtype = np.float16
+                # If input comes from a Cast node, update it to cast to fp16
+                if len(inp.inputs) == 1 and inp.inputs[0].op == "Cast":
+                    cast_node = inp.inputs[0]
+                    cast_node.attrs["to"] = onnx.TensorProto.FLOAT16
 
         # Update outputs to fp16
         for out in node.outputs:
