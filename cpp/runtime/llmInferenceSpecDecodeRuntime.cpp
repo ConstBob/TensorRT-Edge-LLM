@@ -496,6 +496,17 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     // Check if any batch finished immediately after prefill
     updateFinishStates();
 
+    // If everything finished during prefill, evict once so activeBatchSize reaches 0
+    if (checkAllFinished() && context.activeBatchSize > 0)
+    {
+        bool const batchEvictStatus = performBatchEvict(context);
+        if (!batchEvictStatus)
+        {
+            LOG_ERROR("Failed to perform batch eviction.");
+            return false;
+        }
+    }
+
     while (!checkAllFinished())
     {
         if (context.generationRound == 0)
