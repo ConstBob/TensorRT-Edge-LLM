@@ -209,7 +209,7 @@ def attention_plugin(
     Args:
         qkv: Concatenated QKV tensor of shape (batch_size, seq_len, num_q_heads * head_size + 2 * num_kv_heads * head_size)
         past_key_value: KV cache tensor of shape (batch_size, 2, num_kv_heads, past_len, head_size)
-        rope_rotary_cos_sin: RoPE tensor of shape (batch_size, seq_len, 2 * head_size) containing cos and sin values
+        rope_rotary_cos_sin: RoPE tensor of shape (batch_size, seq_len, rotary_dim) containing cos and sin values
         context_lengths: Context length tensor of shape (batch_size,) indicating current position in cache
         kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size,), required
         num_q_heads: Number of query heads
