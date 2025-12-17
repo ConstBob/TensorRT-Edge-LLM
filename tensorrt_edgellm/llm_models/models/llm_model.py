@@ -117,7 +117,7 @@ class EdgeLLMModel(nn.Module):
         Args:
             past_key_values: Past key-value cache for efficient decoding
                            List of tensors, each with shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
-            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, head_dim)
+            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, rotary_dim)
             context_lengths: Context length tensor indicating current position in cache, shape (batch_size,)
             kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size, 1), required
             position_ids: Position IDs for positional encoding, shape (batch_size, seq_len), optional
@@ -283,7 +283,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
         Args:
             past_key_values: Past key-value cache for efficient decoding, tuple of tensors
                            Each tensor has shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
-            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, head_dim)
+            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, rotary_dim)
             context_lengths: Context length tensor indicating current position in cache, shape (batch_size,)
             last_token_ids: Indices of the last tokens to extract, shape (batch_size,)
             kvcache_start_index: Start index of KV cache of shape (batch_size), optional

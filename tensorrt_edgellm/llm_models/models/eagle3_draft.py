@@ -161,7 +161,7 @@ class Eagle3DraftModel(nn.Module):
         Args:
             past_key_values: Past key-value cache for efficient decoding
                            List of tensors, each with shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
-            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, head_dim)
+            rope_rotary_cos_sin: RoPE rotary embeddings, shape (batch_size, seq_len, rotary_dim)
             context_lengths: Context length tensor indicating current position in cache, shape (batch_size,)
             last_token_ids: Indices of the last tokens to extract, shape (batch_size,)
             hidden_states_from_base: Hidden states from the base model, shape (batch_size, seq_len, target_hidden_size * 3)
