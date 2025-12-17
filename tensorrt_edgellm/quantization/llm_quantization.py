@@ -354,7 +354,7 @@ def quantize_and_save_llm(model_dir: str,
     """
     start_time = time.time()
     # Load model and tokenizer
-    model, tokenizer = load_hf_model(model_dir, dtype, device)
+    model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
 
     if is_quantized(model):
         print(f"Model is already quantized, skipping quantization.")
@@ -371,6 +371,8 @@ def quantize_and_save_llm(model_dir: str,
     with torch.inference_mode():
         model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    if processor is not None:
+        processor.save_pretrained(output_dir)
 
     # Save the quant config
     quant_config = get_quant_config(model)
@@ -424,7 +426,7 @@ def quantize_and_save_draft(
     if is_quantized(draft_model):
         print(f"Draft Model is already quantized, skipping quantization.")
     else:
-        base_model, tokenizer = load_hf_model(base_model_dir, dtype, device)
+        base_model, tokenizer, _ = load_hf_model(base_model_dir, dtype, device)
         draft_model = quantize_draft(base_model, draft_model, tokenizer,
                                      quantization, dataset_dir,
                                      lm_head_quantization)

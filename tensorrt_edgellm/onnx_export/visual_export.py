@@ -25,7 +25,6 @@ import shutil
 from typing import Optional
 
 import torch
-from transformers import AutoProcessor
 
 from tensorrt_edgellm.quantization.visual_quantization import quantize_visual
 # Import visual model wrappers
@@ -80,7 +79,7 @@ def visual_export(model_dir: str,
 
     # Load the model and processor
     try:
-        model, _ = load_hf_model(model_dir, dtype, device)
+        model, _, processor = load_hf_model(model_dir, dtype, device)
     except Exception as e:
         raise ValueError(f"Could not load model from {model_dir}. Error: {e}")
 
@@ -106,8 +105,6 @@ def visual_export(model_dir: str,
 
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
-            processor = AutoProcessor.from_pretrained(model_dir,
-                                                      trust_remote_code=True)
             wrapped_model = quantize_visual(wrapped_model, quantization,
                                             processor, dataset_dir)
 
@@ -125,8 +122,6 @@ def visual_export(model_dir: str,
         wrapped_model.eval().to(device)
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
-            processor = AutoProcessor.from_pretrained(model_dir,
-                                                      trust_remote_code=True)
             wrapped_model = quantize_visual(wrapped_model, quantization,
                                             processor, dataset_dir)
 
@@ -144,8 +139,6 @@ def visual_export(model_dir: str,
         wrapped_model.eval().to(device)
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
-            processor = AutoProcessor.from_pretrained(model_dir,
-                                                      trust_remote_code=True)
             wrapped_model = quantize_visual(wrapped_model, quantization,
                                             processor, dataset_dir)
 
@@ -160,10 +153,9 @@ def visual_export(model_dir: str,
 
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
-            processor = AutoProcessor.from_pretrained(
-                model_dir, trust_remote_code=True).image_processor
             wrapped_model = quantize_visual(wrapped_model, quantization,
-                                            processor, dataset_dir)
+                                            processor.image_processor,
+                                            dataset_dir)
 
         # Export using the wrapper's export function
         export_internvl3_visual(wrapped_model, output_dir, torch_dtype)
@@ -172,14 +164,13 @@ def visual_export(model_dir: str,
         print(f"Exporting Phi4MM visual model from {model_dir}")
         # Create Phi4MM wrapper model
         wrapped_model = Phi4MMVisionModel(model)
-        processor = AutoProcessor.from_pretrained(
-            model_dir, trust_remote_code=True).image_processor
         wrapped_model.eval().to(device)
 
         # Apply quantization to wrapped model if requested
         if quantization == "fp8":
             wrapped_model = quantize_visual(wrapped_model, quantization,
-                                            processor, dataset_dir)
+                                            processor.image_processor,
+                                            dataset_dir)
         export_phi4mm_visual(wrapped_model, output_dir, torch_dtype)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
