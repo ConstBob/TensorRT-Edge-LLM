@@ -167,49 +167,60 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
 bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
 {
     bool setTensorAddressStatus{true};
-    mVitInput = rt::Tensor({mConfig.maxHW, mConfig.inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mVitInput = rt::Tensor(
+        {mConfig.maxHW, mConfig.inputDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "QwenViTRunner::mVitInput");
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
 
-    mAttentionMask = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mAttentionMask = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+        "QwenViTRunner::mAttentionMask");
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kAttentionMask, mAttentionMask.rawPointer());
 
-    mRotaryPosEmb = rt::Tensor({mConfig.maxHW, mConfig.vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mRotaryPosEmb = rt::Tensor({mConfig.maxHW, mConfig.vitPosEmbDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
+        "QwenViTRunner::mRotaryPosEmb");
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kRotaryPosEmb, mRotaryPosEmb.rawPointer());
 
     // In Qwen-VL, VIT input mHW is always numImageTokens * spatial_merge_size ** 2.
     auto const maxImageTokens = mConfig.maxHW / (mConfig.mergeSize * mConfig.mergeSize);
-    mOutputEmbedding
-        = rt::Tensor({maxImageTokens, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mOutputEmbedding = rt::Tensor({maxImageTokens, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "QwenViTRunner::mOutputEmbedding");
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
 
     if (mModelType == multimodal::ModelType::QWEN2_5_VL)
     {
-        mWindowAttentionMask
-            = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        mWindowAttentionMask = rt::Tensor({1, mConfig.maxHW, mConfig.maxHW}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF, "QwenViTRunner::mWindowAttentionMask");
         setTensorAddressStatus
             &= mContext->setTensorAddress(binding_names::kWindowAttentionMask, mWindowAttentionMask.rawPointer());
 
-        mWindowIndexHost = rt::Tensor({maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64);
-        mWindowIndexDevice = rt::Tensor({maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+        mWindowIndexHost = rt::Tensor(
+            {maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mWindowIndexHost");
+        mWindowIndexDevice = rt::Tensor(
+            {maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mWindowIndexDevice");
         setTensorAddressStatus
             &= mContext->setTensorAddress(binding_names::kWindowIndex, mWindowIndexDevice.rawPointer());
 
-        mReverseWindowIndexHost = rt::Tensor({maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64);
-        mReverseWindowIndexDevice = rt::Tensor({maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+        mReverseWindowIndexHost = rt::Tensor({maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64,
+            "QwenViTRunner::mReverseWindowIndexHost");
+        mReverseWindowIndexDevice = rt::Tensor({maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64,
+            "QwenViTRunner::mReverseWindowIndexDevice");
         setTensorAddressStatus
             &= mContext->setTensorAddress(binding_names::kReverseWindowIndex, mReverseWindowIndexDevice.rawPointer());
 
         // Use maxImageTokens as a safe upper bound for cumulative window sequence lengths.
-        mCuWindowSeqlensHost = rt::Tensor({maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64);
-        mCuWindowSeqlensDevice = rt::Tensor({maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+        mCuWindowSeqlensHost = rt::Tensor(
+            {maxImageTokens}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mCuWindowSeqlensHost");
+        mCuWindowSeqlensDevice = rt::Tensor({maxImageTokens}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64,
+            "QwenViTRunner::mCuWindowSeqlensDevice");
     }
     else if (mModelType == multimodal::ModelType::QWEN3_VL)
     {
-        mFastPosEmbIdx = rt::Tensor({4, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+        mFastPosEmbIdx = rt::Tensor(
+            {4, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mFastPosEmbIdx");
         setTensorAddressStatus
             &= mContext->setTensorAddress(binding_names::kFastPosEmbIdx, mFastPosEmbIdx.rawPointer());
 
-        mFastPosEmbWeight = rt::Tensor({4, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+        mFastPosEmbWeight = rt::Tensor(
+            {4, mConfig.maxHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "QwenViTRunner::mFastPosEmbWeight");
         setTensorAddressStatus
             &= mContext->setTensorAddress(binding_names::kFastPosEmbWeight, mFastPosEmbWeight.rawPointer());
 
@@ -232,8 +243,8 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
 
     // Copy image mean and std to device to be used in normalizeImage
     auto channels = mConfig.imageMean.size();
-    mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageMean");
+    mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageStd");
     CUDA_CHECK(cudaMemcpyAsync(
         mImageMean.rawPointer(), mConfig.imageMean.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(
@@ -242,21 +253,26 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     // Pre-allocate temporary image buffers for preprocessing
     int64_t const maxImagePixels = mVitInput.getShape().volume();
     // Set max image size to 1xmaxImagePixelsxchannels, will reshape to actual image size in resizeImage
-    rt::Tensor resizeBuffer({1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+    rt::Tensor resizeBuffer(
+        {1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "QwenViTRunner::resizeBuffer");
     mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
-    mImageDevice = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    mNormalizedImageDevice = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mImageDevice
+        = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "QwenViTRunner::mImageDevice");
+    mNormalizedImageDevice = rt::Tensor(
+        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "QwenViTRunner::mNormalizedImageDevice");
 
     // Pre-allocate tensors for MRoPE position IDs
-    mMropePositionIdsHost
-        = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64);
-    mMropePositionIdsDevice
-        = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    mMropePositionIdsHost = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kCPU,
+        nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsHost");
+    mMropePositionIdsDevice = rt::Tensor({mLLMMaxBatchSize, 3, mLLMMaxSequenceLength}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kINT64, "QwenViTRunner::mMropePositionIdsDevice");
 
     // Pre-allocate tensors for cumulative sequence lengths.
     // The size of the tensor is maxNumImages + 1 because the first element is 0.
-    mCuSeqlensDevice = rt::Tensor({mConfig.maxNumImages + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-    mCuSeqlensHost = rt::Tensor({mConfig.maxNumImages + 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64);
+    mCuSeqlensDevice = rt::Tensor({mConfig.maxNumImages + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64,
+        "QwenViTRunner::mCuSeqlensDevice");
+    mCuSeqlensHost = rt::Tensor(
+        {mConfig.maxNumImages + 1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64, "QwenViTRunner::mCuSeqlensHost");
 
     return true;
 }

@@ -270,6 +270,7 @@ bool LLMBuilder::build()
 
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+    config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");
@@ -898,6 +899,7 @@ bool VisualBuilder::build()
 
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+    config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");

@@ -16,6 +16,7 @@
  */
 
 #include "runtime/linearKVCache.h"
+#include "common/logger.h"
 
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -36,7 +37,12 @@ LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
     int64_t const kvCacheVolume = mConfig.numDecoderLayers * mConfig.maxBatchSize * 2 * mConfig.numKVHeads
         * mConfig.maxSequenceLength * mConfig.headDim;
     CUDA_CHECK(cudaMalloc(&mDeviceKVCache, kvCacheVolume * sizeof(KVCacheType)));
-    mDeviceKVCacheLengths = rt::Tensor({mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32);
+    LOG_DEBUG("KVCache of shape [%ld, %ld, %ld, %ld, %ld, %ld] allocated on GPU with size: %ld bytes (%.2f MB)",
+        mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength,
+        mConfig.headDim, kvCacheVolume * sizeof(KVCacheType),
+        static_cast<float>(kvCacheVolume * sizeof(KVCacheType)) / (1024.0 * 1024.0));
+    mDeviceKVCacheLengths = rt::Tensor(
+        {mConfig.maxBatchSize}, DeviceType::kGPU, DataType::kINT32, "LinearKVCache::mDeviceKVCacheLengths");
     CUDA_CHECK(
         cudaMemsetAsync(mDeviceKVCacheLengths.rawPointer(), 0, mDeviceKVCacheLengths.getMemoryCapacity(), stream));
 }

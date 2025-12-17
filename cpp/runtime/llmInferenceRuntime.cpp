@@ -82,19 +82,22 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     try
     {
         // Use Int8 to indicate byte for workspace.
-        mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8);
+        mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8,
+            "LLMInferenceRuntime::mSamplingWorkspace");
         mInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
-            rt::DeviceType::kGPU, DataType::kINT32);
+            rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceRuntime::mInputIds");
         mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
-            rt::DeviceType::kCPU, DataType::kINT32);
-        mOutputLogits = rt::Tensor(
-            {mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32);
-        mHostSelectedTokenIds
-            = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-        mHostContextLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-        mHostReuseKVCacheLengths
-            = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+            rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceRuntime::mHostPackedInputIds");
+        mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMInferenceRuntime::mOutputLogits");
+        mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceRuntime::mSelectedIndices");
+        mHostSelectedTokenIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+            DataType::kINT32, "LLMInferenceRuntime::mHostSelectedTokenIds");
+        mHostContextLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMInferenceRuntime::mHostContextLengths");
+        mHostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+            DataType::kINT32, "LLMInferenceRuntime::mHostReuseKVCacheLengths");
     }
     catch (std::exception const& e)
     {
@@ -620,8 +623,8 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     SystemPromptKVCache savedKVCache;
     savedKVCache.systemPrompt = prompt;
     savedKVCache.tokenizedPrompt = tokenizedPrompt;
-    savedKVCache.kvCacheContent
-        = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT);
+    savedKVCache.kvCacheContent = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT,
+        "LLMInferenceRuntime::savedKVCache.kvCacheContent");
 
     // We only process one sequence at a time.
     constexpr int32_t CACHE_BATCH_IDX{0};

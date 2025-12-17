@@ -18,6 +18,7 @@
 #include "profileFormatter.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "common/tensor.h"
 #include "memoryMonitor.h"
 #include "profiling/timer.h"
 #include <algorithm>
@@ -35,11 +36,6 @@ using namespace trt_edgellm;
 
 namespace
 {
-//! Helper function to convert bytes to megabytes
-double toMB(size_t bytes)
-{
-    return static_cast<double>(bytes) / (1024.0 * 1024.0);
-}
 
 //! Utility function for calculating prefill tokens per second
 float getPrefillTokensPerSecond(metrics::LLMPrefillMetrics const& prefillMetrics)
@@ -317,13 +313,27 @@ void outputMultimodalProfile(std::ostream& output, metrics::MultimodalMetrics co
     }
 }
 
-void outputMemoryProfile(std::ostream& output, size_t peakGpuMemoryBytes)
+void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor)
 {
-    if (peakGpuMemoryBytes > 0)
+    output << "=== Memory Usage ===" << std::endl;
+
+    if (memoryMonitor.isIntegratedGPU())
     {
-        output << "=== Memory Usage ===" << std::endl;
-        output << "Peak GPU Memory: " << std::fixed << std::setprecision(2) << toMB(peakGpuMemoryBytes) << " MB ("
-               << peakGpuMemoryBytes << " bytes)" << std::endl;
+        // iGPU: Only show unified memory
+        size_t peakUnifiedMemoryBytes = memoryMonitor.getPeakUnifiedMemory();
+        output << "Peak Unified Memory: " << std::fixed << std::setprecision(2)
+               << rt::utils::toMB(peakUnifiedMemoryBytes) << " MB (" << peakUnifiedMemoryBytes << " bytes)"
+               << std::endl;
+    }
+    else
+    {
+        // dGPU: Show both GPU and CPU memory
+        size_t peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
+        size_t peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
+        output << "Peak GPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakGpuMemoryBytes)
+               << " MB (" << peakGpuMemoryBytes << " bytes)" << std::endl;
+        output << "Peak CPU Memory: " << std::fixed << std::setprecision(2) << rt::utils::toMB(peakCpuMemoryBytes)
+               << " MB (" << peakCpuMemoryBytes << " bytes)" << std::endl;
     }
 }
 
@@ -405,12 +415,24 @@ void addJsonTimingStages(nlohmann::json& summary)
     }
 }
 
-void addJsonMemorySummary(nlohmann::json& summary, size_t peakGpuMemoryBytes)
+void addJsonMemorySummary(nlohmann::json& summary, MemoryMonitor const& memoryMonitor)
 {
-    if (peakGpuMemoryBytes > 0)
+    if (memoryMonitor.isIntegratedGPU())
     {
+        // iGPU: Only add unified memory
+        size_t peakUnifiedMemoryBytes = memoryMonitor.getPeakUnifiedMemory();
+        summary["peak_unified_memory_bytes"] = peakUnifiedMemoryBytes;
+        summary["peak_unified_memory_mb"] = rt::utils::toMB(peakUnifiedMemoryBytes);
+    }
+    else
+    {
+        // dGPU: Add both GPU and CPU memory
+        size_t peakGpuMemoryBytes = memoryMonitor.getPeakGpuMemory();
+        size_t peakCpuMemoryBytes = memoryMonitor.getPeakCpuMemory();
         summary["peak_gpu_memory_bytes"] = peakGpuMemoryBytes;
-        summary["peak_gpu_memory_mb"] = toMB(peakGpuMemoryBytes);
+        summary["peak_gpu_memory_mb"] = rt::utils::toMB(peakGpuMemoryBytes);
+        summary["peak_cpu_memory_bytes"] = peakCpuMemoryBytes;
+        summary["peak_cpu_memory_mb"] = rt::utils::toMB(peakCpuMemoryBytes);
     }
 }
 

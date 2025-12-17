@@ -65,7 +65,8 @@ ImageData loadImageFromFile(std::string const& path)
     // throw an exception.
     try
     {
-        imgTensor = rt::Tensor({height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+        imgTensor = rt::Tensor({height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
+            "imageUtils::loadImageFromFile::imgTensor");
     }
     catch (std::exception const& e)
     {
@@ -93,7 +94,8 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
     // throw an exception.
     try
     {
-        imgTensor = rt::Tensor({height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+        imgTensor = rt::Tensor({height, width, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
+            "imageUtils::loadImageFromMemory::imgTensor");
     }
     catch (std::exception const& e)
     {
