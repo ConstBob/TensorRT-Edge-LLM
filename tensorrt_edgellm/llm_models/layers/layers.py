@@ -550,14 +550,14 @@ class EdgeLLMDecoderLayer(nn.Module):
         Forward pass through the decoder layer for ONNX export.
         
         Args:
-            hidden_states: Input hidden states of shape (batch, seq_len, embed_dim)
+            hidden_states: Input hidden states of shape (batch_size, seq_len, embed_dim)
             past_key_value: Cached past key-value states of shape (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
-            rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch, seq_len, head_dim)
-            context_lengths: Context length tensor of shape (batch,)
+            rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch_size, seq_len, rotary_dim)
+            context_lengths: Context length tensor of shape (batch_size,)
             kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size,), required
-            inputs_embeds: Input embeddings for EAGLE3 draft of shape (batch, seq_len, embed_dim), optional
-            attention_mask: Attention mask of shape (batch, seq_len, seq_len + past_len), optional
-            position_ids: Position IDs of shape (batch, seq_len), optional
+            inputs_embeds: Input embeddings for EAGLE3 draft of shape (batch_size, seq_len, embed_dim), optional
+            attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
+            position_ids: Position IDs of shape (batch_size, seq_len), optional
             
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Output hidden states and updated key-value cache
@@ -606,9 +606,9 @@ class EdgeLLMDecoderLayer(nn.Module):
         Forward pass through the decoder layer for quantization.
 
         Args:
-            hidden_states: Hidden states of shape (batch, seq_len, embed_dim)
+            hidden_states: Hidden states of shape (batch_size, seq_len, embed_dim)
             position_embeddings: Tuple of tensors, containing cos and sin
-            inputs_embeds: Input embeddings of shape (batch, seq_len, embed_dim)
+            inputs_embeds: Input embeddings of shape (batch_size, seq_len, embed_dim)
         """
 
         residual = hidden_states
