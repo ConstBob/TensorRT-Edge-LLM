@@ -19,6 +19,7 @@ This module provides functions to check the accuracy of model predictions agains
 """
 
 import json
+import os
 import re
 
 import pytest
@@ -101,6 +102,13 @@ def check_accuracy_with_dataset(output_json_file,
                 'python3', rouge_script, '--predictions_file',
                 output_json_file, '--references_file', reference_json_file
             ]
+
+            # Add rouge_dir from environment variable if available
+            edge_llm_cache_dir = os.environ.get('EDGE_LLM_CACHE_DIR')
+            if edge_llm_cache_dir:
+                rouge_dir = os.path.join(edge_llm_cache_dir, 'rouge')
+                if os.path.exists(rouge_dir):
+                    cmd.extend(['--rouge_dir', rouge_dir])
             cmd_result = run_command(cmd,
                                      remote_config=None,
                                      timeout=600,

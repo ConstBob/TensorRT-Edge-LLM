@@ -19,12 +19,13 @@ import json
 import evaluate
 
 
-def calculate_rouge_score(predictions, references):
+def calculate_rouge_score(predictions, references, rouge_dir=None):
     """
     Compute Rouge score between predictions and references.
     Args:
         predictions: List of predictions.
         references: List of references.
+        rouge_dir: Optional path to local rouge metric directory.
     Returns:
         Rouge score. Format: {
             "rouge1": float,
@@ -33,8 +34,12 @@ def calculate_rouge_score(predictions, references):
             "rougeLsum": float
         }
     """
-    rouge = evaluate.load("rouge")
-    return rouge.compute(predictions=predictions, references=references)
+    if rouge_dir is not None:
+        rouge_evaluator = evaluate.load(rouge_dir)
+    else:
+        rouge_evaluator = evaluate.load("rouge")
+    return rouge_evaluator.compute(predictions=predictions,
+                                   references=references)
 
 
 def main():
@@ -49,6 +54,10 @@ def main():
                         type=str,
                         required=True,
                         help="Path to references JSON file")
+    parser.add_argument("--rouge_dir",
+                        type=str,
+                        default=None,
+                        help="Path to local rouge metric directory")
 
     args = parser.parse_args()
 
@@ -103,7 +112,8 @@ def main():
             'valid_count': 0
         }
 
-    rouge_score_result = calculate_rouge_score(predictions, references)
+    rouge_score_result = calculate_rouge_score(predictions, references,
+                                               args.rouge_dir)
 
     print("Rouge Score Results:")
     valid_count = len(predictions)
