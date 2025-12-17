@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "memoryMonitor.h"
 #include "profiling/metrics.h"
 #include <nlohmann/json.hpp>
 #include <ostream>
@@ -52,7 +53,7 @@ void outputEagleGenerationProfile(
 void outputMultimodalProfile(std::ostream& output, trt_edgellm::metrics::MultimodalMetrics const& multimodalMetrics);
 
 //! Output memory usage summary to ostream
-void outputMemoryProfile(std::ostream& output, size_t peakGpuMemoryBytes);
+void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor);
 
 //! Add JSON for prefill stage to existing json object
 void addJsonPrefillSummary(nlohmann::json& summary, trt_edgellm::metrics::LLMPrefillMetrics const& prefillMetrics);
@@ -73,7 +74,7 @@ void addJsonMultimodalSummary(
 void addJsonTimingStages(nlohmann::json& summary);
 
 //! Add JSON for memory usage to existing json object
-void addJsonMemorySummary(nlohmann::json& summary, size_t peakGpuMemoryBytes);
+void addJsonMemorySummary(nlohmann::json& summary, MemoryMonitor const& memoryMonitor);
 
 //! Check string for invalid UTF-8 sequences
 //! Returns original string if valid, or error message if invalid UTF-8 detected

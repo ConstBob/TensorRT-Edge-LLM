@@ -176,64 +176,77 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
 
     try
     {
-        mIdsInput = rt::Tensor(
-            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kGPU, DataType::kINT32);
-        mContextLengthsInput = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+        mIdsInput = rt::Tensor({mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mIdsInput");
+        mContextLengthsInput = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mContextLengthsInput");
         // Allocate mLogitsOutput with max capacity to support both draft (smaller vocab) and base (larger vocab)
         // operations Max size needed: batch_size * verify_tree_size * base_vocab_size for base verification
         int32_t const maxLogitsSize = mMaxRuntimeBatchSize * maxDraftTreeSize;
         int32_t const maxVocabSize = std::max(mBaseEngineConfig.vocabSize, mDraftEngineConfig.draftModelVocabSize);
-        mLogitsOutput = rt::Tensor({maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mDraftTreeSize = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        mDraftTreeMask = rt::Tensor(
-            {mMaxRuntimeBatchSize, maxDraftTreeSize, maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT8);
+        mLogitsOutput = rt::Tensor({maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT,
+            "LLMInferenceSpecDecodeRuntime::mLogitsOutput");
+        mDraftTreeSize = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mDraftTreeSize");
+        mDraftTreeMask = rt::Tensor({mMaxRuntimeBatchSize, maxDraftTreeSize, maxDraftTreeSize}, rt::DeviceType::kGPU,
+            DataType::kINT8, "LLMInferenceSpecDecodeRuntime::mDraftTreeMask");
         mBaseHiddenStatesOutput = rt::Tensor(
             {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.outputHiddenDim},
-            rt::DeviceType::kGPU, DataType::kHALF);
+            rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mBaseHiddenStatesOutput");
         mDraftHiddenStatesInput = rt::Tensor(
             {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mDraftEngineConfig.draftModelHiddenDim},
-            rt::DeviceType::kGPU, DataType::kHALF);
+            rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mDraftHiddenStatesInput");
         mDraftHiddenStatesOutput = rt::Tensor({mMaxRuntimeBatchSize, draftTopK, mDraftEngineConfig.draftModelHiddenDim},
-            rt::DeviceType::kGPU, DataType::kHALF);
-        mDraftTokenIdsFullTable
-            = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kINT32);
-        mDraftTokenScoreFullTable
-            = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mDraftTokenPredecessorFullTable
-            = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU, DataType::kINT32);
-        mDraftVocabMappingTable = rt::Tensor(
-            {mMaxRuntimeBatchSize, mDraftEngineConfig.draftModelVocabSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        mDraftTreeRootTokenId = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        mDraftTokenIdsTable
-            = rt::Tensor({mMaxRuntimeBatchSize, draftTopK * draftTopK}, rt::DeviceType::kGPU, DataType::kINT32);
-        mDraftTokenScoresTable
-            = rt::Tensor({mMaxRuntimeBatchSize, draftTopK * draftTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mDraftTokenIntermediateScores
-            = rt::Tensor({mMaxRuntimeBatchSize, draftTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mDraftTokenIntermediateParents
-            = rt::Tensor({mMaxRuntimeBatchSize, draftTopK}, rt::DeviceType::kGPU, DataType::kINT32);
-        mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8);
-        mSamplingIndices = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32);
-        mSamplingScores = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+            rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mDraftHiddenStatesOutput");
+        mDraftTokenIdsFullTable = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mDraftTokenIdsFullTable");
+        mDraftTokenScoreFullTable = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMInferenceSpecDecodeRuntime::mDraftTokenScoreFullTable");
+        mDraftTokenPredecessorFullTable = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mDraftTokenPredecessorFullTable");
+        mDraftVocabMappingTable = rt::Tensor({mMaxRuntimeBatchSize, mDraftEngineConfig.draftModelVocabSize},
+            rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mDraftVocabMappingTable");
+        mDraftTreeRootTokenId = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mDraftTreeRootTokenId");
+        mDraftTokenIdsTable = rt::Tensor({mMaxRuntimeBatchSize, draftTopK * draftTopK}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mDraftTokenIdsTable");
+        mDraftTokenScoresTable = rt::Tensor({mMaxRuntimeBatchSize, draftTopK * draftTopK}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMInferenceSpecDecodeRuntime::mDraftTokenScoresTable");
+        mDraftTokenIntermediateScores = rt::Tensor({mMaxRuntimeBatchSize, draftTopK}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMInferenceSpecDecodeRuntime::mDraftTokenIntermediateScores");
+        mDraftTokenIntermediateParents = rt::Tensor({mMaxRuntimeBatchSize, draftTopK}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mDraftTokenIntermediateParents");
+        mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8,
+            "LLMInferenceSpecDecodeRuntime::mSamplingWorkspace");
+        mSamplingIndices = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mSamplingIndices");
+        mSamplingScores = rt::Tensor({maxSamplingSize}, rt::DeviceType::kGPU, DataType::kFLOAT,
+            "LLMInferenceSpecDecodeRuntime::mSamplingScores");
 
         // DraftModel prefill/accept-decode-token will also produce one layer of draft tree, so the max accepted
         // depth should be drafting step + 1.
         int32_t const maxAcceptDepth = mDraftingConfig.draftingStep + 1;
-        mAcceptedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, maxAcceptDepth}, rt::DeviceType::kGPU, DataType::kINT32);
-        mAcceptedTokenIndices
-            = rt::Tensor({mMaxRuntimeBatchSize, maxAcceptDepth}, rt::DeviceType::kGPU, DataType::kINT32);
-        mAcceptLength = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        mAcceptedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, maxAcceptDepth}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mAcceptedTokenIds");
+        mAcceptedTokenIndices = rt::Tensor({mMaxRuntimeBatchSize, maxAcceptDepth}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mAcceptedTokenIndices");
+        mAcceptLength = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mAcceptLength");
 
         // Allocate batch mapping tensor for batch eviction
-        mDeviceBatchMapping = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        mDeviceBatchMapping = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mDeviceBatchMapping");
 
-        mHostPackedTokenIds = rt::Tensor(
-            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kCPU, DataType::kINT32);
-        mHostSelectedTokenIds = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-        mHostAcceptLengths = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-        mHostAcceptedTokenIds = rt::Tensor(
-            {mMaxRuntimeBatchSize, mDraftingConfig.draftingStep + 1}, rt::DeviceType::kCPU, DataType::kINT32);
-        mHostReuseKVCacheLengths = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+        mHostPackedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength},
+            rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mHostPackedTokenIds");
+        mHostSelectedTokenIds = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mHostSelectedTokenIds");
+        mHostAcceptLengths = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mHostAcceptLengths");
+        mHostAcceptedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, mDraftingConfig.draftingStep + 1},
+            rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mHostAcceptedTokenIds");
+        mHostReuseKVCacheLengths = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMInferenceSpecDecodeRuntime::mHostReuseKVCacheLengths");
     }
     catch (std::exception const& e)
     {
