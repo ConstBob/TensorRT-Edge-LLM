@@ -116,6 +116,7 @@ Complete documentation for installation, usage, and deployment:
   - [Advanced Runtime Features](docs/source/developer_guide/04.4_Advanced_Runtime_Features.md)
 - **[Examples](docs/source/developer_guide/05_Examples.md)** - Working code examples
 - **[Chat Template Format](docs/source/developer_guide/06_Chat_Template_Format.md)** - Chat template configuration
+- **[TensorRT Plugins](docs/source/developer_guide/07_TensorRT_Plugins.md)** - Introduction for TensorRT plugins.
 
 
 ### Additional Resources

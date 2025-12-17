@@ -84,6 +84,17 @@ Reference implementations demonstrating LLM, multimodal, and utility use cases.
 
    developer_guide/05_Examples.md
 
+TensorRT Plugins
+----------------
+
+Learn about the usage of TensorRT plugins with TensorRT Edge-LLM and how to make further customizations.
+
+.. toctree::
+   :maxdepth: 2
+   :caption: TensorRT Plugins
+
+   developer_guide/07_TensorRT_Plugins.md
+
 APIs
 ----
 
