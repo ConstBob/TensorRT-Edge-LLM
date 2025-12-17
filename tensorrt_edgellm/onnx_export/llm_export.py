@@ -492,7 +492,7 @@ def export_llm_model(model_dir: str,
             reduced_vocab_dir, device)
 
     # Load model
-    model, use_prompt_tuning, tokenizer = load_llm_model(
+    model, use_prompt_tuning, tokenizer, processor = load_llm_model(
         model_dir,
         dtype='fp16',
         device=device,
@@ -533,6 +533,11 @@ def export_llm_model(model_dir: str,
     # Save tokenizer files
     tokenizer.save_pretrained(output_dir)
     print(f"Tokenizer saved to {output_dir}")
+
+    # Save processor files if available
+    if processor is not None:
+        processor.save_pretrained(output_dir)
+        print(f"Processor saved to {output_dir}")
 
     # Check if model requires explicit chat template
     is_incompatible, incompatible_model_type = is_incompatible_chat_template_model(

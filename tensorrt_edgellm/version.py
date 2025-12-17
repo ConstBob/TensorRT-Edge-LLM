@@ -18,4 +18,4 @@ Defines the version string for TensorRT Edge-LLM. Update the BUILD number when f
 Format: MAJOR.MINOR.PATCH.BUILD (e.g., 0.4.0.0)
 """
 
-__version__: str = "0.4.0.0"
+__version__: str = "0.4.0.1"
