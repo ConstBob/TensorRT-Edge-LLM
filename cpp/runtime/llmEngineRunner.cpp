@@ -1373,7 +1373,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
 
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
     executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
@@ -1514,7 +1514,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
 
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
     executeStatus &= mGenerationExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
