@@ -392,7 +392,7 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 
 void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, std::vector<int64_t> const& numImages,
-    std::vector<int64_t> const& imageTokenLengths, tokenizer::Tokenizer* tokenizer)
+    std::vector<int64_t> const& imageTokenLengths, tokenizer::Tokenizer const* tokenizer)
 {
     if (numImages.size() != request.requests.size())
     {
@@ -436,7 +436,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 }
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
-    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer* tokenizer,
+    std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
     rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;
