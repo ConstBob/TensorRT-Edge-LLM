@@ -203,8 +203,19 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_
 
 ---
 
+## Next Steps
+
+Now that you've explored the examples:
+
+1. **Customize for Your Needs**: Learn how to extend and customize the framework in the [Customization Guide](06_Customization_Guide.md)
+2. **Build Your Application**: Use the examples as templates for your own applications
+3. **Optimize Performance**: Experiment with different quantization methods, batch sizes, and CUDA graphs
+
+---
+
 ## Additional Resources
 
 - [Overview](01.1_Overview.md)
 - [Quick Start Guide](01.2_Quick_Start_Guide.md)
 - [Supported Models](02_Supported_Models.md)
+- [Customization Guide](06_Customization_Guide.md)

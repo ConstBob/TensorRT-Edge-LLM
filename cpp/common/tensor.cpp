@@ -17,6 +17,7 @@
 
 #include "tensor.h"
 #include "checkMacros.h"
+#include "logger.h"
 
 #include <sstream>
 
@@ -146,10 +147,14 @@ Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType da
     if (deviceType == DeviceType::kCPU)
     {
         CUDA_CHECK(cudaMallocHost(&data, memoryCapacity));
+        LOG_DEBUG("Tensor %s of shape %s with size %ld bytes (%.2f MB) allocated on CPU", name.c_str(),
+            shape.formatString().c_str(), memoryCapacity, utils::toMB(memoryCapacity));
     }
     else
     {
         CUDA_CHECK(cudaMalloc(&data, memoryCapacity));
+        LOG_DEBUG("Tensor %s of shape %s with size %ld bytes (%.2f MB) allocated on GPU", name.c_str(),
+            shape.formatString().c_str(), memoryCapacity, utils::toMB(memoryCapacity));
     }
 }
 
@@ -319,10 +324,14 @@ void Tensor::releaseResource()
     {
         if (mDeviceType == DeviceType::kCPU)
         {
+            LOG_DEBUG("Tensor %s of shape %s with size %ld bytes (%.2f MB) freed on CPU", mName.c_str(),
+                mShape.formatString().c_str(), memoryCapacity, utils::toMB(memoryCapacity));
             CUDA_CHECK(cudaFreeHost(data));
         }
         else
         {
+            LOG_DEBUG("Tensor %s of shape %s with size %ld bytes (%.2f MB) freed on GPU", mName.c_str(),
+                mShape.formatString().c_str(), memoryCapacity, utils::toMB(memoryCapacity));
             CUDA_CHECK(cudaFree(data));
         }
     }

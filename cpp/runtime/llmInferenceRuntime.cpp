@@ -70,10 +70,10 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     LOG_INFO("LLMEngineRunner successfully loaded and initialized llm engine.");
 
     mEngineConfig = mLLMEngineRunner->getEngineConfig();
-    // Setup sampling workspace, use default topK=100 to reserve workspace.
-    // FIXME: Find a better approach to reserve sampling workspace to handle various request configurations.
-    int32_t const defaultTopK = 100;
-    float const defaultTopP = 0.9F;
+
+    // Use TopP sampling parameter to reserve max possible workspace size for sampling.
+    int32_t const defaultTopK{0};
+    float const defaultTopP{0.9F};
     trt_edgellm::SamplingParams samplingParams(
         mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize, 1.0f, defaultTopK, defaultTopP);
     int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(trt_edgellm::getTopKtopPSamplingWorkspaceSize(
@@ -83,19 +83,22 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     try
     {
         // Use Int8 to indicate byte for workspace.
-        mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8);
+        mSamplingWorkspace = rt::Tensor({maxSamplingWorkspaceSize}, rt::DeviceType::kGPU, DataType::kINT8,
+            "LLMInferenceRuntime::mSamplingWorkspace");
         mInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
-            rt::DeviceType::kGPU, DataType::kINT32);
+            rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceRuntime::mInputIds");
         mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
-            rt::DeviceType::kCPU, DataType::kINT32);
-        mOutputLogits = rt::Tensor(
-            {mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32);
-        mHostSelectedTokenIds
-            = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-        mHostContextLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-        mHostReuseKVCacheLengths
-            = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+            rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceRuntime::mHostPackedInputIds");
+        mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMInferenceRuntime::mOutputLogits");
+        mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32,
+            "LLMInferenceRuntime::mSelectedIndices");
+        mHostSelectedTokenIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+            DataType::kINT32, "LLMInferenceRuntime::mHostSelectedTokenIds");
+        mHostContextLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
+            "LLMInferenceRuntime::mHostContextLengths");
+        mHostReuseKVCacheLengths = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
+            DataType::kINT32, "LLMInferenceRuntime::mHostReuseKVCacheLengths");
     }
     catch (std::exception const& e)
     {
@@ -181,8 +184,6 @@ bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
             LOG_ERROR(
                 "LLMInferenceRuntime(): There is an empty request in the batch. Either 'messages' or "
                 "'formatted_system_prompt' and 'formatted_complete_request' must be provided.Skip this batch of "
-                "LLMInferenceRuntime(): There is an empty request in the batch. Either 'messages' or "
-                "'formatted_system_prompt' and 'formatted_complete_request' must be provided. Skip this batch of "
                 "requests. Please check the input data contents.");
             return false;
         }
@@ -647,8 +648,8 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     SystemPromptKVCache savedKVCache;
     savedKVCache.systemPrompt = prompt;
     savedKVCache.tokenizedPrompt = tokenizedPrompt;
-    savedKVCache.kvCacheContent
-        = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT);
+    savedKVCache.kvCacheContent = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT,
+        "LLMInferenceRuntime::savedKVCache.kvCacheContent");
 
     // We only process one sequence at a time.
     constexpr int32_t CACHE_BATCH_IDX{0};

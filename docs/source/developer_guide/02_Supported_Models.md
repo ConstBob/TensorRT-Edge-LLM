@@ -61,8 +61,12 @@
 | [Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) | 7B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | 3B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | 7B | ✅ | ✅ | ✅ | ✅ |
+| [Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) | 2B | ✅ | ✅ | ✅ | ✅ |
+| [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) | 4B | ✅ | ✅ | ✅ | ✅ |
+| [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) | 8B | ✅ | ✅ | ✅ | ✅ |
 | [InternVL3-1B](https://huggingface.co/OpenGVLab/InternVL3-1B-hf) | 1B | ✅ | ✅ | ✅ | ✅ |
 | [InternVL3-2B](https://huggingface.co/OpenGVLab/InternVL3-2B-hf) | 2B | ✅ | ✅ | ✅ | ✅ |
+| [Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) | 6B | ✅ | ✅ | ✅ | ✅ |
 
 ---
 
@@ -95,6 +99,17 @@
 - FP8 quantization requires SM89+ (Ada Lovelace architecture or newer, e.g., RTX 40-series)
 - NVFP4 quantization requires SM100+ (Blackwell architecture or newer, e.g., Thor platforms)
 - Platform requirements apply to both model weights and operations (including ViT encoders and LM heads)
+
+**Development GPUs:**
+
+For development purposes, TensorRT Edge-LLM supports the following discrete GPU compute capabilities:
+- **SM80**: Ampere (e.g., A100, A30, A10)
+- **SM86**: Ampere (e.g., RTX 30 series, RTX Pro Ampere series)
+- **SM89**: Ada Lovelace (e.g., RTX 40 series, L4, L40, RTX Pro Ada series)
+- **SM100**: Blackwell (e.g., GB200)
+- **SM120**: Blackwell (e.g., RTX 50 series, RTX Pro Blackwell series)
+
+> **Note:** While these GPUs are supported for development and testing, the officially supported deployment platforms are NVIDIA Jetson Thor (JetPack 7.1) and NVIDIA DRIVE Thor (DriveOS 7). For performant inference solutions on these GPUs please refer to [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
 
 ---
 
