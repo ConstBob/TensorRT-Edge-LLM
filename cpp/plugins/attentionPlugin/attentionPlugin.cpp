@@ -424,7 +424,7 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
 
     // We use half precisions for now.
     int32_t const nbBytesPerData{2};
-    int32_t workspaceSize = 0;
+    size_t workspaceSize = 0;
 
     // CuQSeqLens for FMHA.
     workspaceSize = accumulateWorkspaceSize(workspaceSize, {maxBatchSize + 1}, DataType::kINT32);
