@@ -13,6 +13,7 @@
 - [Build Examples](#build-examples)
 - [Inference Examples](#inference-examples)
 - [Complete Workflows](#complete-workflows)
+- [Input File Formats](#input-file-formats)
 - [Common Parameters](#common-parameters)
 
 ---
@@ -143,14 +144,14 @@ tensorrt-edgellm-export-llm --model_dir quantized/qwen3-4b --output_dir onnx_mod
 ```bash
 # 1. Export (x86 host)
 tensorrt-edgellm-export-llm --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b
-tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b
+tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b/visual_enc_onnx
 
 # 2. Build Engines (Thor device)
 ./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b --engineDir engines/qwen2.5-vl-3b --vlm
 ./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-3b
 
 # 3. Run Inference (Thor device)
-./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input.json --outputFile output.json
+./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input_with_images.json --outputFile output.json
 ```
 
 ### Multimodal VLM with EAGLE Speculative Decoding (End-to-End)
@@ -167,8 +168,53 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_
 ./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-7b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-7b
 
 # 3. Run Inference (Thor device)
-./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-7b_eagle --multimodalEngineDir visual_engines/qwen2.5-vl-7b --inputFile input.json --outputFile output.json --eagle
+./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-7b_eagle --multimodalEngineDir visual_engines/qwen2.5-vl-7b --inputFile input_with_images.json --outputFile output.json --eagle
 ```
+
+---
+
+## Input File Formats
+
+### VLM Input Format (`input_with_images.json`)
+
+For multimodal (VLM) models, create an input JSON file with image content:
+
+```json
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 50,
+    "max_generate_length": 128,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please describe the image."
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
+```
+
+### LLM Input Format (`input.json`)
+
+For standard LLM models (text-only), refer to `examples/llm/INPUT_FORMAT.md`.
 
 ---
 
@@ -207,7 +253,7 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_
 
 Now that you've explored the examples:
 
-1. **Customize for Your Needs**: Learn how to extend and customize the framework in the [Customization Guide](06_Customization_Guide.md)
+1. **Customize for Your Needs**: Learn how to extend and customize the framework in the [Customization Guide](07_Customization_Guide.md)
 2. **Build Your Application**: Use the examples as templates for your own applications
 3. **Optimize Performance**: Experiment with different quantization methods, batch sizes, and CUDA graphs
 
@@ -218,4 +264,4 @@ Now that you've explored the examples:
 - [Overview](01.1_Overview.md)
 - [Quick Start Guide](01.2_Quick_Start_Guide.md)
 - [Supported Models](02_Supported_Models.md)
-- [Customization Guide](06_Customization_Guide.md)
+- [Customization Guide](07_Customization_Guide.md)
