@@ -595,6 +595,14 @@ int main(int argc, char* argv[])
         printUsage(argv[0]);
         return 1;
     }
+    bool profilerEnabled = args.dumpProfile;
+    MemoryMonitor memoryMonitor;
+    // Start memory monitoring at the beginning if profiling is enabled
+    if (profilerEnabled)
+    {
+        memoryMonitor.start();
+    }
+
     auto pluginHandles = loadEdgellmPluginLib();
     // load input file and parse to requests
     std::unordered_map<std::string, std::string> loraWeightsMap;
@@ -617,8 +625,6 @@ int main(int argc, char* argv[])
         LOG_ERROR("No valid requests found in input file.");
         return EXIT_FAILURE;
     }
-    bool profilerEnabled = args.dumpProfile;
-    MemoryMonitor memoryMonitor;
 
     // Create runtime based on mode
     std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
@@ -722,8 +728,6 @@ int main(int argc, char* argv[])
     if (profilerEnabled)
     {
         setProfilingEnabled(true);
-        // Start memory monitoring for examples
-        memoryMonitor.start();
     }
 
     // Structure to collect all responses for JSON export
@@ -840,8 +844,6 @@ int main(int argc, char* argv[])
         memoryMonitor.stop();
     }
 
-    // Dump profile summary to console
-    size_t peakMemoryBytes = profilerEnabled ? memoryMonitor.getPeakMemory() : 0;
     if (args.dumpProfile)
     {
         std::ostringstream profileOutput;
@@ -856,7 +858,7 @@ int main(int argc, char* argv[])
             outputPrefillProfile(profileOutput, prefillMetrics);
             outputEagleGenerationProfile(profileOutput, eagleGenerationMetrics);
             outputMultimodalProfile(profileOutput, multimodalMetrics);
-            outputMemoryProfile(profileOutput, peakMemoryBytes);
+            outputMemoryProfile(profileOutput, memoryMonitor);
         }
         else
         {
@@ -864,7 +866,7 @@ int main(int argc, char* argv[])
             outputPrefillProfile(profileOutput, llmInferenceRuntime->getPrefillMetrics());
             outputGenerationProfile(profileOutput, llmInferenceRuntime->getGenerationMetrics());
             outputMultimodalProfile(profileOutput, multimodalMetrics);
-            outputMemoryProfile(profileOutput, peakMemoryBytes);
+            outputMemoryProfile(profileOutput, memoryMonitor);
         }
         profileOutput << "=====================================" << std::endl;
         LOG_INFO("%s", profileOutput.str().c_str());
@@ -893,7 +895,7 @@ int main(int argc, char* argv[])
                 addJsonTimingStages(profileJson);
 
                 // Add memory usage
-                addJsonMemorySummary(profileJson, peakMemoryBytes);
+                addJsonMemorySummary(profileJson, memoryMonitor);
             }
             else
             {
@@ -908,7 +910,7 @@ int main(int argc, char* argv[])
                 addJsonTimingStages(profileJson);
 
                 // Add memory usage
-                addJsonMemorySummary(profileJson, peakMemoryBytes);
+                addJsonMemorySummary(profileJson, memoryMonitor);
             }
 
             std::ofstream profileFile(args.profileOutputFile);

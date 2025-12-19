@@ -315,6 +315,21 @@ std::string formatString(Tensor const& tensor)
     return ss.str();
 }
 
+double toKB(size_t bytes)
+{
+    return static_cast<double>(bytes) / 1024.0;
+}
+
+double toMB(size_t bytes)
+{
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+double toGB(size_t bytes)
+{
+    return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+}
+
 } // namespace utils
 } // namespace rt
 } // namespace trt_edgellm

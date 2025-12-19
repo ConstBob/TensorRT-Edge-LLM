@@ -153,7 +153,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
     // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
-    mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "LLMEngineRunner::mExecContextMemory");
 
     // Use single executionContext for both prefill and generation.
     mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
@@ -180,10 +181,10 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         check::check(ropeConfig.longRope.has_value() && ropeConfig.longRope.value().originalMaxPositionEmbeddings != -1,
             "longRope is not set correctly");
 
-        rt::Tensor shortCosSinCache
-            = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        rt::Tensor longCosSinCache
-            = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+        rt::Tensor shortCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::shortCosSinCache");
+        rt::Tensor longCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
+            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::longCosSinCache");
         bool const initRopeStatus
             = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, configJson, stream);
         if (!initRopeStatus)
@@ -205,15 +206,15 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     {
         this->mPosEncCosSinCache
             = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
-                rt::DeviceType::kGPU, DataType::kFLOAT);
+                rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
         break;
     }
     default:
     {
         LOG_DEBUG("Initialize persistent Rope CosSinCache.");
-        this->mPosEncCosSinCache
-            = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
         bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
         if (!initRopeStatus)
         {
@@ -240,38 +241,39 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             stream);
 
     // Instantiate other GPU memory input that needed by the Engine execution.
-    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+        "LLMEngineRunner::mSequenceContextLengths");
     CUDA_CHECK(
         cudaMemsetAsync(mSequenceContextLengths.rawPointer(), 0, mSequenceContextLengths.getMemoryCapacity(), stream));
 
     if (mConfig.enableEagleSpecDecode)
     {
         // For EAGLE: last_token_ids is 2D [batch_size, num_selected_tokens] to support multi-batch
-        this->mSelectTokenIndices = rt::Tensor(
-            {mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize}, rt::DeviceType::kGPU, DataType::kINT64);
+        this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
+            rt::DeviceType::kGPU, DataType::kINT64, "LLMEngineRunner::mSelectTokenIndices");
         CUDA_CHECK(
             cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
-        this->mHostSelectTokenIndices = rt::Tensor(
-            {mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize}, rt::DeviceType::kCPU, DataType::kINT64);
-        this->mEagleBasePositionIds = rt::Tensor(
-            {mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
+            rt::DeviceType::kCPU, DataType::kINT64, "LLMEngineRunner::mHostSelectTokenIndices");
+        this->mEagleBasePositionIds = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
+            rt::DeviceType::kGPU, DataType::kINT32, "LLMEngineRunner::mEagleBasePositionIds");
         CUDA_CHECK(
             cudaMemsetAsync(mEagleBasePositionIds.rawPointer(), 0, mEagleBasePositionIds.getMemoryCapacity(), stream));
         int32_t const packedMaskSize = divUp(mConfig.maxVerifyTreeSize, 32);
         this->mEagleBasePackedMask
             = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize, packedMaskSize},
-                rt::DeviceType::kGPU, DataType::kINT32);
+                rt::DeviceType::kGPU, DataType::kINT32, "LLMEngineRunner::mEagleBasePackedMask");
         CUDA_CHECK(
             cudaMemsetAsync(mEagleBasePackedMask.rawPointer(), 0, mEagleBasePackedMask.getMemoryCapacity(), stream));
     }
     else
     {
-        this->mSelectTokenIndices
-            = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT64);
+        this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
+            DataType::kINT64, "LLMEngineRunner::mSelectTokenIndices");
         CUDA_CHECK(
             cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
-        this->mHostSelectTokenIndices
-            = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU, DataType::kINT64);
+        this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU,
+            DataType::kINT64, "LLMEngineRunner::mHostSelectTokenIndices");
     }
 
     // Add the LoRA weights to the engine.
@@ -303,7 +305,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         static_cast<int64_t>(mConfig.maxSupportedBatchSize), // attention mask/pos IDs/KV cache start index
         static_cast<int64_t>(getMaxLoraWeightsDimension() * kEMPTY_LORA_RANK), // LoRA weights
     });
-    mDummyTensor = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mDummyTensor = rt::Tensor(
+        {maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyTensor");
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyTensor.rawPointer(), 0, mDummyTensor.getMemoryCapacity(), stream));
 

@@ -6,95 +6,13 @@
 
 ## Overview
 
-TensorRT Edge-LLM is NVIDIA's production-ready C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. Designed for NVIDIA Jetson Thor and DRIVE Thor, it delivers state-of-the-art performance with minimal memory footprint through advanced quantization and TensorRT optimization.
-
-### Key Features
-
-- **🚀 High Performance**: Optimized CUDA kernels and TensorRT integration for maximum throughput
-- **💾 Memory Efficient**: Advanced quantization support (FP8, INT8, INT4, NVFP4) with intelligent KV-cache management
-- **🔄 Production Ready**: C++-only runtime with zero Python dependencies for deployment
-- **🎯 Edge Optimized**: Purpose-built for NVIDIA Jetson and DRIVE platforms
-- **🔧 Flexible**: LoRA adapters, EAGLE speculative decoding, and multimodal models
-- **📊 Complete Toolkit**: Integrated Python export pipeline, engine builder, and runtime
-
-### Supported Platforms
-
-| Platform | Architecture | Supported Precisions |
-|----------|--------------|---------------------|
-| **Jetson Thor** | Blackwell (SM100+) | FP16, FP8, INT8, INT4, NVFP4 |
-| **DRIVE Thor** | Blackwell (SM100+) | FP16, FP8, INT8, INT4, NVFP4 |
-
-### Supported Models
-
-**Language Models:**
-- Llama 3/3.1/3.2 (3B-8B)
-- Qwen 2/2.5/3 (0.5B-7B)
-- DeepSeek-R1 Distilled (1.5B, 7B)
-
-**Vision-Language Models:**
-- Qwen2/2.5-VL (2B-7B)
-- InternVL3 (1B-2B)
-
-**Quantization Support:** FP16, FP8, INT8 (SmoothQuant), INT4 (AWQ/GPTQ), NVFP4
+TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson and NVIDIA DRIVE platforms. TensorRT Edge-LLM provides convenient Python scripts to convert HuggingFace checkpoints to [ONNX](https://onnx.ai). Engine build and end-to-end inference runs entirely on Edge platforms.
 
 ---
 
-## Quick Start
+## Getting Started
 
-Get started with TensorRT Edge-LLM in ~15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](docs/source/developer_guide/01.2_Quick_Start_Guide.md).
-
-
-### 1. Install Python Export Tools (x86 host)
-
-```bash
-git clone https://github.com/NVIDIA/TensorRT-Edge-LLM.git
-cd TensorRT-Edge-LLM
-pip install .
-```
-
-### 2. Export and Quantize Model (x86 host)
-
-```bash
-# Quantize to FP8
-tensorrt-edgellm-quantize-llm \
-    --model_dir Qwen/Qwen3-0.6B \
-    --output_dir ./quantized/qwen3-0.6b \
-    --quantization fp8
-
-# Export to ONNX
-tensorrt-edgellm-export-llm \
-    --model_dir ./quantized/qwen3-0.6b \
-    --output_dir ./onnx/qwen3-0.6b
-```
-
-### 3. Build C++ Runtime (Thor device)
-
-```bash
-mkdir build && cd build
-cmake .. \
-    -DTRT_PACKAGE_DIR=/path/to/TensorRT \
-    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
-    -DEMBEDDED_TARGET=jetson-thor
-make -j$(nproc)
-```
-
-### 4. Build TensorRT Engine (Thor device)
-
-```bash
-./build/examples/llm/llm_build \
-    --onnxDir ./onnx/qwen3-0.6b \
-    --engineDir ./engines/qwen3-0.6b \
-    --maxBatchSize 1
-```
-
-### 5. Run Inference (Thor device)
-
-```bash
-./build/examples/llm/llm_inference \
-    --engineDir ./engines/qwen3-0.6b \
-    --inputFile input.json \
-    --outputFile output.json
-```
+For the supported platforms, models and precisions, see the [**Overview**](docs/source/developer_guide/01.1_Overview.md). Get started with TensorRT Edge-LLM in <15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](docs/source/developer_guide/01.2_Quick_Start_Guide.md).
 
 ---
 
@@ -116,6 +34,7 @@ Complete documentation for installation, usage, and deployment:
   - [Advanced Runtime Features](docs/source/developer_guide/04.4_Advanced_Runtime_Features.md)
 - **[Examples](docs/source/developer_guide/05_Examples.md)** - Working code examples
 - **[Chat Template Format](docs/source/developer_guide/06_Chat_Template_Format.md)** - Chat template configuration
+- **[TensorRT Plugins](docs/source/developer_guide/07_TensorRT_Plugins.md)** - Introduction for TensorRT plugins.
 
 
 ### Additional Resources

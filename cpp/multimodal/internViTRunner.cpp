@@ -116,13 +116,13 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
         mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW);
     mVitInput
         = rt::Tensor({mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW},
-            rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+            rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mVitInput");
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
     LOG_INFO("InternViTRunner::allocateBuffer() mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d",
         mConfig.maxNumBlocks, mConfig.outHiddenSize);
     // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
-    mOutputEmbedding = rt::Tensor(
-        {mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mOutputEmbedding = rt::Tensor({mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "InternViTRunner::mOutputEmbedding");
     setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
     if (!setTensorAddressStatus)
     {
@@ -132,8 +132,9 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
 
     // Copy image mean and std to device to be used in normalizeImage
     int64_t const channels = static_cast<int64_t>(mConfig.imageMean.size());
-    mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mImageMean
+        = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "InternViTRunner::mImageMean");
+    mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "InternViTRunner::mImageStd");
     CUDA_CHECK(cudaMemcpyAsync(
         mImageMean.rawPointer(), mConfig.imageMean.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(
@@ -141,14 +142,17 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
 
     // Pre-allocate temporary image buffers for preprocessing
     int64_t const maxImagePixels = mVitInput.getShape().volume();
-    mImageDevice = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
-    mNormalizedImageDevice = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    mImageDevice = rt::Tensor(
+        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "InternViTRunner::mImageDevice");
+    mNormalizedImageDevice = rt::Tensor(
+        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mNormalizedImageDevice");
     // Set max image size to 1xmaxImagePixelsxchannels, will reshape to actual image size in resizeImage
-    rt::Tensor resizeBuffer({1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+    rt::Tensor resizeBuffer({1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
+        "InternViTRunner::resizeBuffer");
     mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
     // Thumbnail image has fixed size: blockImageSizeH x blockImageSizeW x channels)
-    rt::Tensor thumbnailBuffer(
-        {mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+    rt::Tensor thumbnailBuffer({mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU,
+        nvinfer1::DataType::kUINT8, "InternViTRunner::thumbnailBuffer");
     mThumbnailImageHost = rt::imageUtils::ImageData(std::move(thumbnailBuffer));
 
     return true;

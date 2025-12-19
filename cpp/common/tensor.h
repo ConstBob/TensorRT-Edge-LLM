@@ -389,6 +389,21 @@ std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape);
 //! @param tensor Tensor to format
 //! @return String representation of tensor
 std::string formatString(Tensor const& tensor);
+
+//! @brief Convert bytes to kilobytes
+//! @param bytes Size in bytes
+//! @return Size in kilobytes
+double toKB(size_t bytes);
+
+//! @brief Convert bytes to megabytes
+//! @param bytes Size in bytes
+//! @return Size in megabytes
+double toMB(size_t bytes);
+
+//! @brief Convert bytes to gigabytes
+//! @param bytes Size in bytes
+//! @return Size in gigabytes
+double toGB(size_t bytes);
 } // namespace utils
 
 //! @brief Optional input tensor type wrapper

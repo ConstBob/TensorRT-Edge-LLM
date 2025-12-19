@@ -33,8 +33,8 @@ from modelopt.torch.quantization.utils import is_quantized_linear
 from peft import PeftModel
 from safetensors.torch import safe_open
 from transformers import (AutoConfig, AutoModelForCausalLM,
-                          AutoModelForImageTextToText, AutoTokenizer,
-                          PreTrainedModel)
+                          AutoModelForImageTextToText, AutoProcessor,
+                          AutoTokenizer, PreTrainedModel)
 
 from .models.eagle3_draft import Eagle3DraftModel
 from .models.llm_model import EdgeLLMModelForCausalLM
@@ -211,9 +211,9 @@ def _load_phi4mm_war(model_dir: str):
 def load_hf_model(
     model_dir: str, dtype: str, device: str
 ) -> Tuple[Union[AutoModelForCausalLM, AutoModelForImageTextToText],
-           AutoTokenizer]:
+           AutoTokenizer, Optional[AutoProcessor]]:
     """
-    Load a HuggingFace model and tokenizer with automatic model type detection.
+    Load a HuggingFace model, tokenizer, and optional processor with automatic model type detection.
     
     Args:
         model_dir: Directory containing the model files
@@ -221,7 +221,8 @@ def load_hf_model(
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
         
     Returns:
-        Tuple of (model, tokenizer)
+        Tuple of (model, tokenizer, processor)
+        processor will be None if AutoProcessor cannot be loaded from the model directory
         
     Raises:
         ValueError: If dtype is not supported or model loading fails
@@ -284,7 +285,23 @@ def load_hf_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    return model, tokenizer
+    # Try to load processor if available
+    processor = None
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_dir,
+            trust_remote_code=True,
+            # The fields are required because during quantization it may OOM due to large images in the dataset.
+            min_pixels=128 * 28 * 28,
+            max_pixels=2048 * 32 * 32)
+        print(
+            f"Warning: Loaded processor from {model_dir}. The processor will skip image processing for images smaller than 128x28x28 or bigger than 2048x32x32 due to excessive memory usage during image quntization."
+        )
+    except Exception:
+        # Processor not available for this model
+        pass
+
+    return model, tokenizer, processor
 
 
 def load_llm_model(
@@ -294,7 +311,7 @@ def load_llm_model(
     is_eagle_base: bool,
     reduced_vocab_size: Optional[int] = None,
     vocab_map: Optional[torch.Tensor] = None
-) -> tuple[nn.Module, bool, AutoTokenizer]:
+) -> tuple[nn.Module, bool, AutoTokenizer, Optional[AutoProcessor]]:
     """
     Load a language model (standard or EAGLE base).
     
@@ -307,7 +324,8 @@ def load_llm_model(
         vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
         
     Returns:
-        tuple: (model, use_prompt_tuning, tokenizer)
+        tuple: (model, use_prompt_tuning, tokenizer, processor)
+        processor will be None if AutoProcessor cannot be loaded from the model directory
     """
     # Determine model type and print message
     if is_eagle_base:
@@ -315,7 +333,7 @@ def load_llm_model(
     else:
         print(f"Loading standard model from {model_dir}")
 
-    model, tokenizer = load_hf_model(model_dir, dtype, device)
+    model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
     use_prompt_tuning = is_vlm(model_dir)
     set_dynamic_quant(model, dtype)
 
@@ -329,7 +347,7 @@ def load_llm_model(
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    return edge_model, use_prompt_tuning, tokenizer
+    return edge_model, use_prompt_tuning, tokenizer, processor
 
 
 def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,

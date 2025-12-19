@@ -150,7 +150,8 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
 
     int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
     // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
-    mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8);
+    mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "EagleDraftEngineRunner::mExecContextMemory");
 
     // Use single executionContext for both prefill and generation.
     mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
@@ -179,14 +180,16 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     int32_t const packedTreeMaskLen = static_cast<int64_t>(divUp(mConfig.maxDraftTreeSize, 32));
     // Instantiate other GPU memory input that needed by the Engine execution.
     // last_token_ids is 2D [batch_size, num_selected_tokens] to match the frontend model export (commit 106a3623d)
-    this->mSelectTokenIndices
-        = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT64);
-    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    this->mDraftTreePositionIds
-        = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxDraftTreeSize},
+        rt::DeviceType::kGPU, DataType::kINT64, "EagleDraftEngineRunner::mSelectTokenIndices");
+    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+        "EagleDraftEngineRunner::mSequenceContextLengths");
+    this->mDraftTreePositionIds = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxDraftTreeSize},
+        rt::DeviceType::kGPU, DataType::kINT32, "EagleDraftEngineRunner::mDraftTreePositionIds");
     this->mPackedTreeMask = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxDraftTreeSize, packedTreeMaskLen},
-        rt::DeviceType::kGPU, DataType::kINT32);
-    this->mAcceptedTokenNums = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        rt::DeviceType::kGPU, DataType::kINT32, "EagleDraftEngineRunner::mPackedTreeMask");
+    this->mAcceptedTokenNums = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+        "EagleDraftEngineRunner::mAcceptedTokenNums");
 
     // Initialize the dummy tensor for unused input tensors as TensorRT does not support nullptr for binding.
     // Calculate maximum memory requirements across all use cases:
@@ -200,7 +203,8 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         static_cast<int64_t>(mConfig.maxSupportedBatchSize * 1),     // attention position IDs
         static_cast<int64_t>(mConfig.maxSupportedBatchSize)          // KV cache start index
     });
-    this->mDummyTensor = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, DataType::kHALF);
+    this->mDummyTensor
+        = rt::Tensor({maxDummyElements}, rt::DeviceType::kGPU, DataType::kHALF, "EagleDraftEngineRunner::mDummyTensor");
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyTensor.rawPointer(), 0, mDummyTensor.getMemoryCapacity(), stream));
 
@@ -211,8 +215,8 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         // For non-MRope (Default Rope): allocate with batch_size=1
         // AttentionPlugin will handle broadcasting via the independent rope_batch_size axis
         LOG_DEBUG("Initialize 1D persistent Rope CosSinCache.");
-        this->mPosEncCosSinCache
-            = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU, DataType::kFLOAT);
+        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "EagleDraftEngineRunner::mPosEncCosSinCache");
         bool const initRopeStatus
             = initializeRopeCosSinCache(mPosEncCosSinCache, mConfig.ropeConfig, configJson, stream);
         if (!initRopeStatus)
@@ -225,7 +229,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     {
         this->mPosEncCosSinCache
             = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
-                rt::DeviceType::kGPU, DataType::kFLOAT);
+                rt::DeviceType::kGPU, DataType::kFLOAT, "EagleDraftEngineRunner::mPosEncCosSinCache");
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
     }
 
@@ -1039,8 +1043,8 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     int32_t const activeBatchSize = draftTreeInputIds.getShape()[0];
     constexpr int32_t simulateCacheLength{128};
     std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
-    rt::Tensor const reuseKVCacheLengthsTensor(
-        reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+    rt::Tensor const reuseKVCacheLengthsTensor(reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU,
+        DataType::kINT32, "draft_reuse_kv_cache_lengths");
 
     mLinearKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
 
