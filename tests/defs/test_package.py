@@ -62,7 +62,8 @@ class PackageTester:
         tools = [
             "tensorrt-edgellm-quantize-llm", "tensorrt-edgellm-export-llm",
             "tensorrt-edgellm-export-visual", "tensorrt-edgellm-insert-lora",
-            "tensorrt-edgellm-process-lora", "tensorrt-edgellm-reduce-vocab"
+            "tensorrt-edgellm-process-lora", "tensorrt-edgellm-merge-lora",
+            "tensorrt-edgellm-reduce-vocab"
         ]
 
         for tool in tools:
