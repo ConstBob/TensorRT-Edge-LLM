@@ -1,4 +1,13 @@
 # Release Notes
+## 0.4.0
+- Refactored AttentionPlugin to use Tensor class and clearer shape checks
+- Added support for multi-batch EAGLE3
+- Enabled Open-AI style chat template
+- Enabled vocab reduction to improve lm_head time
+- Removed deprecated plugin fields
+- Added Qwen3-VL support
+- Added Phi-4-Multimodal support
+
 ## 0.3.0
 - Refactored the vanilla decoding and EAGLE3 runtime to use consumer-producer design with `Tensor` class to manage all runtime memory
 - Refactored and added unit tests for eagle utility and sampling kernels
