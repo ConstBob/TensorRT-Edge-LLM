@@ -12,4 +12,4 @@ threadpoolctl>=3.6.0
 tokenicer>=0.0.5
 pypcre>=0.2.5
 device-smi>=0.5.1
-optimum
+optimum==2.0.0
