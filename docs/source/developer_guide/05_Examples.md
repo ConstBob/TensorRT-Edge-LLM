@@ -71,7 +71,7 @@ Builds TensorRT engines for LLMs (standard, EAGLE, VLM, LoRA).
 
 ### `visual_build` - Source: `examples/multimodal/visual_build.cpp`
 
-Builds TensorRT engines for vision encoders (Qwen-VL, InternVL).
+Builds TensorRT engines for vision encoders (Qwen-VL, InternVL, Phi-4-Multimodal).
 
 ```bash
 ./build/examples/multimodal/visual_build \
@@ -151,6 +151,32 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_
 
 # 3. Run Inference (Thor device)
 ./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input.json --outputFile output.json
+```
+
+### Multimodal VLM with LoRA (End-to-End)
+
+```bash
+# 1. Merge LoRA (x86 host)
+tensorrt-edgellm-merge-lora --model_dir microsoft/Phi-4-multimodal-instruct \
+                            --lora_dir microsoft/Phi-4-multimodal-instruct/vision-lora \
+                            --output_dir microsoft/Phi-4-multimodal-instruct-merged-vision
+
+# 2. Quantize (x86 host)
+tensorrt-edgellm-quantize-llm --model_dir microsoft/Phi-4-multimodal-instruct-merged-vision \
+                               --output_dir microsoft/Phi-4-multimodal-instruct-merged-vision-nvfp4 \
+                               --quantization=nvfp4
+
+# 3. Export (x86 host)
+tensorrt-edgellm-export-llm --model_dir microsoft/Phi-4-multimodal-instruct-merged-vision-nvfp4 --output_dir onnx_models/phi4-mm
+# Use the original weights for visual model export
+tensorrt-edgellm-export-visual --model_dir microsoft/Phi-4-multimodal-instruct --output_dir onnx_models/phi4-mm/visual_enc_onnx
+
+# 4. Build Engines (Thor device)
+./build/examples/llm/llm_build --onnxDir onnx_models/phi4-mm --engineDir engines/phi4-mm --vlm
+./build/examples/multimodal/visual_build --onnxDir onnx_models/phi4-mm/visual_enc_onnx --engineDir visual_engines/phi4-mm
+
+# 5. Run Inference (Thor device)
+./build/examples/llm/llm_inference --engineDir engines/phi4-mm --multimodalEngineDir visual_engines/phi4-mm --inputFile input.json --outputFile output.json
 ```
 
 ### Multimodal VLM with EAGLE Speculative Decoding (End-to-End)

@@ -1152,7 +1152,7 @@ bool VisualBuilder::setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile* pr
 
     if (mBuilderConfig.minImageTokens % 256 != 0 || mBuilderConfig.maxImageTokens % 256 != 0)
     {
-        LOG_ERROR("minImageTokens and maxImageTokens must be divisible by 256 for InternVL ViT model.");
+        LOG_ERROR("minImageTokens and maxImageTokens must be divisible by 256 for InternVL/Phi4-MM ViT model.");
         return false;
     }
 

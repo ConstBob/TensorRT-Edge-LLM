@@ -30,7 +30,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from modelopt.torch.quantization.utils import is_quantized_linear
-from peft import PeftModel
 from safetensors.torch import safe_open
 from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoProcessor,
@@ -187,23 +186,58 @@ def _load_phi4mm_war(model_dir: str):
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
 
-    # WAR: Override Phi4MMForCausalLM.__init__ to prevent the model from being
-    # converted into a PEFT model, which modelopt and transformers cannot handle correctly.
-    # The LoRA weights have already been merged into the base model.
-    if (hasattr(module, "Phi4MMForCausalLM")
-            and hasattr(module, "Phi4MMModel")
-            and hasattr(module, "Phi4MMPreTrainedModel")):
+    lora_dir = os.path.join(model_dir, "vision-lora")
+    if os.path.exists(lora_dir):
+        print(f"Loading LoRA models into the PEFT framework.")
+        if hasattr(module, "Phi4MMModel"):
 
-        def _phi4mm_init_war(self, config):
-            module.Phi4MMPreTrainedModel.__init__(self, config)
-            self.model = module.Phi4MMModel(config)
-            self.vocab_size = config.vocab_size
-            self.lm_head = nn.Linear(config.hidden_size,
-                                     config.vocab_size,
-                                     bias=False)
-            self.post_init()
+            def _fake_prepare_inputs_for_generation(self, *args, **kwargs):
+                pass
 
-        module.Phi4MMForCausalLM.__init__ = _phi4mm_init_war
+            module.Phi4MMModel.prepare_inputs_for_generation = _fake_prepare_inputs_for_generation
+    else:
+        # WAR: Override Phi4MMForCausalLM.__init__ to prevent the model from being
+        # converted into a PEFT model, which modelopt and transformers cannot handle correctly.
+        # The LoRA weights have already been merged into the base model.
+        if (hasattr(module, "Phi4MMForCausalLM")
+                and hasattr(module, "Phi4MMModel")
+                and hasattr(module, "Phi4MMPreTrainedModel")):
+
+            def _phi4mm_init_war(self, config):
+                module.Phi4MMPreTrainedModel.__init__(self, config)
+                self.model = module.Phi4MMModel(config)
+                self.vocab_size = config.vocab_size
+                self.lm_head = nn.Linear(config.hidden_size,
+                                         config.vocab_size,
+                                         bias=False)
+
+            module.Phi4MMForCausalLM.__init__ = _phi4mm_init_war
+
+        if hasattr(module, "Phi4MMImageAudioEmbedding"):
+
+            def _phi4mm_image_audio_embedding_init_text_only(
+                    self, config, **kwargs):
+                nn.Module.__init__(self)
+                self.vocab_size = config.vocab_size
+
+                # Keep token ids consistent for assertions/BC.
+                self.image_input_id = kwargs.get("image_input_id", -1)
+                self.audio_input_id = kwargs.get("audio_input_id", -10000)
+                assert self.image_input_id != self.audio_input_id, (
+                    "image_input_id and audio_input_id should be different")
+                self.image_embed = None
+                self.audio_embed = None
+                self.input_image_embeds = None
+                self.image_sizes = None
+                self.image_attention_mask = None
+                self.input_audio_embeds = None
+                self.audio_embed_sizes = None
+
+            # Override Phi4MMImageAudioEmbedding.__init__ to set `image_embed` and `audio_embed` to None.
+            # This avoids creating the image/audio towers in the LLM export/quantization pipeline, which
+            # is not compatible with ModelOpt currently. We export the visual encoder with a
+            # dedicated script (`tensorrt-edgellm-export-visual`) that handles the visual model separately.
+            module.Phi4MMImageAudioEmbedding.__init__ = _phi4mm_image_audio_embedding_init_text_only
 
     return module
 
@@ -234,6 +268,9 @@ def load_hf_model(
         raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
 
+    tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                              trust_remote_code=True)
+
     if _is_phi4mm_model(model_dir):
         # Avoid converting the model into a PEFT-wrapped model, which ModelOpt and
         # Transformers cannot currently handle correctly. LoRA weights will instead
@@ -244,16 +281,6 @@ def load_hf_model(
             torch_dtype=torch_dtype,
             trust_remote_code=True,
             _attn_implementation="eager").to(device)
-        # Only the vision modality is supported for now; by default, we merge the vision LoRA.
-        lora_dir = os.path.join(model_dir, "vision-lora")
-        if os.path.exists(lora_dir):
-            lora_model = PeftModel.from_pretrained(model,
-                                                   lora_dir,
-                                                   adapter_name="vision")
-            lora_model.set_adapter("vision")
-            print("Merging LoRA weights into base model...")
-            model = lora_model.merge_and_unload()
-
     else:
         # Try loading as AutoModelForCausalLM first
         try:
@@ -275,9 +302,6 @@ def load_hf_model(
                     f"Could not load model from {model_dir}. Error: {e}")
     if not is_gptq_model(model):
         model.to(torch_dtype)
-
-    tokenizer = AutoTokenizer.from_pretrained(model_dir,
-                                              trust_remote_code=True)
 
     # Set tokenizer padding token if needed
     if tokenizer.pad_token != "<unk>":
