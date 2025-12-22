@@ -76,13 +76,23 @@ def quantize_model(
         # Create progress bar for calibration
         print(f"Calibrating model on {len(calib_dataloader)} samples...")
         pbar = tqdm(calib_dataloader, desc="Calibrating", unit="num_samples")
+
+        # Add extra necessary kwargs for Phi-4-Multimodal
+        kwargs = {}
+        if hasattr(model, "config") and "phi4mm" in getattr(
+                model.config, "model_type", "").lower():
+            # Have already merged the vision LoRA, so set input_mode=0 (LANGUAGE) during quantization
+            kwargs["input_mode"] = 0
+            # Work around a transformers version mismatch between Phi-4MM and Edge-LLM
+            kwargs["use_cache"] = False
+
         for data in pbar:
             if isinstance(data, dict):
                 data = {k: v.to(model.device) for k, v in data.items()}
-                model(**data)
+                model(**data, **kwargs)
             else:
                 data = data.to(model.device)
-                model(data)
+                model(data, **kwargs)
 
     # Get quantization config and perform quantization
     mtq.quantize(model, quant_config, forward_loop=calibrate_loop)
