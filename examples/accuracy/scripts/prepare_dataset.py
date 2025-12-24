@@ -58,6 +58,7 @@ DEFAULT_DATASETS = {
     "MMLU": "cais/mmlu",
     "MMLU_Pro": "TIGER-Lab/MMLU-Pro",
     "MMMU": "MMMU/MMMU",
+    "MMMU_VLMEvalkit": "MMMU/MMMU",
     "MMMU_Pro": "MMMU/MMMU_Pro",
     "MMStar": "Lin-Chen/MMStar",
     "MTBench": "philschmid/mt-bench"
@@ -72,6 +73,7 @@ DEFAULT_MAX_GENERATE_LENGTHS = {
     "MMLU": 1,
     "MMLU_Pro": 1,
     "MMMU": 20,
+    "MMMU_VLMEvalkit": 8192,
     "MMMU_Pro": 1,
     "MMStar": 512,
     "MTBench": 512
@@ -114,7 +116,8 @@ def main():
                         required=True,
                         choices=[
                             "AIME", "GSM8K", "HumanEval", "MATH500", "MMLU",
-                            "MMLU_Pro", "MMMU", "MMMU_Pro", "MMStar", "MTBench"
+                            "MMLU_Pro", "MMMU", "MMMU_VLMEvalkit", "MMMU_Pro",
+                            "MMStar", "MTBench"
                         ],
                         help="Dataset type to convert")
 
@@ -261,6 +264,20 @@ def main():
             convert_mmmu_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir)
+
+        elif args.dataset == "MMMU_VLMEvalkit":
+            # Create config for MMMU
+            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
+                "MMMU_VLMEvalkit"]
+            config = DatasetConfig(batch_size=args.batch_size,
+                                   temperature=args.temperature,
+                                   top_p=args.top_p,
+                                   top_k=args.top_k,
+                                   max_generate_length=max_generate_length)
+            convert_mmmu_dataset(config=config,
+                                 dataset_name_or_dir=dataset_path,
+                                 output_dir=args.output_dir,
+                                 vlmevalkit=True)
 
         elif args.dataset == "MMMU_Pro":
             print(f"Using subset: {args.subset}")
