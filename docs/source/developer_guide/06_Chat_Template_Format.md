@@ -100,13 +100,13 @@ By default, when you export a model, the tool:
 
 ### Providing a Custom Template (Optional)
 
-You can override the default behavior by supplying your own chat template with the `--chat-template` flag:
+You can override the default behavior by supplying your own chat template with the `--chat_template` flag:
 
 ```bash
 tensorrt-edgellm-export-llm \
     --model_dir /path/to/model \
     --output_dir /path/to/output \
-    --chat-template /path/to/my_custom_template.json
+    --chat_template /path/to/my_custom_template.json
 ```
 
 Provide a custom template when:

@@ -710,6 +710,7 @@ bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
 
         // Collect other fields from the chat template if exists.
         mChatTemplate.generationPrompt = jsonData.value("generation_prompt", mChatTemplate.generationPrompt);
+        mChatTemplate.generationPromptThinking = jsonData.value("generation_prompt_thinking", "");
         mChatTemplate.defaultSystemPrompt = jsonData.value("default_system_prompt", mChatTemplate.defaultSystemPrompt);
     }
     catch (std::exception const& e)
@@ -723,30 +724,30 @@ bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
     return true;
 }
 
-bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& request, bool addGenerationPrompt) const
+bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& request,
+    rt::LLMGenerationRequest::FormattedRequest& formattedRequest, bool applyChatTemplate, bool addGenerationPrompt,
+    bool enableThinking) const
 {
     if (request.messages.empty())
     {
-        LOG_ERROR("Request shall contain at least one message. to proceed with execution.");
+        LOG_ERROR("Request shall contain at least one message to proceed with execution.");
         return false;
     }
 
     std::string formattedPrefixSystemPrompt{};
     std::string formattedCompleteRequest{};
 
-    // Check if there's a given system message in the request. If not, we will use the default system prompt
-    // with priority order: 1) request.defaultSystemPrompt, 2) model's defaultSystemPrompt
-    std::string systemPromptToUse{};
+    // Extract system prompt from first message or use default
     auto const& leadMessage = request.messages.front();
+    std::string systemPrompt{};
+
     if (leadMessage.role == kRoleSystem)
     {
-        // User provided system message, verify the contents are all text, combine them and apply chat template.
-        std::string combinedSystemContent{};
         for (auto const& content : leadMessage.contents)
         {
             if (content.type == "text")
             {
-                combinedSystemContent += content.content;
+                systemPrompt += content.content;
             }
             else
             {
@@ -754,55 +755,59 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
                     content.type.c_str());
             }
         }
-        systemPromptToUse = combinedSystemContent;
     }
-    else if (!request.defaultSystemPrompt.empty())
+    else if (applyChatTemplate && !mChatTemplate.defaultSystemPrompt.empty())
     {
-        systemPromptToUse = request.defaultSystemPrompt;
-    }
-    else if (!mChatTemplate.defaultSystemPrompt.empty())
-    {
-        systemPromptToUse = mChatTemplate.defaultSystemPrompt;
+        systemPrompt = mChatTemplate.defaultSystemPrompt;
     }
 
-    if (!systemPromptToUse.empty())
+    // Format system prompt
+    if (!systemPrompt.empty())
     {
-        auto roleIt = mChatTemplate.roles.find(kRoleSystem);
-        if (roleIt != mChatTemplate.roles.end())
+        if (applyChatTemplate)
         {
-            formattedPrefixSystemPrompt = roleIt->second.prefix + systemPromptToUse + roleIt->second.suffix;
+            auto roleIt = mChatTemplate.roles.find(kRoleSystem);
+            if (roleIt != mChatTemplate.roles.end())
+            {
+                formattedPrefixSystemPrompt = roleIt->second.prefix + systemPrompt + roleIt->second.suffix;
+            }
+            else
+            {
+                LOG_WARNING("System role not found in chat template. Using raw content.");
+                formattedPrefixSystemPrompt = systemPrompt;
+            }
         }
         else
         {
-            LOG_WARNING("System role not found in chat template. Skip the format and use the raw content: %s.",
-                systemPromptToUse.c_str());
-            formattedPrefixSystemPrompt = systemPromptToUse;
+            formattedPrefixSystemPrompt = systemPrompt;
         }
-        formattedCompleteRequest += formattedPrefixSystemPrompt;
+        formattedCompleteRequest = formattedPrefixSystemPrompt;
     }
 
-    // Process each message
+    // Process messages
     for (size_t i = 0; i < request.messages.size(); ++i)
     {
-        // Get role configuration
         auto const& message = request.messages[i];
+
+        if (message.role == kRoleSystem && i == 0)
+        {
+            continue;
+        }
+
         auto roleIt = mChatTemplate.roles.find(message.role);
         if (roleIt == mChatTemplate.roles.end())
         {
             LOG_WARNING("Unknown role: %s", message.role.c_str());
             continue;
         }
-        if (message.role == kRoleSystem && i == 0)
-        {
-            // Skip since we have already proceed it in the previous step.
-            continue;
-        }
 
-        auto const& role = roleIt->second;
-
-        // Build formatted message
         std::string formattedMessage;
-        formattedMessage += role.prefix;
+
+        // Add role prefix only in chat template mode
+        if (applyChatTemplate)
+        {
+            formattedMessage = roleIt->second.prefix;
+        }
 
         // Process content items
         for (auto const& contentItem : message.contents)
@@ -826,20 +831,30 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
             }
         }
 
-        formattedMessage += role.suffix;
-        // Add current message to the complete request.
+        // Add role suffix only in chat template mode
+        if (applyChatTemplate)
+        {
+            formattedMessage += roleIt->second.suffix;
+        }
+
         formattedCompleteRequest += formattedMessage;
     }
 
-    // Add generation prompt if requested and available
-    if (addGenerationPrompt && !mChatTemplate.generationPrompt.empty())
+    // Add generation prompt (only in chat template mode)
+    if (applyChatTemplate && addGenerationPrompt)
     {
-        formattedCompleteRequest += mChatTemplate.generationPrompt;
+        if (enableThinking && !mChatTemplate.generationPromptThinking.empty())
+        {
+            formattedCompleteRequest += mChatTemplate.generationPromptThinking;
+        }
+        else if (!mChatTemplate.generationPrompt.empty())
+        {
+            formattedCompleteRequest += mChatTemplate.generationPrompt;
+        }
     }
 
-    // Update the request with the formatted system prompt and complete request.
-    request.formattedSystemPrompt = formattedPrefixSystemPrompt;
-    request.formattedCompleteRequest = formattedCompleteRequest;
+    formattedRequest.formattedSystemPrompt = formattedPrefixSystemPrompt;
+    formattedRequest.formattedCompleteRequest = formattedCompleteRequest;
     return true;
 }
 

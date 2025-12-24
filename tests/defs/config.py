@@ -802,15 +802,6 @@ class TestConfig:
         Returns:
             Path to chat template JSON file, or None if no custom template for this model
         """
-        # Custom chat templates mapping: model_name -> template_filename
-        CUSTOM_CHAT_TEMPLATES = {
-            "Qwen3-0.6B": "qwen3_no_thinking.json",
-            "Qwen2.5-VL-7B-Instruct": "qwen2.5_vl_7b.json",
-        }
-
-        if self.model_name in CUSTOM_CHAT_TEMPLATES:
-            template_filename = CUSTOM_CHAT_TEMPLATES[self.model_name]
-            return f"tests/chat_templates/{template_filename}"
 
         return None
 

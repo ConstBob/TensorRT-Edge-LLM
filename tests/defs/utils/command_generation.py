@@ -76,7 +76,7 @@ def _generate_llm_export_commands(
     # Add custom chat template if specified for this model
     chat_template_path = config.get_chat_template_file()
     if chat_template_path:
-        llm_cmd.append(f"--chat-template={chat_template_path}")
+        llm_cmd.append(f"--chat_template={chat_template_path}")
 
     return [(llm_cmd, 1200)]
 

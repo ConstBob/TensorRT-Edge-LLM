@@ -177,13 +177,11 @@ bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
 
     for (auto const& request : request.requests)
     {
-        if (request.messages.empty()
-            && (request.formattedSystemPrompt.empty() || request.formattedCompleteRequest.empty()))
+        if (request.messages.empty())
         {
             LOG_ERROR(
-                "LLMInferenceRuntime(): There is an empty request in the batch. Either 'messages' or "
-                "'formatted_system_prompt' and 'formatted_complete_request' must be provided.Skip this batch of "
-                "requests. Please check the input data contents.");
+                "There is an empty request in the batch. 'messages' must be provided. "
+                "Skip this batch of requests. Please check the input data contents.");
             return false;
         }
     }
@@ -299,29 +297,24 @@ bool LLMInferenceRuntime::handleRequest(
 
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
 
-    // Preprocess system prompts and save KVCache for each sequence.
+    // Apply chat template, extract system prompts, and optionally save KVCache
+    request.formattedRequests.resize(activeBatchSize);
+    batchSystemPrompts.reserve(activeBatchSize);
+
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        // Use cached formatted prompts if available, otherwise compute them
-        if (request.requests[i].formattedSystemPrompt.empty() || request.requests[i].formattedCompleteRequest.empty())
-        {
-            // Apply chat template to populate both formatted system prompt and full formatted prompt
-            mTokenizer->applyChatTemplate(request.requests[i], true);
-        }
-        else
-        {
-            LOG_WARNING(
-                "LLMInferenceRuntime(): Pre-formatted prompts are provided. "
-                "Skipping chat template application for this request.");
-        }
+        // Apply chat template
+        mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
+            request.addGenerationPrompt, request.enableThinking);
 
-        batchSystemPrompts.emplace_back(request.requests[i].formattedSystemPrompt);
+        // Extract system prompt
+        batchSystemPrompts.emplace_back(request.formattedRequests[i].formattedSystemPrompt);
 
+        // Save KVCache if requested
         if (request.saveSystemPromptKVCache)
         {
             if (mMultimodalRunner)
             {
-                // Use the already formatted system prompt (tokenizer already applied chat template)
                 mMultimodalRunner->preprocessSystemPrompt(
                     batchSystemPrompts[i], mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream);
             }
@@ -338,10 +331,11 @@ bool LLMInferenceRuntime::handleRequest(
     // Preprocess user prompts and encode them.
     if (!mMultimodalRunner)
     {
+        batchedInputIds.reserve(activeBatchSize);
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            // Use the cached full formatted prompt
-            batchedInputIds.emplace_back(mTokenizer->encode(request.requests[i].formattedCompleteRequest, true));
+            batchedInputIds.emplace_back(
+                mTokenizer->encode(request.formattedRequests[i].formattedCompleteRequest, true));
         }
     }
     else

@@ -552,10 +552,10 @@ def export_llm_model(model_dir: str,
         template_source = get_template_path(incompatible_model_type)
         if template_source is None:
             raise ValueError(
-                f"Model '{incompatible_model_type}' requires the --chat-template flag.\n"
+                f"Model '{incompatible_model_type}' requires the --chat_template flag.\n"
                 f"This model type does not have a compatible chat template that can be "
                 f"automatically extracted from its tokenizer, and no template is available.\n"
-                f"Please provide a chat template JSON file using: --chat-template /path/to/template.json\n"
+                f"Please provide a chat template JSON file using: --chat_template /path/to/template.json\n"
                 f"See docs/source/developer_guide/06_Chat_Template_Format.md for the required format."
             )
     else:
