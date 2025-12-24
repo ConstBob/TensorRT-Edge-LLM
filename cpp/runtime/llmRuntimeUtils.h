@@ -52,25 +52,26 @@ struct Message
 struct LLMGenerationRequest
 {
     //! \cond INTERNAL
+    /*!
+     * @brief Formatted request structure containing chat template output
+     */
+    struct FormattedRequest
+    {
+        std::string formattedSystemPrompt;    //!< Formatted prefix system prompt that can be used for KVCache saving.
+        std::string formattedCompleteRequest; //!< Formatted complete request (including prefix system prompt)
+    };
+
     /*! \brief Request structure containing structured messages
      */
     struct Request
     {
         std::vector<Message> messages; //!< Structured messages (required - use chat template format)
         std::vector<rt::imageUtils::ImageData> imageBuffers; //!< Optional image data for multimodal inputs
-        std::string defaultSystemPrompt{""};
-        //!< Default system prompt to use if no system message is present in messages
-
-        // The following two fields are portal to bypass the tokenizer's chat template application during inference.
-        // If these fields are provided, the inference runtime will directly use them for inference. Otherwise, the
-        // tokenizer will apply the chat-template based on the messages and modify these two fields.
-        mutable std::string formattedSystemPrompt{
-            ""}; //!< Formatted prefix system prompt that can be used for KVCache saving.
-        mutable std::string formattedCompleteRequest{
-            ""}; //!< Formatted complete request (including prefix system prompt)
     };
     //! \endcond
-    std::vector<Request> requests;   //!< Vector of requests for a batch
+    std::vector<Request> requests; //!< Vector of requests for a batch
+    mutable std::vector<FormattedRequest>
+        formattedRequests;           //!< Formatted requests (mutable to allow runtime modification)
     float temperature;               //!< Temperature parameter for sampling
     float topP;                      //!< Top-p (nucleus) sampling parameter
     int64_t topK;                    //!< Top-k sampling parameter
@@ -78,6 +79,13 @@ struct LLMGenerationRequest
     std::string loraWeightsName{""}; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
     bool saveSystemPromptKVCache{
         false}; //!< Whether to save system prompt KV cache of this request to be used by later requests
+    bool applyChatTemplate{true};
+    //!< Whether to apply chat template formatting. If false, raw messages will be concatenated without special tokens
+    bool addGenerationPrompt{true};
+    //!< Whether to add generation prompt (e.g., assistant header) at the end. Only effective when
+    //!< applyChatTemplate=true
+    bool enableThinking{false};
+    //!< Whether to enable thinking mode for models that support it. Default is disabled
 };
 
 /*! \brief LLM Generation Response structure

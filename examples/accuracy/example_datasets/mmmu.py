@@ -47,11 +47,6 @@ class MMMUDataset(EdgeLLMDataset):
         self.images_dir = os.path.join(self.output_dir, "images")
         os.makedirs(self.images_dir, exist_ok=True)
 
-    def format_system_prompt(self, data: Dict[str, Any]) -> str:
-        """Format MMMU system prompt"""
-        # vlm_accuracy.cpp doesn't use a system prompt, just user prompt
-        return ""
-
     def format_user_prompt(self, data: Dict[str, Any]) -> str:
         """Format MMMU prompt with question and multiple choice options"""
         # Start with the question

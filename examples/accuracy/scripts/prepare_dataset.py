@@ -182,12 +182,6 @@ def main():
         "Maximum number of tokens to generate (uses dataset default if not provided)"
     )
 
-    parser.add_argument(
-        "--default_system_prompt",
-        type=str,
-        required=False,
-        help="Custom system prompt (uses dataset default if not provided)")
-
     args = parser.parse_args()
 
     try:
@@ -203,54 +197,39 @@ def main():
 
         if args.dataset == "AIME":
             # Create config for AIME
-            default_system_prompt = args.default_system_prompt or (
-                "You are solving a mathematical problem from the American Invitational Mathematics Examination. "
-                "Please reason step by step, and put your final answer within \\boxed{}."
-            )
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "AIME"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_aime_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir)
 
         elif args.dataset == "GSM8K":
             # Create config for GSM8K
-            default_system_prompt = args.default_system_prompt or (
-                "You are answering a grade school math problem. "
-                "Please show your calculation process with formulas between << and >>.\n"
-                "Please form your final answer as a number after ####.")
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "GSM8K"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_gsm8k_dataset(config=config,
                                   dataset_name_or_dir=dataset_path,
                                   output_dir=args.output_dir)
 
         elif args.dataset == "MMLU":
             # Create config for MMLU
-            default_system_prompt = args.default_system_prompt or (
-                "You are answering a multiple choice question. "
-                "Please answer the question directly with the option's letter from the given choices."
-            )
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "MMLU"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_mmlu_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir,
@@ -258,18 +237,13 @@ def main():
 
         elif args.dataset == "MMLU_Pro":
             # Create config for MMLU-Pro
-            default_system_prompt = args.default_system_prompt or (
-                "You are answering a multiple choice question. "
-                "Please answer the question directly with the option's letter from the given choices."
-            )
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "MMLU_Pro"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_mmlu_pro_dataset(config=config,
                                      dataset_name_or_dir=dataset_path,
                                      output_dir=args.output_dir,
@@ -277,18 +251,13 @@ def main():
 
         elif args.dataset == "MMMU":
             # Create config for MMMU
-            default_system_prompt = args.default_system_prompt or (
-                "You are answering a science question. "
-                "Please answer the question directly with the option's letter from the given choices "
-                "(A, B, C, D, ...) or using a single word or phrase.")
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "MMMU"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_mmmu_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir)
@@ -296,18 +265,13 @@ def main():
         elif args.dataset == "MMMU_Pro":
             print(f"Using subset: {args.subset}")
             # Create config for MMMU_Pro
-            default_system_prompt = args.default_system_prompt or (
-                "You are answering a science question. "
-                "Please answer the question directly with the option's letter from the given choices "
-                "(A, B, C, D, ...).")
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "MMMU_Pro"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_mmmu_pro_dataset(config=config,
                                      dataset_name_or_dir=dataset_path,
                                      output_dir=args.output_dir,
@@ -315,71 +279,52 @@ def main():
 
         elif args.dataset == "HumanEval":
             # Create config for HumanEval
-            default_system_prompt = args.default_system_prompt or (
-                "You are completing a Python function. "
-                "Please provide only the function implementation without any additional explanation."
-            )
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "HumanEval"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_humaneval_dataset(config=config,
                                       dataset_name_or_dir=dataset_path,
                                       output_dir=args.output_dir)
 
         elif args.dataset == "MATH500":
             # Create config for MATH500
-            default_system_prompt = args.default_system_prompt or (
-                "You are solving a mathematical problem. "
-                "Please provide a detailed solution and put your final answer within \\boxed{}."
-            )
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "MATH500"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_math500_dataset(config=config,
                                     dataset_name_or_dir=dataset_path,
                                     output_dir=args.output_dir)
 
         elif args.dataset == "MMStar":
             # Create config for MMStar
-            default_system_prompt = args.default_system_prompt or (
-                "You are answering questions about images. "
-                "Please analyze the image carefully and provide a clear, accurate answer."
-            )
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "MMStar"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_mmstar_dataset(config=config,
                                    dataset_name_or_dir=dataset_path,
                                    output_dir=args.output_dir)
 
         elif args.dataset == "MTBench":
             # Create config for MTBench
-            default_system_prompt = args.default_system_prompt or (
-                "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
-            )
             max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
                 "MTBench"]
             config = DatasetConfig(batch_size=args.batch_size,
                                    temperature=args.temperature,
                                    top_p=args.top_p,
                                    top_k=args.top_k,
-                                   max_generate_length=max_generate_length,
-                                   default_system_prompt=default_system_prompt)
+                                   max_generate_length=max_generate_length)
             convert_mtbench_dataset(config=config,
                                     dataset_name_or_dir=dataset_path,
                                     output_dir=args.output_dir)

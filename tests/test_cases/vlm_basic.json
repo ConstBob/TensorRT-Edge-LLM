@@ -8,10 +8,6 @@
         {
             "messages": [
                 {
-                    "role": "system",
-                    "content": "You are a helpful assistant."
-                },
-                {
                     "role": "user",
                     "content": [
                         {
@@ -29,10 +25,6 @@
         },
         {
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant."
-                },
                 {
                     "role": "user",
                     "content": [

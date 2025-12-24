@@ -659,8 +659,8 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
-        // Use the cached full formatted prompt
-        std::vector<int32_t> ids = tokenizer->encode(request.requests[i].formattedCompleteRequest);
+        // Use the formatted complete request
+        std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
 
         // insert image tokens
         std::vector<int32_t> newIds;

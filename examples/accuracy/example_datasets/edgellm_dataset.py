@@ -36,7 +36,6 @@ class DatasetConfig:
     top_p: float
     top_k: int
     max_generate_length: int
-    default_system_prompt: str = "You are a helpful assistant."
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -67,7 +66,6 @@ class EdgeLLMDataset:
         top_p (float): Nucleus sampling parameter
         top_k (int): Top-k sampling parameter
         max_generate_length (int): Maximum number of tokens to generate
-        default_system_prompt (str): Default system prompt for all messages
         formatted_data (List[Dict]): Processed dataset entries
     """
 
@@ -75,6 +73,7 @@ class EdgeLLMDataset:
                  dataset: Dataset,
                  config: DatasetConfig,
                  output_dir: Union[str, os.PathLike] = "./output",
+                 apply_chat_template: Optional[bool] = None,
                  **kwargs):
         """
         Initialize the EdgeLLMDataset.
@@ -83,10 +82,12 @@ class EdgeLLMDataset:
             dataset: Dataset object
             config: DatasetConfig object with processing parameters (required)
             output_dir: Directory where images and output JSON will be saved
+            apply_chat_template: Whether to apply chat template formatting (optional, defaults to None which means use default behavior)
             **kwargs: Additional parameters to override config values
         """
         self.dataset = dataset
         self.output_dir = str(output_dir)
+        self.apply_chat_template = apply_chat_template
 
         # Override config with kwargs if provided
         config_dict = config.__dict__.copy()
@@ -99,7 +100,6 @@ class EdgeLLMDataset:
         self.top_p = self.config.top_p
         self.top_k = self.config.top_k
         self.max_generate_length = self.config.max_generate_length
-        self.default_system_prompt = self.config.default_system_prompt
 
         self.formatted_data: List[Dict[str, Any]] = []
 
@@ -146,7 +146,7 @@ class EdgeLLMDataset:
         """
         Format the system prompt from dataset entry.
         """
-        raise NotImplementedError("format_system_prompt is not implemented")
+        return ""
 
     def process_and_save_dataset(
             self,
@@ -165,11 +165,8 @@ class EdgeLLMDataset:
             "requests": [
                 {
                     "messages": [
-                        {"role": "system", "content": "<string>"},
                         {"role": "user", "content": "<string or array>"}
                     ],
-                    "formatted_system_prompt": "<string>",  // optional
-                    "formatted_complete_request": "<string>",  // optional
                     "answer": "<string>",  // optional
                     "id": "<string>",      // optional
                     "subject": "<string>"  // optional
@@ -192,12 +189,6 @@ class EdgeLLMDataset:
                 # Format the prompt
                 user_prompt = self.format_user_prompt(data_entry)
 
-                # Format the system prompt
-                try:
-                    system_prompt = self.format_system_prompt(data_entry)
-                except NotImplementedError:
-                    system_prompt = None
-
                 # Extract reference answer
                 try:
                     answer = self.extract_answer(data_entry)
@@ -216,10 +207,6 @@ class EdgeLLMDataset:
                 # Build messages array in OpenAI format
                 messages = []
 
-                # Add system message
-                system_content = system_prompt if system_prompt else self.default_system_prompt
-                messages.append({"role": "system", "content": system_content})
-
                 # Add user message with content
                 if image_paths:
                     # Multimodal: content is array with images and text
@@ -235,11 +222,6 @@ class EdgeLLMDataset:
 
                 request["messages"] = messages
 
-                if overwrite_formatted_prompts:
-                    if system_prompt:
-                        request["formatted_system_prompt"] = system_prompt
-                    request["formatted_complete_request"] = (system_prompt or
-                                                             "") + user_prompt
                 # Add reference answer if available
                 if answer:
                     request["answer"] = answer
@@ -280,6 +262,10 @@ class EdgeLLMDataset:
             "max_generate_length": self.max_generate_length,
             "requests": self.formatted_data
         }
+
+        # Add apply_chat_template if specified
+        if self.apply_chat_template is not None:
+            output_data["apply_chat_template"] = self.apply_chat_template
 
         # Save to JSON file with pretty formatting
         with open(output_path, 'w', encoding='utf-8') as f:

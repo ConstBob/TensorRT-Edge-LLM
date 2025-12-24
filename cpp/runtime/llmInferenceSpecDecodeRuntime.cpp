@@ -357,14 +357,12 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     std::vector<std::vector<int32_t>> batchedInputIds;
 
     // Apply chat template for all requests (common for both multimodal and non-multimodal)
+    request.formattedRequests.resize(activeBatchSize);
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        // Use cached formatted prompts if available, otherwise compute them
-        if (request.requests[i].formattedSystemPrompt.empty() || request.requests[i].formattedCompleteRequest.empty())
-        {
-            // Apply chat template to populate both formatted system prompt and full formatted prompt
-            mTokenizer->applyChatTemplate(request.requests[i], true);
-        }
+        // Apply chat template to populate both formatted system prompt and full formatted prompt
+        mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
+            request.addGenerationPrompt, request.enableThinking);
     }
 
     if (!mMultimodalRunner)
@@ -373,11 +371,11 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
             // Store the formatted system prompt for KV cache
-            context.systemPrompts[i] = request.requests[i].formattedSystemPrompt;
+            context.systemPrompts[i] = request.formattedRequests[i].formattedSystemPrompt;
 
-            // Use the cached full formatted prompt
+            // Use the full formatted prompt
             context.rawBatchedInputIds.emplace_back(
-                mTokenizer->encode(request.requests[i].formattedCompleteRequest, false));
+                mTokenizer->encode(request.formattedRequests[i].formattedCompleteRequest, false));
             if (context.rawBatchedInputIds[i].empty())
             {
                 LOG_ERROR("Failed to tokenize input text for batch %d", i);
