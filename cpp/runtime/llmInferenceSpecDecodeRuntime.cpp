@@ -1310,6 +1310,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     tempContext.promptLengths.resize(1, 0);
     tempContext.finishedStates.resize(1, 0);
     tempContext.multimodalEmbeddings = context.multimodalEmbeddings;
+    tempContext.extraInputTensors = context.extraInputTensors;
     tempContext.generationRound = 0;
     tempContext.maxGenerateLength = 0; // Not generating, just caching
     tempContext.activeBatchSize = 1;
