@@ -74,9 +74,9 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     int32_t const defaultTopK{0};
     float const defaultTopP{0.9F};
     trt_edgellm::SamplingParams samplingParams(
-        mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize, 1.0f, defaultTopK, defaultTopP);
+        mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, 1.0f, defaultTopK, defaultTopP);
     int64_t maxSamplingWorkspaceSize = static_cast<int64_t>(trt_edgellm::getTopKtopPSamplingWorkspaceSize(
-        mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize, samplingParams));
+        mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize, samplingParams));
 
     // Allocate workspace and activation tensors for LLM engine.
     try
@@ -267,7 +267,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     linearKVCache.resetForNewSequences(mHostReuseKVCacheLengths, stream);
     mInputIds.reshape({activeBatchSize, packedInputLength});
     mHostContextLengths.reshape({activeBatchSize});
-    mOutputLogits.reshape({activeBatchSize, mEngineConfig.vocabSize});
+    mOutputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize});
 
     CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), mHostPackedInputIds.rawPointer(),
         activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
@@ -388,7 +388,8 @@ bool LLMInferenceRuntime::handleRequest(
     mHostSelectedTokenIds.reshape({activeBatchSize});
     int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
 
-    SamplingParams params(activeBatchSize, mEngineConfig.vocabSize, request.temperature, request.topK, request.topP);
+    SamplingParams params(
+        activeBatchSize, mEngineConfig.outputVocabSize, request.temperature, request.topK, request.topP);
     auto sampleTokens = [&]() {
         trt_edgellm::topKtopPSamplingFromLogits(mOutputLogits, mSelectedIndices, params, mSamplingWorkspace, stream);
         // Apply vocabulary mapping if reduced vocabulary is used
@@ -497,7 +498,7 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     for (int32_t batchSize = minSupportedBatchSize; batchSize <= maxSupportedBatchSize; ++batchSize)
     {
         mSelectedIndices.reshape({batchSize, 1});
-        mOutputLogits.reshape({batchSize, mEngineConfig.vocabSize});
+        mOutputLogits.reshape({batchSize, mEngineConfig.outputVocabSize});
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
             mSelectedIndices, mOutputLogits, mEmptyLoraWeightsName, stream);
         if (mEngineConfig.maxSupportedLoraRank > 0)

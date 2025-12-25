@@ -24,7 +24,7 @@ Build engines under the tensorrt_edgellm root directory. Use large sequence leng
   --onnxDir /path/to/text/onnx/model/ \
   --engineDir /path/to/text/engine/ \
   --maxInputLen 8192 \
-  --maxSeqLen 10240 \
+  --maxKVCacheCapacity 10240 \
   --maxBatchSize 1
 ```
 
@@ -46,7 +46,7 @@ Build both visual encoder and text engines:
   --onnxDir /path/to/text/onnx/model/ \
   --engineDir /path/to/text/engine/ \
   --maxInputLen 8192 \
-  --maxSeqLen 10240 \
+  --maxKVCacheCapacity 10240 \
   --maxBatchSize 1 \
   --vlm \
   --minImageTokens 256 \
