@@ -50,6 +50,7 @@ size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens);
  * Algorithm:
  * - Token 0 is always selected (depth 0)
  * - For each subsequent token, pick top-1 from logits
+ * - If vocab mapping table is provided, map selected tokens from reduced vocab to full vocab
  * - Check if the selected token exists at the correct depth in the tree and attends to the previous token
  * - Tree depth is computed from attention mask - tokens at depth d attend to d other tokens
  * - Continue until no valid attention or max depth reached
@@ -70,6 +71,8 @@ size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens);
  * @param acceptedTokenIds Output accepted token IDs with shape [batch_size, max_depth] (INT32, GPU)
  * @param acceptedLogitsIndices Output corresponding logits indices with shape [batch_size, max_depth] (INT32, GPU)
  * @param acceptLength Output tensor with accept lengths for each batch with shape [batch_size] (INT32, GPU)
+ * @param vocabMappingTable Optional vocab mapping table for reduced vocabulary (INT32, GPU, 1D). Use std::nullopt if
+ * not needed.
  * @param workspace Workspace buffer for temporary allocations
  * @param workspaceSize Size of workspace buffer in bytes
  * @param stream CUDA stream for execution
@@ -77,10 +80,11 @@ size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens);
  * @note All tensor parameters must be allocated on GPU device
  * @note Workspace must be at least getEagleAcceptWorkspaceSize(batchSize, numTokens) bytes
  * @note Shared memory usage: Stage 1: CUB temp storage (~1KB), Stage 2: numTokens * sizeof(int32_t) + small overhead
+ * @note vocabMappingTable should be provided when base model uses reduced vocabulary
  */
 void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tensor const& attentionMask,
-    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength, void* workspace,
-    size_t workspaceSize, cudaStream_t stream);
+    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength,
+    rt::OptionalInputTensor const& vocabMappingTable, void* workspace, size_t workspaceSize, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

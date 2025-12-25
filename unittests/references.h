@@ -102,8 +102,8 @@ struct EagleAcceptResult
 };
 
 EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<int32_t> const& tokenIds,
-    std::vector<int8_t> const& attentionMask, int32_t batchSize, int32_t numTokens, int32_t vocabSize,
-    int32_t maxDepth);
+    std::vector<int8_t> const& attentionMask, int32_t batchSize, int32_t numTokens, int32_t vocabSize, int32_t maxDepth,
+    std::vector<int32_t> const& vocabMappingTable = {});
 
 // Image utility reference functions
 void transposeToPatchQwenReference(std::vector<half> const& originalImage, std::vector<half>& patch,

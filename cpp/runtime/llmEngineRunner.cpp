@@ -411,6 +411,8 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.vocabSize = configJson["vocab_size"].get<int32_t>();
         // Optional: reduced vocabulary size (0 if not present)
         mConfig.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
+        // Set actual output vocab size: use reduced size if enabled, otherwise full size
+        mConfig.outputVocabSize = (mConfig.reducedVocabSize > 0) ? mConfig.reducedVocabSize : mConfig.vocabSize;
 
         // Extract builder_config values
         mConfig.isVlm = builderConfig["is_vlm"].get<bool>();
@@ -633,22 +635,10 @@ bool LLMEngineRunner::validateConfigFromEngine()
     // Obtain vocab size from the engine.
     // Logits shape is [batch_size, num_tokens/num_selected_tokens, vocab_size] for both EAGLE and vanilla models
     Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
-    int32_t const expectedEngineVocabSize
-        = (mConfig.reducedVocabSize > 0) ? mConfig.reducedVocabSize : mConfig.vocabSize;
-    if (expectedEngineVocabSize != logitsDim.d[2])
+    if (mConfig.outputVocabSize != logitsDim.d[2])
     {
-        if (mConfig.reducedVocabSize > 0)
-        {
-            LOG_ERROR(
-                "vocabSize is not consistent. Engine uses reduced vocabulary. From engine: %d, expected reduced vocab "
-                "size: %d (full vocab size: %d)",
-                logitsDim.d[2], mConfig.reducedVocabSize, mConfig.vocabSize);
-        }
-        else
-        {
-            LOG_ERROR(
-                "vocabSize is not consistent. From engine: %d, from config: %d", logitsDim.d[2], mConfig.vocabSize);
-        }
+        LOG_ERROR("vocabSize is not consistent. From engine: %d, expected output vocab size: %d", logitsDim.d[2],
+            mConfig.outputVocabSize);
         return false;
     }
 
@@ -800,12 +790,12 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
     }
 
     bool const isLogitsShapeValid
-        = outputLogits.getShape().getNumDims() == 2 && outputLogits.getShape()[1] == mConfig.vocabSize;
+        = outputLogits.getShape().getNumDims() == 2 && outputLogits.getShape()[1] == mConfig.outputVocabSize;
     if (!isLogitsShapeValid)
     {
         LOG_ERROR(
             "Invalid shape of the output logits tensor. The output logits tensor should have shape "
-            "[activeBatchSize, VocabSize]. Current logits shape is %s.",
+            "[activeBatchSize, outputVocabSize]. Current logits shape is %s.",
             outputLogits.getShape().formatString().c_str());
         return false;
     }
@@ -992,12 +982,12 @@ bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& input
         return false;
     }
     bool checkInputShapeValid = inputIds.getShape().getNumDims() == 2 && inputIds.getShape()[1] == 1
-        && outputLogits.getShape().getNumDims() == 2 && outputLogits.getShape()[1] == mConfig.vocabSize;
+        && outputLogits.getShape().getNumDims() == 2 && outputLogits.getShape()[1] == mConfig.outputVocabSize;
     if (!checkInputShapeValid)
     {
         LOG_ERROR(
             "executeGeneration(): Invalid shape of the input tensors. The input tensor should have shape "
-            "[activeBatchSize, 1] and the output tensor should have shape [activeBatchSize, VocabSize].");
+            "[activeBatchSize, 1] and the output tensor should have shape [activeBatchSize, outputVocabSize].");
         return false;
     }
 
@@ -1146,7 +1136,7 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
     }
 
     bool const isOutputShapeValid = outputLogits.getShape()[0] == outputHiddenStates.getShape()[0]
-        && outputLogits.getShape()[1] == mConfig.vocabSize
+        && outputLogits.getShape()[1] == mConfig.outputVocabSize
         && outputHiddenStates.getShape()[1] == mConfig.outputHiddenDim;
     if (!isOutputShapeValid)
     {
@@ -1154,7 +1144,7 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
             "eagleBaseTreeDecodingStepInputValidation(): Invalid shape of the output tensors. Logits shape shall be "
             "[select-token-size, %d], hidden states shape shall be [select-token-size, %d], "
             "current outputLogits shape: %s, outputHiddenStates shape: %s",
-            mConfig.vocabSize, mConfig.outputHiddenDim, outputLogits.getShape().formatString().c_str(),
+            mConfig.outputVocabSize, mConfig.outputHiddenDim, outputLogits.getShape().formatString().c_str(),
             outputHiddenStates.getShape().formatString().c_str());
         return false;
     }

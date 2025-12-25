@@ -738,7 +738,8 @@ int32_t computeTokenDepthRef(int32_t tokenIdx, std::vector<int8_t> const& attent
 }
 
 EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<int32_t> const& tokenIds,
-    std::vector<int8_t> const& attentionMask, int32_t batchSize, int32_t numTokens, int32_t vocabSize, int32_t maxDepth)
+    std::vector<int8_t> const& attentionMask, int32_t batchSize, int32_t numTokens, int32_t vocabSize, int32_t maxDepth,
+    std::vector<int32_t> const& vocabMappingTable)
 {
     EagleAcceptResult result;
     result.acceptedTokenIds.resize(batchSize * maxDepth, -1);
@@ -791,6 +792,12 @@ EagleAcceptResult eagleAcceptRef(std::vector<float> const& logits, std::vector<i
                     maxLogit = logits[logitsOffset + v];
                     selectedTokenId = v;
                 }
+            }
+
+            // Apply vocab mapping if provided (for reduced vocabulary)
+            if (!vocabMappingTable.empty() && selectedTokenId < static_cast<int32_t>(vocabMappingTable.size()))
+            {
+                selectedTokenId = vocabMappingTable[selectedTokenId];
             }
 
             // Step 2: Always accept the selected token
