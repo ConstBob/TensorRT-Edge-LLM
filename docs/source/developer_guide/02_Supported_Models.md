@@ -43,6 +43,8 @@
 |-------|-----------|------|-----|------|-------|
 | [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | 0.6B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) | 4B | ✅ | ✅ | ✅ | ✅ |
+| [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | 8B | ✅ | ✅ | ✅ | ✅ |
+
 
 ### DeepSeek-R1 Distilled Family
 

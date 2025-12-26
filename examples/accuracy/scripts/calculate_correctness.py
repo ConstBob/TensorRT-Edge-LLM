@@ -27,7 +27,12 @@ def clean_text(text):
     Returns:
         Cleaned text string.
     """
-    return text.strip().strip("().,")
+
+    # Remove <|endoftext|> from text for phi4mm
+    if "<|endoftext|>" in text:
+        text = text.split("<|endoftext|>")[0]
+    text = text.strip().strip("().,")
+    return text
 
 
 def parse_multi_choice_response(text):

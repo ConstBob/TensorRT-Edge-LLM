@@ -141,6 +141,8 @@ tensorrt-edgellm-export-llm --model_dir quantized/qwen3-4b --output_dir onnx_mod
 
 ### Multimodal VLM (End-to-End)
 
+Note: Phi-4 requires additional merge-lora step. Please follow the steps. 
+
 ```bash
 # 1. Export (x86 host)
 tensorrt-edgellm-export-llm --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b
@@ -154,23 +156,28 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_
 ./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input_with_images.json --outputFile output.json
 ```
 
-### Multimodal VLM with LoRA (End-to-End)
+### Phi-4 and Multimodal VLM with LoRA (End-to-End)
 **NOTE: LoRA model is not compatible with the quantization pipeline, thus we need to merge the lora adapter into main model at first.**
 ```bash
+# 0. Clone Phi-4-multimodal-instruct into disk
+git clone https://huggingface.co/microsoft/Phi-4-multimodal-instruct
+cd Phi-4-multimodal-instruct
+git lfs pull
+
 # 1. Merge LoRA (x86 host)
-tensorrt-edgellm-merge-lora --model_dir microsoft/Phi-4-multimodal-instruct \
-                            --lora_dir microsoft/Phi-4-multimodal-instruct/vision-lora \
-                            --output_dir microsoft/Phi-4-multimodal-instruct-merged-vision
+tensorrt-edgellm-merge-lora --model_dir Phi-4-multimodal-instruct \
+                            --lora_dir Phi-4-multimodal-instruct/vision-lora \
+                            --output_dir Phi-4-multimodal-instruct-merged-vision
 
 # 2. Quantize (x86 host)
-tensorrt-edgellm-quantize-llm --model_dir microsoft/Phi-4-multimodal-instruct-merged-vision \
-                               --output_dir microsoft/Phi-4-multimodal-instruct-merged-vision-nvfp4 \
+tensorrt-edgellm-quantize-llm --model_dir Phi-4-multimodal-instruct-merged-vision \
+                               --output_dir Phi-4-multimodal-instruct-merged-vision-nvfp4 \
                                --quantization=nvfp4
 
 # 3. Export (x86 host)
-tensorrt-edgellm-export-llm --model_dir microsoft/Phi-4-multimodal-instruct-merged-vision-nvfp4 --output_dir onnx_models/phi4-mm
+tensorrt-edgellm-export-llm --model_dir Phi-4-multimodal-instruct-merged-vision-nvfp4 --output_dir onnx_models/phi4-mm
 # Use the original weights for visual model export
-tensorrt-edgellm-export-visual --model_dir microsoft/Phi-4-multimodal-instruct --output_dir onnx_models/phi4-mm/visual_enc_onnx
+tensorrt-edgellm-export-visual --model_dir Phi-4-multimodal-instruct --output_dir onnx_models/phi4-mm/visual_enc_onnx
 
 # 4. Build Engines (Thor device)
 ./build/examples/llm/llm_build --onnxDir onnx_models/phi4-mm --engineDir engines/phi4-mm --vlm
