@@ -883,13 +883,22 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
-    // Setup the KVCache start index tensor.
-    // Always use the KVCache lengths tensor with correct batch_size shape to satisfy TensorRT engine requirements.
-    // When KVCache is empty, the tensor contains zeros; otherwise it contains the actual cache lengths.
-    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
+    // Otherwise, we shall supply the KVCache lengths tensor to the engine.
+    if (mKVCache.getKVCacheAllEmpty())
+    {
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
+    }
+    else
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+    }
 
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
     // For MRope, the cache is initialized with maxBatchSize and does not need reshaping during prefill.
