@@ -718,13 +718,22 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
 
-    // Setup the KVCache start index tensor.
-    // Always use the KVCache lengths tensor with correct batch_size shape to satisfy TensorRT engine requirements.
-    // When KVCache is empty, the tensor contains zeros; otherwise it contains the actual cache lengths.
-    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
+    // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
+    // Otherwise, we shall supply the KVCache lengths tensor to the engine.
+    if (!mLinearKVCache.getKVCacheAllEmpty())
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
+    }
+    else
+    {
+        setEngineIOStatus
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setEngineIOStatus
+            &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
+    }
 
     // For MRope (ND-Rope, context-dependent), reshape to match activeBatchSize (per-batch values needed)
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
