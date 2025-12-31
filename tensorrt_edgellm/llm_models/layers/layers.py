@@ -17,6 +17,7 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from modelopt.torch.quantization.utils import is_quantized_linear
 from transformers.models.llama.modeling_llama import (LlamaAttention, LlamaMLP,
                                                       LlamaRMSNorm,
                                                       apply_rotary_pos_emb,
@@ -187,6 +188,8 @@ class EdgeLLMAttention(nn.Module):
             self.head_dim: int = attention_module.config.hidden_size // self.num_attention_heads
 
         # Copy projection layers from original attention module
+        # For fused qkv_proj (Phi4MM), we keep it as-is if quantized to avoid breaking ONNX export
+        self.qkv_proj = None  # Will be set if using fused projection
         if hasattr(attention_module, 'q_proj'):
             assert hasattr(attention_module, 'k_proj') and hasattr(attention_module, 'v_proj'), \
                 "q_proj, k_proj, and v_proj must be present"
@@ -194,51 +197,60 @@ class EdgeLLMAttention(nn.Module):
             self.k_proj = attention_module.k_proj
             self.v_proj = attention_module.v_proj
         elif hasattr(attention_module, 'qkv_proj'):
-            # For Phi4MM, split the qkv_proj into q_proj, k_proj, and v_proj to align with the other models.
             q_dim = self.num_attention_heads * self.head_dim
             kv_dim = self.num_key_value_heads * self.head_dim
-            device = attention_module.qkv_proj.weight.device
-            dtype = attention_module.qkv_proj.weight.dtype
-            has_bias = attention_module.qkv_proj.bias is not None
 
-            self.q_proj = nn.Linear(self.hidden_size,
-                                    q_dim,
-                                    bias=has_bias,
-                                    device=device,
-                                    dtype=dtype)
-            self.k_proj = nn.Linear(self.hidden_size,
-                                    kv_dim,
-                                    bias=has_bias,
-                                    device=device,
-                                    dtype=dtype)
-            self.v_proj = nn.Linear(self.hidden_size,
-                                    kv_dim,
-                                    bias=has_bias,
-                                    device=device,
-                                    dtype=dtype)
+            # For quantized qkv_proj, keep it fused to preserve quantization metadata
+            # Splitting would break ONNX export due to scale tensor shape mismatch
+            if is_quantized_linear(attention_module.qkv_proj):
+                self.qkv_proj = attention_module.qkv_proj
+                self.q_proj = None
+                self.k_proj = None
+                self.v_proj = None
+            else:
+                # For non-quantized, split into separate projections
+                device = attention_module.qkv_proj.weight.device
+                dtype = attention_module.qkv_proj.weight.dtype
+                has_bias = attention_module.qkv_proj.bias is not None
 
-            # copy weights (from fused -> split)
-            with torch.no_grad():
-                W = attention_module.qkv_proj.weight  # [q_dim+2*kv_dim, hidden_size]
+                self.q_proj = nn.Linear(self.hidden_size,
+                                        q_dim,
+                                        bias=has_bias,
+                                        device=device,
+                                        dtype=dtype)
+                self.k_proj = nn.Linear(self.hidden_size,
+                                        kv_dim,
+                                        bias=has_bias,
+                                        device=device,
+                                        dtype=dtype)
+                self.v_proj = nn.Linear(self.hidden_size,
+                                        kv_dim,
+                                        bias=has_bias,
+                                        device=device,
+                                        dtype=dtype)
 
-                # Validate fused layout and shapes
-                assert W.ndim == 2, f"qkv weight must be 2D, got {W.ndim}D"
-                assert W.shape[0] == q_dim + 2 * kv_dim and W.shape[1] == self.hidden_size, \
-                    f"Unexpected qkv shape {tuple(W.shape)}; expected {(q_dim + 2*kv_dim, self.hidden_size)}"
-                if attention_module.qkv_proj.bias is not None:
-                    b = attention_module.qkv_proj.bias
-                    assert b.ndim == 1 and b.numel() == q_dim + 2 * kv_dim, \
-                        f"Unexpected qkv bias shape {tuple(b.shape)}; expected {(q_dim + 2*kv_dim,)}"
+                # copy weights (from fused -> split)
+                with torch.no_grad():
+                    W = attention_module.qkv_proj.weight  # [q_dim+2*kv_dim, hidden_size]
 
-                self.q_proj.weight.copy_(W[:q_dim])
-                self.k_proj.weight.copy_(W[q_dim:q_dim + kv_dim])
-                self.v_proj.weight.copy_(W[q_dim + kv_dim:])
+                    # Validate fused layout and shapes
+                    assert W.ndim == 2, f"qkv weight must be 2D, got {W.ndim}D"
+                    assert W.shape[0] == q_dim + 2 * kv_dim and W.shape[1] == self.hidden_size, \
+                        f"Unexpected qkv shape {tuple(W.shape)}; expected {(q_dim + 2*kv_dim, self.hidden_size)}"
+                    if attention_module.qkv_proj.bias is not None:
+                        b = attention_module.qkv_proj.bias
+                        assert b.ndim == 1 and b.numel() == q_dim + 2 * kv_dim, \
+                            f"Unexpected qkv bias shape {tuple(b.shape)}; expected {(q_dim + 2*kv_dim,)}"
 
-                if attention_module.qkv_proj.bias is not None:
-                    b = attention_module.qkv_proj.bias  # [q_dim+2*kv_dim]
-                    self.q_proj.bias.copy_(b[:q_dim])
-                    self.k_proj.bias.copy_(b[q_dim:q_dim + kv_dim])
-                    self.v_proj.bias.copy_(b[q_dim + kv_dim:])
+                    self.q_proj.weight.copy_(W[:q_dim])
+                    self.k_proj.weight.copy_(W[q_dim:q_dim + kv_dim])
+                    self.v_proj.weight.copy_(W[q_dim + kv_dim:])
+
+                    if attention_module.qkv_proj.bias is not None:
+                        b = attention_module.qkv_proj.bias  # [q_dim+2*kv_dim]
+                        self.q_proj.bias.copy_(b[:q_dim])
+                        self.k_proj.bias.copy_(b[q_dim:q_dim + kv_dim])
+                        self.v_proj.bias.copy_(b[q_dim + kv_dim:])
 
         self.o_proj = attention_module.o_proj
 
@@ -283,8 +295,18 @@ class EdgeLLMAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
+        if self.qkv_proj is not None:
+            # Fused qkv_proj path (for quantized Phi4MM)
+            q_dim = self.num_attention_heads * self.head_dim
+            kv_dim = self.num_key_value_heads * self.head_dim
+            qkv_out = self.qkv_proj(hidden_states)
+            query_states = qkv_out[..., :q_dim]
+            key_states = qkv_out[..., q_dim:q_dim + kv_dim]
+            value_states = qkv_out[..., q_dim + kv_dim:]
+        else:
+            # Separate q/k/v projections path
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
 
         # Calculate shared shapes for normalization
         if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
@@ -308,7 +330,8 @@ class EdgeLLMAttention(nn.Module):
                 key_states.view(hidden_shape)).contiguous().view(
                     bsz, q_len, -1)
 
-        value_states = self.v_proj(hidden_states)
+        if self.qkv_proj is None:
+            value_states = self.v_proj(hidden_states)
 
         # Concatenate QKV for the plugin
         qkv = torch.concat([query_states, key_states, value_states], dim=-1)
@@ -365,8 +388,19 @@ class EdgeLLMAttention(nn.Module):
         """
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
+        # Apply Q, K, V projections
+        if self.qkv_proj is not None:
+            # Fused qkv_proj path (for quantized Phi4MM)
+            q_dim = self.num_attention_heads * self.head_dim
+            kv_dim = self.num_key_value_heads * self.head_dim
+            qkv_out = self.qkv_proj(hidden_states)
+            query_states = qkv_out[..., :q_dim]
+            key_states = qkv_out[..., q_dim:q_dim + kv_dim]
+            value_states = qkv_out[..., q_dim + kv_dim:]
+        else:
+            # Separate q/k/v projections path
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
 
         # Calculate shared shapes for normalization
         if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
@@ -390,7 +424,8 @@ class EdgeLLMAttention(nn.Module):
                 key_states.view(hidden_shape)).contiguous().view(
                     bsz, q_len, -1)
 
-        value_states = self.v_proj(hidden_states)
+        if self.qkv_proj is None:
+            value_states = self.v_proj(hidden_states)
 
         query_states = query_states.view(bsz, q_len, self.num_attention_heads,
                                          self.head_dim).transpose(1, 2)
