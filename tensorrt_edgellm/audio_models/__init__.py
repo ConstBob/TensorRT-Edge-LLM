@@ -13,18 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-ONNX export utilities for TensorRT Edge-LLM.
+Audio model implementations for TensorRT Edge-LLM.
 
-This module provides functions for exporting LLM and visual models to ONNX format
-for deployment on edge devices.
+This module contains various audio model implementations for multimodal models.
 """
-
-from .llm_export import export_draft_model, export_llm_model
-from .visual_export import visual_export
-
-__all__ = [
-    "export_draft_model",
-    "export_llm_model",
-    "visual_export",
-    "audio_export",
-]

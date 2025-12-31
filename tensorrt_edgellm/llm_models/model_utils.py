@@ -122,6 +122,12 @@ def _is_phi4mm_model(dir_path: str) -> bool:
     return _check_model_type(dir_path, "phi4mm")
 
 
+def _is_qwen3_omni_model(model_dir: str) -> bool:
+    """Check if the model is a Qwen3 Omni model by checking config.json for model_type."""
+    cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    return getattr(cfg, "model_type", None) == "qwen3_omni"
+
+
 # Models that require explicit chat template because auto-extraction fails
 INCOMPATIBLE_CHAT_TEMPLATE_MODELS = [
     "phi4mm",  # Phi-4-multimodal: tokenizer lacks proper chat template
@@ -281,6 +287,11 @@ def load_hf_model(
             torch_dtype=torch_dtype,
             trust_remote_code=True,
             _attn_implementation="eager").to(device)
+    elif _is_qwen3_omni_model(model_dir):
+        from transformers import Qwen3OmniForConditionalGeneration
+        model = Qwen3OmniForConditionalGeneration.from_pretrained(
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).to(device)
     else:
         # Try loading as AutoModelForCausalLM first
         try:

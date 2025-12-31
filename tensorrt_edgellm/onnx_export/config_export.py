@@ -190,3 +190,17 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     output_config['edgellm_version'] = __version__
 
     return output_config
+
+
+def export_audio_config(config: Any) -> Dict[str, Any]:
+    """Export audio configuration without modification."""
+    config_dict = config.to_dict()
+
+    has_audio = "audio_config" in config_dict
+    if not (has_audio):
+        raise KeyError("Required field 'audio_config' not found in config")
+    # Add TensorRT Edge-LLM version
+    config_dict['edgellm_version'] = __version__
+
+    # Return the original config_dict as-is without any modification
+    return config_dict
