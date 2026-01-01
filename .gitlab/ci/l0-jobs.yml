@@ -1,6 +1,6 @@
 # ==============================================================================
 # L0 TESTS - Merge Request Triggered
-# Cache Directory: /scratch.edge_llm_cache/L0/
+# Cache Directory: /scratch.edge_llm_cache/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}/
 # ==============================================================================
 
 include:
@@ -12,7 +12,7 @@ l0_ampere_model_export:
   variables:
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/ampere_model_export"
     PRIORITY: l0_export_ampere
     ONNX_DIR: "$TEST_CACHE_DIR/onnx"
@@ -23,6 +23,7 @@ l0_ampere_model_export:
   extends:
     - .export_onnx_template
     - .l0_rules
+    - .l0_environment
   interruptible: true
 
 # Model export for Blackwell/Thor (fp8 or fp4)
@@ -31,7 +32,7 @@ l0_blackwell_model_export:
   variables:
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/blackwell_model_export"
     PRIORITY: l0_export_blackwell
     ONNX_DIR: "$TEST_CACHE_DIR/onnx"
@@ -42,6 +43,7 @@ l0_blackwell_model_export:
   extends:
     - .export_onnx_template
     - .l0_rules
+    - .l0_environment
   interruptible: true
 
 l0_blackwell_eagle_model_export:
@@ -49,7 +51,7 @@ l0_blackwell_eagle_model_export:
   variables:
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/blackwell_model_export"
     PRIORITY: l0_eagle_export_blackwell
     ONNX_DIR: "$TEST_CACHE_DIR/onnx"
@@ -60,6 +62,7 @@ l0_blackwell_eagle_model_export:
   extends:
     - .export_onnx_template
     - .l0_rules
+    - .l0_environment
   interruptible: true
 
 # Building and testing with A30 Linux
@@ -70,7 +73,7 @@ l0_a30:
   variables:
     CUDA_VERSION: "12.9"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/a30"
     PRIORITY: l0_pipeline_a30
     ONNX_DIR: "$L0_CACHE_DIR/ampere_model_export/onnx"
@@ -83,6 +86,7 @@ l0_a30:
   extends:
     - .x86_test_template
     - .l0_rules
+    - .l0_environment
   interruptible: true
 
 # Building and testing with RTX5080 Linux
@@ -93,7 +97,7 @@ l0_rtx5080:
     variables:
       CUDA_VERSION: "12.9"
       IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-      L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+      L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
       TEST_CACHE_DIR: "$L0_CACHE_DIR/rtx5080"
       PRIORITY: l0_pipeline_rtx5080
       ONNX_DIR: "$L0_CACHE_DIR/blackwell_model_export/onnx"
@@ -106,6 +110,7 @@ l0_rtx5080:
     extends:
       - .x86_test_template
       - .l0_rules
+      - .l0_environment
     interruptible: true
 
 # Building and testing with B100 Linux
@@ -117,7 +122,7 @@ l0_b100:
     variables:
       CUDA_VERSION: "12.9"
       IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-      L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+      L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
       TEST_CACHE_DIR: "$L0_CACHE_DIR/b100"
       PRIORITY: l0_pipeline_b100
       ONNX_DIR: "$L0_CACHE_DIR/blackwell_model_export/onnx"
@@ -130,6 +135,7 @@ l0_b100:
     extends:
       - .x86_test_template
       - .l0_rules
+      - .l0_environment
     interruptible: true
 
 # Building and testing with Jetson Orin
@@ -140,7 +146,7 @@ l0_jetson_orin:
   variables:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "12.9"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/jetson_orin"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.jp6.cuda-$CUDA_VERSION"
     PRIORITY: l0_pipeline_orin
@@ -152,6 +158,7 @@ l0_jetson_orin:
   extends:
     - .device_test_template
     - .l0_rules
+    - .l0_environment
   interruptible: true
 
 # Building and testing with Drive Thor
@@ -162,7 +169,7 @@ l0_drive_thor_ferrix:
   variables:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "12.8"
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/$CI_PIPELINE_ID"
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/drive_thor_ferrix"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d7l.cuda-$CUDA_VERSION"
     PRIORITY: l0_pipeline_thor_ferrix
@@ -174,6 +181,7 @@ l0_drive_thor_ferrix:
   extends:
     - .device_test_template
     - .l0_rules
+    - .l0_environment
   interruptible: true
 
 # Cross-build for Drive Orin (D6L)
@@ -190,4 +198,39 @@ l0_cross_build_d6l:
   extends:
     - .cross_build_template
     - .l0_rules
+    - .l0_environment
   interruptible: true
+
+# Cleanup job - Triggered when MR environment is stopped (merged/closed)
+cleanup_l0_mr_cache:
+  stage: .post
+  variables:
+    GIT_STRATEGY: none
+  tags:
+    - a30-edgellm-nvks
+  script:
+    - echo "Cleaning up L0 cache for MR ${CI_MERGE_REQUEST_IID}"
+    # Safety check: ensure CI_MERGE_REQUEST_IID is set
+    - |
+      if [ -z "$CI_MERGE_REQUEST_IID" ]; then
+        echo "ERROR: CI_MERGE_REQUEST_IID is not set!"
+        echo "This cleanup job requires a merge request context."
+        exit 1
+      fi
+    - MR_CACHE_DIR="${EDGE_LLM_CACHE_DIR}/L0/MR_${CI_MERGE_REQUEST_IID}"
+    - |
+      if [ -d "$MR_CACHE_DIR" ]; then
+        echo "Found MR cache directory: $MR_CACHE_DIR"
+        echo "Disk usage before cleanup:"
+        du -sh "$MR_CACHE_DIR" || true
+        echo "Removing $MR_CACHE_DIR..."
+        rm -rf "$MR_CACHE_DIR"
+        echo "✅ Cleanup completed successfully for MR ${CI_MERGE_REQUEST_IID}"
+      else
+        echo "ℹ️  No cache directory found at $MR_CACHE_DIR (already cleaned or no cache created)"
+      fi
+  environment:
+    name: l0_cache/mr_$CI_MERGE_REQUEST_IID
+    action: stop
+  when: on_success
+  allow_failure: true
