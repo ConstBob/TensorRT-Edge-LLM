@@ -97,6 +97,13 @@ class MMMUDataset(EdgeLLMDataset):
 
         return prompt
 
+    def format_system_prompt(self, data: Dict[str, Any]) -> str:
+        """Format system prompt for MMMU dataset (not used in VLMEvalKit mode)"""
+        if self.vlmevalkit:
+            return ""
+
+        return "You are answering a science question. Please answer the question directly with the option's letter from the given choices (A, B, C, D, ...) or using a single word or phrase."
+
     def save_image(self, data: Dict[str, Any]) -> List[str]:
         """Save MMMU image and return relative path."""
         image_paths = []
