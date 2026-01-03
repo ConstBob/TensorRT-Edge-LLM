@@ -207,6 +207,14 @@ class EdgeLLMDataset:
                 # Build messages array in OpenAI format
                 messages = []
 
+                # Add system message if available
+                system_prompt = self.format_system_prompt(data_entry)
+                if system_prompt:
+                    messages.append({
+                        "role": "system",
+                        "content": system_prompt
+                    })
+
                 # Add user message with content
                 if image_paths:
                     # Multimodal: content is array with images and text
