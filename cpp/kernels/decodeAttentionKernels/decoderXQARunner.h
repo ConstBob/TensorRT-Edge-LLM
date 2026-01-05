@@ -39,7 +39,8 @@ struct XQALaunchParams
     void* output = nullptr;          //!< Output tensor
     void const* qInputPtr = nullptr; //!< Query input pointer
     KVCache kvCache;                 //!< KV cache structure
-    float const* kvScale = nullptr;  //!< KV scaling factors
+    float const* kScale = nullptr;   //!< K scaling factors (quantized -> original)
+    float const* vScale = nullptr;   //!< V scaling factors (quantized -> original)
     int32_t* semaphores = nullptr;   //!< Semaphores for synchronization
     void* scratch = nullptr;         //!< Scratch memory
 

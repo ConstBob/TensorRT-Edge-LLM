@@ -327,7 +327,7 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
 
     void* kernelParams[]
         = {&params.numKVheads, &params.qScale, &params.output, &params.qInputPtr, &params.attentionSinks,
-            &params.kvCache, &params.batchSize, &params.kvScale, &params.semaphores, &params.scratch};
+            &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
 
     // The multi-block kernel launch is mainly for long sequence.
     // TODO: Add multiple block launch logic. The launch configuration highly depends on usecase and performance
@@ -353,7 +353,7 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
 
     void* kernelParams[] = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen,
         &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
-        &params.kvCache, &params.batchSize, &params.kvScale, &params.semaphores, &params.scratch};
+        &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
     constexpr int32_t CTA_TILE_Y = 32;
     int32_t const tokenBlockPerGroup = (params.qSeqLen * params.headGroupSize - 1) / CTA_TILE_Y + 1;
     dim3 const dimGrid{1, mNumKVHeads * tokenBlockPerGroup, mBatchSize};
