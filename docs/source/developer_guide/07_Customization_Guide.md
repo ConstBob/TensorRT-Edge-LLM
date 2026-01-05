@@ -1,15 +1,11 @@
 # Customization Guide
 
-**Previous**: [Examples](05_Examples.md)
-
----
-
 ## Customization Architecture
 
 TensorRT Edge-LLM follows a clear data flow from models through to inference, with customization points at each layer:
 
 ```mermaid
-%%{init: {'themeVariables': {'edgeLabelBackground': 'white'}}}%%
+%%{init: {'theme':'neutral', 'themeVariables': {'primaryColor':'#76B900','primaryTextColor':'#fff','primaryBorderColor':'#5a8f00','lineColor':'#666','edgeLabelBackground':'#ffffff','labelTextColor':'#000','clusterBkg':'#ffffff','clusterBorder':'#999'}}}%%
 
 graph TB
     subgraph MODELS ["Models"]
@@ -55,8 +51,8 @@ graph TB
     ENGINE --> RUNTIME
     RUNTIME --> APP
 
-    classDef nvNode fill:#76B900, stroke-width:0px, color:#ffffff
-    classDef layerBox fill:#ffffff, stroke:#76B900, stroke-width:2px
+    classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
+    classDef layerBox fill:none,stroke:#76B900,stroke-width:2px
     
     class MODEL_ARCH,MODEL_WEIGHTS,QUANT,ONNX_EXPORT,CUSTOM_OPERATORS,BUILD_CONFIG,TRT_PLUGINS,TOKENIZATION,SAMPLING_CONFIG,RUNTIME_CONFIG,MULTIMODAL_RUNNER,EXAMPLES nvNode
     class MODELS,EXPORT,ENGINE,RUNTIME,APP layerBox
@@ -64,298 +60,30 @@ graph TB
 
 ### Customization Points by Layer
 
-<table class="simple-table" style="width: 100%;">
-<tr>
-<th class="simple-table-header" style="width: 180px;">Layer</th>
-<th class="simple-table-header" style="width: 220px;">Component</th>
-<th class="simple-table-header">Customization Options</th>
-</tr>
-
-<!-- Models -->
-<tr>
-<td class="simple-table-cell-center" rowspan="2">
-
-**Models**
-
-</td>
-<td class="simple-table-cell">
-
-Model Architecture
-
-</td>
-<td class="simple-table-cell">
-
-**Configuration:** Model config JSON files
-**Inherit/Adapt:** `EdgeLLMModel`, `EdgeLLMDecoderLayer` (`nn.Module`)<br>
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell">
-
-Model Weights
-
-</td>
-<td class="simple-table-cell">
-
-**Drop-in:** Load fine-tuned HuggingFace models<br>
-**Configuration:** Specify model directory path
-
-</td>
-</tr>
-
-<!-- Python Export Pipeline -->
-<tr>
-<td class="simple-table-cell-center" rowspan="3">
-
-**Python Export**
-
-</td>
-<td class="simple-table-cell">
-
-Quantization Strategy
-
-</td>
-<td class="simple-table-cell">
-
-**Configuration:** Choose FP16/FP8/INT4_AWQ/NVFP4/INT8_SQ, calibration settings<br>
-**Inherit/Adapt:** `modelopt.torch.quantization` classes<br>
-**Note:** GPTQ models are loaded as pre-quantized (not created via quantization)
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell">
-
-ONNX Export Logic
-
-</td>
-<td class="simple-table-cell">
-
-**Inherit/Adapt:** `export_llm_model()`, `visual_export()`, `export_draft_model()` functions<br>
-**Configuration:** Dynamic axes, opset version
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell">
-
-Custom Operators
-
-</td>
-<td class="simple-table-cell">
-
-**Registration:** Custom operators via `@torch.library.custom_op()` and `register_custom_op_symbolic()`<br>
-
-</td>
-</tr>
-
-<!-- Engine Builder -->
-<tr>
-<td class="simple-table-cell-center" rowspan="2">
-
-**Engine Builder**
-
-</td>
-<td class="simple-table-cell">
-
-Build Configuration
-
-</td>
-<td class="simple-table-cell">
-
-**Configuration:** Batch size, sequence length, precision, LoRA rank,<br>
-EAGLE settings, VLM mode, image tokens
-**Inherit/Adapt:** Setup optimization profiles for custom models
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell">
-
-Custom Operations
-
-</td>
-<td class="simple-table-cell">
-
-**Plugin:** Implement `IPluginV2DynamicExt`, `IPluginCreator` for TensorRT<br>
-Examples: Custom attention, specialized kernels
-
-</td>
-</tr>
-
-<!-- C++ Runtime -->
-<tr>
-<td class="simple-table-cell-center" rowspan="4">
-
-**C++ Runtime**
-
-</td>
-<td class="simple-table-cell">
-
-Text Processing
-
-</td>
-<td class="simple-table-cell">
-
-**Configuration:** Load different tokenizer vocab files<br>
-**Inherit/Adapt:** `PreTokenizer`, `TokenEncoder` for custom preprocessing
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell">
-
-Sampling Parameters
-
-</td>
-<td class="simple-table-cell">
-
-**Configuration:** Temperature, top-k, top-p values in input JSON<br>
-**Inherit/Adapt:** Extend `sampling.cu` for custom algorithms
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell">
-
-Multimodal Runner
-
-</td>
-<td class="simple-table-cell">
-
-**Inherit/Adapt:** `MultimodalRunner` base class for new multimodal encoders<br>
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell">
-
-Runtime Behavior
-
-</td>
-<td class="simple-table-cell">
-
-**Configuration:** EAGLE parameters, warmup iterations,<br>
-CUDA graphs, system prompt caching, profiling
-
-</td>
-</tr>
-
-<!-- Application Layer -->
-<tr>
-<td class="simple-table-cell-center-last">
-
-**Application**
-
-</td>
-<td class="simple-table-cell-last">
-
-Custom Applications
-
-</td>
-<td class="simple-table-cell-last">
-
-Use examples as templates (see [Examples](05_Examples.md))
-
-</td>
-</tr>
-</table>
+| Layer | Component | Customization Options |
+|-------|-----------|----------------------|
+| **Models** | Model Architecture | **Configuration:** Model config JSON files. **Inherit/Adapt:** `EdgeLLMModel`, `EdgeLLMDecoderLayer` (`nn.Module`) |
+| **Models** | Model Weights | **Drop-in:** Load fine-tuned HuggingFace models. **Configuration:** Specify model directory path |
+| **Python Export** | Quantization Strategy | **Configuration:** Choose FP16/FP8/INT4_AWQ/NVFP4/INT8_SQ, calibration settings. **Inherit/Adapt:** `modelopt.torch.quantization` classes. **Note:** GPTQ models are loaded as pre-quantized (not created via quantization) |
+| **Python Export** | ONNX Export Logic | **Inherit/Adapt:** `export_llm_model()`, `visual_export()`, `export_draft_model()` functions. **Configuration:** Dynamic axes, opset version |
+| **Python Export** | Custom Operators | **Registration:** Custom operators via `@torch.library.custom_op()` and `register_custom_op_symbolic()` |
+| **Engine Builder** | Build Configuration | **Configuration:** Batch size, sequence length, precision, LoRA rank, EAGLE settings, VLM mode, image tokens. **Inherit/Adapt:** Setup optimization profiles for custom models |
+| **Engine Builder** | Custom Operations | **Plugin:** Implement `IPluginV2DynamicExt`, `IPluginCreator` for TensorRT. Examples: Custom attention, specialized kernels |
+| **C++ Runtime** | Text Processing | **Configuration:** Load different tokenizer vocab files. **Inherit/Adapt:** `PreTokenizer`, `TokenEncoder` for custom preprocessing |
+| **C++ Runtime** | Sampling Parameters | **Configuration:** Temperature, top-k, top-p values in input JSON. **Inherit/Adapt:** Extend `sampling.cu` for custom algorithms |
+| **C++ Runtime** | Multimodal Runner | **Inherit/Adapt:** `MultimodalRunner` base class for new multimodal encoders |
+| **C++ Runtime** | Runtime Behavior | **Configuration:** EAGLE parameters, warmup iterations, CUDA graphs, system prompt caching, profiling |
+| **Application** | Custom Applications | Use examples as templates (see [Examples](05_Examples.md)) |
 
 ### Customization Methods Summary
 
-<table class="simple-table">
-<tr>
-<th class="simple-table-header" style="width: 200px;">Method</th>
-<th class="simple-table-header">Description</th>
-<th class="simple-table-header" style="width: 300px;">Best For</th>
-</tr>
-<tr>
-<td class="simple-table-cell-center">
-
-**Inherit/Adapt**
-
-</td>
-<td class="simple-table-cell">
-
-Extend base classes with custom implementations
-
-</td>
-<td class="simple-table-cell">
-
-Model architectures, Multimodal runner, PreTokenizer
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell-center">
-
-**Configuration**
-
-</td>
-<td class="simple-table-cell">
-
-Modify behavior via config files and parameters
-
-</td>
-<td class="simple-table-cell">
-
-Model configs, build settings, runtime parameters, LoRA
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell-center">
-
-**Drop-in Replacement**
-
-</td>
-<td class="simple-table-cell">
-
-Substitute entire components with same interface
-
-</td>
-<td class="simple-table-cell">
-
-Fine-tuned model weights
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell-center">
-
-**Registration**
-
-</td>
-<td class="simple-table-cell">
-
-Register custom components in existing systems
-
-</td>
-<td class="simple-table-cell">
-
-ONNX custom operators, graph patterns
-
-</td>
-</tr>
-<tr>
-<td class="simple-table-cell-center-last">
-
-**Plugin**
-
-</td>
-<td class="simple-table-cell-last">
-
-Implement TensorRT plugins for custom operations
-
-</td>
-<td class="simple-table-cell-last">
-
-Custom TensorRT layers, hardware-specific ops
-
-</td>
-</tr>
-</table>
+| Method | Description | Best For |
+|--------|-------------|----------|
+| **Inherit/Adapt** | Extend base classes with custom implementations | Model architectures, Multimodal runner, PreTokenizer |
+| **Configuration** | Modify behavior via config files and parameters | Model configs, build settings, runtime parameters, LoRA |
+| **Drop-in Replacement** | Substitute entire components with same interface | Fine-tuned model weights |
+| **Registration** | Register custom components in existing systems | ONNX custom operators, graph patterns |
+| **Plugin** | Implement TensorRT plugins for custom operations | Custom TensorRT layers, hardware-specific ops |
 
 ---
 
@@ -581,9 +309,9 @@ The [`SamplingParams`](../../../cpp/sampler/sampling.h) structure controls token
 
 | Parameter | Range | Effect |
 |-----------|-------|--------|
-| `temperature` | 0.0 - 2.0 | **0.0**: Deterministic (greedy)<br>**1.0**: Standard sampling<br>**>1.0**: More random/creative |
-| `top_k` | 0 - vocab_size | **0**: Disabled<br>**1**: Greedy<br>**50**: Sample from top 50 tokens |
-| `top_p` | 0.0 - 1.0 | **1.0**: Disabled<br>**0.9**: Nucleus sampling (top 90% prob mass) |
+| `temperature` | 0.0 - 2.0 | **0.0**: Deterministic (greedy). **1.0**: Standard sampling. **>1.0**: More random/creative |
+| `top_k` | 0 - vocab_size | **0**: Disabled. **1**: Greedy. **50**: Sample from top 50 tokens |
+| `top_p` | 0.0 - 1.0 | **1.0**: Disabled. **0.9**: Nucleus sampling (top 90% prob mass) |
 
 To add more sampling params (e.g., repetition_penalty, logits_bias) or custom sampling algorithms (e.g., beam search), extend the sampling functions in [`sampling.cu`](../../../cpp/sampler/sampling.cu).
 
@@ -612,7 +340,7 @@ The [`LLMInferenceRuntime`](../../../cpp/runtime/llmInferenceRuntime.h) provides
 - **CUDA Graph Capture**: Reduces kernel launch overhead by capturing and replaying execution sequences via `captureDecodingCUDAGraph()`
 - **System Prompt Caching**: Caches KV states for frequently-used system prompts via `genAndSaveSystemPromptKVCache()` to reduce first-token latency
 - **LoRA Switching**: Dynamically switches between LoRA adapters at runtime without engine rebuild
-- **EAGLE3 Speculative Decoding**: Accelerates generation using draft-then-verify approach via [`EagleInferenceRuntime`](../../../cpp/runtime/eagleInferenceRuntime.h) with tree-based draft proposal and verification
+- **EAGLE3 Speculative Decoding**: Accelerates generation using draft-then-verify approach via [`llmInferenceSpecDecodeRuntime`](../../../cpp/runtime/llmInferenceSpecDecodeRuntime.h) with tree-based draft proposal and verification
 
 To extend runtime capabilities, modify [`LLMEngineRunner`](../../../cpp/runtime/llmEngineRunner.h) for core execution logic or [`LLMInferenceRuntime`](../../../cpp/runtime/llmInferenceRuntime.cpp) for high-level request handling.
 

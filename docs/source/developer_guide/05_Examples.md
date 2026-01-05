@@ -1,22 +1,6 @@
 # Examples
 
-**Previous**: [Advanced Runtime Features](04.4_Advanced_Runtime_Features.md)
-
----
-
 > **Code Location:** `examples/` | **Build:** `examples/llm/`, `examples/multimodal/`
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Example Flow](#example-flow)
-- [Build Examples](#build-examples)
-- [Inference Examples](#inference-examples)
-- [Complete Workflows](#complete-workflows)
-- [Input File Formats](#input-file-formats)
-- [Common Parameters](#common-parameters)
-
----
 
 ## Overview
 

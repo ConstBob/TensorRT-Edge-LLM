@@ -2,13 +2,6 @@
 
 This documentation explains the usage of TensorRT plugins with TensorRT Edge-LLM and guides users to make further customizations.
 
-## Table of Contents
-- [Overview](#overview)
-- [AttentionPlugin](#attentionplugin)
-- [Int4GroupwiseGemmPlugin](#int4groupwisegemmplugin)
-
----
-
 ## Overview
 
 TensorRT plugins are custom operations that extend the functionality of the TensorRT core library through user-defined layer implementations. Within the TensorRT Edge-LLM framework, plugins provide specialized implementations for key large language model (LLM) inference operations that require optimizations beyond those available through standard TensorRT library deliverables.

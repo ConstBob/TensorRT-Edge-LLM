@@ -1,19 +1,6 @@
 # Supported Models
 
-**Previous**: [Installation](01.3_Installation.md) | **Next**: [Python Export Pipeline](03.1_Python_Export_Pipeline.md)
-
----
-
 > **Code Location:** `tensorrt_edgellm/` (export), `cpp/` (runtime)
-
-## Table of Contents
-
-- [Large Language Models (LLMs)](#large-language-models-llms)
-- [Vision-Language Models (VLMs)](#vision-language-models-vlms)
-- [Precision Support](#precision-support)
-- [Platform Compatibility](#platform-compatibility)
-
----
 
 ## Large Language Models (LLMs)
 

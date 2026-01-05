@@ -36,22 +36,22 @@ bool isValidVersionFormat(std::string const& version)
     }
 
     std::stringstream ss(version);
-    int major, minor, patch, build;
-    char dot1, dot2, dot3;
+    int major, minor, patch;
+    char dot1, dot2;
 
-    // Try to parse: major.minor.patch.build
-    if (!(ss >> major >> dot1 >> minor >> dot2 >> patch >> dot3 >> build))
+    // Try to parse: major.minor.patch
+    if (!(ss >> major >> dot1 >> minor >> dot2 >> patch))
     {
         return false;
     }
 
     // Verify dots are correct
-    if (dot1 != '.' || dot2 != '.' || dot3 != '.')
+    if (dot1 != '.' || dot2 != '.')
     {
         return false;
     }
 
-    // Verify no extra characters after build number
+    // Verify no extra characters after patch number
     std::string remaining;
     if (ss >> remaining)
     {
@@ -59,7 +59,7 @@ bool isValidVersionFormat(std::string const& version)
     }
 
     // Verify all parts are non-negative
-    if (major < 0 || minor < 0 || patch < 0 || build < 0)
+    if (major < 0 || minor < 0 || patch < 0)
     {
         return false;
     }
@@ -79,7 +79,7 @@ bool checkVersion(std::string const& modelVersion)
 
     if (!isValidVersionFormat(modelVersion))
     {
-        LOG_ERROR("Invalid model version format: %s. Expected major.minor.patch.build", modelVersion.c_str());
+        LOG_ERROR("Invalid model version format: %s. Expected major.minor.patch", modelVersion.c_str());
         return false;
     }
 
