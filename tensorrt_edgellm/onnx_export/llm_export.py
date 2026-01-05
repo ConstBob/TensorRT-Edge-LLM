@@ -309,7 +309,7 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         inputs = tuple(base_inputs)
 
         # Create input names
-        input_names = [f'past_key_values.{i}' for i in range(num_layers)] + [
+        input_names = [f'past_key_values_{i}' for i in range(num_layers)] + [
             'rope_rotary_cos_sin', 'context_lengths', 'last_token_ids'
         ]
 
@@ -336,16 +336,16 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         # Create output names
         if is_eagle_base or is_eagle_draft:
             output_names = ['logits', 'hidden_states'] + [
-                f'present_key_values.{i}' for i in range(num_layers)
+                f'present_key_values_{i}' for i in range(num_layers)
             ]
         else:
             output_names = ['logits'] + [
-                f'present_key_values.{i}' for i in range(num_layers)
+                f'present_key_values_{i}' for i in range(num_layers)
             ]
 
         # Create dynamic shapes
         past_key_values_shapes = {
-            f"past_key_values.{i}": {
+            f"past_key_values_{i}": {
                 0: "batch_size",
                 3: "past_len"
             }
@@ -353,7 +353,7 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         }
 
         present_key_values_shapes = {
-            f"present_key_values.{i}": {
+            f"present_key_values_{i}": {
                 0: "batch_size",
                 3: "present_kv_cache_len"
             }

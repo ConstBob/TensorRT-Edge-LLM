@@ -275,7 +275,7 @@ inline constexpr char const* kLoraBPrefix = "lora_B";
  * @brief EDGELLM version
  *
  * Value: "major.minor.patch.build"
- * Example: "0.4.0.0"
+ * Example: "0.5.0.0"
  */
 inline constexpr char const* kEdgellmVersion = "edgellm_version";
 
@@ -294,7 +294,7 @@ inline constexpr char const* kEdgellmVersion = "edgellm_version";
  */
 inline std::string formatKVCacheName(int32_t layerIdx, bool isPast = true)
 {
-    return std::string(isPast ? kPastKeyValuesTemplate : kPresentKeyValuesTemplate) + "." + std::to_string(layerIdx);
+    return std::string(isPast ? kPastKeyValuesTemplate : kPresentKeyValuesTemplate) + "_" + std::to_string(layerIdx);
 }
 
 /*!
