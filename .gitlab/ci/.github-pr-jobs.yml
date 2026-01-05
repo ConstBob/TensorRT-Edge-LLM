@@ -24,6 +24,12 @@
     - rm -rf 3rdParty/googletest 3rdParty/nlohmannJson
     - export LLM_SDK_DIR=$GITHUB_CLONE_DIR
 
+.github_pr_cleanup:
+  after_script:
+    - echo "Cleaning up GitHub PR clone directory"
+    - rm -rf /tmp/github_pr_${CI_PIPELINE_ID}
+    - echo "Cleanup complete"
+
 github_pr_l0_ampere_export:
   stage: l0_test
   variables:
@@ -39,6 +45,7 @@ github_pr_l0_ampere_export:
   image: "$IMAGE"
   extends:
     - .github_pr_clone
+    - .github_pr_cleanup
     - .export_onnx_template
     - .github_pr_rules_manual
 
@@ -61,5 +68,6 @@ github_pr_l0_a30:
   image: "$IMAGE"
   extends:
     - .github_pr_clone
+    - .github_pr_cleanup
     - .x86_test_template
     - .github_pr_rules_auto

@@ -42,6 +42,7 @@ using Json = nlohmann::json;
 // Enum for command line option IDs (using traditional enum for C library compatibility)
 enum LLMInferenceOptionId : int
 {
+    HELP = 900,
     INPUT_FILE = 901,
     ENGINE_DIR = 902,
     MULTIMODAL_ENGINE_DIR = 903,
@@ -80,6 +81,7 @@ struct EagleArgs
 
 struct LLMInferenceArgs
 {
+    bool help{false};
     std::string engineDir;
     std::string multimodalEngineDir{""};
     std::string inputFile;
@@ -107,6 +109,7 @@ void printUsage(char const* programName)
                  "[--eagleVerifyTreeSize=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
+    std::cerr << "  --help                    Display this help message" << std::endl;
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
     std::cerr << "  --engineDir               Path to engine directory" << std::endl;
     std::cerr << "  --multimodalEngineDir     Path to multimodal engine directory (optional)" << std::endl;
@@ -131,7 +134,8 @@ void printUsage(char const* programName)
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
-    static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, LLMInferenceOptionId::INPUT_FILE},
+    static struct option inferenceOptions[] = {{"help", no_argument, 0, LLMInferenceOptionId::HELP},
+        {"inputFile", required_argument, 0, LLMInferenceOptionId::INPUT_FILE},
         {"engineDir", required_argument, 0, LLMInferenceOptionId::ENGINE_DIR},
         {"multimodalEngineDir", required_argument, 0, LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR},
         {"outputFile", required_argument, 0, LLMInferenceOptionId::OUTPUT_FILE},
@@ -152,6 +156,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     {
         switch (opt)
         {
+        case LLMInferenceOptionId::HELP: args.help = true; return true;
         case LLMInferenceOptionId::INPUT_FILE: args.inputFile = optarg; break;
         case LLMInferenceOptionId::ENGINE_DIR: args.engineDir = optarg; break;
         case LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
@@ -589,7 +594,12 @@ int main(int argc, char* argv[])
     if (!parseLLMInferenceArgs(args, argc, argv))
     {
         printUsage(argv[0]);
-        return 1;
+        return EXIT_FAILURE;
+    }
+    if (args.help)
+    {
+        printUsage(argv[0]);
+        return EXIT_SUCCESS;
     }
     bool profilerEnabled = args.dumpProfile;
     MemoryMonitor memoryMonitor;
