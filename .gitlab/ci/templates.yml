@@ -30,7 +30,7 @@
 .sanity_python_check_template:
   script:
     - echo "Pipeline start time:$(date)"
-    - export LLM_SDK_DIR=$(pwd)
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - echo "Installing TensorRT Edge-LLM in editable mode for sanity check"
     - pip3 install -e .
     - echo "✅ TensorRT Edge-LLM installation successful!"
@@ -48,7 +48,7 @@
     - apt install -y -qq python3 python3-pip git curl >/dev/null 2>&1
     - echo "Testing model export"
     - ls /scratch.trt_llm_data
-    - export LLM_SDK_DIR=$(pwd)
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - echo "Installing package dependencies"
     - cd $LLM_SDK_DIR
     - pip3 install -q build
@@ -78,7 +78,7 @@
     - echo "Checking TRT x86_64 package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
     - echo "Using TensorRT x86_64 package directly from cache"
-    - export LLM_SDK_DIR=$(pwd)
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
@@ -108,7 +108,7 @@
     # clean up the packages in the board
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_init.sh
     - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
-    - export LLM_SDK_DIR=$(pwd)
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
