@@ -96,7 +96,8 @@ class AssistantMessage(Message):
 
 def _format_messages(tokenizer: Any,
                      messages: List[Message],
-                     add_generation_prompt: bool = False) -> str:
+                     add_generation_prompt: bool = False,
+                     enable_thinking: Optional[bool] = None) -> str:
     """
     Format the messages using the tokenizer's chat template.
     
@@ -104,6 +105,10 @@ def _format_messages(tokenizer: Any,
         tokenizer: HuggingFace loaded tokenizer
         messages: List of messages
         add_generation_prompt: Whether to add generation prompt
+        enable_thinking: Optional parameter for models that support thinking mode
+                        None = use model default behavior
+                        False = disable thinking
+                        True = explicitly enable thinking
         
     Returns:
         Formatted text
@@ -111,38 +116,41 @@ def _format_messages(tokenizer: Any,
     Raises:
         ValueError: If unable to format messages
     """
+    # Convert dataclass messages to dictionaries
+    message_dicts = [asdict(msg) for msg in messages]
+
+    # Build kwargs for apply_chat_template
+    kwargs = {
+        'tokenize': False,
+        'add_generation_prompt': add_generation_prompt
+    }
+
+    # Only add enable_thinking if explicitly set (Qwen3-specific)
+    if enable_thinking is not None:
+        kwargs['enable_thinking'] = enable_thinking
+
     try:
-        # Convert dataclass messages to dictionaries using asdict
-        message_dicts = [asdict(msg) for msg in messages]
-
-        return tokenizer.apply_chat_template(
-            message_dicts,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt)
+        return tokenizer.apply_chat_template(message_dicts, **kwargs)
     except Exception:
-        # Try fallback: convert list content to string for tokenizers that don't support multimodal
-        try:
-            message_dicts = []
-            for msg in messages:
-                content = msg.content
-                # If content is a list, extract the first text element
-                if isinstance(content, list):
-                    for item in content:
-                        if isinstance(item,
-                                      dict) and item.get('type') == 'text':
-                            content = item.get('text', '')
-                            break
-                message_dicts.append({"role": msg.role, "content": content})
+        # Fallback: convert list content to string for tokenizers that don't support multimodal
+        message_dicts = []
+        for msg in messages:
+            content = msg.content
+            # If content is a list, extract the first text element
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get('type') == 'text':
+                        content = item.get('text', '')
+                        break
+            message_dicts.append({"role": msg.role, "content": content})
 
-            return tokenizer.apply_chat_template(
-                message_dicts,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt)
-        except Exception as e2:
+        try:
+            return tokenizer.apply_chat_template(message_dicts, **kwargs)
+        except Exception as e:
             raise ValueError(
-                f"Unable to format messages using HuggingFace tokenizer's apply_chat_template method."
-                f"Messages need to be in the format: role: <str>, content: <str|list of dicts>. Check INPUT_FORMAT.md for more details."
-                f"Error: {e2}") from e2
+                f"Unable to format messages using HuggingFace tokenizer's apply_chat_template method. "
+                f"Messages need to be in the format: role: <str>, content: <str|list of dicts>. "
+                f"Check INPUT_FORMAT.md for more details. Error: {e}") from e
 
 
 def _extract_prefix_suffix(text: str, placeholder: str) -> Tuple[str, str]:
@@ -349,11 +357,31 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     assistant_prefix, assistant_suffix = _extract_prefix_suffix(
         assistant_formatted[len(user_formatted):], assistant_prompt.content)
 
-    # Extract generation prompt
+    # Extract standard generation prompt with thinking disabled
     generation_formatted = _format_messages(tokenizer,
                                             [system_prompt, user_prompt],
-                                            add_generation_prompt=True)
+                                            add_generation_prompt=True,
+                                            enable_thinking=False)
     generation_prompt = generation_formatted[len(user_formatted):]
+
+    # Extract generation prompt with thinking enabled (if supported by model)
+    generation_prompt_thinking = None
+    try:
+        thinking_formatted = _format_messages(tokenizer,
+                                              [system_prompt, user_prompt],
+                                              add_generation_prompt=True)
+        generation_prompt_thinking = thinking_formatted[len(user_formatted):]
+
+        # Only keep if different (model supports thinking mode)
+        if generation_prompt_thinking != generation_prompt:
+            print(
+                "Detected thinking mode support, extracted both generation prompts"
+            )
+        else:
+            generation_prompt_thinking = None
+    except Exception:
+        # Model doesn't support thinking mode
+        pass
 
     # Build content types
     content_types = {}
@@ -430,6 +458,11 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
         "generation_prompt": generation_prompt,
         "default_system_prompt": default_system_prompt
     }
+
+    # Add thinking mode generation prompt if model supports it
+    if generation_prompt_thinking is not None:
+        chat_template_data[
+            "generation_prompt_thinking"] = generation_prompt_thinking
 
     # Save to output directory
     os.makedirs(output_dir, exist_ok=True)

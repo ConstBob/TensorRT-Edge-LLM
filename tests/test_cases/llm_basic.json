@@ -8,10 +8,6 @@
         {
             "messages": [
                 {
-                    "role": "system",
-                    "content": "You are a helpful assistant and you want to provide friendly answers for the user's question and provide a concise answer if possible."
-                },
-                {
                     "role": "user",
                     "content": "Please introduce the company NVIDIA and its CEO."
                 }

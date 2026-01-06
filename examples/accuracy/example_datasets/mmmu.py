@@ -42,18 +42,21 @@ class MMMUDataset(EdgeLLMDataset):
     }
     """
 
-    def __init__(self, dataset: Dataset, config: DatasetConfig, **kwargs):
+    def __init__(self,
+                 dataset: Dataset,
+                 config: DatasetConfig,
+                 vlmevalkit: bool = False,
+                 **kwargs):
         super().__init__(dataset=dataset, config=config, **kwargs)
         self.images_dir = os.path.join(self.output_dir, "images")
         os.makedirs(self.images_dir, exist_ok=True)
-
-    def format_system_prompt(self, data: Dict[str, Any]) -> str:
-        """Format MMMU system prompt"""
-        # vlm_accuracy.cpp doesn't use a system prompt, just user prompt
-        return ""
+        self.vlmevalkit = vlmevalkit
 
     def format_user_prompt(self, data: Dict[str, Any]) -> str:
         """Format MMMU prompt with question and multiple choice options"""
+        if self.vlmevalkit:
+            return self.format_user_prompt_vlmevalkit(data)
+
         # Start with the question
         if "question" in data:
             user_prompt = data["question"]
@@ -73,6 +76,33 @@ class MMMUDataset(EdgeLLMDataset):
             user_prompt += "\n\nAnswer the question using a single word or phrase."
 
         return user_prompt
+
+    def format_user_prompt_vlmevalkit(self, data: Dict[str, Any]) -> str:
+        """Format MMMU prompt with question and multiple choice options for VLMEvalkit format"""
+
+        question = data['question']
+        prompt = f'Question: {question}\n'
+
+        options_str = data["options"].strip("[]") if "options" in data else ""
+        if options_str:
+            options_list = ast.literal_eval(options_str)
+            if len(options_list):
+                options_prompt = 'Options:\n'
+                for i, option in enumerate(options_list):
+                    letter = chr(ord('A') + i)
+                    options_prompt += f'{letter}. {option}\n'
+
+                prompt += options_prompt
+                prompt += 'Please select the correct answer from the options above. \n'
+
+        return prompt
+
+    def format_system_prompt(self, data: Dict[str, Any]) -> str:
+        """Format system prompt for MMMU dataset (not used in VLMEvalKit mode)"""
+        if self.vlmevalkit:
+            return ""
+
+        return "You are answering a science question. Please answer the question directly with the option's letter from the given choices (A, B, C, D, ...) or using a single word or phrase."
 
     def save_image(self, data: Dict[str, Any]) -> List[str]:
         """Save MMMU image and return relative path."""
@@ -149,7 +179,8 @@ def convert_mmmu_pro_dataset(
 
 def convert_mmmu_dataset(config: DatasetConfig,
                          dataset_name_or_dir: str = "MMMU/MMMU",
-                         output_dir: Union[str, os.PathLike] = "mmmu_dataset"):
+                         output_dir: Union[str, os.PathLike] = "mmmu_dataset",
+                         vlmevalkit: bool = False):
     """
     Convert MMMU dataset to TensorRT Edge-LLM format.
     
@@ -157,6 +188,7 @@ def convert_mmmu_dataset(config: DatasetConfig,
         config: DatasetConfig object with processing parameters
         dataset_name_or_dir: HuggingFace dataset name or local directory path
         output_dir: Output directory for converted dataset
+        vlmevalkit: Whether to convert to VLMEvalkit format
     """
     # https://huggingface.co/datasets/MMMU/MMMU
     if "MMMU/MMMU" not in dataset_name_or_dir:
@@ -181,6 +213,7 @@ def convert_mmmu_dataset(config: DatasetConfig,
 
     edge_llm_mmmu_dataset = MMMUDataset(dataset=concat_mmmu_dataset,
                                         config=config,
+                                        vlmevalkit=vlmevalkit,
                                         output_dir=output_dir)
 
     print(f"Processing MMMU dataset with config: {config}")

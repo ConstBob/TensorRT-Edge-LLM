@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define the output archive name
-VERSION="0.5.0.0"
+VERSION="0.5.0"
 OUTPUT_FILE="tensorrt_edge_llm-${VERSION}.tar.gz"
 TMP_DIR="tensorrt_edge_llm-${VERSION}"
 mkdir -p $TMP_DIR

@@ -60,6 +60,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     if os.path.exists(args.output_dir):
+        print(f"Removing existing output directory {args.output_dir}")
         shutil.rmtree(args.output_dir)
     os.makedirs(args.output_dir)
 

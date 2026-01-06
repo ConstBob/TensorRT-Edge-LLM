@@ -394,6 +394,15 @@ void phi4mmPostprocessVisionTokens(rt::Tensor const& srcEmbedding, rt::Tensor& d
         "phi4mmPostprocessVisionTokens(): Embeddings and dstEmbedding must be FP16.");
 
     int32_t const hidden = static_cast<int32_t>(srcEmbedding.getShape()[1]);
+    check::check(hidden == dstEmbedding.getShape()[1],
+        "phi4mmPostprocessVisionTokens(): srcEmbedding and dstEmbedding must have the same hidden size.");
+
+    // Require enough space for totalOutTokens * hidden elements of dstEmbedding's data type.
+    int64_t const bytesPerElem = static_cast<int64_t>(rt::utils::getTypeSize(dstEmbedding.getDataType()));
+    int64_t const requiredBytes = totalOutTokens * static_cast<int64_t>(hidden) * bytesPerElem;
+    check::check(requiredBytes <= dstEmbedding.getMemoryCapacity(),
+        "phi4mmPostprocessVisionTokens(): Total output tokens exceed dstEmbedding memory capacity.");
+
     dim3 block(128);
     dim3 grid(static_cast<uint32_t>(totalOutTokens));
     phi4mmPostprocessVisionTokensKernel<<<grid, block, 0, stream>>>(

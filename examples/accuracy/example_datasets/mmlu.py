@@ -82,29 +82,29 @@ class MMLUDataset(EdgeLLMDataset):
         # Return up to num_shot examples
         return subject_examples[:self.num_shot]
 
-    def format_system_prompt(self, data: Dict[str, Any]) -> str:
-        """Format MMLU system prompt"""
-        # Format subject name
-        subject_fmt = data["subject"].replace("_", " ")
-        system_prompt = f"The following are multiple choice questions (with answers) about {subject_fmt}.\n\n"
-
-        # Add few-shot examples if available
-        few_shot_examples = self._get_few_shot_examples(data["subject"])
-        for example in few_shot_examples:
-            system_prompt += self._format_single_example(example,
-                                                         include_answer=True)
-        return system_prompt
-
     def format_user_prompt(self, data: Dict[str, Any]) -> str:
-        """Format MMLU prompt with question and multiple choice options - matches C++ genDevPrompt approach."""
+        """Format MMLU prompt with question and multiple choice options."""
 
         assert "question" in data, "question is required"
         assert "choices" in data, "choices is required"
         assert "answer" in data, "answer is required"
         assert "subject" in data, "subject is required"
 
+        # Build user prompt with few-shot examples prepended
+        user_prompt = ""
+
+        # Format subject name and add header
+        subject_fmt = data["subject"].replace("_", " ")
+        user_prompt += f"The following are multiple choice questions (with answers) about {subject_fmt}.\n\n"
+
+        # Add few-shot examples if available
+        few_shot_examples = self._get_few_shot_examples(data["subject"])
+        for example in few_shot_examples:
+            user_prompt += self._format_single_example(example,
+                                                       include_answer=True)
+
         # Add the current question
-        user_prompt = self._format_single_example(data, include_answer=False)
+        user_prompt += self._format_single_example(data, include_answer=False)
         return user_prompt
 
     def extract_answer(self, data: Dict[str, Any]) -> Optional[str]:
@@ -153,11 +153,11 @@ def convert_mmlu_dataset(config: DatasetConfig,
                                         config=config,
                                         dev_dataset=dev_dataset,
                                         num_shot=num_shot,
-                                        output_dir=output_dir)
+                                        output_dir=output_dir,
+                                        apply_chat_template=False)
 
     print(f"Processing MMLU dataset with config: {config}")
-    edge_llm_mmlu_dataset.process_and_save_dataset(
-        "mmlu_dataset.json", overwrite_formatted_prompts=True)
+    edge_llm_mmlu_dataset.process_and_save_dataset("mmlu_dataset.json")
 
     print(f"Successfully converted MMLU dataset to {output_dir}")
     return edge_llm_mmlu_dataset

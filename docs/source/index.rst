@@ -93,7 +93,7 @@ Learn how to customize and extend TensorRT Edge-LLM for your specific needs.
    :maxdepth: 2
    :caption: Customization
 
-   developer_guide/06_Customization_Guide.md
+   developer_guide/07_Customization_Guide.md
    
 TensorRT Plugins
 ----------------
@@ -104,7 +104,7 @@ Learn about the usage of TensorRT plugins with TensorRT Edge-LLM and how to make
    :maxdepth: 2
    :caption: TensorRT Plugins
 
-   developer_guide/07_TensorRT_Plugins.md
+   developer_guide/08_TensorRT_Plugins.md
 
 
 APIs

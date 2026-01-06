@@ -277,6 +277,8 @@ def load_hf_model(
     tokenizer = AutoTokenizer.from_pretrained(model_dir,
                                               trust_remote_code=True)
 
+    # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
+    # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
     if _is_phi4mm_model(model_dir):
         # Avoid converting the model into a PEFT-wrapped model, which ModelOpt and
         # Transformers cannot currently handle correctly. LoRA weights will instead

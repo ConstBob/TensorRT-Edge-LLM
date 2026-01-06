@@ -19,6 +19,6 @@
       "format": "<|endoftext10|>"
     }
   },
-  "generation_prompt": "<|end|><|assistant|>",
+  "generation_prompt": "<|assistant|>",
   "default_system_prompt": ""
 }

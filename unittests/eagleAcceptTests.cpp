@@ -52,7 +52,8 @@ protected:
         std::function<void(std::vector<int32_t> const&, std::vector<int32_t> const&, std::vector<int32_t> const&,
             EagleAcceptResult const&)>
             validator
-        = nullptr)
+        = nullptr,
+        std::vector<int32_t> const& vocabMappingTableData = {})
     {
         // Create GPU tensors with proper shapes
         rt::Tensor logitsTensor(
@@ -79,11 +80,23 @@ protected:
         void* workspace;
         CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
+        // Setup vocab mapping table if provided
+        rt::OptionalInputTensor vocabMappingTable = std::nullopt;
+        rt::Tensor vocabMappingTableTensor;
+        if (!vocabMappingTableData.empty())
+        {
+            vocabMappingTableTensor = rt::Tensor({static_cast<int64_t>(vocabMappingTableData.size())},
+                rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "vocabMappingTable");
+            CUDA_CHECK(cudaMemcpy(vocabMappingTableTensor.rawPointer(), vocabMappingTableData.data(),
+                vocabMappingTableData.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+            vocabMappingTable = std::ref(vocabMappingTableTensor);
+        }
+
         // Execute kernel with timing
         auto start = std::chrono::high_resolution_clock::now();
         EXPECT_NO_THROW({
             kernel::eagleAccept(logitsTensor, tokenIdsTensor, attentionMaskTensor, acceptedTokenIdsTensor,
-                acceptedLogitsIndicesTensor, acceptLengthTensor, workspace, workspaceSize, stream);
+                acceptedLogitsIndicesTensor, acceptLengthTensor, vocabMappingTable, workspace, workspaceSize, stream);
             CUDA_CHECK(cudaDeviceSynchronize());
         });
         auto end = std::chrono::high_resolution_clock::now();
@@ -93,8 +106,8 @@ protected:
         CUDA_CHECK(cudaFree(workspace));
 
         // Run reference implementation for comparison
-        EagleAcceptResult refResult
-            = eagleAcceptRef(logits, tokenIds, attentionMask, batchSize, numTokens, vocabSize, maxDepth);
+        EagleAcceptResult refResult = eagleAcceptRef(
+            logits, tokenIds, attentionMask, batchSize, numTokens, vocabSize, maxDepth, vocabMappingTableData);
 
         // Copy results back to host for validation
         std::vector<int32_t> hostAcceptedTokenIds(batchSize * maxDepth);
@@ -723,10 +736,234 @@ TEST_F(EagleAcceptTest, DeviceValidation)
     CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
     // Kernel should throw due to CPU tensor
-    EXPECT_THROW(kernel::eagleAccept(logitsTensor, tokenIdsTensor, attentionMaskTensor, acceptedTokenIdsTensor,
-                     acceptedLogitsIndicesTensor, acceptLengthTensor, workspace, workspaceSize, stream),
+    rt::OptionalInputTensor vocabMappingTable = std::nullopt;
+    EXPECT_THROW(
+        kernel::eagleAccept(logitsTensor, tokenIdsTensor, attentionMaskTensor, acceptedTokenIdsTensor,
+            acceptedLogitsIndicesTensor, acceptLengthTensor, vocabMappingTable, workspace, workspaceSize, stream),
         std::runtime_error)
         << "Should reject CPU tensor";
 
     CUDA_CHECK(cudaFree(workspace));
+}
+
+// Test vocabulary reduction with mapping table - single batch
+TEST_F(EagleAcceptTest, VocabularyReductionSingleBatch)
+{
+    constexpr int32_t numTokens = 4;
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t reducedVocabSize = 8; // Reduced vocabulary (output by model)
+    constexpr int32_t maxDepth = 4;
+
+    /*
+     * Reduced vocab [0,1,2,3,4,5,6,7] maps to full vocab [50,51,52,53,54,55,56,57]
+     * Tree [50->51->52->53] in full vocab space
+     * Logits predict [1,2,3,0] in reduced vocab -> maps to [51,52,53,50] in full vocab
+     * Expected: [51,52,53,50] indices=[0,1,2,3] length=4
+     */
+
+    // Setup vocab mapping table: reduced vocab index -> full vocab token
+    std::vector<int32_t> vocabMappingTable(reducedVocabSize);
+    for (int32_t i = 0; i < reducedVocabSize; ++i)
+    {
+        vocabMappingTable[i] = 50 + i; // Maps 0->50, 1->51, ..., 7->57
+    }
+
+    // Setup token IDs in full vocab space: [50, 51, 52, 53]
+    std::vector<int32_t> tokenIds(batchSize * numTokens);
+    tokenIds[0] = 50;
+    tokenIds[1] = 51;
+    tokenIds[2] = 52;
+    tokenIds[3] = 53;
+
+    // Setup triangular attention mask (full chain)
+    std::vector<int8_t> attentionMask(batchSize * numTokens * numTokens, 0);
+    for (int32_t i = 0; i < numTokens; ++i)
+    {
+        for (int32_t j = 0; j <= i; ++j)
+        {
+            attentionMask[i * numTokens + j] = 1;
+        }
+    }
+
+    // Setup logits in REDUCED vocab space
+    std::vector<float> logits(batchSize * numTokens * reducedVocabSize, -5.0f);
+
+    // Add noise
+    for (int32_t i = 0; i < batchSize * numTokens * reducedVocabSize; ++i)
+    {
+        logits[i] += (i % 7) * 0.01f;
+    }
+
+    // Favor path in reduced vocab: [1,2,3,0] -> maps to full vocab [51,52,53,50]
+    logits[0 * reducedVocabSize + 1] = 10.0f; // pos 0 -> reduced 1 -> full 51
+    logits[1 * reducedVocabSize + 2] = 10.0f; // pos 1 -> reduced 2 -> full 52
+    logits[2 * reducedVocabSize + 3] = 10.0f; // pos 2 -> reduced 3 -> full 53
+    logits[3 * reducedVocabSize + 0] = 10.0f; // pos 3 -> reduced 0 -> full 50
+
+    runEagleAcceptTest(
+        tokenIds, attentionMask, logits, batchSize, numTokens, reducedVocabSize, maxDepth,
+        "VocabularyReductionSingleBatch",
+        [](auto const& acceptedTokenIds, auto const& acceptedLogitsIndices, auto const& acceptLengths, auto const&) {
+            EXPECT_EQ(acceptLengths[0], 4) << "Should accept all 4 tokens in the chain";
+
+            // Verify accepted tokens are in FULL vocab space after mapping
+            EXPECT_EQ(acceptedTokenIds[0], 51) << "Token 0: reduced 1 -> full 51";
+            EXPECT_EQ(acceptedTokenIds[1], 52) << "Token 1: reduced 2 -> full 52";
+            EXPECT_EQ(acceptedTokenIds[2], 53) << "Token 2: reduced 3 -> full 53";
+            EXPECT_EQ(acceptedTokenIds[3], 50) << "Token 3: reduced 0 -> full 50";
+
+            EXPECT_EQ(acceptedLogitsIndices[0], 0) << "Logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[1], 1) << "Logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[2], 2) << "Logits index 2";
+            EXPECT_EQ(acceptedLogitsIndices[3], 3) << "Logits index 3";
+        },
+        vocabMappingTable);
+}
+
+// Test vocabulary reduction with multi-batch
+TEST_F(EagleAcceptTest, VocabularyReductionMultiBatch)
+{
+    constexpr int32_t numTokens = 3;
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t reducedVocabSize = 16; // Reduced vocabulary
+    constexpr int32_t maxDepth = 3;
+
+    /*
+     * Reduced vocab [0-15] maps to full vocab [100-115]
+     * BATCH 0: Tree [100->101->102], logits [1,2,0] reduced -> [101,102,100] full
+     * BATCH 1: Tree [105->106], logits [6,7] reduced -> [106,107] full (107 not in tree)
+     */
+
+    // Setup vocab mapping table: reduced vocab index -> full vocab token
+    std::vector<int32_t> vocabMappingTable(reducedVocabSize);
+    for (int32_t i = 0; i < reducedVocabSize; ++i)
+    {
+        vocabMappingTable[i] = 100 + i; // Maps 0->100, 1->101, ..., 15->115
+    }
+
+    // Setup token IDs in full vocab space
+    std::vector<int32_t> tokenIds(batchSize * numTokens);
+    tokenIds[0 * numTokens + 0] = 100;
+    tokenIds[0 * numTokens + 1] = 101;
+    tokenIds[0 * numTokens + 2] = 102;
+    tokenIds[1 * numTokens + 0] = 105;
+    tokenIds[1 * numTokens + 1] = 106;
+    tokenIds[1 * numTokens + 2] = 107; // This won't be matched
+
+    // Setup attention masks
+    std::vector<int8_t> attentionMask(batchSize * numTokens * numTokens, 0);
+
+    // Batch 0: full chain [100->101->102]
+    for (int32_t i = 0; i < numTokens; ++i)
+    {
+        for (int32_t j = 0; j <= i; ++j)
+        {
+            attentionMask[0 * numTokens * numTokens + i * numTokens + j] = 1;
+        }
+    }
+
+    // Batch 1: partial chain [105->106] (107 not attended)
+    attentionMask[1 * numTokens * numTokens + 0 * numTokens + 0] = 1;
+    attentionMask[1 * numTokens * numTokens + 1 * numTokens + 0] = 1;
+    attentionMask[1 * numTokens * numTokens + 1 * numTokens + 1] = 1;
+
+    // Setup logits in REDUCED vocab space
+    std::vector<float> logits(batchSize * numTokens * reducedVocabSize, -5.0f);
+
+    // Add noise
+    for (int32_t i = 0; i < batchSize * numTokens * reducedVocabSize; ++i)
+    {
+        logits[i] += (i % 11) * 0.01f;
+    }
+
+    // Batch 0: favor path [1,2,0] in reduced vocab -> [101,102,100] in full vocab
+    logits[0 * numTokens * reducedVocabSize + 0 * reducedVocabSize + 1] = 10.0f;
+    logits[0 * numTokens * reducedVocabSize + 1 * reducedVocabSize + 2] = 10.0f;
+    logits[0 * numTokens * reducedVocabSize + 2 * reducedVocabSize + 0] = 10.0f;
+
+    // Batch 1: favor path [6,7] in reduced vocab -> [106,107] in full vocab
+    logits[1 * numTokens * reducedVocabSize + 0 * reducedVocabSize + 6] = 10.0f;
+    logits[1 * numTokens * reducedVocabSize + 1 * reducedVocabSize + 7] = 10.0f;
+
+    runEagleAcceptTest(
+        tokenIds, attentionMask, logits, batchSize, numTokens, reducedVocabSize, maxDepth,
+        "VocabularyReductionMultiBatch",
+        [](auto const& acceptedTokenIds, auto const& acceptedLogitsIndices, auto const& acceptLengths, auto const&) {
+            EXPECT_EQ(acceptLengths[0], 3) << "Batch 0 should accept all 3 tokens";
+            EXPECT_EQ(acceptLengths[1], 2) << "Batch 1 should accept 2 tokens (107 not in tree)";
+
+            // Batch 0: verify mapped tokens
+            EXPECT_EQ(acceptedTokenIds[0 * 3 + 0], 101) << "Batch 0 token 0";
+            EXPECT_EQ(acceptedTokenIds[0 * 3 + 1], 102) << "Batch 0 token 1";
+            EXPECT_EQ(acceptedTokenIds[0 * 3 + 2], 100) << "Batch 0 token 2";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 3 + 0], 0) << "Batch 0 logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 3 + 1], 1) << "Batch 0 logits index 1";
+            EXPECT_EQ(acceptedLogitsIndices[0 * 3 + 2], 2) << "Batch 0 logits index 2";
+
+            // Batch 1: verify mapped tokens
+            EXPECT_EQ(acceptedTokenIds[1 * 3 + 0], 106) << "Batch 1 token 0";
+            EXPECT_EQ(acceptedTokenIds[1 * 3 + 1], 107) << "Batch 1 token 1 (not in tree, terminates)";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 0], 0) << "Batch 1 logits index 0";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 1], 1) << "Batch 1 logits index 1";
+
+            EXPECT_EQ(acceptedTokenIds[1 * 3 + 2], 0) << "Batch 1 unused position should be 0";
+            EXPECT_EQ(acceptedLogitsIndices[1 * 3 + 2], -1) << "Batch 1 unused logits index should be -1";
+        },
+        vocabMappingTable);
+}
+
+// Test vocabulary reduction with edge case: mapping to very large token IDs
+TEST_F(EagleAcceptTest, VocabularyReductionLargeTokenIds)
+{
+    constexpr int32_t numTokens = 3;
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t reducedVocabSize = 10;
+    constexpr int32_t maxDepth = 3;
+
+    /*
+     * Test that vocab mapping works with large token IDs (e.g., 32000+)
+     * Reduced vocab [0-9] maps to full vocab [32000,32001,...,32009]
+     * Tree [32000->32001->32002]
+     */
+
+    // Setup vocab mapping table with large token IDs
+    std::vector<int32_t> vocabMappingTable(reducedVocabSize);
+    for (int32_t i = 0; i < reducedVocabSize; ++i)
+    {
+        vocabMappingTable[i] = 32000 + i;
+    }
+
+    // Setup token IDs
+    std::vector<int32_t> tokenIds(batchSize * numTokens);
+    tokenIds[0] = 32000;
+    tokenIds[1] = 32001;
+    tokenIds[2] = 32002;
+
+    // Setup triangular attention mask
+    std::vector<int8_t> attentionMask(batchSize * numTokens * numTokens, 0);
+    for (int32_t i = 0; i < numTokens; ++i)
+    {
+        for (int32_t j = 0; j <= i; ++j)
+        {
+            attentionMask[i * numTokens + j] = 1;
+        }
+    }
+
+    // Setup logits in reduced vocab space
+    std::vector<float> logits(batchSize * numTokens * reducedVocabSize, -5.0f);
+    logits[0 * reducedVocabSize + 1] = 10.0f; // reduced 1 -> full 32001
+    logits[1 * reducedVocabSize + 2] = 10.0f; // reduced 2 -> full 32002
+    logits[2 * reducedVocabSize + 0] = 10.0f; // reduced 0 -> full 32000
+
+    runEagleAcceptTest(
+        tokenIds, attentionMask, logits, batchSize, numTokens, reducedVocabSize, maxDepth,
+        "VocabularyReductionLargeTokenIds",
+        [](auto const& acceptedTokenIds, auto const& acceptedLogitsIndices, auto const& acceptLengths, auto const&) {
+            EXPECT_EQ(acceptLengths[0], 3) << "Should accept all 3 tokens";
+
+            EXPECT_EQ(acceptedTokenIds[0], 32001) << "Token 0: reduced 1 -> full 32001";
+            EXPECT_EQ(acceptedTokenIds[1], 32002) << "Token 1: reduced 2 -> full 32002";
+            EXPECT_EQ(acceptedTokenIds[2], 32000) << "Token 2: reduced 0 -> full 32000";
+        },
+        vocabMappingTable);
 }

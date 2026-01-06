@@ -134,9 +134,10 @@ __forceinline__ size_t alignSharedMem(size_t size)
 }
 
 // Stage 1: Compute top-1 tokens for all positions using sampling strategy
+// Optionally map from reduced vocab to full vocab if mapping table is provided
 template <int32_t BLOCK_SIZE>
-__global__ void eagleComputeTop1Kernel(
-    float const* logits, int32_t* top1Tokens, int32_t batchSize, int32_t numTokens, int32_t vocabSize)
+__global__ void eagleComputeTop1Kernel(float const* logits, int32_t* top1Tokens, int32_t const* vocabMappingTable,
+    int32_t batchSize, int32_t numTokens, int32_t vocabSize)
 {
     typedef cub::BlockReduce<Top1Helper, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -163,11 +164,19 @@ __global__ void eagleComputeTop1Kernel(
     // Block-level reduction to find global max
     Top1Helper blockMax = BlockReduce(tempStorage).Reduce(partial, top1MaxOpFunctor());
 
-    // Store result
+    // Store result - map from reduced vocab to full vocab if mapping table provided
     if (tid == 0)
     {
         int32_t outputIdx = batchIdx * numTokens + tokenIdx;
-        top1Tokens[outputIdx] = (blockMax.index != -1) ? blockMax.index : 0;
+        int32_t selectedIdx = (blockMax.index != -1) ? blockMax.index : 0;
+
+        // Apply vocab mapping if provided (for reduced vocabulary)
+        if (vocabMappingTable != nullptr)
+        {
+            selectedIdx = vocabMappingTable[selectedIdx];
+        }
+
+        top1Tokens[outputIdx] = selectedIdx;
     }
 }
 // Helper function to compute tree depth - count total connections (sum of 1s)
@@ -285,8 +294,9 @@ __global__ void eagleAcceptKernel(int32_t const* top1Tokens, int32_t const* toke
 
 // Optimized kernel launcher function using workspace and two-stage approach
 void launchEagleAcceptKernel(float const* logits, int32_t const* tokenIds, int8_t const* attentionMask,
-    int32_t* acceptedTokenIds, int32_t* acceptedLogitsIndices, int32_t* acceptLength, int32_t batchSize,
-    int32_t numTokens, int32_t vocabSize, int32_t maxDepth, void* workspace, size_t workspaceSize, cudaStream_t stream)
+    int32_t* acceptedTokenIds, int32_t* acceptedLogitsIndices, int32_t* acceptLength, int32_t const* vocabMappingTable,
+    int32_t batchSize, int32_t numTokens, int32_t vocabSize, int32_t maxDepth, void* workspace, size_t workspaceSize,
+    cudaStream_t stream)
 {
     constexpr int32_t blockSize = 256;
 
@@ -297,7 +307,7 @@ void launchEagleAcceptKernel(float const* logits, int32_t const* tokenIds, int8_
     // Validate workspace buffer
     assert(ws.top1Tokens != nullptr);
 
-    // Stage 1: Compute top-1 tokens for all positions
+    // Stage 1: Compute top-1 tokens for all positions (with optional vocab mapping)
     dim3 const gridSizeStage1(batchSize * numTokens);
     dim3 const blockSizeStage1(blockSize);
 
@@ -306,7 +316,7 @@ void launchEagleAcceptKernel(float const* logits, int32_t const* tokenIds, int8_
     sharedMemSizeStage1 = alignSharedMem(sharedMemSizeStage1);
 
     eagleComputeTop1Kernel<blockSize><<<gridSizeStage1, blockSizeStage1, sharedMemSizeStage1, stream>>>(
-        logits, ws.top1Tokens, batchSize, numTokens, vocabSize);
+        logits, ws.top1Tokens, vocabMappingTable, batchSize, numTokens, vocabSize);
 
     // Stage 2: Run optimized eagle accept algorithm
     dim3 const gridSizeStage2(batchSize);
@@ -323,8 +333,8 @@ void launchEagleAcceptKernel(float const* logits, int32_t const* tokenIds, int8_
 } // namespace
 
 void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tensor const& attentionMask,
-    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength, void* workspace,
-    size_t workspaceSize, cudaStream_t stream)
+    rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength,
+    rt::OptionalInputTensor const& vocabMappingTable, void* workspace, size_t workspaceSize, cudaStream_t stream)
 {
     // Validate input shapes
     auto const logitsShape = logits.getShape();
@@ -375,6 +385,18 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
     check::check(acceptLength.getDeviceType() == rt::DeviceType::kGPU, "acceptLength must be on GPU device");
     check::check(maxDepth > 0 && maxDepth <= numTokens, "maxDepth must be positive and <= numTokens");
 
+    // Validate vocab mapping table if provided
+    int32_t const* vocabMappingTablePtr = nullptr;
+    if (vocabMappingTable.has_value())
+    {
+        rt::Tensor const& vocabMapTensor = vocabMappingTable.value().get();
+        check::check(vocabMapTensor.getDeviceType() == rt::DeviceType::kGPU, "vocabMappingTable must be on GPU device");
+        check::check(vocabMapTensor.getDataType() == nvinfer1::DataType::kINT32, "vocabMappingTable must be INT32");
+        check::check(vocabMapTensor.getShape().getNumDims() == 1, "vocabMappingTable must be 1D");
+        check::check(vocabMapTensor.getShape()[0] == vocabSize, "vocabMappingTable size must match vocab size");
+        vocabMappingTablePtr = vocabMapTensor.dataPointer<int32_t>();
+    }
+
     // Get device pointers
     float const* logitsPtr = logits.dataPointer<float>();
     int32_t const* tokenIdsPtr = tokenIds.dataPointer<int32_t>();
@@ -393,7 +415,8 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
 
     // Launch kernel
     launchEagleAcceptKernel(logitsPtr, tokenIdsPtr, attentionMaskPtr, acceptedTokenIdsPtr, acceptedLogitsIndicesPtr,
-        acceptLengthPtr, batchSize, numTokens, vocabSize, maxDepth, workspace, workspaceSize, stream);
+        acceptLengthPtr, vocabMappingTablePtr, batchSize, numTokens, vocabSize, maxDepth, workspace, workspaceSize,
+        stream);
 }
 
 } // namespace kernel

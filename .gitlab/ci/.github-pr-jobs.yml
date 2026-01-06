@@ -1,0 +1,73 @@
+# This job is used to test a GitHub PR against the TensorRT Edge LLM pipeline.
+# Be extra careful if you're trying to run this job for an external contribution 
+# since it will clone the external repository and might run malicious code.
+
+.github_pr_rules_manual:
+  rules:
+    - if: $GITHUB_PR && $GITHUB_REPO
+      when: manual
+
+.github_pr_rules_auto:
+  rules:
+    - if: $GITHUB_PR && $GITHUB_REPO
+      when: on_success
+
+.github_pr_clone:
+  before_script:
+    - echo "Cloning GitHub repo $GITHUB_REPO"
+    - export GITHUB_CLONE_DIR="/tmp/github_pr_${CI_PIPELINE_ID}"
+    - git clone https://oauth2:${TMP_GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git $GITHUB_CLONE_DIR
+    - cd $GITHUB_CLONE_DIR
+    - echo "Fetching PR ${GITHUB_PR} from ${GITHUB_REPO}"
+    - git fetch origin pull/${GITHUB_PR}/head:pr-${GITHUB_PR}
+    - git checkout pr-${GITHUB_PR}
+    - rm -rf 3rdParty/googletest 3rdParty/nlohmannJson
+    - export LLM_SDK_DIR=$GITHUB_CLONE_DIR
+
+.github_pr_cleanup:
+  after_script:
+    - echo "Cleaning up GitHub PR clone directory"
+    - rm -rf /tmp/github_pr_${CI_PIPELINE_ID}
+    - echo "Cleanup complete"
+
+github_pr_l0_ampere_export:
+  stage: l0_test
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/github_pr_$CI_PIPELINE_ID"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/ampere_model_export"
+    PRIORITY: l0_export_ampere
+    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .github_pr_clone
+    - .github_pr_cleanup
+    - .export_onnx_template
+    - .github_pr_rules_manual
+
+github_pr_l0_a30:
+  stage: l0_test
+  needs:
+    - github_pr_l0_ampere_export
+  variables:
+    CUDA_VERSION: "12.9"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/github_pr_$CI_PIPELINE_ID"
+    TEST_CACHE_DIR: "$L0_CACHE_DIR/a30"
+    PRIORITY: l0_pipeline_a30
+    ONNX_DIR: "$L0_CACHE_DIR/ampere_model_export/onnx"
+    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
+    ENGINE_DIR: "$TEST_CACHE_DIR/engines"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  extends:
+    - .github_pr_clone
+    - .github_pr_cleanup
+    - .x86_test_template
+    - .github_pr_rules_auto

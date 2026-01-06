@@ -129,8 +129,11 @@ bool Phi4MMViTRunner::allocateBuffer(cudaStream_t stream)
     int64_t const vitImageTokens = mConfig.maxNumBlocks * 256;
     // Conservative capacity for postprocessed tokens:
     // - Sub-crops: insert one sub_GN per row → tokensPerSide * max_hBlocks ≤ tokensPerSide * maxNumBlocks
-    // - Global: tokensPerSide of newline (one per row of tokensPerSide x tokensPerSide) + 1 glb_GN
-    int64_t const conservativeExtra = mConfig.tokensPerSide * mConfig.maxNumBlocks + mConfig.tokensPerSide + 1;
+    // - Global: (tokensPerSide newline tokens (one per row in a tokensPerSide x tokensPerSide grid) + 1 glb_GN)
+    //           * maxNumImages (≤ maxNumBlocks)
+    int64_t const glbExtraPerImage = mConfig.tokensPerSide + 1;
+    int64_t const conservativeExtra
+        = mConfig.tokensPerSide * mConfig.maxNumBlocks + glbExtraPerImage * mConfig.maxNumBlocks;
     int64_t const totalCapacity = vitImageTokens + conservativeExtra;
 
     mEngineOutputEmbedding = rt::Tensor({vitImageTokens, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
@@ -370,11 +373,13 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 
     // Calculate total image tokens for profiling (Phi4MM: each block generates 256 tokens)
     int64_t totalImageTokens = totalNumBlocks * 256;
-    int64_t const conservativeExtra = mConfig.tokensPerSide * totalHBlocks + mConfig.tokensPerSide + 1;
+    // Each image adds (tokensPerSide * hBlocks) for sub_GN separators + (tokensPerSide + 1) for glb segment
+    int64_t const imageCount = std::accumulate(numImages.begin(), numImages.end(), static_cast<int64_t>(0));
+    int64_t const glbExtraPerImage = mConfig.tokensPerSide + 1;
+    int64_t const conservativeExtra = mConfig.tokensPerSide * totalHBlocks + glbExtraPerImage * imageCount;
     int64_t const totalOutTokens = totalImageTokens + conservativeExtra;
 
     // Record performance data
-    int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), 0);
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
 
     check::check(
@@ -403,8 +408,8 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
-        // Use the cached full formatted prompt
-        std::vector<int32_t> ids = tokenizer->encode(request.requests[i].formattedCompleteRequest);
+        // Use the formatted complete request
+        std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
 
         // Replace image placeholder tokens with sequential image token IDs
         std::vector<int32_t> newIds;

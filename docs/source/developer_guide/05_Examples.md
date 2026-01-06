@@ -1,21 +1,6 @@
 # Examples
 
-**Previous**: [Advanced Runtime Features](04.4_Advanced_Runtime_Features.md)
-
----
-
 > **Code Location:** `examples/` | **Build:** `examples/llm/`, `examples/multimodal/`
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Example Flow](#example-flow)
-- [Build Examples](#build-examples)
-- [Inference Examples](#inference-examples)
-- [Complete Workflows](#complete-workflows)
-- [Common Parameters](#common-parameters)
-
----
 
 ## Overview
 
@@ -140,17 +125,50 @@ tensorrt-edgellm-export-llm --model_dir quantized/qwen3-4b --output_dir onnx_mod
 
 ### Multimodal VLM (End-to-End)
 
+Note: Phi-4 requires additional merge-lora step. Please follow the steps. 
+
 ```bash
 # 1. Export (x86 host)
 tensorrt-edgellm-export-llm --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b
-tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b
+tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b/visual_enc_onnx
 
 # 2. Build Engines (Thor device)
 ./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b --engineDir engines/qwen2.5-vl-3b --vlm
 ./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-3b
 
 # 3. Run Inference (Thor device)
-./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input.json --outputFile output.json
+./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-3b --multimodalEngineDir visual_engines/qwen2.5-vl-3b --inputFile input_with_images.json --outputFile output.json
+```
+
+### Phi-4 and Multimodal VLM with LoRA (End-to-End)
+**NOTE: LoRA model is not compatible with the quantization pipeline, thus we need to merge the lora adapter into main model at first.**
+```bash
+# 0. Clone Phi-4-multimodal-instruct into disk
+git clone https://huggingface.co/microsoft/Phi-4-multimodal-instruct
+cd Phi-4-multimodal-instruct
+git lfs pull
+
+# 1. Merge LoRA (x86 host)
+tensorrt-edgellm-merge-lora --model_dir Phi-4-multimodal-instruct \
+                            --lora_dir Phi-4-multimodal-instruct/vision-lora \
+                            --output_dir Phi-4-multimodal-instruct-merged-vision
+
+# 2. Quantize (x86 host)
+tensorrt-edgellm-quantize-llm --model_dir Phi-4-multimodal-instruct-merged-vision \
+                               --output_dir Phi-4-multimodal-instruct-merged-vision-nvfp4 \
+                               --quantization=nvfp4
+
+# 3. Export (x86 host)
+tensorrt-edgellm-export-llm --model_dir Phi-4-multimodal-instruct-merged-vision-nvfp4 --output_dir onnx_models/phi4-mm
+# Use the original weights for visual model export
+tensorrt-edgellm-export-visual --model_dir Phi-4-multimodal-instruct --output_dir onnx_models/phi4-mm/visual_enc_onnx
+
+# 4. Build Engines (Thor device)
+./build/examples/llm/llm_build --onnxDir onnx_models/phi4-mm --engineDir engines/phi4-mm --vlm
+./build/examples/multimodal/visual_build --onnxDir onnx_models/phi4-mm/visual_enc_onnx --engineDir visual_engines/phi4-mm
+
+# 5. Run Inference (Thor device)
+./build/examples/llm/llm_inference --engineDir engines/phi4-mm --multimodalEngineDir visual_engines/phi4-mm --inputFile input_with_images.json --outputFile output.json
 ```
 
 ### Multimodal VLM with LoRA (End-to-End)
@@ -193,8 +211,53 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_
 ./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-7b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-7b
 
 # 3. Run Inference (Thor device)
-./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-7b_eagle --multimodalEngineDir visual_engines/qwen2.5-vl-7b --inputFile input.json --outputFile output.json --eagle
+./build/examples/llm/llm_inference --engineDir engines/qwen2.5-vl-7b_eagle --multimodalEngineDir visual_engines/qwen2.5-vl-7b --inputFile input_with_images.json --outputFile output.json --eagle
 ```
+
+---
+
+## Input File Formats
+
+### VLM Input Format (`input_with_images.json`)
+
+For multimodal (VLM) models, create an input JSON file with image content:
+
+```json
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 50,
+    "max_generate_length": 128,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please describe the image."
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
+```
+
+### LLM Input Format (`input.json`)
+
+For standard LLM models (text-only), refer to `examples/llm/INPUT_FORMAT.md`.
 
 ---
 
@@ -233,7 +296,7 @@ tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_
 
 Now that you've explored the examples:
 
-1. **Customize for Your Needs**: Learn how to extend and customize the framework in the [Customization Guide](06_Customization_Guide.md)
+1. **Customize for Your Needs**: Learn how to extend and customize the framework in the [Customization Guide](07_Customization_Guide.md)
 2. **Build Your Application**: Use the examples as templates for your own applications
 3. **Optimize Performance**: Experiment with different quantization methods, batch sizes, and CUDA graphs
 
@@ -244,4 +307,4 @@ Now that you've explored the examples:
 - [Overview](01.1_Overview.md)
 - [Quick Start Guide](01.2_Quick_Start_Guide.md)
 - [Supported Models](02_Supported_Models.md)
-- [Customization Guide](06_Customization_Guide.md)
+- [Customization Guide](07_Customization_Guide.md)

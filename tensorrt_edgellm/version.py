@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Defines the version string for TensorRT Edge-LLM. Update the BUILD number when frontend models are updated. Update the MINOR number when new features are added.
+Defines the version string for TensorRT Edge-LLM. Update the PATCH number when new features are added.
 
-Format: MAJOR.MINOR.PATCH.BUILD (e.g., 0.5.0.0)
+Format: MAJOR.MINOR.PATCH (e.g., 0.5.0)
 """
 
-__version__: str = "0.5.0.0"
+__version__: str = "0.5.0"

@@ -17,7 +17,8 @@ The JSON file must contain the following top-level structure:
     "top_p": <float>,
     "top_k": <integer>,
     "max_generate_length": <integer>,
-    "default_system_prompt": "<string>",  // optional
+    "apply_chat_template": <boolean>,  // optional (default: true)
+    "enable_thinking": <boolean>,  // optional (default: false, Qwen3-specific)
     "available_lora_weights": {  // optional. Only needed for LoRA engines.
         "<lora_name>": "<path_to_safetensors_file>",
         ...
@@ -39,7 +40,8 @@ The JSON file must contain the following top-level structure:
                     ]
                 }
             ],
-            "lora_name": "<string>"  // optional. Name of LoRA weights from available_lora_weights.
+            "lora_name": "<string>",  // optional. Name of LoRA weights from available_lora_weights.
+            "save_system_prompt_kv_cache": <boolean>  // optional (default: false). Save system prompt KV cache for reuse.
         }
     ]
 }
@@ -102,8 +104,14 @@ Then reference these adapters by name in each request:
 - **`top_p`** (float, default: 0.8): Nucleus sampling parameter (0.0-1.0)
 - **`top_k`** (integer, default: 50): Top-k sampling parameter
 - **`max_generate_length`** (integer, default: 256): Maximum number of tokens to generate
-- **`default_system_prompt`** (string, default: ""): Default system prompt to be used when a request doesn't include a system message. If not provided, the model's default system prompt from the chat template will be used
+- **`apply_chat_template`** (boolean, default: true): Whether to apply chat template formatting with special tokens. When set to `false`, messages will be concatenated without role prefixes/suffixes or special tokens, useful for models that don't require chat template formatting
+- **`enable_thinking`** (boolean, default: false): Whether to enable thinking mode for models that support it. When set to `false`, standard generation prompt is used. When set to `true`, thinking-enabled generation prompt is used if available. This parameter only affects models with thinking mode support and is ignored for other models
 - **`available_lora_weights`** (object, default: {}): Map of LoRA adapter names to their file paths. Only needed for LoRA-enabled engines
+
+## System Prompt Behavior
+
+- If a system message is provided in the request, it will be used
+- If no system message is provided, the model's default system prompt from the chat template will be used (if available)
 
 ## Request Structure
 
@@ -117,6 +125,8 @@ Each request in the `requests` array is an object with the following fields:
 
 - **`lora_name`** (string): Name of the LoRA adapter to use for this conversation, referencing an entry in the global `available_lora_weights` map. This allows different conversations to use different fine-tuned adapters. Note that all requests within the same batch must use the same LoRA weights.
 
+- **`save_system_prompt_kv_cache`** (boolean, default: false): Whether to save the system prompt KV cache for later reuse. This is useful for optimizing performance when using the same system prompt across multiple requests, as it avoids recomputing the KV cache for the system prompt. Note: If any request in a batch sets this to `true`, all requests in that batch will cache the system prompt KV cache.
+
 ### Message Structure
 
 Each message object contains:
@@ -124,7 +134,7 @@ Each message object contains:
 #### Required Fields
 
 - **`role`** (string): The role of the message sender. Must be one of:
-  - `"system"`: System instructions or context
+  - `"system"`: System instructions or context (optional, model default will be used if not provided)
   - `"user"`: User input or question
   - `"assistant"`: Assistant's previous response (for multi-turn conversations)
 
@@ -353,21 +363,92 @@ The format allows you to specify different LoRA adapters for each conversation b
 
 **Note:** The above example will naturally process each conversation in separate batches (assuming `batch_size` is 1) since they use different LoRA weights. If you manually group them into the same batch by setting `batch_size` to 2 or higher, **the program will error out** with the message: "Different LoRA weights within the same batch are not supported".
 
+### Raw Format Input (Without Chat Template)
+
+When you want to use raw concatenation without chat template special tokens, set the global `apply_chat_template` parameter to `false`:
+
+```json
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 0.8,
+    "top_k": 50,
+    "max_generate_length": 256,
+    "apply_chat_template": false,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the capital of France?"
+                }
+            ]
+        }
+    ]
+}
+```
+
+This will produce a raw prompt without any special tokens like `<|im_start|>`, `<|im_end|>`, etc. The text will be concatenated directly. This is useful for:
+- Models trained without chat templates
+- Custom prompt engineering
+- Direct control over the input format
+
+Note: The `apply_chat_template` flag applies to all requests in the batch for consistency.
+
+### System Prompt KV Cache Optimization
+
+When using long system prompts repeatedly, you can set `save_system_prompt_kv_cache` to `true` in a request to cache the system prompt's KV cache for reuse:
+
+```json
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 0.8,
+    "top_k": 50,
+    "max_generate_length": 256,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant with extensive knowledge..."
+                },
+                {
+                    "role": "user",
+                    "content": "What is the capital of France?"
+                }
+            ],
+            "save_system_prompt_kv_cache": true
+        }
+    ]
+}
+```
+
+This optimization is particularly useful for:
+- Long system prompts that are reused across multiple requests
+- Initialization phase setup where you want to cache system instructions
+- Scenarios where the same system context is used repeatedly
+
 ## Processing Behavior
 
-1. **Chat Template Application**: The chat template (loaded from `processed_chat_template.json`) is automatically applied to format messages with the appropriate role prefixes/suffixes and special tokens
-2. **System Prompts**: System prompt fallback hierarchy:
-   - If a request includes a system message, it will be used
-   - Otherwise, the `default_system_prompt` (if specified) will be used
-   - If neither is provided, the model's default system prompt from the chat template will be used
-3. **Batching**: Requests are processed in batches according to the `batch_size` parameter
-4. **Multi-Turn Support**: Each request can contain multiple messages to support conversation context
-5. **Content Type Handling**: 
+1. **Chat Template Application**: The chat template (loaded from `processed_chat_template.json`) is automatically applied to format messages with the appropriate role prefixes/suffixes and special tokens when `apply_chat_template` is `true` (default)
+2. **Raw Format Mode**: When `apply_chat_template` is set to `false`, messages are concatenated without role-specific tokens or special formatting. This is useful for:
+   - Models that don't use chat templates
+   - Custom prompt formats
+   - Direct control over prompt structure
+   - Simple concatenation of text and images
+3. **System Prompts**: 
+   - If a system message is provided, it will be used
+   - If no system message is provided, the model's default system prompt from the chat template will be used (if available)
+4. **Batching**: Requests are processed in batches according to the `batch_size` parameter
+5. **Multi-Turn Support**: Each request can contain multiple messages to support conversation context
+6. **Content Type Handling**: 
    - Text content is directly inserted into the formatted output
    - Image/video placeholders are formatted according to the chat template
-6. **Image Loading**: Images are loaded from the specified file paths during processing
-7. **LoRA Weights**: LoRA adapters are loaded once at initialization from `available_lora_weights`, then switched per batch based on `lora_name` references
-8. **Error Handling**: The tool will throw errors if:
+7. **Image Loading**: Images are loaded from the specified file paths during processing
+8. **LoRA Weights**: LoRA adapters are loaded once at initialization from `available_lora_weights`, then switched per batch based on `lora_name` references
+9. **System Prompt KV Cache**: When `save_system_prompt_kv_cache` is set to `true` for a request, the system prompt's KV cache is saved for reuse, improving performance for repeated system prompts
+10. **Error Handling**: The tool will throw errors if:
    - The JSON file cannot be parsed
    - A message is missing the required `role` or `content` field
    - A request object is missing the required `messages` field

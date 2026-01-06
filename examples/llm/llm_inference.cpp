@@ -43,6 +43,7 @@ using Json = nlohmann::json;
 // Enum for command line option IDs (using traditional enum for C library compatibility)
 enum LLMInferenceOptionId : int
 {
+    HELP = 900,
     INPUT_FILE = 901,
     ENGINE_DIR = 902,
     MULTIMODAL_ENGINE_DIR = 903,
@@ -81,6 +82,7 @@ struct EagleArgs
 
 struct LLMInferenceArgs
 {
+    bool help{false};
     std::string engineDir;
     std::string multimodalEngineDir{""};
     std::string inputFile;
@@ -108,6 +110,7 @@ void printUsage(char const* programName)
                  "[--eagleVerifyTreeSize=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
+    std::cerr << "  --help                    Display this help message" << std::endl;
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
     std::cerr << "  --engineDir               Path to engine directory" << std::endl;
     std::cerr << "  --multimodalEngineDir     Path to multimodal engine directory (optional)" << std::endl;
@@ -132,7 +135,8 @@ void printUsage(char const* programName)
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
-    static struct option inferenceOptions[] = {{"inputFile", required_argument, 0, LLMInferenceOptionId::INPUT_FILE},
+    static struct option inferenceOptions[] = {{"help", no_argument, 0, LLMInferenceOptionId::HELP},
+        {"inputFile", required_argument, 0, LLMInferenceOptionId::INPUT_FILE},
         {"engineDir", required_argument, 0, LLMInferenceOptionId::ENGINE_DIR},
         {"multimodalEngineDir", required_argument, 0, LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR},
         {"outputFile", required_argument, 0, LLMInferenceOptionId::OUTPUT_FILE},
@@ -153,6 +157,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     {
         switch (opt)
         {
+        case LLMInferenceOptionId::HELP: args.help = true; return true;
         case LLMInferenceOptionId::INPUT_FILE: args.inputFile = optarg; break;
         case LLMInferenceOptionId::ENGINE_DIR: args.engineDir = optarg; break;
         case LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
@@ -369,7 +374,14 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
         throw std::runtime_error("Invalid max_generate_length value (must be positive)");
     }
 
-    std::string defaultSystemPrompt = inputData.value("default_system_prompt", "");
+    // Read apply_chat_template flag (defaults to true)
+    bool applyChatTemplate = inputData.value("apply_chat_template", true);
+
+    // Read add_generation_prompt flag (defaults to true)
+    bool addGenerationPrompt = inputData.value("add_generation_prompt", true);
+
+    // Read enable_thinking flag (defaults to false)
+    bool enableThinking = inputData.value("enable_thinking", false);
 
     std::unordered_map<std::string, std::string> loraWeightsMap;
     if (inputData.contains("available_lora_weights") && inputData["available_lora_weights"].is_object())
@@ -406,6 +418,9 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             batchRequest.topP = topP;
             batchRequest.topK = topK;
             batchRequest.maxGenerateLength = maxGenerateLength;
+            batchRequest.applyChatTemplate = applyChatTemplate;
+            batchRequest.addGenerationPrompt = addGenerationPrompt;
+            batchRequest.enableThinking = enableThinking;
 
             // Track LoRA weights for validation
             std::string batchLoraWeightsName = "";
@@ -553,18 +568,6 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 rt::LLMGenerationRequest::Request request;
                 request.messages = std::move(chatMessages);
                 request.imageBuffers = std::move(imageBuffers);
-                request.defaultSystemPrompt = defaultSystemPrompt;
-
-                // Optionally read pre-formatted prompts. If provided, these will override the text input
-                // generated from messages during inference, bypassing the tokenizer's chat template application.
-                // This is useful when the user wants to provide pre-formatted prompts directly.
-                if (requestItem.contains("formatted_system_prompt")
-                    && requestItem.contains("formatted_complete_request"))
-                {
-                    request.formattedSystemPrompt = requestItem["formatted_system_prompt"].get<std::string>();
-                    request.formattedCompleteRequest = requestItem["formatted_complete_request"].get<std::string>();
-                }
-
                 batchRequest.requests.push_back(std::move(request));
             }
 
@@ -593,7 +596,12 @@ int main(int argc, char* argv[])
     if (!parseLLMInferenceArgs(args, argc, argv))
     {
         printUsage(argv[0]);
-        return 1;
+        return EXIT_FAILURE;
+    }
+    if (args.help)
+    {
+        printUsage(argv[0]);
+        return EXIT_SUCCESS;
     }
     bool profilerEnabled = args.dumpProfile;
     MemoryMonitor memoryMonitor;
@@ -823,8 +831,8 @@ int main(int argc, char* argv[])
             }
             responseJson["messages"] = messagesJson;
             // Store formatted prompts for reference
-            responseJson["formatted_system_prompt"] = request.requests[batchIdx].formattedSystemPrompt;
-            responseJson["formatted_complete_request"] = request.requests[batchIdx].formattedCompleteRequest;
+            responseJson["formatted_system_prompt"] = request.formattedRequests[batchIdx].formattedSystemPrompt;
+            responseJson["formatted_complete_request"] = request.formattedRequests[batchIdx].formattedCompleteRequest;
             outputData["responses"].push_back(responseJson);
         }
     }

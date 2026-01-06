@@ -61,9 +61,10 @@ struct ChatTemplateConfig
     std::string modelPath;                                   //!< Model path or identifier
     std::unordered_map<std::string, ChatTemplateRole> roles; //!< Role configurations (system, user, assistant)
     std::unordered_map<std::string, ChatTemplateContentType>
-        contentTypes;                //!< Content type configurations (text, image, video)
-    std::string generationPrompt;    //!< Generation prompt string
-    std::string defaultSystemPrompt; //!< Default system prompt
+        contentTypes;                     //!< Content type configurations (text, image, video)
+    std::string generationPrompt;         //!< Standard generation prompt (thinking disabled)
+    std::string generationPromptThinking; //!< Generation prompt with thinking enabled (optional, model-specific)
+    std::string defaultSystemPrompt;      //!< Default system prompt
 };
 
 /*!
@@ -223,12 +224,17 @@ public:
 
     /**
      * @brief Apply chat template to a request
-     * @param request Request object containing messages. The attributes formattedSystemPrompt and
-     * formattedCompleteRequest will be populated (mutable)
-     * @param addGenerationPrompt Whether to add generation prompt at the end
+     * @param request Request object containing messages
+     * @param formattedRequest Output formatted request object that will be populated
+     * @param applyChatTemplate Whether to apply full chat template formatting (with special tokens) or raw
+     * concatenation
+     * @param addGenerationPrompt Whether to add generation prompt at the end (only used when applyChatTemplate is true)
+     * @param enableThinking Whether to enable thinking mode for models that support it
      * @return true if chat template is applied successfully; false if encountered errors
      */
-    bool applyChatTemplate(rt::LLMGenerationRequest::Request const& request, bool addGenerationPrompt = true) const;
+    bool applyChatTemplate(rt::LLMGenerationRequest::Request const& request,
+        rt::LLMGenerationRequest::FormattedRequest& formattedRequest, bool applyChatTemplate = true,
+        bool addGenerationPrompt = true, bool enableThinking = false) const;
 
     /**
      * @brief Get default system prompt from chat template

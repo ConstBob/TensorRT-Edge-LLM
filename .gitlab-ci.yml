@@ -18,6 +18,7 @@ workflow:
     # Run for main/release branches
     - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH =~ /^release/
+    - if: $GITHUB_PR && $GITHUB_REPO
 
 include:
   - local: '.gitlab/ci/templates.yml'
@@ -26,6 +27,7 @@ include:
   - local: '.gitlab/ci/l1-jobs.yml'
   - local: '.gitlab/ci/sonar-jobs.yml'
   - local: '.gitlab/ci/pages-jobs.yml'
+  - local: '.gitlab/ci/.github-pr-jobs.yml'
 
 stages:
 - setup

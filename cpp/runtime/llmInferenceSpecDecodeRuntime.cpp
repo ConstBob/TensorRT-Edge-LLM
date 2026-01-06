@@ -171,7 +171,7 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     // Reserve enough workspace for sampling, accounting for batch dimension in draft proposal stage
     // In draft proposal loop, we process (batchSize * draftTopK) rows, each doing topK selection
     int32_t const maxSamplingWorkspaceSize
-        = std::max(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.vocabSize, 1),
+        = std::max(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1),
             getSelectAllTopKWorkspaceSize(
                 mMaxRuntimeBatchSize * draftTopK, mDraftEngineConfig.draftModelVocabSize, draftTopK));
 
@@ -205,8 +205,9 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
             DataType::kFLOAT, "LLMInferenceSpecDecodeRuntime::mDraftTokenScoreFullTable");
         mDraftTokenPredecessorFullTable = rt::Tensor({mMaxRuntimeBatchSize, draftFullTableLength}, rt::DeviceType::kGPU,
             DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mDraftTokenPredecessorFullTable");
-        mDraftVocabMappingTable = rt::Tensor({mMaxRuntimeBatchSize, mDraftEngineConfig.draftModelVocabSize},
-            rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mDraftVocabMappingTable");
+        // Draft vocab mapping table is 1D and shared across all batches (not batch-dependent)
+        mDraftVocabMappingTable = rt::Tensor({mDraftEngineConfig.draftModelVocabSize}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mDraftVocabMappingTable");
         mDraftTreeRootTokenId = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMInferenceSpecDecodeRuntime::mDraftTreeRootTokenId");
         mDraftTokenIdsTable = rt::Tensor({mMaxRuntimeBatchSize, draftTopK * draftTopK}, rt::DeviceType::kGPU,
@@ -358,14 +359,12 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     std::vector<std::vector<int32_t>> batchedInputIds;
 
     // Apply chat template for all requests (common for both multimodal and non-multimodal)
+    request.formattedRequests.resize(activeBatchSize);
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        // Use cached formatted prompts if available, otherwise compute them
-        if (request.requests[i].formattedSystemPrompt.empty() || request.requests[i].formattedCompleteRequest.empty())
-        {
-            // Apply chat template to populate both formatted system prompt and full formatted prompt
-            mTokenizer->applyChatTemplate(request.requests[i], true);
-        }
+        // Apply chat template to populate both formatted system prompt and full formatted prompt
+        mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
+            request.addGenerationPrompt, request.enableThinking);
     }
 
     if (!mMultimodalRunner)
@@ -374,11 +373,11 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
             // Store the formatted system prompt for KV cache
-            context.systemPrompts[i] = request.requests[i].formattedSystemPrompt;
+            context.systemPrompts[i] = request.formattedRequests[i].formattedSystemPrompt;
 
-            // Use the cached full formatted prompt
+            // Use the full formatted prompt
             context.rawBatchedInputIds.emplace_back(
-                mTokenizer->encode(request.requests[i].formattedCompleteRequest, false));
+                mTokenizer->encode(request.formattedRequests[i].formattedCompleteRequest, false));
             if (context.rawBatchedInputIds[i].empty())
             {
                 LOG_ERROR("Failed to tokenize input text for batch %d", i);
@@ -654,7 +653,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     mIdsInput.reshape({activeBatchSize, inputIdsLength});
     mContextLengthsInput.reshape({activeBatchSize});
     mBaseHiddenStatesOutput.reshape({activeBatchSize, inputIdsLength, mBaseEngineConfig.outputHiddenDim});
-    mLogitsOutput.reshape({activeBatchSize, mBaseEngineConfig.vocabSize});
+    mLogitsOutput.reshape({activeBatchSize, mBaseEngineConfig.outputVocabSize});
 
     // Setup the input tensors. ContextLen input is on CPU.
     int32_t* ctxLenData = mContextLengthsInput.dataPointer<int32_t>();
@@ -801,7 +800,6 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
     mDraftTokenScoreFullTable.reshape({activeBatchSize, draftFullTableLength});
     mDraftTokenPredecessorFullTable.reshape({activeBatchSize, draftFullTableLength});
     mDraftTreeRootTokenId.reshape({activeBatchSize});
-    mDraftVocabMappingTable.reshape({activeBatchSize, mDraftEngineConfig.draftModelVocabSize});
     mDraftTokenIdsTable.reshape({activeBatchSize, draftTopK * draftTopK});
     mDraftTokenScoresTable.reshape({activeBatchSize, draftTopK * draftTopK});
     mDraftTokenIntermediateScores.reshape({activeBatchSize, draftTopK});
@@ -945,7 +943,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
 
     // Engine expects 2D tensors: [batch_size * verify_tree_size, vocab_size/hidden_dim]
     int32_t const selectTokenSize = activeBatchSize * mDraftingConfig.verifyTreeSize;
-    mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.vocabSize});
+    mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.outputVocabSize});
     mBaseHiddenStatesOutput.reshape({selectTokenSize, mBaseEngineConfig.outputHiddenDim});
 
     bool const verifySuccess = mBaseEngineRunner->executeEagleBaseTreeDecodingStep(
@@ -963,14 +961,13 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     mAcceptLength.reshape({activeBatchSize});
 
     // Collected accepted token ids and indices. Use sampling workspace for eagle accept process.
+    // Pass vocab mapping table if base model uses reduced vocabulary
+    // Note: accepted tokens will already be in full vocab space after eagleAccept (mapping happens inside kernel)
+    rt::OptionalInputTensor vocabMappingTable
+        = (mBaseEngineConfig.reducedVocabSize > 0) ? std::optional{std::ref(mBaseVocabMappingTable)} : std::nullopt;
     kernel::eagleAccept(mLogitsOutput, mIdsInput, mDraftTreeMask, mAcceptedTokenIds, mAcceptedTokenIndices,
-        mAcceptLength, mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(), context.stream);
-
-    // Apply vocabulary mapping if base model uses reduced vocabulary
-    if (mBaseEngineConfig.reducedVocabSize > 0)
-    {
-        mapReducedVocabToFullVocab(mAcceptedTokenIds, mBaseVocabMappingTable, context.stream);
-    }
+        mAcceptLength, vocabMappingTable, mSamplingWorkspace.rawPointer(), mSamplingWorkspace.getMemoryCapacity(),
+        context.stream);
 
     // Inplace update the KVCache and input hidden states from the accepted token indices.
     // Also commit KVCache to reflect the latest KVCache length (We can only do this after knowing how many tokens are
@@ -1184,7 +1181,7 @@ bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_
     {
         // Engine expects 2D tensors: [batch_size * verify_tree_size, vocab_size/hidden_dim]
         int32_t const selectTokenSize = batchSize * mDraftingConfig.verifyTreeSize;
-        mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.vocabSize});
+        mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.outputVocabSize});
         mBaseHiddenStatesOutput.reshape({selectTokenSize, mBaseEngineConfig.outputHiddenDim});
 
         mIdsInput.reshape({batchSize, mDraftingConfig.verifyTreeSize});
@@ -1338,6 +1335,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     tempContext.promptLengths.resize(1, 0);
     tempContext.finishedStates.resize(1, 0);
     tempContext.multimodalEmbeddings = context.multimodalEmbeddings;
+    tempContext.extraInputTensors = context.extraInputTensors;
     tempContext.generationRound = 0;
     tempContext.maxGenerateLength = 0; // Not generating, just caching
     tempContext.activeBatchSize = 1;
