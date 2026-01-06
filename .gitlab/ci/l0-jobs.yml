@@ -232,5 +232,5 @@ cleanup_l0_mr_cache:
   environment:
     name: l0_cache/mr_$CI_MERGE_REQUEST_IID
     action: stop
-  when: on_success
+  when: manual
   allow_failure: true
