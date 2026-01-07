@@ -84,55 +84,6 @@ class PromptTuningEmbedding(torch.nn.Module):
         return inputs_embeds
 
 
-class Qwen3VLDeepStackProcess(nn.Module):
-    """
-    DeepStack process for Qwen3VL model.
-    
-    This module processes the deepstack visual embeddings and adds them to the hidden states.
-    Similar to PromptTuningEmbedding, it selects the positions of visual tokens by using token IDs 
-    beyond the normal vocabulary size to represent visual tokens.
-    
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-    ) -> None:
-        """
-        Initialize the Qwen3VLDeepStackProcess module.
-        
-        Args:
-            vocab_size: Size of the vocabulary for text tokens
-        """
-        super().__init__()
-        self.vocab_size = vocab_size
-
-    def forward(self, input_ids: torch.Tensor, hidden_states: torch.Tensor,
-                deepstack_features: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for deepstack process.
-        
-        Args:
-            input_ids: Token IDs with visual tokens having IDs > vocab_size
-            hidden_states: Input hidden states of shape (batch_size, seq_len, hidden_size)
-            deepstack_features: Visual embeddings of shape (visual_seqlen, hidden_size)
-        """
-        # Identify visual tokens (IDs > vocab_size)
-        image_mask = input_ids > (self.vocab_size - 1)
-
-        # Map visual tokens to embedding indices
-        visual_tokens = torch.where(image_mask, input_ids - self.vocab_size, 0)
-        deepstack_features = torch.nn.functional.embedding(
-            visual_tokens, deepstack_features)
-
-        # Add visual embeddings to hidden states based on mask
-        hidden_states = torch.where(image_mask.unsqueeze(-1),
-                                    deepstack_features + hidden_states,
-                                    hidden_states)
-
-        return hidden_states
-
-
 class EdgeLLMAttention(nn.Module):
     """
     Multi-headed attention using the custom attention plugin for optimized inference.

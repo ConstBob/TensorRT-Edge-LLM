@@ -533,6 +533,53 @@ std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::
     return result;
 }
 
+std::vector<half> assembleDeepstackEmbeddingRef(std::vector<int32_t> const& inputIds,
+    std::vector<half> const& deepstackFeatures, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
+    int64_t hiddenSize, int64_t numImageTokens)
+{
+    std::vector<half> result(batchSize * seqLen * hiddenSize, __float2half(0.0f));
+
+    for (int64_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
+        {
+            int32_t const tokenId = inputIds[batchIdx * seqLen + tokenIdx];
+            bool const isImageToken = tokenId >= vocabSize;
+
+            for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
+            {
+                int64_t const resultIdx = batchIdx * seqLen * hiddenSize + tokenIdx * hiddenSize + elementIdx;
+
+                half embeddingValue;
+                if (isImageToken)
+                {
+                    // For image tokens (tokenId >= vocabSize), use deepstack features
+                    int32_t const deepstackIdx = tokenId - vocabSize;
+                    if (deepstackIdx >= 0 && deepstackIdx < numImageTokens)
+                    {
+                        int64_t const featuresIdx = deepstackIdx * hiddenSize + elementIdx;
+                        embeddingValue = deepstackFeatures[featuresIdx];
+                    }
+                    else
+                    {
+                        // Out-of-bounds image token, use zero embedding
+                        embeddingValue = __float2half(0.0f);
+                    }
+                }
+                else
+                {
+                    // Token ID < vocabSize, use zero embedding
+                    embeddingValue = __float2half(0.0f);
+                }
+
+                result[resultIdx] = embeddingValue;
+            }
+        }
+    }
+
+    return result;
+}
+
 void assembleDraftTreeDescReference(std::vector<int8_t> const& draftTreeMask,
     std::vector<int32_t> const& draftTreeLength, std::vector<int32_t> const& sequenceStartIndex,
     std::vector<int32_t>& packedDraftTreeMask, std::vector<int32_t>& tensorPositionIndices, int32_t paddedDraftTreeSize)

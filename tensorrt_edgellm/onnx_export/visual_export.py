@@ -21,7 +21,6 @@ This module provides functions to export visual components of multimodal models
 
 import json
 import os
-import shutil
 from typing import Optional
 
 import torch
@@ -181,9 +180,7 @@ def visual_export(model_dir: str,
         json.dump(config_dict, f, indent=2)
 
     # Export processor configuration to JSON if exists
-    if os.path.exists(os.path.join(model_dir, "preprocessor_config.json")):
-        shutil.copy(os.path.join(model_dir, "preprocessor_config.json"),
-                    os.path.join(output_dir, "preprocessor_config.json"))
+    processor.save_pretrained(output_dir)
 
     print(
         f"Visual export completed for {model_type} with dtype={dtype}, quantization={quantization}, device={device}"

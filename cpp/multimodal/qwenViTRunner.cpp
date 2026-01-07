@@ -783,7 +783,7 @@ bool QwenViTRunner::infer(cudaStream_t stream)
     return true;
 }
 
-rt::OptionalInputTensors QwenViTRunner::getExtraVisualFeatures()
+rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
 {
     if (mModelType != multimodal::ModelType::QWEN3_VL)
     {

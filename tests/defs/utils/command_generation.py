@@ -209,9 +209,6 @@ def _generate_draft_export_commands(
         f"--output_dir={config.get_draft_onnx_dir()}"
     ]
 
-    if config.model_type == ModelType.VLM:
-        export_draft_cmd.append("--use_prompt_tuning")
-
     commands.append((export_draft_cmd, 600))
 
     return commands
@@ -258,11 +255,6 @@ def _generate_draft_build_commands(
         f"--maxDraftTreeSize={config.max_draft_tree_size}"
     ])
 
-    if config.model_type == ModelType.VLM:
-        draft_cmd.append("--vlm")
-        draft_cmd.append(f"--minImageTokens={config.min_image_tokens}")
-        draft_cmd.append(f"--maxImageTokens={config.max_image_tokens}")
-
     commands.append((draft_cmd, 1200))
     return commands
 
@@ -300,10 +292,8 @@ def generate_build_commands(
             f"--onnxDir={config.get_llm_onnx_dir()}",
             f"--engineDir={config.get_llm_engine_dir()}",
             f"--maxInputLen={config.max_input_len}",
-            f"--maxKVCacheCapacity={config.max_seq_len}", "--vlm",
-            f"--maxBatchSize={config.max_batch_size}",
-            f"--minImageTokens={config.min_image_tokens}",
-            f"--maxImageTokens={config.max_image_tokens}"
+            f"--maxKVCacheCapacity={config.max_seq_len}",
+            f"--maxBatchSize={config.max_batch_size}"
         ])
 
         if config.is_eagle:

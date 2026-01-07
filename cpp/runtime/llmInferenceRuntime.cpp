@@ -22,6 +22,7 @@
 #include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
@@ -58,6 +59,22 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
 
+    // Load embedding table from embedding.safetensors
+    std::filesystem::path const embeddingPath = std::filesystem::path(engineDir) / "embedding.safetensors";
+    LOG_INFO("Loading embedding table from: %s", embeddingPath.string().c_str());
+    std::vector<rt::Tensor> embeddingTensors;
+    if (!safetensors::loadSafetensors(embeddingPath, embeddingTensors, stream))
+    {
+        LOG_ERROR("Failed to load embedding table from: %s", embeddingPath.string().c_str());
+        throw std::runtime_error("Failed to load embedding table from: " + embeddingPath.string());
+    }
+    check::check(embeddingTensors.size() == 1, "embedding.safetensors should contain exactly one tensor");
+    check::check(
+        embeddingTensors[0].getShape().getNumDims() == 2, "embedding tensor should be 2D [vocabSize, hiddenSize]");
+    mEmbeddingTable = std::move(embeddingTensors[0]);
+    LOG_INFO("Embedding table loaded successfully with shape [%d, %d]", mEmbeddingTable.getShape()[0],
+        mEmbeddingTable.getShape()[1]);
+
     try
     {
         mLLMEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
@@ -87,6 +104,24 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
             "LLMInferenceRuntime::mSamplingWorkspace");
         mInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
             rt::DeviceType::kGPU, DataType::kINT32, "LLMInferenceRuntime::mInputIds");
+        mInputsEmbeds = rt::Tensor(
+            {mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength, mEngineConfig.hiddenSize},
+            rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceRuntime::mInputsEmbeds");
+        // Allocate deepstack embeddings if needed (one tensor per feature)
+        if (mEngineConfig.numDeepstackFeatures > 0)
+        {
+            mDeepstackEmbeds.resize(mEngineConfig.numDeepstackFeatures);
+            for (int32_t i = 0; i < mEngineConfig.numDeepstackFeatures; ++i)
+            {
+                mDeepstackEmbeds[i] = rt::Tensor({mEngineConfig.maxSupportedBatchSize,
+                                                     mEngineConfig.maxSupportedInputLength, mEngineConfig.hiddenSize},
+                    rt::DeviceType::kGPU, DataType::kHALF,
+                    format::fmtstr("LLMInferenceRuntime::mDeepstackEmbeds[%d]", i));
+            }
+            LOG_INFO("Allocated %d deepstack embeds tensors with shape [%d, %d, %d]",
+                mEngineConfig.numDeepstackFeatures, mEngineConfig.maxSupportedBatchSize,
+                mEngineConfig.maxSupportedInputLength, mEngineConfig.hiddenSize);
+        }
         mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
             rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceRuntime::mHostPackedInputIds");
         mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU,
@@ -420,12 +455,55 @@ bool LLMInferenceRuntime::handleRequest(
         ++generationIter;
     };
 
-    // Use empty tensor for when no multimodal runner is available.
-    // All other data input used by prefill step is already set up in setUpForPrefillExecution().
+    // Perform embedding lookup for prefill
+    int32_t const prefillSequenceLength = mInputIds.getShape()[1];
+    mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensors extraVisualFeatures
-        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+
+    if (multimodalEmbeddings.has_value())
+    {
+        // Use image insertion variant for multimodal models
+        rt::Tensor const& imageEmbedsTensor = multimodalEmbeddings.value().get();
+        kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
+    }
+    else
+    {
+        // Standard embedding lookup
+        kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
+    }
+
+    // Process deepstack features: perform embedding assembly or error if not available
+    rt::OptionalInputTensors deepstackEmbeds{};
+    if (mEngineConfig.numDeepstackFeatures > 0)
+    {
+        if (mMultimodalRunner)
+        {
+            // Multimodal runner exists: perform deepstack embedding assembly
+            rt::OptionalInputTensors deepstackFeatures = mMultimodalRunner->getDeepstackFeatures();
+            for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
+            {
+                rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
+
+                // Reshape and perform embedding assembly for this feature
+                mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+                kernel::assembleDeepstackEmbedding(
+                    mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
+
+                // Add to output vector (engine will bind by index)
+                deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
+            }
+        }
+        else
+        {
+            LOG_ERROR(
+                "Deepstack features are required (numDeepstackFeatures=%d) but no multimodal runner is available to "
+                "provide them.",
+                mEngineConfig.numDeepstackFeatures);
+            return false;
+        }
+    }
 
     // Profile all sampling operations as one stage
     // Prefill profiling session
@@ -441,8 +519,8 @@ bool LLMInferenceRuntime::handleRequest(
                 .c_str(),
             nvtx_colors::BLUE);
 
-        bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings,
-            extraVisualFeatures, mOutputLogits, outputHiddenStates, stream);
+        bool prefillStatus = mLLMEngineRunner->executePrefillStep(
+            mInputsEmbeds, mHostContextLengths, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
         if (!prefillStatus)
         {
             LOG_ERROR(
@@ -455,8 +533,8 @@ bool LLMInferenceRuntime::handleRequest(
     // Record prefill metrics
     mPrefillMetrics.recordRun(tokenCount.totalReusedTokens, tokenCount.totalComputedTokens);
 
-    // Reshape inputIds for decoding step
-    mInputIds.reshape({activeBatchSize, 1});
+    // Reshape for decoding step
+    mInputsEmbeds.reshape({activeBatchSize, 1, mEngineConfig.hiddenSize});
 
     // Profile entire generation phase like benchmark profiler
     {
@@ -477,8 +555,11 @@ bool LLMInferenceRuntime::handleRequest(
                     .c_str(),
                 nvtx_colors::LIGHT_GREEN);
 
-            // Use the selected token indices as the input token indices for the decoding step.
-            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mSelectedIndices, mOutputLogits, stream);
+            // Perform embedding lookup for the selected token indices (decode only has text, no images)
+            kernel::embeddingLookup(mSelectedIndices, mEmbeddingTable, mInputsEmbeds, stream);
+
+            // Use the embedded tokens as input for the decoding step.
+            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mInputsEmbeds, mOutputLogits, stream);
             if (!decodingStatus)
             {
                 LOG_ERROR("LLMInferenceRuntime(): Failed to execute decoding step.");
@@ -523,15 +604,17 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     for (int32_t batchSize = minSupportedBatchSize; batchSize <= maxSupportedBatchSize; ++batchSize)
     {
         mSelectedIndices.reshape({batchSize, 1});
+        mInputsEmbeds.reshape({batchSize, 1, mEngineConfig.hiddenSize});
         mOutputLogits.reshape({batchSize, mEngineConfig.outputVocabSize});
+
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-            mSelectedIndices, mOutputLogits, mEmptyLoraWeightsName, stream);
+            mInputsEmbeds, mOutputLogits, mEmptyLoraWeightsName, stream);
         if (mEngineConfig.maxSupportedLoraRank > 0)
         {
             for (auto const& loraWeightsName : mLLMEngineRunner->getAvailableLoraWeights())
             {
                 captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
-                    mSelectedIndices, mOutputLogits, loraWeightsName, stream);
+                    mInputsEmbeds, mOutputLogits, loraWeightsName, stream);
             }
         }
     }
@@ -619,14 +702,59 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     }
 
     // Execute prefill step to initialize the KVCache data.
+    // Perform embedding lookup
+    int32_t const prefillSequenceLength = mInputIds.getShape()[1];
+    mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensors extraVisualFeatures
-        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+
+    if (multimodalEmbeddings.has_value())
+    {
+        // Use image insertion variant for multimodal models
+        rt::Tensor const& imageEmbedsTensor = multimodalEmbeddings.value().get();
+        kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
+    }
+    else
+    {
+        // Standard embedding lookup
+        kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
+    }
+
+    // Process deepstack features: perform embedding lookup or provide zero tensors
+    rt::OptionalInputTensors deepstackEmbeds{};
+    if (mEngineConfig.numDeepstackFeatures > 0)
+    {
+        if (mMultimodalRunner)
+        {
+            // Multimodal runner exists: perform deepstack embedding lookup
+            rt::OptionalInputTensors deepstackFeatures = mMultimodalRunner->getDeepstackFeatures();
+            for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
+            {
+                rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
+
+                // Reshape and perform embedding lookup for this feature
+                mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+                kernel::assembleDeepstackEmbedding(
+                    mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
+
+                // Add to output vector (engine will bind by index)
+                deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
+            }
+        }
+        else
+        {
+            LOG_ERROR(
+                "Deepstack features are required (numDeepstackFeatures=%d) but no multimodal runner is available to "
+                "provide them.",
+                mEngineConfig.numDeepstackFeatures);
+            return false;
+        }
+    }
 
     rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
-    bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputIds, mHostContextLengths, multimodalEmbeddings,
-        extraVisualFeatures, mOutputLogits, outputHiddenStates, stream);
+    bool prefillStatus = mLLMEngineRunner->executePrefillStep(
+        mInputsEmbeds, mHostContextLengths, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
     if (!prefillStatus)
     {
         LOG_ERROR("LLMInferenceRuntime(): Failed to execute prefill step.");

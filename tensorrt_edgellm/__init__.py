@@ -79,7 +79,6 @@ Example Usage:
             draft_model_dir="path/to/draft_model",
             output_dir="path/to/output",
             base_model_dir="path/to/base_model",
-            use_prompt_tuning=False
         )
         
         # Export visual model to ONNX

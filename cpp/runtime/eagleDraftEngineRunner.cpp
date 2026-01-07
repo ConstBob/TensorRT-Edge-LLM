@@ -23,6 +23,7 @@
 #include "common/logger.h"
 #include "common/mmapReader.h"
 #include "common/version.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <fstream>
@@ -45,17 +46,17 @@ std::string formatEngineConfig(trt_edgellm::rt::EagleDraftEngineRunnerConfig con
        << "  maxKVCacheCapacity: " << config.maxKVCacheCapacity
        << "  draftModelVocabSize: " << config.draftModelVocabSize << "  maxDraftTreeSize: " << config.maxDraftTreeSize
        << "  baseModelHiddenDim: " << config.baseModelHiddenDim
-       << "  draftModelHiddenDim: " << config.draftModelHiddenDim << "  isVlm: " << config.isVlm;
+       << "  draftModelHiddenDim: " << config.draftModelHiddenDim;
     return ss.str();
 }
 
-size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputIds, rt::Tensor const& baseModelHiddenStates,
+size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputsEmbeds, rt::Tensor const& baseModelHiddenStates,
     rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
 {
-    int64_t const activeBatchSize = draftTreeInputIds.getShape()[0];
-    int64_t const paddedDraftTreeSize = draftTreeInputIds.getShape()[1];
+    int64_t const activeBatchSize = draftTreeInputsEmbeds.getShape()[0];
+    int64_t const paddedDraftTreeSize = draftTreeInputsEmbeds.getShape()[1];
     int64_t const selectTokenSize = outputLogits.getShape()[1];
-    uintptr_t const inputIdsAddr = reinterpret_cast<uintptr_t>(draftTreeInputIds.rawPointer());
+    uintptr_t const inputsEmbedsAddr = reinterpret_cast<uintptr_t>(draftTreeInputsEmbeds.rawPointer());
     uintptr_t const baseModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(baseModelHiddenStates.rawPointer());
     uintptr_t const draftModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(draftModelHiddenStates.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
@@ -65,7 +66,7 @@ size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputIds, rt::Tensor co
     hash_utils::hashCombine(hashValue, activeBatchSize);
     hash_utils::hashCombine(hashValue, paddedDraftTreeSize);
     hash_utils::hashCombine(hashValue, selectTokenSize);
-    hash_utils::hashCombine(hashValue, inputIdsAddr);
+    hash_utils::hashCombine(hashValue, inputsEmbedsAddr);
     hash_utils::hashCombine(hashValue, baseModelHiddenStatesAddr);
     hash_utils::hashCombine(hashValue, draftModelHiddenStatesAddr);
     hash_utils::hashCombine(hashValue, outputLogitsAddr);
@@ -73,12 +74,12 @@ size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputIds, rt::Tensor co
     return hashValue;
 }
 
-size_t hashAcceptDecodeTokenInput(rt::Tensor const& acceptedTokens, rt::Tensor const& baseModelHiddenStates,
+size_t hashAcceptDecodeTokenInput(rt::Tensor const& acceptedTokensEmbeds, rt::Tensor const& baseModelHiddenStates,
     rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
 {
-    int64_t const activeBatchSize = acceptedTokens.getShape()[0];
-    int64_t const inputIdsLength = acceptedTokens.getShape()[1];
-    uintptr_t const acceptedTokensAddr = reinterpret_cast<uintptr_t>(acceptedTokens.rawPointer());
+    int64_t const activeBatchSize = acceptedTokensEmbeds.getShape()[0];
+    int64_t const inputEmbedsLength = acceptedTokensEmbeds.getShape()[1];
+    uintptr_t const acceptedTokensEmbedsAddr = reinterpret_cast<uintptr_t>(acceptedTokensEmbeds.rawPointer());
     uintptr_t const baseModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(baseModelHiddenStates.rawPointer());
     uintptr_t const draftModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(draftModelHiddenStates.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
@@ -86,8 +87,8 @@ size_t hashAcceptDecodeTokenInput(rt::Tensor const& acceptedTokens, rt::Tensor c
 
     size_t hashValue = 0;
     hash_utils::hashCombine(hashValue, activeBatchSize);
-    hash_utils::hashCombine(hashValue, inputIdsLength);
-    hash_utils::hashCombine(hashValue, acceptedTokensAddr);
+    hash_utils::hashCombine(hashValue, inputEmbedsLength);
+    hash_utils::hashCombine(hashValue, acceptedTokensEmbedsAddr);
     hash_utils::hashCombine(hashValue, baseModelHiddenStatesAddr);
     hash_utils::hashCombine(hashValue, draftModelHiddenStatesAddr);
     hash_utils::hashCombine(hashValue, outputLogitsAddr);
@@ -107,6 +108,7 @@ static constexpr int32_t kDRAFT_MODEL_GENERATION_PROFILE_INDEX{1};
 EagleDraftEngineRunner::EagleDraftEngineRunner(
     std::filesystem::path const& enginePath, std::filesystem::path const& configPath, cudaStream_t stream)
 {
+
     LOG_INFO("Loading eagle draft config file: %s", configPath.string().c_str());
 
     // Parse and validate configuration from JSON file first to fail fast if config is invalid
@@ -193,12 +195,10 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
 
     // Initialize the dummy tensor for unused input tensors as TensorRT does not support nullptr for binding.
     // Calculate maximum memory requirements across all use cases:
-    // 1. Multimodal embeddings: {1, baseModelHiddenDim/3}
-    // 2. Attention mask: {maxSupportedBatchSize, 1, 1}
-    // 3. Attention position IDs: {maxSupportedBatchSize, 1}
-    // 4. KV cache start index: {maxSupportedBatchSize}
+    // 1. Attention mask: {maxSupportedBatchSize, 1, 1}
+    // 2. Attention position IDs: {maxSupportedBatchSize, 1}
+    // 3. KV cache start index: {maxSupportedBatchSize}
     int64_t maxDummyElements = std::max({
-        static_cast<int64_t>(mConfig.baseModelHiddenDim / 3),        // multimodal embeddings
         static_cast<int64_t>(mConfig.maxSupportedBatchSize * 1 * 1), // attention mask
         static_cast<int64_t>(mConfig.maxSupportedBatchSize * 1),     // attention position IDs
         static_cast<int64_t>(mConfig.maxSupportedBatchSize)          // KV cache start index
@@ -254,22 +254,6 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         throw std::runtime_error("Failed to bind engine input tensors.");
     }
 
-    // Set multimodal embeddings to dummy tensor for generation contexts if VLM is enabled
-    if (mConfig.isVlm)
-    {
-        bool setMultimodalStatus{true};
-        int64_t multimodalEmbeddingsHiddenSize = mConfig.baseModelHiddenDim / 3;
-        setMultimodalStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
-        setMultimodalStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kImageEmbeds, rt::Coords{1, multimodalEmbeddingsHiddenSize}.getTRTDims());
-        if (!setMultimodalStatus)
-        {
-            LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
-            throw std::runtime_error("Failed to set multimodal embeddings dummy tensor for generation context");
-        }
-    }
-
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
@@ -312,8 +296,8 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
         auto const& builderConfig = configJson["builder_config"];
 
         // Define required fields for builder_config
-        std::vector<std::string> const requiredBuilderConfigFields = {
-            "max_batch_size", "max_input_len", "max_kv_cache_capacity", "eagle_draft", "max_draft_tree_size", "is_vlm"};
+        std::vector<std::string> const requiredBuilderConfigFields
+            = {"max_batch_size", "max_input_len", "max_kv_cache_capacity", "eagle_draft", "max_draft_tree_size"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -346,7 +330,6 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
         mConfig.maxKVCacheCapacity = builderConfig["max_kv_cache_capacity"].get<int32_t>();
         mConfig.maxDraftTreeSize = builderConfig["max_draft_tree_size"].get<int32_t>();
-        mConfig.isVlm = builderConfig["is_vlm"].get<bool>();
 
         // Validate configuration values - all must be positive except numDecoderLayers (can be 1 for draft)
         if (mConfig.numDecoderLayers < 1)
@@ -398,13 +381,7 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
         return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPastKeyValuesTemplate) != std::string::npos;
     };
 
-    // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
-    auto identifyMultimodalEmbeddingsBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 2 && bindingName == binding_names::kImageEmbeds;
-    };
-
     int32_t nbKVCacheInputs{0};
-    bool foundMultimodalEmbeddingsInput{false};
     int32_t numIOBindings = mEngine->getNbIOTensors();
 
     // Lambda to validate KV cache dimensions against profile shape
@@ -454,32 +431,8 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
             }
             ++nbKVCacheInputs;
         }
-        if (identifyMultimodalEmbeddingsBinding(bindingName, tensorDim))
-        {
-            foundMultimodalEmbeddingsInput = true;
-            // For Eagle draft models, multimodal embeddings should match base model hidden dim / 3
-            int64_t expectedMultimodalHiddenSize = mConfig.baseModelHiddenDim / 3;
-            if (expectedMultimodalHiddenSize != tensorDim.d[1])
-            {
-                LOG_ERROR("multimodal embeddings hidden size is not consistent. From engine: %d, expected: %d",
-                    tensorDim.d[1], expectedMultimodalHiddenSize);
-                return false;
-            }
-            if (!mConfig.isVlm)
-            {
-                LOG_ERROR("VLM is not enabled but multimodal embeddings input image_embeds found in engine");
-                return false;
-            }
-        }
     }
 
-    // Validate VLM configuration
-    if (mConfig.isVlm && !foundMultimodalEmbeddingsInput)
-    {
-        LOG_ERROR(
-            "VLM is enabled but multimodal embeddings input (%s) not found in engine", binding_names::kImageEmbeds);
-        return false;
-    }
     if (nbKVCacheInputs != mConfig.numDecoderLayers)
     {
         LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,
@@ -487,11 +440,11 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
         return false;
     }
 
-    // Validate input shapes from optimization profiles
+    // Validate input shapes from optimization profiles (inputs_embeds is 3D: [batch, seq, hidden])
     Dims const maxInputPrefillShape = mEngine->getProfileShape(
-        binding_names::kInputIds, kDRAFT_MODEL_PREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+        binding_names::kInputsEmbeds, kDRAFT_MODEL_PREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
     Dims const maxInputGenShape = mEngine->getProfileShape(
-        binding_names::kInputIds, kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
+        binding_names::kInputsEmbeds, kDRAFT_MODEL_GENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
 
     // Validate and potentially override maxSupportedBatchSize from engine's actual max profile
     int32_t const engineMaxBatchSize = maxInputPrefillShape.d[0];
@@ -512,6 +465,12 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     {
         LOG_ERROR("maxDraftTreeSize is not consistent. From engine: %d, from config: %d", maxInputGenShape.d[1],
             mConfig.maxDraftTreeSize);
+        return false;
+    }
+    if (mConfig.draftModelHiddenDim != maxInputPrefillShape.d[2])
+    {
+        LOG_ERROR("draftModelHiddenDim is not consistent. From engine inputs_embeds: %d, from config: %d",
+            maxInputPrefillShape.d[2], mConfig.draftModelHiddenDim);
         return false;
     }
 
@@ -552,11 +511,11 @@ rt::LinearKVCache& EagleDraftEngineRunner::getLinearKVCache()
     return mLinearKVCache;
 }
 
-bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds,
+bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputsEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths,
-    rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
-    bool const checkInputsGPUTensor = inputIds.getDeviceType() == rt::DeviceType::kGPU
+    bool const checkInputsGPUTensor = inputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
         && baseModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
         && draftModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
         && contextLengths.getDeviceType() == rt::DeviceType::kCPU
@@ -568,21 +527,21 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
         return false;
     }
 
-    bool const isInputTypeValid = inputIds.getDataType() == DataType::kINT32
+    bool const isInputTypeValid = inputsEmbeds.getDataType() == DataType::kHALF
         && baseModelHiddenStates.getDataType() == DataType::kHALF
         && draftModelHiddenStates.getDataType() == DataType::kHALF && contextLengths.getDataType() == DataType::kINT32
         && outputLogits.getDataType() == DataType::kFLOAT && outputHiddenStates.getDataType() == DataType::kHALF;
     if (!isInputTypeValid)
     {
         LOG_ERROR(
-            "Invalid data type of I/O tensors. Inputs shall be INT32, contextLengths shall be INT32, "
+            "Invalid data type of I/O tensors. InputsEmbeds shall be FLOAT16, contextLengths shall be INT32, "
             "base model hidden states shall be FLOAT16, draft model hidden states shall be FLOAT16, "
             "output logits shall be FLOAT32, output hidden states shall be FLOAT16.");
         return false;
     }
 
     // Validate batch size consistency and bounds
-    int32_t const batchSize = inputIds.getShape()[0];
+    int32_t const batchSize = inputsEmbeds.getShape()[0];
     bool const isBatchValid = batchSize > 0 && batchSize <= mConfig.maxSupportedBatchSize
         && baseModelHiddenStates.getShape()[0] == batchSize && draftModelHiddenStates.getShape()[0] == batchSize
         && contextLengths.getShape()[0] == batchSize;
@@ -591,14 +550,14 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
         LOG_ERROR(
             "Invalid batch size of the input tensors. Batch size shall be in range [1, %d] and consistent across "
             "tensors, "
-            "current inputIds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
-            mConfig.maxSupportedBatchSize, inputIds.getShape().formatString().c_str(),
+            "current inputsEmbeds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
+            mConfig.maxSupportedBatchSize, inputsEmbeds.getShape().formatString().c_str(),
             baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
-    int64_t const inputSequenceLength = inputIds.getShape()[1];
+    int64_t const inputSequenceLength = inputsEmbeds.getShape()[1];
     bool const sequenceLengthValid = inputSequenceLength <= mConfig.maxSupportedInputLength
         && baseModelHiddenStates.getShape()[1] == inputSequenceLength
         && draftModelHiddenStates.getShape()[1] == inputSequenceLength;
@@ -606,40 +565,25 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
     {
         LOG_ERROR(
             "Invalid sequence length of the input tensors. Sequence length shall be consistent and smaller than max "
-            "supported length %d, current inputIds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates "
+            "supported length %d, current inputsEmbeds shape: %s, baseModelHiddenStates shape: %s, "
+            "draftModelHiddenStates "
             "shape: %s",
-            mConfig.maxSupportedInputLength, inputIds.getShape().formatString().c_str(),
+            mConfig.maxSupportedInputLength, inputsEmbeds.getShape().formatString().c_str(),
             baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
-    bool const isInputHiddenSizeValid = baseModelHiddenStates.getShape()[2] == mConfig.baseModelHiddenDim
+    bool const isInputHiddenSizeValid = inputsEmbeds.getShape()[2] == mConfig.draftModelHiddenDim
+        && baseModelHiddenStates.getShape()[2] == mConfig.baseModelHiddenDim
         && draftModelHiddenStates.getShape()[2] == mConfig.draftModelHiddenDim;
     if (!isInputHiddenSizeValid)
     {
         LOG_ERROR(
             "Invalid hidden size of the input tensors. Hidden size shall be consistent with the model config, "
-            "current baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
-            baseModelHiddenStates.getShape().formatString().c_str(),
+            "current inputsEmbeds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
+            inputsEmbeds.getShape().formatString().c_str(), baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
-        return false;
-    }
-
-    // Validate multimodal embeddings based on is_vlm flag
-    int64_t multimodalEmbeddingsHiddenSize = mConfig.baseModelHiddenDim / 3;
-    bool const isMultimodalEmbeddingsValid
-        = (mConfig.isVlm && multimodalEmbeddings.has_value()
-              && multimodalEmbeddings.value().get().getShape().getNumDims() == 2
-              && multimodalEmbeddings.value().get().getShape()[1] == multimodalEmbeddingsHiddenSize)
-        || (!mConfig.isVlm && !multimodalEmbeddings.has_value());
-    if (!isMultimodalEmbeddingsValid)
-    {
-        LOG_ERROR("Invalid multimodal embeddings. VLM=%s, provided=%s, expected shape=[*, %d]. Current shape: %s",
-            mConfig.isVlm ? "true" : "false", multimodalEmbeddings.has_value() ? "true" : "false",
-            multimodalEmbeddingsHiddenSize,
-            multimodalEmbeddings.has_value() ? multimodalEmbeddings.value().get().getShape().formatString().c_str()
-                                             : "None");
         return false;
     }
 
@@ -659,10 +603,10 @@ bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputI
     return true;
 }
 
-bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
+bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputsEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths,
-    rt::OptionalInputTensor multimodalEmbeddings, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-    rt::Tensor const& baseRopeCosSinCache, cudaStream_t stream)
+    rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, rt::Tensor const& baseRopeCosSinCache,
+    cudaStream_t stream)
 {
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus
@@ -673,8 +617,8 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    bool const validateInputStatus = this->prefillStepInputValidation(inputIds, baseModelHiddenStates,
-        draftModelHiddenStates, contextLengths, multimodalEmbeddings, outputLogits, outputHiddenStates);
+    bool const validateInputStatus = this->prefillStepInputValidation(
+        inputsEmbeds, baseModelHiddenStates, draftModelHiddenStates, contextLengths, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Prefill request not performed due to invalid input tensors.");
@@ -682,8 +626,8 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     }
 
     // Prepare the input for the engine execution.
-    int32_t const activeBatchSize = static_cast<int32_t>(inputIds.getShape()[0]);
-    int32_t const inputSequenceLength = static_cast<int32_t>(inputIds.getShape()[1]);
+    int32_t const activeBatchSize = static_cast<int32_t>(inputsEmbeds.getShape()[0]);
+    int32_t const inputSequenceLength = static_cast<int32_t>(inputsEmbeds.getShape()[1]);
     constexpr int32_t kCONTEXT_SELECT_TOKEN_LENGTH{1};
     mSequenceContextLengths.reshape({activeBatchSize});
     mSelectTokenIndices.reshape({activeBatchSize, kCONTEXT_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
@@ -697,10 +641,10 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
     bool setEngineIOStatus{true};
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
     setEngineIOStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -764,16 +708,6 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kAttentionMask, emptyMaskShape.getTRTDims());
 
-    // Bind the optional multimodal embeddings tensor into the engine.
-    if (multimodalEmbeddings.has_value())
-    {
-        rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
-    }
-
     // Bind the output tensor into the engine.
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
     setEngineIOStatus
@@ -800,13 +734,13 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputIds,
     return true;
 }
 
-bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& draftTreeInputIds,
+bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& draftTreeInputsEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
     rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor const& outputLogits,
     rt::Tensor const& outputHiddenStates)
 {
     // All input tensors shall reside on GPU.
-    bool const checkInputsGPUTensor = draftTreeInputIds.getDeviceType() == rt::DeviceType::kGPU
+    bool const checkInputsGPUTensor = draftTreeInputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
         && baseModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
         && draftModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
         && draftTreeLength.getDeviceType() == rt::DeviceType::kGPU
@@ -818,7 +752,7 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
         return false;
     }
     // Validate datatypes of the input tensors.
-    bool const isInputTypeValid = draftTreeInputIds.getDataType() == DataType::kINT32
+    bool const isInputTypeValid = draftTreeInputsEmbeds.getDataType() == DataType::kHALF
         && baseModelHiddenStates.getDataType() == DataType::kHALF
         && draftModelHiddenStates.getDataType() == DataType::kHALF && draftTreeLength.getDataType() == DataType::kINT32
         && draftTreeMask.getDataType() == DataType::kINT8 && outputLogits.getDataType() == DataType::kFLOAT
@@ -826,12 +760,12 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
     if (!isInputTypeValid)
     {
         LOG_ERROR(
-            "Input token ids shall be INT32, hidden states I/O shall be FLOAT16, "
+            "Input embeds shall be FLOAT16, hidden states I/O shall be FLOAT16, "
             "draft tree length shall be INT32, draft tree mask shall be INT8, output logits shall be FLOAT32.");
         return false;
     }
     // Validate batch size consistency and bounds
-    int32_t const batchSize = draftTreeInputIds.getShape()[0];
+    int32_t const batchSize = draftTreeInputsEmbeds.getShape()[0];
     bool const isBatchValid = batchSize > 0 && batchSize <= mConfig.maxSupportedBatchSize
         && baseModelHiddenStates.getShape()[0] == batchSize && draftModelHiddenStates.getShape()[0] == batchSize
         && draftTreeLength.getShape()[0] == batchSize && draftTreeMask.getShape()[0] == batchSize;
@@ -840,17 +774,17 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
         LOG_ERROR(
             "Invalid batch size of the input tensors. Batch size shall be in range [1, %d] and consistent across "
             "tensors, "
-            "current draft tree input ids shape: %s, base model hidden states shape: %s, draft model hidden states "
+            "current draft tree input embeds shape: %s, base model hidden states shape: %s, draft model hidden states "
             "shape: %s, "
             "draft tree length shape: %s, draft tree mask shape: %s",
-            mConfig.maxSupportedBatchSize, draftTreeInputIds.getShape().formatString().c_str(),
+            mConfig.maxSupportedBatchSize, draftTreeInputsEmbeds.getShape().formatString().c_str(),
             baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str(), draftTreeLength.getShape().formatString().c_str(),
             draftTreeMask.getShape().formatString().c_str());
         return false;
     }
 
-    int64_t const paddedDraftTreeSize = draftTreeInputIds.getShape()[1];
+    int64_t const paddedDraftTreeSize = draftTreeInputsEmbeds.getShape()[1];
     bool const isPaddedDraftTreeSizeValid = paddedDraftTreeSize <= mConfig.maxDraftTreeSize
         && draftTreeMask.getShape()[1] == paddedDraftTreeSize && draftTreeMask.getShape()[2] == paddedDraftTreeSize
         && baseModelHiddenStates.getShape()[1] == paddedDraftTreeSize
@@ -867,13 +801,15 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
         return false;
     }
 
-    bool const isHiddenSizeValid = baseModelHiddenStates.getShape()[2] == mConfig.baseModelHiddenDim
+    bool const isHiddenSizeValid = draftTreeInputsEmbeds.getShape()[2] == mConfig.draftModelHiddenDim
+        && baseModelHiddenStates.getShape()[2] == mConfig.baseModelHiddenDim
         && draftModelHiddenStates.getShape()[2] == mConfig.draftModelHiddenDim;
     if (!isHiddenSizeValid)
     {
         LOG_ERROR(
             "Invalid hidden size of the input tensors. Hidden size shall be consistent with the model config, "
-            "current baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
+            "current inputsEmbeds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
+            draftTreeInputsEmbeds.getShape().formatString().c_str(),
             baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
         return false;
@@ -898,21 +834,22 @@ bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& 
     return true;
 }
 
-bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& draftTreeInputIds,
+bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& draftTreeInputsEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
     rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor& outputLogits,
     rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
-    bool const validateInputStatus = this->draftProposalStepInputValidation(draftTreeInputIds, baseModelHiddenStates,
-        draftModelHiddenStates, draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
+    bool const validateInputStatus
+        = this->draftProposalStepInputValidation(draftTreeInputsEmbeds, baseModelHiddenStates, draftModelHiddenStates,
+            draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Draft proposal request not performed due to invalid input tensors.");
         return false;
     }
 
-    int32_t const activeBatchSize = static_cast<int32_t>(draftTreeInputIds.getShape()[0]);
-    int32_t const paddedDraftTreeSize = static_cast<int32_t>(draftTreeInputIds.getShape()[1]);
+    int32_t const activeBatchSize = static_cast<int32_t>(draftTreeInputsEmbeds.getShape()[0]);
+    int32_t const paddedDraftTreeSize = static_cast<int32_t>(draftTreeInputsEmbeds.getShape()[1]);
     // outputLogits is now 3D: [batch_size, num_tokens, vocab_size]
     int32_t const selectTokenSize = static_cast<int32_t>(outputLogits.getShape()[1]);
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(paddedDraftTreeSize, 32));
@@ -930,7 +867,7 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
     size_t const hashValue = hashDraftProposalInput(
-        draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+        draftTreeInputsEmbeds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
     if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
     {
         LOG_DEBUG("executeEagleDraftProposalStep(): Use pre-captured CUDA graph for draft proposal step.");
@@ -949,13 +886,14 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
         }
 
         LOG_INFO("executeEagleDraftProposalStep(): Draft proposal step CUDA graph not captured.");
+
         // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
         // initialization.
         bool setEngineIOStatus{true};
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kInputIds, const_cast<void*>(draftTreeInputIds.rawPointer()));
-        setEngineIOStatus
-            &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, draftTreeInputIds.getShape().getTRTDims());
+            binding_names::kInputsEmbeds, const_cast<void*>(draftTreeInputsEmbeds.rawPointer()));
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+            binding_names::kInputsEmbeds, draftTreeInputsEmbeds.getShape().getTRTDims());
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1026,7 +964,7 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
     return true;
 }
 
-bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const& draftTreeInputIds,
+bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const& draftTreeInputsEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
     rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor& outputLogits,
     rt::Tensor& outputHiddenStates, cudaStream_t stream)
@@ -1041,7 +979,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     }
 
     size_t const hashValue = hashDraftProposalInput(
-        draftTreeInputIds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+        draftTreeInputsEmbeds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
     if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
     {
         LOG_INFO("Draft proposal CUDA graph already captured.");
@@ -1049,7 +987,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     }
 
     // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
-    int32_t const activeBatchSize = draftTreeInputIds.getShape()[0];
+    int32_t const activeBatchSize = draftTreeInputsEmbeds.getShape()[0];
     constexpr int32_t simulateCacheLength{128};
     std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
     rt::Tensor const reuseKVCacheLengthsTensor(reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU,
@@ -1058,15 +996,16 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     mLinearKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
 
     // Validate the input tensors.
-    bool const validateInputStatus = this->draftProposalStepInputValidation(draftTreeInputIds, baseModelHiddenStates,
-        draftModelHiddenStates, draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
+    bool const validateInputStatus
+        = this->draftProposalStepInputValidation(draftTreeInputsEmbeds, baseModelHiddenStates, draftModelHiddenStates,
+            draftTreeLength, draftTreeMask, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Draft proposal request not performed due to invalid input tensors.");
         return false;
     }
 
-    int32_t const paddedDraftTreeSize = static_cast<int32_t>(draftTreeInputIds.getShape()[1]);
+    int32_t const paddedDraftTreeSize = static_cast<int32_t>(draftTreeInputsEmbeds.getShape()[1]);
     // outputLogits is now 3D: [batch_size, num_tokens, vocab_size]
     int32_t const selectTokenSize = static_cast<int32_t>(outputLogits.getShape()[1]);
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(paddedDraftTreeSize, 32));
@@ -1091,9 +1030,9 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(draftTreeInputIds.rawPointer()));
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, draftTreeInputIds.getShape().getTRTDims());
+        binding_names::kInputsEmbeds, const_cast<void*>(draftTreeInputsEmbeds.rawPointer()));
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kInputsEmbeds, draftTreeInputsEmbeds.getShape().getTRTDims());
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1175,18 +1114,18 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     else
     {
         LOG_DEBUG("captureEagleDraftProposalCudaGraph(): CUDA graph captured successfully for input shape %s.",
-            draftTreeInputIds.getShape().formatString().c_str());
+            draftTreeInputsEmbeds.getShape().formatString().c_str());
     }
 
     return true;
 }
 
-bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor const& acceptedTokens,
+bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor const& acceptedTokensEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
     rt::Tensor const& acceptedTokenNums, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
     // All input tensors shall reside on GPU.
-    bool const checkInputsGPUTensor = acceptedTokens.getDeviceType() == rt::DeviceType::kGPU
+    bool const checkInputsGPUTensor = acceptedTokensEmbeds.getDeviceType() == rt::DeviceType::kGPU
         && baseModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
         && draftModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
         && outputLogits.getDeviceType() == rt::DeviceType::kGPU
@@ -1198,20 +1137,21 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
     }
 
     // Validate datatypes of the input tensors.
-    bool const isInputTypeValid = acceptedTokens.getDataType() == DataType::kINT32
+    bool const isInputTypeValid = acceptedTokensEmbeds.getDataType() == DataType::kHALF
         && baseModelHiddenStates.getDataType() == DataType::kHALF
         && draftModelHiddenStates.getDataType() == DataType::kHALF && outputLogits.getDataType() == DataType::kFLOAT
         && outputHiddenStates.getDataType() == DataType::kHALF;
     if (!isInputTypeValid)
     {
         LOG_ERROR(
-            "Invalid data type of I/O tensors. Accepted tokens shall be INT32, hidden states I/O shall be FLOAT16, "
+            "Invalid data type of I/O tensors. Accepted tokens embeds shall be FLOAT16, hidden states I/O shall be "
+            "FLOAT16, "
             "output logits shall be FLOAT32, output hidden states shall be FLOAT16.");
         return false;
     }
 
     // Validate batch size consistency and bounds
-    int32_t const batchSize = acceptedTokens.getShape()[0];
+    int32_t const batchSize = acceptedTokensEmbeds.getShape()[0];
     bool const isBatchValid = batchSize > 0 && batchSize <= mConfig.maxSupportedBatchSize
         && baseModelHiddenStates.getShape()[0] == batchSize && draftModelHiddenStates.getShape()[0] == batchSize;
     if (!isBatchValid)
@@ -1219,9 +1159,10 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
         LOG_ERROR(
             "Invalid batch size of the input tensors. Batch size shall be in range [1, %d] and consistent across "
             "tensors, "
-            "current accepted tokens shape: %s, base model hidden states shape: %s, draft model hidden states shape: "
+            "current accepted tokens embeds shape: %s, base model hidden states shape: %s, draft model hidden states "
+            "shape: "
             "%s",
-            mConfig.maxSupportedBatchSize, acceptedTokens.getShape().formatString().c_str(),
+            mConfig.maxSupportedBatchSize, acceptedTokensEmbeds.getShape().formatString().c_str(),
             baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
         return false;
@@ -1237,7 +1178,7 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
         return false;
     }
 
-    int64_t const acceptedTokenNum = acceptedTokens.getShape()[1];
+    int64_t const acceptedTokenNum = acceptedTokensEmbeds.getShape()[1];
     bool const isAcceptedTokenNumValid = acceptedTokenNum <= mConfig.maxDraftTreeSize
         && baseModelHiddenStates.getShape()[1] == acceptedTokenNum
         && draftModelHiddenStates.getShape()[1] == acceptedTokenNum;
@@ -1245,21 +1186,24 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
     {
         LOG_ERROR(
             "Invalid accepted token number of the input tensors. Accepted token number shall be smaller than max limit "
-            "%d, And be consistent among input tensors, current accepted tokens shape: %s, base model hidden states "
+            "%d, And be consistent among input tensors, current accepted tokens embeds shape: %s, base model hidden "
+            "states "
             "shape: %s, draft model hidden states shape: %s",
-            mConfig.maxDraftTreeSize, acceptedTokens.getShape().formatString().c_str(),
+            mConfig.maxDraftTreeSize, acceptedTokensEmbeds.getShape().formatString().c_str(),
             baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
         return false;
     }
 
-    bool const isHiddenSizeValid = baseModelHiddenStates.getShape()[2] == mConfig.baseModelHiddenDim
+    bool const isHiddenSizeValid = acceptedTokensEmbeds.getShape()[2] == mConfig.draftModelHiddenDim
+        && baseModelHiddenStates.getShape()[2] == mConfig.baseModelHiddenDim
         && draftModelHiddenStates.getShape()[2] == mConfig.draftModelHiddenDim;
     if (!isHiddenSizeValid)
     {
         LOG_ERROR(
             "Invalid hidden size of the input tensors. Hidden size shall be consistent with the model config, "
-            "current baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
+            "current acceptedTokensEmbeds shape: %s, baseModelHiddenStates shape: %s, draftModelHiddenStates shape: %s",
+            acceptedTokensEmbeds.getShape().formatString().c_str(),
             baseModelHiddenStates.getShape().formatString().c_str(),
             draftModelHiddenStates.getShape().formatString().c_str());
         return false;
@@ -1283,20 +1227,20 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor con
     return true;
 }
 
-bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const& acceptedTokens,
+bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const& acceptedTokensEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
     rt::Tensor const& acceptedTokenNums, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
-    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(acceptedTokens, baseModelHiddenStates,
-        draftModelHiddenStates, acceptedTokenNums, outputLogits, outputHiddenStates);
+    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(acceptedTokensEmbeds,
+        baseModelHiddenStates, draftModelHiddenStates, acceptedTokenNums, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Accept decode token request not performed due to invalid input tensors.");
         return false;
     }
 
-    int32_t const activeBatchSize = static_cast<int32_t>(acceptedTokens.getShape()[0]);
-    int32_t const acceptedTokenNum = static_cast<int32_t>(acceptedTokens.getShape()[1]);
+    int32_t const activeBatchSize = static_cast<int32_t>(acceptedTokensEmbeds.getShape()[0]);
+    int32_t const acceptedTokenNum = static_cast<int32_t>(acceptedTokensEmbeds.getShape()[1]);
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(acceptedTokenNum, 32));
     constexpr int32_t kACCEPT_DECODE_SELECT_TOKEN_LENGTH{1};
 
@@ -1316,7 +1260,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
     size_t const hashValue = hashAcceptDecodeTokenInput(
-        acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+        acceptedTokensEmbeds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
     if (mAcceptDecodeTokenCudaGraphs.find(hashValue) != mAcceptDecodeTokenCudaGraphs.end())
     {
         LOG_DEBUG(
@@ -1336,13 +1280,14 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
         }
 
         LOG_INFO("executeEagleAcceptDecodeTokenStep(): Draft accept decode token step CUDA graph not captured.");
+
         // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
         // initialization.
         bool setEngineIOStatus{true};
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kInputIds, const_cast<void*>(acceptedTokens.rawPointer()));
-        setEngineIOStatus
-            &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, acceptedTokens.getShape().getTRTDims());
+            binding_names::kInputsEmbeds, const_cast<void*>(acceptedTokensEmbeds.rawPointer()));
+        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+            binding_names::kInputsEmbeds, acceptedTokensEmbeds.getShape().getTRTDims());
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1415,7 +1360,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     return true;
 }
 
-bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor const& acceptedTokens,
+bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor const& acceptedTokensEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
     rt::Tensor const& acceptedTokenNums, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
 {
@@ -1429,22 +1374,22 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     }
 
     size_t const hashValue = hashAcceptDecodeTokenInput(
-        acceptedTokens, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
+        acceptedTokensEmbeds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
     if (mAcceptDecodeTokenCudaGraphs.find(hashValue) != mAcceptDecodeTokenCudaGraphs.end())
     {
         LOG_INFO("Draft accept decode token CUDA graph already captured.");
         return true;
     }
-    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(acceptedTokens, baseModelHiddenStates,
-        draftModelHiddenStates, acceptedTokenNums, outputLogits, outputHiddenStates);
+    bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(acceptedTokensEmbeds,
+        baseModelHiddenStates, draftModelHiddenStates, acceptedTokenNums, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR("Accept decode token request not performed due to invalid input tensors.");
         return false;
     }
 
-    int32_t const activeBatchSize = static_cast<int32_t>(acceptedTokens.getShape()[0]);
-    int32_t const acceptedTokenNum = static_cast<int32_t>(acceptedTokens.getShape()[1]);
+    int32_t const activeBatchSize = static_cast<int32_t>(acceptedTokensEmbeds.getShape()[0]);
+    int32_t const acceptedTokenNum = static_cast<int32_t>(acceptedTokensEmbeds.getShape()[1]);
     int32_t const packedTreeMaskLen = static_cast<int32_t>(divUp(acceptedTokenNum, 32));
     constexpr int32_t kACCEPT_DECODE_SELECT_TOKEN_LENGTH{1};
 
@@ -1473,9 +1418,9 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(acceptedTokens.rawPointer()));
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, acceptedTokens.getShape().getTRTDims());
+        binding_names::kInputsEmbeds, const_cast<void*>(acceptedTokensEmbeds.rawPointer()));
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kInputsEmbeds, acceptedTokensEmbeds.getShape().getTRTDims());
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kBaseModelHiddenStates, const_cast<void*>(baseModelHiddenStates.rawPointer()));
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1556,7 +1501,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     else
     {
         LOG_DEBUG("captureEagleAcceptDecodeTokenCudaGraph(): CUDA graph captured successfully for input shape %s.",
-            acceptedTokens.getShape().formatString().c_str());
+            acceptedTokensEmbeds.getShape().formatString().c_str());
     }
 
     return true;

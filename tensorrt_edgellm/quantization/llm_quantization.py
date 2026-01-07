@@ -432,11 +432,8 @@ def quantize_and_save_draft(
     """
     start_time = time.time()
 
-    # No VLM inputs are used. VLM models can be quantized using pure text inputs.
-    use_prompt_tuning = False
-
     draft_model = load_eagle3_draft_model(draft_model_dir, base_model_dir,
-                                          use_prompt_tuning, dtype, device)
+                                          dtype, device)
 
     if is_quantized(draft_model):
         print(f"Draft Model is already quantized, skipping quantization.")

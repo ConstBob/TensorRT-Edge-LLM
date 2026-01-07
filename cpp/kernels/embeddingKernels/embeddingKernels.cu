@@ -72,6 +72,7 @@ __global__ void embeddingLookupKernel(int32_t const* inputIds, half const* embed
         else
         {
             // Use zero embedding for out-of-bounds tokens
+#pragma unroll
             for (uint32_t i = 0; i < vecSize; ++i)
             {
                 embeddingVec[i] = __float2half(0.0f);
@@ -167,6 +168,7 @@ __global__ void embeddingLookupWithImageInsertionKernel(int32_t const* inputIds,
         else
         {
             // Use zero embedding for error cases
+#pragma unroll
             for (uint32_t i = 0; i < vecSize; ++i)
             {
                 embeddingVec[i] = __float2half(0.0f);
@@ -216,6 +218,82 @@ void launchEmbeddingLookupWithImageInsertionKernel(int32_t const* inputIds, half
 
     embeddingLookupWithImageInsertionKernel<<<gridSize, threadsPerBlock, 0, stream>>>(
         inputIds, embeddingTable, imageEmbeds, output, batchSize, seqLen, vocabSize, hiddenSize, imageTokenLen);
+}
+
+// CUDA kernel for assembling deepstack embeddings (FP16 only)
+// Extracts image token embeddings from deepstack features based on token IDs
+// Token IDs >= vocabSize are mapped to deepstack features, others get zero embeddings
+__global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half const* deepstackFeatures, half* output,
+    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize, int64_t numImageTokens)
+{
+    // Each warp handles one hidden state (one token's embedding)
+    // Each thread processes 8 FP16 elements (128-bit granularity)
+    constexpr uint32_t vecSize = DVec<half>::vec_size;
+    constexpr uint32_t warpSize = 32;
+
+    // Use 2D CTA: (32, 4) - warp index directly from blockIdx.x * blockDim.y + threadIdx.y
+    uint32_t const warpId = blockIdx.x * blockDim.y + threadIdx.y;
+    uint32_t const laneId = threadIdx.x;
+
+    if (warpId >= batchSize * seqLen)
+    {
+        return;
+    }
+
+    // Calculate token indices
+    uint32_t const batchIdx = warpId / seqLen;
+    uint32_t const tokenIdx = warpId % seqLen;
+
+    // Get token ID
+    int32_t const tokenId = inputIds[batchIdx * seqLen + tokenIdx];
+
+    // Determine if this is an image token (>= vocabSize)
+    bool const isImageToken = tokenId >= vocabSize;
+
+    // Calculate base indices for this warp's work
+    uint32_t const baseOutputIdx = warpId * hiddenSize;
+
+    // Each thread processes vecSize elements, loop until we cover the entire hidden state
+    for (uint32_t offset = laneId * vecSize; offset < hiddenSize; offset += warpSize * vecSize)
+    {
+        DVec<half> embeddingVec;
+
+        if (isImageToken)
+        {
+            // Calculate the index into deepstackFeatures
+            int32_t const deepstackIdx = tokenId - vocabSize;
+
+            // Validate that deepstackIdx is within bounds
+            if (deepstackIdx >= 0 && deepstackIdx < numImageTokens)
+            {
+                // Load embedding data from deepstack features
+                uint32_t const embeddingOffset = deepstackIdx * hiddenSize + offset;
+                embeddingVec.load(deepstackFeatures + embeddingOffset);
+            }
+            else
+            {
+                // Out-of-bounds image token, use zero embedding
+#pragma unroll
+                for (uint32_t i = 0; i < vecSize; ++i)
+                {
+                    embeddingVec[i] = __float2half(0.0f);
+                }
+            }
+        }
+        else
+        {
+            // Token ID < vocabSize, use zero embedding
+#pragma unroll
+            for (uint32_t i = 0; i < vecSize; ++i)
+            {
+                embeddingVec[i] = __float2half(0.0f);
+            }
+        }
+
+        // Store to output
+        uint32_t const outputIdx = baseOutputIdx + offset;
+        embeddingVec.store(output + outputIdx);
+    }
 }
 
 } // namespace
@@ -296,6 +374,53 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
     // Launch optimized kernel with dynamic thread block sizing
     launchEmbeddingLookupWithImageInsertionKernel(inputIdsPtr, embeddingTablePtr, imageEmbedsPtr, outputPtr, batchSize,
         seqLen, vocabSize, hiddenSize, imageTokenLen, stream);
+}
+
+void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& deepstackFeatures, int32_t vocabSize,
+    rt::Tensor& deepstackEmbeds, cudaStream_t stream)
+{
+    // Validate input shapes
+    auto const inputShape = inputIds.getShape();
+    auto const featuresShape = deepstackFeatures.getShape();
+    auto const outputShape = deepstackEmbeds.getShape();
+
+    check::check(inputShape.getNumDims() == 2, "inputIds must be 2D tensor [batchSize, seqLen]");
+    check::check(featuresShape.getNumDims() == 2, "deepstackFeatures must be 2D tensor [numImageTokens, hiddenSize]");
+    check::check(outputShape.getNumDims() == 3, "deepstackEmbeds must be 3D tensor [batchSize, seqLen, hiddenSize]");
+
+    int64_t const batchSize = inputShape[0];
+    int64_t const seqLen = inputShape[1];
+    int64_t const numImageTokens = featuresShape[0];
+    int64_t const hiddenSize = featuresShape[1];
+
+    check::check(outputShape[0] == batchSize, "Output batch size mismatch");
+    check::check(outputShape[1] == seqLen, "Output sequence length mismatch");
+    check::check(outputShape[2] == hiddenSize, "Output hidden size mismatch");
+
+    // Validate data types
+    check::check(inputIds.getDataType() == nvinfer1::DataType::kINT32, "inputIds must be INT32");
+    check::check(deepstackFeatures.getDataType() == nvinfer1::DataType::kHALF, "deepstackFeatures must be FP16");
+    check::check(deepstackEmbeds.getDataType() == nvinfer1::DataType::kHALF, "deepstackEmbeds must be FP16");
+
+    // Get device pointers
+    int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
+    half const* deepstackFeaturesPtr = deepstackFeatures.dataPointer<half>();
+    half* outputPtr = deepstackEmbeds.dataPointer<half>();
+
+    // Launch kernel
+    constexpr uint32_t vecSize = DVec<half>::vec_size;
+    uint32_t const totalTokens = batchSize * seqLen;
+
+    // Validate that hiddenSize is a multiple of vecSize to avoid partial loads
+    check::check(hiddenSize % vecSize == 0,
+        format::fmtstr("hiddenSize must be a multiple of %d for efficient vectorized access", vecSize));
+
+    // Use 2D CTA: (32, 4) - 4 warps per block
+    dim3 const threadsPerBlock(32, 4);               // (32, 4) = 128 threads total
+    uint32_t const gridSize = (totalTokens + 3) / 4; // 4 warps per block
+
+    assembleDeepstackEmbeddingKernel<<<gridSize, threadsPerBlock, 0, stream>>>(
+        inputIdsPtr, deepstackFeaturesPtr, outputPtr, batchSize, seqLen, vocabSize, hiddenSize, numImageTokens);
 }
 
 } // namespace kernel

@@ -62,6 +62,10 @@ std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::
     int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
     std::optional<std::vector<half>> const& imageEmbeds = std::nullopt, int64_t imageTokenLen = 0);
 
+std::vector<half> assembleDeepstackEmbeddingRef(std::vector<int32_t> const& inputIds,
+    std::vector<half> const& deepstackFeatures, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
+    int64_t hiddenSize, int64_t numImageTokens);
+
 // Eagle reference functions
 void assembleDraftTreeDescReference(std::vector<int8_t> const& draftTreeMask,
     std::vector<int32_t> const& draftTreeLength, std::vector<int32_t> const& sequenceStartIndex,

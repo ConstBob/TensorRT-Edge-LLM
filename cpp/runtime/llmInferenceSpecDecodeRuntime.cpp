@@ -22,6 +22,7 @@
 #include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/speculative/batchEvictKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
@@ -58,7 +59,7 @@ namespace rt
 {
 
 void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _maxGenerateLength,
-    rt::OptionalInputTensor const& _mutimodalEmbeddings, rt::OptionalInputTensors const& _extraInputTensors,
+    rt::OptionalInputTensor const& _mutimodalEmbeddings, rt::OptionalInputTensors const& _deepstackFeatures,
     cudaStream_t _stream)
 {
     systemPrompts.resize(_activeBatchSize);
@@ -85,7 +86,7 @@ void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _m
     evictedPromptLengths.clear();
 
     multimodalEmbeddings = _mutimodalEmbeddings;
-    extraInputTensors = _extraInputTensors;
+    deepstackFeatures = _deepstackFeatures;
     generationRound = 0;
     maxGenerateLength = _maxGenerateLength;
     activeBatchSize = _activeBatchSize;
@@ -97,6 +98,22 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     std::string const& multimodalEngineDir, EagleDraftingConfig const& draftingConfig, cudaStream_t stream)
 {
     mDraftingConfig = draftingConfig;
+
+    // Load shared embedding table from embedding.safetensors (shared between base and draft models)
+    std::filesystem::path const embeddingPath = std::filesystem::path(engineDir) / "embedding.safetensors";
+    LOG_INFO("Loading shared embedding table from: %s", embeddingPath.string().c_str());
+    std::vector<rt::Tensor> embeddingTensors;
+    if (!safetensors::loadSafetensors(embeddingPath, embeddingTensors, stream))
+    {
+        LOG_ERROR("Failed to load embedding table from: %s", embeddingPath.string().c_str());
+        throw std::runtime_error("Failed to load embedding table from: " + embeddingPath.string());
+    }
+    check::check(embeddingTensors.size() == 1, "embedding.safetensors should contain exactly one tensor");
+    check::check(
+        embeddingTensors[0].getShape().getNumDims() == 2, "embedding tensor should be 2D [vocabSize, hiddenSize]");
+    mEmbeddingTable = std::move(embeddingTensors[0]);
+    LOG_INFO("Shared embedding table loaded successfully with shape [%d, %d]", mEmbeddingTable.getShape()[0],
+        mEmbeddingTable.getShape()[1]);
 
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "eagle_base.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "base_config.json";
@@ -179,6 +196,24 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     {
         mIdsInput = rt::Tensor({mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength}, rt::DeviceType::kGPU,
             DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mIdsInput");
+        mInputsEmbeds = rt::Tensor(
+            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.hiddenSize},
+            rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mInputsEmbeds");
+        // Allocate deepstack embeddings if needed (one tensor per feature)
+        if (mBaseEngineConfig.numDeepstackFeatures > 0)
+        {
+            mDeepstackEmbeds.resize(mBaseEngineConfig.numDeepstackFeatures);
+            for (int32_t i = 0; i < mBaseEngineConfig.numDeepstackFeatures; ++i)
+            {
+                mDeepstackEmbeds[i] = rt::Tensor(
+                    {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.hiddenSize},
+                    rt::DeviceType::kGPU, DataType::kHALF,
+                    format::fmtstr("LLMInferenceSpecDecodeRuntime::mDeepstackEmbeds[%d]", i));
+            }
+            LOG_INFO("Allocated %d deepstack embeds tensors with shape [%d, %d, %d]",
+                mBaseEngineConfig.numDeepstackFeatures, mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength,
+                mBaseEngineConfig.hiddenSize);
+        }
         mContextLengthsInput = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
             "LLMInferenceSpecDecodeRuntime::mContextLengthsInput");
         // Allocate mLogitsOutput with max capacity to support both draft (smaller vocab) and base (larger vocab)
@@ -346,14 +381,14 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     // All other data input used by prefill step is already set up in setUpForPrefillExecution().
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
-    rt::OptionalInputTensors extraInputTensors
-        = mMultimodalRunner ? mMultimodalRunner->getExtraVisualFeatures() : rt::OptionalInputTensors{};
+    rt::OptionalInputTensors deepstackFeatures
+        = mMultimodalRunner ? mMultimodalRunner->getDeepstackFeatures() : rt::OptionalInputTensors{};
 
     int32_t maxGenerateLength = request.maxGenerateLength;
 
     // Initialize context for multi-batch
     SpecDecodeInferenceContext context;
-    context.initialize(activeBatchSize, maxGenerateLength, multimodalEmbeddings, extraInputTensors, stream);
+    context.initialize(activeBatchSize, maxGenerateLength, multimodalEmbeddings, deepstackFeatures, stream);
 
     // Preprocess user prompts and encode them.
     std::vector<std::vector<int32_t>> batchedInputIds;
@@ -674,9 +709,54 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     CUDA_CHECK(cudaMemcpyAsync(idsInputData, hostPackedTokenIdsData, activeBatchSize * inputIdsLength * sizeof(int32_t),
         cudaMemcpyHostToDevice, context.stream));
 
-    bool const prefillSuccess
-        = mBaseEngineRunner->executePrefillStep(mIdsInput, mContextLengthsInput, context.multimodalEmbeddings,
-            context.extraInputTensors, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
+    // Perform embedding lookup for base model prefill
+    mInputsEmbeds.reshape({activeBatchSize, inputIdsLength, mBaseEngineConfig.hiddenSize});
+
+    if (context.multimodalEmbeddings.has_value())
+    {
+        // Use image insertion variant for multimodal models
+        rt::Tensor const& imageEmbedsTensor = context.multimodalEmbeddings.value().get();
+        kernel::embeddingLookupWithImageInsertion(
+            mIdsInput, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, context.stream);
+    }
+    else
+    {
+        // Standard embedding lookup
+        kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+    }
+
+    // Process deepstack features: perform embedding lookup or provide zero tensors
+    rt::OptionalInputTensors deepstackEmbeds{};
+    if (mBaseEngineConfig.numDeepstackFeatures > 0)
+    {
+        if (!context.deepstackFeatures.empty())
+        {
+            // Perform deepstack embedding lookup for each feature by index
+            for (int32_t idx = 0; idx < static_cast<int32_t>(context.deepstackFeatures.size()); ++idx)
+            {
+                rt::Tensor const& featureTensor = context.deepstackFeatures[idx].get();
+
+                // Reshape and perform embedding lookup for this feature
+                mDeepstackEmbeds[idx].reshape({activeBatchSize, inputIdsLength, mBaseEngineConfig.hiddenSize});
+                kernel::assembleDeepstackEmbedding(
+                    mIdsInput, featureTensor, mBaseEngineConfig.vocabSize, mDeepstackEmbeds[idx], context.stream);
+
+                // Add to output vector (engine will bind by index)
+                deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
+            }
+        }
+        else
+        {
+            LOG_ERROR(
+                "Deepstack features are required (numDeepstackFeatures=%d) but no multimodal runner is available to "
+                "provide them.",
+                mBaseEngineConfig.numDeepstackFeatures);
+            return false;
+        }
+    }
+
+    bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(mInputsEmbeds, mContextLengthsInput,
+        deepstackEmbeds, mLogitsOutput, std::ref(mBaseHiddenStatesOutput), context.stream);
     if (!prefillSuccess)
     {
         LOG_ERROR("Failed to execute prefill step for base model.");
@@ -763,9 +843,25 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
     CUDA_CHECK(cudaMemcpyAsync(idsInputData, hostPackedTokenIdsData, activeBatchSize * inputIdsLength * sizeof(int32_t),
         cudaMemcpyHostToDevice, context.stream));
 
-    bool const prefillSuccess = mDraftEngineRunner->executeEaglePrefillStep(mIdsInput, mBaseHiddenStatesOutput,
-        mDraftHiddenStatesInput, mContextLengthsInput, context.multimodalEmbeddings, mLogitsOutput,
-        mDraftHiddenStatesOutput, mBaseEngineRunner->getRopeCosSinCacheTensor(), context.stream);
+    // Perform embedding lookup for draft model prefill
+    mInputsEmbeds.reshape({activeBatchSize, inputIdsLength, mDraftEngineConfig.draftModelHiddenDim});
+
+    if (context.multimodalEmbeddings.has_value())
+    {
+        // Use image insertion variant for multimodal models (draft model uses base model hidden dim / 3)
+        rt::Tensor const& imageEmbedsTensor = context.multimodalEmbeddings.value().get();
+        kernel::embeddingLookupWithImageInsertion(
+            mIdsInput, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, context.stream);
+    }
+    else
+    {
+        // Standard embedding lookup
+        kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+    }
+
+    bool const prefillSuccess = mDraftEngineRunner->executeEaglePrefillStep(mInputsEmbeds, mBaseHiddenStatesOutput,
+        mDraftHiddenStatesInput, mContextLengthsInput, mLogitsOutput, mDraftHiddenStatesOutput,
+        mBaseEngineRunner->getRopeCosSinCacheTensor(), context.stream);
     if (!prefillSuccess)
     {
         LOG_ERROR("Failed to execute prefill step for draft model.");
@@ -872,8 +968,12 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
         mLogitsOutput.reshape({activeBatchSize, draftTopK, mDraftEngineConfig.draftModelVocabSize});
         mDraftHiddenStatesOutput.reshape({activeBatchSize, draftTopK, mDraftEngineConfig.draftModelHiddenDim});
 
+        // Perform embedding lookup for draft proposal input (draft proposal only has text, no images)
+        mInputsEmbeds.reshape({activeBatchSize, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
+        kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+
         // Invoke the eagle draft engine to produce the new round of logits and hidden states.
-        bool const draftProposalStatus = mDraftEngineRunner->executeEagleDraftProposalStep(mIdsInput,
+        bool const draftProposalStatus = mDraftEngineRunner->executeEagleDraftProposalStep(mInputsEmbeds,
             mBaseHiddenStatesOutput, mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, mLogitsOutput,
             mDraftHiddenStatesOutput, context.stream);
         if (!draftProposalStatus)
@@ -941,13 +1041,17 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
             && mDraftTreeMask.getShape()[2] == mDraftingConfig.verifyTreeSize,
         "DraftTreeMask shall have shape [batch_size, verify_tree_size, verify_tree_size]");
 
+    // Perform embedding lookup for base model verification (Eagle base tree decoding only has text, no images)
+    mInputsEmbeds.reshape({activeBatchSize, mDraftingConfig.verifyTreeSize, mBaseEngineConfig.hiddenSize});
+    kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+
     // Engine expects 2D tensors: [batch_size * verify_tree_size, vocab_size/hidden_dim]
     int32_t const selectTokenSize = activeBatchSize * mDraftingConfig.verifyTreeSize;
     mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.outputVocabSize});
     mBaseHiddenStatesOutput.reshape({selectTokenSize, mBaseEngineConfig.outputHiddenDim});
 
     bool const verifySuccess = mBaseEngineRunner->executeEagleBaseTreeDecodingStep(
-        mIdsInput, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, context.stream);
+        mInputsEmbeds, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, context.stream);
     if (!verifySuccess)
     {
         LOG_ERROR("Failed to execute base tree verification step for base model.");
@@ -1074,8 +1178,12 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInference
             inputIdsLength * sizeof(int32_t), cudaMemcpyDeviceToDevice, context.stream));
     }
 
+    // Perform embedding lookup for draft model accept decode token (only text, no images)
+    mInputsEmbeds.reshape({activeBatchSize, inputIdsLength, mDraftEngineConfig.draftModelHiddenDim});
+    kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+
     bool const acceptTokenSuccess
-        = mDraftEngineRunner->executeEagleAcceptDecodeTokenStep(mIdsInput, mBaseHiddenStatesOutput,
+        = mDraftEngineRunner->executeEagleAcceptDecodeTokenStep(mInputsEmbeds, mBaseHiddenStatesOutput,
             mDraftHiddenStatesInput, mAcceptLength, mLogitsOutput, mDraftHiddenStatesOutput, context.stream);
     if (!acceptTokenSuccess)
     {
@@ -1106,9 +1214,9 @@ bool LLMInferenceSpecDecodeRuntime::captureDraftProposalCudaGraph(cudaStream_t s
         // Output tensors must be 3D: [batch_size, num_tokens, vocab_size/hidden_dim] not 2D
         mLogitsOutput.reshape({batchSize, draftTopK, mDraftEngineConfig.draftModelVocabSize});
         mDraftHiddenStatesOutput.reshape({batchSize, draftTopK, mDraftEngineConfig.draftModelHiddenDim});
+        mInputsEmbeds.reshape({batchSize, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
 
-        // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
-        captureStatus &= mDraftEngineRunner->captureEagleDraftProposalCudaGraph(mIdsInput, mBaseHiddenStatesOutput,
+        captureStatus &= mDraftEngineRunner->captureEagleDraftProposalCudaGraph(mInputsEmbeds, mBaseHiddenStatesOutput,
             mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, mLogitsOutput, mDraftHiddenStatesOutput, stream);
     }
 
@@ -1151,8 +1259,12 @@ bool LLMInferenceSpecDecodeRuntime::captureDraftAcceptDecodeTokenCudaGraph(cudaS
             CUDA_CHECK(cudaMemcpyAsync(mAcceptLength.rawPointer(), acceptLengthsVec.data(), batchSize * sizeof(int32_t),
                 cudaMemcpyHostToDevice, stream));
 
+            // Note: During CUDA graph capture, we skip embedding lookup as the actual embedding values
+            // don't matter for graph capture - only tensor shapes and memory layout matter
+            mInputsEmbeds.reshape({batchSize, acceptLength, mDraftEngineConfig.draftModelHiddenDim});
+
             captureStatus
-                &= mDraftEngineRunner->captureEagleAcceptDecodeTokenCudaGraph(mIdsInput, mBaseHiddenStatesOutput,
+                &= mDraftEngineRunner->captureEagleAcceptDecodeTokenCudaGraph(mInputsEmbeds, mBaseHiddenStatesOutput,
                     mDraftHiddenStatesInput, mAcceptLength, mLogitsOutput, mDraftHiddenStatesOutput, stream);
         }
     }
@@ -1187,9 +1299,12 @@ bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_
         mIdsInput.reshape({batchSize, mDraftingConfig.verifyTreeSize});
         mDraftTreeMask.reshape({batchSize, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});
 
-        // Don't pass multimodal embeddings during CUDA graph capture as they are invalid
+        // Note: During CUDA graph capture, we skip embedding lookup as the actual embedding values
+        // don't matter for graph capture - only tensor shapes and memory layout matter
+        mInputsEmbeds.reshape({batchSize, mDraftingConfig.verifyTreeSize, mBaseEngineConfig.hiddenSize});
+
         captureStatus &= mBaseEngineRunner->captureEagleBaseTreeDecodingCudaGraph(
-            mIdsInput, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, stream);
+            mInputsEmbeds, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, stream);
     }
 
     if (captureStatus)
@@ -1335,7 +1450,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     tempContext.promptLengths.resize(1, 0);
     tempContext.finishedStates.resize(1, 0);
     tempContext.multimodalEmbeddings = context.multimodalEmbeddings;
-    tempContext.extraInputTensors = context.extraInputTensors;
+    tempContext.deepstackFeatures = context.deepstackFeatures;
     tempContext.generationRound = 0;
     tempContext.maxGenerateLength = 0; // Not generating, just caching
     tempContext.activeBatchSize = 1;

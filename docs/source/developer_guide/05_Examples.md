@@ -37,10 +37,7 @@ Builds TensorRT engines for LLMs (standard, EAGLE, VLM, LoRA).
   --engineDir engines/qwen2.5-vl-3b \
   --maxBatchSize 1 \
   --maxInputLen=1024 \
-  --maxKVCacheCapacity=4096 \
-  --vlm \
-  --minImageTokens 128 \
-  --maxImageTokens 512
+  --maxKVCacheCapacity=4096
 
 # EAGLE (speculative decoding)
 ./build/examples/llm/llm_build \
@@ -133,7 +130,7 @@ tensorrt-edgellm-export-llm --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir
 tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-3B-Instruct --output_dir onnx_models/qwen2.5-vl-3b/visual_enc_onnx
 
 # 2. Build Engines (Thor device)
-./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b --engineDir engines/qwen2.5-vl-3b --vlm
+./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-3b --engineDir engines/qwen2.5-vl-3b
 ./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-3b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-3b
 
 # 3. Run Inference (Thor device)
@@ -202,12 +199,12 @@ tensorrt-edgellm-export-visual --model_dir microsoft/Phi-4-multimodal-instruct -
 ```bash
 # 1. Export (x86 host)
 tensorrt-edgellm-export-llm --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_dir onnx_models/qwen2.5-vl-7b_eagle_base --is_eagle_base
-tensorrt-edgellm-export-draft --base_model_dir Qwen/Qwen2.5-VL-7B-Instruct --draft_model_dir path/to/draft --output_dir onnx_models/qwen2.5-vl-7b_eagle_draft --use_prompt_tuning
+tensorrt-edgellm-export-draft --base_model_dir Qwen/Qwen2.5-VL-7B-Instruct --draft_model_dir path/to/draft --output_dir onnx_models/qwen2.5-vl-7b_eagle_draft
 tensorrt-edgellm-export-visual --model_dir Qwen/Qwen2.5-VL-7B-Instruct --output_dir onnx_models/qwen2.5-vl-7b/visual_enc_onnx
 
 # 2. Build Engines (Thor device)
-./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-7b_eagle_base --engineDir engines/qwen2.5-vl-7b_eagle --vlm --eagleBase
-./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-7b_eagle_draft --engineDir engines/qwen2.5-vl-7b_eagle --vlm --eagleDraft
+./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-7b_eagle_base --engineDir engines/qwen2.5-vl-7b_eagle --eagleBase
+./build/examples/llm/llm_build --onnxDir onnx_models/qwen2.5-vl-7b_eagle_draft --engineDir engines/qwen2.5-vl-7b_eagle --eagleDraft
 ./build/examples/multimodal/visual_build --onnxDir onnx_models/qwen2.5-vl-7b/visual_enc_onnx --engineDir visual_engines/qwen2.5-vl-7b
 
 # 3. Run Inference (Thor device)
@@ -272,7 +269,6 @@ For standard LLM models (text-only), refer to `examples/llm/INPUT_FORMAT.md`.
 | `--maxBatchSize` | Maximum batch size | 4 |
 | `--maxInputLen` | Maximum input length | 128 |
 | `--maxKVCacheCapacity` | Maximum KV-cache capacity | 4096 |
-| `--vlm` | VLM mode | false |
 | `--eagleBase/Draft` | EAGLE mode | false |
 | `--maxLoraRank` | LoRA rank (0=disabled) | 0 |
 

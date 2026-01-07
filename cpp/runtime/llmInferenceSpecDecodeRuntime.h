@@ -71,7 +71,7 @@ struct SpecDecodeInferenceContext
     std::unordered_map<int32_t, int32_t> evictedPromptLengths;                   //!< Prompt lengths of evicted batches
     std::vector<int32_t> batchIndexMapping;       //!< Maps current batch index to original index
     rt::OptionalInputTensor multimodalEmbeddings; //!< Optional multimodal embeddings
-    rt::OptionalInputTensors extraInputTensors;   //!< Extra input tensors (e.g., deepstack features)
+    rt::OptionalInputTensors deepstackFeatures;   //!< Deepstack features for Qwen3-VL (raw features before embedding)
     int32_t generationRound;                      //!< Current generation round (shared across all batches)
     int32_t maxGenerateLength;                    //!< Maximum generation length
     int32_t activeBatchSize;                      //!< Current active batch size
@@ -84,11 +84,11 @@ struct SpecDecodeInferenceContext
      * @param batchSize Active batch size
      * @param maxGenLength Maximum generation length
      * @param multimodal Optional multimodal embeddings
-     * @param extraInputTensors Extra input tensors (e.g., deepstack features)
+     * @param deepstackFeatures Deepstack features for Qwen3-VL (raw features before embedding)
      * @param cudaStream CUDA stream for operations
      */
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal,
-        rt::OptionalInputTensors const& extraInputTensors, cudaStream_t cudaStream);
+        rt::OptionalInputTensors const& deepstackFeatures, cudaStream_t cudaStream);
 };
 
 /*!
@@ -182,7 +182,10 @@ private:
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
     // [1] I/O Tensors to work with base and eagle draft engine.
-    rt::Tensor mIdsInput;
+    rt::Tensor mEmbeddingTable;               //!< Embedding table [vocabSize, hiddenSize]
+    rt::Tensor mIdsInput;                     //!< Input token IDs (used for embedding lookup)
+    rt::Tensor mInputsEmbeds;                 //!< Input embeddings (after embedding lookup)
+    std::vector<rt::Tensor> mDeepstackEmbeds; //!< Deepstack embeddings for Qwen3-VL (one per feature)
     rt::Tensor mContextLengthsInput;
     rt::Tensor mLogitsOutput;
     rt::Tensor mDraftTreeSize;

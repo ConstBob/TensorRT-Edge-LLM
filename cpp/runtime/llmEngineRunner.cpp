@@ -26,6 +26,7 @@
 #include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
 #include "common/version.h"
+#include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -47,14 +48,15 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& con
 
     ss << std::boolalpha;
     ss << "LLMEngineRunnerConfig:"
-       << "  enableEagleSpecDecode: " << config.enableEagleSpecDecode << "  isVlm: " << config.isVlm
+       << "  enableEagleSpecDecode: " << config.enableEagleSpecDecode
        << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
        << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
        << "  hiddenSize: " << config.hiddenSize << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
        << "  minSupportedInputLength: " << config.minSupportedInputLength
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
        << "  maxKVCacheCapacity: " << config.maxKVCacheCapacity
-       << "  maxSupportedLoraRank: " << config.maxSupportedLoraRank;
+       << "  maxSupportedLoraRank: " << config.maxSupportedLoraRank
+       << "  numDeepstackFeatures: " << config.numDeepstackFeatures;
     if (config.enableEagleSpecDecode)
     {
         ss << "  outputHiddenDim (For Eagle SpecDecode): " << config.outputHiddenDim;
@@ -65,33 +67,34 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& con
 
 // Compute a unique hash value that can distinguish the various decoding steps.
 // Extend this function when we need to capture more information.
-size_t hashDecodingInput(rt::Tensor const& inputIds, rt::Tensor const& outputLogits, std::string const& loraWeightsName)
+size_t hashDecodingInput(
+    rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits, std::string const& loraWeightsName)
 {
     // For vanilla decoding step, the shape can be distingusihed by active batch size.
     // Also capture the pointer address to ensure we are read/write correct locations.
-    int64_t const activeBatchSize = inputIds.getShape()[0];
-    uintptr_t const inputIdsAddr = reinterpret_cast<uintptr_t>(inputIds.rawPointer());
+    int64_t const activeBatchSize = inputsEmbeds.getShape()[0];
+    uintptr_t const inputsEmbedsAddr = reinterpret_cast<uintptr_t>(inputsEmbeds.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
 
     size_t hashValue = 0;
     hash_utils::hashCombine(hashValue, activeBatchSize);
-    hash_utils::hashCombine(hashValue, inputIdsAddr);
+    hash_utils::hashCombine(hashValue, inputsEmbedsAddr);
     hash_utils::hashCombine(hashValue, outputLogitsAddr);
     hash_utils::hashCombine(hashValue, loraWeightsName);
     return hashValue;
 }
 
-size_t hashBaseTreeDecodingInput(
-    rt::Tensor const& baseTreeDecodingInputIds, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+size_t hashBaseTreeDecodingInput(rt::Tensor const& baseTreeDecodingInputsEmbeds, rt::Tensor const& outputLogits,
+    rt::Tensor const& outputHiddenStates)
 {
-    int64_t const activeBatchSize = baseTreeDecodingInputIds.getShape()[0];
-    uintptr_t const inputIdsAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingInputIds.rawPointer());
+    int64_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
+    uintptr_t const inputsEmbedsAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingInputsEmbeds.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
     uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
 
     size_t hashValue = 0;
     hash_utils::hashCombine(hashValue, activeBatchSize);
-    hash_utils::hashCombine(hashValue, inputIdsAddr);
+    hash_utils::hashCombine(hashValue, inputsEmbedsAddr);
     hash_utils::hashCombine(hashValue, outputLogitsAddr);
     hash_utils::hashCombine(hashValue, outputHiddenStatesAddr);
     return hashValue;
@@ -111,6 +114,7 @@ static constexpr int32_t kGENERATION_PROFILE_INDEX{1};
 LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
+
     LOG_INFO("Loading config file %s", configPath.string().c_str());
 
     // Parse configuration from JSON file
@@ -295,16 +299,28 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     // Initialize the dummy tensor as TensorRT does not support nullptr for binding
     // Calculate maximum memory requirements across all use cases:
-    // 1. Multimodal embeddings: {1, hiddenSize}
-    // 2. Attention mask: {maxSupportedBatchSize, 1, 1}
-    // 3. Attention position IDs: {maxSupportedBatchSize, 1}
-    // 4. LoRA weights: max dimension across all adapters
-    // 5. KV cache start index: {maxSupportedBatchSize}
-    int64_t maxDummyElements = std::max({
-        static_cast<int64_t>(mConfig.hiddenSize),            // multimodal embeddings
-        static_cast<int64_t>(mConfig.maxSupportedBatchSize), // attention mask/pos IDs/KV cache start index
+    // 1. Attention mask: {maxSupportedBatchSize, 1, 1}
+    // 2. Attention position IDs: {maxSupportedBatchSize, 1}
+    // 3. LoRA weights: max dimension across all adapters
+    // 4. KV cache start index: {maxSupportedBatchSize}
+    // 5. Deepstack embeds for generation: {maxSupportedBatchSize, maxVerifyTreeSize or 1, hiddenSize}
+    std::vector<int64_t> dummySizes = {
+        static_cast<int64_t>(
+            mConfig.maxSupportedBatchSize), // attention mask/attention position IDs/KV cache start index
         static_cast<int64_t>(getMaxLoraWeightsDimension() * kEMPTY_LORA_RANK), // LoRA weights
-    });
+    };
+
+    // Add deepstack_embeds size for generation profile
+    // Use maxVerifyTreeSize for eagle or 1 for vanilla decoding
+    if (mConfig.numDeepstackFeatures > 0)
+    {
+        int64_t const deepstackSeqLen = mConfig.enableEagleSpecDecode ? mConfig.maxVerifyTreeSize : 1;
+        int64_t const deepstackSize
+            = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * deepstackSeqLen * mConfig.hiddenSize;
+        dummySizes.push_back(deepstackSize);
+    }
+
+    int64_t maxDummyElements = *std::max_element(dummySizes.begin(), dummySizes.end());
     mDummyTensor = rt::Tensor(
         {maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyTensor");
     // Initialize dummy tensor memory to zero
@@ -322,32 +338,6 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         {
             LOG_ERROR("Failed to set kKVCacheStartIndex dummy tensor for initialization");
             throw std::runtime_error("Failed to set kKVCacheStartIndex dummy tensor for initialization");
-        }
-    }
-
-    // Set multimodal embeddings to dummy tensor for generation contexts if VLM is enabled
-    if (mConfig.isVlm)
-    {
-        bool setMultimodalStatus{true};
-        setMultimodalStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kImageEmbeds, mDummyTensor.rawPointer());
-        setMultimodalStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kImageEmbeds, rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
-
-        // Set deepstack features if exists.
-        for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
-        {
-            std::string deepstackFeatureName = binding_names::formatDeepstackFeaturesName(idx);
-            setMultimodalStatus
-                &= mTRTExecutionContext->setTensorAddress(deepstackFeatureName.c_str(), mDummyTensor.rawPointer());
-            setMultimodalStatus &= mTRTExecutionContext->setInputShape(
-                deepstackFeatureName.c_str(), rt::Coords{1, mConfig.hiddenSize}.getTRTDims());
-        }
-
-        if (!setMultimodalStatus)
-        {
-            LOG_ERROR("Failed to set multimodal embeddings dummy tensor for generation context");
-            throw std::runtime_error("Failed to set multimodal embeddings dummy tensor for generation context");
         }
     }
     // Reset the LoRA weights to zero tensors.
@@ -387,7 +377,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         // Define required fields for builder_config
         std::vector<std::string> const requiredBuilderConfigFields
-            = {"max_batch_size", "max_input_len", "max_kv_cache_capacity", "max_lora_rank", "eagle_base", "is_vlm"};
+            = {"max_batch_size", "max_input_len", "max_kv_cache_capacity", "max_lora_rank", "eagle_base"};
 
         // Validate required fields exist in builder_config
         for (auto const& field : requiredBuilderConfigFields)
@@ -410,9 +400,10 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
         mConfig.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
         // Set actual output vocab size: use reduced size if enabled, otherwise full size
         mConfig.outputVocabSize = (mConfig.reducedVocabSize > 0) ? mConfig.reducedVocabSize : mConfig.vocabSize;
+        // Read num_deepstack_features if present (Qwen3VL models)
+        mConfig.numDeepstackFeatures = configJson["num_deepstack_features"].get<int32_t>();
 
         // Extract builder_config values
-        mConfig.isVlm = builderConfig["is_vlm"].get<bool>();
         mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
         mConfig.minSupportedInputLength = 1; // TODO: Change this to min input length
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
@@ -496,19 +487,13 @@ bool LLMEngineRunner::validateConfigFromEngine()
         return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPastKeyValuesTemplate) != std::string::npos;
     };
 
-    // If the engine comes with multimodal embeddings binding, it means the engine supports VLM.
-    auto identifyMultimodalEmbeddingsBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 2 && bindingName == binding_names::kImageEmbeds;
-    };
-
-    // If the engine comes with deepstack features binding, it means the engine is Qwen3-VL.
-    auto identifyDeepstackFeaturesBinding = [](std::string const& bindingName, Dims const& tensorDim) {
-        return tensorDim.nbDims == 2
-            && bindingName.find(binding_names::kDeepstackFeaturesTemplate) != std::string::npos;
+    // If the engine comes with deepstack embeds binding, it means the engine is Qwen3-VL.
+    auto identifyDeepstackEmbedsBinding = [](std::string const& bindingName, Dims const& tensorDim) {
+        return tensorDim.nbDims == 3 && bindingName.find(binding_names::kDeepstackEmbedsTemplate) != std::string::npos;
     };
 
     int32_t nbKVCacheInputs{0};
-    bool foundMultimodalEmbeddingsInput{false};
+    int32_t nbDeepstackEmbedsInputs{0};
     int32_t numIOBindings = mEngine->getNbIOTensors();
 
     // Lambda to validate KV cache dimensions against profile shape
@@ -558,44 +543,17 @@ bool LLMEngineRunner::validateConfigFromEngine()
             }
             ++nbKVCacheInputs;
         }
-        if (identifyMultimodalEmbeddingsBinding(bindingName, tensorDim))
+        if (identifyDeepstackEmbedsBinding(bindingName, tensorDim))
         {
-            foundMultimodalEmbeddingsInput = true;
-            if (mConfig.hiddenSize != tensorDim.d[1])
+            if (mConfig.hiddenSize != tensorDim.d[2])
             {
-                LOG_ERROR("hiddenSize is not consistent. From engine multimodal embeddings: %d, from config: %d",
-                    tensorDim.d[1], mConfig.hiddenSize);
+                LOG_ERROR("hiddenSize is not consistent. From engine deepstack_embeds: %d, from config: %d",
+                    tensorDim.d[2], mConfig.hiddenSize);
                 return false;
             }
-            if (!mConfig.isVlm)
-            {
-                LOG_ERROR("VLM is not enabled but multimodal embeddings input image_embeds found in engine");
-                return false;
-            }
+            LOG_DEBUG("validateConfigFromEngine(): Found deepstack embeds binding: %s", bindingName.c_str());
+            ++nbDeepstackEmbedsInputs;
         }
-        if (identifyDeepstackFeaturesBinding(bindingName, tensorDim))
-        {
-            if (mConfig.hiddenSize != tensorDim.d[1])
-            {
-                LOG_ERROR("hiddenSize is not consistent. From engine multimodal embeddings: %d, from config: %d",
-                    tensorDim.d[1], mConfig.hiddenSize);
-                return false;
-            }
-            if (!mConfig.isVlm)
-            {
-                LOG_ERROR("VLM is not enabled but deepstack features input found in engine");
-                return false;
-            }
-            LOG_DEBUG("validateConfigFromEngine(): Found deepstack features binding: %s", bindingName.c_str());
-            ++mConfig.numDeepstackFeatures;
-        }
-    }
-    // Validate hiddenSize from multimodal embeddings if VLM is enabled
-    if (mConfig.isVlm && !foundMultimodalEmbeddingsInput)
-    {
-        LOG_ERROR(
-            "VLM is enabled but multimodal embeddings input (%s) not found in engine", binding_names::kImageEmbeds);
-        return false;
     }
     if (nbKVCacheInputs != mConfig.numDecoderLayers)
     {
@@ -603,10 +561,18 @@ bool LLMEngineRunner::validateConfigFromEngine()
             mConfig.numDecoderLayers);
         return false;
     }
+    if (nbDeepstackEmbedsInputs != mConfig.numDeepstackFeatures)
+    {
+        LOG_ERROR("numDeepstackFeatures is not consistent. From engine: %d, from config: %d", nbDeepstackEmbedsInputs,
+            mConfig.numDeepstackFeatures);
+        return false;
+    }
     Dims const minInputPrefillShape
-        = mEngine->getProfileShape(binding_names::kInputIds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMIN);
+        = mEngine->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMIN);
     Dims const maxInputPrefillShape
-        = mEngine->getProfileShape(binding_names::kInputIds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+        = mEngine->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+
+    // inputs_embeds is 3D: [batch_size, seq_len, hidden_size]
     if (mConfig.minSupportedInputLength != minInputPrefillShape.d[1])
     {
         LOG_ERROR("minSupportedInputLength is not consistent. From engine: %d, from config: %d",
@@ -617,6 +583,12 @@ bool LLMEngineRunner::validateConfigFromEngine()
     {
         LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d",
             maxInputPrefillShape.d[1], mConfig.maxSupportedInputLength);
+        return false;
+    }
+    if (mConfig.hiddenSize != maxInputPrefillShape.d[2])
+    {
+        LOG_ERROR("hiddenSize is not consistent. From engine inputs_embeds: %d, from config: %d",
+            maxInputPrefillShape.d[2], mConfig.hiddenSize);
         return false;
     }
 
@@ -699,21 +671,24 @@ rt::LinearKVCache& LLMEngineRunner::getLinearKVCache()
     return mKVCache;
 }
 
-bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& contextLengths,
-    rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates,
-    rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors)
+bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
+    rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates, rt::OptionalInputTensors deepstackEmbeds)
 {
-    int32_t activeBatchSize = inputIds.getShape()[0];
-    int32_t prefillSequenceLength = inputIds.getShape()[1];
+    int32_t activeBatchSize = inputsEmbeds.getShape()[0];
+    int32_t prefillSequenceLength = inputsEmbeds.getShape()[1];
 
-    bool const checkInputsGPUTensor = inputIds.getDeviceType() == rt::DeviceType::kGPU
-        && contextLengths.getDeviceType() == rt::DeviceType::kCPU
+    // Validate inputsEmbeds
+    bool const checkInputsGPUTensor = inputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
+        && inputsEmbeds.getDataType() == nvinfer1::DataType::kHALF && inputsEmbeds.getShape().getNumDims() == 3
+        && inputsEmbeds.getShape()[2] == mConfig.hiddenSize && contextLengths.getDeviceType() == rt::DeviceType::kCPU
         && outputLogits.getDeviceType() == rt::DeviceType::kGPU;
     if (!checkInputsGPUTensor)
     {
         LOG_ERROR(
-            "Invalid device type of I/O tensors. ContextLengths input should reside on CPU and "
-            "the rest should reside on GPU.");
+            "Invalid device type or shape of I/O tensors. InputsEmbeds should be 3D FLOAT16 on GPU with shape "
+            "[batchSize, seqLen, %d], "
+            "ContextLengths input should reside on CPU and the rest should reside on GPU.",
+            mConfig.hiddenSize);
         return false;
     }
     bool const isBatchValid = activeBatchSize <= mConfig.maxSupportedBatchSize
@@ -723,8 +698,8 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
         LOG_ERROR(
             "Invalid batchSize of the input tensors. Either batchSize is larger than "
             "maxSupportedBatchSize or batchSize is not consistent among the input tensors. "
-            "Current inputIds shape: %s, contextLengths shape: %s, logits shape: %s",
-            inputIds.getShape().formatString().c_str(), contextLengths.getShape().formatString().c_str(),
+            "Current inputsEmbeds shape: %s, contextLengths shape: %s, logits shape: %s",
+            inputsEmbeds.getShape().formatString().c_str(), contextLengths.getShape().formatString().c_str(),
             outputLogits.getShape().formatString().c_str());
         return false;
     }
@@ -732,53 +707,36 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
     {
         LOG_ERROR(
             "Invalid sequence length of the input tensors. Input sequence length (%d) is larger "
-            "than maxSupportedInputLength (%d). Current inputIds shape: %s.",
-            prefillSequenceLength, mConfig.maxSupportedInputLength, inputIds.getShape().formatString().c_str());
+            "than maxSupportedInputLength (%d). Current inputsEmbeds shape: %s.",
+            prefillSequenceLength, mConfig.maxSupportedInputLength, inputsEmbeds.getShape().formatString().c_str());
         return false;
     }
 
-    // Validate multimodal embeddings based on is_vlm flag
-    bool const isMultimodalEmbeddingsValid
-        = (mConfig.isVlm && multimodalEmbeddings.has_value()
-              && multimodalEmbeddings.value().get().getShape().getNumDims() == 2
-              && multimodalEmbeddings.value().get().getShape()[1] == mConfig.hiddenSize)
-        || (!mConfig.isVlm && !multimodalEmbeddings.has_value());
-    if (!isMultimodalEmbeddingsValid)
+    // Validate deepstack embeds for Qwen3-VL (these are already embedded)
+    int32_t deepstackEmbedsCount = static_cast<int32_t>(deepstackEmbeds.size());
+    if ((deepstackEmbedsCount != mConfig.numDeepstackFeatures) && (deepstackEmbedsCount != 0))
     {
-        LOG_ERROR("Invalid multimodal embeddings. VLM=%s, provided=%s, expected shape=[*, %d]. Current shape: %s",
-            mConfig.isVlm ? "true" : "false", multimodalEmbeddings.has_value() ? "true" : "false", mConfig.hiddenSize,
-            multimodalEmbeddings.has_value() ? multimodalEmbeddings.value().get().getShape().formatString().c_str()
-                                             : "None");
+        LOG_ERROR("Invalid deepstack embeds count. Expected either %d or 0, got %d", mConfig.numDeepstackFeatures,
+            deepstackEmbedsCount);
         return false;
     }
 
-    // Validate extra input tensors, e.g. deepstack features for Qwen3-VL
-    int32_t deepstackFeaturesCount{0};
-    for (auto const& tensorRef : extraInputTensors)
+    // Validate each deepstack embed tensor
+    for (int32_t i = 0; i < deepstackEmbedsCount; ++i)
     {
-        rt::Tensor const& tensor = tensorRef.get();
-        std::string const tensorName = tensor.getName();
-
-        // Deepstack features
-        if (tensorName.find(binding_names::kDeepstackFeaturesTemplate) != std::string::npos)
+        rt::Tensor const& tensor = deepstackEmbeds[i].get();
+        bool const isTensorValid = tensor.getDeviceType() == rt::DeviceType::kGPU && tensor.getShape().getNumDims() == 3
+            && tensor.getShape()[0] == activeBatchSize && tensor.getShape()[1] == prefillSequenceLength
+            && tensor.getShape()[2] == mConfig.hiddenSize;
+        if (!isTensorValid)
         {
-            bool const isTensorValid = tensor.getDeviceType() == rt::DeviceType::kGPU
-                && tensor.getShape().getNumDims() == 2 && tensor.getShape()[1] == mConfig.hiddenSize;
-            if (!isTensorValid)
-            {
-                LOG_ERROR(
-                    "Invalid deepstack feature '%s'. Expected device type: GPU, shape: [*, %d]. Current shape: %s",
-                    tensorName.c_str(), mConfig.hiddenSize, tensor.getShape().formatString().c_str());
-                return false;
-            }
-            ++deepstackFeaturesCount;
+            LOG_ERROR(
+                "Invalid deepstack embed at index %d. Expected device type: GPU, shape: [%d, %d, %d]. Current shape: "
+                "%s",
+                i, activeBatchSize, prefillSequenceLength, mConfig.hiddenSize,
+                tensor.getShape().formatString().c_str());
+            return false;
         }
-    }
-    if (deepstackFeaturesCount != mConfig.numDeepstackFeatures)
-    {
-        LOG_ERROR("Invalid deepstack features count. Expected %d, got %d", mConfig.numDeepstackFeatures,
-            deepstackFeaturesCount);
-        return false;
     }
 
     bool const isLogitsShapeValid
@@ -812,9 +770,9 @@ bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputIds, rt:
     return true;
 }
 
-bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor const& hostContextLengths,
-    rt::OptionalInputTensor multimodalEmbeddings, rt::OptionalInputTensors extraInputTensors, rt::Tensor& outputLogits,
-    rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream)
+bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Tensor const& hostContextLengths,
+    rt::OptionalInputTensors deepstackEmbeds, rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
+    cudaStream_t stream)
 {
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus &= mTRTExecutionContext->setOptimizationProfileAsync(kPREFILL_PROFILE_INDEX, stream);
@@ -825,15 +783,15 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     }
 
     bool const validateInputStatus = this->prefillStepInputValidation(
-        inputIds, hostContextLengths, outputLogits, outputHiddenStates, multimodalEmbeddings, extraInputTensors);
+        inputsEmbeds, hostContextLengths, outputLogits, outputHiddenStates, deepstackEmbeds);
     if (!validateInputStatus)
     {
         LOG_ERROR("executePrefill(): Prefill request not performed due to invalid input tensors.");
         return false;
     }
 
-    // Verirify input tensorShape is valid.
-    int32_t activeBatchSize = inputIds.getShape()[0];
+    // Verify input tensorShape is valid.
+    int32_t activeBatchSize = inputsEmbeds.getShape()[0];
 
     bool reshapeStatus{true};
     // conduct preparation work for the engine execution. Provide correct shapes for MISC input tensors.
@@ -859,11 +817,11 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
     bool setEngineIOStatus{true};
-    // Engine input tensors.
+    // Engine input tensors - bind inputs_embeds directly
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
     setEngineIOStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -899,24 +857,21 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     }
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-    if (multimodalEmbeddings.has_value())
+
+    // Process deepstack embeds: bind already-embedded tensors to engine
+    // Runtime must provide these tensors (zero tensors for non-multimodal use cases)
+    if (mConfig.numDeepstackFeatures > 0)
     {
-        rt::Tensor const& multimodalEmbeddingsTensor = multimodalEmbeddings.value().get();
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kImageEmbeds, const_cast<void*>(multimodalEmbeddingsTensor.rawPointer()));
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kImageEmbeds, multimodalEmbeddingsTensor.getShape().getTRTDims());
-    }
-    if (!extraInputTensors.empty())
-    {
-        for (auto const& tensorRef : extraInputTensors)
+        // Bind deepstack embeds to engine by index
+        for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
         {
-            // Bind the extra input tensor to the engine according to its name.
-            rt::Tensor const& tensor = tensorRef.get();
+            rt::Tensor const& embedTensor = deepstackEmbeds[idx].get();
+            std::string embedName = binding_names::formatDeepstackEmbedsName(idx);
+
             setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-                tensor.getName().c_str(), const_cast<void*>(tensor.rawPointer()));
+                embedName.c_str(), const_cast<void*>(embedTensor.rawPointer()));
             setEngineIOStatus
-                &= mTRTExecutionContext->setInputShape(tensor.getName().c_str(), tensor.getShape().getTRTDims());
+                &= mTRTExecutionContext->setInputShape(embedName.c_str(), embedTensor.getShape().getTRTDims());
         }
     }
     if (mConfig.enableEagleSpecDecode)
@@ -960,16 +915,17 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputIds, rt::Tensor 
     return true;
 }
 
-bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& inputIds, rt::Tensor const& outputLogits)
+bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits)
 {
-    int32_t activeBatchSize = inputIds.getShape()[0];
-    bool const checkInputsGPUTensor
-        = inputIds.getDeviceType() == rt::DeviceType::kGPU && outputLogits.getDeviceType() == rt::DeviceType::kGPU;
+    int32_t activeBatchSize = inputsEmbeds.getShape()[0];
+    bool const checkInputsGPUTensor = inputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
+        && inputsEmbeds.getDataType() == nvinfer1::DataType::kHALF
+        && outputLogits.getDeviceType() == rt::DeviceType::kGPU;
     if (!checkInputsGPUTensor)
     {
         LOG_ERROR(
-            "executeGeneration(): Invalid device type of the input tensors. inputIds and outputLogits should reside on "
-            "GPU.");
+            "executeGeneration(): Invalid device type of the input tensors. inputsEmbeds (FLOAT16) and outputLogits "
+            "should reside on GPU.");
         return false;
     }
     bool const isBatchValid = activeBatchSize == mKVCache.getActiveBatchSize();
@@ -980,13 +936,15 @@ bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& input
             "size set by the previous prefill stage.");
         return false;
     }
-    bool checkInputShapeValid = inputIds.getShape().getNumDims() == 2 && inputIds.getShape()[1] == 1
-        && outputLogits.getShape().getNumDims() == 2 && outputLogits.getShape()[1] == mConfig.outputVocabSize;
+    bool checkInputShapeValid = inputsEmbeds.getShape().getNumDims() == 3 && inputsEmbeds.getShape()[1] == 1
+        && inputsEmbeds.getShape()[2] == mConfig.hiddenSize && outputLogits.getShape().getNumDims() == 2
+        && outputLogits.getShape()[1] == mConfig.outputVocabSize;
     if (!checkInputShapeValid)
     {
         LOG_ERROR(
             "executeGeneration(): Invalid shape of the input tensors. The input tensor should have shape "
-            "[activeBatchSize, 1] and the output tensor should have shape [activeBatchSize, outputVocabSize].");
+            "[activeBatchSize, 1, hiddenSize] and the output tensor should have shape [activeBatchSize, "
+            "outputVocabSize].");
         return false;
     }
 
@@ -994,17 +952,17 @@ bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& input
 }
 
 bool LLMEngineRunner::executeVanillaDecodingStep(
-    rt::Tensor const& inputIds, rt::Tensor& outputLogits, cudaStream_t stream)
+    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream)
 {
-    bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputIds, outputLogits);
+    bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputsEmbeds, outputLogits);
     if (!validateInputStatus)
     {
         LOG_ERROR("executeGeneration(): Generation request not performed due to invalid input tensors.");
         return false;
     }
 
-    int32_t activeBatchSize = inputIds.getShape()[0];
-    // For vanllia decode stage, the selected token indices are always 0.
+    int32_t activeBatchSize = inputsEmbeds.getShape()[0];
+    // For vanilla decode stage, the selected token indices are always 0.
     // Also setup the sequence length of each sequence for this run based on committed KVCache length.
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
     CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), mKVCache.getKVCacheLengths().rawPointer(),
@@ -1014,7 +972,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     kernel::incrementLengthTensor(mSequenceContextLengths, kDECODE_INCREMENT, stream);
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
-    size_t const graphHash = hashDecodingInput(inputIds, outputLogits, mActiveLoraWeightsName);
+    size_t const graphHash = hashDecodingInput(inputsEmbeds, outputLogits, mActiveLoraWeightsName);
     if (mCudaGraphs.find(graphHash) != mCudaGraphs.end())
     {
         LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for vanilla decoding step.");
@@ -1033,11 +991,11 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         }
 
         bool setEngineIOStatus{true};
-        // Engine input tensors.
+        // Engine input tensors - bind inputs_embeds directly
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
+            binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
         setEngineIOStatus
-            &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+            &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1062,6 +1020,19 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
 
         // Update KV cache shapes to match activeBatchSize
         setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
+        // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding
+        if (mConfig.numDeepstackFeatures > 0)
+        {
+            for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
+            {
+                std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
+                setEngineIOStatus
+                    &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyTensor.rawPointer());
+                setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+                    deepstackEmbedName.c_str(), rt::Coords{activeBatchSize, 1, mConfig.hiddenSize}.getTRTDims());
+            }
+        }
 
         // Engine output tensors.
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
@@ -1090,11 +1061,11 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     return true;
 }
 
-bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputIds,
+bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputsEmbeds,
     rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
     // All input tensors shall reside on GPU.
-    bool const checkInputsGPUTensor = baseTreeDecodingInputIds.getDeviceType() == rt::DeviceType::kGPU
+    bool const checkInputsGPUTensor = baseTreeDecodingInputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
         && baseTreeDecodingMask.getDeviceType() == rt::DeviceType::kGPU
         && outputLogits.getDeviceType() == rt::DeviceType::kGPU
         && outputHiddenStates.getDeviceType() == rt::DeviceType::kGPU;
@@ -1107,19 +1078,19 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
         return false;
     }
     // Validate datatypes of the input tensors.
-    bool const isInputTypeValid = baseTreeDecodingInputIds.getDataType() == DataType::kINT32
+    bool const isInputTypeValid = baseTreeDecodingInputsEmbeds.getDataType() == DataType::kHALF
         && baseTreeDecodingMask.getDataType() == DataType::kINT8 && outputLogits.getDataType() == DataType::kFLOAT
         && outputHiddenStates.getDataType() == DataType::kHALF;
     if (!isInputTypeValid)
     {
         LOG_ERROR(
-            "eagleBaseTreeDecodingStepInputValidation(): Input token ids shall be INT32, hidden states I/O shall be "
+            "eagleBaseTreeDecodingStepInputValidation(): Input embeds shall be FLOAT16, hidden states I/O shall be "
             "FLOAT16, "
             "base tree decoding mask shall be INT8, output logits shall be FLOAT32.");
         return false;
     }
     // Validate shapes of the input tensors.
-    bool const isBatchValid = baseTreeDecodingInputIds.getShape()[0] == mKVCache.getActiveBatchSize()
+    bool const isBatchValid = baseTreeDecodingInputsEmbeds.getShape()[0] == mKVCache.getActiveBatchSize()
         && baseTreeDecodingMask.getShape()[0] == mKVCache.getActiveBatchSize();
     if (!isBatchValid)
     {
@@ -1130,15 +1101,18 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
         return false;
     }
 
-    int64_t const baseTreeDecodingSize = baseTreeDecodingInputIds.getShape()[1];
+    int64_t const baseTreeDecodingSize = baseTreeDecodingInputsEmbeds.getShape()[1];
     bool const isBaseTreeDecodingSizeValid = baseTreeDecodingMask.getShape()[1] == baseTreeDecodingSize
-        && baseTreeDecodingMask.getShape()[2] == baseTreeDecodingSize;
+        && baseTreeDecodingMask.getShape()[2] == baseTreeDecodingSize
+        && baseTreeDecodingInputsEmbeds.getShape()[2] == mConfig.hiddenSize;
     if (!isBaseTreeDecodingSizeValid)
     {
         LOG_ERROR(
             "eagleBaseTreeDecodingStepInputValidation(): Invalid base tree decoding size of the input tensors. "
-            "Base tree decoding size %d, current base tree decoding mask shape: %s",
-            baseTreeDecodingSize, baseTreeDecodingMask.getShape().formatString().c_str());
+            "Base tree decoding size %d, expected hiddenSize %d, current base tree decoding mask shape: %s, "
+            "inputsEmbeds shape: %s",
+            baseTreeDecodingSize, mConfig.hiddenSize, baseTreeDecodingMask.getShape().formatString().c_str(),
+            baseTreeDecodingInputsEmbeds.getShape().formatString().c_str());
         return false;
     }
 
@@ -1159,12 +1133,12 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
     return true;
 }
 
-bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputIds,
+bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputsEmbeds,
     rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
     cudaStream_t stream)
 {
     bool const validateInputStatus = this->eagleBaseTreeDecodingStepInputValidation(
-        baseTreeDecodingInputIds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
+        baseTreeDecodingInputsEmbeds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR(
@@ -1173,8 +1147,8 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
         return false;
     }
 
-    int32_t const activeBatchSize = baseTreeDecodingInputIds.getShape()[0];
-    int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputIds.getShape()[1]);
+    int32_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
+    int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputsEmbeds.getShape()[1]);
     int32_t const packedBaseTreeDecodingMaskLen = static_cast<int32_t>(divUp(baseTreeDecodingSize, 32));
 
     // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
@@ -1190,7 +1164,7 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
         mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
-    size_t const graphHash = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, outputLogits, outputHiddenStates);
+    size_t const graphHash = hashBaseTreeDecodingInput(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
     if (mBaseTreeDecodingCudaGraphs.find(graphHash) != mBaseTreeDecodingCudaGraphs.end())
     {
         LOG_DEBUG("executeEagleBaseTreeDecodingStep(): Use pre-captured CUDA graph for eagle base tree decoding step.");
@@ -1212,9 +1186,9 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
         // initialization.
         bool setEngineIOStatus{true};
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
+            binding_names::kInputsEmbeds, const_cast<void*>(baseTreeDecodingInputsEmbeds.rawPointer()));
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kInputIds, baseTreeDecodingInputIds.getShape().getTRTDims());
+            binding_names::kInputsEmbeds, baseTreeDecodingInputsEmbeds.getShape().getTRTDims());
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1248,6 +1222,20 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
             binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
+
+        // Bind deepstack_embeds to dummy tensors for Qwen3VL models during Eagle base tree decoding
+        if (mConfig.numDeepstackFeatures > 0)
+        {
+            for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
+            {
+                std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
+                setEngineIOStatus
+                    &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyTensor.rawPointer());
+                setEngineIOStatus &= mTRTExecutionContext->setInputShape(deepstackEmbedName.c_str(),
+                    rt::Coords{activeBatchSize, baseTreeDecodingSize, mConfig.hiddenSize}.getTRTDims());
+            }
+        }
+
         // Bind the output tensor into the engine.
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
@@ -1281,7 +1269,7 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
 }
 
 bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
-    rt::Tensor const& inputIds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
+    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
 {
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus
@@ -1292,7 +1280,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    size_t const hashValue = hashDecodingInput(inputIds, outputLogits, loraWeightsPath);
+    size_t const hashValue = hashDecodingInput(inputsEmbeds, outputLogits, loraWeightsPath);
     if (mCudaGraphs.find(hashValue) != mCudaGraphs.end())
     {
         LOG_INFO(
@@ -1312,7 +1300,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
 
     // To avoid CUDA graph error from TensorRT engine, we need to enqueueV3() once prior to graph capture.
     // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
-    int64_t const activeBatchSize = inputIds.getShape()[0];
+    int64_t const activeBatchSize = inputsEmbeds.getShape()[0];
     constexpr int32_t simulateCacheLength{128};
     std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
     rt::Tensor const reuseKVCacheLengthsTensor(
@@ -1321,7 +1309,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     mKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
 
     // Validate the condition here after the simulate prefill step.
-    bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputIds, outputLogits);
+    bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputsEmbeds, outputLogits);
     if (!validateInputStatus)
     {
         LOG_ERROR("captureVanillaDecodingCudaGraph(): Generation request is invalid, unable to capture CUDA graph.");
@@ -1343,10 +1331,10 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
 
     // Set engine I/O using the same logic as executeVanillaDecodingStep().
     bool setEngineIOStatus{true};
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
     setEngineIOStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kInputIds, const_cast<void*>(inputIds.rawPointer()));
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kInputIds, inputIds.getShape().getTRTDims());
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1361,6 +1349,19 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
+    // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding CUDA graph capture
+    if (mConfig.numDeepstackFeatures > 0)
+    {
+        for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
+        {
+            std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
+            setEngineIOStatus
+                &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyTensor.rawPointer());
+            setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+                deepstackEmbedName.c_str(), rt::Coords{activeBatchSize, 1, mConfig.hiddenSize}.getTRTDims());
+        }
+    }
 
     // Engine output tensors.
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
@@ -1403,13 +1404,13 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         LOG_DEBUG(
             "captureVanillaDecodingCudaGraph(): CUDA graph captured successfully for input shape %s with LoRA weights "
             "'%s' (Empty string if no LoRA weights).",
-            inputIds.getShape().formatString().c_str(), loraWeightsPath.c_str());
+            inputsEmbeds.getShape().formatString().c_str(), loraWeightsPath.c_str());
     }
 
     return true;
 }
 
-bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputIds,
+bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputsEmbeds,
     rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
     cudaStream_t stream)
 {
@@ -1422,7 +1423,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    size_t const hashValue = hashBaseTreeDecodingInput(baseTreeDecodingInputIds, outputLogits, outputHiddenStates);
+    size_t const hashValue = hashBaseTreeDecodingInput(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
     if (mBaseTreeDecodingCudaGraphs.find(hashValue) != mBaseTreeDecodingCudaGraphs.end())
     {
         LOG_INFO("captureEagleBaseTreeDecodingCudaGraph(): CUDA graph already captured for the input tensors.");
@@ -1430,7 +1431,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     }
 
     // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
-    int32_t const activeBatchSize = baseTreeDecodingInputIds.getShape()[0];
+    int32_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
     constexpr int32_t simulateCacheLength{128};
     std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
     rt::Tensor const reuseKVCacheLengthsTensor(
@@ -1439,7 +1440,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     mKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
 
     bool const validateInputStatus = this->eagleBaseTreeDecodingStepInputValidation(
-        baseTreeDecodingInputIds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
+        baseTreeDecodingInputsEmbeds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
     if (!validateInputStatus)
     {
         LOG_ERROR(
@@ -1451,7 +1452,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
 
     // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
     // indices, sequence context lengths.
-    int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputIds.getShape()[1]);
+    int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputsEmbeds.getShape()[1]);
     int32_t const packedBaseTreeDecodingMaskLen = static_cast<int32_t>(divUp(baseTreeDecodingSize, 32));
     mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
     mSequenceContextLengths.reshape({activeBatchSize});
@@ -1471,9 +1472,9 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kInputIds, const_cast<void*>(baseTreeDecodingInputIds.rawPointer()));
+        binding_names::kInputsEmbeds, const_cast<void*>(baseTreeDecodingInputsEmbeds.rawPointer()));
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kInputIds, baseTreeDecodingInputIds.getShape().getTRTDims());
+        binding_names::kInputsEmbeds, baseTreeDecodingInputsEmbeds.getShape().getTRTDims());
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1503,6 +1504,19 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
         &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
+
+    // Bind deepstack_embeds to dummy tensors for Qwen3VL models during Eagle base tree decoding CUDA graph capture
+    if (mConfig.numDeepstackFeatures > 0)
+    {
+        for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
+        {
+            std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
+            setEngineIOStatus
+                &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyTensor.rawPointer());
+            setEngineIOStatus &= mTRTExecutionContext->setInputShape(deepstackEmbedName.c_str(),
+                rt::Coords{activeBatchSize, baseTreeDecodingSize, mConfig.hiddenSize}.getTRTDims());
+        }
+    }
 
     // Bind the output tensor into the engine.
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
@@ -1550,7 +1564,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     else
     {
         LOG_DEBUG("captureEagleBaseTreeDecodingCudaGraph(): CUDA graph captured successfully for input shape %s.",
-            baseTreeDecodingInputIds.getShape().formatString().c_str());
+            baseTreeDecodingInputsEmbeds.getShape().formatString().c_str());
     }
 
     return true;

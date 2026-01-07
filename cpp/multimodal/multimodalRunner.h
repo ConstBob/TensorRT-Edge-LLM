@@ -111,9 +111,9 @@ public:
     //! @return Reference to output embedding tensor
     virtual rt::Tensor& getOutputEmbedding();
 
-    //! @brief Get extra visual features
-    //! @return Optional input tensors vector (e.g. deepstack features for Qwen3-VL)
-    virtual rt::OptionalInputTensors getExtraVisualFeatures();
+    //! @brief Get deepstack features for Qwen3-VL models
+    //! @return Optional deepstack features vector (raw features before embedding lookup)
+    virtual rt::OptionalInputTensors getDeepstackFeatures();
 
     /*!
      * @brief Validate and fill configuration from file

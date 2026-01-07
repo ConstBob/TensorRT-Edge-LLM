@@ -103,9 +103,9 @@ public:
     //! \return True if allocation succeeded, false otherwise
     bool allocateBuffer(cudaStream_t stream) override;
 
-    //! \brief Get extra visual features
-    //! \return Optional input tensors vector (e.g. deepstack features for Qwen3-VL)
-    rt::OptionalInputTensors getExtraVisualFeatures() override;
+    //! \brief Get deepstack features for Qwen3-VL
+    //! \return Optional input tensors vector containing deepstack features
+    rt::OptionalInputTensors getDeepstackFeatures() override;
 
 private:
     //! \brief Calculate resized image dimensions based on dynamic resolution constraints

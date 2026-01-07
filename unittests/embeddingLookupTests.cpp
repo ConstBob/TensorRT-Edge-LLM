@@ -67,15 +67,21 @@ bool compareResults(
 class EmbeddingLookupTest : public ::testing::Test
 {
 protected:
+    cudaStream_t stream;
+
     void SetUp() override
     {
         // Initialize CUDA device
         cudaSetDevice(0);
+
+        // Create a non-default CUDA stream for testing
+        CUDA_CHECK(cudaStreamCreate(&stream));
     }
 
     void TearDown() override
     {
-        // Clean up any resources if needed
+        // Destroy the CUDA stream
+        CUDA_CHECK(cudaStreamDestroy(stream));
     }
 };
 
@@ -118,7 +124,7 @@ TEST_F(EmbeddingLookupTest, StandardEmbeddingLookupAccuracy)
             embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
 
         // Run GPU kernel
-        kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor);
+        kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor, stream);
 
         // Get result from GPU
         std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
@@ -169,7 +175,7 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeError)
 
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
-        { kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor); }, std::runtime_error)
+        { kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor, stream); }, std::runtime_error)
         << "Kernel should error out when hiddenSize is not a multiple of 8";
 }
 
@@ -218,7 +224,7 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeErrorWithImageInsertion)
     EXPECT_THROW(
         {
             kernel::embeddingLookupWithImageInsertion(
-                inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor);
+                inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor, stream);
         },
         std::runtime_error)
         << "Image insertion kernel should error out when hiddenSize is not a multiple of 8";
@@ -256,7 +262,7 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandling)
         embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
 
     // Run GPU kernel
-    kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor);
+    kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor, stream);
 
     // Get result from GPU
     std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
@@ -335,7 +341,8 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandlingWithImageInsertion)
         imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice));
 
     // Run GPU kernel
-    kernel::embeddingLookupWithImageInsertion(inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor);
+    kernel::embeddingLookupWithImageInsertion(
+        inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor, stream);
 
     // Get result from GPU
     std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
@@ -429,7 +436,7 @@ TEST_F(EmbeddingLookupTest, EmbeddingLookupWithImageInsertionAccuracy)
 
         // Run GPU kernel
         kernel::embeddingLookupWithImageInsertion(
-            inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor);
+            inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor, stream);
 
         // Get result from GPU
         std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
@@ -445,4 +452,197 @@ TEST_F(EmbeddingLookupTest, EmbeddingLookupWithImageInsertionAccuracy)
             << "GPU and CPU results don't match for test case: batchSize=" << batchSize << ", seqLen=" << seqLen
             << ", vocabSize=" << vocabSize << ", hiddenSize=" << hiddenSize << ", imageTokenLen=" << imageTokenLen;
     }
+}
+
+// Test deepstack embedding lookup accuracy
+TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLookupAccuracy)
+{
+    // Simple test cases for accuracy
+    std::vector<std::tuple<int64_t, int64_t, int32_t, int64_t, int64_t>> testCases = {
+        {1, 10, 100, 128, 64},  // Small test
+        {2, 20, 200, 256, 128}, // Medium test
+        {4, 50, 500, 128, 256}, // Large test
+    };
+
+    for (auto const& [batchSize, seqLen, vocabSize, hiddenSize, numImageTokens] : testCases)
+    {
+        SCOPED_TRACE("Testing: batchSize=" + std::to_string(batchSize) + ", seqLen=" + std::to_string(seqLen)
+            + ", vocabSize=" + std::to_string(vocabSize) + ", hiddenSize=" + std::to_string(hiddenSize)
+            + ", numImageTokens=" + std::to_string(numImageTokens));
+
+        // Generate test data - mix of tokens < vocabSize and >= vocabSize
+        std::vector<int32_t> inputIds(batchSize * seqLen);
+        uniformIntInitialization<int32_t>(inputIds, vocabSize, vocabSize + numImageTokens - 1);
+
+        std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
+        uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
+
+        // Create tensors
+        rt::Coords inputShape{batchSize, seqLen};
+        rt::Tensor inputIdsTensor(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+
+        rt::Coords featuresShape{numImageTokens, hiddenSize};
+        rt::Tensor deepstackFeaturesTensor(featuresShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+        rt::Coords outputShape{batchSize, seqLen, hiddenSize};
+        rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+        // Copy data to GPU
+        CUDA_CHECK(cudaMemcpy(
+            inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(deepstackFeaturesTensor.rawPointer(), deepstackFeatures.data(),
+            deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+        // Run GPU kernel
+        kernel::assembleDeepstackEmbedding(inputIdsTensor, deepstackFeaturesTensor, vocabSize, outputTensor, stream);
+
+        // Get result from GPU
+        std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
+        CUDA_CHECK(cudaMemcpy(
+            gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+
+        // Run CPU reference
+        auto cpuResult = assembleDeepstackEmbeddingRef(
+            inputIds, deepstackFeatures, batchSize, seqLen, vocabSize, hiddenSize, numImageTokens);
+
+        // Compare results
+        EXPECT_TRUE(compareResults(cpuResult, gpuResult, "Deepstack Embedding Lookup Accuracy Test"))
+            << "GPU and CPU results don't match for test case: batchSize=" << batchSize << ", seqLen=" << seqLen
+            << ", vocabSize=" << vocabSize << ", hiddenSize=" << hiddenSize << ", numImageTokens=" << numImageTokens;
+    }
+}
+
+// Test deepstack embedding lookup with out-of-bounds handling
+TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLookupOutOfBounds)
+{
+    // Test case with mixed tokens
+    int64_t const batchSize = 1;
+    int64_t const seqLen = 6;
+    int32_t const vocabSize = 100;
+    int64_t const hiddenSize = 128;
+    int64_t const numImageTokens = 10;
+
+    // Generate test data with specific tokens:
+    // - Tokens < vocabSize (should be zero)
+    // - Tokens >= vocabSize and < vocabSize + numImageTokens (should use deepstack features)
+    // - Tokens >= vocabSize + numImageTokens (should be zero - out of bounds)
+    std::vector<int32_t> inputIds = {50, 100, 105, 110, 115, 200};
+    // 50: < vocabSize -> zero
+    // 100: = vocabSize -> deepstack[0]
+    // 105: = vocabSize + 5 -> deepstack[5]
+    // 110: = vocabSize + 10 -> out of bounds -> zero
+    // 115: = vocabSize + 15 -> out of bounds -> zero
+    // 200: >> vocabSize + numImageTokens -> out of bounds -> zero
+
+    std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
+    uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
+
+    // Create tensors
+    rt::Coords inputShape{batchSize, seqLen};
+    rt::Tensor inputIdsTensor(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+
+    rt::Coords featuresShape{numImageTokens, hiddenSize};
+    rt::Tensor deepstackFeaturesTensor(featuresShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    rt::Coords outputShape{batchSize, seqLen, hiddenSize};
+    rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    // Copy data to GPU
+    CUDA_CHECK(cudaMemcpy(
+        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(deepstackFeaturesTensor.rawPointer(), deepstackFeatures.data(),
+        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+    // Run GPU kernel
+    kernel::assembleDeepstackEmbedding(inputIdsTensor, deepstackFeaturesTensor, vocabSize, outputTensor, stream);
+
+    // Get result from GPU
+    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
+    CUDA_CHECK(cudaMemcpy(
+        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+
+    // Run CPU reference
+    auto cpuResult = assembleDeepstackEmbeddingRef(
+        inputIds, deepstackFeatures, batchSize, seqLen, vocabSize, hiddenSize, numImageTokens);
+
+    // Compare results
+    EXPECT_TRUE(compareResults(cpuResult, gpuResult, "Deepstack Embedding Lookup Out-of-Bounds Test"))
+        << "GPU and CPU results don't match for deepstack out-of-bounds handling";
+
+    // Verify specific token behaviors
+    for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
+    {
+        int32_t const tokenId = inputIds[tokenIdx];
+        bool shouldBeZero = false;
+
+        if (tokenId < vocabSize)
+        {
+            // Tokens below vocabSize should be zero
+            shouldBeZero = true;
+        }
+        else
+        {
+            int32_t const deepstackIdx = tokenId - vocabSize;
+            if (deepstackIdx < 0 || deepstackIdx >= numImageTokens)
+            {
+                // Out-of-bounds image tokens should be zero
+                shouldBeZero = true;
+            }
+        }
+
+        if (shouldBeZero)
+        {
+            // Check that all elements for this token are zero
+            for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
+            {
+                int64_t const resultIdx = tokenIdx * hiddenSize + elementIdx;
+                EXPECT_TRUE(isclose(gpuResult[resultIdx], __float2half(0.0f), 1e-6, 1e-6))
+                    << "Token " << tokenId << " at position " << tokenIdx
+                    << " should produce zero embedding at element " << elementIdx;
+            }
+        }
+    }
+}
+
+// Test that deepstack kernel properly errors out for uneven hiddenSize
+TEST_F(EmbeddingLookupTest, DeepstackUnevenHiddenSizeError)
+{
+    // Test case with hiddenSize = 15 (not a multiple of 8)
+    int64_t const batchSize = 1;
+    int64_t const seqLen = 5;
+    int32_t const vocabSize = 100;
+    int64_t const hiddenSize = 15; // Not a multiple of 8
+    int64_t const numImageTokens = 10;
+
+    // Generate test data
+    std::vector<int32_t> inputIds(batchSize * seqLen);
+    uniformIntInitialization<int32_t>(inputIds, vocabSize, vocabSize + numImageTokens - 1);
+
+    std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
+    uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
+
+    // Create tensors
+    rt::Coords inputShape{batchSize, seqLen};
+    rt::Tensor inputIdsTensor(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+
+    rt::Coords featuresShape{numImageTokens, hiddenSize};
+    rt::Tensor deepstackFeaturesTensor(featuresShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    rt::Coords outputShape{batchSize, seqLen, hiddenSize};
+    rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    // Copy data to GPU
+    CUDA_CHECK(cudaMemcpy(
+        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(deepstackFeaturesTensor.rawPointer(), deepstackFeatures.data(),
+        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+    // Expect the kernel to throw an error due to uneven hiddenSize
+    EXPECT_THROW(
+        {
+            kernel::assembleDeepstackEmbedding(
+                inputIdsTensor, deepstackFeaturesTensor, vocabSize, outputTensor, stream);
+        },
+        std::runtime_error)
+        << "Deepstack kernel should error out when hiddenSize is not a multiple of 8";
 }

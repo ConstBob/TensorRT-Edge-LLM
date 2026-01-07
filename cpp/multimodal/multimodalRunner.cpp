@@ -108,7 +108,7 @@ rt::Tensor& MultimodalRunner::getOutputEmbedding()
     return mOutputEmbedding;
 }
 
-rt::OptionalInputTensors MultimodalRunner::getExtraVisualFeatures()
+rt::OptionalInputTensors MultimodalRunner::getDeepstackFeatures()
 {
     return {};
 }

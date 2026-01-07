@@ -169,7 +169,6 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     config_class_name = config.__class__.__name__
     model_name = config_class_name.lower().replace('config', '')
 
-    # For other model types, use text_config if available
     if "text_config" in config_dict:
         print("Detected multimodal model, using text_config")
         config_dict = config_dict["text_config"]
