@@ -147,10 +147,12 @@ class EdgeLLMModel(nn.Module):
 
             present_key_values += (present_key_value, )
 
-            # Apply deepstack processing for Qwen3VL
+            # Apply deepstack processing for Qwen3VL and Qwen3OmniThinker
             if deepstack_visual_embeds is not None and idx in range(
                     len(deepstack_visual_embeds)):
-                assert self.config.model_type == "qwen3_vl_text", "Qwen3VLTextModel is required for deepstack processing"
+                assert self.config.model_type in [
+                    "qwen3_vl_text", "qwen3_omni_text"
+                ], "Qwen3VLTextModel or Qwen3OmniTextModel is required for deepstack processing"
                 hidden_states = hidden_states + deepstack_visual_embeds[idx]
 
         # Apply final normalization

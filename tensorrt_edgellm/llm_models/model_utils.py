@@ -380,8 +380,12 @@ def load_llm_model(
     set_dynamic_quant(model, dtype)
 
     # Create EdgeLLMModelForCausalLM wrapper.
-    edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
-                                         reduced_vocab_size, vocab_map)
+    if _is_qwen3_omni_model(model_dir):
+        edge_model = EdgeLLMModelForCausalLM(model.thinker, is_eagle_base,
+                                             reduced_vocab_size, vocab_map)
+    else:
+        edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
+                                             reduced_vocab_size, vocab_map)
 
     del model
     gc.collect()

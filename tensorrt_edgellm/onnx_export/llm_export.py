@@ -20,7 +20,7 @@ with custom attention plugin integration. It supports standard models and EAGLE 
 
 ONNX Input Naming Conventions:
 - inputs_embeds: Input embeddings for all models (replaces input_ids + image_embeds)
-- deepstack_embeds: Deepstack visual embeddings for Qwen3VL models (list of 3 tensors, each with shape (batch_size, seq_len, hidden_size))
+- deepstack_embeds: Deepstack visual embeddings for Qwen3VL and Qwen3Omni models (list of 3 tensors, each with shape (batch_size, seq_len, hidden_size))
 - hidden_states_input: Renamed from hidden_states_from_base for ONNX export
 - attention_pos_id: Renamed from position_ids for ONNX export
 
@@ -32,7 +32,7 @@ Embedding Export:
 - All LLM models (both EAGLE base and regular): Export embedding.safetensors containing embedding layer weights
 - Draft models only: Do not export embeddings (use base model embeddings)
 
-Qwen3VL Deepstack Processing:
+Qwen3VL and Qwen3Omni Deepstack Processing:
 - Deepstack embeddings are provided as 3 tensors with shape (batch_size, seq_len, hidden_size)
 - Each tensor is directly added to hidden_states at specific decoder layers
 - Simple element-wise addition for clean ONNX graph
@@ -124,6 +124,9 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
 
     # Get model configuration
     model_config = model.config
+    if model_config.model_type == "qwen3_omni_thinker":
+        model_config = model_config.text_config
+
     hidden_size = model_config.hidden_size
     num_layers = model_config.num_hidden_layers
     num_heads = model_config.num_attention_heads
@@ -199,8 +202,8 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
                                 device=device)
     base_inputs['inputs_embeds'] = inputs_embeds
 
-    # For Qwen3VL, add deepstack visual embeds
-    if model_config.model_type == "qwen3_vl_text":
+    # For Qwen3VL and Qwen3OmniThinker, add deepstack visual embeds
+    if model_config.model_type in ["qwen3_vl_text", "qwen3_omni_text"]:
         deepstack_visual_embeds = [
             torch.randn(batch_size,
                         seq_len,
@@ -288,6 +291,8 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
 
         # Get model configuration for dynamic shapes
         model_config = model.config
+        if model_config.model_type == "qwen3_omni_thinker":
+            model_config = model_config.text_config
         num_layers = model_config.num_hidden_layers
 
         # Prepare inputs - order must match model forward signature
@@ -316,8 +321,11 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
             # Standard models pass None for position_ids and attention_mask
             base_inputs.extend([None, None])
 
-        # For Qwen3VL, add deepstack visual embeds
-        if model_config.model_type == "qwen3_vl_text":
+        # For Qwen3VL and Qwen3Omni, add deepstack visual embeds
+        require_deepstack_embeds = model_config.model_type in [
+            "qwen3_vl_text", "qwen3_omni_text"
+        ]
+        if require_deepstack_embeds:
             base_inputs.extend([dummy_inputs['deepstack_visual_embeds']])
 
         inputs = tuple(base_inputs)
@@ -337,7 +345,7 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         elif is_eagle_base:
             input_names += ['attention_pos_id', 'attention_mask']
 
-        if model_config.model_type == "qwen3_vl_text":
+        if require_deepstack_embeds:
             input_names += [f'deepstack_embeds_{i}' for i in range(3)]
 
         # Create output names
@@ -418,7 +426,7 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
                 },
             })
 
-        if model_config.model_type == "qwen3_vl_text":
+        if require_deepstack_embeds:
             dynamic_axes.update({
                 **{
                     f"deepstack_embeds_{i}": {
