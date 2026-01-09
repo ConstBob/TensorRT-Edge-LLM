@@ -291,10 +291,8 @@ def load_hf_model(
         # be merged directly into the base model.
         module = _load_phi4mm_war(model_dir)
         model = module.Phi4MMForCausalLM.from_pretrained(
-            model_dir,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-            _attn_implementation="eager").to(device)
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).to(device)
     elif _is_qwen3_omni_model(model_dir):
         from transformers import Qwen3OmniForConditionalGeneration
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
@@ -304,10 +302,8 @@ def load_hf_model(
         # Try loading as AutoModelForCausalLM first
         try:
             model = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                torch_dtype=torch_dtype,
-                trust_remote_code=True,
-                _attn_implementation="eager").to(device)
+                model_dir, torch_dtype=torch_dtype,
+                trust_remote_code=True).to(device)
         except Exception:
             # If that fails, try AutoModelForImageTextToText
             try:
