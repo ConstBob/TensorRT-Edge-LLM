@@ -771,8 +771,8 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     SystemPromptKVCache savedKVCache;
     savedKVCache.systemPrompt = prompt;
     savedKVCache.tokenizedPrompt = tokenizedPrompt;
-    savedKVCache.kvCacheContent = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT,
-        "LLMInferenceRuntime::savedKVCache.kvCacheContent");
+    savedKVCache.kvCacheContent = rt::Tensor(savedKVCacheShape, rt::DeviceType::kGPU,
+        linearKVCache.getConfig().kvCacheTypeTRT, "LLMInferenceRuntime::savedKVCache.kvCacheContent");
 
     // We only process one sequence at a time.
     constexpr int32_t CACHE_BATCH_IDX{0};

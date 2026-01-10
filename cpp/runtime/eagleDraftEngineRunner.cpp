@@ -171,10 +171,36 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
             "Failed to match config file " + configPath.string() + " with engine file: " + enginePath.string());
     }
 
+    // Detect KV cache storage dtype from engine bindings.
+    std::string const kvBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+    DataType kvCacheType = mEngine->getTensorDataType(kvBindingName0.c_str());
+
+    // Sanity check: ensure KV-cache precision (dtype) is consistent across all layers (and both past/present).
+    // We rely on a single dtype when allocating/owning the KV cache buffers.
+    auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
+        std::string const kvBindingName = binding_names::formatKVCacheName(layerIdx, isPast);
+        DataType const dt = mEngine->getTensorDataType(kvBindingName.c_str());
+        if (dt != kvCacheType)
+        {
+            LOG_ERROR(
+                "KV cache dtype mismatch detected. Expected all layers to use the same dtype as '%s' (dtype=%d), but "
+                "binding '%s' (layer=%d, %s) has dtype=%d.",
+                kvBindingName0.c_str(), static_cast<int32_t>(kvCacheType), kvBindingName.c_str(), layerIdx,
+                (isPast ? "past" : "present"), static_cast<int32_t>(dt));
+            throw std::runtime_error("KV cache dtype mismatch across layers");
+        }
+    };
+
+    for (int32_t layerIdx = 0; layerIdx < mConfig.numDecoderLayers; ++layerIdx)
+    {
+        checkKVCacheDType(layerIdx, /*isPast=*/true);
+        checkKVCacheDType(layerIdx, /*isPast=*/false);
+    }
+
     // Instantiate the KVCache instance of the EngineRunner.
     this->mLinearKVCache
         = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
-                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim},
+                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim, kvCacheType},
             stream);
 
     // By design for tree attention kernel we use, the tree mask will be packed into in32_t values where each bit

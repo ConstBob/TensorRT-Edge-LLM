@@ -33,20 +33,35 @@ def _generate_quantization_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
     """Generate quantization commands if needed"""
     commands = []
-    if config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
+    # Quantize weights (for non-fp16) and/or KV cache (when fp8_kv_cache is enabled).
+    # NOTE: `tensorrt-edgellm-quantize-llm` requires at least one of:
+    #   --quantization, --lm_head_quantization, --kv_cache_quantization
+    needs_weight_quant = config.llm_precision != "fp16" and config.llm_precision != "int4_gptq"
+    needs_kv_cache_quant = bool(config.fp8_kv_cache)
+    if needs_weight_quant or needs_kv_cache_quant:
         torch_model_dir = config.get_torch_model_dir()
-        quantized_model_dir = config.get_quantized_model_dir()
+        if needs_weight_quant:
+            output_model_dir = config.get_quantized_model_dir()
+        else:
+            # KV-cache-only quantization (fp16 weights)
+            output_model_dir = config.get_kv_cache_quantized_model_dir()
 
         quantize_cmd = [
-            "tensorrt-edgellm-quantize-llm", f"--model_dir={torch_model_dir}",
-            f"--output_dir={quantized_model_dir}",
-            f"--quantization={config.llm_precision}",
-            f"--dataset_dir={config.get_cnn_dailymail_dataset_dir()}"
+            "tensorrt-edgellm-quantize-llm",
+            f"--model_dir={torch_model_dir}",
+            f"--output_dir={output_model_dir}",
+            f"--dataset_dir={config.get_cnn_dailymail_dataset_dir()}",
         ]
 
-        if config.lm_head_precision != "fp16":
+        if needs_weight_quant:
+            quantize_cmd.append(f"--quantization={config.llm_precision}")
+
+        if config.lm_head_precision != "fp16" and needs_weight_quant:
             quantize_cmd.append(
                 f"--lm_head_quantization={config.lm_head_precision}")
+
+        if needs_kv_cache_quant:
+            quantize_cmd.append("--kv_cache_quantization=fp8")
 
         commands.append((quantize_cmd, 1200))
 
@@ -58,7 +73,10 @@ def _generate_llm_export_commands(
     """Generate LLM export commands"""
     torch_model_dir = config.get_torch_model_dir()
 
-    if config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
+    if config.fp8_kv_cache and config.llm_precision == "fp16":
+        # KV-cache-only quantization produces a derived model dir that should be exported.
+        model_dir = config.get_kv_cache_quantized_model_dir()
+    elif config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
         # Use quantized model for export
         model_dir = config.get_quantized_model_dir()
     else:
@@ -69,6 +87,9 @@ def _generate_llm_export_commands(
         "tensorrt-edgellm-export-llm", f"--model_dir={model_dir}",
         f"--output_dir={config.get_llm_onnx_dir()}"
     ]
+
+    if config.fp8_kv_cache:
+        llm_cmd.append("--fp8_kv_cache")
 
     if config.is_eagle:
         llm_cmd.append("--is_eagle_base")

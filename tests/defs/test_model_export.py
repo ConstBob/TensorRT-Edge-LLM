@@ -88,6 +88,10 @@ class TestModelExport:
         if config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
             quantized_model_dir = config.get_quantized_model_dir()
             os.makedirs(quantized_model_dir, exist_ok=True)
+        elif config.fp8_kv_cache:
+            # fp16 weights + FP8 KV cache requires a derived model directory produced by quantize-llm
+            kv_cache_quantized_dir = config.get_kv_cache_quantized_model_dir()
+            os.makedirs(kv_cache_quantized_dir, exist_ok=True)
 
         if config.is_eagle:
             draft_onnx_dir = config.get_draft_onnx_dir()

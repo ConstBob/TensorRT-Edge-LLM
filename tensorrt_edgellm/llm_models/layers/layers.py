@@ -25,6 +25,10 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
 
 from .attention_plugin import attention_plugin
 
+# FP8 (E4M3) quantization constants
+# Max finite value representable by NVIDIA FP8 E4M3 format; used to derive per-tensor KV cache scale.
+FP8_E4M3_MAX: float = 448.0
+
 
 class PromptTuningEmbedding(torch.nn.Module):
     """
@@ -167,6 +171,30 @@ class EdgeLLMAttention(nn.Module):
         # EAGLE3 draft uses 2x hidden_size input dimension
         self.eagle3_draft: bool = eagle3_draft
 
+        if hasattr(attention_module, 'k_bmm_quantizer') and hasattr(
+                attention_module, 'v_bmm_quantizer'):
+            k_amax = getattr(attention_module.k_bmm_quantizer, 'amax', None)
+            v_amax = getattr(attention_module.v_bmm_quantizer, 'amax', None)
+
+            # Derive scale so that max(K,V) maps into FP8 E4M3 dynamic range.
+            def _scale_quant_orig(amax):
+                return (amax.cpu() / FP8_E4M3_MAX).float().view(
+                    1) if amax is not None else torch.tensor(
+                        [1.0], dtype=torch.float32)
+
+            k_scale_quant_orig = _scale_quant_orig(k_amax)
+            v_scale_quant_orig = _scale_quant_orig(v_amax)
+            # Pack dequant scales into a single tensor input for AttentionPlugin:
+            # [k_scale_quant_orig, v_scale_quant_orig]
+            k_v_scale_quant_orig = torch.cat(
+                [k_scale_quant_orig.view(1),
+                 v_scale_quant_orig.view(1)],
+                dim=0).float()
+            self.register_buffer("k_v_scale_quant_orig", k_v_scale_quant_orig)
+        else:
+            # Always define these buffers so downstream code can safely access them.
+            self.register_buffer("k_v_scale_quant_orig", None)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -237,9 +265,12 @@ class EdgeLLMAttention(nn.Module):
         # Convert to FP16 for plugin compatibility
         # For int8 quantization, we always need to explicitly convert to FP16
         qkv = qkv.to(torch.float16)
-        if past_key_value.dtype != torch.float16:
-            past_key_value = past_key_value.to(torch.float16)
-
+        fp8_kv_cache = past_key_value.dtype == torch.float8_e4m3fn
+        if fp8_kv_cache:
+            assert self.k_v_scale_quant_orig is not None, \
+                "k_v_scale_quant_orig must be set when past_key_value is float8_e4m3fn"
+        else:
+            assert past_key_value.dtype == torch.float16, "past_key_value must be FP16 or FP8 E4M3"
         # Ensure rope embeddings are FP32
         assert rope_rotary_cos_sin.dtype == torch.float32, "rope_rotary_cos_sin must be FP32"
 
@@ -257,8 +288,10 @@ class EdgeLLMAttention(nn.Module):
             self.num_key_value_heads,
             enable_tree_attention,
             self.head_dim,
+            fp8_kv_cache,
             attention_mask,
             position_ids,
+            k_v_scale_quant_orig=self.k_v_scale_quant_orig,
         )
 
         # Reshape output and apply final projection

@@ -1501,11 +1501,11 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     savedKVCacheBase.systemPrompt = prompt;
     savedKVCacheBase.tokenizedPrompt = tokenizedPrompt;
     savedKVCacheBase.kvCacheContent
-        = rt::Tensor(savedKVCacheShapeBase, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT);
+        = rt::Tensor(savedKVCacheShapeBase, rt::DeviceType::kGPU, linearKVCacheBase.getConfig().kvCacheTypeTRT);
     savedKVCacheDraft.systemPrompt = prompt;
     savedKVCacheDraft.tokenizedPrompt = tokenizedPrompt;
     savedKVCacheDraft.kvCacheContent
-        = rt::Tensor(savedKVCacheShapeDraft, rt::DeviceType::kGPU, rt::LinearKVCache::KVCacheTypeTRT);
+        = rt::Tensor(savedKVCacheShapeDraft, rt::DeviceType::kGPU, linearKVCacheDraft.getConfig().kvCacheTypeTRT);
 
     // We only process one sequence at a time
     constexpr int32_t CACHE_BATCH_IDX{0};

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "cudaMacros.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
 #include <array>
@@ -68,6 +69,14 @@ template <>
 struct is_arithmetic_ext<__nv_bfloat16> : std::true_type
 {
 };
+
+#if SUPPORTS_FP8
+//! @brief Specialization for fp8 precision floating point
+template <>
+struct is_arithmetic_ext<__nv_fp8_e4m3> : std::true_type
+{
+};
+#endif
 
 //! Array of dimensions that used to store the shape of a tensor.
 //! Support up to 8 dimensions with all dimensions are non-negative.

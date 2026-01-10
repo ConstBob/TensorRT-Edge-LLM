@@ -168,6 +168,10 @@ class TestConfig:
     # Inference parameters
     test_case: Optional[str] = None
 
+    # KV cache options
+    fp8_kv_cache: Optional[
+        bool] = None  # If true, export ONNX/config with FP8 KV cache enabled
+
     # Benchmark parameters
     batch_size: Optional[int] = None
     input_seq_len: Optional[int] = None
@@ -198,6 +202,12 @@ class TestConfig:
         # Export-specific parameters
         ParameterSpec("lora",
                       "", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("fp8_kv_cache",
+                      "fp8kv", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("is_eagle",
                       "eagle",
@@ -341,6 +351,8 @@ class TestConfig:
                 parsed_params['max_seq_len'] = int(part[4:])
             elif part == "lora":
                 parsed_params['lora'] = True
+            elif part == "fp8kv":
+                parsed_params['fp8_kv_cache'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -457,6 +469,8 @@ class TestConfig:
             if self.task_type == TaskType.EXPORT:
                 if self.lora is None:
                     self.lora = False
+                if self.fp8_kv_cache is None:
+                    self.fp8_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
@@ -466,6 +480,8 @@ class TestConfig:
                     self.max_lora_rank = 0
                 if self.lora is None:
                     self.lora = self.max_lora_rank > 0
+                if self.fp8_kv_cache is None:
+                    self.fp8_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
@@ -527,6 +543,8 @@ class TestConfig:
     def get_onnx_model_id(self) -> str:
         """Generate unique model identifier"""
         model_id = f"{self.llm_precision}-{self.lm_head_precision}"
+        if self.fp8_kv_cache:
+            model_id += "-fp8kv"
         return model_id
 
     def get_engine_id(self) -> str:
@@ -822,7 +840,20 @@ class TestConfig:
             return self.get_torch_model_dir()
         prefix = "quantized-base" if self.is_eagle else "quantized"
         quantized_name = f"{self.llm_precision}-{self.lm_head_precision}"
+        if self.fp8_kv_cache:
+            quantized_name += "-fp8kv"
+
         return os.path.join(self.get_onnx_base_dir(), prefix, quantized_name)
+
+    def get_kv_cache_quantized_model_dir(self) -> str:
+        """
+        Get a derived model directory for KV-cache-only quantization.
+
+        Used when llm_precision == fp16 but fp8_kv_cache is enabled, so we need a distinct
+        output directory for `tensorrt-edgellm-quantize-llm --kv_cache_quantization fp8`.
+        """
+        return os.path.join(self.get_onnx_base_dir(), "quantized-kvcache",
+                            self.get_onnx_model_id())
 
     def get_cnn_dailymail_dataset_dir(self) -> str:
         """Get CNN DailyMail dataset directory for LLM quantization calibration"""

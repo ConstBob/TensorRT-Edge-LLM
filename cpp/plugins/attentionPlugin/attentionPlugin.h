@@ -39,8 +39,9 @@ public:
     //! \param[in] numKVHeads Number of key-value heads
     //! \param[in] headSize Head dimension size
     //! \param[in] supportsSpecDecode Whether to support speculative decoding (Tree attention)
-    AttentionPlugin(
-        std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t supportsSpecDecode);
+    //! \param[in] enableFp8KVCache Whether to enable FP8 KV cache
+    AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+        int32_t supportsSpecDecode, int32_t enableFp8KVCache);
 
     //! \brief Constructor for deserialization
     //! \param[in] name Plugin instance name
@@ -172,6 +173,8 @@ protected:
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
+
+    int32_t mEnableFp8KVCache{}; //!< Whether FP8 KV cache is enabled
 };
 
 //! \brief Factory class for creating AttentionPlugin instances

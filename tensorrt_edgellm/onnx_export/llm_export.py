@@ -100,8 +100,10 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
     print(f"Saved embedding.safetensors to {output_dir}")
 
 
-def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
-                        is_eagle_draft: bool) -> Dict[str, Any]:
+def create_dummy_inputs(model: nn.Module,
+                        is_eagle_base: bool,
+                        is_eagle_draft: bool,
+                        fp8_kv_cache: bool = False) -> Dict[str, Any]:
     """
     Create dummy inputs for ONNX export.
     
@@ -109,6 +111,7 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
         model: The model to create inputs for
         is_eagle_base: Whether this is an EAGLE base model
         is_eagle_draft: Whether this is an EAGLE draft model
+        fp8_kv_cache: Whether to use FP8 KV cache
         
     Returns:
         dict: Dictionary containing dummy inputs
@@ -157,6 +160,8 @@ def create_dummy_inputs(model: nn.Module, is_eagle_base: bool,
                                      head_dim,
                                      dtype=torch.float16,
                                      device=device)
+        if fp8_kv_cache:
+            past_key_value = past_key_value.to(torch.float8_e4m3fn)
         past_key_values.append(past_key_value)
 
     # Create last_token_ids
@@ -454,7 +459,8 @@ def export_llm_model(model_dir: str,
                      device: str = "cuda",
                      is_eagle_base: bool = False,
                      reduced_vocab_dir: Optional[str] = None,
-                     chat_template_path: Optional[str] = None) -> None:
+                     chat_template_path: Optional[str] = None,
+                     fp8_kv_cache: bool = False) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -468,6 +474,7 @@ def export_llm_model(model_dir: str,
         is_eagle_base: Whether the model is an EAGLE3 base model (vs standard LLM)
         reduced_vocab_dir: Directory containing vocab_map.safetensors for vocabulary reduction (optional)
         chat_template_path: Path to chat template JSON file. When provided, this template is validated and used instead of inferring from the model (optional)
+        fp8_kv_cache: Whether to use FP8 KV cache
     """
     start_time = time.time()
 
@@ -501,7 +508,8 @@ def export_llm_model(model_dir: str,
     # Create dummy inputs
     dummy_inputs = create_dummy_inputs(model,
                                        is_eagle_base=is_eagle_base,
-                                       is_eagle_draft=False)
+                                       is_eagle_draft=False,
+                                       fp8_kv_cache=fp8_kv_cache)
 
     # Export to ONNX
     export_model_to_onnx(model,

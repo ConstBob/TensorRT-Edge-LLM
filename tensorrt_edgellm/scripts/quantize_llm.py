@@ -79,6 +79,14 @@ def main() -> None:
         "Quantization method for language model head (only fp8 and nvfp4 are currently supported)"
     )
     parser.add_argument(
+        "--kv_cache_quantization",
+        type=str,
+        required=False,
+        choices=["fp8"],
+        default=None,
+        help=
+        "Quantization method for KV cache (only fp8 is currently supported)")
+    parser.add_argument(
         "--device",
         type=str,
         required=False,
@@ -94,6 +102,7 @@ def main() -> None:
                               dtype=args.dtype,
                               dataset_dir=args.dataset_dir,
                               lm_head_quantization=args.lm_head_quantization,
+                              kv_cache_quantization=args.kv_cache_quantization,
                               device=args.device)
         print("Model quantization completed successfully!")
     except Exception as e:

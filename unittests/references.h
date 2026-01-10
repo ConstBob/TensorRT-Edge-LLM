@@ -23,9 +23,11 @@
 #include <set>
 #include <vector>
 
-std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<half> const& k, std::vector<half> const& v,
+template <typename T>
+std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> const& k, std::vector<T> const& v,
     int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    std::optional<std::vector<int32_t>> const& treeAttnMask = std::nullopt);
+    std::optional<std::vector<int32_t>> const& treeAttnMask = std::nullopt, float const kScaleQuantOrig = 1.0f,
+    float const vScaleQuantOrig = 1.0f);
 
 std::vector<half> ropeRef(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,
     int32_t const rotaryDim, int32_t const seqIdx, float const ropeScale, float const ropeTheta, bool const permute);
