@@ -51,15 +51,13 @@ def eager_attention_forward(
     key: torch.Tensor,
     value: torch.Tensor,
     scaling: float,
-    attention_mask: torch.Tensor = None,
+    attention_mask: torch.Tensor,
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+    attn_weights = attn_weights + attention_mask
 
     attn_weights = nn.functional.softmax(attn_weights,
                                          dim=-1,
@@ -78,12 +76,14 @@ class Qwen3OmniAudioAttentionPatch(Qwen3OmniAudioAttention):
     def __init__(self, config: Any) -> None:
         super().__init__(config)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor,
+                attention_mask: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with custom attention implementation.
         
         Args:
             hidden_states: Input hidden states
+            attention_mask: Optional attention mask with shape [num_attention_elems, num_attention_elems]
             
         Returns:
             Attention output
@@ -109,6 +109,7 @@ class Qwen3OmniAudioAttentionPatch(Qwen3OmniAudioAttention):
             key_states,
             value_states,
             scaling=self.scaling,
+            attention_mask=attention_mask,
         )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -134,17 +135,20 @@ class Qwen3OmniAudioEncoderLayerPatch(Qwen3OmniAudioEncoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer
+            attention_mask (`torch.FloatTensor`, optional): attention mask with shape [num_attention_elems, num_attention_elems]
 
         Returns:
             hidden_states (`torch.FloatTensor`): output of the layer
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(hidden_states=hidden_states, )
+        hidden_states = self.self_attn(hidden_states=hidden_states,
+                                       attention_mask=attention_mask)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -186,18 +190,20 @@ class Qwen3OmniAudioEncoderPatch(Qwen3OmniAudioEncoder):
         ])
 
     def forward(self, padded_feature: torch.Tensor,
-                padded_mask_after_cnn_indices: torch.Tensor) -> torch.Tensor:
+                padded_mask_after_cnn_indices: torch.Tensor,
+                attention_mask: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the audio encoder.
         Three changes have been made to the original forward pass:
         1. padded_feature preprocessing is not TRT friendly and is moved to runtime.
         2. boolean indexing using padded_mask_after_cnn results in NonZero node in ONNX and is not TRT friendly.
         Instead, use padded_mask_after_cnn_indices as model input: padded_mask_after_cnn_indices = torch.nonzero(padded_mask_after_cnn).
-        3. cu_seqlens is only used in Flash Attention, not in eager Attention, so after_cnn_lens input is dropped.
+        3. cu_seqlens is only used in Flash Attention, not in eager Attention, so after_cnn_lens input is dropped. In its place, attention_mask is used.
         
         Args:
             padded_feature: Padded feature tensor [num_chunks, num_mel_bins, n_window]
             padded_mask_after_cnn_indices: Indices for the boolean padded mask after CNN layers [num_attention_elems, 2]
+            attention_mask: Optional attention mask with shape [num_attention_elems, num_attention_elems]
 
         Returns:
             `torch.Tensor`: hidden_states.
@@ -221,7 +227,8 @@ class Qwen3OmniAudioEncoderPatch(Qwen3OmniAudioEncoder):
                                      padded_mask_after_cnn_indices[:, 1]]
 
         for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(hidden_states)
+            layer_outputs = encoder_layer(hidden_states,
+                                          attention_mask=attention_mask)
             hidden_states = layer_outputs
 
         hidden_states = self.ln_post(hidden_states)
@@ -253,7 +260,7 @@ def export_qwen3_omni_audio(
     n_window = model.config.n_window
     num_chunks = 3
     padded_mask_chunk_length = 13
-    mask_length = 38
+    num_attention_elems = 38
 
     # Create input tensors with appropriate shapes and dtypes
     padded_feature = torch.randn(num_chunks,
@@ -262,13 +269,28 @@ def export_qwen3_omni_audio(
                                  dtype=torch_dtype,
                                  device=model.device)
     padded_mask_after_cnn = torch.tensor(
-        [True] * mask_length + [False] *
-        (num_chunks * padded_mask_chunk_length - mask_length),
+        [True] * num_attention_elems + [False] *
+        (num_chunks * padded_mask_chunk_length - num_attention_elems),
         device=model.device).reshape(num_chunks, padded_mask_chunk_length)
     padded_mask_after_cnn_indices = torch.nonzero(padded_mask_after_cnn)
 
-    inputs = (padded_feature, padded_mask_after_cnn_indices)
-    input_names = ["padded_feature", "padded_mask_after_cnn_indices"]
+    # In this case the attention mask should be a block diagonal matrix with block sizes 26x26, 12x12,
+    # as indicated by cu_seqlens, such that only audio signals within each block attend to each other.
+    attention_mask = torch.full(
+        [num_attention_elems, num_attention_elems],
+        torch.finfo(torch_dtype).min,
+        device=model.device,
+        dtype=torch_dtype,
+    )
+    cu_seqlens = [0, 26, 38]
+    for i in range(1, len(cu_seqlens)):
+        attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i],
+                       cu_seqlens[i - 1]:cu_seqlens[i]] = 0
+
+    inputs = (padded_feature, padded_mask_after_cnn_indices, attention_mask)
+    input_names = [
+        "padded_feature", "padded_mask_after_cnn_indices", "attention_mask"
+    ]
     output_names = ["last_hidden_state"]
 
     # Define dynamic axes for variable input sizes
@@ -279,6 +301,10 @@ def export_qwen3_omni_audio(
         },
         'padded_mask_after_cnn_indices': {
             0: 'num_attention_elems'
+        },
+        'attention_mask': {
+            0: 'num_attention_elems',
+            1: 'num_attention_elems'
         },
         # Model outputs
         'last_hidden_state': {
