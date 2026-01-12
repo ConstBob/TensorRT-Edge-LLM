@@ -29,6 +29,24 @@ AVAILABLE_LORA_WEIGHTS = {
 }
 
 
+def _generate_merge_lora_commands(
+        config: TestConfig) -> List[Tuple[List[str], int]]:
+    """Generate merge LoRA commands for models with embedded LoRA (e.g., Phi-4)"""
+    commands = []
+    if not config.merge_lora:
+        return commands
+
+    merge_lora_cmd = [
+        "tensorrt-edgellm-merge-lora",
+        f"--model_dir={config.get_torch_model_dir()}",
+        f"--lora_dir={config.get_lora_adapter_dir()}",
+        f"--output_dir={config.get_merged_model_dir()}"
+    ]
+    commands.append((merge_lora_cmd, 600))
+
+    return commands
+
+
 def _generate_quantization_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
     """Generate quantization commands if needed"""
@@ -39,7 +57,12 @@ def _generate_quantization_commands(
     needs_weight_quant = config.llm_precision != "fp16" and config.llm_precision != "int4_gptq"
     needs_kv_cache_quant = bool(config.fp8_kv_cache)
     if needs_weight_quant or needs_kv_cache_quant:
-        torch_model_dir = config.get_torch_model_dir()
+        # Use merged model if merge_lora is enabled, otherwise use torch model
+        if config.merge_lora:
+            input_model_dir = config.get_merged_model_dir()
+        else:
+            input_model_dir = config.get_torch_model_dir()
+
         if needs_weight_quant:
             output_model_dir = config.get_quantized_model_dir()
         else:
@@ -48,7 +71,7 @@ def _generate_quantization_commands(
 
         quantize_cmd = [
             "tensorrt-edgellm-quantize-llm",
-            f"--model_dir={torch_model_dir}",
+            f"--model_dir={input_model_dir}",
             f"--output_dir={output_model_dir}",
             f"--dataset_dir={config.get_cnn_dailymail_dataset_dir()}",
         ]
@@ -71,17 +94,18 @@ def _generate_quantization_commands(
 def _generate_llm_export_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
     """Generate LLM export commands"""
-    torch_model_dir = config.get_torch_model_dir()
-
     if config.fp8_kv_cache and config.llm_precision == "fp16":
         # KV-cache-only quantization produces a derived model dir that should be exported.
         model_dir = config.get_kv_cache_quantized_model_dir()
     elif config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
         # Use quantized model for export
         model_dir = config.get_quantized_model_dir()
+    elif config.merge_lora:
+        # Use merged model for fp16/int4_gptq export when merge_lora is enabled
+        model_dir = config.get_merged_model_dir()
     else:
         # Use original torch model for fp16 and int4_gptq export
-        model_dir = torch_model_dir
+        model_dir = config.get_torch_model_dir()
 
     llm_cmd = [
         "tensorrt-edgellm-export-llm", f"--model_dir={model_dir}",
@@ -98,6 +122,9 @@ def _generate_llm_export_commands(
     chat_template_path = config.get_chat_template_file()
     if chat_template_path:
         llm_cmd.append(f"--chat_template={chat_template_path}")
+
+    if config.reduced_vocab_size:
+        llm_cmd.append(f"--reduced_vocab_dir={config.get_reduced_vocab_dir()}")
 
     return [(llm_cmd, 1200)]
 
@@ -235,24 +262,56 @@ def _generate_draft_export_commands(
     return commands
 
 
+def _generate_vocab_reduction_commands(
+        config: TestConfig) -> List[Tuple[List[str], int]]:
+    """Generate vocabulary reduction commands if needed"""
+    commands = []
+    if not config.reduced_vocab_size:
+        return commands
+
+    torch_model_dir = config.get_torch_model_dir()
+    reduced_vocab_dir = config.get_reduced_vocab_dir()
+
+    vocab_reduction_cmd = [
+        "tensorrt-edgellm-reduce-vocab",
+        f"--model_dir={torch_model_dir}",
+        f"--output_dir={reduced_vocab_dir}",
+        f"--reduced_vocab_size={config.reduced_vocab_size}",
+        f"--method={config.vocab_reduction_method}",
+        f"--max_samples={config.vocab_reduction_max_samples}",
+    ]
+
+    # Add d2t_path for EAGLE models
+    if config.is_eagle:
+        # d2t.safetensors is in the draft ONNX directory after export
+        d2t_path = os.path.join(config.get_draft_onnx_dir(), "d2t.safetensors")
+        vocab_reduction_cmd.append(f"--d2t_path={d2t_path}")
+
+    commands.append((vocab_reduction_cmd, 600))
+    return commands
+
+
 def generate_export_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
     """Generate export commands - returns list of (command, timeout) tuples"""
     commands = []
 
     # Generate commands in order:
-    # 1. Quantize base model (if needed)
-    # 2. Export base model
-    # 3. Export visual model (VLM only)
-    # 4. Process LoRA (if needed)
-    # 5. Quantize draft model (EAGLE only)
-    # 6. Export draft model (EAGLE only)
+    # 1. Merge LoRA (if needed, e.g., Phi-4 with vision-lora)
+    # 2. Quantize/export draft model (EAGLE only, needed for vocab reduction)
+    # 3. Reduce vocabulary (if needed, requires d2t.safetensors for EAGLE)
+    # 4. Quantize base model (if needed)
+    # 5. Export base model
+    # 6. Export visual model (VLM only)
+    # 7. Process LoRA (if needed)
+    commands.extend(_generate_merge_lora_commands(config))
+    commands.extend(_generate_draft_quantization_commands(config))
+    commands.extend(_generate_draft_export_commands(config))
+    commands.extend(_generate_vocab_reduction_commands(config))
     commands.extend(_generate_quantization_commands(config))
     commands.extend(_generate_llm_export_commands(config))
     commands.extend(_generate_visual_export_commands(config))
     commands.extend(_generate_lora_commands(config))
-    commands.extend(_generate_draft_quantization_commands(config))
-    commands.extend(_generate_draft_export_commands(config))
 
     return commands
 
@@ -372,7 +431,7 @@ def generate_inference_commands(
     if config.batch_size is not None:
         cmd.append(f"--batchSize={config.batch_size}")
 
-    commands.append((cmd, 1200))
+    commands.append((cmd, 6000))
     return commands
 
 
