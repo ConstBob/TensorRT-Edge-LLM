@@ -1548,8 +1548,6 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
 
-    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
-
     if (!setEngineIOStatus)
     {
         LOG_ERROR("captureEagleBaseTreeDecodingCudaGraph(): Failed to bind engine input and output tensors.");
