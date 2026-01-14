@@ -43,7 +43,7 @@ __device__ __forceinline__ half applyRope<half>(
 
 template <typename T>
 __device__ __forceinline__ DVec<T> vecApplyRopeNonInterleave(
-    T* dataPtr, DVec<float> const& cosVec, DVec<float> const& sinVec, uint32_t const rotaryDim)
+    T const* dataPtr, DVec<float> const& cosVec, DVec<float> const& sinVec, uint32_t const rotaryDim)
 {
     DVec<T> result;
     DVec<T> input;

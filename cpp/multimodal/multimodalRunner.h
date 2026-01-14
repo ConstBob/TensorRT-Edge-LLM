@@ -85,7 +85,7 @@ public:
      * @return True on success, false on failure
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
         = 0;
 
     /*!
@@ -97,7 +97,7 @@ public:
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    virtual bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer* tokenizer,
+    virtual bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
 
     /*!
