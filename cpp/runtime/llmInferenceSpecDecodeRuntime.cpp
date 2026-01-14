@@ -66,9 +66,8 @@ void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _m
     rawBatchedInputIds.reserve(_activeBatchSize);
     tokenIds.resize(_activeBatchSize);
     currentGenerateLengths.resize(_activeBatchSize, 0);
-    promptLengths.resize(_activeBatchSize, 0);
+    effectivePrefillLengths.resize(_activeBatchSize, 0);
     finishedStates.resize(_activeBatchSize, 0);
-    actualIterations.resize(_activeBatchSize, 0);
 
     // Initialize batch index mapping (identity mapping initially)
     batchIndexMapping.resize(_activeBatchSize);
@@ -77,20 +76,14 @@ void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _m
         batchIndexMapping[i] = i;
     }
 
-    // Clear evicted batch storage
-    evictedTokenIds.clear();
-    evictedGenerateLengths.clear();
-    evictedActualIterations.clear();
-    evictedSystemPrompts.clear();
-    evictedRawBatchedInputIds.clear();
-    evictedPromptLengths.clear();
+    // Clear completed batch storage
+    completedBatches.clear();
 
     multimodalEmbeddings = _mutimodalEmbeddings;
     deepstackFeatures = _deepstackFeatures;
     generationRound = 0;
     maxGenerateLength = _maxGenerateLength;
     activeBatchSize = _activeBatchSize;
-    originalBatchSize = _activeBatchSize; // Save original batch size
     stream = _stream;
 }
 
@@ -464,8 +457,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     {
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
-            context.genAndSaveSystemCacheIndex = i;
-            bool const saveCacheStatus = genAndSaveSystemPromptKVCache(context);
+            bool const saveCacheStatus = genAndSaveSystemPromptKVCache(context, i);
             if (!saveCacheStatus)
             {
                 LOG_WARNING(
@@ -518,11 +510,6 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     auto updateFinishStates = [&]() {
         for (int32_t i = 0; i < context.activeBatchSize; ++i)
         {
-            if (context.finishedStates[i])
-            {
-                continue;
-            }
-
             // Check EOS
             if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
             {
@@ -590,8 +577,9 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
             return false;
         }
 
-        // Update iterations and check finish conditions
+        // Update iterations, check finish conditions and increment generation round
         updateFinishStates();
+        context.generationRound += 1;
 
         // Perform batch eviction if needed (after verification, before updating finish states)
         bool const batchEvictStatus = performBatchEvict(context);
@@ -600,8 +588,6 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
             LOG_ERROR("Failed to perform batch eviction.");
             return false;
         }
-
-        context.generationRound += 1;
     }
 
     if (context.activeBatchSize != 0)
@@ -617,16 +603,15 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     int32_t totalGeneratedTokens = 0;
     int32_t totalIterations = 0;
 
-    // Accumulate from evicted batches
-    for (auto const& entry : context.evictedGenerateLengths)
+    // Accumulate from completed batches
+    for (auto const& [originalIdx, batchResult] : context.completedBatches)
     {
-        int32_t originalIdx = entry.first;
-        int32_t rawPromptLength = static_cast<int32_t>(context.evictedRawBatchedInputIds.at(originalIdx).size());
-        int32_t computedLength = context.evictedPromptLengths.at(originalIdx);
+        int32_t rawPromptLength = static_cast<int32_t>(batchResult.rawBatchedInputIds.size());
+        int32_t computedLength = batchResult.effectivePrefillLength;
         totalReusedTokens += (rawPromptLength - computedLength);
         totalComputedTokens += computedLength;
-        totalGeneratedTokens += context.evictedGenerateLengths.at(originalIdx);
-        totalIterations += context.evictedActualIterations.at(originalIdx);
+        totalGeneratedTokens += batchResult.generateLength;
+        totalIterations += batchResult.actualIterations;
     }
 
     mPrefillMetrics.recordRun(totalReusedTokens, totalComputedTokens);
@@ -636,31 +621,28 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     // Maintain original batch order using original batch indices
     response.outputIds.clear();
     response.outputTexts.clear();
-    response.outputIds.resize(context.originalBatchSize);
-    response.outputTexts.resize(context.originalBatchSize);
+    response.outputIds.resize(context.completedBatches.size());
+    response.outputTexts.resize(context.completedBatches.size());
 
-    // Add outputs from evicted batches (using saved original indices)
-    for (auto const& entry : context.evictedGenerateLengths)
+    // Add outputs from completed batches (using saved original indices)
+    for (auto const& [originalIdx, batchResult] : context.completedBatches)
     {
-        int32_t originalIdx = entry.first;
-        int32_t genLength = entry.second;
+        int32_t genLength = batchResult.generateLength;
 
         // Log acceptance metrics for evicted batch
         int32_t const verificationTokens = genLength > 0 ? genLength - 1 : 0;
-        float const acceptanceRate = context.evictedActualIterations.at(originalIdx) > 0
-            ? static_cast<float>(verificationTokens)
-                / static_cast<float>(context.evictedActualIterations.at(originalIdx))
+        float const acceptanceRate = batchResult.actualIterations > 0
+            ? static_cast<float>(verificationTokens) / static_cast<float>(batchResult.actualIterations)
             : 0.0f;
         LOG_INFO("Batch (evicted, original idx %d) - Acceptance rate: %.3f, Generated tokens: %d, Iterations: %d",
-            originalIdx, acceptanceRate, genLength, context.evictedActualIterations.at(originalIdx));
+            originalIdx, acceptanceRate, genLength, batchResult.actualIterations);
 
         // Extract generated tokens
-        auto const& evictedTokens = context.evictedTokenIds.at(originalIdx);
-        int32_t const totalLength = static_cast<int32_t>(evictedTokens.size());
+        int32_t const totalLength = static_cast<int32_t>(batchResult.tokenIds.size());
 
         check::check(totalLength >= genLength, "Total length should be greater than or equal to generated length");
-        response.outputIds[originalIdx]
-            = std::vector<int32_t>(evictedTokens.begin() + (totalLength - genLength), evictedTokens.end());
+        response.outputIds[originalIdx] = std::vector<int32_t>(
+            batchResult.tokenIds.begin() + (totalLength - genLength), batchResult.tokenIds.end());
         response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
     }
 
@@ -675,15 +657,10 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
 
     int32_t const activeBatchSize = context.activeBatchSize;
 
-    // Prepare the inputs for prefill stage execution.
-    // Reuse packedInputLength from setup (already considers engine constraints)
-    int32_t const inputIdsLength = context.packedInputLength;
-    if (inputIdsLength > mBaseEngineConfig.maxSupportedInputLength)
-    {
-        LOG_ERROR("Input ids length %d is greater than the max supported input length %d", inputIdsLength,
-            mBaseEngineConfig.maxSupportedInputLength);
-        return false;
-    }
+    // Prepare the inputs for prefill stage execution. The prefill length are already checked to be within the
+    // engine supported range.
+    int32_t const inputIdsLength
+        = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
 
     mIdsInput.reshape({activeBatchSize, inputIdsLength});
     mContextLengthsInput.reshape({activeBatchSize});
@@ -701,7 +678,8 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     // Use actual prompt length (not padded length) for context_lengths to ensure we select the last real token
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        ctxLenData[i] = context.promptLengths[i]; // Use actual prompt length instead of padded length
+        ctxLenData[i]
+            = context.effectivePrefillLengths[i]; // Use actual effective prefill length instead of padded length
         int32_t const batchTokenLength = static_cast<int32_t>(context.tokenIds[i].size());
         std::copy(context.tokenIds[i].begin(), context.tokenIds[i].end(), hostPackedTokenIdsData + i * inputIdsLength);
     }
@@ -809,8 +787,9 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
     // eagle draft engine. The formulation of the feature "vector" is F_n = F(H_n, Token_{n+1}), therefore we
     // need to trim out the first token of the sequence from the token_ids input.
 
-    // Draft Model Prefill Input Length should be the same as the base model prefill input length.
-    int32_t const inputIdsLength = context.packedInputLength;
+    // Draft model prefill same amount of tokens as the base model prefill.
+    int32_t const inputIdsLength
+        = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
 
     check::check(mBaseHiddenStatesOutput.getShape()[0] == activeBatchSize
             && mBaseHiddenStatesOutput.getShape()[1] == inputIdsLength,
@@ -1119,11 +1098,6 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
         }
 
         int32_t const acceptLength = hostAcceptLengthsData[batchIdx];
-        // update iterations for each batch
-        if (acceptLength > 0)
-        {
-            context.actualIterations[batchIdx] += 1;
-        }
         for (int32_t i = 0; i < acceptLength; i++)
         {
             int32_t const token = hostAcceptedTokenIdsData[batchIdx * maxAcceptDepth + i];
@@ -1339,13 +1313,13 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     // Initialize reuse lengths to 0 for all active sequences
     std::fill(reuseKVCacheLengthsData, reuseKVCacheLengthsData + activeBatchSize, 0);
 
-    // Initialize tokenIds and promptLengths for each sequence
+    // Initialize tokenIds and effectivePrefillLengths for each sequence
     context.tokenIds.clear();
     context.tokenIds.resize(activeBatchSize);
 
     // Search if the system prompt has been cached. If there are cached system prompts, insert
     // the pre-computed KVCache and remove the cached portion from inputIds.
-    // Directly populate context.tokenIds and context.promptLengths (no padding)
+    // Directly populate context.tokenIds and context.effectivePrefillLengths (no padding)
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         auto promptHash = hashSystemPrompt(context.systemPrompts[i]);
@@ -1369,7 +1343,7 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
 
             // Directly assign to context.tokenIds (skip only the reused portion, keep the next token for normal flow)
             context.tokenIds[i].assign(batchedInputIds[i].begin() + effectiveReuseLength, batchedInputIds[i].end());
-            context.promptLengths[i] = static_cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
+            context.effectivePrefillLengths[i] = static_cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
 
             bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
                 precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
@@ -1384,13 +1358,14 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
         {
             // Directly assign to context.tokenIds (full input)
             context.tokenIds[i] = batchedInputIds[i];
-            context.promptLengths[i] = static_cast<int32_t>(batchedInputIds[i].size());
+            context.effectivePrefillLengths[i] = static_cast<int32_t>(batchedInputIds[i].size());
             reuseKVCacheLengthsData[i] = 0;
         }
     }
 
     // Validate max input length
-    int32_t const maxInputLength = *std::max_element(context.promptLengths.begin(), context.promptLengths.end());
+    int32_t const maxInputLength
+        = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
     if (maxInputLength > mBaseEngineConfig.maxSupportedInputLength)
     {
         LOG_ERROR("The max input length (%d) exceeds the max supported input length (%d) of the LLM Engine.",
@@ -1398,20 +1373,17 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
         return false;
     }
 
-    // The LLM Engine could also have minSupportedInputLength constraint.
-    context.packedInputLength = std::max(maxInputLength, mBaseEngineConfig.minSupportedInputLength);
-
     linearKVCacheBase.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
     linearKVCacheDraft.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
 
     return true;
 }
 
-bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context)
+bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
+    SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx)
 {
     // Check if cache already exists
-    int32_t const batchIdx = context.genAndSaveSystemCacheIndex;
-    std::string const prompt = context.systemPrompts[batchIdx];
+    std::string const prompt = context.systemPrompts[genAndSaveBatchIdx];
 
     if (prompt.empty())
     {
@@ -1441,21 +1413,13 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     // Create a temporary single-batch context for system prompt KVCache generation
     // Reuse the existing prefill functions which will use runtime member tensors (mIdsInput, mLogitsOutput, etc.)
     SpecDecodeInferenceContext tempContext;
-    tempContext.systemPrompts.resize(1);
+    // Generate with batch size 1 and generate length 1 (prefill only).
+    constexpr int32_t GEN_CACHE_BATCH_SIZE{1};
+    constexpr int32_t GEN_CACHE_MAX_GENERATE_LENGTH{1};
+    tempContext.initialize(1, 1, context.multimodalEmbeddings, context.deepstackFeatures, context.stream);
     tempContext.systemPrompts[0] = prompt;
-    tempContext.rawBatchedInputIds.emplace_back(tokenizedPrompt);
-    tempContext.tokenIds.resize(1);
+    tempContext.rawBatchedInputIds[0] = tokenizedPrompt;
     tempContext.tokenIds[0] = tokenizedPrompt;
-    tempContext.currentGenerateLengths.resize(1, 0);
-    tempContext.promptLengths.resize(1, 0);
-    tempContext.finishedStates.resize(1, 0);
-    tempContext.multimodalEmbeddings = context.multimodalEmbeddings;
-    tempContext.deepstackFeatures = context.deepstackFeatures;
-    tempContext.generationRound = 0;
-    tempContext.maxGenerateLength = 0; // Not generating, just caching
-    tempContext.activeBatchSize = 1;
-    tempContext.genAndSaveSystemCacheIndex = 0;
-    tempContext.stream = context.stream;
 
     // Setup for prefill execution: handles KV cache reset and applies any reused system prompt cache
     if (!setUpForPrefillExecution(tempContext))
@@ -1517,7 +1481,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(SpecDecodeInfe
     mSystemPromptKVCacheDraft.insert({promptHash, std::move(savedKVCacheDraft)});
 
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
-    LOG_DEBUG("System prompt KVCache saved for batch %d: {%s}", batchIdx, prompt.c_str());
+    LOG_DEBUG("System prompt KVCache saved for batch %d: {%s}", genAndSaveBatchIdx, prompt.c_str());
 
     return true;
 }
@@ -1667,22 +1631,25 @@ bool LLMInferenceSpecDecodeRuntime::performBatchEvict(SpecDecodeInferenceContext
         {
             // This batch is evicted and finished, save its results with original index
             int32_t originalIdx = context.batchIndexMapping[i];
-            context.evictedTokenIds[originalIdx] = std::move(context.tokenIds[i]);
-            context.evictedGenerateLengths[originalIdx] = context.currentGenerateLengths[i];
-            context.evictedActualIterations[originalIdx] = context.actualIterations[i];
-            context.evictedSystemPrompts[originalIdx] = std::move(context.systemPrompts[i]);
-            context.evictedRawBatchedInputIds[originalIdx] = std::move(context.rawBatchedInputIds[i]);
-            context.evictedPromptLengths[originalIdx] = context.promptLengths[i];
+
+            // Create and populate BatchResult with all related data
+            BatchResult result;
+            result.tokenIds = std::move(context.tokenIds[i]);
+            result.generateLength = context.currentGenerateLengths[i];
+            result.actualIterations = context.generationRound;
+            result.rawBatchedInputIds = std::move(context.rawBatchedInputIds[i]);
+            result.effectivePrefillLength = context.effectivePrefillLengths[i];
+
+            context.completedBatches[originalIdx] = std::move(result);
         }
     }
 
     rt::compactVector(batchMapping, context.finishedStates);
     rt::compactVector(batchMapping, context.currentGenerateLengths);
-    rt::compactVector(batchMapping, context.actualIterations);
     rt::compactVector(batchMapping, context.tokenIds);
     rt::compactVector(batchMapping, context.systemPrompts);
     rt::compactVector(batchMapping, context.rawBatchedInputIds);
-    rt::compactVector(batchMapping, context.promptLengths);
+    rt::compactVector(batchMapping, context.effectivePrefillLengths);
     rt::compactVector(batchMapping, context.batchIndexMapping);
 
     // Update active batch size

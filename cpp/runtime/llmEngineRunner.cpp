@@ -52,7 +52,6 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& con
        << "  numDecoderLayers: " << config.numDecoderLayers << "  numKVHeads: " << config.numKVHeads
        << "  headDim: " << config.headDim << "  rotaryDim: " << config.rotaryDim
        << "  hiddenSize: " << config.hiddenSize << "  maxSupportedBatchSize: " << config.maxSupportedBatchSize
-       << "  minSupportedInputLength: " << config.minSupportedInputLength
        << "  maxSupportedInputLength: " << config.maxSupportedInputLength
        << "  maxKVCacheCapacity: " << config.maxKVCacheCapacity
        << "  maxSupportedLoraRank: " << config.maxSupportedLoraRank
@@ -430,7 +429,6 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         // Extract builder_config values
         mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
-        mConfig.minSupportedInputLength = 1; // TODO: Change this to min input length
         mConfig.maxSupportedInputLength = builderConfig["max_input_len"].get<int32_t>();
         mConfig.maxKVCacheCapacity = builderConfig["max_kv_cache_capacity"].get<int32_t>();
         mConfig.maxSupportedLoraRank = builderConfig["max_lora_rank"].get<int32_t>();
@@ -592,18 +590,10 @@ bool LLMEngineRunner::validateConfigFromEngine()
             mConfig.numDeepstackFeatures);
         return false;
     }
-    Dims const minInputPrefillShape
-        = mEngine->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMIN);
     Dims const maxInputPrefillShape
         = mEngine->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
 
     // inputs_embeds is 3D: [batch_size, seq_len, hidden_size]
-    if (mConfig.minSupportedInputLength != minInputPrefillShape.d[1])
-    {
-        LOG_ERROR("minSupportedInputLength is not consistent. From engine: %d, from config: %d",
-            minInputPrefillShape.d[1], mConfig.minSupportedInputLength);
-        return false;
-    }
     if (mConfig.maxSupportedInputLength != maxInputPrefillShape.d[1])
     {
         LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d",

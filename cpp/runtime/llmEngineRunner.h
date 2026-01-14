@@ -50,7 +50,6 @@ struct LLMEngineRunnerConfig
     int32_t rotaryDim{};                 //!< Rotary embedding dimension
     int32_t hiddenSize{};                //!< Model's hidden dimension
     int32_t maxSupportedBatchSize{};     //!< Maximum supported batch size
-    int32_t minSupportedInputLength{};   //!< Minimum supported input length
     int32_t maxSupportedInputLength{};   //!< Maximum supported input length
     int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity
     int32_t vocabSize{};                 //!< Vocabulary size (full vocabulary)
