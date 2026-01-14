@@ -231,6 +231,8 @@ def get_llm_quant_config(
         quant_cfg = mtq.INT4_AWQ_CFG.copy()
     elif quantization == "nvfp4":
         quant_cfg = mtq.NVFP4_DEFAULT_CFG.copy()
+    elif quantization == "mxfp8":
+        quant_cfg = mtq.MXFP8_DEFAULT_CFG.copy()
     elif quantization == "int8_sq":
         quant_cfg = mtq.INT8_SMOOTHQUANT_CFG.copy()
     else:
@@ -248,6 +250,8 @@ def get_llm_quant_config(
             quant_cfg["quant_cfg"].update(FP8_LM_HEAD_CONFIG["quant_cfg"])
         elif lm_head_quantization == "nvfp4":
             quant_cfg["quant_cfg"].update(NVFP4_LM_HEAD_CONFIG["quant_cfg"])
+        elif lm_head_quantization == "mxfp8":
+            quant_cfg["quant_cfg"].update(MXFP8_LM_HEAD_CONFIG["quant_cfg"])
 
     # Add KV cache quantization if specified
     if kv_cache_quantization is not None:
@@ -289,8 +293,10 @@ def quantize_llm(
     """
     assert (quantization is not None) or (lm_head_quantization is not None) or (kv_cache_quantization is not None), \
         "At least one of 'quantization', 'lm_head_quantization', or 'kv_cache_quantization' must be set (not all None)."
-    assert quantization in [None, "fp8", "int4_awq", "nvfp4", "int8_sq"]
-    assert lm_head_quantization in [None, "fp8", "nvfp4"]
+    assert quantization in [
+        None, "fp8", "int4_awq", "nvfp4", "mxfp8", "int8_sq"
+    ]
+    assert lm_head_quantization in [None, "fp8", "nvfp4", "mxfp8"]
     assert kv_cache_quantization in [None, "fp8"]
 
     # Get calibration dataloader
@@ -337,8 +343,8 @@ def quantize_draft(
     Raises:
         AssertionError: If quantization method is not supported
     """
-    assert quantization in ["fp8", "int4_awq", "nvfp4", "int8_sq"]
-    assert lm_head_quantization in [None, "fp8", "nvfp4"]
+    assert quantization in ["fp8", "int4_awq", "nvfp4", "int8_sq", "mxfp8"]
+    assert lm_head_quantization in [None, "fp8", "nvfp4", "mxfp8"]
     assert kv_cache_quantization in [None, "fp8"]
 
     # Get calibration dataloader
@@ -376,10 +382,10 @@ def quantize_and_save_llm(model_dir: str,
     Args:
         model_dir: Directory containing the input HuggingFace model
         output_dir: Directory to save the quantized model
-        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "int8_sq")
+        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "int8_sq", "mxfp8")
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
-        lm_head_quantization: Optional separate quantization for language model head (only "fp8" and "nvfp4" is currently supported)
+        lm_head_quantization: Optional separate quantization for language model head (only "fp8", "nvfp4", and "mxfp8" are currently supported)
         device: Device to use for model loading and quantization ("cuda", "cpu")
         
     Raises:
@@ -440,11 +446,11 @@ def quantize_and_save_draft(
         base_model_dir: Directory containing the base HuggingFace model
         draft_model_dir: Directory containing the EAGLE draft model
         output_dir: Directory to save the quantized model
-        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "int8_sq")
+        quantization: Quantization method to apply (None, "fp8", "int4_awq", "nvfp4", "int8_sq", "mxfp8")
         device: Device to use for model loading and quantization ("cuda", "cpu")
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
-        lm_head_quantization: Optional separate quantization for language model head (only "fp8" and "nvfp4" is currently supported)
+        lm_head_quantization: Optional separate quantization for language model head (only "fp8", "nvfp4", and "mxfp8" are currently supported)
         kv_cache_quantization: Optional separate quantization for KV cache (only "fp8" is currently supported)
 
     Raises:
