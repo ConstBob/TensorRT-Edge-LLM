@@ -287,10 +287,8 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
         return false;
     }
 
-    // The LLM Engine could also have minSupportedInputLength constraint.
-    int32_t const packedInputLength = std::max(maxInputLength, mEngineConfig.minSupportedInputLength);
-
     // Reshape and fill the pre-allocated pinned host tensor with pad tokens
+    int32_t const packedInputLength = maxInputLength;
     mHostPackedInputIds.reshape({activeBatchSize, packedInputLength});
     int32_t* packedInputIdsData = mHostPackedInputIds.dataPointer<int32_t>();
     std::fill(packedInputIdsData, packedInputIdsData + activeBatchSize * packedInputLength, mTokenizer->getPadId());
