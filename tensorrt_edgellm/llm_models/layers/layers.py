@@ -178,9 +178,9 @@ class EdgeLLMAttention(nn.Module):
 
             # Derive scale so that max(K,V) maps into FP8 E4M3 dynamic range.
             def _scale_quant_orig(amax):
-                return (amax.cpu() / FP8_E4M3_MAX).float().view(
-                    1) if amax is not None else torch.tensor(
-                        [1.0], dtype=torch.float32)
+                return (amax.cpu().float() / FP8_E4M3_MAX
+                        ).view(1) if amax is not None else torch.tensor(
+                            [1.0], dtype=torch.float32)
 
             k_scale_quant_orig = _scale_quant_orig(k_amax)
             v_scale_quant_orig = _scale_quant_orig(v_amax)

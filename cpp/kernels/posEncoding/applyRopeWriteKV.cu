@@ -87,7 +87,7 @@ __device__ __forceinline__ void storeVec(
         // If scaleQuantOrig is provided, it represents the dequant scale (quant -> orig),
         // so quantization uses its reciprocal (orig -> quant).
         DVec<__nv_fp8_e4m3> out;
-        float const invScale = (scaleQuantOrig != nullptr) ? __fdividef(1.0f, scaleQuantOrig[0]) : 1.0f;
+        float const invScale = (scaleQuantOrig != nullptr) ? (1.0f / scaleQuantOrig[0]) : 1.0f;
 #pragma unroll
         for (uint32_t i = 0; i < DVec<half>::vec_size; ++i)
         {
