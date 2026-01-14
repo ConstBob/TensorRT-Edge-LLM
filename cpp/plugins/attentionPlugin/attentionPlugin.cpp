@@ -28,6 +28,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -183,7 +184,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
         mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode);
 }
 
-AttentionPlugin::AttentionPlugin(std::string const& name, void const* data, size_t length)
+AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data, size_t length)
     : mLayerName(name)
 {
     deserializeValue(&data, &length, &mNumQHeads);
@@ -605,7 +606,17 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
     // Align the workspace pointer so that each tensor assigned from the workspace will align to the device alignment
     // granularity.
-    void* alignedWorkspacePtr = alignDevicePtr(workspace);
+    auto const nbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
+        + (mEnableFp8KVCache ? kNUM_FP8_KVCACHE_OPTIONAL_INPUTS : 0);
+    auto const nbOutputs = kNUM_REQUIRED_OUTPUTS;
+    size_t space = getWorkspaceSize(inputDesc, nbInputs, outputDesc, nbOutputs);
+    std::byte* alignedWorkspacePtr
+        = static_cast<std::byte*>(std::align(kDEVICE_ALIGNMENT, space - kDEVICE_ALIGNMENT, workspace, space));
+    if (alignedWorkspacePtr == nullptr)
+    {
+        LOG_ERROR("Workspace size is too small to hold all data structures with correct alignment");
+        return 1;
+    }
 
     if (executionMode == AttentionExecutionMode::kNORMAL_PREFILL
         || executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
@@ -722,11 +733,12 @@ size_t AttentionPlugin::getSerializationSize() const noexcept
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
 {
-    serializeValue(&buffer, mNumQHeads);
-    serializeValue(&buffer, mNumKVHeads);
-    serializeValue(&buffer, mHeadSize);
-    serializeValue(&buffer, mEnableTreeAttention);
-    serializeValue(&buffer, mEnableFp8KVCache);
+    std::byte* byteBuffer = static_cast<std::byte*>(buffer);
+    serializeValue(&byteBuffer, mNumQHeads);
+    serializeValue(&byteBuffer, mNumKVHeads);
+    serializeValue(&byteBuffer, mHeadSize);
+    serializeValue(&byteBuffer, mEnableTreeAttention);
+    serializeValue(&byteBuffer, mEnableFp8KVCache);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -820,7 +832,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::deserializePlugin(
 {
     try
     {
-        return new AttentionPlugin(name, serialData, serialLength);
+        return new AttentionPlugin(name, static_cast<std::byte const*>(serialData), serialLength);
     }
     catch (std::exception const& e)
     {

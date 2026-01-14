@@ -49,7 +49,7 @@ public:
      * @param data Serialized plugin data
      * @param length Size of serialized data
      */
-    Int4GroupwiseGemmPlugin(std::string const& name, void const* data, size_t length);
+    Int4GroupwiseGemmPlugin(std::string const& name, std::byte const* data, size_t length);
 
     //! @brief Deleted default constructor
     Int4GroupwiseGemmPlugin() = delete;

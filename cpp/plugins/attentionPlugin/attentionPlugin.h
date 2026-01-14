@@ -18,6 +18,7 @@
 #pragma once
 
 #include <NvInferRuntime.h>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -47,7 +48,7 @@ public:
     //! \param[in] name Plugin instance name
     //! \param[in] data Serialized plugin data
     //! \param[in] length Length of serialized data
-    AttentionPlugin(std::string const& name, void const* data, size_t length);
+    AttentionPlugin(std::string const& name, std::byte const* data, size_t length);
 
     //! Force to distinguish different instances of the plugin
     AttentionPlugin() = delete;
