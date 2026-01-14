@@ -270,7 +270,9 @@ bool LLMBuilder::build()
 
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+#if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
+#endif
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");
@@ -941,7 +943,9 @@ bool VisualBuilder::build()
 
     // Create builder config
     auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
+#if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
+#endif
     if (!config)
     {
         LOG_ERROR("Failed to create builder config.");
