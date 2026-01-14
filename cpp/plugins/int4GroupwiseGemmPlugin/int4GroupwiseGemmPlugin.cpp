@@ -56,7 +56,7 @@ Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, int32_
 {
 }
 
-Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, void const* data, size_t length)
+Int4GroupwiseGemmPlugin::Int4GroupwiseGemmPlugin(std::string const& name, std::byte const* data, size_t length)
     : mLayerName(name)
 {
     deserializeValue(&data, &length, &mGemmN);
@@ -200,20 +200,20 @@ int32_t Int4GroupwiseGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     auto const& inputDesc0 = inputDesc[0];
     int32_t const M = inputDesc0.dims.d[0] * inputDesc0.dims.d[1];
 
-    half* gemmInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[0]));
-    int8_t* weightsInPtr = reinterpret_cast<int8_t*>(const_cast<void*>(inputs[1]));
-    half* ScaleInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[2]));
-    half* gemmOutDevicePtr = reinterpret_cast<half*>(outputs[0]);
+    auto gemmInPtr = static_cast<half const*>(inputs[0]);
+    auto weightsInPtr = static_cast<int8_t const*>(inputs[1]);
+    auto scaleInPtr = static_cast<half const*>(inputs[2]);
+    auto gemmOutDevicePtr = static_cast<half*>(outputs[0]);
 
     if (M <= 6)
     {
         trt_edgellm::kernel::gemv_forward_cuda_new(
-            gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+            gemmInPtr, weightsInPtr, scaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
     }
     else
     {
         trt_edgellm::kernel::gemm_forward_cuda_new(
-            gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+            gemmInPtr, weightsInPtr, scaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
     }
     return 0;
 }
@@ -225,9 +225,10 @@ size_t Int4GroupwiseGemmPlugin::getSerializationSize() const noexcept
 
 void Int4GroupwiseGemmPlugin::serialize(void* buffer) const noexcept
 {
-    serializeValue(&buffer, mGemmN);
-    serializeValue(&buffer, mGemmK);
-    serializeValue(&buffer, mGroupSize);
+    auto typedBuffer = static_cast<std::byte*>(buffer);
+    serializeValue(&typedBuffer, mGemmN);
+    serializeValue(&typedBuffer, mGemmK);
+    serializeValue(&typedBuffer, mGroupSize);
 }
 
 int32_t Int4GroupwiseGemmPlugin::initialize() noexcept
@@ -312,7 +313,8 @@ nvinfer1::IPluginV2* Int4GroupwiseGemmPluginCreator::deserializePlugin(
 {
     try
     {
-        return new Int4GroupwiseGemmPlugin(name, serialData, serialLength);
+        auto typedData = static_cast<std::byte const*>(serialData);
+        return new Int4GroupwiseGemmPlugin(name, typedData, serialLength);
     }
     catch (std::exception const& e)
     {
