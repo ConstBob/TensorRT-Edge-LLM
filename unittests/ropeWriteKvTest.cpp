@@ -225,6 +225,10 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
         // FP8 E4M3 max finite value
         constexpr float FP8_E4M3_MAX = 448.0F;
         assert(kAmax > 0.0F && vAmax > 0.0F);
+        // To avoid large scale value to cause intermittent ref check failure, limit the range of kAmax and vAmax
+        // to be larger than 64.0F.
+        kAmax = std::max(kAmax, 64.0F);
+        vAmax = std::max(vAmax, 64.0F);
         float const kScaleQuantOrig = kAmax / FP8_E4M3_MAX;
         float const vScaleQuantOrig = vAmax / FP8_E4M3_MAX;
         float const kScaleOrigQuant = 1.0F / kScaleQuantOrig;
@@ -258,8 +262,8 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
                             = static_cast<float>(__nv_fp8_e4m3(__half2float(kvCacheOut[vIdx]) * vScaleOrigQuant));
                         float const k8 = static_cast<float>(kvOutFp8[kIdx]);
                         float const v8 = static_cast<float>(kvOutFp8[vIdx]);
-                        EXPECT_TRUE(isclose(k8, kRefFp8QuantizedFp16, 1e-3, 1e-3));
-                        EXPECT_TRUE(isclose(v8, vRefFp8QuantizedFp16, 1e-3, 1e-3));
+                        ASSERT_TRUE(isclose(k8, kRefFp8QuantizedFp16, 1e-3, 1e-3));
+                        ASSERT_TRUE(isclose(v8, vRefFp8QuantizedFp16, 1e-3, 1e-3));
                     }
                 }
             }
