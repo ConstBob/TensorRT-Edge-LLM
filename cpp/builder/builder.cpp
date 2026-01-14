@@ -630,9 +630,21 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile* contextP
         result &= setOptimizationProfile(contextProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
-        result &= setOptimizationProfile(generationProfile, deepstackInputName.c_str(), createDims({1, 1, mHiddenSize}),
-            createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
-            createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
+
+        if (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft)
+        {
+            int const maxTokens
+                = mBuilderConfig.eagleDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+            result &= setOptimizationProfile(generationProfile, deepstackInputName.c_str(),
+                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
+        }
+        else
+        {
+            result &= setOptimizationProfile(generationProfile, deepstackInputName.c_str(),
+                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
+        }
     }
 
     if (!result)
