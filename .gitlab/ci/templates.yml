@@ -92,6 +92,11 @@
     - pip3 install -q -r tests/requirements.txt
     - echo "Installing accuracy dependencies"
     - pip3 install -q -r examples/accuracy/requirements.txt
+    - echo "Installing TensorRT Python package from cache"
+    - pip3 install -q $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
+    - echo "Installing python cuda dependencies"
+    - pip3 install -q pycuda
+    - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
     - echo "Setting up test environment"
     - echo "Running pipeline tests with pytest. Time:$(date)"
     - python3 -m pytest tests/ --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
