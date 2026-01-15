@@ -12,7 +12,7 @@ include:
 l1_ampere_model_export:
   stage: l1_test
   variables:
-    CUDA_VERSION: "12.9"
+    CUDA_VERSION: "13.0"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_ampere_model_export"
@@ -33,7 +33,8 @@ l1_a30:
   needs:
     - l1_ampere_model_export
   variables:
-    CUDA_VERSION: "12.9"
+    CUDA_VERSION: "13.0"
+    TRT_CUDA_VERSION: "13.1"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_a30"
@@ -41,7 +42,7 @@ l1_a30:
     ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_model_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
-    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$CUDA_VERSION"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
