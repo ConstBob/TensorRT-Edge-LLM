@@ -278,6 +278,42 @@ inline constexpr char const* kVocabMapFileName = "vocab_map.safetensors";
 
 /*! @} */
 
+/*! @name Audio Encoder Bindings (Qwen3-Omni)
+ * @{
+ */
+
+/*!
+ * @brief Audio padded features tensor - chunked and padded Mel-spectrogram
+ *
+ * Shape: [num_chunks, mel_bins, max_chunk_len] (FLOAT16)
+ */
+inline constexpr char const* kAudioPaddedFeatures = "padded_feature";
+
+/*!
+ * @brief Audio padded mask indices - nonzero indices from mask
+ *
+ * Shape: [num_valid_elements, 2] (INT64)
+ * Each row is [chunk_idx, position_idx] indicating valid positions after CNN downsampling
+ */
+inline constexpr char const* kAudioPaddedMaskIndices = "padded_mask_after_cnn_indices";
+
+/*!
+ * @brief Audio attention mask - block-diagonal mask for chunk-wise attention
+ *
+ * Shape: [num_attention_elems, num_attention_elems] (FLOAT16)
+ * Block-diagonal matrix where each block corresponds to one audio chunk
+ */
+inline constexpr char const* kAudioAttentionMask = "attention_mask";
+
+/*!
+ * @brief Audio encoder output - audio embeddings
+ *
+ * Shape: [num_audio_tokens, hidden_size] (FLOAT16)
+ */
+inline constexpr char const* kAudioOutput = "last_hidden_state";
+
+/*! @} */
+
 /*! @name LoRA (Low-Rank Adaptation) Bindings
  * @{
  */

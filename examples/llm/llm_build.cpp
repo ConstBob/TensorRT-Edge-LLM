@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "builder/builder.h"
+#include "builder/llmBuilder.h"
 #include "common/cudaUtils.h"
 #include "common/fileUtils.h"
 #include "common/logger.h"

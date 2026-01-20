@@ -30,6 +30,7 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "sampler/sampling.h"
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <string>
@@ -47,13 +48,84 @@ std::tuple<std::string, std::string> keySystemPromptWithLoraWeights(
     return std::make_tuple(systemPrompt, loraWeightsName);
 }
 
+//! \brief Generate multimodal indices for embeddingLookupMultimodal kernel
+//!
+//! This function scans the input IDs and generates indices for audio/image embeddings.
+//! For each multimodal token position, it assigns a sequential index starting from 0.
+//!
+//! \param inputIds Input token IDs on CPU [batchSize, seqLen]
+//! \param audioTokenId Special token ID for audio (<|audio_pad|>), or std::nullopt if no audio
+//! \param imageTokenId Special token ID for image (usually >= vocabSize), or std::nullopt if no image
+//! \param vocabSize Vocabulary size (for detecting image tokens when imageTokenId is not explicitly set)
+//! \return multimodalIndices tensor on CPU [batchSize, seqLen]
+rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
+    std::optional<int32_t> imageTokenId, int32_t vocabSize)
+{
+    auto const shape = inputIds.getShape();
+    check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
+    int64_t const batchSize = shape[0];
+    int64_t const seqLen = shape[1];
+
+    // Create output tensor on CPU
+    rt::Tensor multimodalIndices({batchSize, seqLen}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
+
+    int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
+    int32_t* indicesPtr = multimodalIndices.dataPointer<int32_t>();
+
+    // Global indexing across the entire batch (not per-sample)
+    int32_t audioIndex = 0;
+    int32_t imageIndex = 0;
+
+    // Process each sample in the batch
+    for (int64_t b = 0; b < batchSize; ++b)
+    {
+        for (int64_t s = 0; s < seqLen; ++s)
+        {
+            int64_t const pos = b * seqLen + s;
+            int32_t const tokenId = inputIdsPtr[pos];
+
+            // Check if this is an audio token
+            if (audioTokenId.has_value() && tokenId == *audioTokenId)
+            {
+                indicesPtr[pos] = audioIndex++;
+            }
+            // Check if this is an image token (either explicit imageTokenId or >= vocabSize)
+            else if ((imageTokenId.has_value() && tokenId == *imageTokenId) || tokenId >= vocabSize)
+            {
+                indicesPtr[pos] = imageIndex++;
+            }
+            else
+            {
+                // Normal text token, index not used
+                indicesPtr[pos] = 0;
+            }
+        }
+    }
+
+    return multimodalIndices;
+}
+
 } // namespace
 namespace rt
 {
 LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
-    std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "llm.engine";
+    // Find the first .engine file in engineDir
+    // For Qwen3-Omni: export ensures only thinker.engine exists in this directory
+    std::filesystem::path enginePath;
+    for (auto const& entry : std::filesystem::directory_iterator(engineDir))
+    {
+        if (entry.path().extension() == ".engine")
+        {
+            enginePath = entry.path();
+            break;
+        }
+    }
+    if (enginePath.empty())
+    {
+        throw std::runtime_error("No .engine file found in directory: " + engineDir);
+    }
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
 
     // Load embedding table from embedding.safetensors
@@ -174,20 +246,48 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         LOG_INFO("Vocabulary mapping table successfully loaded.");
     }
 
-    // Optional: Setup multimodal engine runner
+    // Optional: Setup multimodal engine runners
     if (!multimodalEngineDir.empty())
     {
-        try
+        // Multimodal engine directory structure:
+        //   multimodalEngineDir/audio/  - Audio encoder (audio_encoder.engine, config.json)
+        //   multimodalEngineDir/visual/ - Visual encoder (visual.engine, config.json)
+        //
+        // Note: audio_build and visual_build automatically append /audio and /visual subdirectories.
+        // Both builders should use the same base --engineDir path.
+
+        // Helper lambda to try loading a runner from a directory
+        auto tryLoadRunner = [&](std::string const& dir, std::string const& name) -> std::unique_ptr<MultimodalRunner> {
+            try
+            {
+                LOG_DEBUG("Attempting to load %s runner from %s", name.c_str(), dir.c_str());
+                auto runner = MultimodalRunner::create(
+                    dir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxKVCacheCapacity, stream);
+                LOG_INFO("%s runner successfully initialized", name.c_str());
+                return runner;
+            }
+            catch (std::exception const& e)
+            {
+                LOG_DEBUG("Failed to load %s runner from %s: %s", name.c_str(), dir.c_str(), e.what());
+                return nullptr;
+            }
+        };
+
+        // Try to load audio runner from multimodalEngineDir/audio
+        mAudioRunner = tryLoadRunner(multimodalEngineDir + "/audio", "Audio");
+
+        // Try to load visual runner from multimodalEngineDir/visual (with fallback to root for pure visual models)
+        mVisionRunner = tryLoadRunner(multimodalEngineDir + "/visual", "Visual");
+        if (!mVisionRunner)
         {
-            mMultimodalRunner = MultimodalRunner::create(
-                multimodalEngineDir, mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxKVCacheCapacity, stream);
+            mVisionRunner = tryLoadRunner(multimodalEngineDir, "Vision");
         }
-        catch (std::exception const& e)
+
+        // At least one runner must be available
+        if (!mAudioRunner && !mVisionRunner)
         {
-            LOG_ERROR("Failed to initialize MultimodalRunner: %s", e.what());
-            throw std::runtime_error("Failed to initialize MultimodalRunner: " + std::string(e.what()));
+            throw std::runtime_error("No valid multimodal engine found in " + multimodalEngineDir);
         }
-        LOG_INFO("MultimodalRunner successfully loaded and initialized multimodal engine.");
     }
 }
 
@@ -346,9 +446,9 @@ bool LLMInferenceRuntime::handleRequest(
         // Save KVCache if requested
         if (request.saveSystemPromptKVCache)
         {
-            if (mMultimodalRunner)
+            if (mVisionRunner)
             {
-                mMultimodalRunner->preprocessSystemPrompt(
+                mVisionRunner->preprocessSystemPrompt(
                     batchSystemPrompts[i], mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream);
             }
             bool const saveCacheStatus = genAndSaveSystemPromptKVCache(batchSystemPrompts[i], loraWeightsName, stream);
@@ -362,8 +462,56 @@ bool LLMInferenceRuntime::handleRequest(
     }
 
     // Preprocess user prompts and encode them.
-    if (!mMultimodalRunner)
+    // Check if request has audio or vision inputs
+    bool hasAudio = std::any_of(
+        request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.audioBuffers.empty(); });
+    bool hasVision = std::any_of(
+        request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.imageBuffers.empty(); });
+
+    if ((hasAudio && mAudioRunner) || (hasVision && mVisionRunner))
     {
+        // Mark multimodal preprocessing and inference for NVTX profiling
+        NVTX_SCOPED_RANGE(nvtx_multimodal, "MULTIMODAL_PROCESSING", nvtx_colors::ORANGE);
+
+        // Process audio inputs (if present)
+        if (hasAudio && mAudioRunner)
+        {
+            LOG_INFO("Processing audio inputs");
+            if (!mAudioRunner->preprocess(
+                    request, batchedInputIds, mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
+            {
+                LOG_ERROR("LLMInferenceRuntime(): Audio preprocessing failed. This request cannot be handled.");
+                return false;
+            }
+
+            if (!mAudioRunner->infer(stream))
+            {
+                LOG_ERROR("LLMInferenceRuntime(): Audio inference failed. This request cannot be handled.");
+                return false;
+            }
+        }
+
+        // Process vision inputs (if present)
+        if (hasVision && mVisionRunner)
+        {
+            LOG_INFO("Processing vision inputs");
+            if (!mVisionRunner->preprocess(
+                    request, batchedInputIds, mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
+            {
+                LOG_ERROR("LLMInferenceRuntime(): Vision preprocessing failed. This request cannot be handled.");
+                return false;
+            }
+
+            if (!mVisionRunner->infer(stream))
+            {
+                LOG_ERROR("LLMInferenceRuntime(): Vision inference failed. This request cannot be handled.");
+                return false;
+            }
+        }
+    }
+    else
+    {
+        // Pure text mode: directly tokenize
         batchedInputIds.reserve(activeBatchSize);
         for (int32_t i = 0; i < activeBatchSize; ++i)
         {
@@ -374,24 +522,6 @@ bool LLMInferenceRuntime::handleRequest(
                 LOG_ERROR("Failed to encode input text for request %d in batch", i);
                 return false;
             }
-        }
-    }
-    else
-    {
-        // Mark multimodal preprocessing and inference for NVTX profiling
-        NVTX_SCOPED_RANGE(nvtx_multimodal, "MULTIMODAL_PROCESSING", nvtx_colors::ORANGE);
-        if (!mMultimodalRunner->preprocess(
-                request, batchedInputIds, mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream))
-        {
-            LOG_ERROR(
-                "LLMInferenceRuntime(): Multimodal input request processing failed. This request cannot be handled.");
-            return false;
-        }
-
-        if (!mMultimodalRunner->infer(stream))
-        {
-            LOG_ERROR("LLMInferenceRuntime(): Multimodal inference failed. This request cannot be handled.");
-            return false;
         }
     }
 
@@ -460,51 +590,72 @@ bool LLMInferenceRuntime::handleRequest(
     check::check(mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
         "Tensor reshape failed");
 
-    rt::OptionalInputTensor multimodalEmbeddings
-        = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+    // Get embeddings from independent runners
+    rt::OptionalInputTensor visionEmbeddings
+        = mVisionRunner ? std::optional{std::ref(mVisionRunner->getOutputEmbedding())} : std::nullopt;
+    rt::OptionalInputTensor audioEmbeddings
+        = mAudioRunner ? std::optional{std::ref(mAudioRunner->getOutputEmbedding())} : std::nullopt;
 
-    if (multimodalEmbeddings.has_value())
+    if (audioEmbeddings.has_value())
     {
-        // Use image insertion variant for multimodal models
-        rt::Tensor const& imageEmbedsTensor = multimodalEmbeddings.value().get();
+        // Audio present: use embeddingLookupMultimodal (handles audio and/or vision)
+        // Copy inputIds to CPU for index generation
+        auto const inputShape = mInputIds.getShape();
+        size_t const inputSizeBytes = inputShape.volume() * sizeof(int32_t);
+        rt::Tensor inputIdsCPU(inputShape, rt::DeviceType::kCPU, mInputIds.getDataType());
+        CUDA_CHECK(
+            cudaMemcpy(inputIdsCPU.rawPointer(), mInputIds.rawPointer(), inputSizeBytes, cudaMemcpyDeviceToHost));
+
+        // Generate multimodal indices
+        std::optional<int32_t> audioTokenId
+            = (mEngineConfig.audioTokenId != 0) ? std::optional{mEngineConfig.audioTokenId} : std::nullopt;
+        std::optional<int32_t> imageTokenId
+            = (mEngineConfig.imageTokenId != 0) ? std::optional{mEngineConfig.imageTokenId} : std::nullopt;
+        rt::Tensor multimodalIndicesCPU
+            = generateMultimodalIndices(inputIdsCPU, audioTokenId, imageTokenId, mEngineConfig.vocabSize);
+
+        // Copy to GPU
+        auto const indicesShape = multimodalIndicesCPU.getShape();
+        size_t const indicesSizeBytes = indicesShape.volume() * sizeof(int32_t);
+        mMultimodalIndices = rt::Tensor(indicesShape, rt::DeviceType::kGPU, multimodalIndicesCPU.getDataType());
+        CUDA_CHECK(cudaMemcpy(mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesSizeBytes,
+            cudaMemcpyHostToDevice));
+
+        // Call embedding lookup
+        kernel::embeddingLookupMultimodal(mInputIds, mEmbeddingTable, std::optional{std::ref(mMultimodalIndices)},
+            imageTokenId, visionEmbeddings, audioTokenId, audioEmbeddings, mInputsEmbeds, stream);
+    }
+    else if (visionEmbeddings.has_value())
+    {
+        // Vision-only (Qwen2-VL, InternVL, etc.)
+        rt::Tensor const& imageEmbedsTensor = visionEmbeddings.value().get();
         kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
     }
     else
     {
-        // Standard embedding lookup
+        // Standard embedding lookup (pure text)
         kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
     }
 
-    // Process deepstack features: perform embedding assembly or error if not available
+    // Process deepstack features: perform embedding assembly if vision runner is available
+    // Note: Deepstack features are only provided by VisionRunner, not Qwen3OmniAudioRunner
     rt::OptionalInputTensors deepstackEmbeds{};
-    if (mEngineConfig.numDeepstackFeatures > 0)
+    if (mEngineConfig.numDeepstackFeatures > 0 && mVisionRunner)
     {
-        if (mMultimodalRunner)
+        rt::OptionalInputTensors deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+        for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
         {
-            // Multimodal runner exists: perform deepstack embedding assembly
-            rt::OptionalInputTensors deepstackFeatures = mMultimodalRunner->getDeepstackFeatures();
-            for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
-            {
-                rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
+            rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
 
-                // Reshape and perform embedding assembly for this feature
-                check::check(
-                    mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
-                    "Tensor reshape failed");
-                kernel::assembleDeepstackEmbedding(
-                    mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
+            // Reshape and perform embedding assembly for this feature
+            check::check(
+                mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
+                "Tensor reshape failed");
+            kernel::assembleDeepstackEmbedding(
+                mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
 
-                // Add to output vector (engine will bind by index)
-                deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
-            }
-        }
-        else
-        {
-            LOG_ERROR(
-                "Deepstack features are required (numDeepstackFeatures=%d) but no multimodal runner is available to "
-                "provide them.",
-                mEngineConfig.numDeepstackFeatures);
-            return false;
+            // Add to output vector (engine will bind by index)
+            deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
         }
     }
 
@@ -715,51 +866,72 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     check::check(mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
         "Tensor reshape failed");
 
-    rt::OptionalInputTensor multimodalEmbeddings
-        = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
+    // Get embeddings from independent runners
+    rt::OptionalInputTensor visionEmbeddings
+        = mVisionRunner ? std::optional{std::ref(mVisionRunner->getOutputEmbedding())} : std::nullopt;
+    rt::OptionalInputTensor audioEmbeddings
+        = mAudioRunner ? std::optional{std::ref(mAudioRunner->getOutputEmbedding())} : std::nullopt;
 
-    if (multimodalEmbeddings.has_value())
+    if (audioEmbeddings.has_value())
     {
-        // Use image insertion variant for multimodal models
-        rt::Tensor const& imageEmbedsTensor = multimodalEmbeddings.value().get();
+        // Audio present: use embeddingLookupMultimodal (handles audio and/or vision)
+        // Copy inputIds to CPU for index generation
+        auto const inputShape = mInputIds.getShape();
+        size_t const inputSizeBytes = inputShape.volume() * sizeof(int32_t);
+        rt::Tensor inputIdsCPU(inputShape, rt::DeviceType::kCPU, mInputIds.getDataType());
+        CUDA_CHECK(
+            cudaMemcpy(inputIdsCPU.rawPointer(), mInputIds.rawPointer(), inputSizeBytes, cudaMemcpyDeviceToHost));
+
+        // Generate multimodal indices
+        std::optional<int32_t> audioTokenId
+            = (mEngineConfig.audioTokenId != 0) ? std::optional{mEngineConfig.audioTokenId} : std::nullopt;
+        std::optional<int32_t> imageTokenId
+            = (mEngineConfig.imageTokenId != 0) ? std::optional{mEngineConfig.imageTokenId} : std::nullopt;
+        rt::Tensor multimodalIndicesCPU
+            = generateMultimodalIndices(inputIdsCPU, audioTokenId, imageTokenId, mEngineConfig.vocabSize);
+
+        // Copy to GPU
+        auto const indicesShape = multimodalIndicesCPU.getShape();
+        size_t const indicesSizeBytes = indicesShape.volume() * sizeof(int32_t);
+        mMultimodalIndices = rt::Tensor(indicesShape, rt::DeviceType::kGPU, multimodalIndicesCPU.getDataType());
+        CUDA_CHECK(cudaMemcpy(mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesSizeBytes,
+            cudaMemcpyHostToDevice));
+
+        // Call embedding lookup
+        kernel::embeddingLookupMultimodal(mInputIds, mEmbeddingTable, std::optional{std::ref(mMultimodalIndices)},
+            imageTokenId, visionEmbeddings, audioTokenId, audioEmbeddings, mInputsEmbeds, stream);
+    }
+    else if (visionEmbeddings.has_value())
+    {
+        // Vision-only (Qwen2-VL, InternVL, etc.)
+        rt::Tensor const& imageEmbedsTensor = visionEmbeddings.value().get();
         kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
     }
     else
     {
-        // Standard embedding lookup
+        // Standard embedding lookup (pure text)
         kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
     }
 
-    // Process deepstack features: perform embedding lookup or provide zero tensors
+    // Process deepstack features: perform embedding lookup if vision runner is available
+    // Note: Deepstack features are only provided by VisionRunner, not Qwen3OmniAudioRunner
     rt::OptionalInputTensors deepstackEmbeds{};
-    if (mEngineConfig.numDeepstackFeatures > 0)
+    if (mEngineConfig.numDeepstackFeatures > 0 && mVisionRunner)
     {
-        if (mMultimodalRunner)
+        rt::OptionalInputTensors deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+        for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
         {
-            // Multimodal runner exists: perform deepstack embedding lookup
-            rt::OptionalInputTensors deepstackFeatures = mMultimodalRunner->getDeepstackFeatures();
-            for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
-            {
-                rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
+            rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
 
-                // Reshape and perform embedding lookup for this feature
-                check::check(
-                    mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
-                    "Tensor reshape failed");
-                kernel::assembleDeepstackEmbedding(
-                    mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
+            // Reshape and perform embedding lookup for this feature
+            check::check(
+                mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
+                "Tensor reshape failed");
+            kernel::assembleDeepstackEmbedding(
+                mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
 
-                // Add to output vector (engine will bind by index)
-                deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
-            }
-        }
-        else
-        {
-            LOG_ERROR(
-                "Deepstack features are required (numDeepstackFeatures=%d) but no multimodal runner is available to "
-                "provide them.",
-                mEngineConfig.numDeepstackFeatures);
-            return false;
+            // Add to output vector (engine will bind by index)
+            deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
         }
     }
 

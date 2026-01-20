@@ -40,11 +40,13 @@ namespace metrics
  */
 namespace StageNames
 {
-inline std::string const kLLM_PREFILL = "llm_prefill";                               //!< LLM prefill stage
-inline std::string const kLLM_GENERATION = "llm_generation";                         //!< LLM generation stage
-inline std::string const kLLM_LAYER = "llm_layer";                                   //!< LLM layer profiling
-inline std::string const kMULTIMODAL_PROCESSING = "multimodal_processing";           //!< Multimodal processing stage
-inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";               //!< Eagle draft prefill stage
+inline std::string const kLLM_PREFILL = "llm_prefill";                     //!< LLM prefill stage
+inline std::string const kLLM_GENERATION = "llm_generation";               //!< LLM generation stage
+inline std::string const kLLM_LAYER = "llm_layer";                         //!< LLM layer profiling
+inline std::string const kMULTIMODAL_PROCESSING = "multimodal_processing"; //!< Multimodal processing stage (legacy)
+inline std::string const kAUDIO_ENCODER = "audio_encoder";                 //!< Audio encoder stage
+inline std::string const kVISION_ENCODER = "vision_encoder";               //!< Vision encoder stage
+inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";     //!< Eagle draft prefill stage
 inline std::string const kEAGLE_CONSTRUCT_DRAFT_TREE = "eagle_construct_draft_tree"; //!< Eagle draft tree construction
 inline std::string const kEAGLE_BASE_VERIFICATION = "eagle_base_verification";       //!< Eagle base verification stage
 } // namespace StageNames
@@ -123,18 +125,22 @@ public:
 /*!
  * @brief Multimodal processing stage metrics
  *
- * Tracks image processing statistics.
+ * Tracks image and audio processing statistics.
  */
 class MultimodalMetrics : public BaseMetrics
 {
 public:
     int64_t totalImages{0};      //!< Total number of processed images
     int64_t totalImageTokens{0}; //!< Total number of image tokens generated
+    int64_t totalAudios{0};      //!< Total number of processed audio clips (Qwen3-Omni)
+    int64_t totalAudioTokens{0}; //!< Total number of audio tokens generated (Qwen3-Omni)
 
     //! @brief Record a multimodal processing run
     //! @param imageCount Number of images processed
     //! @param imageTokens Number of image tokens generated
-    void recordRun(int64_t imageCount, int64_t imageTokens) noexcept
+    //! @param audioCount Number of audio clips processed (optional, for Qwen3-Omni)
+    //! @param audioTokens Number of audio tokens generated (optional, for Qwen3-Omni)
+    void recordRun(int64_t imageCount, int64_t imageTokens, int64_t audioCount = 0, int64_t audioTokens = 0) noexcept
     {
         if (!getProfilingEnabled())
         {
@@ -143,6 +149,8 @@ public:
         totalRuns++;
         totalImages += imageCount;
         totalImageTokens += imageTokens;
+        totalAudios += audioCount;
+        totalAudioTokens += audioTokens;
     }
 };
 

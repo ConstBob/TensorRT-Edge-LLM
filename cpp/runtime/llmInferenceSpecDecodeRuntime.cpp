@@ -324,19 +324,39 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     LOG_INFO("Tokenizer successfully loaded from model directory: %s", engineDir.c_str());
 
     // Optional: Setup multimodal engine runner
+    // Convention: visual engines in <multimodalEngineDir>/visual/
+    // Note: Eagle speculative decoding currently only supports visual models
     if (!multimodalEngineDir.empty())
     {
-        try
+        // Helper lambda to try loading a runner from a directory
+        auto tryLoadRunner = [&](std::string const& dir, std::string const& name) -> std::unique_ptr<MultimodalRunner> {
+            try
+            {
+                LOG_DEBUG("Attempting to load %s runner from %s", name.c_str(), dir.c_str());
+                auto runner = MultimodalRunner::create(
+                    dir, mBaseEngineConfig.maxSupportedBatchSize, mBaseEngineConfig.maxKVCacheCapacity, stream);
+                LOG_INFO("%s runner successfully initialized", name.c_str());
+                return runner;
+            }
+            catch (std::exception const& e)
+            {
+                LOG_DEBUG("Failed to load %s runner from %s: %s", name.c_str(), dir.c_str(), e.what());
+                return nullptr;
+            }
+        };
+
+        // Try to load visual runner (with fallback to root directory for backward compatibility)
+        mMultimodalRunner = tryLoadRunner(multimodalEngineDir + "/visual", "Visual");
+        if (!mMultimodalRunner)
         {
-            mMultimodalRunner = MultimodalRunner::create(multimodalEngineDir, mBaseEngineConfig.maxSupportedBatchSize,
-                mBaseEngineConfig.maxKVCacheCapacity, stream);
+            mMultimodalRunner = tryLoadRunner(multimodalEngineDir, "Vision");
         }
-        catch (std::exception const& e)
+
+        // At least one multimodal runner must be available
+        if (!mMultimodalRunner)
         {
-            LOG_ERROR("Failed to initialize MultimodalRunner: %s", e.what());
-            throw std::runtime_error("Failed to initialize MultimodalRunner: " + std::string(e.what()));
+            throw std::runtime_error("No valid multimodal engine found in " + multimodalEngineDir);
         }
-        LOG_INFO("MultimodalRunner successfully loaded and initialized multimodal engine.");
     }
 }
 

@@ -113,7 +113,9 @@ public:
      */
     metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
     {
-        return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
+        return mVisionRunner ? mVisionRunner->getMultimodalMetrics()
+            : mAudioRunner   ? mAudioRunner->getMultimodalMetrics()
+                             : metrics::MultimodalMetrics{};
     }
 
 private:
@@ -133,16 +135,18 @@ private:
     TokenCountInfo calculateTokenCounts(std::vector<std::vector<int32_t>> const& batchedInputIds,
         std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName) const noexcept;
 
-    std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};   //!< LLM engine runner instance
-    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner instance (optional)
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};    //!< Tokenizer instance
+    std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr}; //!< LLM engine runner instance
+    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};    //!< Audio runner instance (optional)
+    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};   //!< Vision runner instance (optional)
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};  //!< Tokenizer instance
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCache{}; //!< Cache of system prompts / LORA weights and their KV caches
 
-    rt::Tensor mEmbeddingTable{};             //!< Shared embedding table [vocabSize, hiddenSize]
-    rt::Tensor mSamplingWorkspace{};          //!< Workspace tensor for sampling operations
-    rt::Tensor mInputIds{};                   //!< Input token IDs tensor
-    rt::Tensor mInputsEmbeds{};               //!< Input embeddings tensor [batchSize, seqLen, hiddenSize]
+    rt::Tensor mEmbeddingTable{};    //!< Shared embedding table [vocabSize, hiddenSize]
+    rt::Tensor mSamplingWorkspace{}; //!< Workspace tensor for sampling operations
+    rt::Tensor mInputIds{};          //!< Input token IDs tensor
+    rt::Tensor mInputsEmbeds{};      //!< Input embeddings tensor [batchSize, seqLen, hiddenSize]
+    rt::Tensor mMultimodalIndices{}; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
     std::vector<rt::Tensor> mDeepstackEmbeds; //!< Deepstack embeddings tensors for Qwen3-VL (one per feature)
     rt::Tensor mHostPackedInputIds{};         //!< Host tensor for packed input IDs
     rt::Tensor mHostContextLengths{};         //!< Host tensor for context lengths

@@ -307,7 +307,28 @@ void outputMultimodalProfile(std::ostream& output, metrics::MultimodalMetrics co
     if (multimodalMetrics.getTotalRuns() > 0)
     {
         output << "=== Multimodal Processing ===" << std::endl;
-        output << "Total Image Tokens: " << multimodalMetrics.totalImageTokens << std::endl;
+
+        // Show audio stats if present (Qwen3-Omni)
+        if (multimodalMetrics.totalAudios > 0)
+        {
+            output << "Total Audio Clips: " << multimodalMetrics.totalAudios << std::endl;
+            output << "Total Audio Tokens: " << multimodalMetrics.totalAudioTokens << std::endl;
+        }
+
+        // Show image stats if present
+        if (multimodalMetrics.totalImages > 0)
+        {
+            output << "Total Images: " << multimodalMetrics.totalImages << std::endl;
+            output << "Total Image Tokens: " << multimodalMetrics.totalImageTokens << std::endl;
+        }
+
+        // Show combined stats
+        int64_t totalTokens = multimodalMetrics.totalImageTokens + multimodalMetrics.totalAudioTokens;
+        if (totalTokens > 0)
+        {
+            output << "Total Multimodal Tokens: " << totalTokens << std::endl;
+        }
+
         output << "Average Time per Token: " << std::fixed << std::setprecision(4)
                << getMultimodalAverageTimePerToken(multimodalMetrics) << " ms" << std::endl;
         appendStageTimingData(output, metrics::StageNames::kMULTIMODAL_PROCESSING, "Multimodal Processing");
@@ -385,8 +406,12 @@ void addJsonMultimodalSummary(nlohmann::json& summary, metrics::MultimodalMetric
 {
     if (multimodalMetrics.getTotalRuns() > 0)
     {
+        int64_t totalTokens = multimodalMetrics.totalImageTokens + multimodalMetrics.totalAudioTokens;
+
         summary["multimodal"] = {{"total_runs", multimodalMetrics.getTotalRuns()},
             {"total_images", multimodalMetrics.totalImages}, {"total_image_tokens", multimodalMetrics.totalImageTokens},
+            {"total_audios", multimodalMetrics.totalAudios}, {"total_audio_tokens", multimodalMetrics.totalAudioTokens},
+            {"total_multimodal_tokens", totalTokens},
             {"average_time_per_token_ms", getMultimodalAverageTimePerToken(multimodalMetrics)}};
     }
 }

@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import AutoProcessor, AutoTokenizer
 
-from ..llm_models.model_utils import is_vlm
+from ..llm_models.model_utils import _is_qwen3_omni_model, is_vlm
 
 
 @dataclass
@@ -82,6 +82,9 @@ class MultimodalUserMessage(Message):
 
     def add_video_content(self, video: str):
         self.content.append({"type": "video", "video": video})
+
+    def add_audio_content(self, audio: str):
+        self.content.append({"type": "audio", "audio": audio})
 
 
 @dataclass
@@ -180,13 +183,13 @@ def _extract_content_pattern(tokenizer: Any, system_prompt: SystemMessage,
                              text_only_formatted: str,
                              placeholder_text: str) -> Optional[str]:
     """
-    Extract the pattern for a specific content type (image/video) by comparing
+    Extract the pattern for a specific content type (image/video/audio) by comparing
     with text-only message.
     
     Args:
         tokenizer: The loaded tokenizer
         system_prompt: System message to use
-        content_type: Type of content ('image' or 'video')
+        content_type: Type of content ('image', 'video', or 'audio')
         placeholder: Placeholder string for the content
         text_only_formatted: Formatted text-only message
         placeholder_text: The text placeholder used
@@ -200,6 +203,8 @@ def _extract_content_pattern(tokenizer: Any, system_prompt: SystemMessage,
         user_with_content.add_image_content(placeholder)
     elif content_type == 'video':
         user_with_content.add_video_content(placeholder)
+    elif content_type == 'audio':
+        user_with_content.add_audio_content(placeholder)
     else:
         return None
 
@@ -412,6 +417,24 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                                                  placeholder_text)
         if video_pattern:
             content_types['video'] = {'format': video_pattern}
+
+    # Check for Omni models (audio + vision + text)
+    elif _is_qwen3_omni_model(model_dir):
+        print(
+            "Detected Omni-modal model (audio + vision), using special token placeholders..."
+        )
+        # For Omni models, use special tokens as placeholders that the C++ multimodal runners expect
+        # These are single tokens that Qwen3OmniAudioRunner and QwenViTRunner will find and replace
+        content_types['audio'] = {'format': '<|audio_pad|>'}
+        content_types['image'] = {'format': '<|image_pad|>'}
+        content_types['video'] = {'format': '<|video_pad|>'}
+        print(
+            "  Using special token placeholders: <|audio_pad|>, <|image_pad|>, <|video_pad|>"
+        )
+        print(
+            "  Note: These will be expanded by Qwen3OmniAudioRunner/VisionRunner during inference"
+        )
+
     else:
         print(
             "Text-only LLM detected, skipping multimodal content pattern extraction"

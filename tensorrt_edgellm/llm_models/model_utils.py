@@ -365,7 +365,6 @@ def load_llm_model(
         
     Returns:
         tuple: (model, tokenizer, processor)
-        processor will be None if AutoProcessor cannot be loaded from the model directory
     """
     from .models.llm_model import (EdgeLLMModelForCausalLM,
                                    EdgeLLMModelNativeOps)
@@ -379,9 +378,9 @@ def load_llm_model(
     model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
     set_dynamic_quant(model, dtype)
 
-    # Create EdgeLLMModelForCausalLM wrapper.
-    # Handle Qwen3-Omni model which has a special structure
+    # Create EdgeLLMModelForCausalLM wrapper
     if _is_qwen3_omni_model(model_dir):
+        # For Qwen3-Omni, extract the thinker submodel
         hf_model = model.thinker
     else:
         hf_model = model

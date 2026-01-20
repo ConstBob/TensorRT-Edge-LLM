@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "builder/builder.h"
+#include "builder/visualBuilder.h"
 #include "common/fileUtils.h"
 #include "common/logger.h"
 
@@ -61,9 +61,8 @@ void printUsage(char const* programName)
     std::cerr
         << "  --onnxDir            Provide the directory containing the input onnx file for visual encoder. Required. "
         << std::endl;
-    std::cerr
-        << "  --engineDir          Provide the output TensorRT engine directory path for visual encoder. Required. "
-        << std::endl;
+    std::cerr << "  --engineDir          Base output directory for visual encoder. Required." << std::endl;
+    std::cerr << "                       Note: Engine will be saved to <engineDir>/visual/" << std::endl;
     std::cerr << "  --debug              Use debug mode, which outputs tensors." << std::endl;
     std::cerr << "  --minImageTokens     Minimum image tokens. Default = 4" << std::endl;
     std::cerr << "  --maxImageTokens     Maximum image tokens. Default = 1024" << std::endl;
@@ -182,8 +181,10 @@ int main(int argc, char** argv)
     config.maxImageTokens = args.maxImageTokens;
     config.maxImageTokensPerImage = args.maxImageTokensPerImage;
 
+    std::string actualEngineDir = args.engineDir + "/visual";
+
     // Create and run the builder
-    builder::VisualBuilder visualBuilder(args.onnxDir, args.engineDir, config);
+    builder::VisualBuilder visualBuilder(args.onnxDir, actualEngineDir, config);
     if (!visualBuilder.build())
     {
         LOG_ERROR("Failed to build Visual engine.");

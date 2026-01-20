@@ -27,12 +27,14 @@ namespace multimodal
 //! Enum for supported multimodal model types
 enum class ModelType
 {
-    QWEN2_VL,   //!< Qwen2-VL model
-    QWEN2_5_VL, //!< Qwen2.5-VL model
-    QWEN3_VL,   //!< Qwen3-VL model
-    INTERNVL,   //!< InternVL model
-    PHI4MM,     //!< Phi-4MM model
-    UNKNOWN     //!< Unknown or unsupported model type
+    QWEN2_VL,                  //!< Qwen2-VL model
+    QWEN2_5_VL,                //!< Qwen2.5-VL model
+    QWEN3_VL,                  //!< Qwen3-VL model
+    QWEN3_OMNI_AUDIO_ENCODER,  //!< Qwen3-Omni audio encoder (audio + text input/output)
+    QWEN3_OMNI_VISION_ENCODER, //!< Qwen3-Omni vision encoder (image + text input/output)
+    INTERNVL,                  //!< InternVL model
+    PHI4MM,                    //!< Phi-4MM model
+    UNKNOWN                    //!< Unknown or unsupported model type
 };
 
 //! Convert string to ModelType enum
@@ -46,6 +48,10 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::QWEN2_5_VL;
     if (modelTypeStr == "qwen3_vl")
         return ModelType::QWEN3_VL;
+    if (modelTypeStr == "qwen3_omni" || modelTypeStr == "qwen3_omni_thinker" || modelTypeStr == "qwen3_omni_text")
+        return ModelType::QWEN3_OMNI_AUDIO_ENCODER;
+    if (modelTypeStr == "qwen3_omni_vision_encoder")
+        return ModelType::QWEN3_OMNI_VISION_ENCODER;
     if (modelTypeStr == "internvl" || modelTypeStr == "internvl_vision")
         return ModelType::INTERNVL;
     if (modelTypeStr == "phi4mm")
