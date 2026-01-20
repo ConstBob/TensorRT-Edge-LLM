@@ -244,21 +244,3 @@ request.maxLength = 200;
 auto response = runtime.handleRequest(request);
 std::cout << "Generated: " << response.outputText << std::endl;
 ```
-
----
-
-## Next Steps
-
-1. **Explore Advanced Features**: Refer to [Advanced Runtime Features](04.4_Advanced_Runtime_Features.md) for CUDA graphs, LoRA, and more
-2. **Try Examples**: Run the [Examples](05_Examples.md) to see the runtime in action
-3. **Benchmark Performance**: Compare EAGLE performance vs standard runtime for your use case
-
----
-
-## Additional Resources
-
-- **Runtime API**: Refer to the `cpp/runtime/` directory
-- **EAGLE Documentation**: Refer to EAGLE-specific documentation in `cpp/runtime/eagleDraftEngineRunner.h`
-- **Architecture Overview**: Refer to [Overview](01.1_Overview.md)
-
-

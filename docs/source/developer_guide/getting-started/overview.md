@@ -60,10 +60,10 @@ graph LR
 
 | Component | Description |
 |-----------|-------------|
-| **Python Export Pipeline** | Python-based toolchain that converts HuggingFace models into ONNX format with quantization (FP8, INT4, NVFP4). [Learn More](03.1_Python_Export_Pipeline.md) |
-| **Engine Builder** | C++-based application that compiles ONNX models into optimized TensorRT engines. [Learn More](03.2_Engine_Builder.md) |
-| **C++ Runtime** | C++-based runtime that executes TensorRT engines with CUDA graphs, LoRA, and EAGLE support. [Learn More](04.1_C++_Runtime_Overview.md) |
-| **Examples** | Reference implementations demonstrating LLM, multimodal, and utility use cases. [Learn More](05_Examples.md) |
+| **Python Export Pipeline** | Python-based toolchain that converts HuggingFace models into ONNX format with quantization (FP8, INT4, NVFP4). [Learn More](../software-design/python-export-pipeline.md) |
+| **Engine Builder** | C++-based application that compiles ONNX models into optimized TensorRT engines. [Learn More](../software-design/engine-builder.md) |
+| **C++ Runtime** | C++-based runtime that executes TensorRT engines with CUDA graphs, LoRA, and EAGLE support. [Learn More](../software-design/cpp-runtime-overview.md) |
+| **Examples** | Reference implementations demonstrating LLM, multimodal, and utility use cases. [Learn More](examples.md) |
 
 ## Use Cases
 
@@ -96,28 +96,13 @@ TensorRT Edge-LLM is ideal for:
 
 ### Supported Model Families
 
-**Large Language Models:**
-- Llama 3.x (1B - 8B)
-- Qwen 2/2.5/3 (0.5B - 7B)
-- DeepSeek-R1 Distilled (1.5B, 7B)
+TensorRT Edge-LLM supports a wide range of state-of-the-art models:
+- **Large Language Models**: Llama 3.x, Qwen 2/2.5/3, DeepSeek-R1 Distilled
+- **Vision-Language Models**: Qwen2/2.5/3-VL, InternVL3, Phi-4-Multimodal
+- **Quantization**: FP16, FP8 (SM89+), INT4 AWQ/GPTQ, NVFP4 (SM100+)
 
-**Vision-Language Models:**
-- Qwen2/2.5/3-VL (2B - 8B)
-- InternVL3 (1B, 2B)
-- Phi-4-Multimodal (Phi-4-multimodal-instruct, 5.6B)
-
-Refer to [Supported Models](02_Supported_Models.md) for a complete list.
-
----
-
-## Next Steps
-
-1. **[Quick Start Guide](01.2_Quick_Start_Guide.md)**: Get up and running in 15 minutes
-2. **[Installation](01.3_Installation.md)**: Detailed installation instructions
-3. **[Supported Models](02_Supported_Models.md)**: Learn about supported models
-4. **[Customization Guide](07_Customization_Guide.md)**: Customize and extend for your needs (source code provided)
+For the complete list of supported models, precision requirements, and platform compatibility, see **[Supported Models](supported-models.md)**.
 
 ---
 
 **For questions or issues, visit our [TensorRT Edge-LLM GitHub repository](https://github.com/NVIDIA/TensorRT-Edge-LLM).**
-

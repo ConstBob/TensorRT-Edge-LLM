@@ -424,24 +424,3 @@ tensorrt-edgellm-quantize-llm \
 ```
 
 2. Change the quantization recipe in `tensorrt_edgellm/quantization/llm_quantization.py` or `tensorrt_edgellm/quantization/visual_quantization.py` to disable quantization for most sensitive layers. Follow the documentation of [NVIDIA Model Optimizer](https://nvidia.github.io/Model-Optimizer/)
-
----
-
-## Next Steps
-
-After exporting your model to ONNX:
-
-1. **Build TensorRT Engine**: Use the [Engine Builder](03.2_Engine_Builder.md) to compile ONNX to TRT
-2. **Deploy with C++ Runtime**: Use the [C++ Runtime](04.1_C++_Runtime_Overview.md) for inference
-3. **Run Examples**: Try the [Examples](05_Examples.md) to validate your export
-
----
-
-## Additional Resources
-
-- **Model Signing**: [model-signing package](https://github.com/sigstore/model-transparency)
-- **Python API Documentation**: Refer to the `tensorrt_edgellm/` directory
-- **Quantization Details**: Refer to [NVIDIA Model Optimizer](https://nvidia.github.io/Model-Optimizer/)
-- **ONNX Format**: Refer to [ONNX GitHub](https://github.com/onnx/onnx)
-- **Model Support**: Refer to [Supported Models](02_Supported_Models.md)
-

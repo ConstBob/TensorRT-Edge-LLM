@@ -102,5 +102,3 @@ The Int4GroupwiseGemmPlugin integrates into the TensorRT Edge-LLM inference pipe
 2. **Export Phase**: During ONNX model export, quantized matrix multiplication operations are annotated for Int4GroupwiseGemmPlugin implementation through the Python export pipeline.
 3. **Engine Construction**: The TensorRT engine builder identifies Int4GroupwiseGemmPlugin operations via registered plugin creators and integrates them into the optimized computation graph.
 4. **Runtime Execution**: During inference, the Int4GroupwiseGemmPlugin executes quantized GEMM/GEMV operations as nodes within the TensorRT engine's execution graph.
-
-

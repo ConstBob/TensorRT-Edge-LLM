@@ -118,7 +118,7 @@ TensorRT Edge-LLM supports **drop-in replacement** of model weights. Any fine-tu
 
 **Compatible Fine-Tuning Methods:**
 - Full fine-tuning
-- [LoRA (Low-Rank Adaptation)](04.4_Advanced_Runtime_Features.md#lora-low-rank-adaptation-support)
+- [LoRA (Low-Rank Adaptation)](features/advanced-runtime-features.md#lora-low-rank-adaptation-support)
 - PEFT adapters (merged)
 - GPTQ pre-quantized models
 

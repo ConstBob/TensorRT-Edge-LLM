@@ -58,22 +58,3 @@ The C++ runtime is organized around **two distinct, mutually exclusive runtime i
 |-----------|-------------|
 | **LLM Inference Runtime** | Top-level orchestrator for standard and multimodal inference. Owns and coordinates all components for the inference pipeline. Creates and directly manages a single `LLMEngineRunner` instance (`mLLMEngineRunner`) that handles both prefill and generation phases. Manages memory allocation, request processing, tokenization, and response generation. Supports both text-only and multimodal (VLM) inference scenarios. |
 | **LLM Inference SpecDecode Runtime** | Specialized runtime for EAGLE speculative decoding. Completely separate from the LLM Inference Runtime, owns and coordinates two distinct engine runners: `mBaseEngineRunner` (LLMEngineRunner) and `mDraftEngineRunner` (EagleDraftEngineRunner). Implements sophisticated EAGLE tree-based speculative generation with draft model candidate generation and base model verification. Handles draft vocabulary mapping for EAGLE3. |
-
----
-
-## Next Steps
-
-1. **Standard Inference**: Learn about the [LLM Inference Runtime](04.2_LLM_Inference_Runtime.md)
-2. **EAGLE Speculative Decoding**: Refer to [LLM Inference SpecDecode Runtime](04.3_LLM_Inference_SpecDecode_Runtime.md)
-3. **Advanced Features**: Explore [Advanced Runtime Features](04.4_Advanced_Runtime_Features.md)
-4. **Try Examples**: Run the [Examples](05_Examples.md) to see the runtime in action
-
----
-
-## Additional Resources
-
-- **Runtime API**: Refer to the `cpp/runtime/` directory
-- **Example Applications**: Refer to `examples/llm/` and `examples/multimodal/`
-- **Architecture Overview**: Refer to [Overview](01.1_Overview.md)
-
-
