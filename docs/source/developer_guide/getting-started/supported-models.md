@@ -70,7 +70,7 @@
 | **NVFP4** | 4x reduction | NVFP4 GEMMs + FP16 | **SM100+** (Blackwell and newer) | **Thor platforms (recommended)** |
 
 ### Additional Features
-- **FP8 Vision Encoder**: Supported for visual models (Qwen2-VL, InternVL3) on SM89+
+- **FP8 Vision Encoder**: Supported for visual models on SM89+
 - **FP8/NVFP4 LM Head**: Supported for language model heads with platform-specific requirements
 
 ---
@@ -99,11 +99,3 @@ For development purposes, TensorRT Edge-LLM supports the following discrete GPU 
 - **SM120**: Blackwell (e.g., RTX 50 series, RTX Pro Blackwell series)
 
 > **Note:** While these GPUs are supported for development and testing, the officially supported deployment platforms are NVIDIA Jetson Thor (JetPack 7.1) and NVIDIA DRIVE Thor (DriveOS 7). For performant inference solutions on these GPUs please refer to [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
-
----
-
-## Additional Resources
-
-- [Overview](01.1_Overview.md)
-- [Quick Start Guide](01.2_Quick_Start_Guide.md)
-- [Examples](05_Examples.md)

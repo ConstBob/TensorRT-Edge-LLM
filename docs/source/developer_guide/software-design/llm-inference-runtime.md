@@ -198,22 +198,3 @@ request.maxLength = 150;
 auto response = runtime.handleRequest(request);
 std::cout << "Generated: " << response.outputText << std::endl;
 ```
-
----
-
-## Next Steps
-
-1. **Learn About Speculative Decoding**: Refer to [LLM Inference SpecDecode Runtime](04.3_LLM_Inference_SpecDecode_Runtime.md) for EAGLE support
-2. **Explore Advanced Features**: Refer to [Advanced Runtime Features](04.4_Advanced_Runtime_Features.md) for CUDA graphs, LoRA, and more
-3. **Try Examples**: Run the [Examples](05_Examples.md) to see the runtime in action
-4. **Integrate into Application**: Use the runtime API in your application
-
----
-
-## Additional Resources
-
-- **Runtime API**: Refer to the `cpp/runtime/` directory
-- **Example Applications**: Refer to `examples/llm/` and `examples/multimodal/`
-- **Architecture Overview**: Refer to [Overview](01.1_Overview.md)
-
-

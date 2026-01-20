@@ -21,6 +21,7 @@ The Python export pipeline converts and quantizes models. This must run on an x8
 - **GPU**: NVIDIA GPU (for model quantization)
 - **CUDA**: 12.x or 13.x
 - **Python**: 3.10+
+- **Disk Space**: ~50-100GB for models, quantized weights, and ONNX files
 
 ### Installing
 
@@ -60,6 +61,16 @@ tensorrt-edgellm-export-llm --help
 tensorrt-edgellm-quantize-llm --help
 ```
 
+**4. Configure HuggingFace Access (for gated models)**
+
+For gated models like Llama and Phi-4:
+
+```bash
+# Install HuggingFace CLI and login
+huggingface-cli login
+# Enter your HuggingFace access token when prompted
+```
+
 **You're done with export pipeline setup!** You can now export and quantize models. The ONNX files will be transferred to the Edge device for runtime deployment.
 
 ---
@@ -75,6 +86,7 @@ The C++ runtime builds and executes models on the target Edge device. This must 
 - JetPack 7.1
 - CUDA 13.x (included in JetPack)
 - TensorRT 10.x+ (included in JetPack)
+- Disk Space: ~20-50GB for ONNX files and TensorRT engines
 
 ### Build Instructions
 
@@ -103,6 +115,8 @@ dpkg -l | grep tensorrt  # Should show TensorRT 10.x+
 **3. Clone Repository (on Edge device)**
 
 ```bash
+# Clone to home directory (used in all examples)
+cd ~
 git clone https://github.com/NVIDIA/TensorRT-Edge-LLM.git
 cd TensorRT-Edge-LLM
 git submodule update --init --recursive
@@ -139,7 +153,7 @@ cmake .. \
 | `CUDA_VERSION` | CUDA version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 
-> **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](02_Supported_Models.md#platform-compatibility)
+> **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
 
 **5. Build Project**
 
@@ -161,19 +175,9 @@ Build time: ~1-2 minutes depending on hardware.
 
 ---
 
-## Complete Workflow Summary
+## Next Steps
 
-**On x86 Host (Export Pipeline):**
-1. Install Python package
-2. Export and quantize models
-3. Transfer ONNX files to Edge device
-
-**On Edge Device (C++ Runtime):**
-1. Build C++ runtime
-2. Build TensorRT engines from ONNX files
-3. Run inference
-
-Refer to the [Quick Start Guide](01.2_Quick_Start_Guide.md) for a complete end-to-end example.
+After installation, proceed to the [Quick Start Guide](quick-start-guide.md) for a complete end-to-end workflow, or see the [Examples Guide](examples.md) for detailed pipeline stages and advanced use cases.
 
 ---
 
@@ -232,19 +236,3 @@ make -j  # Instead of make -j$(nproc)
 **C++ Runtime (Edge Device):**
 - Remove build directory: `rm -rf build`
 - Remove repository (optional): `rm -rf TensorRT-Edge-LLM`
-
----
-
-## Next Steps
-
-Now that you have TensorRT Edge-LLM installed, continue to:
-
-1. **[Overview](01.1_Overview.md)**: Platform overview, supported features, and key components
-2. **[Quick Start Guide](01.2_Quick_Start_Guide.md)**: Get up and running in 15 minutes
-3. **[Supported Models](02_Supported_Models.md)**: Learn about supported models and how to prepare them
-4. **[Examples](05_Examples.md)**: Explore example applications and use cases
-
----
-
-**For questions or issues, visit our [TensorRT Edge-LLM GitHub repository](https://github.com/NVIDIA/TensorRT-Edge-LLM).**
-

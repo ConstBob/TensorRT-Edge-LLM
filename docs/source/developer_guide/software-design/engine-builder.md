@@ -60,7 +60,7 @@ graph LR
 
 **⚠️ VERSION COMPATIBILITY**: ONNX models and TensorRT engines are **NOT portable** across different versions of TensorRT Edge-LLM or TensorRT. Always re-export ONNX models and rebuild engines when upgrading versions.
 
-**⚠️ USER RESPONSIBILITY**: Users are responsible for verifying model integrity before export and build, validating outputs, and maintaining proper model sanity throughout the pipeline. See the [Security and Model Integrity](03.1_Python_Export_Pipeline.md) section in the Python Export Pipeline guide for verification best practices.
+**⚠️ USER RESPONSIBILITY**: Users are responsible for verifying model integrity before export and build, validating outputs, and maintaining proper model sanity throughout the pipeline. See the [Security and Model Integrity](python-export-pipeline.md#security-and-model-integrity) section in the Python Export Pipeline guide for verification best practices.
 
 ---
 
@@ -422,23 +422,3 @@ Base and draft engine directories should be the same.
 - Check TensorRT version compatibility
 - Verify ONNX model integrity
 - Check plugin library loading
-
----
-
-## Next Steps
-
-After building your TensorRT engine:
-
-1. **Deploy with C++ Runtime**: Use the [C++ Runtime](04.1_C++_Runtime_Overview.md) for inference
-2. **Run Examples**: Try the [Examples](05_Examples.md) to validate your engine
-3. **Benchmark Performance**: Measure latency and throughput for your use case
-
----
-
-## Additional Resources
-
-- **Builder API**: Refer to the `cpp/builder/` directory
-- **TensorRT Documentation**: [NVIDIA TensorRT](https://docs.nvidia.com/deeplearning/tensorrt/)
-- **Plugin Development**: Refer to the `cpp/plugins/` directory
-- **Build Examples**: Refer to `examples/llm/llm_build.cpp`
-
