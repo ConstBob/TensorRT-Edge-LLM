@@ -569,6 +569,75 @@ std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::
     return result;
 }
 
+std::vector<half> embeddingLookupMultimodalRef(std::vector<int32_t> const& inputIds,
+    std::vector<half> const& embeddingTable, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
+    std::vector<int32_t> const& multimodalIndices, int32_t imageTokenId, std::vector<half> const& imageEmbeds,
+    int64_t imageTokenLen, int32_t audioTokenId, std::vector<half> const& audioEmbeds, int64_t audioTokenLen)
+{
+    std::vector<half> result(batchSize * seqLen * hiddenSize, __float2half(0.0f));
+
+    for (int64_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
+        {
+            int64_t const linearIdx = batchIdx * seqLen + tokenIdx;
+            int32_t const tokenId = inputIds[linearIdx];
+
+            for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
+            {
+                int64_t const resultIdx = linearIdx * hiddenSize + elementIdx;
+
+                half embeddingValue;
+                if (tokenId == imageTokenId)
+                {
+                    // Image token: use multimodalIndices to get the index into imageEmbeds
+                    int32_t const imageIdx = multimodalIndices[linearIdx];
+                    if (imageIdx >= 0 && imageIdx < imageTokenLen)
+                    {
+                        int64_t const imageEmbedIdx = imageIdx * hiddenSize + elementIdx;
+                        embeddingValue = imageEmbeds[imageEmbedIdx];
+                    }
+                    else
+                    {
+                        embeddingValue = __float2half(0.0f);
+                    }
+                }
+                else if (tokenId == audioTokenId)
+                {
+                    // Audio token: use multimodalIndices to get the index into audioEmbeds
+                    int32_t const audioIdx = multimodalIndices[linearIdx];
+                    if (audioIdx >= 0 && audioIdx < audioTokenLen)
+                    {
+                        int64_t const audioEmbedIdx = audioIdx * hiddenSize + elementIdx;
+                        embeddingValue = audioEmbeds[audioEmbedIdx];
+                    }
+                    else
+                    {
+                        embeddingValue = __float2half(0.0f);
+                    }
+                }
+                else
+                {
+                    // Normal text token: check bounds and use embeddingTable
+                    if (tokenId >= 0 && tokenId < vocabSize)
+                    {
+                        int64_t const embeddingIdx = tokenId * hiddenSize + elementIdx;
+                        embeddingValue = embeddingTable[embeddingIdx];
+                    }
+                    else
+                    {
+                        embeddingValue = __float2half(0.0f);
+                    }
+                }
+
+                result[resultIdx] = embeddingValue;
+            }
+        }
+    }
+
+    return result;
+}
+
 std::vector<half> assembleDeepstackEmbeddingRef(std::vector<int32_t> const& inputIds,
     std::vector<half> const& deepstackFeatures, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
     int64_t hiddenSize, int64_t numImageTokens)
