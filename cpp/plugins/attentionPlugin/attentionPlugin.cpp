@@ -129,7 +129,12 @@ AttentionExecutionMode deduceModeTreeAttention(
     int64_t const runtimeSeqLen = qkvInputTensor.getShape()[1];
     int64_t const positionIdLen = attentionPosIdTensor.getShape()[1];
 
-    if (positionIdLen == runtimeSeqLen)
+    if (runtimeSeqLen == 1)
+    {
+        // Also supports single token decoding mode when tree attention is enabled.
+        return AttentionExecutionMode::kVANILLA_DECODING;
+    }
+    else if (positionIdLen == runtimeSeqLen)
     {
         return AttentionExecutionMode::kTREE_DECODING;
     }

@@ -328,7 +328,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // 3. LoRA weights: max dimension across all adapters
     // 4. KV cache start index: {maxSupportedBatchSize}
     // 5. Deepstack embeds for generation: {maxSupportedBatchSize, maxVerifyTreeSize or 1, hiddenSize}
-    std::vector<int64_t> dummySizes = {
+    std::vector<int64_t> dummyInputSizes = {
         static_cast<int64_t>(
             mConfig.maxSupportedBatchSize), // attention mask/attention position IDs/KV cache start index
         static_cast<int64_t>(getMaxLoraWeightsDimension() * kEMPTY_LORA_RANK), // LoRA weights
@@ -341,21 +341,28 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         int64_t const deepstackSeqLen = mConfig.enableEagleSpecDecode ? mConfig.maxVerifyTreeSize : 1;
         int64_t const deepstackSize
             = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * deepstackSeqLen * mConfig.hiddenSize;
-        dummySizes.push_back(deepstackSize);
+        dummyInputSizes.push_back(deepstackSize);
     }
 
-    int64_t maxDummyElements = *std::max_element(dummySizes.begin(), dummySizes.end());
-    mDummyTensor = rt::Tensor(
-        {maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyTensor");
+    int64_t maxDummyElements = *std::max_element(dummyInputSizes.begin(), dummyInputSizes.end());
+    mDummyInputTensor = rt::Tensor(
+        {maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyInputTensor");
     // Initialize dummy tensor memory to zero
-    CUDA_CHECK(cudaMemsetAsync(mDummyTensor.rawPointer(), 0, mDummyTensor.getMemoryCapacity(), stream));
+    CUDA_CHECK(cudaMemsetAsync(mDummyInputTensor.rawPointer(), 0, mDummyInputTensor.getMemoryCapacity(), stream));
+
+    if (mConfig.enableEagleSpecDecode)
+    {
+        int64_t const dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * mConfig.outputHiddenDim;
+        mDummyOutputTensor = rt::Tensor(
+            {dummyOutputSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyOutputTensor");
+    }
 
     // Initialize kKVCacheStartIndex to dummy tensor for both profiles to avoid "address not set" error
     // when switching optimization profiles. The actual address will be set during runtime execution.
     {
         bool setKVCacheStartIndexStatus{true};
-        setKVCacheStartIndexStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setKVCacheStartIndexStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mDummyInputTensor.rawPointer());
         setKVCacheStartIndexStatus
             &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
         if (!setKVCacheStartIndexStatus)
@@ -850,8 +857,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     // Otherwise, we shall supply the KVCache lengths tensor to the engine.
     if (mKVCache.getKVCacheAllEmpty())
     {
-        setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kKVCacheStartIndex, mDummyTensor.rawPointer());
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kKVCacheStartIndex, mDummyInputTensor.rawPointer());
         setEngineIOStatus
             &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
     }
@@ -895,11 +902,11 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
             binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
         // Mask input and optional token pos-ids are not used, set to dummy data.
         setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyTensor.rawPointer());
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyInputTensor.rawPointer());
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionMask, Coords{activeBatchSize, 1, 1}.getTRTDims());
         setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyTensor.rawPointer());
+            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionPosId, mDummyInputTensor.rawPointer());
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
             binding_names::kAttentionPosId, Coords{activeBatchSize, 1}.getTRTDims());
     }
@@ -939,7 +946,7 @@ bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& input
     if (!checkInputsGPUTensor)
     {
         LOG_ERROR(
-            "executeGeneration(): Invalid device type of the input tensors. inputsEmbeds (FLOAT16) and outputLogits "
+            "Invalid device type of the input tensors. inputsEmbeds (FLOAT16) and outputLogits "
             "should reside on GPU.");
         return false;
     }
@@ -947,7 +954,7 @@ bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& input
     if (!isBatchValid)
     {
         LOG_ERROR(
-            "executeGeneration(): Invalid batchSize of the input tensors. batchSize shall be equal to the active batch "
+            "Invalid batchSize of the input tensors. batchSize shall be equal to the active batch "
             "size set by the previous prefill stage.");
         return false;
     }
@@ -957,7 +964,7 @@ bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& input
     if (!checkInputShapeValid)
     {
         LOG_ERROR(
-            "executeGeneration(): Invalid shape of the input tensors. The input tensor should have shape "
+            "Invalid shape of the input tensors. The input tensor should have shape "
             "[activeBatchSize, 1, hiddenSize] and the output tensor should have shape [activeBatchSize, "
             "outputVocabSize].");
         return false;
@@ -1042,8 +1049,8 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
             for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
             {
                 std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
-                setEngineIOStatus
-                    &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyTensor.rawPointer());
+                setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+                    deepstackEmbedName.c_str(), mDummyInputTensor.rawPointer());
                 setEngineIOStatus &= mTRTExecutionContext->setInputShape(
                     deepstackEmbedName.c_str(), rt::Coords{activeBatchSize, 1, mConfig.hiddenSize}.getTRTDims());
             }
@@ -1051,6 +1058,14 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
 
         // Engine output tensors.
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+
+        // Bind output hidden states tensor if engine enable Eagle SpecDecode. Since TensorRT engine will always write
+        // this output tensor even if the content is not needed afterwards.
+        if (mConfig.enableEagleSpecDecode)
+        {
+            setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+                binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
+        }
 
         if (!setEngineIOStatus)
         {
@@ -1244,8 +1259,8 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
             for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
             {
                 std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
-                setEngineIOStatus
-                    &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyTensor.rawPointer());
+                setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+                    deepstackEmbedName.c_str(), mDummyInputTensor.rawPointer());
                 setEngineIOStatus &= mTRTExecutionContext->setInputShape(deepstackEmbedName.c_str(),
                     rt::Coords{activeBatchSize, baseTreeDecodingSize, mConfig.hiddenSize}.getTRTDims());
             }
@@ -1372,7 +1387,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         {
             std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
             setEngineIOStatus
-                &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyTensor.rawPointer());
+                &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyInputTensor.rawPointer());
             setEngineIOStatus &= mTRTExecutionContext->setInputShape(
                 deepstackEmbedName.c_str(), rt::Coords{activeBatchSize, 1, mConfig.hiddenSize}.getTRTDims());
         }
@@ -1380,6 +1395,11 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
 
     // Engine output tensors.
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+    if (mConfig.enableEagleSpecDecode)
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
+    }
 
     // Bind the KVCache since we haven't executed the real prefill step.
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
@@ -1527,7 +1547,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
         {
             std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
             setEngineIOStatus
-                &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyTensor.rawPointer());
+                &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyInputTensor.rawPointer());
             setEngineIOStatus &= mTRTExecutionContext->setInputShape(deepstackEmbedName.c_str(),
                 rt::Coords{activeBatchSize, baseTreeDecodingSize, mConfig.hiddenSize}.getTRTDims());
         }
@@ -1597,7 +1617,8 @@ bool LLMEngineRunner::resetLoraWeights(cudaStream_t stream)
             = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
 
         // Use dummy tensor as zero tensor for LoRA weights
-        resetStatus &= mTRTExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
+        resetStatus
+            &= mTRTExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyInputTensor.rawPointer());
 
         // Set shape to kEMPTY_LORA_RANK and assign zero value tensor to disable LoRA
         if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
@@ -1752,8 +1773,8 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cuda
                 shape.d[0] = kEMPTY_LORA_RANK;
             }
             setLoraWeightsStatus &= mTRTExecutionContext->setInputShape(loraWeightsTensorName.c_str(), shape);
-            setLoraWeightsStatus
-                &= mTRTExecutionContext->setTensorAddress(loraWeightsTensorName.c_str(), mDummyTensor.rawPointer());
+            setLoraWeightsStatus &= mTRTExecutionContext->setTensorAddress(
+                loraWeightsTensorName.c_str(), mDummyInputTensor.rawPointer());
             LOG_DEBUG(
                 "LoRA weights tensor with name '%s' not found. Set shape to rank %d with zero "
                 "tensor.",

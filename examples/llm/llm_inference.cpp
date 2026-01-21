@@ -439,15 +439,18 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                     throw std::runtime_error("Each request must be an object with 'messages' key");
                 }
 
-                // Explicit query whether to save the system prompt KVCache of this message for later reuse.
-                // This logic has limitation that once one prompt sets saveSystemPromptKVCache to true, all prompts in
-                // the same batch will cache system prompt KVCache. Since long instruction cache saving is
-                // usually done during system setup, this limitation can be resolved by issuing single batch request at
-                // initialization stage for KVCache saving.
+                // These are request level property but currently we don't support the mechanism to group requests
+                // manually in the input file. Thus, we adopt simply philosophy that we enable the property for all
+                // requests in the batch if any request has set the property.
                 bool saveSystemPromptKVCache = requestItem.value("save_system_prompt_kv_cache", false);
                 if (saveSystemPromptKVCache)
                 {
                     batchRequest.saveSystemPromptKVCache = true;
+                }
+                bool disableSpecDecode = requestItem.value("disable_spec_decode", false);
+                if (disableSpecDecode)
+                {
+                    batchRequest.disableSpecDecode = true;
                 }
 
                 if (!requestItem.contains("messages") || !requestItem["messages"].is_array())
@@ -661,27 +664,10 @@ int main(int argc, char* argv[])
             return EXIT_FAILURE;
         }
 
-        bool const draftProposalCaptureStatus = eagleInferenceRuntime->captureDraftProposalCudaGraph(stream);
-        if (!draftProposalCaptureStatus)
+        if (!eagleInferenceRuntime->captureDecodingCudaGraph(stream))
         {
             LOG_WARNING(
-                "Failed to capture CUDA graph for draft proposal usage, proceeding with normal engine execution.");
-        }
-
-        bool const draftAcceptCaptureStatus = eagleInferenceRuntime->captureDraftAcceptDecodeTokenCudaGraph(stream);
-        if (!draftAcceptCaptureStatus)
-        {
-            LOG_WARNING(
-                "Failed to capture CUDA graph for draft accept decode token usage, proceeding with normal engine "
-                "execution.");
-        }
-
-        bool const baseCaptureStatus = eagleInferenceRuntime->captureBaseVerificationCudaGraph(stream);
-        if (!baseCaptureStatus)
-        {
-            LOG_WARNING(
-                "Failed to capture CUDA graph for base model verification usage, proceeding with normal engine "
-                "execution.");
+                "Failed to capture CUDA graph for Eagle decoding usage, proceeding with normal engine execution.");
         }
     }
     else
