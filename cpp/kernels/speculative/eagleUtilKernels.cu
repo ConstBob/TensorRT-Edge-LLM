@@ -670,9 +670,10 @@ __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int
 
     int32_t const actualAcceptLength = acceptLengths[kvBatchIdx];
     int32_t const pastKvCacheLength = kvCacheLengths[kvBatchIdx];
-    int32_t const kvCacheOffset = kvLayerIdx * maxBatchSize * 2 * numHeads * maxSeqLen * HEAD_DIM
-        + kvBatchIdx * 2 * numHeads * maxSeqLen * HEAD_DIM + kvHeadIdx * maxSeqLen * HEAD_DIM
-        + pastKvCacheLength * HEAD_DIM;
+    // Use int64_t to avoid integer overflow when processing large batch sizes
+    int64_t const kvCacheOffset = static_cast<int64_t>(kvLayerIdx) * maxBatchSize * 2 * numHeads * maxSeqLen * HEAD_DIM
+        + static_cast<int64_t>(kvBatchIdx) * 2 * numHeads * maxSeqLen * HEAD_DIM
+        + static_cast<int64_t>(kvHeadIdx) * maxSeqLen * HEAD_DIM + static_cast<int64_t>(pastKvCacheLength) * HEAD_DIM;
 
     // PHASE 1: Collect all accepted data into local temp buffer
     // Start from 1 since the root position will always be accepted.
@@ -681,7 +682,8 @@ __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int
         int32_t const acceptedIdx = acceptedIndices[kvBatchIdx * maxDepth + i];
         if (acceptedIdx >= 0 && acceptedIdx + pastKvCacheLength < maxSeqLen)
         {
-            int32_t const srcOffset = kvCacheOffset + acceptedIdx * HEAD_DIM + tIdx * DVec<KV_T>::vec_size;
+            int64_t const srcOffset
+                = kvCacheOffset + static_cast<int64_t>(acceptedIdx) * HEAD_DIM + tIdx * DVec<half>::vec_size;
             tempBuffer[i].load(kvCacheBuffer + srcOffset);
         }
     }
@@ -689,7 +691,7 @@ __global__ void eagleBaseCommitKVCacheKernel(int32_t const* acceptedIndices, int
     // PHASE 2: Write from local temp buffer to final positions
     for (int32_t i = 1; i < actualAcceptLength; ++i)
     {
-        int32_t const dstOffset = kvCacheOffset + i * HEAD_DIM + tIdx * DVec<KV_T>::vec_size;
+        int64_t const dstOffset = kvCacheOffset + static_cast<int64_t>(i) * HEAD_DIM + tIdx * DVec<half>::vec_size;
         tempBuffer[i].store(kvCacheBuffer + dstOffset);
     }
 }
