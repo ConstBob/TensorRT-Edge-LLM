@@ -131,20 +131,17 @@ public:
 
     //! @brief Destructor
     ~LLMInferenceSpecDecodeRuntime() = default;
-    //! @brief Capture CUDA graph for draft proposal
-    //! @param stream CUDA stream
-    //! @return True on success, false on failure
-    bool captureDraftProposalCudaGraph(cudaStream_t stream);
 
-    //! @brief Capture CUDA graph for draft accept decode token
+    //! @brief Capture CUDA graphs for Eagle decoding stages to optimize performance.
+    //!
+    //! Captures graphs for draft proposal, draft accept token, base verification, and
+    //! base vanilla decoding across all supported batch sizes.
+    //!
     //! @param stream CUDA stream
-    //! @return True on success, false on failure
-    bool captureDraftAcceptDecodeTokenCudaGraph(cudaStream_t stream);
-
-    //! @brief Capture CUDA graph for base verification
-    //! @param stream CUDA stream
-    //! @return True on success, false on failure
-    bool captureBaseVerificationCudaGraph(cudaStream_t stream);
+    //! @return True if all stage captures succeed, false otherwise
+    //! @note If capture fails for any stage, the inference can proceed without CUDA graph capture,
+    //! but at cost of performance degradation.
+    bool captureDecodingCudaGraph(cudaStream_t stream);
 
     /*!
      * @brief Handle generation request
@@ -257,6 +254,9 @@ private:
     // Consume the selected tokens and base model hidden state, produce the draft hidden states and logits for the last
     // token of the accepted sequence.
     bool runDraftModelAcceptToken(SpecDecodeInferenceContext& context);
+
+    // Consume the token sequence & KVCache to produce the next token directly.
+    bool runVanillaDecoding(SpecDecodeInferenceContext& context);
 
     // Consume system prompt, produce the hash table of system prompt KVCache if kv cache reuse is enabled.
     bool genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx);

@@ -356,6 +356,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
 {
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
+    bool const enableSpecDecode = !request.disableSpecDecode;
 
     if (activeBatchSize == 0)
     {
@@ -544,37 +545,49 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 
     while (!checkAllFinished())
     {
-        if (context.generationRound == 0)
+        if (enableSpecDecode)
         {
-            bool const draftPrefillStatus = runDraftModelPrefill(context);
-            if (!draftPrefillStatus)
+            if (context.generationRound == 0)
             {
-                LOG_ERROR("Failed to execute prefill step for draft model.");
+                bool const draftPrefillStatus = runDraftModelPrefill(context);
+                if (!draftPrefillStatus)
+                {
+                    LOG_ERROR("Failed to execute prefill step for draft model.");
+                    return false;
+                }
+            }
+            else
+            {
+                bool const draftAcceptTokenStatus = runDraftModelAcceptToken(context);
+                if (!draftAcceptTokenStatus)
+                {
+                    LOG_ERROR("Failed to execute accept token step for draft model.");
+                    return false;
+                }
+            }
+
+            bool const draftTreeConstructionStatus = constructDraftTree(context);
+            if (!draftTreeConstructionStatus)
+            {
+                LOG_ERROR("Failed to construct draft tree.");
+                return false;
+            }
+
+            bool const baseModelVerificationStatus = runBaseModelVerification(context);
+            if (!baseModelVerificationStatus)
+            {
+                LOG_ERROR("Failed to verify token draft tree with base model.");
                 return false;
             }
         }
         else
         {
-            bool const draftAcceptTokenStatus = runDraftModelAcceptToken(context);
-            if (!draftAcceptTokenStatus)
+            bool const vanillaDecodingStatus = runVanillaDecoding(context);
+            if (!vanillaDecodingStatus)
             {
-                LOG_ERROR("Failed to execute accept token step for draft model.");
+                LOG_ERROR("Failed to decode tokens with vanilla decoding.");
                 return false;
             }
-        }
-
-        bool const draftTreeConstructionStatus = constructDraftTree(context);
-        if (!draftTreeConstructionStatus)
-        {
-            LOG_ERROR("Failed to construct draft tree.");
-            return false;
-        }
-
-        bool const baseModelVerificationStatus = runBaseModelVerification(context);
-        if (!baseModelVerificationStatus)
-        {
-            LOG_ERROR("Failed to verify token draft tree with base model.");
-            return false;
         }
 
         // Update iterations, check finish conditions and increment generation round
@@ -615,7 +628,10 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     }
 
     mPrefillMetrics.recordRun(totalReusedTokens, totalComputedTokens);
-    mEagleGenerationMetrics.recordRun(totalIterations, totalGeneratedTokens);
+    if (enableSpecDecode)
+    {
+        mEagleGenerationMetrics.recordRun(totalIterations, totalGeneratedTokens);
+    }
 
     // Save output ids and decoded texts to response.
     // Maintain original batch order using original batch indices
@@ -630,12 +646,17 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         int32_t genLength = batchResult.generateLength;
 
         // Log acceptance metrics for evicted batch
-        int32_t const verificationTokens = genLength > 0 ? genLength - 1 : 0;
-        float const acceptanceRate = batchResult.actualIterations > 0
-            ? static_cast<float>(verificationTokens) / static_cast<float>(batchResult.actualIterations)
-            : 0.0f;
-        LOG_INFO("Batch (evicted, original idx %d) - Acceptance rate: %.3f, Generated tokens: %d, Iterations: %d",
-            originalIdx, acceptanceRate, genLength, batchResult.actualIterations);
+        if (enableSpecDecode)
+        {
+            int32_t const verificationTokens = genLength > 0 ? genLength - 1 : 0;
+            float const acceptanceRate = batchResult.actualIterations > 0
+                ? static_cast<float>(verificationTokens) / static_cast<float>(batchResult.actualIterations)
+                : 0.0f;
+            LOG_DEBUG(
+                "Batch (completed with SpecDecode, original idx %d) - Acceptance rate: %.3f, Generated tokens: %d, "
+                "Iterations: %d",
+                originalIdx, acceptanceRate, genLength, batchResult.actualIterations);
+        }
 
         // Extract generated tokens
         int32_t const totalLength = static_cast<int32_t>(batchResult.tokenIds.size());
@@ -1092,11 +1113,6 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // Update tokenIds and check for EOS for each batch
     for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
     {
-        if (context.finishedStates[batchIdx])
-        {
-            continue;
-        }
-
         int32_t const acceptLength = hostAcceptLengthsData[batchIdx];
         for (int32_t i = 0; i < acceptLength; i++)
         {
@@ -1104,11 +1120,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
             context.tokenIds[batchIdx].push_back(token);
             context.currentGenerateLengths[batchIdx]++;
 
+            // Abandon token after EOS if they exist.
             if (token == mTokenizer->getEosId())
             {
-                context.finishedStates[batchIdx] = 1;
-                LOG_DEBUG("Batch %d encountered EOS (token %d) at generation round %d", batchIdx, token,
-                    context.generationRound);
                 break;
             }
         }
@@ -1116,6 +1130,69 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
 
     // Produce base model hidden states for the next step
     // Note: Hidden states shape is already set by the kernel
+    return true;
+}
+
+bool LLMInferenceSpecDecodeRuntime::runVanillaDecoding(SpecDecodeInferenceContext& context)
+{
+    NVTX_SCOPED_RANGE(nvtx_vanilla_decoding,
+        ("VANILLA_DECODING[R" + std::to_string(context.generationRound) + "," + std::to_string(context.activeBatchSize)
+            + "]")
+            .c_str(),
+        nvtx_colors::BLUE);
+
+    int32_t const activeBatchSize = context.activeBatchSize;
+    mHostPackedTokenIds.reshape({activeBatchSize});
+    int32_t* hostPackedTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
+
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        int32_t const lastTokenId = context.tokenIds[i].back();
+        hostPackedTokenIdsData[i] = lastTokenId;
+    }
+
+    mIdsInput.reshape({activeBatchSize, 1});
+    CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), mHostPackedTokenIds.rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
+
+    mInputsEmbeds.reshape({activeBatchSize, 1, mBaseEngineConfig.hiddenSize});
+    kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+
+    mLogitsOutput.reshape({activeBatchSize, mBaseEngineConfig.outputVocabSize});
+
+    bool const vanillaDecodingSuccess
+        = mBaseEngineRunner->executeVanillaDecodingStep(mInputsEmbeds, mLogitsOutput, context.stream);
+    if (!vanillaDecodingSuccess)
+    {
+        LOG_ERROR("Failed to execute vanilla decoding step for base model.");
+        return false;
+    }
+
+    // Only support greedy decoding to stay align with Eagle-Spec-Decode implementation.
+    // This should introduce less confusions for now.
+    mSamplingIndices.reshape({activeBatchSize, 1});
+    constexpr int32_t kSAMPLING_TOP_K = 1;
+    selectAllTopK(mLogitsOutput, std::nullopt, mSamplingIndices, kSAMPLING_TOP_K, mSamplingWorkspace, context.stream);
+
+    // Apply vocabulary mapping if base model uses reduced vocabulary
+    if (mBaseEngineConfig.reducedVocabSize > 0)
+    {
+        mapReducedVocabToFullVocab(mSamplingIndices, mBaseVocabMappingTable, context.stream);
+    }
+
+    mHostSelectedTokenIds.reshape({activeBatchSize});
+    int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
+    CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mSamplingIndices.rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
+    CUDA_CHECK(cudaStreamSynchronize(context.stream));
+
+    // Update tokenIds and generation length for each sequence
+    for (int32_t i = 0; i < activeBatchSize; ++i)
+    {
+        context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
+        context.currentGenerateLengths[i] += 1;
+    }
+
     return true;
 }
 
@@ -1169,18 +1246,21 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInference
     return true;
 }
 
-bool LLMInferenceSpecDecodeRuntime::captureDraftProposalCudaGraph(cudaStream_t stream)
+bool LLMInferenceSpecDecodeRuntime::captureDecodingCudaGraph(cudaStream_t stream)
 {
-    bool captureStatus{true};
+    bool draftProposalCaptureStatus{true};
+    bool draftAcceptCaptureStatus{true};
+    bool baseVerificationCaptureStatus{true};
+    bool baseVanillaDecodingCaptureStatus{true};
+
     int32_t const draftTopK = mDraftingConfig.draftingTopK;
     int32_t const paddedDraftTreeSize = mDraftingConfig.draftingStep * draftTopK;
+    int32_t const draftingStep = mDraftingConfig.draftingStep;
 
     // Capture CUDA graph for all supported batch sizes
     for (int32_t batchSize = 1; batchSize <= mMaxRuntimeBatchSize; ++batchSize)
     {
-        mSamplingIndices.reshape({batchSize, draftTopK});
-        mSamplingScores.reshape({batchSize, draftTopK});
-        mIdsInput.reshape({batchSize, paddedDraftTreeSize});
+        // Draft proposal capture
         mBaseHiddenStatesOutput.reshape({batchSize, paddedDraftTreeSize, mBaseEngineConfig.outputHiddenDim});
         mDraftHiddenStatesInput.reshape({batchSize, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
         mDraftTreeSize.reshape({batchSize});
@@ -1190,31 +1270,11 @@ bool LLMInferenceSpecDecodeRuntime::captureDraftProposalCudaGraph(cudaStream_t s
         mDraftHiddenStatesOutput.reshape({batchSize, draftTopK, mDraftEngineConfig.draftModelHiddenDim});
         mInputsEmbeds.reshape({batchSize, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim});
 
-        captureStatus &= mDraftEngineRunner->captureEagleDraftProposalCudaGraph(mInputsEmbeds, mBaseHiddenStatesOutput,
-            mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, mLogitsOutput, mDraftHiddenStatesOutput, stream);
-    }
+        draftProposalCaptureStatus &= mDraftEngineRunner->captureEagleDraftProposalCudaGraph(mInputsEmbeds,
+            mBaseHiddenStatesOutput, mDraftHiddenStatesInput, mDraftTreeSize, mDraftTreeMask, mLogitsOutput,
+            mDraftHiddenStatesOutput, stream);
 
-    if (captureStatus)
-    {
-        LOG_INFO(
-            "Successfully captured the draft proposal CUDA graph for all batch sizes (1-%d).", mMaxRuntimeBatchSize);
-    }
-    else
-    {
-        LOG_WARNING("Failed to capture the draft proposal CUDA graph for some batch sizes.");
-    }
-
-    return captureStatus;
-}
-
-bool LLMInferenceSpecDecodeRuntime::captureDraftAcceptDecodeTokenCudaGraph(cudaStream_t stream)
-{
-    bool captureStatus{true};
-    int32_t const draftingStep = mDraftingConfig.draftingStep;
-
-    // Capture CUDA graph for all supported batch sizes and accept lengths
-    for (int32_t batchSize = 1; batchSize <= mMaxRuntimeBatchSize; ++batchSize)
-    {
+        // Draft accept decode token capture
         mLogitsOutput.reshape({batchSize, mDraftEngineConfig.draftModelVocabSize});
         mDraftHiddenStatesOutput.reshape({batchSize, mDraftEngineConfig.draftModelHiddenDim});
 
@@ -1223,7 +1283,6 @@ bool LLMInferenceSpecDecodeRuntime::captureDraftAcceptDecodeTokenCudaGraph(cudaS
         for (int32_t acceptLength = 1; acceptLength <= draftingStep + 1; acceptLength++)
         {
             mBaseHiddenStatesOutput.reshape({batchSize, acceptLength, mBaseEngineConfig.outputHiddenDim});
-            mIdsInput.reshape({batchSize, acceptLength});
             mDraftHiddenStatesInput.reshape({batchSize, acceptLength, mDraftEngineConfig.draftModelHiddenDim});
 
             // Create a temporary acceptLength tensor for CUDA graph capture
@@ -1233,62 +1292,45 @@ bool LLMInferenceSpecDecodeRuntime::captureDraftAcceptDecodeTokenCudaGraph(cudaS
             CUDA_CHECK(cudaMemcpyAsync(mAcceptLength.rawPointer(), acceptLengthsVec.data(), batchSize * sizeof(int32_t),
                 cudaMemcpyHostToDevice, stream));
 
-            // Note: During CUDA graph capture, we skip embedding lookup as the actual embedding values
-            // don't matter for graph capture - only tensor shapes and memory layout matter
             mInputsEmbeds.reshape({batchSize, acceptLength, mDraftEngineConfig.draftModelHiddenDim});
 
-            captureStatus
+            draftAcceptCaptureStatus
                 &= mDraftEngineRunner->captureEagleAcceptDecodeTokenCudaGraph(mInputsEmbeds, mBaseHiddenStatesOutput,
                     mDraftHiddenStatesInput, mAcceptLength, mLogitsOutput, mDraftHiddenStatesOutput, stream);
         }
-    }
 
-    if (captureStatus)
-    {
-        LOG_INFO(
-            "Successfully captured the draft accept decode token CUDA graph for all batch sizes (1-%d) and accept "
-            "lengths (1-%d).",
-            mMaxRuntimeBatchSize, draftingStep + 1);
-    }
-    else
-    {
-        LOG_WARNING("Failed to capture the draft accept decode token CUDA graph for some combinations.");
-    }
-
-    return captureStatus;
-}
-
-bool LLMInferenceSpecDecodeRuntime::captureBaseVerificationCudaGraph(cudaStream_t stream)
-{
-    bool captureStatus{true};
-
-    // Capture CUDA graph for all supported batch sizes
-    for (int32_t batchSize = 1; batchSize <= mMaxRuntimeBatchSize; ++batchSize)
-    {
+        // Base verification capture
         // Engine expects 2D tensors: [batch_size * verify_tree_size, vocab_size/hidden_dim]
         int32_t const selectTokenSize = batchSize * mDraftingConfig.verifyTreeSize;
         mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.outputVocabSize});
         mBaseHiddenStatesOutput.reshape({selectTokenSize, mBaseEngineConfig.outputHiddenDim});
-
-        mIdsInput.reshape({batchSize, mDraftingConfig.verifyTreeSize});
         mDraftTreeMask.reshape({batchSize, mDraftingConfig.verifyTreeSize, mDraftingConfig.verifyTreeSize});
 
-        // Note: During CUDA graph capture, we skip embedding lookup as the actual embedding values
-        // don't matter for graph capture - only tensor shapes and memory layout matter
         mInputsEmbeds.reshape({batchSize, mDraftingConfig.verifyTreeSize, mBaseEngineConfig.hiddenSize});
 
-        captureStatus &= mBaseEngineRunner->captureEagleBaseTreeDecodingCudaGraph(
+        baseVerificationCaptureStatus &= mBaseEngineRunner->captureEagleBaseTreeDecodingCudaGraph(
             mInputsEmbeds, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, stream);
+
+        // Base Vanilla Decoding capture.
+        mInputsEmbeds.reshape({batchSize, 1, mBaseEngineConfig.hiddenSize});
+        mLogitsOutput.reshape({batchSize, mBaseEngineConfig.outputVocabSize});
+
+        std::string const emptyLoraWeightsName = "";
+        baseVanillaDecodingCaptureStatus &= mBaseEngineRunner->captureVanillaDecodingCudaGraph(
+            mInputsEmbeds, mLogitsOutput, emptyLoraWeightsName, stream);
     }
 
+    bool const captureStatus = draftProposalCaptureStatus && draftAcceptCaptureStatus && baseVerificationCaptureStatus
+        && baseVanillaDecodingCaptureStatus;
     if (captureStatus)
     {
-        LOG_INFO("Successfully captured the base model verification CUDA graph for all batch sizes (1-%d).",
-            mMaxRuntimeBatchSize);
+        LOG_INFO("Successfully captured Eagle decoding CUDA graphs for all stages.");
     }
     else
     {
-        LOG_WARNING("Failed to capture the base model verification CUDA graph for some batch sizes.");
+        LOG_WARNING(
+            "Failed to capture Eagle decoding CUDA graphs for some stages. The inference can proceed without"
+            "CUDA graph capture, but at cost of performance degradation.");
     }
 
     return captureStatus;

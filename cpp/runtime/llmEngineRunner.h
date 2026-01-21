@@ -120,8 +120,9 @@ public:
     //!     operation shall be performed after the prefill step is completed.
     //! Inputs:
     //!     inputsEmbeds [GPU]: The input embeddings for the batch of new requests [batchSize, 1, hiddenSize].
-    //!     outputLogits [GPU]: The output logits for the batch of requests.
     //!     stream: The CUDA stream to execute the decoding step.
+    //! Outputs:
+    //!     outputLogits [GPU]: The output logits for the batch of requests.
     //! Returns:
     //!     True if the decoding step is successful, false otherwise.
     bool executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream);
@@ -227,9 +228,13 @@ private:
     //! The LinearKVCache tensor that carried for the LLM model execution.
     rt::LinearKVCache mKVCache{};
 
-    //! Dummy tensor used to reserved space for un-used input tensors. Apply this workaround since TensorRT
-    //! does not support nullptr for input bindings.
-    rt::Tensor mDummyTensor{};
+    //! Dummy input tensor used to reserve space for unused input tensors. We always keep this tensor as zero tensor
+    //! because to "void" some computation (ex. use as empty lora weights as if there is no LoRA GEMM).
+    rt::Tensor mDummyInputTensor{};
+
+    //! Dummy output tensor used to reserve space for unused output tensors. TRT engines have static I/O, to keep
+    //! runtime design clean, we will route unused output tensors to this dummy tensor.
+    rt::Tensor mDummyOutputTensor{};
 
     //! The eagle base position ids tensor within the sequence that used by positional encoding.
     rt::Tensor mEagleBasePositionIds{};
