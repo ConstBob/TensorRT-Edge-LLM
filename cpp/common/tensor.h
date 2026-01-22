@@ -116,6 +116,17 @@ public:
         std::copy(dims.d, dims.d + mNumDims, mDims.begin());
     }
 
+    //! @brief Equality comparison operator
+    //! @param other Coords object to compare with
+    //! @return True if both Coords have the same number of dimensions
+    //!         and all corresponding dimension values are equal, false otherwise
+    bool operator==(Coords const& other) const noexcept;
+
+    //! @brief Inequality comparison operator
+    //! @param other Coords object to compare with
+    //! @return True if the Coords are not equal (i.e., operator== returns false), false otherwise
+    bool operator!=(Coords const& other) const noexcept;
+
     /*!
      * @brief Construct from iterator range
      * @tparam IT Iterator type

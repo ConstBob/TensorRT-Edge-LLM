@@ -1,4 +1,5 @@
 # Release Notes
+
 ## 0.4.0
 - Refactored AttentionPlugin to use Tensor class and clearer shape checks
 - Added support for multi-batch EAGLE3

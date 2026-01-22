@@ -84,6 +84,20 @@ std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape)
 }
 } // namespace utils
 
+bool Coords::operator==(Coords const& other) const noexcept
+{
+    if (mNumDims != other.mNumDims)
+    {
+        return false;
+    }
+    return std::equal(mDims.begin(), mDims.begin() + mNumDims, other.mDims.begin());
+}
+
+bool Coords::operator!=(Coords const& other) const noexcept
+{
+    return !(*this == other);
+}
+
 int64_t Coords::volume() const
 {
     if (mNumDims == 0)
