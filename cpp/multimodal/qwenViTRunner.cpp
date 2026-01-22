@@ -416,52 +416,60 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     // Reshape tensors
     int64_t totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
     mVitInput.reshape({totalSeqLength, mConfig.inputDim});
-    mAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
-    mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim});
     mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
-
     // Record performance data
     int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), int64_t(0));
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
 
-    // Compute attention mask
-    CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensDevice.rawPointer(), mCuSeqlensHost.rawPointer(),
-        cuSeqlensSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
-    kernel::initAttentionMaskQwenViT(mCuSeqlensDevice, mAttentionMask, stream);
-
-    // Compute rotary position embeddings
-    for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+    /*
+     * Cache optimization for ViT attention mask，rotary position embeddings, and other image grid dependent
+     * input tensors. Reuse the data from last round of computation if the image grid sizes are identical.
+     * This reduces inference latency by skipping invariant tensor initialization.
+     */
+    if (imageGridTHWs != mLastImageGridTHWs)
     {
-        kernel::initRotaryPosEmbQwenViT(
-            mRotaryPosEmb, imageGridTHWs[i], mConfig.mergeSize, cuSeqlensData[i], 10000.0f, 1.0f, stream);
-    }
+        mAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
+        // Compute attention mask
+        CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensDevice.rawPointer(), mCuSeqlensHost.rawPointer(),
+            cuSeqlensSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+        kernel::initAttentionMaskQwenViT(mCuSeqlensDevice, mAttentionMask, stream);
 
-    // Compute additional inputs
-    if (mModelType == multimodal::ModelType::QWEN2_5_VL)
-    {
-        mWindowAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
-        mWindowIndexHost.reshape({totalImageTokens});
-        mWindowIndexDevice.reshape({totalImageTokens});
-        mReverseWindowIndexHost.reshape({totalImageTokens});
-        mReverseWindowIndexDevice.reshape({totalImageTokens});
-
-        getWindowIndex(imageGridTHWs, totalSeqLength, stream);
-    }
-    else if (mModelType == multimodal::ModelType::QWEN3_VL)
-    {
-        mFastPosEmbIdx.reshape({4, totalSeqLength});
-        mFastPosEmbWeight.reshape({4, totalSeqLength});
-
+        mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim});
+        // Compute rotary position embeddings
         for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
         {
-            kernel::initFastPosEmbedQwenViT(mFastPosEmbIdx, mFastPosEmbWeight, imageGridTHWs[i], mConfig.mergeSize,
-                mConfig.numGridPerSide, cuSeqlensData[i], stream);
+            kernel::initRotaryPosEmbQwenViT(
+                mRotaryPosEmb, imageGridTHWs[i], mConfig.mergeSize, cuSeqlensData[i], 10000.0f, 1.0f, stream);
         }
 
-        for (int64_t i = 0; i < mConfig.numDeepstackFeatures; ++i)
+        // Compute additional inputs
+        if (mModelType == multimodal::ModelType::QWEN2_5_VL)
         {
-            mDeepstackFeatures[i].reshape({totalImageTokens, mConfig.outHiddenSize});
+            mWindowAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
+            mWindowIndexHost.reshape({totalImageTokens});
+            mWindowIndexDevice.reshape({totalImageTokens});
+            mReverseWindowIndexHost.reshape({totalImageTokens});
+            mReverseWindowIndexDevice.reshape({totalImageTokens});
+
+            getWindowIndex(imageGridTHWs, totalSeqLength, stream);
         }
+        else if (mModelType == multimodal::ModelType::QWEN3_VL)
+        {
+            mFastPosEmbIdx.reshape({4, totalSeqLength});
+            mFastPosEmbWeight.reshape({4, totalSeqLength});
+
+            for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+            {
+                kernel::initFastPosEmbedQwenViT(mFastPosEmbIdx, mFastPosEmbWeight, imageGridTHWs[i], mConfig.mergeSize,
+                    mConfig.numGridPerSide, cuSeqlensData[i], stream);
+            }
+
+            for (int64_t i = 0; i < mConfig.numDeepstackFeatures; ++i)
+            {
+                mDeepstackFeatures[i].reshape({totalImageTokens, mConfig.outHiddenSize});
+            }
+        }
+        mLastImageGridTHWs = imageGridTHWs;
     }
 }
 
