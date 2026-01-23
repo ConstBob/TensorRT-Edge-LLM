@@ -18,8 +18,8 @@ set(CUDA_PTXAS_FLAGS "-warn-lmem-usage -warn-double-usage -warn-spills")
 set(CMAKE_CUDA_FLAGS_RELEASE
     "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo -res-usage --use_fast_math -Xptxas='${CUDA_PTXAS_FLAGS}'"
 )
-set(CMAKE_CUDA_FLAGS_DEBUG "")
 
+set(CMAKE_CUDA_FLAGS_DEBUG "")
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")

@@ -40,14 +40,10 @@ namespace trt_edgellm
 
 namespace
 {
-
-// Left a utility function here in case we want to move to a better hashing method.
-size_t hashSystemPromptWithLoraWeights(std::string const& systemPrompt, std::string const& loraWeightsName)
+std::tuple<std::string, std::string> keySystemPromptWithLoraWeights(
+    std::string const& systemPrompt, std::string const& loraWeightsName)
 {
-    size_t hashValue = 0;
-    hash_utils::hashCombine(hashValue, systemPrompt);
-    hash_utils::hashCombine(hashValue, loraWeightsName);
-    return hashValue;
+    return std::make_tuple(systemPrompt, loraWeightsName);
 }
 
 } // namespace
@@ -245,10 +241,10 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     // the pre-computed KVCache and remove the contents from inputIds.
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        auto promptHash = hashSystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
-        if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+        auto const promptKey = keySystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
+        if (mSystemPromptKVCache.find(promptKey) != mSystemPromptKVCache.end())
         {
-            auto& precachedKVCache = mSystemPromptKVCache[promptHash];
+            auto& precachedKVCache = mSystemPromptKVCache[promptKey];
             auto const& kvCacheContent = precachedKVCache.kvCacheContent;
             kernel::instantiateKVCacheFromTensor(kvCacheBuffer, kvCacheContent, i, stream);
             int32_t reuseLength = static_cast<int32_t>(kvCacheContent.getShape()[3]);
@@ -643,10 +639,10 @@ LLMInferenceRuntime::TokenCountInfo LLMInferenceRuntime::calculateTokenCounts(
     {
         int32_t contextLength = static_cast<int32_t>(batchedInputIds[i].size());
         // Calculate reused length from system prompt cache
-        auto promptHash = hashSystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
-        if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+        auto const promptKey = keySystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
+        if (mSystemPromptKVCache.find(promptKey) != mSystemPromptKVCache.end())
         {
-            int32_t reusedLength = static_cast<int32_t>(mSystemPromptKVCache.at(promptHash).tokenizedPrompt.size());
+            int32_t reusedLength = static_cast<int32_t>(mSystemPromptKVCache.at(promptKey).tokenizedPrompt.size());
             tokenCount.totalReusedTokens += reusedLength;
             tokenCount.totalComputedTokens += (contextLength - reusedLength);
         }
@@ -669,8 +665,8 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     }
 
     // hash the prompt if check if the prompt cache already exists.
-    size_t const promptHash = hashSystemPromptWithLoraWeights(prompt, loraWeightsName);
-    if (mSystemPromptKVCache.find(promptHash) != mSystemPromptKVCache.end())
+    auto const promptKey = keySystemPromptWithLoraWeights(prompt, loraWeightsName);
+    if (mSystemPromptKVCache.find(promptKey) != mSystemPromptKVCache.end())
     {
         LOG_DEBUG(
             "LLMInferenceRuntime(): The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
@@ -775,7 +771,7 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     // We only process one sequence at a time.
     constexpr int32_t CACHE_BATCH_IDX{0};
     kernel::saveKVCacheIntoTensor(savedKVCache.kvCacheContent, kvCacheBuffer, CACHE_BATCH_IDX, stream);
-    mSystemPromptKVCache.insert({promptHash, std::move(savedKVCache)});
+    mSystemPromptKVCache.insert({promptKey, std::move(savedKVCache)});
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
     LOG_DEBUG("LLMInferenceRuntime(): The KVCache is saved for the prompt: {%s}", prompt.c_str());

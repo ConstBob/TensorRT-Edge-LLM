@@ -50,8 +50,9 @@ std::string formatEngineConfig(trt_edgellm::rt::EagleDraftEngineRunnerConfig con
     return ss.str();
 }
 
-size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputsEmbeds, rt::Tensor const& baseModelHiddenStates,
-    rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
+trt_edgellm::rt::EagleDraftEngineRunner::DraftProposalKey draftProposalKey(rt::Tensor const& draftTreeInputsEmbeds,
+    rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits,
+    rt::Tensor& outputHiddenStates)
 {
     int64_t const activeBatchSize = draftTreeInputsEmbeds.getShape()[0];
     int64_t const paddedDraftTreeSize = draftTreeInputsEmbeds.getShape()[1];
@@ -61,20 +62,12 @@ size_t hashDraftProposalInput(rt::Tensor const& draftTreeInputsEmbeds, rt::Tenso
     uintptr_t const draftModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(draftModelHiddenStates.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
     uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
-
-    size_t hashValue = 0;
-    hash_utils::hashCombine(hashValue, activeBatchSize);
-    hash_utils::hashCombine(hashValue, paddedDraftTreeSize);
-    hash_utils::hashCombine(hashValue, selectTokenSize);
-    hash_utils::hashCombine(hashValue, inputsEmbedsAddr);
-    hash_utils::hashCombine(hashValue, baseModelHiddenStatesAddr);
-    hash_utils::hashCombine(hashValue, draftModelHiddenStatesAddr);
-    hash_utils::hashCombine(hashValue, outputLogitsAddr);
-    hash_utils::hashCombine(hashValue, outputHiddenStatesAddr);
-    return hashValue;
+    return std::make_tuple(activeBatchSize, paddedDraftTreeSize, selectTokenSize, inputsEmbedsAddr,
+        baseModelHiddenStatesAddr, draftModelHiddenStatesAddr, outputLogitsAddr, outputHiddenStatesAddr);
 }
 
-size_t hashAcceptDecodeTokenInput(rt::Tensor const& acceptedTokensEmbeds, rt::Tensor const& baseModelHiddenStates,
+trt_edgellm::rt::EagleDraftEngineRunner::AcceptDecodeTokenKey acceptDecodeTokenKey(
+    rt::Tensor const& acceptedTokensEmbeds, rt::Tensor const& baseModelHiddenStates,
     rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates)
 {
     int64_t const activeBatchSize = acceptedTokensEmbeds.getShape()[0];
@@ -84,16 +77,8 @@ size_t hashAcceptDecodeTokenInput(rt::Tensor const& acceptedTokensEmbeds, rt::Te
     uintptr_t const draftModelHiddenStatesAddr = reinterpret_cast<uintptr_t>(draftModelHiddenStates.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
     uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
-
-    size_t hashValue = 0;
-    hash_utils::hashCombine(hashValue, activeBatchSize);
-    hash_utils::hashCombine(hashValue, inputEmbedsLength);
-    hash_utils::hashCombine(hashValue, acceptedTokensEmbedsAddr);
-    hash_utils::hashCombine(hashValue, baseModelHiddenStatesAddr);
-    hash_utils::hashCombine(hashValue, draftModelHiddenStatesAddr);
-    hash_utils::hashCombine(hashValue, outputLogitsAddr);
-    hash_utils::hashCombine(hashValue, outputHiddenStatesAddr);
-    return hashValue;
+    return std::make_tuple(activeBatchSize, inputEmbedsLength, acceptedTokensEmbedsAddr, baseModelHiddenStatesAddr,
+        draftModelHiddenStatesAddr, outputLogitsAddr, outputHiddenStatesAddr);
 }
 
 } // namespace
@@ -285,12 +270,12 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
 
 EagleDraftEngineRunner::~EagleDraftEngineRunner()
 {
-    for (auto& [hashValue, graphPair] : mDraftProposalCudaGraphs)
+    for (auto& [key, graphPair] : mDraftProposalCudaGraphs)
     {
         CUDA_CHECK(cudaGraphDestroy(graphPair.first));
         CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
     }
-    for (auto& [hashValue, graphPair] : mAcceptDecodeTokenCudaGraphs)
+    for (auto& [key, graphPair] : mAcceptDecodeTokenCudaGraphs)
     {
         CUDA_CHECK(cudaGraphDestroy(graphPair.first));
         CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
@@ -892,12 +877,12 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
     kernel::prepareEagleDraftProposalInputs(draftTreeMask, draftTreeLength, sequenceStartIndex, mPackedTreeMask,
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
-    size_t const hashValue = hashDraftProposalInput(
+    auto const key = draftProposalKey(
         draftTreeInputsEmbeds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
-    if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
+    if (mDraftProposalCudaGraphs.find(key) != mDraftProposalCudaGraphs.end())
     {
         LOG_DEBUG("executeEagleDraftProposalStep(): Use pre-captured CUDA graph for draft proposal step.");
-        cudaGraphExec_t graphExec = mDraftProposalCudaGraphs[hashValue].second;
+        cudaGraphExec_t graphExec = mDraftProposalCudaGraphs[key].second;
         CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
     }
     else
@@ -1004,9 +989,9 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    size_t const hashValue = hashDraftProposalInput(
+    auto const key = draftProposalKey(
         draftTreeInputsEmbeds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
-    if (mDraftProposalCudaGraphs.find(hashValue) != mDraftProposalCudaGraphs.end())
+    if (mDraftProposalCudaGraphs.find(key) != mDraftProposalCudaGraphs.end())
     {
         LOG_INFO("Draft proposal CUDA graph already captured.");
         return true;
@@ -1128,7 +1113,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
-    mDraftProposalCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
+    mDraftProposalCudaGraphs[key] = std::make_pair(graph, graphExec);
 
     if (!executeStatus)
     {
@@ -1285,13 +1270,13 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     kernel::prepareEagleAcceptDecodeTokenInputs(sequenceStartIndex, acceptedTokenNums, mPackedTreeMask,
         mDraftTreePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
-    size_t const hashValue = hashAcceptDecodeTokenInput(
+    auto const key = acceptDecodeTokenKey(
         acceptedTokensEmbeds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
-    if (mAcceptDecodeTokenCudaGraphs.find(hashValue) != mAcceptDecodeTokenCudaGraphs.end())
+    if (mAcceptDecodeTokenCudaGraphs.find(key) != mAcceptDecodeTokenCudaGraphs.end())
     {
         LOG_DEBUG(
             "executeEagleAcceptDecodeTokenStep(): Use pre-captured CUDA graph for draft accept decode token step.");
-        cudaGraphExec_t graphExec = mAcceptDecodeTokenCudaGraphs[hashValue].second;
+        cudaGraphExec_t graphExec = mAcceptDecodeTokenCudaGraphs[key].second;
         CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
     }
     else
@@ -1399,9 +1384,9 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    size_t const hashValue = hashAcceptDecodeTokenInput(
+    auto const key = acceptDecodeTokenKey(
         acceptedTokensEmbeds, baseModelHiddenStates, draftModelHiddenStates, outputLogits, outputHiddenStates);
-    if (mAcceptDecodeTokenCudaGraphs.find(hashValue) != mAcceptDecodeTokenCudaGraphs.end())
+    if (mAcceptDecodeTokenCudaGraphs.find(key) != mAcceptDecodeTokenCudaGraphs.end())
     {
         LOG_INFO("Draft accept decode token CUDA graph already captured.");
         return true;
@@ -1515,7 +1500,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
-    mAcceptDecodeTokenCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
+    mAcceptDecodeTokenCudaGraphs[key] = std::make_pair(graph, graphExec);
 
     if (!executeStatus)
     {
