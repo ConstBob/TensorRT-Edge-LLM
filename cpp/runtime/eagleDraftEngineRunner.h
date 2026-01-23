@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/hashUtils.h"
 #include "common/tensor.h"
 #include "runtime/linearKVCache.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -26,6 +27,7 @@
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 
 namespace trt_edgellm
@@ -199,6 +201,11 @@ public:
         rt::Tensor const& acceptedTokenNums, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
         cudaStream_t stream);
 
+    //! Key to uniquely identify CUDA graphs for draft proposal step
+    using DraftProposalKey = std::tuple<int64_t, int64_t, int64_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t>;
+
+    //! Key to uniquely identify CUDA graphs for accept decode token step
+    using AcceptDecodeTokenKey = std::tuple<int64_t, int64_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t>;
 private:
     EagleDraftEngineRunnerConfig mConfig{};  //!< Configuration for the Eagle Draft Engine Runner
 
@@ -207,8 +214,8 @@ private:
     rt::Tensor mExecContextMemory{};                                          //!< Device memory for the execution contexts
     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext;    //!< TensorRT unified execution context for context and generation phases
 
-    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mDraftProposalCudaGraphs{};  //!< Map of CUDA graphs for draft proposal step indexed by configuration hash
-    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mAcceptDecodeTokenCudaGraphs{};  //!< Map of CUDA graphs for accept decode token step indexed by configuration hash
+    hash_utils::HashMap<DraftProposalKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mDraftProposalCudaGraphs{};  //!< Map of CUDA graphs for draft proposal step indexed by configuration key
+    hash_utils::HashMap<AcceptDecodeTokenKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mAcceptDecodeTokenCudaGraphs{};  //!< Map of CUDA graphs for accept decode token step indexed by configuration key
 
     rt::LinearKVCache mLinearKVCache{};  //!< Linear KV cache for storing key-value pairs
 

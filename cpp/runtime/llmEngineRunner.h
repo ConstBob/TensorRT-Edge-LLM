@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/hashUtils.h"
 #include "common/tensor.h"
 #include "runtime/linearKVCache.h"
 #include "runtime/llmRuntimeUtils.h"
@@ -190,18 +191,25 @@ public:
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
         cudaStream_t stream);
 
+    //! Key to uniquely identify a captured CUDA graph for the decoding step
+    using DecodingGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, std::string>;
+
+    //! Key to uniquely identify a captured CUDA graph for the base model verification step
+    using BaseGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, uintptr_t>;
+
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
     rt::Tensor mExecContextMemory{};                                   //!< Device memory for the execution contexts
     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
-    //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique hash value
+
+    //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value
     //! which denote the input/output shapes and other execution properties like LoRA weights.
-    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
+    hash_utils::HashMap<DecodingGraphKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mCudaGraphs;
 
     //! Holds the CUDA graph captured for the base model verification step. Each CUDA graph is associated with a unique
-    //! hash value which denote the input/output shapes and other execution properties.
-    std::unordered_map<size_t, std::pair<cudaGraph_t, cudaGraphExec_t>> mBaseTreeDecodingCudaGraphs;
+    //! key value which denote the input/output shapes and other execution properties.
+    hash_utils::HashMap<BaseGraphKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mBaseTreeDecodingCudaGraphs;
 
     //! Holds the LoRA weights for the LLM engine.
     std::unordered_map<std::string, std::vector<rt::Tensor>> mLoraWeights{};

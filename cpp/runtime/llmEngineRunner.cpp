@@ -64,9 +64,9 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& con
     return ss.str();
 }
 
-// Compute a unique hash value that can distinguish the various decoding steps.
+// Compute a unique key value that can distinguish the various decoding steps.
 // Extend this function when we need to capture more information.
-size_t hashDecodingInput(
+trt_edgellm::rt::LLMEngineRunner::DecodingGraphKey decodingKey(
     rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits, std::string const& loraWeightsName)
 {
     // For vanilla decoding step, the shape can be distingusihed by active batch size.
@@ -74,29 +74,17 @@ size_t hashDecodingInput(
     int64_t const activeBatchSize = inputsEmbeds.getShape()[0];
     uintptr_t const inputsEmbedsAddr = reinterpret_cast<uintptr_t>(inputsEmbeds.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
-
-    size_t hashValue = 0;
-    hash_utils::hashCombine(hashValue, activeBatchSize);
-    hash_utils::hashCombine(hashValue, inputsEmbedsAddr);
-    hash_utils::hashCombine(hashValue, outputLogitsAddr);
-    hash_utils::hashCombine(hashValue, loraWeightsName);
-    return hashValue;
+    return std::make_tuple(activeBatchSize, inputsEmbedsAddr, outputLogitsAddr, loraWeightsName);
 }
 
-size_t hashBaseTreeDecodingInput(rt::Tensor const& baseTreeDecodingInputsEmbeds, rt::Tensor const& outputLogits,
-    rt::Tensor const& outputHiddenStates)
+trt_edgellm::rt::LLMEngineRunner::BaseGraphKey baseKey(rt::Tensor const& baseTreeDecodingInputsEmbeds,
+    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
 {
     int64_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
     uintptr_t const inputsEmbedsAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingInputsEmbeds.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
     uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
-
-    size_t hashValue = 0;
-    hash_utils::hashCombine(hashValue, activeBatchSize);
-    hash_utils::hashCombine(hashValue, inputsEmbedsAddr);
-    hash_utils::hashCombine(hashValue, outputLogitsAddr);
-    hash_utils::hashCombine(hashValue, outputHiddenStatesAddr);
-    return hashValue;
+    return std::make_tuple(activeBatchSize, inputsEmbedsAddr, outputLogitsAddr, outputHiddenStatesAddr);
 }
 
 } // namespace
@@ -647,12 +635,12 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
 LLMEngineRunner::~LLMEngineRunner()
 {
-    for (auto& [hashValue, graphPair] : mCudaGraphs)
+    for (auto& [key, graphPair] : mCudaGraphs)
     {
         CUDA_CHECK(cudaGraphDestroy(graphPair.first));
         CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
     }
-    for (auto& [hashValue, graphPair] : mBaseTreeDecodingCudaGraphs)
+    for (auto& [key, graphPair] : mBaseTreeDecodingCudaGraphs)
     {
         CUDA_CHECK(cudaGraphDestroy(graphPair.first));
         CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
@@ -994,7 +982,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     kernel::incrementLengthTensor(mSequenceContextLengths, kDECODE_INCREMENT, stream);
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
-    size_t const graphHash = hashDecodingInput(inputsEmbeds, outputLogits, mActiveLoraWeightsName);
+    auto const graphHash = decodingKey(inputsEmbeds, outputLogits, mActiveLoraWeightsName);
     if (mCudaGraphs.find(graphHash) != mCudaGraphs.end())
     {
         LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for vanilla decoding step.");
@@ -1194,7 +1182,7 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
         mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
-    size_t const graphHash = hashBaseTreeDecodingInput(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
+    auto const graphHash = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
     if (mBaseTreeDecodingCudaGraphs.find(graphHash) != mBaseTreeDecodingCudaGraphs.end())
     {
         LOG_DEBUG("executeEagleBaseTreeDecodingStep(): Use pre-captured CUDA graph for eagle base tree decoding step.");
@@ -1310,8 +1298,8 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    size_t const hashValue = hashDecodingInput(inputsEmbeds, outputLogits, loraWeightsPath);
-    if (mCudaGraphs.find(hashValue) != mCudaGraphs.end())
+    auto const key = decodingKey(inputsEmbeds, outputLogits, loraWeightsPath);
+    if (mCudaGraphs.find(key) != mCudaGraphs.end())
     {
         LOG_INFO(
             "captureVanillaDecodingCudaGraph(): CUDA graph already captured for the input tensors with LoRA weights "
@@ -1426,7 +1414,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
-    mCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
+    mCudaGraphs[key] = std::make_pair(graph, graphExec);
 
     if (!executeStatus)
     {
@@ -1458,8 +1446,8 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    size_t const hashValue = hashBaseTreeDecodingInput(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
-    if (mBaseTreeDecodingCudaGraphs.find(hashValue) != mBaseTreeDecodingCudaGraphs.end())
+    auto const key = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
+    if (mBaseTreeDecodingCudaGraphs.find(key) != mBaseTreeDecodingCudaGraphs.end())
     {
         LOG_INFO("captureEagleBaseTreeDecodingCudaGraph(): CUDA graph already captured for the input tensors.");
         return true;
@@ -1585,7 +1573,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     executeStatus &= mTRTExecutionContext->enqueueV3(stream);
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
-    mBaseTreeDecodingCudaGraphs[hashValue] = std::make_pair(graph, graphExec);
+    mBaseTreeDecodingCudaGraphs[key] = std::make_pair(graph, graphExec);
 
     if (!executeStatus)
     {

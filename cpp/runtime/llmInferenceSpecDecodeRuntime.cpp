@@ -19,7 +19,6 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
-#include "common/hashUtils.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
@@ -42,18 +41,6 @@ using namespace nvinfer1;
 
 namespace trt_edgellm
 {
-
-namespace
-{
-// Left a utility function here in case we want to move to a better hashing method.
-size_t hashSystemPrompt(std::string const& systemPrompt)
-{
-    size_t hashValue = 0;
-    hash_utils::hashCombine(hashValue, systemPrompt);
-    return hashValue;
-}
-
-} // namespace
 
 namespace rt
 {
@@ -1364,11 +1351,13 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     // Directly populate context.tokenIds and context.effectivePrefillLengths (no padding)
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
-        auto promptHash = hashSystemPrompt(context.systemPrompts[i]);
-        if (mSystemPromptKVCacheBase.find(promptHash) != mSystemPromptKVCacheBase.end())
+        auto const& prompt = context.systemPrompts[i];
+        if (mSystemPromptKVCacheBase.count(prompt) > 0)
         {
-            auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptHash];
-            auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[promptHash];
+            check::check(mSystemPromptKVCacheDraft.count(prompt) > 0,
+                "System prompt cache inconsistency between base and draft model");
+            auto& precachedKVCacheBase = mSystemPromptKVCacheBase[prompt];
+            auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[prompt];
             auto const& kvCacheContentBase = precachedKVCacheBase.kvCacheContent;
             auto const& kvCacheContentDraft = precachedKVCacheDraft.kvCacheContent;
             kernel::instantiateKVCacheFromTensor(kvCacheBufferBase, kvCacheContentBase, i, context.stream);
@@ -1433,9 +1422,8 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
         return true;
     }
 
-    size_t const promptHash = hashSystemPrompt(prompt);
-    if (mSystemPromptKVCacheBase.find(promptHash) != mSystemPromptKVCacheBase.end()
-        && mSystemPromptKVCacheDraft.find(promptHash) != mSystemPromptKVCacheDraft.end())
+    if (mSystemPromptKVCacheBase.find(prompt) != mSystemPromptKVCacheBase.end()
+        && mSystemPromptKVCacheDraft.find(prompt) != mSystemPromptKVCacheDraft.end())
     {
         LOG_DEBUG("The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
         return true;
@@ -1519,8 +1507,8 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     kernel::saveKVCacheIntoTensor(
         savedKVCacheDraft.kvCacheContent, kvCacheBufferDraft, CACHE_BATCH_IDX, context.stream);
 
-    mSystemPromptKVCacheBase.insert({promptHash, std::move(savedKVCacheBase)});
-    mSystemPromptKVCacheDraft.insert({promptHash, std::move(savedKVCacheDraft)});
+    mSystemPromptKVCacheBase.insert({prompt, std::move(savedKVCacheBase)});
+    mSystemPromptKVCacheDraft.insert({prompt, std::move(savedKVCacheDraft)});
 
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
     LOG_DEBUG("System prompt KVCache saved for batch %d: {%s}", genAndSaveBatchIdx, prompt.c_str());

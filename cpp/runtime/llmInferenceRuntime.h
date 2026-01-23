@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/hashUtils.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
@@ -127,8 +128,8 @@ private:
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};   //!< LLM engine runner instance
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner instance (optional)
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer{nullptr};    //!< Tokenizer instance
-    std::unordered_map<size_t, SystemPromptKVCache>
-        mSystemPromptKVCache{}; //!< Cache of system prompts and their KV caches
+    hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
+        mSystemPromptKVCache{}; //!< Cache of system prompts / LORA weights and their KV caches
 
     rt::Tensor mEmbeddingTable{};             //!< Shared embedding table [vocabSize, hiddenSize]
     rt::Tensor mSamplingWorkspace{};          //!< Workspace tensor for sampling operations
