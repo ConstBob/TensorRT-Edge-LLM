@@ -20,6 +20,7 @@
 #include "common/cudaMacros.h"
 #include <algorithm>
 #include <cassert>
+#include <cfloat>
 #include <cmath>
 #include <cuda.h>
 #include <limits>
@@ -1406,4 +1407,101 @@ void initRotaryPosEmbQwenViTReference(std::vector<float>& rotaryPosEmb,
         auto const& emb = rotaryPosEmbFull[posIds[i]];
         std::copy(emb.begin(), emb.end(), rotaryPosEmb.begin() + i * (vitPosEmbDim / 2));
     }
+}
+
+// ============================================================================
+// MoE TopK Softmax Reference Functions
+// ============================================================================
+
+void referenceMoeSoftmax(std::vector<float> const& input, std::vector<float> const* correctionBias,
+    std::vector<float>& output, int32_t numTokens, int32_t numExperts, float moeSoftcapping)
+{
+    output.resize(numTokens * numExperts);
+
+    for (int32_t t = 0; t < numTokens; t++)
+    {
+        // Step 1: Apply softcapping and bias, find max
+        float maxVal = -FLT_MAX;
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            float val = input[t * numExperts + e];
+
+            // Apply tanh softcapping
+            if (moeSoftcapping != 0.0f)
+            {
+                val = std::tanh(val / moeSoftcapping) * moeSoftcapping;
+            }
+
+            // Apply correction bias
+            if (correctionBias != nullptr)
+            {
+                val += (*correctionBias)[e];
+            }
+
+            output[t * numExperts + e] = val;
+            maxVal = std::max(maxVal, val);
+        }
+
+        // Step 2: Compute exp and sum
+        float sum = 0.0f;
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            output[t * numExperts + e] = std::exp(output[t * numExperts + e] - maxVal);
+            sum += output[t * numExperts + e];
+        }
+
+        // Step 3: Normalize
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            output[t * numExperts + e] /= sum;
+        }
+    }
+}
+
+void referenceMoeTopK(std::vector<float> const& softmaxOutput, std::vector<float>& topkWeights,
+    std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts, int32_t topk, bool renormalize)
+{
+    topkWeights.resize(numTokens * topk);
+    topkIndices.resize(numTokens * topk);
+
+    for (int32_t t = 0; t < numTokens; t++)
+    {
+        // Create index-value pairs
+        std::vector<std::pair<float, int32_t>> pairs(numExperts);
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            pairs[e] = {softmaxOutput[t * numExperts + e], e};
+        }
+
+        // Partial sort to get top-k
+        std::partial_sort(pairs.begin(), pairs.begin() + topk, pairs.end(),
+            [](auto const& a, auto const& b) { return a.first > b.first; });
+
+        // Extract top-k
+        float sum = 0.0f;
+        for (int32_t k = 0; k < topk; k++)
+        {
+            topkWeights[t * topk + k] = pairs[k].first;
+            topkIndices[t * topk + k] = pairs[k].second;
+            sum += pairs[k].first;
+        }
+
+        // Renormalize if requested
+        if (renormalize && sum > 0.0f)
+        {
+            for (int32_t k = 0; k < topk; k++)
+            {
+                topkWeights[t * topk + k] /= sum;
+            }
+        }
+    }
+}
+
+void referenceMoeTopkSoftmax(std::vector<float> const& gatingOutput, std::vector<float> const* correctionBias,
+    std::vector<float>& topkWeights, std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts,
+    int32_t topk, bool renormalize, float moeSoftcapping)
+{
+    std::vector<float> softmaxOutput;
+    referenceMoeSoftmax(gatingOutput, correctionBias, softmaxOutput, numTokens, numExperts, moeSoftcapping);
+    referenceMoeTopK(softmaxOutput, topkWeights, topkIndices, numTokens, numExperts, topk, renormalize);
 }
