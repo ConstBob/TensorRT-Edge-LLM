@@ -368,6 +368,11 @@ bool LLMInferenceRuntime::handleRequest(
         {
             batchedInputIds.emplace_back(
                 mTokenizer->encode(request.formattedRequests[i].formattedCompleteRequest, true));
+            if (batchedInputIds[i].empty())
+            {
+                LOG_ERROR("Failed to encode input text for request %d in batch", i);
+                return false;
+            }
         }
     }
     else
@@ -674,6 +679,11 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     }
 
     auto tokenizedPrompt = mTokenizer->encode(prompt, true);
+    if (tokenizedPrompt.empty())
+    {
+        LOG_ERROR("Failed to encode system prompt for KVCache generation.");
+        return false;
+    }
     int32_t const promptIdsLength = static_cast<int32_t>(tokenizedPrompt.size());
     int32_t const activeBatchSize = 1;
 

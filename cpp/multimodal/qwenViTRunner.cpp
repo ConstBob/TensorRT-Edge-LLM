@@ -17,6 +17,7 @@
 
 #include "qwenViTRunner.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "profiling/timer.h"
@@ -669,6 +670,7 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     {
         // Use the formatted complete request
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
+        check::check(!ids.empty(), "QwenViTRunner::textPreprocess() Failed to encode text");
 
         // insert image tokens
         std::vector<int32_t> newIds;
@@ -719,8 +721,18 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
 bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
     rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
+    if (systemPrompt.empty())
+    {
+        return true;
+    }
+
     // systemPrompt is already formatted by tokenizer's applyChatTemplate
     std::vector<int32_t> ids = tokenizer->encode(systemPrompt);
+    if (ids.empty())
+    {
+        LOG_ERROR("QwenViTRunner::preprocessSystemPrompt(): Failed to encode system prompt.");
+        return false;
+    }
     std::vector<std::vector<int32_t>> batchedInputIds;
     batchedInputIds.emplace_back(std::move(ids));
     std::vector<std::vector<int64_t>> imageGridTHWs;
