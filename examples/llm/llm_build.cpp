@@ -74,7 +74,7 @@ void printUsage(char const* programName)
     std::cerr << "  --onnxDir                 Provide the input ONNX directory path. Required. " << std::endl;
     std::cerr << "  --engineDir               Provide the output TensorRT engine directory path. Required. "
               << std::endl;
-    std::cerr << "  --maxInputLen             Provide the maximum input length for the model. Default = 128"
+    std::cerr << "  --maxInputLen             Provide the maximum input length for the model. Default = 1024"
               << std::endl;
     std::cerr << "  --maxKVCacheCapacity      Provide the maximum KV cache capacity (sequence length). "
                  "Default = 4096"

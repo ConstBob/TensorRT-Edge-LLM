@@ -38,7 +38,7 @@ namespace builder
 //! for Large Language Models, including standard LLMs and Eagle models.
 struct LLMBuilderConfig
 {
-    int64_t maxInputLen{128};         //!< Maximum input sequence length for the model
+    int64_t maxInputLen{1024};        //!< Maximum input sequence length for the model
     bool eagleDraft{false};           //!< Whether this is an Eagle draft model
     bool eagleBase{false};            //!< Whether this is an Eagle base model
     int64_t maxBatchSize{4};          //!< Maximum batch size for inference
