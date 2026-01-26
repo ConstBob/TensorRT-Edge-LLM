@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "common/checkMacros.h"
+#include "common/inputLimits.h"
 #include "common/trtUtils.h"
 #include "memoryMonitor.h"
 #include "profileFormatter.h"
@@ -338,11 +340,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
 
     Json inputData;
     std::ifstream inputFileStream(inputFilePath);
-    if (!inputFileStream.is_open())
-    {
-        LOG_ERROR("Failed to open input file: %s", inputFilePath.string().c_str());
-        throw std::runtime_error("Failed to open input file: " + inputFilePath.string());
-    }
+    check::check(inputFileStream.is_open(), "Failed to open input file: " + inputFilePath.string());
     try
     {
         inputData = Json::parse(inputFileStream);
@@ -350,29 +348,29 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     }
     catch (Json::parse_error const& e)
     {
-        LOG_ERROR("Failed to parse input file with error: %s", e.what());
-        throw std::runtime_error("Failed to parse input file: " + inputFilePath.string());
+        throw std::runtime_error(
+            format::fmtstr("Failed to parse input file %s with error: %s", inputFilePath.string().c_str(), e.what()));
     }
 
     // Extract global parameters
     int batchSize = (batchSizeOverride != -1) ? batchSizeOverride : inputData.value("batch_size", 1);
-    if (batchSize <= 0)
-    {
-        LOG_ERROR("Invalid batch_size value: %d (must be positive)", batchSize);
-        throw std::runtime_error("Invalid batch_size value (must be positive)");
-    }
+    check::check(batchSize > 0, format::fmtstr("Invalid batch_size value: %d (must be positive)", batchSize));
+
+    // Enforce input limits (defined in cpp/common/inputLimits.h) to prevent DoS attacks and
+    // excessive resource consumption. Requests exceeding these bounds are rejected early.
+    // The actual engine-specific limit will be checked after the runtime is fully initialized.
+    check::check(batchSize <= limits::security::kReasonableMaxBatchSize,
+        format::fmtstr("Input rejected: batch_size %d exceeds limit %d. Limit defined in %s.", batchSize,
+            limits::security::kReasonableMaxBatchSize, limits::kInputLimitsLocation));
 
     float temperature = inputData.value("temperature", 1.0f);
     float topP = inputData.value("top_p", 0.8f);
     int64_t topK = inputData.value("top_k", 50);
     int64_t maxGenerateLength
         = (maxGenerateLengthOverride != -1) ? maxGenerateLengthOverride : inputData.value("max_generate_length", 256);
-    if (maxGenerateLength <= 0)
-    {
-        LOG_ERROR(
-            "Invalid max_generate_length value: %lld (must be positive)", static_cast<long long>(maxGenerateLength));
-        throw std::runtime_error("Invalid max_generate_length value (must be positive)");
-    }
+    check::check(maxGenerateLength > 0,
+        format::fmtstr(
+            "Invalid max_generate_length value: %lld (must be positive)", static_cast<long long>(maxGenerateLength)));
 
     // Read apply_chat_template flag (defaults to true)
     bool applyChatTemplate = inputData.value("apply_chat_template", true);
@@ -389,16 +387,9 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
         auto const& availableLoraWeights = inputData["available_lora_weights"];
         for (auto const& [loraName, loraPath] : availableLoraWeights.items())
         {
-            if (!loraPath.is_string())
-            {
-                LOG_ERROR("LoRA weight path for '%s' must be a string", loraName.c_str());
-                throw std::runtime_error("LoRA weight path for '" + loraName + "' must be a string");
-            }
-            if (loraWeightsMap.find(loraName) != loraWeightsMap.end())
-            {
-                LOG_ERROR("Lora weights with name %s already exists", loraName.c_str());
-                throw std::runtime_error("Lora weights with name " + loraName + " already exists");
-            }
+            check::check(loraPath.is_string(), "LoRA weight path for '" + loraName + "' must be a string");
+            check::check(loraWeightsMap.find(loraName) == loraWeightsMap.end(),
+                "Lora weights with name " + loraName + " already exists");
             loraWeightsMap[loraName] = loraPath.get<std::string>();
             LOG_INFO("Registered LoRA weights '%s' -> '%s'", loraName.c_str(), loraWeightsMap[loraName].c_str());
         }
@@ -433,11 +424,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 auto const& requestItem = requestsArray[requestIdx];
 
                 // Each request must be an object with "messages" key
-                if (!requestItem.is_object())
-                {
-                    LOG_ERROR("Each request must be an object with 'messages' key");
-                    throw std::runtime_error("Each request must be an object with 'messages' key");
-                }
+                check::check(requestItem.is_object(), "Each request must be an object with 'messages' key");
 
                 // These are request level property but currently we don't support the mechanism to group requests
                 // manually in the input file. Thus, we adopt simply philosophy that we enable the property for all
@@ -453,11 +440,8 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                     batchRequest.disableSpecDecode = true;
                 }
 
-                if (!requestItem.contains("messages") || !requestItem["messages"].is_array())
-                {
-                    LOG_ERROR("Each request object must contain a 'messages' array");
-                    throw std::runtime_error("Each request object must contain a 'messages' array");
-                }
+                check::check(requestItem.contains("messages") && requestItem["messages"].is_array(),
+                    "Each request object must contain a 'messages' array");
 
                 auto const& messagesArray = requestItem["messages"];
 
@@ -468,12 +452,9 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                     requestLoraName = requestItem["lora_name"].get<std::string>();
 
                     // Validate that the LoRA name exists in available_lora_weights
-                    if (!requestLoraName.empty() && loraWeightsMap.find(requestLoraName) == loraWeightsMap.end())
-                    {
-                        LOG_ERROR("LoRA name '%s' not found in available_lora_weights", requestLoraName.c_str());
-                        throw std::runtime_error(
-                            "LoRA name '" + requestLoraName + "' not found in available_lora_weights");
-                    }
+                    check::check(
+                        requestLoraName.empty() || loraWeightsMap.find(requestLoraName) != loraWeightsMap.end(),
+                        "LoRA name '" + requestLoraName + "' not found in available_lora_weights");
                 }
 
                 // Validate that all requests in this batch use the same LoRA weights
@@ -484,26 +465,25 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 }
                 else
                 {
-                    if (requestLoraName != batchLoraWeightsName)
-                    {
-                        LOG_ERROR(
-                            "All requests within the same batch must use the same LoRA weights. Batch has %d requests.",
-                            static_cast<int>(endIdx - startIdx));
-                        throw std::runtime_error("Different LoRA weights within the same batch are not supported");
-                    }
+                    check::check(requestLoraName == batchLoraWeightsName,
+                        "Different LoRA weights within the same batch are not supported");
                 }
 
                 // Parse messages into structured format
                 std::vector<rt::Message> chatMessages;
                 std::vector<rt::imageUtils::ImageData> imageBuffers;
 
+                // Enforce message count limits
+                check::check(messagesArray.size() <= limits::security::kMaxMessagesPerRequest,
+                    format::fmtstr(
+                        "Input rejected: too many messages in request %zu: %zu (max: %zu). Limit defined in %s.",
+                        requestIdx, messagesArray.size(), limits::security::kMaxMessagesPerRequest,
+                        limits::kInputLimitsLocation));
+
                 for (auto const& messageJson : messagesArray)
                 {
-                    if (!messageJson.contains("role") || !messageJson.contains("content"))
-                    {
-                        LOG_ERROR("Each message must have 'role' and 'content' fields");
-                        throw std::runtime_error("Each message must have 'role' and 'content' fields");
-                    }
+                    check::check(messageJson.contains("role") && messageJson.contains("content"),
+                        "Each message must have 'role' and 'content' fields");
 
                     rt::Message chatMsg;
                     chatMsg.role = messageJson["role"].get<std::string>();
@@ -514,21 +494,35 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                     if (contentJson.is_string())
                     {
                         // Simple string format - treat as text content
+                        std::string const& contentStr = contentJson.get<std::string>();
+
+                        // Enforce content size limits
+                        check::check(contentStr.size() <= limits::security::kMaxMessageContentSizeBytes,
+                            format::fmtstr(
+                                "Input rejected: message content too large in request %zu: %zu bytes (max: %zu). "
+                                "Limit defined in %s.",
+                                requestIdx, contentStr.size(), limits::security::kMaxMessageContentSizeBytes,
+                                limits::kInputLimitsLocation));
+
                         rt::Message::MessageContent msgContent;
                         msgContent.type = "text";
-                        msgContent.content = contentJson.get<std::string>();
+                        msgContent.content = contentStr;
                         chatMsg.contents.push_back(msgContent);
                     }
                     else if (contentJson.is_array())
                     {
                         // Array format - supports multimodal content
+                        // Enforce content item limits
+                        check::check(contentJson.size() <= limits::security::kMaxContentItemsPerMessage,
+                            format::fmtstr("Input rejected: too many content items in message %zu: %zu (max: %zu). "
+                                           "Limit defined in %s.",
+                                requestIdx, contentJson.size(), limits::security::kMaxContentItemsPerMessage,
+                                limits::kInputLimitsLocation));
+
                         for (auto const& contentItemJson : contentJson)
                         {
-                            if (!contentItemJson.contains("type"))
-                            {
-                                LOG_ERROR("Each content item must have a 'type' field");
-                                throw std::runtime_error("Each content item must have a 'type' field");
-                            }
+                            check::check(
+                                contentItemJson.contains("type"), "Each content item must have a 'type' field");
 
                             rt::Message::MessageContent msgContent;
                             msgContent.type = contentItemJson["type"].get<std::string>();
@@ -536,7 +530,17 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                             // Based on type, extract the appropriate field
                             if (msgContent.type == "text")
                             {
-                                msgContent.content = contentItemJson["text"].get<std::string>();
+                                std::string const& textContent = contentItemJson["text"].get<std::string>();
+
+                                // Enforce content size limits
+                                check::check(textContent.size() <= limits::security::kMaxMessageContentSizeBytes,
+                                    format::fmtstr(
+                                        "Input rejected: message content too large in request %zu: %zu bytes "
+                                        "(max: %zu). Limit defined in %s.",
+                                        requestIdx, textContent.size(), limits::security::kMaxMessageContentSizeBytes,
+                                        limits::kInputLimitsLocation));
+
+                                msgContent.content = textContent;
                             }
                             else if (msgContent.type == "image")
                             {
@@ -550,7 +554,6 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                             }
                             else
                             {
-                                LOG_ERROR("Content type must be 'text', 'image', but got: %s", msgContent.type.c_str());
                                 throw std::runtime_error(format::fmtstr(
                                     "Content type must be 'text', 'image', but got: %s", msgContent.type.c_str()));
                             }
@@ -560,7 +563,6 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                     }
                     else
                     {
-                        LOG_ERROR("Message content must be a string or an array");
                         throw std::runtime_error("Message content must be a string or an array");
                     }
 
@@ -585,7 +587,6 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     }
     else
     {
-        LOG_ERROR("'requests' array not found in input file");
         throw std::runtime_error("'requests' array not found in input file");
     }
 

@@ -396,7 +396,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
                 mTokenizer->encode(request.formattedRequests[i].formattedCompleteRequest, false));
             if (context.rawBatchedInputIds[i].empty())
             {
-                LOG_ERROR("Failed to tokenize input text for batch %d", i);
+                LOG_ERROR("Failed to tokenize input text for request %d in batch", i);
                 return false;
             }
         }
@@ -449,7 +449,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
             if (!saveCacheStatus)
             {
                 LOG_WARNING(
-                    "Failed to save system prompt KVCache for batch %d. "
+                    "Failed to save system prompt KVCache for request %d in batch. "
                     "Continue to handle the request without saving the system prompt KVCache.",
                     i);
             }
@@ -1430,6 +1430,11 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     }
 
     auto tokenizedPrompt = mTokenizer->encode(prompt, true);
+    if (tokenizedPrompt.empty())
+    {
+        LOG_ERROR("Failed to encode system prompt for KVCache generation.");
+        return false;
+    }
     int32_t const promptIdsLength = static_cast<int32_t>(tokenizedPrompt.size());
 
     if (promptIdsLength > mBaseEngineConfig.maxSupportedInputLength

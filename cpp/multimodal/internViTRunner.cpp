@@ -17,6 +17,7 @@
 
 #include "internViTRunner.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "multimodal/imageUtils.h"
 #include "profiling/metrics.h"
@@ -293,6 +294,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     {
         // Use the formatted complete request
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
+        check::check(!ids.empty(), "InternViTRunner::textPreprocess() Failed to encode text");
 
         // replace vis tokens
         std::vector<int32_t> newIds;

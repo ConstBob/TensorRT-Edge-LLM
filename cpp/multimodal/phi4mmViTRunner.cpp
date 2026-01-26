@@ -17,6 +17,7 @@
 
 #include "phi4mmViTRunner.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
@@ -410,6 +411,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     {
         // Use the formatted complete request
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
+        check::check(!ids.empty(), "Phi4MMViTRunner::textPreprocess() Failed to encode text");
 
         // Replace image placeholder tokens with sequential image token IDs
         std::vector<int32_t> newIds;
