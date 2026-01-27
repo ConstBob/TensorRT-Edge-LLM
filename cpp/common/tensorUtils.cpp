@@ -125,7 +125,7 @@ size_t getMaxFormatDataWidth(Coords const& shape, T const* data)
 
 template <typename T>
 void buildStringRecursive(std::stringstream& ss, T const* data, Coords const& shape,
-    std::array<int64_t, kMAX_DIMS> const& strides, size_t& offset, size_t dimension, size_t maxWidth,
+    std::array<int64_t, kMAX_DIMS> const& strides, size_t& offset, int32_t dimension, size_t maxWidth,
     std::string const& indent)
 {
     // Apply pytorch-style printing logic, for large tensors, we print the head and tail of the tensor
@@ -144,7 +144,7 @@ void buildStringRecursive(std::stringstream& ss, T const* data, Coords const& sh
         return;
     }
 
-    check::check(dimension < shape.getNumDims() && dimension >= 0, "Dimension shall in range of the shape.");
+    check::check(dimension < shape.getNumDims() && dimension >= 0, "Dimension shall be in range of the shape.");
     ss << "[";
     int64_t dimSize = shape[dimension];
 
@@ -198,7 +198,7 @@ void buildStringRecursive(std::stringstream& ss, T const* data, Coords const& sh
         }
         else
         {
-            for (size_t i = 0; i < dimSize; ++i)
+            for (int32_t i = 0; i < dimSize; ++i)
             {
                 if (i > 0)
                 {
@@ -236,7 +236,7 @@ std::string formatString(Tensor const& tensor)
     }
 
     size_t offset = 0;
-    size_t const startDim{0};
+    int32_t const startDim{0};
     std::string const startIndent{"       "};
     std::stringstream ss;
     ss << "\nTensor(";

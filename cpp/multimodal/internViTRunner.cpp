@@ -207,8 +207,8 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     mNormalizedImageDevice.reshape({1, height, width, channels});
 
     // Copy image to device
-    CUDA_CHECK(cudaMemcpyAsync(mImageDevice.rawPointer(), imageData, height * width * channels * sizeof(unsigned char),
-        cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
 
     // Normalize image
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);

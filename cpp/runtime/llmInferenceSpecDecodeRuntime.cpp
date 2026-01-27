@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
@@ -1363,18 +1364,18 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
             kernel::instantiateKVCacheFromTensor(kvCacheBufferBase, kvCacheContentBase, i, context.stream);
             kernel::instantiateKVCacheFromTensor(kvCacheBufferDraft, kvCacheContentDraft, i, context.stream);
 
-            int32_t reuseLength = static_cast<int32_t>(kvCacheContentBase.getShape()[3]);
+            auto reuseLength = math::cast<size_t>(kvCacheContentBase.getShape()[3]);
             // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
             check::check(reuseLength > 0 && reuseLength < batchedInputIds[i].size(),
-                "The reuse length shall larger than 0 and not exceed the input length.");
+                "The reuse length shall be larger than 0 and not exceed the input length.");
             // Reuse N-1 tokens from the cached prefix so the Nth token is treated as real input in prefill;
             // this keeps the draft prefill boundary aligned with the true next-token position.
-            int32_t const effectiveReuseLength = reuseLength - 1;
-            reuseKVCacheLengthsData[i] = effectiveReuseLength;
+            auto const effectiveReuseLength = reuseLength - 1;
+            reuseKVCacheLengthsData[i] = math::cast<int32_t>(effectiveReuseLength);
 
             // Directly assign to context.tokenIds (skip only the reused portion, keep the next token for normal flow)
             context.tokenIds[i].assign(batchedInputIds[i].begin() + effectiveReuseLength, batchedInputIds[i].end());
-            context.effectivePrefillLengths[i] = static_cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
+            context.effectivePrefillLengths[i] = math::cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
 
             bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
                 precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
