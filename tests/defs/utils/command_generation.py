@@ -441,26 +441,29 @@ def generate_benchmark_commands(
     """Generate benchmark commands - returns list of (command, timeout) tuples"""
     commands = []
 
-    if config.model_type == ModelType.LLM:
-        cmd = [executable_files['llm_benchmark']]
-        cmd.extend([
-            f"--engineDir={config.get_llm_engine_dir()}",
-            f"--inputLength={config.max_input_len}",
-            f"--maxLength={config.output_seq_len + config.max_input_len}",
-            "--warmUp=2", "--numRuns=10"
-        ])
+    cmd = [executable_files['llm_inference']]
+    cmd.extend([
+        f"--engineDir={config.get_llm_engine_dir()}",
+        f"--inputFile={config.get_test_case_file()}",
+        f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
+    ])
 
-    elif config.model_type == ModelType.VLM:
-        cmd = [executable_files['vlm_benchmark']]
-        cmd.extend([
-            f"--engineDir={config.get_llm_engine_dir()}",
-            f"--visualEngineDir={config.get_visual_engine_dir()}",
-            f"--textTokenLength={config.text_token_length}",
-            f"--imageTokenLength={config.image_token_length}",
-            f"--outputLength={config.output_seq_len}",
-            f"--batchSize={config.max_batch_size}", "--warmUp=2",
-            "--numRuns=10"
-        ])
+    # Add EAGLE parameters
+    if config.is_eagle:
+        cmd.append("--eagle")
+        cmd.append(f"--eagleDraftTopK={config.eagle_draft_top_k}")
+        cmd.append(f"--eagleDraftStep={config.eagle_draft_step}")
+        cmd.append(f"--eagleVerifyTreeSize={config.max_verify_tree_size}")
 
-    commands.append((cmd, 1200))
+    if config.model_type == ModelType.VLM:
+        cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
+
+    # Add batch size override if specified
+    if config.batch_size is not None:
+        cmd.append(f"--batchSize={config.batch_size}")
+
+    # Add warmup if specified
+    cmd.append(f"--warmup={config.warmup or 10}")
+
+    commands.append((cmd, 6000))
     return commands

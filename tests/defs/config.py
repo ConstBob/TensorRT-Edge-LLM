@@ -177,6 +177,7 @@ class TestConfig:
     batch_size: Optional[int] = None
     input_seq_len: Optional[int] = None
     output_seq_len: Optional[int] = None
+    warmup: Optional[int] = None
 
     # VLM-specific parameters (no defaults - must be specified)
     text_token_length: Optional[int] = None
@@ -535,6 +536,10 @@ class TestConfig:
                 if self.max_draft_tree_size is None:
                     self.max_draft_tree_size = 60
 
+                warmup_env = os.environ.get('WARMUP')
+                if warmup_env is not None and self.warmup is None:
+                    self.warmup = int(warmup_env)
+
         missing_params = []
         invalid_params = []
 
@@ -626,6 +631,7 @@ class TestConfig:
             "Llama-3.2-1B": "llama-3.2-models/Llama-3.2-1B",
             "Llama-3.2-3B": "llama-3.2-models/Llama-3.2-3B",
             "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
+            "Qwen3-1.7B": "Qwen3/Qwen3-1.7B",
             "Qwen3-8B": "Qwen3/Qwen3-8B",
             "Qwen3-4B-Instruct-2507": "Qwen3/Qwen3-4B-Instruct-2507",
             "Qwen3-VL-2B-Instruct": "Qwen3/Qwen3-VL-2B-Instruct",
@@ -680,7 +686,17 @@ class TestConfig:
                 "eagle3": "Qwen3/qwen3_8b_eagle3",
             },
             "Qwen3-4B-Instruct-2507": {
-                "eagle3": "EAGLE3-Qwen3-4B-v2",
+                "v2": "EAGLE3-Qwen3-4B-v2",
+                "v2.1": "EAGLE3-Qwen3-4B-v2.1",
+            },
+            "Qwen3-VL-4B-Instruct": {
+                "eagle3": "EAGLE3-Qwen3-VL-4B-v1.1",
+            },
+            "Qwen3-1.7B": {
+                "eagle3": "Qwen3/Qwen3-1.7B_eagle3",
+            },
+            "Qwen3-VL-8B-Instruct": {
+                "v0": "Qwen3/qwen3-vl-8b-eagle3-v0",
             },
             # Add more mappings as needed
         }
