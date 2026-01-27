@@ -21,6 +21,7 @@
 #include "common/checkMacros.h"
 #include "common/hashUtils.h"
 #include "common/logger.h"
+#include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
@@ -247,13 +248,13 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
             auto& precachedKVCache = mSystemPromptKVCache[promptKey];
             auto const& kvCacheContent = precachedKVCache.kvCacheContent;
             kernel::instantiateKVCacheFromTensor(kvCacheBuffer, kvCacheContent, i, stream);
-            int32_t reuseLength = static_cast<int32_t>(kvCacheContent.getShape()[3]);
-            processedInputIds.emplace_back(batchedInputIds[i].begin() + reuseLength, batchedInputIds[i].end());
-            processedIdsLengths.emplace_back(static_cast<int32_t>(batchedInputIds[i].size() - reuseLength));
-            reuseKVCacheLengthsData[i] = reuseLength;
-            // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
+            auto reuseLength = math::cast<size_t>(kvCacheContent.getShape()[3]);
             check::check(
                 reuseLength < batchedInputIds[i].size(), "The reuse length shall not exceed the input length.");
+            processedInputIds.emplace_back(batchedInputIds[i].begin() + reuseLength, batchedInputIds[i].end());
+            processedIdsLengths.emplace_back(math::cast<int32_t>(batchedInputIds[i].size() - reuseLength));
+            reuseKVCacheLengthsData[i] = math::cast<int32_t>(reuseLength);
+            // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
             bool const matchIds = std::equal(precachedKVCache.tokenizedPrompt.begin(),
                 precachedKVCache.tokenizedPrompt.end(), batchedInputIds[i].begin());
             if (!matchIds)

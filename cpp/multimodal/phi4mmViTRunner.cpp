@@ -300,8 +300,8 @@ void Phi4MMViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
 
     // Copy image to device.
     mImageDevice.reshape({1, height, width, channels});
-    CUDA_CHECK(cudaMemcpyAsync(mImageDevice.rawPointer(), imageData, height * width * channels * sizeof(unsigned char),
-        cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
 
     // Normalize image
     mNormalizedImageDevice.reshape({1, height, width, channels});

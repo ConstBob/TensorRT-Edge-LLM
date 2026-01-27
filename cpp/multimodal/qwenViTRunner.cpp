@@ -18,10 +18,12 @@
 #include "qwenViTRunner.h"
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
+#include "common/mathUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
 #include "profiling/timer.h"
 #include <cmath>
+#include <cstddef>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <numeric>
@@ -243,13 +245,14 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     }
 
     // Copy image mean and std to device to be used in normalizeImage
-    auto channels = mConfig.imageMean.size();
+    auto nbBytes = mConfig.imageMean.size() * sizeof(float);
+    auto channels = math::cast<int64_t>(mConfig.imageMean.size());
     mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageMean");
     mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageStd");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageMean.rawPointer(), mConfig.imageMean.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageStd.rawPointer(), mConfig.imageStd.data(), channels * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mImageMean.rawPointer(), mConfig.imageMean.data(), nbBytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mImageStd.rawPointer(), mConfig.imageStd.data(), nbBytes, cudaMemcpyHostToDevice, stream));
 
     // Pre-allocate temporary image buffers for preprocessing
     int64_t const maxImagePixels = mVitInput.getShape().volume();
@@ -314,8 +317,8 @@ void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
     auto imageSize = height * width * channels;
     for (int64_t i = 0; i < mConfig.temporalPatchSize; ++i)
     {
-        CUDA_CHECK(cudaMemcpyAsync(mImageDevice.rawPointer() + i * imageSize * sizeof(unsigned char), imageData,
-            imageSize * sizeof(unsigned char), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mImageDevice.rawPointer()) + i * imageSize, imageData,
+            imageSize, cudaMemcpyHostToDevice, stream));
     }
 
     // Normalize image
@@ -437,7 +440,7 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
 
         mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim});
         // Compute rotary position embeddings
-        for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+        for (size_t i = 0; i < imageGridTHWs.size(); ++i)
         {
             kernel::initRotaryPosEmbQwenViT(
                 mRotaryPosEmb, imageGridTHWs[i], mConfig.mergeSize, cuSeqlensData[i], 10000.0f, 1.0f, stream);
@@ -459,7 +462,7 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
             mFastPosEmbIdx.reshape({4, totalSeqLength});
             mFastPosEmbWeight.reshape({4, totalSeqLength});
 
-            for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+            for (size_t i = 0; i < imageGridTHWs.size(); ++i)
             {
                 kernel::initFastPosEmbedQwenViT(mFastPosEmbIdx, mFastPosEmbWeight, imageGridTHWs[i], mConfig.mergeSize,
                     mConfig.numGridPerSide, cuSeqlensData[i], stream);
