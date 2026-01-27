@@ -46,6 +46,7 @@ struct LLMBuilderConfig
     int64_t maxKVCacheCapacity{4096}; //!< Maximum KV cache capacity (sequence length)
     int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
     int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
+    bool useTrtNativeOps{false};   //!< Whether to use TensorRT native operations instead of custom plugin
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -58,6 +59,7 @@ struct LLMBuilderConfig
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
+        json["trt_native_ops"] = useTrtNativeOps;
         // Only include Eagle-specific fields when Eagle is enabled
         if (eagleBase)
         {
@@ -107,6 +109,10 @@ struct LLMBuilderConfig
         if (json.contains("max_draft_tree_size"))
         {
             config.maxDraftTreeSize = json["max_draft_tree_size"];
+        }
+        if (json.contains("trt_native_ops"))
+        {
+            config.useTrtNativeOps = json["trt_native_ops"];
         }
         return config;
     }

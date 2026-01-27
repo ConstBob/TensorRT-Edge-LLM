@@ -1528,7 +1528,7 @@ bool EagleDraftEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
         std::string const pastKeyValuesName = binding_names::formatKVCacheName(i, true);
         std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
 
-        rt::Tensor kvCacheBlock = mLinearKVCache.getKVCacheForDecoderLayer(i);
+        rt::Tensor kvCacheBlock = mLinearKVCache.getCombinedKVCacheForDecoderLayer(i);
         status &= mTRTExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status &= mTRTExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status &= mTRTExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);

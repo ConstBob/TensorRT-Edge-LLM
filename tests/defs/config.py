@@ -189,6 +189,9 @@ class TestConfig:
         str] = None  # "input_aware" or "frequency"
     vocab_reduction_max_samples: Optional[int] = None
 
+    # Add TensorRT native operations flag
+    trt_native_ops: Optional[bool] = None
+
     # Declarative parameter specifications
     _PARAMETER_SPECS = [
         # Core parameters for engine identification
@@ -305,6 +308,11 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("vocab_reduction_max_samples",
                       "vrms", {TaskType.EXPORT},
+                      {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+        ParameterSpec("trt_native_ops",
+                      "ootb",
+                      {TaskType.EXPORT, TaskType.BUILD, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
     ]
@@ -463,6 +471,8 @@ class TestConfig:
             elif part.startswith('vrms'):
                 parsed_params['vocab_reduction_max_samples'] = int(part[4:])
             # For inference parameters
+            elif part.startswith('ootb'):
+                parsed_params['trt_native_ops'] = True
             else:
                 parsed_params['test_case'] = part
 
@@ -592,6 +602,8 @@ class TestConfig:
             model_id += "-fp8kv"
         if self.reduced_vocab_size:
             model_id += f"-rvs{self.reduced_vocab_size}"
+        if self.trt_native_ops:
+            model_id += "-ootb"
         return model_id
 
     def get_engine_id(self) -> str:

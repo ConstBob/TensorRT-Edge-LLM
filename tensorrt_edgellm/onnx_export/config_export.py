@@ -161,7 +161,9 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
     return config_dict
 
 
-def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
+def export_llm_config(config: Any,
+                      model_type: str,
+                      trt_native_ops: bool = False) -> Dict[str, Any]:
     """Export configuration based on model type and EAGLE version."""
     config_dict = config.to_dict()
 
@@ -187,6 +189,9 @@ def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
 
     # Add TensorRT Edge-LLM version
     output_config['edgellm_version'] = __version__
+
+    # Add trt_native_ops to output_config
+    output_config["trt_native_ops"] = trt_native_ops
 
     return output_config
 

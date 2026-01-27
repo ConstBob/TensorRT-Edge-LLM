@@ -24,6 +24,7 @@ from transformers.models.llama.modeling_llama import (LlamaAttention, LlamaMLP,
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
 
 from .attention_plugin import attention_plugin
+from .attention_trt import EdgeLLMAttentionNativeOps
 
 # FP8 (E4M3) quantization constants
 # Max finite value representable by NVIDIA FP8 E4M3 format; used to derive per-tensor KV cache scale.
@@ -598,3 +599,101 @@ class EdgeLLMDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+
+class EdgeLLMDecoderLayerNativeOps(nn.Module):
+    """
+    Decoder layer with TensorRT native attention operations.
+    
+    This module implements a transformer decoder layer with TensorRT native attention operation.
+    Attributes:
+        hidden_size: Hidden dimension size
+        mlp: Multi-layer perceptron component
+        post_attention_layernorm: Post-attention layer normalization
+        self_attn: TensorRT native attention module with fused operations
+    """
+
+    def __init__(self,
+                 config_or_module: nn.Module,
+                 torch_dtype: torch.dtype = torch.float16) -> None:
+        """
+        Initialize the EdgeLLMDecoderLayerNativeOps module.
+        
+        Args:
+            config_or_module: Decoder layer module
+            torch_dtype: Data type of the module
+        """
+        super().__init__()
+
+        self.torch_dtype = torch_dtype
+        # Handle both config and module inputs
+        assert isinstance(config_or_module,
+                          nn.Module), "config_or_module must be a nn.Module"
+
+        decoder_layer = config_or_module
+        if hasattr(decoder_layer, 'hidden_size'):
+            self.hidden_size: int = decoder_layer.hidden_size
+        else:
+            self.hidden_size: int = decoder_layer.self_attn.hidden_size
+
+        self.mlp = decoder_layer.mlp
+        self.input_layernorm = decoder_layer.input_layernorm.to(torch_dtype)
+        self.post_attention_layernorm = decoder_layer.post_attention_layernorm.to(
+            torch_dtype)
+
+        self.self_attn = EdgeLLMAttentionNativeOps(decoder_layer.self_attn)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        k_cache: Optional[torch.Tensor] = None,
+        v_cache: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Forward pass through the decoder layer for ONNX export.
+        
+        Args:
+            hidden_states: Input hidden states of shape (batch, seq_len, embed_dim)
+            rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch, seq_len, head_dim)
+            context_lengths: Context length tensor of shape (batch,)
+            kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size,), required
+            k_cache: Key cache (batch, num_heads, capacity, head_dim)
+            v_cache: Value cache (batch, num_heads, capacity, head_dim)
+            attention_mask: Attention mask of shape (batch, seq_len, seq_len + past_len), optional
+            position_ids: Position IDs of shape (batch, seq_len), optional
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (hidden_states, present_k_cache, present_v_cache)
+        """
+        residual = hidden_states
+
+        # Standard processing: apply input layernorm if available
+        if self.input_layernorm is not None:
+            hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states, present_k_cache, present_v_cache = self.self_attn(
+            hidden_states=hidden_states,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            rope_rotary_cos_sin=rope_rotary_cos_sin,
+            context_lengths=context_lengths,
+            kvcache_start_index=kvcache_start_index,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+
+        hidden_states = residual + hidden_states
+
+        # MLP with residual connection
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states, present_k_cache, present_v_cache

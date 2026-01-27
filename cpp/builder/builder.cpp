@@ -427,6 +427,12 @@ bool LLMBuilder::parseConfig()
 
     mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
 
+    // Read trt_native_ops flag from config if present
+    if (mModelConfig.contains("trt_native_ops"))
+    {
+        mBuilderConfig.useTrtNativeOps = mModelConfig["trt_native_ops"].get<bool>();
+    }
+
     return true;
 }
 
@@ -738,19 +744,48 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
 {
     bool result = true;
-    // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
-    nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, mHeadSize});
-    nvinfer1::Dims optKVCacheShape
-        = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-    nvinfer1::Dims maxKVCacheShape
-        = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
-
-    for (int i = 0; i < mNbKVCacheInputs; ++i)
+    if (mBuilderConfig.useTrtNativeOps)
     {
-        result &= setOptimizationProfile(contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-        result &= setOptimizationProfile(generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+        // TRT attention: separate K and V caches without the "2" dimension
+        // Shape: [batch, num_kv_heads, seq_len, head_dim]
+        nvinfer1::Dims minKVCacheShape = createDims({1, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+        nvinfer1::Dims optKVCacheShape
+            = createDims({mBuilderConfig.maxBatchSize, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+        nvinfer1::Dims maxKVCacheShape
+            = createDims({mBuilderConfig.maxBatchSize, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            // K cache bindings
+            result &= setOptimizationProfile(contextProfile, binding_names::formatKCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            result &= setOptimizationProfile(generationProfile, binding_names::formatKCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+
+            // V cache bindings
+            result &= setOptimizationProfile(contextProfile, binding_names::formatVCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            result &= setOptimizationProfile(generationProfile, binding_names::formatVCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+        }
+    }
+    else
+    {
+        // Plugin path: combined KV cache with "2" dimension
+        // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
+        nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, mHeadSize});
+        nvinfer1::Dims optKVCacheShape
+            = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+        nvinfer1::Dims maxKVCacheShape
+            = createDims({mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, mHeadSize});
+
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            result &= setOptimizationProfile(contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            result &= setOptimizationProfile(generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
+                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+        }
     }
 
     return result;

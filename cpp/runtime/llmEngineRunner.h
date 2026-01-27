@@ -45,6 +45,7 @@ struct LLMEngineRunnerConfig
     RopeConfig ropeConfig{};             //!< Type of rotary positional encoding
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
     bool enableEagleSpecDecode{false};   //!< Enable Eagle speculative decoding
+    bool useTrtNativeOps{false};         //!< Use TensorRT native operations instead of custom plugin
     int32_t numDecoderLayers{};          //!< Number of decoder layers
     int32_t numKVHeads{};                //!< Number of key-value heads
     int32_t headDim{};                   //!< Dimension of each attention head
@@ -307,6 +308,29 @@ private:
     //! @brief Check if LoRA weights are supported
     //! @return True if supported, false otherwise
     bool isLoraWeightsSupported() const;
+
+    //! @brief Get the KV cache type
+    //! @return The KV cache type
+    nvinfer1::DataType getKVCacheType() const;
+
+    //! @brief Validate the KV cache type consistency
+    //! @return True if the KV cache type is consistent, false otherwise
+    bool validateKVCacheType() const;
+
+private:
+    /*!
+     * @brief Bind KV cache to engine for prefill and generation of new requests (plugin path)
+     * @param activeBatchSize Number of active sequences
+     * @return True on success, false on failure
+     */
+    bool bindPluginKVCacheToEngine(int32_t activeBatchSize);
+
+    /*!
+     * @brief Bind separate K and V caches to engine for new requests (TRT native path)
+     * @param activeBatchSize Number of active sequences
+     * @return True on success, false on failure
+     */
+    bool bindTRTNativeKVCacheToEngine(int32_t activeBatchSize);
 };
 
 } // namespace rt
