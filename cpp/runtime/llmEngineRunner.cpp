@@ -136,7 +136,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
     if (mmapReader->getData() == nullptr)
     {
-        LOG_ERROR("LLMEngineRunner(): Failed to use MMap to read engine from file path: %s", enginePath.string());
+        LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());
         throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
     }
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
@@ -225,31 +225,14 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         throw std::runtime_error("Failed to set rope cos sin cache to the engine");
     }
 
-    // Detect KV cache storage dtype from engine bindings.
-    std::string const kvBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
-    DataType kvCacheType = mEngine->getTensorDataType(kvBindingName0.c_str());
-
-    // Sanity check: ensure KV-cache precision (dtype) is consistent across all layers (and both past/present).
-    // We rely on a single dtype when allocating/owning the KV cache buffers.
-    auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
-        std::string const kvBindingName = binding_names::formatKVCacheName(layerIdx, isPast);
-        DataType const dt = mEngine->getTensorDataType(kvBindingName.c_str());
-        if (dt != kvCacheType)
-        {
-            LOG_ERROR(
-                "KV cache dtype mismatch detected. Expected all layers to use the same dtype as '%s' (dtype=%d), but "
-                "binding '%s' (layer=%d, %s) has dtype=%d.",
-                kvBindingName0.c_str(), static_cast<int32_t>(kvCacheType), kvBindingName.c_str(), layerIdx,
-                (isPast ? "past" : "present"), static_cast<int32_t>(dt));
-            throw std::runtime_error("KV cache dtype mismatch across layers");
-        }
-    };
-
-    for (int32_t layerIdx = 0; layerIdx < mConfig.numDecoderLayers; ++layerIdx)
+    if (!validateKVCacheType())
     {
-        checkKVCacheDType(layerIdx, /*isPast=*/true);
-        checkKVCacheDType(layerIdx, /*isPast=*/false);
+        LOG_ERROR("Failed to validate KV cache type");
+        throw std::runtime_error("Failed to validate KV cache type");
     }
+
+    // Detect KV cache storage dtype from engine bindings.
+    nvinfer1::DataType kvCacheType = getKVCacheType();
 
     this->mKVCache
         = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
@@ -351,8 +334,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         bool setKVCacheStartIndexStatus{true};
         setKVCacheStartIndexStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kKVCacheStartIndex, mDummyInputTensor.rawPointer());
-        setKVCacheStartIndexStatus
-            &= mTRTExecutionContext->setInputShape(binding_names::kKVCacheStartIndex, rt::Coords{0}.getTRTDims());
+        setKVCacheStartIndexStatus &= mTRTExecutionContext->setInputShape(
+            binding_names::kKVCacheStartIndex, rt::Coords{mConfig.maxSupportedBatchSize}.getTRTDims());
         if (!setKVCacheStartIndexStatus)
         {
             LOG_ERROR("Failed to set kKVCacheStartIndex dummy tensor for initialization");
@@ -368,6 +351,79 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     // Synchronize the stream to ensure all the operations have completed.
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+nvinfer1::DataType LLMEngineRunner::getKVCacheType() const
+{
+    if (mConfig.useTrtNativeOps)
+    {
+        std::string const trtNativeKVBindingName0 = binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true);
+        return mEngine->getTensorDataType(trtNativeKVBindingName0.c_str());
+    }
+    else
+    {
+        std::string const pluginKVBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+        return mEngine->getTensorDataType(pluginKVBindingName0.c_str());
+    }
+}
+
+bool LLMEngineRunner::validateKVCacheType() const
+{
+    // Sanity check: ensure KV-cache precision (dtype) is consistent across all layers (and both past/present).
+    // We rely on a single dtype when allocating/owning the KV cache buffers.
+    if (mConfig.useTrtNativeOps)
+    {
+        auto kBindingName0 = binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true);
+        DataType const kCacheType0 = mEngine->getTensorDataType(kBindingName0.c_str());
+        auto vBindingName0 = binding_names::formatVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+        auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
+            std::string const kBindingName = binding_names::formatKCacheName(layerIdx, isPast);
+            DataType const kCacheType = mEngine->getTensorDataType(kBindingName.c_str());
+            std::string const vBindingName = binding_names::formatVCacheName(layerIdx, isPast);
+            DataType const vCacheType = mEngine->getTensorDataType(vBindingName.c_str());
+            if (kCacheType != kCacheType0 || vCacheType != kCacheType0)
+            {
+                LOG_ERROR(
+                    "KV cache dtype mismatch detected. Expected all layers to use the same dtype as '%s' (dtype=%d), "
+                    "but "
+                    "binding '%s' has dtype=%d and '%s' has dtype=%d.",
+                    kBindingName0.c_str(), static_cast<int32_t>(kCacheType0), kBindingName.c_str(),
+                    static_cast<int32_t>(kCacheType), vBindingName.c_str(), static_cast<int32_t>(vCacheType));
+                throw std::runtime_error("KV cache dtype mismatch across layers");
+            }
+        };
+        for (int32_t layerIdx = 0; layerIdx < mConfig.numDecoderLayers; ++layerIdx)
+        {
+            checkKVCacheDType(layerIdx, /*isPast=*/true);
+            checkKVCacheDType(layerIdx, /*isPast=*/false);
+        }
+    }
+    else
+    {
+        auto kvBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+        DataType const kvCacheType = mEngine->getTensorDataType(kvBindingName0.c_str());
+        auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
+            std::string const kvBindingName = binding_names::formatKVCacheName(layerIdx, isPast);
+            DataType const dt = mEngine->getTensorDataType(kvBindingName.c_str());
+            if (dt != kvCacheType)
+            {
+                LOG_ERROR(
+                    "KV cache dtype mismatch detected. Expected all layers to use the same dtype as '%s' (dtype=%d), "
+                    "but "
+                    "binding '%s' has dtype=%d.",
+                    kvBindingName0.c_str(), static_cast<int32_t>(kvCacheType), kvBindingName.c_str(),
+                    static_cast<int32_t>(dt));
+                throw std::runtime_error("KV cache dtype mismatch across layers");
+            }
+        };
+        for (int32_t layerIdx = 0; layerIdx < mConfig.numDecoderLayers; ++layerIdx)
+        {
+            checkKVCacheDType(layerIdx, /*isPast=*/true);
+            checkKVCacheDType(layerIdx, /*isPast=*/false);
+        }
+    }
+
+    return true;
 }
 
 bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
@@ -431,6 +487,12 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
         // Collect RoPE configuration
         mConfig.ropeConfig = collectRopeConfig(configJson);
+
+        // Initialize useTrtNativeOps from builder_config
+        if (builderConfig.contains("trt_native_ops"))
+        {
+            mConfig.useTrtNativeOps = builderConfig["trt_native_ops"].get<bool>();
+        }
 
         // Validate configuration values - all must be positive except max_lora_rank
         std::vector<std::pair<std::string, int32_t>> positiveFields = {{"num_decoder_layers", mConfig.numDecoderLayers},
@@ -501,8 +563,19 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
 
 bool LLMEngineRunner::validateConfigFromEngine()
 {
+    // Plugin path: combined KV cache [batch, 2, num_kv_heads, seq_len, head_dim]
     auto identifyKVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
         return tensorDim.nbDims == 5 && bindingName.find(binding_names::kPastKeyValuesTemplate) != std::string::npos;
+    };
+
+    // TRT native: separate K cache [batch, num_kv_heads, seq_len, head_dim]
+    auto identifyTRTNativeKCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
+        return tensorDim.nbDims == 4 && bindingName.find(binding_names::kPresentKCacheTemplate) != std::string::npos;
+    };
+
+    // TRT native: separate V cache [batch, num_kv_heads, seq_len, head_dim]
+    auto identifyTRTNativeVCacheBinding = [](std::string const& bindingName, Dims const& tensorDim) {
+        return tensorDim.nbDims == 4 && bindingName.find(binding_names::kPresentVCacheTemplate) != std::string::npos;
     };
 
     // If the engine comes with deepstack embeds binding, it means the engine is Qwen3-VL.
@@ -511,6 +584,8 @@ bool LLMEngineRunner::validateConfigFromEngine()
     };
 
     int32_t nbKVCacheInputs{0};
+    int32_t nbTRTNativeKCacheInputs{0};
+    int32_t nbTRTNativeVCacheInputs{0};
     int32_t nbDeepstackEmbedsInputs{0};
     int32_t numIOBindings = mEngine->getNbIOTensors();
 
@@ -572,12 +647,78 @@ bool LLMEngineRunner::validateConfigFromEngine()
             LOG_DEBUG("validateConfigFromEngine(): Found deepstack embeds binding: %s", bindingName.c_str());
             ++nbDeepstackEmbedsInputs;
         }
+
+        bool const isTRTNativeKCacheBinding = identifyTRTNativeKCacheBinding(bindingName, tensorDim);
+        bool const isTRTNativeVCacheBinding = identifyTRTNativeVCacheBinding(bindingName, tensorDim);
+        if (isTRTNativeKCacheBinding || isTRTNativeVCacheBinding)
+        {
+            if (mConfig.numKVHeads != tensorDim.d[1])
+            {
+                LOG_ERROR("numKVHeads is not consistent (TRT native K or V cache). From engine: %d, from config: %d",
+                    tensorDim.d[1], mConfig.numKVHeads);
+                return false;
+            }
+            if (mConfig.maxKVCacheCapacity != tensorDim.d[2])
+            {
+                LOG_ERROR(
+                    "maxSequenceLength is not consistent (TRT native K or V cache). From engine: %d, from config: %d",
+                    tensorDim.d[2], mConfig.maxKVCacheCapacity);
+                return false;
+            }
+            if (mConfig.headDim != tensorDim.d[3])
+            {
+                LOG_ERROR("headDim is not consistent (TRT native K or V cache). From engine: %d, from config: %d",
+                    tensorDim.d[3], mConfig.headDim);
+                return false;
+            }
+
+            if (isTRTNativeKCacheBinding)
+            {
+                ++nbTRTNativeKCacheInputs;
+            }
+            if (isTRTNativeVCacheBinding)
+            {
+                ++nbTRTNativeVCacheInputs;
+            }
+        }
     }
-    if (nbKVCacheInputs != mConfig.numDecoderLayers)
+
+    // Validate KV cache counts based on attention mode
+    if (mConfig.useTrtNativeOps)
     {
-        LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,
-            mConfig.numDecoderLayers);
-        return false;
+        // TRT native mode: expect separate K and V caches
+        if (nbTRTNativeKCacheInputs != mConfig.numDecoderLayers)
+        {
+            LOG_ERROR("numDecoderLayers is not consistent (TRT native K cache). From engine: %d, from config: %d",
+                nbTRTNativeKCacheInputs, mConfig.numDecoderLayers);
+            return false;
+        }
+        if (nbTRTNativeVCacheInputs != mConfig.numDecoderLayers)
+        {
+            LOG_ERROR("numDecoderLayers is not consistent (TRT native V cache). From engine: %d, from config: %d",
+                nbTRTNativeVCacheInputs, mConfig.numDecoderLayers);
+            return false;
+        }
+        if (nbKVCacheInputs > 0)
+        {
+            LOG_ERROR("Found plugin-style KV cache bindings but config specifies TRT native mode");
+            return false;
+        }
+    }
+    else
+    {
+        // Plugin mode: expect combined KV caches
+        if (nbKVCacheInputs != mConfig.numDecoderLayers)
+        {
+            LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,
+                mConfig.numDecoderLayers);
+            return false;
+        }
+        if (nbTRTNativeKCacheInputs > 0 || nbTRTNativeVCacheInputs > 0)
+        {
+            LOG_ERROR("Found TRT native-style K/V cache bindings but config specifies plugin attention mode");
+            return false;
+        }
     }
     if (nbDeepstackEmbedsInputs != mConfig.numDeepstackFeatures)
     {
@@ -647,7 +788,7 @@ LLMEngineRunner::~LLMEngineRunner()
     }
 }
 
-bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
+bool LLMEngineRunner::bindPluginKVCacheToEngine(int32_t activeBatchSize)
 {
     // Prepare special input binding shape for prefill stage KVCache input.
     Dims const kvCacheDims = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
@@ -658,12 +799,59 @@ bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
         std::string const pastKeyValuesName = binding_names::formatKVCacheName(i, true);
         std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
 
-        rt::Tensor kvCacheBlock = mKVCache.getKVCacheForDecoderLayer(i);
+        rt::Tensor kvCacheBlock = mKVCache.getCombinedKVCacheForDecoderLayer(i);
         status &= mTRTExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status &= mTRTExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status &= mTRTExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
     }
     return status;
+}
+
+bool LLMEngineRunner::bindTRTNativeKVCacheToEngine(int32_t activeBatchSize)
+{
+    // TRT native path: separate K and V caches without the "2" dimension
+    // Shape: [batch, num_kv_heads, seq_len, head_dim]
+    Dims const kCacheDimIn = {4, {activeBatchSize, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
+    Dims const vCacheDimIn = {4, {activeBatchSize, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
+
+    bool status{true};
+    // Bind separate K and V cache tensors to execution contexts
+    for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
+    {
+        std::string const pastKCacheName = binding_names::formatKCacheName(i, true);
+        std::string const presentKCacheName = binding_names::formatKCacheName(i, false);
+        std::string const pastVCacheName = binding_names::formatVCacheName(i, true);
+        std::string const presentVCacheName = binding_names::formatVCacheName(i, false);
+
+        std::pair<rt::Tensor, rt::Tensor> kvCacheBlocks = mKVCache.getSeparateKVCacheForDecoderLayer(i);
+        rt::Tensor& kCacheBlock = kvCacheBlocks.first;
+        rt::Tensor& vCacheBlock = kvCacheBlocks.second;
+
+        // Bind K cache
+        status &= mTRTExecutionContext->setTensorAddress(pastKCacheName.c_str(), kCacheBlock.rawPointer());
+        status &= mTRTExecutionContext->setTensorAddress(presentKCacheName.c_str(), kCacheBlock.rawPointer());
+
+        // Bind V cache
+        status &= mTRTExecutionContext->setTensorAddress(pastVCacheName.c_str(), vCacheBlock.rawPointer());
+        status &= mTRTExecutionContext->setTensorAddress(presentVCacheName.c_str(), vCacheBlock.rawPointer());
+
+        // Set shapes for K/V cache
+        status &= mTRTExecutionContext->setInputShape(pastKCacheName.c_str(), kCacheDimIn);
+        status &= mTRTExecutionContext->setInputShape(pastVCacheName.c_str(), vCacheDimIn);
+    }
+    return status;
+}
+
+bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
+{
+    if (mConfig.useTrtNativeOps)
+    {
+        return bindTRTNativeKVCacheToEngine(activeBatchSize);
+    }
+    else
+    {
+        return bindPluginKVCacheToEngine(activeBatchSize);
+    }
 }
 
 rt::Tensor& LLMEngineRunner::getRopeCosSinCacheTensor()
@@ -843,7 +1031,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
 
     // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
     // Otherwise, we shall supply the KVCache lengths tensor to the engine.
-    if (mKVCache.getKVCacheAllEmpty())
+    if (!mConfig.useTrtNativeOps && mKVCache.getKVCacheAllEmpty())
     {
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kKVCacheStartIndex, mDummyInputTensor.rawPointer());
@@ -901,7 +1089,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
 
     // Engine output tensors.
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    // Bind the KVCache IO to the engine.
+
+    // Bind the KVCache IO to the engine
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
     if (!setEngineIOStatus)
@@ -938,7 +1127,8 @@ bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& input
             "should reside on GPU.");
         return false;
     }
-    bool const isBatchValid = activeBatchSize == mKVCache.getActiveBatchSize();
+    int32_t activeKVCacheBatchSize = mKVCache.getActiveBatchSize();
+    bool const isBatchValid = activeBatchSize == activeKVCacheBatchSize;
     if (!isBatchValid)
     {
         LOG_ERROR(
@@ -975,8 +1165,21 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     // For vanilla decode stage, the selected token indices are always 0.
     // Also setup the sequence length of each sequence for this run based on committed KVCache length.
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
-    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), mKVCache.getKVCacheLengths().rawPointer(),
-        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+
+    // For TRT native path, the sequence length input always refer to the length of Q.
+    // For plugin path, the sequence length refer to the length of K and V.
+    if (mConfig.useTrtNativeOps)
+    {
+        CUDA_CHECK(cudaMemsetAsync(mSequenceContextLengths.rawPointer(), 0, activeBatchSize * sizeof(int32_t), stream));
+    }
+    else
+    {
+        // Get KV cache lengths
+        rt::Tensor& kvCacheLengths = mKVCache.getKVCacheLengths();
+        CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), kvCacheLengths.rawPointer(),
+            activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+    }
+
     // Increment the sequence length due to the implementation constraint of AttentionPlugin.
     constexpr int32_t kDECODE_INCREMENT{1};
     kernel::incrementLengthTensor(mSequenceContextLengths, kDECODE_INCREMENT, stream);
@@ -1367,7 +1570,6 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-
     // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding CUDA graph capture
     if (mConfig.numDeepstackFeatures > 0)
     {
@@ -1388,7 +1590,6 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
     }
-
     // Bind the KVCache since we haven't executed the real prefill step.
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
     if (!setEngineIOStatus)
@@ -1409,12 +1610,33 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     cudaGraph_t graph;
-    cudaGraphExec_t graphExec;
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
-    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-    CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
-    mCudaGraphs[key] = std::make_pair(graph, graphExec);
+    try
+    {
+        cudaGraphExec_t graphExec;
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        executeStatus &= mTRTExecutionContext->enqueueV3(stream);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
+        mCudaGraphs[key] = std::make_pair(graph, graphExec);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_WARNING("captureVanillaDecodingCudaGraph(): Failed to capture CUDA graph: %s", e.what());
+        // Clean up any CUDA error if the context is not graph-capturable.
+        // We do not want to check return value here, so add static_cast<void> to suppress coverity error.
+        static_cast<void>(cudaGetLastError());
+        // Stop the capture mode and clear CUDA error status if the stream is still in capturing mode.
+        cudaStreamCaptureStatus streamStatus;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &streamStatus));
+        if (streamStatus != cudaStreamCaptureStatusNone)
+        {
+            static_cast<void>(cudaStreamEndCapture(stream, &graph));
+            static_cast<void>(cudaGetLastError());
+        }
+        // At this point, there should be no more cuda errors.
+        CUDA_CHECK(cudaGetLastError());
+        return false;
+    }
 
     if (!executeStatus)
     {

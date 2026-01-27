@@ -81,10 +81,18 @@ public:
     //! @return Reference to this
     LinearKVCache& operator=(LinearKVCache&&) noexcept;
 
-    //! Get the KVCache for the given decoder layer.
+    //! Get the combined KVCache for the given decoder layer, for EdgeLLM Attention TRT plugin implementation.
     //! @param decoderLayerIdx The index of the decoder layer.
-    //! @return A non-owned tensor object that points to the KVCache memory with shape information.
-    rt::Tensor getKVCacheForDecoderLayer(int32_t decoderLayerIdx);
+    //! @return A non-owned tensor object with shape [batch_size, 2, num_kv_heads, max_sequence_length, head_dim] that
+    //! points to the combined KVCache memory with shape information.
+    rt::Tensor getCombinedKVCacheForDecoderLayer(int32_t decoderLayerIdx);
+
+    //! Get the separate K and V caches for the given decoder layer, for TRT native KVCacheUpdate/Attention operations.
+    //! Returns a pair of tensors, the first is the K cache and the second is the V cache.
+    //! @param decoderLayerIdx The index of the decoder layer.
+    //! @return A pair of tensors, the first is the K cache and the second is the V cache, with shapes [batch_size,
+    //! num_kv_heads, max_sequence_length, head_dim].
+    std::pair<rt::Tensor, rt::Tensor> getSeparateKVCacheForDecoderLayer(int32_t decoderLayerIdx);
 
     //! Get the full KVCache buffer as a non-owned tensor.
     rt::Tensor getKVCacheBuffer();

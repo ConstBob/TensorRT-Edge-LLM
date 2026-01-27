@@ -56,6 +56,8 @@ from ..chat_templates import (get_template_path, process_chat_template,
                               validate_chat_template)
 from ..llm_models.layers.attention_plugin import \
     register_attention_plugin_onnx_symbolic_functions
+from ..llm_models.layers.attention_trt import \
+    register_trt_native_attention_onnx_symbolic_functions
 from ..llm_models.layers.gather_nd import \
     register_gather_nd_onnx_symbolic_functions
 from ..llm_models.layers.int4_gemm_plugin import (
@@ -65,6 +67,7 @@ from ..llm_models.model_utils import (is_gptq_model,
                                       is_incompatible_chat_template_model,
                                       load_eagle3_draft_model, load_llm_model,
                                       load_reduced_vocab_map)
+from ..llm_models.models.llm_model import EdgeLLMModelNativeOps
 from .config_export import export_llm_config
 from .onnx_utils import export_onnx
 
@@ -91,7 +94,7 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
     from safetensors.torch import save_file
 
     # Get the embedding layer from the model
-    embed_tokens = base_model.model.embed_tokens
+    embed_tokens = base_model.embed_tokens
     embedding_weight = embed_tokens.weight.data.cpu()
 
     # Save as safetensors with key 'embedding'
@@ -275,9 +278,34 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
     return model
 
 
-def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
-                         output_dir: str, is_eagle_base: bool,
-                         is_eagle_draft: bool) -> None:
+def export_model_to_onnx_with_trt_native_ops(model: EdgeLLMModelNativeOps,
+                                             output_dir: str) -> None:
+    """
+    Export the model to ONNX format with TensorRT native operations.
+    """
+    assert isinstance(model, EdgeLLMModelNativeOps
+                      ), "Model must be an instance of EdgeLLMModelNativeOps"
+
+    try:
+        device = next(model.parameters()).device
+        dummy_inputs, input_names, dynamic_axes, output_names = model.prepare_onnx_required_arguments(
+            model.config, device)
+        register_gather_nd_onnx_symbolic_functions()
+        register_trt_native_attention_onnx_symbolic_functions()
+
+        # Export to ONNX
+        export_onnx(model, tuple(dummy_inputs), output_dir, input_names,
+                    output_names, dynamic_axes)
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to export model to ONNX: {str(e)}")
+
+
+def export_model_to_onnx(model: nn.Module,
+                         output_dir: str,
+                         is_eagle_base: bool,
+                         is_eagle_draft: bool,
+                         fp8_kv_cache: bool = False) -> None:
     """
     Export the model to ONNX format.
     
@@ -289,6 +317,9 @@ def export_model_to_onnx(model: nn.Module, dummy_inputs: Dict[str, Any],
         is_eagle_draft: Whether this is an EAGLE draft model
     """
     print(f"Exporting model to ONNX format: {output_dir}")
+
+    dummy_inputs = create_dummy_inputs(model, is_eagle_base, is_eagle_draft,
+                                       fp8_kv_cache)
 
     try:
         # Set model to evaluation mode
@@ -460,7 +491,8 @@ def export_llm_model(model_dir: str,
                      is_eagle_base: bool = False,
                      reduced_vocab_dir: Optional[str] = None,
                      chat_template_path: Optional[str] = None,
-                     fp8_kv_cache: bool = False) -> None:
+                     fp8_kv_cache: bool = False,
+                     trt_native_ops: bool = False) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -475,8 +507,17 @@ def export_llm_model(model_dir: str,
         reduced_vocab_dir: Directory containing vocab_map.safetensors for vocabulary reduction (optional)
         chat_template_path: Path to chat template JSON file. When provided, this template is validated and used instead of inferring from the model (optional)
         fp8_kv_cache: Whether to use FP8 KV cache
+        trt_native_ops: Whether to use TensorRT native operations instead of plugin
     """
     start_time = time.time()
+
+    if trt_native_ops:
+        print("Using TensorRT native operations for attention")
+        # Validate compatibility
+        if is_eagle_base:
+            raise ValueError(
+                "EAGLE base models are not supported in TensorRT native mode yet"
+            )
 
     if is_eagle_base:
         print(f"Exporting EAGLE3 base model to ONNX format")
@@ -501,26 +542,24 @@ def export_llm_model(model_dir: str,
         device=device,
         is_eagle_base=is_eagle_base,
         reduced_vocab_size=reduced_vocab_size,
-        vocab_map=vocab_map)
+        vocab_map=vocab_map,
+        trt_native_ops=trt_native_ops)
 
     model = replace_torch_quant_linear_with_int4_plugin(model)
 
-    # Create dummy inputs
-    dummy_inputs = create_dummy_inputs(model,
-                                       is_eagle_base=is_eagle_base,
-                                       is_eagle_draft=False,
-                                       fp8_kv_cache=fp8_kv_cache)
-
     # Export to ONNX
-    export_model_to_onnx(model,
-                         dummy_inputs,
-                         output_dir,
-                         is_eagle_base=is_eagle_base,
-                         is_eagle_draft=False)
+    if trt_native_ops:
+        export_model_to_onnx_with_trt_native_ops(model, output_dir)
+    else:
+        export_model_to_onnx(model,
+                             output_dir,
+                             is_eagle_base=is_eagle_base,
+                             is_eagle_draft=False,
+                             fp8_kv_cache=fp8_kv_cache)
 
     # Save model configuration
     model_type = 'eagle3_base' if is_eagle_base else 'llm'
-    model_config = export_llm_config(model.config, model_type)
+    model_config = export_llm_config(model.config, model_type, trt_native_ops)
 
     # Add reduced_vocab_size to config if vocabulary reduction is used
     if reduced_vocab_size is not None:
@@ -604,7 +643,7 @@ def export_draft_model(draft_model_dir: str,
                        base_model_dir: Optional[str] = None,
                        device: str = "cuda") -> None:
     """
-    Export an EAGLE draft model to ONNX format with custom attention plugin.
+    Export an EAGLE draft model to ONNX format.
     
     This is the main entry point for exporting EAGLE draft models to ONNX format.
     The draft model requires a base model for weight copying.
@@ -632,17 +671,14 @@ def export_draft_model(draft_model_dir: str,
 
     # Export draft model
     print(f"Exporting draft model to {output_dir}")
-    draft_dummy_inputs = create_dummy_inputs(draft_model,
-                                             is_eagle_base=False,
-                                             is_eagle_draft=True)
     export_model_to_onnx(draft_model,
-                         draft_dummy_inputs,
                          output_dir,
                          is_eagle_base=False,
-                         is_eagle_draft=True)
+                         is_eagle_draft=True,
+                         fp8_kv_cache=False)
 
     # Save draft model configuration
-    draft_config = export_llm_config(draft_model.config, 'eagle_draft')
+    draft_config = export_llm_config(draft_model.config, 'eagle_draft', False)
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, 'w') as f:
         json.dump(draft_config, f, indent=2)

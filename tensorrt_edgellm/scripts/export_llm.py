@@ -88,6 +88,10 @@ def main() -> None:
                         required=False,
                         action='store_true',
                         help="Whether to use FP8 KV cache")
+    parser.add_argument("--trt_native_ops",
+                        required=False,
+                        action='store_true',
+                        help="Whether to use TensorRT native operations")
 
     args = parser.parse_args()
 
@@ -99,7 +103,8 @@ def main() -> None:
                          is_eagle_base=args.is_eagle_base,
                          reduced_vocab_dir=args.reduced_vocab_dir,
                          chat_template_path=args.chat_template_path,
-                         fp8_kv_cache=args.fp8_kv_cache)
+                         fp8_kv_cache=args.fp8_kv_cache,
+                         trt_native_ops=args.trt_native_ops)
 
         print("LLM model export completed successfully!")
 

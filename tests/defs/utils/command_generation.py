@@ -126,6 +126,10 @@ def _generate_llm_export_commands(
     if config.reduced_vocab_size:
         llm_cmd.append(f"--reduced_vocab_dir={config.get_reduced_vocab_dir()}")
 
+    # Add TensorRT native operations flag if enabled
+    if config.trt_native_ops:
+        llm_cmd.append("--trt_native_ops")
+
     return [(llm_cmd, 1200)]
 
 

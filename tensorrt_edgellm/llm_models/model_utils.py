@@ -36,7 +36,6 @@ from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoTokenizer, PreTrainedModel)
 
 from .models.eagle3_draft import Eagle3DraftModel
-from .models.llm_model import EdgeLLMModelForCausalLM
 
 
 def is_nvfp4_linear(module: nn.Module) -> bool:
@@ -349,7 +348,8 @@ def load_llm_model(
     device: str,
     is_eagle_base: bool,
     reduced_vocab_size: Optional[int] = None,
-    vocab_map: Optional[torch.Tensor] = None
+    vocab_map: Optional[torch.Tensor] = None,
+    trt_native_ops: bool = False
 ) -> tuple[nn.Module, AutoTokenizer, Optional[AutoProcessor]]:
     """
     Load a language model (standard or EAGLE base).
@@ -361,11 +361,15 @@ def load_llm_model(
         is_eagle_base: Whether this is an EAGLE3 base model
         reduced_vocab_size: Size of the reduced vocabulary (optional)
         vocab_map: Tensor of shape (reduced_vocab_size,) with int32 indices for vocabulary reduction (optional)
+        trt_native_ops: Whether to use TensorRT native operations instead of plugin
         
     Returns:
         tuple: (model, tokenizer, processor)
         processor will be None if AutoProcessor cannot be loaded from the model directory
     """
+    from .models.llm_model import (EdgeLLMModelForCausalLM,
+                                   EdgeLLMModelNativeOps)
+
     # Determine model type and print message
     if is_eagle_base:
         print(f"Loading eagle3 base model from {model_dir}")
@@ -376,12 +380,18 @@ def load_llm_model(
     set_dynamic_quant(model, dtype)
 
     # Create EdgeLLMModelForCausalLM wrapper.
+    # Handle Qwen3-Omni model which has a special structure
     if _is_qwen3_omni_model(model_dir):
-        edge_model = EdgeLLMModelForCausalLM(model.thinker, is_eagle_base,
+        hf_model = model.thinker
+    else:
+        hf_model = model
+
+    if not trt_native_ops:
+        edge_model = EdgeLLMModelForCausalLM(hf_model, is_eagle_base,
                                              reduced_vocab_size, vocab_map)
     else:
-        edge_model = EdgeLLMModelForCausalLM(model, is_eagle_base,
-                                             reduced_vocab_size, vocab_map)
+        edge_model = EdgeLLMModelNativeOps(hf_model, reduced_vocab_size,
+                                           vocab_map)
 
     del model
     gc.collect()
@@ -495,3 +505,31 @@ def load_reduced_vocab_map(reduced_vocab_dir: str,
     print(f"Loaded vocab_map with reduced_vocab_size={reduced_vocab_size}")
 
     return reduced_vocab_size, vocab_map
+
+
+def prepare_language_model_and_config(hf_model: nn.Module):
+    """
+    Prepare the language model and config from the HuggingFace model.
+    
+    Args:
+        hf_model: HuggingFace model
+        
+    Returns:
+        Tuple of (model, config)
+    """
+
+    language_model = None
+    config = None
+
+    # Use language_model if available, otherwise use model.model.
+    if hasattr(hf_model, 'language_model'):
+        language_model = hf_model.language_model
+        config = hf_model.config.text_config
+    else:
+        language_model = hf_model.model
+        config = hf_model.config
+
+    if hasattr(hf_model.config, "quantization_config"):
+        config.quantization_config = hf_model.config.quantization_config
+
+    return language_model, config

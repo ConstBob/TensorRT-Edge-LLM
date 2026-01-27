@@ -87,7 +87,7 @@ LinearKVCache& LinearKVCache::operator=(LinearKVCache&& other) noexcept
     return *this;
 }
 
-rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx)
+rt::Tensor LinearKVCache::getCombinedKVCacheForDecoderLayer(int32_t decoderLayerIdx)
 {
     int64_t const kvCacheOffset
         = decoderLayerIdx * mConfig.maxBatchSize * 2 * mConfig.numKVHeads * mConfig.maxSequenceLength * mConfig.headDim;
@@ -98,6 +98,35 @@ rt::Tensor LinearKVCache::getKVCacheForDecoderLayer(int32_t decoderLayerIdx)
     return rt::Tensor(kvCachePtr,
         {mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength, mConfig.headDim}, DeviceType::kGPU,
         mConfig.kvCacheTypeTRT);
+}
+
+std::pair<rt::Tensor, rt::Tensor> LinearKVCache::getSeparateKVCacheForDecoderLayer(int32_t decoderLayerIdx)
+{
+    // Get the combined KV cache for this layer from base class
+    rt::Tensor kvCache = LinearKVCache::getCombinedKVCacheForDecoderLayer(decoderLayerIdx);
+
+    // The KV cache has shape: [maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+    // K cache is at index 0 of dimension 2, so we just need to point to the beginning
+    // and reshape to remove the "2" dimension
+
+    CacheConfig config = getConfig();
+    void* kvCachePtr = static_cast<void*>(kvCache.rawPointer());
+
+    void* kCachePtr = static_cast<void*>(kvCachePtr);
+    rt::Tensor kCache
+        = rt::Tensor(kCachePtr, {config.maxBatchSize, config.numKVHeads, config.maxSequenceLength, config.headDim},
+            DeviceType::kGPU, mConfig.kvCacheTypeTRT);
+
+    // Calculate offset to V cache: skip the entire K cache portion
+    // Offset = maxBatchSize * 1 (K portion) * numKVHeads * maxSequenceLength * headDim
+    int64_t vCacheOffset = config.maxBatchSize * config.numKVHeads * config.maxSequenceLength * config.headDim
+        * static_cast<int64_t>(rt::utils::getTypeSize(mConfig.kvCacheTypeTRT));
+    void* vCachePtr = static_cast<void*>(static_cast<char*>(kvCachePtr) + vCacheOffset);
+
+    rt::Tensor vCache
+        = rt::Tensor(vCachePtr, {config.maxBatchSize, config.numKVHeads, config.maxSequenceLength, config.headDim},
+            DeviceType::kGPU, mConfig.kvCacheTypeTRT);
+    return {std::move(kCache), std::move(vCache)};
 }
 
 rt::Tensor LinearKVCache::getKVCacheBuffer()

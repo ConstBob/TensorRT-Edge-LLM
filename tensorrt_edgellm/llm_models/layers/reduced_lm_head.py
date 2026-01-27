@@ -49,9 +49,11 @@ def reduce_lm_head(lm_head: nn.Linear, reduced_vocab_size: int,
         >>> reduced_lm_head = reduce_lm_head(lm_head, 5, vocab_map)
         >>> reduced_lm_head.out_features  # 5
     """
-    if vocab_map.shape[0] != reduced_vocab_size:
-        raise ValueError(f"vocab_map size {vocab_map.shape[0]} does not match "
-                         f"reduced_vocab_size {reduced_vocab_size}")
+
+    print(f"Reducing vocabulary size from {lm_head.out_features} "
+          f"to {reduced_vocab_size}")
+    assert vocab_map.shape[
+        0] == reduced_vocab_size, f"vocab_map size {vocab_map.shape[0]} does not match reduced_vocab_size {reduced_vocab_size}"
 
     # Ensure vocab_map is on the same device as lm_head
     device = lm_head.weight.device

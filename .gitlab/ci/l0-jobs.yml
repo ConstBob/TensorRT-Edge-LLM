@@ -238,6 +238,7 @@ l0_cross_build_d6l:
 # Cleanup job - Triggered when MR environment is stopped (merged/closed)
 cleanup_l0_mr_cache:
   stage: .post
+  dependencies: []
   variables:
     GIT_STRATEGY: none
   tags:

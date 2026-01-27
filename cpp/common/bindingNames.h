@@ -113,6 +113,38 @@ inline constexpr char const* kPastKeyValuesTemplate = "past_key_values";
  */
 inline constexpr char const* kPresentKeyValuesTemplate = "present_key_values";
 
+/*!
+ * @brief K cache tensor template for TensorRT native KVCacehUpdate operations - use with layer index formatting
+ *
+ * Template: "k_cache_{layer_idx}"
+ * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ */
+inline constexpr char const* kKCacheTemplate = "k_cache";
+
+/*!
+ * @brief V cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
+ *
+ * Template: "v_cache_{layer_idx}"
+ * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ */
+inline constexpr char const* kVCacheTemplate = "v_cache";
+
+/*!
+ * @brief Present K cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
+ *
+ * Template: "present_k_cache_{layer_idx}"
+ * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ */
+inline constexpr char const* kPresentKCacheTemplate = "present_k_cache";
+
+/*!
+ * @brief Present V cache tensor template for TensorRT native KVCacheUpdate operations - use with layer index formatting
+ *
+ * Template: "present_v_cache_{layer_idx}"
+ * Shape: [batch_size, num_kv_heads, seq_len, head_dim] (FLOAT16)
+ */
+inline constexpr char const* kPresentVCacheTemplate = "present_v_cache";
+
 /*! @} */
 
 /*! @name Eagle Speculative Decoding Bindings
@@ -293,6 +325,30 @@ inline std::string formatKVCacheName(int32_t layerIdx, bool isPast = true)
 }
 
 /*!
+ * @brief Format K cache binding name for a specific layer (TensorRT native operations)
+ *
+ * @param layerIdx The decoder layer index
+ * @param isPast Whether this is past (true) or present (false) K cache
+ * @return Formatted binding name like "k_cache_0" or "present_k_cache_0"
+ */
+inline std::string formatKCacheName(int32_t layerIdx, bool isPast = true)
+{
+    return std::string(isPast ? kKCacheTemplate : kPresentKCacheTemplate) + "_" + std::to_string(layerIdx);
+}
+
+/*!
+ * @brief Format V cache binding name for a specific layer (TensorRT native operations)
+ *
+ * @param layerIdx The decoder layer index
+ * @param isPast Whether this is past (true) or present (false) V cache
+ * @return Formatted binding name like "v_cache_0" or "present_v_cache_0"
+ */
+inline std::string formatVCacheName(int32_t layerIdx, bool isPast = true)
+{
+    return std::string(isPast ? kVCacheTemplate : kPresentVCacheTemplate) + "_" + std::to_string(layerIdx);
+}
+
+/*!
  * @brief Check if a binding name is a LoRA weight tensor
  *
  * @param bindingName The tensor binding name to check
@@ -312,7 +368,11 @@ inline bool isLoraBinding(std::string const& bindingName)
 inline bool isKVCacheBinding(std::string const& bindingName)
 {
     return bindingName.find(kPastKeyValuesTemplate) != std::string::npos
-        || bindingName.find(kPresentKeyValuesTemplate) != std::string::npos;
+        || bindingName.find(kPresentKeyValuesTemplate) != std::string::npos
+        || bindingName.find(kKCacheTemplate) != std::string::npos
+        || bindingName.find(kVCacheTemplate) != std::string::npos
+        || bindingName.find(kPresentKCacheTemplate) != std::string::npos
+        || bindingName.find(kPresentVCacheTemplate) != std::string::npos;
 }
 
 /*!
