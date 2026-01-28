@@ -35,6 +35,7 @@ using XQADataType = xqa::kernels::Data_type;
 namespace
 {
 
+//! @throws std::runtime_error if datatype is unsupported
 XQADataType trtToXqaDataType(nvinfer1::DataType type)
 {
     XQADataType xqaType{XQADataType::DATA_TYPE_FP16};
@@ -55,7 +56,7 @@ struct XQAKernelLoadHashKey
     int32_t sm;
     bool specDecode;
 
-    bool operator==(XQAKernelLoadHashKey const& other) const
+    bool operator==(XQAKernelLoadHashKey const& other) const noexcept
     {
         return data_type == other.data_type && kv_data_type == other.kv_data_type && sm == other.sm
             && specDecode == other.specDecode;
@@ -64,7 +65,7 @@ struct XQAKernelLoadHashKey
 
 struct XQAKernelLoadHasher
 {
-    size_t operator()(XQAKernelLoadHashKey const& s) const
+    size_t operator()(XQAKernelLoadHashKey const& s) const noexcept
     {
         size_t key = s.data_type;
         key <<= 16;
@@ -85,14 +86,14 @@ struct XQAKernelRuntimeHashKey
     int32_t num_q_heads_per_kv;
     int32_t beam_size;
 
-    bool operator==(XQAKernelRuntimeHashKey const& other) const
+    bool operator==(XQAKernelRuntimeHashKey const& other) const noexcept
     {
         return q_data_type == other.q_data_type && kv_data_type == other.kv_data_type && head_size == other.head_size
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size;
     }
 };
 
-XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQALaunchParams const& xqaParams)
+XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQALaunchParams const& xqaParams) noexcept
 {
     constexpr int32_t kBEAM_SIZE{1};
     int32_t numQHeadPerKV = xqaParams.numQheads / xqaParams.numKVheads;
@@ -100,7 +101,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQALaunchParams const& xq
         numQHeadPerKV, kBEAM_SIZE};
 }
 
-XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams const& xqaParams)
+XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams const& xqaParams) noexcept
 {
     constexpr int32_t kBEAM_SIZE{1};
     constexpr int32_t kQHEAD_PER_KV = 0; // Tree attention kernel supports any ratio of Q/KV heads.
@@ -110,7 +111,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams
 
 struct XQAKernelRuntimeHasher
 {
-    size_t operator()(XQAKernelRuntimeHashKey const& s) const
+    size_t operator()(XQAKernelRuntimeHashKey const& s) const noexcept
     {
         size_t key = s.q_data_type;
         key <<= 16;
@@ -137,7 +138,7 @@ class XQAKernelList
     using TKernelMetaInfo = xqa::kernels::XQAKernelMetaInfo;
 
 public:
-    XQAKernelList(XQADataType dataType, XQADataType kvDataType, uint32_t sm, bool specDecode)
+    XQAKernelList(XQADataType dataType, XQADataType kvDataType, uint32_t sm, bool specDecode) noexcept
         : mKernelMeta(nullptr)
         , mKernelMetaCount(0)
         , mSMVersion(sm)
@@ -149,6 +150,8 @@ public:
         mKernelMetaCount = sizeof(xqa::kernels::sXqaKernelMetaInfo) / sizeof(xqa::kernels::sXqaKernelMetaInfo[0]);
     }
 
+    //! @throws std::runtime_error if a CUDA driver error occurs
+    //! @throws std::bad_alloc if memory allocation fails
     void loadXQAKernels()
     {
         if (!mFunctions.empty())
@@ -239,6 +242,8 @@ class XQAKernelLoader
 {
 
 public:
+    //! @throws std::runtime_error if a CUDA driver error occurs
+    //! @throws std::bad_alloc if memory allocation fails
     XQAKernelList* getXQAKernelList(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
     {
         static std::mutex s_mutex;
@@ -275,6 +280,8 @@ private:
     std::unordered_map<XQAKernelLoadHashKey, std::unique_ptr<XQAKernelList> const, XQAKernelLoadHasher> mKernels;
 };
 
+//! @throws std::runtime_error if a CUDA driver error occurs
+//! @throws std::bad_alloc if memory allocation fails
 inline XQAKernelList* getXQAKernels(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
 {
     return XQAKernelLoader::Get().getXQAKernelList(dataType, kvDataType, sm, specDecode);
@@ -283,7 +290,7 @@ inline XQAKernelList* getXQAKernels(XQADataType dataType, XQADataType kvDataType
 } // namespace
 
 DecoderXQARunner::DecoderXQARunner(nvinfer1::DataType const dataType, nvinfer1::DataType const kvDataType,
-    int32_t batchSize, int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion)
+    int32_t batchSize, int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion) noexcept
     : mDataType(dataType)
     , mKVDataType(kvDataType)
     , mBatchSize(batchSize)
@@ -294,7 +301,7 @@ DecoderXQARunner::DecoderXQARunner(nvinfer1::DataType const dataType, nvinfer1::
 {
 }
 
-XQALaunchParams DecoderXQARunner::initXQAParams()
+XQALaunchParams DecoderXQARunner::initXQAParams() noexcept
 {
     XQALaunchParams params{};
     params.numQheads = mNumHeads;
@@ -309,7 +316,7 @@ XQALaunchParams DecoderXQARunner::initXQAParams()
 }
 
 bool DecoderXQARunner::canImplement(
-    int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, DataType dataType, DataType kvDataType)
+    int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, DataType dataType, DataType kvDataType) noexcept
 {
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;

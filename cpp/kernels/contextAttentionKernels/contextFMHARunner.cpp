@@ -46,6 +46,7 @@ union __float_uint32_t_union
     uint32_t u32;
 };
 
+//! @throws std::runtime_error if alpha value has an unsupported type
 static inline void set_alpha(uint32_t& alpha, float norm, FMHADataType dtype)
 {
     if (dtype == FMHADataType::DATA_TYPE_FP16)
@@ -78,6 +79,7 @@ static inline void set_alpha(uint32_t& alpha, float norm, FMHADataType dtype)
     }
 }
 
+//! @throws std::runtime_error if FMHA datatype is unsupported
 FMHADataType trtToFMHADataType(nvinfer1::DataType type)
 {
     FMHADataType fmhaType{FMHADataType::DATA_TYPE_FP16};
@@ -92,7 +94,7 @@ FMHADataType trtToFMHADataType(nvinfer1::DataType type)
     return fmhaType;
 }
 
-int32_t attentionMaskTypeToInt(ContextAttentionMaskType type)
+int32_t attentionMaskTypeToInt(ContextAttentionMaskType type) noexcept
 {
     int32_t result{};
     switch (type)
@@ -105,7 +107,7 @@ int32_t attentionMaskTypeToInt(ContextAttentionMaskType type)
     return result;
 }
 
-int32_t attentionInputLayoutToInt(AttentionInputLayout layout)
+int32_t attentionInputLayoutToInt(AttentionInputLayout layout) noexcept
 {
     int32_t result{};
     switch (layout)
@@ -123,7 +125,7 @@ struct FMHAKernelLoadHashKey
     FMHADataType data_type;
     int32_t sm;
 
-    bool operator==(FMHAKernelLoadHashKey const& other) const
+    bool operator==(FMHAKernelLoadHashKey const& other) const noexcept
     {
         return data_type == other.data_type && sm == other.sm;
     }
@@ -131,7 +133,7 @@ struct FMHAKernelLoadHashKey
 
 struct FMHAKernelLoadHasher
 {
-    size_t operator()(FMHAKernelLoadHashKey const& s) const
+    size_t operator()(FMHAKernelLoadHashKey const& s) const noexcept
     {
         size_t key = s.data_type;
         key <<= 16;
@@ -152,7 +154,7 @@ struct FMHAKernelHashKey
     bool tiled;
     int32_t attention_input_layout;
 
-    bool operator==(FMHAKernelHashKey const& other) const
+    bool operator==(FMHAKernelHashKey const& other) const noexcept
     {
         // Flash attention kernel supports any sequence length. So for this set of kernel, we will match any sequence
         // length.
@@ -165,7 +167,7 @@ struct FMHAKernelHashKey
 
 struct FMHAKernelHasher
 {
-    size_t operator()(FMHAKernelHashKey const& hashKey) const
+    size_t operator()(FMHAKernelHashKey const& hashKey) const noexcept
     {
         // flash attention support unlimited-sequence length
         int32_t s = hashKey.flash_attention ? 0 : hashKey.sequenceLen;
@@ -190,7 +192,7 @@ class FMHAKernelList
     using TKernelMetaInfo = fmha_v2::FusedMultiHeadAttentionKernelMetaInfoV2;
 
 public:
-    FMHAKernelList(FMHADataType type, int32_t sm)
+    FMHAKernelList(FMHADataType type, int32_t sm) noexcept
         : mDataType(type)
         , mSMVersion(sm)
     {
@@ -198,6 +200,8 @@ public:
         mKernelMetaCount = sizeof(fmha_v2::sMhaKernelMetaInfosV2) / sizeof(fmha_v2::sMhaKernelMetaInfosV2[0]);
     }
 
+    //! @throws std::runtime_error if a CUDA driver error occurs
+    //! @throws std::bad_alloc if a memory allocation error occurs
     void loadFMHAKernels()
     {
         if (!mFunctions.empty())
@@ -246,7 +250,7 @@ public:
         }
     }
 
-    FMHAKernelFuncInfo findKernelFunction(FMHAKernelHashKey const& key) const
+    FMHAKernelFuncInfo findKernelFunction(FMHAKernelHashKey const& key) const noexcept
     {
         auto const findIter = mFunctions.find(key);
         if (findIter == mFunctions.end())
@@ -272,6 +276,8 @@ class FMHAKernelLoader
 {
 
 public:
+    //! @throws std::runtime_error if a CUDA driver error occurs
+    //! @throws std::bad_alloc if a memory allocation error occurs
     FMHAKernelList* getFMHAKernelList(FMHADataType type, int32_t sm)
     {
         static std::mutex s_mutex;
@@ -307,6 +313,8 @@ private:
     std::unordered_map<FMHAKernelLoadHashKey, std::unique_ptr<FMHAKernelList> const, FMHAKernelLoadHasher> mKernels;
 };
 
+//! @throws std::runtime_error if a CUDA driver error occurs
+//! @throws std::bad_alloc if a memory allocation error occurs
 inline FMHAKernelList* getFMHAKernels(FMHADataType type, int32_t sm)
 {
     return FMHAKernelLoader::Get().getFMHAKernelList(type, sm);
@@ -408,7 +416,8 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
     }
 }
 
-bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType)
+bool ContextFMHARunner::canImplement(
+    int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType) noexcept
 {
     bool const checkType = dataType == DataType::kHALF;
     bool const checkHeadSize = headSize == 128 || headSize == 64;

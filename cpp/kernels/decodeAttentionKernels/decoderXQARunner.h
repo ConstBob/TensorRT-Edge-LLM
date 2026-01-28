@@ -78,20 +78,24 @@ public:
     //! \param[in] headSize Head dimension size
     //! \param[in] smVersion CUDA SM version
     DecoderXQARunner(nvinfer1::DataType const dataType, nvinfer1::DataType const kvDataType, int32_t batchSize,
-        int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion);
+        int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion) noexcept;
 
-    DecoderXQARunner() = default;
+    DecoderXQARunner() noexcept = default;
 
-    ~DecoderXQARunner() = default;
+    ~DecoderXQARunner() noexcept = default;
 
     //! \brief Dispatch XQA kernel and compute the attention result
     //! \param[in,out] params Launch parameters for XQA kernel
     //! \param[in] stream CUDA stream for kernel execution
+    //! \throws std::runtime_error if device pointers are invalid or no available kernel available
+    //! \throws std::runtime_error if a CUDA driver error occurs
     void dispatchXQAKernel(XQALaunchParams& params, cudaStream_t const& stream);
 
     //! \brief Dispatch spec-decode XQA kernel for tree attention
     //! \param[in,out] params Launch parameters for XQA kernel
     //! \param[in] stream CUDA stream for kernel execution
+    //! \throws std::runtime_error if device pointers are invalid or no available kernel available
+    //! \throws std::runtime_error if a CUDA driver error occurs
     void dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cudaStream_t const& stream);
 
     //! \brief Initialize XQA parameters with MHA and hardware configuration
@@ -100,7 +104,7 @@ public:
     //! Device pointer shall be setup by caller to dispatch XQA kernel.
     //!
     //! \return Initialized XQA launch parameters
-    XQALaunchParams initXQAParams();
+    XQALaunchParams initXQAParams() noexcept;
 
     //! \brief Check if XQA kernel can be implemented with given configuration
     //! \param[in] numQHeads Number of query heads
@@ -110,7 +114,7 @@ public:
     //! \param[in] kvDataType KV cache data type
     //! \return True if implementation is supported, false otherwise
     static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, nvinfer1::DataType dataType,
-        nvinfer1::DataType kvDataType);
+        nvinfer1::DataType kvDataType) noexcept;
 
     //! \brief Load decoder XQA kernels for given configuration
     //! \param[in] smVersion CUDA SM version
@@ -118,6 +122,8 @@ public:
     //! \param[in] kvDataType KV cache data type
     //! \param[in] useSpecDecodeKernels Whether to load spec-decode kernels
     //! \return True if kernels loaded successfully, false otherwise
+    //! \throws std::runtime_error if a CUDA driver error occurs
+    //! \throws std::bad_alloc if memory allocation fails
     static bool loadDecodeXQAKernels(
         int32_t smVersion, nvinfer1::DataType dataType, nvinfer1::DataType kvDataType, bool useSpecDecodeKernels);
 
