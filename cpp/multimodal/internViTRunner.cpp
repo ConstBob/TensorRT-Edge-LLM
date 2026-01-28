@@ -331,7 +331,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) noexcept
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
@@ -350,7 +350,7 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     return true;
 }
 
-bool InternViTRunner::infer(cudaStream_t stream)
+bool InternViTRunner::infer(cudaStream_t stream) noexcept
 {
     // Skip VIT inference if there are no images to process
     // Check if the first dimension (sequence length) is 0, indicating no images

@@ -439,7 +439,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream)
+    rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream) noexcept
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
