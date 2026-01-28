@@ -12,7 +12,7 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 
 ## Getting Started
 
-For the supported platforms, models and precisions, see the [**Overview**](docs/source/developer_guide/01.1_Overview.md). Get started with TensorRT Edge-LLM in <15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](docs/source/developer_guide/01.2_Quick_Start_Guide.md).
+For the supported platforms, models and precisions, see the [**Overview**](docs/source/developer_guide/getting-started/overview.md). Get started with TensorRT Edge-LLM in <15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](docs/source/developer_guide/getting-started/quick-start-guide.md).
 
 ---
 
@@ -22,19 +22,19 @@ For the supported platforms, models and precisions, see the [**Overview**](docs/
 
 Complete documentation for installation, usage, and deployment:
 
-- **[Overview](docs/source/developer_guide/01.1_Overview.md)** - What is TensorRT Edge-LLM and key features
-- **[Quick Start Guide](docs/source/developer_guide/01.2_Quick_Start_Guide.md)** - Get started in ~15 minutes
-- **[Installation](docs/source/developer_guide/01.3_Installation.md)** - Detailed installation instructions
-- **[Supported Models](docs/source/developer_guide/02_Supported_Models.md)** - Complete model compatibility matrix
-- **[Python Export Pipeline](docs/source/developer_guide/03.1_Python_Export_Pipeline.md)** - Model export and quantization
-- **[Engine Builder](docs/source/developer_guide/03.2_Engine_Builder.md)** - Building TensorRT engines
-- **[C++ Runtime Overview](docs/source/developer_guide/04.1_C++_Runtime_Overview.md)** - Runtime system architecture
-  - [LLM Inference Runtime](docs/source/developer_guide/04.2_LLM_Inference_Runtime.md)
-  - [LLM SpecDecode Runtime](docs/source/developer_guide/04.3_LLM_Inference_SpecDecode_Runtime.md)
-  - [Advanced Runtime Features](docs/source/developer_guide/04.4_Advanced_Runtime_Features.md)
-- **[Examples](docs/source/developer_guide/05_Examples.md)** - Working code examples
-- **[Chat Template Format](docs/source/developer_guide/06_Chat_Template_Format.md)** - Chat template configuration
-- **[TensorRT Plugins](docs/source/developer_guide/07_TensorRT_Plugins.md)** - Introduction for TensorRT plugins.
+- **[Overview](docs/source/developer_guide/getting-started/overview.md)** - What is TensorRT Edge-LLM and key features
+- **[Quick Start Guide](docs/source/developer_guide/getting-started/quick-start-guide.md)** - Get started in ~15 minutes
+- **[Installation](docs/source/developer_guide/getting-started/installation.md)** - Detailed installation instructions
+- **[Supported Models](docs/source/developer_guide/getting-started/supported-models.md)** - Complete model compatibility matrix
+- **[Python Export Pipeline](docs/source/developer_guide/software-design/python-export-pipeline.md)** - Model export and quantization
+- **[Engine Builder](docs/source/developer_guide/software-design/engine-builder.md)** - Building TensorRT engines
+- **[C++ Runtime Overview](docs/source/developer_guide/software-design/cpp-runtime-overview.md)** - Runtime system architecture
+  - [LLM Inference Runtime](docs/source/developer_guide/software-design/llm-inference-runtime.md)
+  - [LLM SpecDecode Runtime](docs/source/developer_guide/software-design/llm-inference-specdecode-runtime.md)
+  - [Advanced Runtime Features](docs/source/developer_guide/features/advanced-runtime-features.md)
+- **[Examples](docs/source/developer_guide/getting-started/examples.md)** - Working code examples
+- **[Chat Template Format](docs/source/developer_guide/getting-started/chat-template-format.md)** - Chat template configuration
+- **[TensorRT Plugins](docs/source/developer_guide/customization/tensorrt-plugins.md)** - Introduction for TensorRT plugins.
 
 
 ### Additional Resources
@@ -90,7 +90,7 @@ Follow our [GitHub repository](https://github.com/NVIDIA/TensorRT-Edge-LLM) for 
 
 ## Support
 
-- **Documentation**: [Developer Guide](docs/source/developer_guide/01.1_Overview.md)
+- **Documentation**: [Developer Guide](docs/source/developer_guide/getting-started/overview.md)
 - **Issues**: [GitHub Issues](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/NVIDIA/TensorRT-Edge-LLM/discussions)
 - **Forums**: [NVIDIA Developer Forums](https://forums.developer.nvidia.com/)
