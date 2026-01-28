@@ -30,8 +30,8 @@ inline constexpr char const* kRUNTIME_VERSION = "0.5.0";
 //! Check if model version matches runtime version
 //! @param modelVersion Version string from model's config.json
 //! @return True if versions match, false otherwise
-//! Logs warning if versions don't match or have invalid format
-bool checkVersion(std::string const& modelVersion);
+//! @note Logs warning if versions don't match or have invalid format
+bool checkVersion(std::string const& modelVersion) noexcept;
 
 } // namespace version
 } // namespace trt_edgellm

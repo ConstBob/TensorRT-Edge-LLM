@@ -35,7 +35,7 @@ namespace check
  *
  * @param condition Condition to check
  * @param errorMsg Error message to include in exception
- * @throw std::runtime_error if condition is false
+ * @throws std::runtime_error If condition is false
  */
 inline void check(bool condition, std::string errorMsg)
 {
@@ -52,7 +52,7 @@ inline void check(bool condition, std::string errorMsg)
  * @param func Function name string
  * @param file Source file name
  * @param line Source line number
- * @throw std::runtime_error if CUDA error occurred
+ * @throws std::runtime_error If CUDA error occurred
  */
 inline void _checkCuda(cudaError_t result, char const* const func, [[maybe_unused]] char const* const file,
     [[maybe_unused]] int const line)
@@ -70,7 +70,7 @@ inline void _checkCuda(cudaError_t result, char const* const func, [[maybe_unuse
  * @param func Function name string
  * @param file Source file name
  * @param line Source line number
- * @throw std::runtime_error if CUDA driver error occurred
+ * @throws std::runtime_error If CUDA driver error occurred
  */
 inline void _checkCudaDriver(
     CUresult result, char const* const func, [[maybe_unused]] char const* const file, [[maybe_unused]] int const line)

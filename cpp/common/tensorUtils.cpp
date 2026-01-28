@@ -70,9 +70,14 @@ constexpr char const* getDeviceTypeString(DeviceType deviceType)
     return "UNKNOWN";
 }
 
-// Helper function to acquire the string representation of a numeric value.
-// With Float type, we always upcast the value to float32 for printing and emit
-// the float value with 4 decimal places.
+/*!
+ * Helper function to acquire the string representation of a numeric value.
+ * With Float type, we always upcast the value to float32 for printing and emit
+ * the float value with 4 decimal places.
+ *
+ * @throws std::runtime_error if data type is unsupported
+ * @throws std::runtime_error if string formatting fails
+ */
 template <typename T>
 std::string formatElement(T value)
 {
@@ -118,7 +123,14 @@ std::string formatElement(T value)
         }
         ss << std::fixed << std::setprecision(4) << fval;
     }
-    return ss.str();
+    if (ss.good())
+    {
+        return ss.str();
+    }
+    else
+    {
+        throw std::runtime_error("Element formatting failed");
+    }
 }
 
 template <typename T>
@@ -322,17 +334,17 @@ std::string formatString(Tensor const& tensor)
     return ss.str();
 }
 
-double toKB(size_t bytes)
+double toKB(size_t bytes) noexcept
 {
     return static_cast<double>(bytes) / 1024.0;
 }
 
-double toMB(size_t bytes)
+double toMB(size_t bytes) noexcept
 {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
-double toGB(size_t bytes)
+double toGB(size_t bytes) noexcept
 {
     return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
 }

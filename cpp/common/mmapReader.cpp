@@ -34,7 +34,7 @@ namespace trt_edgellm
 namespace file_io
 {
 
-MmapReader::MmapReader()
+MmapReader::MmapReader() noexcept
     : mData(nullptr)
     , mBytes(0)
 {
@@ -50,12 +50,12 @@ MmapReader::MmapReader(std::filesystem::path const& fp)
     }
 }
 
-MmapReader::~MmapReader()
+MmapReader::~MmapReader() noexcept
 {
     release();
 }
 
-void MmapReader::release()
+void MmapReader::release() noexcept
 {
     if (mData != nullptr && mBytes > 0)
     {

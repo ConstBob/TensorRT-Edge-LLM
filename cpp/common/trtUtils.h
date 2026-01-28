@@ -53,7 +53,7 @@ struct DlDeleter
  *
  * @return Unique pointer to library handle, or nullptr on failure
  */
-inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void)
+inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
 {
     char const* pluginPath = std::getenv("EDGELLM_PLUGIN_PATH");
 

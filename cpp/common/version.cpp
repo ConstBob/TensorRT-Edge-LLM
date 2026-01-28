@@ -70,38 +70,52 @@ bool parseVersion(std::string const& version, int& major, int& minor, int& patch
 }
 } // anonymous namespace
 
-bool checkVersion(std::string const& modelVersion)
+bool checkVersion(std::string const& modelVersion) noexcept
 {
-    if (modelVersion.empty())
+    try
     {
-        LOG_WARNING(
-            "Model does not have %s. Current runtime version: %s", binding_names::kEdgellmVersion, kRUNTIME_VERSION);
+        if (modelVersion.empty())
+        {
+            LOG_WARNING("Model does not have %s. Current runtime version: %s", binding_names::kEdgellmVersion,
+                kRUNTIME_VERSION);
+            return false;
+        }
+
+        int major, minor, patch;
+        if (!parseVersion(modelVersion, major, minor, patch))
+        {
+            LOG_ERROR("Invalid model version format: %s. Expected major.minor.patch", modelVersion.c_str());
+            return false;
+        }
+
+        // Reject versions < 0.5.0
+        if (major == 0 && minor <= 4)
+        {
+            LOG_ERROR(
+                "ONNX model version %s is no longer supported. Minimum supported version is 0.5.0 "
+                "Please re-export your model with the latest tensorrt-edgellm.",
+                modelVersion.c_str());
+            return false;
+        }
+
+        if (modelVersion != std::string(kRUNTIME_VERSION))
+        {
+            LOG_WARNING("Model version %s does not match runtime version %s. Consider re-exporting or re-building.",
+                modelVersion.c_str(), kRUNTIME_VERSION);
+            return false;
+        }
+
+        return true;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Exception thrown while checking model version: '%s'", e.what());
         return false;
     }
-
-    int major, minor, patch;
-    if (!parseVersion(modelVersion, major, minor, patch))
+    catch (...)
     {
-        LOG_ERROR("Invalid model version format: %s. Expected major.minor.patch", modelVersion.c_str());
         return false;
     }
-
-    // Reject versions <= 0.4.0
-    if (major == 0 && minor <= 4)
-    {
-        throw std::runtime_error("ONNX model version " + modelVersion
-            + " is no longer supported. Minimum supported version is 0.5.0. "
-              "Please re-export your model with the latest tensorrt-edgellm.");
-    }
-
-    if (modelVersion != std::string(kRUNTIME_VERSION))
-    {
-        LOG_WARNING("Model version %s does not match runtime version %s. Consider re-exporting or re-building.",
-            modelVersion.c_str(), kRUNTIME_VERSION);
-        return false;
-    }
-
-    return true;
 }
 
 } // namespace version

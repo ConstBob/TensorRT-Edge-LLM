@@ -318,6 +318,7 @@ inline constexpr char const* kEdgellmVersion = "edgellm_version";
  * @param layerIdx The decoder layer index
  * @param isPast Whether this is past (true) or present (false) key-values
  * @return Formatted binding name like "past_key_values_0" or "present_key_values_0"
+ * @throws std::bad_alloc If memory allocation fails during string construction
  */
 inline std::string formatKVCacheName(int32_t layerIdx, bool isPast = true)
 {
@@ -330,6 +331,7 @@ inline std::string formatKVCacheName(int32_t layerIdx, bool isPast = true)
  * @param layerIdx The decoder layer index
  * @param isPast Whether this is past (true) or present (false) K cache
  * @return Formatted binding name like "k_cache_0" or "present_k_cache_0"
+ * @throws std::bad_alloc If memory allocation fails during string construction
  */
 inline std::string formatKCacheName(int32_t layerIdx, bool isPast = true)
 {
@@ -342,6 +344,7 @@ inline std::string formatKCacheName(int32_t layerIdx, bool isPast = true)
  * @param layerIdx The decoder layer index
  * @param isPast Whether this is past (true) or present (false) V cache
  * @return Formatted binding name like "v_cache_0" or "present_v_cache_0"
+ * @throws std::bad_alloc If memory allocation fails during string construction
  */
 inline std::string formatVCacheName(int32_t layerIdx, bool isPast = true)
 {
@@ -354,7 +357,7 @@ inline std::string formatVCacheName(int32_t layerIdx, bool isPast = true)
  * @param bindingName The tensor binding name to check
  * @return True if the binding is a LoRA weight tensor
  */
-inline bool isLoraBinding(std::string const& bindingName)
+inline bool isLoraBinding(std::string const& bindingName) noexcept
 {
     return bindingName.find(kLoraAPrefix) != std::string::npos || bindingName.find(kLoraBPrefix) != std::string::npos;
 }
@@ -365,7 +368,7 @@ inline bool isLoraBinding(std::string const& bindingName)
  * @param bindingName The tensor binding name to check
  * @return True if the binding is a KV cache tensor
  */
-inline bool isKVCacheBinding(std::string const& bindingName)
+inline bool isKVCacheBinding(std::string const& bindingName) noexcept
 {
     return bindingName.find(kPastKeyValuesTemplate) != std::string::npos
         || bindingName.find(kPresentKeyValuesTemplate) != std::string::npos
@@ -380,6 +383,7 @@ inline bool isKVCacheBinding(std::string const& bindingName)
  *
  * @param layerIdx The layer index
  * @return Formatted binding name like "deepstack_features_0"
+ * @throws std::bad_alloc If memory allocation fails during string construction
  */
 inline std::string formatDeepstackFeaturesName(int32_t layerIdx)
 {
@@ -391,6 +395,7 @@ inline std::string formatDeepstackFeaturesName(int32_t layerIdx)
  *
  * @param embedIdx The embedding index (0, 1, or 2 for Qwen3VL)
  * @return Formatted binding name like "deepstack_embeds_0"
+ * @throws std::bad_alloc If memory allocation fails during string construction
  */
 inline std::string formatDeepstackEmbedsName(int32_t embedIdx)
 {
