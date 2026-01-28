@@ -87,14 +87,9 @@ class Eagle3DraftModel(nn.Module):
 
         # Fusion layer for combining hidden states
         bias = getattr(config, "bias", False)
-        if hasattr(config, "target_hidden_size"):
-            self.fc = nn.Linear(config.target_hidden_size * 3,
-                                self.hidden_size,
-                                bias=bias)
-        else:
-            self.fc = nn.Linear(config.hidden_size * 3,
-                                self.hidden_size,
-                                bias=bias)
+        self.fc = nn.Linear(self.target_hidden_size * 3,
+                            self.hidden_size,
+                            bias=bias)
 
         self.embed_tokens = nn.Embedding(config.vocab_size,
                                          config.hidden_size,
