@@ -188,7 +188,7 @@ std::string normalizeRegex(std::string const& expr)
     return normalizedExpr;
 }
 
-bool validateFileSize(std::filesystem::path const& filePath, size_t maxSizeBytes)
+bool validateFileSize(std::filesystem::path const& filePath, size_t maxSizeBytes) noexcept
 {
     std::error_code ec;
     auto fileSize = std::filesystem::file_size(filePath, ec);

@@ -107,7 +107,7 @@ std::vector<std::string> RegexSplit::process(std::string const& text) const
 }
 
 // Sequence implementation
-Sequence::Sequence(std::vector<std::unique_ptr<PreTokenizer>> steps)
+Sequence::Sequence(std::vector<std::unique_ptr<PreTokenizer>> steps) noexcept
     : mSteps(std::move(steps))
 {
     // Empty sequences are allowed - they act as pass-through

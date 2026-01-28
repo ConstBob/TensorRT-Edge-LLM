@@ -53,8 +53,8 @@ public:
      * @brief Constructor for token encoder
      * @param type Encoder algorithm type (default: BPE)
      */
-    TokenEncoder(Type type = BPE);
-    ~TokenEncoder() = default;
+    TokenEncoder(Type type = BPE) noexcept;
+    ~TokenEncoder() noexcept = default;
 
     /**
      * @brief Initialize with vocabulary
@@ -62,6 +62,7 @@ public:
      * @param specialTokens Special tokens mapping
      * @return true if vocab is non-empty and initialization completes;
      *         false if vocab is empty
+     * @throws std::bad_alloc If vector allocation fails
      */
     bool initialize(TokenToRanks const& vocab, TokenToRanks const& specialTokens = {});
 
@@ -72,7 +73,7 @@ public:
      * @return true if piece is within size limits and encoding completes successfully;
      *         false if piece exceeds 1MB limit or encoding algorithm fails
      */
-    bool encode(std::string const& piece, std::vector<Rank>& output) const;
+    bool encode(std::string const& piece, std::vector<Rank>& output) const noexcept;
 
     /**
      * @brief Decode token IDs back to text
@@ -82,7 +83,7 @@ public:
      * @return true if all tokens are found in vocabulary or skipped successfully;
      *         false if unknown tokens are encountered and skipSpecialTokens is false
      */
-    bool decode(std::vector<Rank> const& tokens, std::string& output, bool skipSpecialTokens = false) const;
+    bool decode(std::vector<Rank> const& tokens, std::string& output, bool skipSpecialTokens = false) const noexcept;
 
     /*!
      * @brief Get encoder type
@@ -107,29 +108,32 @@ public:
      * @param token Token string to check
      * @return true if token exists, false otherwise
      */
-    bool hasToken(std::string const& token) const;
+    bool hasToken(std::string const& token) const noexcept;
 
     /*!
      * @brief Get token rank from token string
      * @param token Token string
      * @return Token rank/ID
      */
-    Rank getTokenRank(std::string const& token) const;
+    Rank getTokenRank(std::string const& token) const noexcept;
 
     /*!
      * @brief Get token string from rank
      * @param rank Token rank/ID
      * @return Token string
+     * @throws std::bad_alloc If string allocation fails
      */
     std::string getRankToken(Rank rank) const;
 
 private:
     /**
      * @brief Byte Pair Encoding implementation
+     * @throws std::bad_alloc If string or vector allocation fails
      */
     void bytePairEncode(std::string const& piece, std::vector<Rank>& output) const;
     /**
      * @brief Get string representation of encoder type
+     * @throws std::bad_alloc If string allocation fails
      */
     std::string getTypeString(Type type) const;
 

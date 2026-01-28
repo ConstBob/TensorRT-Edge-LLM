@@ -34,7 +34,7 @@ namespace tokenizer
 // Chat template role names
 constexpr char kRoleSystem[] = "system";
 
-Tokenizer::Tokenizer()
+Tokenizer::Tokenizer() noexcept
     : mNumVocab(0)
     , mBosId(-1)
     , mEosId(-1)
@@ -521,7 +521,8 @@ std::vector<Rank> Tokenizer::encode(std::string const& text, bool addBos, bool a
     return output;
 }
 
-bool Tokenizer::partitionSpecialTokens(std::string const& text, std::forward_list<textPartition>& partitions) const
+bool Tokenizer::partitionSpecialTokens(
+    std::string const& text, std::forward_list<textPartition>& partitions) const noexcept
 {
     try
     {
@@ -623,7 +624,7 @@ bool Tokenizer::isInitialized() const noexcept
     return mInitialized && mPreTokenizer && mTokenEncoder;
 }
 
-void Tokenizer::appendBos(std::vector<Rank>& tokens) const noexcept
+void Tokenizer::appendBos(std::vector<Rank>& tokens) const
 {
     if (mBosId != -1)
     {
@@ -635,7 +636,7 @@ void Tokenizer::appendBos(std::vector<Rank>& tokens) const noexcept
     }
 }
 
-void Tokenizer::appendEos(std::vector<Rank>& tokens) const noexcept
+void Tokenizer::appendEos(std::vector<Rank>& tokens) const
 {
     if (mEosId != -1)
     {
