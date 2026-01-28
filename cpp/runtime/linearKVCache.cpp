@@ -54,7 +54,7 @@ LinearKVCache::LinearKVCache(CacheConfig const& config, cudaStream_t stream)
         cudaMemsetAsync(mDeviceKVCacheLengths.rawPointer(), 0, mDeviceKVCacheLengths.getMemoryCapacity(), stream));
 }
 
-LinearKVCache::~LinearKVCache() {}
+LinearKVCache::~LinearKVCache() noexcept {}
 
 LinearKVCache::LinearKVCache(LinearKVCache&& other) noexcept
 {
@@ -87,7 +87,7 @@ LinearKVCache& LinearKVCache::operator=(LinearKVCache&& other) noexcept
     return *this;
 }
 
-rt::Tensor LinearKVCache::getCombinedKVCacheForDecoderLayer(int32_t decoderLayerIdx)
+rt::Tensor LinearKVCache::getCombinedKVCacheForDecoderLayer(int32_t decoderLayerIdx) noexcept
 {
     int64_t const kvCacheOffset
         = decoderLayerIdx * mConfig.maxBatchSize * 2 * mConfig.numKVHeads * mConfig.maxSequenceLength * mConfig.headDim;
@@ -100,7 +100,7 @@ rt::Tensor LinearKVCache::getCombinedKVCacheForDecoderLayer(int32_t decoderLayer
         mConfig.kvCacheTypeTRT);
 }
 
-std::pair<rt::Tensor, rt::Tensor> LinearKVCache::getSeparateKVCacheForDecoderLayer(int32_t decoderLayerIdx)
+std::pair<rt::Tensor, rt::Tensor> LinearKVCache::getSeparateKVCacheForDecoderLayer(int32_t decoderLayerIdx) noexcept
 {
     // Get the combined KV cache for this layer from base class
     rt::Tensor kvCache = LinearKVCache::getCombinedKVCacheForDecoderLayer(decoderLayerIdx);
@@ -129,7 +129,7 @@ std::pair<rt::Tensor, rt::Tensor> LinearKVCache::getSeparateKVCacheForDecoderLay
     return {std::move(kCache), std::move(vCache)};
 }
 
-rt::Tensor LinearKVCache::getKVCacheBuffer()
+rt::Tensor LinearKVCache::getKVCacheBuffer() noexcept
 {
     return rt::Tensor(mDeviceKVCache.rawPointer(),
         {mConfig.numDecoderLayers, mConfig.maxBatchSize, 2, mConfig.numKVHeads, mConfig.maxSequenceLength,
@@ -189,22 +189,22 @@ void LinearKVCache::commitSequenceLength(int32_t increment, cudaStream_t stream)
     mKVCacheAllEmpty = false;
 }
 
-rt::Tensor& LinearKVCache::getKVCacheLengths()
+rt::Tensor& LinearKVCache::getKVCacheLengths() noexcept
 {
     return mDeviceKVCacheLengths;
 }
 
-LinearKVCache::CacheConfig LinearKVCache::getConfig() const
+LinearKVCache::CacheConfig LinearKVCache::getConfig() const noexcept
 {
     return mConfig;
 }
 
-int32_t LinearKVCache::getActiveBatchSize() const
+int32_t LinearKVCache::getActiveBatchSize() const noexcept
 {
     return mActiveBatchSize;
 }
 
-bool LinearKVCache::getKVCacheAllEmpty() const
+bool LinearKVCache::getKVCacheAllEmpty() const noexcept
 {
     return mKVCacheAllEmpty;
 }

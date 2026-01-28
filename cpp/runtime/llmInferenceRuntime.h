@@ -52,25 +52,31 @@ public:
      *  \param multimodalEngineDir Directory containing the multimodal engine
      *  \param loraWeightsMap Map of LoRA weights names to their paths
      *  \param stream CUDA stream for initialization
+     *  \throws std::runtime_error if loading data from directories fails, or tensor shapes are invalid, or there is an
+     * initialization error
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
     /*! \brief Destructor
      */
-    ~LLMInferenceRuntime() = default;
+    ~LLMInferenceRuntime() noexcept = default;
 
     /*! \brief Handle an LLM generation request
      *  \param request The generation request containing prompt and generation parameters
      *  \param response The generation response to be filled with output
      *  \param stream CUDA stream for execution
      *  \return True if request was handled successfully, false otherwise
+     *  \throws std::bad_alloc if memory allocation fails
+     *  \throws std::runtime_error if a LLM operation or CUDA operation fails
      */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
 
     /*! \brief Capture CUDA graph for the decoding step to optimize performance
      *  \param stream CUDA stream for graph capture
      *  \return True if graph was captured successfully, false otherwise
+     *  \throws std::bad_alloc if memory allocation fails
+     *  \throws std::runtime_error if a CUDA operation fails
      */
     bool captureDecodingCUDAGraph(cudaStream_t stream);
 
@@ -80,6 +86,8 @@ public:
      *  \param loraWeightsName The name of the LoRA weights
      *  \param stream The CUDA stream used for the generation
      *  \return True if the KVCache is generated and saved successfully, false otherwise
+     *  \throws std::bad_alloc if memory allocation fails
+     *  \throws std::runtime_error if a CUDA operation fails
      */
     bool genAndSaveSystemPromptKVCache(
         std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream);
@@ -87,7 +95,7 @@ public:
     /*! \brief Get LLM prefill stage metrics
      *  \return Reference to prefill metrics
      */
-    metrics::LLMPrefillMetrics const& getPrefillMetrics() const
+    metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
     {
         return mPrefillMetrics;
     }
@@ -95,7 +103,7 @@ public:
     /*! \brief Get LLM generation stage metrics
      *  \return Reference to generation metrics
      */
-    metrics::LLMGenerationMetrics const& getGenerationMetrics() const
+    metrics::LLMGenerationMetrics const& getGenerationMetrics() const noexcept
     {
         return mGenerationMetrics;
     }
@@ -103,7 +111,7 @@ public:
     /*! \brief Get multimodal metrics (returns empty metrics if no multimodal runner)
      *  \return Multimodal metrics, or empty metrics if no multimodal runner is available
      */
-    metrics::MultimodalMetrics getMultimodalMetrics() const
+    metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
     {
         return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
     }
@@ -123,7 +131,7 @@ private:
     //! \param loraWeightsName Name of the LoRA weights being used
     //! \return TokenCountInfo structure containing reused and computed token counts
     TokenCountInfo calculateTokenCounts(std::vector<std::vector<int32_t>> const& batchedInputIds,
-        std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName) const;
+        std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName) const noexcept;
 
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr};   //!< LLM engine runner instance
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner instance (optional)
@@ -154,7 +162,7 @@ private:
     //! Examine and validate the generation request.
     //! \param request The generation request to examine
     //! \return True if request is valid, false otherwise
-    bool examineRequest(LLMGenerationRequest const& request);
+    bool examineRequest(LLMGenerationRequest const& request) noexcept;
 
     //! Set up tensors and state for prefill execution.
     //! \param batchedInputIds Batched input token IDs
@@ -162,6 +170,7 @@ private:
     //! \param loraWeightsName Name of the LoRA weights being used
     //! \param stream CUDA stream for execution
     //! \return True if setup was successful, false otherwise
+    //! \throws std::runtime_error if system prompt is malformed, or a CUDA operation fails
     bool setUpForPrefillExecution(std::vector<std::vector<int32_t>> const& batchedInputIds,
         std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName, cudaStream_t stream);
 };

@@ -81,25 +81,28 @@ public:
      * @param configPath Path to model configuration file
      * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param stream CUDA stream for operations
+     * @throws std::runtime_error If engine loading, configuration parsing, or initialization fails, or a CUDA operation
+     * fails
+     * @throws std::bad_alloc If memory allocation fails
      */
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
     //! @brief Destructor
-    ~LLMEngineRunner();
+    ~LLMEngineRunner() noexcept;
 
     //! API entry to get the Rope CosSinCache tensor.
     //! The API is useful when the rope cos/sin cache depends on the context which cannot be initialized
     //! in advance when creating the LLMEngineRunner instance.
-    rt::Tensor& getRopeCosSinCacheTensor();
+    rt::Tensor& getRopeCosSinCacheTensor() noexcept;
 
     //! @brief Get reference to the linear KV cache
     //! @return Reference to LinearKVCache
-    rt::LinearKVCache& getLinearKVCache();
+    rt::LinearKVCache& getLinearKVCache() noexcept;
 
     //! @brief Get engine configuration
     //! @return Engine configuration structure
-    LLMEngineRunnerConfig getEngineConfig() const;
+    LLMEngineRunnerConfig getEngineConfig() const noexcept;
 
     //! API entry to execute one prefill engine action for a batched request. The API will clear existing KVCache for
     //! last
@@ -113,6 +116,7 @@ public:
     //!     stream: The CUDA stream to execute the prefill step.
     //! Returns:
     //!     True if the prefill step is successful, false otherwise.
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
         rt::OptionalInputTensors deepstackEmbeds, rt::Tensor& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
         cudaStream_t stream);
@@ -127,6 +131,7 @@ public:
     //!     outputLogits [GPU]: The output logits for the batch of requests.
     //! Returns:
     //!     True if the decoding step is successful, false otherwise.
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream);
 
     //! API entry to execute eagle base tree decoding step. The API will takes a draft tree of input embeddings.
@@ -140,6 +145,7 @@ public:
     //! Outputs:
     //!     outputLogits [GPU, Float16]: The output logits with shape [batchSize*Tree-Size, base-Vocab-Size].
     //!     outputHiddenStates [GPU]: The output hidden states with shape [batchSize*Tree-Size, base-hidden-dim].
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
         cudaStream_t stream);
@@ -153,6 +159,7 @@ public:
     //!     stream: The CUDA stream to execute the decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool captureVanillaDecodingCudaGraph(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
         std::string const& loraWeightsName, cudaStream_t stream);
 
@@ -161,16 +168,19 @@ public:
     //!     loraWeightsName: The name of the LoRA weights.
     //! Returns:
     //!     True if the LoRA weights switch is successful, false otherwise.
+    //! @throws std::bad_alloc if memory allocation fails
     bool switchLoraWeights(std::string const& loraWeightsName);
 
     //! API entry to get the active LoRA weights name.
     //! Returns:
     //!     The active LoRA weights name.
+    //! @throws std::bad_alloc if string allocation fails
     std::string getActiveLoraWeightsName() const;
 
     //! API entry to get the LoRA weights.
     //! Returns:
     //!     The LoRA weights names.
+    //! @throws std::bad_alloc if memory allocation fails
     std::vector<std::string> getAvailableLoraWeights() const;
 
     //! API entry to capture the CUDA graph for the base model tree decoding step. If CUDA graph capture is successful,
@@ -187,6 +197,7 @@ public:
     //!     decoding step.
     //! Returns:
     //!     True if the CUDA graph capture is successful, false otherwise.
+    //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
         cudaStream_t stream);
@@ -255,11 +266,12 @@ private:
      * @param configJson JSON configuration object
      * @return True on success, false on failure
      */
-    bool initializeConfigFromJson(Json const& configJson);
+    bool initializeConfigFromJson(Json const& configJson) noexcept;
 
     /*!
      * @brief Validate configuration against engine
      * @return True if valid, false otherwise
+     * @throws std::bad_alloc if string allocation fails
      */
     bool validateConfigFromEngine();
 
@@ -267,52 +279,61 @@ private:
      * @brief Bind KV cache to engine for prefill and generation of new requests
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
+     * @throws std::bad_alloc if string allocation fails
      */
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
     //! @brief Validate inputs for prefill step
     bool prefillStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
         rt::Tensor const& outputLogits, rt::OptionalOutputTensor outputHiddenStates,
-        rt::OptionalInputTensors deepstackEmbeds);
+        rt::OptionalInputTensors deepstackEmbeds) noexcept;
 
     //! @brief Validate inputs for vanilla decoding step
-    bool vanillaDecodingStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits);
+    bool vanillaDecodingStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits) noexcept;
 
     //! @brief Validate inputs for Eagle base tree decoding step
     bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputsEmbeds,
-        rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
+        rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits,
+        rt::Tensor const& outputHiddenStates) noexcept;
 
     //! The Function is used to add a LoRA weights to the LLM engine.
+    //! @throws std::bad_alloc if memory allocation fails
     bool addLoraWeights(std::string const& loraWeightsName, std::string const& loraWeightsPath, cudaStream_t stream);
 
     /*!
      * @brief Reset LoRA weights to dummy tensors with rank 0
      * @return True on success, false on failure
+     * @throws std::bad_alloc if memory allocation fails
      */
     bool resetLoraWeights();
 
     /*!
      * @brief Get maximum dimension required for LoRA weights across all LoRA bindings
      * @return Maximum dimension (k for LoRA A, n for LoRA B), or 0 if no LoRA bindings
+     * @throws std::bad_alloc if memory allocation fails
      */
     int32_t getMaxLoraWeightsDimension() const;
 
     /*!
      * @brief Get tensor names of LoRA weights
      * @return Vector of LoRA weight tensor names
+     * @throws std::bad_alloc if memory allocation fails
      */
     std::vector<std::string> getLoraWeightsTensorNames() const;
 
     //! @brief Check if LoRA weights are supported
     //! @return True if supported, false otherwise
-    bool isLoraWeightsSupported() const;
+    bool isLoraWeightsSupported() const noexcept;
 
     //! @brief Get the KV cache type
     //! @return The KV cache type
+    //! @throws std::bad_alloc if string memory allocation fails
     nvinfer1::DataType getKVCacheType() const;
 
     //! @brief Validate the KV cache type consistency
     //! @return True if the KV cache type is consistent, false otherwise
+    //! @throws std::bad_alloc if string memory allocation fails
+    //! @throws std::runtime_error if KV cache has mismatching data type
     bool validateKVCacheType() const;
 
 private:
@@ -320,6 +341,7 @@ private:
      * @brief Bind KV cache to engine for prefill and generation of new requests (plugin path)
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
+     * @throws std::bad_alloc if string memory allocation fails
      */
     bool bindPluginKVCacheToEngine(int32_t activeBatchSize);
 
@@ -327,6 +349,7 @@ private:
      * @brief Bind separate K and V caches to engine for new requests (TRT native path)
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
+     * @throws std::bad_alloc if string memory allocation fails
      */
     bool bindTRTNativeKVCacheToEngine(int32_t activeBatchSize);
 };

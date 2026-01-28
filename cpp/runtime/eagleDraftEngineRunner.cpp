@@ -273,21 +273,23 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-EagleDraftEngineRunner::~EagleDraftEngineRunner()
+EagleDraftEngineRunner::~EagleDraftEngineRunner() noexcept
 {
     for (auto& [key, graphPair] : mDraftProposalCudaGraphs)
     {
-        CUDA_CHECK(cudaGraphDestroy(graphPair.first));
-        CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
+        // No CUDA_CHECK since destructors should not throw exceptions
+        cudaGraphDestroy(graphPair.first);
+        cudaGraphExecDestroy(graphPair.second);
     }
     for (auto& [key, graphPair] : mAcceptDecodeTokenCudaGraphs)
     {
-        CUDA_CHECK(cudaGraphDestroy(graphPair.first));
-        CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
+        // No CUDA_CHECK since destructors should not throw exceptions
+        cudaGraphDestroy(graphPair.first);
+        cudaGraphExecDestroy(graphPair.second);
     }
 }
 
-bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson)
+bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
 {
     try
     {
@@ -512,24 +514,24 @@ bool EagleDraftEngineRunner::validateConfigFromEngine()
     return true;
 }
 
-rt::EagleDraftEngineRunnerConfig EagleDraftEngineRunner::getDraftEngineConfig() const
+rt::EagleDraftEngineRunnerConfig EagleDraftEngineRunner::getDraftEngineConfig() const noexcept
 {
     return mConfig;
 }
 
-rt::Tensor& EagleDraftEngineRunner::getRopeCosSinCacheTensor()
+rt::Tensor& EagleDraftEngineRunner::getRopeCosSinCacheTensor() noexcept
 {
     return mPosEncCosSinCache;
 }
 
-rt::LinearKVCache& EagleDraftEngineRunner::getLinearKVCache()
+rt::LinearKVCache& EagleDraftEngineRunner::getLinearKVCache() noexcept
 {
     return mLinearKVCache;
 }
 
 bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputsEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths,
-    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates) noexcept
 {
     bool const checkInputsGPUTensor = inputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
         && baseModelHiddenStates.getDeviceType() == rt::DeviceType::kGPU
@@ -755,7 +757,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputsEmb
 bool EagleDraftEngineRunner::draftProposalStepInputValidation(rt::Tensor const& draftTreeInputsEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
     rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor const& outputLogits,
-    rt::Tensor const& outputHiddenStates)
+    rt::Tensor const& outputHiddenStates) noexcept
 {
     // All input tensors shall reside on GPU.
     bool const checkInputsGPUTensor = draftTreeInputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
@@ -1146,7 +1148,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
 
 bool EagleDraftEngineRunner::acceptDecodeTokenStepInputValidation(rt::Tensor const& acceptedTokensEmbeds,
     rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
-    rt::Tensor const& acceptedTokenNums, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+    rt::Tensor const& acceptedTokenNums, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates) noexcept
 {
     // All input tensors shall reside on GPU.
     bool const checkInputsGPUTensor = acceptedTokensEmbeds.getDeviceType() == rt::DeviceType::kGPU

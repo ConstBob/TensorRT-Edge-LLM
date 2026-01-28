@@ -52,7 +52,7 @@ public:
     //! \endcond
 
     //! @brief Default constructor
-    LinearKVCache() = default;
+    LinearKVCache() noexcept = default;
 
     /*!
      * @brief Construct and initialize KV cache
@@ -61,11 +61,12 @@ public:
      *
      * @param config Cache configuration
      * @param stream CUDA stream for allocation
+     * @throws std::runtime_error if CUDA operations fail or data type is unsupported
      */
     LinearKVCache(CacheConfig const& config, cudaStream_t stream);
 
     //! @brief Destructor
-    ~LinearKVCache();
+    ~LinearKVCache() noexcept;
 
     //! @brief Deleted copy constructor to avoid large data copy
     LinearKVCache(LinearKVCache const&) = delete;
@@ -85,51 +86,55 @@ public:
     //! @param decoderLayerIdx The index of the decoder layer.
     //! @return A non-owned tensor object with shape [batch_size, 2, num_kv_heads, max_sequence_length, head_dim] that
     //! points to the combined KVCache memory with shape information.
-    rt::Tensor getCombinedKVCacheForDecoderLayer(int32_t decoderLayerIdx);
+    rt::Tensor getCombinedKVCacheForDecoderLayer(int32_t decoderLayerIdx) noexcept;
 
     //! Get the separate K and V caches for the given decoder layer, for TRT native KVCacheUpdate/Attention operations.
     //! Returns a pair of tensors, the first is the K cache and the second is the V cache.
     //! @param decoderLayerIdx The index of the decoder layer.
     //! @return A pair of tensors, the first is the K cache and the second is the V cache, with shapes [batch_size,
     //! num_kv_heads, max_sequence_length, head_dim].
-    std::pair<rt::Tensor, rt::Tensor> getSeparateKVCacheForDecoderLayer(int32_t decoderLayerIdx);
+    std::pair<rt::Tensor, rt::Tensor> getSeparateKVCacheForDecoderLayer(int32_t decoderLayerIdx) noexcept;
 
     //! Get the full KVCache buffer as a non-owned tensor.
-    rt::Tensor getKVCacheBuffer();
+    rt::Tensor getKVCacheBuffer() noexcept;
 
     //! Asynchronously reset the KVCache buffer state for a new setup of input context.
     //! @param hostReuseKVCacheLengths The lengths of the KVCache to be reused from precomputed KVCache content.
     //! @param stream The stream is used to perform GPU memory operations.
+    //! @throws std::runtime_error if tensor shape, location or data type are invalid, or if a CUDA operation fails
     void resetForNewSequences(rt::Tensor const& hostReuseKVCacheLengths, cudaStream_t stream);
 
     //! Asynchronously commit the KVCache buffer for a prefill request, record stored KVCache lengths.
     //! @param newContextLengths [GPU, Int32]: The context length to commit for the KVCache.
     //! @param stream The stream is used to perform GPU memory operations.
+    //! @throws std::runtime_error if tensor shape, location or data type are invalid
     void commitSequenceLength(rt::Tensor const& newContextLengths, cudaStream_t stream);
 
     //! Commit the KVCache buffer for a decode request, increment the KVCache lengths by 1 for active sequences.
     //! @param increment The amount to increment sequence lengths (typically 1 for decode step)
     //! @param stream The stream is used to perform GPU memory operations.
+    //! @throws std::runtime_error if KV cache lengths tensor has wrong location or data type
     void commitSequenceLength(int32_t increment, cudaStream_t stream);
 
     //! @brief Get KV cache lengths for active sequences
     //! @return Reference to KV cache lengths tensor
-    rt::Tensor& getKVCacheLengths();
+    rt::Tensor& getKVCacheLengths() noexcept;
 
     //! @brief Get KV cache configuration
     //! @return Cache configuration
-    CacheConfig getConfig() const;
+    CacheConfig getConfig() const noexcept;
 
     //! @brief Get active batch size
     //! @return Number of active sequences
-    int32_t getActiveBatchSize() const;
+    int32_t getActiveBatchSize() const noexcept;
 
     //! @brief Get flag to indicate if KVCache for all sequences are empty.
     //! @return Flag to indicate if KVCache for all sequences are empty.
-    bool getKVCacheAllEmpty() const;
+    bool getKVCacheAllEmpty() const noexcept;
 
     //! @brief Set active batch size (for batch eviction)
     //! @param newActiveBatchSize New active batch size after eviction
+    //! @throws std::runtime_error If newActiveBatchSize is out of valid range [0, maxBatchSize]
     void setActiveBatchSize(int32_t newActiveBatchSize);
 
 private:

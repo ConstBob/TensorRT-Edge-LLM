@@ -46,23 +46,25 @@ public:
     /*!
      * @brief Default constructor (creates uninitialized ImageData)
      */
-    ImageData() = default;
+    ImageData() noexcept = default;
 
     /*!
      * @brief Construct image data
      * @param data Image tensor
+     * @throws std::runtime_error if tensor content not UINT8, or tensor shape not 3D, or number of channels not 3
      */
     ImageData(rt::Tensor&& data);
 
     //! @brief Get raw image data pointer
     //! @return Pointer to image data
-    unsigned char* data() const;
+    unsigned char* data() const noexcept;
 };
 
 /*!
  * @brief Load image from file
  * @param path Path to image file
  * @return Loaded image data
+ * @throws std::runtime_error if image cannot be loaded from file, or memory allocation fails
  */
 ImageData loadImageFromFile(std::string const& path);
 
@@ -71,6 +73,7 @@ ImageData loadImageFromFile(std::string const& path);
  * @param data Pointer to image data in memory
  * @param size Size of image data in bytes
  * @return Loaded image data
+ * @throws std::runtime_error if image cannot be loaded from memory, or memory allocation fails
  */
 ImageData loadImageFromMemory(unsigned char const* data, size_t size);
 
@@ -80,6 +83,7 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size);
  * @param resizedImage Output buffer (will be reshaped to target dimensions)
  * @param newWidth Target width
  * @param newHeight Target height
+ * @throws std::runtime_error if image buffer cannot be reshaped
  */
 void resizeImage(ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight);
 

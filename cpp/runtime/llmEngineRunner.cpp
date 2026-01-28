@@ -68,7 +68,7 @@ std::string formatEngineConfig(trt_edgellm::rt::LLMEngineRunnerConfig const& con
 // Compute a unique key value that can distinguish the various decoding steps.
 // Extend this function when we need to capture more information.
 trt_edgellm::rt::LLMEngineRunner::DecodingGraphKey decodingKey(
-    rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits, std::string const& loraWeightsName)
+    rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits, std::string const& loraWeightsName) noexcept
 {
     // For vanilla decoding step, the shape can be distingusihed by active batch size.
     // Also capture the pointer address to ensure we are read/write correct locations.
@@ -79,7 +79,7 @@ trt_edgellm::rt::LLMEngineRunner::DecodingGraphKey decodingKey(
 }
 
 trt_edgellm::rt::LLMEngineRunner::BaseGraphKey baseKey(rt::Tensor const& baseTreeDecodingInputsEmbeds,
-    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates) noexcept
 {
     int64_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
     uintptr_t const inputsEmbedsAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingInputsEmbeds.rawPointer());
@@ -432,7 +432,7 @@ bool LLMEngineRunner::validateKVCacheType() const
     return true;
 }
 
-bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson)
+bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
 {
     try
     {
@@ -780,17 +780,17 @@ bool LLMEngineRunner::validateConfigFromEngine()
     return true;
 }
 
-LLMEngineRunner::~LLMEngineRunner()
+LLMEngineRunner::~LLMEngineRunner() noexcept
 {
     for (auto& [key, graphPair] : mCudaGraphs)
     {
-        CUDA_CHECK(cudaGraphDestroy(graphPair.first));
-        CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
+        cudaGraphDestroy(graphPair.first);
+        cudaGraphExecDestroy(graphPair.second);
     }
     for (auto& [key, graphPair] : mBaseTreeDecodingCudaGraphs)
     {
-        CUDA_CHECK(cudaGraphDestroy(graphPair.first));
-        CUDA_CHECK(cudaGraphExecDestroy(graphPair.second));
+        cudaGraphDestroy(graphPair.first);
+        cudaGraphExecDestroy(graphPair.second);
     }
 }
 
@@ -860,23 +860,24 @@ bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
     }
 }
 
-rt::Tensor& LLMEngineRunner::getRopeCosSinCacheTensor()
+rt::Tensor& LLMEngineRunner::getRopeCosSinCacheTensor() noexcept
 {
     return mPosEncCosSinCache;
 }
 
-LLMEngineRunnerConfig LLMEngineRunner::getEngineConfig() const
+LLMEngineRunnerConfig LLMEngineRunner::getEngineConfig() const noexcept
 {
     return mConfig;
 }
 
-rt::LinearKVCache& LLMEngineRunner::getLinearKVCache()
+rt::LinearKVCache& LLMEngineRunner::getLinearKVCache() noexcept
 {
     return mKVCache;
 }
 
 bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
-    rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates, rt::OptionalInputTensors deepstackEmbeds)
+    rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates,
+    rt::OptionalInputTensors deepstackEmbeds) noexcept
 {
     int32_t activeBatchSize = inputsEmbeds.getShape()[0];
     int32_t prefillSequenceLength = inputsEmbeds.getShape()[1];
@@ -1121,7 +1122,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     return true;
 }
 
-bool LLMEngineRunner::vanillaDecodingStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits)
+bool LLMEngineRunner::vanillaDecodingStepInputValidation(
+    rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits) noexcept
 {
     int32_t activeBatchSize = inputsEmbeds.getShape()[0];
     bool const checkInputsGPUTensor = inputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
@@ -1291,7 +1293,8 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
 }
 
 bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputsEmbeds,
-    rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates)
+    rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits,
+    rt::Tensor const& outputHiddenStates) noexcept
 {
     // All input tensors shall reside on GPU.
     bool const checkInputsGPUTensor = baseTreeDecodingInputsEmbeds.getDeviceType() == rt::DeviceType::kGPU
@@ -2032,7 +2035,7 @@ std::vector<std::string> LLMEngineRunner::getAvailableLoraWeights() const
     return loraWeightsNames;
 }
 
-bool LLMEngineRunner::isLoraWeightsSupported() const
+bool LLMEngineRunner::isLoraWeightsSupported() const noexcept
 {
     return mConfig.maxSupportedLoraRank > 0;
 }

@@ -44,9 +44,9 @@ ImageData::ImageData(rt::Tensor&& data)
     buffer = std::make_shared<rt::Tensor>(std::move(data));
 }
 
-unsigned char* ImageData::data() const
+unsigned char* ImageData::data() const noexcept
 {
-    return buffer->dataPointer<unsigned char>();
+    return buffer ? buffer->dataPointer<unsigned char>() : nullptr;
 }
 
 ImageData loadImageFromFile(std::string const& path)

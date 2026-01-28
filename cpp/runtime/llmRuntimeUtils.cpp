@@ -149,7 +149,7 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
     return ropeConfig;
 }
 
-bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream)
+bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream) noexcept
 {
     if (config.type == RopeType::kMRope)
     {
