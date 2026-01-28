@@ -73,6 +73,7 @@ struct LLMBuilderConfig
     //! Create configuration from JSON format.
     //! @param json JSON object containing configuration parameters
     //! @return LLMBuilderConfig object with parsed parameters
+    //! @throws nlohmann::json::type_error If JSON value types don't match expected types
     static LLMBuilderConfig fromJson(Json const& json)
     {
         LLMBuilderConfig config;
@@ -154,7 +155,7 @@ public:
         std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config);
 
     //! Destructor.
-    ~LLMBuilder() = default;
+    ~LLMBuilder() noexcept = default;
 
     //! Build the TensorRT engine from the ONNX model.
     //! This method performs the complete build process including:
@@ -163,6 +164,7 @@ public:
     //! - Building the TensorRT engine
     //! - Copying necessary files to the engine directory
     //! @return true if build was successful, false otherwise
+    //! @throws std::filesystem::filesystem_error If filesystem operations fail
     bool build();
 
 private:
@@ -173,6 +175,8 @@ private:
     //! Parse the model configuration from config.json.
     //! Extracts model dimensions and parameters needed for optimization profile setup.
     //! @return true if parsing was successful, false otherwise
+    //! @throws json::type_error if JSON value types don't match expected types
+    //! @throws json::parse_error if JSON parsing fails
     bool parseConfig();
 
     //! Set up optimization profiles for LLM models.
@@ -181,6 +185,7 @@ private:
     //! @param config TensorRT builder config object
     //! @param network TensorRT network definition
     //! @return true if setup was successful, false otherwise
+    //! @throws json::type_error if JSON value types don't match expected types
     bool setupLLMOptimizationProfiles(
         nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network);
 
@@ -214,6 +219,7 @@ private:
     //! @param generationProfile Optimization profile for generation processing
     //! @param network TensorRT network definition for input analysis
     //! @return true if setup was successful, false otherwise
+    //! @throws json::type_error if JSON value types don't match expected types
     bool setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextProfile,
         nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
@@ -253,6 +259,7 @@ private:
     //! Copy vocabulary mapping files to the engine directory.
     //! Copies vocab_map.safetensors file if reduced vocabulary is used.
     //! @return true if copying was successful, false otherwise
+    //! @throws nlohmann::json::type_error If JSON value types don't match expected types
     bool copyVocabMappingFiles();
 
     //! Copy embedding table file to the engine directory.
