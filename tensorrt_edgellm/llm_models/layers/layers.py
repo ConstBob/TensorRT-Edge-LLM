@@ -25,6 +25,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
 
 from .attention_plugin import attention_plugin
 from .attention_trt import EdgeLLMAttentionNativeOps
+from .layer_utils import EdgeLLMQKNorm, EdgeLLMQKVProj
 
 # FP8 (E4M3) quantization constants
 # Max finite value representable by NVIDIA FP8 E4M3 format; used to derive per-tensor KV cache scale.
@@ -142,29 +143,10 @@ class EdgeLLMAttention(nn.Module):
         else:
             self.head_dim: int = attention_module.config.hidden_size // self.num_attention_heads
 
-        # Copy projection layers from original attention module
-        # Phi4MM uses a fused qkv_proj; we support both split and fused Q/K/V paths for compatibility.
-        if hasattr(attention_module, 'q_proj'):
-            assert hasattr(attention_module, 'k_proj') and hasattr(attention_module, 'v_proj'), \
-                "q_proj, k_proj, and v_proj must be present"
-            self.fused_qkv_proj = False
-            self.q_proj = attention_module.q_proj
-            self.k_proj = attention_module.k_proj
-            self.v_proj = attention_module.v_proj
-        elif hasattr(attention_module, 'qkv_proj'):
-            self.fused_qkv_proj = True
-            self.q_dim = self.num_attention_heads * self.head_dim
-            self.kv_dim = self.num_key_value_heads * self.head_dim
-            self.qkv_proj = attention_module.qkv_proj
-
+        self.qkv_proj = EdgeLLMQKVProj(attention_module, eagle3_draft)
         self.o_proj = attention_module.o_proj
 
-        # Qwen3 models have QK normalization layers
-        self.q_norm = getattr(attention_module, 'q_norm', None)
-        self.k_norm = getattr(attention_module, 'k_norm', None)
-
-        # Llama4 models have QK normalization layers
-        self.qk_norm = getattr(attention_module, 'qk_norm', None)
+        self.qk_norm = EdgeLLMQKNorm(attention_module)
 
         # Maximum sequence length for positional embeddings
         self.max_position_embeddings: int = attention_module.config.max_position_embeddings
@@ -224,39 +206,11 @@ class EdgeLLMAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        if self.fused_qkv_proj:
-            # Fused qkv_proj path (for Phi4MM)
-            qkv_out = self.qkv_proj(hidden_states)
-            query_states = qkv_out[..., :self.q_dim]
-            key_states = qkv_out[..., self.q_dim:self.q_dim + self.kv_dim]
-            value_states = qkv_out[..., self.q_dim + self.kv_dim:]
-        else:
-            # Separate q/k/v projections path
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
 
-        # Calculate shared shapes for normalization
-        if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.head_dim)
-
-        if self.q_norm is not None:
-            query_states = self.q_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-        if self.k_norm is not None:
-            key_states = self.k_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-
-        if self.qk_norm is not None:
-            query_states = self.qk_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-            key_states = self.qk_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
+        norm_shape = [bsz, q_len, -1, self.head_dim]
+        query_states, key_states = self.qk_norm(query_states, key_states,
+                                                norm_shape)
 
         # Concatenate QKV for the plugin
         qkv = torch.concat([query_states, key_states, value_states], dim=-1)
@@ -319,39 +273,11 @@ class EdgeLLMAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        if self.fused_qkv_proj:
-            # Fused qkv_proj path (for Phi4MM)
-            qkv_out = self.qkv_proj(hidden_states)
-            query_states = qkv_out[..., :self.q_dim]
-            key_states = qkv_out[..., self.q_dim:self.q_dim + self.kv_dim]
-            value_states = qkv_out[..., self.q_dim + self.kv_dim:]
-        else:
-            # Separate q/k/v projections path
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
 
-        # Calculate shared shapes for normalization
-        if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.head_dim)
-
-        if self.q_norm is not None:
-            query_states = self.q_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-        if self.k_norm is not None:
-            key_states = self.k_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-
-        if self.qk_norm is not None:
-            query_states = self.qk_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-            key_states = self.qk_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
+        norm_shape = [bsz, q_len, -1, self.head_dim]
+        query_states, key_states = self.qk_norm(query_states, key_states,
+                                                norm_shape)
 
         query_states = query_states.view(bsz, q_len, self.num_attention_heads,
                                          self.head_dim).transpose(1, 2)
@@ -481,20 +407,6 @@ class EdgeLLMDecoderLayer(nn.Module):
 
             self.self_attn = EdgeLLMAttention(attention_module,
                                               eagle3_draft=eagle3_draft)
-            if eagle3_draft:
-                # Double the input dimension for the attention module
-                self.self_attn.q_proj = nn.Linear(
-                    attention_module.q_proj.in_features * 2,
-                    attention_module.q_proj.out_features,
-                    bias=attention_module.q_proj.bias is not None)
-                self.self_attn.k_proj = nn.Linear(
-                    attention_module.k_proj.in_features * 2,
-                    attention_module.k_proj.out_features,
-                    bias=attention_module.k_proj.bias is not None)
-                self.self_attn.v_proj = nn.Linear(
-                    attention_module.v_proj.in_features * 2,
-                    attention_module.v_proj.out_features,
-                    bias=attention_module.v_proj.bias is not None)
 
     def forward(
         self,
