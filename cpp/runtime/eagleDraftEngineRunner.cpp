@@ -640,8 +640,9 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputsEmb
     int32_t const activeBatchSize = static_cast<int32_t>(inputsEmbeds.getShape()[0]);
     int32_t const inputSequenceLength = static_cast<int32_t>(inputsEmbeds.getShape()[1]);
     constexpr int32_t kCONTEXT_SELECT_TOKEN_LENGTH{1};
-    mSequenceContextLengths.reshape({activeBatchSize});
-    mSelectTokenIndices.reshape({activeBatchSize, kCONTEXT_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, kCONTEXT_SELECT_TOKEN_LENGTH}),
+        "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
 
     // Copy per-batch context lengths.
     CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), contextLengths.rawPointer(),
@@ -697,7 +698,8 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputsEmb
         // Copy MRoPE cosine/sine cache tensor from the base model
         CUDA_CHECK(cudaMemcpyAsync(mPosEncCosSinCache.rawPointer(), baseRopeCosSinCache.rawPointer(),
             baseRopeCosSinCache.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+            "Tensor reshape failed");
     }
 
     setEngineIOStatus
@@ -867,10 +869,12 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({activeBatchSize, selectTokenSize}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({activeBatchSize});
-    mDraftTreePositionIds.reshape({activeBatchSize, paddedDraftTreeSize});
-    mPackedTreeMask.reshape({activeBatchSize, paddedDraftTreeSize, packedTreeMaskLen});
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, selectTokenSize}),
+        "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mDraftTreePositionIds.reshape({activeBatchSize, paddedDraftTreeSize}), "Tensor reshape failed");
+    check::check(
+        mPackedTreeMask.reshape({activeBatchSize, paddedDraftTreeSize, packedTreeMaskLen}), "Tensor reshape failed");
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
@@ -930,7 +934,8 @@ bool EagleDraftEngineRunner::executeEagleDraftProposalStep(rt::Tensor const& dra
         // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+            check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+                "Tensor reshape failed");
         }
 
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1023,10 +1028,12 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({activeBatchSize, selectTokenSize}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({activeBatchSize});
-    mDraftTreePositionIds.reshape({activeBatchSize, paddedDraftTreeSize});
-    mPackedTreeMask.reshape({activeBatchSize, paddedDraftTreeSize, packedTreeMaskLen});
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, selectTokenSize}),
+        "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mDraftTreePositionIds.reshape({activeBatchSize, paddedDraftTreeSize}), "Tensor reshape failed");
+    check::check(
+        mPackedTreeMask.reshape({activeBatchSize, paddedDraftTreeSize, packedTreeMaskLen}), "Tensor reshape failed");
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
@@ -1069,7 +1076,8 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+            "Tensor reshape failed");
     }
 
     setEngineIOStatus
@@ -1257,10 +1265,12 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
 
     // Prepare extra input for engine execution. Assemble packed tree mask, position indices, select token indices,
     // sequence context lengths.
-    mSelectTokenIndices.reshape({activeBatchSize, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({activeBatchSize});
-    mDraftTreePositionIds.reshape({activeBatchSize, acceptedTokenNum});
-    mPackedTreeMask.reshape({activeBatchSize, acceptedTokenNum, packedTreeMaskLen});
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}),
+        "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mDraftTreePositionIds.reshape({activeBatchSize, acceptedTokenNum}), "Tensor reshape failed");
+    check::check(
+        mPackedTreeMask.reshape({activeBatchSize, acceptedTokenNum, packedTreeMaskLen}), "Tensor reshape failed");
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
@@ -1324,7 +1334,8 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
         // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+            check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+                "Tensor reshape failed");
         }
 
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1411,10 +1422,12 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
         reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
     mLinearKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
 
-    mSelectTokenIndices.reshape({activeBatchSize, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({activeBatchSize});
-    mDraftTreePositionIds.reshape({activeBatchSize, acceptedTokenNum});
-    mPackedTreeMask.reshape({activeBatchSize, acceptedTokenNum, packedTreeMaskLen});
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}),
+        "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mDraftTreePositionIds.reshape({activeBatchSize, acceptedTokenNum}), "Tensor reshape failed");
+    check::check(
+        mPackedTreeMask.reshape({activeBatchSize, acceptedTokenNum, packedTreeMaskLen}), "Tensor reshape failed");
 
     rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
 
@@ -1457,7 +1470,8 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     // For non-MRope (Default Rope), keep batch_size=1 (TensorRT broadcasts via independent rope_batch_size axis)
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+            "Tensor reshape failed");
     }
 
     setEngineIOStatus

@@ -235,7 +235,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     rt::Tensor kvCacheBuffer = linearKVCache.getKVCacheBuffer();
 
     // Record the length of the reused KVCache for each sequence using pre-allocated tensor
-    mHostReuseKVCacheLengths.reshape({activeBatchSize});
+    check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* reuseKVCacheLengthsData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
 
     // Search if the system prompt has been cached. If there are cached system prompts, insert
@@ -286,7 +286,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
 
     // Reshape and fill the pre-allocated pinned host tensor with pad tokens
     int32_t const packedInputLength = maxInputLength;
-    mHostPackedInputIds.reshape({activeBatchSize, packedInputLength});
+    check::check(mHostPackedInputIds.reshape({activeBatchSize, packedInputLength}), "Tensor reshape failed");
     int32_t* packedInputIdsData = mHostPackedInputIds.dataPointer<int32_t>();
     std::fill(packedInputIdsData, packedInputIdsData + activeBatchSize * packedInputLength, mTokenizer->getPadId());
 
@@ -298,9 +298,9 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     }
 
     linearKVCache.resetForNewSequences(mHostReuseKVCacheLengths, stream);
-    mInputIds.reshape({activeBatchSize, packedInputLength});
-    mHostContextLengths.reshape({activeBatchSize});
-    mOutputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize});
+    check::check(mInputIds.reshape({activeBatchSize, packedInputLength}), "Tensor reshape failed");
+    check::check(mHostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mOutputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize}), "Tensor reshape failed");
 
     CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), mHostPackedInputIds.rawPointer(),
         activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
@@ -424,8 +424,8 @@ bool LLMInferenceRuntime::handleRequest(
     int32_t generationIter{0};
     std::vector<std::vector<int32_t>> outputIds(activeBatchSize);
     std::vector<bool> finishedStates(activeBatchSize, false);
-    mSelectedIndices.reshape({activeBatchSize, 1});
-    mHostSelectedTokenIds.reshape({activeBatchSize});
+    check::check(mSelectedIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
+    check::check(mHostSelectedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostSelectedTokenIdsData = mHostSelectedTokenIds.dataPointer<int32_t>();
 
     SamplingParams params(
@@ -457,7 +457,8 @@ bool LLMInferenceRuntime::handleRequest(
 
     // Perform embedding lookup for prefill
     int32_t const prefillSequenceLength = mInputIds.getShape()[1];
-    mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+    check::check(mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
+        "Tensor reshape failed");
 
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
@@ -487,7 +488,9 @@ bool LLMInferenceRuntime::handleRequest(
                 rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
 
                 // Reshape and perform embedding assembly for this feature
-                mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+                check::check(
+                    mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
+                    "Tensor reshape failed");
                 kernel::assembleDeepstackEmbedding(
                     mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
 
@@ -534,7 +537,7 @@ bool LLMInferenceRuntime::handleRequest(
     mPrefillMetrics.recordRun(tokenCount.totalReusedTokens, tokenCount.totalComputedTokens);
 
     // Reshape for decoding step
-    mInputsEmbeds.reshape({activeBatchSize, 1, mEngineConfig.hiddenSize});
+    check::check(mInputsEmbeds.reshape({activeBatchSize, 1, mEngineConfig.hiddenSize}), "Tensor reshape failed");
 
     // Profile entire generation phase like benchmark profiler
     {
@@ -603,9 +606,9 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
     // Capture the CUDA graph for all available batch sizes.
     for (int32_t batchSize = minSupportedBatchSize; batchSize <= maxSupportedBatchSize; ++batchSize)
     {
-        mSelectedIndices.reshape({batchSize, 1});
-        mInputsEmbeds.reshape({batchSize, 1, mEngineConfig.hiddenSize});
-        mOutputLogits.reshape({batchSize, mEngineConfig.outputVocabSize});
+        check::check(mSelectedIndices.reshape({batchSize, 1}), "Tensor reshape failed");
+        check::check(mInputsEmbeds.reshape({batchSize, 1, mEngineConfig.hiddenSize}), "Tensor reshape failed");
+        check::check(mOutputLogits.reshape({batchSize, mEngineConfig.outputVocabSize}), "Tensor reshape failed");
 
         captureStatus &= mLLMEngineRunner->captureVanillaDecodingCudaGraph(
             mInputsEmbeds, mOutputLogits, mEmptyLoraWeightsName, stream);
@@ -709,7 +712,8 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     // Execute prefill step to initialize the KVCache data.
     // Perform embedding lookup
     int32_t const prefillSequenceLength = mInputIds.getShape()[1];
-    mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+    check::check(mInputsEmbeds.reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
+        "Tensor reshape failed");
 
     rt::OptionalInputTensor multimodalEmbeddings
         = mMultimodalRunner ? std::optional{std::ref(mMultimodalRunner->getOutputEmbedding())} : std::nullopt;
@@ -739,7 +743,9 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
                 rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
 
                 // Reshape and perform embedding lookup for this feature
-                mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize});
+                check::check(
+                    mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
+                    "Tensor reshape failed");
                 kernel::assembleDeepstackEmbedding(
                     mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
 

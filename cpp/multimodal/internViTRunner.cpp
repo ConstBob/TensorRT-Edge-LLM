@@ -203,8 +203,8 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     }
 
     // Reshape pre-allocated temporary buffers to current image dimensions
-    mImageDevice.reshape({1, height, width, channels});
-    mNormalizedImageDevice.reshape({1, height, width, channels});
+    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
 
     // Copy image to device
     CUDA_CHECK(cudaMemcpyAsync(
@@ -252,7 +252,9 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
 
     if (totalNumBlocks == 0)
     {
-        mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
+        check::check(
+            mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW}),
+            "Tensor reshape failed");
         return;
     }
 
@@ -270,8 +272,10 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
     int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), int64_t(0));
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
 
-    mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW});
-    mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
+    check::check(
+        mVitInput.reshape({totalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW}),
+        "Tensor reshape failed");
+    check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
 }
 
 void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
@@ -327,7 +331,7 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;

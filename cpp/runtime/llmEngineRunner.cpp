@@ -1002,7 +1002,7 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
         return false;
     }
 
-    mHostSelectTokenIndices.reshape({activeBatchSize, 1});
+    check::check(mHostSelectTokenIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     int64_t* selectTokenIndicesData = mHostSelectTokenIndices.dataPointer<int64_t>();
     int32_t const* contextLengthsData = hostContextLengths.dataPointer<int32_t>();
     for (int32_t i = 0; i < activeBatchSize; ++i)
@@ -1051,7 +1051,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     // For non-MRope, the cache is fixed at {1, maxSeqLen, rotaryDim} and shared across all batches.
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+            "Tensor reshape failed");
     }
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
@@ -1225,7 +1226,8 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+            check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+                "Tensor reshape failed");
         }
 
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1374,10 +1376,12 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
 
     // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
     // indices, sequence context lengths.
-    mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({activeBatchSize});
-    mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize});
-    mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen});
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}),
+        "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize}), "Tensor reshape failed");
+    check::check(mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen}),
+        "Tensor reshape failed");
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndices = mKVCache.getKVCacheLengths();
@@ -1426,7 +1430,8 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
         // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
         if (mConfig.ropeConfig.type == RopeType::kMRope)
         {
-            mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+            check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+                "Tensor reshape failed");
         }
 
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1539,12 +1544,13 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
 
     // Set shape of mSelectTokenIndices and set value to all zero.
     // Set sequence context length input for decoding step.
-    mSelectTokenIndices.reshape({activeBatchSize, 1});
-    mSequenceContextLengths.reshape({activeBatchSize});
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
     // Need to reshape the mPosEncCosSinCache for MROPE.
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+            "Tensor reshape failed");
     }
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
     CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), mKVCache.getKVCacheLengths().rawPointer(),
@@ -1699,10 +1705,12 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     // indices, sequence context lengths.
     int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputsEmbeds.getShape()[1]);
     int32_t const packedBaseTreeDecodingMaskLen = static_cast<int32_t>(divUp(baseTreeDecodingSize, 32));
-    mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}); // 2D tensor [batch, num_tokens]
-    mSequenceContextLengths.reshape({activeBatchSize});
-    mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize});
-    mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen});
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}),
+        "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    check::check(mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize}), "Tensor reshape failed");
+    check::check(mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen}),
+        "Tensor reshape failed");
 
     rt::Tensor const& sequenceStartIndices = mKVCache.getKVCacheLengths();
 
@@ -1736,7 +1744,8 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
     if (mConfig.ropeConfig.type == RopeType::kMRope)
     {
-        mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim});
+        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+            "Tensor reshape failed");
     }
 
     setEngineIOStatus

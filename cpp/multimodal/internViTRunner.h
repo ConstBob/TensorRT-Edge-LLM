@@ -67,11 +67,12 @@ public:
     //! \param[in] request LLM generation request containing images and text
     //! \param[in,out] batchedInputIds Batched input token IDs after preprocessing
     //! \param[in] tokenizer Tokenizer for text processing
-    //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
+    //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache (unused by this model)
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice,
+        cudaStream_t stream) override;
 
     //! \brief Run inference on the vision encoder
     //! \param[in] stream CUDA stream for execution

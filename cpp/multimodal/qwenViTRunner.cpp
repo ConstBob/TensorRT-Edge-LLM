@@ -310,8 +310,9 @@ void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
     imageTokenLengths.emplace_back(curSeqLength / mConfig.mergeSize / mConfig.mergeSize);
 
     // Reshape pre-allocated temporary buffers to current image dimensions
-    mImageDevice.reshape({mConfig.temporalPatchSize, height, width, channels});
-    mNormalizedImageDevice.reshape({mConfig.temporalPatchSize, height, width, channels});
+    check::check(mImageDevice.reshape({mConfig.temporalPatchSize, height, width, channels}), "Tensor reshape failed");
+    check::check(
+        mNormalizedImageDevice.reshape({mConfig.temporalPatchSize, height, width, channels}), "Tensor reshape failed");
 
     // Copy image to device. Repeat for T = temporalPatchSize
     auto imageSize = height * width * channels;
@@ -407,7 +408,7 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     int64_t totalSeqLength = cuSeqlensData[cuSeqlensSize - 1];
     if (totalSeqLength == 0)
     {
-        mVitInput.reshape({totalSeqLength, mConfig.inputDim});
+        check::check(mVitInput.reshape({totalSeqLength, mConfig.inputDim}), "Tensor reshape failed");
         return;
     }
 
@@ -419,8 +420,8 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
 
     // Reshape tensors
     int64_t totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
-    mVitInput.reshape({totalSeqLength, mConfig.inputDim});
-    mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize});
+    check::check(mVitInput.reshape({totalSeqLength, mConfig.inputDim}), "Tensor reshape failed");
+    check::check(mOutputEmbedding.reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
     // Record performance data
     int64_t imageCount = std::accumulate(numImages.begin(), numImages.end(), int64_t(0));
     mMultimodalMetrics.recordRun(imageCount, totalImageTokens);
@@ -432,13 +433,13 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
      */
     if (imageGridTHWs != mLastImageGridTHWs)
     {
-        mAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
+        check::check(mAttentionMask.reshape({1, totalSeqLength, totalSeqLength}), "Tensor reshape failed");
         // Compute attention mask
         CUDA_CHECK(cudaMemcpyAsync(mCuSeqlensDevice.rawPointer(), mCuSeqlensHost.rawPointer(),
             cuSeqlensSize * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
         kernel::initAttentionMaskQwenViT(mCuSeqlensDevice, mAttentionMask, stream);
 
-        mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim});
+        check::check(mRotaryPosEmb.reshape({totalSeqLength, mConfig.vitPosEmbDim}), "Tensor reshape failed");
         // Compute rotary position embeddings
         for (size_t i = 0; i < imageGridTHWs.size(); ++i)
         {
@@ -449,18 +450,18 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
         // Compute additional inputs
         if (mModelType == multimodal::ModelType::QWEN2_5_VL)
         {
-            mWindowAttentionMask.reshape({1, totalSeqLength, totalSeqLength});
-            mWindowIndexHost.reshape({totalImageTokens});
-            mWindowIndexDevice.reshape({totalImageTokens});
-            mReverseWindowIndexHost.reshape({totalImageTokens});
-            mReverseWindowIndexDevice.reshape({totalImageTokens});
+            check::check(mWindowAttentionMask.reshape({1, totalSeqLength, totalSeqLength}), "Tensor reshape failed");
+            check::check(mWindowIndexHost.reshape({totalImageTokens}), "Tensor reshape failed");
+            check::check(mWindowIndexDevice.reshape({totalImageTokens}), "Tensor reshape failed");
+            check::check(mReverseWindowIndexHost.reshape({totalImageTokens}), "Tensor reshape failed");
+            check::check(mReverseWindowIndexDevice.reshape({totalImageTokens}), "Tensor reshape failed");
 
             getWindowIndex(imageGridTHWs, totalSeqLength, stream);
         }
         else if (mModelType == multimodal::ModelType::QWEN3_VL)
         {
-            mFastPosEmbIdx.reshape({4, totalSeqLength});
-            mFastPosEmbWeight.reshape({4, totalSeqLength});
+            check::check(mFastPosEmbIdx.reshape({4, totalSeqLength}), "Tensor reshape failed");
+            check::check(mFastPosEmbWeight.reshape({4, totalSeqLength}), "Tensor reshape failed");
 
             for (size_t i = 0; i < imageGridTHWs.size(); ++i)
             {
@@ -470,7 +471,8 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
 
             for (int64_t i = 0; i < mConfig.numDeepstackFeatures; ++i)
             {
-                mDeepstackFeatures[i].reshape({totalImageTokens, mConfig.outHiddenSize});
+                check::check(
+                    mDeepstackFeatures[i].reshape({totalImageTokens, mConfig.outHiddenSize}), "Tensor reshape failed");
             }
         }
         mLastImageGridTHWs = imageGridTHWs;
@@ -565,14 +567,15 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     }
 
     // Initialize mropePositionIds and copy to device
-    mMropePositionIdsHost.reshape({activeBatchSize, 3, maxPositionEmbeddings});
-    mMropePositionIdsDevice.reshape({activeBatchSize, 3, maxPositionEmbeddings});
+    check::check(mMropePositionIdsHost.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
+    check::check(mMropePositionIdsDevice.reshape({activeBatchSize, 3, maxPositionEmbeddings}), "Tensor reshape failed");
     getMRopePositionIds(batchInputIds, imageGridTHWs);
     CUDA_CHECK(cudaMemcpyAsync(mMropePositionIdsDevice.rawPointer(), mMropePositionIdsHost.rawPointer(),
         activeBatchSize * 3 * maxPositionEmbeddings * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
 
     // Initialize mrope cosSinCacheDevice
-    ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim});
+    check::check(
+        ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim}), "Tensor reshape failed");
     bool interleaved = mModelType == multimodal::ModelType::QWEN3_VL;
     kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
         mMropePositionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
