@@ -80,25 +80,28 @@ public:
      * @param request Generation request with prompts and images
      * @param batchedInputIds Output batched input token IDs
      * @param tokenizer Tokenizer instance
-     * @param ropeRotaryCosSinDevice RoPE cache tensor
+     * @param ropeRotaryCosSinDevice RoPE cache tensor (only used by image / language models)
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
         = 0;
 
     /*!
      * @brief Used for KVCache saving where we need to conduct the tokenization of the system prompt and generate
      * ND-Rope parameters for the system prompt.
+     * @details This function may be a no-op for some multimodal runners and only performs nontrivial work for some
+     *          derived subclasses.
      * @param systemPrompt System prompt text
      * @param tokenizer Tokenizer instance
      * @param ropeRotaryCosSinDevice RoPE cache tensor
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    virtual bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
-        rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
+    virtual bool preprocessSystemPrompt([[maybe_unused]] std::string const& systemPrompt,
+        [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice,
+        [[maybe_unused]] cudaStream_t stream);
 
     /*!
      * @brief Run multimodal inference

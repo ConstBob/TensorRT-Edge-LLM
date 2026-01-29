@@ -148,7 +148,7 @@ void LinearKVCache::resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, 
         "The data type of the reuseKVCacheLengths tensor shall match the data type of the Device KVCache Lengths.");
 
     mActiveBatchSize = batchSize;
-    mDeviceKVCacheLengths.reshape({mActiveBatchSize});
+    check::check(mDeviceKVCacheLengths.reshape({mActiveBatchSize}), "Tensor reshape failed");
 
     // If all reuseSequenceLengths are 0, then we can set flag mKVCacheAllEmpty to true.
     int32_t const* reuseSequenceLengthsData = reuseKVCacheLengths.dataPointer<int32_t>();
@@ -214,7 +214,7 @@ void LinearKVCache::setActiveBatchSize(int32_t newActiveBatchSize)
     check::check(newActiveBatchSize >= 0 && newActiveBatchSize <= mConfig.maxBatchSize,
         "Invalid active batch size: must be in range [0, maxBatchSize]");
     mActiveBatchSize = newActiveBatchSize;
-    mDeviceKVCacheLengths.reshape({mActiveBatchSize});
+    check::check(mDeviceKVCacheLengths.reshape({mActiveBatchSize}), "Tensor reshape failed");
 }
 
 } // namespace rt

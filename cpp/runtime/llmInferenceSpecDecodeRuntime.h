@@ -28,8 +28,6 @@
 
 namespace trt_edgellm
 {
-namespace
-{
 /*! \brief Structure to hold cached system prompt and its KV cache
  */
 struct SystemPromptKVCache
@@ -38,7 +36,6 @@ struct SystemPromptKVCache
     std::vector<tokenizer::Rank> tokenizedPrompt; //!< Tokenized version of the system prompt
     rt::Tensor kvCacheContent;                    //!< Cached KV cache content for the system prompt
 };
-} // namespace
 
 namespace rt
 {
