@@ -100,6 +100,7 @@ int32_t attentionMaskTypeToInt(ContextAttentionMaskType type)
     case ContextAttentionMaskType::PADDING: result = 0; break;
     case ContextAttentionMaskType::CAUSAL: result = 1; break;
     case ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL: result = 2; break;
+    case ContextAttentionMaskType::CUSTOM_MASK: result = 3; break;
     }
     return result;
 }

@@ -1828,7 +1828,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     return true;
 }
 
-bool LLMEngineRunner::resetLoraWeights(cudaStream_t stream)
+bool LLMEngineRunner::resetLoraWeights()
 {
     if (!isLoraWeightsSupported())
     {

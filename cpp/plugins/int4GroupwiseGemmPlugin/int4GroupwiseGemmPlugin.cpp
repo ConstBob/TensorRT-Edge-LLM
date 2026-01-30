@@ -136,7 +136,7 @@ int32_t Int4GroupwiseGemmPlugin::getNbOutputs() const noexcept
 }
 
 int32_t Int4GroupwiseGemmPlugin::getOutputDataTypes(
-    DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
+    DataType* outputTypes, int32_t nbOutputs, DataType const* /* inputTypes */, int32_t /* nbInputs */) const noexcept
 {
     try
     {
@@ -151,7 +151,7 @@ int32_t Int4GroupwiseGemmPlugin::getOutputDataTypes(
 }
 
 int32_t Int4GroupwiseGemmPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
-    DimsExprs const* shapeInputs, int32_t nbShapeInputs, DimsExprs* outputs, int32_t nbOutputs,
+    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs, int32_t nbOutputs,
     IExprBuilder& exprBuilder) noexcept
 {
     try
@@ -226,20 +226,20 @@ bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
     }
 }
 
-int32_t Int4GroupwiseGemmPlugin::configurePlugin(
-    DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+int32_t Int4GroupwiseGemmPlugin::configurePlugin(DynamicPluginTensorDesc const* /* in */, int32_t /* nbInputs */,
+    DynamicPluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept
 {
     return 0;
 }
 
-size_t Int4GroupwiseGemmPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
-    DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
+size_t Int4GroupwiseGemmPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */, int32_t /* nbInputs */,
+    DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
     return 0;
 }
 
-int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
-    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
+    void const* const* inputs, void* const* outputs, void* /* workspace */, cudaStream_t stream) noexcept
 {
     try
     {
@@ -269,13 +269,13 @@ int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
     }
 }
 
-int32_t Int4GroupwiseGemmPlugin::onShapeChange(
-    PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
+int32_t Int4GroupwiseGemmPlugin::onShapeChange(PluginTensorDesc const* /* in */, int32_t /* nbInputs */,
+    PluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept
 {
     return 0;
 }
 
-IPluginV3* Int4GroupwiseGemmPlugin::attachToContext(IPluginResourceContext* context) noexcept
+IPluginV3* Int4GroupwiseGemmPlugin::attachToContext(IPluginResourceContext* /* context */) noexcept
 {
     return clone();
 }
@@ -332,7 +332,7 @@ char const* Int4GroupwiseGemmPluginCreator::getPluginVersion() const noexcept
 }
 
 IPluginV3* Int4GroupwiseGemmPluginCreator::createPlugin(
-    char const* name, PluginFieldCollection const* fc, TensorRTPhase phase) noexcept
+    char const* name, PluginFieldCollection const* fc, TensorRTPhase /* phase */) noexcept
 {
     try
     {

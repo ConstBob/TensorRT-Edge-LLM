@@ -137,7 +137,7 @@ class XQAKernelList
     using TKernelMetaInfo = xqa::kernels::XQAKernelMetaInfo;
 
 public:
-    XQAKernelList(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
+    XQAKernelList(XQADataType dataType, XQADataType kvDataType, uint32_t sm, bool specDecode)
         : mKernelMeta(nullptr)
         , mKernelMetaCount(0)
         , mSMVersion(sm)
@@ -226,7 +226,7 @@ public:
 protected:
     TKernelMetaInfo const* mKernelMeta;
     int32_t mKernelMetaCount;
-    int32_t mSMVersion;
+    uint32_t mSMVersion;
     bool mSpecDecode;
     XQADataType mDataType;
     XQADataType mKVDataType;

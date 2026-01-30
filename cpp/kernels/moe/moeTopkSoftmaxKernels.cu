@@ -100,10 +100,7 @@ __device__ __forceinline__ float convertToFloat(T x)
     {
         return x;
     }
-    else
-    {
-        return static_cast<float>(x);
-    }
+    return static_cast<float>(x);
 }
 
 // ====================== Fallback Path: Separate Softmax + TopK ======================

@@ -45,6 +45,10 @@ constexpr char const* getDataTypeString(DataType const dataType)
     case DataType::kFP8: return "FLOAT8_E4M3";
     case DataType::kINT8: return "INT8";
     case DataType::kUINT8: return "UINT8";
+    case DataType::kBOOL: return "BOOL";
+    case DataType::kE8M0: return "FLOAT8_E8M0";
+    case DataType::kFP4: return "FLOAT4";
+    case DataType::kINT4: return "INT4";
     }
 
     return "UNKNOWN";

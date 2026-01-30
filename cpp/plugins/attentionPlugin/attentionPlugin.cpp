@@ -645,7 +645,6 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
         // Prepare FMHA_v2 params to launch FMHA kernel
         FusedMultiheadAttentionParamsV2 params{};
-        memset(&params, 0, sizeof(params));
         fmhaRunner.setupParams(params);
         params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
 
@@ -702,7 +701,6 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         auto xqaRunner = DecoderXQARunner(mDataType, selectKvCacheDataType(mEnableFp8KVCache), runtimeBatchSize,
             mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion);
         XQALaunchParams params = xqaRunner.initXQAParams();
-        float const* const kvScales = mEnableFp8KVCache ? kvScaleQuantOrigTensor.dataPointer<float>() : nullptr;
         if (mEnableFp8KVCache)
         {
             float const* const kvScales = kvScaleQuantOrigTensor.dataPointer<float>();

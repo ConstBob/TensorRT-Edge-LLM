@@ -288,10 +288,9 @@ private:
 
     /*!
      * @brief Reset LoRA weights to dummy tensors with rank 0
-     * @param stream CUDA stream for operations
      * @return True on success, false on failure
      */
-    bool resetLoraWeights(cudaStream_t stream);
+    bool resetLoraWeights();
 
     /*!
      * @brief Get maximum dimension required for LoRA weights across all LoRA bindings

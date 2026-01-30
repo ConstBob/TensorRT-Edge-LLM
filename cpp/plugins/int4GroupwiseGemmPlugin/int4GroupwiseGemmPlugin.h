@@ -88,24 +88,24 @@ public:
     //! @brief Get output tensor data types
     //! @param outputTypes Output array for data types
     //! @param nbOutputs Number of outputs
-    //! @param inputTypes Input data types
-    //! @param nbInputs Number of inputs
+    //! @param inputTypes Input data types (not used)
+    //! @param nbInputs Number of inputs (not used)
     //! @return 0 on success, non-zero on error
-    int32_t getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs, nvinfer1::DataType const* inputTypes,
-        int32_t nbInputs) const noexcept override;
+    int32_t getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs,
+        nvinfer1::DataType const* /* inputTypes */, int32_t /* nbInputs */) const noexcept override;
 
     //! @brief Get output tensor shapes
     //! @param inputs Input dimensions
     //! @param nbInputs Number of inputs
-    //! @param shapeInputs Shape tensor inputs
-    //! @param nbShapeInputs Number of shape inputs
+    //! @param shapeInputs Shape tensor inputs (not used)
+    //! @param nbShapeInputs Number of shape inputs (not used)
     //! @param outputs Output dimensions
     //! @param nbOutputs Number of outputs
     //! @param exprBuilder Expression builder for dynamic shapes
     //! @return 0 on success, non-zero on error
-    int32_t getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs, nvinfer1::DimsExprs const* shapeInputs,
-        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
-        nvinfer1::IExprBuilder& exprBuilder) noexcept override;
+    int32_t getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
+        nvinfer1::DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, nvinfer1::DimsExprs* outputs,
+        int32_t nbOutputs, nvinfer1::IExprBuilder& exprBuilder) noexcept override;
 
     //! @brief Check if format combination is supported
     //! @param pos Position in input/output array
@@ -117,22 +117,23 @@ public:
         int32_t nbOutputs) noexcept override;
 
     //! @brief Configure plugin with tensor descriptions
-    //! @param in Input tensor descriptors
-    //! @param nbInputs Number of inputs
-    //! @param out Output tensor descriptors
-    //! @param nbOutputs Number of outputs
+    //! @param in Input tensor descriptors (not used)
+    //! @param nbInputs Number of inputs (not used)
+    //! @param out Output tensor descriptors (not used)
+    //! @param nbOutputs Number of outputs (not used)
+    //! @details This operation is a no-op for this plugin type.
     //! @return 0 on success, non-zero on error
-    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
-        nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
+    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* /* in */, int32_t /* nbInputs */,
+        nvinfer1::DynamicPluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept override;
 
     //! @brief Get workspace size required for execution
-    //! @param inputs Input tensor descriptors
-    //! @param nbInputs Number of inputs
-    //! @param outputs Output tensor descriptors
-    //! @param nbOutputs Number of outputs
-    //! @return Workspace size in bytes
-    size_t getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
-        nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
+    //! @param inputs Input tensor descriptors (not used)
+    //! @param nbInputs Number of inputs (not used)
+    //! @param outputs Output tensor descriptors (not used)
+    //! @param nbOutputs Number of outputs (not used)
+    //! @return Zero bytes (this plugin does not use workspace)
+    size_t getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* /* inputs */, int32_t /* nbInputs */,
+        nvinfer1::DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept override;
 
     //! @brief Execute the plugin
     //! @param inputDesc Input tensor descriptors
@@ -142,22 +143,23 @@ public:
     //! @param workspace Workspace pointer
     //! @param stream CUDA stream
     //! @return 0 on success, non-zero on error
-    int32_t enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
+    int32_t enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* /* outputDesc */,
+        void const* const* inputs, void* const* outputs, void* /* workspace */, cudaStream_t stream) noexcept override;
 
     //! @brief Called when input/output shapes change during runtime
-    //! @param in Input tensor descriptors
-    //! @param nbInputs Number of inputs
-    //! @param out Output tensor descriptors
-    //! @param nbOutputs Number of outputs
-    //! @return 0 on success, non-zero on error
-    int32_t onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs, nvinfer1::PluginTensorDesc const* out,
-        int32_t nbOutputs) noexcept override;
+    //! @param in Input tensor descriptors (unused)
+    //! @param nbInputs Number of inputs (unused)
+    //! @param out Output tensor descriptors (unused)
+    //! @param nbOutputs Number of outputs (unused)
+    //! @details This is a no-op for this plugin type.
+    //! @return 0 to signal success
+    int32_t onShapeChange(nvinfer1::PluginTensorDesc const* /* in */, int32_t /* nbInputs */,
+        nvinfer1::PluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept override;
 
     //! @brief Attach plugin to an execution context
-    //! @param context Plugin resource context
+    //! @param context Plugin resource context (not used by this plugin)
     //! @return Cloned plugin attached to context
-    nvinfer1::IPluginV3* attachToContext(nvinfer1::IPluginResourceContext* context) noexcept override;
+    nvinfer1::IPluginV3* attachToContext(nvinfer1::IPluginResourceContext* /* context */) noexcept override;
 
     //! @brief Get plugin fields for serialization
     //! @return Field collection for serialization
@@ -216,10 +218,10 @@ public:
     //! @brief Create plugin from field collection
     //! @param name Plugin name
     //! @param fc Field collection with parameters
-    //! @param phase TensorRT phase (build or runtime)
+    //! @param phase TensorRT phase (build or runtime) - not used by this plugin
     //! @return Created plugin instance
-    nvinfer1::IPluginV3* createPlugin(
-        char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
+    nvinfer1::IPluginV3* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc,
+        nvinfer1::TensorRTPhase /* phase */) noexcept override;
 
 private:
     static nvinfer1::PluginFieldCollection mFieldCollection;
