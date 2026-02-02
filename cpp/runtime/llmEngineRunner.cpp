@@ -29,6 +29,7 @@
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
+#include "profiling/layerProfiler.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <fstream>
 #include <sstream>
@@ -150,6 +151,11 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Use single executionContext for both prefill and generation.
     mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
+
+    if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
+    {
+        mTRTExecutionContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
+    }
 
     mTRTExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
     LOG_INFO(

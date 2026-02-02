@@ -42,6 +42,7 @@ namespace StageNames
 {
 inline std::string const kLLM_PREFILL = "llm_prefill";                               //!< LLM prefill stage
 inline std::string const kLLM_GENERATION = "llm_generation";                         //!< LLM generation stage
+inline std::string const kLLM_LAYER = "llm_layer";                                   //!< LLM layer profiling
 inline std::string const kMULTIMODAL_PROCESSING = "multimodal_processing";           //!< Multimodal processing stage
 inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";               //!< Eagle draft prefill stage
 inline std::string const kEAGLE_CONSTRUCT_DRAFT_TREE = "eagle_construct_draft_tree"; //!< Eagle draft tree construction
