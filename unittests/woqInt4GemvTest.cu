@@ -87,7 +87,7 @@ void TestInt4GroupwiseGemvAccuracy(int m, int n, int k, int group_size)
         d_weight_ref, scaled_weights.data(), ((size_t) k * n) * sizeof(__half), cudaMemcpyHostToDevice, stream));
 
     // WOQ kernel inference
-    trt_edgellm::kernel::gemm_forward_cuda_new(d_act, d_weight, d_scales, d_out, m, n, k, group_size, stream);
+    trt_edgellm::kernel::gemv_forward_cuda_new(d_act, d_weight, d_scales, d_out, m, n, k, group_size, stream);
 
     // Reference GEMM inference
     naive_gemm_forward(d_act, d_weight_ref, d_out_ref, m, n, k, stream);

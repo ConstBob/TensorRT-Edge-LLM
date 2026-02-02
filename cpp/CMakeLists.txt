@@ -29,9 +29,16 @@ file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
 file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
 
+# Enable relocatable device code for MoE Marlin kernels
+file(GLOB_RECURSE MOE_MARLIN_CU_SRCS "kernels/moe/moe_marlin/*.cu")
+set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
+                                                             "-rdc=true")
+
 add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
                                   ${COMMON_CPP_SRCS})
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
+# Enable separable compilation for MoE Marlin kernel templates
+set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 add_library(
   edgellmCore STATIC
@@ -45,6 +52,8 @@ add_library(
   ${PROFILER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(edgellmCore PRIVATE dl)
+# Enable separable compilation for MoE Marlin kernel templates
+set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # Generate tokenizer C++ static library
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
