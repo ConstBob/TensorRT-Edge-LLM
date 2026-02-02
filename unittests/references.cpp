@@ -57,12 +57,14 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> 
                 {
                     float qVal = __half2float(q[qoIndexer(tokenIdx, qHeadIdx, valIdx)]);
                     float kvVal;
+#if SUPPORTS_FP8
                     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
                     {
                         kvVal = static_cast<float>(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)])
                             * kScaleQuantOrig; // FP8 -> FP32
                     }
                     else
+#endif
                     {
                         kvVal = __half2float(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)]); // half -> FP32
                     }
@@ -105,6 +107,7 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> 
                 for (int32_t kvIdx = 0; kvIdx < kvlen; ++kvIdx)
                 {
                     float vVal;
+#if SUPPORTS_FP8
                     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
                     {
                         // Dequantize FP8 value back to original range using vScaleQuantOrig
@@ -112,6 +115,7 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> 
                             * vScaleQuantOrig; // FP8 -> FP32
                     }
                     else
+#endif
                     {
                         vVal = __half2float(v[kvIndexer(kvIdx, kvHeadIdx, valIdx)]); // half -> FP32
                     }
