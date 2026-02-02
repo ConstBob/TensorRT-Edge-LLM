@@ -55,6 +55,9 @@ void outputMultimodalProfile(std::ostream& output, trt_edgellm::metrics::Multimo
 //! Output memory usage summary to ostream
 void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor);
 
+//! Output layer profiles summary to ostream
+void outputLayerProfiles(std::ostream& output, bool detailed = false);
+
 //! Add JSON for prefill stage to existing json object
 void addJsonPrefillSummary(nlohmann::json& summary, trt_edgellm::metrics::LLMPrefillMetrics const& prefillMetrics);
 

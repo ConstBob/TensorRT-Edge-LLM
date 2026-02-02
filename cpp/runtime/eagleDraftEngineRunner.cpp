@@ -25,6 +25,7 @@
 #include "common/version.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
+#include "profiling/layerProfiler.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <fstream>
 #include <sstream>
@@ -147,6 +148,11 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     mTRTExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
     LOG_INFO("Allocated a shared device memory of %zu bytes for the prefill and generation contexts.",
         execContextMemoryInBytes);
+
+    if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
+    {
+        mTRTExecutionContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
+    }
 
     if (!this->validateConfigFromEngine())
     {
