@@ -63,38 +63,45 @@ def run_command(cmd: List[str],
         local_env.update(env_vars)
 
     try:
-        result = subprocess.run(final_cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                text=True,
-                                timeout=timeout,
-                                env=local_env)
+        process = subprocess.Popen(final_cmd,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT,
+                                   text=True,
+                                   bufsize=1,
+                                   env=local_env)
 
-        success = result.returncode == 0
+        output_lines = []
+        # Real-time line-by-line output
+        for line in iter(process.stdout.readline, ''):
+            line = line.rstrip('\n')
+            output_lines.append(line)
+            if logger:
+                logger.info(f"  {line}")
+
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        success = returncode == 0
+        combined_output = '\n'.join(output_lines)
 
         if logger:
             if success:
-                # Log successful command completion
                 logger.info(
-                    f"Command completed successfully (code {result.returncode}): {cmd_display}"
+                    f"Command completed successfully (code {returncode}): {cmd_display}"
                 )
             else:
                 logger.error(
-                    f"Command failed (code {result.returncode}): {cmd_display}"
-                )
-            # Log all output (stdout + stderr merged) in chronological order
-            if result.stdout and result.stdout.strip():
-                logger.info("Command output:")
-                for line in result.stdout.strip().split('\n'):
-                    if line.strip():
-                        logger.info(f"  {line}")
+                    f"Command failed (code {returncode}): {cmd_display}")
 
         return {
             'success': success,
-            'returncode': result.returncode,
-            'output': result.stdout or '',
+            'returncode': returncode,
+            'output': combined_output,
             'error': '',
-            'combined_output': result.stdout or ''
+            'combined_output': combined_output
         }
 
     except subprocess.TimeoutExpired:

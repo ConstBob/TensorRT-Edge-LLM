@@ -33,8 +33,9 @@ class DeviceConfig:
         arch = _get_arch(remote_config, logger)
         cuda_version = _get_cuda_version(remote_config, logger)
         compute_cap = _get_compute_capability(remote_config, logger)
+        is_driveos = _is_driveos(remote_config, logger)
 
-        target = cls._map_compute_cap_to_target(compute_cap)
+        target = cls._map_to_target(arch, compute_cap, is_driveos)
 
         device_config = cls(arch, cuda_version, target, compute_cap)
 
@@ -48,20 +49,30 @@ class DeviceConfig:
         return device_config
 
     @staticmethod
-    def _map_compute_cap_to_target(compute_cap: Optional[int]) -> str:
-        """Map compute capability to target"""
-        if compute_cap == 87:
-            return 'jetson-orin'
-        # Assume auto-thor uses CUDA 12.8 and compute cap 101
-        elif compute_cap == 101:
-            return 'auto-thor'
-        # Assume jetson-thor uses CUDA 13.0 and compute cap 110. Need to adjust this later with build system.
-        elif compute_cap == 110:
-            return 'jetson-thor'
-        elif compute_cap == 121:
-            return 'gb10'
-        else:
-            return 'x86'  # let cmake decide for x86 architectures
+    def _map_to_target(arch: str,
+                       compute_cap: Optional[int],
+                       is_driveos: bool = False) -> str:
+        """Map architecture and compute capability to target
+        
+        Args:
+            arch: System architecture (e.g., 'aarch64', 'x86_64')
+            compute_cap: GPU compute capability (e.g., 87, 101, 110)
+            is_driveos: True if running on DriveOS (D6L/D7L) system
+        """
+        # jetson-* and auto-* targets require aarch64 architecture
+        if arch == 'aarch64':
+            if compute_cap == 87:
+                return 'jetson-orin'
+            elif compute_cap in (101, 110):  # Thor: 10.1 or 11.0
+                if is_driveos:
+                    return 'auto-thor'
+                else:
+                    return 'jetson-thor'
+            elif compute_cap == 121:
+                return 'gb10'
+
+        # x86_64 or unknown arch - let cmake decide
+        return 'x86'
 
 
 def _get_arch(remote_config=None, logger=None) -> str:
@@ -71,6 +82,21 @@ def _get_arch(remote_config=None, logger=None) -> str:
         raise RuntimeError(
             f"Failed to get architecture from uname -m. {result}")
     return result['output'].strip()
+
+
+def _is_driveos(remote_config=None, logger=None) -> bool:
+    """Check if running on DriveOS (D6L/D7L) system
+    
+    DriveOS has /etc/nvidia/version-ubuntu-rootfs.txt file
+    """
+    result = run_command(['cat', '/etc/nvidia/version-ubuntu-rootfs.txt'],
+                         remote_config, 10, logger)
+    if result['success'] and result['output'].strip():
+        version = result['output'].strip()
+        if logger:
+            logger.info(f"Detected DriveOS version: {version}")
+        return True
+    return False
 
 
 def _get_cuda_version(remote_config=None, logger=None) -> str:

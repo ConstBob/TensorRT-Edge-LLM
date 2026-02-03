@@ -95,6 +95,19 @@ def execute_benchmark_test(
         env_config: Optional[EnvironmentConfig]) -> Dict[str, Any]:
     """Execute benchmark test for any model type"""
 
+    # Handle LoRA weights replacement if needed
+    if config.max_lora_rank > 0:
+        # Edit the test case file to replace $LORA_WEIGHTS_DIR with the lora weights directory
+        test_case_file = config.get_test_case_file()
+        result = run_command([
+            'sed', '-i',
+            f's|$LORA_WEIGHTS_DIR|{config.get_lora_weights_dir()}|g',
+            test_case_file
+        ], remote_config, 300, logger)
+        if not result['success']:
+            result['test_type'] = TaskType.BENCHMARK.value
+            return result
+
     # Generate all benchmark commands
     commands = generate_benchmark_commands(config, executable_files)
 
@@ -118,12 +131,31 @@ def execute_benchmark_test(
                 'test_type': TaskType.BENCHMARK.value
             }
 
-    return {
+    # Calculate metrics based on dataset type
+    final_result = {
         'success': True,
         'error': None,
         'output': '\n'.join(all_outputs),
         'test_type': TaskType.BENCHMARK.value
     }
+
+    try:
+        # Use model-specific reference if available, fallback to generic test case file
+        reference_file = config.get_reference_json_file(
+        ) or config.get_test_case_file()
+        # Pass file paths directly to the accuracy checker (runs on host only)
+        metrics_result = check_accuracy_with_dataset(
+            config.get_output_json_file(), reference_file, config.test_case,
+            logger)
+
+        # Merge metrics result into final result
+        final_result.update(metrics_result)
+
+    except Exception as e:
+        final_result['error'] = f"Failed to calculate metrics: {str(e)}"
+        final_result['success'] = False
+
+    return final_result
 
 
 def execute_inference_test(
