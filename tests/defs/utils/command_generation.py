@@ -339,6 +339,9 @@ def _generate_draft_build_commands(
         f"--maxDraftTreeSize={config.max_draft_tree_size}"
     ])
 
+    if config.debug:
+        draft_cmd.append("--debug")
+
     commands.append((draft_cmd, 1200))
     return commands
 
@@ -367,6 +370,9 @@ def generate_build_commands(
         if config.max_lora_rank > 0:
             cmd.append(f"--maxLoraRank={config.max_lora_rank}")
 
+        if config.debug:
+            cmd.append("--debug")
+
         commands.append((cmd, 1200))
 
     elif config.model_type == ModelType.VLM:
@@ -388,6 +394,9 @@ def generate_build_commands(
         if config.max_lora_rank > 0:
             llm_cmd.append(f"--maxLoraRank={config.max_lora_rank}")
 
+        if config.debug:
+            llm_cmd.append("--debug")
+
         commands.append((llm_cmd, 1200))
 
         # VLM visual build command
@@ -399,6 +408,9 @@ def generate_build_commands(
             f"--maxImageTokens={config.max_image_tokens}",
             f"--maxImageTokensPerImage={config.max_image_tokens_per_image}"
         ])
+
+        if config.debug:
+            visual_cmd.append("--debug")
 
         commands.append((visual_cmd, 1200))
 
@@ -435,6 +447,9 @@ def generate_inference_commands(
     if config.batch_size is not None:
         cmd.append(f"--batchSize={config.batch_size}")
 
+    if config.debug:
+        cmd.append("--debug")
+
     commands.append((cmd, 6000))
     return commands
 
@@ -468,6 +483,9 @@ def generate_benchmark_commands(
 
     # Add warmup if specified
     cmd.append(f"--warmup={config.warmup or 10}")
+
+    if config.debug:
+        cmd.append("--debug")
 
     commands.append((cmd, 6000))
     return commands
