@@ -183,7 +183,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         rt::Tensor longCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
             rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::longCosSinCache");
         bool const initRopeStatus
-            = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, configJson, stream);
+            = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, stream);
         if (!initRopeStatus)
         {
             LOG_ERROR("Failed to initialize long Rope CosSinCache.");
@@ -212,7 +212,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         LOG_DEBUG("Initialize persistent Rope CosSinCache.");
         this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
             DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
-        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, configJson, stream);
+        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, stream);
         if (!initRopeStatus)
         {
             LOG_ERROR("Failed to initialize persistent Rope CosSinCache.");
@@ -349,7 +349,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         }
     }
     // Reset the LoRA weights to zero tensors.
-    if (!this->resetLoraWeights(stream))
+    if (!this->resetLoraWeights())
     {
         LOG_ERROR("Failed to initialize LoRA weights to zero tensors");
         throw std::runtime_error("Failed to initialize LoRA weights to zero tensors");
@@ -1522,7 +1522,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         return true;
     }
 
-    if (isLoraWeightsSupported() && !this->switchLoraWeights(loraWeightsPath, stream))
+    if (isLoraWeightsSupported() && !this->switchLoraWeights(loraWeightsPath))
     {
         LOG_ERROR(
             "captureVanillaDecodingCudaGraph(): Failed to switch LoRA weights to '%s', unable to capture CUDA graph.",
@@ -1935,7 +1935,7 @@ std::vector<std::string> LLMEngineRunner::getLoraWeightsTensorNames() const
     return loraWeightsTensorNames;
 }
 
-bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cudaStream_t stream)
+bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName)
 {
     if (!isLoraWeightsSupported())
     {
@@ -1944,7 +1944,7 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName, cuda
     }
     if (loraWeightsName.empty())
     {
-        this->resetLoraWeights(stream);
+        this->resetLoraWeights();
         LOG_DEBUG("switchLoraWeights(): Switched to no LoRA weights.");
         return true;
     }

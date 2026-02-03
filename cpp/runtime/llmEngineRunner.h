@@ -159,10 +159,9 @@ public:
     //! API entry to switch the LoRA weights of the LLM engine.
     //! Inputs:
     //!     loraWeightsName: The name of the LoRA weights.
-    //!     stream: The CUDA stream to execute the switch step.
     //! Returns:
     //!     True if the LoRA weights switch is successful, false otherwise.
-    bool switchLoraWeights(std::string const& loraWeightsName, cudaStream_t stream);
+    bool switchLoraWeights(std::string const& loraWeightsName);
 
     //! API entry to get the active LoRA weights name.
     //! Returns:

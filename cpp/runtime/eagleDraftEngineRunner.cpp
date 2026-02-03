@@ -234,8 +234,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         LOG_DEBUG("Initialize 1D persistent Rope CosSinCache.");
         this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
             DataType::kFLOAT, "EagleDraftEngineRunner::mPosEncCosSinCache");
-        bool const initRopeStatus
-            = initializeRopeCosSinCache(mPosEncCosSinCache, mConfig.ropeConfig, configJson, stream);
+        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, mConfig.ropeConfig, stream);
         if (!initRopeStatus)
         {
             LOG_ERROR("Failed to initialize persistent Rope CosSinCache.");

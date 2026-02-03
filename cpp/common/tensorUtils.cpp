@@ -17,6 +17,7 @@
 
 #include "tensor.h"
 
+#include "NvInferVersion.h"
 #include "checkMacros.h"
 #include "cudaMacros.h"
 #include <iomanip>
@@ -46,8 +47,12 @@ constexpr char const* getDataTypeString(DataType const dataType)
     case DataType::kINT8: return "INT8";
     case DataType::kUINT8: return "UINT8";
     case DataType::kBOOL: return "BOOL";
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 12)
     case DataType::kE8M0: return "FLOAT8_E8M0";
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
     case DataType::kFP4: return "FLOAT4";
+#endif
     case DataType::kINT4: return "INT4";
     }
 
