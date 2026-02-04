@@ -11,17 +11,28 @@
 # Add a code snippet demonstrating how to use this
 ```
 
-## Testing
-<!-- Mention how have you tested your change if applicable. -->
+## 🚀 Pull Request Checklist
 
-## Before your PR is "*Ready for review*"
-<!-- If you haven't finished some of the above items you can still open `Draft` PR. -->
+Thank you for contributing to TensorRT Edge-LLM! Before we review your pull request, please make sure the following items are complete.
+Please also refer to [Contributor guidelines](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/CONTRIBUTING.md) for general guidelines.
 
-- **Make sure you read and follow [Contributor guidelines](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/CONTRIBUTING.md)** and your commits are signed.
-- **Is this change backward compatible?**: Yes/No <!--- If No, explain why. -->
-- **Did you write any new necessary tests?**: Yes/No
-- **Did you add or update any necessary documentation?**: Yes/No
-- **Did you update [Changelog](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/CHANGELOG.md)?**: Yes/No <!--- Only for new features, API changes, critical bug fixes or bw breaking changes. -->
+### ✅ Pre-commit Checks
+
+- [ ] I have installed `pre-commit` by running `pip install pre-commit`.
+- [ ] I have installed the hooks with `pre-commit install`.
+- [ ] I have run the hooks manually with `pre-commit run --all-files` and fixed any reported issues.
+
+### 🧪 Tests
+
+- [ ] Tests have been added or updated as needed.
+- [ ] All tests are passing.
+
+
+### 📄 Documentation
+- [ ] Updated any necessary documentation
+
+### ⚙️ Compatibility
+- [ ] The change is backward compatible
 
 ## Additional Information
 <!-- E.g. related issue. -->
