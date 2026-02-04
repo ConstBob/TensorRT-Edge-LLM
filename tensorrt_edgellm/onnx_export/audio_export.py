@@ -21,18 +21,18 @@ This module provides functions to export audio components of multimodal models
 
 import json
 import os
-import shutil
 
 import torch
 
 from ..llm_models.model_utils import load_hf_model
-from .config_export import export_audio_config
+from .config_export import export_audio_config, export_code2wav_config
 
 
 def audio_export(model_dir: str,
                  output_dir: str,
                  dtype: str,
-                 device: str = "cuda") -> str:
+                 device: str = "cuda",
+                 export_models: str = None) -> str:
     """
     Export audio model using the appropriate wrapper based on model architecture.
     
@@ -44,7 +44,7 @@ def audio_export(model_dir: str,
         output_dir: Directory to save the exported ONNX model
         dtype: Data type for export (currently only "fp16" supported)
         device: Device to load the model on (default: "cuda", options: cpu, cuda, cuda:0, cuda:1, etc.)
-    
+        export_models: Comma-separated list of models to export for Qwen3-Omni (e.g., 'audio_encoder', 'code2wav', or both. Default is to export both models)
     Returns:
         str: Path to the output directory where the exported model is saved
     
@@ -70,30 +70,64 @@ def audio_export(model_dir: str,
     # Detect model architecture and use appropriate wrapper
     if model_type == 'qwen3_omni':
         print(f"Exporting Qwen3-Omni audio model from {model_dir}")
-        # Create Qwen3-Omni wrapper model
-        from tensorrt_edgellm.audio_models.qwen3_omni_model import (
-            Qwen3OmniAudioEncoderPatch, export_qwen3_omni_audio)
-        wrapped_model = Qwen3OmniAudioEncoderPatch._from_config(
-            model.thinker.audio_tower.config,
-            torch_dtype=torch_dtype,
-        )
-        wrapped_model.load_state_dict(model.thinker.audio_tower.state_dict())
-        wrapped_model.eval().to(device)
 
-        # Export using the wrapper's export function
-        export_qwen3_omni_audio(wrapped_model, output_dir, torch_dtype)
+        # Parse export_models parameter
+        valid_models = {'audio_encoder', 'code2wav'}
+        if export_models is None:
+            models_to_export = valid_models
+        else:
+            models_to_export = set(m.strip() for m in export_models.split(','))
+            invalid_models = models_to_export - valid_models
+            if invalid_models:
+                raise ValueError(f"Invalid export_models: {invalid_models}. "
+                                 f"Valid options are: {valid_models}")
+
+        # Export audio_encoder if requested
+        if 'audio_encoder' in models_to_export:
+            from tensorrt_edgellm.audio_models.qwen3_omni_model import (
+                Qwen3OmniAudioEncoderPatch, export_qwen3_omni_audio)
+
+            wrapped_model = Qwen3OmniAudioEncoderPatch._from_config(
+                model.thinker.audio_tower.config,
+                torch_dtype=torch_dtype,
+            )
+            wrapped_model.load_state_dict(
+                model.thinker.audio_tower.state_dict())
+            wrapped_model.eval().to(device)
+            audio_encoder_output_dir = os.path.join(output_dir,
+                                                    'audio_encoder')
+            export_qwen3_omni_audio(wrapped_model, audio_encoder_output_dir,
+                                    torch_dtype)
+            print(f"Exported audio_encoder to {audio_encoder_output_dir}")
+
+            # Export model configuration to JSON
+            config_dict = export_audio_config(model.thinker.config)
+            with open(os.path.join(audio_encoder_output_dir, "config.json"),
+                      "w") as f:
+                json.dump(config_dict, f, indent=2)
+
+        # Export code2wav if requested
+        if 'code2wav' in models_to_export:
+            from tensorrt_edgellm.audio_models.qwen3_omni_model import (
+                Qwen3OmniCode2WavModelPatch, export_qwen3_omni_code2wav)
+
+            wrapped_code2wav = Qwen3OmniCode2WavModelPatch._from_config(
+                model.code2wav.config,
+                torch_dtype=torch_dtype,
+            )
+            wrapped_code2wav.load_state_dict(model.code2wav.state_dict())
+            wrapped_code2wav.eval().to(device)
+            code2wav_output_dir = os.path.join(output_dir, 'code2wav')
+            export_qwen3_omni_code2wav(wrapped_code2wav, code2wav_output_dir)
+            print(f"Exported code2wav to {code2wav_output_dir}")
+
+            # Export model configuration to JSON
+            config_dict = export_code2wav_config(model.config)
+            with open(os.path.join(code2wav_output_dir, "config.json"),
+                      "w") as f:
+                json.dump(config_dict, f, indent=2)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
-
-    # Export model configuration to JSON
-    config_dict = export_audio_config(model.thinker.config)
-    with open(os.path.join(output_dir, "config.json"), "w") as f:
-        json.dump(config_dict, f, indent=2)
-
-    # Export processor configuration to JSON if exists
-    if os.path.exists(os.path.join(model_dir, "preprocessor_config.json")):
-        shutil.copy(os.path.join(model_dir, "preprocessor_config.json"),
-                    os.path.join(output_dir, "preprocessor_config.json"))
 
     print(
         f"Audio export completed for {model_type} with dtype={dtype}, device={device}"
