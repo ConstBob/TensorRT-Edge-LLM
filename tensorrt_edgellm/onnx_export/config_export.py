@@ -208,3 +208,17 @@ def export_audio_config(config: Any) -> Dict[str, Any]:
 
     # Return the original config_dict as-is without any modification
     return config_dict
+
+
+def export_code2wav_config(config: Any) -> Dict[str, Any]:
+    """Export code2wav configuration without modification."""
+    config_dict = config.to_dict()
+
+    has_code2wav = "code2wav_config" in config_dict
+    if not (has_code2wav):
+        raise KeyError("Required field 'code2wav_config' not found in config")
+    # Add TensorRT Edge-LLM version
+    config_dict['edgellm_version'] = __version__
+
+    # Return the original config_dict as-is without any modification
+    return config_dict

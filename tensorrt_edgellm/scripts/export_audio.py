@@ -62,6 +62,14 @@ def main() -> None:
         help=
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
+    parser.add_argument(
+        "--export_models",
+        type=str,
+        required=False,
+        default=None,
+        help=
+        "Comma-separated list of models to export for Qwen3-Omni (e.g., 'audio_encoder', 'code2wav', or both. Default is to export both models)"
+    )
 
     args = parser.parse_args()
 
@@ -69,7 +77,8 @@ def main() -> None:
         audio_export(model_dir=args.model_dir,
                      output_dir=args.output_dir,
                      dtype=args.dtype,
-                     device=args.device)
+                     device=args.device,
+                     export_models=args.export_models)
         print("Audio model export completed successfully!")
     except Exception as e:
         print(f"Error during audio model export: {e}")
