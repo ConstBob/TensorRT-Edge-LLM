@@ -64,8 +64,10 @@ public:
     //! \brief Constructor for Phi4MMViTRunner
     //! \param[in] engineDir Directory containing the TensorRT engine files
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if engineDir does not contain valid engine files
+    //! \throws std::runtime_error if buffer allocation fails
     Phi4MMViTRunner(std::string const& engineDir, cudaStream_t stream);
-    ~Phi4MMViTRunner() = default;
+    ~Phi4MMViTRunner() noexcept = default;
 
     //! \brief Preprocess multimodal input including images and text
     //! \param[in] request LLM generation request containing images and text
@@ -75,21 +77,25 @@ public:
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice,
+        cudaStream_t stream) noexcept override;
 
     //! \brief Run inference on the vision encoder and perform HD postprocess
     //! \param[in] stream CUDA stream for execution
     //! \return True if inference succeeded, false otherwise
+    //! \throws std::runtime_error if a CUDA operation fails
     bool infer(cudaStream_t stream) override;
 
     //! \brief Validate and load configuration from JSON file
     //! \param[in] configPath Path to configuration file
     //! \return True if configuration is valid and loaded successfully, false otherwise
+    //! \throws std::bad_alloc if string allocation fails
     bool validateAndFillConfig(std::string const& configPath) override;
 
     //! \brief Allocate buffers for inference and postprocess
     //! \param[in] stream CUDA stream for execution
     //! \return True if allocation succeeded, false otherwise
+    //! \throws std::runtime_error if a CUDA operation fails
     bool allocateBuffer(cudaStream_t stream) override;
 
 private:
@@ -99,6 +105,7 @@ private:
     //! \param[out] numImages Number of images per prompt
     //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if an image reshape fails, or the number of blocks is inconsistent
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, std::vector<std::vector<std::vector<int64_t>>>& imagesBlockGridHW,
         bool doResize, cudaStream_t stream);
@@ -109,11 +116,14 @@ private:
     //! \param[in] numImages Number of images per request
     //! \param[in] imageTokenLengths Token lengths for each image
     //! \param[in] tokenizer Tokenizer for text processing
+    //! \throws std::runtime_error if the text encoding fails, or the number of images does not match the
+    //!         number of requests
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         tokenizer::Tokenizer const* tokenizer);
 
     //! \brief Copy and normalize one image, tile to blocks, and update token-length accounting
+    //! \throws std::runtime_error if image not divisible into blocks
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
         int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
 

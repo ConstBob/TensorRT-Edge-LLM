@@ -65,10 +65,13 @@ public:
     //! \param[in] llmMaxBatchSize Maximum batch size from LLM engine
     //! \param[in] llmMaxSequenceLength Maximum sequence length from LLM engine
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if engine directory does not contain engine files, or if buffer allocation fails
+    //! \throws std::bad_alloc if memory allocation fails
+    //! \throws json::type_error if JSON configuration contains unexpected datatypes
     QwenViTRunner(
         std::string const& engineDir, int32_t llmMaxBatchSize, int32_t llmMaxSequenceLength, cudaStream_t stream);
 
-    ~QwenViTRunner() = default;
+    ~QwenViTRunner() noexcept = default;
 
     //! \brief Preprocess multimodal input including images and text
     //! \param[in] request LLM generation request containing images and text
@@ -77,6 +80,8 @@ public:
     //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
+    //! \throws std::runtime_error if sequence length is invalid, or a CUDA error occurs
+    //! \throws std::bad_alloc if memory allocation fails
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
@@ -86,25 +91,31 @@ public:
     //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
+    //! \throws std::bad_alloc if memory allocation fails
     bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
 
     //! \brief Run inference on the vision encoder
     //! \param[in] stream CUDA stream for execution
     //! \return True if inference succeeded, false otherwise
-    bool infer(cudaStream_t stream) override;
+    bool infer(cudaStream_t stream) noexcept override;
 
     //! \brief Validate and load configuration from JSON file
     //! \param[in] engineDir Path to engine directory
     //! \return True if configuration is valid and loaded successfully, false otherwise
+    //! \throws std::bad_alloc if memory allocation fails
+    //! \throws json::type_error if JSON configuration contains unexpected datatypes
     bool validateAndFillConfig(std::string const& engineDir) override;
 
     //! \brief Allocate buffers for inference
     //! \return True if allocation succeeded, false otherwise
+    //! \throws std::bad_alloc if memory allocation fails
+    //! \throws std::runtime_error if a CUDA operation fails
     bool allocateBuffer(cudaStream_t stream) override;
 
     //! \brief Get deepstack features for Qwen3-VL
     //! \return Optional input tensors vector containing deepstack features
+    //! \throws std::bad_alloc if memory allocation fails
     rt::OptionalInputTensors getDeepstackFeatures() override;
 
 private:
@@ -113,6 +124,7 @@ private:
     //! \param[in] width Input image width
     //! \param[in] maxRatio Maximum aspect ratio (default: 200)
     //! \return Tuple of (resized_height, resized_width)
+    //! \throws std::runtime_error if aspect ratio is invalid
     std::tuple<int64_t, int64_t> getResizedImageSize(
         int64_t const height, int64_t const width, int64_t const maxRatio = 200);
 
@@ -122,6 +134,8 @@ private:
     //! \param[in] numImages Number of images per request
     //! \param[in] imageTokenLengths Token lengths for each image
     //! \param[in] tokenizer Tokenizer for text processing
+    //! \throws std::runtime_error if requests size incorrect
+    //! \throws std::bad_alloc if memory allocation fails
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         trt_edgellm::tokenizer::Tokenizer const* tokenizer);
@@ -130,6 +144,7 @@ private:
     //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)
     //! \param[in] curHW Current height * width
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if image dimensions invalid
     void getWindowIndex(
         std::vector<std::vector<int64_t>> const& imageGridTHWs, int64_t const curHW, cudaStream_t stream);
 
@@ -140,20 +155,25 @@ private:
     //! \param[in,out] cuSeqlensData Pointer to cumulative sequence lengths data
     //! \param[in,out] cuSeqlensSize Reference to current size of cumulative sequence lengths
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
+    //! range
+    //! \throws std::runtime_error if a CUDA error occurs
+    //! \throws std::bad_alloc if memory allocation fails
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<std::vector<int64_t>>& imageGridTHWs,
         std::vector<int64_t>& imageTokenLengths, int64_t* cuSeqlensData, int64_t& cuSeqlensSize, cudaStream_t stream);
 
     //! \brief Get multi-dimensional RoPE position indices
     //! \param[in] batchInputIds Batch of input token IDs
     //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)
-    void getMRopePositionIds(
-        std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<std::vector<int64_t>> const& imageGridTHWs);
+    void getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
+        std::vector<std::vector<int64_t>> const& imageGridTHWs) noexcept;
 
     //! \brief Generate multi-dimensional RoPE parameters
     //! \param[in] batchInputIds Batch of input token IDs
     //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)
     //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if shape validation fails, or a CUDA operation fails
     void generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
         std::vector<std::vector<int64_t>> const& imageGridTHWs, rt::Tensor& ropeRotaryCosSinDevice,
         cudaStream_t stream);
@@ -165,6 +185,11 @@ private:
     //! \param[out] numImages Number of images per request
     //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
+    //! \throws std::runtime_error if aspect ratio is invalid
+    //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
+    //! range
+    //! \throws std::runtime_error if a CUDA error occurs
+    //! \throws std::bad_alloc if memory allocation fails
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int64_t>>& imageGridTHWs,
         std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
 

@@ -49,17 +49,19 @@ class MultimodalRunner
 {
 public:
     //! @brief Default constructor
-    MultimodalRunner() = default;
+    MultimodalRunner() noexcept = default;
 
     /*!
      * @brief Construct multimodal runner
      * @param engineDir Directory containing engine files
      * @param stream CUDA stream for operations
+     * @throws std::runtime_error If engine loading or initialization fails
+     * @throws std::bad_alloc If memory allocation fails
      */
     MultimodalRunner(std::string const& engineDir, cudaStream_t stream);
 
     //! @brief Virtual destructor
-    virtual ~MultimodalRunner() = default;
+    virtual ~MultimodalRunner() noexcept = default;
 
     /*!
      * @brief Create appropriate multimodal runner instance
@@ -71,6 +73,8 @@ public:
      * @param llmMaxPositionEmbeddings Maximum position embeddings from LLM engine
      * @param stream CUDA stream for operations
      * @return Unique pointer to created runner
+     * @throws std::runtime_error If model type is unknown or runner creation fails
+     * @throws std::bad_alloc If memory allocation fails
      */
     static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, int32_t llmMaxBatchSize,
         int64_t llmMaxPositionEmbeddings, cudaStream_t stream);
@@ -131,14 +135,14 @@ public:
 
     //! @brief Get model type
     //! @return Model type enum
-    virtual multimodal::ModelType getModelType() const
+    virtual multimodal::ModelType getModelType() const noexcept
     {
         return mModelType;
     }
 
     //! @brief Get multimodal processing metrics
     //! @return Multimodal metrics
-    metrics::MultimodalMetrics const& getMultimodalMetrics() const
+    metrics::MultimodalMetrics const& getMultimodalMetrics() const noexcept
     {
         return mMultimodalMetrics;
     }

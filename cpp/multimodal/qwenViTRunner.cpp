@@ -479,8 +479,8 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
     }
 }
 
-void QwenViTRunner::getMRopePositionIds(
-    std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<std::vector<int64_t>> const& imageGridTHWs)
+void QwenViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
+    std::vector<std::vector<int64_t>> const& imageGridTHWs) noexcept
 {
     // According to transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLModel.get_rope_index
     // mropePositionIds: (bs, 3, maxPositionEmbeddings), 3 is for T, H, W
@@ -756,7 +756,7 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
     return true;
 }
 
-bool QwenViTRunner::infer(cudaStream_t stream)
+bool QwenViTRunner::infer(cudaStream_t stream) noexcept
 {
     // Skip VIT inference if there are no images to process
     // Check if the first dimension (sequence length) is 0, indicating no images
