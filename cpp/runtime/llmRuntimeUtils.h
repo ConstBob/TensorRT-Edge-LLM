@@ -145,24 +145,21 @@ RopeConfig collectRopeConfig(nlohmann::json const& config);
  *
  *  \param cosSinCache [GPU] The tensor to store the rope cos/sin cache
  *  \param config [RopeConfig] The basic rope configuration
- *  \param modelConfig [JSON] Model config json that can supply additional information for the rope initialization
  *  \param stream [CUDA stream] The stream to execute the initialization
  *  \return True if the initialization is successful, false otherwise
  */
-bool initializeRopeCosSinCache(
-    rt::Tensor& cosSinCache, RopeConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream);
+bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream);
 
 /*! \brief Initialize the rope cos/sin cache tensor for long rope type
  *
  *  \param shortCosSinCache [GPU] The tensor to store the short rope cos/sin cache
  *  \param longCosSinCache [GPU] The tensor to store the long rope cos/sin cache
  *  \param config [RopeConfig] The rope configuration
- *  \param modelConfig [JSON] Model config json that can supply additional information for the rope initialization
  *  \param stream [CUDA stream] The stream to execute the initialization
  *  \return True if the initialization is successful, false otherwise
  */
-bool initializeLongRopeCosSinCache(rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config,
-    nlohmann::json const& modelConfig, cudaStream_t stream);
+bool initializeLongRopeCosSinCache(
+    rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config, cudaStream_t stream);
 
 /*!
  * @brief Format rope configuration into string

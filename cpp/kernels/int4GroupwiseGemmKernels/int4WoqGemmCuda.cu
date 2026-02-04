@@ -254,12 +254,12 @@ template <int CTA_M, int CTA_N, int CTA_K, int STAGES, bool ldmatrix, int shared
 __device__ __inline__ void share_to_reg_one_stage_B_T2(
     half const* src, half* src_scales, half* dst, half* dst_fp16, int warp_offset_m, int warp_offset_n, int k_0_1)
 {
-    constexpr int kSmemCol = CTA_K + SMEM_PAD_B;
+    [[maybe_unused]] constexpr int kSmemCol = CTA_K + SMEM_PAD_B;
     int r0 = ((threadIdx.x / 8 / 2) * 8 + threadIdx.x % 8);
     int c0 = ((threadIdx.x / 8) % 2) * 8;
     int r = r0 / 4;
     int c = (r0 % 4) * 16 + c0;
-    int c_swizzled = ((c / PACK_SIZE) ^ (r % 2) & 7) * PACK_SIZE;
+    [[maybe_unused]] int c_swizzled = ((c / PACK_SIZE) ^ (r % 2) & 7) * PACK_SIZE;
 
     if constexpr (ldmatrix)
     {

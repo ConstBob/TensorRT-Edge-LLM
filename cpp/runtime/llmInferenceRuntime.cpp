@@ -306,7 +306,7 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
         activeBatchSize * packedInputLength * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     memcpy(mHostContextLengths.dataPointer<int32_t>(), processedIdsLengths.data(), activeBatchSize * sizeof(int32_t));
 
-    if (mEngineConfig.maxSupportedLoraRank > 0 && !mLLMEngineRunner->switchLoraWeights(loraWeightsName, stream))
+    if (mEngineConfig.maxSupportedLoraRank > 0 && !mLLMEngineRunner->switchLoraWeights(loraWeightsName))
     {
         LOG_ERROR("Failed to switch LoRA weights to %s", loraWeightsName.c_str());
         return false;

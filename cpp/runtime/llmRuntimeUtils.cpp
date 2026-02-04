@@ -149,8 +149,7 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
     return ropeConfig;
 }
 
-bool initializeRopeCosSinCache(
-    rt::Tensor& cosSinCache, RopeConfig const& config, nlohmann::json const& modelConfig, cudaStream_t stream)
+bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream)
 {
     if (config.type == RopeType::kMRope)
     {
@@ -200,8 +199,8 @@ bool initializeRopeCosSinCache(
     return true;
 }
 
-bool initializeLongRopeCosSinCache(rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config,
-    nlohmann::json const& modelConfig, cudaStream_t stream)
+bool initializeLongRopeCosSinCache(
+    rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config, cudaStream_t stream)
 {
 
     if (config.type != RopeType::kLongRope)

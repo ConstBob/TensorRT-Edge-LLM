@@ -488,7 +488,6 @@ __global__ void initRotaryPosEmbQwenKernel(float* rotaryPosEmb, int64_t const T,
     auto const hOrWPos = (tid % (vitPosEmbDim)) / (vitPosEmbDim / 2);
     auto const dimIdx = tid % (vitPosEmbDim / 2);
 
-    int64_t const llmGridH = H / mergeSize;
     int64_t const llmGridW = W / mergeSize;
     auto const llmGridHIdx = hwIdx / (llmGridW * mergeSize * mergeSize);
     auto const llmGridWIdx = (hwIdx % (llmGridW * mergeSize * mergeSize)) / (mergeSize * mergeSize);
