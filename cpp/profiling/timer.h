@@ -34,8 +34,8 @@ namespace trt_edgellm
 //! Global profiling control flag
 //! When false, no profiling data (metrics or timing) will be recorded
 //! This is useful to exclude warmup runs from benchmark statistics
-bool getProfilingEnabled();
-void setProfilingEnabled(bool enabled);
+bool getProfilingEnabled() noexcept;
+void setProfilingEnabled(bool enabled) noexcept;
 
 namespace timer
 {
@@ -53,6 +53,7 @@ struct TimerPair
     bool isInitialized{false};     //!< Whether events are initialized
 
     //! @brief Initialize CUDA events
+    //! @throws std::runtime_error if CUDA event creation fails
     void initialize()
     {
         if (!isInitialized)
@@ -64,7 +65,7 @@ struct TimerPair
     }
 
     //! @brief Destructor - destroys CUDA events
-    ~TimerPair()
+    ~TimerPair() noexcept
     {
         if (isInitialized)
         {
@@ -142,21 +143,21 @@ class TimerSession
 public:
     //! @brief Construct active session with callback
     //! @param onEnd Callback to execute on destruction
-    TimerSession(std::function<void()> onEnd)
+    TimerSession(std::function<void()> onEnd) noexcept
         : mOnEnd(std::move(onEnd))
         , mActive(true)
     {
     }
 
     //! @brief Construct inactive session
-    TimerSession(std::nullptr_t)
+    TimerSession(std::nullptr_t) noexcept
         : mOnEnd(nullptr)
         , mActive(false)
     {
     }
 
     //! @brief Destructor - executes callback if active
-    ~TimerSession()
+    ~TimerSession() noexcept
     {
         if (mActive && mOnEnd)
         {
@@ -210,34 +211,35 @@ struct StageTimingData
 
     //! @brief Add timing measurement
     //! @param timeMs Time in milliseconds
+    //! @throws std::bad_alloc If vector allocation fails
     void addTiming(float timeMs)
     {
         gpuTimesMs.push_back(timeMs);
     }
 
     //! @brief Reset all timing data
-    void reset()
+    void reset() noexcept
     {
         gpuTimesMs.clear();
     }
 
     //! @brief Calculate total GPU time
     //! @return Total time in milliseconds
-    float getTotalGpuTimeMs() const
+    float getTotalGpuTimeMs() const noexcept
     {
         return std::accumulate(gpuTimesMs.begin(), gpuTimesMs.end(), 0.0f);
     }
 
     //! @brief Calculate average time per run
     //! @return Average time in milliseconds
-    float getAverageTimeMs() const
+    float getAverageTimeMs() const noexcept
     {
         return gpuTimesMs.empty() ? 0.0f : getTotalGpuTimeMs() / gpuTimesMs.size();
     }
 
     //! @brief Get total number of runs
     //! @return Run count
-    int64_t getTotalRuns() const
+    int64_t getTotalRuns() const noexcept
     {
         return static_cast<int64_t>(gpuTimesMs.size());
     }
@@ -258,13 +260,15 @@ public:
     ~Timer() = default;
 
     //! @brief Reset all timing data
-    void reset();
+    void reset() noexcept;
 
     /*!
      * @brief Start timing a stage with automatic cleanup
      * @param stageId Stage identifier
      * @param stream CUDA stream (default: 0)
      * @return RAII session that stops timing on destruction
+     * @throws std::runtime_error if a CUDA error occurs
+     * @throws std::bad_alloc if container allocation fails
      */
     TimerSession startStage(std::string const& stageId, cudaStream_t stream);
 
@@ -272,12 +276,16 @@ public:
      * @brief Get timing data for a stage
      * @param stageId Stage identifier
      * @return Timing data if available, nullopt otherwise
+     * @throws std::runtime_error if a CUDA error occurs
+     * @throws std::bad_alloc if container allocation fails
      */
     std::optional<StageTimingData> getTimingData(std::string const& stageId) const;
 
     /*!
      * @brief Get all timing data
      * @return Map of stage IDs to timing data
+     * @throws std::runtime_error if a CUDA error occurs
+     * @throws std::bad_alloc if container allocation fails
      */
     std::unordered_map<std::string, StageTimingData> const& getAllTimingData() const;
 
@@ -289,15 +297,23 @@ private:
     mutable std::unordered_set<std::string> mPendingTimings;                    //!< Stages with pending timings
 
     //! @brief Start timer for stage
+    //! @throws std::runtime_error if a CUDA error occurs
+    //! @throws std::bad_alloc if container allocation fails
     void startTimer(std::string const& stageId, cudaStream_t stream);
 
     //! @brief End timer for stage
+    //! @throws std::runtime_error if a CUDA error occurs
+    //! @throws std::bad_alloc if container allocation fails
     void endTimer(std::string const& stageId, cudaStream_t stream);
 
     //! @brief Record timing measurement
+    //! @throws std::runtime_error if a CUDA error occurs
+    //! @throws std::bad_alloc if container allocation fails
     void recordTiming(std::string const& stageId) const;
 
     //! @brief Handle stage completion
+    //! @throws std::runtime_error if a CUDA error occurs
+    //! @throws std::bad_alloc if container allocation fails
     void onStageComplete(std::string const& stageId);
 };
 

@@ -26,8 +26,8 @@ namespace trt_edgellm
 //! \cond INTERNAL
 //! Global profiling control flag accessors (defined in timer.cpp)
 //! When false, no profiling data (metrics or timing) will be recorded
-bool getProfilingEnabled();
-void setProfilingEnabled(bool enabled);
+bool getProfilingEnabled() noexcept;
+void setProfilingEnabled(bool enabled) noexcept;
 //! \endcond
 
 namespace metrics
@@ -58,11 +58,11 @@ class BaseMetrics
 {
 public:
     //! @brief Virtual destructor
-    virtual ~BaseMetrics() = default;
+    virtual ~BaseMetrics() noexcept = default;
 
     //! @brief Get total number of runs
     //! @return Total runs count
-    int64_t getTotalRuns() const
+    int64_t getTotalRuns() const noexcept
     {
         return totalRuns;
     }
@@ -85,7 +85,7 @@ public:
     //! @brief Record a prefill run
     //! @param reused Number of reused tokens
     //! @param computed Number of computed tokens
-    void recordRun(int64_t reused, int64_t computed)
+    void recordRun(int64_t reused, int64_t computed) noexcept
     {
         if (!getProfilingEnabled())
         {
@@ -109,7 +109,7 @@ public:
 
     //! @brief Record a generation run
     //! @param generated Number of generated tokens
-    void recordRun(int64_t generated)
+    void recordRun(int64_t generated) noexcept
     {
         if (!getProfilingEnabled())
         {
@@ -134,7 +134,7 @@ public:
     //! @brief Record a multimodal processing run
     //! @param imageCount Number of images processed
     //! @param imageTokens Number of image tokens generated
-    void recordRun(int64_t imageCount, int64_t imageTokens)
+    void recordRun(int64_t imageCount, int64_t imageTokens) noexcept
     {
         if (!getProfilingEnabled())
         {
@@ -160,7 +160,7 @@ public:
     //! @brief Record an Eagle generation run
     //! @param iterations Number of iterations
     //! @param generatedTokens Number of generated tokens
-    void recordRun(int64_t iterations, int64_t generatedTokens)
+    void recordRun(int64_t iterations, int64_t generatedTokens) noexcept
     {
         if (!getProfilingEnabled())
         {

@@ -27,12 +27,12 @@ namespace trt_edgellm
 // Global profiling control flag implementation
 static bool gProfilingEnabled = false;
 
-bool getProfilingEnabled()
+bool getProfilingEnabled() noexcept
 {
     return gProfilingEnabled;
 }
 
-void setProfilingEnabled(bool enabled)
+void setProfilingEnabled(bool enabled) noexcept
 {
     gProfilingEnabled = enabled;
 }
@@ -40,7 +40,7 @@ void setProfilingEnabled(bool enabled)
 namespace timer
 {
 
-void Timer::reset()
+void Timer::reset() noexcept
 {
     mTimingData.clear();
     mTimers.clear();
