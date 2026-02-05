@@ -99,6 +99,7 @@ struct SamplingWorkspace;
  * \param[in] stream CUDA stream to execute the kernel
  * \param[in] philoxSeed Random seed for sampling (default: 42)
  * \param[in] philoxOffset Random offset for sampling (default: 0)
+ * \throws std::runtime_error If CUDA operations fail
  */
 void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIndices, SamplingParams const& params,
     rt::Tensor& workspace, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
@@ -117,6 +118,7 @@ void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIn
  * \param[in] topK Number of top elements to select
  * \param[in,out] workspace Workspace buffer [GPU, Int8] for intermediate computations
  * \param[in] stream CUDA stream to execute the kernel
+ * \throws std::runtime_error If CUDA operations fail
  */
 void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues, rt::Tensor& topKIndices, int32_t topK,
     rt::Tensor& workspace, cudaStream_t stream);
@@ -132,6 +134,7 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
  * \param[in] vocabSize Vocabulary size
  * \param[in] params Sampling parameters
  * \return Required workspace size in bytes
+ * \throws std::runtime_error if topK and topP are both not set
  */
 size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, SamplingParams const& params);
 
@@ -147,7 +150,7 @@ size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, Sa
  * \param[in] topK Number of top elements to select
  * \return Required workspace size in bytes
  */
-size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK);
+size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK) noexcept;
 
 /*!
  * \brief Map reduced vocabulary IDs to full vocabulary IDs using a lookup table (in-place).
@@ -162,6 +165,7 @@ size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32
  * \param[in] vocabMappingTable Lookup table [GPU, Int32] with shape [reduced_vocab_size] mapping reduced IDs to full
  * IDs
  * \param[in] stream CUDA stream to execute the kernel
+ * \throws std::runtime_error If CUDA operations fail
  */
 void mapReducedVocabToFullVocab(rt::Tensor& vocabIds, rt::Tensor const& vocabMappingTable, cudaStream_t stream);
 

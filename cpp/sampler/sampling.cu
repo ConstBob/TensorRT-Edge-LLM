@@ -246,7 +246,7 @@ size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, Sa
 }
 
 // Calculate workspace size for selectAllTopK (FP32 only)
-size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK)
+size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK) noexcept
 {
     auto alignSize = [](size_t size) -> size_t {
         size_t const alignment = 256;
