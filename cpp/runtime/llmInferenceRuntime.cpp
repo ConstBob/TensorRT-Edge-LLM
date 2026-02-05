@@ -191,7 +191,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     }
 }
 
-bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request)
+bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request) noexcept
 {
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
 
@@ -639,7 +639,7 @@ bool LLMInferenceRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 
 LLMInferenceRuntime::TokenCountInfo LLMInferenceRuntime::calculateTokenCounts(
     std::vector<std::vector<int32_t>> const& batchedInputIds, std::vector<std::string> const& systemPrompts,
-    std::string const& loraWeightsName) const
+    std::string const& loraWeightsName) const noexcept
 {
     TokenCountInfo tokenCount;
     int32_t const activeBatchSize = static_cast<int32_t>(batchedInputIds.size());

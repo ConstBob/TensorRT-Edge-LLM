@@ -65,28 +65,32 @@ public:
      *  \param enginePath Path to the TensorRT engine file
      *  \param configPath Path to the configuration JSON file
      *  \param stream CUDA stream for initialization
+     *  \throws std::runtime_error if engine loading, configuration parsing, or initialization fails
+     *  \throws std::runtime_error if there is a data type mismatch, or mismatch between engine and config
+     *  \throws std::runtime_error if a CUDA error occurs
+     *  \throws std::bad_alloc If memory allocation fails
      */
     EagleDraftEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         cudaStream_t stream);
 
     /*! \brief Destructor
      */
-    ~EagleDraftEngineRunner();
+    ~EagleDraftEngineRunner() noexcept;
 
     /*! \brief Get internal RoPE cosine/sine cache tensor for the eagle draft engine
      *  \return Reference to the RoPE cosine/sine cache tensor
      */
-    rt::Tensor& getRopeCosSinCacheTensor();
+    rt::Tensor& getRopeCosSinCacheTensor() noexcept;
     
     /*! \brief Get internal linear KV cache for the eagle draft engine
      *  \return Reference to the linear KV cache
      */
-    rt::LinearKVCache& getLinearKVCache();
+    rt::LinearKVCache& getLinearKVCache() noexcept;
 
     /*! \brief Get the draft engine configuration
      *  \return The draft engine configuration structure
      */
-    EagleDraftEngineRunnerConfig getDraftEngineConfig() const;
+    EagleDraftEngineRunnerConfig getDraftEngineConfig() const noexcept;
 
     /*! \brief API entry to execute prefill step for the eagle draft engine
      * 
@@ -106,6 +110,7 @@ public:
      *  \param baseRopeCosSinCache [GPU, Float32] The RoPE cos/sin cache from the base model (for MRope)
      *  \param stream The CUDA stream to execute the prefill step
      *  \return True if execution was successful, false otherwise
+     *  \throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
      */
     bool executeEaglePrefillStep(rt::Tensor const& inputsEmbeds, rt::Tensor const& baseModelHiddenStates,
         rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths, rt::Tensor& outputLogits,
@@ -129,6 +134,7 @@ public:
      *  \param outputHiddenStates [GPU, Float16] The output hidden states with shape [batch_size, num_selected_tokens, draft-hidden-dim]
      *  \param stream The CUDA stream to execute the draft proposal step
      *  \return True if execution was successful, false otherwise
+     *  \throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
      * 
      *  \note The API will automatically collect the "last" topK logits and hidden-states counting from the tail of
      *        "real" draft tree size. Caller shall specify the topK parameter through tensor dimension. 
@@ -152,6 +158,7 @@ public:
      *  \param outputHiddenStates [GPU, Float16] The output hidden states with shape [batch_size, draft-hidden-dim]
      *  \param stream The CUDA stream to execute the accept decode token step
      *  \return True if execution was successful, false otherwise
+     *  \throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
      * 
      *  \note This API will "commit" the KVCache for the accepted tokens.
      */
@@ -175,6 +182,7 @@ public:
      *  \param outputHiddenStates [GPU, Float16] The output hidden states with shape [batch_size, num_selected_tokens, draft-hidden-dim]
      *  \param stream The CUDA stream to capture the CUDA graph. The API will capture the CUDA graph for the draft proposal step
      *  \return True if the CUDA graph is captured successfully, false otherwise
+     *  \throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
      */
     bool captureEagleDraftProposalCudaGraph(rt::Tensor const& draftTreeInputsEmbeds,
         rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
@@ -195,6 +203,7 @@ public:
      *  \param outputHiddenStates [GPU, Float16] The output hidden states with shape [batch_size, draft-hidden-dim]
      *  \param stream The CUDA stream to capture the CUDA graph. The API will capture the CUDA graph for the accept decode token step
      *  \return True if the CUDA graph is captured successfully, false otherwise
+     *  \throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
      */
     bool captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor const& acceptedTokensEmbeds,
         rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
@@ -232,15 +241,17 @@ private:
     //! Initialize the configuration from the JSON file.
     //! \param configJson The JSON configuration object
     //! \return True if initialization was successful, false otherwise
-    bool initializeConfigFromJson(Json const& configJson);
+    bool initializeConfigFromJson(Json const& configJson) noexcept;
 
     //! Validate the configuration from the engine.
     //! \return True if validation was successful, false otherwise
+    //! \throws std::bad_alloc if string allocation fails
     bool validateConfigFromEngine();
 
     //! Bind KV cache to the engine.
     //! \param activeBatchSize The active batch size
     //! \return True if binding was successful, false otherwise
+    //! \throws std::bad_alloc if string allocation fails
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
     //! Validate input parameters for the prefill step.
@@ -253,7 +264,7 @@ private:
     //! \return True if validation passed, false otherwise
     bool prefillStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& baseModelHiddenStates,
         rt::Tensor const& draftModelHiddenStates, rt::Tensor const& contextLengths, rt::Tensor const& outputLogits,
-        rt::Tensor const& outputHiddenStates);
+        rt::Tensor const& outputHiddenStates) noexcept;
 
     //! Validate input parameters for the draft proposal step.
     //! \param draftTreeInputsEmbeds Draft tree input embeddings tensor
@@ -267,7 +278,7 @@ private:
     bool draftProposalStepInputValidation(rt::Tensor const& draftTreeInputsEmbeds,
         rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
         rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor const& outputLogits,
-        rt::Tensor const& outputHiddenStates);
+        rt::Tensor const& outputHiddenStates) noexcept;
 
     //! Validate input parameters for the accept decode token step.
     //! \param acceptedTokensEmbeds Accepted tokens embeddings tensor [batch_size, N_accepted_padded, draft-hidden-dim]
@@ -279,7 +290,7 @@ private:
     //! \return True if validation passed, false otherwise
     bool acceptDecodeTokenStepInputValidation(rt::Tensor const& acceptedTokensEmbeds,
         rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
-        rt::Tensor const& acceptedTokenNums, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates);
+        rt::Tensor const& acceptedTokenNums, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates) noexcept;
 };
 
 // clang-format on

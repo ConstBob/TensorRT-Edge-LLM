@@ -138,6 +138,7 @@ struct RopeConfig
  *
  *  \param config [JSON] The model config file supplied with the model
  *  \return The parsed rope configuration
+ *  \throws nlohmann::json::type_error if JSON value types don't match expected types
  */
 RopeConfig collectRopeConfig(nlohmann::json const& config);
 
@@ -148,7 +149,7 @@ RopeConfig collectRopeConfig(nlohmann::json const& config);
  *  \param stream [CUDA stream] The stream to execute the initialization
  *  \return True if the initialization is successful, false otherwise
  */
-bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream);
+bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream) noexcept;
 
 /*! \brief Initialize the rope cos/sin cache tensor for long rope type
  *
@@ -157,12 +158,14 @@ bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config
  *  \param config [RopeConfig] The rope configuration
  *  \param stream [CUDA stream] The stream to execute the initialization
  *  \return True if the initialization is successful, false otherwise
+ *  \throws std::runtime_error if CUDA operations fail
  */
 bool initializeLongRopeCosSinCache(
     rt::Tensor& shortCosSinCache, rt::Tensor& longCosSinCache, RopeConfig const& config, cudaStream_t stream);
 
 /*!
  * @brief Format rope configuration into string
+ * @throws std::bad_alloc if memory allocation fails
  */
 std::string formatRopeConfig(RopeConfig const& config);
 
@@ -175,6 +178,8 @@ std::string formatRopeConfig(RopeConfig const& config);
  * @tparam T Element type
  * @param batchMapping      [oldActiveBatch] CPU vector (const input), mapping[i] = newBatchIdx or -1 (evict)
  * @param vec               Vector to compact (output, modified in-place)
+ * @throws std::invalid_argument if sizes of input vectors don't match
+ * @throws std::bad_alloc if memory allocation fails
  */
 template <typename T>
 void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec);
@@ -188,6 +193,7 @@ void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec
  * @param finishedStates    [oldActiveBatch] CPU vector indicating which batches are finished (0=not finished,
  * 1=finished)
  * @return Vector mapping old batch indices to new indices (-1 for evicted batches)
+ * @throws std::bad_alloc if memory allocation fails
  */
 std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates);
 
