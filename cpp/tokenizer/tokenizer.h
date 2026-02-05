@@ -87,7 +87,7 @@ struct textPartition
      * @brief Constructor for special token partition
      * @param _token Token ID for the special token
      */
-    textPartition(Rank _token)
+    textPartition(Rank _token) noexcept
         : type(TEXT_PART_SPECIAL_TOKEN)
         , token(_token)
         , rawText(_dummy)
@@ -101,6 +101,7 @@ struct textPartition
      * @param _rawText Reference to the raw text string
      * @param _offset Offset into the raw text string
      * @param _length Length of the text partition
+     * @throws std::bad_alloc if string allocation fails
      */
     textPartition(std::string const& _rawText, int _offset, int _length)
         : type(TEXT_PART_RAW_TEXT)
@@ -131,8 +132,8 @@ struct textPartition
 class Tokenizer
 {
 public:
-    Tokenizer();
-    ~Tokenizer() = default;
+    Tokenizer() noexcept;
+    ~Tokenizer() noexcept = default;
 
     // TODO: Add constructor with preTokenizer and tokenEncoder
     // Tokenizer(std::string const& patStr, BPETokenToRanks& mergeableRanks, BPETokenToRanks& specialTokens,
@@ -144,6 +145,8 @@ public:
      * @param addBos Whether to add beginning-of-sequence token
      * @param addEos Whether to add end-of-sequence token
      * @return Vector of token IDs
+     * @throws std::bad_alloc if memory allocation fails
+     * @throws std::runtime_error if tokenization encounters an error
      */
     std::vector<Rank> encode(std::string const& text, bool addBos = false, bool addEos = false) const;
 
@@ -152,6 +155,7 @@ public:
      * @param tokens Vector of token IDs
      * @param skipSpecialTokens Whether to skip special tokens in output
      * @return Decoded text string
+     * @throws std::bad_alloc if memory allocation fails
      */
     std::string decode(std::vector<Rank> const& tokens, bool skipSpecialTokens = false) const;
 
@@ -161,6 +165,7 @@ public:
      * @return true if directory exists, tokenizer.json is found and parsed successfully,
      *         pretokenizer and encoder are created successfully; false if directory doesn't exist,
      *         tokenizer.json is missing/corrupt, or initialization fails
+     * @throws std::bad_alloc if memory allocation fails
      */
     bool loadFromHF(std::filesystem::path const& modelDir);
 
@@ -219,6 +224,7 @@ public:
      * @brief Load chat template configuration from JSON file
      * @param chatTemplateFile Path to the processed_chat_template.json file
      * @return true if chat template is loaded successfully; false if file doesn't exist or parsing fails
+     * @throws std::bad_alloc if string memory allocation fails
      */
     bool loadChatTemplate(std::filesystem::path const& chatTemplateFile);
 
@@ -231,6 +237,7 @@ public:
      * @param addGenerationPrompt Whether to add generation prompt at the end (only used when applyChatTemplate is true)
      * @param enableThinking Whether to enable thinking mode for models that support it
      * @return true if chat template is applied successfully; false if encountered errors
+     * @throws std::bad_alloc if string memory allocation fails
      */
     bool applyChatTemplate(rt::LLMGenerationRequest::Request const& request,
         rt::LLMGenerationRequest::FormattedRequest& formattedRequest, bool applyChatTemplate = true,
@@ -239,6 +246,7 @@ public:
     /**
      * @brief Get default system prompt from chat template
      * @return Default system prompt string
+     * @throws std::bad_alloc if string memory allocation fails
      */
     std::string getDefaultSystemPrompt() const noexcept
     {
@@ -254,6 +262,7 @@ protected:
      * @return true if file size is valid, file opens successfully, JSON parses correctly,
      *         and pretokenizer/vocabulary load; false if file is too large, can't be opened,
      *         contains invalid JSON, or configuration is malformed
+     * @throws std::bad_alloc if memory allocation fails
      */
     bool parseTokenizerConfig(
         std::filesystem::path const& tokenizerFile, TokenToRanks& vocab, TokenToRanks& specialTokens);
@@ -264,6 +273,7 @@ protected:
      * @param specialTokens Output special tokens mapping
      * @return true if file size is valid, file opens successfully, and JSON parses correctly;
      *         false if file is too large, can't be opened, or contains invalid JSON
+     * @throws std::bad_alloc if memory allocation fails
      */
     bool parseSpecialTokenConfig(std::filesystem::path const& configFile, TokenToRanks& specialTokens);
 
@@ -272,6 +282,7 @@ protected:
      * @param preTokenizerConfig JSON configuration for pretokenizer
      * @return Unique pointer to created pretokenizer: RegexSplit for recognized Split/Regex types,
      *         Sequence for pretokenizer arrays, or default empty Sequence for unknown configurations
+     * @throws std::bad_alloc if memory allocation fails
      */
     std::unique_ptr<PreTokenizer> createPreTokenizer(nlohmann::json const& preTokenizerConfig);
 
@@ -279,6 +290,7 @@ protected:
      * @brief Determine encoder type from configuration
      * @param modelConfig JSON configuration for the model
      * @return TokenEncoder type
+     * @throws std::bad_alloc if memory allocation fails
      */
     TokenEncoder::Type determineEncoderType(nlohmann::json const& modelConfig);
 
@@ -288,6 +300,7 @@ protected:
      * @param vocab Output vocabulary mapping
      * @return true if model configuration contains valid vocab object and tokens are loaded;
      *         false if vocab section is missing/invalid or no valid tokens found
+     * @throws std::bad_alloc if memory allocation fails
      */
     bool loadVocabulary(nlohmann::json const& modelConfig, TokenToRanks& vocab);
 
@@ -297,6 +310,7 @@ protected:
      * @param specialTokens Output special tokens mapping
      * @return true if special tokens are extracted and processed successfully;
      *         false if extraction fails
+     * @throws std::bad_alloc if memory allocation fails
      */
     bool loadSpecialTokens(nlohmann::json const& tokenizerConfig, TokenToRanks& specialTokens);
 
@@ -307,19 +321,21 @@ protected:
      * @return true if text is partitioned successfully without exceptions;
      *         false if partitioning fails due to processing errors
      */
-    bool partitionSpecialTokens(std::string const& text, std::forward_list<textPartition>& partitions) const;
+    bool partitionSpecialTokens(std::string const& text, std::forward_list<textPartition>& partitions) const noexcept;
 
     /**
      * @brief Add BOS token if configured
      * @param tokens Token vector to modify
+     * @throws std::bad_alloc if memory allocation fails
      */
-    void appendBos(std::vector<Rank>& tokens) const noexcept;
+    void appendBos(std::vector<Rank>& tokens) const;
 
     /**
      * @brief Add EOS token if configured
      * @param tokens Token vector to modify
+     * @throws std::bad_alloc if memory allocation fails
      */
-    void appendEos(std::vector<Rank>& tokens) const noexcept;
+    void appendEos(std::vector<Rank>& tokens) const;
 
     // Core components
     std::unique_ptr<PreTokenizer> mPreTokenizer; //!< Pretokenizer for splitting input text

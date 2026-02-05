@@ -30,7 +30,7 @@ namespace tokenizer
 // Size limits for token encoder processing
 constexpr size_t LARGE_PIECE_WARNING_BYTES = 65536; // 64KB warning threshold
 
-TokenEncoder::TokenEncoder(Type type)
+TokenEncoder::TokenEncoder(Type type) noexcept
     : mType(type)
     , mVocabSize(0)
 {
@@ -55,7 +55,7 @@ bool TokenEncoder::initialize(TokenToRanks const& vocab, TokenToRanks const& spe
     return true;
 }
 
-bool TokenEncoder::encode(std::string const& piece, std::vector<Rank>& output) const
+bool TokenEncoder::encode(std::string const& piece, std::vector<Rank>& output) const noexcept
 {
     if (piece.empty())
     {
@@ -89,7 +89,7 @@ bool TokenEncoder::encode(std::string const& piece, std::vector<Rank>& output) c
     }
 }
 
-bool TokenEncoder::decode(std::vector<Rank> const& tokens, std::string& output, bool skipSpecialTokens) const
+bool TokenEncoder::decode(std::vector<Rank> const& tokens, std::string& output, bool skipSpecialTokens) const noexcept
 {
     try
     {
@@ -127,12 +127,12 @@ bool TokenEncoder::decode(std::vector<Rank> const& tokens, std::string& output, 
     }
 }
 
-bool TokenEncoder::hasToken(std::string const& token) const
+bool TokenEncoder::hasToken(std::string const& token) const noexcept
 {
     return mEncoder.find(token) != mEncoder.end() || mSpecialTokensEncoder.find(token) != mSpecialTokensEncoder.end();
 }
 
-Rank TokenEncoder::getTokenRank(std::string const& token) const
+Rank TokenEncoder::getTokenRank(std::string const& token) const noexcept
 {
     auto it = mEncoder.find(token);
     if (it != mEncoder.end())

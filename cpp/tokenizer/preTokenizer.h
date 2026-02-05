@@ -39,7 +39,7 @@ constexpr size_t MAX_TEXT_SIZE_BYTES = 1024 * 1024;
 class PreTokenizer
 {
 public:
-    virtual ~PreTokenizer() = default;
+    virtual ~PreTokenizer() noexcept = default;
 
     /**
      * @brief Process text and return split pieces
@@ -51,6 +51,7 @@ public:
     /**
      * @brief Get the type name of this step
      * @return String identifying the step type
+     * @throws std::bad_alloc if the string cannot be allocated
      */
     virtual std::string getTypeName() const = 0;
 };
@@ -64,11 +65,27 @@ public:
     /*!
      * @brief Constructor with regex pattern
      * @param pattern Regex pattern for splitting text
+     * @throws std::invalid_argument if the pattern is empty
+     * @throws std::runtime_error if the pattern is invalid
      */
     explicit RegexSplit(std::string const& pattern);
     ~RegexSplit() override = default;
 
+    /*!
+     * @brief Process text and return split pieces
+     * @param text Input text to process
+     * @return Vector of text pieces after processing
+     * @throws std::runtime_error if the text is too large for regex processing
+     * @throws std::runtime_error if Unicode text collapse fails
+     * @throws std::runtime_error if Unicode regex split fails
+     * @throws std::bad_alloc if the vector or any of the strings cannot be allocated
+     */
     std::vector<std::string> process(std::string const& text) const override;
+    /*!
+     * @brief Get the type name of this step
+     * @return String identifying the step type
+     * @throws std::bad_alloc if the string cannot be allocated
+     */
     std::string getTypeName() const override
     {
         return "RegexSplit";
@@ -97,17 +114,30 @@ class Sequence : public PreTokenizer
 {
 public:
     //! Default constructor - creates empty sequence (acts as pass-through)
-    Sequence() = default;
+    Sequence() noexcept = default;
 
     /*!
      * @brief Constructor with sequence of pretokenizer steps
      * @param steps Vector of pretokenizer steps to apply in order
      */
-    explicit Sequence(std::vector<std::unique_ptr<PreTokenizer>> steps);
+    explicit Sequence(std::vector<std::unique_ptr<PreTokenizer>> steps) noexcept;
 
-    ~Sequence() = default;
+    ~Sequence() noexcept = default;
 
+    /*!
+     * @brief Process text and return split pieces
+     * @param text Input text to process
+     * @return Vector of text pieces after processing
+     * @throws std::runtime_error if the text is too large for processing
+     * @throws std::bad_alloc if the vector or any of the strings cannot be allocated
+     */
     std::vector<std::string> process(std::string const& text) const override;
+
+    /*!
+     * @brief Get the type name of this step
+     * @return String identifying the step type
+     * @throws std::bad_alloc if the string cannot be allocated
+     */
     std::string getTypeName() const override
     {
         return "Sequence";
@@ -116,6 +146,8 @@ public:
     /**
      * @brief Add a processing step to the sequence
      * @param step Unique pointer to the step to add
+     * @throws std::invalid_argument if the step is null
+     * @throws std::bad_alloc if the vector cannot be allocated
      */
     void addStep(std::unique_ptr<PreTokenizer> step);
 
