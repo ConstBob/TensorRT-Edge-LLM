@@ -43,6 +43,7 @@ public:
      * @param headSize Attention head dimension
      * @param smVersion CUDA compute capability (e.g., 89 for SM 8.9)
      * @param inputLayout Input tensor layout
+     * @throws std::runtime_error if a CUDA error occurs, or if the SM is not supported
      */
     ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t paddedSeqLen, int32_t numQHeads,
         int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout);
@@ -51,7 +52,7 @@ public:
     ContextFMHARunner() = delete;
 
     //! @brief Destructor
-    ~ContextFMHARunner() = default;
+    ~ContextFMHARunner() noexcept = default;
 
     //! @brief Get required workspace size in bytes
     //! @return Workspace size
@@ -63,6 +64,7 @@ public:
      * Configures FMHA parameters. Device pointers must be set by caller.
      *
      * @param params FMHA parameter structure
+     * @throws std::runtime_error if input layout or alpha type is unsupported
      */
     void setupParams(FusedMultiheadAttentionParamsV2& params);
 
@@ -70,6 +72,7 @@ public:
      * @brief Dispatch FMHA kernel execution
      * @param params FMHA parameters with device pointers set
      * @param stream CUDA stream for kernel launch
+     * @throws std::runtime_error if device pointers are invalid, or a CUDA error happens
      */
     void dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream);
 
@@ -81,13 +84,15 @@ public:
      * @param dataType Data type
      * @return True if implementation is available
      */
-    static bool canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType);
+    static bool canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType) noexcept;
 
     /*!
      * @brief Load FMHA kernel cubins into device
      * @param sm CUDA compute capability
      * @param dataType Data type
      * @return True if successful
+     * @throws std::runtime_error if a CUDA driver error occurs
+     * @throws std::bad_alloc if a memory allocation error occurs
      */
     static bool loadContextFMHAKernels(int32_t sm, nvinfer1::DataType dataType);
 

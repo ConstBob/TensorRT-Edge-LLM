@@ -38,6 +38,7 @@ namespace kernel
  * @param stream            CUDA stream
  *
  * @note This function updates kvCacheBuffer and kvCacheLengths in-place with compacted values
+ * @throws std::runtime_error if tensors are not located on the GPU, or batch size is excessive
  */
 void compactKVCache(rt::Tensor const& batchMapping, rt::Tensor& kvCacheBuffer, rt::Tensor& kvCacheLengths,
     int32_t oldActiveBatch, int32_t newActiveBatch, cudaStream_t stream);
@@ -56,6 +57,7 @@ void compactKVCache(rt::Tensor const& batchMapping, rt::Tensor& kvCacheBuffer, r
  *
  * @note Assumes batch dimension is the first dimension (dim 0)
  * @note For in-place operation, pass the same tensor as both src and dst
+ * @throws std::runtime_error if tensors are not located on the GPU, or tensor shapes are invalid
  */
 void compactTensorBatch(rt::Tensor const& src, rt::Tensor const& batchMapping, rt::Tensor& dst, int32_t oldActiveBatch,
     int32_t newActiveBatch, cudaStream_t stream);

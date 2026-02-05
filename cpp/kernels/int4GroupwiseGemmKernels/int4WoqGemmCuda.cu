@@ -477,7 +477,7 @@ __global__ void gemm_w4a16_T2(half const* __restrict__ A, half const* __restrict
 }
 
 void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
-    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
+    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream) noexcept
 {
     // The GEMM kernel will load packed int4 weights as fp16 data tensor.
     half const* kernel = reinterpret_cast<half const*>(weights_device);

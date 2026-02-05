@@ -37,12 +37,12 @@ struct AlibiParams
         return x - (x >> 1);
     }
 
-    AlibiParams() = default;
+    AlibiParams() noexcept = default;
 
     //! \brief Constructor for ALiBi parameters
     //! \param h Number of attention heads
     //! \param scale_after_alibi Scaling factor to apply after ALiBi bias (default 1.0)
-    AlibiParams(int32_t h, float scale_after_alibi = 1.f)
+    AlibiParams(int32_t h, float scale_after_alibi = 1.f) noexcept
         : scale_after_alibi(scale_after_alibi)
     {
         h_pow_2 = round_down_to_power_two(h);
@@ -55,7 +55,7 @@ struct AlibiParams
     //! \param tp_size Tensor parallelism size
     //! \param rank Current rank in tensor parallel group
     //! \param scale_after_alibi Scaling factor to apply after ALiBi bias (default 1.0)
-    AlibiParams(int32_t h, int32_t s, int32_t tp_size, int32_t rank, float scale_after_alibi = 1.f)
+    AlibiParams(int32_t h, int32_t s, int32_t tp_size, int32_t rank, float scale_after_alibi = 1.f) noexcept
         : AlibiParams(h * tp_size, scale_after_alibi)
     {
         head_idx_offset = h * rank;
@@ -112,8 +112,8 @@ struct KvBlockArray
     //! \param tokensPerBlock Number of tokens per block (must be power of 2)
     //! \param bytesPerBlock Size of each KV cache block in bytes
     //! \param poolPtr Pointer to the beginning of the memory pool
-    KvBlockArray(
-        int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, int32_t bytesPerBlock, void* poolPtr)
+    KvBlockArray(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, int32_t bytesPerBlock,
+        void* poolPtr) noexcept
         : mMaxSeqs(batchSize)
         , mMaxBlocksPerSeq(maxBlocksPerSeq)
         , mTokensPerBlock(tokensPerBlock)

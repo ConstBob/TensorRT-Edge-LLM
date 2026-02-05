@@ -32,6 +32,7 @@ namespace kernel
 //! \param[in] increment The scalar increment value
 //! \param[in] stream The CUDA stream to be used
 //! \note LengthTensor shall reside on GPU and have data type of int32_t.
+//! \throws std::runtime_error if tensor has wrong location or data type
 void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStream_t stream);
 
 //! \brief Increment the lengthTensor by element-wise values from another tensor
@@ -42,6 +43,7 @@ void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStre
 //! \param[in] newIncrementTensor The tensor containing per-element increment values
 //! \param[in] stream The CUDA stream to be used
 //! \note LengthTensor and newIncrementTensor shall reside on GPU, have equal length, and have data type of int32_t.
+//! \throws std::runtime_error if tensor has wrong location, shape or data type
 void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrementTensor, cudaStream_t stream);
 
 //! \brief Instantiate the KVCache from a pre-computed KVCache tensor
@@ -55,6 +57,7 @@ void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrem
 //!                              Layout: [numDecoderLayers, 2, numKVHeads, sequenceLength, headDim]
 //! \param[in] batchIdx The batch index of the KVCache to be instantiated
 //! \param[in] stream The CUDA stream to be used
+//! \throws std::runtime_error batchIdx or sequenceLength is out of range, or tensor data type is wrong
 void instantiateKVCacheFromTensor(
     rt::Tensor& dstKVCacheBuffer, rt::Tensor const& srcKVCacheTensor, int32_t batchIdx, cudaStream_t stream);
 
@@ -70,6 +73,7 @@ void instantiateKVCacheFromTensor(
 //!                              Layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
 //! \param[in] batchIdx The batch index of the KVCache to be saved
 //! \param[in] stream The CUDA stream to be used
+//! \throws std::runtime_error batchIdx or sequenceLength is out of range, or tensor data type is wrong
 void saveKVCacheIntoTensor(
     rt::Tensor& dstKVCacheTensor, rt::Tensor const& srcKVCacheBuffer, int32_t batchIdx, cudaStream_t stream);
 

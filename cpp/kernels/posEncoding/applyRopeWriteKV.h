@@ -36,6 +36,7 @@ namespace kernel
 //! @param[out] kvCache FP16 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
 //! from the start positions.
 //! @param[in] stream CUDA stream to launch the kernel
+//! @throws std::runtime_error if tensor shape or data type is incorrect
 void launchApplyRopeWriteKVPackedQKV(rt::Tensor const& cosSinCache, rt::Tensor& qkv, rt::Tensor& kvCache,
     rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
@@ -49,6 +50,7 @@ void launchApplyRopeWriteKVPackedQKV(rt::Tensor const& cosSinCache, rt::Tensor& 
 //! @param[out] qOut FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim], the output Q tensor.
 //! @param[in] stream CUDA stream to launch the kernel
 //! @note We won't overwrite QKV tensor in this case but we use Tensor& signature to reduce duplicate code.
+//! @throws std::runtime_error if tensor shape or data type is incorrect
 void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
     rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
@@ -63,6 +65,7 @@ void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, 
 //! @param[out] qOut FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim], the output Q tensor.
 //! @param[in] stream CUDA stream to launch the kernel
 //! @note We won't overwrite QKV tensor in this case but we use Tensor& signature to reduce duplicate code.
+//! @throws std::runtime_error if tensor shape or data type is incorrect
 void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
     rt::Tensor const& tokenPosIds, rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut,
     rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);

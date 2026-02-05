@@ -33,6 +33,7 @@ namespace kernel
 //! \param[in] embeddingTable Embedding table with shape [vocabSize, hiddenSize]
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
+//! \throws std::runtime_error if tensor shapes or data types are invalid
 void embeddingLookup(
     rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::Tensor& output, cudaStream_t stream);
 
@@ -43,6 +44,7 @@ void embeddingLookup(
 //! \param[in] imageEmbeds Image embeddings with shape [imageTokenLen, hiddenSize]
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
+//! \throws std::runtime_error if tensor shapes or data types are invalid
 void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
     rt::Tensor const& imageEmbeds, rt::Tensor& output, cudaStream_t stream);
 
@@ -62,6 +64,7 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
 //! \param[in] vocabSize Vocabulary size threshold for distinguishing text vs image tokens
 //! \param[out] deepstackEmbeds Output embeddings with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
+//! \throws std::runtime_error if tensor shapes or data types are invalid
 void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& deepstackFeatures, int32_t vocabSize,
     rt::Tensor& deepstackEmbeds, cudaStream_t stream);
 

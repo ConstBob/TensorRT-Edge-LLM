@@ -45,6 +45,7 @@ namespace kernel
 //! \param[in]  runtimeSeqLen     Runtime sequence length (equals to the maximum of inputSeqLen).
 //! \param[in]  stream            CUDA stream used to launch the kernel.
 //! \note kvCacheStartIndices is optional. If it is not provided, kvStartIndices will be assumed to be 0.
+//! \throws std::runtime_error if tensor shapes are invalid
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs, int32_t const runtimeSeqLen,
     cudaStream_t stream);
@@ -60,6 +61,7 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 //! \param[in] kvScaleQuantOrig Optional packed dequant scale tensor for FP8 KV cache (shape [2], float).
 //!            Layout: [kScaleQuantOrig, vScaleQuantOrig].
 //! \param[in] stream CUDA stream to launch the kernel on
+//! \throws std::runtime_error if tensor shapes or data types are invalid
 void cvtKVLayoutBHSDToBSHD(
     rt::Tensor const& src, rt::Tensor& dst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
