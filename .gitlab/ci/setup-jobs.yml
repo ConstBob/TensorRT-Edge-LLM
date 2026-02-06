@@ -10,6 +10,7 @@ pre_commit_checks:
   tags:
     - cpu-k8s
   script:
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - echo "Installing dependencies"
     - export DEBIAN_FRONTEND=noninteractive
     - apt update -qq >/dev/null 2>&1
@@ -33,6 +34,7 @@ l0_cache_cleanup:
     - a30-edgellm-nvks
   script:
     - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - echo "Starting cache cleanup for L0 directories older than 3 days in $EDGE_LLM_CACHE_DIR/L0"
     - echo "Current contents in $EDGE_LLM_CACHE_DIR/L0:"
     - ls -la "$EDGE_LLM_CACHE_DIR/L0" || echo "Directory is empty or inaccessible"
@@ -51,6 +53,7 @@ l1_cache_cleanup:
     - a30-edgellm-nvks
   script:
     - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - echo "Starting cache cleanup for L1 directories older than 7 days in $EDGE_LLM_CACHE_DIR/L1"
     - echo "Current contents in $EDGE_LLM_CACHE_DIR/L1:"
     - ls -la "$EDGE_LLM_CACHE_DIR/L1" || echo "Directory is empty or inaccessible"

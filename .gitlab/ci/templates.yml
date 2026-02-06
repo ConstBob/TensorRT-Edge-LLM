@@ -36,6 +36,7 @@
 .sanity_python_check_template:
   script:
     - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     - echo "Installing TensorRT Edge-LLM in editable mode for sanity check"
     - pip3 install -e .
@@ -47,6 +48,7 @@
 .export_onnx_template:
   script:
     - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - mkdir -p $ONNX_DIR $TEST_LOG_DIR
     - echo "Installing dependencies"
     - export DEBIAN_FRONTEND=noninteractive
@@ -74,6 +76,7 @@
 .x86_test_template:
   script:
     - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - mkdir -p $TEST_LOG_DIR $ENGINE_DIR
     - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
@@ -107,6 +110,7 @@
 .device_test_template:
   script:
     - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - mkdir -p $TEST_LOG_DIR
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
@@ -147,6 +151,7 @@
 .cross_build_template:
   script:
     - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
     - echo "Starting cross-build for target platform"
     - echo "Checking TRT package"
     - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT package not found at $TRT_PACKAGE_DIR"; exit 1; fi
