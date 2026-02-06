@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 
 using namespace trt_edgellm;
@@ -312,7 +313,7 @@ bool LLMBuilder::build()
         engineFileName = "llm.engine";
     }
     std::string engineFilePath = mEngineDir.string() + "/" + engineFileName;
-    auto engine = builder->buildSerializedNetwork(*network, *config);
+    std::unique_ptr<nvinfer1::IHostMemory> engine(builder->buildSerializedNetwork(*network, *config));
 
     if (!engine)
     {
@@ -1034,7 +1035,7 @@ bool VisualBuilder::build()
 
     // Save engine
     std::string engineFilePath = mEngineDir.string() + "/visual.engine";
-    auto engine = builder->buildSerializedNetwork(*network, *config);
+    std::unique_ptr<nvinfer1::IHostMemory> engine(builder->buildSerializedNetwork(*network, *config));
 
     if (!engine)
     {
