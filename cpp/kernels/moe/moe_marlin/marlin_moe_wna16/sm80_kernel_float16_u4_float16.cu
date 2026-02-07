@@ -113,4 +113,4 @@ template __global__ void Marlin<trt_edgellm::marlin_dtypes::kFloat16.id(), trt_e
 
 }
 
-#endif
+#endif // CUDA_VERSION >= 11080

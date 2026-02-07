@@ -21,9 +21,6 @@
  */
 #pragma once
 
-#ifndef _marlin_cuh
-#define _marlin_cuh
-
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -78,55 +75,7 @@ constexpr int div_ceil(int a, int b)
     return (a + b - 1) / b;
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-
-__device__ inline void cp_async1_ca_pred(void* smem_ptr, const void* glob_ptr, bool pred = true)
-{
-    if (pred)
-    {
-        reinterpret_cast<int32_t*>(smem_ptr)[0] = reinterpret_cast<int32_t const*>(glob_ptr)[0];
-    }
-}
-
-__device__ inline void cp_async2_ca_pred(void* smem_ptr, void const* glob_ptr, bool pred = true)
-{
-    if (pred)
-    {
-        reinterpret_cast<int64_t*>(smem_ptr)[0] = reinterpret_cast<int64_t const*>(glob_ptr)[0];
-    }
-}
-
-__device__ inline void cp_async4_ca_pred(void* smem_ptr, void const* glob_ptr, bool pred = true)
-{
-    if (pred)
-    {
-        reinterpret_cast<int4*>(smem_ptr)[0] = reinterpret_cast<int4 const*>(glob_ptr)[0];
-    }
-}
-
-__device__ inline void cp_async4_pred(void* smem_ptr, void const* glob_ptr, bool pred = true)
-{
-    if (pred)
-    {
-        reinterpret_cast<int4*>(smem_ptr)[0] = reinterpret_cast<int4 const*>(glob_ptr)[0];
-    }
-}
-
-__device__ inline void cp_async4(void* smem_ptr, void const* glob_ptr)
-{
-    reinterpret_cast<int4*>(smem_ptr)[0] = reinterpret_cast<int4 const*>(glob_ptr)[0];
-}
-
-__device__ inline void cp_async_fence() {}
-
-template <int n>
-__device__ inline void cp_async_wait()
-{
-}
-
-#else
-
-__device__ inline void cp_async1_ca_pred(void* smem_ptr, const void* glob_ptr, bool pred = true)
+__device__ inline void cp_async1_ca_pred(void* smem_ptr, void const* glob_ptr, bool pred = true)
 {
     int const BYTES = 4;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -200,8 +149,4 @@ __device__ inline void cp_async_wait()
     asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 }
 
-#endif
-
 } // namespace MARLIN_NAMESPACE_NAME
-
-#endif
