@@ -27,7 +27,6 @@
  */
 
 #include <cuda_runtime.h>
-
 #if CUDA_VERSION >= 11080
 
 #include "common/checkMacros.h"

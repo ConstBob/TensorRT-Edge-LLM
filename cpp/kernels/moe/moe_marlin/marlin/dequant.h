@@ -91,7 +91,6 @@ where `scale_factor * multiplier` can be computed at weight loading.
 namespace MARLIN_NAMESPACE_NAME
 {
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 // Lookup-table based 3-input logical operation; explicitly used for
 // dequantization as the compiler does not seem to automatically recognize it in
 // all cases.
@@ -239,99 +238,6 @@ __device__ inline void dequant<nv_bfloat162, trt_edgellm::marlin_dtypes::kU4.id(
     frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<nv_bfloat162 const*>(&SUB));
 }
 
-//
-// Fast Int8ToFp16/Int8ToBf16: Efficiently dequantize 8bit int values to fp16 or
-// bf16 Reference:
-// - FP16:
-// https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h#L53-L85
-// - BF16:
-// https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h#L125-L175
-//
-template <>
-__device__ inline void dequant<half2, trt_edgellm::marlin_dtypes::kU8B128.id(), true>(int q, half2* frag_b)
-{
-    static constexpr uint32_t mask_for_elt_01 = 0x5250;
-    static constexpr uint32_t mask_for_elt_23 = 0x5351;
-    static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
-
-    uint32_t lo = prmt<start_byte_for_fp16, mask_for_elt_01>(q);
-    uint32_t hi = prmt<start_byte_for_fp16, mask_for_elt_23>(q);
-
-    frag_b[0] = *reinterpret_cast<half2*>(&lo);
-    frag_b[1] = *reinterpret_cast<half2*>(&hi);
-}
-
-template <>
-__device__ inline void dequant<half2, trt_edgellm::marlin_dtypes::kU8B128.id(), false>(int q, half2* frag_b)
-{
-    dequant<half2, trt_edgellm::marlin_dtypes::kU8B128.id(), true>(q, frag_b);
-
-    static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
-    frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<half2 const*>(&I8s_TO_F16s_MAGIC_NUM));
-    frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<half2 const*>(&I8s_TO_F16s_MAGIC_NUM));
-}
-
-template <>
-__device__ inline void dequant<half2, trt_edgellm::marlin_dtypes::kU8.id(), true>(int q, half2* frag_b)
-{
-    dequant<half2, trt_edgellm::marlin_dtypes::kU8B128.id(), true>(q, frag_b);
-}
-
-template <>
-__device__ inline void dequant<half2, trt_edgellm::marlin_dtypes::kU8.id(), false>(int q, half2* frag_b)
-{
-    dequant<half2, trt_edgellm::marlin_dtypes::kU8.id(), true>(q, frag_b);
-
-    static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64006400;
-    frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<half2 const*>(&I8s_TO_F16s_MAGIC_NUM));
-    frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<half2 const*>(&I8s_TO_F16s_MAGIC_NUM));
-}
-
-template <>
-__device__ inline void dequant<nv_bfloat162, trt_edgellm::marlin_dtypes::kU8B128.id(), false>(
-    int q, nv_bfloat162* frag_b)
-{
-    float fp32_intermediates[4];
-    uint32_t* fp32_intermediates_casted = reinterpret_cast<uint32_t*>(fp32_intermediates);
-
-    static constexpr uint32_t fp32_base = 0x4B000000;
-    fp32_intermediates_casted[0] = __byte_perm(q, fp32_base, 0x7650);
-    fp32_intermediates_casted[1] = __byte_perm(q, fp32_base, 0x7652);
-    fp32_intermediates_casted[2] = __byte_perm(q, fp32_base, 0x7651);
-    fp32_intermediates_casted[3] = __byte_perm(q, fp32_base, 0x7653);
-
-    fp32_intermediates[0] -= 8388736.f;
-    fp32_intermediates[1] -= 8388736.f;
-    fp32_intermediates[2] -= 8388736.f;
-    fp32_intermediates[3] -= 8388736.f;
-
-    uint32_t* bf16_result_ptr = reinterpret_cast<uint32_t*>(frag_b);
-    bf16_result_ptr[0] = __byte_perm(fp32_intermediates_casted[0], fp32_intermediates_casted[1], 0x7632);
-    bf16_result_ptr[1] = __byte_perm(fp32_intermediates_casted[2], fp32_intermediates_casted[3], 0x7632);
-}
-
-template <>
-__device__ inline void dequant<nv_bfloat162, trt_edgellm::marlin_dtypes::kU8.id(), false>(int q, nv_bfloat162* frag_b)
-{
-    float fp32_intermediates[4];
-    uint32_t* fp32_intermediates_casted = reinterpret_cast<uint32_t*>(fp32_intermediates);
-
-    static constexpr uint32_t fp32_base = 0x4B000000;
-    fp32_intermediates_casted[0] = __byte_perm(q, fp32_base, 0x7650);
-    fp32_intermediates_casted[1] = __byte_perm(q, fp32_base, 0x7652);
-    fp32_intermediates_casted[2] = __byte_perm(q, fp32_base, 0x7651);
-    fp32_intermediates_casted[3] = __byte_perm(q, fp32_base, 0x7653);
-
-    fp32_intermediates[0] -= 8388608.f;
-    fp32_intermediates[1] -= 8388608.f;
-    fp32_intermediates[2] -= 8388608.f;
-    fp32_intermediates[3] -= 8388608.f;
-
-    uint32_t* bf16_result_ptr = reinterpret_cast<uint32_t*>(frag_b);
-    bf16_result_ptr[0] = __byte_perm(fp32_intermediates_casted[0], fp32_intermediates_casted[1], 0x7632);
-    bf16_result_ptr[1] = __byte_perm(fp32_intermediates_casted[2], fp32_intermediates_casted[3], 0x7632);
-}
-
 template <>
 __device__ inline void dequant<half2, trt_edgellm::marlin_dtypes::kFE4M3fn.id(), true>(int q, half2* frag_b)
 {
@@ -408,113 +314,7 @@ __device__ inline void dequant<nv_bfloat162, trt_edgellm::marlin_dtypes::kFE4M3f
     frag_b[0] = __hmul2(frag_b[0], bias_reg);
 }
 
-template <>
-__device__ inline void dequant<half2, trt_edgellm::marlin_dtypes::kFE2M1f.id(), true>(int q, half2* frag_b)
-{
-    // Constants for FP4 (E2M1) and FP16 formats
-    constexpr int FP4_EXPONENT = 2, FP16_EXPONENT = 5;
-    constexpr int RIGHT_SHIFT = FP16_EXPONENT - FP4_EXPONENT;
-    constexpr int MASK = 0x70007000;
-
-    // Extract and shift FP4 values to FP16 format
-    int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
-    q <<= 4;
-    int Out2 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
-
-    // Note: reverse indexing is intentional because weights are permuted
-    frag_b[1] = *reinterpret_cast<half2 const*>(&Out1);
-    frag_b[0] = *reinterpret_cast<half2 const*>(&Out2);
-}
-
-template <>
-__device__ inline void dequant<half2, trt_edgellm::marlin_dtypes::kFE2M1f.id(), false>(int q, half2* frag_b)
-{
-    dequant<half2, trt_edgellm::marlin_dtypes::kFE2M1f.id(), true>(q, frag_b);
-
-    // Constants for FP4 (E2M1) and FP16 formats
-    constexpr int FP4_EXPONENT = 2, FP16_EXPONENT = 5;
-
-    // Construct and apply exponent bias
-    constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP4_EXPONENT - 1));
-    half2 const bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
-
-    // Convert to half2 and apply bias
-    frag_b[1] = __hmul2(frag_b[1], bias_reg);
-    frag_b[0] = __hmul2(frag_b[0], bias_reg);
-}
-
-template <>
-__device__ inline void dequant<nv_bfloat162, trt_edgellm::marlin_dtypes::kFE2M1f.id(), true>(
-    int q, nv_bfloat162* frag_b)
-{
-    // Constants for FP4 (E2M1) and FP16 formats
-    constexpr int FP4_EXPONENT = 2, BF16_EXPONENT = 8;
-    constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP4_EXPONENT;
-    constexpr int MASK = 0x70007000;
-
-    // Extract and shift FP4 values to FP16 format
-    int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
-    q <<= 4;
-    int Out2 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
-
-    // Note: reverse indexing is intentional because weights are permuted
-    frag_b[1] = *reinterpret_cast<nv_bfloat162 const*>(&Out1);
-    frag_b[0] = *reinterpret_cast<nv_bfloat162 const*>(&Out2);
-}
-
-template <>
-__device__ inline void dequant<nv_bfloat162, trt_edgellm::marlin_dtypes::kFE2M1f.id(), false>(
-    int q, nv_bfloat162* frag_b)
-{
-    dequant<nv_bfloat162, trt_edgellm::marlin_dtypes::kFE2M1f.id(), true>(q, frag_b);
-
-    // Constants for FP4 (E2M1) and BF16 formats
-    constexpr int FP4_EXPONENT = 2, BF16_EXPONENT = 8;
-
-    // Construct and apply exponent bias
-    constexpr int BIAS_OFFSET = (1 << (BF16_EXPONENT - 1)) - (1 << (FP4_EXPONENT - 1));
-    // Add 127 (float exponent bias) to BIAS_OFFSET and shift to float exponent
-    // position
-    constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
-    nv_bfloat162 const bias_reg = __float2bfloat162_rn(*reinterpret_cast<float const*>(&BIAS));
-
-    // Convert to half2 and apply bias
-    frag_b[1] = __hmul2(frag_b[1], bias_reg);
-    frag_b[0] = __hmul2(frag_b[0], bias_reg);
-}
-
 #if SUPPORTS_FP8
-template <>
-__device__ inline void dequant<__nv_fp8x4_e4m3, trt_edgellm::marlin_dtypes::kFE2M1f.id(), true>(
-    int q, __nv_fp8x4_e4m3* frag_b)
-{
-    // Constants for FP4 (E2M1) and FP16 formats
-    constexpr int FP4_EXPONENT = 2, FP8_EXPONENT = 4;
-    constexpr int RIGHT_SHIFT = FP8_EXPONENT - FP4_EXPONENT;
-    constexpr int MASK = 0x70707070;
-
-    // Extract and shift FP4 values to FP16 format
-    int Out1 = (q & 0x80808080) | ((q & MASK) >> RIGHT_SHIFT);
-    q <<= 4;
-    int Out2 = (q & 0x80808080) | ((q & MASK) >> RIGHT_SHIFT);
-
-    // Note1: reverse indexing is intentional because weights are permuted
-    // Note2: when dequant to 8bit type, we write to `frag_b[2]` instead of
-    //        `frag_b[1]` to fit the layout of tensorcore
-    frag_b[1] = *reinterpret_cast<__nv_fp8x4_e4m3 const*>(&Out1);
-    frag_b[0] = *reinterpret_cast<__nv_fp8x4_e4m3 const*>(&Out2);
-}
-
-template <>
-__device__ inline void dequant<int32_t, trt_edgellm::marlin_dtypes::kU4B8.id(), true>(int q, int32_t* frag_b)
-{
-    constexpr int repeated_zp = 0x08080808;
-    constexpr int MASK = 0x80808080;
-
-    frag_b[0] = ((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK;
-    q >>= 4;
-    frag_b[1] = ((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK;
-}
 
 template <>
 __device__ inline void dequant<__nv_fp8x4_e4m3, trt_edgellm::marlin_dtypes::kU4B8.id(), true>(
@@ -564,67 +364,6 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, trt_edgellm::marlin_dtyp
     frag_b[0] = *reinterpret_cast<nv_bfloat162 const*>(&Out2);
 }
 
-template <>
-__device__ inline void dequant_fp8_scales<nv_bfloat162, trt_edgellm::marlin_dtypes::kFE8M0fnu.id()>(
-    int q, nv_bfloat162* frag_b)
-{
-    // In this conversion, 2 ** -127 in FP8E8M0 would become 0 in BF16,
-    // but we assume that such a extreme value would not occur in real models.
-    int Out1 = (q & 0xFF00FF00) >> 1;
-    q <<= 7;
-    int Out2 = q & 0x7F807F80;
-
-    // Note: reverse indexing is intentional because weights are permuted
-    frag_b[1] = *reinterpret_cast<nv_bfloat162 const*>(&Out1);
-    frag_b[0] = *reinterpret_cast<nv_bfloat162 const*>(&Out2);
-};
-
-#endif
-
-// subtract zero point in quanted format and then dequant
-template <typename scalar_t2, trt_edgellm::marlin_dtypes::ScalarTypeId w_type_id, bool skip_flop = false>
-__device__ inline void sub_zp_and_dequant(int q, scalar_t2* frag_b, int zp);
-
-template <>
-__device__ inline void sub_zp_and_dequant<int32_t, trt_edgellm::marlin_dtypes::kU4.id(), true>(
-    int q, int32_t* frag_b, int zp)
-{
-    // INT4 with zp -> INT8
-    // see https://github.com/vllm-project/vllm/pull/24722
-    int repeated_zp = 0x01010101 * zp;
-    int MASK = 0x80808080;
-
-    frag_b[0] = ((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK;
-    q >>= 4;
-    frag_b[1] = ((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK;
-}
-
-#if SUPPORTS_FP8
-template <>
-__device__ inline void sub_zp_and_dequant<__nv_fp8x4_e4m3, trt_edgellm::marlin_dtypes::kU4.id(), true>(
-    int q, __nv_fp8x4_e4m3* frag_b, int zp)
-{
-    // INT4 with zp -> FP8
-    // see https://github.com/vllm-project/vllm/pull/24722
-    uint32_t u_q = *reinterpret_cast<uint32_t*>(&q);
-    uint32_t u_zp = *reinterpret_cast<uint32_t*>(&zp);
-    uint32_t u_zp1 = u_zp + 1;
-    uint32_t repeated_zp = 0x01010101 * u_zp;
-
-    uint32_t q0, s;
-    q0 = (u_q & 0x0F0F0F0F) | 0x70707070;
-    s = (q0 + repeated_zp) & 0x80808080;
-    uint32_t Out1 = (q0 + (s >> 7) * u_zp1) & 0x0F0F0F0F | s;
-
-    u_q >>= 4;
-    q0 = (u_q & 0x0F0F0F0F) | 0x70707070;
-    s = (q0 + repeated_zp) & 0x80808080;
-    uint32_t Out2 = (q0 + (s >> 7) * u_zp1) & 0x0F0F0F0F | s;
-
-    frag_b[0] = *reinterpret_cast<__nv_fp8x4_e4m3 const*>(&Out1);
-    frag_b[1] = *reinterpret_cast<__nv_fp8x4_e4m3 const*>(&Out2);
-}
-#endif
 #endif
 
 } // namespace MARLIN_NAMESPACE_NAME

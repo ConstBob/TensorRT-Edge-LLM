@@ -39,7 +39,6 @@
 /*
  * Adapted from https://github.com/IST-DASLab/marlin
  */
-
 #include <cuda_runtime.h>
 #if CUDA_VERSION >= 11080
 
