@@ -18,28 +18,34 @@ For the supported platforms, models and precisions, see the [**Overview**](docs/
 
 ## Documentation
 
-### Developer Guide
-
-Complete documentation for installation, usage, and deployment:
+### Introduction
 
 - **[Overview](docs/source/developer_guide/getting-started/overview.md)** - What is TensorRT Edge-LLM and key features
-- **[Quick Start Guide](docs/source/developer_guide/getting-started/quick-start-guide.md)** - Get started in ~15 minutes
-- **[Installation](docs/source/developer_guide/getting-started/installation.md)** - Detailed installation instructions
 - **[Supported Models](docs/source/developer_guide/getting-started/supported-models.md)** - Complete model compatibility matrix
+
+### User Guide
+
+- **[Installation](docs/source/developer_guide/getting-started/installation.md)** - Set up Python export pipeline and C++ runtime
+- **[Quick Start Guide](docs/source/developer_guide/getting-started/quick-start-guide.md)** - Run your first inference in ~15 minutes
+- **[Examples](docs/source/developer_guide/getting-started/examples.md)** - End-to-end LLM, VLM, EAGLE, and LoRA workflows
+- **[Input Format Guide](docs/source/developer_guide/getting-started/input-format.md)** - Request format and specifications
+- **[Chat Template Format](docs/source/developer_guide/getting-started/chat-template-format.md)** - Chat template configuration
+
+### Developer Guide
+
+#### Software Design
+
 - **[Python Export Pipeline](docs/source/developer_guide/software-design/python-export-pipeline.md)** - Model export and quantization
 - **[Engine Builder](docs/source/developer_guide/software-design/engine-builder.md)** - Building TensorRT engines
 - **[C++ Runtime Overview](docs/source/developer_guide/software-design/cpp-runtime-overview.md)** - Runtime system architecture
   - [LLM Inference Runtime](docs/source/developer_guide/software-design/llm-inference-runtime.md)
   - [LLM SpecDecode Runtime](docs/source/developer_guide/software-design/llm-inference-specdecode-runtime.md)
   - [Advanced Runtime Features](docs/source/developer_guide/features/advanced-runtime-features.md)
-- **[Examples](docs/source/developer_guide/getting-started/examples.md)** - Working code examples
-- **[Chat Template Format](docs/source/developer_guide/getting-started/chat-template-format.md)** - Chat template configuration
-- **[TensorRT Plugins](docs/source/developer_guide/customization/tensorrt-plugins.md)** - Introduction for TensorRT plugins.
 
+#### Advanced Topics
 
-### Additional Resources
-
-- **[Examples Directory](examples/)** - LLM and VLM inference examples
+- **[Customization Guide](docs/source/developer_guide/customization/customization-guide.md)** - Customizing TensorRT Edge-LLM for your needs
+- **[TensorRT Plugins](docs/source/developer_guide/customization/tensorrt-plugins.md)** - Custom plugin development
 - **[Tests](tests/)** - Comprehensive test suite for contributors
 
 ---

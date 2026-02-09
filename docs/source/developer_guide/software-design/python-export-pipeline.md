@@ -238,35 +238,6 @@ The export pipeline supports multiple quantization methods optimized for differe
 
 ---
 
-## Security and Model Integrity
-
-**⚠️ USER RESPONSIBILITY**: Users are responsible for verifying the integrity of all model artifacts (base models, LoRA weights, tokenizers, configs) before exporting models to TensorRT Edge-LLM format.
-
-### Model Signing and Verification
-
-It is **strongly recommended** to use the [model-signing](https://github.com/sigstore/model-transparency) package to sign and verify models before inference.
-
-**Installation:**
-```bash
-pip install model-signing
-```
-
-**Basic Usage:**
-```bash
-# Sign a model
-model_signing sign /path/to/your/model --signature model.sig
-
-# Verify a model
-model_signing verify /path/to/your/model \
-  --signature model.sig \
-  --identity "$identity" \
-  --identity_provider "$oidc_provider"
-```
-
-**For more details**, refer to the [model-signing documentation](https://github.com/sigstore/model-transparency)
-
----
-
 ## Usage Examples
 
 ### Standard LLM Export
@@ -338,6 +309,20 @@ tensorrt-edgellm-export-visual \
 
 ```
 
+### Where to Get Draft Models for EAGLE3
+
+**Open-Source Draft Models:**
+
+Draft models for EAGLE speculative decoding can be found on HuggingFace:
+- [EAGLE-3 Models on HuggingFace](https://github.com/SafeAILab/EAGLE?tab=readme-ov-file#eagle-3-models-on-hugging-face) - Official list of available EAGLE-3 draft models for various base models
+- Search HuggingFace for your specific base model name + "EAGLE"
+
+**Training Your Own Draft Models:**
+
+If no pre-trained draft model exists for your base model, you'll need to train one yourself. Refer to the [EAGLE training repository](https://github.com/SafeAILab/EAGLE) for instructions on training draft models.
+
+> **Important:** Draft models must be trained specifically for their corresponding base model. A draft model trained for Qwen2.5-7B will only work with that exact base model and cannot be used with other models.
+
 ### LoRA-Enabled Export
 
 ```bash
@@ -364,11 +349,6 @@ tensorrt-edgellm-process-lora \
 ---
 
 ## Best Practices
-
-### Security
-
-1. **Verify model integrity** before export (see [Security and Model Integrity](#security-and-model-integrity))
-2. **Sign models** before deployment using [model-signing](https://github.com/sigstore/model-transparency)
 
 ### Model Selection
 
@@ -397,18 +377,111 @@ tensorrt-edgellm-process-lora \
 3. **Cache downloads**: Reuse downloaded models across exports
 4. **Monitor memory usage**: Track peak memory during export
 
+### Model Signing and Verification
+
+1. **Verify model integrity**: Users are responsible for verifying the integrity of model artifacts (base models, LoRA weights, tokenizers, configs) before deployment
+2. **Sign models**: It is **strongly recommended** to use the [model-signing](https://github.com/sigstore/model-transparency) package to sign and verify models before inference.
+
+**Installation:**
+```bash
+pip install model-signing
+```
+
+**Basic Usage:**
+```bash
+# Sign a model
+model_signing sign /path/to/your/model --signature model.sig
+
+# Verify a model
+model_signing verify /path/to/your/model \
+  --signature model.sig \
+  --identity "$identity" \
+  --identity_provider "$oidc_provider"
+```
+
+**For more details**, refer to the [model-signing documentation](https://github.com/sigstore/model-transparency)
+
 ---
 
 ## Common Issues and Solutions
 
+### Issue: Model Download Fails or Times Out
+
+**Cause**: Network issues, insufficient disk space, or HuggingFace access problems.
+
+**Solution**:
+
+1. Check disk space:
+```bash
+df -h $WORKSPACE_DIR
+# Ensure at least 10-20GB free for small models
+```
+
+2. Check network connectivity:
+```bash
+curl -I https://huggingface.co
+# Should return HTTP 200 OK
+```
+
+3. For gated models (Llama, Phi-4), login to HuggingFace:
+```bash
+huggingface-cli login
+# Enter your access token
+```
+
+4. Manual download as a workaround:
+```bash
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen3-0.6B
+
+# Then use local path for quantization
+tensorrt-edgellm-quantize-llm \
+    --model_dir ./Qwen3-0.6B \
+    --output_dir quantized/Qwen3-0.6B \
+    --quantization fp8
+```
+
 ### Issue: GPU Out of Memory During Export or Quantization
 
+**Cause**: Model size exceeds available GPU memory.
+
 **Solution**: 
+
 1. Change to a larger GPU. Empirically a 40GB GPU is enough for 4B or less model and 80GB GPU is enough for 8B or less.   
 2. You may try `--device cpu` flag during quantization and export. However, CPU support may fail for some precisions.
 
+### Issue: Calibration Dataset Download Fails (`cnn_dailymail` not found)
+
+**Cause**: Network connectivity issues preventing download of the calibration dataset from HuggingFace, or firewall/proxy blocking access.
+
+**Solution**:
+
+1. Check network connectivity to HuggingFace:
+```bash
+curl -I https://huggingface.co
+curl -I https://huggingface.co/datasets/abisee/cnn_dailymail
+# Should return HTTP 200 OK
+```
+
+2. If network is down or blocked, download the dataset manually:
+
+```bash
+git lfs install
+git clone https://huggingface.co/datasets/abisee/cnn_dailymail
+
+# Pass the local dataset path explicitly to quantization
+tensorrt-edgellm-quantize-llm \
+    --model_dir Qwen/Qwen3-0.6B \
+    --output_dir quantized/Qwen3-0.6B \
+    --quantization fp8 \
+    --calib_dataset ./cnn_dailymail/3.0.0
+```
+
+> **Note:** Replace `./cnn_dailymail/3.0.0` with the actual path where you downloaded the dataset. The dataset version 3.0.0 is commonly used for calibration. This allows you to use a local dataset instead of relying on HuggingFace cache.
 
 ### Issue: Quantization Degrades Accuracy
+
+**Cause**: Aggressive quantization or insufficient calibration.
 
 **Solution**: 
 
