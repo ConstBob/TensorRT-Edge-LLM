@@ -23,7 +23,8 @@ This guide describes the input JSON format for the LLM inference tool. The forma
                 }
             ],
             "lora_name": "optional_lora_name",
-            "save_system_prompt_kv_cache": false
+            "save_system_prompt_kv_cache": false,
+            "disable_spec_decode": false
         }
     ]
 }
@@ -49,6 +50,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 - **`messages`** (required): Array of conversation messages
 - **`lora_name`** (optional): LoRA adapter name from `available_lora_weights`
 - **`save_system_prompt_kv_cache`** (optional): Cache system prompt KV for reuse
+- **`disable_spec_decode`** (optional, default: false): Disable EAGLE speculative decoding for this request even if draft engine is loaded
 
 ### Message Fields
 - **`role`**: `"system"`, `"user"`, or `"assistant"`
@@ -163,6 +165,30 @@ This guide describes the input JSON format for the LLM inference tool. The forma
     ]
 }
 ```
+
+### Disable Speculative Decoding
+
+When using EAGLE speculative decoding, you can disable it for specific requests:
+
+```json
+{
+    "requests": [
+        {
+            "messages": [
+                {"role": "user", "content": "Your question here"}
+            ],
+            "disable_spec_decode": true
+        }
+    ]
+}
+```
+
+**Use cases:**
+- Quality: Some inputs may benefit from standard decoding over EAGLE
+- Switching strategies: Different batches can use different decoding strategies (one batch with EAGLE, another without). 
+- Debugging: Compare performance with/without speculative decoding
+
+**Note:** If any request in a batch has `disable_spec_decode: true`, speculative decoding will be disabled for the entire batch. Requests within one batch cannot use different decoding strategies simultaneously for now.
 
 ## Notes
 

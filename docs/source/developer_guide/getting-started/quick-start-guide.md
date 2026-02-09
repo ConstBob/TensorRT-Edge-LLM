@@ -35,6 +35,13 @@ tensorrt-edgellm-export-llm \
     --output_dir $MODEL_NAME/onnx
 ```
 
+<details>
+<summary><b>⚠️ Troubleshooting Export Issues</b></summary>
+
+If you encounter issues during quantization or export, see the [Python Export Pipeline - Common Issues and Solutions](../software-design/python-export-pipeline.md#common-issues-and-solutions).
+
+</details>
+
 ### Transfer to Device
 
 Transfer the ONNX folder to your Thor device:
@@ -43,6 +50,8 @@ Transfer the ONNX folder to your Thor device:
 # From x86 host - transfer to device
 scp -r $MODEL_NAME/onnx <device_user>@<device_ip>:~/tensorrt-edgellm-workspace/$MODEL_NAME/
 ```
+
+> **Note:** Replace `<device_user>` and `<device_ip>` with your actual device credentials (e.g., `nvidia@192.168.1.100`). If the directory doesn't exist on the device, create it first: `ssh <device_user>@<device_ip> "mkdir -p ~/tensorrt-edgellm-workspace/$MODEL_NAME"`
 
 ---
 
@@ -71,15 +80,10 @@ Build time: ~2-5 minutes
 
 ### Run Inference
 
-Create an input file using your preferred text editor:
+Create an input file with a sample question:
 
 ```bash
-nano $WORKSPACE_DIR/input.json
-```
-
-Paste the following content:
-
-```json
+cat > $WORKSPACE_DIR/input.json << 'EOF'
 {
     "batch_size": 1,
     "temperature": 1.0,
@@ -97,7 +101,10 @@ Paste the following content:
         }
     ]
 }
+EOF
 ```
+
+> **Tip:** You can also use example input files from `~/TensorRT-Edge-LLM/tests/test_cases/` (e.g., `llm_basic.json`) instead of creating your own.
 
 Run inference:
 
@@ -110,7 +117,27 @@ cd ~/TensorRT-Edge-LLM
     --outputFile $WORKSPACE_DIR/output.json
 ```
 
-**Success!** 🎉 Check `output.json` for model responses.
+Verify the output:
+
+```bash
+# View the model response
+cat $WORKSPACE_DIR/output.json
+```
+
+You should see a JSON response with the model's answer, similar to:
+
+```json
+{
+  "responses": [
+    {
+      "text": "The capital of the United States is Washington, D.C.",
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+**Success!** 🎉 You've successfully run LLM inference on your edge device!
 
 ---
 
