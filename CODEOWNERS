@@ -7,6 +7,7 @@
 
 # == C++/CUDA runtime & kernel components ==
 /cpp/ @fans
+/cpp/builder/ @luxiaoz @fans @amberl
 /cpp/common/ @fkaster @fans
 /cpp/kernels/ @fans @ruochengj
 /cpp/multimodal/ @amberl @ruochengj
@@ -32,6 +33,6 @@
 /tensorrt_edgellm/quantization/ @luxiaoz @ruochengj @amberl
 
 # == Documentation ==
-/docs/ @luxiaoz @ffriedmann @kchemudupati
-/.github/ @luxiaoz @ffriedmann @kchemudupati
-/design/ @fkaster
+/docs/ @luxiaoz @ffriedmann @kchemudupati @amberl @mchi
+/.github/ @luxiaoz @ffriedmann @kchemudupati @amberl
+/design/ @fkaster @fans
