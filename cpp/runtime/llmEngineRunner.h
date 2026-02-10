@@ -60,7 +60,9 @@ struct LLMEngineRunnerConfig
     int32_t maxSupportedLoraRank{};  //!< Maximum supported LoRA rank
     int32_t outputHiddenDim{};       //!< Output hidden dimension for Eagle speculative decoding (hidden_size * 3)
     int32_t maxVerifyTreeSize{};     //!< Maximum verification tree size for Eagle speculative decoding
-    int32_t numDeepstackFeatures{0}; //!< Number of deepstack features for Qwen3-VL
+    int32_t numDeepstackFeatures{0}; //!< Number of deepstack features for Qwen3-VL and Qwen3-Omni
+    int32_t audioTokenId{0};         //!< Special token ID for audio in Qwen3-Omni
+    int32_t imageTokenId{0};         //!< Special token ID for image in Qwen3-Omni
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.

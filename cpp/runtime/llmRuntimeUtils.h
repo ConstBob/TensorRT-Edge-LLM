@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
 
 #include <cstdint>
@@ -67,6 +68,9 @@ struct LLMGenerationRequest
     {
         std::vector<Message> messages; //!< Structured messages (required - use chat template format)
         std::vector<rt::imageUtils::ImageData> imageBuffers; //!< Optional image data for multimodal inputs
+        std::vector<rt::audioUtils::AudioData> audioBuffers; //!< Optional audio data for multimodal inputs (Qwen3-Omni)
+
+        mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };
     //! \endcond
     std::vector<Request> requests; //!< Vector of requests for a batch

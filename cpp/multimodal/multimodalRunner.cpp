@@ -17,6 +17,7 @@
 
 #include "multimodalRunner.h"
 #include "common/mmapReader.h"
+#include "multimodal/audioRunner.h"
 #include "multimodal/internViTRunner.h"
 #include "multimodal/phi4mmViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
@@ -24,6 +25,7 @@
 #include "profiling/timer.h"
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -84,6 +86,16 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     if (modelType == multimodal::ModelType::QWEN2_VL || modelType == multimodal::ModelType::QWEN2_5_VL
         || modelType == multimodal::ModelType::QWEN3_VL)
     {
+        multimodalRunner
+            = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    }
+    else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER)
+    {
+        multimodalRunner = std::make_unique<Qwen3OmniAudioRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
+    {
+        // Qwen3-Omni Vision Encoder: Visual engine should exist
         multimodalRunner
             = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }

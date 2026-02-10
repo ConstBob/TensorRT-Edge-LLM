@@ -171,8 +171,18 @@ def export_llm_config(config: Any,
     config_class_name = config.__class__.__name__
     model_name = config_class_name.lower().replace('config', '')
 
+    # For multimodal models, preserve token IDs before switching to text_config
+    multimodal_token_ids = {}
     if "text_config" in config_dict:
         print("Detected multimodal model, using text_config")
+        # Automatically preserve any field ending with '_token_id' or '_token_ids' at the top level
+        for key, value in config_dict.items():
+            if key.endswith('_token_id') or key.endswith('_token_ids'):
+                multimodal_token_ids[key] = value
+        if multimodal_token_ids:
+            print(
+                f"Preserved multimodal token IDs: {list(multimodal_token_ids.keys())}"
+            )
         config_dict = config_dict["text_config"]
 
     if model_type == 'llm':
@@ -192,6 +202,13 @@ def export_llm_config(config: Any,
 
     # Add trt_native_ops to output_config
     output_config["trt_native_ops"] = trt_native_ops
+
+    # Restore multimodal token IDs if any were saved
+    if multimodal_token_ids:
+        output_config.update(multimodal_token_ids)
+        print(
+            f"Restored multimodal token IDs to output config: {list(multimodal_token_ids.keys())}"
+        )
 
     return output_config
 

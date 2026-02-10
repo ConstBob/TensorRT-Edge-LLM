@@ -472,6 +472,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 // Parse messages into structured format
                 std::vector<rt::Message> chatMessages;
                 std::vector<rt::imageUtils::ImageData> imageBuffers;
+                std::vector<rt::audioUtils::AudioData> audioBuffers;
 
                 // Enforce message count limits
                 check::check(messagesArray.size() <= limits::security::kMaxMessagesPerRequest,
@@ -552,10 +553,44 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                                     imageBuffers.push_back(std::move(image));
                                 }
                             }
+                            else if (msgContent.type == "audio")
+                            {
+                                // Audio content for Qwen3-Omni
+                                msgContent.content = contentItemJson["audio"].get<std::string>();
+                                rt::audioUtils::AudioData audio;
+                                std::string audioPath = msgContent.content;
+
+                                // Check file extension
+                                size_t dotPos = audioPath.find_last_of('.');
+                                std::string extension;
+                                if (dotPos != std::string::npos)
+                                {
+                                    extension = audioPath.substr(dotPos);
+                                }
+
+                                // Support mel-spectrogram .safetensors files directly
+                                if (extension == ".safetensors")
+                                {
+                                    audio.melSpectrogramPath = audioPath;
+                                    audio.melSpectrogramFormat = "safetensors";
+                                    audioBuffers.push_back(std::move(audio));
+                                    LOG_INFO("Loaded mel-spectrogram from: %s (safetensors format)", audioPath.c_str());
+                                }
+                                else
+                                {
+                                    LOG_WARNING(
+                                        "Unsupported audio format: %s (only .safetensors mel-spectrograms are "
+                                        "supported)",
+                                        audioPath.c_str());
+                                }
+                            }
                             else
                             {
-                                throw std::runtime_error(format::fmtstr(
-                                    "Content type must be 'text', 'image', but got: %s", msgContent.type.c_str()));
+                                LOG_ERROR("Content type must be 'text', 'image', 'audio', but got: %s",
+                                    msgContent.type.c_str());
+                                throw std::runtime_error(
+                                    format::fmtstr("Content type must be 'text', 'image', 'audio', but got: %s",
+                                        msgContent.type.c_str()));
                             }
 
                             chatMsg.contents.push_back(msgContent);
@@ -573,6 +608,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 rt::LLMGenerationRequest::Request request;
                 request.messages = std::move(chatMessages);
                 request.imageBuffers = std::move(imageBuffers);
+                request.audioBuffers = std::move(audioBuffers);
                 batchRequest.requests.push_back(std::move(request));
             }
 

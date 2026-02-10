@@ -481,8 +481,12 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         mConfig.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
         // Set actual output vocab size: use reduced size if enabled, otherwise full size
         mConfig.outputVocabSize = (mConfig.reducedVocabSize > 0) ? mConfig.reducedVocabSize : mConfig.vocabSize;
-        // Read num_deepstack_features if present (Qwen3VL models)
+        // Read num_deepstack_features if present (Qwen3-VL and Qwen3-Omni models)
         mConfig.numDeepstackFeatures = configJson["num_deepstack_features"].get<int32_t>();
+
+        // Read audio and image token IDs for Qwen3-Omni (used by embeddingLookupQwen3Omni kernel)
+        mConfig.audioTokenId = configJson.value("audio_token_id", 0);
+        mConfig.imageTokenId = configJson.value("image_token_id", 0);
 
         // Extract builder_config values
         mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
