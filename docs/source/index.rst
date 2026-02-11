@@ -35,7 +35,8 @@ for large language models and vision-language models on edge devices.
    :maxdepth: 2
    :caption: Advanced Features
 
-   developer_guide/features/advanced-runtime-features.md
+   developer_guide/features/lora.md
+   developer_guide/features/reduce-vocab.md
 
 .. toctree::
    :maxdepth: 2
