@@ -26,34 +26,39 @@ namespace trt_edgellm
 namespace file_io
 {
 
-bool copyFile(std::string const& srcPath, std::string const& dstPath)
+bool copyFile(std::string const& srcPath, std::string const& dstPath) noexcept
 {
-    std::filesystem::path const src{srcPath};
-    if (!std::filesystem::exists(src))
+    try
     {
-        LOG_INFO("Failed to open file for reading: %s", srcPath.c_str());
-        return false;
-    }
-    std::filesystem::path const dst{dstPath};
-    if (std::filesystem::exists(dst) && std::filesystem::equivalent(src, dst))
-    {
-        LOG_INFO("Source and target file path are same, skip copying.");
-    }
-    else
-    {
-        try
+        std::filesystem::path const src{srcPath};
+        if (!std::filesystem::exists(src))
+        {
+            LOG_INFO("Failed to open file for reading: %s", srcPath.c_str());
+            return false;
+        }
+        std::filesystem::path const dst{dstPath};
+        if (std::filesystem::exists(dst) && std::filesystem::equivalent(src, dst))
+        {
+            LOG_INFO("Source and target file path are same, skip copying.");
+        }
+        else
         {
             auto const options = std::filesystem::copy_options::overwrite_existing;
             std::filesystem::copy(src, dst, options);
             LOG_INFO("Successfully copied %s to %s", srcPath.c_str(), dstPath.c_str());
         }
-        catch (std::filesystem::filesystem_error& e)
-        {
-            LOG_ERROR("Error copying %s to %s - %s", srcPath.c_str(), dstPath.c_str(), e.what());
-            return false;
-        }
+        return true;
     }
-    return true;
+    catch (std::filesystem::filesystem_error& e)
+    {
+        LOG_ERROR("Error copying %s to %s - %s", srcPath.c_str(), dstPath.c_str(), e.what());
+        return false;
+    }
+    catch (...)
+    {
+        LOG_ERROR("Unknown error copying %s to %s", srcPath.c_str(), dstPath.c_str());
+        return false;
+    }
 }
 
 } // namespace file_io

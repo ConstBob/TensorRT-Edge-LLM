@@ -35,7 +35,7 @@ namespace trt_edgellm
  * @return Ceiling of a/n
  */
 template <typename T1, typename T2>
-inline size_t divUp(const T1& a, const T2& n)
+inline size_t divUp(const T1& a, const T2& n) noexcept
 {
     size_t tmp_a = static_cast<size_t>(a);
     size_t tmp_n = static_cast<size_t>(n);
@@ -48,6 +48,7 @@ inline size_t divUp(const T1& a, const T2& n)
  * Returns the compute capability as an integer (e.g., 89 for SM 8.9).
  *
  * @return Compute capability version (major * 10 + minor)
+ * @throws std::runtime_error If CUDA device query fails
  */
 inline int getSMVersion()
 {
@@ -71,7 +72,7 @@ inline int getSMVersion()
  * @param graph The cudaGraph_t to instantiate.
  * @return cudaError_t indicating success or failure of the instantiation.
  */
-inline cudaError_t instantiateCudaGraph(cudaGraphExec_t* exec, cudaGraph_t graph)
+inline cudaError_t instantiateCudaGraph(cudaGraphExec_t* exec, cudaGraph_t graph) noexcept
 {
 #if CUDA_VERSION < 12000
     return cudaGraphInstantiate(exec, graph, nullptr, nullptr, 0);

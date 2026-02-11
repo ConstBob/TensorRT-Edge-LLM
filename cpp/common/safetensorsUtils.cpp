@@ -36,7 +36,10 @@ namespace safetensors
 namespace
 {
 
-// Helper function to convert TensorRT data type to safetensors dtype string
+//! @brief Helper function to convert TensorRT data type to safetensors dtype string
+//! @param dataType TensorRT data type
+//! @return Safetensors dtype string
+//! @throws std::runtime_error If data type is unsupported
 std::string dataTypeToString(nvinfer1::DataType dataType)
 {
     switch (dataType)
@@ -53,7 +56,10 @@ std::string dataTypeToString(nvinfer1::DataType dataType)
     }
 }
 
-// Helper function to convert safetensors dtype string to TensorRT data type
+//! @brief Helper function to convert safetensors dtype string to TensorRT data type
+//! @param dtype Safetensors dtype string
+//! @return TensorRT data type
+//! @throws std::runtime_error If data type is unsupported
 nvinfer1::DataType stringToDataType(std::string const& dtype)
 {
     if (dtype == "F32")

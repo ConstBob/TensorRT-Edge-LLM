@@ -98,7 +98,7 @@ bool Coords::operator!=(Coords const& other) const noexcept
     return !(*this == other);
 }
 
-int64_t Coords::volume() const
+int64_t Coords::volume() const noexcept
 {
     if (mNumDims == 0)
     {
@@ -112,7 +112,7 @@ int64_t Coords::volume() const
     return vol;
 }
 
-nvinfer1::Dims Coords::getTRTDims() const
+nvinfer1::Dims Coords::getTRTDims() const noexcept
 {
     nvinfer1::Dims dims;
     dims.nbDims = mNumDims;
@@ -175,8 +175,8 @@ Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType da
     }
 }
 
-Tensor::Tensor(void* data, Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType,
-    std::string const& name) noexcept
+Tensor::Tensor(
+    void* data, Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType, std::string const& name)
 {
     // Populate the tensor information and only serve as a data container with shape.
     mShape = shape;
@@ -201,9 +201,19 @@ Tensor::Tensor(void* data, Coords const& shape, DeviceType deviceType, nvinfer1:
     mName = name;
 }
 
-Tensor::~Tensor()
+Tensor::~Tensor() noexcept
 {
-    releaseResource();
+    try
+    {
+        releaseResource();
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Exception during tensor destruction: %s", e.what());
+    }
+    catch (...)
+    {
+    }
 }
 
 Tensor::Tensor(Tensor&& other) noexcept
@@ -231,7 +241,13 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept
 {
     if (this != &other)
     {
-        releaseResource();
+        try
+        {
+            releaseResource();
+        }
+        catch (...)
+        {
+        }
         this->data = other.data;
         this->mShape = other.mShape;
         this->mStrides = other.mStrides;

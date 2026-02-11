@@ -36,11 +36,12 @@ class MmapReader
 {
 public:
     //! @brief Default constructor
-    MmapReader();
+    MmapReader() noexcept;
 
     /*!
      * @brief Construct and load file
      * @param fp Path to file to load
+     * @throws std::runtime_error If file cannot be loaded
      */
     explicit MmapReader(std::filesystem::path const& fp);
 
@@ -51,15 +52,16 @@ public:
     MmapReader& operator=(MmapReader const&) = delete;
 
     //! @brief Destructor
-    ~MmapReader();
+    ~MmapReader() noexcept;
 
     //! @brief Release mapped memory
-    void release();
+    void release() noexcept;
 
     /*!
      * @brief Load and memory-map a file
      * @param fp Path to file to load
      * @return True on success, false on failure
+     * @throws std::bad_alloc If string memory allocation fails
      */
     bool loadFile(std::filesystem::path const& fp);
 
