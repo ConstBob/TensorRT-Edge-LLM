@@ -126,6 +126,23 @@ def audio_export(model_dir: str,
             with open(os.path.join(code2wav_output_dir, "config.json"),
                       "w") as f:
                 json.dump(config_dict, f, indent=2)
+    elif model_type == 'qwen3_asr':
+        print(f"Exporting Qwen3-ASR audio model from {model_dir}")
+        from tensorrt_edgellm.audio_models.qwen3_asr_model import (
+            Qwen3ASRModelPatch, export_qwen3_asr_audio)
+        wrapped_asr = Qwen3ASRModelPatch._from_config(
+            model.thinker.audio_tower.config,
+            torch_dtype=torch_dtype,
+        )
+        wrapped_asr.load_state_dict(model.thinker.audio_tower.state_dict())
+        wrapped_asr.eval().to(device)
+        export_qwen3_asr_audio(wrapped_asr, output_dir, torch_dtype)
+        print(f"Exported ASR audio encoder to {output_dir}")
+
+        # Export model configuration to JSON
+        config_dict = export_audio_config(model.thinker.config)
+        with open(os.path.join(output_dir, "config.json"), "w") as f:
+            json.dump(config_dict, f, indent=2)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 

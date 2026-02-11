@@ -133,6 +133,11 @@ def _is_qwen3_omni_model(model_dir: str) -> bool:
     return getattr(cfg, "model_type", None) == "qwen3_omni"
 
 
+def _is_qwen3_asr_model(model_dir: str) -> bool:
+    """Qwen3-ASR is not integrated into transformers yet."""
+    return "Qwen3-ASR" in model_dir
+
+
 # Models that require explicit chat template because auto-extraction fails
 INCOMPATIBLE_CHAT_TEMPLATE_MODELS = [
     "phi4mm",  # Phi-4-multimodal: tokenizer lacks proper chat template
@@ -292,6 +297,11 @@ def load_hf_model(
         model = module.Phi4MMForCausalLM.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).to(device)
+    elif _is_qwen3_asr_model(model_dir):
+        from qwen_asr import Qwen3ASRModel
+        model = Qwen3ASRModel.from_pretrained(
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).model.to(device)
     elif _is_qwen3_omni_model(model_dir):
         from transformers import Qwen3OmniForConditionalGeneration
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
@@ -379,8 +389,8 @@ def load_llm_model(
     set_dynamic_quant(model, dtype)
 
     # Create EdgeLLMModelForCausalLM wrapper
-    if _is_qwen3_omni_model(model_dir):
-        # For Qwen3-Omni, extract the thinker submodel
+    if _is_qwen3_omni_model(model_dir) or _is_qwen3_asr_model(model_dir):
+        # For Qwen3-Omni and Qwen3-ASR, extract the thinker submodel
         hf_model = model.thinker
     else:
         hf_model = model

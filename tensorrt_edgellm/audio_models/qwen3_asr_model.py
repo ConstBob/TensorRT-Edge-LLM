@@ -13,27 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Qwen3-Omni audio encoder model wrapper and export functionality.
+Qwen3-ASR audio encoder model wrapper and export functionality.
 
-This module provides wrapper classes and export functions for Qwen3-Omni audio encoder,
-enabling ONNX export with proper attention mechanism handling.
+This module provides wrapper classes and export functions for Qwen3-ASR audio encoder,
+enabling ONNX export with proper attention mechanism handling. The ASR model shares
+the same architecture as the Omni model, so the attention patching logic is reused.
 """
 
 from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.models.qwen3_omni.modeling_qwen3_omni import (
-    Qwen3OmniAudioAttention, Qwen3OmniAudioEncoder, Qwen3OmniAudioEncoderLayer,
-    Qwen3OmniCode2Wav, Qwen3OmniCode2WavTransformerModel)
+from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+    Qwen3ASRAudioAttention, Qwen3ASRAudioEncoder, Qwen3ASRAudioEncoderLayer)
 
-from ..onnx_export.onnx_utils import export_onnx, export_onnx_dynamo
+from ..onnx_export.onnx_utils import export_onnx
 from .audio_utils import eager_attention_forward
 
 
-class Qwen3OmniAudioAttentionPatch(Qwen3OmniAudioAttention):
+class Qwen3ASRAudioAttentionPatch(Qwen3ASRAudioAttention):
     """
-    Patched version of Qwen3-Omni audio attention for ONNX export.
+    Patched version of Qwen3-ASR audio attention for ONNX export.
     """
 
     def __init__(self, config: Any) -> None:
@@ -81,9 +81,9 @@ class Qwen3OmniAudioAttentionPatch(Qwen3OmniAudioAttention):
         return attn_output
 
 
-class Qwen3OmniAudioEncoderLayerPatch(Qwen3OmniAudioEncoderLayer):
+class Qwen3ASRAudioEncoderLayerPatch(Qwen3ASRAudioEncoderLayer):
     """
-    Patched version of Qwen3OmniAudioEncoderLayer with custom attention mechanism.
+    Patched version of Qwen3ASRAudioEncoderLayer with custom attention mechanism.
     
     This class replaces the original attention mechanism with a custom implementation
     that is compatible with ONNX export.
@@ -93,7 +93,7 @@ class Qwen3OmniAudioEncoderLayerPatch(Qwen3OmniAudioEncoderLayer):
                  config: Any,
                  attn_implementation: str = "eager") -> None:
         super().__init__(config)
-        self.self_attn = Qwen3OmniAudioAttentionPatch(config)
+        self.self_attn = Qwen3ASRAudioAttentionPatch(config)
 
     def forward(
         self,
@@ -129,11 +129,11 @@ class Qwen3OmniAudioEncoderLayerPatch(Qwen3OmniAudioEncoderLayer):
         return hidden_states
 
 
-class Qwen3OmniAudioEncoderPatch(Qwen3OmniAudioEncoder):
+class Qwen3ASRAudioEncoderPatch(Qwen3ASRAudioEncoder):
     """
-    Patched version of Qwen3OmniAudioEncoder for ONNX export.
+    Patched version of Qwen3ASRAudioEncoder for ONNX export.
     
-    This class provides a wrapper around the original Qwen3-Omni audio encoder
+    This class provides a wrapper around the original Qwen3-ASR audio encoder
     with custom blocks that are compatible with ONNX export.
     """
 
@@ -147,8 +147,7 @@ class Qwen3OmniAudioEncoderPatch(Qwen3OmniAudioEncoder):
         super().__init__(config)
         # Replace all blocks with patched versions
         self.layers = nn.ModuleList([
-            Qwen3OmniAudioEncoderLayerPatch(config,
-                                            config._attn_implementation)
+            Qwen3ASRAudioEncoderLayerPatch(config, config._attn_implementation)
             for _ in range(config.encoder_layers)
         ])
 
@@ -201,101 +200,23 @@ class Qwen3OmniAudioEncoderPatch(Qwen3OmniAudioEncoder):
         return hidden_states
 
 
-class Qwen3OmniCode2WavTransformerModelPatch(Qwen3OmniCode2WavTransformerModel
-                                             ):
-    """
-    Patched version of Qwen3OmniCode2WavTransformerModel for ONNX export.
-    This class replaces the original sliding window attention mask generation logic with a custom implementation
-    that is compatible with ONNX export.
-    """
-
-    def __init__(self, config: Any) -> None:
-        super().__init__(config)
-
-    def forward(
-        self,
-        inputs_embeds=None,
-        **kwargs,
-    ) -> torch.Tensor:
-
-        past_seen_tokens = 0
-        cache_position = torch.arange(past_seen_tokens,
-                                      past_seen_tokens +
-                                      inputs_embeds.shape[1],
-                                      device=inputs_embeds.device)
-        position_ids = cache_position.unsqueeze(0)
-
-        hidden_states = inputs_embeds
-
-        # Create sliding window attention mask with a window size of 72.
-        # A token at query position q can attend to key position k if: (q - 72) < k <= q
-        seq_len = inputs_embeds.shape[1]
-        q_pos = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(1)
-        k_pos = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0)
-        valid_mask = (k_pos > q_pos - 72) & (k_pos <= q_pos)
-        attention_mask = torch.where(valid_mask, 0,
-                                     torch.finfo(inputs_embeds.dtype).min).to(
-                                         inputs_embeds.dtype)
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        for decoder_layer in self.layers[:self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+# Alias for consistency with naming convention
+Qwen3ASRModelPatch = Qwen3ASRAudioEncoderPatch
 
 
-class Qwen3OmniCode2WavModelPatch(Qwen3OmniCode2Wav):
-    """
-    Patched version of Qwen3OmniCode2WavModel for ONNX export.
-    The pre-transformer is replaced with a patched version whose sliding window attention mask generation logic is compatible with ONNX export.
-    """
-
-    def __init__(self, config: Any) -> None:
-        super().__init__(config)
-        # Replace pre_transformer with patched version
-        self.pre_transformer = Qwen3OmniCode2WavTransformerModelPatch(config)
-
-    def forward(self, codes: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the code2wav model.
-        """
-        if codes.shape[1] != self.config.num_quantizers:
-            raise ValueError(
-                f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}"
-            )
-        hidden = self.code_embedding(codes + self.code_offset).mean(1)
-        hidden = self.pre_transformer(inputs_embeds=hidden)
-        hidden = hidden.permute(0, 2, 1)
-        for blocks in self.upsample:
-            for block in blocks:
-                hidden = block(hidden)
-        wav = hidden
-        for block in self.decoder:
-            wav = block(wav)
-        return wav.clamp(min=-1, max=1)
-
-
-def export_qwen3_omni_audio(
-    model: Qwen3OmniAudioEncoderPatch,
+def export_qwen3_asr_audio(
+    model: Qwen3ASRAudioEncoderPatch,
     output_dir: str,
     torch_dtype: torch.dtype,
 ) -> None:
     """
-    Export Qwen3-Omni audio encoder model to ONNX format.
+    Export Qwen3-ASR audio encoder model to ONNX format.
     
-    This function takes a patched Qwen3-Omni audio encoder model, prepares dummy inputs 
+    This function takes a patched Qwen3-ASR audio encoder model, prepares dummy inputs 
     for ONNX export, and saves the model in ONNX format.
     
     Args:
-        model: Patched Qwen3-Omni audio encoder model
+        model: Patched Qwen3-ASR audio encoder model
         output_dir: Directory to save the exported ONNX model
         torch_dtype: PyTorch data type for the model
     """
@@ -359,57 +280,3 @@ def export_qwen3_omni_audio(
 
     export_onnx(model, inputs, output_dir, input_names, output_names,
                 dynamic_axes)
-
-
-def export_qwen3_omni_code2wav(
-    model: Qwen3OmniCode2WavModelPatch,
-    output_dir: str,
-) -> None:
-    """
-    Export Qwen3-Omni code2wav model to ONNX format.
-    The ONNX dynamo exporter is used here as torchscript cannot resolve some dynamic shapes
-    in the Qwen3OmniCausalConvNet module correctly.
-    """
-    # Model configuration
-    num_quantizers = model.config.num_quantizers  # 16 for Qwen3-Omni
-
-    # Dummy input dimensions
-    batch_size = 2
-    # Chunked decode uses code length of 300
-    opt_code_len = 300
-
-    # Prepare dummy input with optimal length
-    codes = torch.randint(0,
-                          model.config.codebook_size,
-                          (batch_size, num_quantizers, opt_code_len),
-                          dtype=torch.int64,
-                          device=model.device)
-    # Pack inputs
-    inputs = (codes, )
-
-    input_names = ['codes']
-    output_names = ['waveform']
-
-    # Define dynamic axes for variable-length codes
-    input_dynamic_shapes = (
-        # Input 0: 'codes'
-        {
-            0: 'batch',
-            2: 'code_len'
-        },  # dim 1 is fixed (num_quantizers=16)
-    )
-    output_dynamic_shapes = (
-        # Output 0: 'waveform'
-        {
-            0: 'batch',
-            2: 'waveform_len'
-        },  # dim 1 is fixed (1 channel)
-    )
-
-    export_onnx_dynamo(model,
-                       inputs,
-                       output_dir,
-                       input_names=input_names,
-                       output_names=output_names,
-                       input_dynamic_shapes=input_dynamic_shapes,
-                       output_dynamic_shapes=output_dynamic_shapes)

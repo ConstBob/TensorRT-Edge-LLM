@@ -131,7 +131,7 @@ def create_dummy_inputs(model: nn.Module,
 
     # Get model configuration
     model_config = model.config
-    if model_config.model_type == "qwen3_omni_thinker":
+    if model_config.model_type in ["qwen3_omni_thinker", "qwen3_asr"]:
         model_config = model_config.text_config
 
     hidden_size = model_config.hidden_size
@@ -332,7 +332,7 @@ def export_model_to_onnx(model: nn.Module,
 
         # Get model configuration for dynamic shapes
         model_config = model.config
-        if model_config.model_type == "qwen3_omni_thinker":
+        if model_config.model_type in ["qwen3_omni_thinker", "qwen3_asr"]:
             model_config = model_config.text_config
         num_layers = model_config.num_hidden_layers
 
