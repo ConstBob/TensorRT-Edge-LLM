@@ -40,6 +40,7 @@ try:
     import pycuda.autoinit  # Initialize CUDA context
     import pycuda.driver as cuda
     import tensorrt as trt
+
     DEPENDENCIES_AVAILABLE = True
     IMPORT_ERROR = None
 except ImportError as e:
@@ -108,13 +109,14 @@ class AttentionPluginRunner:
 
         p = self.params
 
-        # Calculate QKV hidden size
-        qkv_hidden_size = (p.num_q_heads + p.num_kv_heads +
-                           p.num_kv_heads) * p.head_size
+        # Calculate hidden sizes
+        q_hidden_size = p.num_q_heads * p.head_size
+        kv_hidden_size = p.num_kv_heads * p.head_size
 
         # Add inputs
-        qkv_input = network.add_input("qkv", trt.float16,
-                                      (-1, -1, qkv_hidden_size))
+        q_input = network.add_input("q", trt.float16, (-1, -1, q_hidden_size))
+        k_input = network.add_input("k", trt.float16, (-1, -1, kv_hidden_size))
+        v_input = network.add_input("v", trt.float16, (-1, -1, kv_hidden_size))
         # KV Cache: [B, 2, Hkv, capacity, D]
         kv_cache_input = network.add_input(
             "kv_cache", trt.float16,
@@ -165,17 +167,17 @@ class AttentionPluginRunner:
             trt.PluginField(
                 "enable_tree_attention",
                 np.array([self.enable_tree_attention], dtype=np.int32),
-                trt.PluginFieldType.INT32),
+                trt.PluginFieldType.INT32,
+            ),
         ]
 
         plugin_field_collection = trt.PluginFieldCollection(plugin_fields)
         plugin = plugin_creator.create_plugin("attention",
                                               plugin_field_collection)
 
-        # Add plugin layer
         plugin_inputs = [
-            qkv_input, kv_cache_input, context_lengths, rope_cos_sin,
-            kv_cache_indices
+            q_input, k_input, v_input, kv_cache_input, context_lengths,
+            rope_cos_sin, kv_cache_indices
         ]
         if self.enable_tree_attention:
             plugin_inputs.extend([tree_mask, position_ids])
@@ -191,28 +193,47 @@ class AttentionPluginRunner:
         # Setup optimization profile
         profile = builder.create_optimization_profile()
 
-        # QKV profile
-        profile.set_shape("qkv", (1, 1, qkv_hidden_size),
-                          (p.batch_size, p.seq_len, qkv_hidden_size),
-                          (p.max_batch_size, p.max_seq_len, qkv_hidden_size))
+        # Q, K, V profiles
+        profile.set_shape(
+            "q",
+            (1, 1, q_hidden_size),
+            (p.batch_size, p.seq_len, q_hidden_size),
+            (p.max_batch_size, p.max_seq_len, q_hidden_size),
+        )
+        profile.set_shape(
+            "k",
+            (1, 1, kv_hidden_size),
+            (p.batch_size, p.seq_len, kv_hidden_size),
+            (p.max_batch_size, p.max_seq_len, kv_hidden_size),
+        )
+        profile.set_shape(
+            "v",
+            (1, 1, kv_hidden_size),
+            (p.batch_size, p.seq_len, kv_hidden_size),
+            (p.max_batch_size, p.max_seq_len, kv_hidden_size),
+        )
 
         # KV cache profile
         profile.set_shape(
             "kv_cache",
             (1, 2, p.num_kv_heads, p.kv_cache_capacity, p.head_size),
             (p.batch_size, 2, p.num_kv_heads, p.kv_cache_capacity,
-             p.head_size), (p.max_batch_size, 2, p.num_kv_heads,
-                            p.kv_cache_capacity, p.head_size))
+             p.head_size),
+            (p.max_batch_size, 2, p.num_kv_heads, p.kv_cache_capacity,
+             p.head_size),
+        )
 
         # Context lengths profile
         profile.set_shape("context_lengths", (1, ), (p.batch_size, ),
                           (p.max_batch_size, ))
 
         # RoPE cos/sin profile
-        profile.set_shape("rope_cos_sin",
-                          (1, p.max_position_embeddings, p.head_size),
-                          (1, p.max_position_embeddings, p.head_size),
-                          (1, p.max_position_embeddings, p.head_size))
+        profile.set_shape(
+            "rope_cos_sin",
+            (1, p.max_position_embeddings, p.head_size),
+            (1, p.max_position_embeddings, p.head_size),
+            (1, p.max_position_embeddings, p.head_size),
+        )
 
         # Cache indices profile
         profile.set_shape("kv_cache_indices", (1, ), (p.batch_size, ),
@@ -221,9 +242,12 @@ class AttentionPluginRunner:
         # Tree attention specific profiles
         if self.enable_tree_attention:
             # Attention mask profile: [B, S, S]
-            profile.set_shape("tree_mask", (1, 1, 1),
-                              (p.batch_size, p.seq_len, p.seq_len),
-                              (p.max_batch_size, p.max_seq_len, p.max_seq_len))
+            profile.set_shape(
+                "tree_mask",
+                (1, 1, 1),
+                (p.batch_size, p.seq_len, p.seq_len),
+                (p.max_batch_size, p.max_seq_len, p.max_seq_len),
+            )
 
             # Position IDs profile: [B, S]
             profile.set_shape("position_ids", (1, 1),
@@ -238,18 +262,24 @@ class AttentionPluginRunner:
         self.engine = runtime.deserialize_cuda_engine(serialized_engine)
         self.context = self.engine.create_execution_context()
 
-    def execute(self,
-                device_buffers: dict,
-                qkv_shape: tuple,
-                kv_cache_shape: tuple,
-                context_lengths_shape: tuple,
-                rope_cos_sin_shape: tuple,
-                cache_indices_shape: tuple,
-                mask_shape: tuple = None,
-                position_ids_shape: tuple = None):
+    def execute(
+        self,
+        device_buffers: dict,
+        q_shape: tuple,
+        k_shape: tuple,
+        v_shape: tuple,
+        kv_cache_shape: tuple,
+        context_lengths_shape: tuple,
+        rope_cos_sin_shape: tuple,
+        cache_indices_shape: tuple,
+        mask_shape: tuple = None,
+        position_ids_shape: tuple = None,
+    ):
         """Execute the TensorRT engine with plugin."""
         # Set input shapes
-        utils.check_trt(self.context.set_input_shape("qkv", qkv_shape))
+        utils.check_trt(self.context.set_input_shape("q", q_shape))
+        utils.check_trt(self.context.set_input_shape("k", k_shape))
+        utils.check_trt(self.context.set_input_shape("v", v_shape))
         utils.check_trt(
             self.context.set_input_shape("kv_cache", kv_cache_shape))
         utils.check_trt(
@@ -275,39 +305,41 @@ class AttentionPluginRunner:
 
         # Set tensor addresses
         utils.check_trt(
-            self.context.set_tensor_address("qkv",
-                                            int(device_buffers['d_qkv'])))
+            self.context.set_tensor_address("q", int(device_buffers["d_q"])))
+        utils.check_trt(
+            self.context.set_tensor_address("k", int(device_buffers["d_k"])))
+        utils.check_trt(
+            self.context.set_tensor_address("v", int(device_buffers["d_v"])))
         utils.check_trt(
             self.context.set_tensor_address("kv_cache",
-                                            int(device_buffers['d_kv_cache'])))
+                                            int(device_buffers["d_kv_cache"])))
         utils.check_trt(
             self.context.set_tensor_address(
-                "context_lengths", int(device_buffers['d_context_lengths'])))
+                "context_lengths", int(device_buffers["d_context_lengths"])))
         utils.check_trt(
             self.context.set_tensor_address(
-                "rope_cos_sin", int(device_buffers['d_rope_cos_sin'])))
+                "rope_cos_sin", int(device_buffers["d_rope_cos_sin"])))
         utils.check_trt(
             self.context.set_tensor_address(
-                "kv_cache_indices", int(device_buffers['d_cache_indices'])))
+                "kv_cache_indices", int(device_buffers["d_cache_indices"])))
 
         # Tree attention specific tensor addresses
         if self.enable_tree_attention:
             utils.check_trt(
                 self.context.set_tensor_address(
-                    "tree_mask", int(device_buffers['d_tree_mask'])))
+                    "tree_mask", int(device_buffers["d_tree_mask"])))
             utils.check_trt(
                 self.context.set_tensor_address(
-                    "position_ids", int(device_buffers['d_position_ids'])))
+                    "position_ids", int(device_buffers["d_position_ids"])))
 
         utils.check_trt(
             self.context.set_tensor_address(
-                "attention_output", int(device_buffers['d_attn_output'])))
+                "attention_output", int(device_buffers["d_attn_output"])))
         # Plugin updates KV cache in-place
         utils.check_trt(
             self.context.set_tensor_address("kv_cache_output",
-                                            int(device_buffers['d_kv_cache'])))
+                                            int(device_buffers["d_kv_cache"])))
 
-        # Execute
         utils.check_trt(self.context.execute_async_v3(self.stream.handle))
 
 
@@ -346,27 +378,31 @@ class TestAttentionPluginVsNumpy:
         p = params
 
         # Calculate buffer sizes for max shapes
-        qkv_size = p.max_batch_size * p.max_seq_len * p.qkv_hidden_size * np.dtype(
+        q_size = p.max_batch_size * p.max_seq_len * p.num_q_heads * p.head_size * np.dtype(
             np.float16).itemsize
-        attn_output_size = p.max_batch_size * p.max_seq_len * p.num_q_heads * p.head_size * np.dtype(
+        kv_size = p.max_batch_size * p.max_seq_len * p.num_kv_heads * p.head_size * np.dtype(
             np.float16).itemsize
+        attn_output_size = (p.max_batch_size * p.max_seq_len * p.num_q_heads *
+                            p.head_size * np.dtype(np.float16).itemsize)
         cache_indices_size = p.max_batch_size * np.dtype(np.int32).itemsize
-
         # Plugin uses combined KV cache [B, 2, Hkv, capacity, D]
-        kv_cache_size = p.max_batch_size * 2 * p.num_kv_heads * p.kv_cache_capacity * p.head_size * np.dtype(
-            np.float16).itemsize
+        kv_cache_size = (p.max_batch_size * 2 * p.num_kv_heads *
+                         p.kv_cache_capacity * p.head_size *
+                         np.dtype(np.float16).itemsize)
         # Plugin uses combined RoPE cos/sin [1, max_pos_emb, D]
         rope_cos_sin_size = p.max_position_embeddings * p.head_size * np.dtype(
             np.float32).itemsize
         context_lengths_size = p.max_batch_size * np.dtype(np.int32).itemsize
 
         device_buffers = {
-            'd_qkv': cuda.mem_alloc(qkv_size),
-            'd_cache_indices': cuda.mem_alloc(cache_indices_size),
-            'd_attn_output': cuda.mem_alloc(attn_output_size),
-            'd_kv_cache': cuda.mem_alloc(kv_cache_size),
-            'd_rope_cos_sin': cuda.mem_alloc(rope_cos_sin_size),
-            'd_context_lengths': cuda.mem_alloc(context_lengths_size),
+            "d_q": cuda.mem_alloc(q_size),
+            "d_k": cuda.mem_alloc(kv_size),
+            "d_v": cuda.mem_alloc(kv_size),
+            "d_cache_indices": cuda.mem_alloc(cache_indices_size),
+            "d_attn_output": cuda.mem_alloc(attn_output_size),
+            "d_kv_cache": cuda.mem_alloc(kv_cache_size),
+            "d_rope_cos_sin": cuda.mem_alloc(rope_cos_sin_size),
+            "d_context_lengths": cuda.mem_alloc(context_lengths_size),
         }
 
         # Tree attention specific buffers
@@ -374,12 +410,12 @@ class TestAttentionPluginVsNumpy:
             # Tree mask: [max_batch, max_seq, max_seq]
             tree_mask_size = p.max_batch_size * p.max_seq_len * p.max_seq_len * np.dtype(
                 np.int32).itemsize
-            device_buffers['d_tree_mask'] = cuda.mem_alloc(tree_mask_size)
+            device_buffers["d_tree_mask"] = cuda.mem_alloc(tree_mask_size)
 
             # Position IDs: [max_batch, max_seq]
             position_ids_size = p.max_batch_size * p.max_seq_len * np.dtype(
                 np.int32).itemsize
-            device_buffers['d_position_ids'] = cuda.mem_alloc(
+            device_buffers["d_position_ids"] = cuda.mem_alloc(
                 position_ids_size)
 
         return device_buffers
@@ -391,39 +427,40 @@ class TestAttentionPluginVsNumpy:
                 buf.free()
 
     def copy_plugin_inputs_to_device(
-            self,
-            device_buffers: dict,
-            qkv: np.ndarray,
-            kv_cache: np.ndarray,
-            context_lengths: np.ndarray,
-            rope_cos_sin: np.ndarray,
-            cache_indices: np.ndarray,
-            stream: cuda.Stream,
-            attention_mask: Optional[np.ndarray] = None,
-            position_ids: Optional[np.ndarray] = None):
-        """Copy plugin input data from host to device.
-
-        Args:
-            attention_mask: Optional [B, S, S] packed tree attention mask
-            position_ids: Optional [B, S] position IDs
-        """
-        cuda.memcpy_htod_async(device_buffers['d_qkv'], qkv.astype(np.float16),
+        self,
+        device_buffers: dict,
+        q: np.ndarray,
+        k: np.ndarray,
+        v: np.ndarray,
+        kv_cache: np.ndarray,
+        context_lengths: np.ndarray,
+        rope_cos_sin: np.ndarray,
+        cache_indices: np.ndarray,
+        stream: cuda.Stream,
+        attention_mask: Optional[np.ndarray] = None,
+        position_ids: Optional[np.ndarray] = None,
+    ):
+        """Copy plugin input data from host to device."""
+        cuda.memcpy_htod_async(device_buffers["d_q"], q.astype(np.float16),
                                stream)
-        cuda.memcpy_htod_async(device_buffers['d_kv_cache'],
+        cuda.memcpy_htod_async(device_buffers["d_k"], k.astype(np.float16),
+                               stream)
+        cuda.memcpy_htod_async(device_buffers["d_v"], v.astype(np.float16),
+                               stream)
+        cuda.memcpy_htod_async(device_buffers["d_kv_cache"],
                                kv_cache.astype(np.float16), stream)
-        cuda.memcpy_htod_async(device_buffers['d_context_lengths'],
+        cuda.memcpy_htod_async(device_buffers["d_context_lengths"],
                                context_lengths.astype(np.int32), stream)
-        cuda.memcpy_htod_async(device_buffers['d_rope_cos_sin'],
+        cuda.memcpy_htod_async(device_buffers["d_rope_cos_sin"],
                                rope_cos_sin.astype(np.float32), stream)
-        cuda.memcpy_htod_async(device_buffers['d_cache_indices'],
+        cuda.memcpy_htod_async(device_buffers["d_cache_indices"],
                                cache_indices.astype(np.int32), stream)
 
-        # Tree attention specific inputs
         if attention_mask is not None:
-            cuda.memcpy_htod_async(device_buffers['d_tree_mask'],
+            cuda.memcpy_htod_async(device_buffers["d_tree_mask"],
                                    attention_mask.astype(np.int32), stream)
         if position_ids is not None:
-            cuda.memcpy_htod_async(device_buffers['d_position_ids'],
+            cuda.memcpy_htod_async(device_buffers["d_position_ids"],
                                    position_ids.astype(np.int32), stream)
 
     def copy_plugin_outputs_from_device(self, device_buffers: dict,
@@ -431,9 +468,9 @@ class TestAttentionPluginVsNumpy:
                                         kv_cache: np.ndarray,
                                         stream: cuda.Stream):
         """Copy plugin output data from device to host."""
-        cuda.memcpy_dtoh_async(attn_output, device_buffers['d_attn_output'],
+        cuda.memcpy_dtoh_async(attn_output, device_buffers["d_attn_output"],
                                stream)
-        cuda.memcpy_dtoh_async(kv_cache, device_buffers['d_kv_cache'], stream)
+        cuda.memcpy_dtoh_async(kv_cache, device_buffers["d_kv_cache"], stream)
 
     def _run_plugin_attention_test(self,
                                    num_rounds: int,
@@ -509,6 +546,11 @@ class TestAttentionPluginVsNumpy:
             qkv = self.rng.standard_normal(
                 (p.batch_size, p.seq_len,
                  p.qkv_hidden_size)).astype(np.float32)
+            q_size = p.num_q_heads * p.head_size
+            kv_size = p.num_kv_heads * p.head_size
+            q = qkv[:, :, :q_size]
+            k = qkv[:, :, q_size:q_size + kv_size]
+            v = qkv[:, :, q_size + kv_size:]
             position_ids = np.arange(current_pos,
                                      current_pos + p.seq_len,
                                      dtype=np.int32)[None, :].repeat(
@@ -539,19 +581,28 @@ class TestAttentionPluginVsNumpy:
                 qkv, np_k_cache, np_v_cache, rope_cos_cache, rope_sin_cache,
                 position_ids, cache_indices, p, causal_mask)
 
-            # Run Plugin
-            # Copy inputs to device
-            self.copy_plugin_inputs_to_device(device_buffers, qkv,
-                                              plugin_kv_cache, context_lengths,
-                                              rope_cos_sin_cache,
-                                              cache_indices,
-                                              plugin_runner.stream)
+            self.copy_plugin_inputs_to_device(
+                device_buffers,
+                q,
+                k,
+                v,
+                plugin_kv_cache,
+                context_lengths,
+                rope_cos_sin_cache,
+                cache_indices,
+                plugin_runner.stream,
+            )
 
-            # Execute plugin
-            plugin_runner.execute(device_buffers, qkv.shape,
-                                  plugin_kv_cache.shape, context_lengths.shape,
-                                  rope_cos_sin_cache.shape,
-                                  cache_indices.shape)
+            plugin_runner.execute(
+                device_buffers,
+                q.shape,
+                k.shape,
+                v.shape,
+                plugin_kv_cache.shape,
+                context_lengths.shape,
+                rope_cos_sin_cache.shape,
+                cache_indices.shape,
+            )
 
             # Prepare output buffers
             plugin_attn_out = np.zeros(
@@ -686,6 +737,11 @@ class TestAttentionPluginVsNumpy:
             qkv = self.rng.standard_normal(
                 (p.batch_size, p.seq_len,
                  p.qkv_hidden_size)).astype(np.float32)
+            q_size = p.num_q_heads * p.head_size
+            kv_size = p.num_kv_heads * p.head_size
+            q = qkv[:, :, :q_size]
+            k = qkv[:, :, q_size:q_size + kv_size]
+            v = qkv[:, :, q_size + kv_size:]
 
             # Construct position_ids based on tree structure
             # Base position depths: [0, 1, 1, 2] (relative depth in tree)
@@ -724,24 +780,35 @@ class TestAttentionPluginVsNumpy:
                 position_ids,
                 cache_indices,
                 p,
-                attention_mask=full_mask)
+                attention_mask=full_mask,
+            )
 
-            # Run Plugin with full tree (for verification)
-            self.copy_plugin_inputs_to_device(device_buffers,
-                                              qkv,
-                                              plugin_kv_cache,
-                                              context_lengths,
-                                              rope_cos_sin_cache,
-                                              cache_indices,
-                                              plugin_runner.stream,
-                                              attention_mask=packed_tree_mask,
-                                              position_ids=position_ids)
+            self.copy_plugin_inputs_to_device(
+                device_buffers,
+                q,
+                k,
+                v,
+                plugin_kv_cache,
+                context_lengths,
+                rope_cos_sin_cache,
+                cache_indices,
+                plugin_runner.stream,
+                attention_mask=packed_tree_mask,
+                position_ids=position_ids,
+            )
 
-            plugin_runner.execute(device_buffers, qkv.shape,
-                                  plugin_kv_cache.shape, context_lengths.shape,
-                                  rope_cos_sin_cache.shape,
-                                  cache_indices.shape, packed_tree_mask.shape,
-                                  position_ids.shape)
+            plugin_runner.execute(
+                device_buffers,
+                q.shape,
+                k.shape,
+                v.shape,
+                plugin_kv_cache.shape,
+                context_lengths.shape,
+                rope_cos_sin_cache.shape,
+                cache_indices.shape,
+                packed_tree_mask.shape,
+                position_ids.shape,
+            )
 
             # Get outputs (full tree)
             plugin_attn_out = np.zeros(
@@ -769,9 +836,10 @@ class TestAttentionPluginVsNumpy:
                 np_k_cache_out, np_v_cache_out, accepted_indices, current_pos,
                 p.seq_len)
 
-            plugin_k_cache_out, plugin_v_cache_out = plugin_kv_cache_out[:,
-                                                                         0, :, :, :], plugin_kv_cache_out[:,
-                                                                                                          1, :, :, :]
+            plugin_k_cache_out, plugin_v_cache_out = (
+                plugin_kv_cache_out[:, 0, :, :, :],
+                plugin_kv_cache_out[:, 1, :, :, :],
+            )
             plugin_k_cache_committed, plugin_v_cache_committed = utils.commit_kv_cache(
                 plugin_k_cache_out, plugin_v_cache_out, accepted_indices,
                 current_pos, p.seq_len)
@@ -825,7 +893,7 @@ class TestAttentionPluginVsNumpy:
             )
 
             # Sync committed cache back to device
-            cuda.memcpy_htod_async(device_buffers['d_kv_cache'],
+            cuda.memcpy_htod_async(device_buffers["d_kv_cache"],
                                    plugin_kv_cache.astype(np.float16),
                                    plugin_runner.stream)
             plugin_runner.stream.synchronize()

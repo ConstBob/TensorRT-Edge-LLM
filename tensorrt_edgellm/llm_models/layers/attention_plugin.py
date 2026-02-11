@@ -43,8 +43,18 @@ attention_plugin_schema = OpSchema(
     "Custom TensorRT attention plugin with RoPE, KV cache, and attention computation.",
     inputs=[
         OpSchema.FormalParameter(
-            name="qkv",
-            description="Concatenated QKV tensor",
+            name="q",
+            description="Query tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="k",
+            description="Key tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="v",
+            description="Value tensor",
             type_str="T",
         ),
         OpSchema.FormalParameter(
@@ -105,7 +115,7 @@ attention_plugin_schema = OpSchema(
         (
             "T",
             ["tensor(float16)"],
-            "Input QKV data type.",
+            "Input Q/K/V data type.",
         ),
         (
             "T_KV",
@@ -150,11 +160,13 @@ attention_plugin_schema = OpSchema(
 onnx.defs.register_schema(attention_plugin_schema)
 
 
-@symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i", "b", "i", "b",
-                            "v", "v", "v")
+@symbolic_helper.parse_args("v", "v", "v", "v", "v", "v", "v", "i", "i", "b",
+                            "i", "b", "v", "v", "v")
 def symbolic_attention_plugin(
     g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
-    qkv: torch._C.Value,
+    q: torch._C.Value,
+    k: torch._C.Value,
+    v: torch._C.Value,
     past_key_value: torch._C.Value,
     context_lengths: torch._C.Value,
     rope_rotary_cos_sin: torch._C.Value,
@@ -172,7 +184,7 @@ def symbolic_attention_plugin(
 
     # Build inputs list - kvcache_start_index is now always required
     inputs = [
-        qkv, past_key_value, context_lengths, rope_rotary_cos_sin,
+        q, k, v, past_key_value, context_lengths, rope_rotary_cos_sin,
         kvcache_start_index
     ]
     if enable_tree_attention:
@@ -190,7 +202,7 @@ def symbolic_attention_plugin(
         ) != "NoneType", "k_v_scale_quant_orig should be provided for FP8 KV cache"
         inputs.append(k_v_scale_quant_orig)
 
-    qkv_type = qkv.type()
+    q_type = q.type()
     past_key_value_type = past_key_value.type()
     attn_output, present_key_value = g.op(
         "trt::AttentionPlugin",
@@ -202,9 +214,9 @@ def symbolic_attention_plugin(
         enable_fp8_kv_cache_i=1 if enable_fp8_kv_cache else 0,
         outputs=2)
 
-    qkv_sizes = _get_tensor_sizes(qkv)
-    attn_output_sizes = qkv_sizes[:-1] + [num_q_heads, head_size]
-    attn_output.setType(qkv_type.with_sizes(attn_output_sizes))
+    q_sizes = _get_tensor_sizes(q)
+    attn_output_sizes = q_sizes[:-1] + [num_q_heads, head_size]
+    attn_output.setType(q_type.with_sizes(attn_output_sizes))
 
     # KV Cache output has the same shape as input past_key_value except for dimension 3 (sequence length)
     # Shape: [batch_size, 2, num_kv_heads, present_kv_cache_len (dynamic), head_size]
@@ -216,7 +228,9 @@ def symbolic_attention_plugin(
 
 @torch.library.custom_op("trt::attention_plugin", mutates_args=())
 def attention_plugin(
-    qkv: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     past_key_value: torch.Tensor,
     context_lengths: torch.Tensor,
     rope_rotary_cos_sin: torch.Tensor,
@@ -232,16 +246,18 @@ def attention_plugin(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Dummy TensorRT operation for attention computation, this is not used in the actual inference.
-    
-    This operation wraps the logic after v_proj and before o_proj into a single 
+
+    This operation wraps the logic after v_proj and before o_proj into a single
     AttentionPlugin operation during ONNX export. It handles RoPE application,
     KV cache management, and attention computation in a fused manner.
-    
+
     Args:
-        qkv: Concatenated QKV tensor of shape (batch_size, seq_len, num_q_heads * head_size + 2 * num_kv_heads * head_size)
+        q: Query tensor of shape (batch_size, seq_len, num_q_heads * head_size)
+        k: Key tensor of shape (batch_size, seq_len, num_kv_heads * head_size)
+        v: Value tensor of shape (batch_size, seq_len, num_kv_heads * head_size)
         past_key_value: KV cache tensor of shape (batch_size, 2, num_kv_heads, past_len, head_size)
-        rope_rotary_cos_sin: RoPE tensor of shape (batch_size, seq_len, rotary_dim) containing cos and sin values
         context_lengths: Context length tensor of shape (batch_size,) indicating current position in cache
+        rope_rotary_cos_sin: RoPE tensor of shape (batch_size, seq_len, rotary_dim) containing cos and sin values
         kvcache_start_index: Start index of KV cache of shape (kv_cache_start_batch_size,), required
         num_q_heads: Number of query heads
         num_kv_heads: Number of key-value heads
@@ -252,12 +268,12 @@ def attention_plugin(
         position_ids: Position IDs tensor of shape (batch_size, seq_len), optional
         k_v_scale_quant_orig: Packed KV dequant scales for FP8 KV cache, shape (2), optional.
             Layout: [k_scale_quant_orig, v_scale_quant_orig]
-        
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Attention output tensor and updated KV cache
             - Attention output: shape (batch_size, seq_len, num_q_heads * head_size)
             - Updated KV cache: shape (batch_size, 2, num_kv_heads, present_kv_cache_len, head_size) with dynamic shapes
-        
+
     Raises:
         AssertionError: If enable_tree_attention is True but required tensors are missing
     """
@@ -269,20 +285,43 @@ def attention_plugin(
         assert k_v_scale_quant_orig.numel(
         ) == 2, "k_v_scale_quant_orig must have 2 elements: [k_scale_quant_orig, v_scale_quant_orig]"
 
-    batch_size, seq_len, qkv_size = qkv.shape
-    assert head_size * (
-        num_q_heads + 2 * num_kv_heads
-    ) == qkv_size, f"qkv_size {qkv_size} should be equal to head_size * (num_q_heads + 2 * num_kv_heads) {head_size * (num_q_heads + 2 * num_kv_heads)}"
-    assert past_key_value.shape[
-        0] == batch_size, f"batch_size of kv_cache {past_key_value.shape[0]} should be equal to batch_size of qkv {batch_size}"
+    batch_size_q, seq_len_q, q_size = q.shape
+    batch_size_k, seq_len_k, k_size = k.shape
+    batch_size_v, seq_len_v, v_size = v.shape
+    assert (
+        batch_size_q == batch_size_k == batch_size_v
+    ), f"batch_size of q/k/v should be equal. Got {batch_size_q}, {batch_size_k}, {batch_size_v}"
+    assert (
+        seq_len_q == seq_len_k == seq_len_v
+    ), f"seq_len of q/k/v should be equal. Got {seq_len_q}, {seq_len_k}, {seq_len_v}"
+
+    batch_size, seq_len = batch_size_q, seq_len_q
+
+    assert (
+        q_size == head_size * num_q_heads
+    ), f"q_size {q_size} should be equal to head_size * num_q_heads {head_size * num_q_heads}"
+    assert (
+        k_size == head_size * num_kv_heads
+    ), f"k_size {k_size} should be equal to head_size * num_kv_heads {head_size * num_kv_heads}"
+    assert (
+        v_size == head_size * num_kv_heads
+    ), f"v_size {v_size} should be equal to head_size * num_kv_heads {head_size * num_kv_heads}"
+
+    assert (
+        past_key_value.shape[0] == batch_size
+    ), f"batch_size of kv_cache {past_key_value.shape[0]} should be equal to batch_size of q/k/v {batch_size}"
     assert past_key_value.shape[
         1] == 2, f"kv_cache {past_key_value.shape[1]} should have 2 tensors"
-    assert past_key_value.shape[
-        2] == num_kv_heads, f"num_kv_heads of kv_cache {past_key_value.shape[2]} should be equal to num_kv_heads of qkv {num_kv_heads}"
-    assert past_key_value.shape[
-        4] == head_size, f"head_size of kv_cache {past_key_value.shape[4]} should be equal to head_size of qkv {head_size}"
+    assert (
+        past_key_value.shape[2] == num_kv_heads
+    ), f"num_kv_heads of kv_cache {past_key_value.shape[2]} should be equal to num_kv_heads of k/v {num_kv_heads}"
+    assert (
+        past_key_value.shape[4] == head_size
+    ), f"head_size of kv_cache {past_key_value.shape[4]} should be equal to head_size of q/k/v {head_size}"
 
-    assert qkv.dtype == torch.float16, f"qkv {qkv.dtype} should be in float16"
+    assert q.dtype == torch.float16, f"q {q.dtype} should be in float16"
+    assert k.dtype == torch.float16, f"k {k.dtype} should be in float16"
+    assert v.dtype == torch.float16, f"v {v.dtype} should be in float16"
     assert past_key_value.dtype == torch.float16 or past_key_value.dtype == torch.float8_e4m3fn, f"past_key_value {past_key_value.dtype} should be in float16, float8_e4m3fn"
 
     # Dummy implementation for ONNX export, this is not used in the actual inference
@@ -290,8 +329,8 @@ def attention_plugin(
                               seq_len,
                               num_q_heads,
                               head_size,
-                              dtype=qkv.dtype,
-                              device=qkv.device)
+                              dtype=q.dtype,
+                              device=q.device)
 
     return attn_output, past_key_value.clone()
 

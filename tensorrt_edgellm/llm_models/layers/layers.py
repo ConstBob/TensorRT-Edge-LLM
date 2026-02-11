@@ -212,14 +212,14 @@ class EdgeLLMAttention(nn.Module):
         query_states, key_states = self.qk_norm(query_states, key_states,
                                                 norm_shape)
 
-        # Concatenate QKV for the plugin
-        qkv = torch.concat([query_states, key_states, value_states], dim=-1)
-
-        dtype = qkv.dtype
+        dtype = query_states.dtype
 
         # Convert to FP16 for plugin compatibility
         # For int8 quantization, we always need to explicitly convert to FP16
-        qkv = qkv.to(torch.float16)
+        query_states = query_states.to(torch.float16)
+        key_states = key_states.to(torch.float16)
+        value_states = value_states.to(torch.float16)
+
         fp8_kv_cache = past_key_value.dtype == torch.float8_e4m3fn
         if fp8_kv_cache:
             assert self.k_v_scale_quant_orig is not None, \
@@ -234,7 +234,9 @@ class EdgeLLMAttention(nn.Module):
 
         # Call fused attention plugin
         attn_output, present_key_value = attention_plugin(
-            qkv,
+            query_states,
+            key_states,
+            value_states,
             past_key_value,
             context_lengths,
             rope_rotary_cos_sin,

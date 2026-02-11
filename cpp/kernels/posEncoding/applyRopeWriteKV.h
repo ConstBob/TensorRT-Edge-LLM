@@ -28,46 +28,45 @@ namespace trt_edgellm
 namespace kernel
 {
 
-//! @brief Launch kernel to handle case where KVCache is empty. We will instantiate the KVCache and overwrite the QKV
-//! tensor directly.
+//! @brief Launch kernel to apply RoPE positional encoding to Q/K and write K/V to KVCache.
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
-//! @param[in,out] qkv FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq + Hk + Hv, headDim], the tensor
-//! will perform inplace update.
-//! @param[out] kvCache FP16 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
-//! from the start positions.
+//! @param[in] kvCacheEndLens Optional INT32 type tensor with layout of [batchSize], the end position of KVCache after
+//! writing. When nullopt, KVCache is written from the start (prefill without prior cache).
+//! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]
+//! @param[in,out] k FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
+//! @param[in] v FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
+//! @param[out] kvCache FP16/FP8 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim]
+//! @param[in] kvScaleQuantOrig FP32 type tensor with layout of [2] for FP8 KV cache quantization scales. Empty for
+//! FP16.
 //! @param[in] stream CUDA stream to launch the kernel
+//! @param[in] writeKInPlace Controls whether roped K is additionally written back to the K tensor in-place,
+//!     on top of always being written to kvCache.
+//!     Set to true for the initial prefill path (SEPARATE_Q_K_V) where the downstream FMHA kernel reads Q, K, V
+//!     as separate contiguous tensors rather than from the KV cache. In this case K must contain the roped result.
+//!     Set to false (default) for chunked prefill with KV cache reuse, where FMHA reads KV from the transposed
+//!     KV cache, and for all decoding paths (vanilla / tree), where the XQA kernel reads KV from the cache.
 //! @throws std::runtime_error if tensor shape or data type is incorrect
-void launchApplyRopeWriteKVPackedQKV(rt::Tensor const& cosSinCache, rt::Tensor& qkv, rt::Tensor& kvCache,
-    rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
-
-//! @brief Launch the kernel to handle case where KVCache is not empty. We will write to a dedicated Q tensor and
-//! KVCache.
-//! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
-//! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], the end position of KVCache after writing.
-//! @param[in] qkv FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq + Hk + Hv, headDim]
-//! @param[out] kvCache FP16 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
-//! from the end position.
-//! @param[out] qOut FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim], the output Q tensor.
-//! @param[in] stream CUDA stream to launch the kernel
-//! @note We won't overwrite QKV tensor in this case but we use Tensor& signature to reduce duplicate code.
-//! @throws std::runtime_error if tensor shape or data type is incorrect
-void launchApplyRopeWriteKVContinuousQAndKVCache(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
-    rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
+void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q,
+    rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream,
+    bool writeKInPlace);
 
 //! @brief Launch the kernel when we are performing tree attention for speculative decoding.
 //! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
 //! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], the end position of KVCache after writing.
 //! @param[in] tokenPosIds INT32 type tensor with layout of [batchSize, runtimeSeqLen], the position of token within
 //! sequence.
-//! @param[in] qkv FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq + Hk + Hv, headDim]
-//! @param[out] kvCache FP16 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
+//! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]
+//! @param[in] k FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
+//! @param[in] v FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
+//! @param[out] kvCache FP16/FP8 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim], write KVCache
 //! from the end position.
-//! @param[out] qOut FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim], the output Q tensor.
+//! @param[in] kvScaleQuantOrig FP32 type tensor with layout of [2] for FP8 KV cache quantization scales. Empty for
+//! FP16.
 //! @param[in] stream CUDA stream to launch the kernel
-//! @note We won't overwrite QKV tensor in this case but we use Tensor& signature to reduce duplicate code.
+//! @note We won't overwrite K/V tensor in this case but we use Tensor& signature to reduce duplicate code.
 //! @throws std::runtime_error if tensor shape or data type is incorrect
 void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
-    rt::Tensor const& tokenPosIds, rt::Tensor& qkv, rt::Tensor& kvCache, rt::Tensor& qOut,
+    rt::Tensor const& tokenPosIds, rt::Tensor& q, rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache,
     rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
 } // namespace kernel

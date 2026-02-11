@@ -396,15 +396,16 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
 
-    check::check(mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV
+    check::check(mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V
             || mLaunchParams.attention_input_layout == AttentionInputLayout::CONTIGUOUS_Q_KV,
         "Unsupported input layout");
-    if (mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV)
+    if (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V)
     {
-        int64_t stride_in_bytes = (mNumHeads + 2 * mNumKVHeads) * mHeadSize * sizeof(half);
-        params.q_stride_in_bytes = stride_in_bytes;
-        params.k_stride_in_bytes = stride_in_bytes;
-        params.v_stride_in_bytes = stride_in_bytes;
+        int64_t q_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
+        int64_t kv_stride_in_bytes = mNumKVHeads * mHeadSize * sizeof(half);
+        params.q_stride_in_bytes = q_stride_in_bytes;
+        params.k_stride_in_bytes = kv_stride_in_bytes;
+        params.v_stride_in_bytes = kv_stride_in_bytes;
     }
     else
     {
@@ -433,9 +434,10 @@ bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::Data
 
 void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream)
 {
-    if (mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV)
+    if (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V)
     {
-        check::check(params.qkv_ptr != nullptr && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr,
+        check::check(params.q_ptr != nullptr && params.k_ptr != nullptr && params.v_ptr != nullptr
+                && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr && params.cu_kv_seqlens != nullptr,
             "Device pointers are supposed to be valid");
     }
     else // CONTIGUOUS_Q_KV
