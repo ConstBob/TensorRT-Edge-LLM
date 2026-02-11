@@ -9,8 +9,8 @@
 | Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
 |-------|-----------|------|-----|------|-------|
 | [Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | 8B | ✅ | ✅ | ✅ | ✅ |
-| [Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) | 8B | ✅ | ✅ | ✅ | ✅ |
-| [Llama-3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) | 3B | ✅ | ✅ | ✅ | ✅ |
+| [Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) | 8B | ✅ | ✅ | ✅ | ✅ |
+| [Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) | 3B | ✅ | ✅ | ✅ | ✅ |
 
 ### Qwen2/2.5 Family
 
@@ -29,9 +29,9 @@
 | Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
 |-------|-----------|------|-----|------|-------|
 | [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | 0.6B | ✅ | ✅ | ✅ | ✅ |
+| [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) | 1.7B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) | 4B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | 8B | ✅ | ✅ | ✅ | ✅ |
-
 
 ### DeepSeek-R1 Distilled Family
 
@@ -73,6 +73,8 @@
 - **FP8 Vision Encoder**: Supported for visual models on SM89+
 - **FP8/NVFP4 LM Head**: Supported for language model heads with platform-specific requirements
 
+> **Experimental Support:** INT8 SmoothQuant and MXFP8 are experimental features. Functionality, accuracy and performance are not guaranteed.
+
 ---
 
 ## Platform Compatibility
@@ -98,4 +100,4 @@ For development purposes, TensorRT Edge-LLM supports the following discrete GPU 
 - **SM100**: Blackwell (e.g., GB200)
 - **SM120**: Blackwell (e.g., RTX 50 series, RTX Pro Blackwell series)
 
-> **Note:** While these GPUs are supported for development and testing, the officially supported deployment platforms are NVIDIA Jetson Thor (JetPack 7.1) and NVIDIA DRIVE Thor (DriveOS 7). For performant inference solutions on these GPUs please refer to [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
+> **Note:** While these GPUs are supported for development and testing, for performant inference solutions on these GPUs please refer to [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)

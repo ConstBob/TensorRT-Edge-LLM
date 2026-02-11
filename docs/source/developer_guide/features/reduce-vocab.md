@@ -48,7 +48,7 @@ The runtime automatically applies vocabulary reduction when `vocab_map.safetenso
 
 ## EAGLE Speculative Decoding Support
 
-When using vocabulary reduction for EAGLE base models, you must include all tokens referenced in the draft's `d2t.safetensors` mapping. 
+When using vocabulary reduction for EAGLE base models, you must include all tokens referenced in the draft's `d2t.safetensors` mapping.
 
 **Prerequisite**: Export the draft model first using `tensorrt-edgellm-export-draft` to generate `d2t.safetensors`, then use the `--d2t_path` flag:
 

@@ -2,8 +2,7 @@
 
 > **Repository:** [github.com/NVIDIA/TensorRT-Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM)
 
-> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release 
-
+> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release
 
 ## What is TensorRT Edge-LLM?
 
@@ -13,10 +12,18 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 
 ### Hardware Platforms
 
+**Officially Supported Platforms:**
+
 | Platform | Software Release | Link |
 |----------|------------------|------|
 | NVIDIA Jetson Thor | JetPack 7.1 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
 | NVIDIA DRIVE Thor | NVIDIA DriveOS 7 | For details refer to NVIDIA DriveOS 7 release documentation |
+
+**Compatible Platforms:**
+
+| Platform | Software Release | Notes |
+|----------|------------------|-------|
+| NVIDIA Jetson Orin | JetPack 6.2 & 6.2.1 | Compatible but not actively maintained |
 
 > **Note:** The platforms listed above are officially supported and tested. While TensorRT Edge-LLM may run on other NVIDIA GPU platforms (for example, discrete GPUs, other Jetson devices), these are not officially supported but may be used for experimental purposes.
 
@@ -39,7 +46,7 @@ For the complete list of supported models, precision requirements, and platform 
 - **🎯 Edge Optimized**: Designed specifically for embedded and automotive platforms
 - **🔧 Flexible**: Support for LoRA adapters, speculative decoding, and multimodal models
 - **📊 Complete Toolkit**: Python export pipeline, engine builder, and runtime in one package
-- **📚 Feature Set**: Including EAGLE-3, KV-cache reuse, vocab reduction, and more, see **[Advanced Runtime Features](../features/advanced-runtime-features.md)**
+- **📚 Feature Set**: Including EAGLE-3, KV-cache reuse, [vocab reduction](../features/reduce-vocab.md), [LoRA adapters](../features/lora.md), and more
 
 ## Key Components
 
@@ -87,22 +94,6 @@ graph LR
 | **Engine Builder** | C++-based application that compiles ONNX models into optimized TensorRT engines. [Learn More](../software-design/engine-builder.md) |
 | **C++ Runtime** | C++-based runtime that executes TensorRT engines with CUDA graphs, LoRA, and EAGLE support. [Learn More](../software-design/cpp-runtime-overview.md) |
 | **Examples** | Reference implementations demonstrating LLM, multimodal, and utility use cases. [Learn More](examples.md) |
-
-## Use Cases
-
-TensorRT Edge-LLM is ideal for:
-
-**🚗 Automotive**
-- In-vehicle AI assistants
-- Voice-controlled interfaces
-- Scene understanding and description
-- Driver assistance systems
-
-**🤖 Robotics**
-- Natural language interaction
-- Task planning and reasoning
-- Visual question answering
-- Human-robot collaboration
 
 ---
 

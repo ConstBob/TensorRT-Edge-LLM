@@ -20,8 +20,8 @@ TensorRT plugins are user-defined layers that implement the `IPluginV2DynamicExt
 
 ## AttentionPlugin
 
-**Functional Description**: 
-- Handles Rotary positional encoding, KVCache I/O, and MHA/GQA attention computation. 
+**Functional Description**:
+- Handles Rotary positional encoding, KVCache I/O, and MHA/GQA attention computation.
 - Implements FP16 precision and covers all supported SMs of TensorRT Edge-LLM.
 - Supports prefill (normal and chunked) stage causal attention.
 - Supports vanilla decoding attention and tree decoding attention that is used by EAGLE speculative decoding.
@@ -53,7 +53,7 @@ TensorRT plugins are user-defined layers that implement the `IPluginV2DynamicExt
 
 ### Kernel Sources
 
-Attention kernels are compiled into CUDA binaries. We provide the methods to produce CUDA binaries in `kernelSrcs/`. 
+Attention kernels are compiled into CUDA binaries. We provide the methods to produce CUDA binaries in `kernelSrcs/`.
 
 **Kernel Libraries**:
 - `fmha_v2`: Performant context phase attention kernels developed by NVIDIA. Please refer to the original code repository for additional context and extension guidance.
