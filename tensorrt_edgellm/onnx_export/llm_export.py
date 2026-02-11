@@ -67,7 +67,8 @@ from ..llm_models.model_utils import (is_gptq_model,
                                       is_incompatible_chat_template_model,
                                       load_eagle3_draft_model, load_llm_model,
                                       load_reduced_vocab_map)
-from ..llm_models.models.llm_model import EdgeLLMModelNativeOps
+from ..llm_models.models.llm_model_trtnative import (Eagle3DraftModelTRTNative,
+                                                     EdgeLLMModelTRTNative)
 from .config_export import export_llm_config
 from .onnx_utils import export_onnx
 
@@ -278,13 +279,17 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
     return model
 
 
-def export_model_to_onnx_with_trt_native_ops(model: EdgeLLMModelNativeOps,
-                                             output_dir: str) -> None:
+def export_model_to_onnx_with_trt_native_ops(model, output_dir: str) -> None:
     """
     Export the model to ONNX format with TensorRT native operations.
+    
+    Args:
+        model: Model to export (EdgeLLMModelTRTNative or Eagle3DraftModelTRTNative)
+        output_dir: Directory to save the exported ONNX model
     """
-    assert isinstance(model, EdgeLLMModelNativeOps
-                      ), "Model must be an instance of EdgeLLMModelNativeOps"
+    assert isinstance(
+        model, (EdgeLLMModelTRTNative, Eagle3DraftModelTRTNative)
+    ), "Model must be an instance of EdgeLLMModelTRTNative or Eagle3DraftModelTRTNative"
 
     try:
         device = next(model.parameters()).device
@@ -511,14 +516,6 @@ def export_llm_model(model_dir: str,
     """
     start_time = time.time()
 
-    if trt_native_ops:
-        print("Using TensorRT native operations for attention")
-        # Validate compatibility
-        if is_eagle_base:
-            raise ValueError(
-                "EAGLE base models are not supported in TensorRT native mode yet"
-            )
-
     if is_eagle_base:
         print(f"Exporting EAGLE3 base model to ONNX format")
     else:
@@ -641,7 +638,8 @@ def export_llm_model(model_dir: str,
 def export_draft_model(draft_model_dir: str,
                        output_dir: str,
                        base_model_dir: Optional[str] = None,
-                       device: str = "cuda") -> None:
+                       device: str = "cuda",
+                       trt_native_ops: bool = False) -> None:
     """
     Export an EAGLE draft model to ONNX format.
     
@@ -653,37 +651,45 @@ def export_draft_model(draft_model_dir: str,
         output_dir: Directory to save the exported ONNX model
         base_model_dir: Directory containing the base model (for weight copying)
         device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
+        trt_native_ops: Whether to use TensorRT native operations instead of plugin
     """
     start_time = time.time()
 
-    print(f"Exporting EAGLE3 draft model")
+    if trt_native_ops:
+        print("Exporting EAGLE3 draft model with TensorRT native operations")
+    else:
+        print("Exporting EAGLE3 draft model with custom attention plugin")
 
     # Create subdirectories
     os.makedirs(output_dir, exist_ok=True)
 
     # Load draft model with base model for weight copying
     print(f"Loading draft model from {draft_model_dir}")
-
     draft_model = load_eagle3_draft_model(draft_model_dir, base_model_dir,
-                                          'fp16', device)
+                                          'fp16', device, trt_native_ops)
 
     draft_model = replace_torch_quant_linear_with_int4_plugin(draft_model)
 
     # Export draft model
     print(f"Exporting draft model to {output_dir}")
-    export_model_to_onnx(draft_model,
-                         output_dir,
-                         is_eagle_base=False,
-                         is_eagle_draft=True,
-                         fp8_kv_cache=False)
+    if trt_native_ops:
+        export_model_to_onnx_with_trt_native_ops(draft_model, output_dir)
+    else:
+        export_model_to_onnx(draft_model,
+                             output_dir,
+                             is_eagle_base=False,
+                             is_eagle_draft=True,
+                             fp8_kv_cache=False)
 
     # Save draft model configuration
-    draft_config = export_llm_config(draft_model.config, 'eagle_draft', False)
+    draft_config = export_llm_config(draft_model.config, 'eagle_draft',
+                                     trt_native_ops)
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, 'w') as f:
         json.dump(draft_config, f, indent=2)
     print(f"Draft model configuration saved to {config_path}")
 
+    # Save d2t mapping
     save_d2t_for_eagle3_draft(draft_model, output_dir)
 
     draft_end_time = time.time()

@@ -24,7 +24,7 @@ from transformers.models.llama.modeling_llama import (LlamaAttention, LlamaMLP,
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
 
 from .attention_plugin import attention_plugin
-from .attention_trt import EdgeLLMAttentionNativeOps
+from .attention_trt import EdgeLLMAttentionTRTNative
 from .layer_utils import EdgeLLMQKNorm, EdgeLLMQKVProj
 
 # FP8 (E4M3) quantization constants
@@ -513,7 +513,7 @@ class EdgeLLMDecoderLayer(nn.Module):
         return hidden_states
 
 
-class EdgeLLMDecoderLayerNativeOps(nn.Module):
+class EdgeLLMDecoderLayerTRTNative(nn.Module):
     """
     Decoder layer with TensorRT native attention operations.
     
@@ -526,10 +526,12 @@ class EdgeLLMDecoderLayerNativeOps(nn.Module):
     """
 
     def __init__(self,
-                 config_or_module: nn.Module,
-                 torch_dtype: torch.dtype = torch.float16) -> None:
+                 config_or_module: Union[nn.Module, Any],
+                 torch_dtype: torch.dtype = torch.float16,
+                 layer_index: int = 0,
+                 eagle3_draft: bool = False) -> None:
         """
-        Initialize the EdgeLLMDecoderLayerNativeOps module.
+        Initialize the EdgeLLMDecoderLayerTRTNative module.
         
         Args:
             config_or_module: Decoder layer module
@@ -538,22 +540,61 @@ class EdgeLLMDecoderLayerNativeOps(nn.Module):
         super().__init__()
 
         self.torch_dtype = torch_dtype
-        # Handle both config and module inputs
-        assert isinstance(config_or_module,
-                          nn.Module), "config_or_module must be a nn.Module"
-
-        decoder_layer = config_or_module
-        if hasattr(decoder_layer, 'hidden_size'):
-            self.hidden_size: int = decoder_layer.hidden_size
+        self.eagle3_draft = eagle3_draft
+        self.layer_index = layer_index
+        if hasattr(config_or_module, 'hidden_size'):
+            self.hidden_size: int = config_or_module.hidden_size
         else:
-            self.hidden_size: int = decoder_layer.self_attn.hidden_size
+            self.hidden_size: int = config_or_module.self_attn.hidden_size
+        self.self_attn = None
+        self.mlp = None
+        self.input_layernorm = None
+        self.post_attention_layernorm = None
+        self.hidden_norm = None
+
+        if isinstance(config_or_module, nn.Module):
+            self._init_with_module(config_or_module)
+        else:
+            self._init_with_config(config_or_module)
+
+        assert self.self_attn is not None
+        assert self.mlp is not None
+
+    def _init_with_module(self, decoder_layer: nn.Module):
 
         self.mlp = decoder_layer.mlp
-        self.input_layernorm = decoder_layer.input_layernorm.to(torch_dtype)
+        self.input_layernorm = decoder_layer.input_layernorm.to(
+            self.torch_dtype)
         self.post_attention_layernorm = decoder_layer.post_attention_layernorm.to(
-            torch_dtype)
+            self.torch_dtype)
+        self.self_attn = EdgeLLMAttentionTRTNative(
+            decoder_layer.self_attn, eagle3_draft=self.eagle3_draft)
 
-        self.self_attn = EdgeLLMAttentionNativeOps(decoder_layer.self_attn)
+    def _init_with_config(self, config: Any):
+        # Construct new components from config (for draft models)
+        self.post_attention_layernorm = LlamaRMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps).to(self.torch_dtype)
+
+        # Handle input layernorm based on model type and layer index
+        if self.eagle3_draft:
+            # EAGLE3 draft: all layers have input_layernorm and hidden_norm
+            self.hidden_norm = LlamaRMSNorm(self.hidden_size,
+                                            eps=config.rms_norm_eps).to(
+                                                self.torch_dtype)
+            self.input_layernorm = LlamaRMSNorm(self.hidden_size,
+                                                eps=config.rms_norm_eps).to(
+                                                    self.torch_dtype)
+
+        # Create attention module from config based on model type
+        if "qwen" in config.model_type:
+            attention_module = Qwen2Attention(config, self.layer_index)
+            self.mlp = Qwen2MLP(config)
+        else:
+            attention_module = LlamaAttention(config, self.layer_index)
+            self.mlp = LlamaMLP(config)
+
+        self.self_attn = EdgeLLMAttentionTRTNative(
+            attention_module, eagle3_draft=self.eagle3_draft)
 
     def forward(
         self,
@@ -565,6 +606,7 @@ class EdgeLLMDecoderLayerNativeOps(nn.Module):
         v_cache: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[
             torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
@@ -579,15 +621,24 @@ class EdgeLLMDecoderLayerNativeOps(nn.Module):
             v_cache: Value cache (batch, num_heads, capacity, head_dim)
             attention_mask: Attention mask of shape (batch, seq_len, seq_len + past_len), optional
             position_ids: Position IDs of shape (batch, seq_len), optional
+            inputs_embeds: Input embeddings for EAGLE3 draft (batch, seq_len, hidden_size), optional
             
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (hidden_states, present_k_cache, present_v_cache)
         """
         residual = hidden_states
 
-        # Standard processing: apply input layernorm if available
-        if self.input_layernorm is not None:
-            hidden_states = self.input_layernorm(hidden_states)
+        if self.eagle3_draft:
+            if inputs_embeds is None:
+                raise ValueError("inputs_embeds is required for EAGLE3 draft")
+            # EAGLE3 draft: apply layernorm to both inputs and concatenate
+            hidden_states = self.hidden_norm(hidden_states)
+            inputs_embeds = self.input_layernorm(inputs_embeds)
+            hidden_states = torch.cat((inputs_embeds, hidden_states), dim=-1)
+        else:
+            # Standard processing: apply input layernorm if available
+            if self.input_layernorm is not None:
+                hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states, present_k_cache, present_v_cache = self.self_attn(
             hidden_states=hidden_states,

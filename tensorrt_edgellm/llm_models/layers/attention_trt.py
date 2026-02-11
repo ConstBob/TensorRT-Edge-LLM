@@ -34,6 +34,7 @@ from torch.onnx import symbolic_helper
 from torch.onnx.symbolic_helper import _get_tensor_sizes
 
 from ...common import ONNX_OPSET_VERSION
+from .layer_utils import EdgeLLMQKNorm, EdgeLLMQKVProj
 
 
 @symbolic_helper.parse_args("v", "v", "v")
@@ -85,6 +86,7 @@ def symbolic_attention(
     attn_output = g.op("Attention",
                        *inputs,
                        is_causal_i=is_causal,
+                       TRT_decomposable_i=1,
                        scale_f=scale)
     attn_output.setType(query.type().with_sizes(query_shape))
 
@@ -135,7 +137,7 @@ def rope_onnx(
     return x.clone()
 
 
-class EdgeLLMAttentionNativeOps(nn.Module):
+class EdgeLLMAttentionTRTNative(nn.Module):
     """
     Multi-headed attention using TensorRT native operations.
     
@@ -159,9 +161,10 @@ class EdgeLLMAttentionNativeOps(nn.Module):
         qk_scale: Scaling factor for Q@K^T
     """
 
-    def __init__(self, attention_module: nn.Module) -> None:
+    def __init__(self, attention_module: nn.Module,
+                 eagle3_draft: bool) -> None:
         """
-        Initialize the EdgeLLMAttentionNativeOps module.
+        Initialize the EdgeLLMAttentionTRTNative module.
         
         Args:
             attention_module: Original attention module to extract components from
@@ -169,27 +172,10 @@ class EdgeLLMAttentionNativeOps(nn.Module):
         super().__init__()
 
         # Copy projection layers from original attention module
-        self.q_proj = attention_module.q_proj
-        self.k_proj = attention_module.k_proj
-        self.v_proj = attention_module.v_proj
+        self.qkv_proj = EdgeLLMQKVProj(attention_module, eagle3_draft)
         self.o_proj = attention_module.o_proj
-
-        # Qwen3 models have QK normalization layers
-        if hasattr(attention_module, 'q_norm'):
-            self.q_norm = attention_module.q_norm
-        else:
-            self.q_norm = None
-
-        if hasattr(attention_module, 'k_norm'):
-            self.k_norm = attention_module.k_norm
-        else:
-            self.k_norm = None
-
-        # Llama4 models have QK normalization layers
-        if hasattr(attention_module, 'qk_norm'):
-            self.qk_norm = attention_module.qk_norm
-        else:
-            self.qk_norm = None
+        self.qk_norm = EdgeLLMQKNorm(attention_module)
+        self.eagle3_draft = eagle3_draft
 
         # Copy configuration attributes from the original attention module
         self.hidden_size: int = attention_module.config.hidden_size
@@ -210,8 +196,6 @@ class EdgeLLMAttentionNativeOps(nn.Module):
 
         # Compute QK scale factor
         self.qk_scale: float = 1.0 / (self.head_dim**0.5)
-
-        self.eagle3_draft: bool = False
 
     def forward(
         self,
@@ -234,7 +218,7 @@ class EdgeLLMAttentionNativeOps(nn.Module):
             rope_rotary_cos_sin: RoPE rotary embeddings of shape (batch_size, max_position_embeddings, head_dim)
             context_lengths: Context length tensor of shape (batch_size,)
             kvcache_start_index: Start index of KV cache of shape (batch_size), optional
-            attention_mask: Not supported in TensorRT native operations (must be None)
+            attention_mask: Attention mask of shape (batch_size, seq_len, seq_len), optional
             position_ids: Position IDs of shape (batch_size, seq_len), optional
             
         Returns:
@@ -243,40 +227,14 @@ class EdgeLLMAttentionNativeOps(nn.Module):
                 - Updated K cache
                 - Updated V cache
         """
-        if attention_mask is not None:
-            raise NotImplementedError(
-                "Tree attention is not supported in TensorRT native operations attention mode yet"
-            )
-
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
 
-        # Calculate shared shapes for normalization
-        if self.q_norm is not None or self.k_norm is not None or self.qk_norm is not None:
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.head_dim)
-
-        if self.q_norm is not None:
-            query_states = self.q_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-        if self.k_norm is not None:
-            key_states = self.k_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-
-        if self.qk_norm is not None:
-            query_states = self.qk_norm(
-                query_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-            key_states = self.qk_norm(
-                key_states.view(hidden_shape)).contiguous().view(
-                    bsz, q_len, -1)
-
-        value_states = self.v_proj(hidden_states)
+        norm_shape = [bsz, q_len, -1, self.head_dim]
+        query_states, key_states = self.qk_norm(query_states, key_states,
+                                                norm_shape)
 
         # Convert to FP16 for TensorRT compatibility
         compute_type = torch.float16
@@ -347,7 +305,7 @@ class EdgeLLMAttentionNativeOps(nn.Module):
         query_states = query_states * self.qk_scale
 
         attn_output = self._compute_attention(query_states, k_present,
-                                              v_present)
+                                              v_present, attention_mask)
 
         # Reshape output: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads * head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()

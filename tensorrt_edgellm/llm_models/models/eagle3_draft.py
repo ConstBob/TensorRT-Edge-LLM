@@ -29,12 +29,11 @@ from typing import Any, List, Optional, Tuple
 
 import modelopt.torch.opt as mto
 import torch
-from safetensors.torch import load_file
 from torch import nn
-from transformers import AutoConfig
 from transformers.models.llama.modeling_llama import (LlamaRMSNorm,
                                                       LlamaRotaryEmbedding)
 
+from .. import model_utils
 from ..layers.gather_nd import custom_gather_nd
 from ..layers.layers import EdgeLLMDecoderLayer
 
@@ -254,7 +253,7 @@ class Eagle3DraftModel(nn.Module):
         
         Args:
             draft_model_dir: Path to the draft model directory
-            base_model: Base model to copy weights from if needed
+            base_model_dir: Base model directory to copy weights from if needed
             device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
 
         Returns:
@@ -263,78 +262,23 @@ class Eagle3DraftModel(nn.Module):
         Raises:
             FileNotFoundError: If model files cannot be found
         """
-
         # Load configuration
-        config = AutoConfig.from_pretrained(draft_model_dir,
-                                            trust_remote_code=True)
-
-        # Auto-detect VLM models and extract text config
-        if hasattr(config, 'text_config'):
-            config = config.text_config
-
-        pytorch_bin_path = os.path.join(draft_model_dir, "pytorch_model.bin")
-        safetensors_path = os.path.join(draft_model_dir, "model.safetensors")
-        # TODO: Compatible with other formats of quantized weights
-        quantized_model_path = os.path.join(draft_model_dir,
-                                            "modelopt_quantized_model.pth")
-        assert os.path.exists(quantized_model_path) or os.path.exists(
-            pytorch_bin_path
-        ) or os.path.exists(
-            safetensors_path
-        ), f"Model file not found at {pytorch_bin_path} or {safetensors_path} or {quantized_model_path}"
-
+        config = model_utils.get_eagle3_draft_config(draft_model_dir)
         model = cls(config)
 
+        # Load from quantized model if it exists
+        quantized_model_path = os.path.join(draft_model_dir,
+                                            "modelopt_quantized_model.pth")
         if os.path.exists(quantized_model_path):
-            # Load quantized model from modelopt
             mto.restore(model, quantized_model_path)
-        else:
-            # Load model from pytorch_model.bin or model.safetensors
-            if os.path.exists(pytorch_bin_path):
-                print(f"Loading model from {pytorch_bin_path}")
-                draft_state_dict = torch.load(pytorch_bin_path,
-                                              weights_only=True,
-                                              map_location=device)
-            else:
-                print(f"Loading model from {safetensors_path}")
-                draft_state_dict = load_file(safetensors_path, device=device)
-            # Handle EAGLE3 specific key mapping
-            processed_state_dict = {}
-            for key, value in draft_state_dict.items():
-                if 'd2t' in key:
-                    processed_state_dict[key] = draft_state_dict[key]
-                elif 'midlayer' in key:
-                    new_key = key.replace('midlayer', 'layers.0')
-                    processed_state_dict[new_key] = value
-                elif 't2d' in key:
-                    continue
-                else:
-                    processed_state_dict[key] = value
+            return model
 
-            # Use weights from base model if missing
-            def load_embedding_weights(processed_state_dict, base_model_dir,
-                                       device):
-                from ..model_utils import load_tensor_by_candidate_keys
-                if "embed_tokens.weight" not in processed_state_dict:
-                    assert base_model_dir is not None, "Base model directory is required to load embedding weights"
-                    key_candidates = [
-                        "embed_tokens.weight", "model.embed_tokens.weight",
-                        "model.language_model.embed_tokens.weight",
-                        "language_model.model.embed_tokens.weight"
-                    ]
-                    embed_tokens_weight = load_tensor_by_candidate_keys(
-                        base_model_dir, key_candidates, device)
-                    if embed_tokens_weight is not None:
-                        processed_state_dict[
-                            "embed_tokens.weight"] = embed_tokens_weight
-                    else:
-                        raise ValueError(
-                            "embed_tokens.weight not found in base or draft model"
-                        )
+        # Load and prepare weights
+        processed_state_dict = model_utils.load_and_prepare_eagle3_draft_weights(
+            draft_model_dir, base_model_dir, device)
 
-            load_embedding_weights(processed_state_dict, base_model_dir,
-                                   device)
-            model.load_state_dict(processed_state_dict, strict=False)
+        # Load state dict into model
+        model.load_state_dict(processed_state_dict, strict=False)
 
         return model
 

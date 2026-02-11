@@ -367,8 +367,8 @@ def load_llm_model(
         tuple: (model, tokenizer, processor)
         processor will be None if AutoProcessor cannot be loaded from the model directory
     """
-    from .models.llm_model import (EdgeLLMModelForCausalLM,
-                                   EdgeLLMModelNativeOps)
+    from .models.llm_model import EdgeLLMModelForCausalLM
+    from .models.llm_model_trtnative import EdgeLLMModelTRTNative
 
     # Determine model type and print message
     if is_eagle_base:
@@ -390,8 +390,8 @@ def load_llm_model(
         edge_model = EdgeLLMModelForCausalLM(hf_model, is_eagle_base,
                                              reduced_vocab_size, vocab_map)
     else:
-        edge_model = EdgeLLMModelNativeOps(hf_model, reduced_vocab_size,
-                                           vocab_map)
+        edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
+                                           reduced_vocab_size, vocab_map)
 
     del model
     gc.collect()
@@ -401,8 +401,11 @@ def load_llm_model(
     return edge_model, tokenizer, processor
 
 
-def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
-                            dtype: str, device: str) -> nn.Module:
+def load_eagle3_draft_model(draft_model_dir: str,
+                            base_model_dir: str,
+                            dtype: str,
+                            device: str,
+                            trt_native_ops: bool = False) -> nn.Module:
     """
     Load an EAGLE draft model with base model for weight copying.
     
@@ -410,10 +413,11 @@ def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
         draft_model_dir: Directory containing the draft model
         base_model_dir: Directory containing the base model 
         dtype: Model data type ("fp16")
-        device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.)
+        device: Device to load the model on ("cpu", "cuda", or "cuda:0", "cuda:1", etc.")
+        trt_native_ops: Whether to use TensorRT native operations instead of plugin
         
     Returns:
-        nn.Module: Draft model
+        nn.Module: Draft model (Eagle3DraftModel or Eagle3DraftModelTRTNative)
     """
     print(f"Loading eagle3 draft model from {draft_model_dir}")
     # Convert dtype string to torch dtype
@@ -423,10 +427,19 @@ def load_eagle3_draft_model(draft_model_dir: str, base_model_dir: str,
         raise ValueError(f"Unsupported dtype: {dtype}")
 
     # Load draft model using from_pretrained. Draft model only support fp16.
-    draft_model = Eagle3DraftModel.from_pretrained(
-        draft_model_dir=draft_model_dir,
-        base_model_dir=base_model_dir,
-        device=device).eval().to(device)
+    if trt_native_ops:
+        from .models.llm_model_trtnative import Eagle3DraftModelTRTNative
+        draft_model = Eagle3DraftModelTRTNative.from_pretrained(
+            draft_model_dir=draft_model_dir,
+            base_model_dir=base_model_dir,
+            device=device,
+            torch_dtype=torch_dtype).eval().to(device)
+    else:
+        draft_model = Eagle3DraftModel.from_pretrained(
+            draft_model_dir=draft_model_dir,
+            base_model_dir=base_model_dir,
+            device=device).eval().to(device)
+
     if not is_gptq_model(draft_model):
         draft_model.to(torch_dtype)
 
@@ -533,3 +546,169 @@ def prepare_language_model_and_config(hf_model: nn.Module):
         config.quantization_config = hf_model.config.quantization_config
 
     return language_model, config
+
+
+def get_eagle3_draft_config(draft_model_dir: str):
+    """
+    Load and prepare configuration for EAGLE3 draft model.
+    
+    This function:
+    - Loads configuration from the draft model directory
+    - Auto-detects VLM models and extracts text config
+    
+    Args:
+        draft_model_dir: Path to the draft model directory
+        
+    Returns:
+        Model configuration object
+    """
+    config = AutoConfig.from_pretrained(draft_model_dir,
+                                        trust_remote_code=True)
+
+    # Auto-detect VLM models and extract text config
+    if hasattr(config, 'text_config'):
+        config = config.text_config
+
+    return config
+
+
+def _load_eagle3_draft_weights(draft_model_dir: str,
+                               device: str) -> Tuple[Optional[dict], str]:
+    """
+    Load EAGLE3 draft model weights from available formats.
+    
+    Checks for weights in the following priority:
+    1. pytorch_model.bin
+    2. model.safetensors
+    
+    Args:
+        draft_model_dir: Path to the draft model directory
+        device: Device to load weights on
+        
+    Returns:
+        state_dict: Loaded weights dictionary
+        
+    Raises:
+        AssertionError: If no model file is found
+    """
+    from safetensors.torch import load_file
+
+    pytorch_bin_path = os.path.join(draft_model_dir, "pytorch_model.bin")
+    safetensors_path = os.path.join(draft_model_dir, "model.safetensors")
+
+    if os.path.exists(pytorch_bin_path):
+        print(f"Loading model from {pytorch_bin_path}")
+        state_dict = torch.load(pytorch_bin_path,
+                                weights_only=True,
+                                map_location=device)
+        return state_dict
+    elif os.path.exists(safetensors_path):
+        print(f"Loading model from {safetensors_path}")
+        state_dict = load_file(safetensors_path, device=device)
+        return state_dict
+
+    raise FileNotFoundError(
+        f"Model file not found at {pytorch_bin_path} or {safetensors_path}")
+
+
+def _process_eagle3_draft_state_dict(state_dict: dict) -> dict:
+    """
+    Process EAGLE3 draft model state dict with specific key mapping.
+    
+    This function handles EAGLE3 specific transformations:
+    - Keeps 'd2t' key as-is
+    - Renames 'midlayer' to 'layers.0'
+    - Skips 't2d' key
+    - Keeps all other keys unchanged
+    
+    Args:
+        state_dict: Raw state dictionary from loaded weights
+        
+    Returns:
+        Processed state dictionary with renamed keys
+    """
+    processed_state_dict = {}
+    for key, value in state_dict.items():
+        if 'd2t' in key:
+            processed_state_dict[key] = state_dict[key]
+        elif 'midlayer' in key:
+            new_key = key.replace('midlayer', 'layers.0')
+            processed_state_dict[new_key] = value
+        elif 't2d' in key:
+            continue
+        else:
+            processed_state_dict[key] = value
+
+    return processed_state_dict
+
+
+def _load_eagle3_draft_embedding_weights(processed_state_dict: dict,
+                                         base_model_dir: Optional[str],
+                                         device: str) -> None:
+    """
+    Load embedding weights for EAGLE3 draft model.
+    
+    If embedding weights are not present in the processed state dict,
+    attempts to load them from the base model directory.
+    
+    Args:
+        processed_state_dict: Processed state dictionary (modified in-place)
+        base_model_dir: Path to the base model directory (optional)
+        device: Device to load weights on
+        
+    Raises:
+        ValueError: If embedding weights are not found and base_model_dir is not provided
+    """
+    if "embed_tokens.weight" not in processed_state_dict:
+        assert base_model_dir is not None, "Base model directory is required to load embedding weights"
+        key_candidates = [
+            "embed_tokens.weight", "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.model.embed_tokens.weight"
+        ]
+        embed_tokens_weight = load_tensor_by_candidate_keys(
+            base_model_dir, key_candidates, device)
+        if embed_tokens_weight is not None:
+            processed_state_dict["embed_tokens.weight"] = embed_tokens_weight
+        else:
+            raise ValueError(
+                "embed_tokens.weight not found in base or draft model")
+
+
+def load_and_prepare_eagle3_draft_weights(
+        draft_model_dir: str, base_model_dir: Optional[str],
+        device: str) -> Tuple[Optional[dict], str]:
+    """
+    Combined helper to load, process, and prepare EAGLE3 draft model weights.
+    
+    This function combines three operations:
+    1. Load weights from disk (handles quantized, pytorch_bin, safetensors)
+    2. Process state dict with EAGLE3 specific key mapping
+    3. Load embedding weights from base model if needed
+    
+    Args:
+        draft_model_dir: Path to the draft model directory
+        base_model_dir: Path to the base model directory (optional, needed for embeddings)
+        device: Device to load weights on
+        
+    Returns:
+        Tuple of (processed_state_dict, weight_format) where:
+        - processed_state_dict: Fully processed state dictionary ready for model.load_state_dict()
+          (None if quantized format)
+        - weight_format: One of "quantized", "pytorch_bin", or "safetensors"
+        
+    Raises:
+        AssertionError: If no model file is found
+        ValueError: If embedding weights are not found when needed
+    """
+    # Step 1: Load weights from disk
+    state_dict = _load_eagle3_draft_weights(draft_model_dir, device)
+
+    # Step 2: Process EAGLE3 specific key mapping
+    processed_state_dict = _process_eagle3_draft_state_dict(state_dict)
+
+    # Step 3: Load embedding weights from base model if needed
+    _load_eagle3_draft_embedding_weights(processed_state_dict, base_model_dir,
+                                         device)
+
+    return processed_state_dict
