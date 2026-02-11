@@ -2,7 +2,7 @@
 
 > **Repository:** [github.com/NVIDIA/TensorRT-Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM)
 
-> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release 
+> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release
 
 This quick start guide will get you up and running with TensorRT Edge-LLM in ~15 minutes.
 
@@ -35,12 +35,7 @@ tensorrt-edgellm-export-llm \
     --output_dir $MODEL_NAME/onnx
 ```
 
-<details>
-<summary><b>⚠️ Troubleshooting Export Issues</b></summary>
-
-If you encounter issues during quantization or export, see the [Python Export Pipeline - Common Issues and Solutions](../software-design/python-export-pipeline.md#common-issues-and-solutions).
-
-</details>
+> **⚠️ Troubleshooting Export Issues:** If you encounter issues during quantization or export, see the [Python Export Pipeline - Common Issues and Solutions](../software-design/python-export-pipeline.md#common-issues-and-solutions).
 
 ### Transfer to Device
 

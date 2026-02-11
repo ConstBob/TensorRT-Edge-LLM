@@ -17,25 +17,25 @@ graph LR
     TRT_ENGINE[TensorRT<br>Engine]
     CPP_RUNTIME[C++<br>Runtime]
     OUTPUT[Inference<br>Results]
-    
+
     subgraph EXPORT_SG [" "]
         PYTHON_EXPORT[Python<br>Export<br>Pipeline]
     end
-    
+
     HF_MODEL --> PYTHON_EXPORT
     PYTHON_EXPORT --> ONNX_FILES
     ONNX_FILES --> ENGINE_BUILDER
     ENGINE_BUILDER --> TRT_ENGINE
     TRT_ENGINE --> CPP_RUNTIME
     CPP_RUNTIME --> OUTPUT
-    
+
     classDef inputNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef nvLightNode fill:#b8d67e,stroke:#76B900,stroke-width:1px,color:#333
     classDef itemNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef darkNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef greenSubGraph fill:none,stroke:#76B900,stroke-width:1.5px
-    
+
     class HF_MODEL inputNode
     class PYTHON_EXPORT nvNode
     class ENGINE_BUILDER,CPP_RUNTIME nvLightNode
@@ -54,13 +54,13 @@ graph LR
     ONNX_EXPORT(ONNX<br>Export)
     GRAPH_SURGERY(Graph<br>Surgery)
     ONNX_OUTPUT[Optimized<br>ONNX Model]
-    
+
     subgraph EXPORT_TOOLS ["Python Export Pipeline"]
         QUANTIZATION
         ONNX_EXPORT
         GRAPH_SURGERY
     end
-    
+
     HF_MODEL --> QUANTIZATION
     QUANTIZATION --> ONNX_EXPORT
     ONNX_EXPORT --> GRAPH_SURGERY
@@ -87,11 +87,9 @@ graph LR
 5. **Configuration Generation**: Create build configuration files
 
 
-
-
 ## Export Tools
 
-TensorRT Edge-LLM provides specialized command-line tools to support quantization and export to ONNX format: 
+TensorRT Edge-LLM provides specialized command-line tools to support quantization and export to ONNX format:
 
 
 ```mermaid
@@ -104,13 +102,13 @@ graph LR
         BASE_MODEL[Base<BR>Model]
         LORA_WEIGHTS[LoRA<BR>Weights]
     end
-    
+
     subgraph QUANT [Optional Quantization]
         QUANTIZE_VISUAL(Quantization via<BR>export-visual)
         QUANTIZE_DRAFT(quantize-draft)
         QUANTIZE_LLM(quantize-llm)
     end
-    
+
     subgraph EXPORT [Export & Processing]
         EXPORT_VISUAL(export-visual)
         EXPORT_DRAFT(export-draft)
@@ -118,7 +116,7 @@ graph LR
         INSERT_LORA(insert-lora)
         PROCESS_LORA(process-lora)
     end
-    
+
     subgraph RESULTS [" "]
         VISUAL_ONNX[Visual ONNX]
         DRAFT_ONNX[Draft ONNX]
@@ -126,22 +124,22 @@ graph LR
         LORA_ONNX[LoRA-Enabled<br>ONNX]
         SAFETENSORS[SafeTensors]
     end
-    
+
     VLM_MODEL --> QUANTIZE_VISUAL
     VLM_MODEL --> QUANTIZE_LLM
     QUANTIZE_VISUAL --> EXPORT_VISUAL
     EXPORT_VISUAL --> VISUAL_ONNX
-    
+
     DRAFT_MODEL --> QUANTIZE_DRAFT
     QUANTIZE_DRAFT --> EXPORT_DRAFT
     EXPORT_DRAFT --> DRAFT_ONNX
-    
+
     BASE_MODEL --> QUANTIZE_LLM
     QUANTIZE_LLM --> EXPORT_LLM
     EXPORT_LLM --> LLM_ONNX
     EXPORT_LLM -->|If LoRA| INSERT_LORA
     INSERT_LORA --> LORA_ONNX
-    
+
     LORA_WEIGHTS --> PROCESS_LORA
     PROCESS_LORA --> SAFETENSORS
 
@@ -181,58 +179,9 @@ The `tensorrt-edgellm` package provides seven specialized command-line tools for
 
 ## Quantization Methods
 
-The export pipeline supports multiple quantization methods optimized for different hardware platforms and performance requirements:
+The export pipeline supports multiple quantization methods optimized for different hardware platforms and performance requirements.
 
-| Method | Description | Precision | Platform Requirements | Memory Reduction |
-|--------|-------------|-----------|----------------------|------------------|
-| **FP16** | Half-precision floating point | 16-bit | All platforms | Baseline |
-| **FP8** | 8-bit floating point | 8-bit | **SM89+** (Ada Lovelace and newer) | 2x |
-| **INT8 SQ** | 8-bit SmoothQuant | 8-bit | All platforms | 2x |
-| **INT4 AWQ** | 4-bit integer with AWQ | 4-bit | All platforms | 4x |
-| **INT4 GPTQ** | 4-bit GPTQ weight quantization | 4-bit | All platforms | 4x |
-| **NVFP4** | NVIDIA 4-bit floating point | 4-bit | **SM100+** (Blackwell and newer) | 4x |
-
-### Quantization Details
-
-**FP16 (Baseline)**
-- Standard half-precision floating point
-- Universal compatibility across all platforms
-- Best accuracy, largest memory footprint
-- Recommended for validation and accuracy baselines
-
-**FP8 (General Purpose)**
-- 8-bit floating point quantization
-- 2x memory reduction with minimal accuracy loss
-- Requires **SM89+** (Ada Lovelace generation or newer GPUs)
-- Automatic calibration using sample data
-- **FP8 Vision Encoder**: Supported for visual models
-- **FP8 LM Head**: Supported for language model heads
-
-**INT8 SQ (SmoothQuant)**
-- 8-bit integer quantization with SmoothQuant algorithm
-- Supported on all platforms, primarily for Ampere generation
-- Use FP8 or NVFP4 on Blackwell generation for better accuracy and performance
-
-**INT4 AWQ (Activation-Aware Weight Quantization)**
-- 4-bit integer weight quantization
-- Uses activation statistics for optimal quantization
-- 4x memory reduction
-- Good accuracy preservation with proper calibration
-- Supported on all platforms
-
-**INT4 GPTQ**
-- 4-bit GPTQ weight quantization
-- Can load quantized models from HuggingFace directly
-- No additional quantization step needed for GPTQ checkpoints
-- Install: `BUILD_CUDA_EXT=0 pip install -v gptqmodel --no-build-isolation`
-- Supported on all platforms
-
-**NVFP4 (NVIDIA Floating Point 4-bit)**
-- NVIDIA's proprietary 4-bit floating point format
-- Hardware-accelerated on **SM100+** (Blackwell generation and newer GPUs)
-- 4x memory reduction with optimal performance
-- Recommended for Thor platforms
-- **NVFP4 LM Head**: Supported for language model heads
+For complete details on quantization methods, precision requirements, platform compatibility, and memory reduction, see the **[Precision Support](../getting-started/supported-models.md#precision-support)** section in the Supported Models guide.
 
 **Note**: INT4 GPTQ models can be loaded directly from HuggingFace Hub or quantized using [GPTQModel](https://github.com/ModelCloud/GPTQModel). No additional quantization step with `tensorrt-edgellm-quantize-llm` is required for pre-quantized GPTQ checkpoints.
 
@@ -445,9 +394,9 @@ tensorrt-edgellm-quantize-llm \
 
 **Cause**: Model size exceeds available GPU memory.
 
-**Solution**: 
+**Solution**:
 
-1. Change to a larger GPU. Empirically a 40GB GPU is enough for 4B or less model and 80GB GPU is enough for 8B or less.   
+1. Change to a larger GPU. Empirically a 40GB GPU is enough for 4B or less model and 80GB GPU is enough for 8B or less.
 2. You may try `--device cpu` flag during quantization and export. However, CPU support may fail for some precisions.
 
 ### Issue: Calibration Dataset Download Fails (`cnn_dailymail` not found)
@@ -483,7 +432,7 @@ tensorrt-edgellm-quantize-llm \
 
 **Cause**: Aggressive quantization or insufficient calibration.
 
-**Solution**: 
+**Solution**:
 
 1. Increase calibration dataset size or use less aggressive quantization
 

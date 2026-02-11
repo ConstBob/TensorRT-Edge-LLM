@@ -185,7 +185,7 @@ When using EAGLE speculative decoding, you can disable it for specific requests:
 
 **Use cases:**
 - Quality: Some inputs may benefit from standard decoding over EAGLE
-- Switching strategies: Different batches can use different decoding strategies (one batch with EAGLE, another without). 
+- Switching strategies: Different batches can use different decoding strategies (one batch with EAGLE, another without)
 - Debugging: Compare performance with/without speculative decoding
 
 **Note:** If any request in a batch has `disable_spec_decode: true`, speculative decoding will be disabled for the entire batch. Requests within one batch cannot use different decoding strategies simultaneously for now.

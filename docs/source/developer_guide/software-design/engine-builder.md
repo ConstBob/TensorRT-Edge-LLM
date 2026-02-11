@@ -18,25 +18,25 @@ graph LR
     TRT_ENGINE[TensorRT<br>Engine]
     CPP_RUNTIME[C++<br>Runtime]
     OUTPUT[Inference<br>Results]
-    
+
     subgraph BUILDER_SG [" "]
         ENGINE_BUILDER[Engine<br>Builder]
     end
-    
+
     HF_MODEL --> PYTHON_EXPORT
     PYTHON_EXPORT --> ONNX_FILES
     ONNX_FILES --> ENGINE_BUILDER
     ENGINE_BUILDER --> TRT_ENGINE
     TRT_ENGINE --> CPP_RUNTIME
     CPP_RUNTIME --> OUTPUT
-    
+
     classDef inputNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef nvLightNode fill:#b8d67e,stroke:#76B900,stroke-width:1px,color:#333
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef itemNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef darkNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef greenSubGraph fill:none,stroke:#76B900,stroke-width:1.5px
-    
+
     class HF_MODEL inputNode
     class PYTHON_EXPORT,CPP_RUNTIME nvLightNode
     class ENGINE_BUILDER nvNode
@@ -73,7 +73,7 @@ graph LR
       INPUT_SPACER_LEFT
       ONNX_INPUT[ONNX Models<br>+ Export Configs]
     end
-    
+
     subgraph ENGINE_BUILDER ["Engine Builder"]
         BUILDER_SPACER_1
         BUILDER_SPACER_2
@@ -81,7 +81,7 @@ graph LR
         TEXT_LLM("← IF LLM")
         TEXT_VISUAL("IF Vision Encoder →")
         VISION_BUILDER[Vision Encoder<br>Builder]
-        
+
         PLUGIN_LOADING( 1 <br>Plugin<br>Loading)
         CONFIG_PARSING( 2 <br>Configuration<br>Parsing)
         NETWORK_CREATION( 3 <br>Network<br>Creation)
@@ -94,21 +94,21 @@ graph LR
     end
 
     INPUT_SPACER_LEFT -.-> BUILDER_SPACER_1 -.-> BUILDER_SPACER_2 -.-> LLM_BUILDER -.-> TEXT_LLM -.-> TEXT_VISUAL -.-> VISION_BUILDER
-    
+
     linkStyle 0 stroke:transparent
-    linkStyle 1 stroke:transparent  
+    linkStyle 1 stroke:transparent
     linkStyle 2 stroke:transparent
     linkStyle 3 stroke:transparent
     linkStyle 4 stroke:transparent
     linkStyle 5 stroke:transparent
-    
+
     subgraph RESULTS [" "]
         RUNTIME_CONFIG[Runtime<br>Config]
         TOKENIZER_FILES[Tokenizer<br>Files]
         TRT_ENGINE[TensorRT<br>Engine]
         EAGLE_MAPPINGS[EAGLE<br>Mappings]
     end
-    
+
     ONNX_INPUT --> PLUGIN_LOADING
     PLUGIN_LOADING --> CONFIG_PARSING
     CONFIG_PARSING --> NETWORK_CREATION
@@ -121,7 +121,7 @@ graph LR
     FILE_MANAGEMENT --> TOKENIZER_FILES
     FILE_MANAGEMENT --> TRT_ENGINE
     FILE_MANAGEMENT -->|IF LLM Builder<br>& IF EAGLE| EAGLE_MAPPINGS
-    
+
     classDef greyNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef darkNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
@@ -130,13 +130,13 @@ graph LR
     classDef greySubGraph fill:none,stroke:#bbb,stroke-width:1px
     classDef greenSubGraph fill:none,stroke:#76B900,stroke-width:1.5px
     classDef contextBox fill:none,stroke:transparent
-    classDef invisibleNode fill:transparent,stroke:transparent   
+    classDef invisibleNode fill:transparent,stroke:transparent
 
 
     classDef invisible fill:transparent,stroke:transparent,color:transparent,font-size:1px
     classDef invisibleSubGraph fill:transparent,stroke:transparent
     classDef textOnly fill:transparent,stroke:transparent
-    
+
     class VISION_BUILDER,LLM_BUILDER nvNode
     class TEXT_LLM,TEXT_VISUAL textOnly
     class ONNX_INPUT inputNode
@@ -276,7 +276,7 @@ The Visual Encoder Builder supports multiple vision architectures with architect
 - **Configuration**: Configurable input channels (typically 3 for RGB)
 - **Resolution**: Fixed image size processing with dynamic token output
 
-**Phi-4-multimodal Models** (`setupInternPhi4ViTProfile`):  
+**Phi-4-multimodal Models** (`setupInternPhi4ViTProfile`):
 - **Architecture**: Phi-4-multimodal vision encoder with 0.5 downsampling ratio(downsampling by a factor of 2 in each dimension, resulting in a 4× reduction in tokens).
 - **Constraints**: Image tokens must be multiples of 256 for optimal processing
 - **Configuration**: Configurable input channels (typically 3 for RGB)

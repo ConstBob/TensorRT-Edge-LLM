@@ -1,7 +1,6 @@
 # Installation
 
-> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release 
-
+> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release
 
 TensorRT Edge-LLM has two separate components that need to be installed on different systems:
 
@@ -62,6 +61,20 @@ After installation, verify with `nvcc --version` and `nvidia-smi`.
 
 ### Installing
 
+For a containerized environment for clean installation, it is recommended to use the NVIDIA PyTorch Docker image:
+
+```bash
+# Pull the recommended Docker image
+docker pull nvcr.io/nvidia/pytorch:25.12-py3
+
+# Run the container with GPU support
+docker run --gpus all -it --rm \
+    -v $(pwd):/workspace \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    bash
+```
+
 **1. Clone Repository**
 
 ```bash
@@ -72,11 +85,16 @@ git submodule update --init --recursive
 
 **2. Install Python Package**
 
+If you are not using container, it is recommended to use a virtual environment:
 ```bash
 # Create virtual environment (recommended)
 python3 -m venv venv
 source venv/bin/activate
+```
 
+Then just install the software:
+
+```bash
 # Install package with all dependencies
 pip3 install .
 ```
@@ -185,8 +203,7 @@ cmake .. \
     -DEMBEDDED_TARGET=jetson-thor
 ```
 
-<details>
-<summary><b>Alternative: Building on x86 GPU Systems (Optional for Developers)</b></summary>
+**Alternative: Building on x86 GPU Systems (Optional for Developers)**
 
 If you want to build and test on an x86 workstation with NVIDIA GPU (for development purposes before deploying to Edge devices), you can use this configuration instead:
 
@@ -201,8 +218,6 @@ cmake .. \
 ```
 
 > **Note:** Replace `/usr/local/TensorRT-10.x.x` with your actual TensorRT installation path. Use `dpkg -l | grep tensorrt` to find it, or download from [NVIDIA TensorRT downloads](https://developer.nvidia.com/tensorrt).
-
-</details>
 
 **CMake Options:**
 
