@@ -20,6 +20,7 @@ for large language models and vision-language models on edge devices.
    developer_guide/getting-started/examples.md
    developer_guide/getting-started/input-format.md
    developer_guide/getting-started/chat-template-format.md
+   developer_guide/getting-started/code-coverage.md
 
 .. toctree::
    :maxdepth: 2
