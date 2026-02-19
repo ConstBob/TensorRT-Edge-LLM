@@ -403,7 +403,7 @@ Base and draft engine directories should be the same.
    - Use `--minImageTokens` and `--maxImageTokens` to set the range
    - Set `--maxImageTokensPerImage` for batch processing limits
 
-4. **Enable Verbose Logging**: Use `--verbose` for debugging build issues
+4. **Enable Debug Logging**: Use `--debug` for debugging build issues
 
 
 ### Troubleshooting

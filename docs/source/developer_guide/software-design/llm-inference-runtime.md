@@ -147,54 +147,126 @@ The generation phase operates autoregressively, processing one token at a time:
 ### Standard LLM Inference
 
 ```cpp
-#include "llmInferenceRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
+#include <unordered_map>
 
-// Initialize runtime
-LLMInferenceRuntime runtime(engineDir);
+// Initialize CUDA stream
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&stream));
+
+// Initialize runtime (4 parameters: engineDir, multimodalEngineDir, loraWeightsMap, stream)
+std::unordered_map<std::string, std::string> loraWeightsMap{}; // Empty for no LoRA
+LLMInferenceRuntime runtime(engineDir, "", loraWeightsMap, stream);
 
 // Prepare request
-InferenceRequest request;
-request.inputText = "What is the capital of France?";
-request.maxLength = 100;
-request.temperature = 0.7;
+LLMGenerationRequest request;
+request.requests.resize(1);
+request.requests[0].messages.push_back({{"role", "user"}, {"content", "What is the capital of France?"}});
+request.maxGenerateLength = 100;
+request.temperature = 1.0;
+request.topK = 50;
+request.topP = 0.8;
 
-// Execute inference
-auto response = runtime.handleRequest(request);
-std::cout << "Generated: " << response.outputText << std::endl;
+// Prepare response
+LLMGenerationResponse response;
+
+// Execute inference (3 parameters: request, response, stream)
+if (runtime.handleRequest(request, response, stream)) {
+    std::cout << "Generated: " << response.outputTexts[0] << std::endl;
+}
+
+// Cleanup
+CUDA_CHECK(cudaStreamDestroy(stream));
 ```
 
 ### LoRA Adapter Switching
 
 ```cpp
-// Load LoRA adapters
-runtime.addLoraWeights("medical", "lora_weights/medical_adapter.safetensors");
-runtime.addLoraWeights("legal", "lora_weights/legal_adapter.safetensors");
+#include "runtime/llmInferenceRuntime.h"
+#include <unordered_map>
 
-// Use medical adapter
-runtime.switchLoraWeights("medical");
-auto medical_response = runtime.handleRequest(medical_request);
+// Initialize CUDA stream
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&stream));
 
-// Switch to legal adapter
-runtime.switchLoraWeights("legal");
-auto legal_response = runtime.handleRequest(legal_request);
+// Initialize runtime with LoRA weights map
+std::unordered_map<std::string, std::string> loraWeightsMap{
+    {"medical", "lora_weights/medical_adapter.safetensors"},
+    {"legal", "lora_weights/legal_adapter.safetensors"}
+};
+LLMInferenceRuntime runtime(engineDir, "", loraWeightsMap, stream);
 
-// Disable LoRA
-runtime.switchLoraWeights("");
-auto base_response = runtime.handleRequest(base_request);
+// Prepare requests
+LLMGenerationRequest medicalRequest;
+medicalRequest.requests.resize(1);
+medicalRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Medical question"}});
+medicalRequest.loraWeightsName = "medical";
+medicalRequest.maxGenerateLength = 100;
+
+LLMGenerationRequest legalRequest;
+legalRequest.requests.resize(1);
+legalRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Legal question"}});
+legalRequest.loraWeightsName = "legal";
+legalRequest.maxGenerateLength = 100;
+
+// Execute inference with different LoRA adapters
+LLMGenerationResponse medicalResponse;
+runtime.handleRequest(medicalRequest, medicalResponse, stream);
+
+LLMGenerationResponse legalResponse;
+runtime.handleRequest(legalRequest, legalResponse, stream);
+
+// Disable LoRA (use empty string)
+LLMGenerationRequest baseRequest;
+baseRequest.requests.resize(1);
+baseRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Base question"}});
+baseRequest.loraWeightsName = "";
+baseRequest.maxGenerateLength = 100;
+
+LLMGenerationResponse baseResponse;
+runtime.handleRequest(baseRequest, baseResponse, stream);
+
+// Cleanup
+CUDA_CHECK(cudaStreamDestroy(stream));
 ```
 
 ### Multimodal VLM Inference
 
 ```cpp
-// Initialize multimodal runtime
-LLMInferenceRuntime runtime(engineDir, visualEngineDir);
+#include "runtime/llmInferenceRuntime.h"
+#include <unordered_map>
+
+// Initialize CUDA stream
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&stream));
+
+// Initialize multimodal runtime (4 parameters: engineDir, multimodalEngineDir, loraWeightsMap, stream)
+std::unordered_map<std::string, std::string> loraWeightsMap{}; // Empty for no LoRA
+LLMInferenceRuntime runtime(engineDir, visualEngineDir, loraWeightsMap, stream);
 
 // Prepare multimodal request
-InferenceRequest request;
-request.inputText = "What's in this image?";
-request.imagePaths = {"image.jpg"};
-request.maxLength = 150;
+LLMGenerationRequest request;
+request.requests.resize(1);
+request.requests[0].messages.push_back({
+    {"role", "user"},
+    {"content", {
+        {{"type", "image"}, {"image", "/path/to/image.jpg"}},
+        {{"type", "text"}, {"text", "What's in this image?"}}
+    }}
+});
+request.maxGenerateLength = 150;
+request.temperature = 1.0;
+request.topK = 50;
+request.topP = 0.8;
 
-auto response = runtime.handleRequest(request);
-std::cout << "Generated: " << response.outputText << std::endl;
+// Prepare response
+LLMGenerationResponse response;
+
+// Execute inference (3 parameters: request, response, stream)
+if (runtime.handleRequest(request, response, stream)) {
+    std::cout << "Generated: " << response.outputTexts[0] << std::endl;
+}
+
+// Cleanup
+CUDA_CHECK(cudaStreamDestroy(stream));
 ```

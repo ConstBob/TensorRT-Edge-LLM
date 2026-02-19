@@ -434,15 +434,16 @@ tensorrt-edgellm-quantize-llm \
 
 **Solution**:
 
-1. Increase calibration dataset size or use less aggressive quantization
+1. Use less aggressive quantization
 
 ```bash
 # Use FP8 instead of INT4 for better accuracy
 tensorrt-edgellm-quantize-llm \
   --model_dir model_name \
   --output_dir quantized/model_name \
-  --quantization fp8 \  # Better accuracy than int4, nvfp4, or int8_sq
-  --calib_size 512      # Increase from default
+  --quantization fp8  # Better accuracy than int4, nvfp4, or int8_sq
 ```
 
 2. Change the quantization recipe in `tensorrt_edgellm/quantization/llm_quantization.py` or `tensorrt_edgellm/quantization/visual_quantization.py` to disable quantization for most sensitive layers. Follow the documentation of [NVIDIA Model Optimizer](https://nvidia.github.io/Model-Optimizer/)
+
+3. Increase calibration size (`num_samples` field) in `tensorrt_edgellm/quantization/llm_quantization.py`.
