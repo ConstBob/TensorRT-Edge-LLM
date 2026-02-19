@@ -231,16 +231,39 @@ The generation phase uses iterative tree-based speculation with conditional draf
 ### EAGLE Speculative Decoding
 
 ```cpp
-#include "llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmRuntimeUtils.h"
 
-// Initialize runtime with base and draft models
-LLMInferenceSpecDecodeRuntime runtime(baseModelDir, draftModelDir);
+// Initialize CUDA stream
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&stream));
 
-// Execute inference
-InferenceRequest request;
-request.inputText = "Explain quantum computing.";
-request.maxLength = 200;
+// Configure EAGLE drafting parameters
+EagleDraftingConfig draftingConfig;
+draftingConfig.draftingTopK = 10;
+draftingConfig.draftingStep = 6;
+draftingConfig.verifyTreeSize = 60;
 
-auto response = runtime.handleRequest(request);
-std::cout << "Generated: " << response.outputText << std::endl;
+// Initialize runtime (4 parameters: engineDir, multimodalEngineDir, draftingConfig, stream)
+LLMInferenceSpecDecodeRuntime runtime(engineDir, "", draftingConfig, stream);
+
+// Prepare request
+LLMGenerationRequest request;
+request.requests.resize(1);
+request.requests[0].messages.push_back({{"role", "user"}, {"content", "Explain quantum computing."}});
+request.maxGenerateLength = 200;
+request.temperature = 1.0;
+request.topK = 50;
+request.topP = 0.8;
+
+// Prepare response
+LLMGenerationResponse response;
+
+// Execute inference (3 parameters: request, response, stream)
+if (runtime.handleRequest(request, response, stream)) {
+    std::cout << "Generated: " << response.outputTexts[0] << std::endl;
+}
+
+// Cleanup
+CUDA_CHECK(cudaStreamDestroy(stream));
 ```

@@ -19,19 +19,22 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 | NVIDIA Jetson Thor | JetPack 7.1 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
 | NVIDIA DRIVE Thor | NVIDIA DriveOS 7 | For details refer to NVIDIA DriveOS 7 release documentation |
 
+> **Note:** The platforms listed above are officially supported and tested. While TensorRT Edge-LLM may run on other NVIDIA GPU platforms (for example, discrete GPUs, other Jetson devices), these are not officially supported but may be used for experimental purposes.
+
 **Compatible Platforms:**
 
-| Platform | Software Release | Notes |
-|----------|------------------|-------|
-| NVIDIA Jetson Orin | JetPack 6.2 & 6.2.1 | Compatible but not actively maintained |
+| Platform | Software Release |
+|----------|------------------|
+| NVIDIA Jetson Orin | JetPack 6.2.x |
 
-> **Note:** The platforms listed above are officially supported and tested. While TensorRT Edge-LLM may run on other NVIDIA GPU platforms (for example, discrete GPUs, other Jetson devices), these are not officially supported but may be used for experimental purposes.
+> **Note:** TensorRT Edge-LLM will officially support Jetson Orin via later JetPack releases. While JetPack 6.2.x is compatible, the support is experimental. 
+
 
 ### Supported Model Families
 
 TensorRT Edge-LLM supports a wide range of state-of-the-art models:
 - **Large Language Models**: Llama 3.x, Qwen 2/2.5/3, DeepSeek-R1 Distilled
-- **Vision-Language Models**: Qwen2/2.5/3-VL, InternVL3, Phi-4-Multimodal
+- **Vision-Language Models**: Qwen2/2.5/3-VL, InternVL3-1B-hf, InternVL3-2B-hf, Phi-4-Multimodal
 - **Quantization**: FP16, FP8 (SM89+), INT4 AWQ/GPTQ, NVFP4 (SM100+)
 
 For the complete list of supported models, precision requirements, and platform compatibility, see **[Supported Models](supported-models.md)**.
@@ -40,13 +43,12 @@ For the complete list of supported models, precision requirements, and platform 
 
 ## Key Features
 
-- **🚀 High Performance**: Optimized CUDA kernels and TensorRT integration for maximum throughput
-- **💾 Memory Efficient**: Advanced KV cache management and quantization support (FP8, INT4)
-- **🔄 Production Ready**: C++-only runtime with no Python dependencies
-- **🎯 Edge Optimized**: Designed specifically for embedded and automotive platforms
-- **🔧 Flexible**: Support for LoRA adapters, speculative decoding, and multimodal models
-- **📊 Complete Toolkit**: Python export pipeline, engine builder, and runtime in one package
-- **📚 Feature Set**: Including EAGLE-3, KV-cache reuse, [vocab reduction](../features/reduce-vocab.md), [LoRA adapters](../features/lora.md), and more
+- **🚀 High Performance**: Optimized CUDA kernels and TensorRT integration for minimum latency
+- **💾 Memory Efficient**: Supporting 4-bit quantization for reduced memory footprint, with [FP8 KV cache](../features/FP8KV.md) support for additional memory savings
+- **🔄 Production Ready**: C++-only runtime with no Python dependencies, designed for deployment on edge devices
+- **🎯 Edge Optimized**: Built specifically for NVIDIA Jetson and DRIVE platforms with platform-specific optimizations
+- **🔧 Rich Feature Set**: Supports [LoRA adapters](../features/lora.md), EAGLE3 speculative decoding, [system prompt caching](../features/system-prompt-cache.md), [vocabulary reduction](../features/reduce-vocab.md), and vision-language models
+- **📊 Complete Toolkit**: End-to-end workflow from Python export pipeline to C++ runtime, with engine builder and examples
 
 ## Key Components
 

@@ -168,7 +168,7 @@ sudo apt install -y \
 
 **2. Verify CUDA and TensorRT Installation**
 
-After Jetpack is installed, TensorRT should be installed in /usr
+After JetPack is installed, TensorRT should be installed in /usr
 
 ```bash
 # Check CUDA version
@@ -214,10 +214,10 @@ cd build
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
-    -DCUDA_VERSION=13.0
+    -DCUDA_VERSION=<YOUR_CUDA_VERSION>
 ```
 
-> **Note:** Replace `/usr/local/TensorRT-10.x.x` with your actual TensorRT installation path. Use `dpkg -l | grep tensorrt` to find it, or download from [NVIDIA TensorRT downloads](https://developer.nvidia.com/tensorrt).
+> **Note:** Replace `/usr/local/TensorRT-10.x.x` with your actual TensorRT installation path. Use `dpkg -l | grep tensorrt` to find it, or download from [NVIDIA TensorRT downloads](https://developer.nvidia.com/tensorrt). Replace `<YOUR_CUDA_VERSION>` with your actual CUDA version (e.g., `13.0`). Use `nvcc --version` to check your CUDA version.
 
 **CMake Options:**
 
@@ -281,7 +281,7 @@ nvcc --version
 
 **Issue: `TensorRT not found` during CMake**
 
-Solution: Specify TensorRT package directory. This directory shall contain `lib` and `include` and we are looking for `nvinfer` library and header:
+Solution: Specify TensorRT package directory. This directory should contain `lib` and `include` directories, and we are looking for the `nvinfer` library and header:
 ```bash
 cmake .. \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \

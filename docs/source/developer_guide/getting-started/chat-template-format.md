@@ -80,8 +80,7 @@ Pre-built templates are automatically used for models with known tokenizer issue
     "assistant": {"prefix": "<|im_start|>assistant\n", "suffix": "<|im_end|>\n"}
   },
   "content_types": {
-    "image": {"format": "<|vision_start|><|image_pad|><|vision_end|>"},
-    "video": {"format": "<|vision_start|><|video_pad|><|vision_end|>"}
+    "image": {"format": "<|vision_start|><|image_pad|><|vision_end|>"}
   },
   "generation_prompt": "<|im_start|>assistant\n",
   "default_system_prompt": "You are a helpful assistant."

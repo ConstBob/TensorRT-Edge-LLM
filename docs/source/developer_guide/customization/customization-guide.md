@@ -68,7 +68,7 @@ graph TB
 | **Python Export** | ONNX Export Logic | **Inherit/Adapt:** `export_llm_model()`, `visual_export()`, `export_draft_model()` functions. **Configuration:** Dynamic axes, opset version |
 | **Python Export** | Custom Operators | **Registration:** Custom operators via `@torch.library.custom_op()` and `register_custom_op_symbolic()` |
 | **Engine Builder** | Build Configuration | **Configuration:** Batch size, sequence length, precision, LoRA rank, EAGLE settings, VLM mode, image tokens. **Inherit/Adapt:** Setup optimization profiles for custom models |
-| **Engine Builder** | Custom Operations | **Plugin:** Implement `IPluginV2DynamicExt`, `IPluginCreator` for TensorRT. Examples: Custom attention, specialized kernels |
+| **Engine Builder** | Custom Operations | **Plugin:** Implement TensorRT Plugin via `IPluginV3` layer. Examples: Custom attention, specialized kernels |
 | **C++ Runtime** | Text Processing | **Configuration:** Load different tokenizer vocab files. **Inherit/Adapt:** `PreTokenizer`, `TokenEncoder` for custom preprocessing |
 | **C++ Runtime** | Sampling Parameters | **Configuration:** Temperature, top-k, top-p values in input JSON. **Inherit/Adapt:** Extend `sampling.cu` for custom algorithms |
 | **C++ Runtime** | Multimodal Runner | **Inherit/Adapt:** `MultimodalRunner` base class for new multimodal encoders |

@@ -43,6 +43,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 - **`top_k`** (default: 50): Top-k sampling parameter
 - **`max_generate_length`** (default: 256): Maximum tokens to generate
 - **`apply_chat_template`** (default: true): Apply chat template formatting
+- **`add_generation_prompt`** (default: true): Add generation prompt token sequence
 - **`enable_thinking`** (default: false): Enable thinking mode (Qwen3+)
 - **`available_lora_weights`** (default: {}): Map of LoRA adapter names to file paths
 
@@ -59,7 +60,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 **Content Array Format:**
 - Text: `{"type": "text", "text": "..."}`
 - Image: `{"type": "image", "image": "/path/to/image.jpg"}`
-- Video: `{"type": "video", "video": "/path/to/video.mp4"}`
+- Video: `{"type": "video", "video": "/path/to/video.mp4"}` *(Note: Video support is a placeholder for future releases and is not available for now)*
 
 ## Examples
 
