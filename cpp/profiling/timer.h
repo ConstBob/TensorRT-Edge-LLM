@@ -211,7 +211,6 @@ struct StageTimingData
 
     //! @brief Add timing measurement
     //! @param timeMs Time in milliseconds
-    //! @throws std::bad_alloc If vector allocation fails
     void addTiming(float timeMs)
     {
         gpuTimesMs.push_back(timeMs);
@@ -268,7 +267,6 @@ public:
      * @param stream CUDA stream (default: 0)
      * @return RAII session that stops timing on destruction
      * @throws std::runtime_error if a CUDA error occurs
-     * @throws std::bad_alloc if container allocation fails
      */
     TimerSession startStage(std::string const& stageId, cudaStream_t stream);
 
@@ -277,7 +275,6 @@ public:
      * @param stageId Stage identifier
      * @return Timing data if available, nullopt otherwise
      * @throws std::runtime_error if a CUDA error occurs
-     * @throws std::bad_alloc if container allocation fails
      */
     std::optional<StageTimingData> getTimingData(std::string const& stageId) const;
 
@@ -285,7 +282,6 @@ public:
      * @brief Get all timing data
      * @return Map of stage IDs to timing data
      * @throws std::runtime_error if a CUDA error occurs
-     * @throws std::bad_alloc if container allocation fails
      */
     std::unordered_map<std::string, StageTimingData> const& getAllTimingData() const;
 
@@ -298,22 +294,18 @@ private:
 
     //! @brief Start timer for stage
     //! @throws std::runtime_error if a CUDA error occurs
-    //! @throws std::bad_alloc if container allocation fails
     void startTimer(std::string const& stageId, cudaStream_t stream);
 
     //! @brief End timer for stage
     //! @throws std::runtime_error if a CUDA error occurs
-    //! @throws std::bad_alloc if container allocation fails
     void endTimer(std::string const& stageId, cudaStream_t stream);
 
     //! @brief Record timing measurement
     //! @throws std::runtime_error if a CUDA error occurs
-    //! @throws std::bad_alloc if container allocation fails
     void recordTiming(std::string const& stageId) const;
 
     //! @brief Handle stage completion
     //! @throws std::runtime_error if a CUDA error occurs
-    //! @throws std::bad_alloc if container allocation fails
     void onStageComplete(std::string const& stageId);
 };
 

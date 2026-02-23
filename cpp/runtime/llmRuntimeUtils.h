@@ -169,7 +169,6 @@ bool initializeLongRopeCosSinCache(
 
 /*!
  * @brief Format rope configuration into string
- * @throws std::bad_alloc if memory allocation fails
  */
 std::string formatRopeConfig(RopeConfig const& config);
 
@@ -183,7 +182,6 @@ std::string formatRopeConfig(RopeConfig const& config);
  * @param batchMapping      [oldActiveBatch] CPU vector (const input), mapping[i] = newBatchIdx or -1 (evict)
  * @param vec               Vector to compact (output, modified in-place)
  * @throws std::invalid_argument if sizes of input vectors don't match
- * @throws std::bad_alloc if memory allocation fails
  */
 template <typename T>
 void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec);
@@ -197,7 +195,6 @@ void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec
  * @param finishedStates    [oldActiveBatch] CPU vector indicating which batches are finished (0=not finished,
  * 1=finished)
  * @return Vector mapping old batch indices to new indices (-1 for evicted batches)
- * @throws std::bad_alloc if memory allocation fails
  */
 std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates);
 

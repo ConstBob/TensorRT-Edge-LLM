@@ -89,7 +89,6 @@ public:
     //! \brief Validate and load configuration from JSON file
     //! \param[in] configPath Path to configuration file
     //! \return True if configuration is valid and loaded successfully, false otherwise
-    //! \throws std::bad_alloc if string allocation fails
     bool validateAndFillConfig(std::string const& configPath) override;
 
     //! \brief Allocate buffers for inference and postprocess

@@ -92,7 +92,6 @@ public:
      * @param dataType Data type
      * @return True if successful
      * @throws std::runtime_error if a CUDA driver error occurs
-     * @throws std::bad_alloc if a memory allocation error occurs
      */
     static bool loadContextFMHAKernels(int32_t sm, nvinfer1::DataType dataType);
 

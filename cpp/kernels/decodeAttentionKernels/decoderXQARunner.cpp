@@ -151,7 +151,6 @@ public:
     }
 
     //! @throws std::runtime_error if a CUDA driver error occurs
-    //! @throws std::bad_alloc if memory allocation fails
     void loadXQAKernels()
     {
         if (!mFunctions.empty())
@@ -243,7 +242,6 @@ class XQAKernelLoader
 
 public:
     //! @throws std::runtime_error if a CUDA driver error occurs
-    //! @throws std::bad_alloc if memory allocation fails
     XQAKernelList* getXQAKernelList(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
     {
         static std::mutex s_mutex;
@@ -281,7 +279,6 @@ private:
 };
 
 //! @throws std::runtime_error if a CUDA driver error occurs
-//! @throws std::bad_alloc if memory allocation fails
 inline XQAKernelList* getXQAKernels(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
 {
     return XQAKernelLoader::Get().getXQAKernelList(dataType, kvDataType, sm, specDecode);

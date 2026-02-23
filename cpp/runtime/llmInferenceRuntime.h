@@ -67,7 +67,6 @@ public:
      *  \param response The generation response to be filled with output
      *  \param stream CUDA stream for execution
      *  \return True if request was handled successfully, false otherwise
-     *  \throws std::bad_alloc if memory allocation fails
      *  \throws std::runtime_error if a LLM operation or CUDA operation fails
      */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
@@ -75,7 +74,6 @@ public:
     /*! \brief Capture CUDA graph for the decoding step to optimize performance
      *  \param stream CUDA stream for graph capture
      *  \return True if graph was captured successfully, false otherwise
-     *  \throws std::bad_alloc if memory allocation fails
      *  \throws std::runtime_error if a CUDA operation fails
      */
     bool captureDecodingCUDAGraph(cudaStream_t stream);
@@ -86,7 +84,6 @@ public:
      *  \param loraWeightsName The name of the LoRA weights
      *  \param stream The CUDA stream used for the generation
      *  \return True if the KVCache is generated and saved successfully, false otherwise
-     *  \throws std::bad_alloc if memory allocation fails
      *  \throws std::runtime_error if a CUDA operation fails
      */
     bool genAndSaveSystemPromptKVCache(

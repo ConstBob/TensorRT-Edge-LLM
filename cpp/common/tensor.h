@@ -208,7 +208,6 @@ public:
 
     //! @brief Format coordinates as string
     //! @return String representation of coordinates
-    //! @throws std::bad_alloc If memory allocation fails during string construction
     //! @throws std::runtime_error If coordinates are invalid or cannot be formatted
     std::string formatString() const;
 
@@ -278,7 +277,6 @@ public:
      * @param deviceType The device type of the memory
      * @param dataType The data type of the tensor
      * @param name Optional name for the tensor
-     * @throws std::bad_alloc If string allocation fails
      */
     Tensor(void* data, Coords const& extent, DeviceType deviceType, nvinfer1::DataType dataType,
         std::string const& name = "");
@@ -418,7 +416,6 @@ std::array<int64_t, kMAX_DIMS> computeStrides(Coords const& shape);
 //! @param tensor Tensor to format
 //! @return String representation of tensor
 //! @throws std::runtime_error If data type is unsupported or CUDA memory copy fails
-//! @throws std::bad_alloc If memory allocation fails during string construction
 std::string formatString(Tensor const& tensor);
 
 //! @brief Convert bytes to kilobytes

@@ -43,7 +43,6 @@ namespace safetensors
  * @param stream CUDA stream for async operations
  * @return True on success, false on failure
  * @throws std::runtime_error If CUDA operations fail or data type is unsupported
- * @throws std::bad_alloc If memory allocation fails
  */
 bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> const& tensors, cudaStream_t stream);
 
@@ -57,7 +56,6 @@ bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> 
  * @param stream CUDA stream for async operations
  * @return True on success, false on failure
  * @throws std::runtime_error If CUDA operations fail, data type is unsupported, or tensor allocation fails
- * @throws std::bad_alloc If memory allocation fails
  */
 bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>& tensors, cudaStream_t stream);
 
