@@ -140,7 +140,7 @@ cmake .. \
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/path/to/TensorRT \
-    -DCUDA_VERSION=13.0
+    -DCUDA_CTK_VERSION=13.0
 ```
 
 **CMake Options:**
@@ -150,7 +150,7 @@ cmake .. \
 | `TRT_PACKAGE_DIR` | Path to TensorRT installation | Required |
 | `CMAKE_TOOLCHAIN_FILE` | **Required for Edge devices**: Use `cmake/aarch64_linux_toolchain.cmake` for Edge device builds. **Not needed for GPU builds** | N/A |
 | `EMBEDDED_TARGET` | **Required for Edge devices**: Target platform (`jetson-thor`). **Not needed for GPU builds** | N/A |
-| `CUDA_VERSION` | CUDA version (such as 13.0). Important for matching target platform. | 13.0 |
+| `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 
 > **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
