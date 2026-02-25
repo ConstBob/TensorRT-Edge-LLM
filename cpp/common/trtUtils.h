@@ -22,8 +22,8 @@
 #include <NvInfer.h>
 #include <dlfcn.h>
 #include <memory>
+#include <optional>
 #include <stdexcept>
-
 namespace trt_edgellm
 {
 
@@ -75,5 +75,16 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
     }
     return handle;
 }
+
+//! Capture a TensorRT CUDA graph from an execution context and stream.
+//! @return Pair of graph and graph exec on success, std::nullopt on failure
+std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
+    nvinfer1::IExecutionContext* context, cudaStream_t stream);
+
+//! Convert TensorRT dimensions to a string representation.
+std::string dimsToString(nvinfer1::Dims const& dims) noexcept;
+
+//! Print the engine information for a specific profile index.
+std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profileIndex) noexcept;
 
 } // namespace trt_edgellm

@@ -293,10 +293,24 @@ private:
     //! @brief Validate inputs for vanilla decoding step
     bool vanillaDecodingStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& outputLogits) noexcept;
 
+    //! @brief Prepare inputs for vanilla decoding step (shared between execute and capture)
+    bool vanillaDecodingStepPrepareInputs(int32_t activeBatchSize, cudaStream_t stream);
+
+    //! @brief Bind tensors for vanilla decoding step (shared between execute and capture)
+    bool vanillaDecodingStepBindTensors(
+        rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, int32_t activeBatchSize);
+
     //! @brief Validate inputs for Eagle base tree decoding step
     bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& outputLogits,
         rt::Tensor const& outputHiddenStates) noexcept;
+
+    //! @brief Prepare and bind tensors for Eagle base tree decoding step (shared between execute and capture)
+    bool eagleBaseTreeDecodingStepBindTensors(rt::Tensor const& baseTreeDecodingInputsEmbeds, rt::Tensor& outputLogits,
+        rt::Tensor& outputHiddenStates, int32_t activeBatchSize);
+
+    bool eagleBaseTreeDecodingStepPrepareInputs(rt::Tensor const& baseTreeDecodingInputsEmbeds,
+        rt::Tensor const& baseTreeDecodingMask, int32_t activeBatchSize, cudaStream_t stream);
 
     //! The Function is used to add a LoRA weights to the LLM engine.
     //! @throws std::bad_alloc if memory allocation fails

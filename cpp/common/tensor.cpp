@@ -53,6 +53,7 @@ size_t getTypeSize(DataType dataType)
         size = 2;
         break;
     }
+    case DataType::kBOOL:
     case DataType::kFP8:
     case DataType::kINT8:
     case DataType::kUINT8:
