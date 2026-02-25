@@ -166,7 +166,7 @@
         -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR 
         -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake 
         -DEMBEDDED_TARGET=$EMBEDDED_TARGET
-        -DCUDA_VERSION=$CUDA_VERSION
+        -DCUDA_CTK_VERSION=$CUDA_VERSION
     - echo "Building the project"
     - make -j$(nproc)
     - echo "Cross-build completed successfully"

@@ -50,7 +50,7 @@ def test_build_project(env_config: EnvironmentConfig,
     # Use trt_package_dir from env_config
     if env_config.trt_package_dir:
         cmake_cmd.append(f'-DTRT_PACKAGE_DIR={env_config.trt_package_dir}')
-    cmake_cmd.append(f'-DCUDA_VERSION={device_config.cuda_version}')
+    cmake_cmd.append(f'-DCUDA_CTK_VERSION={device_config.cuda_version}')
 
     if device_config.target in [
             'jetson-orin', 'auto-thor', 'jetson-thor', 'gb10'

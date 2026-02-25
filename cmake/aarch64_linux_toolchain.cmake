@@ -41,9 +41,16 @@ macro(set_ifndef var val)
   message(STATUS "Configurable variable ${var} set to ${${var}}")
 endmacro()
 
+if(DEFINED CUDA_VERSION)
+  message(
+    FATAL_ERROR
+      "CUDA_VERSION can cause ambiguity with CUDA Macros. Please use -DCUDA_CTK_VERSION to specify the CUDA Toolkit version."
+  )
+endif()
+
 if("${EMBEDDED_TARGET}" STREQUAL "auto-thor")
-  set_ifndef(CUDA_VERSION 13.0)
-  if(CUDA_VERSION VERSION_LESS 13.0)
+  set_ifndef(CUDA_CTK_VERSION 13.0)
+  if(CUDA_CTK_VERSION VERSION_LESS 13.0)
     set(CMAKE_CUDA_ARCHITECTURES 101)
   else()
     set(CMAKE_CUDA_ARCHITECTURES 110)
@@ -56,19 +63,19 @@ if("${EMBEDDED_TARGET}" STREQUAL "auto-thor")
       CACHE STRING "CUDA toolkit target dir")
   message(STATUS "Using CUDA toolkit dir: ${CUDA_DIR}")
 elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-thor")
-  set_ifndef(CUDA_VERSION 13.0)
+  set_ifndef(CUDA_CTK_VERSION 13.0)
   set(CMAKE_CUDA_ARCHITECTURES 110)
   set(CUDA_DIR
       /usr/local/cuda/targets/sbsa-linux
       CACHE STRING "CUDA toolkit dir")
 elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-orin")
-  set_ifndef(CUDA_VERSION 12.6)
+  set_ifndef(CUDA_CTK_VERSION 12.6)
   set(CMAKE_CUDA_ARCHITECTURES 87)
   set(CUDA_DIR
       /usr/local/cuda/targets/aarch64-linux
       CACHE STRING "CUDA toolkit dir")
 elseif("${EMBEDDED_TARGET}" STREQUAL "gb10")
-  set_ifndef(CUDA_VERSION 13.0)
+  set_ifndef(CUDA_CTK_VERSION 13.0)
   set(CMAKE_CUDA_ARCHITECTURES 121)
   set(CUDA_DIR
       /usr/local/cuda/targets/sbsa-linux
