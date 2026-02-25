@@ -254,6 +254,11 @@ private:
     //! \throws std::bad_alloc if string allocation fails
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
+    //! Bind plugin-style KV cache to the engine (combined K/V format).
+    //! \param activeBatchSize The active batch size
+    //! \return True if binding was successful, false otherwise
+    bool bindPluginKVCacheToEngine(int32_t activeBatchSize);
+
     //! Validate input parameters for the prefill step.
     //! \param inputsEmbeds Input embeddings tensor
     //! \param baseModelHiddenStates Base model hidden states tensor
@@ -291,6 +296,21 @@ private:
     bool acceptDecodeTokenStepInputValidation(rt::Tensor const& acceptedTokensEmbeds,
         rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
         rt::Tensor const& acceptedTokenNums, rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates) noexcept;
+
+    bool draftProposalStepPrepareInputs(rt::Tensor const& draftTreeInputsEmbeds,
+        rt::Tensor const& draftTreeLength, rt::Tensor const& draftTreeMask, rt::Tensor& outputLogits, cudaStream_t stream);
+    
+    bool draftProposalStepBindTensors(rt::Tensor const& draftTreeInputsEmbeds, rt::Tensor const& baseModelHiddenStates,
+        rt::Tensor const& draftModelHiddenStates, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+        int32_t activeBatchSize);
+
+    bool acceptDecodeTokenStepPrepareInputs(rt::Tensor const& acceptedTokensEmbeds,
+        rt::Tensor const& acceptedTokenNums, cudaStream_t stream);
+    
+    bool acceptDecodeTokenStepBindTensors(rt::Tensor const& acceptedTokensEmbeds,
+        rt::Tensor const& baseModelHiddenStates, rt::Tensor const& draftModelHiddenStates,
+        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, int32_t activeBatchSize);
+
 };
 
 // clang-format on

@@ -49,6 +49,7 @@ std::string dataTypeToString(nvinfer1::DataType dataType)
     case nvinfer1::DataType::kBF16: return "BF16";
     case nvinfer1::DataType::kINT8: return "I8";
     case nvinfer1::DataType::kUINT8: return "U8";
+    case nvinfer1::DataType::kBOOL: return "BOOL";
     case nvinfer1::DataType::kINT32: return "I32";
     case nvinfer1::DataType::kINT64: return "I64";
     case nvinfer1::DataType::kFP8: return "F8_E4M3";

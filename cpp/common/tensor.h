@@ -435,6 +435,12 @@ double toMB(size_t bytes) noexcept;
 //! @param bytes Size in bytes
 //! @return Size in gigabytes
 double toGB(size_t bytes) noexcept;
+
+//! @brief Get maximum value from an INT32 tensor on CPU
+//! @param tensor CPU tensor containing INT32 data
+//! @return Maximum value in the tensor (0 if tensor is empty)
+//! @throws std::runtime_error If tensor is not on CPU or data type is not INT32
+int32_t getMaxInt32Value(Tensor const& tensor);
 } // namespace utils
 
 //! @brief Optional input tensor type wrapper

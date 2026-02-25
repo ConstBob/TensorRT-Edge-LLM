@@ -25,6 +25,7 @@
 #include "common/mmapReader.h"
 #include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
+#include "common/trtUtils.h"
 #include "common/version.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
@@ -260,8 +261,10 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
         this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
             rt::DeviceType::kCPU, DataType::kINT64, "LLMEngineRunner::mHostSelectTokenIndices");
-        this->mEagleBasePositionIds = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
-            rt::DeviceType::kGPU, DataType::kINT32, "LLMEngineRunner::mEagleBasePositionIds");
+        // Allocate position IDs to support both prefill and tree decoding
+        int32_t const maxSeqLen = std::max(mConfig.maxSupportedInputLength, mConfig.maxVerifyTreeSize);
+        this->mEagleBasePositionIds = rt::Tensor({mConfig.maxSupportedBatchSize, maxSeqLen}, rt::DeviceType::kGPU,
+            DataType::kINT32, "LLMEngineRunner::mEagleBasePositionIds");
         CUDA_CHECK(
             cudaMemsetAsync(mEagleBasePositionIds.rawPointer(), 0, mEagleBasePositionIds.getMemoryCapacity(), stream));
         int32_t const packedMaskSize = divUp(mConfig.maxVerifyTreeSize, 32);
@@ -593,6 +596,19 @@ bool LLMEngineRunner::validateConfigFromEngine()
         return tensorDim.nbDims == 3 && bindingName.find(binding_names::kDeepstackEmbedsTemplate) != std::string::npos;
     };
 
+    auto validate_eq_engine_with_config
+        = [&](int32_t const& configValue, int32_t const& engineValue, std::string const& name) -> bool {
+        if (configValue != engineValue)
+        {
+            LOG_ERROR("%s is not consistent. From engine: %d, from config: %d", name.c_str(), engineValue, configValue);
+            return false;
+        }
+        return true;
+    };
+
+    LOG_DEBUG("Prefill profile info: %s", printEngineInfo(mEngine.get(), kPREFILL_PROFILE_INDEX).c_str());
+    LOG_DEBUG("Generation profile info: %s", printEngineInfo(mEngine.get(), kGENERATION_PROFILE_INDEX).c_str());
+
     int32_t nbKVCacheInputs{0};
     int32_t nbTRTNativeKCacheInputs{0};
     int32_t nbTRTNativeVCacheInputs{0};
@@ -601,27 +617,16 @@ bool LLMEngineRunner::validateConfigFromEngine()
 
     // Lambda to validate KV cache dimensions against profile shape
     auto validateKVCacheProfile = [&](Dims const& maxKVCacheShape, std::string const& profileName) -> bool {
-        if (mConfig.numKVHeads != maxKVCacheShape.d[2])
-        {
-            LOG_ERROR("numKVHeads is not consistent. From engine %s profile: %d, from config: %d", profileName.c_str(),
-                maxKVCacheShape.d[2], mConfig.numKVHeads);
-            return false;
-        }
-        if (mConfig.maxKVCacheCapacity != maxKVCacheShape.d[3])
-        {
-            LOG_ERROR("maxKVCacheCapacity is not consistent. From engine %s profile max: %d, from config: %d",
-                profileName.c_str(), maxKVCacheShape.d[3], mConfig.maxKVCacheCapacity);
-            return false;
-        }
-        if (mConfig.headDim != maxKVCacheShape.d[4])
-        {
-            LOG_ERROR("headDim is not consistent. From engine %s profile: %d, from config: %d", profileName.c_str(),
-                maxKVCacheShape.d[4], mConfig.headDim);
-            return false;
-        }
-        return true;
+        bool status{true};
+        status
+            &= validate_eq_engine_with_config(mConfig.numKVHeads, maxKVCacheShape.d[2], profileName + ": numKVHeads");
+        status &= validate_eq_engine_with_config(
+            mConfig.maxKVCacheCapacity, maxKVCacheShape.d[3], profileName + ": maxKVCacheCapacity");
+        status &= validate_eq_engine_with_config(mConfig.headDim, maxKVCacheShape.d[4], profileName + ": headDim");
+        return status;
     };
 
+    bool isOk{true};
     for (int32_t i = 0; i < numIOBindings; ++i)
     {
         std::string const bindingName = mEngine->getIOTensorName(i);
@@ -636,24 +641,13 @@ bool LLMEngineRunner::validateConfigFromEngine()
                 = mEngine->getProfileShape(bindingName.c_str(), kGENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
 
             // Validate both profiles
-            if (!validateKVCacheProfile(maxKVCacheShapePrefill, "prefill"))
-            {
-                return false;
-            }
-            if (!validateKVCacheProfile(maxKVCacheShapeGen, "generation"))
-            {
-                return false;
-            }
+            isOk &= validateKVCacheProfile(maxKVCacheShapePrefill, "prefill");
+            isOk &= validateKVCacheProfile(maxKVCacheShapeGen, "generation");
             ++nbKVCacheInputs;
         }
         if (identifyDeepstackEmbedsBinding(bindingName, tensorDim))
         {
-            if (mConfig.hiddenSize != tensorDim.d[2])
-            {
-                LOG_ERROR("hiddenSize is not consistent. From engine deepstack_embeds: %d, from config: %d",
-                    tensorDim.d[2], mConfig.hiddenSize);
-                return false;
-            }
+            isOk &= validate_eq_engine_with_config(mConfig.hiddenSize, tensorDim.d[2], "hiddenSize");
             LOG_DEBUG("validateConfigFromEngine(): Found deepstack embeds binding: %s", bindingName.c_str());
             ++nbDeepstackEmbedsInputs;
         }
@@ -730,58 +724,35 @@ bool LLMEngineRunner::validateConfigFromEngine()
             return false;
         }
     }
-    if (nbDeepstackEmbedsInputs != mConfig.numDeepstackFeatures)
-    {
-        LOG_ERROR("numDeepstackFeatures is not consistent. From engine: %d, from config: %d", nbDeepstackEmbedsInputs,
-            mConfig.numDeepstackFeatures);
-        return false;
-    }
+    isOk &= validate_eq_engine_with_config(
+        mConfig.numDeepstackFeatures, nbDeepstackEmbedsInputs, "numDeepstackFeatures");
+
     Dims const maxInputPrefillShape
         = mEngine->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
 
     // inputs_embeds is 3D: [batch_size, seq_len, hidden_size]
-    if (mConfig.maxSupportedInputLength != maxInputPrefillShape.d[1])
-    {
-        LOG_ERROR("maxSupportedInputLength is not consistent. From engine: %d, from config: %d",
-            maxInputPrefillShape.d[1], mConfig.maxSupportedInputLength);
-        return false;
-    }
-    if (mConfig.hiddenSize != maxInputPrefillShape.d[2])
-    {
-        LOG_ERROR("hiddenSize is not consistent. From engine inputs_embeds: %d, from config: %d",
-            maxInputPrefillShape.d[2], mConfig.hiddenSize);
-        return false;
-    }
+    isOk &= validate_eq_engine_with_config(
+        mConfig.maxSupportedInputLength, maxInputPrefillShape.d[1], "maxSupportedInputLength");
+    isOk &= validate_eq_engine_with_config(mConfig.hiddenSize, maxInputPrefillShape.d[2], "hiddenSize");
 
     // Validate and potentially override maxSupportedBatchSize from engine's actual max profile
     int32_t const engineMaxBatchSize = maxInputPrefillShape.d[0];
-    if (mConfig.maxSupportedBatchSize != engineMaxBatchSize)
-    {
-        LOG_ERROR("maxSupportedBatchSize mismatch! Config is %d, engine's max optimization profile is %d.",
-            mConfig.maxSupportedBatchSize, engineMaxBatchSize);
-        return false;
-    }
+    isOk &= validate_eq_engine_with_config(mConfig.maxSupportedBatchSize, engineMaxBatchSize, "maxSupportedBatchSize");
 
     // Obtain vocab size from the engine.
     // Logits shape is [batch_size, num_tokens/num_selected_tokens, vocab_size] for both EAGLE and vanilla models
     Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
-    if (mConfig.outputVocabSize != logitsDim.d[2])
-    {
-        LOG_ERROR("vocabSize is not consistent. From engine: %d, expected output vocab size: %d", logitsDim.d[2],
-            mConfig.outputVocabSize);
-        return false;
-    }
+    isOk &= validate_eq_engine_with_config(mConfig.outputVocabSize, logitsDim.d[2], "outputVocabSize");
 
     // Obtain rotary dim from the engine.
     Dims const ropeCosSinCacheDim = mEngine->getTensorShape(binding_names::kRopeCosSin);
-    if (mConfig.rotaryDim != ropeCosSinCacheDim.d[2])
-    {
-        LOG_ERROR("rotaryDim is not consistent. From engine: %d, from config: %d", ropeCosSinCacheDim.d[2],
-            mConfig.rotaryDim);
-        return false;
-    }
+    isOk &= validate_eq_engine_with_config(mConfig.rotaryDim, ropeCosSinCacheDim.d[2], "rotaryDim");
 
-    return true;
+    if (!isOk)
+    {
+        LOG_ERROR("Validation failed. Please check the engine configuration.");
+    }
+    return isOk;
 }
 
 LLMEngineRunner::~LLMEngineRunner() noexcept
@@ -1088,7 +1059,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     {
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
-        // Mask input and optional token pos-ids are not used, set to dummy data.
+
+        // Plugin path: masks and position IDs are not used during prefill, set to dummy data
         setEngineIOStatus
             &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyInputTensor.rawPointer());
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1164,19 +1136,20 @@ bool LLMEngineRunner::vanillaDecodingStepInputValidation(
     return true;
 }
 
-bool LLMEngineRunner::executeVanillaDecodingStep(
-    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream)
+bool LLMEngineRunner::vanillaDecodingStepPrepareInputs(int32_t activeBatchSize, cudaStream_t stream)
 {
-    bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputsEmbeds, outputLogits);
-    if (!validateInputStatus)
-    {
-        LOG_ERROR("executeGeneration(): Generation request not performed due to invalid input tensors.");
-        return false;
-    }
-
-    int32_t activeBatchSize = inputsEmbeds.getShape()[0];
     // For vanilla decode stage, the selected token indices are always 0.
     // Also setup the sequence length of each sequence for this run based on committed KVCache length.
+    check::check(mSelectTokenIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
+    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+
+    // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
+    {
+        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+            "Tensor reshape failed");
+    }
+
     CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
 
     // For TRT native path, the sequence length input always refer to the length of Q.
@@ -1197,11 +1170,86 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     constexpr int32_t kDECODE_INCREMENT{1};
     kernel::incrementLengthTensor(mSequenceContextLengths, kDECODE_INCREMENT, stream);
 
+    return true;
+}
+
+bool LLMEngineRunner::vanillaDecodingStepBindTensors(
+    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, int32_t activeBatchSize)
+{
+    bool setEngineIOStatus{true};
+    // Engine input tensors - bind inputs_embeds directly
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
+    setEngineIOStatus
+        &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
+    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
+
+    setEngineIOStatus
+        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
+    // Update KV cache shapes to match activeBatchSize
+    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
+    // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding
+    if (mConfig.numDeepstackFeatures > 0)
+    {
+        for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
+        {
+            std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
+            setEngineIOStatus
+                &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyInputTensor.rawPointer());
+            setEngineIOStatus &= mTRTExecutionContext->setInputShape(
+                deepstackEmbedName.c_str(), rt::Coords{activeBatchSize, 1, mConfig.hiddenSize}.getTRTDims());
+        }
+    }
+
+    // Engine output tensors.
+    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
+
+    // Bind output hidden states tensor if engine enable Eagle SpecDecode. Since TensorRT engine will always write
+    // this output tensor even if the content is not needed afterwards.
+    if (mConfig.enableEagleSpecDecode)
+    {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
+    }
+
+    return setEngineIOStatus;
+}
+
+bool LLMEngineRunner::executeVanillaDecodingStep(
+    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream)
+{
+    bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputsEmbeds, outputLogits);
+    if (!validateInputStatus)
+    {
+        LOG_ERROR("executeGeneration(): Generation request not performed due to invalid input tensors.");
+        return false;
+    }
+
+    int32_t const activeBatchSize = inputsEmbeds.getShape()[0];
+    if (!vanillaDecodingStepPrepareInputs(activeBatchSize, stream))
+    {
+        LOG_ERROR("Failed to prepare inputs.");
+        return false;
+    }
+
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
     auto const graphHash = decodingKey(inputsEmbeds, outputLogits, mActiveLoraWeightsName);
     if (mCudaGraphs.find(graphHash) != mCudaGraphs.end())
     {
-        LOG_DEBUG("executeVanillaDecodingStep(): Use pre-captured CUDA graph for vanilla decoding step.");
+        LOG_DEBUG("Use pre-captured CUDA graph for vanilla decoding step.");
         cudaGraphExec_t graphExec = mCudaGraphs[graphHash].second;
         CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
     }
@@ -1216,65 +1264,10 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
             throw std::runtime_error("Failed to set optimization profile to the engine");
         }
 
-        bool setEngineIOStatus{true};
-        // Engine input tensors - bind inputs_embeds directly
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
-        setEngineIOStatus
-            &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-        setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
-
-        // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
-        if (mConfig.ropeConfig.type == RopeType::kMRope)
+        LOG_INFO("Vanilla decoding step CUDA graph not captured.");
+        if (!vanillaDecodingStepBindTensors(inputsEmbeds, outputLogits, activeBatchSize))
         {
-            check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
-                "Tensor reshape failed");
-        }
-
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-
-        // Update KV cache shapes to match activeBatchSize
-        setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
-
-        // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding
-        if (mConfig.numDeepstackFeatures > 0)
-        {
-            for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
-            {
-                std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
-                setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-                    deepstackEmbedName.c_str(), mDummyInputTensor.rawPointer());
-                setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-                    deepstackEmbedName.c_str(), rt::Coords{activeBatchSize, 1, mConfig.hiddenSize}.getTRTDims());
-            }
-        }
-
-        // Engine output tensors.
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-
-        // Bind output hidden states tensor if engine enable Eagle SpecDecode. Since TensorRT engine will always write
-        // this output tensor even if the content is not needed afterwards.
-        if (mConfig.enableEagleSpecDecode)
-        {
-            setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-                binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
-        }
-
-        if (!setEngineIOStatus)
-        {
-            LOG_ERROR("executeVanillaDecodingStep(): Failed to set engine input tensors.");
+            LOG_ERROR("Failed to bind tensors.");
             return false;
         }
 
@@ -1283,7 +1276,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         executeStatus &= mTRTExecutionContext->enqueueV3(stream);
         if (!executeStatus)
         {
-            LOG_ERROR("executeVanillaDecodingStep(): Failed on TensorRT decode stage enqueueV3() call.");
+            LOG_ERROR("Failed on TensorRT decode stage enqueueV3() call.");
             return false;
         }
     }
@@ -1291,8 +1284,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
     // Completed decoding step, commit the KVCache length of this run.
     constexpr int32_t kVANILLA_DECODE_INCREMENT{1};
     mKVCache.commitSequenceLength(kVANILLA_DECODE_INCREMENT, stream);
-    LOG_DEBUG("executeVanillaDecodingStep(): Decoding stage execution completed for request with batch size %d.",
-        activeBatchSize);
+    LOG_DEBUG("Decoding stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
 }
 
@@ -1369,355 +1361,19 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepInputValidation(rt::Tensor const&
     return true;
 }
 
-bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputsEmbeds,
-    rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-    cudaStream_t stream)
+bool LLMEngineRunner::eagleBaseTreeDecodingStepPrepareInputs(rt::Tensor const& baseTreeDecodingInputsEmbeds,
+    rt::Tensor const& baseTreeDecodingMask, int32_t activeBatchSize, cudaStream_t stream)
 {
-    bool const validateInputStatus = this->eagleBaseTreeDecodingStepInputValidation(
-        baseTreeDecodingInputsEmbeds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
-    if (!validateInputStatus)
-    {
-        LOG_ERROR(
-            "executeEagleBaseTreeDecodingStep(): Eagle base tree decoding request not performed due to invalid input "
-            "tensors.");
-        return false;
-    }
-
-    int32_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
     int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputsEmbeds.getShape()[1]);
     int32_t const packedBaseTreeDecodingMaskLen = static_cast<int32_t>(divUp(baseTreeDecodingSize, 32));
 
-    // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
+    // Prepare extra input for engine execution. Assemble mask, position indices, select token
     // indices, sequence context lengths.
-    check::check(mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}),
-        "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
-    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
-    check::check(mEagleBasePositionIds.reshape({activeBatchSize, baseTreeDecodingSize}), "Tensor reshape failed");
-    check::check(mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen}),
-        "Tensor reshape failed");
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
     rt::Tensor const& sequenceStartIndices = mKVCache.getKVCacheLengths();
-    kernel::prepareEagleBaseTreeDecodingInputs(baseTreeDecodingMask, sequenceStartIndices, mEagleBasePackedMask,
-        mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
 
-    // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
-    auto const graphHash = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
-    if (mBaseTreeDecodingCudaGraphs.find(graphHash) != mBaseTreeDecodingCudaGraphs.end())
-    {
-        LOG_DEBUG("executeEagleBaseTreeDecodingStep(): Use pre-captured CUDA graph for eagle base tree decoding step.");
-        cudaGraphExec_t graphExec = mBaseTreeDecodingCudaGraphs[graphHash].second;
-        CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
-    }
-    else
-    {
-        bool setOptimizationProfileStatus{true};
-        setOptimizationProfileStatus
-            &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
-        if (!setOptimizationProfileStatus)
-        {
-            LOG_ERROR("Failed to set optimization profile to the engine");
-            throw std::runtime_error("Failed to set optimization profile to the engine");
-        }
-
-        // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
-        // initialization.
-        bool setEngineIOStatus{true};
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kInputsEmbeds, const_cast<void*>(baseTreeDecodingInputsEmbeds.rawPointer()));
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kInputsEmbeds, baseTreeDecodingInputsEmbeds.getShape().getTRTDims());
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-        setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
-
-        // For MRope (VLM), reshape the RopeCosSinCache to match the activeBatchSize
-        if (mConfig.ropeConfig.type == RopeType::kMRope)
-        {
-            check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
-                "Tensor reshape failed");
-        }
-
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-
-        // Update KV cache shapes to match activeBatchSize
-        setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
-
-        setEngineIOStatus
-            &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kAttentionMask, mEagleBasePackedMask.getShape().getTRTDims());
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kAttentionPosId, mEagleBasePositionIds.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-            binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
-
-        // Bind deepstack_embeds to dummy tensors for Qwen3VL models during Eagle base tree decoding
-        if (mConfig.numDeepstackFeatures > 0)
-        {
-            for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
-            {
-                std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
-                setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-                    deepstackEmbedName.c_str(), mDummyInputTensor.rawPointer());
-                setEngineIOStatus &= mTRTExecutionContext->setInputShape(deepstackEmbedName.c_str(),
-                    rt::Coords{activeBatchSize, baseTreeDecodingSize, mConfig.hiddenSize}.getTRTDims());
-            }
-        }
-
-        // Bind the output tensor into the engine.
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, outputHiddenStates.rawPointer());
-
-        if (!setEngineIOStatus)
-        {
-            LOG_ERROR("executeEagleBaseTreeDecodingStep(): Failed to bind engine input and output tensors.");
-            return false;
-        }
-
-        // launch the engine execution.
-        bool executeStatus{true};
-        executeStatus &= mTRTExecutionContext->enqueueV3(stream);
-        if (!executeStatus)
-        {
-            LOG_ERROR(
-                "executeEagleBaseTreeDecodingStep(): Failed on TensorRT eagle base tree decoding stage enqueueV3() "
-                "call.");
-            return false;
-        }
-    }
-
-    // Note in the base tree decoding step we explicitly don't commit the KVCache since we process the "whole tree" in
-    // these steps.
-    LOG_DEBUG(
-        "executeEagleBaseTreeDecodingStep(): Eagle base tree decoding stage execution completed for request with batch "
-        "size %d.",
-        activeBatchSize);
-    return true;
-}
-
-bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
-    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
-{
-    bool setOptimizationProfileStatus{true};
-    setOptimizationProfileStatus
-        &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
-    if (!setOptimizationProfileStatus)
-    {
-        LOG_ERROR("Failed to set optimization profile to the engine");
-        throw std::runtime_error("Failed to set optimization profile to the engine");
-    }
-
-    auto const key = decodingKey(inputsEmbeds, outputLogits, loraWeightsPath);
-    if (mCudaGraphs.find(key) != mCudaGraphs.end())
-    {
-        LOG_INFO(
-            "captureVanillaDecodingCudaGraph(): CUDA graph already captured for the input tensors with LoRA weights "
-            "%s.",
-            loraWeightsPath.c_str());
-        return true;
-    }
-
-    if (isLoraWeightsSupported() && !this->switchLoraWeights(loraWeightsPath))
-    {
-        LOG_ERROR(
-            "captureVanillaDecodingCudaGraph(): Failed to switch LoRA weights to '%s', unable to capture CUDA graph.",
-            loraWeightsPath.c_str());
-        return false;
-    }
-
-    // To avoid CUDA graph error from TensorRT engine, we need to enqueueV3() once prior to graph capture.
-    // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
-    int64_t const activeBatchSize = inputsEmbeds.getShape()[0];
-    constexpr int32_t simulateCacheLength{128};
-    std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
-    rt::Tensor const reuseKVCacheLengthsTensor(
-        reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-
-    mKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
-
-    // Validate the condition here after the simulate prefill step.
-    bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputsEmbeds, outputLogits);
-    if (!validateInputStatus)
-    {
-        LOG_ERROR("captureVanillaDecodingCudaGraph(): Generation request is invalid, unable to capture CUDA graph.");
-        return false;
-    }
-
-    // Set shape of mSelectTokenIndices and set value to all zero.
-    // Set sequence context length input for decoding step.
-    check::check(mSelectTokenIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-    check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
-    // Need to reshape the mPosEncCosSinCache for MROPE.
-    if (mConfig.ropeConfig.type == RopeType::kMRope)
-    {
-        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
-            "Tensor reshape failed");
-    }
-    CUDA_CHECK(cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, activeBatchSize * sizeof(int64_t), stream));
-    CUDA_CHECK(cudaMemcpyAsync(mSequenceContextLengths.rawPointer(), mKVCache.getKVCacheLengths().rawPointer(),
-        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
-
-    // Set engine I/O using the same logic as executeVanillaDecodingStep().
-    bool setEngineIOStatus{true};
-    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kInputsEmbeds, const_cast<void*>(inputsEmbeds.rawPointer()));
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kInputsEmbeds, inputsEmbeds.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kContextLengths, mSequenceContextLengths.getShape().getTRTDims());
-    setEngineIOStatus
-        &= mTRTExecutionContext->setTensorAddress(binding_names::kLastTokenIds, mSelectTokenIndices.rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
-    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().rawPointer());
-    setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mKVCache.getKVCacheLengths().getShape().getTRTDims());
-    setEngineIOStatus
-        &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
-    // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding CUDA graph capture
-    if (mConfig.numDeepstackFeatures > 0)
-    {
-        for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
-        {
-            std::string deepstackEmbedName = binding_names::formatDeepstackEmbedsName(idx);
-            setEngineIOStatus
-                &= mTRTExecutionContext->setTensorAddress(deepstackEmbedName.c_str(), mDummyInputTensor.rawPointer());
-            setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-                deepstackEmbedName.c_str(), rt::Coords{activeBatchSize, 1, mConfig.hiddenSize}.getTRTDims());
-        }
-    }
-
-    // Engine output tensors.
-    setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
-    if (mConfig.enableEagleSpecDecode)
-    {
-        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-            binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
-    }
-    // Bind the KVCache since we haven't executed the real prefill step.
-    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
-    if (!setEngineIOStatus)
-    {
-        LOG_ERROR(
-            "captureVanillaDecodingCudaGraph(): Failed to set engine input tensors, unable to capture CUDA graph.");
-        return false;
-    }
-
-    bool executeStatus{true};
-    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
-    if (!executeStatus)
-    {
-        LOG_ERROR("captureVanillaDecodingCudaGraph(): Failed on TensorRT engine enqueueV3() call.");
-        return false;
-    }
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    cudaGraph_t graph;
-    try
-    {
-        cudaGraphExec_t graphExec;
-        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-        executeStatus &= mTRTExecutionContext->enqueueV3(stream);
-        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-        CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
-        mCudaGraphs[key] = std::make_pair(graph, graphExec);
-    }
-    catch (std::exception const& e)
-    {
-        LOG_WARNING("captureVanillaDecodingCudaGraph(): Failed to capture CUDA graph: %s", e.what());
-        // Clean up any CUDA error if the context is not graph-capturable.
-        // We do not want to check return value here, so add static_cast<void> to suppress coverity error.
-        static_cast<void>(cudaGetLastError());
-        // Stop the capture mode and clear CUDA error status if the stream is still in capturing mode.
-        cudaStreamCaptureStatus streamStatus;
-        CUDA_CHECK(cudaStreamIsCapturing(stream, &streamStatus));
-        if (streamStatus != cudaStreamCaptureStatusNone)
-        {
-            static_cast<void>(cudaStreamEndCapture(stream, &graph));
-            static_cast<void>(cudaGetLastError());
-        }
-        // At this point, there should be no more cuda errors.
-        CUDA_CHECK(cudaGetLastError());
-        return false;
-    }
-
-    if (!executeStatus)
-    {
-        LOG_WARNING(
-            "captureVanillaDecodingCudaGraph(): Failed on TensorRT engine enqueueV3() call during CUDA graph capture.");
-        return false;
-    }
-    else
-    {
-        LOG_DEBUG(
-            "captureVanillaDecodingCudaGraph(): CUDA graph captured successfully for input shape %s with LoRA weights "
-            "'%s' (Empty string if no LoRA weights).",
-            inputsEmbeds.getShape().formatString().c_str(), loraWeightsPath.c_str());
-    }
-
-    return true;
-}
-
-bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputsEmbeds,
-    rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-    cudaStream_t stream)
-{
-    bool setOptimizationProfileStatus{true};
-    setOptimizationProfileStatus
-        &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
-    if (!setOptimizationProfileStatus)
-    {
-        LOG_ERROR("Failed to set optimization profile to the engine");
-        throw std::runtime_error("Failed to set optimization profile to the engine");
-    }
-
-    auto const key = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
-    if (mBaseTreeDecodingCudaGraphs.find(key) != mBaseTreeDecodingCudaGraphs.end())
-    {
-        LOG_INFO("captureEagleBaseTreeDecodingCudaGraph(): CUDA graph already captured for the input tensors.");
-        return true;
-    }
-
-    // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
-    int32_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
-    constexpr int32_t simulateCacheLength{128};
-    std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
-    rt::Tensor const reuseKVCacheLengthsTensor(
-        reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
-
-    mKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
-
-    bool const validateInputStatus = this->eagleBaseTreeDecodingStepInputValidation(
-        baseTreeDecodingInputsEmbeds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
-    if (!validateInputStatus)
-    {
-        LOG_ERROR(
-            "captureEagleBaseTreeDecodingCudaGraph(): Eagle base tree decoding request not performed due to invalid "
-            "input "
-            "tensors.");
-        return false;
-    }
-
-    // Prepare extra input for engine execution. Assemble packed base tree decoding mask, position indices, select token
-    // indices, sequence context lengths.
-    int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputsEmbeds.getShape()[1]);
-    int32_t const packedBaseTreeDecodingMaskLen = static_cast<int32_t>(divUp(baseTreeDecodingSize, 32));
+    // Prepare inputs for plugin-based attention
     check::check(mSelectTokenIndices.reshape({activeBatchSize, baseTreeDecodingSize}),
         "Tensor reshape failed"); // 2D tensor [batch, num_tokens]
     check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
@@ -1725,18 +1381,18 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     check::check(mEagleBasePackedMask.reshape({activeBatchSize, baseTreeDecodingSize, packedBaseTreeDecodingMaskLen}),
         "Tensor reshape failed");
 
-    rt::Tensor const& sequenceStartIndices = mKVCache.getKVCacheLengths();
-
     kernel::prepareEagleBaseTreeDecodingInputs(baseTreeDecodingMask, sequenceStartIndices, mEagleBasePackedMask,
         mEagleBasePositionIds, mSelectTokenIndices, mSequenceContextLengths, stream);
+    return true;
+}
 
+bool LLMEngineRunner::eagleBaseTreeDecodingStepBindTensors(rt::Tensor const& baseTreeDecodingInputsEmbeds,
+    rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, int32_t activeBatchSize)
+{
+    int32_t const baseTreeDecodingSize = static_cast<int32_t>(baseTreeDecodingInputsEmbeds.getShape()[1]);
     // Bind the input and output tensor into the engine. RopeCosSinCache and KVCache are pre-bind during runner
     // initialization.
     bool setEngineIOStatus{true};
-
-    // Update KV cache shapes to match activeBatchSize for CUDA graph capture
-    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
-
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
         binding_names::kInputsEmbeds, const_cast<void*>(baseTreeDecodingInputsEmbeds.rawPointer()));
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1763,6 +1419,11 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
 
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
+
+    // Update KV cache shapes to match activeBatchSize
+    setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+
+    // Bind packed attention mask for plugin-based attention
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mEagleBasePackedMask.rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1772,7 +1433,7 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kAttentionPosId, mEagleBasePositionIds.getShape().getTRTDims());
 
-    // Bind deepstack_embeds to dummy tensors for Qwen3VL models during Eagle base tree decoding CUDA graph capture
+    // Bind deepstack_embeds to dummy tensors for Qwen3VL models during Eagle base tree decoding
     if (mConfig.numDeepstackFeatures > 0)
     {
         for (int32_t idx = 0; idx < mConfig.numDeepstackFeatures; ++idx)
@@ -1792,7 +1453,207 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
 
     if (!setEngineIOStatus)
     {
-        LOG_ERROR("captureEagleBaseTreeDecodingCudaGraph(): Failed to bind engine input and output tensors.");
+        LOG_ERROR("Failed to bind engine input and output tensors.");
+        return false;
+    }
+
+    return true;
+}
+
+bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTreeDecodingInputsEmbeds,
+    rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+    cudaStream_t stream)
+{
+    bool const validateInputStatus = this->eagleBaseTreeDecodingStepInputValidation(
+        baseTreeDecodingInputsEmbeds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
+    if (!validateInputStatus)
+    {
+        LOG_ERROR("Eagle base tree decoding request not performed due to invalid input tensors.");
+        return false;
+    }
+
+    int32_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
+
+    if (!eagleBaseTreeDecodingStepPrepareInputs(
+            baseTreeDecodingInputsEmbeds, baseTreeDecodingMask, activeBatchSize, stream))
+    {
+        LOG_ERROR("Failed to prepare inputs.");
+        return false;
+    }
+
+    // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
+    auto const graphHash = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
+    if (mBaseTreeDecodingCudaGraphs.find(graphHash) != mBaseTreeDecodingCudaGraphs.end())
+    {
+        LOG_DEBUG("Use pre-captured CUDA graph for eagle base tree decoding step.");
+        cudaGraphExec_t graphExec = mBaseTreeDecodingCudaGraphs[graphHash].second;
+        CUDA_CHECK(cudaGraphLaunch(graphExec, stream));
+    }
+    else
+    {
+        bool setOptimizationProfileStatus{true};
+        setOptimizationProfileStatus
+            &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+        if (!setOptimizationProfileStatus)
+        {
+            LOG_ERROR("Failed to set optimization profile to the engine");
+            throw std::runtime_error("Failed to set optimization profile to the engine");
+        }
+
+        // Prepare and bind tensors using shared helper function
+        if (!eagleBaseTreeDecodingStepBindTensors(
+                baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates, activeBatchSize))
+        {
+            LOG_ERROR("Failed to bind tensors.");
+            return false;
+        }
+
+        // launch the engine execution.
+        bool executeStatus{true};
+        executeStatus &= mTRTExecutionContext->enqueueV3(stream);
+        if (!executeStatus)
+        {
+            LOG_ERROR("Failed on TensorRT eagle base tree decoding stage enqueueV3() call.");
+            return false;
+        }
+    }
+
+    // Note in the base tree decoding step we explicitly don't commit the KVCache since we process the "whole tree" in
+    // these steps.
+    LOG_DEBUG("Eagle base tree decoding stage execution completed for request with batch size %d.", activeBatchSize);
+    return true;
+}
+
+bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
+    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
+{
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
+    auto const key = decodingKey(inputsEmbeds, outputLogits, loraWeightsPath);
+    if (mCudaGraphs.find(key) != mCudaGraphs.end())
+    {
+        LOG_INFO("CUDA graph already captured for the input tensors with LoRA weights %s.", loraWeightsPath.c_str());
+        return true;
+    }
+
+    if (isLoraWeightsSupported() && !this->switchLoraWeights(loraWeightsPath))
+    {
+        LOG_ERROR("Failed to switch LoRA weights to '%s', unable to capture CUDA graph.", loraWeightsPath.c_str());
+        return false;
+    }
+
+    // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
+    int32_t const activeBatchSize = inputsEmbeds.getShape()[0];
+    constexpr int32_t simulateCacheLength{128};
+    std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
+    rt::Tensor const reuseKVCacheLengthsTensor(reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU,
+        DataType::kINT32, "vanilla_reuse_kv_cache_lengths");
+
+    mKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
+
+    // Validate the input tensors.
+    bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputsEmbeds, outputLogits);
+    if (!validateInputStatus)
+    {
+        LOG_ERROR("Generation request is invalid, unable to capture CUDA graph.");
+        return false;
+    }
+    if (!vanillaDecodingStepPrepareInputs(activeBatchSize, stream))
+    {
+        LOG_ERROR("Failed to prepare inputs.");
+        return false;
+    }
+
+    if (!vanillaDecodingStepBindTensors(inputsEmbeds, outputLogits, activeBatchSize))
+    {
+        LOG_ERROR("Failed to bind engine input and output tensors.");
+        return false;
+    }
+
+    // launch the engine execution. This will trigger the shape machine of TensorRT engine to avoid cudaGraph capture
+    // error.
+    bool executeStatus{true};
+    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
+    if (!executeStatus)
+    {
+        LOG_ERROR("Failed on TensorRT engine enqueueV3() call.");
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto graphPair = captureTRTCudaGraph(mTRTExecutionContext.get(), stream);
+    if (!graphPair)
+    {
+        LOG_WARNING("Failed to capture CUDA graph.");
+        return false;
+    }
+    else
+    {
+        LOG_DEBUG(
+            "CUDA graph captured successfully for input shape %s with LoRA weights '%s' (Empty string if no LoRA "
+            "weights).",
+            inputsEmbeds.getShape().formatString().c_str(), loraWeightsPath.c_str());
+        mCudaGraphs[key] = graphPair.value();
+        return true;
+    }
+}
+
+bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputsEmbeds,
+    rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
+    cudaStream_t stream)
+{
+    bool setOptimizationProfileStatus{true};
+    setOptimizationProfileStatus
+        &= mTRTExecutionContext->setOptimizationProfileAsync(kGENERATION_PROFILE_INDEX, stream);
+    if (!setOptimizationProfileStatus)
+    {
+        LOG_ERROR("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile to the engine");
+    }
+
+    auto const key = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
+    if (mBaseTreeDecodingCudaGraphs.find(key) != mBaseTreeDecodingCudaGraphs.end())
+    {
+        LOG_INFO("CUDA graph already captured for the input tensors.");
+        return true;
+    }
+
+    // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
+    int32_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
+    constexpr int32_t simulateCacheLength{128};
+    std::vector<int32_t> reuseKVCacheLengths(activeBatchSize, simulateCacheLength);
+    rt::Tensor const reuseKVCacheLengthsTensor(
+        reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32);
+
+    mKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
+
+    bool const validateInputStatus = this->eagleBaseTreeDecodingStepInputValidation(
+        baseTreeDecodingInputsEmbeds, baseTreeDecodingMask, outputLogits, outputHiddenStates);
+    if (!validateInputStatus)
+    {
+        LOG_ERROR("Eagle base tree decoding request not performed due to invalid input tensors.");
+        return false;
+    }
+
+    // Prepare and bind tensors using shared helper function
+    if (!eagleBaseTreeDecodingStepPrepareInputs(
+            baseTreeDecodingInputsEmbeds, baseTreeDecodingMask, activeBatchSize, stream))
+    {
+        LOG_ERROR("Failed to prepare inputs.");
+        return false;
+    }
+
+    if (!eagleBaseTreeDecodingStepBindTensors(
+            baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates, activeBatchSize))
+    {
+        LOG_ERROR("Failed to bind tensors.");
         return false;
     }
 
@@ -1803,36 +1664,25 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
 
     if (!executeStatus)
     {
-        LOG_ERROR(
-            "captureEagleBaseTreeDecodingCudaGraph(): Failed on TensorRT eagle base tree decoding stage enqueueV3() "
-            "call.");
+        LOG_ERROR("Failed on TensorRT eagle base tree decoding stage enqueueV3() call.");
         return false;
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    cudaGraph_t graph;
-    cudaGraphExec_t graphExec;
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    executeStatus &= mTRTExecutionContext->enqueueV3(stream);
-    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-    CUDA_CHECK(instantiateCudaGraph(&graphExec, graph));
-    mBaseTreeDecodingCudaGraphs[key] = std::make_pair(graph, graphExec);
-
-    if (!executeStatus)
+    auto graphPair = captureTRTCudaGraph(mTRTExecutionContext.get(), stream);
+    if (!graphPair)
     {
-        LOG_WARNING(
-            "captureEagleBaseTreeDecodingCudaGraph(): Failed on TensorRT engine enqueueV3() call during CUDA graph "
-            "capture.");
+        LOG_WARNING("Failed to capture CUDA graph.");
         return false;
     }
     else
     {
-        LOG_DEBUG("captureEagleBaseTreeDecodingCudaGraph(): CUDA graph captured successfully for input shape %s.",
+        LOG_DEBUG("CUDA graph captured successfully for input shape %s.",
             baseTreeDecodingInputsEmbeds.getShape().formatString().c_str());
+        mBaseTreeDecodingCudaGraphs[key] = graphPair.value();
+        return true;
     }
-
-    return true;
 }
 
 bool LLMEngineRunner::resetLoraWeights()

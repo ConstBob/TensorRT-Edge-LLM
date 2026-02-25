@@ -20,6 +20,7 @@
 #include "NvInferVersion.h"
 #include "checkMacros.h"
 #include "cudaMacros.h"
+#include <algorithm>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -306,6 +307,13 @@ std::string formatString(Tensor const& tensor)
             ss, static_cast<int8_t const*>(dataPtr), shape, strides, offset, startDim, maxWidth, startIndent);
         break;
     }
+    case DataType::kBOOL:
+    {
+        size_t maxWidth = getMaxFormatDataWidth(shape, static_cast<uint8_t const*>(dataPtr));
+        buildStringRecursive(
+            ss, static_cast<uint8_t const*>(dataPtr), shape, strides, offset, startDim, maxWidth, startIndent);
+        break;
+    }
     case DataType::kFP8:
     {
 #if SUPPORTS_FP8
@@ -347,6 +355,26 @@ double toMB(size_t bytes) noexcept
 double toGB(size_t bytes) noexcept
 {
     return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+}
+
+int32_t getMaxInt32Value(Tensor const& tensor)
+{
+    check::check(tensor.getDeviceType() == DeviceType::kCPU, "Tensor must be on CPU");
+    check::check(tensor.getDataType() == DataType::kINT32, "Tensor must be INT32 type");
+
+    int64_t const volume = tensor.getShape().volume();
+    if (volume == 0)
+    {
+        return 0;
+    }
+
+    int32_t const* data = tensor.dataPointer<int32_t>();
+    int32_t maxValue = data[0];
+    for (int64_t i = 1; i < volume; ++i)
+    {
+        maxValue = std::max(maxValue, data[i]);
+    }
+    return maxValue;
 }
 
 } // namespace utils
