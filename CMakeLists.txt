@@ -30,6 +30,10 @@ set(CMAKE_CXX_FLAGS
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 
+# Code coverage with gcov (for SonarQube analysis)
+option(ENABLE_COVERAGE "Enable gcov code coverage instrumentation" OFF)
+include(${CMAKE_SOURCE_DIR}/cmake/CodeCoverage.cmake)
+
 macro(set_ifndef var val)
   if(NOT DEFINED ${var})
     set(${var} ${val})

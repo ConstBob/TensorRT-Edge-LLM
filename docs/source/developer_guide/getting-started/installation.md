@@ -152,6 +152,7 @@ cmake .. \
 | `EMBEDDED_TARGET` | **Required for Edge devices**: Target platform (`jetson-thor`). **Not needed for GPU builds** | N/A |
 | `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
+| `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](code-coverage.md)) | OFF |
 
 > **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
 
