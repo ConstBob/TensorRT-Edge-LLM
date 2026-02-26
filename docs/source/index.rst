@@ -38,6 +38,8 @@ for large language models and vision-language models on edge devices.
 
    developer_guide/features/lora.md
    developer_guide/features/reduce-vocab.md
+   developer_guide/features/FP8KV.md
+   developer_guide/features/system-prompt-cache.md
 
 .. toctree::
    :maxdepth: 2

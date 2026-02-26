@@ -17,25 +17,25 @@ graph LR
     TRT_ENGINE[TensorRT<br>Engine]
     CPP_RUNTIME[C++<br>Runtime]
     OUTPUT[Inference<br>Results]
-    
+
     subgraph EXPORT_SG [" "]
         PYTHON_EXPORT[Python<br>Export<br>Pipeline]
     end
-    
+
     HF_MODEL --> PYTHON_EXPORT
     PYTHON_EXPORT --> ONNX_FILES
     ONNX_FILES --> ENGINE_BUILDER
     ENGINE_BUILDER --> TRT_ENGINE
     TRT_ENGINE --> CPP_RUNTIME
     CPP_RUNTIME --> OUTPUT
-    
+
     classDef inputNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef nvLightNode fill:#b8d67e,stroke:#76B900,stroke-width:1px,color:#333
     classDef itemNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef darkNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef greenSubGraph fill:none,stroke:#76B900,stroke-width:1.5px
-    
+
     class HF_MODEL inputNode
     class PYTHON_EXPORT nvNode
     class ENGINE_BUILDER,CPP_RUNTIME nvLightNode
@@ -54,13 +54,13 @@ graph LR
     ONNX_EXPORT(ONNX<br>Export)
     GRAPH_SURGERY(Graph<br>Surgery)
     ONNX_OUTPUT[Optimized<br>ONNX Model]
-    
+
     subgraph EXPORT_TOOLS ["Python Export Pipeline"]
         QUANTIZATION
         ONNX_EXPORT
         GRAPH_SURGERY
     end
-    
+
     HF_MODEL --> QUANTIZATION
     QUANTIZATION --> ONNX_EXPORT
     ONNX_EXPORT --> GRAPH_SURGERY
@@ -87,11 +87,9 @@ graph LR
 5. **Configuration Generation**: Create build configuration files
 
 
-
-
 ## Export Tools
 
-TensorRT Edge-LLM provides specialized command-line tools to support quantization and export to ONNX format: 
+TensorRT Edge-LLM provides specialized command-line tools to support quantization and export to ONNX format:
 
 
 ```mermaid
@@ -104,13 +102,13 @@ graph LR
         BASE_MODEL[Base<BR>Model]
         LORA_WEIGHTS[LoRA<BR>Weights]
     end
-    
+
     subgraph QUANT [Optional Quantization]
         QUANTIZE_VISUAL(Quantization via<BR>export-visual)
         QUANTIZE_DRAFT(quantize-draft)
         QUANTIZE_LLM(quantize-llm)
     end
-    
+
     subgraph EXPORT [Export & Processing]
         EXPORT_VISUAL(export-visual)
         EXPORT_DRAFT(export-draft)
@@ -118,7 +116,7 @@ graph LR
         INSERT_LORA(insert-lora)
         PROCESS_LORA(process-lora)
     end
-    
+
     subgraph RESULTS [" "]
         VISUAL_ONNX[Visual ONNX]
         DRAFT_ONNX[Draft ONNX]
@@ -126,22 +124,22 @@ graph LR
         LORA_ONNX[LoRA-Enabled<br>ONNX]
         SAFETENSORS[SafeTensors]
     end
-    
+
     VLM_MODEL --> QUANTIZE_VISUAL
     VLM_MODEL --> QUANTIZE_LLM
     QUANTIZE_VISUAL --> EXPORT_VISUAL
     EXPORT_VISUAL --> VISUAL_ONNX
-    
+
     DRAFT_MODEL --> QUANTIZE_DRAFT
     QUANTIZE_DRAFT --> EXPORT_DRAFT
     EXPORT_DRAFT --> DRAFT_ONNX
-    
+
     BASE_MODEL --> QUANTIZE_LLM
     QUANTIZE_LLM --> EXPORT_LLM
     EXPORT_LLM --> LLM_ONNX
     EXPORT_LLM -->|If LoRA| INSERT_LORA
     INSERT_LORA --> LORA_ONNX
-    
+
     LORA_WEIGHTS --> PROCESS_LORA
     PROCESS_LORA --> SAFETENSORS
 
@@ -181,89 +179,11 @@ The `tensorrt-edgellm` package provides seven specialized command-line tools for
 
 ## Quantization Methods
 
-The export pipeline supports multiple quantization methods optimized for different hardware platforms and performance requirements:
+The export pipeline supports multiple quantization methods optimized for different hardware platforms and performance requirements.
 
-| Method | Description | Precision | Platform Requirements | Memory Reduction |
-|--------|-------------|-----------|----------------------|------------------|
-| **FP16** | Half-precision floating point | 16-bit | All platforms | Baseline |
-| **FP8** | 8-bit floating point | 8-bit | **SM89+** (Ada Lovelace and newer) | 2x |
-| **INT8 SQ** | 8-bit SmoothQuant | 8-bit | All platforms | 2x |
-| **INT4 AWQ** | 4-bit integer with AWQ | 4-bit | All platforms | 4x |
-| **INT4 GPTQ** | 4-bit GPTQ weight quantization | 4-bit | All platforms | 4x |
-| **NVFP4** | NVIDIA 4-bit floating point | 4-bit | **SM100+** (Blackwell and newer) | 4x |
-
-### Quantization Details
-
-**FP16 (Baseline)**
-- Standard half-precision floating point
-- Universal compatibility across all platforms
-- Best accuracy, largest memory footprint
-- Recommended for validation and accuracy baselines
-
-**FP8 (General Purpose)**
-- 8-bit floating point quantization
-- 2x memory reduction with minimal accuracy loss
-- Requires **SM89+** (Ada Lovelace generation or newer GPUs)
-- Automatic calibration using sample data
-- **FP8 Vision Encoder**: Supported for visual models
-- **FP8 LM Head**: Supported for language model heads
-
-**INT8 SQ (SmoothQuant)**
-- 8-bit integer quantization with SmoothQuant algorithm
-- Supported on all platforms, primarily for Ampere generation
-- Use FP8 or NVFP4 on Blackwell generation for better accuracy and performance
-
-**INT4 AWQ (Activation-Aware Weight Quantization)**
-- 4-bit integer weight quantization
-- Uses activation statistics for optimal quantization
-- 4x memory reduction
-- Good accuracy preservation with proper calibration
-- Supported on all platforms
-
-**INT4 GPTQ**
-- 4-bit GPTQ weight quantization
-- Can load quantized models from HuggingFace directly
-- No additional quantization step needed for GPTQ checkpoints
-- Install: `BUILD_CUDA_EXT=0 pip install -v gptqmodel --no-build-isolation`
-- Supported on all platforms
-
-**NVFP4 (NVIDIA Floating Point 4-bit)**
-- NVIDIA's proprietary 4-bit floating point format
-- Hardware-accelerated on **SM100+** (Blackwell generation and newer GPUs)
-- 4x memory reduction with optimal performance
-- Recommended for Thor platforms
-- **NVFP4 LM Head**: Supported for language model heads
+For complete details on quantization methods, precision requirements, platform compatibility, and memory reduction, see the **[Precision Support](../getting-started/supported-models.md#precision-support)** section in the Supported Models guide.
 
 **Note**: INT4 GPTQ models can be loaded directly from HuggingFace Hub or quantized using [GPTQModel](https://github.com/ModelCloud/GPTQModel). No additional quantization step with `tensorrt-edgellm-quantize-llm` is required for pre-quantized GPTQ checkpoints.
-
----
-
-## Security and Model Integrity
-
-**⚠️ USER RESPONSIBILITY**: Users are responsible for verifying the integrity of all model artifacts (base models, LoRA weights, tokenizers, configs) before exporting models to TensorRT Edge-LLM format.
-
-### Model Signing and Verification
-
-It is **strongly recommended** to use the [model-signing](https://github.com/sigstore/model-transparency) package to sign and verify models before inference.
-
-**Installation:**
-```bash
-pip install model-signing
-```
-
-**Basic Usage:**
-```bash
-# Sign a model
-model_signing sign /path/to/your/model --signature model.sig
-
-# Verify a model
-model_signing verify /path/to/your/model \
-  --signature model.sig \
-  --identity "$identity" \
-  --identity_provider "$oidc_provider"
-```
-
-**For more details**, refer to the [model-signing documentation](https://github.com/sigstore/model-transparency)
 
 ---
 
@@ -338,6 +258,20 @@ tensorrt-edgellm-export-visual \
 
 ```
 
+### Where to Get Draft Models for EAGLE3
+
+**Open-Source Draft Models:**
+
+Draft models for EAGLE speculative decoding can be found on HuggingFace:
+- [EAGLE-3 Models on HuggingFace](https://github.com/SafeAILab/EAGLE?tab=readme-ov-file#eagle-3-models-on-hugging-face) - Official list of available EAGLE-3 draft models for various base models
+- Search HuggingFace for your specific base model name + "EAGLE"
+
+**Training Your Own Draft Models:**
+
+If no pre-trained draft model exists for your base model, you'll need to train one yourself. Refer to the [EAGLE training repository](https://github.com/SafeAILab/EAGLE) for instructions on training draft models.
+
+> **Important:** Draft models must be trained specifically for their corresponding base model. A draft model trained for Qwen2.5-7B will only work with that exact base model and cannot be used with other models.
+
 ### LoRA-Enabled Export
 
 ```bash
@@ -364,11 +298,6 @@ tensorrt-edgellm-process-lora \
 ---
 
 ## Best Practices
-
-### Security
-
-1. **Verify model integrity** before export (see [Security and Model Integrity](#security-and-model-integrity))
-2. **Sign models** before deployment using [model-signing](https://github.com/sigstore/model-transparency)
 
 ### Model Selection
 
@@ -397,30 +326,124 @@ tensorrt-edgellm-process-lora \
 3. **Cache downloads**: Reuse downloaded models across exports
 4. **Monitor memory usage**: Track peak memory during export
 
+### Model Signing and Verification
+
+1. **Verify model integrity**: Users are responsible for verifying the integrity of model artifacts (base models, LoRA weights, tokenizers, configs) before deployment
+2. **Sign models**: It is **strongly recommended** to use the [model-signing](https://github.com/sigstore/model-transparency) package to sign and verify models before inference.
+
+**Installation:**
+```bash
+pip install model-signing
+```
+
+**Basic Usage:**
+```bash
+# Sign a model
+model_signing sign /path/to/your/model --signature model.sig
+
+# Verify a model
+model_signing verify /path/to/your/model \
+  --signature model.sig \
+  --identity "$identity" \
+  --identity_provider "$oidc_provider"
+```
+
+**For more details**, refer to the [model-signing documentation](https://github.com/sigstore/model-transparency)
+
 ---
 
 ## Common Issues and Solutions
 
+### Issue: Model Download Fails or Times Out
+
+**Cause**: Network issues, insufficient disk space, or HuggingFace access problems.
+
+**Solution**:
+
+1. Check disk space:
+```bash
+df -h $WORKSPACE_DIR
+# Ensure at least 10-20GB free for small models
+```
+
+2. Check network connectivity:
+```bash
+curl -I https://huggingface.co
+# Should return HTTP 200 OK
+```
+
+3. For gated models (Llama, Phi-4), login to HuggingFace:
+```bash
+huggingface-cli login
+# Enter your access token
+```
+
+4. Manual download as a workaround:
+```bash
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen3-0.6B
+
+# Then use local path for quantization
+tensorrt-edgellm-quantize-llm \
+    --model_dir ./Qwen3-0.6B \
+    --output_dir quantized/Qwen3-0.6B \
+    --quantization fp8
+```
+
 ### Issue: GPU Out of Memory During Export or Quantization
 
-**Solution**: 
-1. Change to a larger GPU. Empirically a 40GB GPU is enough for 4B or less model and 80GB GPU is enough for 8B or less.   
+**Cause**: Model size exceeds available GPU memory.
+
+**Solution**:
+
+1. Change to a larger GPU. Empirically a 40GB GPU is enough for 4B or less model and 80GB GPU is enough for 8B or less.
 2. You may try `--device cpu` flag during quantization and export. However, CPU support may fail for some precisions.
 
+### Issue: Calibration Dataset Download Fails (`cnn_dailymail` not found)
+
+**Cause**: Network connectivity issues preventing download of the calibration dataset from HuggingFace, or firewall/proxy blocking access.
+
+**Solution**:
+
+1. Check network connectivity to HuggingFace:
+```bash
+curl -I https://huggingface.co
+curl -I https://huggingface.co/datasets/abisee/cnn_dailymail
+# Should return HTTP 200 OK
+```
+
+2. If network is down or blocked, download the dataset manually:
+
+```bash
+git lfs install
+git clone https://huggingface.co/datasets/abisee/cnn_dailymail
+
+# Pass the local dataset path explicitly to quantization
+tensorrt-edgellm-quantize-llm \
+    --model_dir Qwen/Qwen3-0.6B \
+    --output_dir quantized/Qwen3-0.6B \
+    --quantization fp8 \
+    --calib_dataset ./cnn_dailymail/3.0.0
+```
+
+> **Note:** Replace `./cnn_dailymail/3.0.0` with the actual path where you downloaded the dataset. The dataset version 3.0.0 is commonly used for calibration. This allows you to use a local dataset instead of relying on HuggingFace cache.
 
 ### Issue: Quantization Degrades Accuracy
 
-**Solution**: 
+**Cause**: Aggressive quantization or insufficient calibration.
 
-1. Increase calibration dataset size or use less aggressive quantization
+**Solution**:
+
+1. Use less aggressive quantization
 
 ```bash
 # Use FP8 instead of INT4 for better accuracy
 tensorrt-edgellm-quantize-llm \
   --model_dir model_name \
   --output_dir quantized/model_name \
-  --quantization fp8 \  # Better accuracy than int4, nvfp4, or int8_sq
-  --calib_size 512      # Increase from default
+  --quantization fp8  # Better accuracy than int4, nvfp4, or int8_sq
 ```
 
 2. Change the quantization recipe in `tensorrt_edgellm/quantization/llm_quantization.py` or `tensorrt_edgellm/quantization/visual_quantization.py` to disable quantization for most sensitive layers. Follow the documentation of [NVIDIA Model Optimizer](https://nvidia.github.io/Model-Optimizer/)
+
+3. Increase calibration size (`num_samples` field) in `tensorrt_edgellm/quantization/llm_quantization.py`.

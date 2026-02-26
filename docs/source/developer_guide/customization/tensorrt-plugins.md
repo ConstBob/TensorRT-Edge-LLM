@@ -8,7 +8,7 @@ TensorRT plugins are custom operations that extend the functionality of the Tens
 
 ### Plugin Architecture and Capabilities
 
-TensorRT plugins are user-defined layers that implement the `IPluginV2DynamicExt` interface, providing the following capabilities:
+TensorRT plugins are user-defined layers that implement the `IPluginV2DynamicExt` or `IPluginV3` interface. Note that TensorRT Edge-LLM is migrating all plugins to V3. TensorRT Plugins provide the following capabilities:
 
 - **Feature Extension**: Extend functionality of existing TensorRT versions with new runtime and kernel level optimizations.
 - **Modular Encapsulation**: Package complex computational logic into reusable components with configurable parameters.
@@ -20,9 +20,10 @@ TensorRT plugins are user-defined layers that implement the `IPluginV2DynamicExt
 
 ## AttentionPlugin
 
-**Functional Description**: 
-- Handles Rotary positional encoding, KVCache I/O, and MHA/GQA attention computation. 
+**Functional Description**:
+- Handles Rotary positional encoding, KVCache I/O, and MHA/GQA attention computation.
 - Implements FP16 precision and covers all supported SMs of TensorRT Edge-LLM.
+- Supports FP8 KV cache for improved memory efficiency with CUDA >= 11.8.
 - Supports prefill (normal and chunked) stage causal attention.
 - Supports vanilla decoding attention and tree decoding attention that is used by EAGLE speculative decoding.
 - Supports linear KVCache with equal capacity within one batch.
@@ -33,6 +34,7 @@ TensorRT plugins are user-defined layers that implement the `IPluginV2DynamicExt
 - `num_kv_heads`: Integer specification of key-value head count (enables MQA/GQA configurations)
 - `head_size`: Integer specification of per-head dimension size
 - `enable_tree_attention`: Boolean flag to enable tree attention for speculative decoding implementations
+- `kv_cache_type`: Data type for KV cache (FP16 or FP8)
 
 **Input Tensors**:
 - `PackedQKV`: Packed tensors from attention Q/K/V projections with layout `[B, S, H, D]`
@@ -53,7 +55,7 @@ TensorRT plugins are user-defined layers that implement the `IPluginV2DynamicExt
 
 ### Kernel Sources
 
-Attention kernels are compiled into CUDA binaries. We provide the methods to produce CUDA binaries in `kernelSrcs/`. 
+Attention kernels are compiled into CUDA binaries. We provide the methods to produce CUDA binaries in `kernelSrcs/`.
 
 **Kernel Libraries**:
 - `fmha_v2`: Performant context phase attention kernels developed by NVIDIA. Please refer to the original code repository for additional context and extension guidance.
@@ -71,7 +73,7 @@ The AttentionPlugin integrates into the TensorRT Edge-LLM inference pipeline thr
 ## Int4GroupwiseGemmPlugin
 
 **Functional Description**
-- Implement A([M, K]) x B([K, N]) GEMM semantic where A is activation input, B is weights input.
+- Implements A([M, K]) x B([K, N]) GEMM semantic where A is activation input, B is weights input.
 - Supports INT4 weights-only groupwise quantization GEMM.
 - Supports group size of 128.
 - Accumulation is performed in FP16 precision for both GEMM and GEMV kernels.

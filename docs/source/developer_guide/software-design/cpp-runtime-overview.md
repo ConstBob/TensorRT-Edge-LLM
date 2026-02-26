@@ -18,25 +18,25 @@ graph LR
     ENGINE_BUILDER[Engine<br>Builder]
     TRT_ENGINE[TensorRT<br>Engine]
     OUTPUT[Inference<br>Results]
-    
+
     subgraph RUNTIME_SG [" "]
         CPP_RUNTIME[C++<br>Runtime]
     end
-    
+
     HF_MODEL --> PYTHON_EXPORT
     PYTHON_EXPORT --> ONNX_FILES
     ONNX_FILES --> ENGINE_BUILDER
     ENGINE_BUILDER --> TRT_ENGINE
     TRT_ENGINE --> CPP_RUNTIME
     CPP_RUNTIME --> OUTPUT
-    
+
     classDef inputNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef nvLightNode fill:#b8d67e,stroke:#76B900,stroke-width:1px,color:#333
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef itemNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef darkNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef greenSubGraph fill:none,stroke:#76B900,stroke-width:1.5px
-    
+
     class HF_MODEL inputNode
     class PYTHON_EXPORT,ENGINE_BUILDER nvLightNode
     class CPP_RUNTIME nvNode

@@ -18,9 +18,14 @@ This guide provides complete end-to-end workflows for using TensorRT Edge-LLM, c
 
 Every TensorRT Edge-LLM deployment follows this pattern:
 
-```
-HuggingFace Model → [Quantize] → [Export] → ONNX → [Build] → Engine → [Inference]
-     (x86)             (x86)       (x86)    (transfer)  (device)  (device)   (device)
+```mermaid
+graph LR
+    HF[HuggingFace Model<br/>x86] --> QUANT[Quantize<br/>x86]
+    QUANT --> EXPORT[Export<br/>x86]
+    EXPORT --> ONNX[ONNX<br/>transfer]
+    ONNX --> BUILD[Build<br/>device]
+    BUILD --> ENGINE[Engine<br/>device]
+    ENGINE --> INF[Inference<br/>device]
 ```
 
 **Pipeline Stages:**

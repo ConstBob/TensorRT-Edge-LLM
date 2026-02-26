@@ -100,18 +100,18 @@ class END_NODES invisibleSubGraph
 graph LR
     INPUT_PROMPT(Input<BR>Prompt)
     TOKENIZER(Tokenize)
-    
+
     subgraph VIT_BOX ["Optional"]
         VIT_PROCESS(ViT<br>Processing)
     end
-    
+
     BASE_PREFILL_ENGINE[Base Prefill<BR>**TRT Engine**]
     BASE_KV_GEN(Generate Base<BR>KV-Cache, Logits <BR>& Hidden States)
     BASE_SAMPLE(Sample)
     DRAFT_PREFILL_ENGINE[Draft Prefill<BR>**TRT Engine**]
     DRAFT_KV_GEN(Generate Draft<BR>KV-Cache, Logits<BR>& Hidden States)
     PHASE2_START(Phase 2:<BR>Generation)
-    
+
     INPUT_PROMPT --> TOKENIZER
     TOKENIZER --> VIT_PROCESS
     VIT_PROCESS --> BASE_PREFILL_ENGINE
@@ -120,13 +120,13 @@ graph LR
     BASE_SAMPLE --> DRAFT_PREFILL_ENGINE
     DRAFT_PREFILL_ENGINE --> DRAFT_KV_GEN
     DRAFT_KV_GEN --> PHASE2_START
-    
+
     classDef greyNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef nvLightNode fill:#b8d67e,stroke:#76B900,stroke-width:1px,color:#333
     classDef inputNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef optionalBox fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:5 5
-    
+
     class PHASE2_START nvNode
     class INPUT_PROMPT inputNode
     class TOKENIZER,VIT_PROCESS,BASE_PREFILL_ENGINE,DRAFT_PREFILL_ENGINE,BASE_SAMPLE greyNode
@@ -142,20 +142,20 @@ graph LR
     PHASE1_INPUT(Phase 1:<BR>Prefill)
     DRAFT_ACCEPT_ENGINE[Draft Accept Token<BR>**TRT Engine**]
     DRAFT_KV_GEN2(Generate Draft<BR>KV-Cache, Logits<BR>& Hidden States)
-    
+
     subgraph TREE_CONSTRUCTION ["Draft Tree Construction"]
         DRAFT_PROPOSAL_ENGINE[Draft Batch Proposal<BR>**TRT Engine**]
         SELECT_TOP_N(Select Top-N <BR>Tokens via Logits)
         UPDATE_DRAFT_KV(Update Draft<BR>KV-Cache & <BR>Hidden States)
         TREE_ROUND_CHECK{Tree<BR>Done?}
     end
-    
+
     BASE_VERIFY_ENGINE[Base Tree Verification<BR>**TRT Engine**]
     EAGLE_ACCEPT(EAGLE Accept Algorithm<BR>Token Selection)
     BUILD_KV_CACHE(Update Base Model<BR>KV Cache with <BR>Accepted Tokens)
     STOP_CHECK{Stop?}
     OUTPUT_SEQUENCE(Generated<BR>Sequence)
-    
+
     PHASE1_INPUT --> DRAFT_KV_GEN2
     DRAFT_ACCEPT_ENGINE --> DRAFT_KV_GEN2
     DRAFT_KV_GEN2 --> DRAFT_PROPOSAL_ENGINE
@@ -169,13 +169,13 @@ graph LR
     BUILD_KV_CACHE --> STOP_CHECK
     STOP_CHECK -->|N| DRAFT_ACCEPT_ENGINE
     STOP_CHECK -->|Y| OUTPUT_SEQUENCE
-    
+
     classDef greyNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef darkNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef nvLightNode fill:#b8d67e,stroke:#76B900,stroke-width:1px,color:#333
     classDef lightSubGraph fill:none,stroke:#aaa,stroke-width:1.5px
-    
+
     class PHASE1_INPUT nvNode
     class TOKENIZER,TREE_ROUND_CHECK,STOP_CHECK,SELECT_TOP_N,DRAFT_ACCEPT_ENGINE,DRAFT_PROPOSAL_ENGINE,BASE_VERIFY_ENGINE greyNode
     class DRAFT_KV_GEN2,UPDATE_DRAFT_KV,BUILD_KV_CACHE nvLightNode
@@ -204,7 +204,7 @@ The generation phase uses iterative tree-based speculation with conditional draf
 - **Subsequent Rounds**: Draft model accept token operation instead of full prefill
 - **Draft Tree Construction**: Draft model generates candidate token trees using top-k sampling from draft logits
 - **Base Model Verification**: Base model processes entire draft tree in parallel and generates logits for all tree positions
-- **EAGLE Accept Algorithm**: 
+- **EAGLE Accept Algorithm**:
   - Base model's top-1 predictions are **always selected** as final tokens
   - Draft tree tokens are **accepted only when they match** base model predictions
   - When draft tokens diverge from base predictions, remaining draft tokens are **rejected**
@@ -231,16 +231,39 @@ The generation phase uses iterative tree-based speculation with conditional draf
 ### EAGLE Speculative Decoding
 
 ```cpp
-#include "llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmRuntimeUtils.h"
 
-// Initialize runtime with base and draft models
-LLMInferenceSpecDecodeRuntime runtime(baseModelDir, draftModelDir);
+// Initialize CUDA stream
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&stream));
 
-// Execute inference
-InferenceRequest request;
-request.inputText = "Explain quantum computing.";
-request.maxLength = 200;
+// Configure EAGLE drafting parameters
+EagleDraftingConfig draftingConfig;
+draftingConfig.draftingTopK = 10;
+draftingConfig.draftingStep = 6;
+draftingConfig.verifyTreeSize = 60;
 
-auto response = runtime.handleRequest(request);
-std::cout << "Generated: " << response.outputText << std::endl;
+// Initialize runtime (4 parameters: engineDir, multimodalEngineDir, draftingConfig, stream)
+LLMInferenceSpecDecodeRuntime runtime(engineDir, "", draftingConfig, stream);
+
+// Prepare request
+LLMGenerationRequest request;
+request.requests.resize(1);
+request.requests[0].messages.push_back({{"role", "user"}, {"content", "Explain quantum computing."}});
+request.maxGenerateLength = 200;
+request.temperature = 1.0;
+request.topK = 50;
+request.topP = 0.8;
+
+// Prepare response
+LLMGenerationResponse response;
+
+// Execute inference (3 parameters: request, response, stream)
+if (runtime.handleRequest(request, response, stream)) {
+    std::cout << "Generated: " << response.outputTexts[0] << std::endl;
+}
+
+// Cleanup
+CUDA_CHECK(cudaStreamDestroy(stream));
 ```

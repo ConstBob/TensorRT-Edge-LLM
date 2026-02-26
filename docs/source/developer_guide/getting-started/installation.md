@@ -1,7 +1,6 @@
 # Installation
 
-> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release 
-
+> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release
 
 TensorRT Edge-LLM has two separate components that need to be installed on different systems:
 
@@ -18,12 +17,63 @@ The Python export pipeline converts and quantizes models. This must run on an x8
 
 - **Platform**: x86-64 Linux system
 - **Recommended OS**: Ubuntu 22.04, 24.04
-- **GPU**: NVIDIA GPU (for model quantization)
+- **GPU**: NVIDIA GPU with Compute Capability 8.0+ (Ampere or newer)
 - **CUDA**: 12.x or 13.x
 - **Python**: 3.10+
-- **Disk Space**: ~50-100GB for models, quantized weights, and ONNX files
+
+#### Memory Requirements
+
+**GPU Memory (VRAM):**
+- General rule: ~2-3x model size for most operations, ~5-6x model size for FP8 ONNX export
+- Small models (0.6B-3B): 8-16GB
+- Large models (7B-8B): 20-48GB
+- Very large models (13B+): 48GB+
+
+**CPU Memory (RAM):**
+- General rule: ~2-3x model size for most operations, **~18-20x** model size for FP8 ONNX export
+- Small models (0.6B-3B): 8-16GB (48GB+ for FP8 ONNX export)
+- Large models (7B-8B): 20-48GB (128GB+ for FP8 ONNX export)
+- Very large models (13B+): 48GB+
+
+> **Note:** FP8 ONNX export currently requires significantly higher CPU (up to 20x model size) and GPU (up to 6x model size) memory due to internal processing. This is a known issue and is being actively optimized.
+
+**Verify Your Prerequisites:**
+
+```bash
+# Check CUDA installation
+nvcc --version
+# Should show CUDA 12.x or 13.x
+
+# Check GPU and available memory
+nvidia-smi
+# Look for GPU memory (e.g., "24576MiB" for 24GB)
+
+# Check Python version
+python3 --version
+# Should show Python 3.10 or higher
+```
+
+**If CUDA is not installed:**
+
+Download and install CUDA Toolkit from [NVIDIA CUDA Downloads](https://developer.nvidia.com/cuda-downloads). Choose version 12.x or 13.x for your system.
+
+After installation, verify with `nvcc --version` and `nvidia-smi`.
 
 ### Installing
+
+For a containerized environment for clean installation, it is recommended to use the NVIDIA PyTorch Docker image:
+
+```bash
+# Pull the recommended Docker image
+docker pull nvcr.io/nvidia/pytorch:25.12-py3
+
+# Run the container with GPU support
+docker run --gpus all -it --rm \
+    -v $(pwd):/workspace \
+    -w /workspace \
+    nvcr.io/nvidia/pytorch:25.12-py3 \
+    bash
+```
 
 **1. Clone Repository**
 
@@ -35,11 +85,16 @@ git submodule update --init --recursive
 
 **2. Install Python Package**
 
+If you are not using container, it is recommended to use a virtual environment:
 ```bash
 # Create virtual environment (recommended)
 python3 -m venv venv
 source venv/bin/activate
+```
 
+Then just install the software:
+
+```bash
 # Install package with all dependencies
 pip3 install .
 ```
@@ -61,15 +116,26 @@ tensorrt-edgellm-export-llm --help
 tensorrt-edgellm-quantize-llm --help
 ```
 
-**4. Configure HuggingFace Access (for gated models)**
+**4. Configure HuggingFace Access (Optional)**
 
-For gated models like Llama and Phi-4:
+Some models on HuggingFace require you to accept terms before downloading. This is **not required** for the quick start example (Qwen3-0.6B).
+
+**Models that require HuggingFace login:**
+- Llama family (Llama 3.x)
+- Phi-4 and Phi-4-Multimodal
+- Other models marked as "gated" on HuggingFace
+
+**To configure access:**
 
 ```bash
 # Install HuggingFace CLI and login
 huggingface-cli login
 # Enter your HuggingFace access token when prompted
 ```
+
+> **How to get a token:** Visit [HuggingFace Settings - Tokens](https://huggingface.co/settings/tokens), create a new token (read access is sufficient), and copy it.
+
+> **For the quick start guide:** You can skip this step and proceed to verification.
 
 **You're done with export pipeline setup!** You can now export and quantize models. The ONNX files will be transferred to the Edge device for runtime deployment.
 
@@ -102,7 +168,7 @@ sudo apt install -y \
 
 **2. Verify CUDA and TensorRT Installation**
 
-After Jetpack is installed, TensorRT should be installed in /usr
+After JetPack is installed, TensorRT should be installed in /usr
 
 ```bash
 # Check CUDA version
@@ -124,24 +190,34 @@ git submodule update --init --recursive
 
 **4. Configure Build**
 
+On your Jetson Thor device, configure the build with the following command:
+
 ```bash
 mkdir build
 cd build
 
-# For Edge platforms, it requires toolchain + embedded target
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr \
     -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
     -DEMBEDDED_TARGET=jetson-thor
+```
 
-# If you are just developing on GPUs (SM80, 86, 89, 120) - No toolchain or embedded target needed.
+**Alternative: Building on x86 GPU Systems (Optional for Developers)**
+
+If you want to build and test on an x86 workstation with NVIDIA GPU (for development purposes before deploying to Edge devices), you can use this configuration instead:
+
+```bash
+mkdir build
+cd build
 
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
-    -DTRT_PACKAGE_DIR=/path/to/TensorRT \
-    -DCUDA_CTK_VERSION=13.0
+    -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
+    -DCUDA_VERSION=<YOUR_CUDA_VERSION>
 ```
+
+> **Note:** Replace `/usr/local/TensorRT-10.x.x` with your actual TensorRT installation path. Use `dpkg -l | grep tensorrt` to find it, or download from [NVIDIA TensorRT downloads](https://developer.nvidia.com/tensorrt). Replace `<YOUR_CUDA_VERSION>` with your actual CUDA version (e.g., `13.0`). Use `nvcc --version` to check your CUDA version.
 
 **CMake Options:**
 
@@ -206,7 +282,7 @@ nvcc --version
 
 **Issue: `TensorRT not found` during CMake**
 
-Solution: Specify TensorRT package directory. This directory shall contain `lib` and `include` and we are looking for `nvinfer` library and header:
+Solution: Specify TensorRT package directory. This directory should contain `lib` and `include` directories, and we are looking for the `nvinfer` library and header:
 ```bash
 cmake .. \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \

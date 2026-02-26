@@ -12,40 +12,40 @@ graph TB
         MODEL_ARCH[Model Architecture]
         MODEL_WEIGHTS[Model Weights]
     end
-    
+
     subgraph EXPORT ["Python Export Pipeline"]
         QUANT[Quantization]
         ONNX_EXPORT[ONNX Export]
         CUSTOM_OPERATORS[Custom Operators]
     end
-    
+
     subgraph ENGINE ["Engine Builder"]
         BUILD_CONFIG[Build Configuration]
         TRT_PLUGINS[TensorRT Plugins]
     end
-    
+
     subgraph RUNTIME ["C++ Runtime"]
         TOKENIZATION[Text Processing]
         SAMPLING_CONFIG[Sampling Parameters]
         RUNTIME_CONFIG[Runtime Configuration]
         MULTIMODAL_RUNNER[Multimodal Runner]
     end
-    
+
     subgraph APP ["Application"]
         EXAMPLES[Examples]
     end
-    
+
     MODEL_ARCH ~~~ MODEL_WEIGHTS
-    
+
     QUANT ~~~ ONNX_EXPORT
     ONNX_EXPORT ~~~ CUSTOM_OPERATORS
-    
+
     BUILD_CONFIG ~~~ TRT_PLUGINS
-    
+
     TOKENIZATION ~~~ SAMPLING_CONFIG
     SAMPLING_CONFIG ~~~ RUNTIME_CONFIG
     RUNTIME_CONFIG ~~~ MULTIMODAL_RUNNER
-    
+
     MODELS --> EXPORT
     EXPORT --> ENGINE
     ENGINE --> RUNTIME
@@ -53,7 +53,7 @@ graph TB
 
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef layerBox fill:none,stroke:#76B900,stroke-width:2px
-    
+
     class MODEL_ARCH,MODEL_WEIGHTS,QUANT,ONNX_EXPORT,CUSTOM_OPERATORS,BUILD_CONFIG,TRT_PLUGINS,TOKENIZATION,SAMPLING_CONFIG,RUNTIME_CONFIG,MULTIMODAL_RUNNER,EXAMPLES nvNode
     class MODELS,EXPORT,ENGINE,RUNTIME,APP layerBox
 ```
@@ -68,7 +68,7 @@ graph TB
 | **Python Export** | ONNX Export Logic | **Inherit/Adapt:** `export_llm_model()`, `visual_export()`, `export_draft_model()` functions. **Configuration:** Dynamic axes, opset version |
 | **Python Export** | Custom Operators | **Registration:** Custom operators via `@torch.library.custom_op()` and `register_custom_op_symbolic()` |
 | **Engine Builder** | Build Configuration | **Configuration:** Batch size, sequence length, precision, LoRA rank, EAGLE settings, VLM mode, image tokens. **Inherit/Adapt:** Setup optimization profiles for custom models |
-| **Engine Builder** | Custom Operations | **Plugin:** Implement `IPluginV2DynamicExt`, `IPluginCreator` for TensorRT. Examples: Custom attention, specialized kernels |
+| **Engine Builder** | Custom Operations | **Plugin:** Implement TensorRT Plugin via `IPluginV3` layer. Examples: Custom attention, specialized kernels |
 | **C++ Runtime** | Text Processing | **Configuration:** Load different tokenizer vocab files. **Inherit/Adapt:** `PreTokenizer`, `TokenEncoder` for custom preprocessing |
 | **C++ Runtime** | Sampling Parameters | **Configuration:** Temperature, top-k, top-p values in input JSON. **Inherit/Adapt:** Extend `sampling.cu` for custom algorithms |
 | **C++ Runtime** | Multimodal Runner | **Inherit/Adapt:** `MultimodalRunner` base class for new multimodal encoders |
@@ -170,15 +170,15 @@ from torch.utils.data import DataLoader, Dataset
 
 class CustomCalibDataset(Dataset):
     """Custom calibration dataset for domain-specific quantization."""
-    
+
     def __init__(self, tokenizer, texts, max_length=512):
         self.tokenizer = tokenizer
         self.texts = texts
         self.max_length = max_length
-    
+
     def __len__(self):
         return len(self.texts)
-    
+
     def __getitem__(self, idx):
         encoded = self.tokenizer(
             self.texts[idx],
@@ -366,14 +366,14 @@ Use the example as a template and adapt for your use case:
 int main(int argc, char** argv) {
     // 1. Parse command line arguments
     // ... argument parsing ...
-    
+
     // 2. Initialize CUDA
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    
+
     // 3. Load plugin library
     auto pluginHandles = trt_edgellm::loadEdgellmPluginLib();
-    
+
     // 4. Create runtime
     auto runtime = trt_edgellm::rt::LLMInferenceRuntime::create(
         engineDir,
@@ -381,18 +381,18 @@ int main(int argc, char** argv) {
         loraWeightsMap,
         stream
     );
-    
+
     // 5. Optional: Warmup and CUDA graph capture
     if (warmupIterations > 0) {
         // Run warmup requests
         runtime->captureDecodingCUDAGraph(stream);
     }
-    
+
     // 6. Process requests
     for (auto const& input : inputs) {
         trt_edgellm::rt::LLMGenerationRequest request;
         trt_edgellm::rt::LLMGenerationResponse response;
-        
+
         // Fill request from input
         request.userPrompt = input.prompt;
         request.systemPrompt = input.systemPrompt;
@@ -400,17 +400,17 @@ int main(int argc, char** argv) {
         request.topK = input.topK;
         request.topP = input.topP;
         request.maxGenerateLength = input.maxLength;
-        
+
         // Handle request
         if (!runtime->handleRequest(request, response, stream)) {
             LOG_ERROR("Failed to handle request");
             continue;
         }
-        
+
         // Process response
         std::cout << "Generated: " << response.generatedText << std::endl;
     }
-    
+
     // 7. Cleanup
     CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
