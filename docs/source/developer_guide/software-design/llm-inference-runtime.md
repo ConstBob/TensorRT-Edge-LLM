@@ -18,26 +18,26 @@ graph TB
     KV_CACHE1[Linear KV Cache]
     SAMPLING1[Sampling Kernels]
     STANDARD_ENGINE[TRT Engine]
-    
+
     %% Connections
     CLIENT1 -->|handleRequest| STANDARD_RT
     STANDARD_RT -->|owns & manages| LLM_RUNNER1
     STANDARD_RT -->|owns optional| MULTIMODAL1
     STANDARD_RT -->|owns| TOKENIZER1
     STANDARD_RT -->|calls| SAMPLING1
-    
+
     LLM_RUNNER1 -->|owns & manages| KV_CACHE1
     LLM_RUNNER1 -->|executes| STANDARD_ENGINE
-    
+
     MULTIMODAL1 -->|provides embeddings| LLM_RUNNER1
     TOKENIZER1 -->|encode/decode| LLM_RUNNER1
-    
+
     %% Styling
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
     classDef greyNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef darkNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef inputNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
-    
+
     class CLIENT1 inputNode
     class STANDARD_RT,LLM_RUNNER1,TOKENIZER1,MULTIMODAL1,KV_CACHE1,SAMPLING1 nvNode
     class STANDARD_ENGINE greyNode
@@ -66,32 +66,32 @@ The LLM Inference Runtime implements a dual-phase processing architecture optimi
 %%{init: {'theme':'neutral', 'themeVariables': {'primaryColor':'#76B900','primaryTextColor':'#fff','primaryBorderColor':'#5a8f00','lineColor':'#666','edgeLabelBackground':'#ffffff','labelTextColor':'#000','clusterBkg':'#ffffff','clusterBorder':'#999'}}}%%
 graph LR
     INPUT_PROMPT(Input<br/>Prompt) --> TOKENIZER(Tokenize)
-    
+
     subgraph VIT_BOX ["Optional"]
         VIT_PROCESS(ViT<br>Processing)
     end
-    
+
     TOKENIZER --> VIT_PROCESS
     VIT_PROCESS --> PREFILL_ENGINE(Prefill<br/>**TRT Engine**)
-    
+
     PREFILL_ENGINE --> GENERATE_KV[Generate<br/>KV-Cache]
     GENERATE_KV --> SAMPLE_FIRST(Sample First<br/>Token)
-    
+
     SAMPLE_FIRST --> GENERATION_ENGINE[Generation<br/>**TRT Engine** or<br>**CUDA Graph**]
-    
+
     GENERATION_ENGINE --> UPDATE_KV(Update<br>KV Cache)
     UPDATE_KV --> SAMPLE_TOKEN(Sample Next<br/>Token)
-    
+
     SAMPLE_TOKEN --> STOP_CHECK{Stop<br/>Condition?}
     STOP_CHECK -->|N| GENERATION_ENGINE
     STOP_CHECK -->|Y| OUTPUT_SEQUENCE(Generated<br/>Sequence)
-    
+
     subgraph PHASE1 ["Phase 1: Prefill"]
         PREFILL_ENGINE
         GENERATE_KV
         SAMPLE_FIRST
     end
-    
+
     subgraph PHASE2 ["Phase 2: Generation"]
         GENERATION_ENGINE
         UPDATE_KV
@@ -99,7 +99,7 @@ graph LR
         STOP_CHECK
         OUTPUT_SEQUENCE
     end
-    
+
     classDef greyNode fill:#f5f5f5,stroke:#999,stroke-width:1px,color:#333
     classDef darkNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef nvNode fill:#76B900,stroke:#5a8f00,stroke-width:1px,color:#fff
@@ -108,7 +108,7 @@ graph LR
     classDef itemNode fill:#ffffff,stroke:#999,stroke-width:1px,color:#333
     classDef lightSubGraph fill:none,stroke:#aaa,stroke-width:1.5px
     classDef optionalBox fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:5 5
-    
+
     class INPUT_PROMPT inputNode
     class TOKENIZER,SAMPLE_FIRST,SAMPLE_TOKEN,VIT_PROCESS,STOP_CHECK,PREFILL_ENGINE,GENERATION_ENGINE greyNode
     class GENERATE_KV,UPDATE_KV nvLightNode
@@ -125,7 +125,7 @@ graph LR
 The prefill phase processes the entire input prompt in parallel to establish the initial inference state:
 
 - **Input Processing**: Text is tokenized and padded to batch requirements
-- **Multimodal Integration**: For VLMs, vision embeddings are processed through ViT components and integrated with text embeddings  
+- **Multimodal Integration**: For VLMs, vision embeddings are processed through ViT components and integrated with text embeddings
 - **Parallel Execution**: All prompt tokens are processed simultaneously through transformer layers
 - **KV-Cache Generation**: Key-value cache is populated for all prompt tokens
 - **First Token Sampling**: Initial generated token is sampled from output logits
@@ -147,54 +147,126 @@ The generation phase operates autoregressively, processing one token at a time:
 ### Standard LLM Inference
 
 ```cpp
-#include "llmInferenceRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
+#include <unordered_map>
 
-// Initialize runtime
-LLMInferenceRuntime runtime(engineDir);
+// Initialize CUDA stream
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&stream));
+
+// Initialize runtime (4 parameters: engineDir, multimodalEngineDir, loraWeightsMap, stream)
+std::unordered_map<std::string, std::string> loraWeightsMap{}; // Empty for no LoRA
+LLMInferenceRuntime runtime(engineDir, "", loraWeightsMap, stream);
 
 // Prepare request
-InferenceRequest request;
-request.inputText = "What is the capital of France?";
-request.maxLength = 100;
-request.temperature = 0.7;
+LLMGenerationRequest request;
+request.requests.resize(1);
+request.requests[0].messages.push_back({{"role", "user"}, {"content", "What is the capital of France?"}});
+request.maxGenerateLength = 100;
+request.temperature = 1.0;
+request.topK = 50;
+request.topP = 0.8;
 
-// Execute inference
-auto response = runtime.handleRequest(request);
-std::cout << "Generated: " << response.outputText << std::endl;
+// Prepare response
+LLMGenerationResponse response;
+
+// Execute inference (3 parameters: request, response, stream)
+if (runtime.handleRequest(request, response, stream)) {
+    std::cout << "Generated: " << response.outputTexts[0] << std::endl;
+}
+
+// Cleanup
+CUDA_CHECK(cudaStreamDestroy(stream));
 ```
 
 ### LoRA Adapter Switching
 
 ```cpp
-// Load LoRA adapters
-runtime.addLoraWeights("medical", "lora_weights/medical_adapter.safetensors");
-runtime.addLoraWeights("legal", "lora_weights/legal_adapter.safetensors");
+#include "runtime/llmInferenceRuntime.h"
+#include <unordered_map>
 
-// Use medical adapter
-runtime.switchLoraWeights("medical");
-auto medical_response = runtime.handleRequest(medical_request);
+// Initialize CUDA stream
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&stream));
 
-// Switch to legal adapter
-runtime.switchLoraWeights("legal");
-auto legal_response = runtime.handleRequest(legal_request);
+// Initialize runtime with LoRA weights map
+std::unordered_map<std::string, std::string> loraWeightsMap{
+    {"medical", "lora_weights/medical_adapter.safetensors"},
+    {"legal", "lora_weights/legal_adapter.safetensors"}
+};
+LLMInferenceRuntime runtime(engineDir, "", loraWeightsMap, stream);
 
-// Disable LoRA
-runtime.switchLoraWeights("");
-auto base_response = runtime.handleRequest(base_request);
+// Prepare requests
+LLMGenerationRequest medicalRequest;
+medicalRequest.requests.resize(1);
+medicalRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Medical question"}});
+medicalRequest.loraWeightsName = "medical";
+medicalRequest.maxGenerateLength = 100;
+
+LLMGenerationRequest legalRequest;
+legalRequest.requests.resize(1);
+legalRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Legal question"}});
+legalRequest.loraWeightsName = "legal";
+legalRequest.maxGenerateLength = 100;
+
+// Execute inference with different LoRA adapters
+LLMGenerationResponse medicalResponse;
+runtime.handleRequest(medicalRequest, medicalResponse, stream);
+
+LLMGenerationResponse legalResponse;
+runtime.handleRequest(legalRequest, legalResponse, stream);
+
+// Disable LoRA (use empty string)
+LLMGenerationRequest baseRequest;
+baseRequest.requests.resize(1);
+baseRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Base question"}});
+baseRequest.loraWeightsName = "";
+baseRequest.maxGenerateLength = 100;
+
+LLMGenerationResponse baseResponse;
+runtime.handleRequest(baseRequest, baseResponse, stream);
+
+// Cleanup
+CUDA_CHECK(cudaStreamDestroy(stream));
 ```
 
 ### Multimodal VLM Inference
 
 ```cpp
-// Initialize multimodal runtime
-LLMInferenceRuntime runtime(engineDir, visualEngineDir);
+#include "runtime/llmInferenceRuntime.h"
+#include <unordered_map>
+
+// Initialize CUDA stream
+cudaStream_t stream;
+CUDA_CHECK(cudaStreamCreate(&stream));
+
+// Initialize multimodal runtime (4 parameters: engineDir, multimodalEngineDir, loraWeightsMap, stream)
+std::unordered_map<std::string, std::string> loraWeightsMap{}; // Empty for no LoRA
+LLMInferenceRuntime runtime(engineDir, visualEngineDir, loraWeightsMap, stream);
 
 // Prepare multimodal request
-InferenceRequest request;
-request.inputText = "What's in this image?";
-request.imagePaths = {"image.jpg"};
-request.maxLength = 150;
+LLMGenerationRequest request;
+request.requests.resize(1);
+request.requests[0].messages.push_back({
+    {"role", "user"},
+    {"content", {
+        {{"type", "image"}, {"image", "/path/to/image.jpg"}},
+        {{"type", "text"}, {"text", "What's in this image?"}}
+    }}
+});
+request.maxGenerateLength = 150;
+request.temperature = 1.0;
+request.topK = 50;
+request.topP = 0.8;
 
-auto response = runtime.handleRequest(request);
-std::cout << "Generated: " << response.outputText << std::endl;
+// Prepare response
+LLMGenerationResponse response;
+
+// Execute inference (3 parameters: request, response, stream)
+if (runtime.handleRequest(request, response, stream)) {
+    std::cout << "Generated: " << response.outputTexts[0] << std::endl;
+}
+
+// Cleanup
+CUDA_CHECK(cudaStreamDestroy(stream));
 ```

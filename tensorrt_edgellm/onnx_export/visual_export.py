@@ -207,7 +207,12 @@ def visual_export(model_dir: str,
         json.dump(config_dict, f, indent=2)
 
     # Export processor configuration to JSON if exists
-    processor.save_pretrained(output_dir)
+    if processor is not None:
+        # Phi4MMProcessor may not define audio_tokenizer, but transformers'
+        # save_pretrained expects the attribute.
+        if not hasattr(processor, "audio_tokenizer"):
+            processor.audio_tokenizer = None
+        processor.save_pretrained(output_dir)
 
     print(
         f"Visual export completed for {model_type} with dtype={dtype}, quantization={quantization}, device={device}"

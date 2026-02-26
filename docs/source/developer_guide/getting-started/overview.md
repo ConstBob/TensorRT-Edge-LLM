@@ -2,21 +2,53 @@
 
 > **Repository:** [github.com/NVIDIA/TensorRT-Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM)
 
-> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release 
-
+> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release
 
 ## What is TensorRT Edge-LLM?
 
 TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson and NVIDIA DRIVE platforms.
 
+## Supported Platforms
+
+### Hardware Platforms
+
+**Officially Supported Platforms:**
+
+| Platform | Software Release | Link |
+|----------|------------------|------|
+| NVIDIA Jetson Thor | JetPack 7.1 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
+| NVIDIA DRIVE Thor | NVIDIA DriveOS 7 | For details refer to NVIDIA DriveOS 7 release documentation |
+
+> **Note:** The platforms listed above are officially supported and tested. While TensorRT Edge-LLM may run on other NVIDIA GPU platforms (for example, discrete GPUs, other Jetson devices), these are not officially supported but may be used for experimental purposes.
+
+**Compatible Platforms:**
+
+| Platform | Software Release |
+|----------|------------------|
+| NVIDIA Jetson Orin | JetPack 6.2.x |
+
+> **Note:** TensorRT Edge-LLM will officially support Jetson Orin via later JetPack releases. While JetPack 6.2.x is compatible, the support is experimental. 
+
+
+### Supported Model Families
+
+TensorRT Edge-LLM supports a wide range of state-of-the-art models:
+- **Large Language Models**: Llama 3.x, Qwen 2/2.5/3, DeepSeek-R1 Distilled
+- **Vision-Language Models**: Qwen2/2.5/3-VL, InternVL3-1B-hf, InternVL3-2B-hf, Phi-4-Multimodal
+- **Quantization**: FP16, FP8 (SM89+), INT4 AWQ/GPTQ, NVFP4 (SM100+)
+
+For the complete list of supported models, precision requirements, and platform compatibility, see **[Supported Models](supported-models.md)**.
+
+---
+
 ## Key Features
 
-- **🚀 High Performance**: Optimized CUDA kernels and TensorRT integration for maximum throughput
-- **💾 Memory Efficient**: Advanced KV cache management and quantization support (FP8, INT4)
-- **🔄 Production Ready**: C++-only runtime with no Python dependencies
-- **🎯 Edge Optimized**: Designed specifically for embedded and automotive platforms
-- **🔧 Flexible**: Support for LoRA adapters, speculative decoding, and multimodal models
-- **📊 Complete Toolkit**: Python export pipeline, engine builder, and runtime in one package
+- **🚀 High Performance**: Optimized CUDA kernels and TensorRT integration for minimum latency
+- **💾 Memory Efficient**: Supporting 4-bit quantization for reduced memory footprint, with [FP8 KV cache](../features/FP8KV.md) support for additional memory savings
+- **🔄 Production Ready**: C++-only runtime with no Python dependencies, designed for deployment on edge devices
+- **🎯 Edge Optimized**: Built specifically for NVIDIA Jetson and DRIVE platforms with platform-specific optimizations
+- **🔧 Rich Feature Set**: Supports [LoRA adapters](../features/lora.md), EAGLE3 speculative decoding, [system prompt caching](../features/system-prompt-cache.md), [vocabulary reduction](../features/reduce-vocab.md), and vision-language models
+- **📊 Complete Toolkit**: End-to-end workflow from Python export pipeline to C++ runtime, with engine builder and examples
 
 ## Key Components
 
@@ -65,43 +97,17 @@ graph LR
 | **C++ Runtime** | C++-based runtime that executes TensorRT engines with CUDA graphs, LoRA, and EAGLE support. [Learn More](../software-design/cpp-runtime-overview.md) |
 | **Examples** | Reference implementations demonstrating LLM, multimodal, and utility use cases. [Learn More](examples.md) |
 
-## Use Cases
-
-TensorRT Edge-LLM is ideal for:
-
-**🚗 Automotive**
-- In-vehicle AI assistants
-- Voice-controlled interfaces
-- Scene understanding and description
-- Driver assistance systems
-
-**🤖 Robotics**
-- Natural language interaction
-- Task planning and reasoning
-- Visual question answering
-- Human-robot collaboration
-
 ---
 
-## Supported Platforms
+## Next Steps
 
-### Hardware Platforms
+Ready to get started with TensorRT Edge-LLM? Follow these steps:
 
-| Platform | Software Release | Link |
-|----------|------------------|------|
-| NVIDIA Jetson Thor | JetPack 7.1 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
-| NVIDIA DRIVE Thor | NVIDIA DriveOS 7 | For details refer to NVIDIA DriveOS 7 release documentation |
+1. **[Installation Guide](installation.md)** - Set up the Python export pipeline on your x86 host and build the C++ runtime on your edge device
 
-> **Note:** The platforms listed above are officially supported and tested. While TensorRT Edge-LLM may run on other NVIDIA GPU platforms (for example, discrete GPUs, other Jetson devices), these are not officially supported but may be used for experimental purposes.
+2. **[Quick Start Guide](quick-start-guide.md)** - Run your first LLM inference in ~15 minutes with step-by-step instructions
 
-### Supported Model Families
-
-TensorRT Edge-LLM supports a wide range of state-of-the-art models:
-- **Large Language Models**: Llama 3.x, Qwen 2/2.5/3, DeepSeek-R1 Distilled
-- **Vision-Language Models**: Qwen2/2.5/3-VL, InternVL3, Phi-4-Multimodal
-- **Quantization**: FP16, FP8 (SM89+), INT4 AWQ/GPTQ, NVFP4 (SM100+)
-
-For the complete list of supported models, precision requirements, and platform compatibility, see **[Supported Models](supported-models.md)**.
+3. **[Examples](examples.md)** - Explore advanced workflows including VLM inference, EAGLE speculative decoding, and LoRA support
 
 ---
 
