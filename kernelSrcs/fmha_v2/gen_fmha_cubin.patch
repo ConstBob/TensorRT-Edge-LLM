@@ -1,65 +1,48 @@
 diff --git a/cpp/kernels/fmha_v2/Makefile b/cpp/kernels/fmha_v2/Makefile
-index bec3b70e7..a001885ea 100644
+index bec3b70e7..91bcc9301 100644
 --- a/cpp/kernels/fmha_v2/Makefile
 +++ b/cpp/kernels/fmha_v2/Makefile
-@@ -95,24 +95,37 @@ NVCC_FLAGS += $(PREPROCESSOR_FLAGS)
- # The include directories.
- INCLUDE_DIRS += -I./src -I./generated -I$(CUDA)/include
- 
-+ifdef ENABLE_SM12X
-+GENCODE_SM70 =
-+GENCODE_SM72 =
-+GENCODE_SM75 =
-+GENCODE_SM80 =
-+GENCODE_SM86 =
-+GENCODE_SM87 =
-+GENCODE_SM89 =
-+GENCODE_SM90 =
-+GENCODE_SM101 =
-+GENCODE_SM120 = -gencode=arch=compute_120,code=\"sm_120\"
-+GENCODE_SM121 = -gencode=arch=compute_121,code=\"sm_121\"
-+else
- GENCODE_SM80 = -gencode=arch=compute_80,code=\"sm_80\"
- GENCODE_SM86 = -gencode=arch=compute_86,code=\"sm_86\"
- GENCODE_SM87 = -gencode=arch=compute_87,code=\"sm_87\"
+@@ -101,16 +101,20 @@ GENCODE_SM87 = -gencode=arch=compute_87,code=\"sm_87\"
  GENCODE_SM89 = -gencode=arch=compute_89,code=\"sm_89\"
  GENCODE_SM90 = -gencode=arch=compute_90a,code=\"sm_90a\"
  
 -ifndef ENABLE_SM100
--GENCODE_SM100 =
-+ifdef ENABLE_SM100
-+GENCODE_SM100 = -gencode=arch=compute_100a,code=\"sm_100a\"
++ifndef ENABLE_SM10X
+ GENCODE_SM100 =
++GENCODE_SM101 =
  else
--GENCODE_SM100 = -gencode=arch=compute_100,code=\"sm_100\"
-+GENCODE_SM100 =
+ GENCODE_SM100 = -gencode=arch=compute_100,code=\"sm_100\"
++GENCODE_SM101 = -gencode=arch=compute_101,code=\"sm_101\"
  endif
  
 -ifndef ENABLE_SM120
 +ifndef ENABLE_SM12X
-+GENCODE_SM101 = -gencode=arch=compute_101,code=\"sm_101\"
  GENCODE_SM120 =
--else
--GENCODE_SM120 = -gencode=arch=compute_120,code=\"sm_120\"
 +GENCODE_SM121 =
-+endif
+ else
+ GENCODE_SM120 = -gencode=arch=compute_120,code=\"sm_120\"
++GENCODE_SM121 = -gencode=arch=compute_121,code=\"sm_121\"
  endif
--
  
- NVCC_FLAGS += --keep --keep-dir $(TMP_DIR)
  
-@@ -135,8 +148,10 @@ GENCODES += $(GENCODE_SM89)
+@@ -135,6 +139,8 @@ GENCODES += $(GENCODE_SM89)
  GENCODES += $(GENCODE_SM90)
  GENCODES += $(GENCODE_SM100)
  GENCODES += $(GENCODE_SM120)
 +GENCODES += $(GENCODE_SM101)
 +GENCODES += $(GENCODE_SM121)
  
--SOFTMAX_GENCODES = $(GENCODE_SM80) $(GENCODE_SM89) $(GENCODE_SM90)
-+SOFTMAX_GENCODES = $(GENCODE_SM80) $(GENCODE_SM89) $(GENCODE_SM90) $(GENCODE_SM100)
+ SOFTMAX_GENCODES = $(GENCODE_SM80) $(GENCODE_SM89) $(GENCODE_SM90)
  ifdef SOFTMAX_ALL_GENCODES
- SOFTMAX_GENCODES = $(GENCODES)
- endif
-@@ -255,6 +270,10 @@ obj/%_sm100.cu.o: ./generated/%_sm100.cu ./src/*.h ./src/fmha/*.h ./src/fmha/hop
+@@ -191,6 +197,7 @@ cubin: $(CUBIN_CPP)
+ cubin_demobert:
+ 	$(MAKE) dirs
+ 	$(MAKE) PREPROCESSOR_FLAGS="$(PREPROCESSOR_FLAGS) -DUSE_DEMO_BERT_PARAMS=1" $(CUBIN_CPP)
++	cp ./generated/fmha_cubin.cpp ./cubin/fmha_cubin.h
+ 
+ clean:
+ 	rm -rf bin obj cubin generated train_ops/build
+@@ -255,6 +262,10 @@ obj/%_sm100.cu.o: ./generated/%_sm100.cu ./src/*.h ./src/fmha/*.h ./src/fmha/hop
  	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM100) $(INCLUDE_DIRS) -c -o $@ $<
  obj/%_sm120.cu.o: ./generated/%_sm120.cu ./src/*.h ./src/fmha/*.h
  	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM120) $(INCLUDE_DIRS) -c -o $@ $<
@@ -70,7 +53,7 @@ index bec3b70e7..a001885ea 100644
  
  obj/%_sm80.no_i2f_f2i.cu.o: ./generated/%_sm80.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
  	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM80) $(INCLUDE_DIRS) -c -o $@ $<
-@@ -270,6 +289,10 @@ obj/%_sm100.no_i2f_f2i.cu.o: ./generated/%_sm100.no_i2f_f2i.cu ./src/*.h ./src/f
+@@ -270,6 +281,10 @@ obj/%_sm100.no_i2f_f2i.cu.o: ./generated/%_sm100.no_i2f_f2i.cu ./src/*.h ./src/f
  	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM100) $(INCLUDE_DIRS) -c -o $@ $<
  obj/%_sm120.no_i2f_f2i.cu.o: ./generated/%_sm120.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
  	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM120) $(INCLUDE_DIRS) -c -o $@ $<
@@ -81,7 +64,7 @@ index bec3b70e7..a001885ea 100644
  
  obj/softmax_%.cu.o: ./src/softmax_%.cu
  	$(NVCC) $(NVCC_FLAGS) $(INCLUDE_DIRS) $(SOFTMAX_GENCODES) -c -o $@ $<
-@@ -314,6 +337,10 @@ cubin/%_sm100.cu.cubin: ./generated/%_sm100.cu ./src/*.h ./src/fmha/*.h
+@@ -314,6 +329,10 @@ cubin/%_sm100.cu.cubin: ./generated/%_sm100.cu ./src/*.h ./src/fmha/*.h
  	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM100) $(INCLUDE_DIRS) -cubin -o $@ $<
  cubin/%_sm120.cu.cubin: ./generated/%_sm120.cu ./src/*.h ./src/fmha/*.h
  	$(NVCC) $(NVCC_FLAGS) $(I2F_F2I_FLAGS) $(GENCODE_SM120) $(INCLUDE_DIRS) -cubin -o $@ $<
@@ -92,7 +75,7 @@ index bec3b70e7..a001885ea 100644
  
  cubin/%_sm80.no_i2f_f2i.cu.cubin: ./generated/%_sm80.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
  	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM80) $(INCLUDE_DIRS) -cubin -o $@ $<
-@@ -329,6 +356,10 @@ cubin/%_sm100.no_i2f_f2i.cu.cubin: ./generated/%_sm100.no_i2f_f2i.cu ./src/*.h .
+@@ -329,6 +348,10 @@ cubin/%_sm100.no_i2f_f2i.cu.cubin: ./generated/%_sm100.no_i2f_f2i.cu ./src/*.h .
  	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM100) $(INCLUDE_DIRS) -cubin -o $@ $<
  cubin/%_sm120.no_i2f_f2i.cu.cubin: ./generated/%_sm120.no_i2f_f2i.cu ./src/*.h ./src/fmha/*.h
  	$(NVCC) $(NVCC_FLAGS) $(GENCODE_SM120) $(INCLUDE_DIRS) -cubin -o $@ $<
@@ -104,31 +87,131 @@ index bec3b70e7..a001885ea 100644
  ###################################################################################################
  
 diff --git a/cpp/kernels/fmha_v2/setup.py b/cpp/kernels/fmha_v2/setup.py
-index cc3931caa..c1cdb96c4 100644
+index cc3931caa..5dbbd2507 100644
 --- a/cpp/kernels/fmha_v2/setup.py
 +++ b/cpp/kernels/fmha_v2/setup.py
-@@ -4965,6 +4965,74 @@ def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
+@@ -1947,7 +1947,7 @@ def get_hopper_instruction_traits(instruction_traits, kernel_spec):
+ 
+ 
+ def get_effective_sm_and_name(kspec):
+-    sm = kspec.sm
++    sm = kspec.sm_mma
+     # Override the mma instruction with an older one.
+     if kspec.sm_mma in sm2name:
+         assert kspec.sm_mma <= kspec.sm, "Instruction version should be at most target arch"
+@@ -1962,7 +1962,7 @@ def selected_mask_types(kspec):
+     padding_mask = '1'
+     causal_mask = '1'
+     sliding_or_chunked_causal_mask = '1'
+-    custom_mask = '1'
++    custom_mask = '0'
+     # only generate certain needed combinations of input_layout and mask types for trt-llm.
+     if "GENERATE_CUBIN" in os.environ:
+         if kspec.sage_block_sizes:
+@@ -3520,8 +3520,6 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
+     bool mEnableSkipSoftmax;{launcher_line}
+ }};
+ 
+-extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[];
+-extern const int sMhaKernelMetaInfosV2Size;
+ 
+ }} // namespace kernels
+ TRTLLM_NAMESPACE_END
+@@ -3530,13 +3528,7 @@ TRTLLM_NAMESPACE_END
+         source_content = '''\
+ {copyright}
+ 
+-#include "tensorrt_llm/common/config.h"
+-
+-#include <cstddef>
+-#include <cstdint>
+-#include <cuda_runtime_api.h>
+-
+-{local_ns_open}
++#pragma once
+ 
+ //--- Cubin Arrays
+ {cubins}
+@@ -3544,17 +3536,7 @@ TRTLLM_NAMESPACE_END
+ //--- Cubin Lengths
+ {cubin_lens}
+ 
+-{local_ns_close}
+-
+-using namespace tensorrt_llm::kernels;
+-
+-namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels {{
+-
+-class Fused_multihead_attention_params_v2;
+-class Launch_params;
+-
+-//--- Kernel Launchers
+-{launchers}
++namespace fmha_v2 {{
+ 
+ // FIXME: These are duplicated declarations, we should remove them in the future.
+ constexpr int32_t kSM_70 = 70;
+@@ -3562,6 +3544,7 @@ constexpr int32_t kSM_72 = 72;
+ constexpr int32_t kSM_75 = 75;
+ constexpr int32_t kSM_80 = 80;
+ constexpr int32_t kSM_86 = 86;
++constexpr int32_t kSM_87 = 87;
+ constexpr int32_t kSM_89 = 89;
+ constexpr int32_t kSM_90 = 90;
+ constexpr int32_t kSM_100 = 100;
+@@ -3569,6 +3552,7 @@ constexpr int32_t kSM_100f = 10100;
+ constexpr int32_t kSM_103 = 103;
+ constexpr int32_t kSM_120 = 120;
+ constexpr int32_t kSM_121 = 121;
++constexpr int32_t kSM_101 = 101;
+ 
+ // FIXME: These are duplicated declarations, we should remove them in the future.
+ enum Data_type
+@@ -3621,8 +3605,7 @@ extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[] = {
+ {metadata_v2}
+ }};
+ 
+-extern const int sMhaKernelMetaInfosV2Size = sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]);
+-}} // namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels
++}} // namespace fmha_v2
+ '''.format(**locals(), copyright=copyright)
+     else:
+         # Non-GENERATE_CUBIN mode: use old behavior
+@@ -4965,6 +4948,55 @@ def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
                                            head_size_v)
  
  
-+def enumerate_hmma_flash_kernels_edge_llm(specs, sm=80, dtype='fp16', input_layout=InputLayout.PACKED_QKV):
++def enumerate_hmma_flash_kernels_edge_llm(specs, 
++                                          sm=80, dtype='fp16', 
++                                          input_layout=InputLayout.PACKED_QKV, 
++                                          enable_attn_logit_softcapping=False, 
++                                          head_size_v=0):
 +    """EdgeLLM-specific kernel enumeration for fp16 with limited head sizes."""
-+    for head_size in [64, 128]:
-+        for q_loop_step, kv_loop_step in [(64, 32), (64, 128)]:
-+            # _nl_tiled kernels
++    sm_mma = 0
++    if sm in [70, 72]:
++        sm_mma = 70
++    elif sm in [75]:
++        sm_mma = 75
++    elif sm in [80, 86, 87, 89, 90, 100, 101, 120, 121]:
++        sm_mma = 80
++
++    tiled_head_dim_q_kv_step = [[0, 64, 64, 32],
++                                [0, 128, 64, 32],
++                                [1, 128, 64, 128]]
++    for tiled, head_size, q_loop_step, kv_loop_step in tiled_head_dim_q_kv_step:
 +            specs.append(
 +                kernel_spec(
 +                    sm=sm,
-+                    sm_mma=80,
++                    sm_mma=sm_mma,
 +                    dtype=dtype,
 +                    flash_attention=True,
-+                    tiled=1,
-+                    seq_len=0,
++                    tiled=tiled,
++                    seq_len=0,  # means any sequence here
 +                    kv_loop_step=kv_loop_step,
 +                    limit_qk_fragments=False,
 +                    limit_v_fragments=False,
 +                    head_size=head_size,
-+                    head_size_v=0,
++                    head_size_v=head_size_v,
 +                    warps_m=4,
 +                    warps_n=1,
 +                    version=2,
@@ -144,47 +227,15 @@ index cc3931caa..c1cdb96c4 100644
 +                    has_scale_max=False,
 +                    ctas_per_head=1,
 +                    input_layout=input_layout,
-+                    enable_attn_logit_softcapping=False,
-+                    is_mtp=False))
-+        # _nl kernels (non-tiled)
-+        specs.append(
-+            kernel_spec(
-+                sm=sm,
-+                sm_mma=80,
-+                dtype=dtype,
-+                flash_attention=True,
-+                tiled=0,
-+                seq_len=0,
-+                kv_loop_step=32,
-+                limit_qk_fragments=False,
-+                limit_v_fragments=False,
-+                head_size=head_size,
-+                head_size_v=0,
-+                warps_m=4,
-+                warps_n=1,
-+                version=2,
-+                interleaved=False,
-+                ldgsts_q=True,
-+                ldgsts_k=True,
-+                ldgsts_v=True,
-+                share_smem_k_v=False,
-+                loop_step=64,
-+                has_noloop=1,
-+                noloop_step=64,
-+                unroll_threshold=1,
-+                has_scale_max=False,
-+                ctas_per_head=1,
-+                input_layout=input_layout,
-+                enable_attn_logit_softcapping=False,
-+                is_mtp=False))
-+
++                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
++                    is_mtp=(head_size == 576 and head_size_v == 512)))
 +
  # Note this will be used in TRT-LLM.
  def enumerate_hmma_flash_kernels_base(specs,
                                        sm=80,
-@@ -6539,6 +6607,18 @@ def enumerate_kernels():
-                                      head_sizes=[192, 576],
-                                      output_dtype="bf16")
+@@ -6405,6 +6437,29 @@ def enumerate_kernels():
+ 
+     specs = []
  
 +    if 'GENERATE_EDGE_LLM' in os.environ:
 +        # EdgeLLM: fp16 only, limited head sizes, qkv/q_kv/q_k_v layouts
@@ -198,41 +249,20 @@ index cc3931caa..c1cdb96c4 100644
 +            for input_layout in [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.SEPARATE_Q_K_V]:
 +                enumerate_hmma_flash_kernels_edge_llm(specs, sm=sm, dtype='fp16', input_layout=input_layout)
 +
-     if 'ENABLE_HMMA_FP32' in os.environ:
-         enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16_fp32')
-         enumerate_hmma_flash_kernels(specs, sm=86, dtype='fp16_fp32')
-@@ -6606,9 +6686,30 @@ def enumerate_kernels():
-             kspec._replace(head_interleaved=False) for kspec in specs_expanded
-         ]
-     # yapf: disable
-+    if 'GENERATE_EDGE_LLM' in os.environ:
-+        if 'ENABLE_SM12X' in os.environ:
-+            sm_list = [120, 121]
-+        else:
-+            sm_list = [80, 86, 87, 89]
-+            if 'ENABLE_SM100' in os.environ:
-+                sm_list.extend([100, 101])
-+    else:
-+        sm_list = [80, 86, 89, 90, 120]
-     specs_names = [(kspec, *encode_name(kspec)) for kspec in specs_expanded
-                   # Volta is deprecated in TRT-LLM.
--                  if  (kspec.sm            in [80, 86, 89, 90, 120]
-+                  # EdgeLLM kernels (fp16 q_kv/q_k_v/qkv for specific SMs)
-+                  if  ('GENERATE_EDGE_LLM' in os.environ
-+                  and kspec.sm             in sm_list
-+                  and kspec.dtype          in ['fp16']
-+                  and kspec.head_size      in [64, 128]
-+                  and kspec.head_size_v    == 0
-+                  and kspec.version        == 2
-+                  and kspec.cross_mha      == False
-+                  and kspec.flash_attention == True
-+                  and kspec.input_layout   in [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.SEPARATE_Q_K_V]
-+                  and kspec.enable_attn_logit_softcapping == False)
-+                  # Standard TRT-LLM kernels
-+                  or  (kspec.sm            in [80, 86, 89, 90, 120]
-                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
-                   and kspec.head_size     <= 256
-                   and kspec.head_size_v   == 0
++        # TRT-EdgeLLM uses the head_interleaved=False mode.
++        if 'GENERATE_CUBIN' in os.environ:
++            specs_expanded = [
++                kspec._replace(head_interleaved=False) for kspec in specs
++            ]
++        # yapf: disable
++        specs_names = [(kspec, *encode_name(kspec)) for kspec in specs]
++
++        generate_files(specs_names)
++        return
++
+     # TODO we have to select the unroll_threshold over a grid of b and h for each arch
+ 
+     # Current fp16 384 kernel does 1x8 (smem limit), STEP=48. FP16 does not currently have noloop.
 diff --git a/cpp/kernels/fmha_v2/src/fmha/gmem_tile_qkv_packed.h b/cpp/kernels/fmha_v2/src/fmha/gmem_tile_qkv_packed.h
 index 34b5ccfd3..89dc1a5bb 100644
 --- a/cpp/kernels/fmha_v2/src/fmha/gmem_tile_qkv_packed.h

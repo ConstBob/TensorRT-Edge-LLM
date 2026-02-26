@@ -248,7 +248,7 @@ struct LaunchParams
     //! true: never unroll
     bool ignore_b1opt = false;
     bool force_unroll = false;        //!< true: always unroll
-    bool force_fp32_acc = false;      //!< Use FP32 accumulation
+    bool force_fp32_acc = true;       //!< Use FP32 accumulation
     bool interleaved = false;         //!< The C/32 format
     bool use_tma = false;             //!< By default TMA is not used
     int32_t total_q_seqlen = 0;       //!< Total number of q tokens to set TMA descriptors

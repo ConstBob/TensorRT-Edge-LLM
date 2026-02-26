@@ -19,7 +19,7 @@ These architectures can be compiled with a **CUDA 12.8** Toolkit.
 **Steps:**
 ```bash
 # 1) Generate the arch–specific .cu sources & headers
-export GENERATE_EDGE_LLM=1 GENERATE_CUBIN=1 ENABLE_SM100=1
+export GENERATE_EDGE_LLM=1 GENERATE_CUBIN=1 ENABLE_SM10X=1
 python3 setup.py
 
 # 2) Build the cubins (old BERT parameter layout)

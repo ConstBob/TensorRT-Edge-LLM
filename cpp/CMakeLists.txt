@@ -20,6 +20,39 @@ set(CMAKE_CUDA_FLAGS_RELEASE
 )
 
 set(CMAKE_CUDA_FLAGS_DEBUG "")
+
+# ------------------------------------------------------------------------------
+# FMHA Cubin Conditional Compilation Exclude SM architectures that are not in
+# CMAKE_CUDA_ARCHITECTURES to reduce binary size. Only cubins for the target
+# architectures will be compiled.
+# ------------------------------------------------------------------------------
+set(FMHA_ALL_SM_VERSIONS
+    80
+    86
+    87
+    89
+    100
+    101
+    120
+    121)
+set(FMHA_EXCLUDE_DEFINITIONS "")
+
+foreach(SM_VER ${FMHA_ALL_SM_VERSIONS})
+  list(FIND CMAKE_CUDA_ARCHITECTURES ${SM_VER} SM_INDEX)
+  if(SM_INDEX EQUAL -1)
+    # This SM is not in the target architectures, exclude it
+    list(APPEND FMHA_EXCLUDE_DEFINITIONS "EXCLUDE_SM_${SM_VER}")
+  endif()
+endforeach()
+
+if(FMHA_EXCLUDE_DEFINITIONS)
+  message(
+    STATUS
+      "FMHA Kernels: Excluding SM architectures: ${FMHA_EXCLUDE_DEFINITIONS}")
+else()
+  message(STATUS "FMHA Kernels: Compiling cubins for all SM architectures")
+endif()
+
 # Generate Core C++ static library for LLM-SDK
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
@@ -37,6 +70,8 @@ set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
 add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
                                   ${COMMON_CPP_SRCS})
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
+# Apply FMHA SM exclusion definitions
+target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
@@ -52,6 +87,8 @@ add_library(
   ${PROFILER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(edgellmCore PRIVATE dl)
+# Apply FMHA SM exclusion definitions
+target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
@@ -75,6 +112,9 @@ set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                         ${CMAKE_BINARY_DIR})
 target_include_directories(NvInfer_edgellm_plugin
                            PRIVATE ${COMMON_INCLUDE_DIRS})
+# Apply FMHA SM exclusion definitions
+target_compile_definitions(NvInfer_edgellm_plugin
+                           PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt edgellmKernels
                       ${CUDA_DRIVER_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
