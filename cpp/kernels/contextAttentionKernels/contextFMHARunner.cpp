@@ -160,7 +160,7 @@ struct FMHAKernelHashKey
         // length.
         return data_type == other.data_type && (sequenceLen == other.sequenceLen || flash_attention == true)
             && headSize == other.headSize && unroll == other.unroll && force_fp32_acc == other.force_fp32_acc
-            && flash_attention == other.flash_attention && attention_mask_type && other.attention_mask_type
+            && flash_attention == other.flash_attention && attention_mask_type == other.attention_mask_type
             && tiled == other.tiled && attention_input_layout == other.attention_input_layout;
     }
 };
@@ -173,8 +173,9 @@ struct FMHAKernelHasher
         int32_t s = hashKey.flash_attention ? 0 : hashKey.sequenceLen;
         // D <= 2048
         return (size_t) s << 32 | hashKey.headSize << 16 | (hashKey.attention_mask_type << 6)
-            | (hashKey.tiled ? 16ull : 0ull) | (hashKey.force_fp32_acc ? 8ull : 0ull)
-            | (hashKey.flash_attention ? 4ull : 0ull) | (hashKey.unroll ? 2ull : 0ull);
+            | (hashKey.attention_input_layout << 10) | (hashKey.tiled ? 16ull : 0ull)
+            | (hashKey.force_fp32_acc ? 8ull : 0ull) | (hashKey.flash_attention ? 4ull : 0ull)
+            | (hashKey.unroll ? 2ull : 0ull);
     }
 };
 
