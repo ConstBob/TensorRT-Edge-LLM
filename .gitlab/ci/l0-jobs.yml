@@ -142,7 +142,6 @@ l0_b100:
       - .l0_rules
       - .l0_environment
     interruptible: true
-    allow_failure: true  # TODO: Remove once B100 infrastructure issues are resolved
 
 # Unit tests for low-level components (attention kernels, etc.)
 l0_unit_tests_x86:
@@ -193,7 +192,6 @@ l0_jetson_orin:
     - .l0_rules
     - .l0_environment
   interruptible: true
-  allow_failure: true  # TODO: Remove once Jetson Orin infrastructure issues are resolved
 
 # Building and testing with Drive Thor
 l0_drive_thor_ferrix:
