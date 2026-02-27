@@ -86,7 +86,7 @@ cmake -S "${PROJECT_ROOT}" -B "${BUILD_DIR}" \
     -DBUILD_UNIT_TESTS=ON \
     -DENABLE_COVERAGE=ON \
     -DTRT_PACKAGE_DIR="${TRT_PACKAGE_DIR}" \
-    -DCUDA_VERSION="${CUDA_VERSION}"
+    -DCUDA_CTK_VERSION="${CUDA_VERSION}"
 
 # ---------------------------------------------------------------------------
 # Step 2 — Build
