@@ -364,6 +364,9 @@ class EdgeLLMDecoderLayer(nn.Module):
 
         self.eagle3_draft = eagle3_draft
         self.torch_dtype = torch_dtype
+        self.laurel = None
+        self.pre_feedforward_layernorm = None
+        self.post_feedforward_layernorm = None
 
         # Handle both config and module inputs
         if isinstance(config_or_module, nn.Module):
@@ -378,6 +381,36 @@ class EdgeLLMDecoderLayer(nn.Module):
                 torch_dtype)
             self.post_attention_layernorm = decoder_layer.post_attention_layernorm.to(
                 torch_dtype)
+
+            laurel_module = getattr(decoder_layer, 'laurel', None)
+            if laurel_module is not None:
+                if self.eagle3_draft:
+                    raise ValueError(
+                        "LAuReL is not supported for EAGLE3 draft models. "
+                        "EAGLE3 concatenates inputs to 2x hidden size before attention, "
+                        "which is incompatible with Gemma3n LAuReL modules.")
+
+                self.pre_feedforward_layernorm = getattr(
+                    decoder_layer, 'pre_feedforward_layernorm', None)
+                self.post_feedforward_layernorm = getattr(
+                    decoder_layer, 'post_feedforward_layernorm', None)
+
+                missing = []
+                if self.pre_feedforward_layernorm is None:
+                    missing.append("pre_feedforward_layernorm")
+                if self.post_feedforward_layernorm is None:
+                    missing.append("post_feedforward_layernorm")
+                if missing:
+                    missing_str = ", ".join(missing)
+                    raise ValueError(
+                        "LAuReL requires pre/post feedforward layernorms. "
+                        f"Missing: {missing_str}.")
+
+                self.laurel = laurel_module.to(torch_dtype)
+                self.pre_feedforward_layernorm = self.pre_feedforward_layernorm.to(
+                    torch_dtype)
+                self.post_feedforward_layernorm = self.post_feedforward_layernorm.to(
+                    torch_dtype)
 
             # Replace attention with custom implementation
             self.self_attn = EdgeLLMAttention(decoder_layer.self_attn,
@@ -451,6 +484,10 @@ class EdgeLLMDecoderLayer(nn.Module):
             if self.input_layernorm is not None:
                 hidden_states = self.input_layernorm(hidden_states)
 
+        laurel_output: Optional[torch.Tensor] = None
+        if self.laurel is not None:
+            laurel_output = self.laurel(hidden_states)
+
         # Self attention with residual connection
         hidden_states, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -461,13 +498,24 @@ class EdgeLLMDecoderLayer(nn.Module):
             rope_rotary_cos_sin=rope_rotary_cos_sin,
             context_lengths=context_lengths,
         )
-        hidden_states = residual + hidden_states
+        if self.laurel is not None:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = (hidden_states + laurel_output) * (2.0**-0.5)
 
-        # MLP with residual connection
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states = residual + hidden_states
+
+            # MLP with residual connection
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
         return hidden_states, present_key_value
 
@@ -500,17 +548,32 @@ class EdgeLLMDecoderLayer(nn.Module):
             if self.input_layernorm is not None:
                 hidden_states = self.input_layernorm(hidden_states)
 
+        laurel_output: Optional[torch.Tensor] = None
+        if self.laurel is not None:
+            laurel_output = self.laurel(hidden_states)
+
         # Self Attention
         hidden_states = self.self_attn.quant_forward(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings)
-        hidden_states = residual + hidden_states
+        if self.laurel is not None:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = (hidden_states + laurel_output) * (2.0**-0.5)
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states = residual + hidden_states
+
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
         return hidden_states
 
@@ -553,6 +616,9 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
         self.input_layernorm = None
         self.post_attention_layernorm = None
         self.hidden_norm = None
+        self.laurel = None
+        self.pre_feedforward_layernorm = None
+        self.post_feedforward_layernorm = None
 
         if isinstance(config_or_module, nn.Module):
             self._init_with_module(config_or_module)
@@ -569,6 +635,36 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
             self.torch_dtype)
         self.post_attention_layernorm = decoder_layer.post_attention_layernorm.to(
             self.torch_dtype)
+
+        laurel_module = getattr(decoder_layer, 'laurel', None)
+        if laurel_module is not None:
+            if self.eagle3_draft:
+                raise ValueError(
+                    "LAuReL is not supported for EAGLE3 draft models. "
+                    "EAGLE3 concatenates inputs to 2x hidden size before attention, "
+                    "which is incompatible with Gemma3n LAuReL modules.")
+
+            self.pre_feedforward_layernorm = getattr(
+                decoder_layer, 'pre_feedforward_layernorm', None)
+            self.post_feedforward_layernorm = getattr(
+                decoder_layer, 'post_feedforward_layernorm', None)
+
+            missing = []
+            if self.pre_feedforward_layernorm is None:
+                missing.append("pre_feedforward_layernorm")
+            if self.post_feedforward_layernorm is None:
+                missing.append("post_feedforward_layernorm")
+            if missing:
+                missing_str = ", ".join(missing)
+                raise ValueError(
+                    "LAuReL requires pre/post feedforward layernorms. "
+                    f"Missing: {missing_str}.")
+
+            self.laurel = laurel_module.to(self.torch_dtype)
+            self.pre_feedforward_layernorm = self.pre_feedforward_layernorm.to(
+                self.torch_dtype)
+            self.post_feedforward_layernorm = self.post_feedforward_layernorm.to(
+                self.torch_dtype)
         self.self_attn = EdgeLLMAttentionTRTNative(
             decoder_layer.self_attn, eagle3_draft=self.eagle3_draft)
 
@@ -642,6 +738,10 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
             if self.input_layernorm is not None:
                 hidden_states = self.input_layernorm(hidden_states)
 
+        laurel_output: Optional[torch.Tensor] = None
+        if self.laurel is not None:
+            laurel_output = self.laurel(hidden_states)
+
         hidden_states, present_k_cache, present_v_cache = self.self_attn(
             hidden_states=hidden_states,
             k_cache=k_cache,
@@ -653,12 +753,23 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
             position_ids=position_ids,
         )
 
-        hidden_states = residual + hidden_states
+        if self.laurel is not None:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = (hidden_states + laurel_output) * (2.0**-0.5)
 
-        # MLP with residual connection
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states = residual + hidden_states
+
+            # MLP with residual connection
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
         return hidden_states, present_k_cache, present_v_cache
