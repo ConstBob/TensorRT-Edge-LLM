@@ -1,0 +1,6 @@
+= LLM Design Notes
+{nbsp}
+:description: Index of design notes for LLM-related components in TensorRT Edge-LLM
+
+== Index
+- `laurel_support.adoc`: LAuReL residual support in decoder layers and exports

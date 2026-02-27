@@ -1,0 +1,127 @@
+= LAuReL Support in Decoder Layers (Python)
+{nbsp}
+:description: Design notes for LAuReL integration in Python decoder layers and exports
+
+== Scope
+This document describes the minimal design added to support Gemma3n-style LAuReL residuals in the
+Python decoder path and its related exports/tests. It is intentionally concise and focused on
+structure, not on implementation details.
+
+== Source References
+LAuReL integration was derived from the Gemma3n model pages:
+- https://huggingface.co/google/gemma-3n-E4B
+- https://huggingface.co/google/gemma-3n-E2B
+
+== Files Covered
+- `tensorrt_edgellm/llm_models/layers/layers.py`
+- `tensorrt_edgellm/onnx_export/config_export.py`
+- `tests/python-unittests/test_laurel_config_export.py`
+- `tests/test_lists/l0_export_ampere.yml` (TODO marker)
+
+== Structure and Rationale
+Pre-attention normalization and LAuReL/FFN-residual logic are duplicated across both decoder
+implementations (standard and TRT-native) to match the main branch style and keep each class
+self-contained. The concrete decoder classes still own attention modules and model-specific
+construction.
+
+Key reasons:
+
+- Reduce duplication between `EdgeLLMDecoderLayer` and `EdgeLLMDecoderLayerTRTNative`.
+- Centralize the EAGLE3 vs standard pre-attention normalization path.
+- Keep LAuReL optional and localized to the post-attention residual path.
+- Preserve separate attention implementations while sharing identical residual math.
+- Explicitly forbid LAuReL in EAGLE3 draft to avoid 2x hidden-size concatenation mismatch.
+  EAGLE3 concatenates `inputs_embeds` and `hidden_states` before attention, producing a 2x hidden
+  size tensor. Gemma3n LAuReL modules are defined for the base hidden size; applying them after the
+  concatenation would either fail at runtime due to shape mismatch or silently change the intended
+  residual semantics. We therefore raise a clear error during initialization.
+
+== Class Structure
+[source]
+----
+nn.Module
+  ├─ EdgeLLMAttention
+  ├─ EdgeLLMAttentionTRTNative
+  ├─ EdgeLLMDecoderLayer
+  │    └─ has-a EdgeLLMAttention
+  └─ EdgeLLMDecoderLayerTRTNative
+       └─ has-a EdgeLLMAttentionTRTNative
+----
+
+== Decoder Flow (Standard and TRT-Native)
+[source]
+----
+forward(...)
+  ├─ maybe_input_norm()  # standard vs eagle3_draft
+  ├─ laurel_output? = laurel(hidden_states)
+  ├─ self_attn(...)
+  └─ _apply_post_attention_path(...)
+        ├─ if laurel:
+        │    h_attn  = post_attention_layernorm(attn_out)
+        │    h_merge = (residual + h_attn + laurel_output) / sqrt(2)
+        │    h_ffn   = post_ffn_ln(mlp(pre_ffn_ln(h_merge)))
+        │    out     = h_merge + h_ffn
+        └─ else:
+             h     = residual + attn_out
+             h_ffn = mlp(post_attention_layernorm(h))
+             out   = h + h_ffn
+----
+
+== Residual Path Diagrams
+Standard Residual Path:
+[mermaid]
+----
+flowchart TD
+  R[residual] --> Hsum[residual + attn_out]
+  A[attn_out] --> Hsum
+  Hsum --> LN[post_attention_layernorm]
+  LN --> MLP[mlp]
+  MLP --> OutSum[Hsum + MLP]
+  Hsum --> OutSum
+  OutSum --> Out[out]
+----
+
+LAuReL Residual Path:
+[mermaid]
+----
+flowchart TD
+  R[residual] --> Merge[residual + h_attn + laurel]
+  A[attn_out] --> LNattn[post_attention_layernorm]
+  LNattn --> Merge
+  L[laurel_output] --> Merge
+  Merge --> Scale["/ sqrt(2)"]
+  Scale --> PreLN[pre_feedforward_layernorm]
+  PreLN --> MLP[mlp]
+  MLP --> PostLN[post_feedforward_layernorm]
+  PostLN --> OutSum[Scale + PostLN]
+  Scale --> OutSum
+  OutSum --> Out[out]
+----
+
+== LAuReL Attribute Ownership
+Each decoder layer owns the LAuReL-related members and initializes them directly through its
+own `_init_residual_ffn_components(...)` helper. This keeps the construction rules local to
+the concrete decoder classes while preserving the same contracts.
+
+== Config Export Flow
+`config_export.py` includes `laurel_rank` when the source model exposes LAuReL configuration.
+This makes the exported config reflect LAuReL capability without changing the default path.
+
+[source]
+----
+export_llm_config(...)
+  ├─ read base config fields
+  ├─ if laurel present -> add laurel_rank
+  └─ return config dict
+----
+
+== ONNX Export Considerations
+The ONNX path preserves the LAuReL residual math (including sqrt(2) scaling). Export validation is
+covered via end-to-end export tests.
+
+== Tests and Coverage
+Unit coverage includes config export validation in `test_laurel_config_export.py`. Export behavior
+and residual math are exercised through end-to-end tests.
+
+Integration TODOs are tracked in `tests/test_lists/l0_export_ampere.yml` until Gemma3n end-to-end
+paths are fully supported.

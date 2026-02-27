@@ -19,7 +19,15 @@ from ..version import __version__
 
 
 def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Export LLM configuration with required fields."""
+    """
+    Export LLM configuration with required fields.
+
+    Args:
+        config_dict: Raw model configuration dictionary.
+
+    Returns:
+        Dict[str, Any]: Sanitized LLM configuration for Edge-LLM export.
+    """
     required_fields = [
         "vocab_size", "max_position_embeddings", "hidden_size",
         "intermediate_size", "num_hidden_layers", "num_attention_heads",
@@ -57,6 +65,10 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
             "partial_rotary_factor"]
     else:
         llm_config["partial_rotary_factor"] = 1.0
+
+    # Gemma3n LAuReL config
+    if "laurel_rank" in config_dict:
+        llm_config["laurel_rank"] = config_dict["laurel_rank"]
 
     llm_config["model_type"] = "llm"
     return llm_config
