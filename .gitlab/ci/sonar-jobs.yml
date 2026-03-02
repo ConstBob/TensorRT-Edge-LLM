@@ -43,17 +43,20 @@ build-coverage:
   image: "$IMAGE"
   artifacts:
     paths:
-      - build_coverage/compile_commands.json
       - build_coverage/sonarqube-coverage.xml
+      - bw-output/
     expire_in: 1 hour
   script:
     - export DEBIAN_FRONTEND=noninteractive
     - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip git >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip git unzip >/dev/null 2>&1
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
     - pip3 install gcovr
-    - scripts/run_coverage.sh --trt-package-dir "$TRT_PACKAGE_DIR" --cuda-version "$CUDA_VERSION"
+    - curl -sSLo build-wrapper.zip "${SONAR_HOST_URL}/static/cpp/build-wrapper-linux-x86.zip"
+    - unzip -o build-wrapper.zip
+    - build-wrapper-linux-x86/build-wrapper-linux-x86 --out-dir bw-output
+        scripts/run_coverage.sh --trt-package-dir "$TRT_PACKAGE_DIR" --cuda-version "$CUDA_VERSION"
   allow_failure: true
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
