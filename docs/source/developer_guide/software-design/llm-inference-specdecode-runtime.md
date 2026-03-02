@@ -79,8 +79,8 @@ class END_NODES invisibleSubGraph
 
 | Component | Description |
 |-----------|-------------|
-| **LLM Engine Runner (Base)** | Executes TensorRT engines and manages dual-phase inference for base model. Core engine execution component owned by LLM Inference SpecDecode Runtime (as `mBaseEngineRunner`). Handles separate TensorRT execution contexts for prefill and generation phases. Manages its own Linear KV Cache instance, produces logits that are consumed by the runtime's sampling calls. **Note**: CUDA graph optimization is not available in EAGLE SpecDecode mode. Supports dynamic LoRA adapter switching. *Files:* `cpp/runtime/llmEngineRunner.{h,cpp}` |
-| **EAGLE Draft Engine Runner** | Specialized engine runner for EAGLE draft models. Executes draft model inference for speculative decoding. Owned by LLM Inference SpecDecode Runtime (as `mDraftEngineRunner`). Generates candidate token sequences that are verified by the base model's LLMEngineRunner. Maintains its own separate KV cache and execution contexts optimized for draft model characteristics and tree-based token generation. *Files:* `cpp/runtime/eagleDraftEngineRunner.{h,cpp}` |
+| **LLM Engine Runner (Base)** | Executes TensorRT engines and manages dual-phase inference for base model. Core engine execution component owned by LLM Inference SpecDecode Runtime (as `mBaseEngineRunner`). Uses a single TensorRT execution context that switches optimization profiles between prefill and generation phases. Manages its own Linear KV Cache instance, produces logits that are consumed by the runtime's sampling calls. Supports dynamic LoRA adapter switching. *Files:* `cpp/runtime/llmEngineRunner.{h,cpp}` |
+| **EAGLE Draft Engine Runner** | Specialized engine runner for EAGLE draft models. Executes draft model inference for speculative decoding. Owned by LLM Inference SpecDecode Runtime (as `mDraftEngineRunner`). Generates candidate token sequences that are verified by the base model's LLMEngineRunner. Maintains its own separate KV cache and uses a single TensorRT execution context with profile switching for draft model stages. *Files:* `cpp/runtime/eagleDraftEngineRunner.{h,cpp}` |
 | **Tokenizer** | HuggingFace-compatible text tokenization system. Converts between text and token IDs using Byte-Pair Encoding (BPE). The LLM Inference SpecDecode Runtime owns its own tokenizer instance. Supports various model vocabularies (GPT, Llama, Qwen) with configurable special tokens and preprocessing steps. *Files:* `cpp/tokenizer/tokenizer.{h,cpp}`, `preTokenizer.{h,cpp}`, `tokenEncoder.{h,cpp}` |
 | **Multimodal Runner** | Vision processing for multimodal models (VLMs). Processes image inputs through Vision Transformer models and generates vision embeddings. Supports Qwen-VL and InternVL architectures with dynamic image token generation. Integrates vision embeddings with text tokens for multimodal inference. *Files:* `cpp/multimodal/multimodalRunner.{h,cpp}`, `qwenViTRunner.{h,cpp}`, `internViTRunner.{h,cpp}` |
 | **Linear KV Cache** | Attention key-value cache management. Each engine runner maintains its own Linear KV Cache instance. Stores attention key-value pairs across inference steps for efficient autoregressive generation. Uses linear memory layout optimized for GPU access with support for batched processing and variable sequence lengths. *Files:* `cpp/runtime/linearKVCache.{h,cpp}` |
@@ -210,7 +210,7 @@ The generation phase uses iterative tree-based speculation with conditional draf
   - When draft tokens diverge from base predictions, remaining draft tokens are **rejected**
   - Process continues following the draft tree path as long as tokens match
 - **Token Generation Source**: All final output tokens come from base model, draft model only provides speculative candidates
-- **No CUDA Graphs**: Unlike the LLM Inference Runtime, EAGLE does not support CUDA graph optimization
+- **CUDA Graph Capture Support**: EAGLE runtime supports CUDA graph capture for draft proposal, draft accept-token, base verification, and base vanilla decode paths.
 - **Iterative Process**: Continues until stop conditions or maximum generation length reached
 
 ---
@@ -218,10 +218,10 @@ The generation phase uses iterative tree-based speculation with conditional draf
 ## Key Differences from LLM Inference Runtime
 
 - **Sequential Prefill**: Base model prefilled first, draft model prefilled only in first generation round
-- **No CUDA Graph Support**: LLM Inference SpecDecode Runtime does not support CUDA graph optimization
+- **CUDA Graph Support**: LLM Inference SpecDecode Runtime supports CUDA graph capture for major decode stages.
 - **Tree-Based Speculation**: Draft model constructs candidate token trees, base model always generates final tokens
 - **Accept/Reject Mechanism**: Base model generates tokens during verification, draft tokens accepted only when they match
-- **Batch Size Constraint**: Limited to batch size 1 only
+- **Dynamic Batching with Eviction**: Supports batched requests up to runtime capacity and compacts active batches by evicting finished sequences during generation.
 - **Complex State Management**: Maintains separate KV caches and hidden states for both models
 
 ---
@@ -250,7 +250,10 @@ LLMInferenceSpecDecodeRuntime runtime(engineDir, "", draftingConfig, stream);
 // Prepare request
 LLMGenerationRequest request;
 request.requests.resize(1);
-request.requests[0].messages.push_back({{"role", "user"}, {"content", "Explain quantum computing."}});
+rt::Message userMsg;
+userMsg.role = "user";
+userMsg.contents.push_back({"text", "Explain quantum computing."});
+request.requests[0].messages.push_back(std::move(userMsg));
 request.maxGenerateLength = 200;
 request.temperature = 1.0;
 request.topK = 50;

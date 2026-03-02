@@ -48,7 +48,7 @@ graph TB
 
 | Component | Description |
 |-----------|-------------|
-| **LLM Engine Runner** | Executes TensorRT engines and manages dual-phase inference. Core engine execution component owned by LLM Inference Runtime (as `mLLMEngineRunner`). Handles separate TensorRT execution contexts for prefill and generation phases. Manages its own Linear KV Cache instance, produces logits that are consumed by the runtime's sampling calls, and provides CUDA graph optimization for reduced latency. Supports dynamic LoRA adapter switching. *Files:* `cpp/runtime/llmEngineRunner.{h,cpp}` |
+| **LLM Engine Runner** | Executes TensorRT engines and manages dual-phase inference. Core engine execution component owned by LLM Inference Runtime (as `mLLMEngineRunner`). Uses a single TensorRT execution context that switches optimization profiles between prefill and generation phases. Manages its own Linear KV Cache instance, produces logits that are consumed by the runtime's sampling calls, and provides CUDA graph optimization for reduced latency. Supports dynamic LoRA adapter switching. *Files:* `cpp/runtime/llmEngineRunner.{h,cpp}` |
 | **Tokenizer** | HuggingFace-compatible text tokenization system. Converts between text and token IDs using Byte-Pair Encoding (BPE). The LLM Inference Runtime owns its own tokenizer instance. Supports various model vocabularies (GPT, Llama, Qwen) with configurable special tokens and preprocessing steps. *Files:* `cpp/tokenizer/tokenizer.{h,cpp}`, `preTokenizer.{h,cpp}`, `tokenEncoder.{h,cpp}` |
 | **Multimodal Runner** | Vision processing for multimodal models (VLMs). Processes image inputs through Vision Transformer models and generates vision embeddings. Supports Qwen-VL and InternVL architectures with dynamic image token generation. Integrates vision embeddings with text tokens for multimodal inference. *Files:* `cpp/multimodal/multimodalRunner.{h,cpp}`, `qwenViTRunner.{h,cpp}`, `internViTRunner.{h,cpp}` |
 | **Linear KV Cache** | Attention key-value cache management. The LLM Engine Runner maintains its own Linear KV Cache instance. Stores attention key-value pairs across inference steps for efficient autoregressive generation. Uses linear memory layout optimized for GPU access with support for batched processing and variable sequence lengths. *Files:* `cpp/runtime/linearKVCache.{h,cpp}` |
@@ -161,7 +161,10 @@ LLMInferenceRuntime runtime(engineDir, "", loraWeightsMap, stream);
 // Prepare request
 LLMGenerationRequest request;
 request.requests.resize(1);
-request.requests[0].messages.push_back({{"role", "user"}, {"content", "What is the capital of France?"}});
+Message userMsg;
+userMsg.role = "user";
+userMsg.contents.push_back({"text", "What is the capital of France?"});
+request.requests[0].messages.push_back(std::move(userMsg));
 request.maxGenerateLength = 100;
 request.temperature = 1.0;
 request.topK = 50;
@@ -199,13 +202,23 @@ LLMInferenceRuntime runtime(engineDir, "", loraWeightsMap, stream);
 // Prepare requests
 LLMGenerationRequest medicalRequest;
 medicalRequest.requests.resize(1);
-medicalRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Medical question"}});
+{
+    Message msg;
+    msg.role = "user";
+    msg.contents.push_back({"text", "Medical question"});
+    medicalRequest.requests[0].messages.push_back(std::move(msg));
+}
 medicalRequest.loraWeightsName = "medical";
 medicalRequest.maxGenerateLength = 100;
 
 LLMGenerationRequest legalRequest;
 legalRequest.requests.resize(1);
-legalRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Legal question"}});
+{
+    Message msg;
+    msg.role = "user";
+    msg.contents.push_back({"text", "Legal question"});
+    legalRequest.requests[0].messages.push_back(std::move(msg));
+}
 legalRequest.loraWeightsName = "legal";
 legalRequest.maxGenerateLength = 100;
 
@@ -219,7 +232,12 @@ runtime.handleRequest(legalRequest, legalResponse, stream);
 // Disable LoRA (use empty string)
 LLMGenerationRequest baseRequest;
 baseRequest.requests.resize(1);
-baseRequest.requests[0].messages.push_back({{"role", "user"}, {"content", "Base question"}});
+{
+    Message msg;
+    msg.role = "user";
+    msg.contents.push_back({"text", "Base question"});
+    baseRequest.requests[0].messages.push_back(std::move(msg));
+}
 baseRequest.loraWeightsName = "";
 baseRequest.maxGenerateLength = 100;
 
@@ -234,6 +252,7 @@ CUDA_CHECK(cudaStreamDestroy(stream));
 
 ```cpp
 #include "runtime/llmInferenceRuntime.h"
+#include "runtime/imageUtils.h"
 #include <unordered_map>
 
 // Initialize CUDA stream
@@ -247,13 +266,14 @@ LLMInferenceRuntime runtime(engineDir, visualEngineDir, loraWeightsMap, stream);
 // Prepare multimodal request
 LLMGenerationRequest request;
 request.requests.resize(1);
-request.requests[0].messages.push_back({
-    {"role", "user"},
-    {"content", {
-        {{"type", "image"}, {"image", "/path/to/image.jpg"}},
-        {{"type", "text"}, {"text", "What's in this image?"}}
-    }}
-});
+Message mmMsg;
+mmMsg.role = "user";
+// Content metadata in messages should align with the external buffers order.
+mmMsg.contents.push_back({"image", "/path/to/image.jpg"});
+mmMsg.contents.push_back({"text", "What's in this image?"});
+request.requests[0].messages.push_back(std::move(mmMsg));
+// Image bytes are provided separately via imageBuffers.
+request.requests[0].imageBuffers.push_back(imageUtils::loadImageFromFile("/path/to/image.jpg"));
 request.maxGenerateLength = 150;
 request.temperature = 1.0;
 request.topK = 50;
