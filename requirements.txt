@@ -9,4 +9,6 @@ numpy~=2.2.6
 # For Phi-4MM model
 peft==0.18.1
 backoff==2.2.1
-
+# For audio preprocessing
+soundfile==0.13.1
+librosa==0.11.0
