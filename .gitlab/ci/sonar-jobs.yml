@@ -31,11 +31,46 @@ get-binaries:
     - if: $CI_COMMIT_BRANCH == 'main'
     - if: $L1 == "true"
 
+build-coverage:
+  stage: get-binaries
+  variables:
+    CUDA_VERSION: "13.0"
+    TRT_CUDA_VERSION: "13.1"
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+  tags:
+    - a30-edgellm-nvks
+  image: "$IMAGE"
+  artifacts:
+    paths:
+      - build_coverage/sonarqube-coverage.xml
+      - bw-output/
+    expire_in: 1 hour
+  script:
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip git unzip >/dev/null 2>&1
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - pip3 install gcovr
+    - curl -sSLo build-wrapper.zip "${SONAR_HOST_URL}/static/cpp/build-wrapper-linux-x86.zip"
+    - unzip -o build-wrapper.zip
+    - build-wrapper-linux-x86/build-wrapper-linux-x86 --out-dir bw-output
+        scripts/run_coverage.sh --trt-package-dir "$TRT_PACKAGE_DIR" --cuda-version "$CUDA_VERSION"
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH =~ /^release/
+    - if: $CI_COMMIT_BRANCH == 'main'
+    - if: $L1 == "true"
+
 build-sonar:
   stage: build-sonar
   image: gcc
   needs:
     - get-binaries
+    - job: build-coverage
+      artifacts: true
 
   
   cache:
