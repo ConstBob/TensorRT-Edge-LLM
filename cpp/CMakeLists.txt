@@ -40,10 +40,14 @@ set(FMHA_EXCLUDE_DEFINITIONS "")
 foreach(SM_VER ${FMHA_ALL_SM_VERSIONS})
   list(FIND CMAKE_CUDA_ARCHITECTURES ${SM_VER} SM_INDEX)
   if(SM_INDEX EQUAL -1)
-    # This SM is not in the target architectures, exclude it
     list(APPEND FMHA_EXCLUDE_DEFINITIONS "EXCLUDE_SM_${SM_VER}")
   endif()
 endforeach()
+
+# SM 110 uses SM 101 FMHA cubins at runtime
+if(110 IN_LIST CMAKE_CUDA_ARCHITECTURES)
+  list(REMOVE_ITEM FMHA_EXCLUDE_DEFINITIONS "EXCLUDE_SM_101")
+endif()
 
 if(FMHA_EXCLUDE_DEFINITIONS)
   message(
