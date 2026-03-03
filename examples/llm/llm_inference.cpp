@@ -682,18 +682,12 @@ int main(int argc, char* argv[])
 
     if (args.eagleArgs.enabled)
     {
-        // Eagle mode - LoRA is not supported
-        if (!loraWeightsMap.empty())
-        {
-            LOG_WARNING("Eagle mode does not support LoRA weights. Ignoring LoRA weights.");
-        }
-
         rt::EagleDraftingConfig draftingConfig{
             args.eagleArgs.draftTopK, args.eagleArgs.draftStep, args.eagleArgs.verifyTreeSize};
         try
         {
             eagleInferenceRuntime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
-                args.engineDir, args.multimodalEngineDir, draftingConfig, stream);
+                args.engineDir, args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
         }
         catch (std::exception const& e)
         {

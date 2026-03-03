@@ -42,13 +42,21 @@ using namespace nvinfer1;
 
 namespace trt_edgellm
 {
+namespace
+{
+std::tuple<std::string, std::string> keySystemPromptWithLoraWeights(
+    std::string const& systemPrompt, std::string const& loraWeightsName)
+{
+    return std::make_tuple(systemPrompt, loraWeightsName);
+}
+} // namespace
 
 namespace rt
 {
 
 void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _maxGenerateLength,
     rt::OptionalInputTensor const& _mutimodalEmbeddings, rt::OptionalInputTensors const& _deepstackFeatures,
-    cudaStream_t _stream)
+    std::string const& _loraWeightsName, cudaStream_t _stream)
 {
     systemPrompts.resize(_activeBatchSize);
     rawBatchedInputIds.reserve(_activeBatchSize);
@@ -72,11 +80,13 @@ void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _m
     generationRound = 0;
     maxGenerateLength = _maxGenerateLength;
     activeBatchSize = _activeBatchSize;
+    loraWeightsName = _loraWeightsName;
     stream = _stream;
 }
 
 LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& engineDir,
-    std::string const& multimodalEngineDir, EagleDraftingConfig const& draftingConfig, cudaStream_t stream)
+    std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+    EagleDraftingConfig const& draftingConfig, cudaStream_t stream)
 {
     mDraftingConfig = draftingConfig;
 
@@ -98,8 +108,6 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
 
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "eagle_base.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "base_config.json";
-    // Currently, we don't support LoRA weights along with Eagle SpecDecode.
-    std::unordered_map<std::string, std::string> loraWeightsMap{};
     try
     {
         mBaseEngineRunner = std::make_unique<LLMEngineRunner>(enginePath, configPath, loraWeightsMap, stream);
@@ -365,6 +373,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 {
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
     bool const enableSpecDecode = !request.disableSpecDecode;
+    std::string const& loraWeightsName = request.loraWeightsName;
 
     if (activeBatchSize == 0)
     {
@@ -390,7 +399,8 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 
     // Initialize context for multi-batch
     SpecDecodeInferenceContext context;
-    context.initialize(activeBatchSize, maxGenerateLength, multimodalEmbeddings, deepstackFeatures, stream);
+    context.initialize(
+        activeBatchSize, maxGenerateLength, multimodalEmbeddings, deepstackFeatures, loraWeightsName, stream);
 
     // Preprocess user prompts and encode them.
     std::vector<std::vector<int32_t>> batchedInputIds;
@@ -1369,15 +1379,30 @@ bool LLMInferenceSpecDecodeRuntime::captureDecodingCudaGraph(cudaStream_t stream
             "Tensor reshape failed");
 
         baseVerificationCaptureStatus &= mBaseEngineRunner->captureEagleBaseTreeDecodingCudaGraph(
-            mInputsEmbeds, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, stream);
+            mInputsEmbeds, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, mEmptyLoraWeightsName, stream);
+        if (mBaseEngineConfig.maxSupportedLoraRank > 0)
+        {
+            for (auto const& loraWeightsName : mBaseEngineRunner->getAvailableLoraWeights())
+            {
+                baseVerificationCaptureStatus &= mBaseEngineRunner->captureEagleBaseTreeDecodingCudaGraph(
+                    mInputsEmbeds, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, loraWeightsName, stream);
+            }
+        }
 
         // Base Vanilla Decoding capture.
         check::check(mInputsEmbeds.reshape({batchSize, 1, mBaseEngineConfig.hiddenSize}), "Tensor reshape failed");
         check::check(mLogitsOutput.reshape({batchSize, mBaseEngineConfig.outputVocabSize}), "Tensor reshape failed");
 
-        std::string const emptyLoraWeightsName = "";
         baseVanillaDecodingCaptureStatus &= mBaseEngineRunner->captureVanillaDecodingCudaGraph(
-            mInputsEmbeds, mLogitsOutput, emptyLoraWeightsName, stream);
+            mInputsEmbeds, mLogitsOutput, mEmptyLoraWeightsName, stream);
+        if (mBaseEngineConfig.maxSupportedLoraRank > 0)
+        {
+            for (auto const& loraWeightsName : mBaseEngineRunner->getAvailableLoraWeights())
+            {
+                baseVanillaDecodingCaptureStatus &= mBaseEngineRunner->captureVanillaDecodingCudaGraph(
+                    mInputsEmbeds, mLogitsOutput, loraWeightsName, stream);
+            }
+        }
     }
 
     bool const captureStatus = draftProposalCaptureStatus && draftAcceptCaptureStatus && baseVerificationCaptureStatus
@@ -1399,6 +1424,12 @@ bool LLMInferenceSpecDecodeRuntime::captureDecodingCudaGraph(cudaStream_t stream
 bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInferenceContext& context)
 {
     NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
+
+    if (mBaseEngineConfig.maxSupportedLoraRank > 0 && !mBaseEngineRunner->switchLoraWeights(context.loraWeightsName))
+    {
+        LOG_ERROR("Failed to switch LoRA weights to %s", context.loraWeightsName.c_str());
+        return false;
+    }
 
     int32_t const activeBatchSize = context.activeBatchSize;
     std::vector<std::vector<int32_t>> const& batchedInputIds = context.rawBatchedInputIds;
@@ -1425,12 +1456,13 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         auto const& prompt = context.systemPrompts[i];
-        if (mSystemPromptKVCacheBase.count(prompt) > 0)
+        auto const promptKey = keySystemPromptWithLoraWeights(prompt, context.loraWeightsName);
+        if (mSystemPromptKVCacheBase.count(promptKey) > 0)
         {
-            check::check(mSystemPromptKVCacheDraft.count(prompt) > 0,
+            check::check(mSystemPromptKVCacheDraft.count(promptKey) > 0,
                 "System prompt cache inconsistency between base and draft model");
-            auto& precachedKVCacheBase = mSystemPromptKVCacheBase[prompt];
-            auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[prompt];
+            auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptKey];
+            auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[promptKey];
             auto const& kvCacheContentBase = precachedKVCacheBase.kvCacheContent;
             auto const& kvCacheContentDraft = precachedKVCacheDraft.kvCacheContent;
             kernel::instantiateKVCacheFromTensor(kvCacheBufferBase, kvCacheContentBase, i, context.stream);
@@ -1486,8 +1518,10 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
 bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx)
 {
+    std::string const& loraWeightsName = context.loraWeightsName;
     // Check if cache already exists
     std::string const prompt = context.systemPrompts[genAndSaveBatchIdx];
+    auto const promptKey = keySystemPromptWithLoraWeights(prompt, loraWeightsName);
 
     if (prompt.empty())
     {
@@ -1495,8 +1529,8 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
         return true;
     }
 
-    if (mSystemPromptKVCacheBase.find(prompt) != mSystemPromptKVCacheBase.end()
-        && mSystemPromptKVCacheDraft.find(prompt) != mSystemPromptKVCacheDraft.end())
+    if (mSystemPromptKVCacheBase.find(promptKey) != mSystemPromptKVCacheBase.end()
+        && mSystemPromptKVCacheDraft.find(promptKey) != mSystemPromptKVCacheDraft.end())
     {
         LOG_DEBUG("The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
         return true;
@@ -1522,7 +1556,8 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     // Reuse the existing prefill functions which will use runtime member tensors (mIdsInput, mLogitsOutput, etc.)
     SpecDecodeInferenceContext tempContext;
     // Generate with batch size 1 and generate length 1 (prefill only).
-    tempContext.initialize(1, 1, context.multimodalEmbeddings, context.deepstackFeatures, context.stream);
+    tempContext.initialize(
+        1, 1, context.multimodalEmbeddings, context.deepstackFeatures, loraWeightsName, context.stream);
     tempContext.systemPrompts[0] = prompt;
     tempContext.rawBatchedInputIds[0] = tokenizedPrompt;
     tempContext.tokenIds[0] = tokenizedPrompt;
@@ -1583,8 +1618,8 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     kernel::saveKVCacheIntoTensor(
         savedKVCacheDraft.kvCacheContent, kvCacheBufferDraft, CACHE_BATCH_IDX, context.stream);
 
-    mSystemPromptKVCacheBase.insert({prompt, std::move(savedKVCacheBase)});
-    mSystemPromptKVCacheDraft.insert({prompt, std::move(savedKVCacheDraft)});
+    mSystemPromptKVCacheBase.insert({promptKey, std::move(savedKVCacheBase)});
+    mSystemPromptKVCacheDraft.insert({promptKey, std::move(savedKVCacheDraft)});
 
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
     LOG_DEBUG("System prompt KVCache saved for batch %d: {%s}", genAndSaveBatchIdx, prompt.c_str());

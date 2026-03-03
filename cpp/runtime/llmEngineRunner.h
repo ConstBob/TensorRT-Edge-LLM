@@ -202,13 +202,13 @@ public:
     //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputsEmbeds,
         rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-        cudaStream_t stream);
+        std::string const& loraWeightsName, cudaStream_t stream);
 
     //! Key to uniquely identify a captured CUDA graph for the decoding step
     using DecodingGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, std::string>;
 
     //! Key to uniquely identify a captured CUDA graph for the base model verification step
-    using BaseGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, uintptr_t>;
+    using BaseGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, uintptr_t, std::string>;
 
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime

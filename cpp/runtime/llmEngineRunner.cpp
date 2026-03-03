@@ -80,13 +80,14 @@ trt_edgellm::rt::LLMEngineRunner::DecodingGraphKey decodingKey(
 }
 
 trt_edgellm::rt::LLMEngineRunner::BaseGraphKey baseKey(rt::Tensor const& baseTreeDecodingInputsEmbeds,
-    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates) noexcept
+    rt::Tensor const& outputLogits, rt::Tensor const& outputHiddenStates, std::string const& loraWeightsName) noexcept
 {
     int64_t const activeBatchSize = baseTreeDecodingInputsEmbeds.getShape()[0];
     uintptr_t const inputsEmbedsAddr = reinterpret_cast<uintptr_t>(baseTreeDecodingInputsEmbeds.rawPointer());
     uintptr_t const outputLogitsAddr = reinterpret_cast<uintptr_t>(outputLogits.rawPointer());
     uintptr_t const outputHiddenStatesAddr = reinterpret_cast<uintptr_t>(outputHiddenStates.rawPointer());
-    return std::make_tuple(activeBatchSize, inputsEmbedsAddr, outputLogitsAddr, outputHiddenStatesAddr);
+    return std::make_tuple(
+        activeBatchSize, inputsEmbedsAddr, outputLogitsAddr, outputHiddenStatesAddr, loraWeightsName);
 }
 
 } // namespace
@@ -1482,7 +1483,8 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
     }
 
     // Launch cuda graph if available for this request, otherwise proceed with normal TensorRT engine execution step.
-    auto const graphHash = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
+    auto const graphHash
+        = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates, mActiveLoraWeightsName);
     if (mBaseTreeDecodingCudaGraphs.find(graphHash) != mBaseTreeDecodingCudaGraphs.end())
     {
         LOG_DEBUG("Use pre-captured CUDA graph for eagle base tree decoding step.");
@@ -1607,7 +1609,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
 
 bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& baseTreeDecodingInputsEmbeds,
     rt::Tensor const& baseTreeDecodingMask, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
-    cudaStream_t stream)
+    std::string const& loraWeightsName, cudaStream_t stream)
 {
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus
@@ -1618,11 +1620,17 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
         throw std::runtime_error("Failed to set optimization profile to the engine");
     }
 
-    auto const key = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates);
+    auto const key = baseKey(baseTreeDecodingInputsEmbeds, outputLogits, outputHiddenStates, loraWeightsName);
     if (mBaseTreeDecodingCudaGraphs.find(key) != mBaseTreeDecodingCudaGraphs.end())
     {
-        LOG_INFO("CUDA graph already captured for the input tensors.");
+        LOG_INFO("CUDA graph already captured for the input tensors with LoRA weights %s.", loraWeightsName.c_str());
         return true;
+    }
+
+    if (isLoraWeightsSupported() && !this->switchLoraWeights(loraWeightsName))
+    {
+        LOG_ERROR("Failed to switch LoRA weights to '%s', unable to capture CUDA graph.", loraWeightsName.c_str());
+        return false;
     }
 
     // Here we will simulate the state of the EngineRunner after executing one prefill request for a batched request.
@@ -1678,8 +1686,10 @@ bool LLMEngineRunner::captureEagleBaseTreeDecodingCudaGraph(rt::Tensor const& ba
     }
     else
     {
-        LOG_DEBUG("CUDA graph captured successfully for input shape %s.",
-            baseTreeDecodingInputsEmbeds.getShape().formatString().c_str());
+        LOG_DEBUG(
+            "CUDA graph captured successfully for input shape %s with LoRA weights '%s' (Empty string if no LoRA "
+            "weights).",
+            baseTreeDecodingInputsEmbeds.getShape().formatString().c_str(), loraWeightsName.c_str());
         mBaseTreeDecodingCudaGraphs[key] = graphPair.value();
         return true;
     }
