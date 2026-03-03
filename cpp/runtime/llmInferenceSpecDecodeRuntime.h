@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "common/hashUtils.h"
 #include "common/tensor.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
@@ -23,6 +24,7 @@
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -81,6 +83,7 @@ struct SpecDecodeInferenceContext
     int32_t generationRound;                    //!< Current generation round (shared across all batches)
     int32_t maxGenerateLength;                  //!< Maximum generation length
     int32_t activeBatchSize;                    //!< Current active batch size
+    std::string loraWeightsName{""};            //!< LoRA adapter name used by this request
     cudaStream_t stream;                        //!< CUDA stream
 
     /*!
@@ -89,11 +92,12 @@ struct SpecDecodeInferenceContext
      * @param maxGenLength Maximum generation length
      * @param multimodal Optional multimodal embeddings
      * @param deepstackFeatures Deepstack features for Qwen3-VL (raw features before embedding)
+     * @param loraName LoRA weights name used by this request
      * @param cudaStream CUDA stream for operations
      * @throws std::bad_alloc if memory allocation fails
      */
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal,
-        rt::OptionalInputTensors const& deepstackFeatures, cudaStream_t cudaStream);
+        rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
 };
 
 /*!
@@ -121,12 +125,14 @@ public:
      * @brief Construct speculative decode runtime
      * @param engineDir Directory containing engine files
      * @param multimodalEngineDir Directory containing multimodal engine files
+     * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param draftingConfig Eagle drafting configuration
      * @param stream CUDA stream for operations
      * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
      */
     LLMInferenceSpecDecodeRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        EagleDraftingConfig const& draftingConfig, cudaStream_t stream);
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, EagleDraftingConfig const& draftingConfig,
+        cudaStream_t stream);
 
     //! @brief Destructor
     ~LLMInferenceSpecDecodeRuntime() noexcept = default;
@@ -182,10 +188,11 @@ private:
     std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;   //!< Draft model engine runner
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner (optional)
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;             //!< Tokenizer
-    std::unordered_map<std::string, SystemPromptKVCache>
+    hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase; //!< System prompt KVCache for base model
-    std::unordered_map<std::string, SystemPromptKVCache>
-        mSystemPromptKVCacheDraft; //!< System prompt KVCache for draft model
+    hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
+        mSystemPromptKVCacheDraft;         //!< System prompt KVCache for draft model
+    std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
     // [1] I/O Tensors to work with base and eagle draft engine.
