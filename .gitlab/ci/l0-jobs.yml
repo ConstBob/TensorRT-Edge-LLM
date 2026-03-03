@@ -223,7 +223,7 @@ l0_cross_build_d6l:
   variables:
     CUDA_VERSION: "11.4"
     TRT_VERSION: "10.13.3.9" # The d6l build is missing in edgellm cache for the latest TensorRT
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-cross-aarch64-d6l-cuda$CUDA_VERSION
+    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:rel-10.15-cross-aarch64-d6l-cuda$CUDA_VERSION
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.d6l.cuda-$CUDA_VERSION"
     EMBEDDED_TARGET: jetson-orin
   tags:
