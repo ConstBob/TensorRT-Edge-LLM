@@ -45,15 +45,6 @@ namespace
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
 
-// Workaround for CUDA12/13 Thor re-numbering. The kernels themselves have version compatibility.
-void applyThorSMRenumberWAR(int32_t& smVersion)
-{
-    if (smVersion == 110)
-    {
-        smVersion = 101;
-    }
-}
-
 // Select KV cache storage datatype based on FP8 enablement
 static inline DataType selectKvCacheDataType(bool enableFp8KVCache)
 {
@@ -168,7 +159,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    bool canImplementFMHA = ContextFMHARunner::canImplement(mHeadSize, mSMVersion, mDataType);
+    // Plugin constructor does not know runtime execution mode yet, so keep this check conservative.
+    bool canImplementFMHA = ContextFMHARunner::canImplement(
+        mHeadSize, mSMVersion, mDataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL);
     bool canImplementXQA = DecoderXQARunner::canImplement(
         mNumQHeads, mNumKVHeads, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
 

@@ -17,6 +17,7 @@
 
 #include "contextFMHARunner.h"
 #include "common/checkMacros.h"
+#include "common/logger.h"
 #include "cubin/fmha_cubin.h"
 #include "fmhaParams_v2.h"
 
@@ -324,7 +325,8 @@ inline FMHAKernelList* getFMHAKernels(FMHADataType type, int32_t sm)
 }; // namespace
 
 ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t paddedSeqLen,
-    int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout)
+    int32_t numQHeads, int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout,
+    ContextAttentionMaskType maskType, bool isSPadded)
     : mDataType(dataType)
     , mBatchSize(batchSize)
     , mPaddedSequenceLen(paddedSeqLen)
@@ -332,6 +334,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     , mNumKVHeads(numKvHeads)
     , mHeadSize(headSize)
     , mSmVersion(smVersion)
+    , mIsSPadded(isSPadded)
 {
     // The context FMHA-v2 kernels taken by the project only support ampere/ada for
     // reference on x86 machine, Orin/Thor for production on auto platforms.
@@ -339,8 +342,7 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     CUDA_CHECK(cudaGetDeviceProperties(&props, 0));
     mLaunchParams.multi_processor_count = props.multiProcessorCount;
     mLaunchParams.device_l2_cache_size = props.l2CacheSize;
-    // Only causal attention kernel get integrated and used now.
-    mLaunchParams.attention_mask_type = ContextAttentionMaskType::CAUSAL;
+    mLaunchParams.attention_mask_type = maskType;
     mLaunchParams.attention_input_layout = inputLayout;
 
     bool const isSm8x = (smVersion == fmha_v2::kSM_80 || smVersion == fmha_v2::kSM_86 || smVersion == fmha_v2::kSM_87
@@ -390,10 +392,12 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
     params.h = mNumHeads;
     params.h_kv = mNumKVHeads;
     params.h_q_per_kv = mNumHeads / mNumKVHeads;
-    params.s = mPaddedSequenceLen; // max sequence length of a batch of input queries.
+    // is_s_padded=true means Q/K/V use normal [B, S, H, D] layout and s is used for indexing.
+    // Otherwise tensors are ragged (B x S compacted), cu_seqlens drives indexing, and s is not used.
+    params.s = mPaddedSequenceLen;
     params.d = mHeadSize;
     params.dv = mHeadSize;
-    params.is_s_padded = true;
+    params.is_s_padded = mIsSPadded;
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
 
@@ -418,13 +422,38 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
     }
 }
 
-bool ContextFMHARunner::canImplement(
-    int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType) noexcept
+bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType,
+    AttentionInputLayout inputLayout, ContextAttentionMaskType maskType) noexcept
 {
-    bool const checkType = dataType == DataType::kHALF;
-    bool const checkHeadSize = headSize == 128 || headSize == 64;
+    if (dataType != DataType::kHALF)
+    {
+        LOG_ERROR(
+            "ContextFMHARunner::canImplement() only supports FP16. Got dataType=%d.", static_cast<int32_t>(dataType));
+        return false;
+    }
 
-    return checkType && checkHeadSize;
+    if (headSize == 64 || headSize == 128)
+    {
+        return true;
+    }
+
+    // Head sizes 72/80 are only available for PADDING mask with SEPARATE_Q_K_V layout, used for VIT.
+    if (headSize == 72 || headSize == 80)
+    {
+        if (inputLayout != AttentionInputLayout::SEPARATE_Q_K_V || maskType != ContextAttentionMaskType::PADDING)
+        {
+            LOG_ERROR(
+                "ContextFMHARunner::canImplement() headSize=%d requires inputLayout=SEPARATE_Q_K_V and "
+                "maskType=PADDING. Got inputLayout=%d, maskType=%d.",
+                headSize, static_cast<int32_t>(inputLayout), static_cast<int32_t>(maskType));
+            return false;
+        }
+        return true;
+    }
+
+    LOG_ERROR("ContextFMHARunner::canImplement() unsupported headSize=%d. Supported head sizes are 64, 72, 80, 128.",
+        headSize);
+    return false;
 }
 
 bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::DataType dataType)
