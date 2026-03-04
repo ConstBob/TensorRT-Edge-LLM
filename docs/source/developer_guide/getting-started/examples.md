@@ -611,17 +611,12 @@ Create an input file `$WORKSPACE_DIR/input_asr.json` (replace `/path/to/audio_in
         {
             "messages": [
                 {
+                    "role": "system",
+                    "content": ""
+                },
+                {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "audio",
-                            "audio": "/path/to/audio_input.safetensors"
-                        },
-                        {
-                            "type": "text",
-                            "text": "Transcribe the audio."
-                        }
-                    ]
+                    "content": [{"type": "audio", "audio": "/path/to/audio_input.safetensors"}]
                 }
             ]
         }
