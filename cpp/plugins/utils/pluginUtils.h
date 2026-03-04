@@ -34,6 +34,10 @@ namespace plugins
 //! Device memory alignment requirement (128 bytes)
 constexpr int32_t kDEVICE_ALIGNMENT{128};
 
+//! @brief Workaround for CUDA12/13 Thor SM re-numbering.
+//! @param smVersion CUDA SM version that may be normalized in-place.
+void applyThorSMRenumberWAR(int32_t& smVersion);
+
 /*!
  * @brief Convert C++ type to TensorRT PluginFieldType
  * @tparam T C++ type

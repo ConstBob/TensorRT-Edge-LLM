@@ -26,6 +26,15 @@ namespace trt_edgellm
 namespace plugins
 {
 
+void applyThorSMRenumberWAR(int32_t& smVersion)
+{
+    // Workaround for CUDA12/13 Thor re-numbering. The kernels themselves have version compatibility.
+    if (smVersion == 110)
+    {
+        smVersion = 101;
+    }
+}
+
 size_t alignTensorSize(size_t size)
 {
     return ((size + kDEVICE_ALIGNMENT - 1) / kDEVICE_ALIGNMENT) * kDEVICE_ALIGNMENT;

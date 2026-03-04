@@ -46,7 +46,8 @@ public:
      * @throws std::runtime_error if a CUDA error occurs, or if the SM is not supported
      */
     ContextFMHARunner(nvinfer1::DataType const dataType, int32_t batchSize, int32_t paddedSeqLen, int32_t numQHeads,
-        int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout);
+        int32_t numKvHeads, int32_t headSize, int32_t smVersion, AttentionInputLayout inputLayout,
+        ContextAttentionMaskType maskType = ContextAttentionMaskType::CAUSAL, bool isSPadded = true);
 
     //! @brief Deleted default constructor
     ContextFMHARunner() = delete;
@@ -78,13 +79,16 @@ public:
 
     // Static methods to check kernel availability and load cubins into device.
     /*!
-     * @brief Check if FMHA can be implemented for given configuration
+     * @brief Check if FMHA can be implemented for given head size/layout/mask combination
      * @param headSize Attention head dimension
      * @param sm CUDA compute capability
      * @param dataType Data type
+     * @param inputLayout Input tensor layout
+     * @param maskType Attention mask type
      * @return True if implementation is available
      */
-    static bool canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType) noexcept;
+    static bool canImplement(int32_t headSize, int32_t sm, nvinfer1::DataType dataType,
+        AttentionInputLayout inputLayout, ContextAttentionMaskType maskType) noexcept;
 
     /*!
      * @brief Load FMHA kernel cubins into device
@@ -103,6 +107,7 @@ private:
     int32_t mNumHeads;            //!< Number of query heads
     int32_t mNumKVHeads;          //!< Number of key-value heads
     int32_t mHeadSize;            //!< Attention head dimension
+    bool mIsSPadded;              //!< Whether input/output tensors are padded in S dimension
 
     int32_t mSmVersion;         //!< CUDA compute capability
     LaunchParams mLaunchParams; //!< Kernel launch parameters

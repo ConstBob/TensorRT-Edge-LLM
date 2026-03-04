@@ -30,24 +30,30 @@
 using namespace nvinfer1;
 using namespace trt_edgellm;
 
-void TestContextAttentionAccuracy(
-    int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, bool causal = true)
+void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, int32_t maxSeqLen, bool isCompact = false, bool causal = true)
 {
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
 
     // Check if context FMHA is supported for this configuration
-    if (!ContextFMHARunner::canImplement(headSize, smVersion, DataType::kHALF))
+    AttentionInputLayout const inputLayout = AttentionInputLayout::SEPARATE_Q_K_V;
+    ContextAttentionMaskType const maskType
+        = causal ? ContextAttentionMaskType::CAUSAL : ContextAttentionMaskType::PADDING;
+    if (!ContextFMHARunner::canImplement(headSize, smVersion, DataType::kHALF, inputLayout, maskType))
     {
         GTEST_SKIP() << "Context FMHA not supported for headSize=" << headSize << ", SM=" << smVersion;
     }
 
     // Calculate total elements
-    size_t const qSize = static_cast<size_t>(batchSize) * seqLen * numQHeads * headSize;
-    size_t const kvSize = static_cast<size_t>(batchSize) * seqLen * numKVHeads * headSize;
-    size_t const outSize = static_cast<size_t>(batchSize) * seqLen * numQHeads * headSize;
+    int32_t const batchSize = static_cast<int32_t>(cuSeqlens.size()) - 1;
+    int32_t const totalTokens = cuSeqlens.back();
 
-    // Initialize input data in BSHD layout: [B, S, H, D]
+    size_t const qSize = static_cast<size_t>(totalTokens) * numQHeads * headSize;
+    size_t const kvSize = static_cast<size_t>(totalTokens) * numKVHeads * headSize;
+    size_t const outSize = static_cast<size_t>(totalTokens) * numQHeads * headSize;
+
+    // Initialize input data
     std::vector<half> qInput(qSize);
     std::vector<half> kInput(kvSize);
     std::vector<half> vInput(kvSize);
@@ -56,21 +62,44 @@ void TestContextAttentionAccuracy(
     uniformFloatInitialization(kInput, -1.0f, 1.0f);
     uniformFloatInitialization(vInput, -1.0f, 1.0f);
 
-    // Create Tensor objects (they allocate device memory internally)
-    rt::Tensor qTensor({batchSize, seqLen, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor kTensor({batchSize, seqLen, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor vTensor({batchSize, seqLen, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor oTensorRef({batchSize, seqLen, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
-    rt::Tensor oTensorKernel({batchSize, seqLen, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    // Create Tensor objects based on layout (they allocate device memory internally)
+    rt::Tensor qTensor, kTensor, vTensor, oTensorRef, oTensorKernel;
+    if (isCompact)
+    {
+        qTensor = rt::Tensor({totalTokens, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+        kTensor = rt::Tensor({totalTokens, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+        vTensor = rt::Tensor({totalTokens, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+        oTensorRef = rt::Tensor({totalTokens, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+        oTensorKernel = rt::Tensor({totalTokens, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    }
+    else
+    {
+        qTensor = rt::Tensor({batchSize, maxSeqLen, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+        kTensor = rt::Tensor({batchSize, maxSeqLen, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+        vTensor = rt::Tensor({batchSize, maxSeqLen, numKVHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+        oTensorRef = rt::Tensor({batchSize, maxSeqLen, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+        oTensorKernel = rt::Tensor({batchSize, maxSeqLen, numQHeads, headSize}, rt::DeviceType::kGPU, DataType::kHALF);
+    }
 
     // Copy input data to device
     CUDA_CHECK(cudaMemcpy(qTensor.rawPointer(), qInput.data(), qSize * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(kTensor.rawPointer(), kInput.data(), kvSize * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(vTensor.rawPointer(), vInput.data(), kvSize * sizeof(half), cudaMemcpyHostToDevice));
+    rt::Tensor cuSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
+    CUDA_CHECK(cudaMemcpy(
+        cuSeqLensTensor.rawPointer(), cuSeqlens.data(), (batchSize + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
 
-    // Compute reference output using the BSHD reference kernel
+    // Compute reference output
     cudaStream_t stream = nullptr;
-    rt::launchFmhaReferenceBshd(qTensor, kTensor, vTensor, oTensorRef, causal, stream);
+    if (isCompact)
+    {
+        rt::launchFmhaReferenceCompact(
+            qTensor, kTensor, vTensor, oTensorRef, cuSeqLensTensor, maxSeqLen, false, stream);
+    }
+    else
+    {
+        rt::launchFmhaReferenceBshd(qTensor, kTensor, vTensor, oTensorRef, causal, stream);
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
 
@@ -79,32 +108,22 @@ void TestContextAttentionAccuracy(
     CUDA_CHECK(
         cudaMemcpy(outReference.data(), oTensorRef.rawPointer(), outSize * sizeof(half), cudaMemcpyDeviceToHost));
 
-    // Simple case for batches of fixed length sequences.
-    // TODO: update to take ragged layout with variable sequence lengths.
-    std::vector<int32_t> cuSeqLens(batchSize + 1);
-    for (int32_t i = 0; i <= batchSize; i++)
-    {
-        cuSeqLens[i] = i * seqLen;
-    }
-
-    // Create Tensor for cu_seqlens and copy data
-    rt::Tensor cuSeqLensTensor({batchSize + 1}, rt::DeviceType::kGPU, DataType::kINT32);
-    CUDA_CHECK(cudaMemcpy(
-        cuSeqLensTensor.rawPointer(), cuSeqLens.data(), (batchSize + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
-
     // Load context FMHA kernels
     EXPECT_TRUE(ContextFMHARunner::loadContextFMHAKernels(smVersion, DataType::kHALF));
 
-    // Create context FMHA runner with SEPARATE_Q_K_V layout
-    ContextFMHARunner runner(DataType::kHALF, batchSize, seqLen, numQHeads, numKVHeads, headSize, smVersion,
-        AttentionInputLayout::SEPARATE_Q_K_V);
+    // Create context FMHA runner
+    ContextFMHARunner runner(DataType::kHALF, batchSize, maxSeqLen, numQHeads, numKVHeads, headSize, smVersion,
+        inputLayout, maskType, !isCompact);
 
     // Setup parameters
     FusedMultiheadAttentionParamsV2 params;
     runner.setupParams(params);
 
     // Set device pointers
-    params.s_kv = seqLen;
+    if (!isCompact)
+    {
+        params.s_kv = maxSeqLen; // Only needed for padded layout
+    }
     params.q_ptr = qTensor.rawPointer();
     params.k_ptr = kTensor.rawPointer();
     params.v_ptr = vTensor.rawPointer();
@@ -144,12 +163,35 @@ void TestContextAttentionAccuracy(
 
     float passRate1E_3 = static_cast<float>(numCloseWithin1E_3) / totalElements;
 
-    std::cout << "Context Attention test. " << (causal ? "[Causal] " : "[Non-causal] ") << "batch_size: " << batchSize
-              << " seq_len: " << seqLen << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads
-              << " head_size: " << headSize << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
+    std::string layoutStr = isCompact ? "[Compact]" : "[Padded]";
+    std::string maskStr = causal ? "[Causal] " : "[Non-causal] ";
+    std::cout << "Context Attention test. " << layoutStr << maskStr << "batch_size: " << batchSize;
+    if (isCompact)
+    {
+        std::cout << " total_tokens: " << totalTokens << " max_seq_len: " << maxSeqLen;
+    }
+    else
+    {
+        std::cout << " seq_len: " << maxSeqLen;
+    }
+    std::cout << " num_Q_heads: " << numQHeads << " num_KV_heads: " << numKVHeads << " head_size: " << headSize
+              << " pass_rate_1e-3: " << passRate1E_3 << std::endl;
 
     EXPECT_GT(passRate1E_3, 0.9);
     EXPECT_FALSE(NanValueDetected);
+}
+
+// Convenience wrapper for padded layout (fixed sequence length)
+void TestContextAttentionAccuracy(
+    int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, bool causal = true)
+{
+    // Generate cu_seqlens for fixed-length sequences
+    std::vector<int32_t> cuSeqlens(batchSize + 1);
+    for (int32_t i = 0; i <= batchSize; i++)
+    {
+        cuSeqlens[i] = i * seqLen;
+    }
+    TestContextAttentionAccuracy(cuSeqlens, numQHeads, numKVHeads, headSize, seqLen, false, causal);
 }
 
 // Test cases with different head ratios (similar to XQA tests)
@@ -199,4 +241,19 @@ TEST(ContextAttentionTest, longSequence_Causal)
     TestContextAttentionAccuracy(1, 1024, 12, 4, 128, true);
     TestContextAttentionAccuracy(1, 1024, 12, 2, 128, true);
     TestContextAttentionAccuracy(1, 2048, 24, 3, 64, true);
+}
+
+// Convenience wrapper for compact layout (variable sequence lengths, non-causal)
+void TestContextAttentionCompactAccuracy(
+    std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t maxSeqLen)
+{
+    TestContextAttentionAccuracy(cuSeqlens, numQHeads, numKVHeads, headSize, maxSeqLen, true, false);
+}
+
+TEST(ContextAttentionTest, compactLayout_NonCausal)
+{
+    // VIT attention with compact layout and variable sequence lengths (non-causal)
+    TestContextAttentionCompactAccuracy({0, 32, 60, 88, 128}, 16, 16, 64, 128);
+    TestContextAttentionCompactAccuracy({0, 16, 64}, 16, 16, 72, 128);
+    TestContextAttentionCompactAccuracy({0, 100, 200, 300}, 8, 8, 80, 512);
 }

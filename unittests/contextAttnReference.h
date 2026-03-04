@@ -41,5 +41,22 @@ namespace rt
 void launchFmhaReferenceBshd(
     Tensor const& Q, Tensor const& K, Tensor const& V, Tensor& O, bool causal, cudaStream_t stream = nullptr);
 
+/*!
+ * Launch reference FMHA kernel for compact layout.
+ * Inputs: Q/K/V/O [total_tokens, H, D], cuSeqlens [B+1].
+ * maxSeqLen controls grid/shared-memory extent and must cover every per-batch sequence length.
+ *
+ * @param Q        Query tensor [total_tokens, H, D]
+ * @param K        Key tensor [total_tokens, H, D]
+ * @param V        Value tensor [total_tokens, H, D]
+ * @param O        Output tensor [total_tokens, H, D]
+ * @param cuSeqlens Prefix-sum lengths [B+1]
+ * @param maxSeqLen Maximum sequence length
+ * @param causal   If true, apply causal mask (k > q disallowed).
+ * @param stream   CUDA stream for kernel launch
+ */
+void launchFmhaReferenceCompact(Tensor const& Q, Tensor const& K, Tensor const& V, Tensor& O, Tensor const& cuSeqlens,
+    int32_t maxSeqLen, bool causal, cudaStream_t stream = nullptr);
+
 } // namespace rt
 } // namespace trt_edgellm

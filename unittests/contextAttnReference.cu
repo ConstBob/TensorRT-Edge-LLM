@@ -15,14 +15,17 @@
  * limitations under the License.
  */
 
+#include "common/checkMacros.h"
 #include "common/tensor.h"
 #include "contextAttnReference.h"
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <stdexcept>
 #include <stdint.h>
+#include <vector>
 
 template <typename T>
 __device__ __forceinline__ float to_float(T x)
@@ -66,8 +69,7 @@ struct AttnMaskBS
     uint8_t const* mask_bqk; // nullable, packed: ((b*Sq + q)*Sk + k)
 };
 
-__device__ __forceinline__ bool mask_allow_bshd(
-    int64_t b, int64_t q, int64_t k, int64_t Sq, int64_t Sk, AttnMaskBS const& m)
+__device__ __forceinline__ bool mask_allow(int64_t b, int64_t q, int64_t k, int64_t Sq, int64_t Sk, AttnMaskBS const& m)
 {
     if (m.causal && (k > q))
     {
@@ -87,10 +89,17 @@ __device__ __forceinline__ int64_t idx_bshd(int64_t b, int64_t s, int64_t h, int
     return ((b * S + s) * H + h) * D + d;
 }
 
+// Compact layout indexing helper: ((token*H + h)*D + d)
+__device__ __forceinline__ int64_t idx_compact(int64_t token, int64_t h, int64_t d, int64_t H, int64_t D)
+{
+    return (token * H + h) * D + d;
+}
+
 // A very simple FMHA fwd kernel that only cares about simplicity and correctness.
 template <typename Tqkv, typename To>
-__global__ void fmha_reference_bshd(Tqkv const* __restrict__ Q, Tqkv const* __restrict__ K, Tqkv const* __restrict__ V,
-    To* __restrict__ O, int64_t B, int64_t Sq, int64_t Sk, int64_t Hq, int64_t Hkv, int64_t D, AttnMaskBS mask)
+__global__ void fmha_reference(Tqkv const* __restrict__ Q, Tqkv const* __restrict__ K, Tqkv const* __restrict__ V,
+    To* __restrict__ O, int64_t B, int64_t Sq, int64_t Sk, int64_t Hq, int64_t Hkv, int64_t D, AttnMaskBS mask,
+    bool compactLayout, int32_t const* __restrict__ cuSeqlens)
 {
     extern __shared__ float s_scores[]; // size >= Sk floats
     int64_t const LIdx = blockIdx.y;
@@ -98,6 +107,27 @@ __global__ void fmha_reference_bshd(Tqkv const* __restrict__ Q, Tqkv const* __re
     int64_t const qHeadIdx = LIdx % Hq;
 
     int64_t const kvHeadIdx = (Hq == Hkv) ? qHeadIdx : (qHeadIdx * Hkv / Hq);
+
+    int64_t seqStart = 0;
+    int64_t seqLen = 0;
+    int64_t qLoopEnd = 0;
+    if (compactLayout)
+    {
+        seqStart = cuSeqlens[batchIdx];
+        seqLen = cuSeqlens[batchIdx + 1] - seqStart;
+        if (seqLen <= 0)
+        {
+            return;
+        }
+        qLoopEnd = seqLen;
+    }
+    else
+    {
+        seqStart = 0;
+        seqLen = Sk;
+        qLoopEnd = Sq;
+    }
+
     if (batchIdx >= B)
     {
         return;
@@ -109,23 +139,27 @@ __global__ void fmha_reference_bshd(Tqkv const* __restrict__ Q, Tqkv const* __re
     int64_t const startQ = blockIdx.x;
     int64_t const strideQ = gridDim.x;
 
-    for (int64_t qIdx = startQ; qIdx < Sq; qIdx += strideQ)
+    for (int64_t qIdx = startQ; qIdx < qLoopEnd; qIdx += strideQ)
     {
         // 1) Each thread in the CTA will loop through SK dimension. This memory access pattern is bad
         // but we intentionally do this to make reference implementation very easy to understand.
-        for (int kIdx = threadIdx.x; kIdx < Sk; kIdx += blockDim.x)
+        for (int kIdx = threadIdx.x; kIdx < seqLen; kIdx += blockDim.x)
         {
             float acc = 0.0f;
 
-            int64_t const qBase = idx_bshd(batchIdx, qIdx, qHeadIdx, 0, Sq, Hq, D);
-            int64_t const kBase = idx_bshd(batchIdx, kIdx, kvHeadIdx, 0, Sk, Hkv, D);
+            int64_t const qBase = compactLayout ? idx_compact((seqStart + qIdx), qHeadIdx, 0, Hq, D)
+                                                : idx_bshd(batchIdx, qIdx, qHeadIdx, 0, Sq, Hq, D);
+            int64_t const kBase = compactLayout ? idx_compact((seqStart + kIdx), kvHeadIdx, 0, Hkv, D)
+                                                : idx_bshd(batchIdx, kIdx, kvHeadIdx, 0, Sk, Hkv, D);
 
             for (int64_t d = 0; d < D; ++d)
             {
                 acc += to_float(Q[qBase + d]) * to_float(K[kBase + d]);
             }
 
-            if (!mask_allow_bshd(batchIdx, qIdx, kIdx, Sq, Sk, mask))
+            int64_t const maskSq = compactLayout ? seqLen : Sq;
+            int64_t const maskSk = compactLayout ? seqLen : Sk;
+            if (!mask_allow(batchIdx, qIdx, kIdx, maskSq, maskSk, mask))
             {
                 acc = -CUDART_INF_F;
             }
@@ -136,7 +170,7 @@ __global__ void fmha_reference_bshd(Tqkv const* __restrict__ Q, Tqkv const* __re
 
         // 2) max (reference-style: every thread loops all k)
         float maxS = -CUDART_INF_F;
-        for (int64_t kIdx = 0; kIdx < Sk; ++kIdx)
+        for (int64_t kIdx = 0; kIdx < seqLen; ++kIdx)
         {
             maxS = fmaxf(maxS, s_scores[kIdx]);
         }
@@ -144,7 +178,7 @@ __global__ void fmha_reference_bshd(Tqkv const* __restrict__ Q, Tqkv const* __re
         __syncthreads();
 
         // 3) exp
-        for (int k = threadIdx.x; k < Sk; k += blockDim.x)
+        for (int k = threadIdx.x; k < seqLen; k += blockDim.x)
         {
             float x = s_scores[k];
             s_scores[k] = __expf(softmax_scale * (x - maxS));
@@ -155,7 +189,7 @@ __global__ void fmha_reference_bshd(Tqkv const* __restrict__ Q, Tqkv const* __re
         // 4) In a normal kernel we shall perform a reduction sum across the whole CTA.
         // but since we are doing a simple reference, let's let each thread to derive the complete sum for simplicity.
         float sum = 0.0f;
-        for (int64_t kIdx = 0; kIdx < Sk; ++kIdx)
+        for (int64_t kIdx = 0; kIdx < seqLen; ++kIdx)
         {
             sum += s_scores[kIdx];
         }
@@ -165,13 +199,15 @@ __global__ void fmha_reference_bshd(Tqkv const* __restrict__ Q, Tqkv const* __re
         for (int64_t d = threadIdx.x; d < D; d += blockDim.x)
         {
             float acc = 0.0f;
-            for (int64_t kIdx = 0; kIdx < Sk; ++kIdx)
+            for (int64_t kIdx = 0; kIdx < seqLen; ++kIdx)
             {
                 float const pk = s_scores[kIdx];
-                int64_t const vBase = idx_bshd(batchIdx, kIdx, kvHeadIdx, 0, Sk, Hkv, D);
+                int64_t const vBase = compactLayout ? idx_compact((seqStart + kIdx), kvHeadIdx, 0, Hkv, D)
+                                                    : idx_bshd(batchIdx, kIdx, kvHeadIdx, 0, Sk, Hkv, D);
                 acc += pk * to_float(V[vBase + d]);
             }
-            int64_t const oIdx = idx_bshd(batchIdx, qIdx, qHeadIdx, d, Sq, Hq, D);
+            int64_t const oIdx = compactLayout ? idx_compact((seqStart + qIdx), qHeadIdx, d, Hq, D)
+                                               : idx_bshd(batchIdx, qIdx, qHeadIdx, d, Sq, Hq, D);
             O[oIdx] = from_float<To>(acc * inv_sum);
         }
 
@@ -182,8 +218,8 @@ __global__ void fmha_reference_bshd(Tqkv const* __restrict__ Q, Tqkv const* __re
 // --- Launcher: QKV in, attention O out (BSHD layout) ---
 
 template <typename Tqkv, typename To>
-void launchFmhaReferenceBshdTyped(Tqkv const* Q, Tqkv const* K, Tqkv const* V, To* O, int64_t B, int64_t Sq, int64_t Sk,
-    int64_t Hq, int64_t Hkv, int64_t D, bool causal, cudaStream_t stream)
+void launchFmhaReferenceTyped(Tqkv const* Q, Tqkv const* K, Tqkv const* V, To* O, int64_t B, int64_t Sq, int64_t Sk,
+    int64_t Hq, int64_t Hkv, int64_t D, bool causal, bool compactLayout, int32_t const* cuSeqlens, cudaStream_t stream)
 {
     AttnMaskBS mask;
     mask.causal = causal;
@@ -206,7 +242,8 @@ void launchFmhaReferenceBshdTyped(Tqkv const* Q, Tqkv const* K, Tqkv const* V, T
     dim3 grid((unsigned int) numBlocksX, (unsigned int) numBlocksY);
     dim3 block((unsigned int) blockSize);
 
-    fmha_reference_bshd<Tqkv, To><<<grid, block, smemBytes, stream>>>(Q, K, V, O, B, Sq, Sk, Hq, Hkv, D, mask);
+    fmha_reference<Tqkv, To>
+        <<<grid, block, smemBytes, stream>>>(Q, K, V, O, B, Sq, Sk, Hq, Hkv, D, mask, compactLayout, cuSeqlens);
 }
 
 // --- Tensor-based launcher ---
@@ -215,6 +252,32 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
+void launchFmhaReferenceImpl(Tensor const& Q, Tensor const& K, Tensor const& V, Tensor& O, bool causal,
+    bool compactLayout, int64_t B, int64_t Sq, int64_t Sk, int64_t Hq, int64_t Hkv, int64_t D,
+    int32_t const* cuSeqlensPtr, cudaStream_t stream)
+{
+    nvinfer1::DataType const dtype = Q.getDataType();
+    if (dtype != K.getDataType() || dtype != V.getDataType() || dtype != O.getDataType())
+    {
+        throw std::runtime_error("launchFmhaReference: Q, K, V, O must have the same data type.");
+    }
+
+    switch (dtype)
+    {
+    case nvinfer1::DataType::kHALF:
+        launchFmhaReferenceTyped<__half, __half>(Q.dataPointer<__half>(), K.dataPointer<__half>(),
+            V.dataPointer<__half>(), O.dataPointer<__half>(), B, Sq, Sk, Hq, Hkv, D, causal, compactLayout,
+            cuSeqlensPtr, stream);
+        break;
+    case nvinfer1::DataType::kBF16:
+        launchFmhaReferenceTyped<__nv_bfloat16, __nv_bfloat16>(Q.dataPointer<__nv_bfloat16>(),
+            K.dataPointer<__nv_bfloat16>(), V.dataPointer<__nv_bfloat16>(), O.dataPointer<__nv_bfloat16>(), B, Sq, Sk,
+            Hq, Hkv, D, causal, compactLayout, cuSeqlensPtr, stream);
+        break;
+    default: throw std::runtime_error("launchFmhaReference: unsupported data type (use kHALF, or kBF16).");
+    }
+}
 
 void launchFmhaReferenceBshd(
     Tensor const& Q, Tensor const& K, Tensor const& V, Tensor& O, bool causal, cudaStream_t stream)
@@ -254,25 +317,54 @@ void launchFmhaReferenceBshd(
         throw std::runtime_error("launchFmhaReferenceBshd: O shape must be [B, Sq, Hq, D].");
     }
 
-    nvinfer1::DataType const dtype = Q.getDataType();
-    if (dtype != K.getDataType() || dtype != V.getDataType() || dtype != O.getDataType())
+    launchFmhaReferenceImpl(Q, K, V, O, causal, false, B, Sq, Sk, Hq, Hkv, D, nullptr, stream);
+}
+
+void launchFmhaReferenceCompact(Tensor const& Q, Tensor const& K, Tensor const& V, Tensor& O, Tensor const& cuSeqlens,
+    int32_t maxSeqLen, bool causal, cudaStream_t stream)
+{
+    Coords const qShape = Q.getShape();
+    Coords const kShape = K.getShape();
+    Coords const vShape = V.getShape();
+    Coords const oShape = O.getShape();
+
+    if (qShape.getNumDims() != 3 || kShape.getNumDims() != 3 || vShape.getNumDims() != 3 || oShape.getNumDims() != 3)
     {
-        throw std::runtime_error("launchFmhaReferenceBshd: Q, K, V, O must have the same data type.");
+        throw std::runtime_error("launchFmhaReferenceCompact: Q/K/V/O must be 3D.");
     }
 
-    switch (dtype)
+    Coords const cuShape = cuSeqlens.getShape();
+    if (cuShape.getNumDims() != 1 || cuShape[0] < 2)
     {
-    case nvinfer1::DataType::kHALF:
-        launchFmhaReferenceBshdTyped<__half, __half>(Q.dataPointer<__half>(), K.dataPointer<__half>(),
-            V.dataPointer<__half>(), O.dataPointer<__half>(), B, Sq, Sk, Hq, Hkv, D, causal, stream);
-        break;
-    case nvinfer1::DataType::kBF16:
-        launchFmhaReferenceBshdTyped<__nv_bfloat16, __nv_bfloat16>(Q.dataPointer<__nv_bfloat16>(),
-            K.dataPointer<__nv_bfloat16>(), V.dataPointer<__nv_bfloat16>(), O.dataPointer<__nv_bfloat16>(), B, Sq, Sk,
-            Hq, Hkv, D, causal, stream);
-        break;
-    default: throw std::runtime_error("launchFmhaReferenceBshd: unsupported data type (use kHALF, or kBF16).");
+        throw std::runtime_error("launchFmhaReferenceCompact: cuSeqlens must be 1D [B+1].");
     }
+
+    if (maxSeqLen <= 0)
+    {
+        throw std::runtime_error("launchFmhaReferenceCompact: maxSeqLen must be positive.");
+    }
+
+    int32_t const totalTokens = static_cast<int32_t>(qShape[0]);
+    int64_t const Hq = qShape[1];
+    int64_t const Hkv = kShape[1];
+    int64_t const D = qShape[2];
+    if (kShape[0] != totalTokens || vShape[0] != totalTokens || oShape[0] != totalTokens)
+    {
+        throw std::runtime_error("launchFmhaReferenceCompact: total_tokens mismatch.");
+    }
+    if (kShape[2] != D || vShape[2] != D)
+    {
+        throw std::runtime_error("launchFmhaReferenceCompact: head dim D mismatch between Q and K/V.");
+    }
+    if (oShape[1] != Hq || oShape[2] != D)
+    {
+        throw std::runtime_error("launchFmhaReferenceCompact: O shape must be [total_tokens, Hq, D].");
+    }
+
+    int64_t const B = cuShape[0] - 1;
+
+    launchFmhaReferenceImpl(
+        Q, K, V, O, causal, true, B, maxSeqLen, maxSeqLen, Hq, Hkv, D, cuSeqlens.dataPointer<int32_t>(), stream);
 }
 
 } // namespace rt
