@@ -647,6 +647,167 @@ TEST_F(EmbeddingLookupTest, DeepstackUnevenHiddenSizeError)
         << "Deepstack kernel should error out when hiddenSize is not a multiple of 8";
 }
 
+// Test deepstack embedding with explicit imageTokenId and multimodalIndices (Qwen3-Omni path)
+TEST_F(EmbeddingLookupTest, DeepstackEmbeddingExplicitImageTokenId)
+{
+    int64_t const batchSize = 1;
+    int64_t const seqLen = 8;
+    int32_t const vocabSize = 100;
+    int64_t const hiddenSize = 128;
+    int64_t const numImageTokens = 4;
+    int32_t const imageTokenId = 42;
+
+    std::vector<int32_t> inputIds = {10, imageTokenId, 20, imageTokenId, 30, imageTokenId, 40, imageTokenId};
+    std::vector<int32_t> multimodalIndices = {0, 0, 0, 1, 0, 2, 0, 3};
+
+    std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
+    uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
+
+    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor indicesTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor featuresTensor({numImageTokens, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    CUDA_CHECK(cudaMemcpy(
+        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(indicesTensor.rawPointer(), multimodalIndices.data(),
+        multimodalIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(featuresTensor.rawPointer(), deepstackFeatures.data(),
+        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+    kernel::assembleDeepstackEmbedding(
+        inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream, imageTokenId, std::ref(indicesTensor));
+
+    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
+    CUDA_CHECK(cudaMemcpy(
+        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+
+    for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
+    {
+        bool const isImage = (inputIds[tokenIdx] == imageTokenId);
+        for (int64_t elem = 0; elem < hiddenSize; ++elem)
+        {
+            int64_t const idx = tokenIdx * hiddenSize + elem;
+            if (isImage)
+            {
+                int32_t const featureIdx = multimodalIndices[tokenIdx];
+                half const expected = deepstackFeatures[featureIdx * hiddenSize + elem];
+                EXPECT_TRUE(isclose(gpuResult[idx], expected, 1e-6, 1e-6))
+                    << "Image token at position " << tokenIdx << " element " << elem << " mismatch";
+            }
+            else
+            {
+                EXPECT_TRUE(isclose(gpuResult[idx], __float2half(0.0f), 1e-6, 1e-6))
+                    << "Text token at position " << tokenIdx << " element " << elem << " should be zero";
+            }
+        }
+    }
+}
+
+// Test deepstack embedding legacy path still works after isImageToken refactor
+// (imageTokenId=0, no multimodalIndices → uses tokenId >= vocabSize)
+TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLegacyPath)
+{
+    int64_t const batchSize = 1;
+    int64_t const seqLen = 6;
+    int32_t const vocabSize = 100;
+    int64_t const hiddenSize = 128;
+    int64_t const numImageTokens = 3;
+
+    // Mix of text tokens (< vocabSize) and image tokens (>= vocabSize)
+    std::vector<int32_t> inputIds = {50, 100, 20, 101, 80, 102};
+    // 50: text → zero
+    // 100: = vocabSize → deepstack[0]
+    // 20: text → zero
+    // 101: = vocabSize + 1 → deepstack[1]
+    // 80: text → zero
+    // 102: = vocabSize + 2 → deepstack[2]
+
+    std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
+    uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
+
+    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor featuresTensor({numImageTokens, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    CUDA_CHECK(cudaMemcpy(
+        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(featuresTensor.rawPointer(), deepstackFeatures.data(),
+        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+    // imageTokenId=0 → legacy mode, no multimodalIndices
+    kernel::assembleDeepstackEmbedding(inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream);
+
+    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
+    CUDA_CHECK(cudaMemcpy(
+        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+
+    for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
+    {
+        int32_t const tokenId = inputIds[tokenIdx];
+        bool const isImage = (tokenId >= vocabSize);
+        for (int64_t elem = 0; elem < hiddenSize; ++elem)
+        {
+            int64_t const idx = tokenIdx * hiddenSize + elem;
+            if (isImage)
+            {
+                int32_t const featureIdx = tokenId - vocabSize;
+                half const expected = deepstackFeatures[featureIdx * hiddenSize + elem];
+                EXPECT_TRUE(isclose(gpuResult[idx], expected, 1e-6, 1e-6))
+                    << "Legacy image token " << tokenId << " at position " << tokenIdx << " element " << elem
+                    << " mismatch";
+            }
+            else
+            {
+                EXPECT_TRUE(isclose(gpuResult[idx], __float2half(0.0f), 1e-6, 1e-6))
+                    << "Text token at position " << tokenIdx << " element " << elem << " should be zero";
+            }
+        }
+    }
+}
+
+// Test deepstack embedding with explicit imageTokenId but no multimodalIndices (fallback to tokenId - vocabSize)
+TEST_F(EmbeddingLookupTest, DeepstackEmbeddingExplicitIdNoIndices)
+{
+    int64_t const batchSize = 1;
+    int64_t const seqLen = 4;
+    int32_t const vocabSize = 100;
+    int64_t const hiddenSize = 128;
+    int64_t const numImageTokens = 2;
+    int32_t const imageTokenId = 42;
+
+    // imageTokenId=42 is within vocab, but no multimodalIndices → kernel falls back to tokenId - vocabSize
+    // tokenId=42 < vocabSize=100 → deepstackIdx = 42-100 = -58 → out of bounds → zero
+    std::vector<int32_t> inputIds = {imageTokenId, 10, imageTokenId, 50};
+
+    std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
+    uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
+
+    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor featuresTensor({numImageTokens, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+
+    CUDA_CHECK(cudaMemcpy(
+        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(featuresTensor.rawPointer(), deepstackFeatures.data(),
+        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+
+    // Explicit imageTokenId but no multimodalIndices
+    kernel::assembleDeepstackEmbedding(inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream, imageTokenId);
+
+    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
+    CUDA_CHECK(cudaMemcpy(
+        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+
+    // All outputs should be zero: image tokens detected but tokenId - vocabSize is negative → out of bounds
+    // Text tokens are < vocabSize and != imageTokenId → zero
+    for (int64_t i = 0; i < seqLen * hiddenSize; ++i)
+    {
+        EXPECT_TRUE(isclose(gpuResult[i], __float2half(0.0f), 1e-6, 1e-6))
+            << "All outputs should be zero when imageTokenId is within vocab and no multimodalIndices";
+    }
+}
+
 // Test Qwen3-Omni multimodal embedding lookup accuracy
 TEST_F(EmbeddingLookupTest, MultimodalAccuracy)
 {

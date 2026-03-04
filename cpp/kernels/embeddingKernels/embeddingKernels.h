@@ -51,22 +51,25 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
 //! \brief Assemble deepstack embeddings by extracting image token embeddings from deepstack features
 //!
 //! This function processes input token IDs and selectively extracts embeddings for image tokens from
-//! the provided deepstack features. Image tokens are identified by token IDs >= vocabSize. Regular
-//! text tokens (IDs < vocabSize) are assigned zero embeddings. This is typically used in multi-modal
-//! models where deepstack visual features need to be combined with text embeddings.
+//! the provided deepstack features. Image tokens are identified in two ways:
+//! - Legacy: token IDs >= vocabSize (Qwen2.5-VL where image tokens start at vocabSize)
+//! - Explicit: token ID == imageTokenId (Qwen3-Omni where image tokens are within vocab)
 //!
-//! Token ID Mapping:
-//! - Token ID < vocabSize: Zero embedding (text tokens are handled separately)
-//! - Token ID >= vocabSize: Extract from deepstackFeatures at index (tokenId - vocabSize)
+//! When multimodalIndices is provided, it is used to index into deepstackFeatures (required for
+//! Qwen3-Omni where all image tokens share the same ID). Otherwise falls back to tokenId - vocabSize.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
 //! \param[in] deepstackFeatures Deepstack image features with shape [numImageTokens, hiddenSize]
-//! \param[in] vocabSize Vocabulary size threshold for distinguishing text vs image tokens
+//! \param[in] vocabSize Vocabulary size (legacy threshold for image token detection)
+//! \param[in] imageTokenId Explicit image token ID (0 = not set, use legacy >= vocabSize detection)
+//! \param[in] multimodalIndices Pre-computed indices for image embeddings [batchSize, seqLen],
+//!                              or std::nullopt to use legacy tokenId - vocabSize indexing
 //! \param[out] deepstackEmbeds Output embeddings with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
 //! \throws std::runtime_error if tensor shapes or data types are invalid
 void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& deepstackFeatures, int32_t vocabSize,
-    rt::Tensor& deepstackEmbeds, cudaStream_t stream);
+    rt::Tensor& deepstackEmbeds, cudaStream_t stream, int32_t imageTokenId = 0,
+    rt::OptionalInputTensor multimodalIndices = std::nullopt);
 
 //! \brief Embedding lookup with optional image and audio embeddings for multimodal models
 //!
