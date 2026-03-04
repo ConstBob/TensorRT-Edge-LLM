@@ -144,9 +144,12 @@ find_library(
   HINTS ${TRT_PACKAGE_DIR}
   PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
 
+# TRT and CUDA headers are treated as system includes so that the compiler
+# suppresses warnings originating from them (e.g. -Wunused-parameter in
+# NvInferRuntime.h virtual stubs).
+include_directories(SYSTEM ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR})
+
 set(COMMON_INCLUDE_DIRS
-    ${CUDA_INCLUDE_DIR}
-    ${TRT_INCLUDE_DIR}
     ${NVTX_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/cpp
     ${CMAKE_SOURCE_DIR}/examples/multimodal

@@ -94,7 +94,8 @@ bool chunkAndPadFeatures(
     }
     else
     {
-        paddedFeature.reshape({chunkInfo.numChunks, melBins, chunkInfo.maxChunkLength});
+        check::check(paddedFeature.reshape({chunkInfo.numChunks, melBins, chunkInfo.maxChunkLength}),
+            "Failed to reshape paddedFeature");
     }
 
     // Zero out padding
@@ -129,7 +130,7 @@ bool chunkAndPadFeatures(
     return true;
 }
 
-bool createPaddedMask(ChunkInfo const& chunkInfo, int32_t nWindow, rt::Tensor& paddedMask,
+bool createPaddedMask(ChunkInfo const& chunkInfo, [[maybe_unused]] int32_t nWindow, rt::Tensor& paddedMask,
     std::vector<int64_t>& afterCNNLens, cudaStream_t stream)
 {
     // Compute aftercnn_lens for each chunk
@@ -154,7 +155,7 @@ bool createPaddedMask(ChunkInfo const& chunkInfo, int32_t nWindow, rt::Tensor& p
     }
     else
     {
-        paddedMask.reshape({chunkInfo.numChunks, maxLenAfterCNN});
+        check::check(paddedMask.reshape({chunkInfo.numChunks, maxLenAfterCNN}), "Failed to reshape paddedMask");
     }
 
     std::vector<int64_t> maskHost(chunkInfo.numChunks * maxLenAfterCNN, 0);
@@ -176,8 +177,8 @@ bool createPaddedMask(ChunkInfo const& chunkInfo, int32_t nWindow, rt::Tensor& p
     return true;
 }
 
-bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow, int32_t nWindowInfer,
-    rt::Tensor& paddedFeature, rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream)
+bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow, rt::Tensor& paddedFeature,
+    rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream)
 {
     auto const& inputShape = melSpectrogram.getShape();
     if (inputShape.getNumDims() != 3)
@@ -249,7 +250,7 @@ bool convertMaskToIndices(rt::Tensor const& paddedMask, rt::Tensor& paddedMaskIn
     if (numValid == 0)
     {
         LOG_WARNING("No valid elements in mask! Creating empty indices tensor");
-        paddedMaskIndices.reshape({0, 2});
+        check::check(paddedMaskIndices.reshape({0, 2}), "Failed to reshape paddedMaskIndices");
         return true;
     }
 
@@ -260,7 +261,7 @@ bool convertMaskToIndices(rt::Tensor const& paddedMask, rt::Tensor& paddedMaskIn
     }
     else
     {
-        paddedMaskIndices.reshape({numValid, 2});
+        check::check(paddedMaskIndices.reshape({numValid, 2}), "Failed to reshape paddedMaskIndices");
     }
 
     // Step 4: Copy indices from host to device
@@ -293,7 +294,7 @@ bool createChunkwiseAttentionMask(
     }
     else
     {
-        attentionMask.reshape({totalLen, totalLen});
+        check::check(attentionMask.reshape({totalLen, totalLen}), "Failed to reshape attentionMask");
     }
 
     // Initialize with -inf (mask out) - use FP16 min value

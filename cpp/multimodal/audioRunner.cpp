@@ -133,7 +133,7 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
     return true;
 }
 
-bool Qwen3OmniAudioRunner::allocateBuffer(cudaStream_t stream)
+bool Qwen3OmniAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
 {
     if (!mAudioEngine || !mAudioContext)
     {
@@ -175,7 +175,7 @@ bool Qwen3OmniAudioRunner::allocateBuffer(cudaStream_t stream)
 
 bool Qwen3OmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
 {
     std::vector<int64_t> audioTokenLengths;
 
@@ -350,8 +350,8 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
 
         // Preprocess for audio encoder
         std::vector<int64_t> afterCNNLens;
-        if (!audioUtils::preprocessAudioForEncoder(melSpec, mConfig.nWindow, mConfig.nWindowInfer, mPaddedFeature,
-                mPaddedMaskAfterCNN, afterCNNLens, stream))
+        if (!audioUtils::preprocessAudioForEncoder(
+                melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN, afterCNNLens, stream))
         {
             LOG_ERROR("Failed to preprocess audio for encoder");
             return false;
@@ -462,7 +462,7 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
     return true;
 }
 
-bool Qwen3OmniAudioRunner::infer(cudaStream_t stream)
+bool Qwen3OmniAudioRunner::infer([[maybe_unused]] cudaStream_t stream)
 {
     LOG_DEBUG("No-op (inference already done in preprocessAudio)");
     return true;
