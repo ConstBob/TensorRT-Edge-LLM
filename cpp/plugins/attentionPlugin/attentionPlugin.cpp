@@ -508,7 +508,6 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     // [B, S, Hq, D] where S is padded the max length of the input sequence within this batch.
     PluginTensorDesc const& qInputDesc = inputs[kIN_Q_IDX];
     int64_t const maxBatchSize = qInputDesc.dims.d[0];
-    int64_t const maxInputSeqLen = qInputDesc.dims.d[1];
 
     // Obtain max KV cache capacity from the KV cache tensor shape.
     // The KV cache tensor has shape [B, 2, num_kv_heads, capacity, head_dim]

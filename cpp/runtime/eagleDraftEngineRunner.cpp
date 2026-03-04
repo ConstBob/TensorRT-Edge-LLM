@@ -595,7 +595,6 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputsEmb
 
     // Prepare the input for the engine execution.
     int32_t const activeBatchSize = static_cast<int32_t>(inputsEmbeds.getShape()[0]);
-    int32_t const inputSequenceLength = static_cast<int32_t>(inputsEmbeds.getShape()[1]);
     constexpr int32_t kCONTEXT_SELECT_TOKEN_LENGTH{1};
     check::check(mSequenceContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
     check::check(mSelectTokenIndices.reshape({activeBatchSize, kCONTEXT_SELECT_TOKEN_LENGTH}),

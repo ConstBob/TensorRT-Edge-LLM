@@ -52,8 +52,8 @@ bool createPaddedMask(ChunkInfo const& chunkInfo, int32_t nWindow, rt::Tensor& p
     std::vector<int64_t>& afterCNNLens, cudaStream_t stream);
 
 //! Preprocess audio for Qwen3-Omni encoder: chunk, pad, and create masks
-bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow, int32_t nWindowInfer,
-    rt::Tensor& paddedFeature, rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream);
+bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow, rt::Tensor& paddedFeature,
+    rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream);
 
 //! Convert boolean mask to nonzero indices (equivalent to torch.nonzero)
 //! This function implements the NonZero operation that was removed from the ONNX model.
