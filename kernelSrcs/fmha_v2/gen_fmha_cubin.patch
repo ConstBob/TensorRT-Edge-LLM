@@ -243,11 +243,11 @@ index cc3931caa..5dbbd2507 100644
 +            sm_list = [120, 121]
 +        else:
 +            sm_list = [80, 86, 87, 89]
-+            if 'ENABLE_SM100' in os.environ:
++            if 'ENABLE_SM10X' in os.environ:
 +                sm_list.extend([100, 101])
 +        for sm in sm_list:
 +            for input_layout in [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.SEPARATE_Q_K_V]:
-+                enumerate_hmma_flash_kernels_edge_llm(specs, sm=sm, dtype='fp16', input_layout=input_layout)
++                enumerate_hmma_flash_kernels_edge_llm(specs, sm=sm, dtype='fp16_fp32', input_layout=input_layout)
 +
 +        # TRT-EdgeLLM uses the head_interleaved=False mode.
 +        if 'GENERATE_CUBIN' in os.environ:
