@@ -160,7 +160,7 @@ l0_unit_tests_x86:
     matrix:
       - RUNNER_TAG: a30-edgellm-nvks
       - RUNNER_TAG: rtx5080-edgellm-nvks
-        #      - RUNNER_TAG: b100-edgellm-nvks # TODO: Remove once B100 infrastructure issues are resolved
+      - RUNNER_TAG: b100-edgellm-nvks
   tags:
     - ${RUNNER_TAG}
   image: "$IMAGE"
