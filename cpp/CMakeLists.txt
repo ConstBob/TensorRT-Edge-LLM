@@ -37,17 +37,22 @@ set(FMHA_ALL_SM_VERSIONS
     121)
 set(FMHA_EXCLUDE_DEFINITIONS "")
 
+# Build a list of required FMHA SM versions based on target architectures. Some
+# SM versions reuse cubins from other SM versions at runtime.
+set(REQUIRED_FMHA_SM_VERSIONS ${CMAKE_CUDA_ARCHITECTURES})
+
+# SM 110 uses SM 101 FMHA cubins at runtime
+if(110 IN_LIST CMAKE_CUDA_ARCHITECTURES AND NOT 101 IN_LIST
+                                            CMAKE_CUDA_ARCHITECTURES)
+  list(APPEND REQUIRED_FMHA_SM_VERSIONS 101)
+endif()
+
+# Exclude SM versions that are not required
 foreach(SM_VER ${FMHA_ALL_SM_VERSIONS})
-  list(FIND CMAKE_CUDA_ARCHITECTURES ${SM_VER} SM_INDEX)
-  if(SM_INDEX EQUAL -1)
+  if(NOT SM_VER IN_LIST REQUIRED_FMHA_SM_VERSIONS)
     list(APPEND FMHA_EXCLUDE_DEFINITIONS "EXCLUDE_SM_${SM_VER}")
   endif()
 endforeach()
-
-# SM 110 uses SM 101 FMHA cubins at runtime
-if(110 IN_LIST CMAKE_CUDA_ARCHITECTURES)
-  list(REMOVE_ITEM FMHA_EXCLUDE_DEFINITIONS "EXCLUDE_SM_101")
-endif()
 
 if(FMHA_EXCLUDE_DEFINITIONS)
   message(
