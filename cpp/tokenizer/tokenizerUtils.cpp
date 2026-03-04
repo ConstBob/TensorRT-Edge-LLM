@@ -431,6 +431,11 @@ std::string unicodeCollapseText(std::vector<uint32_t> const& cpts)
     return textCollapsed;
 }
 
+// Suppress the GCC false positive compiler warning for
+// match_results::position(), which erroneously reports a potential bounds
+// violation.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
 std::vector<size_t> unicodeRegexSplit(std::string const& text, std::regex const& regex)
 {
     std::vector<size_t> bpeOffsets; // store the offset of each word
@@ -460,6 +465,7 @@ std::vector<size_t> unicodeRegexSplit(std::string const& text, std::regex const&
 
     return bpeOffsets;
 }
+#pragma GCC diagnostic pop
 
 static std::vector<codepointFlags> unicodeCptFlagsArray()
 {

@@ -214,7 +214,7 @@ cd build
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
-    -DCUDA_VERSION=<YOUR_CUDA_VERSION>
+    -DCUDA_CTK_VERSION=<YOUR_CUDA_VERSION>
 ```
 
 > **Note:** Replace `/usr/local/TensorRT-10.x.x` with your actual TensorRT installation path. Use `dpkg -l | grep tensorrt` to find it, or download from [NVIDIA TensorRT downloads](https://developer.nvidia.com/tensorrt). Replace `<YOUR_CUDA_VERSION>` with your actual CUDA version (e.g., `13.0`). Use `nvcc --version` to check your CUDA version.

@@ -134,10 +134,10 @@ void initRotaryPosEmbQwenViTReference(std::vector<float>& rotaryPosEmb,
     int64_t const mergeSize, float const rotaryBaseFrequency, float const scale);
 
 // GEMM weight packing and weight scale reference function for int4-WOQ kernel
-void awqPackReference(int16_t const* kernel_KxN, int N_in, int K_in, int16_t* out_Ndiv4xK);
+void awqPackReference(int16_t const* kernel_KxN, int32_t N_in, int32_t K_in, int16_t* out_Ndiv4xK);
 
-void scaledWeightsReference(
-    int16_t const* kernel_KxN, half const* scales_KdivGxN, int K, int N, int group_size, std::vector<half>& out_KxN);
+void scaledWeightsReference(int16_t const* kernel_KxN, half const* scales_KdivGxN, int32_t K, int32_t N,
+    int32_t group_size, std::vector<half>& out_KxN);
 
 // MoE TopK Softmax reference functions
 void referenceMoeSoftmax(std::vector<float> const& input, std::vector<float> const* correctionBias,

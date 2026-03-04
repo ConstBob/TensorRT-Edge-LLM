@@ -26,8 +26,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_CUDA_STANDARD 17)
 
 set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations -Wall -Werror=return-type")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations")
+    "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations -Wall -Werror -Wno-error=unused-parameter"
+)
+set(CMAKE_CUDA_FLAGS
+    "${CMAKE_CUDA_FLAGS} -Wno-deprecated-declarations -Xcompiler=-Werror,-Wno-error=unused-parameter"
+)
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 
 # Code coverage with gcov (for SonarQube analysis)

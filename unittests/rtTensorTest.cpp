@@ -126,8 +126,8 @@ TEST(TensorTest, HostTensorOwnMemory)
     ASSERT_EQ(tensorExtent[1], 3);
 
     // Verify out of range stride access
-    ASSERT_THROW(tensor.getStride(3), std::out_of_range);
-    ASSERT_THROW(tensor.getStride(-1), std::out_of_range);
+    ASSERT_THROW(static_cast<void>(tensor.getStride(3)), std::out_of_range);
+    ASSERT_THROW(static_cast<void>(tensor.getStride(-1)), std::out_of_range);
 
     // Expect reshape to fail when reshape to shapes out of capacity
     ASSERT_FALSE(tensor.reshape({4, 4, 4}));
@@ -261,7 +261,7 @@ TEST(TensorTest, TensorFormatString)
 
     // Use defer to restore the log level to handle case where
     // failure happens in the test.
-    Defer defer([&gLogger, logLevel]() { gLogger.setLevel(logLevel); });
+    Defer defer([logLevel]() { gLogger.setLevel(logLevel); });
 
     // Print some small tensor for sanity check
     std::vector<float> hostData(24);
