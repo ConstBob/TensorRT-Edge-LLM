@@ -42,6 +42,7 @@ struct AudioConfig
     int32_t audioTokenId{151675};    //!< <|audio_pad|> token ID
     int32_t audioBosTokenId{151669}; //!< <|audio_start|> token ID
     int32_t audioEosTokenId{151670}; //!< <|audio_end|> token ID
+    float mropeTheta{0.0F};          //!< Multi-dimensional RoPE theta (0 = no MRope)
 };
 
 //! \brief Runner for Qwen3-Omni audio encoder
@@ -87,6 +88,18 @@ public:
     //! \return Reference to audio embedding tensor
     rt::Tensor& getOutputEmbedding() override;
 
+    //! \brief Initialize sequential MRope cache for system prompt KVCache saving
+    //! \details For audio-only MRope models (e.g. Qwen3-ASR), initialize sequential MRope cache
+    //!          since no vision runner will fill it. When a vision runner is present, this is a no-op
+    //!          because QwenViTRunner::preprocessSystemPrompt handles MRope initialization.
+    //! \param[in] systemPrompt System prompt text
+    //! \param[in] tokenizer Tokenizer instance
+    //! \param[in,out] ropeRotaryCosSinDevice RoPE cache tensor
+    //! \param[in] stream CUDA stream
+    //! \return True on success, false on failure
+    bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
+        rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+
 private:
     //! \brief Preprocess audio buffers and run encoder inference
     //! \param[in] audioBuffers Input audio data with mel-spectrogram paths or waveforms
@@ -112,6 +125,16 @@ private:
     //! \return True on success, false otherwise
     bool loadMelSpectrogramFromFile(
         std::string const& filePath, std::string const& format, rt::Tensor& melSpectrogram, cudaStream_t stream);
+
+    //! \brief Initialize MRope cos/sin cache with sequential position IDs (T=H=W=[0,1,2,...])
+    //! \details Used for audio+text only models (e.g. Qwen3-ASR) where all 3 MRope dimensions
+    //!          use identical sequential positions. Skipped when mConfig.mropeTheta == 0.
+    //! \param[in] activeBatchSize Number of active sequences in the batch
+    //! \param[in,out] ropeRotaryCosSinDevice RoPE cache tensor to fill
+    //! \param[in] stream CUDA stream for execution
+    //! \return True if initialization succeeded or was skipped, false on failure
+    bool initializeSequentialMRopeCache(
+        int64_t activeBatchSize, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
 
     AudioConfig mConfig{};                                      //!< Audio encoder configuration
     std::unique_ptr<nvinfer1::ICudaEngine> mAudioEngine;        //!< Audio encoder TensorRT engine

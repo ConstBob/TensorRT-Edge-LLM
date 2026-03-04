@@ -451,6 +451,11 @@ bool LLMInferenceRuntime::handleRequest(
                 mVisionRunner->preprocessSystemPrompt(
                     batchSystemPrompts[i], mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream);
             }
+            else if (mAudioRunner)
+            {
+                mAudioRunner->preprocessSystemPrompt(
+                    batchSystemPrompts[i], mTokenizer.get(), mLLMEngineRunner->getRopeCosSinCacheTensor(), stream);
+            }
             bool const saveCacheStatus = genAndSaveSystemPromptKVCache(batchSystemPrompts[i], loraWeightsName, stream);
             if (!saveCacheStatus)
             {

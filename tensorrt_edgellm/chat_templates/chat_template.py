@@ -44,7 +44,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import AutoProcessor, AutoTokenizer
 
-from ..llm_models.model_utils import _is_qwen3_omni_model, is_vlm
+from ..llm_models.model_utils import (_is_qwen3_asr_model,
+                                      _is_qwen3_omni_model, is_vlm)
 
 
 @dataclass
@@ -355,6 +356,29 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     user_prefix, user_suffix = _extract_prefix_suffix(
         user_formatted[len(system_formatted):], user_prompt.content)
 
+    # Some models (e.g. Qwen3-ASR) inject extra role blocks into the
+    # system-only output (an empty user turn).  This causes system_suffix
+    # to contain markers that belong to the user role.  Strip them so
+    # the C++ runtime doesn't emit a spurious empty user block.
+    if user_prefix and user_prefix in system_suffix:
+        system_suffix = system_suffix[:system_suffix.find(user_prefix)]
+    elif not user_prefix and system_suffix:
+        # User extraction failed (e.g. template ignores text-only user
+        # messages).  If system_suffix has an embedded user block it will
+        # look like  SUFFIX + user_prefix + SUFFIX  where SUFFIX is the
+        # end-of-turn marker that appears at both ends.  Decompose it.
+        for length in range(1, len(system_suffix) // 2 + 1):
+            candidate = system_suffix[:length]
+            if (system_suffix.endswith(candidate)
+                    and len(system_suffix) > 2 * len(candidate)):
+                user_prefix = system_suffix[length:-length]
+                user_suffix = candidate
+                system_suffix = candidate
+                print(
+                    f"Extracted user role patterns from system suffix: "
+                    f"prefix={repr(user_prefix)}, suffix={repr(user_suffix)}")
+                break
+
     # Extract assistant role patterns (compare with user case)
     assistant_prompt = AssistantMessage()
     assistant_formatted = _format_messages(
@@ -419,7 +443,7 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             content_types['video'] = {'format': video_pattern}
 
     # Check for Omni models (audio + vision + text)
-    elif _is_qwen3_omni_model(model_dir):
+    elif _is_qwen3_omni_model(model_dir) or _is_qwen3_asr_model(model_dir):
         print(
             "Detected Omni-modal model (audio + vision), using special token placeholders..."
         )

@@ -185,7 +185,7 @@ bool AudioBuilder::parseConfig()
         {
             auto audioConfig = mModelConfig["audio_config"];
             // Read from config with fallback defaults (for Qwen3-Omni)
-            mMelBins = audioConfig.value("mel_bins", 128); // Default: 128 mel frequency bins
+            mMelBins = audioConfig.value("num_mel_bins", 128); // Default: 128 mel frequency bins
             // n_window is chunk size (50), but feature tensor uses 100 (n_window * 2)
             mNWindowDim = audioConfig.value("n_window", 50) * 2;         // Default: 50 * 2 = 100
             mSubsampleFactor = audioConfig.value("subsample_factor", 2); // Default: 2x subsampling

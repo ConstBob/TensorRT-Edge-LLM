@@ -48,7 +48,8 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::QWEN2_5_VL;
     if (modelTypeStr == "qwen3_vl")
         return ModelType::QWEN3_VL;
-    if (modelTypeStr == "qwen3_omni" || modelTypeStr == "qwen3_omni_thinker" || modelTypeStr == "qwen3_omni_text")
+    if (modelTypeStr == "qwen3_omni" || modelTypeStr == "qwen3_omni_thinker" || modelTypeStr == "qwen3_omni_text"
+        || modelTypeStr == "qwen3_asr_thinker")
         return ModelType::QWEN3_OMNI_AUDIO_ENCODER;
     if (modelTypeStr == "qwen3_omni_vision_encoder")
         return ModelType::QWEN3_OMNI_VISION_ENCODER;

@@ -747,9 +747,11 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
     // Extract system prompt from first message or use default
     auto const& leadMessage = request.messages.front();
     std::string systemPrompt{};
+    bool hasExplicitSystemMessage = false;
 
     if (leadMessage.role == kRoleSystem)
     {
+        hasExplicitSystemMessage = true;
         for (auto const& content : leadMessage.contents)
         {
             if (content.type == "text")
@@ -765,11 +767,13 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
     }
     else if (applyChatTemplate && !mChatTemplate.defaultSystemPrompt.empty())
     {
+        hasExplicitSystemMessage = true;
         systemPrompt = mChatTemplate.defaultSystemPrompt;
     }
 
-    // Format system prompt
-    if (!systemPrompt.empty())
+    // Format system prompt (also format when there's an explicit system message with empty content,
+    // since some models like Qwen3-ASR expect the system role block even when empty)
+    if (!systemPrompt.empty() || (hasExplicitSystemMessage && applyChatTemplate))
     {
         if (applyChatTemplate)
         {
