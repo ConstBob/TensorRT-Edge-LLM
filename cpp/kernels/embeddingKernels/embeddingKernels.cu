@@ -224,7 +224,8 @@ void launchEmbeddingLookupWithImageInsertionKernel(int32_t const* inputIds, half
 // Extracts image token embeddings from deepstack features based on token IDs
 // Token IDs >= vocabSize are mapped to deepstack features, others get zero embeddings
 __global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half const* deepstackFeatures, half* output,
-    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize, int64_t numImageTokens)
+    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int32_t imageTokenId, int64_t hiddenSize,
+    int64_t numImageTokens, int32_t const* multimodalIndices = nullptr)
 {
     // Each warp handles one hidden state (one token's embedding)
     // Each thread processes 8 FP16 elements (128-bit granularity)
@@ -240,15 +241,14 @@ __global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half c
         return;
     }
 
-    // Calculate token indices
-    uint32_t const batchIdx = warpId / seqLen;
-    uint32_t const tokenIdx = warpId % seqLen;
+    // Get token ID (warpId == batchIdx * seqLen + tokenIdx)
+    int64_t const pos = static_cast<int64_t>(warpId);
+    int32_t const tokenId = inputIds[pos];
 
-    // Get token ID
-    int32_t const tokenId = inputIds[batchIdx * seqLen + tokenIdx];
-
-    // Determine if this is an image token (>= vocabSize)
-    bool const isImageToken = tokenId >= vocabSize;
+    // Determine if this is an image/multimodal token:
+    // - Legacy path: tokenId >= vocabSize (Qwen2.5-VL where image tokens start at vocabSize)
+    // - Explicit path: tokenId == imageTokenId (Qwen3-Omni where image tokens are within vocab)
+    bool const isImageToken = (tokenId >= vocabSize) || (imageTokenId > 0 && tokenId == imageTokenId);
 
     // Calculate base indices for this warp's work
     uint32_t const baseOutputIdx = warpId * hiddenSize;
@@ -260,8 +260,18 @@ __global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half c
 
         if (isImageToken)
         {
-            // Calculate the index into deepstackFeatures
-            int32_t const deepstackIdx = tokenId - vocabSize;
+            // Calculate the index into deepstackFeatures:
+            // - If multimodalIndices is provided, use it (Qwen3-Omni: all image tokens share same ID)
+            // - Otherwise, fall back to tokenId - vocabSize (Qwen2.5-VL legacy)
+            int32_t deepstackIdx;
+            if (multimodalIndices != nullptr)
+            {
+                deepstackIdx = multimodalIndices[pos];
+            }
+            else
+            {
+                deepstackIdx = tokenId - vocabSize;
+            }
 
             // Validate that deepstackIdx is within bounds
             if (deepstackIdx >= 0 && deepstackIdx < numImageTokens)
@@ -282,7 +292,7 @@ __global__ void assembleDeepstackEmbeddingKernel(int32_t const* inputIds, half c
         }
         else
         {
-            // Token ID < vocabSize, use zero embedding
+            // Not an image token, use zero embedding
 #pragma unroll
             for (uint32_t i = 0; i < vecSize; ++i)
             {
@@ -332,7 +342,6 @@ __global__ void embeddingLookupMultimodalKernel(int32_t const* inputIds, half co
 
     if (imageEmbeds != nullptr && tokenId == imageTokenId)
     {
-        // Image token: use multimodalIndices to get the index into imageEmbeds
         int32_t const imageIdx = multimodalIndices[linearIdx];
 
         // Validate image index
@@ -514,7 +523,7 @@ void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor co
 }
 
 void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& deepstackFeatures, int32_t vocabSize,
-    rt::Tensor& deepstackEmbeds, cudaStream_t stream)
+    rt::Tensor& deepstackEmbeds, cudaStream_t stream, int32_t imageTokenId, rt::OptionalInputTensor multimodalIndices)
 {
     // Validate input shapes
     auto const inputShape = inputIds.getShape();
@@ -544,6 +553,13 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
     half const* deepstackFeaturesPtr = deepstackFeatures.dataPointer<half>();
     half* outputPtr = deepstackEmbeds.dataPointer<half>();
 
+    // Multimodal indices (optional, for Qwen3-Omni where image tokens share same ID)
+    int32_t const* multimodalIndicesPtr = nullptr;
+    if (multimodalIndices.has_value())
+    {
+        multimodalIndicesPtr = multimodalIndices.value().get().dataPointer<int32_t>();
+    }
+
     // Launch kernel
     constexpr uint32_t vecSize = DVec<half>::vec_size;
     uint32_t const totalTokens = batchSize * seqLen;
@@ -556,8 +572,8 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
     dim3 const threadsPerBlock(32, 4);               // (32, 4) = 128 threads total
     uint32_t const gridSize = (totalTokens + 3) / 4; // 4 warps per block
 
-    assembleDeepstackEmbeddingKernel<<<gridSize, threadsPerBlock, 0, stream>>>(
-        inputIdsPtr, deepstackFeaturesPtr, outputPtr, batchSize, seqLen, vocabSize, hiddenSize, numImageTokens);
+    assembleDeepstackEmbeddingKernel<<<gridSize, threadsPerBlock, 0, stream>>>(inputIdsPtr, deepstackFeaturesPtr,
+        outputPtr, batchSize, seqLen, vocabSize, imageTokenId, hiddenSize, numImageTokens, multimodalIndicesPtr);
 }
 
 void embeddingLookupMultimodal(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
