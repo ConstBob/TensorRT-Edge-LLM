@@ -22,6 +22,7 @@
 #include "common/logger.h"
 #include "common/mmapReader.h"
 #include "common/safetensorsUtils.h"
+#include "kernels/posEncoding/initializeCosSinCache.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <algorithm>
@@ -119,8 +120,8 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
     if (jsonConfig.contains("audio_config"))
     {
         auto audioConfig = jsonConfig["audio_config"];
-        mConfig.melBins = audioConfig.value("mel_bins", 128);
-        mConfig.audioFeatureDim = audioConfig.value("feature_dim", 2560);
+        mConfig.melBins = audioConfig.value("num_mel_bins", 128);
+        mConfig.audioFeatureDim = audioConfig.value("output_dim", 2560);
         mConfig.subsampleFactor = audioConfig.value("subsample_factor", 2);
         mConfig.nWindow = audioConfig.value("n_window", 50);
         mConfig.nWindowInfer = audioConfig.value("n_window_infer", 200);
@@ -128,6 +129,32 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
     else
     {
         LOG_WARNING("audio_config not found in config.json, using default values");
+    }
+
+    // Parse audio special token IDs from top-level config (may differ between Qwen3-Omni and Qwen3-ASR)
+    if (jsonConfig.contains("audio_token_id"))
+    {
+        mConfig.audioTokenId = jsonConfig["audio_token_id"].get<int32_t>();
+    }
+    if (jsonConfig.contains("audio_start_token_id"))
+    {
+        mConfig.audioBosTokenId = jsonConfig["audio_start_token_id"].get<int32_t>();
+    }
+    if (jsonConfig.contains("audio_end_token_id"))
+    {
+        mConfig.audioEosTokenId = jsonConfig["audio_end_token_id"].get<int32_t>();
+    }
+    LOG_DEBUG("Audio token IDs: audio_pad=%d, audio_start=%d, audio_end=%d", mConfig.audioTokenId,
+        mConfig.audioBosTokenId, mConfig.audioEosTokenId);
+
+    // Parse rope_theta for MRope initialization (from text_config or top-level)
+    if (jsonConfig.contains("text_config") && jsonConfig["text_config"].contains("rope_theta"))
+    {
+        mConfig.mropeTheta = jsonConfig["text_config"]["rope_theta"].get<float>();
+    }
+    else if (jsonConfig.contains("rope_theta"))
+    {
+        mConfig.mropeTheta = jsonConfig["rope_theta"].get<float>();
     }
 
     return true;
@@ -199,6 +226,17 @@ bool Qwen3OmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
 
     // Step 2: Tokenize and replace audio tokens (similar to QwenViTRunner::textPreprocess)
     textPreprocess(request, batchedInputIds, audioTokenLengths, tokenizer);
+
+    // Step 3: Initialize sequential MRope cache if applicable.
+    // For audio+text only (no vision), all 3 MRope dimensions (T, H, W) use identical sequential positions.
+    // When a vision runner is also present, QwenViTRunner::preprocess will overwrite the MRope cache
+    // with vision-aware position IDs, so this initialization is harmlessly overwritten.
+    int64_t const activeBatchSize = static_cast<int64_t>(request.requests.size());
+    if (!initializeSequentialMRopeCache(activeBatchSize, ropeRotaryCosSinDevice, stream))
+    {
+        LOG_ERROR("Failed to initialize sequential MRope cache for audio input.");
+        return false;
+    }
 
     return true;
 }
@@ -471,6 +509,82 @@ bool Qwen3OmniAudioRunner::infer([[maybe_unused]] cudaStream_t stream)
 rt::Tensor& Qwen3OmniAudioRunner::getOutputEmbedding()
 {
     return mAudioEmbedding;
+}
+
+bool Qwen3OmniAudioRunner::preprocessSystemPrompt(std::string const& systemPrompt,
+    [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+{
+    if (systemPrompt.empty())
+    {
+        return true;
+    }
+
+    // For audio-only MRope models (e.g. Qwen3-ASR), initialize sequential MRope cache
+    // for system prompt since no vision runner will fill it.
+    // Batch size is always 1 for system prompt KVCache generation.
+    return initializeSequentialMRopeCache(1, ropeRotaryCosSinDevice, stream);
+}
+
+bool Qwen3OmniAudioRunner::initializeSequentialMRopeCache(
+    int64_t activeBatchSize, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+{
+    if (mConfig.mropeTheta <= 0.0F)
+    {
+        // Not an MRope model, nothing to do.
+        return true;
+    }
+
+    auto const ropeShape = ropeRotaryCosSinDevice.getShape();
+    int64_t const maxPositionEmbeddings = ropeShape[1];
+    int64_t const rotaryDim = ropeShape[2];
+
+    // Allocate host position IDs: [activeBatchSize, 3, maxPositionEmbeddings]
+    // For audio+text only, all 3 dimensions (T, H, W) use identical sequential positions [0, 1, 2, ...]
+    int64_t const numElements = activeBatchSize * 3 * maxPositionEmbeddings;
+    std::vector<int64_t> positionIdsHost(numElements);
+
+    for (int64_t b = 0; b < activeBatchSize; ++b)
+    {
+        int64_t batchOffset = b * 3 * maxPositionEmbeddings;
+        for (int64_t dim = 0; dim < 3; ++dim)
+        {
+            for (int64_t pos = 0; pos < maxPositionEmbeddings; ++pos)
+            {
+                positionIdsHost[batchOffset + dim * maxPositionEmbeddings + pos] = pos;
+            }
+        }
+    }
+
+    // Copy position IDs to device
+    rt::Tensor positionIdsDevice({activeBatchSize, 3, maxPositionEmbeddings}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kINT64, "sequentialMRopePositionIds");
+    CUDA_CHECK(cudaMemcpyAsync(positionIdsDevice.rawPointer(), positionIdsHost.data(), numElements * sizeof(int64_t),
+        cudaMemcpyHostToDevice, stream));
+
+    // Reshape the cos/sin cache and fill it
+    check::check(
+        ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim}), "Tensor reshape failed");
+
+    // All audio+text MRope models (Qwen3-ASR, Qwen3-Omni) use interleaved layout.
+    bool constexpr interleaved = true;
+    try
+    {
+        kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
+            positionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
+            activeBatchSize, interleaved, stream);
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("initializeSequentialMRopeCache: kernel launch failed: %s", e.what());
+        return false;
+    }
+
+    // Synchronize to ensure kernel completes before local positionIdsDevice is freed.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    LOG_INFO("Initialized sequential MRope cos/sin cache for %ld batches, %ld positions", activeBatchSize,
+        maxPositionEmbeddings);
+
+    return true;
 }
 
 } // namespace rt

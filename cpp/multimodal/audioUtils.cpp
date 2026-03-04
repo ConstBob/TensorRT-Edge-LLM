@@ -31,16 +31,30 @@ namespace rt
 namespace audioUtils
 {
 
-int64_t computeFeatExtractOutputLength(int64_t inputLength)
+int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow)
 {
+    // Floor division that always rounds toward negative infinity, matching Python's "//" operator.
+    auto floorDiv = [](int64_t a, int64_t b) -> int64_t {
+        int64_t q = a / b;
+        // Adjust if the remainder is nonzero and the signs of a and b differ
+        if ((a % b != 0) && ((a ^ b) < 0))
+        {
+            --q;
+        }
+        return q;
+    };
+
+    // Chunk size = nWindow * 2, matching the chunk size used in computeChunkInfo.
+    int64_t const chunkSize = nWindow * 2;
+
     // Three 2x downsampling Conv2D layers (stride=2 each)
-    // Layer 1: input -> (input - 1) / 2 + 1
-    int64_t len1 = (inputLength - 1) / 2 + 1;
-    // Layer 2: len1 -> (len1 - 1) / 2 + 1
-    int64_t len2 = (len1 - 1) / 2 + 1;
-    // Layer 3: len2 -> (len2 - 1) / 2 + 1
-    int64_t len3 = (len2 - 1) / 2 + 1;
-    return len3;
+    // Layer 1: input -> (input - 1) // 2 + 1
+    int64_t len1 = floorDiv(inputLength % chunkSize - 1, 2) + 1;
+    // Layer 2: len1 -> (len1 - 1) // 2 + 1
+    int64_t len2 = floorDiv(len1 - 1, 2) + 1;
+    // Layer 3: len2 -> (len2 - 1) // 2 + 1
+    int64_t len3 = floorDiv(len2 - 1, 2) + 1;
+    return len3 + floorDiv(inputLength, chunkSize) * 13;
 }
 
 ChunkInfo computeChunkInfo(int64_t featureLength, int32_t nWindow)
@@ -140,7 +154,7 @@ bool createPaddedMask(ChunkInfo const& chunkInfo, [[maybe_unused]] int32_t nWind
     int64_t maxLenAfterCNN = 0;
     for (int64_t i = 0; i < chunkInfo.numChunks; ++i)
     {
-        int64_t lenAfterCNN = computeFeatExtractOutputLength(chunkInfo.chunkLengths[i]);
+        int64_t lenAfterCNN = computeFeatExtractOutputLength(chunkInfo.chunkLengths[i], nWindow);
         afterCNNLens.push_back(lenAfterCNN);
         maxLenAfterCNN = std::max(maxLenAfterCNN, lenAfterCNN);
     }

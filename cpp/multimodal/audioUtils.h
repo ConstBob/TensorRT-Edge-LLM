@@ -38,7 +38,7 @@ struct ChunkInfo
 };
 
 //! Compute CNN output length (three 2x downsampling layers)
-int64_t computeFeatExtractOutputLength(int64_t inputLength);
+int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow);
 
 //! Compute chunk split information for audio features
 ChunkInfo computeChunkInfo(int64_t featureLength, int32_t nWindow);

@@ -29,6 +29,7 @@
 #include "common/version.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
+#include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "profiling/layerProfiler.h"
 #include "runtime/llmRuntimeUtils.h"
