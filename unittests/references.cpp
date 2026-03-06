@@ -465,7 +465,7 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
     // mropeRotaryCosSin: (bs, maxPositionEmbeddings, rotaryDim)
 
     std::vector<float> invFreq;
-    for (int i = 0; i < rotaryDim / 2; ++i)
+    for (int32_t i = 0; i < rotaryDim / 2; ++i)
     {
         float value = pow(rotaryBaseFrequency, 2 * i / (float) rotaryDim);
         invFreq.emplace_back(value);
@@ -473,9 +473,9 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
 
     std::vector<std::vector<float>> cosOri(rotaryEmbeddingMaxPositions, std::vector<float>(rotaryDim / 2));
     std::vector<std::vector<float>> sinOri(rotaryEmbeddingMaxPositions, std::vector<float>(rotaryDim / 2));
-    for (int i = 0; i < rotaryEmbeddingMaxPositions; ++i)
+    for (int32_t i = 0; i < rotaryEmbeddingMaxPositions; ++i)
     {
-        for (int j = 0; j < (rotaryDim / 2); ++j)
+        for (int32_t j = 0; j < (rotaryDim / 2); ++j)
         {
             cosOri[i][j] = std::cos(i / invFreq[j]);
             sinOri[i][j] = std::sin(i / invFreq[j]);
@@ -483,35 +483,35 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
     }
 
     int32_t sinOffset = rotaryDim / 2;
-    for (int b = 0; b < batchSize; ++b)
+    for (int32_t b = 0; b < batchSize; ++b)
     {
-        for (int i = 0; i < rotaryEmbeddingMaxPositions; ++i)
+        for (int32_t i = 0; i < rotaryEmbeddingMaxPositions; ++i)
         {
             if (interleaved)
             {
                 // Interleaved format: [THWTHWHTHW...TTTT] Qwen3-VL
                 //     mrope section is [24, 20, 20]
                 //     [THWTHWHTHW...TTTT] has 20 groups of THW and 4 additional T
-                for (int j = 0; j < (rotaryDim / 2); ++j)
+                for (int32_t j = 0; j < (rotaryDim / 2); ++j)
                 {
-                    int sec = (j >= 60) ? 0 : (j % 3);
-                    int pos
+                    int32_t sec = (j >= 60) ? 0 : (j % 3);
+                    int32_t pos
                         = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
-                    int cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
+                    int32_t cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
                     mropeRotaryCosSin[cosDstIdx] = cosOri[pos][j];
                     mropeRotaryCosSin[cosDstIdx + sinOffset] = sinOri[pos][j];
                 }
             }
             else
             {
-                std::vector<int> mRopeSections{0, 16, 40, 64}; // cumsum of {16, 24, 24}
-                for (int sec = 0; sec < 3; ++sec)
+                std::vector<int32_t> mRopeSections{0, 16, 40, 64}; // cumsum of {16, 24, 24}
+                for (int32_t sec = 0; sec < 3; ++sec)
                 {
-                    int pos
+                    int32_t pos
                         = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
-                    for (int j = mRopeSections[sec]; j < mRopeSections[sec + 1]; ++j)
+                    for (int32_t j = mRopeSections[sec]; j < mRopeSections[sec + 1]; ++j)
                     {
-                        int cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
+                        int32_t cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
                         mropeRotaryCosSin[cosDstIdx] = cosOri[pos][j];
                         mropeRotaryCosSin[cosDstIdx + sinOffset] = sinOri[pos][j];
                     }
@@ -695,20 +695,20 @@ void assembleDraftTreeDescReference(std::vector<int8_t> const& draftTreeMask,
     std::vector<int32_t>& packedDraftTreeMask, std::vector<int32_t>& tensorPositionIndices, int32_t paddedDraftTreeSize)
 {
     int32_t const kNUM_MASK_PER_ENTRY{32};
-    size_t batchSize = draftTreeLength.size();
+    int32_t const batchSize = static_cast<int32_t>(draftTreeLength.size());
     int32_t const packedTreeMaskLen = (paddedDraftTreeSize + kNUM_MASK_PER_ENTRY - 1) / kNUM_MASK_PER_ENTRY;
 
-    for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         int32_t const actualDraftTreeSize = draftTreeLength[batchIdx];
         int32_t const sequenceStartIdx = sequenceStartIndex[batchIdx];
 
-        for (size_t tokenIdx = 0; tokenIdx < actualDraftTreeSize; ++tokenIdx)
+        for (int32_t tokenIdx = 0; tokenIdx < actualDraftTreeSize; ++tokenIdx)
         {
             int32_t attendNodeNum = 0;
             int32_t const packedTreeMaskOffset
                 = batchIdx * paddedDraftTreeSize * packedTreeMaskLen + tokenIdx * packedTreeMaskLen;
-            for (size_t i = 0; i <= tokenIdx; ++i)
+            for (int32_t i = 0; i <= tokenIdx; ++i)
             {
                 int8_t const maskFlag = draftTreeMask[batchIdx * paddedDraftTreeSize * paddedDraftTreeSize
                     + tokenIdx * paddedDraftTreeSize + i];
@@ -730,14 +730,14 @@ void prepareEagleDraftProposalMiscInputReference(std::vector<int32_t> const& dra
     std::vector<int32_t> const& sequenceStartIndex, std::vector<int32_t>& sequenceContextLengths,
     std::vector<int64_t>& selectTokenIndices, int32_t selectTokenLength, int32_t paddedDraftTreeSize)
 {
-    size_t batchSize = draftTreeLength.size();
+    int32_t batchSize = static_cast<int32_t>(draftTreeLength.size());
 
-    for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         int32_t const draftTreeSize = draftTreeLength[batchIdx];
         sequenceContextLengths[batchIdx] = sequenceStartIndex[batchIdx] + paddedDraftTreeSize;
 
-        for (size_t i = 0; i < selectTokenLength; ++i)
+        for (int32_t i = 0; i < selectTokenLength; ++i)
         {
             selectTokenIndices[batchIdx * selectTokenLength + i] = draftTreeSize - selectTokenLength + i;
         }
@@ -796,19 +796,19 @@ void prepareEagleBaseTreeDecodingInputReference(std::vector<int8_t> const& baseT
     // selectTokenIndices: (bs, tree-size)
 
     int32_t const kNUM_MASK_PER_ENTRY{32};
-    size_t batchSize = sequenceStartIndex.size();
+    int32_t batchSize = static_cast<int32_t>(sequenceStartIndex.size());
     int32_t const packedTreeMaskLen = (treeSize + kNUM_MASK_PER_ENTRY - 1) / kNUM_MASK_PER_ENTRY;
 
-    for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    for (int32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         int32_t const sequenceStartIdx = sequenceStartIndex[batchIdx];
         sequenceContextLengths[batchIdx] = sequenceStartIdx + treeSize;
 
-        for (size_t tokenIdx = 0; tokenIdx < treeSize; ++tokenIdx)
+        for (int32_t tokenIdx = 0; tokenIdx < treeSize; ++tokenIdx)
         {
             int32_t attendNodeNum = 0;
             int32_t const packedTreeMaskOffset = batchIdx * treeSize * packedTreeMaskLen + tokenIdx * packedTreeMaskLen;
-            for (size_t i = 0; i <= tokenIdx; ++i)
+            for (int32_t i = 0; i <= tokenIdx; ++i)
             {
                 int8_t const maskFlag = baseTreeDecodingMask[batchIdx * treeSize * treeSize + tokenIdx * treeSize + i];
                 if (maskFlag)
@@ -833,28 +833,28 @@ void eagleBaseCommitKVCacheAndAssembleHiddenStateReference(std::vector<int32_t> 
     int32_t const maxBatchSize, int32_t const numHeads, int32_t const maxSeqLen, int32_t const headDim,
     int32_t const maxDepth, int32_t const draftTreeSize, int32_t const baseHiddenDim)
 {
-    size_t const activeBatchSize = acceptLengths.size();
+    int32_t const activeBatchSize = static_cast<int32_t>(acceptLengths.size());
 
-    for (int b = 0; b < activeBatchSize; b++)
+    for (int32_t b = 0; b < activeBatchSize; b++)
     {
         int32_t const kvCacheLength = kvCacheLengths[b];
         int32_t const acceptLength = acceptLengths[b];
 
         // Start from 1 since the root position will always be accepted.
-        for (int i = 1; i < acceptLength; i++)
+        for (int32_t i = 1; i < acceptLength; i++)
         {
             int32_t const acceptedIdx = acceptedIndices[b * maxDepth + i];
             assert(acceptedIdx >= 0 && acceptedIdx + kvCacheLength < maxSeqLen && acceptedIdx < draftTreeSize
                 && "Accepted index out of bounds");
 
             // kvCacheBuffer: [num-layers, max-batch-size, 2, num-heads, max-seq-len, hidden-size-per-head].
-            for (int l = 0; l < numLayers; l++)
+            for (int32_t l = 0; l < numLayers; l++)
             {
-                for (int k = 0; k < 2; k++)
+                for (int32_t k = 0; k < 2; k++)
                 {
-                    for (int h = 0; h < numHeads; h++)
+                    for (int32_t h = 0; h < numHeads; h++)
                     {
-                        for (int d = 0; d < headDim; d++)
+                        for (int32_t d = 0; d < headDim; d++)
                         {
                             int32_t const srcOffset = l * maxBatchSize * 2 * numHeads * maxSeqLen * headDim
                                 + b * 2 * numHeads * maxSeqLen * headDim + k * numHeads * maxSeqLen * headDim
@@ -870,7 +870,7 @@ void eagleBaseCommitKVCacheAndAssembleHiddenStateReference(std::vector<int32_t> 
             }
 
             // hiddenState: [batch, num-tokens, hidden-dim].
-            for (int d = 0; d < baseHiddenDim; d++)
+            for (int32_t d = 0; d < baseHiddenDim; d++)
             {
                 int32_t const srcOffset = b * draftTreeSize * baseHiddenDim + acceptedIdx * baseHiddenDim + d;
                 int32_t const dstOffset = b * draftTreeSize * baseHiddenDim + i * baseHiddenDim + d;
@@ -1047,45 +1047,45 @@ void transposeToPatchQwenReference(std::vector<half> const& originalImage, std::
     int32_t const inputOffset, int32_t const T, int32_t const height, int32_t const width, int32_t const channels,
     int32_t const temporalPatchSize, int32_t const patchSize, int32_t const mergeSize)
 {
-    assert(originalImage.size() == T * height * width * channels);
-    assert(patch.size() == T * height * width * channels);
+    assert(originalImage.size() == static_cast<size_t>(T) * height * width * channels);
+    assert(patch.size() == originalImage.size());
 
-    int const gridT = T / temporalPatchSize;
-    int const gridH = height / (mergeSize * patchSize);
-    int const gridW = width / (mergeSize * patchSize);
+    int32_t const gridT = T / temporalPatchSize;
+    int32_t const gridH = height / (mergeSize * patchSize);
+    int32_t const gridW = width / (mergeSize * patchSize);
 
-    for (int gt = 0; gt < gridT; ++gt)
+    for (int32_t gt = 0; gt < gridT; ++gt)
     {
-        for (int gh = 0; gh < gridH; ++gh)
+        for (int32_t gh = 0; gh < gridH; ++gh)
         {
-            for (int gw = 0; gw < gridW; ++gw)
+            for (int32_t gw = 0; gw < gridW; ++gw)
             {
-                for (int mergeH = 0; mergeH < mergeSize; ++mergeH)
+                for (int32_t mergeH = 0; mergeH < mergeSize; ++mergeH)
                 {
-                    for (int mergeW = 0; mergeW < mergeSize; ++mergeW)
+                    for (int32_t mergeW = 0; mergeW < mergeSize; ++mergeW)
                     {
-                        for (int c = 0; c < channels; ++c)
+                        for (int32_t c = 0; c < channels; ++c)
                         {
-                            for (int t = 0; t < temporalPatchSize; ++t)
+                            for (int32_t t = 0; t < temporalPatchSize; ++t)
                             {
-                                for (int patchH = 0; patchH < patchSize; ++patchH)
+                                for (int32_t patchH = 0; patchH < patchSize; ++patchH)
                                 {
-                                    for (int patchW = 0; patchW < patchSize; ++patchW)
+                                    for (int32_t patchW = 0; patchW < patchSize; ++patchW)
                                     {
                                         // src dimensions: (T, H, W, C) => (gridT, temporalPatchSize, gridH, mergeSize,
                                         // patchSize, gridW, mergeSize, patchSize, C)
-                                        int originalT = gt * temporalPatchSize + t;
-                                        int originalH = gh * mergeSize * patchSize + mergeH * patchSize + patchH;
-                                        int originalW = gw * mergeSize * patchSize + mergeW * patchSize + patchW;
+                                        int32_t originalT = gt * temporalPatchSize + t;
+                                        int32_t originalH = gh * mergeSize * patchSize + mergeH * patchSize + patchH;
+                                        int32_t originalW = gw * mergeSize * patchSize + mergeW * patchSize + patchW;
                                         half value = originalImage[originalT * height * width * channels
                                             + originalH * width * channels + originalW * channels + c];
 
                                         // dst dimensions: (gridT, gridH, gridW, mergeSize, mergeSize) x (channels,
                                         // temporalPatchSize, patchSize, patchSize)
-                                        int dstHW = gt * gridH * gridW * mergeSize * mergeSize
+                                        int32_t dstHW = gt * gridH * gridW * mergeSize * mergeSize
                                             + gh * gridW * mergeSize * mergeSize + gw * mergeSize * mergeSize
                                             + mergeH * mergeSize + mergeW;
-                                        int dstDim = c * temporalPatchSize * patchSize * patchSize
+                                        int32_t dstDim = c * temporalPatchSize * patchSize * patchSize
                                             + t * patchSize * patchSize + patchH * patchSize + patchW;
                                         patch[dstHW * channels * temporalPatchSize * patchSize * patchSize + dstDim]
                                             = value;
@@ -1104,26 +1104,26 @@ void transposeToPatchInternVLReference(std::vector<half> const& originalImage, s
     int32_t const inputOffset, int32_t const height, int32_t const width, int32_t const channels,
     int32_t const blockSizeH, int32_t const blockSizeW)
 {
-    assert(originalImage.size() == height * width * channels);
-    assert(patch.size() == height * width * channels);
+    assert(originalImage.size() == static_cast<size_t>(height) * width * channels);
+    assert(patch.size() == originalImage.size());
 
-    for (int gridH = 0; gridH < height / blockSizeH; ++gridH)
+    for (int32_t gridH = 0; gridH < height / blockSizeH; ++gridH)
     {
-        for (int gridW = 0; gridW < width / blockSizeW; ++gridW)
+        for (int32_t gridW = 0; gridW < width / blockSizeW; ++gridW)
         {
-            for (int blockH = 0; blockH < blockSizeH; ++blockH)
+            for (int32_t blockH = 0; blockH < blockSizeH; ++blockH)
             {
-                for (int blockW = 0; blockW < blockSizeW; ++blockW)
+                for (int32_t blockW = 0; blockW < blockSizeW; ++blockW)
                 {
-                    for (int c = 0; c < channels; ++c)
+                    for (int32_t c = 0; c < channels; ++c)
                     {
                         // src dimensions: (H, W, C) => (gridH, blockSizeH, gridW, blockSizeW, C)
-                        int originalH = gridH * blockSizeH + blockH;
-                        int originalW = gridW * blockSizeW + blockW;
+                        int32_t originalH = gridH * blockSizeH + blockH;
+                        int32_t originalW = gridW * blockSizeW + blockW;
                         half value = originalImage[originalH * width * channels + originalW * channels + c];
 
                         // dst dimensions: (gridH*gridW, C, blockSizeH, blockSizeW)
-                        int dstNumBlocks = gridH * (width / blockSizeW) + gridW;
+                        int32_t dstNumBlocks = gridH * (width / blockSizeW) + gridW;
                         patch[dstNumBlocks * channels * blockSizeH * blockSizeW + c * blockSizeH * blockSizeW
                             + blockH * blockSizeW + blockW]
                             = value;
@@ -1135,43 +1135,43 @@ void transposeToPatchInternVLReference(std::vector<half> const& originalImage, s
 }
 
 // Helper functions for GEMM and GEMV unit tests
-static inline size_t idx4(int i, int j, int k, int t, int A, int B, int C, int Tlast)
+static inline size_t idx4(int32_t i, int32_t j, int32_t k, int32_t t, int32_t A, int32_t B, int32_t C, int32_t Tlast)
 {
     // shape: [A, B, C, Tlast]
     return ((((size_t) i * B + j) * C + k) * Tlast) + t;
 }
-static inline size_t idx3(int i, int j, int k, int A, int B, int C)
+static inline size_t idx3(int32_t i, int32_t j, int32_t k, int32_t A, int32_t B, int32_t C)
 {
     // shape: [A, B, C]
     return ((size_t) i * B + j) * C + k;
 }
 
-static inline size_t idx2(int i0, int i1, int dim1)
+static inline size_t idx2(int32_t i0, int32_t i1, int32_t dim1)
 {
     return static_cast<size_t>(i0) * dim1 + i1;
 }
 
 // C++ implementation for https://github.com/mit-han-lab/llm-awq/blob/main/awq/quantize/qmodule.py#L26
 void awqPackReference(int16_t const* kernel_KxN, // [K_in, N_in], row-major
-    int N_in, int K_in,
+    int32_t N_in, int32_t K_in,
     int16_t* out_Ndiv4xK // [N_in/4, K_in], row-major
 )
 {
     // Python constants
-    int const interleave = 4;
-    int const kstride = 64;
+    int32_t const interleave = 4;
+    int32_t const kstride = 64;
 
     // After Python's: unpacked_kernel = (kernel + 8).T
     // So our working dims become:
     // N = K_in, K = N_in
-    int const N = K_in;
-    int const K = N_in;
+    int32_t const N = K_in;
+    int32_t const K = N_in;
 
     // A = (kernel + 8).T  -> uint8 [K, N]
     std::vector<int16_t> A((size_t) K * N);
-    for (int k_in = 0; k_in < K_in; ++k_in)
+    for (int32_t k_in = 0; k_in < K_in; ++k_in)
     {
-        for (int n_in = 0; n_in < N_in; ++n_in)
+        for (int32_t n_in = 0; n_in < N_in; ++n_in)
         {
             int16_t v = kernel_KxN[idx2(k_in, n_in, N_in)] + 8; // shift to nibble
             // transpose: (N_in, K_in) -> (K_in, N_in) == (N, K)
@@ -1183,13 +1183,13 @@ void awqPackReference(int16_t const* kernel_KxN, // [K_in, N_in], row-major
     //   index_in  t  = ((i0*4 + i1) * 2 + i2)
     //   index_out t' = ((i1*4 + i0) * 2 + i2)
     std::vector<int16_t> B((size_t) K * N);
-    int const K32 = K / 32;
-    for (int n = 0; n < N; ++n)
+    int32_t const K32 = K / 32;
+    for (int32_t n = 0; n < N; ++n)
     {
         size_t const in_row = (size_t) n * K;
         size_t const out_row = (size_t) n * K;
 
-        for (int b = 0; b < K32; ++b)
+        for (int32_t b = 0; b < K32; ++b)
         {
             size_t const in_blk = in_row + (size_t) b * 32;
             size_t const out_blk = out_row + (size_t) b * 32;
@@ -1197,12 +1197,12 @@ void awqPackReference(int16_t const* kernel_KxN, // [K_in, N_in], row-major
             // Inside each 32-lane block, map offset o -> o' as:
             //   decompose o in (4,4,2): a=o//8, b4=(o//2)%4, c=o%2
             //   o' = ((b4*4)+a)*2 + c
-            for (int o = 0; o < 32; ++o)
+            for (int32_t o = 0; o < 32; ++o)
             {
-                int const a = o >> 3;          // 0..3
-                int const b4 = (o >> 1) & 0x3; // 0..3
-                int const c = o & 1;           // 0..1
-                int const o2 = (((b4 << 2) | a) << 1) | c;
+                int32_t const a = o >> 3;          // 0..3
+                int32_t const b4 = (o >> 1) & 0x3; // 0..3
+                int32_t const c = o & 1;           // 0..1
+                int32_t const o2 = (((b4 << 2) | a) << 1) | c;
 
                 B[out_blk + o2] = A[in_blk + o];
             }
@@ -1211,20 +1211,20 @@ void awqPackReference(int16_t const* kernel_KxN, // [K_in, N_in], row-major
     // Step 2: reorder each 8 within each block of 32:
     // Python: reshape(...,4,8) -> reshape(...,4,4,2).transpose(0,1,2,4,3)
     // This is exactly: within each group of 8, [0,1,2,3,4,5,6,7] -> [0,2,4,6,1,3,5,7]
-    static int const REORDER8[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    static int32_t const REORDER8[8] = {0, 4, 1, 5, 2, 6, 3, 7};
     std::vector<int16_t> C((size_t) K * N);
-    for (int n = 0; n < N; ++n)
+    for (int32_t n = 0; n < N; ++n)
     {
-        for (int q = 0; q < K32; ++q)
+        for (int32_t q = 0; q < K32; ++q)
         {
-            int base = q * 32;
-            for (int g = 0; g < 4; ++g)
+            int32_t base = q * 32;
+            for (int32_t g = 0; g < 4; ++g)
             { // 4 groups of 8 within 32
-                int gbase = base + g * 8;
-                for (int j = 0; j < 8; ++j)
+                int32_t gbase = base + g * 8;
+                for (int32_t j = 0; j < 8; ++j)
                 {
-                    int in_idx = gbase + j;
-                    int out_idx = gbase + REORDER8[j];
+                    int32_t in_idx = gbase + j;
+                    int32_t out_idx = gbase + REORDER8[j];
                     C[idx2(n, out_idx, K)] = B[idx2(n, in_idx, K)];
                 }
             }
@@ -1234,18 +1234,18 @@ void awqPackReference(int16_t const* kernel_KxN, // [K_in, N_in], row-major
     // Python: x.reshape(N//4, 4, K//64, 64)
     //         x = x.transpose(0,2,1,3) -> (N//4, K//64, 4, 64)
     //         pack last-4 into a uint16: [lane0|lane1<<4|lane2<<8|lane3<<12]
-    int const Ng = K / 4;  // N4 = N_in / 4
-    int const Kg = N / 64; // K64 = K_in / 64
+    int32_t const Ng = K / 4;  // N4 = N_in / 4
+    int32_t const Kg = N / 64; // K64 = K_in / 64
 
     // Step 3.1: transpose (0,2,1,3) → B[Ng, Kg, interleave, kstride] ---
     std::vector<int16_t> D(static_cast<size_t>(Ng) * Kg * interleave * kstride);
-    for (int ng = 0; ng < Ng; ++ng)
+    for (int32_t ng = 0; ng < Ng; ++ng)
     {
-        for (int ks = 0; ks < Kg; ++ks)
+        for (int32_t ks = 0; ks < Kg; ++ks)
         {
-            for (int j = 0; j < interleave; ++j)
+            for (int32_t j = 0; j < interleave; ++j)
             {
-                for (int i = 0; i < kstride; ++i)
+                for (int32_t i = 0; i < kstride; ++i)
                 {
                     D[idx4(ng, ks, j, i, 0, Kg, interleave, kstride)]
                         = C[idx4(ng, j, ks, i, 0, interleave, Kg, kstride)];
@@ -1261,11 +1261,11 @@ void awqPackReference(int16_t const* kernel_KxN, // [K_in, N_in], row-major
     //   j = L / kstride,  i = L % kstride    (indices in B's (..., interleave, kstride))
     //
     // Then final flatten (ks, ip) → out column k_out = ks*kstride + ip.
-    for (int i = 0; i < Ng; ++i)
+    for (int32_t i = 0; i < Ng; ++i)
     {
-        for (int j = 0; j < Kg; ++j)
+        for (int32_t j = 0; j < Kg; ++j)
         {
-            for (int k = 0; k < kstride; ++k)
+            for (int32_t k = 0; k < kstride; ++k)
             {
                 size_t const base4 = idx4(i, j, k, 0, Ng, Kg, kstride, /*Tlast=*/4);
 
@@ -1284,14 +1284,14 @@ void awqPackReference(int16_t const* kernel_KxN, // [K_in, N_in], row-major
     }
 }
 
-void scaledWeightsReference(
-    int16_t const* kernel_KxN, half const* scales_KdivGxN, int K, int N, int group_size, std::vector<half>& out_KxN)
+void scaledWeightsReference(int16_t const* kernel_KxN, half const* scales_KdivGxN, int32_t K, int32_t N,
+    int32_t group_size, std::vector<half>& out_KxN)
 {
     out_KxN.resize(static_cast<size_t>(K) * N);
-    for (int k = 0; k < K; ++k)
+    for (int32_t k = 0; k < K; ++k)
     {
-        int srow = k / group_size; // (K//G, N)
-        for (int n = 0; n < N; ++n)
+        int32_t srow = k / group_size; // (K//G, N)
+        for (int32_t n = 0; n < N; ++n)
         {
             float w = static_cast<float>(kernel_KxN[idx2(k, n, N)]);
             float sf = __half2float(scales_KdivGxN[idx2(srow, n, N)]);
@@ -1306,11 +1306,11 @@ void fastPosEmbedInterpolateReference(std::vector<std::vector<int64_t>> const& i
 {
     int64_t totalSeqLength = cuSeqlens.back();
 
-    for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
+    for (size_t i = 0; i < imageGridTHWs.size(); ++i)
     {
         int64_t startIdx = cuSeqlens[i];
         auto grid = imageGridTHWs[i];
-        int64_t T = grid[0], H = grid[1], W = grid[2];
+        int64_t H = grid[1], W = grid[2];
         int64_t llmGridH = H / mergeSize;
         int64_t llmGridW = W / mergeSize;
         float lineSpaceH = static_cast<float>(numGridPerSide - 1) / (H - 1);
@@ -1398,7 +1398,7 @@ void initRotaryPosEmbQwenViTReference(std::vector<float>& rotaryPosEmb,
     std::vector<std::vector<float>> rotaryPosEmbFull(maxGridSize + 1, std::vector<float>(vitPosEmbDim / 2));
     for (int64_t i = 0; i <= maxGridSize; ++i)
     {
-        for (int j = 0; j < (vitPosEmbDim / 2); ++j)
+        for (int32_t j = 0; j < (vitPosEmbDim / 2); ++j)
         {
             float value = i * scale / pow(rotaryBaseFrequency, (static_cast<float>(j * 2) / vitPosEmbDim));
             rotaryPosEmbFull[i][j] = value;

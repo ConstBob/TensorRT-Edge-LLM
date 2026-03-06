@@ -31,23 +31,22 @@ using namespace trt_edgellm::kernel;
 
 struct AttnParams
 {
-    uint32_t numQHeads;
-    uint32_t numKVHeads;
-    uint32_t headDim;
-    uint32_t rotaryDim;
+    int32_t numQHeads;
+    int32_t numKVHeads;
+    int32_t headDim;
+    int32_t rotaryDim;
 };
 
-void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnParams, int32_t const kvCacheCapacity,
+void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParams, int32_t const kvCacheCapacity,
     int32_t const qSeqLen, float ropeTheta = 10000.0f, int32_t cosSinCacheBatchSize = 1, int32_t cosSinCacheSeqLen = 0,
     bool const enableFp8Check = false)
 {
     cudaStream_t stream{nullptr};
 
-    uint32_t const headDim = attnParams.headDim;
-    uint32_t const rotaryDim = attnParams.rotaryDim;
-    uint32_t const numQHeads = attnParams.numQHeads;
-    uint32_t const numKVHeads = attnParams.numKVHeads;
-    int32_t const kvCacheVolume = batchSize * (numKVHeads + numKVHeads) * kvCacheCapacity * headDim;
+    int32_t const headDim = attnParams.headDim;
+    int32_t const rotaryDim = attnParams.rotaryDim;
+    int32_t const numQHeads = attnParams.numQHeads;
+    int32_t const numKVHeads = attnParams.numKVHeads;
 
     assert(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == batchSize);
     if (cosSinCacheSeqLen == 0)
@@ -229,9 +228,9 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
         {
             for (int32_t j = 0; j < qSeqLen; ++j)
             {
-                for (int32_t hkv = 0; hkv < static_cast<int32_t>(numKVHeads); ++hkv)
+                for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
                 {
-                    for (uint32_t d = 0; d < headDim; ++d)
+                    for (int32_t d = 0; d < headDim; ++d)
                     {
                         float const fk = std::fabs(__half2float(kvCacheOut[kvIndexer.indexK(b, hkv, j, d)]));
                         float const fv = std::fabs(__half2float(kvCacheOut[kvIndexer.indexV(b, hkv, j, d)]));
@@ -271,9 +270,9 @@ void TestRopeWriteKvPrefill(uint32_t const batchSize, AttnParams const& attnPara
         {
             for (int32_t j = 0; j < qSeqLen; ++j)
             {
-                for (int32_t hkv = 0; hkv < static_cast<int32_t>(numKVHeads); ++hkv)
+                for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
                 {
-                    for (uint32_t d = 0; d < headDim; ++d)
+                    for (int32_t d = 0; d < headDim; ++d)
                     {
                         size_t const kIdx = kvIndexer.indexK(b, hkv, j, d);
                         size_t const vIdx = kvIndexer.indexV(b, hkv, j, d);
@@ -312,10 +311,10 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     EXPECT_TRUE(kvCacheCapacity > 4 * qLen);
     cudaStream_t stream{nullptr};
 
-    uint32_t const headDim = attnParams.headDim;
-    uint32_t const rotaryDim = attnParams.rotaryDim;
-    uint32_t const numQHeads = attnParams.numQHeads;
-    uint32_t const numKVHeads = attnParams.numKVHeads;
+    int32_t const headDim = attnParams.headDim;
+    int32_t const rotaryDim = attnParams.rotaryDim;
+    int32_t const numQHeads = attnParams.numQHeads;
+    int32_t const numKVHeads = attnParams.numKVHeads;
     int32_t const cosSinCacheSeqLen = kvCacheCapacity;
 
     // Random initialized the total length which is committed kv-cache length + new tokens length.
@@ -458,7 +457,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
 
     // Directly compare the output of Q since output and reference have the same layout.
     EXPECT_EQ(qOut.size(), qReference.size());
-    for (int32_t i = 0; i < qOut.size(); ++i)
+    for (size_t i = 0; i < qOut.size(); ++i)
     {
         ASSERT_TRUE(isclose(qOut[i], qReference[i], 1e-3, 4e-3));
     }
@@ -522,9 +521,9 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
             for (int32_t s = 0; s < qLen; ++s)
             {
                 int32_t const inCacheIdx = qStartIdx + s;
-                for (int32_t hkv = 0; hkv < static_cast<int32_t>(numKVHeads); ++hkv)
+                for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
                 {
-                    for (uint32_t d = 0; d < headDim; ++d)
+                    for (int32_t d = 0; d < headDim; ++d)
                     {
                         float const fk = std::fabs(__half2float(kvCacheOut[kvIndexer.indexK(b, hkv, inCacheIdx, d)]));
                         float const fv = std::fabs(__half2float(kvCacheOut[kvIndexer.indexV(b, hkv, inCacheIdx, d)]));
@@ -572,9 +571,9 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
             for (int32_t s = 0; s < qLen; ++s)
             {
                 int32_t const inCacheIdx = qStartIdx + s;
-                for (int32_t hkv = 0; hkv < static_cast<int32_t>(numKVHeads); ++hkv)
+                for (int32_t hkv = 0; hkv < numKVHeads; ++hkv)
                 {
-                    for (uint32_t d = 0; d < headDim; ++d)
+                    for (int32_t d = 0; d < headDim; ++d)
                     {
                         size_t const kIdx = kvIndexer.indexK(b, hkv, inCacheIdx, d);
                         size_t const vIdx = kvIndexer.indexV(b, hkv, inCacheIdx, d);
@@ -605,12 +604,12 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
 }
 
 void BenchmarkRopeWriteKv(
-    uint32_t const batchSize, AttnParams const& attnParams, int32_t const qSeqLen, int32_t cosSinCacheBatchSize = 1)
+    int32_t const batchSize, AttnParams const& attnParams, int32_t const qSeqLen, int32_t cosSinCacheBatchSize = 1)
 {
-    uint32_t const headDim = attnParams.headDim;
-    uint32_t const rotaryDim = attnParams.rotaryDim;
-    uint32_t const numQHeads = attnParams.numQHeads;
-    uint32_t const numKVHeads = attnParams.numKVHeads;
+    int32_t const headDim = attnParams.headDim;
+    int32_t const rotaryDim = attnParams.rotaryDim;
+    int32_t const numQHeads = attnParams.numQHeads;
+    int32_t const numKVHeads = attnParams.numKVHeads;
     int32_t const kvCacheCapacity = 1024 + qSeqLen;
 
     // Initialize the data to non-zero values to avoid the benchmark data is non-realistic.
@@ -643,7 +642,6 @@ void BenchmarkRopeWriteKv(
         cosSinCacheTensor.getShape().volume() * sizeof(float), cudaMemcpyHostToDevice));
 
     cudaStream_t stream{nullptr};
-    int32_t const tokenToProcess = batchSize * qSeqLen;
 
     // Empty scale tensor (ignored for FP16 KV cache).
     rt::Tensor kvScaleQuantOrigTensor{};

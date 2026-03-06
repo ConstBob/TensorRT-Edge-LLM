@@ -135,8 +135,8 @@ int32_t Int4GroupwiseGemmPlugin::getNbOutputs() const noexcept
     return 1;
 }
 
-int32_t Int4GroupwiseGemmPlugin::getOutputDataTypes(
-    DataType* outputTypes, int32_t nbOutputs, DataType const* /* inputTypes */, int32_t /* nbInputs */) const noexcept
+int32_t Int4GroupwiseGemmPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] int32_t nbOutputs,
+    DataType const* /* inputTypes */, int32_t /* nbInputs */) const noexcept
 {
     try
     {
@@ -150,9 +150,9 @@ int32_t Int4GroupwiseGemmPlugin::getOutputDataTypes(
     }
 }
 
-int32_t Int4GroupwiseGemmPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
-    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs, int32_t nbOutputs,
-    IExprBuilder& exprBuilder) noexcept
+int32_t Int4GroupwiseGemmPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
+    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -170,8 +170,8 @@ int32_t Int4GroupwiseGemmPlugin::getOutputShapes(DimsExprs const* inputs, int32_
     }
 }
 
-bool Int4GroupwiseGemmPlugin::supportsFormatCombination(
-    int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+bool Int4GroupwiseGemmPlugin::supportsFormatCombination(int32_t pos, DynamicPluginTensorDesc const* inOut,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
     try
     {

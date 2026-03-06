@@ -21,6 +21,7 @@
 #include "cubin/fmha_cubin.h"
 #include "fmhaParams_v2.h"
 
+#include <cstring>
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <math.h>
@@ -66,13 +67,13 @@ static inline void set_alpha(uint32_t& alpha, float norm, FMHADataType dtype)
     else if (dtype == FMHADataType::DATA_TYPE_INT32)
     {
         int32_t inorm = static_cast<int32_t>(norm);
-        alpha = reinterpret_cast<uint32_t const&>(inorm);
+        std::memcpy(&alpha, &inorm, sizeof(alpha));
     }
     else if (dtype == FMHADataType::DATA_TYPE_BF16)
     {
         // TODO HACK!! BF16 Outputs are computed in FP32 for FP8.
         // This is because cublas does not allow current FP32 output.
-        alpha = reinterpret_cast<uint32_t const&>(norm);
+        std::memcpy(&alpha, &norm, sizeof(alpha));
     }
     else
     {

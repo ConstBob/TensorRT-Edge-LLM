@@ -251,7 +251,7 @@ size_t ViTAttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTen
 
 int32_t ViTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
-    void* workspace, cudaStream_t stream) noexcept
+    [[maybe_unused]] void* workspace, cudaStream_t stream) noexcept
 {
 
     // Construct non-owned tensor objects from I/O data pointers and shapes.

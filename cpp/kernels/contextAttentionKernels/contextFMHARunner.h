@@ -107,9 +107,9 @@ private:
     int32_t mNumHeads;            //!< Number of query heads
     int32_t mNumKVHeads;          //!< Number of key-value heads
     int32_t mHeadSize;            //!< Attention head dimension
+    int32_t mSmVersion;           //!< CUDA compute capability
     bool mIsSPadded;              //!< Whether input/output tensors are padded in S dimension
 
-    int32_t mSmVersion;         //!< CUDA compute capability
     LaunchParams mLaunchParams; //!< Kernel launch parameters
 };
 
