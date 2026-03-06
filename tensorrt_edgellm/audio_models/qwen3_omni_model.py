@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Qwen3-Omni audio encoder model wrapper and export functionality.
+Qwen3-Omni Audio Models for ONNX Export.
 
-This module provides wrapper classes and export functions for Qwen3-Omni audio encoder,
-enabling ONNX export with proper attention mechanism handling.
+This module contains ONNX export adapters for Qwen3-Omni's audio processing components:
+- AudioEncoder: Processes raw audio into features
+- Code2Wav: Converts RVQ codes to audio waveform (vocoder)
+
+Note: LLM-based audio generation models (Talker, CodePredictor) are in llm_models/qwen3_omni_talker.py
 """
 
 from typing import Any
@@ -319,8 +322,8 @@ def export_qwen3_omni_audio(
         device=model.device).reshape(num_chunks, padded_mask_chunk_length)
     padded_mask_after_cnn_indices = torch.nonzero(padded_mask_after_cnn)
 
-    # In this case the attention mask should be a block diagonal matrix with block sizes 26x26, 12x12,
-    # as indicated by cu_seqlens, such that only audio signals within each block attend to each other.
+    # Block-diagonal attention mask matching _prepare_attention_mask + cu_seqlens logic.
+    # Tokens within the same window attend to each other; cross-window attention is masked.
     attention_mask = torch.full(
         [num_attention_elems, num_attention_elems],
         torch.finfo(torch_dtype).min,
@@ -406,10 +409,14 @@ def export_qwen3_omni_code2wav(
         },  # dim 1 is fixed (1 channel)
     )
 
+    # Use dynamo exporter with OPSET 22 to avoid RMSNormalization
+    # OPSET 23+ introduces RMSNormalization as a native op, which TensorRT 10.13 doesn't support
+    # OPSET 22 forces RMSNorm to be decomposed into basic ops (Pow, ReduceMean, Sqrt, Mul)
     export_onnx_dynamo(model,
                        inputs,
                        output_dir,
                        input_names=input_names,
                        output_names=output_names,
                        input_dynamic_shapes=input_dynamic_shapes,
-                       output_dynamic_shapes=output_dynamic_shapes)
+                       output_dynamic_shapes=output_dynamic_shapes,
+                       opset_version=22)

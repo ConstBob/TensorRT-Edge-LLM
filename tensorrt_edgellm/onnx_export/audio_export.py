@@ -16,7 +16,7 @@
 Audio model export functionality for TensorRT Edge-LLM.
 
 This module provides functions to export audio components of multimodal models
-(Qwen3-Omni) to ONNX format.
+(Qwen3-Omni, Qwen3-TTS, Qwen3-ASR) to ONNX format.
 """
 
 import json
@@ -126,6 +126,60 @@ def audio_export(model_dir: str,
             with open(os.path.join(code2wav_output_dir, "config.json"),
                       "w") as f:
                 json.dump(config_dict, f, indent=2)
+    elif model_type == 'qwen3_tts':
+        print(f"Exporting Qwen3-TTS audio models from {model_dir}")
+
+        valid_models = {'tokenizer_decoder', 'speaker_encoder'}
+        if export_models is None:
+            models_to_export = {'tokenizer_decoder'}
+        else:
+            models_to_export = set(m.strip() for m in export_models.split(','))
+            invalid_models = models_to_export - valid_models
+            if invalid_models:
+                raise ValueError(f"Invalid export_models: {invalid_models}. "
+                                 f"Valid options are: {valid_models}")
+
+        if 'tokenizer_decoder' in models_to_export:
+            from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import \
+                Qwen3TTSTokenizerV2Config
+            # speech_tokenizer is None after our load_hf_model (we skip the
+            # overridden from_pretrained to avoid feature_extractor issues).
+            # Load the tokenizer model directly from the HF sub-directory.
+            from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import \
+                Qwen3TTSTokenizerV2Model
+            from transformers import AutoConfig, AutoModel
+
+            from tensorrt_edgellm.audio_models.qwen3_tts_audio_model import \
+                export_qwen3_tts_tokenizer_decoder
+            AutoConfig.register("qwen3_tts_tokenizer_12hz",
+                                Qwen3TTSTokenizerV2Config)
+            AutoModel.register(Qwen3TTSTokenizerV2Config,
+                               Qwen3TTSTokenizerV2Model)
+            from huggingface_hub import snapshot_download
+            tokenizer_dir = snapshot_download(
+                model_dir, allow_patterns=["speech_tokenizer/*"])
+            tokenizer_subdir = os.path.join(tokenizer_dir, "speech_tokenizer")
+            tokenizer_model = Qwen3TTSTokenizerV2Model.from_pretrained(
+                tokenizer_subdir, torch_dtype=torch_dtype).to(device)
+            decoder = tokenizer_model.decoder
+
+            decoder_output_dir = os.path.join(output_dir, 'tokenizer_decoder')
+            export_qwen3_tts_tokenizer_decoder(decoder, decoder_output_dir,
+                                               torch_dtype)
+
+        if 'speaker_encoder' in models_to_export:
+            if model.speaker_encoder is None:
+                print(
+                    "Warning: speaker_encoder is None (tts_model_type != 'base'), skipping"
+                )
+            else:
+                from tensorrt_edgellm.audio_models.qwen3_tts_audio_model import \
+                    export_qwen3_tts_speaker_encoder
+                spk_output_dir = os.path.join(output_dir, 'speaker_encoder')
+                export_qwen3_tts_speaker_encoder(
+                    model.speaker_encoder, model.config.speaker_encoder_config,
+                    spk_output_dir, torch_dtype)
+
     elif model_type == 'qwen3_asr':
         print(f"Exporting Qwen3-ASR audio model from {model_dir}")
         from tensorrt_edgellm.audio_models.qwen3_asr_model import (
@@ -148,6 +202,82 @@ def audio_export(model_dir: str,
 
     print(
         f"Audio export completed for {model_type} with dtype={dtype}, device={device}"
+    )
+    print(f"Exported to: {output_dir}")
+    return output_dir
+
+
+def export_code2wav(model_dir: str,
+                    output_dir: str,
+                    dtype: str,
+                    device: str = "cuda") -> str:
+    """
+    Export Code2Wav vocoder for Qwen3-Omni audio generation.
+    
+    Code2Wav is a CNN-based neural vocoder that converts RVQ audio codes
+    to waveform. It is part of the Talker audio generation pipeline.
+    
+    Args:
+        model_dir: Directory containing the torch model
+        output_dir: Directory to save the exported ONNX model
+        dtype: Data type for export (currently only "fp16" supported)
+        device: Device to load the model on (default: "cuda", options: cpu, cuda, cuda:0, cuda:1, etc.)
+    
+    Returns:
+        str: Path to the output directory where the exported model is saved
+    
+    Raises:
+        ValueError: If unsupported dtype is provided
+        ValueError: If unsupported model type is detected
+    """
+    # Validate input parameters
+    assert dtype == "fp16", f"Only fp16 is supported for dtype. You passed: {dtype}"
+
+    # Load the model and processor
+    try:
+        model, _, _ = load_hf_model(model_dir, dtype, device)
+    except Exception as e:
+        raise ValueError(f"Could not load model from {model_dir}. Error: {e}")
+
+    model_type = model.config.model_type
+    torch_dtype = torch.float16
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Detect model architecture and use appropriate wrapper
+    if model_type == 'qwen3_omni':
+        print(f"Exporting Qwen3-Omni Code2Wav from {model_dir}")
+
+        # Check if code2wav is available
+        if not hasattr(model, 'code2wav'):
+            raise ValueError(
+                "Model does not have code2wav. "
+                "Make sure the model was loaded with enable_audio_output=True")
+
+        # Create Qwen3-Omni Code2Wav wrapper model
+        from tensorrt_edgellm.audio_models.qwen3_omni_model import (
+            Qwen3OmniCode2WavModelPatch, export_qwen3_omni_code2wav)
+
+        wrapped_model = Qwen3OmniCode2WavModelPatch._from_config(
+            model.code2wav.config,
+            torch_dtype=torch_dtype,
+        )
+        wrapped_model.load_state_dict(model.code2wav.state_dict())
+        wrapped_model.eval().to(device)
+
+        export_qwen3_omni_code2wav(wrapped_model, output_dir)
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
+    # Export model configuration to JSON
+    from .config_export import export_code2wav_config
+    config_dict = export_code2wav_config(model.config)
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    print(
+        f"Code2Wav export completed for {model_type} with dtype={dtype}, device={device}"
     )
     print(f"Exported to: {output_dir}")
     return output_dir

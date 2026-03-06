@@ -640,6 +640,76 @@ cd ~/TensorRT-Edge-LLM
 
 ---
 
+## Example 7: Qwen3-TTS Text-to-Speech
+
+Complete workflow for Qwen3-TTS: text input with audio output generation capabilities.
+
+**Prerequisites:** Install `qwen_tts` package (Qwen3-TTS is not yet integrated into transformers):
+
+```bash
+pip install qwen-tts --no-deps
+```
+
+> **Note:** Use `--no-deps` to avoid overwriting the internal transformers version required by TRT-Edge-LLM.
+> If using a local Qwen3-TTS source, install with `pip install -e /path/to/Qwen3-TTS --no-deps`.
+
+### Step 1: Export (x86 Host)
+
+```bash
+export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
+export MODEL_NAME=Qwen3-TTS-12Hz-1.7B-CustomVoice
+cd $WORKSPACE_DIR
+
+# Export LLM components (Talker + CodePredictor, no Thinker)
+tensorrt-edgellm-export-llm \
+  --model_dir Qwen/$MODEL_NAME \
+  --output_dir $MODEL_NAME/onnx/llm
+
+# Export audio components (Tokenizer-12Hz Decoder)
+tensorrt-edgellm-export-audio \
+  --model_dir Qwen/$MODEL_NAME \
+  --output_dir $MODEL_NAME/onnx/audio \
+  --export_models tokenizer_decoder
+
+(Base models only) Export speaker encoder for voice cloning
+tensorrt-edgellm-export-audio \
+  --model_dir Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --output_dir Qwen3-TTS-12Hz-1.7B-Base/onnx/audio \
+  --export_models speaker_encoder
+```
+
+**Note:** Unlike Qwen3-Omni, Qwen3-TTS has no Thinker or visual encoder. The text embedding
+is self-contained in the Talker and exported as `text_embedding.safetensors`.
+
+**Expected export outputs:**
+
+```
+$MODEL_NAME/onnx/
+├── llm/
+│   ├── talker/
+│   │   ├── model.onnx + onnx_model.data   # Talker ONNX
+│   │   ├── config.json                     # model_type: qwen3_tts_talker
+│   │   ├── embedding.safetensors           # codec_embedding
+│   │   ├── text_embedding.safetensors      # TTS-only (no Thinker)
+│   │   └── text_projection.safetensors
+│   ├── code_predictor/
+│   │   ├── model.onnx + onnx_model.data   # CodePredictor ONNX
+│   │   ├── config.json
+│   │   ├── codec_embeddings.safetensors    # 15 embeddings
+│   │   ├── lm_heads.safetensors           # 15 lm_heads
+│   │   └── small_to_mtp_projection.safetensors  # if not Identity
+│   └── tokenizer_config.json              # at top level (no thinker/)
+└── audio/
+    ├── tokenizer_decoder/
+    │   ├── model.onnx + onnx_model.data   # Tokenizer-12Hz vocoder
+    │   └── config.json
+    └── speaker_encoder/                    # Base models only
+        ├── model.onnx + onnx_model.data
+        └── config.json
+```
+
+---
+
 ## Input File Format Reference
 
 All examples in this guide use standardized JSON input files. For complete input format specification including all parameters, multi-turn conversations, LoRA adapters, and advanced features, see the **[Input Format Guide](input-format.md)**.

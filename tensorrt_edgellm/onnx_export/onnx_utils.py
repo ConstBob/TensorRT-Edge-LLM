@@ -306,7 +306,8 @@ def export_onnx_dynamo(model,
                        input_names=None,
                        output_names=None,
                        input_dynamic_shapes=None,
-                       output_dynamic_shapes=None):
+                       output_dynamic_shapes=None,
+                       opset_version=None):
     '''
     Export the model to ONNX format using dynamo.
     Args:
@@ -317,7 +318,11 @@ def export_onnx_dynamo(model,
         output_names: The names of the output tensors
         input_dynamic_shapes: The dynamic shapes of the input tensors
         output_dynamic_shapes: The dynamic shapes of the output tensors, tuple of dicts mapping dim index to name
+        opset_version: ONNX opset version to use (default: ONNX_OPSET_VERSION from common.py)
     '''
+    if opset_version is None:
+        opset_version = ONNX_OPSET_VERSION
+
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
     onnx_path = f'{output_dir}/model.onnx'
@@ -328,7 +333,7 @@ def export_onnx_dynamo(model,
                                            dynamic_shapes=input_dynamic_shapes,
                                            input_names=input_names,
                                            output_names=output_names,
-                                           opset_version=ONNX_OPSET_VERSION,
+                                           opset_version=opset_version,
                                            dynamo=True)
 
     # Modify output dimensions according to output_dynamic_shapes as the dynamo exporter

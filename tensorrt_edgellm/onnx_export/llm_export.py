@@ -69,6 +69,8 @@ from ..llm_models.model_utils import (is_gptq_model,
                                       load_reduced_vocab_map)
 from ..llm_models.models.llm_model_trtnative import (Eagle3DraftModelTRTNative,
                                                      EdgeLLMModelTRTNative)
+from ..llm_models.models.qwen3_omni_talker import (
+    create_qwen3_omni_dummy_inputs, export_qwen3_omni_submodel_to_onnx)
 from .config_export import export_llm_config
 from .onnx_utils import export_onnx
 
@@ -102,6 +104,149 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
     embedding_path = os.path.join(output_dir, "embedding.safetensors")
     save_file({"embedding": embedding_weight}, embedding_path)
     print(f"Saved embedding.safetensors to {output_dir}")
+
+
+# ============================================================================
+# Model-specific export hooks (extensible pattern)
+# ============================================================================
+
+
+def get_model_save_weights_hook(model_name: str):
+    """
+    Get weight saving function for each model type.
+    
+    Every model type has an explicit hook. Talker and CodePredictor have
+    additional weights beyond the standard embedding table.
+    """
+    if model_name == "talker":
+
+        def save_talker_weights(model, output_dir):
+            save_embedding_table(model.transformer, output_dir)
+            from ..llm_models.models.qwen3_omni_talker import \
+                save_qwen3_omni_talker_projections
+            save_qwen3_omni_talker_projections(model, output_dir)
+
+        return save_talker_weights
+
+    if model_name == "code_predictor":
+
+        def save_code_predictor_weights(model, output_dir):
+            from ..llm_models.models.qwen3_omni_talker import (
+                save_qwen3_omni_code_predictor_embeddings,
+                save_qwen3_omni_code_predictor_lm_heads)
+            save_qwen3_omni_code_predictor_embeddings(model, output_dir)
+            save_qwen3_omni_code_predictor_lm_heads(model, output_dir)
+            # small_to_mtp_projection (TTS only — projects talker hidden to CP dimension)
+            proj = getattr(model, 'small_to_mtp_projection', None)
+            if proj is not None and not isinstance(proj, nn.Identity):
+                from safetensors.torch import save_file
+                save_file(
+                    {
+                        "weight": proj.weight.data.cpu().half(),
+                        "bias": proj.bias.data.cpu().half()
+                    },
+                    os.path.join(output_dir,
+                                 "small_to_mtp_projection.safetensors"),
+                )
+                print(
+                    f"Saved small_to_mtp_projection.safetensors to {output_dir}"
+                )
+
+        return save_code_predictor_weights
+
+    # Standard LLM / Thinker / EAGLE: only need embedding table
+    def save_default_weights(model, output_dir):
+        save_embedding_table(model, output_dir)
+
+    return save_default_weights
+
+
+def get_model_config_export_hook(model_name: str,
+                                 model_dir: str = None,
+                                 is_eagle_base: bool = False,
+                                 trt_native_ops: bool = False):
+    """
+    Get config export function for each model type.
+    
+    Every model type has an explicit hook that returns a config dict.
+    """
+    if model_name == "talker":
+        if not model_dir:
+            raise ValueError("model_dir is required for talker config export")
+
+        from transformers import AutoConfig
+
+        from .config_export import (export_talker_config,
+                                    export_tts_talker_config)
+
+        def export_talker_config_hook(model_config):
+            full_config = AutoConfig.from_pretrained(model_dir,
+                                                     trust_remote_code=True)
+            # Omni talker config has thinker_hidden_size; TTS does not
+            has_thinker = hasattr(full_config, 'talker_config') and \
+                          hasattr(full_config.talker_config, 'thinker_hidden_size')
+            if has_thinker:
+                return export_talker_config(full_config)
+            else:
+                return export_tts_talker_config(full_config)
+
+        return export_talker_config_hook
+
+    if model_name == "code_predictor":
+
+        def export_code_predictor_config_hook(model_config):
+            config = export_llm_config(model_config, 'llm', trt_native_ops)
+            config["use_embeddings_input"] = True
+            return config
+
+        return export_code_predictor_config_hook
+
+    if model_name == "thinker":
+
+        def export_thinker_config_hook(model_config):
+            config = export_llm_config(model_config, 'llm', trt_native_ops)
+            if model_dir:
+                from transformers import AutoConfig
+                try:
+                    full_config = AutoConfig.from_pretrained(
+                        model_dir, trust_remote_code=True)
+                except Exception:
+                    full_config = None
+
+                search_configs = [
+                    getattr(full_config, 'thinker_config', None)
+                    if full_config else None,
+                    getattr(full_config, 'text_config', None)
+                    if full_config else None,
+                    full_config,
+                    model_config,
+                ]
+                for field in [
+                        "audio_token_id", "image_token_id", "video_token_id"
+                ]:
+                    for cfg in search_configs:
+                        if cfg is None:
+                            continue
+                        val = getattr(cfg, field, None)
+                        if val is not None:
+                            config[field] = val
+                            break
+            return config
+
+        return export_thinker_config_hook
+
+    # Standard LLM / EAGLE base
+    model_type = 'eagle3_base' if is_eagle_base else 'llm'
+
+    def export_default_config_hook(model_config):
+        return export_llm_config(model_config, model_type, trt_native_ops)
+
+    return export_default_config_hook
+
+
+def is_qwen3_omni_submodel(model_name: str) -> bool:
+    """Check if model is a Qwen3-Omni submodel that needs special ONNX export."""
+    return model_name in ["talker", "code_predictor"]
 
 
 def create_dummy_inputs(model: nn.Module,
@@ -316,15 +461,23 @@ def export_model_to_onnx(model: nn.Module,
     
     Args:
         model: The model to export
-        dummy_inputs: Dummy inputs for tracing
         output_dir: Directory to save the ONNX model
         is_eagle_base: Whether this is an EAGLE base model
         is_eagle_draft: Whether this is an EAGLE draft model
+        fp8_kv_cache: Whether to use FP8 KV cache
     """
     print(f"Exporting model to ONNX format: {output_dir}")
 
     dummy_inputs = create_dummy_inputs(model, is_eagle_base, is_eagle_draft,
                                        fp8_kv_cache)
+
+    # Auto-detect if model should export hidden_states output
+    # - EAGLE base: needs hidden_states for draft model input
+    # - EAGLE draft: needs hidden_states for speculative decoding verification
+    # - Qwen3-Omni Thinker: always export hidden_states (runtime decides whether to use it)
+    model_type = getattr(model.config, 'model_type', '')
+    needs_hidden_states = is_eagle_base or is_eagle_draft or (
+        model_type == "qwen3_omni_text")
 
     try:
         # Set model to evaluation mode
@@ -362,7 +515,7 @@ def export_model_to_onnx(model: nn.Module,
             # Standard models pass None for position_ids and attention_mask
             base_inputs.extend([None, None])
 
-        # For Qwen3VL and Qwen3Omni, add deepstack visual embeds
+        # For Qwen3VL and Qwen3Omni Thinker, add deepstack visual embeds
         require_deepstack_embeds = model_config.model_type in [
             "qwen3_vl_text", "qwen3_omni_text"
         ]
@@ -390,8 +543,14 @@ def export_model_to_onnx(model: nn.Module,
             input_names += [f'deepstack_embeds_{i}' for i in range(3)]
 
         # Create output names
-        output_names = (['logits', 'hidden_states'] if (is_eagle_base or is_eagle_draft) else ['logits']) + \
-                       [f'present_key_values_{i}' for i in range(num_layers)]
+        # EAGLE base, EAGLE draft, and Qwen3-Omni Thinker output hidden_states
+        # Standard LLMs only output logits and present_key_values
+        if needs_hidden_states:
+            output_names = ['logits', 'hidden_states'] + \
+                           [f'present_key_values_{i}' for i in range(num_layers)]
+        else:
+            output_names = ['logits'] + \
+                           [f'present_key_values_{i}' for i in range(num_layers)]
 
         # Create dynamic axes
         dynamic_axes = {
@@ -450,6 +609,15 @@ def export_model_to_onnx(model: nn.Module,
                 },
             })
 
+        # EAGLE base, EAGLE draft, and Qwen3-Omni Thinker output hidden_states
+        if needs_hidden_states:
+            dynamic_axes.update({
+                "hidden_states": {
+                    0: "batch_size",
+                    1: "seq_len"
+                },
+            })
+
         if is_eagle_base or is_eagle_draft:
             dynamic_axes.update({
                 "attention_pos_id": {
@@ -460,10 +628,6 @@ def export_model_to_onnx(model: nn.Module,
                     0: "batch_size",
                     1: "q_len",
                     2: "q_len_padded"
-                },
-                "hidden_states": {
-                    0: "batch_size",
-                    1: "seq_len"
                 },
             })
 
@@ -497,7 +661,8 @@ def export_llm_model(model_dir: str,
                      reduced_vocab_dir: Optional[str] = None,
                      chat_template_path: Optional[str] = None,
                      fp8_kv_cache: bool = False,
-                     trt_native_ops: bool = False) -> None:
+                     trt_native_ops: bool = False,
+                     export_models: Optional[str] = None) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
     
@@ -513,8 +678,15 @@ def export_llm_model(model_dir: str,
         chat_template_path: Path to chat template JSON file. When provided, this template is validated and used instead of inferring from the model (optional)
         fp8_kv_cache: Whether to use FP8 KV cache
         trt_native_ops: Whether to use TensorRT native operations instead of plugin
+        export_models: Comma-separated list of models to export for Qwen3-Omni (e.g., "thinker,talker"). Default: export all models
     """
     start_time = time.time()
+
+    # Parse export_models filter (for selective multi-model exports like Qwen3-Omni)
+    export_models_set = None
+    if export_models:
+        export_models_set = set(m.strip() for m in export_models.split(','))
+        print(f"Export filter: only exporting {export_models_set}")
 
     if is_eagle_base:
         print(f"Exporting EAGLE3 base model to ONNX format")
@@ -532,8 +704,9 @@ def export_llm_model(model_dir: str,
         reduced_vocab_size, vocab_map = load_reduced_vocab_map(
             reduced_vocab_dir, device)
 
-    # Load model
-    model, tokenizer, processor = load_llm_model(
+    # Load model(s)
+    # Always returns dict for uniform processing: {"model_name": model, ...}
+    models_or_dict, tokenizer, processor = load_llm_model(
         model_dir,
         dtype='fp16',
         device=device,
@@ -542,44 +715,73 @@ def export_llm_model(model_dir: str,
         vocab_map=vocab_map,
         trt_native_ops=trt_native_ops)
 
-    model = replace_torch_quant_linear_with_int4_plugin(model)
+    # Normalize to dict (single model wrapped as {"model": model})
+    models_dict = models_or_dict if isinstance(models_or_dict, dict) else {
+        "model": models_or_dict
+    }
+    is_multi_model = len(models_dict) > 1
 
-    # Export to ONNX
-    if trt_native_ops:
-        export_model_to_onnx_with_trt_native_ops(model, output_dir)
-    else:
-        export_model_to_onnx(model,
-                             output_dir,
-                             is_eagle_base=is_eagle_base,
-                             is_eagle_draft=False,
-                             fp8_kv_cache=fp8_kv_cache)
+    # ========== Standard Export Flow ==========
+    # Export each model with unified pipeline
+    for model_name, model in models_dict.items():
+        # Filter check
+        if export_models_set is not None and model_name not in export_models_set:
+            print(f"Skipping {model_name}")
+            continue
 
-    # Save model configuration
-    model_type = 'eagle3_base' if is_eagle_base else 'llm'
-    model_config = export_llm_config(model.config, model_type, trt_native_ops)
+        print(f"\n=== Exporting {model_name} ===")
+        model_output_dir = os.path.join(
+            output_dir, model_name) if is_multi_model else output_dir
 
-    # Add reduced_vocab_size to config if vocabulary reduction is used
-    if reduced_vocab_size is not None:
-        model_config['reduced_vocab_size'] = reduced_vocab_size
-        print(f"Added reduced_vocab_size={reduced_vocab_size} to config")
+        # Step 1: Apply model modifications
+        model = replace_torch_quant_linear_with_int4_plugin(model)
 
-    config_path = os.path.join(output_dir, "config.json")
-    with open(config_path, 'w') as f:
-        json.dump(model_config, f, indent=2)
-    print(f"Model configuration saved to {config_path}")
+        # Step 2: Export ONNX
+        if trt_native_ops:
+            export_model_to_onnx_with_trt_native_ops(model, model_output_dir)
+        elif is_qwen3_omni_submodel(model_name):
+            dummy_inputs = create_qwen3_omni_dummy_inputs(
+                model, model_name, fp8_kv_cache)
+            export_qwen3_omni_submodel_to_onnx(model, dummy_inputs,
+                                               model_output_dir, model_name)
+        else:
+            export_model_to_onnx(model, model_output_dir, is_eagle_base, False,
+                                 fp8_kv_cache)
 
-    # Save embedding.safetensors for all models (EAGLE base and regular models)
-    # Draft models don't need embeddings as they use the base model's embeddings
-    save_embedding_table(model, output_dir)
+        # Step 3: Export config
+        config_hook = get_model_config_export_hook(model_name, model_dir,
+                                                   is_eagle_base,
+                                                   trt_native_ops)
+        model_config = config_hook(model.config)
+
+        if reduced_vocab_size is not None:
+            model_config['reduced_vocab_size'] = reduced_vocab_size
+
+        with open(os.path.join(model_output_dir, "config.json"), 'w') as f:
+            json.dump(model_config, f, indent=2)
+        print(f"Config saved to {model_output_dir}")
+
+        # Step 4: Save weights
+        weights_hook = get_model_save_weights_hook(model_name)
+        weights_hook(model, model_output_dir)
+
+    # ========== Save Shared Resources ==========
+
+    # Determine tokenizer save location
+    # Omni (has thinker): save to thinker subdirectory (where llm_build looks)
+    # TTS / single model: save to top-level
+    has_thinker = "thinker" in models_dict
+    tokenizer_save_dir = os.path.join(output_dir,
+                                      "thinker") if has_thinker else output_dir
 
     # Save tokenizer files
-    tokenizer.save_pretrained(output_dir)
-    print(f"Tokenizer saved to {output_dir}")
+    tokenizer.save_pretrained(tokenizer_save_dir)
+    print(f"Tokenizer saved to {tokenizer_save_dir}")
 
     # Save processor files if available
     if processor is not None:
-        processor.save_pretrained(output_dir)
-        print(f"Processor saved to {output_dir}")
+        processor.save_pretrained(tokenizer_save_dir)
+        print(f"Processor saved to {tokenizer_save_dir}")
 
     # Check if model requires explicit chat template
     is_incompatible, incompatible_model_type = is_incompatible_chat_template_model(
@@ -603,18 +805,18 @@ def export_llm_model(model_dir: str,
     else:
         template_source = None
 
-    # Handle chat template
+    # Handle chat template (save to tokenizer location)
     if template_source is not None:
         # Validate and copy the template
         print(f"Using chat template from: {template_source}")
         validate_chat_template(template_source)
-        output_template_path = os.path.join(output_dir,
+        output_template_path = os.path.join(tokenizer_save_dir,
                                             "processed_chat_template.json")
         shutil.copy2(template_source, output_template_path)
         print(f"Chat template saved to {output_template_path}")
     else:
         # Generate chat template from model
-        process_chat_template(model_dir, output_dir)
+        process_chat_template(model_dir, tokenizer_save_dir)
 
     # Copy vocab_map.safetensors to output directory if reduced_vocab_dir is provided
     if reduced_vocab_dir is not None:

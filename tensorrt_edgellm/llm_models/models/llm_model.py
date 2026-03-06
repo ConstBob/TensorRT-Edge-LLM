@@ -73,6 +73,13 @@ class EdgeLLMModel(nn.Module):
 
         # Keep all the original components
         self.torch_dtype = hf_model.dtype
+
+        # embed_tokens is optional (e.g., Talker/CodePredictor use projected embeddings as input)
+        if hasattr(hf_model, 'embed_tokens'):
+            self.embed_tokens = hf_model.embed_tokens.to(self.torch_dtype)
+        else:
+            self.embed_tokens = None
+
         self.norm = hf_model.norm.to(self.torch_dtype)
 
         # Replace decoder layers with our custom ones
@@ -257,7 +264,9 @@ class EdgeLLMModelForCausalLM(nn.Module):
             For EAGLE3 base: (logits, past_key_values, hidden_states)
         """
         # Determine output configuration based on model type
-        output_hidden_states = self.is_eagle_base
+        # Enable hidden states output for EAGLE base and Qwen3-Omni Thinker
+        is_qwen3_omni_thinker = self.config.model_type == "qwen3_omni_text"
+        output_hidden_states = self.is_eagle_base or is_qwen3_omni_thinker
 
         # Forward pass through the model
         hidden_states, present_key_values, all_hidden_states = self.model(
@@ -295,5 +304,27 @@ class EdgeLLMModelForCausalLM(nn.Module):
                 dim=-1).to(self.torch_dtype)
             return logits, hidden_states, tuple(present_key_values)
 
-        # Standard model: return logits and past key values
+        elif is_qwen3_omni_thinker:
+            # Qwen3-Omni Thinker: return accept_hidden_layer hidden states for Talker
+            # accept_hidden_layer (e.g. 14): thinker_hidden (used for hidden_projection in Talker)
+            # Note: Layer 0 (thinker_embed) is the same as inputs_embeds, already available in runtime
+            # Output shape: [batch_size, seq_len, hidden_size]
+
+            # Read accept_hidden_layer from config (auto from talker_config or default 14)
+            accept_layer = getattr(self.config, 'accept_hidden_layer', 14)
+            if hasattr(self.config, 'talker_config') and hasattr(
+                    self.config.talker_config, 'accept_hidden_layer'):
+                accept_layer = self.config.talker_config.accept_hidden_layer
+
+            if accept_layer >= len(all_hidden_states):
+                raise ValueError(
+                    f"accept_hidden_layer ({accept_layer}) exceeds number of layers ({len(all_hidden_states)})"
+                )
+
+            hidden_states_output = all_hidden_states[accept_layer].to(
+                self.torch_dtype)
+
+            return logits, hidden_states_output, tuple(present_key_values)
+
+        # Standard model: return only logits and kv cache (original behavior)
         return logits, tuple(present_key_values)
