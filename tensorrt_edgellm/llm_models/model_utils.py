@@ -133,6 +133,11 @@ def _is_qwen3_omni_model(model_dir: str) -> bool:
     return getattr(cfg, "model_type", None) == "qwen3_omni"
 
 
+def _is_qwen3_tts_model(model_dir: str) -> bool:
+    """Qwen3-TTS is not integrated into transformers yet."""
+    return "Qwen3-TTS" in model_dir
+
+
 def _is_qwen3_asr_model(model_dir: str) -> bool:
     """Qwen3-ASR is not integrated into transformers yet."""
     return "Qwen3-ASR" in model_dir
@@ -304,6 +309,20 @@ def load_hf_model(
         model = Qwen3ASRModel.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).model.to(device)
+    elif _is_qwen3_tts_model(model_dir):
+        from qwen_tts.core.models import (Qwen3TTSConfig,
+                                          Qwen3TTSForConditionalGeneration)
+        from transformers import AutoConfig, AutoModel, PreTrainedModel
+        AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+        AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+        # Use PreTrainedModel.from_pretrained to skip speech_tokenizer loading
+        # (Qwen3TTSForConditionalGeneration.from_pretrained tries to load
+        # speech_tokenizer/feature_extractor which we don't need for LLM export)
+        model = PreTrainedModel.from_pretrained.__func__(
+            Qwen3TTSForConditionalGeneration,
+            model_dir,
+            torch_dtype=torch_dtype)
+        model = model.to(device)
     elif _is_qwen3_omni_model(model_dir):
         from transformers import Qwen3OmniForConditionalGeneration
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
@@ -390,19 +409,52 @@ def load_llm_model(
     model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
     set_dynamic_quant(model, dtype)
 
-    # Create EdgeLLMModelForCausalLM wrapper
-    if _is_qwen3_omni_model(model_dir) or _is_qwen3_asr_model(model_dir):
-        # For Qwen3-Omni and Qwen3-ASR, extract the thinker submodel
+    # Create EdgeLLMModel wrappers based on model type
+    if _is_qwen3_tts_model(model_dir):
+        # Qwen3-TTS: Talker + CodePredictor only (no Thinker)
+        from .models.qwen3_omni_talker import (Qwen3OmniCodePredictorPatch,
+                                               Qwen3OmniTalkerPatch)
+
+        edge_model = {}
+        edge_model["talker"] = Qwen3OmniTalkerPatch._from_pretrained_tts(
+            model.talker).eval().to(device)
+        edge_model[
+            "code_predictor"] = Qwen3OmniCodePredictorPatch._from_pretrained_tts(
+                model.talker.code_predictor).eval().to(device)
+
+    elif _is_qwen3_omni_model(model_dir) or _is_qwen3_asr_model(model_dir):
+        # Qwen3-Omni / ASR: Thinker + optional Talker + CodePredictor
         hf_model = model.thinker
+
+        if not trt_native_ops:
+            edge_model = {}
+            edge_model["thinker"] = EdgeLLMModelForCausalLM(
+                hf_model, is_eagle_base, reduced_vocab_size, vocab_map)
+
+            if hasattr(model, 'has_talker') and model.has_talker:
+                from .models.qwen3_omni_talker import (
+                    Qwen3OmniCodePredictorPatch, Qwen3OmniTalkerPatch)
+
+                edge_model["talker"] = Qwen3OmniTalkerPatch._from_pretrained(
+                    model.talker).eval().to(device)
+                edge_model[
+                    "code_predictor"] = Qwen3OmniCodePredictorPatch._from_pretrained(
+                        model.talker.code_predictor).eval().to(device)
+        else:
+            edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
+                                               reduced_vocab_size, vocab_map)
+
     else:
+        # Standard LLM / EAGLE
         hf_model = model
 
-    if not trt_native_ops:
-        edge_model = EdgeLLMModelForCausalLM(hf_model, is_eagle_base,
-                                             reduced_vocab_size, vocab_map)
-    else:
-        edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
-                                           reduced_vocab_size, vocab_map)
+        if not trt_native_ops:
+            edge_model = {}
+            edge_model["model"] = EdgeLLMModelForCausalLM(
+                hf_model, is_eagle_base, reduced_vocab_size, vocab_map)
+        else:
+            edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
+                                               reduced_vocab_size, vocab_map)
 
     del model
     gc.collect()
@@ -548,6 +600,10 @@ def prepare_language_model_and_config(hf_model: nn.Module):
     # Use language_model if available, otherwise use model.model.
     if hasattr(hf_model, 'language_model'):
         language_model = hf_model.language_model
+        config = hf_model.config.text_config
+    elif getattr(hf_model.config, 'model_type', '') == 'qwen3_omni_thinker':
+        # Qwen3-Omni Thinker: use text_config (same as Qwen3-VL)
+        language_model = hf_model.model
         config = hf_model.config.text_config
     else:
         language_model = hf_model.model
