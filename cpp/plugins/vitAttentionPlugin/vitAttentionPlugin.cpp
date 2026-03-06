@@ -48,11 +48,12 @@ constexpr int32_t kIN_Q_IDX{0};
 constexpr int32_t kIN_K_IDX{1};
 constexpr int32_t kIN_V_IDX{2};
 constexpr int32_t kIN_CU_SEQLENS_IDX{3};
+constexpr int32_t kIN_MAX_SEQLEN_CARRIER_IDX{4};
 constexpr int32_t kOUT_ATTENTION_IDX{0};
 
 // Reflect the count of Inputs and Outputs of the ViTAttentionPlugin,
 // these definitions shall be consistent.
-constexpr int32_t kNUM_REQUIRED_INPUTS{4};
+constexpr int32_t kNUM_REQUIRED_INPUTS{5};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{1};
 
 } // namespace
@@ -63,11 +64,10 @@ std::vector<PluginField> ViTAttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(ViTAttentionPluginCreator);
 
-ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, int32_t numHeads, int32_t headSize, int32_t maxSeqLen)
+ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, int32_t numHeads, int32_t headSize)
     : mLayerName(name)
     , mNumHeads(numHeads)
     , mHeadSize(headSize)
-    , mMaxSeqLen(maxSeqLen)
 {
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -92,7 +92,6 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, std::byte const*
 {
     deserializeValue(&data, &length, &mNumHeads);
     deserializeValue(&data, &length, &mHeadSize);
-    deserializeValue(&data, &length, &mMaxSeqLen);
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -104,7 +103,7 @@ ViTAttentionPlugin::~ViTAttentionPlugin() {}
 
 IPluginV2DynamicExt* ViTAttentionPlugin::clone() const noexcept
 {
-    ViTAttentionPlugin* plugin = new ViTAttentionPlugin(mLayerName, mNumHeads, mHeadSize, mMaxSeqLen);
+    ViTAttentionPlugin* plugin = new ViTAttentionPlugin(mLayerName, mNumHeads, mHeadSize);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -129,11 +128,6 @@ char const* ViTAttentionPlugin::getPluginVersion() const noexcept
     return kATTENTION_PLUGIN_VERSION;
 }
 
-void ViTAttentionPlugin::setMaxSeqLen(int32_t maxSeqLen) noexcept
-{
-    mMaxSeqLen = maxSeqLen;
-}
-
 int32_t ViTAttentionPlugin::getNbOutputs() const noexcept
 {
     // Output attention result.
@@ -148,7 +142,8 @@ bool ViTAttentionPlugin::supportsFormatCombination(
     //      K tensor (linear FP16) with shape [total_S, H, D]
     //      V tensor (linear FP16) with shape [total_S, H, D]
     //      NOTE: This assumes a head-major layout. The Python export must guarantee this layout.
-    //      CuSeqLens tensor (a vector of scalars) with with shape [batch_size + 1] and type int32_t.
+    //      CuSeqLens tensor (a vector of scalars) with shape [batch_size + 1] and type int32_t.
+    //      max_seqlen_carrier tensor with shape [max_seqlen] and type int32_t. Values are ignored.
 
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [total_S, H, D]
@@ -168,6 +163,14 @@ bool ViTAttentionPlugin::supportsFormatCombination(
     };
 
     auto checkCuSeqLens = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+        bool status{true};
+        status &= tensorDesc.type == DataType::kINT32;
+        status &= tensorDesc.format == TensorFormat::kLINEAR;
+        status &= tensorDesc.dims.nbDims == 1;
+        return status;
+    };
+
+    auto checkMaxSeqLenCarrier = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -196,6 +199,7 @@ bool ViTAttentionPlugin::supportsFormatCombination(
         case kIN_K_IDX: result = checkQKVO(inOut[1]); break;
         case kIN_V_IDX: result = checkQKVO(inOut[2]); break;
         case kIN_CU_SEQLENS_IDX: result = checkCuSeqLens(inOut[3]); break;
+        case kIN_MAX_SEQLEN_CARRIER_IDX: result = checkMaxSeqLenCarrier(inOut[4]); break;
         default: break;
         }
     }
@@ -262,13 +266,16 @@ int32_t ViTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     rt::Tensor cuSeqLensTensor(const_cast<void*>(inputs[kIN_CU_SEQLENS_IDX]), rt::Coords{cuSeqLensInputDesc.dims},
         rt::DeviceType::kGPU, cuSeqLensInputDesc.type);
 
+    PluginTensorDesc const& maxSeqLenCarrierDesc = inputDesc[kIN_MAX_SEQLEN_CARRIER_IDX];
+    int32_t runtimeMaxSeqLen = static_cast<int32_t>(maxSeqLenCarrierDesc.dims.d[0]);
+
     PluginTensorDesc const& attentionOutputDesc = outputDesc[kOUT_ATTENTION_IDX];
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
         rt::DeviceType::kGPU, attentionOutputDesc.type);
 
     int32_t runtimeBatchSize = static_cast<int32_t>(cuSeqLensInputDesc.dims.d[0]) - 1;
 
-    auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, mMaxSeqLen, mNumHeads, mNumHeads, mHeadSize,
+    auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeMaxSeqLen, mNumHeads, mNumHeads, mHeadSize,
         mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::PADDING, false);
 
     // Prepare FMHA_v2 params to launch FMHA kernel
@@ -289,7 +296,7 @@ int32_t ViTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
 size_t ViTAttentionPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mNumHeads) + sizeof(mHeadSize) + sizeof(mMaxSeqLen);
+    return sizeof(mNumHeads) + sizeof(mHeadSize);
 }
 
 void ViTAttentionPlugin::serialize(void* buffer) const noexcept
@@ -297,7 +304,6 @@ void ViTAttentionPlugin::serialize(void* buffer) const noexcept
     std::byte* byteBuffer = static_cast<std::byte*>(buffer);
     serializeValue(&byteBuffer, mNumHeads);
     serializeValue(&byteBuffer, mHeadSize);
-    serializeValue(&byteBuffer, mMaxSeqLen);
 }
 
 int32_t ViTAttentionPlugin::initialize() noexcept
@@ -320,7 +326,6 @@ ViTAttentionPluginCreator::ViTAttentionPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("max_seqlen", nullptr, PluginFieldType::kINT32, 1));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -357,18 +362,16 @@ nvinfer1::IPluginV2* ViTAttentionPluginCreator::createPlugin(
     {
         std::optional<int32_t> numHeads = parsePluginScalarField<int32_t>("num_heads", fc);
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
-        std::optional<int32_t> maxSeqLen = parsePluginScalarField<int32_t>("max_seqlen", fc);
 
         // Enforce Core parameters are specified.
-        bool checkRequiredFields = numHeads.has_value() && headSize.has_value() && maxSeqLen.has_value();
+        bool checkRequiredFields = numHeads.has_value() && headSize.has_value();
         if (!checkRequiredFields)
         {
             LOG_ERROR("Missing required ViTAttentionPlugin fields.");
             return nullptr;
         }
 
-        ViTAttentionPlugin* plugin
-            = new ViTAttentionPlugin(std::string(name), numHeads.value(), headSize.value(), maxSeqLen.value());
+        ViTAttentionPlugin* plugin = new ViTAttentionPlugin(std::string(name), numHeads.value(), headSize.value());
 
         return plugin;
     }

@@ -187,6 +187,12 @@ vit_attention_plugin_schema = OpSchema(
             description="Prefix sum of sequence lengths (int32, shape [B+1])",
             type_str="tensor(int32)",
         ),
+        OpSchema.FormalParameter(
+            name="max_seqlen_carrier",
+            description=
+            "Shape-only input used to carry runtime max sequence length hint; tensor values are ignored.",
+            type_str="tensor(int32)",
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -213,12 +219,6 @@ vit_attention_plugin_schema = OpSchema(
             name="head_size",
             type=OpSchema.AttrType.INT,
             description="Size of each attention head",
-            required=True,
-        ),
-        OpSchema.Attribute(
-            name="max_seqlen",
-            type=OpSchema.AttrType.INT,
-            description="Maximum sequence length",
             required=True,
         ),
     ],
@@ -292,16 +292,16 @@ def symbolic_attention_plugin(
     return attn_output, present_key_value
 
 
-@symbolic_helper.parse_args("v", "v", "v", "v", "i", "i", "i")
+@symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i")
 def symbolic_vit_attention_plugin(
     g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
     q: torch._C.Value,
     k: torch._C.Value,
     v: torch._C.Value,
     cu_seqlens: torch._C.Value,
+    max_seqlen_carrier: torch._C.Value,
     num_heads: torch._C.Value,
     head_size: torch._C.Value,
-    max_seqlen: torch._C.Value,
 ):
     """Custom ViT attention plugin operation for ONNX export."""
     attn_output = g.op(
@@ -310,9 +310,9 @@ def symbolic_vit_attention_plugin(
         k,
         v,
         cu_seqlens,
+        max_seqlen_carrier,
         num_heads_i=num_heads,
         head_size_i=head_size,
-        max_seqlen_i=max_seqlen,
         outputs=1,
     )
     # Attention output has the same shape as q: [total_S, H, D]
@@ -435,9 +435,9 @@ def vit_attention_plugin(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    max_seqlen_carrier: torch.Tensor,
     num_heads: int,
     head_size: int,
-    max_seqlen: int = 512,
 ) -> torch.Tensor:
     """
     Dummy TensorRT operation for ViT attention during ONNX export.
@@ -447,9 +447,9 @@ def vit_attention_plugin(
         k: Key tensor [total_S, H, D] in head-major layout.
         v: Value tensor [total_S, H, D] in head-major layout.
         cu_seqlens: Prefix sum of sequence lengths [B+1].
+        max_seqlen_carrier: Shape-only input carrying max sequence length hint.
         num_heads: Number of heads.
         head_size: Head size.
-        max_seqlen: Maximum sequence length.
     """
     # Output has the same shape as q: [total_S, H, D]
     return torch.zeros_like(q)

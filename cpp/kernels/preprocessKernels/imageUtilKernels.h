@@ -55,15 +55,6 @@ void normalizeImage(rt::Tensor const& originalImage, rt::Tensor const& mean, rt:
 void transposeToPatchQwenViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
     int64_t const temporalPatchSize, int64_t const patchSize, int64_t const mergeSize, cudaStream_t stream);
 
-//! The kernel will initialize the attention mask for Qwen2-VL and Qwen2.5-VL VIT
-//! Inputs:
-//!     cuSeqlens [GPU, Int64]: Cumulative sequence lengths [num]
-//!     stream: CUDA stream for execution
-//! Outputs:
-//!     attentionMask [GPU, Half]: Attention mask tensor [1, curHW, curHW]
-//! \throws std::runtime_error if image has invalid shape, data type or location
-void initAttentionMaskQwenViT(rt::Tensor const& cuSeqlens, rt::Tensor& attentionMask, cudaStream_t stream);
-
 //! The kernel will initialize the rotary position embeddings for Qwen2.5-VL VIT
 //! Inputs:
 //!     gridTHW: Image grid dimensions [T, H, W] (Temporal, Height, Width)

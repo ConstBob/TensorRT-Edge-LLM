@@ -22,38 +22,52 @@ TODO: Input/output names have been aligned with the old multimodal_export.py for
       Future refactoring should consider more descriptive names while maintaining backward compatibility.
 """
 
-import math
-from typing import Any
+from typing import Any, Optional
 
-import modelopt.torch.quantization as mtq
 import torch
-import torch.nn as nn
-from modelopt.torch.quantization.nn import TensorQuantizer
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionTransformerPretrainedModel, Qwen2_5_VLMLP,
     Qwen2_5_VLPatchMerger, Qwen2_5_VLVisionAttention, Qwen2_5_VLVisionBlock,
     apply_rotary_pos_emb_vision)
 
+from ..llm_models.layers.attention_plugin import (
+    register_attention_plugin_onnx_symbolic_functions, vit_attention_plugin)
 from ..onnx_export.onnx_utils import export_onnx
 
 
 class Qwen2_5_VLVisionAttentionPatch(Qwen2_5_VLVisionAttention):
     """
     Patched version of Qwen2.5-VL vision attention for ONNX export.
+    Uses vit attention plugin to support ragged attention via cu_seqlens.
     """
 
-    def __init__(self, config: Any) -> None:
-        super().__init__(config)
+    def __init__(self, attention_module: Qwen2_5_VLVisionAttention) -> None:
+        """
+        Initialize the patched attention module.
+        
+        Args:
+            attention_module: Original attention module to extract components from
+        """
+        super().__init__(attention_module.config)
+        self.qkv = attention_module.qkv
+        self.proj = attention_module.proj
 
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                position_embeddings: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen_carrier: Optional[torch.Tensor],
+        position_embeddings: Optional[tuple[torch.Tensor,
+                                            torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         """
         Forward pass with custom attention implementation.
         
         Args:
             hidden_states: Input hidden states
-            attention_mask: Attention mask
+            cu_seqlens: Prefix sum of sequence lengths
+            max_seqlen_carrier: Shape-only input carrying max sequence length for FMHA launch
             position_embeddings: Position embeddings for rotary attention
             
         Returns:
@@ -67,86 +81,27 @@ class Qwen2_5_VLVisionAttentionPatch(Qwen2_5_VLVisionAttention):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
-            self.head_dim)
-        attn_weights = attn_weights + attention_mask
+        # Convert to FP16 for plugin compatibility
+        q = q.to(torch.float16)
+        k = k.to(torch.float16)
+        v = v.to(torch.float16)
 
-        attn_weights = torch.nn.functional.softmax(attn_weights,
-                                                   dim=-1,
-                                                   dtype=torch.float32).to(
-                                                       v.dtype)
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(0, 1)
+        # Use ViT attention plugin with separate Q, K, V
+        # q, k, v are already in shape [total_S, H, D]
+        attn_output = vit_attention_plugin(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            max_seqlen_carrier,
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+        )
+
+        # Plugin output layout is [total_S, H, D], reshape to [total_S, H * D]
         attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
-
-
-class QuantQwen2_5_VLVisionAttention(Qwen2_5_VLVisionAttentionPatch):
-    """
-    Quantized MHA version of Qwen2_5_VLVisionAttentionPatch.
-    """
-
-    def __init__(self, config: Any) -> None:
-        super().__init__(config)
-        self._setup()
-
-    def _setup(self) -> None:
-        """Initialize quantization components."""
-        self.q_bmm_quantizer = TensorQuantizer()
-        self.k_bmm_quantizer = TensorQuantizer()
-        self.v_bmm_quantizer = TensorQuantizer()
-        self.softmax_quantizer = TensorQuantizer()
-
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                position_embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        Quantized forward pass with custom attention implementation.
-        
-        Args:
-            hidden_states: Input hidden states
-            attention_mask: Attention mask
-            position_embeddings: Position embeddings for rotary attention
-            
-        Returns:
-            Attention output
-        """
-        seq_length = hidden_states.shape[0]
-        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3,
-                                                  self.num_heads,
-                                                  -1).permute(1, 0, 2,
-                                                              3).unbind(0)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        q = self.q_bmm_quantizer(q)
-        k = self.k_bmm_quantizer(k)
-        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
-            self.head_dim)
-        attn_weights = attn_weights + attention_mask
-
-        attn_weights = torch.nn.functional.softmax(attn_weights,
-                                                   dim=-1,
-                                                   dtype=torch.float32).to(
-                                                       v.dtype)
-        attn_weights = self.softmax_quantizer(attn_weights)
-        v = self.v_bmm_quantizer(v)
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.reshape(seq_length, -1)
-        attn_output = self.proj(attn_output)
-        return attn_output
-
-
-mtq.register(original_cls=Qwen2_5_VLVisionAttentionPatch,
-             quantized_cls=QuantQwen2_5_VLVisionAttention)
 
 
 class Qwen2_5_VLMLPPatch(Qwen2_5_VLMLP):
@@ -157,15 +112,20 @@ class Qwen2_5_VLMLPPatch(Qwen2_5_VLMLP):
     layer to FP32 during computation.
     """
 
-    def __init__(self, config: Any, bias: bool = False) -> None:
+    def __init__(self, config: Any, mlp_module: Qwen2_5_VLMLP) -> None:
         """
-        Initialize the patched MLP.
+        Initialize the patched MLP from original MLP module.
         
         Args:
             config: Model configuration object
-            bias: Whether to use bias in the linear layers
+            mlp_module: Original Qwen2_5_VLMLP module to reuse components from
         """
-        super().__init__(config, bias)
+        super().__init__(config, bias=mlp_module.down_proj.bias is not None)
+        # Reuse all MLP components to preserve quantization information
+        self.gate_proj = mlp_module.gate_proj
+        self.up_proj = mlp_module.up_proj
+        self.down_proj = mlp_module.down_proj
+        self.act_fn = mlp_module.act_fn
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """
@@ -197,29 +157,37 @@ class Qwen2_5_VLVisionBlockPatchWAR(Qwen2_5_VLVisionBlock):
     in the Qwen2.5-VL 3B model by using FP32 casting in critical operations.
     """
 
-    def __init__(self,
-                 config: Any,
-                 attn_implementation: str = "eager") -> None:
+    def __init__(self, config: Any,
+                 block_module: Qwen2_5_VLVisionBlock) -> None:
         """
-        Initialize the workaround vision block.
+        Initialize the workaround vision block from original block module.
         
         Args:
             config: Model configuration object
-            attn_implementation: Attention implementation type
+            block_module: Original Qwen2_5_VLVisionBlock module to reuse components from
         """
         super().__init__(config)
-        self.attn = Qwen2_5_VLVisionAttentionPatch(config)
-        self.mlp = Qwen2_5_VLMLPPatch(config, bias=True)
+        # Reuse normalization layers
+        self.norm1 = block_module.norm1
+        self.norm2 = block_module.norm2
+        # Create patched attention and MLP, reusing original components
+        self.attn = Qwen2_5_VLVisionAttentionPatch(block_module.attn)
+        self.mlp = Qwen2_5_VLMLPPatch(config, block_module.mlp)
 
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                position_embeddings: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: Optional[tuple[torch.Tensor,
+                                            torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         """
         Forward pass with FP32 casting for overflow prevention.
         
         Args:
             hidden_states: Input hidden states
-            attention_mask: Attention mask
+            cu_seqlens: Prefix sum of sequence lengths
             position_embeddings: Position embeddings
         
         Returns:
@@ -228,67 +196,34 @@ class Qwen2_5_VLVisionBlockPatchWAR(Qwen2_5_VLVisionBlock):
         # Apply attention with residual connection
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
-            attention_mask=attention_mask,
-            position_embeddings=position_embeddings)
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
         # Apply MLP with FP32 casting and residual connection
         hidden_states = hidden_states.to(torch.float32) + self.mlp(
             self.norm2(hidden_states))
         return hidden_states
 
 
-class Qwen2_5_VLVisionBlockPatch(Qwen2_5_VLVisionBlock):
-    """
-    Standard patched version of Qwen2_5_VLVisionBlock with custom attention mechanism.
-    
-    This class replaces the original attention mechanism with a custom implementation
-    that is compatible with ONNX export.
-    """
-
-    def __init__(self,
-                 config: Any,
-                 attn_implementation: str = "eager") -> None:
-        """
-        Initialize the patched vision block.
-        
-        Args:
-            config: Model configuration object
-            attn_implementation: Attention implementation type
-        """
-        super().__init__(config)
-        self.attn = Qwen2_5_VLVisionAttentionPatch(config)
-
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                position_embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the vision block.
-        
-        Args:
-            hidden_states: Input hidden states
-            attention_mask: Attention mask for the attention mechanism
-            position_embeddings: Position embeddings for rotary attention
-        
-        Returns:
-            torch.Tensor: Output hidden states after processing
-        """
-        # Apply attention with residual connection
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            attention_mask=attention_mask,
-            position_embeddings=position_embeddings)
-        # Apply MLP with residual connection
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
-
-
 class Qwen2_5_VLPatchMergerWAR(Qwen2_5_VLPatchMerger):
     "WAR for Qwen2.5-VL 3B FP16 overflow"
 
-    def __init__(self,
-                 dim: int,
-                 context_dim: int,
-                 spatial_merge_size: int = 2) -> None:
-        super().__init__(dim, context_dim, spatial_merge_size)
+    def __init__(self, config: Any,
+                 merger_module: Qwen2_5_VLPatchMerger) -> None:
+        """
+        Initialize the workaround merger from original merger module.
+        
+        Args:
+            config: Model configuration object
+            merger_module: Original Qwen2_5_VLPatchMerger module to reuse components from
+        """
+        super().__init__(config.out_hidden_size, config.hidden_size,
+                         config.spatial_merge_size)
+        # Reuse all merger components to preserve quantization information
+        self.ln_q = merger_module.ln_q
+        self.mlp = merger_module.mlp
+        self.hidden_size = merger_module.hidden_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.mlp(self.ln_q(x).to(torch.float16).view(-1, self.hidden_size))
@@ -305,44 +240,56 @@ class Qwen2_5_VisionTransformerPretrainedModelPatch(
     for FP16 overflow issues in the 3B model.
     """
 
-    def __init__(self, config: Any) -> None:
+    def __init__(
+            self,
+            original_model: Qwen2_5_VisionTransformerPretrainedModel) -> None:
         """
-        Initialize the patched vision transformer.
+        Initialize the patched vision transformer from original model.
         
         Args:
-            config: Model configuration object
+            original_model: Original Qwen2_5_VisionTransformerPretrainedModel instance
         """
+        config = original_model.config
         super().__init__(config)
-        # Replace all blocks with patched versions
-        self.blocks = nn.ModuleList([
-            Qwen2_5_VLVisionBlockPatch(config, config._attn_implementation)
-            for _ in range(config.depth)
-        ])
+
+        # Reuse all original components
+        self.patch_embed = original_model.patch_embed
+        self.blocks = original_model.blocks
+        self.merger = original_model.merger
+
+        # Replace attention modules
+        for block in self.blocks:
+            block.attn = Qwen2_5_VLVisionAttentionPatch(block.attn)
 
         # Qwen2.5-VL 3B VIT has overflow issue with FP16 and only happens in /blocks.31/mlp/down_proj
         # Apply Patch to cast /blocks.31/mlp/down_proj to FP32 to avoid this issue.
         if config.out_hidden_size == 2048:
             self.blocks[-1] = Qwen2_5_VLVisionBlockPatchWAR(
-                config, config._attn_implementation)
-            self.merger = Qwen2_5_VLPatchMergerWAR(
-                dim=config.out_hidden_size,
-                context_dim=config.hidden_size,
-                spatial_merge_size=config.spatial_merge_size,
-            )
+                config, self.blocks[-1])
+            self.merger = Qwen2_5_VLPatchMergerWAR(config, self.merger)
 
-    def forward(self, hidden_states: torch.Tensor,
-                rotary_pos_emb: torch.Tensor, attention_mask: torch.Tensor,
-                window_attention_mask: torch.Tensor,
-                window_index: torch.Tensor,
-                reverse_window_index: torch.Tensor) -> torch.Tensor:
+        # Calculate window attention max_seqlen: (window_size // patch_size) ** 2
+        self.window_max_seqlen = (config.window_size // config.patch_size)**2
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen_carrier: torch.Tensor,
+        cu_window_seqlens: torch.Tensor,
+        window_index: torch.Tensor,
+        reverse_window_index: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Forward pass through the vision transformer with window attention support.
+        Forward pass through the vision transformer with ragged attention support.
         
         Args:
             hidden_states: Input hidden states
             rotary_pos_emb: Rotary position embeddings
-            attention_mask: Attention mask
-            window_attention_mask: Window attention mask
+            cu_seqlens: Prefix sum of sequence lengths for full attention blocks
+            max_seqlen_carrier: Shape-only input carrying max sequence length hint for full attention
+            cu_window_seqlens: Prefix sum of sequence lengths for window attention blocks
             window_index: Window index for attention
             reverse_window_index: Reverse window index for attention
         
@@ -365,11 +312,18 @@ class Qwen2_5_VisionTransformerPretrainedModelPatch(
 
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
-                attention_mask_now = attention_mask
+                cu_seqlens_now = cu_seqlens
+                max_seqlen_carrier_now = max_seqlen_carrier
             else:
-                attention_mask_now = window_attention_mask
+                cu_seqlens_now = cu_window_seqlens
+                max_seqlen_carrier_now = torch.zeros(
+                    self.window_max_seqlen,
+                    dtype=torch.int32,
+                    device=hidden_states.device)
+            # max_seqlen is passed via kwargs, which will be forwarded to self.attn by the base class
             hidden_states = blk(hidden_states,
-                                attention_mask=attention_mask_now,
+                                cu_seqlens=cu_seqlens_now,
+                                max_seqlen_carrier=max_seqlen_carrier_now,
                                 position_embeddings=position_embeddings)
 
         hidden_states = self.merger(hidden_states)
@@ -414,12 +368,13 @@ def export_qwen2_5_vl_visual(
         (hw, rotary_pos_emb_dim),
         dtype=torch.float32,  # Keep as float32 for rotary embeddings
         device=model.device)
-    attention_mask = torch.randn((1, hw, hw),
-                                 dtype=torch_dtype,
-                                 device=model.device)
-    window_attention_mask = torch.randn((1, hw, hw),
-                                        dtype=torch_dtype,
-                                        device=model.device)
+    cu_seqlens = torch.tensor([0, hw], dtype=torch.int32, device=model.device)
+    max_seqlen_carrier = torch.zeros(hw,
+                                     dtype=torch.int32,
+                                     device=model.device)
+    cu_window_seqlens = torch.tensor([0, hw],
+                                     dtype=torch.int32,
+                                     device=model.device)
 
     # Create window index tensors
     window_index = torch.arange(hw // 4,
@@ -438,13 +393,14 @@ def export_qwen2_5_vl_visual(
         'rotary_pos_emb': {
             0: 'hw'
         },
-        'attention_mask': {
-            1: 'hw',
-            2: 'hw'
+        'cu_seqlens': {
+            0: 'batch_size + 1'
         },
-        'window_attention_mask': {
-            1: 'hw',
-            2: 'hw'
+        'max_seqlen_carrier': {
+            0: 'max_seqlen'
+        },
+        'cu_window_seqlens': {
+            0: 'num_windows + 1'
         },
         'window_index': {
             0: 'hw//4'
@@ -457,13 +413,14 @@ def export_qwen2_5_vl_visual(
         },
     }
 
-    inputs = (input_tensor, rotary_pos_emb, attention_mask,
-              window_attention_mask, window_index, reverse_window_index)
+    inputs = (input_tensor, rotary_pos_emb, cu_seqlens, max_seqlen_carrier,
+              cu_window_seqlens, window_index, reverse_window_index)
     input_names = [
-        "input", "rotary_pos_emb", "attention_mask", "window_attention_mask",
-        "window_index", "reverse_window_index"
+        "input", "rotary_pos_emb", "cu_seqlens", "max_seqlen_carrier",
+        "cu_window_seqlens", "window_index", "reverse_window_index"
     ]
     output_names = ["output"]
 
+    register_attention_plugin_onnx_symbolic_functions()
     export_onnx(model, inputs, output_dir, input_names, output_names,
                 dynamic_axes)
