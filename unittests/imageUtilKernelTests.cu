@@ -392,125 +392,18 @@ TEST(TransposeToPatchQwen, Benchmark)
     BenchmarkTransposeToPatchQwenViT(728, 728);
 }
 
-void TestInitAttentionMaskQwenViT(int32_t const curHW, int32_t const blockSize = 64)
-{
-    cudaStream_t stream{nullptr};
-
-    std::vector<int64_t> cuSeqlens{0};
-    int64_t currentPos = 0;
-    while (currentPos < curHW)
-    {
-        currentPos = std::min(currentPos + blockSize, static_cast<int64_t>(curHW));
-        cuSeqlens.push_back(currentPos);
-    }
-
-    half const disabledMaskValue{-20000.0F};
-    std::vector<half> attentionMaskRef(curHW * curHW, disabledMaskValue);
-    for (size_t s = 1; s < cuSeqlens.size(); ++s)
-    {
-        for (int64_t i = cuSeqlens[s - 1]; i < cuSeqlens[s]; ++i)
-        {
-            for (int64_t j = cuSeqlens[s - 1]; j < cuSeqlens[s]; ++j)
-            {
-                attentionMaskRef[i * curHW + j] = __float2half(0.0f);
-            }
-        }
-    }
-
-    int64_t const cuSeqlensSize = cuSeqlens.size();
-    rt::Tensor cuSeqlensDevice({cuSeqlensSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-    CUDA_CHECK(cudaMemcpyAsync(cuSeqlensDevice.rawPointer(), cuSeqlens.data(), cuSeqlensSize * sizeof(int64_t),
-        cudaMemcpyHostToDevice, stream));
-    rt::Tensor attentionMaskDevice({1, curHW, curHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    kernel::initAttentionMaskQwenViT(cuSeqlensDevice, attentionMaskDevice, stream);
-
-    // Compare data
-    std::vector<half> attentionMaskHost(curHW * curHW);
-    CUDA_CHECK(cudaMemcpyAsync(attentionMaskHost.data(), attentionMaskDevice.rawPointer(),
-        attentionMaskHost.size() * sizeof(half), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    for (int32_t i = 0; i < curHW * curHW; ++i)
-    {
-        ASSERT_TRUE(isclose(attentionMaskHost[i], attentionMaskRef[i], 1e-5, 1e-5));
-    }
-
-    std::cout << "InitAttentionMask Accuracy: curHW=" << curHW << std::endl;
-}
-
-TEST(InitAttentionMaskQwen, Accuracy)
-{
-    TestInitAttentionMaskQwenViT(1024);
-    TestInitAttentionMaskQwenViT(2000);
-}
-
-void BenchmarkInitAttentionMaskQwenViT(int32_t const curHW, int32_t const blockSize = 64)
-{
-    cudaStream_t stream{nullptr};
-
-    std::vector<int64_t> cuSeqlens{0};
-    int64_t currentPos = 0;
-    while (currentPos < curHW)
-    {
-        currentPos = std::min(currentPos + blockSize, static_cast<int64_t>(curHW));
-        cuSeqlens.push_back(currentPos);
-    }
-
-    int64_t const cuSeqlensSize = cuSeqlens.size();
-    rt::Tensor cuSeqlensDevice({cuSeqlensSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
-    CUDA_CHECK(cudaMemcpyAsync(cuSeqlensDevice.rawPointer(), cuSeqlens.data(), cuSeqlensSize * sizeof(int64_t),
-        cudaMemcpyHostToDevice, stream));
-
-    half const disabledMaskValue{-20000.0F};
-    std::vector<half> attentionMask(curHW * curHW, disabledMaskValue);
-    rt::Tensor attentionMaskDevice({1, curHW, curHW}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    auto launchGPU = [&]() { kernel::initAttentionMaskQwenViT(cuSeqlensDevice, attentionMaskDevice, stream); };
-
-    constexpr int32_t numWarmup = 10;
-    for (int32_t i = 0; i < numWarmup; i++)
-    {
-        launchGPU();
-    }
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    constexpr int32_t numBenchIter = 100;
-
-    cudaEventRecord(start, stream);
-    for (int32_t i = 0; i < numBenchIter; i++)
-    {
-        launchGPU();
-    }
-    cudaEventRecord(stop, stream);
-    cudaEventSynchronize(stop);
-
-    float elapsedTime{0.0f};
-    cudaEventElapsedTime(&elapsedTime, start, stop);
-    std::cout << "InitAttentionMask Benchmark: curHW=" << curHW << ", time=" << elapsedTime / numBenchIter << " ms"
-              << std::endl;
-}
-
-TEST(InitAttentionMaskQwen, Benchmark)
-{
-    BenchmarkInitAttentionMaskQwenViT(1024);
-    BenchmarkInitAttentionMaskQwenViT(4096);
-}
-
 void TestInitRotaryPosEmbQwenViT(int32_t const vitPosEmbDim = 40, int32_t const mergeSize = 2,
     float const rotaryBaseFrequency = 10000.0f, float const scale = 1.0f)
 {
     cudaStream_t stream{nullptr};
 
     std::vector<std::vector<int64_t>> imageGridTHWs{{1, 36, 54}, {1, 8, 10}, {1, 32, 20}};
-    std::vector<int64_t> cuSeqlens{0};
+    std::vector<int32_t> cuSeqlens{0};
     for (int64_t i = 0; i < imageGridTHWs.size(); ++i)
     {
         cuSeqlens.push_back(cuSeqlens.back() + imageGridTHWs[i][0] * imageGridTHWs[i][1] * imageGridTHWs[i][2]);
     }
-    int64_t totalSeqLength = cuSeqlens.back();
+    int32_t totalSeqLength = cuSeqlens.back();
 
     // CPU reference
     std::vector<float> rotaryPosEmb(totalSeqLength * vitPosEmbDim);

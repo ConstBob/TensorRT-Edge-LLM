@@ -39,7 +39,7 @@ struct VisualBuilderConfig
 {
     int64_t minImageTokens{4};           //!< Minimum number of image tokens in a batch
     int64_t maxImageTokens{1024};        //!< Maximum number of image tokens in a batch
-    int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image, used for preprocessing
+    int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters

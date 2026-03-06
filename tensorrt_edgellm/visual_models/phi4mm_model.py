@@ -20,7 +20,6 @@ to enable ONNX export that is compatible with TensorRT Edge-LLM runtime bindings
 
 The wrapper aligns I/O names with the expected TensorRT engine bindings:
   - input:          visual input tensor
-  - image_attention_mask: per-crop attention mask tensor
   - output:         visual output embeddings (image_embeds)
 """
 
@@ -53,7 +52,7 @@ class Phi4MMVisionModel(nn.Module):
         # replace the forward function of the embeddings module
         emb = self.vision_model.img_processor.embeddings
 
-        def custom_forward(self, pixel_values, patch_attention_mask):
+        def custom_forward(self, pixel_values):
             batch_size = pixel_values.size(0)
             patch_embeds = self.patch_embedding(pixel_values)
             embeddings = patch_embeds.flatten(2).transpose(1, 2)
@@ -103,7 +102,6 @@ def export_phi4mm_visual(model: Phi4MMVisionModel, output_dir: str,
 
     I/O mapping:
       - input: (num_blocks, 3, H, W)
-      - image_attention_mask: (num_blocks, Mh, Mw)
       - output: (num_blocks, hidden_size)
     """
 

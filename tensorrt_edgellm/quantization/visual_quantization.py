@@ -13,21 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import math
 from fractions import Fraction
 
 import modelopt.torch.quantization as mtq
-import torch
 from datasets import (concatenate_datasets, get_dataset_config_names,
                       load_dataset)
 from PIL import Image
-from torch.nn import functional as F
 from torch.utils.data import Dataset
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
     Qwen2_5_VisionTransformerPretrainedModel
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+try:
+    Qwen3OmniVisionEncoder = importlib.import_module(
+        "transformers.models.qwen3_omni.modeling_qwen3_omni"
+    ).Qwen3OmniVisionEncoder
+except (ImportError, AttributeError):
+    Qwen3OmniVisionEncoder = None
 
 from ..visual_models.internvl3_model import InternVLVisionModel
 from ..visual_models.phi4mm_model import Phi4MMVisionModel
@@ -63,6 +69,20 @@ def resize_image_to_nearest_multiple(image, multiple):
     return image
 
 
+class CalibrationDataset(Dataset):
+
+    def __init__(self, data, preprocess_fn):
+        self.data = data
+        self.preprocess_fn = preprocess_fn
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        raw_data = self.data[idx]
+        return self.preprocess_fn(raw_data)
+
+
 def get_visual_calib_dataloader(
     model,
     processor,
@@ -87,150 +107,64 @@ def get_visual_calib_dataloader(
             f"Unsupported dataset name or local repo directory: {dataset_dir}."
         )
 
-    def _preprocess(data, processor):
+    def _collect_images(data, resize_multiple=None):
+        """
+        If `resize_multiple` is not None, images will be resized to the nearest multiple of `resize_multiple`.
+        For models like InternVL/Phi-4MM, the inputs are expected to be aligned to vision block size.
+        """
         image_inputs = []
-        for (key, value) in data.items():
+        for key, value in data.items():
             if "image" in key and isinstance(value, Image.Image):
+                if resize_multiple is not None:
+                    value = resize_image_to_nearest_multiple(
+                        value, resize_multiple)
                 image_inputs.append(value.convert("RGB"))
-        inputs = processor(
-            text="",
-            images=image_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        return {
-            "hidden_states": inputs["pixel_values"],
-            "grid_thw": inputs["image_grid_thw"],
-        }
-
-    def _preprocess_internvl(data, processor):
-        image_inputs = []
-        for (key, value) in data.items():
-            if "image" in key and isinstance(value, Image.Image):
-                value = resize_image_to_nearest_multiple(value, block_size)
-                image_inputs.append(value.convert("RGB"))
-        inputs = processor(images=image_inputs, )
-        return {"pixel_values": inputs["pixel_values"]}
-
-    def _preprocess_phi4mm(data, processor):
-        image_inputs = []
-        for (key, value) in data.items():
-            if "image" in key and isinstance(value, Image.Image):
-                value = resize_image_to_nearest_multiple(value, block_size)
-                image_inputs.append(value.convert("RGB"))
-        inputs = processor(images=image_inputs, )["input_image_embeds"][0].to(
-            model.dtype)
-        return {"pixel_values": inputs}
+        return image_inputs
 
     if isinstance(model, InternVLVisionModel):
-        preprocess_fn = _preprocess_internvl
+
+        def preprocess_fn(data):
+            image_inputs = _collect_images(data, resize_multiple=block_size)
+            inputs = processor(images=image_inputs, return_tensors="pt")
+            return {"pixel_values": inputs["pixel_values"].to(model.dtype)}
+
     elif isinstance(model, Phi4MMVisionModel):
-        preprocess_fn = _preprocess_phi4mm
-    else:
-        preprocess_fn = _preprocess
 
-    dataset = dataset.map(preprocess_fn,
-                          batched=False,
-                          fn_kwargs={"processor": processor},
-                          remove_columns=dataset.column_names)
-    dataset.set_format(type="torch", columns=dataset.column_names)
+        def preprocess_fn(data):
+            image_inputs = _collect_images(data, resize_multiple=block_size)
+            inputs = processor(images=image_inputs, )["input_image_embeds"][0]
+            return {"pixel_values": inputs.to(model.dtype)}
 
-    if isinstance(model, (
-            Qwen3VLVisionModel,
-            Qwen2_5_VisionTransformerPretrainedModel,
-            Qwen2VisionTransformerPretrainedModel,
-    )):
-        # Initialize additional inputs for model
-        class QwenViTDataset(Dataset):
+    else:  # Qwen VIT series
 
-            def __init__(self, data, model):
-                self.data = data
-                self.model = model
+        def preprocess_fn(data):
+            image_inputs = _collect_images(data)
+            inputs = processor(
+                text="",
+                images=image_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            return {
+                "hidden_states": inputs["pixel_values"].to(model.dtype),
+                "grid_thw": inputs["image_grid_thw"],
+            }
 
-            def __len__(self):
-                return len(self.data)
-
-            def get_attention_mask(self, cu_seqlens, seq_length):
-                attention_mask = torch.full([1, seq_length, seq_length],
-                                            torch.finfo(self.model.dtype).min,
-                                            dtype=self.model.dtype)
-                for i in range(1, len(cu_seqlens)):
-                    attention_mask[..., cu_seqlens[i - 1]:cu_seqlens[i],
-                                   cu_seqlens[i - 1]:cu_seqlens[i]] = 0
-                return attention_mask
-
-            def __getitem__(self, idx):
-                raw_data = self.data[idx]
-                hidden_states = raw_data["hidden_states"].to(self.model.dtype)
-                grid_thw = raw_data["grid_thw"]
-                rotary_pos_emb = self.model.rot_pos_emb(grid_thw)
-                cu_seqlens = torch.repeat_interleave(
-                    grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-                        dim=0,
-                        dtype=torch.int32,
-                    )
-                cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-                seq_length = hidden_states.shape[0]
-                attention_mask = self.get_attention_mask(
-                    cu_seqlens, seq_length)
-                inputs = {
-                    "hidden_states": hidden_states,
-                    "rotary_pos_emb": rotary_pos_emb,
-                    "attention_mask": attention_mask,
-                }
-
-                if isinstance(self.model,
-                              Qwen2_5_VisionTransformerPretrainedModel):
-                    window_index, cu_window_seqlens = self.model.get_window_index(
-                        grid_thw)
-                    cu_window_seqlens = torch.tensor(
-                        cu_window_seqlens,
-                        dtype=torch.int32,
-                    )
-                    cu_window_seqlens = torch.unique_consecutive(
-                        cu_window_seqlens)
-                    window_attention_mask = self.get_attention_mask(
-                        cu_window_seqlens, seq_length)
-                    reverse_window_index = torch.argsort(window_index)
-                    inputs["window_attention_mask"] = window_attention_mask
-                    inputs["window_index"] = window_index
-                    inputs["reverse_window_index"] = reverse_window_index
-                elif isinstance(self.model, Qwen3VLVisionModel):
-                    fast_pos_embed_idx, fast_pos_embed_weight = self.model.fast_pos_embed_interpolate_optimized(
-                        grid_thw)
-                    inputs["fast_pos_embed_idx"] = fast_pos_embed_idx
-                    inputs["fast_pos_embed_weight"] = fast_pos_embed_weight
-
-                return inputs
-
-        dataset = QwenViTDataset(dataset, model)
-    elif isinstance(model, InternVLVisionModel) or isinstance(
-            model, Phi4MMVisionModel):
-
-        class InternVLPhi4MMDataset(Dataset):
-
-            def __init__(self, data, model):
-                self.data = data
-                self.model = model
-
-            def __len__(self):
-                return len(self.data)
-
-            def __getitem__(self, idx):
-                raw_data = self.data[idx]
-                pixel_values = raw_data["pixel_values"].to(self.model.dtype)
-                return {"pixel_values": pixel_values}
-
-        dataset = InternVLPhi4MMDataset(dataset, model)
-
-    return dataset
+    return CalibrationDataset(dataset, preprocess_fn)
 
 
 def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
-    assert isinstance(
-        model, (Qwen3VLVisionModel, Qwen2_5_VisionTransformerPretrainedModel,
-                Qwen2VisionTransformerPretrainedModel, InternVLVisionModel,
-                Phi4MMVisionModel)), f"Invalid model type {type(model)}"
+    supported_model_types = [
+        Qwen3VLVisionModel,
+        Qwen2_5_VisionTransformerPretrainedModel,
+        Qwen2VisionTransformerPretrainedModel,
+        InternVLVisionModel,
+        Phi4MMVisionModel,
+    ]
+    if Qwen3OmniVisionEncoder is not None:
+        supported_model_types.append(Qwen3OmniVisionEncoder)
+    assert isinstance(model, tuple(supported_model_types)), \
+        f"Invalid model type {type(model)}"
     assert precision in [
         "fp8"
     ], f"Only fp8(W8A8) is supported for visual model. You passed an unsupported precision: {precision}."
@@ -239,6 +173,7 @@ def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
     quant_config = mtq.FP8_DEFAULT_CFG.copy()
 
     # (Optional) Uncomment the following lines to enable FP8 MHA for static shape VIT, dynamic shape FP8 MHA fusion is not supported in TensorRT yet.
+    # For Qwen VIT series, MHA is implemented in custom plugin, and FP8 MHA is not supported yet.
     # quant_config["quant_cfg"]["*[qkv]_bmm_quantizer"] = {
     #     "num_bits": (4, 3),
     #     "axis": None
@@ -251,6 +186,7 @@ def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
     # Disable Conv to avoid accuracy degradation
     quant_config["quant_cfg"]["nn.Conv3d"] = {"*": {"enable": False}}
     quant_config["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
+
     # Determine block size: prefer config.vision_config.image_size, fallback to vision_model.crop_size, else 448
     block_size = 448
     vision_cfg = getattr(getattr(model, "config", None), "vision_config", None)
@@ -268,5 +204,4 @@ def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
     data_loader = get_visual_calib_dataloader(model, processor, dataset_dir,
                                               block_size)
     quantized_model = quantize_model(model, quant_config, data_loader)
-    mtq.print_quant_summary(quantized_model)
     return quantized_model

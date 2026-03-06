@@ -37,8 +37,7 @@ public:
     //! \param[in] name Plugin instance name
     //! \param[in] numHeads Number of attention heads
     //! \param[in] headSize Head dimension size
-    //! \param[in] maxSeqLen Maximum sequence length for FMHA params
-    ViTAttentionPlugin(std::string const& name, int32_t numHeads, int32_t headSize, int32_t maxSeqLen);
+    ViTAttentionPlugin(std::string const& name, int32_t numHeads, int32_t headSize);
 
     //! \brief Constructor for deserialization
     //! \param[in] name Plugin instance name
@@ -142,10 +141,6 @@ public:
     //! \return Plugin version string
     char const* getPluginVersion() const noexcept override;
 
-    //! \brief Update maximum sequence length after ONNX parsing
-    //! \param[in] maxSeqLen Maximum sequence length to set
-    void setMaxSeqLen(int32_t maxSeqLen) noexcept;
-
     //! \brief Initialize the plugin
     //! \return 0 on success, non-zero on failure
     int32_t initialize() noexcept override;
@@ -166,8 +161,6 @@ protected:
     int32_t mNumHeads{};
     //! Number of elements per head (head dimension)
     int32_t mHeadSize{};
-    //! Maximum sequence length (plugin field, runtime constant)
-    int32_t mMaxSeqLen{};
 
     //! Datatype of attention. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

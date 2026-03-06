@@ -154,13 +154,15 @@ private:
     //! \param[out] imageTokenLengths Token lengths for each image
     //! \param[in,out] cuSeqlensData Pointer to cumulative sequence lengths data
     //! \param[in,out] cuSeqlensSize Reference to current size of cumulative sequence lengths
+    //! \param[in,out] maxSeqLen Reference to current maximum sequence length in this request
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
     //! range
     //! \throws std::runtime_error if a CUDA error occurs
     //! \throws std::bad_alloc if memory allocation fails
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<std::vector<int64_t>>& imageGridTHWs,
-        std::vector<int64_t>& imageTokenLengths, int64_t* cuSeqlensData, int64_t& cuSeqlensSize, cudaStream_t stream);
+        std::vector<int64_t>& imageTokenLengths, int32_t* cuSeqlensData, int64_t& cuSeqlensSize, int64_t& maxSeqLen,
+        cudaStream_t stream);
 
     //! \brief Get multi-dimensional RoPE position indices
     //! \param[in] batchInputIds Batch of input token IDs
@@ -195,8 +197,10 @@ private:
 
     QwenViTConfig mConfig{};                       //!< Qwen-VL configuration
     rt::Tensor mVitInput{};                        //!< Vision encoder input tensor
-    rt::Tensor mAttentionMask{};                   //!< Attention mask tensor
     rt::Tensor mRotaryPosEmb{};                    //!< Rotary position embeddings tensor (multi-dimensional RoPE)
+    rt::Tensor mCuSeqlens{};                       //!< Cumulative sequence lengths tensor
+    rt::Tensor mCuSeqlensHost{};                   //!< Cumulative sequence lengths host tensor
+    rt::Tensor mMaxSeqLenCarrier{};                //!< Shape-only input carrying max sequence length for FMHA launch
     rt::Tensor mImageMean{};                       //!< Image mean tensor
     rt::Tensor mImageStd{};                        //!< Image standard deviation tensor
     rt::Tensor mImageDevice{};                     //!< Temporary image buffer for preprocessing
@@ -204,16 +208,13 @@ private:
     rt::imageUtils::ImageData mResizedImageHost{}; //!< Pre-allocated buffer for image resizing
     rt::Tensor mMropePositionIdsHost{};            //!< MRoPE position IDs host tensor
     rt::Tensor mMropePositionIdsDevice{};          //!< MRoPE position IDs device tensor
-    rt::Tensor mCuSeqlensHost{};                   //!< Cumulative sequence lengths host tensor
-    rt::Tensor mCuSeqlensDevice{};                 //!< Cumulative sequence lengths device tensor
     // Qwen2.5-VL
-    rt::Tensor mWindowAttentionMask{};      //!< Window attention mask
+    rt::Tensor mCuWindowSeqlens{};          //!< Cumulative window sequence lengths device tensor
+    rt::Tensor mCuWindowSeqlensHost{};      //!< Cumulative window sequence lengths host tensor
     rt::Tensor mWindowIndexHost{};          //!< Window index host tensor for window attention
     rt::Tensor mWindowIndexDevice{};        //!< Window index device tensor for window attention
     rt::Tensor mReverseWindowIndexHost{};   //!< Reverse window index host tensor
     rt::Tensor mReverseWindowIndexDevice{}; //!< Reverse window index device tensor
-    rt::Tensor mCuWindowSeqlensHost{};      //!< Cumulative window sequence lengths host tensor
-    rt::Tensor mCuWindowSeqlensDevice{};    //!< Cumulative window sequence lengths device tensor
     // Qwen3-VL
     rt::Tensor mFastPosEmbIdx{};                  //!< Fast position embeddings index tensor
     rt::Tensor mFastPosEmbWeight{};               //!< Fast position embeddings weight tensor

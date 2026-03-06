@@ -207,11 +207,25 @@ inline constexpr char const* kVisualOutput = "output";
 inline constexpr char const* kRotaryPosEmb = "rotary_pos_emb";
 
 /*!
- * @brief Window attention mask for Qwen2.5-VL models
+ * @brief Cumulative sequence lengths for ragged ViT attention
  *
- * Shape: [1, sequence_length, sequence_length] (FLOAT16)
+ * Shape: [num_images + 1] (INT32)
  */
-inline constexpr char const* kWindowAttentionMask = "window_attention_mask";
+inline constexpr char const* kCuSeqlens = "cu_seqlens";
+
+/*!
+ * @brief Shape-only input used to convey runtime max sequence-length for FMHA launch
+ *
+ * Shape: [max_seqlen] (INT32)
+ */
+inline constexpr char const* kMaxSeqLenCarrier = "max_seqlen_carrier";
+
+/*!
+ * @brief Cumulative window sequence lengths for Qwen2.5-VL window attention
+ *
+ * Shape: [num_windows + 1] (INT32)
+ */
+inline constexpr char const* kCuWindowSeqlens = "cu_window_seqlens";
 
 /*!
  * @brief Window index for Qwen2.5-VL sliding window attention

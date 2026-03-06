@@ -22,37 +22,51 @@ TODO: Input/output names have been aligned with the old multimodal_export.py for
       Future refactoring should consider more descriptive names while maintaining backward compatibility.
 """
 
-import math
-from typing import Any
+from typing import Optional
 
-import modelopt.torch.quantization as mtq
 import torch
-import torch.nn as nn
-from modelopt.torch.quantization.nn import TensorQuantizer
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-    Qwen2VisionTransformerPretrainedModel, Qwen2VLVisionBlock, VisionAttention,
+    Qwen2VisionTransformerPretrainedModel, VisionAttention,
     apply_rotary_pos_emb_vision)
 
+from ..llm_models.layers.attention_plugin import (
+    register_attention_plugin_onnx_symbolic_functions, vit_attention_plugin)
 from ..onnx_export.onnx_utils import export_onnx
 
 
 class Qwen2VisionAttentionPatch(VisionAttention):
     """
     Patched version of Qwen2-VL vision attention for ONNX export.
+    Uses vit attention plugin to support ragged attention via cu_seqlens.
     """
 
-    def __init__(self, config: Any) -> None:
-        super().__init__(config)
+    def __init__(self, attention_module: VisionAttention) -> None:
+        """
+        Initialize the patched attention module.
+        
+        Args:
+            attention_module: Original attention module to extract components from
+        """
+        super().__init__(attention_module.config)
+        self.qkv = attention_module.qkv
+        self.proj = attention_module.proj
 
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                position_embeddings: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen_carrier: torch.Tensor,
+        position_embeddings: Optional[tuple[torch.Tensor,
+                                            torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         """
         Forward pass with custom attention implementation.
         
         Args:
             hidden_states: Input hidden states
-            attention_mask: Attention mask
+            cu_seqlens: Prefix sum of sequence lengths
+            max_seqlen_carrier: Shape-only input carrying max sequence length for FMHA launch
             position_embeddings: Position embeddings for rotary attention
             
         Returns:
@@ -66,131 +80,27 @@ class Qwen2VisionAttentionPatch(VisionAttention):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
-            self.head_dim)
-        attn_weights = attn_weights + attention_mask
+        # Convert to FP16 for plugin compatibility
+        q = q.to(torch.float16)
+        k = k.to(torch.float16)
+        v = v.to(torch.float16)
 
-        attn_weights = torch.nn.functional.softmax(attn_weights,
-                                                   dim=-1,
-                                                   dtype=torch.float32).to(
-                                                       v.dtype)
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(0, 1)
+        # Use ViT attention plugin with separate Q, K, V
+        # q, k, v are already in shape [total_S, H, D]
+        attn_output = vit_attention_plugin(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            max_seqlen_carrier,
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+        )
+
+        # Plugin output layout is [total_S, H, D], reshape to [total_S, H * D]
         attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
-
-
-class QuantQwen2VisionAttentionPatch(Qwen2VisionAttentionPatch):
-    """
-    Quantized MHA version of Qwen2VisionAttentionPatch.
-    """
-
-    def __init__(self, config: Any) -> None:
-        super().__init__(config)
-        self._setup()
-
-    def _setup(self) -> None:
-        """Initialize quantization components."""
-        self.q_bmm_quantizer = TensorQuantizer()
-        self.k_bmm_quantizer = TensorQuantizer()
-        self.v_bmm_quantizer = TensorQuantizer()
-        self.softmax_quantizer = TensorQuantizer()
-
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                position_embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        Quantized forward pass with custom attention implementation.
-        
-        Args:
-            hidden_states: Input hidden states
-            attention_mask: Attention mask
-            position_embeddings: Position embeddings for rotary attention
-            
-        Returns:
-            Attention output
-        """
-        seq_length = hidden_states.shape[0]
-        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3,
-                                                  self.num_heads,
-                                                  -1).permute(1, 0, 2,
-                                                              3).unbind(0)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        q = self.q_bmm_quantizer(q)
-        k = self.k_bmm_quantizer(k)
-        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(
-            self.head_dim)
-        attn_weights = attn_weights + attention_mask
-
-        attn_weights = torch.nn.functional.softmax(attn_weights,
-                                                   dim=-1,
-                                                   dtype=torch.float32).to(
-                                                       v.dtype)
-        attn_weights = self.softmax_quantizer(attn_weights)
-        v = self.v_bmm_quantizer(v)
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.reshape(seq_length, -1)
-        attn_output = self.proj(attn_output)
-        return attn_output
-
-
-mtq.register(original_cls=Qwen2VisionAttentionPatch,
-             quantized_cls=QuantQwen2VisionAttentionPatch)
-
-
-class Qwen2VLVisionBlockPatch(Qwen2VLVisionBlock):
-    """
-    Patched version of Qwen2VLVisionBlock with custom attention mechanism.
-    
-    This class replaces the original attention mechanism with a custom implementation
-    that is compatible with ONNX export.
-    """
-
-    def __init__(self,
-                 config: Any,
-                 attn_implementation: str = "eager") -> None:
-        """
-        Initialize the patched vision block.
-        
-        Args:
-            config: Model configuration object
-            attn_implementation: Attention implementation type
-        """
-        super().__init__(config)
-        self.attn = Qwen2VisionAttentionPatch(config)
-
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor,
-                position_embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the vision block.
-        
-        Args:
-            hidden_states: Input hidden states
-            attention_mask: Attention mask for the attention mechanism
-            position_embeddings: Position embeddings for rotary attention
-        
-        Returns:
-            torch.Tensor: Output hidden states after processing
-        """
-        # Apply attention with residual connection
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            attention_mask=attention_mask,
-            position_embeddings=position_embeddings)
-        # Apply MLP with residual connection
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
 
 
 class Qwen2VisionTransformerPretrainedModelPatch(
@@ -202,30 +112,41 @@ class Qwen2VisionTransformerPretrainedModelPatch(
     with custom blocks that are compatible with ONNX export.
     """
 
-    def __init__(self, config: Any) -> None:
+    def __init__(
+            self,
+            original_model: Qwen2VisionTransformerPretrainedModel) -> None:
         """
-        Initialize the patched vision transformer.
+        Initialize the patched vision transformer from original model.
         
         Args:
-            config: Model configuration object
+            original_model: Original Qwen2VisionTransformerPretrainedModel instance
         """
-        super().__init__(config)
-        # Replace all blocks with patched versions
-        self.blocks = nn.ModuleList([
-            Qwen2VLVisionBlockPatch(config, config._attn_implementation)
-            for _ in range(config.depth)
-        ])
+        super().__init__(original_model.config)
 
-    def forward(self, hidden_states: torch.Tensor,
-                rotary_pos_emb: torch.Tensor,
-                attention_mask: torch.Tensor) -> torch.Tensor:
+        # Reuse all original components
+        self.patch_embed = original_model.patch_embed
+        self.blocks = original_model.blocks
+        self.merger = original_model.merger
+
+        # Replace attention modules, reusing existing components to preserve quantization
+        for block in self.blocks:
+            block.attn = Qwen2VisionAttentionPatch(block.attn)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen_carrier: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Forward pass through the vision transformer.
         
         Args:
             hidden_states: Input hidden states
             rotary_pos_emb: Rotary position embeddings
-            attention_mask: Attention mask
+            cu_seqlens: Prefix sum of sequence lengths
+            max_seqlen_carrier: Shape-only input carrying max sequence length for FMHA launch
         
         Returns:
             torch.Tensor: Output embeddings after processing through all blocks
@@ -240,7 +161,8 @@ class Qwen2VisionTransformerPretrainedModelPatch(
         # Process through all vision blocks
         for blk in self.blocks:
             hidden_states = blk(hidden_states,
-                                attention_mask=attention_mask,
+                                cu_seqlens=cu_seqlens,
+                                max_seqlen_carrier=max_seqlen_carrier,
                                 position_embeddings=position_embeddings)
 
         # Apply final merger to get output embeddings
@@ -281,13 +203,16 @@ def export_qwen2_vl_visual(
         (hw, rotary_pos_emb_dim),
         dtype=torch.float32,  # Keep as float32 for rotary embeddings
         device=model.device)
-    attention_mask = torch.randn((1, hw, hw),
-                                 dtype=torch_dtype,
-                                 device=model.device)
+    cu_seqlens = torch.tensor([0, hw], dtype=torch.int32, device=model.device)
+    max_seqlen_carrier = torch.zeros(hw,
+                                     dtype=torch.int32,
+                                     device=model.device)
 
-    inputs = (pixel_values, rotary_pos_emb, attention_mask)
+    inputs = (pixel_values, rotary_pos_emb, cu_seqlens, max_seqlen_carrier)
 
-    input_names = ["input", "rotary_pos_emb", "attention_mask"]
+    input_names = [
+        "input", "rotary_pos_emb", "cu_seqlens", "max_seqlen_carrier"
+    ]
     output_names = ["output"]
 
     # Define dynamic axes for variable input sizes
@@ -298,14 +223,17 @@ def export_qwen2_vl_visual(
         'rotary_pos_emb': {
             0: 'hw'
         },
-        'attention_mask': {
-            1: 'hw',
-            2: 'hw'
+        'cu_seqlens': {
+            0: 'batch_size + 1'
+        },
+        'max_seqlen_carrier': {
+            0: 'max_seqlen'
         },
         'output': {
             0: 'image_token_len'
         },
     }
 
+    register_attention_plugin_onnx_symbolic_functions()
     export_onnx(model, inputs, output_dir, input_names, output_names,
                 dynamic_axes)

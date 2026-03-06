@@ -16,7 +16,7 @@
 Visual model export functionality for TensorRT Edge-LLM.
 
 This module provides functions to export visual components of multimodal models
-(Qwen2-VL, Qwen2.5-VL, InternVL3) to ONNX format with optional quantization support.
+to ONNX format with optional quantization support.
 """
 
 import json
@@ -35,13 +35,55 @@ from tensorrt_edgellm.visual_models.qwen2_5_vl_model import (
     Qwen2_5_VisionTransformerPretrainedModelPatch, export_qwen2_5_vl_visual)
 from tensorrt_edgellm.visual_models.qwen2_vl_model import (
     Qwen2VisionTransformerPretrainedModelPatch, export_qwen2_vl_visual)
-from tensorrt_edgellm.visual_models.qwen3_omni_model import (
-    Qwen3OmniVisionModelPatch, export_qwen3_omni_visual)
 from tensorrt_edgellm.visual_models.qwen3_vl_model import (
     Qwen3VLVisionModelPatch, export_qwen3_vl_visual)
 
 from ..llm_models.model_utils import load_hf_model
 from .config_export import export_vision_config
+
+
+def _export_qwen_visual(model, model_type: str, model_dir: str,
+                        output_dir: str, torch_dtype: torch.dtype, device: str,
+                        quantization: Optional[str], processor,
+                        dataset_dir: str) -> None:
+    """
+    Export visual models in the Qwen family (qwen2/qwen2.5/qwen3/qwen3-omni).
+    """
+    visual_model = model.visual if model_type != 'qwen3_omni' else model.thinker.visual
+
+    # Quantize the original visual model first
+    if quantization == "fp8":
+        # Qwen2.5-VL 3B VIT has overflow issue with FP16 and only happens in /blocks.31/mlp/down_proj
+        # Apply workaround to cast /blocks.31/mlp/down_proj to FP32 to avoid overflow in quantization.
+        if model_type == 'qwen2_5_vl' and visual_model.config.out_hidden_size == 2048:
+            from tensorrt_edgellm.visual_models.qwen2_5_vl_model import (
+                Qwen2_5_VLMLPPatch, Qwen2_5_VLPatchMergerWAR)
+            last_block = visual_model.blocks[-1]
+            last_block.mlp = Qwen2_5_VLMLPPatch(visual_model.config,
+                                                last_block.mlp)
+            visual_model.merger = Qwen2_5_VLPatchMergerWAR(
+                visual_model.config, visual_model.merger)
+
+        visual_model = quantize_visual(visual_model, quantization, processor,
+                                       dataset_dir)
+
+    print(f"Exporting {model_type} visual model from {model_dir}")
+
+    if model_type == 'qwen2_vl':
+        wrapped_model = Qwen2VisionTransformerPretrainedModelPatch(
+            visual_model)
+        wrapped_model.eval().to(device)
+        export_qwen2_vl_visual(wrapped_model, output_dir, torch_dtype)
+    elif model_type == 'qwen2_5_vl':
+        wrapped_model = Qwen2_5_VisionTransformerPretrainedModelPatch(
+            visual_model)
+        wrapped_model.eval().to(device)
+        export_qwen2_5_vl_visual(wrapped_model, output_dir, torch_dtype)
+    else:
+        # qwen3_vl and qwen3_omni share the same visual wrapper/export path
+        wrapped_model = Qwen3VLVisionModelPatch(visual_model)
+        wrapped_model.eval().to(device)
+        export_qwen3_vl_visual(wrapped_model, output_dir, torch_dtype)
 
 
 def visual_export(model_dir: str,
@@ -71,9 +113,13 @@ def visual_export(model_dir: str,
         ValueError: If unsupported dtype or quantization is provided
         ValueError: If unsupported model type is detected
     """
-    # Validate input parameters
-    assert dtype == "fp16", f"Only fp16 is supported for dtype. You passed: {dtype}"
-    # TODO: Add quantization support
+    # Convert dtype string to torch dtype
+    if dtype == "fp16":
+        torch_dtype = torch.float16
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+
+    # Validate quantization mode
     assert quantization in [
         "fp8", None
     ], f"Only fp8 or None is supported for quantization. You passed: {quantization}"
@@ -86,88 +132,20 @@ def visual_export(model_dir: str,
 
     # Get visual model from the multimodal model
     model_type = model.config.model_type
-    # Convert dtype string to torch dtype
-    # TODO: Add support for bf16
-    torch_dtype = torch.float16
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    # Detect model architecture and use appropriate wrapper
-    if model_type == 'qwen2_vl':
-        print(f"Exporting Qwen2-VL visual model from {model_dir}")
-        # Create Qwen2-VL wrapper model
-        wrapped_model = Qwen2VisionTransformerPretrainedModelPatch._from_config(
-            model.visual.config,
-            torch_dtype=torch_dtype,
-        )
-        wrapped_model.load_state_dict(model.visual.state_dict())
-        wrapped_model.eval().to(device)
-
-        # Apply quantization to wrapped model if requested
-        if quantization == "fp8":
-            wrapped_model = quantize_visual(wrapped_model, quantization,
-                                            processor, dataset_dir)
-
-        # Export using the wrapper's export function
-        export_qwen2_vl_visual(wrapped_model, output_dir, torch_dtype)
-
-    elif model_type == 'qwen2_5_vl':
-        print(f"Exporting Qwen2.5-VL visual model from {model_dir}")
-        # Create Qwen2.5-VL wrapper model
-        wrapped_model = Qwen2_5_VisionTransformerPretrainedModelPatch._from_config(
-            model.visual.config,
-            torch_dtype=torch_dtype,
-        )
-        wrapped_model.load_state_dict(model.visual.state_dict())
-        wrapped_model.eval().to(device)
-        # Apply quantization to wrapped model if requested
-        if quantization == "fp8":
-            wrapped_model = quantize_visual(wrapped_model, quantization,
-                                            processor, dataset_dir)
-
-        # Export using the wrapper's export function
-        export_qwen2_5_vl_visual(wrapped_model, output_dir, torch_dtype)
-
-    elif model_type == 'qwen3_vl':
-        print(f"Exporting Qwen3-VL visual model from {model_dir}")
-        # Create Qwen3-VL wrapper model
-        wrapped_model = Qwen3VLVisionModelPatch._from_config(
-            model.visual.config,
-            torch_dtype=torch_dtype,
-        )
-        wrapped_model.load_state_dict(model.visual.state_dict())
-        wrapped_model.eval().to(device)
-        # Apply quantization to wrapped model if requested
-        if quantization == "fp8":
-            wrapped_model = quantize_visual(wrapped_model, quantization,
-                                            processor, dataset_dir)
-
-        # Export using the wrapper's export function
-        export_qwen3_vl_visual(wrapped_model, output_dir, torch_dtype)
-
-    elif model_type == 'qwen3_omni':
-        print(f"Exporting Qwen3-Omni visual model from {model_dir}")
-        # Qwen3-Omni uses the following structure: model.thinker.visual
-        assert hasattr(model, 'thinker') and hasattr(
-            model.thinker, 'visual'
-        ), f"Could not find visual encoder in Qwen3-Omni model structure"
-
-        # Create Qwen3-Omni wrapper model (extends Qwen3-VL)
-        wrapped_model = Qwen3OmniVisionModelPatch._from_config(
-            model.thinker.visual.config,
-            torch_dtype=torch_dtype,
-        )
-        # Load weights with automatic key mapping
-        wrapped_model.load_omni_state_dict(model.thinker.visual.state_dict())
-        wrapped_model.eval().to(device)
-        # Apply quantization to wrapped model if requested
-        if quantization == "fp8":
-            wrapped_model = quantize_visual(wrapped_model, quantization,
-                                            processor, dataset_dir)
-
-        # Export using the Qwen3-Omni export function (which calls Qwen3-VL export)
-        export_qwen3_omni_visual(wrapped_model, output_dir, torch_dtype)
+    if model_type in ['qwen2_vl', 'qwen2_5_vl', 'qwen3_vl', 'qwen3_omni']:
+        _export_qwen_visual(model,
+                            model_type,
+                            model_dir,
+                            output_dir,
+                            torch_dtype=torch_dtype,
+                            device=device,
+                            quantization=quantization,
+                            processor=processor,
+                            dataset_dir=dataset_dir)
 
     elif model_type == 'internvl':
         print(f"Exporting InternVL3 visual model from {model_dir}")
