@@ -23,7 +23,6 @@
 // clang-format off
 
 #include <cuda_runtime.h>
-#if CUDA_VERSION >= 11080
 
 #include "kernel.h"
 #include "marlin_template.h"
@@ -112,5 +111,3 @@ template __global__ void Marlin<trt_edgellm::marlin_dtypes::kFloat16.id(), trt_e
 template __global__ void Marlin<trt_edgellm::marlin_dtypes::kFloat16.id(), trt_edgellm::marlin_dtypes::kU4.id(), trt_edgellm::marlin_dtypes::kFloat16.id(), trt_edgellm::marlin_dtypes::kFloat16.id(), 128, 4, 8, 4, false, 4, 8, false>( MARLIN_KERNEL_PARAMS );
 
 }
-
-#endif // CUDA_VERSION >= 11080

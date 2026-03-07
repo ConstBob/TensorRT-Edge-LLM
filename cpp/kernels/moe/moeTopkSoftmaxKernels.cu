@@ -61,7 +61,7 @@ static constexpr float TOPK_MASK_VALUE = -10000.f;
 
 // Define reduction operators based on CUDA version
 // CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12090
 #include <cuda/functional>
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;

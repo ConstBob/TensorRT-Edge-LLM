@@ -20,8 +20,9 @@ exported to ONNX format. It handles GPTQ (via direct onnx export translation) an
 operation during ONNX export.
 
 The module contains:
-- Int4GemmPluginModule: Custom module that replaces TorchQuantLinear for ONNX export
+- Int4GemmPluginModule: Custom module that replaces TorchQuantLinear / TorchFusedQuantLinear for ONNX export
 - int4_gemm_plugin: Dummy TensorRT operation for Int4 GEMM computation
+- replace_quant_linear_with_plugin: Replace TorchQuantLinear and TorchFusedQuantLinear with Int4GemmPluginModule
 - ONNX export utilities for the custom operation
 """
 
@@ -468,25 +469,43 @@ class Int4GemmPluginModule(nn.Module):
 
         return output
 
-    def load_state_dict_from_torch_quant_linear(
-            self, torch_quant_linear: nn.Module) -> Optional[torch.Tensor]:
+    def load_state_dict_from_quant_linear(
+            self, source: nn.Module) -> Optional[torch.Tensor]:
         """
-        Load state dict from a TorchQuantLinear module.
+        Load state dict from a TorchQuantLinear or TorchFusedQuantLinear module.
         
-        This method reuses the original module's data without copying when possible.
+        Both use the same GPTQ layout: qweight (K/8, N) int32, qzeros, scales, g_idx.
+        This method reuses the source module's data without copying when possible,
+        then runs the same transformation: unpack -> optional gather by g_idx (desc_act)
+        -> transpose -> pack_intweights -> plugin processed_qweight (N/2, K) int8.
+        
+        For TorchFusedQuantLinear (CPU): must be called before any forward pass, since
+        transform_cpu() overwrites qweight with the int4pack format.
         
         Args:
-            torch_quant_linear: TorchQuantLinear module to copy weights from
+            source: TorchQuantLinear or TorchFusedQuantLinear module to copy weights from
+            
+        Returns:
+            Optional[torch.Tensor]: permute_idx for GatherWrapper if desc_act, else None
+            
+        Raises:
+            RuntimeError: If source is TorchFusedQuantLinear already transformed (after forward).
         """
-        # Reuse the original module's data directly without copying
-        self.qweight = torch_quant_linear.qweight
-        self.qzeros = torch_quant_linear.qzeros
-        self.scales = torch_quant_linear.scales
-        self.g_idx = torch_quant_linear.g_idx
-        if self.bias is not None and torch_quant_linear.bias is not None:
-            self.bias = torch_quant_linear.bias
-
-        # Process the weights for ONNX export after loading
+        expected_shape = (
+            source.in_features // 32 * source.bits,
+            source.out_features,
+        )
+        if source.qweight.shape != expected_shape:
+            raise RuntimeError(
+                "Source module has already been transformed (e.g. TorchFusedQuantLinear after forward). "
+                "Call replace_quant_linear_with_plugin(model) before the first forward pass."
+            )
+        self.qweight = source.qweight
+        self.qzeros = source.qzeros
+        self.scales = source.scales
+        self.g_idx = source.g_idx
+        if self.bias is not None and source.bias is not None:
+            self.bias = source.bias
         return self._process_weights()
 
 
@@ -500,52 +519,52 @@ def register_int4_gemm_plugin_onnx_symbolic_functions() -> None:
     print("Registered ONNX symbolic functions for custom Int4GemmPlugin")
 
 
-def replace_torch_quant_linear_with_plugin(model: nn.Module) -> nn.Module:
+def replace_quant_linear_with_plugin(model: nn.Module) -> nn.Module:
     """
-    Replace all TorchQuantLinear modules in a model with Int4GemmPluginModule.
+    Replace all TorchQuantLinear and TorchFusedQuantLinear modules with Int4GemmPluginModule.
     
-    This function reuses the original module's data without copying when possible.
+    Both source types use the same GPTQ layout (qweight, qzeros, scales, g_idx); weights
+    are transformed once to plugin format (processed_qweight, scales). Reuses original
+    buffers without copying when possible.
+    
+    For TorchFusedQuantLinear: call before the first forward pass so qweight is still
+    in GPTQ format (transform_cpu() overwrites it with int4pack).
     
     Args:
-        model: PyTorch model containing TorchQuantLinear modules
+        model: PyTorch model containing TorchQuantLinear and/or TorchFusedQuantLinear
         
     Returns:
-        nn.Module: Model with TorchQuantLinear modules replaced by Int4GemmPluginModule
+        nn.Module: Model with quant linear modules replaced by Int4GemmPluginModule
     """
+
     from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+    from gptqmodel.nn_modules.qlinear.torch_fused import TorchFusedQuantLinear
 
     for name, module in model.named_modules():
-        if isinstance(module, TorchQuantLinear):
-            # Create new Int4GemmPluginModule with same parameters
-            new_module = Int4GemmPluginModule(
-                bits=module.bits,
-                group_size=module.group_size,
-                desc_act=module.desc_act,
-                in_features=module.in_features,
-                out_features=module.out_features,
-                bias=module.bias is not None,
-                pack_dtype=torch.int8,
-            )
-
-            # Load weights from original module (reuses data without copying)
-            permute_idx = new_module.load_state_dict_from_torch_quant_linear(
-                module)
-
-            final_module = new_module
-            if module.desc_act:
-                assert permute_idx is not None, "Permute index should not be None for desc_act models"
-                final_module = GatherWrapper(new_module, permute_idx)
-
-            # Replace the module in the model
-            parent = model
-            if '.' in name:
-                parent_name, module_name = name.rsplit('.', 1)
-                parent = dict(model.named_modules())[parent_name]
-            else:
-                module_name = name
-
-            setattr(parent, module_name, final_module)
-
+        if not isinstance(module, (TorchQuantLinear, TorchFusedQuantLinear)):
+            continue
+        new_module = Int4GemmPluginModule(
+            bits=module.bits,
+            group_size=module.group_size,
+            desc_act=module.desc_act,
+            in_features=module.in_features,
+            out_features=module.out_features,
+            bias=module.bias is not None,
+            pack_dtype=getattr(module, "pack_dtype", torch.int32),
+        )
+        permute_idx = new_module.load_state_dict_from_quant_linear(module)
+        final_module = new_module
+        if module.desc_act:
+            assert (permute_idx is not None
+                    ), "Permute index should not be None for desc_act models"
+            final_module = GatherWrapper(new_module, permute_idx)
+        parent = model
+        if "." in name:
+            parent_name, module_name = name.rsplit(".", 1)
+            parent = dict(model.named_modules())[parent_name]
+        else:
+            module_name = name
+        setattr(parent, module_name, final_module)
     return model
 
 

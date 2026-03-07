@@ -40,7 +40,6 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 #include <cuda_runtime.h>
-#if CUDA_VERSION >= 11080
 
 #ifndef MARLIN_NAMESPACE_NAME
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
@@ -553,5 +552,3 @@ void marlin_mm(void const* A, void const* B, void* C, void* C_tmp, void* b_bias,
 }
 
 } // namespace MARLIN_NAMESPACE_NAME
-
-#endif // CUDA_VERSION >= 11080

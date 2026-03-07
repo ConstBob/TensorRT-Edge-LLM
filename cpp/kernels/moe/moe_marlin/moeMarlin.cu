@@ -26,37 +26,20 @@
  * - Dequantization: weight_fp16 = (weight_int4 - 8) * scale
  */
 
+#include "moeMarlin.h"
 #include <cuda_runtime.h>
-#if CUDA_VERSION >= 11080
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
 
 #include "common/checkMacros.h"
+#include "common/cudaUtils.h"
 #include "common/stringUtils.h"
 #include "marlin/scalar_type.hpp"
-#include "moeMarlin.h"
 
 #include <algorithm>
 #include <cstdint>
 
-// Forward declare the raw marlin_mm function from ops.cu
-// Note: The namespace matches MARLIN_NAMESPACE_NAME defined in ops.cu
-namespace marlin_moe_wna16
-{
-
-// Constants from kernel.h
-constexpr int min_thread_n = 64;
-constexpr int max_thread_n = 256;
-
-void marlin_mm(void const* A, void const* B, void* C, void* C_tmp, void* b_bias, void* a_s, void* b_s, void* g_s,
-    void* zp, void* g_idx, void* perm, void* a_tmp, void* sorted_token_ids, void* expert_ids,
-    void* num_tokens_past_padded, void* topk_weights, int moe_block_size, int num_experts, int top_k,
-    bool mul_topk_weights, int prob_m, int prob_n, int prob_k, void* workspace,
-    trt_edgellm::marlin_dtypes::ScalarType const& a_type, trt_edgellm::marlin_dtypes::ScalarType const& b_type,
-    trt_edgellm::marlin_dtypes::ScalarType const& c_type, trt_edgellm::marlin_dtypes::ScalarType const& s_type,
-    bool has_bias, bool has_act_order, bool is_k_full, bool has_zp, int num_groups, int group_size, int dev,
-    cudaStream_t stream, int thread_k, int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-    bool use_fp32_reduce, bool is_zp_float);
-
-} // namespace marlin_moe_wna16
+#include "marlin_moe_wna16/ops.cu"
+#include "marlin_moe_wna16/sm80_kernel_float16_u4_float16.cu"
 
 namespace trt_edgellm
 {
@@ -92,8 +75,14 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
     int64_t outDim = scalesShape[2];
 
     // Validate output shape
-    check::check(outputShape[0] == numTokens * topK,
-        fmtstr("Output shape[0] %ld != numTokens*topK %ld", outputShape[0], numTokens * topK));
+    // Note: For MoE, the input can be either:
+    // 1. Original tokens [numTokens, K] → output [numTokens*topK, N] (first GEMM)
+    // 2. Slot activations [numTokens*topK, K] → output [numTokens*topK, N] (second GEMM)
+    // We accept both cases by checking if output matches input*topK OR just input
+    bool validOutputShape = (outputShape[0] == numTokens * topK) || (outputShape[0] == numTokens);
+    check::check(validOutputShape,
+        fmtstr("Output shape[0] %ld must be either numTokens*topK=%ld or numTokens=%ld", outputShape[0],
+            numTokens * topK, numTokens));
     check::check(outputShape[1] == outDim, fmtstr("Output shape[1] %ld != outDim %ld", outputShape[1], outDim));
 
     // Validate data types
@@ -121,8 +110,8 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
     // Get device info
     int dev;
     int sms;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 
     // AWQ W4A16 fixed scalar types
     trt_edgellm::marlin_dtypes::ScalarType aType = trt_edgellm::marlin_dtypes::kFloat16; // A16 activation
@@ -143,15 +132,22 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
 
     // Workspace layout: [locks (INT32)] [c_tmp (FP32)]
     int64_t numTokensPadded = sortedTokenIds.getShape()[0];
-    int64_t locksSize
-        = std::min((outDim / marlin_moe_wna16::min_thread_n) * ((numTokensPadded + moeBlockSize - 1) / moeBlockSize),
-            static_cast<int64_t>(sms * 4));
+    int64_t locksSize = std::min(
+        (outDim / marlin_moe_wna16::min_thread_n) * static_cast<int64_t>(divUp(numTokensPadded, moeBlockSize)),
+        static_cast<int64_t>(sms * 4));
+
+    // Round locksSize up to multiple of 4 to ensure cTmpPtr is 16-byte aligned
+    // (since locks are INT32 = 4 bytes, we need 4 INT32s = 16 bytes alignment)
+    locksSize = static_cast<int64_t>(divUp(locksSize, static_cast<int64_t>(4))) * 4;
 
     int32_t* workspaceBasePtr = static_cast<int32_t*>(workspace.rawPointer());
     void* locksPtr = workspaceBasePtr;
 
     // c_tmp buffer starts after locks (FP32 reduction buffer)
     void* cTmpPtr = workspaceBasePtr + locksSize;
+
+    // Marlin uses locks for reductions; these must be zeroed each call.
+    CUDA_CHECK(cudaMemsetAsync(locksPtr, 0, locksSize * sizeof(int32_t), stream));
 
     // Call the raw marlin_mm function with AWQ-specific parameters
     marlin_moe_wna16::marlin_mm(inputPtr, // A
@@ -190,8 +186,10 @@ int64_t getMoeMarlinWorkspaceSize(int64_t numTokensPadded, int64_t outDim, int64
 {
     // Locks size (INT32)
     int64_t maxNTiles = outDim / marlin_moe_wna16::min_thread_n;
-    int64_t numBlocks = (numTokensPadded + moeBlockSize - 1) / moeBlockSize;
+    int64_t numBlocks = static_cast<int64_t>(divUp(numTokensPadded, moeBlockSize));
     int64_t locksSize = std::min(maxNTiles * numBlocks, numSMs * 4);
+    // Round locksSize up to multiple of 4 to ensure cTmpPtr is 16-byte aligned.
+    locksSize = divUp(locksSize, 4) * 4;
 
     // C_tmp size for FP32 reduction (same element size as INT32)
     int64_t cTmpSize = std::min(
@@ -203,6 +201,33 @@ int64_t getMoeMarlinWorkspaceSize(int64_t numTokensPadded, int64_t outDim, int64
 
     // Total workspace = locks + c_tmp (both are 4 bytes per element)
     return locksSize + cTmpSize;
+}
+
+} // namespace kernel
+} // namespace trt_edgellm
+
+#else // CUDA_VERSION < 11080
+
+// Stub implementations when CUDA < 11.8 (Marlin deps unavailable).
+// Throws at runtime if INT4 MoE is used; allows plugin to link on older CUDA.
+#include <stdexcept>
+
+namespace trt_edgellm
+{
+namespace kernel
+{
+
+void moeAwqW4A16MarlinGemm(rt::Tensor const&, rt::Tensor&, rt::Tensor const&, rt::Tensor const&, rt::Tensor const&,
+    rt::Tensor const&, rt::Tensor const&, rt::Tensor const&, rt::Tensor&, int64_t, int64_t, bool, cudaStream_t)
+{
+    throw std::runtime_error(
+        "INT4 MoE Marlin GEMM requires CUDA 11.8 or later. Please use CUDA 11.8+ for INT4 MoE support.");
+}
+
+int64_t getMoeMarlinWorkspaceSize(int64_t, int64_t, int64_t, int64_t)
+{
+    throw std::runtime_error(
+        "INT4 MoE Marlin GEMM requires CUDA 11.8 or later. Please use CUDA 11.8+ for INT4 MoE support.");
 }
 
 } // namespace kernel

@@ -33,6 +33,12 @@
 | [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) | 4B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | 8B | ✅ | ✅ | ✅ | ✅ |
 
+### MoE (Mixture of Experts)
+
+| Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
+|-------|-----------|------|-----|------|-------|
+| [Qwen3-30B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4) | 30B (3B active) | — | — | ✅ (GPTQ) | — |
+
 ### DeepSeek-R1 Distilled Family
 
 | Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |

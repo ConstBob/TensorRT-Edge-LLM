@@ -35,7 +35,7 @@ namespace trt_edgellm
  * @return Ceiling of a/n
  */
 template <typename T1, typename T2>
-inline size_t divUp(const T1& a, const T2& n) noexcept
+__host__ __device__ inline size_t divUp(const T1& a, const T2& n) noexcept
 {
     size_t tmp_a = static_cast<size_t>(a);
     size_t tmp_n = static_cast<size_t>(n);
