@@ -22,6 +22,8 @@ from transformers.models.llama.modeling_llama import (LlamaAttention, LlamaMLP,
                                                       apply_rotary_pos_emb,
                                                       repeat_kv)
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
+from transformers.models.qwen3_moe.modeling_qwen3_moe import \
+    Qwen3MoeSparseMoeBlock
 
 from .attention_plugin import attention_plugin
 from .attention_trt import EdgeLLMAttentionTRTNative
@@ -515,6 +517,8 @@ class EdgeLLMDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
+            if isinstance(self.mlp, Qwen3MoeSparseMoeBlock):
+                hidden_states = hidden_states[0]
             hidden_states = residual + hidden_states
 
         return hidden_states, present_key_value
@@ -573,6 +577,8 @@ class EdgeLLMDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
+            if isinstance(self.mlp, Qwen3MoeSparseMoeBlock):
+                hidden_states = hidden_states[0]
             hidden_states = residual + hidden_states
 
         return hidden_states

@@ -62,7 +62,10 @@ from ..llm_models.layers.gather_nd import \
     register_gather_nd_onnx_symbolic_functions
 from ..llm_models.layers.int4_gemm_plugin import (
     register_int4_gemm_plugin_onnx_symbolic_functions,
-    replace_torch_quant_linear_with_plugin)
+    replace_quant_linear_with_plugin)
+from ..llm_models.layers.int4_moe_plugin import (
+    is_moe_model, register_int4_moe_plugin_onnx_symbolic_functions,
+    replace_moe_blocks_with_plugin)
 from ..llm_models.model_utils import (is_gptq_model,
                                       is_incompatible_chat_template_model,
                                       load_eagle3_draft_model, load_llm_model,
@@ -417,10 +420,10 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
     """
     if is_gptq_model(model):
         print(
-            "Detected GPTQ quantization, replacing TorchQuantLinear with Int4GemmPluginModule"
+            "Detected GPTQ quantization, replacing quant linear with Int4GemmPluginModule"
         )
         register_int4_gemm_plugin_onnx_symbolic_functions()
-        model = replace_torch_quant_linear_with_plugin(model)
+        model = replace_quant_linear_with_plugin(model)
     return model
 
 
@@ -732,6 +735,12 @@ def export_llm_model(model_dir: str,
         print(f"\n=== Exporting {model_name} ===")
         model_output_dir = os.path.join(
             output_dir, model_name) if is_multi_model else output_dir
+
+        if is_moe_model(model):
+            print(
+                "Detected MoE model, replacing MoE blocks with Int4MoePlugin")
+            register_int4_moe_plugin_onnx_symbolic_functions()
+            model = replace_moe_blocks_with_plugin(model)
 
         # Step 1: Apply model modifications
         model = replace_torch_quant_linear_with_int4_plugin(model)

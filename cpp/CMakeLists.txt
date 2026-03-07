@@ -66,6 +66,9 @@ endif()
 file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
 file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
 file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
+# Exclude MoE Marlin ops/sm80 - compiled only via include from moeMarlin.cu
+list(FILTER KERNELS_CU_SRCS EXCLUDE REGEX
+     "marlin_moe_wna16/(ops|sm80_kernel_float16_u4_float16)\\.cu$")
 file(GLOB_RECURSE SAMPLER_CU_SRCS "sampler/*.cu")
 file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
 file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")

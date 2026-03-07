@@ -98,6 +98,87 @@ def is_gptq_model(model: PreTrainedModel) -> bool:
     return quant_config and quant_config.get("quant_method") == "gptq"
 
 
+def _is_gptq_moe_model(model_dir: str) -> bool:
+    """Check if a model directory contains a GPTQ MoE model (before loading)."""
+    try:
+        cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        cfg_dict = cfg.to_dict()
+        quant_config = cfg_dict.get("quantization_config", None)
+        is_gptq = quant_config and quant_config.get("quant_method") == "gptq"
+        model_type = getattr(cfg, "model_type", "")
+        is_moe = "moe" in model_type.lower()
+        return is_gptq and is_moe
+    except Exception:
+        return False
+
+
+def _resolve_model_path(model_dir: str) -> Path:
+    """Resolve model_dir to actual path, handling HuggingFace model IDs."""
+    model_path = Path(model_dir)
+    if model_path.exists():
+        return model_path
+
+    try:
+        from huggingface_hub import snapshot_download
+        cache_path = snapshot_download(model_dir, local_files_only=True)
+        return Path(cache_path)
+    except Exception:
+        return model_path
+
+
+def _fix_gptq_moe_gate_weights(model: PreTrainedModel, model_dir: str) -> None:
+    """
+    Fix MoE gate weights for GPTQ models.
+
+    In GPTQ quantization, the MoE gate/router layer is typically not quantized.
+    However, gptqmodel incorrectly converts gate layers to TorchFusedQuantLinear,
+    which expects quantized weights (qweight, qzeros, scales, g_idx).
+
+    This function replaces the TorchFusedQuantLinear gate with a regular nn.Linear
+    and loads the FP16 weights from the checkpoint.
+    """
+    model_path = _resolve_model_path(model_dir)
+    safetensor_files = sorted(model_path.glob("*.safetensors"))
+    if not safetensor_files:
+        print(f"Warning: No safetensor files found at {model_path}")
+        return
+
+    gate_weights = {}
+    for shard_path in safetensor_files:
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if ".mlp.gate.weight" in key:
+                    layer_idx = int(key.split(".")[2])
+                    gate_weights[layer_idx] = f.get_tensor(key)
+
+    if not gate_weights:
+        print("Warning: No gate weights found in checkpoint")
+        return
+
+    gate_layers_fixed = 0
+    for layer_idx, gate_weight in gate_weights.items():
+        mlp = model.model.layers[layer_idx].mlp
+        old_gate = mlp.gate
+
+        out_features, in_features = gate_weight.shape
+        new_gate = nn.Linear(in_features, out_features, bias=False)
+        new_gate.weight.data.copy_(gate_weight)
+
+        if hasattr(old_gate, 'qweight'):
+            device = old_gate.qweight.device
+        else:
+            device = next(model.parameters()).device
+        dtype = gate_weight.dtype
+        new_gate = new_gate.to(device=device, dtype=dtype)
+
+        mlp.gate = new_gate
+        gate_layers_fixed += 1
+
+    print(
+        f'Replaced {gate_layers_fixed} MoE gate layers (TorchFusedQuantLinear -> nn.Linear) in the model'
+    )
+
+
 def _check_model_type(model_dir: str, model_identifier: str) -> bool:
     """
     Check if a model matches a given identifier by checking model_type and architectures.
@@ -328,6 +409,14 @@ def load_hf_model(
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).to(device)
+    elif _is_gptq_moe_model(model_dir):
+        print(
+            f"Loading GPTQ MoE model from {model_dir}. You might see warnings saying 'Some weights of the model checkpoint at Qwen/Qwen3-30B-A3B-GPTQ-Int4 were not used when initializing Qwen3MoeForCausalLM', which is expected. The weights will be fixed automatically afterwards."
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).to(device)
+        _fix_gptq_moe_gate_weights(model, model_dir)
     else:
         # Try loading as AutoModelForCausalLM first
         try:
