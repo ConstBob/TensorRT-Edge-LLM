@@ -111,6 +111,7 @@ enum class RopeType
     kDynamic,  //!< Dynamic RoPE type used by InternVL-3
     kLongRope, //!< Long RoPE type used by Phi-4
     kMRope,    //!< MRope type used by Qwen2-VL
+    kNoRope,   //!< No positional encoding (e.g., Nemotron-Nano)
 };
 
 /*! \brief Long-Rope specific parameters */
@@ -154,6 +155,17 @@ RopeConfig collectRopeConfig(nlohmann::json const& config);
  *  \return True if the initialization is successful, false otherwise
  */
 bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream) noexcept;
+
+/*! \brief Initialize an identity cos/sin cache for models without positional encoding (NoPE)
+ *
+ *  Fills the first half of each position's rotaryDim with 1.0 (cos) and the
+ *  second half with 0.0 (sin), making the RoPE kernel a pass-through.
+ *
+ *  \param cosSinCache [GPU] The tensor to fill, shape [1, maxLength, rotaryDim]
+ *  \param stream [CUDA stream] The stream to execute the copy
+ *  \return True on success
+ */
+bool initializeNopeCosSinCache(rt::Tensor& cosSinCache, cudaStream_t stream) noexcept;
 
 /*! \brief Initialize the rope cos/sin cache tensor for long rope type
  *

@@ -17,6 +17,8 @@
 
 #include "llmInferenceRuntime.h"
 
+#include <algorithm>
+
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "common/hashUtils.h"
@@ -398,6 +400,57 @@ bool LLMInferenceRuntime::setUpForPrefillExecution(std::vector<std::vector<int32
     }
 
     linearKVCache.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+
+    // For each Mamba layer and each batch element, either restore the cached
+    // SSM/conv state if the cache hit, or zero the state.
+    if (mEngineConfig.numMambaLayers > 0)
+    {
+        rt::LinearKVCache& kvCache = mLLMEngineRunner->getLinearKVCache();
+        rt::LinearKVCache::CacheConfig const& cacheConfig = kvCache.getConfig();
+        size_t const ssmElemSize = rt::utils::getTypeSize(cacheConfig.ssmStateType);
+        size_t const convElemSize = rt::utils::getTypeSize(cacheConfig.convStateType);
+        size_t const ssmBatchBytes
+            = static_cast<size_t>(cacheConfig.mambaNumHeads * cacheConfig.mambaHeadDim * cacheConfig.ssmStateSize)
+            * ssmElemSize;
+        size_t const convBatchBytes = static_cast<size_t>(cacheConfig.convDim * cacheConfig.convKernel) * convElemSize;
+
+        for (int32_t layer = 0; layer < mEngineConfig.numMambaLayers; ++layer)
+        {
+            rt::Tensor ssmLayer = kvCache.getSSMStateForLayer(layer);
+            rt::Tensor convLayer = kvCache.getConvStateForLayer(layer);
+
+            for (int32_t i = 0; i < activeBatchSize; ++i)
+            {
+                auto* ssmDst = static_cast<std::byte*>(ssmLayer.rawPointer()) + i * ssmBatchBytes;
+                auto* convDst = static_cast<std::byte*>(convLayer.rawPointer()) + i * convBatchBytes;
+
+                auto const promptKey = keySystemPromptWithLoraWeights(systemPrompts[i], loraWeightsName);
+                auto it = mSystemPromptKVCache.find(promptKey);
+                bool const hasCache = (it != mSystemPromptKVCache.end());
+
+                if (hasCache && layer < static_cast<int32_t>(it->second.ssmStateContents.size()))
+                {
+                    CUDA_CHECK(cudaMemcpyAsync(ssmDst, it->second.ssmStateContents[layer].rawPointer(), ssmBatchBytes,
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+                else
+                {
+                    CUDA_CHECK(cudaMemsetAsync(ssmDst, 0, ssmBatchBytes, stream));
+                }
+
+                if (hasCache && layer < static_cast<int32_t>(it->second.convStateContents.size()))
+                {
+                    CUDA_CHECK(cudaMemcpyAsync(convDst, it->second.convStateContents[layer].rawPointer(),
+                        convBatchBytes, cudaMemcpyDeviceToDevice, stream));
+                }
+                else
+                {
+                    CUDA_CHECK(cudaMemsetAsync(convDst, 0, convBatchBytes, stream));
+                }
+            }
+        }
+    }
+
     check::check(mInputIds.reshape({activeBatchSize, packedInputLength}), "Tensor reshape failed");
     check::check(mHostContextLengths.reshape({activeBatchSize}), "Tensor reshape failed");
     check::check(mOutputLogits.reshape({activeBatchSize, mEngineConfig.outputVocabSize}), "Tensor reshape failed");
@@ -686,6 +739,7 @@ bool LLMInferenceRuntime::handleRequest(
                 "LLMInferenceRuntime(): Failed to execute prefill step. Cannot generate the KVCache for this prompt.");
             return false;
         }
+
         sampleTokens();
     }
 
@@ -954,7 +1008,7 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     auto cacheConfig = linearKVCache.getConfig();
     auto kvCacheBuffer = linearKVCache.getKVCacheBuffer();
     rt::Coords savedKVCacheShape{
-        cacheConfig.numDecoderLayers, 2, cacheConfig.numKVHeads, promptIdsLength, cacheConfig.headDim};
+        cacheConfig.numAttentionLayers, 2, cacheConfig.numKVHeads, promptIdsLength, cacheConfig.headDim};
 
     SystemPromptKVCache savedKVCache;
     savedKVCache.systemPrompt = prompt;
@@ -965,6 +1019,15 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     // We only process one sequence at a time.
     constexpr int32_t CACHE_BATCH_IDX{0};
     kernel::saveKVCacheIntoTensor(savedKVCache.kvCacheContent, kvCacheBuffer, CACHE_BATCH_IDX, stream);
+
+    // Save SSM and conv states for Mamba layers
+    if (mEngineConfig.numMambaLayers > 0)
+    {
+        savedKVCache.ssmStateContents = mLLMEngineRunner->getLinearKVCache().captureSSMStates(CACHE_BATCH_IDX, stream);
+        savedKVCache.convStateContents
+            = mLLMEngineRunner->getLinearKVCache().captureConvStates(CACHE_BATCH_IDX, stream);
+    }
+
     mSystemPromptKVCache.insert({promptKey, std::move(savedKVCache)});
 
     CUDA_CHECK(cudaStreamSynchronize(stream));

@@ -240,6 +240,20 @@ private:
     bool setupKVCacheProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Set up optimization profiles for SSM state tensors (Mamba layers).
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @return true if setup was successful, false otherwise
+    bool setupSSMStateProfiles(
+        nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
+
+    //! Set up optimization profiles for conv state tensors (Mamba causal conv1d layers).
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @return true if setup was successful, false otherwise
+    bool setupConvStateProfiles(
+        nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
+
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config
     //! and builder configuration parameters.
@@ -275,7 +289,14 @@ private:
     int32_t mNbKVCacheInputs{0};            //!< Number of KV cache inputs (layers)
     int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
     int32_t mNumDeepstackFeatures{0};       //!< Number of deepstack features (for Qwen3VL)
-    Json mModelConfig;                      //!< Parsed model configuration
+    // TODO: Use better mechanism to organize model configuration.
+    int32_t mNumMambaLayers{0}; //!< Number of Mamba layers
+    int32_t mMambaNumHeads{0};  //!< Number of Mamba heads
+    int32_t mMambaHeadDim{0};   //!< Mamba head dimension
+    int32_t mSSMStateSize{0};   //!< SSM state size (dstate)
+    int32_t mConvDim{0};    //!< Conv state dimension (mamba_num_heads * mamba_head_dim + 2 * n_groups * ssm_state_size)
+    int32_t mConvKernel{0}; //!< Conv kernel size (d_conv)
+    Json mModelConfig;      //!< Parsed model configuration
 };
 
 } // namespace builder

@@ -210,6 +210,19 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
         break;
     }
+    case RopeType::kNoRope:
+    {
+        LOG_DEBUG("No RoPE: initializing identity CosSinCache (cos=1, sin=0).");
+        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
+            DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
+        bool const initStatus = initializeNopeCosSinCache(mPosEncCosSinCache, stream);
+        if (!initStatus)
+        {
+            LOG_ERROR("Failed to initialize identity CosSinCache.");
+            throw std::runtime_error("Failed to initialize identity CosSinCache.");
+        }
+        break;
+    }
     default:
     {
         LOG_DEBUG("Initialize persistent Rope CosSinCache.");
@@ -243,9 +256,16 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Detect KV cache storage dtype from engine bindings.
     nvinfer1::DataType kvCacheType = getKVCacheType();
 
+    int32_t const kvCacheLayers
+        = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
+    DataType const ssmStateType = (mConfig.numMambaLayers > 0) ? getSSMStateType() : DataType::kHALF;
+    DataType const convStateType = (mConfig.numMambaLayers > 0) ? getConvStateType() : DataType::kHALF;
     this->mKVCache
-        = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
-                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim, kvCacheType},
+        = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{kvCacheLayers, mConfig.maxSupportedBatchSize,
+                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim, kvCacheType,
+                                // Mamba state config (zero for pure-attention models)
+                                mConfig.numMambaLayers, mConfig.mambaNumHeads, mConfig.mambaHeadDim,
+                                mConfig.ssmStateSize, ssmStateType, mConfig.convDim, mConfig.convKernel, convStateType},
             stream);
 
     // Instantiate other GPU memory input that needed by the Engine execution.
@@ -378,6 +398,18 @@ nvinfer1::DataType LLMEngineRunner::getKVCacheType() const
     }
 }
 
+nvinfer1::DataType LLMEngineRunner::getSSMStateType() const
+{
+    std::string const name = binding_names::formatSSMStateName(/*mambaLayerIdx=*/0, /*isPast=*/true);
+    return mEngine->getTensorDataType(name.c_str());
+}
+
+nvinfer1::DataType LLMEngineRunner::getConvStateType() const
+{
+    std::string const name = binding_names::formatConvStateName(/*mambaLayerIdx=*/0, /*isPast=*/true);
+    return mEngine->getTensorDataType(name.c_str());
+}
+
 bool LLMEngineRunner::validateKVCacheType() const
 {
     // Sanity check: ensure KV-cache precision (dtype) is consistent across all layers (and both past/present).
@@ -403,7 +435,9 @@ bool LLMEngineRunner::validateKVCacheType() const
                 throw std::runtime_error("KV cache dtype mismatch across layers");
             }
         };
-        for (int32_t layerIdx = 0; layerIdx < mConfig.numDecoderLayers; ++layerIdx)
+        int32_t const kvLayers
+            = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
+        for (int32_t layerIdx = 0; layerIdx < kvLayers; ++layerIdx)
         {
             checkKVCacheDType(layerIdx, /*isPast=*/true);
             checkKVCacheDType(layerIdx, /*isPast=*/false);
@@ -427,7 +461,9 @@ bool LLMEngineRunner::validateKVCacheType() const
                 throw std::runtime_error("KV cache dtype mismatch across layers");
             }
         };
-        for (int32_t layerIdx = 0; layerIdx < mConfig.numDecoderLayers; ++layerIdx)
+        int32_t const kvLayers
+            = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
+        for (int32_t layerIdx = 0; layerIdx < kvLayers; ++layerIdx)
         {
             checkKVCacheDType(layerIdx, /*isPast=*/true);
             checkKVCacheDType(layerIdx, /*isPast=*/false);
@@ -492,6 +528,15 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         // Read audio and image token IDs for Qwen3-Omni (used by embeddingLookupQwen3Omni kernel)
         mConfig.audioTokenId = configJson.value("audio_token_id", 0);
         mConfig.imageTokenId = configJson.value("image_token_id", 0);
+
+        // Hybrid Mamba configuration (optional)
+        mConfig.numMambaLayers = configJson.value("num_mamba_layers", 0);
+        mConfig.numAttentionLayers = configJson.value("num_attention_layers", mConfig.numDecoderLayers);
+        mConfig.mambaNumHeads = configJson.value("mamba_num_heads", 0);
+        mConfig.mambaHeadDim = configJson.value("mamba_head_dim", 0);
+        mConfig.ssmStateSize = configJson.value("ssm_state_size", 0);
+        mConfig.convDim = configJson.value("conv_dim", 0);
+        mConfig.convKernel = configJson.value("conv_kernel", 0);
 
         // Extract builder_config values
         mConfig.maxSupportedBatchSize = builderConfig["max_batch_size"].get<int32_t>();
@@ -690,19 +735,21 @@ bool LLMEngineRunner::validateConfigFromEngine()
     }
 
     // Validate KV cache counts based on attention mode
+    int32_t const expectedKVLayers
+        = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
     if (mConfig.useTrtNativeOps)
     {
         // TRT native mode: expect separate K and V caches
-        if (nbTRTNativeKCacheInputs != mConfig.numDecoderLayers)
+        if (nbTRTNativeKCacheInputs != expectedKVLayers)
         {
-            LOG_ERROR("numDecoderLayers is not consistent (TRT native K cache). From engine: %d, from config: %d",
-                nbTRTNativeKCacheInputs, mConfig.numDecoderLayers);
+            LOG_ERROR("KV cache layer count mismatch (TRT native K cache). From engine: %d, expected: %d",
+                nbTRTNativeKCacheInputs, expectedKVLayers);
             return false;
         }
-        if (nbTRTNativeVCacheInputs != mConfig.numDecoderLayers)
+        if (nbTRTNativeVCacheInputs != expectedKVLayers)
         {
-            LOG_ERROR("numDecoderLayers is not consistent (TRT native V cache). From engine: %d, from config: %d",
-                nbTRTNativeVCacheInputs, mConfig.numDecoderLayers);
+            LOG_ERROR("KV cache layer count mismatch (TRT native V cache). From engine: %d, expected: %d",
+                nbTRTNativeVCacheInputs, expectedKVLayers);
             return false;
         }
         if (nbKVCacheInputs > 0)
@@ -713,11 +760,11 @@ bool LLMEngineRunner::validateConfigFromEngine()
     }
     else
     {
-        // Plugin mode: expect combined KV caches
-        if (nbKVCacheInputs != mConfig.numDecoderLayers)
+        // Plugin mode: expect combined KV caches.
+        if (nbKVCacheInputs != expectedKVLayers)
         {
-            LOG_ERROR("numDecoderLayers is not consistent. From engine: %d, from config: %d", nbKVCacheInputs,
-                mConfig.numDecoderLayers);
+            LOG_ERROR(
+                "KV cache layer count mismatch. From engine: %d, expected: %d", nbKVCacheInputs, expectedKVLayers);
             return false;
         }
         if (nbTRTNativeKCacheInputs > 0 || nbTRTNativeVCacheInputs > 0)
@@ -775,9 +822,11 @@ bool LLMEngineRunner::bindPluginKVCacheToEngine(int32_t activeBatchSize)
 {
     // Prepare special input binding shape for prefill stage KVCache input.
     Dims const kvCacheDims = {5, {activeBatchSize, 2, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
+    int32_t const kvCacheLayers
+        = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
     bool status{true};
     // Bind KV cache tensors to execution contexts
-    for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
+    for (int32_t i = 0; i < kvCacheLayers; ++i)
     {
         std::string const pastKeyValuesName = binding_names::formatKVCacheName(i, true);
         std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
@@ -797,9 +846,11 @@ bool LLMEngineRunner::bindTRTNativeKVCacheToEngine(int32_t activeBatchSize)
     Dims const kCacheDimIn = {4, {activeBatchSize, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
     Dims const vCacheDimIn = {4, {activeBatchSize, mConfig.numKVHeads, mConfig.maxKVCacheCapacity, mConfig.headDim}};
 
+    int32_t const kvCacheLayers
+        = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
     bool status{true};
     // Bind separate K and V cache tensors to execution contexts
-    for (int32_t i = 0; i < mConfig.numDecoderLayers; ++i)
+    for (int32_t i = 0; i < kvCacheLayers; ++i)
     {
         std::string const pastKCacheName = binding_names::formatKCacheName(i, true);
         std::string const presentKCacheName = binding_names::formatKCacheName(i, false);
@@ -835,6 +886,50 @@ bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
     {
         return bindPluginKVCacheToEngine(activeBatchSize);
     }
+}
+
+bool LLMEngineRunner::bindSSMStateToEngine(int32_t activeBatchSize)
+{
+    if (mConfig.numMambaLayers == 0)
+    {
+        return true;
+    }
+
+    Dims const ssmStateDims = {4, {activeBatchSize, mConfig.mambaNumHeads, mConfig.mambaHeadDim, mConfig.ssmStateSize}};
+    bool status{true};
+    for (int32_t i = 0; i < mConfig.numMambaLayers; ++i)
+    {
+        rt::Tensor ssmState = mKVCache.getSSMStateForLayer(i);
+        std::string const pastName = binding_names::formatSSMStateName(i, /*isPast=*/true);
+        std::string const presentName = binding_names::formatSSMStateName(i, /*isPast=*/false);
+
+        status &= mTRTExecutionContext->setTensorAddress(pastName.c_str(), ssmState.rawPointer());
+        status &= mTRTExecutionContext->setTensorAddress(presentName.c_str(), ssmState.rawPointer());
+        status &= mTRTExecutionContext->setInputShape(pastName.c_str(), ssmStateDims);
+    }
+    return status;
+}
+
+bool LLMEngineRunner::bindConvStateToEngine(int32_t activeBatchSize)
+{
+    if (mConfig.numMambaLayers == 0)
+    {
+        return true;
+    }
+
+    Dims const convStateDims = {3, {activeBatchSize, mConfig.convDim, mConfig.convKernel}};
+    bool status{true};
+    for (int32_t i = 0; i < mConfig.numMambaLayers; ++i)
+    {
+        rt::Tensor convState = mKVCache.getConvStateForLayer(i);
+        std::string const pastName = binding_names::formatConvStateName(i, /*isPast=*/true);
+        std::string const presentName = binding_names::formatConvStateName(i, /*isPast=*/false);
+
+        status &= mTRTExecutionContext->setTensorAddress(pastName.c_str(), convState.rawPointer());
+        status &= mTRTExecutionContext->setTensorAddress(presentName.c_str(), convState.rawPointer());
+        status &= mTRTExecutionContext->setInputShape(pastName.c_str(), convStateDims);
+    }
+    return status;
 }
 
 rt::Tensor& LLMEngineRunner::getRopeCosSinCacheTensor() noexcept
@@ -1079,6 +1174,10 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     // Bind the KVCache IO to the engine
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
+    // Bind Mamba state for Mamba layers
+    setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindSSMStateToEngine(activeBatchSize);
+
     if (!setEngineIOStatus)
     {
         LOG_ERROR("executePrefill(): Failed to bind engine input and output tensors.");
@@ -1202,6 +1301,8 @@ bool LLMEngineRunner::vanillaDecodingStepBindTensors(
 
     // Update KV cache shapes to match activeBatchSize
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindSSMStateToEngine(activeBatchSize);
 
     // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding
     if (mConfig.numDeepstackFeatures > 0)
@@ -1424,6 +1525,8 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepBindTensors(rt::Tensor const& bas
 
     // Update KV cache shapes to match activeBatchSize
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindSSMStateToEngine(activeBatchSize);
 
     // Bind packed attention mask for plugin-based attention
     setEngineIOStatus

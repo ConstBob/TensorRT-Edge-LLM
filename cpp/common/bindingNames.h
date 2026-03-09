@@ -147,6 +147,44 @@ inline constexpr char const* kPresentVCacheTemplate = "present_v_cache";
 
 /*! @} */
 
+/*! @name SSM (Mamba) State Bindings
+ * @{
+ */
+
+/*!
+ * @brief Past SSM state tensor template for Mamba layers
+ *
+ * Template: "ssm_state_{mamba_layer_idx}"
+ * Shape: [batch_size, mamba_num_heads, mamba_head_dim, ssm_state_size] (FLOAT16)
+ */
+inline constexpr char const* kSSMStateTemplate = "ssm_state";
+
+/*!
+ * @brief Present SSM state tensor template for Mamba layers
+ *
+ * Template: "present_ssm_state_{mamba_layer_idx}"
+ * Shape: [batch_size, mamba_num_heads, mamba_head_dim, ssm_state_size] (FLOAT16)
+ */
+inline constexpr char const* kPresentSSMStateTemplate = "present_ssm_state";
+
+/*!
+ * @brief Past conv state tensor template for Mamba layers
+ *
+ * Template: "conv_state_{mamba_layer_idx}"
+ * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
+ */
+inline constexpr char const* kConvStateTemplate = "conv_state";
+
+/*!
+ * @brief Present conv state tensor template for Mamba layers
+ *
+ * Template: "present_conv_state_{mamba_layer_idx}"
+ * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
+ */
+inline constexpr char const* kPresentConvStateTemplate = "present_conv_state";
+
+/*! @} */
+
 /*! @name Eagle Speculative Decoding Bindings
  * @{
  */
@@ -399,6 +437,54 @@ inline std::string formatKCacheName(int32_t layerIdx, bool isPast = true)
 inline std::string formatVCacheName(int32_t layerIdx, bool isPast = true)
 {
     return std::string(isPast ? kVCacheTemplate : kPresentVCacheTemplate) + "_" + std::to_string(layerIdx);
+}
+
+/*!
+ * @brief Format SSM state binding name for a specific Mamba layer
+ *
+ * @param mambaLayerIdx The Mamba layer index (0-based, only counting Mamba layers)
+ * @param isPast Whether this is past (true) or present (false) SSM state
+ * @return Formatted binding name like "ssm_state_0" or "present_ssm_state_0"
+ */
+inline std::string formatSSMStateName(int32_t mambaLayerIdx, bool isPast = true)
+{
+    return std::string(isPast ? kSSMStateTemplate : kPresentSSMStateTemplate) + "_" + std::to_string(mambaLayerIdx);
+}
+
+/*!
+ * @brief Check if a binding name is an SSM state tensor
+ *
+ * @param bindingName The tensor binding name to check
+ * @return True if the binding is an SSM state tensor
+ */
+inline bool isSSMStateBinding(std::string const& bindingName)
+{
+    return bindingName.find(kSSMStateTemplate) != std::string::npos
+        || bindingName.find(kPresentSSMStateTemplate) != std::string::npos;
+}
+
+/*!
+ * @brief Format conv state binding name for a specific Mamba layer
+ *
+ * @param mambaLayerIdx The Mamba layer index (0-based, only counting Mamba layers)
+ * @param isPast Whether this is past (true) or present (false) conv state
+ * @return Formatted binding name like "conv_state_0" or "present_conv_state_0"
+ */
+inline std::string formatConvStateName(int32_t mambaLayerIdx, bool isPast = true)
+{
+    return std::string(isPast ? kConvStateTemplate : kPresentConvStateTemplate) + "_" + std::to_string(mambaLayerIdx);
+}
+
+/*!
+ * @brief Check if a binding name is a conv state tensor
+ *
+ * @param bindingName The tensor binding name to check
+ * @return True if the binding is a conv state tensor
+ */
+inline bool isConvStateBinding(std::string const& bindingName)
+{
+    return bindingName.find(kConvStateTemplate) != std::string::npos
+        || bindingName.find(kPresentConvStateTemplate) != std::string::npos;
 }
 
 /*!

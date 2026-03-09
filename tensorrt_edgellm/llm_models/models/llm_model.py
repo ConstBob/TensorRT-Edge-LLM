@@ -24,14 +24,14 @@ The module contains:
 - EdgeLLMModelForCausalLM: Wrapper for causal language modeling tasks
 """
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 from .. import model_utils
 from ..layers.gather_nd import custom_gather_nd
-from ..layers.layers import EdgeLLMDecoderLayer
+from ..layers.layers import EdgeLLMDecoderLayer, EdgeLLMHybridBlock
 from ..layers.reduced_lm_head import reduce_lm_head
 
 
@@ -168,6 +168,186 @@ class EdgeLLMModel(nn.Module):
             all_hidden_states += (hidden_states, )
 
         return hidden_states, present_key_values, all_hidden_states
+
+
+class EdgeLLMHybridModel(nn.Module):
+    """EdgeLLM model for hybrid architectures like Nemotron-Nano (Mamba+Attention+MLP).
+
+    Unlike :class:`EdgeLLMModel` which assumes uniform attention+MLP layers,
+    this class reads ``config.layers_block_type`` to wrap each block
+    appropriately and routes state (KV cache for attention, SSM state for
+    Mamba) through the correct blocks.
+    """
+
+    def __init__(self, hf_model: nn.Module) -> None:
+        super().__init__()
+
+        self.config = hf_model.config
+        self.vocab_size = self.config.vocab_size
+        self.torch_dtype = hf_model.dtype
+        norm_layer = getattr(hf_model, 'norm', None) or hf_model.norm_f
+        self.norm = norm_layer.to(self.torch_dtype)
+
+        self.block_types: List[str] = list(self.config.layers_block_type)
+
+        self.layers = nn.ModuleList([
+            EdgeLLMHybridBlock(hf_layer, self.torch_dtype)
+            for hf_layer in hf_model.layers
+        ])
+
+        # Set max_position_embeddings on attention mixers
+        for layer in self.layers:
+            if layer.block_type == "attention":
+                layer.mixer.max_position_embeddings = (
+                    self.config.max_position_embeddings)
+
+        # Pre-compute index maps for attention / mamba layers
+        self.attn_layer_indices: List[int] = [
+            i for i, bt in enumerate(self.block_types) if bt == "attention"
+        ]
+        self.mamba_layer_indices: List[int] = [
+            i for i, bt in enumerate(self.block_types) if bt == "mamba"
+        ]
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def num_attention_layers(self) -> int:
+        return len(self.attn_layer_indices)
+
+    @property
+    def num_mamba_layers(self) -> int:
+        return len(self.mamba_layer_indices)
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        conv_states: Tuple[torch.Tensor, ...],
+        ssm_states: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[
+            torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
+        """
+        Returns:
+            (hidden_states, present_key_values, present_conv_states, present_ssm_states)
+        """
+        hidden_states = inputs_embeds
+        present_key_values: Tuple[torch.Tensor, ...] = ()
+        present_conv_states: Tuple[torch.Tensor, ...] = ()
+        present_ssm_states: Tuple[torch.Tensor, ...] = ()
+
+        attn_idx = 0
+        mamba_idx = 0
+
+        for idx, layer in enumerate(self.layers):
+            bt = self.block_types[idx]
+
+            if bt == "mamba":
+                hidden_states, conv_state_out, ssm_state_out = layer.forward_mamba(
+                    hidden_states, conv_states[mamba_idx],
+                    ssm_states[mamba_idx])
+                present_conv_states += (conv_state_out, )
+                present_ssm_states += (ssm_state_out, )
+                mamba_idx += 1
+
+            elif bt == "attention":
+                hidden_states, present_kv = layer.forward_attention(
+                    hidden_states,
+                    past_key_values[attn_idx],
+                    rope_rotary_cos_sin,
+                    context_lengths,
+                    kvcache_start_index,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
+                present_key_values += (present_kv, )
+                attn_idx += 1
+
+            elif bt == "mlp":
+                hidden_states = layer.forward_mlp(hidden_states)
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, present_key_values, present_conv_states, present_ssm_states
+
+
+class EdgeLLMHybridModelForCausalLM(nn.Module):
+    """Causal LM wrapper for hybrid Mamba+Attention architectures."""
+
+    def __init__(
+        self,
+        hf_model: nn.Module,
+        reduced_vocab_size: Optional[int] = None,
+        vocab_map: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+
+        language_model, config = model_utils.prepare_language_model_and_config(
+            hf_model)
+        self.torch_dtype = hf_model.dtype
+        self.config = config
+        embed_layer = getattr(language_model, 'embed_tokens',
+                              None) or language_model.embeddings
+        self.embed_tokens = embed_layer.to(self.torch_dtype)
+
+        self.model = EdgeLLMHybridModel(language_model)
+
+        if reduced_vocab_size is not None and vocab_map is not None:
+            print(
+                f"Reducing vocabulary size from {hf_model.lm_head.out_features}"
+                f" to {reduced_vocab_size}")
+            self.lm_head = reduce_lm_head(hf_model.lm_head, reduced_vocab_size,
+                                          vocab_map)
+        else:
+            self.lm_head = hf_model.lm_head
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        conv_states: Tuple[torch.Tensor, ...],
+        ssm_states: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        last_token_ids: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[
+            torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
+        """
+        Returns:
+            (logits, present_key_values, present_conv_states, present_ssm_states)
+        """
+        hidden_states, present_key_values, present_conv_states, present_ssm_states = self.model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            rope_rotary_cos_sin=rope_rotary_cos_sin,
+            context_lengths=context_lengths,
+            kvcache_start_index=kvcache_start_index,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        )
+
+        last_hidden_state_gathered = custom_gather_nd(hidden_states,
+                                                      last_token_ids, 1)
+        logits = self.lm_head(last_hidden_state_gathered)
+        logits = logits.to(torch.float32)
+
+        return logits, tuple(present_key_values), tuple(
+            present_conv_states), tuple(present_ssm_states)
 
 
 class EdgeLLMModelForCausalLM(nn.Module):

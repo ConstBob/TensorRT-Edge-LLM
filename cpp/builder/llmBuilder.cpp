@@ -82,12 +82,16 @@ bool LLMBuilder::build()
     // Print network information
     LOG_DEBUG("%s", printNetworkInfo(network.get(), "LLM").c_str());
 
+    LOG_DEBUG("ONNX parsing complete. mNbKVCacheInputs=%d, mNumMambaLayers=%d", mNbKVCacheInputs, mNumMambaLayers);
+
     // Create builder config
     auto config = createBuilderConfig(builder.get());
     if (!config)
     {
         return false;
     }
+
+    LOG_DEBUG("Builder config created. Setting up optimization profiles...");
 
     // Setup optimization profiles
     if (!setupLLMOptimizationProfiles(*builder.get(), *config.get(), *network.get()))
@@ -207,7 +211,22 @@ bool LLMBuilder::parseConfig()
         mRotaryDim = mHeadSize;
     }
 
-    mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
+    mNumMambaLayers = mModelConfig.value("num_mamba_layers", 0);
+    mMambaNumHeads = mModelConfig.value("mamba_num_heads", 0);
+    mMambaHeadDim = mModelConfig.value("mamba_head_dim", 0);
+    mSSMStateSize = mModelConfig.value("ssm_state_size", 0);
+    mConvDim = mModelConfig.value("conv_dim", 0);
+    mConvKernel = mModelConfig.value("conv_kernel", 0);
+
+    // For hybrid models, only attention layers have KV caches
+    if (mNumMambaLayers > 0)
+    {
+        mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
+    }
+    else
+    {
+        mNbKVCacheInputs = mModelConfig["num_hidden_layers"].get<int32_t>();
+    }
 
     // Read trt_native_ops flag from config if present
     if (mModelConfig.contains("trt_native_ops"))
@@ -291,7 +310,17 @@ bool LLMBuilder::setupCommonProfiles(
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
     // KV cache profiles
+    LOG_DEBUG("Setting up KV cache profiles for %d layers...", mNbKVCacheInputs);
     result &= setupKVCacheProfiles(contextProfile, generationProfile);
+    LOG_DEBUG("KV cache profiles done. Setting up SSM state profiles for %d Mamba layers...", mNumMambaLayers);
+
+    // SSM state profiles for Mamba layers
+    result &= setupSSMStateProfiles(&contextProfile, &generationProfile);
+
+    LOG_DEBUG("SSM state profiles done. Setting up Conv state profiles...");
+    // Conv state profiles for Mamba causal conv1d layers
+    result &= setupConvStateProfiles(&contextProfile, &generationProfile);
+    LOG_DEBUG("Conv state profiles done.");
 
     return result;
 }
@@ -570,6 +599,63 @@ bool LLMBuilder::setupKVCacheProfiles(
         }
     }
 
+    return result;
+}
+
+bool LLMBuilder::setupSSMStateProfiles(
+    nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
+{
+    if (mNumMambaLayers == 0)
+    {
+        return true;
+    }
+
+    bool result = true;
+
+    // SSM state shape: [batch, mamba_num_heads, mamba_head_dim, ssm_state_size]
+    nvinfer1::Dims minSSMShape = createDims({1, mMambaNumHeads, mMambaHeadDim, mSSMStateSize});
+    nvinfer1::Dims optSSMShape
+        = createDims({mBuilderConfig.maxBatchSize, mMambaNumHeads, mMambaHeadDim, mSSMStateSize});
+    nvinfer1::Dims maxSSMShape
+        = createDims({mBuilderConfig.maxBatchSize, mMambaNumHeads, mMambaHeadDim, mSSMStateSize});
+
+    for (int32_t i = 0; i < mNumMambaLayers; ++i)
+    {
+        std::string const ssmStateName = binding_names::formatSSMStateName(i, /*isPast=*/true);
+        result &= setOptimizationProfile(contextProfile, ssmStateName.c_str(), minSSMShape, optSSMShape, maxSSMShape);
+        result
+            &= setOptimizationProfile(generationProfile, ssmStateName.c_str(), minSSMShape, optSSMShape, maxSSMShape);
+    }
+
+    LOG_DEBUG("Set up SSM state optimization profiles for %d Mamba layers", mNumMambaLayers);
+    return result;
+}
+
+bool LLMBuilder::setupConvStateProfiles(
+    nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
+{
+    if (mNumMambaLayers == 0 || mConvDim == 0 || mConvKernel == 0)
+    {
+        return true;
+    }
+
+    bool result = true;
+
+    // Conv state shape: [batch, conv_dim, conv_kernel]
+    nvinfer1::Dims minConvShape = createDims({1, mConvDim, mConvKernel});
+    nvinfer1::Dims optConvShape = createDims({mBuilderConfig.maxBatchSize, mConvDim, mConvKernel});
+    nvinfer1::Dims maxConvShape = createDims({mBuilderConfig.maxBatchSize, mConvDim, mConvKernel});
+
+    for (int32_t i = 0; i < mNumMambaLayers; ++i)
+    {
+        std::string const convStateName = binding_names::formatConvStateName(i, /*isPast=*/true);
+        result
+            &= setOptimizationProfile(contextProfile, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
+        result &= setOptimizationProfile(
+            generationProfile, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
+    }
+
+    LOG_DEBUG("Set up conv state optimization profiles for %d Mamba layers", mNumMambaLayers);
     return result;
 }
 

@@ -54,6 +54,7 @@ enable_huggingface_checkpointing_patch()
 
 from ..chat_templates import (get_template_path, process_chat_template,
                               validate_chat_template)
+from ..common import ONNX_OPSET_VERSION
 from ..llm_models.layers.attention_plugin import \
     register_attention_plugin_onnx_symbolic_functions
 from ..llm_models.layers.attention_trt import \
@@ -66,10 +67,13 @@ from ..llm_models.layers.int4_gemm_plugin import (
 from ..llm_models.layers.int4_moe_plugin import (
     is_moe_model, register_int4_moe_plugin_onnx_symbolic_functions,
     replace_moe_blocks_with_plugin)
+from ..llm_models.layers.mamba_plugin import \
+    register_mamba_plugin_onnx_symbolic_functions
 from ..llm_models.model_utils import (is_gptq_model,
                                       is_incompatible_chat_template_model,
                                       load_eagle3_draft_model, load_llm_model,
                                       load_reduced_vocab_map)
+from ..llm_models.models.llm_model import EdgeLLMHybridModelForCausalLM
 from ..llm_models.models.llm_model_trtnative import (Eagle3DraftModelTRTNative,
                                                      EdgeLLMModelTRTNative)
 from ..llm_models.models.qwen3_omni_talker import (
@@ -427,6 +431,204 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
     return model
 
 
+def create_hybrid_dummy_inputs(
+        model: EdgeLLMHybridModelForCausalLM) -> Dict[str, Any]:
+    """Create dummy inputs for hybrid Mamba+Attention ONNX export."""
+    batch_size = 1
+    seq_len = 2
+    past_len = 2
+
+    config = model.config
+    hidden_size = config.hidden_size
+    num_kv_heads = config.num_key_value_heads
+    num_attn_heads = config.num_attention_heads
+
+    if hasattr(config, 'head_dim'):
+        head_dim = config.head_dim
+    else:
+        head_dim = hidden_size // num_attn_heads
+
+    partial_rotary_factor = getattr(config, 'partial_rotary_factor', 1.0)
+    rotary_dim = int(head_dim * float(partial_rotary_factor))
+    if rotary_dim <= 0 or rotary_dim > head_dim:
+        rotary_dim = head_dim
+    max_position_embeddings = config.max_position_embeddings
+
+    device = next(model.parameters()).device
+
+    num_attn_layers = model.model.num_attention_layers
+    num_mamba_layers = model.model.num_mamba_layers
+
+    mamba_num_heads = config.mamba_num_heads
+    mamba_head_dim = config.mamba_head_dim
+    ssm_state_size = config.ssm_state_size
+
+    past_key_values = []
+    for _ in range(num_attn_layers):
+        past_key_values.append(
+            torch.randn(batch_size,
+                        2,
+                        num_kv_heads,
+                        seq_len,
+                        head_dim,
+                        dtype=torch.float16,
+                        device=device))
+
+    # Conv states (only for mamba layers)
+    conv_dim = config.mamba_num_heads * config.mamba_head_dim + 2 * config.n_groups * ssm_state_size
+    conv_kernel = config.conv_kernel
+    conv_states = []
+    for _ in range(num_mamba_layers):
+        conv_states.append(
+            torch.zeros(batch_size,
+                        conv_dim,
+                        conv_kernel,
+                        dtype=torch.float16,
+                        device=device))
+
+    # SSM states (only for mamba layers)
+    ssm_states = []
+    for _ in range(num_mamba_layers):
+        ssm_states.append(
+            torch.zeros(batch_size,
+                        mamba_num_heads,
+                        mamba_head_dim,
+                        ssm_state_size,
+                        dtype=torch.float16,
+                        device=device))
+
+    inputs_embeds = torch.randn(batch_size,
+                                seq_len,
+                                hidden_size,
+                                dtype=torch.float16,
+                                device=device)
+
+    return {
+        'inputs_embeds':
+        inputs_embeds,
+        'past_key_values':
+        tuple(past_key_values),
+        'conv_states':
+        tuple(conv_states),
+        'ssm_states':
+        tuple(ssm_states),
+        'rope_rotary_cos_sin':
+        torch.randn(batch_size,
+                    max_position_embeddings,
+                    rotary_dim,
+                    dtype=torch.float32,
+                    device=device),
+        'context_lengths':
+        torch.full([batch_size],
+                   past_len + seq_len,
+                   dtype=torch.int32,
+                   device=device),
+        'last_token_ids':
+        torch.full([batch_size, 1],
+                   seq_len - 1,
+                   dtype=torch.int64,
+                   device=device),
+        'kvcache_start_index':
+        torch.zeros(batch_size, dtype=torch.int32, device=device),
+    }
+
+
+def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
+                                output_dir: str) -> None:
+    """Export a hybrid Mamba+Attention model to ONNX."""
+    print(f"Exporting hybrid model to ONNX format: {output_dir}")
+
+    # Move to CPU before tracing to avoid float16 CUBLAS failures on some GPU/CUDA
+    # configurations (CUBLAS_STATUS_INVALID_VALUE). The ONNX graph is device-agnostic
+    # and all plugin stubs (mamba, attention, gather_nd) work correctly on CPU.
+    original_device = next(model.parameters()).device
+    if original_device.type != "cpu":
+        print(
+            f"Moving model to CPU for ONNX tracing (was on {original_device})")
+        model.cpu()
+
+    dummy_inputs = create_hybrid_dummy_inputs(model)
+    model.eval()
+
+    num_attn_layers = model.model.num_attention_layers
+    num_mamba_layers = model.model.num_mamba_layers
+
+    inputs = (
+        dummy_inputs['inputs_embeds'],
+        dummy_inputs['past_key_values'],
+        dummy_inputs['conv_states'],
+        dummy_inputs['ssm_states'],
+        dummy_inputs['rope_rotary_cos_sin'],
+        dummy_inputs['context_lengths'],
+        dummy_inputs['last_token_ids'],
+        dummy_inputs['kvcache_start_index'],
+        None,  # position_ids
+        None,  # attention_mask
+    )
+
+    input_names = (['inputs_embeds'] +
+                   [f'past_key_values_{i}' for i in range(num_attn_layers)] +
+                   [f'conv_state_{i}' for i in range(num_mamba_layers)] +
+                   [f'ssm_state_{i}' for i in range(num_mamba_layers)] + [
+                       'rope_rotary_cos_sin', 'context_lengths',
+                       'last_token_ids', 'kvcache_start_index'
+                   ])
+
+    output_names = (
+        ['logits'] +
+        [f'present_key_values_{i}' for i in range(num_attn_layers)] +
+        [f'present_conv_state_{i}' for i in range(num_mamba_layers)] +
+        [f'present_ssm_state_{i}' for i in range(num_mamba_layers)])
+
+    dynamic_axes = {
+        'inputs_embeds': {
+            0: 'batch_size',
+            1: 'seq_len'
+        },
+        'rope_rotary_cos_sin': {
+            0: 'rope_batch_size',
+            1: 'max_position_embeddings'
+        },
+        'context_lengths': {
+            0: 'batch_size'
+        },
+        'last_token_ids': {
+            0: 'batch_size'
+        },
+        'kvcache_start_index': {
+            0: 'kv_cache_start_batch_size'
+        },
+        'logits': {
+            0: 'batch_size',
+            1: 'num_tokens'
+        },
+    }
+    for i in range(num_attn_layers):
+        dynamic_axes[f'past_key_values_{i}'] = {0: 'batch_size', 3: 'past_len'}
+        dynamic_axes[f'present_key_values_{i}'] = {
+            0: 'batch_size',
+            3: 'present_kv_cache_len'
+        }
+    for i in range(num_mamba_layers):
+        dynamic_axes[f'conv_state_{i}'] = {0: 'batch_size'}
+        dynamic_axes[f'present_conv_state_{i}'] = {0: 'batch_size'}
+        dynamic_axes[f'ssm_state_{i}'] = {0: 'batch_size'}
+        dynamic_axes[f'present_ssm_state_{i}'] = {0: 'batch_size'}
+
+    register_attention_plugin_onnx_symbolic_functions()
+    register_mamba_plugin_onnx_symbolic_functions()
+    register_gather_nd_onnx_symbolic_functions()
+
+    custom_opsets = {"trt_edgellm": ONNX_OPSET_VERSION}
+    export_onnx(model,
+                inputs,
+                output_dir,
+                input_names,
+                output_names,
+                dynamic_axes,
+                custom_opsets=custom_opsets)
+
+
 def export_model_to_onnx_with_trt_native_ops(model, output_dir: str) -> None:
     """
     Export the model to ONNX format with TensorRT native operations.
@@ -748,6 +950,8 @@ def export_llm_model(model_dir: str,
         # Step 2: Export ONNX
         if trt_native_ops:
             export_model_to_onnx_with_trt_native_ops(model, model_output_dir)
+        elif isinstance(model, EdgeLLMHybridModelForCausalLM):
+            export_hybrid_model_to_onnx(model, model_output_dir)
         elif is_qwen3_omni_submodel(model_name):
             dummy_inputs = create_qwen3_omni_dummy_inputs(
                 model, model_name, fp8_kv_cache)
@@ -758,10 +962,14 @@ def export_llm_model(model_dir: str,
                                  fp8_kv_cache)
 
         # Step 3: Export config
-        config_hook = get_model_config_export_hook(model_name, model_dir,
-                                                   is_eagle_base,
-                                                   trt_native_ops)
-        model_config = config_hook(model.config)
+        if isinstance(model, EdgeLLMHybridModelForCausalLM):
+            model_config = export_llm_config(model.config, 'hybrid_mamba',
+                                             trt_native_ops)
+        else:
+            config_hook = get_model_config_export_hook(model_name, model_dir,
+                                                       is_eagle_base,
+                                                       trt_native_ops)
+            model_config = config_hook(model.config)
 
         if reduced_vocab_size is not None:
             model_config['reduced_vocab_size'] = reduced_vocab_size

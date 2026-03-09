@@ -208,6 +208,11 @@ def _is_phi4mm_model(dir_path: str) -> bool:
     return _check_model_type(dir_path, "phi4mm")
 
 
+def _is_nemotron_h_model(model_dir: str) -> bool:
+    """Check if the model is a NemotronH (hybrid Mamba+Attention) model."""
+    return _check_model_type(model_dir, "nemotron_h")
+
+
 def _is_qwen3_omni_model(model_dir: str) -> bool:
     """Check if the model is a Qwen3 Omni model by checking config.json for model_type."""
     cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -373,9 +378,18 @@ def load_hf_model(
     tokenizer = AutoTokenizer.from_pretrained(model_dir,
                                               trust_remote_code=True)
 
+    # NemotronH: apply mamba_ssm stub before import to avoid ABI-broken CUDA extension errors.
+    # The model runs on the pure-PyTorch slow path for ONNX export.
+    if _is_nemotron_h_model(model_dir):
+        from .models.nemotron_h_patch import apply as _apply_nemotron_h_patch
+        _apply_nemotron_h_patch()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, torch_dtype=torch_dtype,
+            trust_remote_code=True).to(device)
+
     # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
     # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
-    if _is_phi4mm_model(model_dir):
+    elif _is_phi4mm_model(model_dir):
         # Avoid converting the model into a PEFT-wrapped model, which ModelOpt and
         # Transformers cannot currently handle correctly. LoRA weights will instead
         # be merged directly into the base model.
@@ -423,7 +437,8 @@ def load_hf_model(
             model = AutoModelForCausalLM.from_pretrained(
                 model_dir, torch_dtype=torch_dtype,
                 trust_remote_code=True).to(device)
-        except Exception:
+        except Exception as e_causal:
+            print(f"AutoModelForCausalLM failed: {e_causal}")
             # If that fails, try AutoModelForImageTextToText
             try:
                 # TODO: Need a WAR to quantize only the language model.
@@ -486,7 +501,8 @@ def load_llm_model(
     Returns:
         tuple: (model, tokenizer, processor)
     """
-    from .models.llm_model import EdgeLLMModelForCausalLM
+    from .models.llm_model import (EdgeLLMHybridModelForCausalLM,
+                                   EdgeLLMModelForCausalLM)
     from .models.llm_model_trtnative import EdgeLLMModelTRTNative
 
     # Determine model type and print message
@@ -537,7 +553,14 @@ def load_llm_model(
         # Standard LLM / EAGLE
         hf_model = model
 
-        if not trt_native_ops:
+        is_hybrid = hasattr(hf_model.config, 'layers_block_type')
+
+        if is_hybrid and not trt_native_ops:
+            print("Detected hybrid (Mamba+Attention) architecture")
+            edge_model = EdgeLLMHybridModelForCausalLM(hf_model,
+                                                       reduced_vocab_size,
+                                                       vocab_map)
+        elif not trt_native_ops:
             edge_model = {}
             edge_model["model"] = EdgeLLMModelForCausalLM(
                 hf_model, is_eagle_base, reduced_vocab_size, vocab_map)
@@ -691,9 +714,11 @@ def prepare_language_model_and_config(hf_model: nn.Module):
         language_model = hf_model.language_model
         config = hf_model.config.text_config
     elif getattr(hf_model.config, 'model_type', '') == 'qwen3_omni_thinker':
-        # Qwen3-Omni Thinker: use text_config (same as Qwen3-VL)
         language_model = hf_model.model
         config = hf_model.config.text_config
+    elif hasattr(hf_model, 'backbone'):
+        language_model = hf_model.backbone
+        config = hf_model.config
     else:
         language_model = hf_model.model
         config = hf_model.config

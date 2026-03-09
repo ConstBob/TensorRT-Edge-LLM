@@ -40,6 +40,8 @@ struct SystemPromptKVCache
     std::string systemPrompt;                     //!< The system prompt text
     std::vector<tokenizer::Rank> tokenizedPrompt; //!< Tokenized version of the system prompt
     rt::Tensor kvCacheContent;                    //!< Cached KV cache content for the system prompt
+    std::vector<rt::Tensor> ssmStateContents;     //!< Cached SSM states for Mamba layers
+    std::vector<rt::Tensor> convStateContents;    //!< Cached conv states for Mamba layers
 };
 
 /*! \brief LLM Inference Runtime for handling generation requests

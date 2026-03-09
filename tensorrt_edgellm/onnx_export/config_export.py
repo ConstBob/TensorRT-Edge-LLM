@@ -74,6 +74,74 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     return llm_config
 
 
+def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Export hybrid Mamba model configuration with Mamba-specific fields."""
+    required_fields = [
+        "vocab_size",
+        "max_position_embeddings",
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+    ]
+    optional_fields_with_defaults = {
+        "rope_theta": 10000.0,
+        "rope_scaling": None,
+    }
+
+    llm_config = {}
+    for field in required_fields:
+        if field not in config_dict:
+            raise KeyError(f"Required field '{field}' not found in config")
+        llm_config[field] = config_dict[field]
+
+    for field, default in optional_fields_with_defaults.items():
+        llm_config[field] = config_dict.get(field, default)
+
+    if "head_dim" in config_dict:
+        llm_config["head_dim"] = config_dict["head_dim"]
+    else:
+        llm_config["head_dim"] = config_dict["hidden_size"] // config_dict[
+            "num_attention_heads"]
+
+    if "partial_rotary_factor" in config_dict:
+        llm_config["partial_rotary_factor"] = config_dict[
+            "partial_rotary_factor"]
+    else:
+        llm_config["partial_rotary_factor"] = 1.0
+
+    layers_block_type = config_dict.get("layers_block_type", [])
+    if not layers_block_type:
+        pattern = config_dict.get("hybrid_override_pattern", "")
+        num_mamba = pattern.count("M")
+        num_attention = pattern.count("*")
+    else:
+        num_mamba = sum(1 for t in layers_block_type if t == "mamba")
+        num_attention = sum(1 for t in layers_block_type if t == "attention")
+
+    llm_config["num_mamba_layers"] = num_mamba
+    llm_config["num_attention_layers"] = num_attention
+    llm_config["mamba_num_heads"] = config_dict.get("mamba_num_heads", 0)
+    llm_config["mamba_head_dim"] = config_dict.get("mamba_head_dim", 0)
+    llm_config["ssm_state_size"] = config_dict.get("ssm_state_size", 0)
+
+    mamba_num_heads = llm_config["mamba_num_heads"]
+    mamba_head_dim = llm_config["mamba_head_dim"]
+    ssm_state_size = llm_config["ssm_state_size"]
+    n_groups = config_dict.get("n_groups",
+                               config_dict.get("mamba_n_groups", 1))
+    llm_config[
+        "conv_dim"] = mamba_num_heads * mamba_head_dim + 2 * n_groups * ssm_state_size
+    llm_config["conv_kernel"] = config_dict.get(
+        "conv_kernel", config_dict.get("mamba_d_conv", 4))
+
+    llm_config["use_rope"] = "rope_theta" in config_dict
+
+    llm_config["model_type"] = "hybrid_mamba"
+    return llm_config
+
+
 def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Export EAGLE base configuration with required fields."""
     required_fields = [
@@ -204,6 +272,8 @@ def export_llm_config(config: Any,
 
     if model_type == 'llm':
         output_config = _export_native_llm_config(config_dict)
+    elif model_type == 'hybrid_mamba':
+        output_config = _export_hybrid_mamba_config(config_dict)
     elif model_type == 'eagle3_base':
         output_config = _export_eagle_base_config(config_dict)
     elif model_type == 'eagle_draft':
