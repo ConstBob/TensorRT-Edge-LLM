@@ -28,7 +28,7 @@ namespace rt
 //! Static Linear KVCache that holds the KVCache for all decoder layers up to maxSequenceLength.
 //! The KVCache implement the design of:
 //! 1. Allocates memory for max supported batch size.
-//! 2. Memory Layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+//! 2. Memory Layout: [numAttentionLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
 //! 3. Synchronous execution of batch requests, all the sequences in the batch will run prefill
 //!    or decode at the same time.
 class LinearKVCache
@@ -42,12 +42,22 @@ public:
      */
     struct CacheConfig
     {
-        int64_t numDecoderLayers{};          //!< Number of decoder layers
+        int64_t numAttentionLayers{};        //!< Number of attention layers needing KV cache
         int64_t maxBatchSize{};              //!< Maximum batch size
         int64_t maxSequenceLength{};         //!< Maximum sequence length
         int64_t numKVHeads{};                //!< Number of key-value heads
         int64_t headDim{};                   //!< Head dimension
         nvinfer1::DataType kvCacheTypeTRT{}; //!< Storage dtype for KV cache (kHALF or kFP8)
+
+        // Mamba SSM/conv state fields (all zero for pure-attention models; no memory is allocated)
+        int32_t numMambaLayers{0};                                   //!< Number of Mamba layers
+        int32_t mambaNumHeads{0};                                    //!< Number of Mamba heads
+        int32_t mambaHeadDim{0};                                     //!< Dimension of each Mamba head
+        int32_t ssmStateSize{0};                                     //!< SSM state dimension (dstate)
+        nvinfer1::DataType ssmStateType{nvinfer1::DataType::kHALF};  //!< SSM state dtype
+        int32_t convDim{0};                                          //!< Conv1d channel dimension
+        int32_t convKernel{0};                                       //!< Conv1d kernel width
+        nvinfer1::DataType convStateType{nvinfer1::DataType::kHALF}; //!< Conv state dtype
     };
     //! \endcond
 
@@ -98,6 +108,26 @@ public:
     //! Get the full KVCache buffer as a non-owned tensor.
     rt::Tensor getKVCacheBuffer() noexcept;
 
+    //! Get SSM state tensor for a Mamba layer (non-owned view).
+    //! Shape: [maxBatchSize, mambaNumHeads, mambaHeadDim, ssmStateSize]
+    rt::Tensor getSSMStateForLayer(int32_t mambaLayerIdx) noexcept;
+
+    //! Get conv state tensor for a Mamba layer (non-owned view).
+    //! Shape: [maxBatchSize, convDim, convKernel]
+    rt::Tensor getConvStateForLayer(int32_t mambaLayerIdx) noexcept;
+
+    //! Zero all SSM and conv state buffers (all layers, all batch slots).
+    //! Called after warmup inference and before CUDA graph capture to ensure a clean starting state.
+    void clearMambaStates(cudaStream_t stream);
+
+    //! Copy one batch slot's SSM states into freshly-allocated tensors (one per Mamba layer).
+    //! Used to snapshot states when saving a system prompt cache entry.
+    std::vector<rt::Tensor> captureSSMStates(int32_t batchIdx, cudaStream_t stream);
+
+    //! Copy one batch slot's conv states into freshly-allocated tensors (one per Mamba layer).
+    //! Used to snapshot states when saving a system prompt cache entry.
+    std::vector<rt::Tensor> captureConvStates(int32_t batchIdx, cudaStream_t stream);
+
     //! Asynchronously reset the KVCache buffer state for a new setup of input context.
     //! @param hostReuseKVCacheLengths The lengths of the KVCache to be reused from precomputed KVCache content.
     //! @param stream The stream is used to perform GPU memory operations.
@@ -143,6 +173,14 @@ private:
     bool mKVCacheAllEmpty{};            //!< Flag to indicate if KVCache for all sequences are empty.
     rt::Tensor mDeviceKVCacheLengths{}; //!< KV cache lengths on device
     rt::Tensor mDeviceKVCache{};        //!< KV cache memory buffer on device
+
+    //! SSM state buffer: [numMambaLayers, maxBatchSize, mambaNumHeads, mambaHeadDim, ssmStateSize]
+    //! Empty when numMambaLayers == 0.
+    rt::Tensor mDeviceSSMStates{};
+
+    //! Conv state buffer: [numMambaLayers, maxBatchSize, convDim, convKernel]
+    //! Empty when numMambaLayers == 0.
+    rt::Tensor mDeviceConvStates{};
 };
 
 } // namespace rt

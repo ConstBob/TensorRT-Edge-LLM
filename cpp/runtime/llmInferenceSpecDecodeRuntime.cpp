@@ -1597,9 +1597,9 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     auto kvCacheBufferBase = linearKVCacheBase.getKVCacheBuffer();
     auto kvCacheBufferDraft = linearKVCacheDraft.getKVCacheBuffer();
     rt::Coords savedKVCacheShapeBase{
-        cacheConfigBase.numDecoderLayers, 2, cacheConfigBase.numKVHeads, promptIdsLength, cacheConfigBase.headDim};
+        cacheConfigBase.numAttentionLayers, 2, cacheConfigBase.numKVHeads, promptIdsLength, cacheConfigBase.headDim};
     rt::Coords savedKVCacheShapeDraft{
-        cacheConfigDraft.numDecoderLayers, 2, cacheConfigDraft.numKVHeads, promptIdsLength, cacheConfigDraft.headDim};
+        cacheConfigDraft.numAttentionLayers, 2, cacheConfigDraft.numKVHeads, promptIdsLength, cacheConfigDraft.headDim};
 
     SystemPromptKVCache savedKVCacheBase;
     SystemPromptKVCache savedKVCacheDraft;

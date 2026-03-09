@@ -28,6 +28,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import \
 from .attention_plugin import attention_plugin
 from .attention_trt import EdgeLLMAttentionTRTNative
 from .layer_utils import EdgeLLMQKNorm, EdgeLLMQKVProj
+from .mamba_plugin import causal_conv1d_plugin, update_ssm_state_plugin
 
 # FP8 (E4M3) quantization constants
 # Max finite value representable by NVIDIA FP8 E4M3 format; used to derive per-tensor KV cache scale.
@@ -779,3 +780,222 @@ class EdgeLLMDecoderLayerTRTNative(nn.Module):
             hidden_states = residual + hidden_states
 
         return hidden_states, present_k_cache, present_v_cache
+
+
+class EdgeLLMMambaLayer(nn.Module):
+    """Wraps a NemotronHMamba2Mixer for ONNX export using TensorRT Mamba plugins.
+
+    Extracts all weights from the original mixer and replaces the forward logic
+    with calls to ``causal_conv1d_plugin`` and ``update_ssm_state_plugin`` custom
+    ops so that ``torch.onnx.export`` traces them into the corresponding ONNX
+    custom ops consumed by the C++ TensorRT plugins.
+    """
+
+    def __init__(self, mixer: nn.Module) -> None:
+        super().__init__()
+
+        # Config extracted from the mixer
+        self.num_heads: int = mixer.num_heads
+        self.head_dim: int = mixer.head_dim
+        self.n_groups: int = mixer.n_groups
+        self.intermediate_size: int = mixer.intermediate_size
+        self.ssm_state_size: int = mixer.ssm_state_size
+        self.conv_dim: int = mixer.conv_dim
+        self.conv_kernel_size: int = mixer.conv_kernel_size
+
+        # Projections (keep the original nn.Linear modules)
+        self.in_proj = mixer.in_proj
+        self.out_proj = mixer.out_proj
+
+        # Conv1d weights: mixer.conv1d is nn.Conv1d with shape [conv_dim, 1, kernel]
+        self.register_buffer("conv1d_weight", mixer.conv1d.weight.data)
+        self.register_buffer(
+            "conv1d_bias",
+            mixer.conv1d.bias.data
+            if mixer.conv1d.bias is not None else torch.zeros(self.conv_dim),
+        )
+
+        # SSM parameters
+        self.A_log = mixer.A_log  # nn.Parameter [num_heads]
+        self.D = mixer.D  # nn.Parameter [num_heads]
+        self.dt_bias = mixer.dt_bias  # nn.Parameter [num_heads]
+
+        # Gated RMSNorm parameters
+        self.register_buffer("norm_weight", mixer.norm.weight.data)
+        self.norm_eps: float = mixer.norm.variance_epsilon
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states: [batch, seq_len, hidden_size]
+            conv_state: [batch, conv_dim, conv_kernel_size]
+            ssm_state: [batch, num_heads, head_dim, ssm_state_size]
+
+        Returns:
+            (output [batch, seq_len, hidden_size],
+             conv_state_out [batch, conv_dim, conv_kernel_size],
+             ssm_state_out [batch, num_heads, head_dim, ssm_state_size])
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # 1. Input projection
+        projected = self.in_proj(hidden_states)
+
+        groups_state_size = self.n_groups * self.ssm_state_size
+        d_mlp = (projected.shape[-1] - 2 * self.intermediate_size -
+                 2 * groups_state_size - self.num_heads) // 2
+        _, _, gate, hidden_states_B_C, dt = projected.split(
+            [
+                d_mlp, d_mlp, self.intermediate_size, self.conv_dim,
+                self.num_heads
+            ],
+            dim=-1,
+        )
+
+        # 2. Causal conv1d via plugin (no activation baked in)
+        hidden_states_B_C, conv_state_out = causal_conv1d_plugin(
+            hidden_states_B_C,
+            self.conv1d_weight,
+            self.conv1d_bias,
+            conv_state,
+            stride=1,
+            padding=self.conv_kernel_size - 1,
+            dilation=1,
+            groups=self.conv_dim,
+        )
+        hidden_states_B_C = torch.nn.functional.silu(hidden_states_B_C)
+
+        x, B_val, C_val = hidden_states_B_C.split(
+            [self.intermediate_size, groups_state_size, groups_state_size],
+            dim=-1,
+        )
+
+        # 3. Reshape for SSM plugin  [batch, seq, ...] → [batch, seq, heads/groups, dim/dstate]
+        x_ssm = x.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        B_ssm = B_val.view(batch_size, seq_len, self.n_groups,
+                           self.ssm_state_size)
+        C_ssm = C_val.view(batch_size, seq_len, self.n_groups,
+                           self.ssm_state_size)
+
+        A = -torch.exp(self.A_log.float())
+
+        ssm_output, ssm_state_out = update_ssm_state_plugin(
+            x_ssm,
+            A,
+            B_ssm,
+            C_ssm,
+            self.D,
+            dt,
+            self.dt_bias,
+            ssm_state,
+            dt_softplus=1,
+            ngroups=self.n_groups,
+        )
+
+        # ssm_output: [batch, seq, num_heads, head_dim] → [batch, seq, intermediate_size]
+        ssm_output = ssm_output.view(batch_size, seq_len,
+                                     self.intermediate_size)
+
+        # 4. Gated RMSNorm (norm_before_gate=False): GroupRMSNorm(x * SiLU(gate)) * weight
+        ssm_output = self._gated_rmsnorm(ssm_output, gate)
+
+        # 5. Output projection
+        output = self.out_proj(ssm_output)
+
+        return output, conv_state_out, ssm_state_out
+
+    def _gated_rmsnorm(self, x: torch.Tensor,
+                       gate: torch.Tensor) -> torch.Tensor:
+        """Gated RMSNorm with ``norm_before_gate=False`` and group-wise variance."""
+        group_size = self.intermediate_size // self.n_groups
+        # norm_before_gate=False: gate first, then normalize
+        gated = (x * torch.nn.functional.silu(gate)).float()
+        gated_grouped = gated.view(*gated.shape[:-1], -1, group_size)
+        variance = gated_grouped.pow(2).mean(-1, keepdim=True)
+        normed = gated_grouped * torch.rsqrt(variance + self.norm_eps)
+        normed = normed.view(*x.shape)
+        return (normed * self.norm_weight).to(x.dtype)
+
+
+class EdgeLLMHybridBlock(nn.Module):
+    """Wraps a single NemotronHBlock for ONNX export.
+
+    Supports three block types:
+      - ``"mamba"``: pre-norm → :class:`EdgeLLMMambaLayer` → residual
+      - ``"attention"``: pre-norm → :class:`EdgeLLMAttention` → residual
+      - ``"mlp"``: pre-norm → MLP → residual
+    """
+
+    def __init__(self,
+                 hf_block: nn.Module,
+                 torch_dtype: torch.dtype = torch.float16) -> None:
+        super().__init__()
+        self.block_type: str = hf_block.block_type
+        self.norm = hf_block.norm.to(torch_dtype)
+
+        if self.block_type == "mamba":
+            self.mixer = EdgeLLMMambaLayer(hf_block.mixer)
+        elif self.block_type == "attention":
+            self.mixer = EdgeLLMAttention(hf_block.mixer)
+        elif self.block_type == "mlp":
+            self.mixer = hf_block.mixer
+        else:
+            raise ValueError(f"Unknown block_type: {self.block_type}")
+
+    # ------------------------------------------------------------------
+    # Mamba forward
+    # ------------------------------------------------------------------
+    def forward_mamba(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states, conv_state_out, ssm_state_out = self.mixer(
+            hidden_states, conv_state, ssm_state)
+        hidden_states = residual + hidden_states
+        return hidden_states, conv_state_out, ssm_state_out
+
+    # ------------------------------------------------------------------
+    # Attention forward
+    # ------------------------------------------------------------------
+    def forward_attention(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states, present_key_value = self.mixer(
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            rope_rotary_cos_sin=rope_rotary_cos_sin,
+            context_lengths=context_lengths,
+            kvcache_start_index=kvcache_start_index,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        hidden_states = residual + hidden_states
+        return hidden_states, present_key_value
+
+    # ------------------------------------------------------------------
+    # MLP forward
+    # ------------------------------------------------------------------
+    def forward_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.mixer(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states

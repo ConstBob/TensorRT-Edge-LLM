@@ -46,6 +46,14 @@
 | [DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) | 1.5B | ✅ | ✅ | ✅ | ✅ |
 | [DeepSeek-R1-Distill-Qwen-7B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) | 7B | ✅ | ✅ | ✅ | ✅ |
 
+### NVIDIA Nemotron Family
+
+| Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
+|-------|-----------|------|-----|------|-------|
+| [NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2) | 9B | ✅ | — | — | — |
+
+> **Note:** NVIDIA-Nemotron-Nano-9B-v2 is verified with FP16 only.
+
 ---
 
 ## Vision-Language Models (VLMs)

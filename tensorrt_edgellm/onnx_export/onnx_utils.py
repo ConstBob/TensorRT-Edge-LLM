@@ -209,8 +209,13 @@ def fix_model_int4_output_dtypes(
     return onnx_model
 
 
-def export_onnx(model, inputs, output_dir, input_names, output_names,
-                dynamic_axes):
+def export_onnx(model,
+                inputs,
+                output_dir,
+                input_names,
+                output_names,
+                dynamic_axes,
+                custom_opsets=None):
     '''
     Export the model to ONNX format.
     Args:
@@ -220,6 +225,7 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
         input_names: The names of the input tensors
         output_names: The names of the output tensors
         dynamic_axes: The dynamic axes of the model
+        custom_opsets: Optional dict mapping custom domain names to opset versions
     '''
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
@@ -234,6 +240,7 @@ def export_onnx(model, inputs, output_dir, input_names, output_names,
                           output_names=output_names,
                           opset_version=ONNX_OPSET_VERSION,
                           do_constant_folding=True,
+                          custom_opsets=custom_opsets,
                           dynamo=False)
     t1 = time.time()
     print(f"ONNX export completed in {t1 - t0}s. Apply post-processing...")
