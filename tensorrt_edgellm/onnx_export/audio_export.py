@@ -54,6 +54,9 @@ def audio_export(model_dir: str,
     """
     # Validate input parameters
     assert dtype == "fp16", f"Only fp16 is supported for dtype. You passed: {dtype}"
+    if not os.path.isdir(model_dir):
+        raise ValueError(
+            f"model_dir must be a local directory. You passed: {model_dir}")
 
     # Load the model and processor
     try:
@@ -155,10 +158,11 @@ def audio_export(model_dir: str,
                                 Qwen3TTSTokenizerV2Config)
             AutoModel.register(Qwen3TTSTokenizerV2Config,
                                Qwen3TTSTokenizerV2Model)
-            from huggingface_hub import snapshot_download
-            tokenizer_dir = snapshot_download(
-                model_dir, allow_patterns=["speech_tokenizer/*"])
-            tokenizer_subdir = os.path.join(tokenizer_dir, "speech_tokenizer")
+            tokenizer_subdir = os.path.join(model_dir, "speech_tokenizer")
+            if not os.path.isdir(tokenizer_subdir):
+                raise ValueError(
+                    "Qwen3-TTS export requires a local speech_tokenizer directory at "
+                    f"{tokenizer_subdir}")
             tokenizer_model = Qwen3TTSTokenizerV2Model.from_pretrained(
                 tokenizer_subdir, torch_dtype=torch_dtype).to(device)
             decoder = tokenizer_model.decoder
