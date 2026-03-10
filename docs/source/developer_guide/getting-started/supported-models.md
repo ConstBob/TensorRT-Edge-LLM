@@ -73,6 +73,15 @@
 
 ---
 
+## Audio Multimodal Models
+
+| Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
+|-------|-----------|------|-----|------|-------|
+| [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | 0.6B | ✅ | — | — | — |
+| [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | 1.7B | ✅ | — | — | — |
+
+---
+
 ## Precision Support
 
 | Precision | Memory | Compute | Platform Requirements | Best For |
