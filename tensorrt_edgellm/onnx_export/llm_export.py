@@ -987,9 +987,10 @@ def export_llm_model(model_dir: str,
     # Determine tokenizer save location
     # Omni (has thinker): save to thinker subdirectory (where llm_build looks)
     # TTS / single model: save to top-level
-    has_thinker = "thinker" in models_dict
-    tokenizer_save_dir = os.path.join(output_dir,
-                                      "thinker") if has_thinker else output_dir
+    if "thinker" in models_dict and is_multi_model:
+        tokenizer_save_dir = os.path.join(output_dir, "thinker")
+    else:
+        tokenizer_save_dir = output_dir
 
     # Save tokenizer files
     tokenizer.save_pretrained(tokenizer_save_dir)
