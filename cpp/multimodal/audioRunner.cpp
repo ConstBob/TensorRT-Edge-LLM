@@ -48,7 +48,7 @@ Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStr
 
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
-    // Initialize audio encoder
+    // Initialize audio encoder (engineDir is already the audio subdirectory)
     std::string audioEnginePath = engineDir + "/audio_encoder.engine";
     if (std::filesystem::exists(audioEnginePath))
     {
@@ -122,7 +122,6 @@ bool Qwen3OmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
         auto audioConfig = jsonConfig["audio_config"];
         mConfig.melBins = audioConfig.value("num_mel_bins", 128);
         mConfig.audioFeatureDim = audioConfig.value("output_dim", 2560);
-        mConfig.subsampleFactor = audioConfig.value("subsample_factor", 2);
         mConfig.nWindow = audioConfig.value("n_window", 50);
         mConfig.nWindowInfer = audioConfig.value("n_window_infer", 200);
     }
@@ -275,19 +274,17 @@ void Qwen3OmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& reques
             {
                 if (ids[j] == mConfig.audioTokenId)
                 {
-                    // Replace <audio> placeholder with: <|audio_start|> + N×<|audio_pad|> + <|audio_end|>
+                    // Replace <|audio_pad|> placeholder with: <|audio_start|> + N×<|audio_pad|> + <|audio_end|>
+                    // TRT chat template only has <|audio_pad|> without start/end markers
                     int64_t numAudioTokens = audioTokenLengths[i];
 
-                    // Insert <|audio_start|>
                     newIds.push_back(mConfig.audioBosTokenId);
 
-                    // Insert N×<|audio_pad|>
                     for (int64_t k = 0; k < numAudioTokens; ++k)
                     {
                         newIds.push_back(mConfig.audioTokenId);
                     }
 
-                    // Insert <|audio_end|>
                     newIds.push_back(mConfig.audioEosTokenId);
                 }
                 else
@@ -405,8 +402,9 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
         LOG_DEBUG("Mask shape: [%ld, %ld], Indices shape: [%ld, %ld]", mPaddedMaskAfterCNN.getShape()[0],
             mPaddedMaskAfterCNN.getShape()[1], mPaddedMaskIndices.getShape()[0], mPaddedMaskIndices.getShape()[1]);
 
-        // Create attention mask
-        if (!audioUtils::createChunkwiseAttentionMask(afterCNNLens, mAudioAttentionMask, stream))
+        // Create attention mask with merged windows (matching PyTorch cu_seqlens logic)
+        if (!audioUtils::createChunkwiseAttentionMask(
+                afterCNNLens, mConfig.nWindow, mConfig.nWindowInfer, mAudioAttentionMask, stream))
         {
             LOG_ERROR("Failed to create attention mask");
             return false;

@@ -366,6 +366,42 @@ inline constexpr char const* kAudioOutput = "last_hidden_state";
 
 /*! @} */
 
+/*! @name CodePredictor Bindings (Qwen3-Omni)
+ * @{
+ */
+
+/*!
+ * @brief LM head weight tensor - dynamically bound weight for CodePredictor
+ *
+ * Shape: [vocab_size, hidden_size] (FLOAT16)
+ * This is used for dynamic lm_head selection in CodePredictor (15 different heads for RVQ layers)
+ */
+inline constexpr char const* kLmHeadWeight = "lm_head_weight";
+
+/*! @} */
+
+/*! @name Code2Wav Vocoder Bindings (Qwen3-Omni)
+ * @{
+ */
+
+/*!
+ * @brief Code2Wav input codes tensor - RVQ codec codes for vocoder
+ *
+ * Shape: [batch_size, num_quantizers, sequence_length] (INT32)
+ * num_quantizers: 15 for Qwen3-Omni
+ */
+inline constexpr char const* kCode2WavCodes = "codes";
+
+/*!
+ * @brief Code2Wav output waveform tensor - generated audio waveform
+ *
+ * Shape: [batch_size, 1, waveform_length] (FLOAT32)
+ * Values in range [-1.0, 1.0]
+ */
+inline constexpr char const* kCode2WavWaveform = "waveform";
+
+/*! @} */
+
 /*! @name LoRA (Low-Rank Adaptation) Bindings
  * @{
  */

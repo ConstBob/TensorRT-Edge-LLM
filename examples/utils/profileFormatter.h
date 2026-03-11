@@ -52,6 +52,9 @@ void outputEagleGenerationProfile(
 //! Output multimodal processing summary to ostream
 void outputMultimodalProfile(std::ostream& output, trt_edgellm::metrics::MultimodalMetrics const& multimodalMetrics);
 
+//! Output Talker audio generation metrics summary to ostream
+void outputTalkerProfile(std::ostream& output, trt_edgellm::metrics::MultimodalMetrics const& talkerMetrics);
+
 //! Output memory usage summary to ostream
 void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor);
 
@@ -72,6 +75,9 @@ void addJsonEagleGenerationSummary(
 //! Add JSON for multimodal processing to existing json object
 void addJsonMultimodalSummary(
     nlohmann::json& summary, trt_edgellm::metrics::MultimodalMetrics const& multimodalMetrics);
+
+//! Add JSON for Talker audio generation to existing json object
+void addJsonTalkerSummary(nlohmann::json& summary, trt_edgellm::metrics::MultimodalMetrics const& talkerMetrics);
 
 //! Add JSON for all timing stages to existing json object
 void addJsonTimingStages(nlohmann::json& summary);

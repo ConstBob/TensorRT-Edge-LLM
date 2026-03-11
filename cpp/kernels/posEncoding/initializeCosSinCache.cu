@@ -333,5 +333,15 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
 }
 
+void initializeTextOnlyMRopeCosSin(
+    float* cosSinCache, float rotaryBaseFrequency, int64_t rotaryDim, int64_t maxPositions, cudaStream_t stream)
+{
+    // When all 3 MRoPE sections (T, H, W) use sequential positions pos[i] = i, the MRoPE
+    // formula reduces to standard RoPE with rotaryScale=1. Reuse initializeNormalRopeCosSin
+    // to avoid constructing temporary position ID buffers.
+    initializeNormalRopeCosSin(cosSinCache, rotaryBaseFrequency, 1.0f, static_cast<int32_t>(rotaryDim),
+        static_cast<int32_t>(maxPositions), stream);
+}
+
 } // namespace kernel
 } // namespace trt_edgellm

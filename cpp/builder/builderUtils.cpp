@@ -324,7 +324,7 @@ bool loadJsonConfig(std::string const& configPath, nlohmann::json& outConfig)
 bool saveConfigWithBuilderInfo(
     std::filesystem::path const& engineDir, nlohmann::json const& modelConfig, nlohmann::json const& builderConfig)
 {
-    std::string targetConfigPath = engineDir.string() + "/config.json";
+    std::string const targetConfigPath = (engineDir / "config.json").string();
 
     // Create a copy of model config and add builder config
     nlohmann::json configWithBuilder = modelConfig;

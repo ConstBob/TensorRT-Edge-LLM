@@ -39,7 +39,7 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
 {
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
-    // Construct engine path from directory
+    // Construct engine path from directory (engineDir already points to visual/ subdirectory)
     std::string enginePath = engineDir + "/visual.engine";
 
     // Load engine

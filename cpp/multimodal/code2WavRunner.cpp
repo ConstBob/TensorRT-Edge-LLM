@@ -1,0 +1,414 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "code2WavRunner.h"
+
+#include "common/bindingNames.h"
+#include "common/checkMacros.h"
+#include "common/cudaUtils.h"
+#include "common/logger.h"
+#include "common/mathUtils.h"
+#include "common/mmapReader.h"
+#include "common/safetensorsUtils.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cuda_fp16.h>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+
+using Json = nlohmann::json;
+
+namespace trt_edgellm
+{
+namespace rt
+{
+
+Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream)
+{
+    if (!validateAndFillConfig(engineDir))
+    {
+        throw std::runtime_error("Failed to validate and fill config");
+    }
+
+    mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
+    if (!mRuntime)
+    {
+        throw std::runtime_error("Failed to create TensorRT runtime");
+    }
+
+    std::string const code2wavEnginePath = engineDir + "/code2wav.engine";
+    if (!std::filesystem::exists(code2wavEnginePath))
+    {
+        throw std::runtime_error("Code2Wav engine not found at " + code2wavEnginePath);
+    }
+
+    try
+    {
+        auto mmapReader = std::make_unique<file_io::MmapReader>(code2wavEnginePath);
+        mCode2WavEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+            mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+        if (!mCode2WavEngine)
+        {
+            throw std::runtime_error("Failed to deserialize Code2Wav engine");
+        }
+
+        mCode2WavContext = std::unique_ptr<nvinfer1::IExecutionContext>(mCode2WavEngine->createExecutionContext());
+        if (!mCode2WavContext)
+        {
+            throw std::runtime_error("Failed to create Code2Wav execution context");
+        }
+
+        if (!mCode2WavContext->setOptimizationProfileAsync(0, stream))
+        {
+            throw std::runtime_error("Failed to set optimization profile");
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to load Code2Wav engine: %s", e.what());
+        throw;
+    }
+
+    if (!allocateBuffer(stream))
+    {
+        throw std::runtime_error("Failed to allocate buffers");
+    }
+
+    LOG_INFO("Code2Wav runner initialized successfully");
+}
+
+bool Code2WavRunner::validateAndFillConfig(std::string const& engineDir)
+{
+    std::string const configPath = engineDir + "/config.json";
+    std::ifstream configFileStream(configPath);
+    if (!configFileStream.is_open())
+    {
+        LOG_ERROR("Failed to open config file: %s", configPath.c_str());
+        return false;
+    }
+
+    Json jsonConfig;
+    try
+    {
+        jsonConfig = Json::parse(configFileStream);
+        configFileStream.close();
+    }
+    catch (Json::parse_error const& e)
+    {
+        LOG_ERROR("Failed to parse config file: %s", e.what());
+        return false;
+    }
+
+    Json const& cfg = jsonConfig.contains("code2wav_config") ? jsonConfig["code2wav_config"] : jsonConfig;
+
+    if (!cfg.contains("num_quantizers"))
+    {
+        LOG_ERROR("num_quantizers not found in config.json");
+        return false;
+    }
+    mConfig.numQuantizers = cfg["num_quantizers"].get<int32_t>();
+
+    mConfig.codebookSize = cfg.value("codebook_size", mConfig.codebookSize);
+    mConfig.hiddenSize = cfg.value("hidden_size", mConfig.hiddenSize);
+    mConfig.decoderDim = cfg.value("decoder_dim", mConfig.decoderDim);
+
+    int64_t rate = 1;
+    if (cfg.contains("upsample_rates"))
+    {
+        for (auto const& r : cfg["upsample_rates"])
+        {
+            rate *= r.get<int64_t>();
+        }
+    }
+    if (cfg.contains("upsampling_ratios"))
+    {
+        for (auto const& r : cfg["upsampling_ratios"])
+        {
+            rate *= r.get<int64_t>();
+        }
+    }
+    if (rate > 1)
+    {
+        mConfig.upsampleRate = math::cast<int32_t>(rate);
+    }
+    else
+    {
+        LOG_ERROR("Failed to calculate upsample_rate from config");
+        return false;
+    }
+
+    if (jsonConfig.contains("builder_config"))
+    {
+        auto const& builderConfig = jsonConfig["builder_config"];
+        mConfig.chunkSize = builderConfig.value("opt_code_len", mConfig.chunkSize);
+    }
+
+    LOG_INFO("Code2Wav config: numQuantizers=%d, codebookSize=%d, upsampleRate=%d, chunkSize=%d", mConfig.numQuantizers,
+        mConfig.codebookSize, mConfig.upsampleRate, mConfig.chunkSize);
+
+    return true;
+}
+
+bool Code2WavRunner::allocateBuffer(cudaStream_t stream)
+{
+    if (!mCode2WavEngine || !mCode2WavContext)
+    {
+        LOG_ERROR("Cannot allocate buffers - engine not loaded");
+        return false;
+    }
+
+    nvinfer1::Dims const codesShapeMax
+        = mCode2WavEngine->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
+
+    int64_t const maxSeqLen = codesShapeMax.d[2];
+    int64_t const maxWaveformLen = maxSeqLen * mConfig.upsampleRate;
+
+    mInputCodesDevice
+        = rt::Tensor({1, mConfig.numQuantizers, maxSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64);
+    mOutputWaveform = rt::Tensor({1, 1, maxWaveformLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    mInputCodesHost
+        = rt::Tensor({1, mConfig.numQuantizers, maxSeqLen}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT64);
+
+    bool setTensorAddressStatus = true;
+    setTensorAddressStatus
+        &= mCode2WavContext->setTensorAddress(binding_names::kCode2WavCodes, mInputCodesDevice.rawPointer());
+    setTensorAddressStatus
+        &= mCode2WavContext->setTensorAddress(binding_names::kCode2WavWaveform, mOutputWaveform.rawPointer());
+    if (!setTensorAddressStatus)
+    {
+        LOG_ERROR("Failed to set tensor addresses");
+        return false;
+    }
+
+    LOG_INFO("Buffers allocated: maxSeqLen=%ld, maxWaveformLen=%ld", maxSeqLen, maxWaveformLen);
+    return true;
+}
+
+bool Code2WavRunner::infer(cudaStream_t stream)
+{
+    TIME_STAGE(metrics::StageNames::kCODE2WAV, stream);
+
+    nvinfer1::Dims const codeDims = mInputCodesDevice.getTRTDims();
+    if (!mCode2WavContext->setInputShape(binding_names::kCode2WavCodes, codeDims))
+    {
+        LOG_ERROR("Failed to set input shape");
+        return false;
+    }
+
+    if (!mCode2WavContext->enqueueV3(stream))
+    {
+        LOG_ERROR("Inference failed");
+        return false;
+    }
+
+    return true;
+}
+
+bool Code2WavRunner::prepareCodes(std::vector<std::vector<int32_t>> const& codes, cudaStream_t stream)
+{
+    if (codes.empty() || codes[0].empty())
+    {
+        LOG_ERROR("Empty codes provided");
+        return false;
+    }
+
+    int64_t const numLayers = math::cast<int64_t>(codes.size());
+    int64_t const seqLen = math::cast<int64_t>(codes[0].size());
+
+    if (numLayers != mConfig.numQuantizers)
+    {
+        LOG_ERROR("Expected %d quantizer layers, got %ld", mConfig.numQuantizers, numLayers);
+        return false;
+    }
+
+    for (size_t i = 1; i < codes.size(); ++i)
+    {
+        if (math::cast<int64_t>(codes[i].size()) != seqLen)
+        {
+            LOG_ERROR("Inconsistent code lengths: layer 0 has %ld, layer %zu has %zu", seqLen, i, codes[i].size());
+            return false;
+        }
+    }
+
+    if (!mInputCodesDevice.reshape({1, numLayers, seqLen}))
+    {
+        LOG_ERROR("Failed to reshape input codes tensor");
+        return false;
+    }
+
+    int64_t* const hostData = static_cast<int64_t*>(mInputCodesHost.rawPointer());
+    for (int64_t layer = 0; layer < numLayers; ++layer)
+    {
+        for (int64_t t = 0; t < seqLen; ++t)
+        {
+            hostData[layer * seqLen + t] = math::cast<int64_t>(codes[layer][t]);
+        }
+    }
+
+    size_t const copySize = math::cast<size_t>(numLayers * seqLen) * sizeof(int64_t);
+    CUDA_CHECK(cudaMemcpyAsync(mInputCodesDevice.rawPointer(), hostData, copySize, cudaMemcpyHostToDevice, stream));
+
+    return true;
+}
+
+bool Code2WavRunner::runChunkedInference(
+    std::vector<std::vector<int32_t>> const& codes, rt::Tensor& outputWaveform, cudaStream_t stream)
+{
+    int64_t const totalLen = math::cast<int64_t>(codes[0].size());
+    int64_t const chunkSize = mConfig.chunkSize;
+    int64_t const contextSize = mConfig.leftContextSize;
+
+    std::vector<rt::Tensor> waveformChunks;
+    std::vector<std::vector<int32_t>> chunkCodes(mConfig.numQuantizers);
+    int64_t startIdx = 0;
+    int32_t chunkIdx = 0;
+
+    while (startIdx < totalLen)
+    {
+        int64_t const endIdx = std::min(startIdx + chunkSize, totalLen);
+        int64_t const actualContextSize = (startIdx >= contextSize) ? contextSize : startIdx;
+        int64_t const actualChunkLen = (endIdx - startIdx) + actualContextSize;
+
+        // Extract chunk with context
+        for (int32_t layer = 0; layer < mConfig.numQuantizers; ++layer)
+        {
+            chunkCodes[layer].assign(
+                codes[layer].begin() + (startIdx - actualContextSize), codes[layer].begin() + endIdx);
+        }
+
+        if (!prepareCodes(chunkCodes, stream))
+        {
+            return false;
+        }
+
+        if (!infer(stream))
+        {
+            return false;
+        }
+
+        // Skip context samples; take only the valid (endIdx - startIdx) frames
+        int64_t const contextSamples = actualContextSize * mConfig.upsampleRate;
+        int64_t const validLen = (endIdx - startIdx) * mConfig.upsampleRate;
+
+        LOG_DEBUG("Chunk %d: codes_len=%ld, context=%ld, valid_len=%ld", chunkIdx, actualChunkLen, actualContextSize,
+            validLen);
+
+        rt::Tensor chunkWaveform({1, 1, validLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+        CUDA_CHECK(cudaMemcpyAsync(chunkWaveform.rawPointer(),
+            static_cast<char*>(mOutputWaveform.rawPointer()) + contextSamples * sizeof(float),
+            math::cast<size_t>(validLen) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+
+        waveformChunks.push_back(std::move(chunkWaveform));
+        startIdx = endIdx;
+        ++chunkIdx;
+    }
+
+    LOG_INFO("Processed %d chunks", chunkIdx);
+
+    int64_t totalSamples = 0;
+    for (auto const& chunk : waveformChunks)
+    {
+        totalSamples += chunk.getShape()[2];
+    }
+
+    outputWaveform = rt::Tensor({1, 1, totalSamples}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+
+    int64_t offset = 0;
+    for (auto const& chunk : waveformChunks)
+    {
+        int64_t const chunkLen = chunk.getShape()[2];
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(outputWaveform.rawPointer()) + offset * sizeof(float),
+            chunk.rawPointer(), math::cast<size_t>(chunkLen) * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        offset += chunkLen;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
+}
+
+bool Code2WavRunner::generateWaveform(
+    std::vector<std::vector<int32_t>> const& codes, rt::audioUtils::AudioData& outputAudio, cudaStream_t stream)
+{
+    if (codes.empty() || codes[0].empty())
+    {
+        LOG_ERROR("Empty codes provided");
+        return false;
+    }
+
+    int64_t const seqLen = math::cast<int64_t>(codes[0].size());
+    int64_t const maxCodeLen = mInputCodesDevice.getShape()[2]; // Max length from engine profile
+    int64_t waveformLen = 0;
+
+    // Use direct inference if sequence fits in engine's max capacity
+    if (seqLen <= maxCodeLen)
+    {
+        LOG_DEBUG("Direct inference: seqLen=%ld", seqLen);
+
+        if (!prepareCodes(codes, stream))
+        {
+            return false;
+        }
+
+        if (!infer(stream))
+        {
+            return false;
+        }
+
+        // TRT dynamic shapes handle the actual seqLen; output is seqLen * upsampleRate FP32 samples
+        waveformLen = seqLen * mConfig.upsampleRate;
+
+        outputAudio.waveform = std::make_shared<rt::Tensor>(
+            rt::Tensor({1, waveformLen}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT));
+        CUDA_CHECK(cudaMemcpyAsync(outputAudio.waveform->rawPointer(), mOutputWaveform.rawPointer(),
+            math::cast<size_t>(waveformLen) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    }
+    else
+    {
+        // Chunked inference for sequences exceeding engine's max capacity
+        LOG_INFO("Using chunked inference for long sequence (len=%ld, max=%ld)", seqLen, maxCodeLen);
+        rt::Tensor finalWaveform;
+        if (!runChunkedInference(codes, finalWaveform, stream))
+        {
+            return false;
+        }
+
+        waveformLen = finalWaveform.getShape()[2];
+
+        outputAudio.waveform = std::make_shared<rt::Tensor>(
+            rt::Tensor({1, waveformLen}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT));
+        CUDA_CHECK(cudaMemcpyAsync(outputAudio.waveform->rawPointer(), finalWaveform.rawPointer(),
+            math::cast<size_t>(waveformLen) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    outputAudio.sampleRate = mConfig.sampleRate;
+    outputAudio.numChannels = 1;
+    outputAudio.hasWaveform = true;
+
+    return true;
+}
+
+} // namespace rt
+} // namespace trt_edgellm

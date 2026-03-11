@@ -32,20 +32,20 @@ namespace trt_edgellm
 namespace builder
 {
 
-//! Configuration structure for audio encoder model building.
-//! Contains parameters needed to configure the TensorRT engine building process
-//! for audio encoders used in multimodal models.
+//! Configuration structure for audio model building.
+//! Contains user-specified build parameters for optimization profiles.
+//! Model-specific parameters (mel_bins, num_quantizers, etc.) are automatically
+//! read from config.json - do NOT specify them here.
 struct AudioBuilderConfig
 {
-    //! Minimum audio time steps. User-configurable via --minTimeSteps command-line argument.
-    //! Default: 100 (~0.64s with hop_length=160, sample_rate=16000 for Qwen3-Omni)
-    //! Note: This is a hardcoded default that should ideally be read from model config if available.
-    int64_t minTimeSteps{100};
+    // Audio encoder profile config (used when building audio_encoder)
+    int64_t minTimeSteps{100};  //!< Minimum audio time steps
+    int64_t maxTimeSteps{6000}; //!< Maximum audio time steps
 
-    //! Maximum audio time steps. User-configurable via --maxTimeSteps command-line argument.
-    //! Default: 6000 (~38.4s with hop_length=160, sample_rate=16000 for Qwen3-Omni)
-    //! Note: This is a hardcoded default that should ideally be read from model config if available.
-    int64_t maxTimeSteps{6000};
+    // Code2Wav profile config (used when building code2wav)
+    int64_t minCodeLen{1};    //!< Minimum code sequence length in frames
+    int64_t optCodeLen{300};  //!< Optimal code sequence length (default matches Qwen3-Omni chunked decode)
+    int64_t maxCodeLen{2000}; //!< Maximum code sequence length in frames
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -61,9 +61,21 @@ struct AudioBuilderConfig
     std::string toString() const;
 };
 
-//! Builder class for audio encoder TensorRT engines.
+//! Enum for audio model build type (auto-detected from config.json)
+enum class AudioBuildType
+{
+    UNKNOWN,       //!< Not yet determined
+    AUDIO_ENCODER, //!< Audio encoder (speech-to-embeddings)
+    CODE2WAV       //!< Code2Wav vocoder (codes-to-waveform)
+};
+
+//! Builder class for audio-related TensorRT engines.
 //! Handles the complete process of building TensorRT engines from ONNX models
-//! for audio encoders used in multimodal models (e.g., Qwen3-Omni).
+//! for audio encoders and Code2Wav vocoders used in multimodal models (e.g., Qwen3-Omni).
+//!
+//! Build type is auto-detected from config.json:
+//! - If "audio_config" exists → builds audio_encoder.engine
+//! - If "code2wav_config" exists → builds code2wav.engine
 class AudioBuilder
 {
 public:
@@ -90,16 +102,25 @@ public:
     bool build();
 
 private:
-    std::filesystem::path mOnnxDir;    //!< Directory containing ONNX model files
-    std::filesystem::path mEngineDir;  //!< Directory for saving built engine
-    AudioBuilderConfig mBuilderConfig; //!< Build configuration
-    multimodal::ModelType mModelType;  //!< Model type inferred from config.json
+    std::filesystem::path mOnnxDir;                                   //!< Directory containing ONNX model files
+    std::filesystem::path mEngineDir;                                 //!< Directory for saving built engine
+    AudioBuilderConfig mBuilderConfig;                                //!< Build configuration
+    multimodal::ModelType mModelType{multimodal::ModelType::UNKNOWN}; //!< Model type from config.json
+    AudioBuildType mBuildType{AudioBuildType::UNKNOWN};               //!< Build type (auto-detected from config.json)
 
     //! Parse the model configuration from config.json.
-    //! Extracts model type and dimensions needed for optimization profile setup.
+    //! Auto-detects build type and extracts model-specific dimensions.
     //! @return true if parsing was successful, false otherwise
     //! @throws nlohmann::json::exception if JSON parsing fails
     bool parseConfig();
+
+    //! Parse audio encoder specific configuration from audio_config.
+    //! @return true if parsing was successful, false otherwise
+    bool parseAudioEncoderConfig();
+
+    //! Parse Code2Wav specific configuration from code2wav_config.
+    //! @return true if parsing was successful, false otherwise
+    bool parseCode2WavConfig();
 
     //! Set up optimization profile for audio encoder.
     //! Creates optimization profile with appropriate dynamic shapes for audio inputs.
@@ -107,14 +128,30 @@ private:
     //! @param config TensorRT builder config object (must not be null)
     //! @param network TensorRT network definition (must not be null)
     //! @return true if setup was successful, false otherwise
-    bool setupAudioOptimizationProfile(
+    bool setupAudioEncoderProfile(
         nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network);
 
-    //! Set up optimization profile for Qwen3-Omni audio encoder.
-    //! Configures inputs for Qwen3-Omni audio encoder.
+    //! Set up Qwen3-Omni audio encoder profile.
     //! @param profile Optimization profile to configure
     //! @return true if setup was successful, false otherwise
-    bool setupQwen3OmniAudioProfile(nvinfer1::IOptimizationProfile& profile);
+    bool setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
+
+    //! Set up optimization profile for Code2Wav vocoder.
+    //! Creates optimization profile with appropriate dynamic shapes for code inputs.
+    //! @param builder TensorRT builder object
+    //! @param config TensorRT builder config object
+    //! @param network TensorRT network definition
+    //! @return true if setup was successful, false otherwise
+    bool setupCode2WavProfile(
+        nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network);
+
+    //! Set up Qwen3-Omni Code2Wav profile.
+    //! Configures input "codes" with shape [1, num_quantizers, code_len].
+    //! @param profile Optimization profile to configure
+    //! @param network Network definition for input dimension inference
+    //! @return true if setup was successful, false otherwise
+    bool setupQwen3OmniCode2WavProfile(
+        nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network);
 
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config
@@ -124,11 +161,16 @@ private:
     //! @throws nlohmann::json::exception if JSON serialization fails
     bool copyConfig();
 
-    // Audio-specific configuration read from config.json
-    int32_t mMelBins{128};       //!< Number of Mel-frequency bins
-    int32_t mNWindowDim{100};    //!< Window dimension for feature tensor
-    int32_t mSubsampleFactor{2}; //!< Audio encoder subsample factor
-    Json mModelConfig;           //!< Parsed model configuration
+    // Model-specific configuration extracted from config.json (initialized to 0, must be read)
+    // Audio encoder config (from audio_config)
+    int32_t mMelBins{0};    //!< Number of Mel-frequency bins
+    int32_t mNWindowDim{0}; //!< Window dimension for feature tensor (n_window * 2)
+
+    // Code2Wav config (from code2wav_config)
+    int32_t mNumQuantizers{0}; //!< Number of RVQ quantizers
+    int32_t mUpsampleRate{0};  //!< Total upsample rate (samples per code frame)
+
+    Json mModelConfig; //!< Parsed model configuration
 };
 
 } // namespace builder

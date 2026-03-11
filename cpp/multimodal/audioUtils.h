@@ -69,21 +69,18 @@ bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow
 //!   Output indices: [[0, 0], [0, 1], [1, 0]]
 bool convertMaskToIndices(rt::Tensor const& paddedMask, rt::Tensor& paddedMaskIndices, cudaStream_t stream);
 
-//! Create block-diagonal attention mask for chunk-wise attention
-//! Each chunk can only attend to tokens within the same chunk, preventing
-//! cross-contamination between different audio segments.
+//! Create block-diagonal attention mask matching _prepare_attention_mask + cu_seqlens logic.
+//! Merges per-chunk after-CNN lengths into larger windows using n_window_infer,
+//! then builds a block-diagonal mask where each window allows bidirectional attention.
 //!
-//! @param afterCNNLens Vector of chunk lengths after CNN downsampling
+//! @param afterCNNLens Per-chunk after-CNN lengths
+//! @param nWindow Audio encoder n_window parameter (default 50)
+//! @param nWindowInfer Audio encoder n_window_infer parameter (default 200)
 //! @param attentionMask Output attention mask [total_len, total_len]
-//!        Values: 0.0 for allowed attention, -65504.0 (FP16 min) for blocked
 //! @param stream CUDA stream for async operations
 //! @return true on success, false on failure
-//!
-//! Example:
-//!   Input: afterCNNLens = [26, 12]
-//!   Output: 38x38 block-diagonal matrix with two blocks (26x26 and 12x12)
-bool createChunkwiseAttentionMask(
-    std::vector<int64_t> const& afterCNNLens, rt::Tensor& attentionMask, cudaStream_t stream);
+bool createChunkwiseAttentionMask(std::vector<int64_t> const& afterCNNLens, int32_t nWindow, int32_t nWindowInfer,
+    rt::Tensor& attentionMask, cudaStream_t stream);
 
 } // namespace audioUtils
 } // namespace rt

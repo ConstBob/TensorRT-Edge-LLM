@@ -61,8 +61,8 @@ void printUsage(char const* programName)
     std::cerr
         << "  --onnxDir            Provide the directory containing the input onnx file for visual encoder. Required. "
         << std::endl;
-    std::cerr << "  --engineDir          Base output directory for visual encoder. Required." << std::endl;
-    std::cerr << "                       Note: Engine will be saved to <engineDir>/visual/" << std::endl;
+    std::cerr << "  --engineDir          Base output directory for multimodal engines. Required." << std::endl;
+    std::cerr << "                       Note: Visual engine will be saved to <engineDir>/visual/" << std::endl;
     std::cerr << "  --debug              Use debug mode, which outputs tensors." << std::endl;
     std::cerr << "  --minImageTokens     Minimum image tokens. Default = 4" << std::endl;
     std::cerr << "  --maxImageTokens     Maximum image tokens. Default = 1024" << std::endl;

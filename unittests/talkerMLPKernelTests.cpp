@@ -279,205 +279,100 @@ TEST_F(TalkerKernelTest, GatherScatterRoundTrip)
 
 // ===== SumReduceOverSequence =====
 
-TEST_F(TalkerKernelTest, SumReduceOverSequence)
+// ===== TalkerLogitAdjust =====
+
+// Helper: upload logits and seenTokens to GPU, run kernel, download result.
+static std::vector<float> runTalkerLogitAdjust(std::vector<float> const& hostLogits, int32_t suppressStart,
+    int32_t suppressEnd, int32_t codecEosId, std::vector<int32_t> const& hostSeenTokens, float repetitionPenalty,
+    cudaStream_t stream)
 {
-    int64_t const seqLen = 8;
-    int64_t const hiddenDim = 64;
+    int32_t const vocabSize = static_cast<int32_t>(hostLogits.size());
 
-    std::vector<half> hostInput(seqLen * hiddenDim);
-    uniformFloatInitialization(hostInput, -1.0f, 1.0f);
-
-    std::vector<half> refOutput(hiddenDim);
-    for (int64_t d = 0; d < hiddenDim; ++d)
-    {
-        float acc = 0.0f;
-        for (int64_t s = 0; s < seqLen; ++s)
-        {
-            acc += __half2float(hostInput[s * hiddenDim + d]);
-        }
-        refOutput[d] = __float2half(acc);
-    }
-
-    rt::Coords inputShape{1, seqLen, hiddenDim};
-    rt::Coords outputShape{1, 1, hiddenDim};
-
-    rt::Tensor gpuInput(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor gpuOutput(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
+    rt::Tensor gpuLogits({1, static_cast<int64_t>(vocabSize)}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
     CUDA_CHECK(
-        cudaMemcpy(gpuInput.rawPointer(), hostInput.data(), hostInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+        cudaMemcpy(gpuLogits.rawPointer(), hostLogits.data(), vocabSize * sizeof(float), cudaMemcpyHostToDevice));
 
-    kernel::sumReduceOverSequence(gpuInput, gpuOutput, stream);
-
-    std::vector<half> gpuResult(hiddenDim);
-    CUDA_CHECK(
-        cudaMemcpy(gpuResult.data(), gpuOutput.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    auto [rtol, atol] = getTolerance<half>();
-    for (int64_t d = 0; d < hiddenDim; ++d)
+    int32_t const maxSeen = std::max(static_cast<int32_t>(hostSeenTokens.size()), 1);
+    rt::Tensor gpuSeen({static_cast<int64_t>(maxSeen)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    if (!hostSeenTokens.empty())
     {
-        EXPECT_TRUE(isclose(gpuResult[d], refOutput[d], rtol, atol))
-            << "Sum reduce mismatch at dim " << d << ": gpu=" << __half2float(gpuResult[d])
-            << ", ref=" << __half2float(refOutput[d]);
+        CUDA_CHECK(cudaMemcpy(gpuSeen.rawPointer(), hostSeenTokens.data(), hostSeenTokens.size() * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
     }
+
+    kernel::invokeTalkerLogitAdjust(gpuSeen, gpuLogits, suppressStart, suppressEnd, codecEosId,
+        static_cast<int32_t>(hostSeenTokens.size()), repetitionPenalty, stream);
+
+    std::vector<float> result(vocabSize);
+    CUDA_CHECK(cudaMemcpy(result.data(), gpuLogits.rawPointer(), vocabSize * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return result;
 }
 
-// ===== ElementwiseAdd =====
-
-TEST_F(TalkerKernelTest, ElementwiseAdd)
-{
-    int64_t const size = 256;
-    std::vector<half> hostA(size), hostB(size);
-    uniformFloatInitialization(hostA, -1.0f, 1.0f);
-    uniformFloatInitialization(hostB, -1.0f, 1.0f);
-
-    rt::Coords shape{size};
-    rt::Tensor gpuA(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor gpuB(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor gpuOut(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    CUDA_CHECK(cudaMemcpy(gpuA.rawPointer(), hostA.data(), size * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuB.rawPointer(), hostB.data(), size * sizeof(half), cudaMemcpyHostToDevice));
-
-    kernel::invokeElementwiseAdd(gpuOut, gpuA, gpuB, stream);
-
-    std::vector<half> gpuResult(size);
-    CUDA_CHECK(cudaMemcpy(gpuResult.data(), gpuOut.rawPointer(), size * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    for (int64_t i = 0; i < size; ++i)
-    {
-        half expected = __float2half(__half2float(hostA[i]) + __half2float(hostB[i]));
-        EXPECT_TRUE(isclose(gpuResult[i], expected, 1e-3f, 1e-3f)) << "ElementwiseAdd mismatch at " << i;
-    }
-}
-
-TEST_F(TalkerKernelTest, ElementwiseAddInplace)
-{
-    int64_t const size = 256;
-    std::vector<half> hostData(size), hostAddend(size);
-    uniformFloatInitialization(hostData, -1.0f, 1.0f);
-    uniformFloatInitialization(hostAddend, -1.0f, 1.0f);
-
-    rt::Coords shape{size};
-    rt::Tensor gpuData(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor gpuAddend(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    CUDA_CHECK(cudaMemcpy(gpuData.rawPointer(), hostData.data(), size * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuAddend.rawPointer(), hostAddend.data(), size * sizeof(half), cudaMemcpyHostToDevice));
-
-    kernel::invokeElementwiseAddInplace(gpuData, gpuAddend, 0, 0, 0, stream);
-
-    std::vector<half> gpuResult(size);
-    CUDA_CHECK(cudaMemcpy(gpuResult.data(), gpuData.rawPointer(), size * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    for (int64_t i = 0; i < size; ++i)
-    {
-        half expected = __float2half(__half2float(hostData[i]) + __half2float(hostAddend[i]));
-        EXPECT_TRUE(isclose(gpuResult[i], expected, 1e-3f, 1e-3f)) << "ElementwiseAddInplace mismatch at " << i;
-    }
-}
-
-TEST_F(TalkerKernelTest, ElementwiseAddInplaceWithOffset)
-{
-    int64_t const totalSize = 512;
-    int64_t const numElements = 128;
-    int64_t const dataOffset = 64;
-    int64_t const addendOffset = 32;
-
-    std::vector<half> hostData(totalSize), hostAddend(totalSize);
-    uniformFloatInitialization(hostData, -1.0f, 1.0f);
-    uniformFloatInitialization(hostAddend, -1.0f, 1.0f);
-
-    rt::Coords shape{totalSize};
-    rt::Tensor gpuData(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor gpuAddend(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    CUDA_CHECK(cudaMemcpy(gpuData.rawPointer(), hostData.data(), totalSize * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(gpuAddend.rawPointer(), hostAddend.data(), totalSize * sizeof(half), cudaMemcpyHostToDevice));
-
-    kernel::invokeElementwiseAddInplace(gpuData, gpuAddend, numElements, dataOffset, addendOffset, stream);
-
-    std::vector<half> gpuResult(totalSize);
-    CUDA_CHECK(cudaMemcpy(gpuResult.data(), gpuData.rawPointer(), totalSize * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    for (int64_t i = 0; i < numElements; ++i)
-    {
-        half expected
-            = __float2half(__half2float(hostData[dataOffset + i]) + __half2float(hostAddend[addendOffset + i]));
-        EXPECT_TRUE(isclose(gpuResult[dataOffset + i], expected, 1e-3f, 1e-3f)) << "Offset add mismatch at " << i;
-    }
-
-    for (int64_t i = 0; i < dataOffset; ++i)
-    {
-        EXPECT_TRUE(isclose(gpuResult[i], hostData[i], 0.f, 0.f)) << "Data before offset was modified at " << i;
-    }
-}
-
-// ===== SuppressLogits =====
-
-TEST_F(TalkerKernelTest, SuppressLogitsWithException)
+// Suppression range [suppressStart, suppressEnd) is set to -inf, except codecEosId.
+TEST_F(TalkerKernelTest, TalkerLogitAdjust_SuppressionWithEosExempt)
 {
     int32_t const vocabSize = 256;
     int32_t const suppressStart = 50;
     int32_t const suppressEnd = 150;
-    int32_t const exceptTokenId = 100;
+    int32_t const codecEosId = 100;
 
-    std::vector<float> hostLogits(vocabSize, 1.0f);
-
-    rt::Coords shape{1, static_cast<int64_t>(vocabSize)};
-    rt::Tensor gpuLogits(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    CUDA_CHECK(
-        cudaMemcpy(gpuLogits.rawPointer(), hostLogits.data(), vocabSize * sizeof(float), cudaMemcpyHostToDevice));
-
-    kernel::invokeSuppressLogits(gpuLogits, suppressStart, suppressEnd, exceptTokenId, stream);
-
-    std::vector<float> gpuResult(vocabSize);
-    CUDA_CHECK(cudaMemcpy(gpuResult.data(), gpuLogits.rawPointer(), vocabSize * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto result = runTalkerLogitAdjust(
+        std::vector<float>(vocabSize, 1.0f), suppressStart, suppressEnd, codecEosId, {}, 1.0f, stream);
 
     for (int32_t i = 0; i < vocabSize; ++i)
     {
-        if (i >= suppressStart && i < suppressEnd && i != exceptTokenId)
+        if (i >= suppressStart && i < suppressEnd && i != codecEosId)
         {
-            EXPECT_TRUE(std::isinf(gpuResult[i]) && gpuResult[i] < 0)
-                << "Token " << i << " should be -inf, got " << gpuResult[i];
+            EXPECT_TRUE(std::isinf(result[i]) && result[i] < 0) << "Token " << i << " should be -inf";
         }
         else
         {
-            EXPECT_FLOAT_EQ(gpuResult[i], 1.0f) << "Token " << i << " should be unchanged";
+            EXPECT_FLOAT_EQ(result[i], 1.0f) << "Token " << i << " should be unchanged";
         }
     }
 }
 
-TEST_F(TalkerKernelTest, SuppressLogitsNoException)
+// No exception token (-1): all tokens in suppress range become -inf.
+TEST_F(TalkerKernelTest, TalkerLogitAdjust_SuppressionNoExempt)
 {
     int32_t const vocabSize = 128;
     int32_t const suppressStart = 0;
     int32_t const suppressEnd = 64;
 
-    std::vector<float> hostLogits(vocabSize, 2.0f);
-
-    rt::Coords shape{1, static_cast<int64_t>(vocabSize)};
-    rt::Tensor gpuLogits(shape, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    CUDA_CHECK(
-        cudaMemcpy(gpuLogits.rawPointer(), hostLogits.data(), vocabSize * sizeof(float), cudaMemcpyHostToDevice));
-
-    kernel::invokeSuppressLogits(gpuLogits, suppressStart, suppressEnd, -1, stream);
-
-    std::vector<float> gpuResult(vocabSize);
-    CUDA_CHECK(cudaMemcpy(gpuResult.data(), gpuLogits.rawPointer(), vocabSize * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    auto result = runTalkerLogitAdjust(
+        std::vector<float>(vocabSize, 2.0f), suppressStart, suppressEnd, /*codecEosId=*/-1, {}, 1.0f, stream);
 
     for (int32_t i = 0; i < suppressEnd; ++i)
     {
-        EXPECT_TRUE(std::isinf(gpuResult[i]) && gpuResult[i] < 0) << "Token " << i << " should be -inf";
+        EXPECT_TRUE(std::isinf(result[i]) && result[i] < 0) << "Token " << i << " should be -inf";
     }
     for (int32_t i = suppressEnd; i < vocabSize; ++i)
     {
-        EXPECT_FLOAT_EQ(gpuResult[i], 2.0f) << "Token " << i << " should be unchanged";
+        EXPECT_FLOAT_EQ(result[i], 2.0f) << "Token " << i << " should be unchanged";
     }
+}
+
+// Repetition penalty applied to seenTokens: positive logit divided, negative multiplied.
+TEST_F(TalkerKernelTest, TalkerLogitAdjust_RepetitionPenalty)
+{
+    int32_t const vocabSize = 64;
+    int32_t const suppressStart = 50;
+    int32_t const suppressEnd = 60;
+    float const penalty = 2.0f;
+
+    // token 5: positive logit (4.0 → 4.0/2 = 2.0)
+    // token 10: negative logit (-4.0 → -4.0*2 = -8.0)
+    std::vector<float> hostLogits(vocabSize, 1.0f);
+    hostLogits[5] = 4.0f;
+    hostLogits[10] = -4.0f;
+
+    auto result = runTalkerLogitAdjust(hostLogits, suppressStart, suppressEnd,
+        /*codecEosId=*/-1, {5, 10}, penalty, stream);
+
+    EXPECT_FLOAT_EQ(result[5], 2.0f) << "Positive logit should be divided by penalty";
+    EXPECT_FLOAT_EQ(result[10], -8.0f) << "Negative logit should be multiplied by penalty";
+    // Unseen tokens in normal range unchanged
+    EXPECT_FLOAT_EQ(result[0], 1.0f) << "Unseen token should be unchanged";
+    EXPECT_FLOAT_EQ(result[20], 1.0f) << "Unseen token should be unchanged";
 }

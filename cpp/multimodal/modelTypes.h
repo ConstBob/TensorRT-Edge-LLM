@@ -30,8 +30,9 @@ enum class ModelType
     QWEN2_VL,                  //!< Qwen2-VL model
     QWEN2_5_VL,                //!< Qwen2.5-VL model
     QWEN3_VL,                  //!< Qwen3-VL model
-    QWEN3_OMNI_AUDIO_ENCODER,  //!< Qwen3-Omni audio encoder (audio + text input/output)
-    QWEN3_OMNI_VISION_ENCODER, //!< Qwen3-Omni vision encoder (image + text input/output)
+    QWEN3_OMNI_AUDIO_ENCODER,  //!< Qwen3-Omni audio encoder (speech-to-embeddings)
+    QWEN3_OMNI_VISION_ENCODER, //!< Qwen3-Omni vision encoder (image-to-embeddings)
+    QWEN3_OMNI_CODE2WAV,       //!< Qwen3-Omni Code2Wav vocoder (codes-to-waveform)
     INTERNVL,                  //!< InternVL model
     PHI4MM,                    //!< Phi-4MM model
     UNKNOWN                    //!< Unknown or unsupported model type
@@ -49,10 +50,12 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
     if (modelTypeStr == "qwen3_vl")
         return ModelType::QWEN3_VL;
     if (modelTypeStr == "qwen3_omni" || modelTypeStr == "qwen3_omni_thinker" || modelTypeStr == "qwen3_omni_text"
-        || modelTypeStr == "qwen3_asr_thinker")
+        || modelTypeStr == "qwen3_asr_thinker" || modelTypeStr == "qwen3_omni_audio_encoder")
         return ModelType::QWEN3_OMNI_AUDIO_ENCODER;
     if (modelTypeStr == "qwen3_omni_vision_encoder")
         return ModelType::QWEN3_OMNI_VISION_ENCODER;
+    if (modelTypeStr == "qwen3_omni_code2wav" || modelTypeStr == "qwen3_tts_code2wav")
+        return ModelType::QWEN3_OMNI_CODE2WAV;
     if (modelTypeStr == "internvl" || modelTypeStr == "internvl_vision")
         return ModelType::INTERNVL;
     if (modelTypeStr == "phi4mm")

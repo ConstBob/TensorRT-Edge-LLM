@@ -36,7 +36,6 @@ struct AudioConfig
     int32_t audioFeatureDim{2560}; //!< Audio feature dimension (output embedding size)
     int32_t nWindow{100};          //!< Window size for audio chunking
     int32_t nWindowInfer{100};     //!< Inference window size
-    int32_t subsampleFactor{2};    //!< Subsampling factor after CNN
 
     // Audio special tokens (from tokenizer_config.json)
     int32_t audioTokenId{151675};    //!< <|audio_pad|> token ID

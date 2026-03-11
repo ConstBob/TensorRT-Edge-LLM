@@ -76,5 +76,21 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
 void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
     int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, cudaStream_t stream);
 
+/*!
+ * @brief Initialize MRoPE cos/sin cache for text-only inputs with sequential positions.
+ *
+ * Initializes the MRoPE cache using sequential position IDs (pos[i] = i) for all 3
+ * MRoPE sections. This is the correct default for text-only and audio-only modes where
+ * no spatial position information is available.
+ *
+ * @param cosSinCache Output cos/sin cache, shape [1, maxPositions, rotaryDim]
+ * @param rotaryBaseFrequency Base frequency
+ * @param rotaryDim Rotary dimension
+ * @param maxPositions Maximum number of positions
+ * @param stream CUDA stream
+ */
+void initializeTextOnlyMRopeCosSin(
+    float* cosSinCache, float rotaryBaseFrequency, int64_t rotaryDim, int64_t maxPositions, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

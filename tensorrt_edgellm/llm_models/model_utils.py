@@ -233,6 +233,7 @@ def _is_qwen3_asr_model(model_dir: str) -> bool:
 INCOMPATIBLE_CHAT_TEMPLATE_MODELS = [
     "phi4mm",  # Phi-4-multimodal: tokenizer lacks proper chat template
     "nemotron_h",  # NemotronH: tokenizer lacks proper chat template
+    "Qwen3-TTS",  # Qwen3-TTS: Special model that does not come with chat template
 ]
 
 

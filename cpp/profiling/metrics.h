@@ -49,6 +49,9 @@ inline std::string const kVISION_ENCODER = "vision_encoder";               //!< 
 inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";     //!< Eagle draft prefill stage
 inline std::string const kEAGLE_CONSTRUCT_DRAFT_TREE = "eagle_construct_draft_tree"; //!< Eagle draft tree construction
 inline std::string const kEAGLE_BASE_VERIFICATION = "eagle_base_verification";       //!< Eagle base verification stage
+inline std::string const kCODE2WAV = "code2wav";                                     //!< Code2Wav vocoder stage
+inline std::string const kTALKER_GENERATION = "talker_generation";                   //!< Talker audio frame generation
+inline std::string const kCODE_PREDICTOR = "code_predictor"; //!< CodePredictor RVQ code generation
 } // namespace StageNames
 
 /*!

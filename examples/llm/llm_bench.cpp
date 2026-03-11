@@ -718,7 +718,9 @@ int main(int argc, char** argv)
         else if (args.mode == BenchMode::kDECODE)
         {
             runner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
-            runner->executeVanillaDecodingStep(decodeInputs, decodeLogits, stream);
+            // No hidden states output needed for benchmark decoding.
+            rt::OptionalOutputTensor const outputHiddenStates{std::nullopt};
+            runner->executeVanillaDecodingStep(decodeInputs, decodeLogits, outputHiddenStates, stream);
         }
         else if (args.mode == BenchMode::kEAGLE_VERIFY)
         {
@@ -759,7 +761,9 @@ int main(int argc, char** argv)
         else if (args.mode == BenchMode::kDECODE)
         {
             runner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
-            runner->executeVanillaDecodingStep(decodeInputs, decodeLogits, stream);
+            // No hidden states output needed for benchmark decoding.
+            rt::OptionalOutputTensor const outputHiddenStates{std::nullopt};
+            runner->executeVanillaDecodingStep(decodeInputs, decodeLogits, outputHiddenStates, stream);
         }
         else if (args.mode == BenchMode::kEAGLE_VERIFY)
         {

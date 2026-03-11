@@ -37,6 +37,7 @@ struct QwenViTConfig
 
     int32_t vocabSize{0};              //!< Vocabulary size
     int32_t visionStartTokenId{0};     //!< Token ID for vision start
+    int32_t visionEndTokenId{0};       //!< Token ID for vision end
     int32_t imageTokenId{0};           //!< Token ID for image placeholder
     int32_t videoTokenId{0};           //!< Token ID for video placeholder
     float mropeTheta{0};               //!< Multi-dimensional RoPE theta parameter

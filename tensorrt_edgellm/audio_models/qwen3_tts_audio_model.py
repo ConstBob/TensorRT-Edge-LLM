@@ -140,7 +140,7 @@ def export_qwen3_tts_tokenizer_decoder(model, output_dir, torch_dtype):
                 })
 
     config_dict = model.config.to_dict()
-    config_dict['model_type'] = 'qwen3_tts_tokenizer_12hz'
+    config_dict['model_type'] = 'qwen3_tts_code2wav'
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=2)
 

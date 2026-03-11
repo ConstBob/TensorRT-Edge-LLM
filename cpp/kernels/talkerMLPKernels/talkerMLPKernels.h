@@ -19,6 +19,7 @@
 
 #include "common/tensor.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace trt_edgellm
@@ -58,6 +59,17 @@ void invokeTalkerMLP(void* cublasHandle, rt::Tensor const& input, rt::Tensor con
     rt::Tensor const& fc1Bias, rt::Tensor const& fc2Weight, rt::Tensor const& fc2Bias, rt::Tensor& output,
     rt::Tensor& workspace, cudaStream_t stream);
 
+//! \brief Single linear layer: output = input @ weight.T + bias
+//!
+//! \param[in] cublasHandle cuBLAS handle for GEMM operations
+//! \param[in] input Input tensor with shape [N, inputDim] (FP16)
+//! \param[in] weight Weight matrix with shape [outputDim, inputDim] (FP16, row-major)
+//! \param[in] bias Bias vector with shape [outputDim] (FP16)
+//! \param[out] output Output tensor with shape [N, outputDim] (FP16)
+//! \param[in] stream CUDA stream for execution
+void invokeLinearLayer(void* cublasHandle, rt::Tensor const& input, rt::Tensor const& weight, rt::Tensor const& bias,
+    rt::Tensor& output, cudaStream_t stream);
+
 //! \brief Gather operation: select rows from source tensor by indices
 //!
 //! Performs: output[i] = source[indices[i]]
@@ -80,48 +92,71 @@ void invokeGather(rt::Tensor const& source, rt::Tensor const& indices, rt::Tenso
 //! \param[in] stream CUDA stream for execution
 void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tensor& output, cudaStream_t stream);
 
-//! \brief Sum reduction over sequence dimension for residual connection
+//! \brief Fused non-streaming assistant preamble construction for TTS input projection
 //!
-//! Performs: output[0, 0, :] = sum(input[0, :, :], dim=1)
-//! where input has shape [1, seqLen, hiddenDim] and output has shape [1, 1, hiddenDim]
+//! Builds the complete non-streaming prefill buffer in one pass.
+//! Total rows written = 8 + textLen + 2 (= seqLen + 2).
 //!
-//! \param[in] input Input tensor with shape [1, seqLen, hiddenDim] (FP16)
-//! \param[out] output Output tensor with shape [1, 1, hiddenDim] (FP16)
-//! \param[in] stream CUDA stream for execution
-void sumReduceOverSequence(rt::Tensor const& input, rt::Tensor& output, cudaStream_t stream);
+//! Row layout (written at outputOffset):
+//!   [0-2]:        projected[0-2]                            (role tokens)
+//!   [3]:          ttsPadEmbed + talkerEmbTable[codecNothinkId]
+//!   [4]:          ttsPadEmbed + talkerEmbTable[codecThinkBosId]
+//!   [5]:          ttsPadEmbed + talkerEmbTable[codecThinkEosId]
+//!   [6]:          ttsPadEmbed + talkerEmbTable[speakerId]
+//!   [7]:          ttsBosEmbed + talkerEmbTable[codecPadId]
+//!   [8..8+N-1]:   projected[3+i] + talkerEmbTable[codecPadId]  (text tokens, N=textLen)
+//!   [8+N]:        ttsEosEmbed + talkerEmbTable[codecPadId]
+//!   [8+N+1]:      ttsPadEmbed + talkerEmbTable[codecBosId]
+//!
+//! \param projected      MLP output [seqLen, H] (FP16)
+//! \param ttsPadEmbed/ttsBosEmbed/ttsEosEmbed  TTS special embeddings [H] (FP16)
+//! \param talkerEmbTable Talker embedding table [vocabSize, H] (FP16)
+//! \param codecNothinkId..codecBosId  Codec token IDs used in rows [3-8+N+1]
+//! \param speakerId      Speaker codec token ID (row 6)
+//! \param textLen        Number of text token rows (N = seqLen - 8)
+//! \param output         Full output buffer [8+N+2, H] (FP16)
+//! \param stream         CUDA stream
+void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
+    rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
+    int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
+    rt::Tensor& output, cudaStream_t stream);
 
-//! \brief Element-wise addition: output = a + b
+//! \brief Fused residual connection for TTS decode input
 //!
-//! \param[out] output Output tensor (FP16)
-//! \param[in] a First input tensor (FP16)
-//! \param[in] b Second input tensor (FP16)
-//! \param[in] stream CUDA stream for execution
-void invokeElementwiseAdd(rt::Tensor& output, rt::Tensor const& a, rt::Tensor const& b, cudaStream_t stream);
+//! Computes: output = embed0[code0] + embed15[code15] + addend + sum(codecHiddens[1..14])
+//! Eliminates 7 separate dispatches (2x H→D, 2x embLookup, 2x D→D, sumReduce) in one kernel.
+//!
+//! \param codecHiddens   [1, 16, H] buffer — rows 1-14 pre-filled by CodePredictor (FP16)
+//! \param embTable0      Talker embedding table [vocabSize, H] (FP16) — for embed(code0)
+//! \param embTable15     CodePredictor embedding table[-1] [vocabSize, H] (FP16) — for embed(code15)
+//! \param code0/code15   Token IDs passed as scalars (no H→D upload needed)
+//! \param addend         Row pointer [H] — trailing_text_hidden[generationStep] or tts_pad_embed (FP16)
+//! \param output         Output tensor [1, 1, H] (FP16)
+//! \param stream         CUDA stream
+void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& embTable0, rt::Tensor const& embTable15,
+    int32_t code0, int32_t code15, half const* addend, rt::Tensor& output, cudaStream_t stream);
 
-//! \brief In-place element-wise addition: data += addend
+//! \brief Adjust Talker logits: suppress special tokens and apply repetition penalty.
 //!
-//! \param[in,out] data Input/output tensor (FP16)
-//! \param[in] addend Tensor to add (FP16)
-//! \param[in] numElements Number of elements to add (0 = use full tensor volume)
-//! \param[in] dataOffset Element offset into data (default 0)
-//! \param[in] addendOffset Element offset into addend (default 0)
-//! \param[in] stream CUDA stream for execution
-void invokeElementwiseAddInplace(rt::Tensor& data, rt::Tensor const& addend, int64_t numElements, int64_t dataOffset,
-    int64_t addendOffset, cudaStream_t stream);
-
-//! \brief Suppress logits for a range of token IDs by setting them to -infinity
+//! Performs two in-place modifications on the logits before sampling:
+//!   1. Suppression: sets logits[i] = -inf for all i in [suppressStart, suppressEnd),
+//!      except for codecEosId which is always preserved.
+//!   2. Repetition penalty: for each token in seenTokens[], divides positive logits by
+//!      repetitionPenalty and multiplies negative logits by repetitionPenalty, matching
+//!      the HuggingFace repetition_penalty convention.
 //!
-//! For all positions in [suppressStart, suppressEnd), sets logits[i] = -inf
-//! UNLESS i == exceptTokenId (typically the EOS token that should remain sampable).
 //! Operates on FP32 logits tensor with shape [1, vocabSize].
 //!
-//! \param[in,out] logits Logits tensor [1, vocabSize] (FP32, in-place)
-//! \param[in] suppressStart Start of suppress range (inclusive)
-//! \param[in] suppressEnd End of suppress range (exclusive)
-//! \param[in] exceptTokenId Token ID to exempt from suppression (-1 to suppress all)
-//! \param[in] stream CUDA stream for execution
-void invokeSuppressLogits(
-    rt::Tensor& logits, int32_t suppressStart, int32_t suppressEnd, int32_t exceptTokenId, cudaStream_t stream);
+//! \param[in] seenTokens          GPU tensor of previously generated token IDs [maxAudioLength] INT32
+//! \param[in,out] logits          Logits tensor [1, vocabSize] (FP32, in-place)
+//! \param[in] suppressStart       Start of suppress range (inclusive)
+//! \param[in] suppressEnd         End of suppress range (exclusive)
+//! \param[in] codecEosId          Token ID exempt from suppression (EOS must remain samplable)
+//! \param[in] numSeenTokens       Number of valid entries in seenTokens (0 to disable penalty)
+//! \param[in] repetitionPenalty   Penalty factor >= 1.0 (1.0 = no penalty)
+//! \param[in] stream              CUDA stream for execution
+void invokeTalkerLogitAdjust(rt::Tensor const& seenTokens, rt::Tensor& logits, int32_t suppressStart,
+    int32_t suppressEnd, int32_t codecEosId, int32_t numSeenTokens, float repetitionPenalty, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

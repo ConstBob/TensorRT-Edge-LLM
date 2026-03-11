@@ -285,19 +285,50 @@ bool convertMaskToIndices(rt::Tensor const& paddedMask, rt::Tensor& paddedMaskIn
     return true;
 }
 
-bool createChunkwiseAttentionMask(
-    std::vector<int64_t> const& afterCNNLens, rt::Tensor& attentionMask, cudaStream_t stream)
+bool createChunkwiseAttentionMask(std::vector<int64_t> const& afterCNNLens, int32_t nWindow, int32_t nWindowInfer,
+    rt::Tensor& attentionMask, cudaStream_t stream)
 {
-    // Calculate total length
-    int64_t totalLen = 0;
+    // Matches modeling_qwen3_omni.py _prepare_attention_mask + cu_seqlens logic:
+    //   window_aftercnn = padded_mask_after_cnn.shape[-1] * (n_window_infer // (n_window * 2))
+    //   cu_seqlens built from aftercnn_lens split by window_aftercnn
+    //   Block-diagonal mask: tokens within the same window attend to each other.
+    int64_t const chunkSize = static_cast<int64_t>(nWindow) * 2;
+    int64_t maxLenAfterCNN = 0;
     for (auto len : afterCNNLens)
+    {
+        maxLenAfterCNN = std::max(maxLenAfterCNN, len);
+    }
+    int64_t const windowAfterCNN = maxLenAfterCNN * (nWindowInfer / chunkSize);
+
+    // Global after-CNN length = sum of per-chunk after-CNN lengths
+    int64_t globalAfterCNNLen = 0;
+    for (auto len : afterCNNLens)
+    {
+        globalAfterCNNLen += len;
+    }
+
+    // Build window lengths from global aftercnn_lens
+    std::vector<int64_t> windowLens;
+    int64_t numFull = globalAfterCNNLen / windowAfterCNN;
+    for (int64_t i = 0; i < numFull; ++i)
+    {
+        windowLens.push_back(windowAfterCNN);
+    }
+    int64_t remainder = globalAfterCNNLen % windowAfterCNN;
+    if (remainder != 0)
+    {
+        windowLens.push_back(remainder);
+    }
+
+    int64_t totalLen = 0;
+    for (auto len : windowLens)
     {
         totalLen += len;
     }
 
     if (totalLen == 0)
     {
-        LOG_ERROR("Total length is 0");
+        LOG_ERROR("Total attention length is 0");
         return false;
     }
 
@@ -311,8 +342,6 @@ bool createChunkwiseAttentionMask(
         check::check(attentionMask.reshape({totalLen, totalLen}), "Failed to reshape attentionMask");
     }
 
-    // Initialize with -inf (mask out) - use FP16 min value
-    // FP16 minimum is approximately -65504
     constexpr float NEG_INF = -65504.0f;
     std::vector<__half> maskHost(totalLen * totalLen);
     for (int64_t i = 0; i < totalLen * totalLen; ++i)
@@ -320,26 +349,21 @@ bool createChunkwiseAttentionMask(
         maskHost[i] = __float2half(NEG_INF);
     }
 
-    // Set block-diagonal regions to 0 (allow attention)
+    // Set block-diagonal regions to 0 (allow attention within each window)
     int64_t offset = 0;
-    for (size_t chunkIdx = 0; chunkIdx < afterCNNLens.size(); ++chunkIdx)
+    for (size_t winIdx = 0; winIdx < windowLens.size(); ++winIdx)
     {
-        int64_t chunkLen = afterCNNLens[chunkIdx];
-
-        // For this chunk, allow all tokens within the chunk to attend to each other
-        for (int64_t i = 0; i < chunkLen; ++i)
+        int64_t winLen = windowLens[winIdx];
+        for (int64_t i = 0; i < winLen; ++i)
         {
-            for (int64_t j = 0; j < chunkLen; ++j)
+            for (int64_t j = 0; j < winLen; ++j)
             {
-                int64_t row = offset + i;
-                int64_t col = offset + j;
-                maskHost[row * totalLen + col] = __float2half(0.0f);
+                maskHost[(offset + i) * totalLen + (offset + j)] = __float2half(0.0f);
             }
         }
-        offset += chunkLen;
+        offset += winLen;
     }
 
-    // Copy to device
     CUDA_CHECK(cudaMemcpyAsync(
         attentionMask.rawPointer(), maskHost.data(), maskHost.size() * sizeof(__half), cudaMemcpyHostToDevice, stream));
 
