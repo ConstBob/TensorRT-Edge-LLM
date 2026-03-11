@@ -61,7 +61,6 @@ public:
      * @brief Load and memory-map a file
      * @param fp Path to file to load
      * @return True on success, false on failure
-     * @throws std::bad_alloc If string memory allocation fails
      */
     bool loadFile(std::filesystem::path const& fp);
 

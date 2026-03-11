@@ -96,7 +96,6 @@ public:
      * @param level Log severity level
      * @param msg Log message
      * @param loc Source location information
-     * @throws std::bad_alloc If memory allocation fails during string formatting
      */
     void logWithLocation(nvinfer1::ILogger::Severity level, std::string const& msg, SourceLocation const& loc)
     {
@@ -115,7 +114,6 @@ public:
      * @brief Log debug message with location tracking
      * @param msg Log message
      * @param loc Source location information
-     * @throws std::bad_alloc If memory allocation fails during string formatting
      */
     void debug(std::string const& msg, SourceLocation const& loc)
     {
@@ -126,7 +124,6 @@ public:
      * @brief Log info message with location tracking
      * @param msg Log message
      * @param loc Source location information
-     * @throws std::bad_alloc If memory allocation fails during string formatting
      */
     void info(std::string const& msg, SourceLocation const& loc)
     {
@@ -137,7 +134,6 @@ public:
      * @brief Log warning message with location tracking
      * @param msg Log message
      * @param loc Source location information
-     * @throws std::bad_alloc If memory allocation fails during string formatting
      */
     void warning(std::string const& msg, SourceLocation const& loc)
     {
@@ -148,7 +144,6 @@ public:
      * @brief Log error message with location tracking
      * @param msg Log message
      * @param loc Source location information
-     * @throws std::bad_alloc If memory allocation fails during string formatting
      */
     void error(std::string const& msg, SourceLocation const& loc)
     {
@@ -283,7 +278,6 @@ public:
      * @param logger Logger instance to use
      * @param funcName Name of the function being traced
      * @param loc Source location information
-     * @throws std::bad_alloc If memory allocation fails during string construction
      */
     ScopedFunctionTracer(EdgeLLMLogger& logger, char const* funcName, SourceLocation const& loc)
         : mLogger(logger)

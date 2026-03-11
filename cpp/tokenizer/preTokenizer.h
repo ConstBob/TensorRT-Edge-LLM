@@ -51,7 +51,6 @@ public:
     /**
      * @brief Get the type name of this step
      * @return String identifying the step type
-     * @throws std::bad_alloc if the string cannot be allocated
      */
     virtual std::string getTypeName() const = 0;
 };
@@ -78,13 +77,11 @@ public:
      * @throws std::runtime_error if the text is too large for regex processing
      * @throws std::runtime_error if Unicode text collapse fails
      * @throws std::runtime_error if Unicode regex split fails
-     * @throws std::bad_alloc if the vector or any of the strings cannot be allocated
      */
     std::vector<std::string> process(std::string const& text) const override;
     /*!
      * @brief Get the type name of this step
      * @return String identifying the step type
-     * @throws std::bad_alloc if the string cannot be allocated
      */
     std::string getTypeName() const override
     {
@@ -129,14 +126,12 @@ public:
      * @param text Input text to process
      * @return Vector of text pieces after processing
      * @throws std::runtime_error if the text is too large for processing
-     * @throws std::bad_alloc if the vector or any of the strings cannot be allocated
      */
     std::vector<std::string> process(std::string const& text) const override;
 
     /*!
      * @brief Get the type name of this step
      * @return String identifying the step type
-     * @throws std::bad_alloc if the string cannot be allocated
      */
     std::string getTypeName() const override
     {
@@ -147,7 +142,6 @@ public:
      * @brief Add a processing step to the sequence
      * @param step Unique pointer to the step to add
      * @throws std::invalid_argument if the step is null
-     * @throws std::bad_alloc if the vector cannot be allocated
      */
     void addStep(std::unique_ptr<PreTokenizer> step);
 

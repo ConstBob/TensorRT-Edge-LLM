@@ -68,7 +68,6 @@ public:
      *  \throws std::runtime_error if engine loading, configuration parsing, or initialization fails
      *  \throws std::runtime_error if there is a data type mismatch, or mismatch between engine and config
      *  \throws std::runtime_error if a CUDA error occurs
-     *  \throws std::bad_alloc If memory allocation fails
      */
     EagleDraftEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         cudaStream_t stream);
@@ -245,13 +244,11 @@ private:
 
     //! Validate the configuration from the engine.
     //! \return True if validation was successful, false otherwise
-    //! \throws std::bad_alloc if string allocation fails
     bool validateConfigFromEngine();
 
     //! Bind KV cache to the engine.
     //! \param activeBatchSize The active batch size
     //! \return True if binding was successful, false otherwise
-    //! \throws std::bad_alloc if string allocation fails
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
     //! Bind plugin-style KV cache to the engine (combined K/V format).

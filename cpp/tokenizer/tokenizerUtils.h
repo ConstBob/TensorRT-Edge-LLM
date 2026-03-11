@@ -73,7 +73,6 @@ static std::regex const specialChars{R"([[\^$.|?*+(){}])"};
  * @brief Reverse token-to-rank mapping
  * @param encoder Token to rank mapping
  * @return Rank to token mapping
- * @throws std::bad_alloc if memory allocation fails
  */
 RanksToToken reverseEncoder(TokenToRanks const& encoder);
 
@@ -81,7 +80,6 @@ RanksToToken reverseEncoder(TokenToRanks const& encoder);
  * @brief Decode HuggingFace format token to normal UTF-8
  * @param hfToken HuggingFace format token string
  * @return Decoded UTF-8 string
- * @throws std::bad_alloc if memory allocation fails
  */
 std::string decodeHFTokenToNormal(std::string const& hfToken);
 
@@ -89,7 +87,6 @@ std::string decodeHFTokenToNormal(std::string const& hfToken);
  * @brief Normalize regex expressions for C++ regex compatibility
  * @param expr Regular expression string
  * @return Normalized regex expression
- * @throws std::bad_alloc if memory allocation fails
  */
 std::string normalizeRegex(std::string const& expr);
 
@@ -205,7 +202,6 @@ bool unicodeCollapseRegex(std::string const& expr, std::regex& regex);
  * @brief Collapse codepoints to text
  * @param cpts Vector of codepoints
  * @return Collapsed text string
- * @throws std::bad_alloc if memory allocation fails
  */
 std::string unicodeCollapseText(std::vector<uint32_t> const& cpts);
 
@@ -214,7 +210,6 @@ std::string unicodeCollapseText(std::vector<uint32_t> const& cpts);
  * @param text Input text
  * @param regex Regex pattern for splitting
  * @return Vector of split positions
- * @throws std::bad_alloc if memory allocation fails
  */
 std::vector<size_t> unicodeRegexSplit(std::string const& text, std::regex const& regex);
 
@@ -222,7 +217,6 @@ std::vector<size_t> unicodeRegexSplit(std::string const& text, std::regex const&
  * @brief Convert UTF-8 string to codepoints
  * @param utf8 UTF-8 encoded string
  * @return Vector of codepoints
- * @throws std::bad_alloc if memory allocation fails
  * @throws std::invalid_argument if input is not valid UTF-8
  */
 std::vector<uint32_t> unicodeCptsFromUtf8(std::string const& utf8);
@@ -240,7 +234,6 @@ uint32_t unicodeCptFromUtf8(std::string const& utf8, size_t& offset);
  * @brief Convert codepoint to UTF-8 string
  * @param cp Codepoint value
  * @return UTF-8 encoded string
- * @throws std::bad_alloc if memory allocation fails
  * @throws std::invalid_argument if input is not a valid Unicode code point
  */
 std::string unicodeCptToUtf8(uint32_t cp);
@@ -249,7 +242,6 @@ std::string unicodeCptToUtf8(uint32_t cp);
  * @brief Get flags for a codepoint
  * @param cp Codepoint value
  * @return Codepoint flags
- * @throws std::bad_alloc if memory allocation fails
  */
 codepointFlags unicodeCptFlags(uint32_t const cp);
 

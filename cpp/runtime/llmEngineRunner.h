@@ -94,7 +94,6 @@ public:
      * @param stream CUDA stream for operations
      * @throws std::runtime_error If engine loading, configuration parsing, or initialization fails, or a CUDA operation
      * fails
-     * @throws std::bad_alloc If memory allocation fails
      */
     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
@@ -179,19 +178,16 @@ public:
     //!     loraWeightsName: The name of the LoRA weights.
     //! Returns:
     //!     True if the LoRA weights switch is successful, false otherwise.
-    //! @throws std::bad_alloc if memory allocation fails
     bool switchLoraWeights(std::string const& loraWeightsName);
 
     //! API entry to get the active LoRA weights name.
     //! Returns:
     //!     The active LoRA weights name.
-    //! @throws std::bad_alloc if string allocation fails
     std::string getActiveLoraWeightsName() const;
 
     //! API entry to get the LoRA weights.
     //! Returns:
     //!     The LoRA weights names.
-    //! @throws std::bad_alloc if memory allocation fails
     std::vector<std::string> getAvailableLoraWeights() const;
 
     //! API entry to capture the CUDA graph for the base model tree decoding step. If CUDA graph capture is successful,
@@ -283,7 +279,6 @@ private:
     /*!
      * @brief Validate configuration against engine
      * @return True if valid, false otherwise
-     * @throws std::bad_alloc if string allocation fails
      */
     bool validateConfigFromEngine();
 
@@ -291,7 +286,6 @@ private:
      * @brief Bind KV cache to engine for prefill and generation of new requests
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
-     * @throws std::bad_alloc if string allocation fails
      */
     bool bindKVCacheToEngine(int32_t activeBatchSize);
 
@@ -323,27 +317,23 @@ private:
         rt::Tensor const& baseTreeDecodingMask, int32_t activeBatchSize, cudaStream_t stream);
 
     //! The Function is used to add a LoRA weights to the LLM engine.
-    //! @throws std::bad_alloc if memory allocation fails
     bool addLoraWeights(std::string const& loraWeightsName, std::string const& loraWeightsPath, cudaStream_t stream);
 
     /*!
      * @brief Reset LoRA weights to dummy tensors with rank 0
      * @return True on success, false on failure
-     * @throws std::bad_alloc if memory allocation fails
      */
     bool resetLoraWeights();
 
     /*!
      * @brief Get maximum dimension required for LoRA weights across all LoRA bindings
      * @return Maximum dimension (k for LoRA A, n for LoRA B), or 0 if no LoRA bindings
-     * @throws std::bad_alloc if memory allocation fails
      */
     int32_t getMaxLoraWeightsDimension() const;
 
     /*!
      * @brief Get tensor names of LoRA weights
      * @return Vector of LoRA weight tensor names
-     * @throws std::bad_alloc if memory allocation fails
      */
     std::vector<std::string> getLoraWeightsTensorNames() const;
 
@@ -353,7 +343,6 @@ private:
 
     //! @brief Get the KV cache type
     //! @return The KV cache type
-    //! @throws std::bad_alloc if string memory allocation fails
     nvinfer1::DataType getKVCacheType() const;
 
     //! @brief Get the SSM state dtype from the engine binding (layer 0)
@@ -364,7 +353,6 @@ private:
 
     //! @brief Validate the KV cache type consistency
     //! @return True if the KV cache type is consistent, false otherwise
-    //! @throws std::bad_alloc if string memory allocation fails
     //! @throws std::runtime_error if KV cache has mismatching data type
     bool validateKVCacheType() const;
 
@@ -373,7 +361,6 @@ private:
      * @brief Bind KV cache to engine for prefill and generation of new requests (plugin path)
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
-     * @throws std::bad_alloc if string memory allocation fails
      */
     bool bindPluginKVCacheToEngine(int32_t activeBatchSize);
 
@@ -381,7 +368,6 @@ private:
      * @brief Bind separate K and V caches to engine for new requests (TRT native path)
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
-     * @throws std::bad_alloc if string memory allocation fails
      */
     bool bindTRTNativeKVCacheToEngine(int32_t activeBatchSize);
 

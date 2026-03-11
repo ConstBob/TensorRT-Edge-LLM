@@ -204,7 +204,6 @@ public:
     }
 
     //! @throws std::runtime_error if a CUDA driver error occurs
-    //! @throws std::bad_alloc if a memory allocation error occurs
     void loadFMHAKernels()
     {
         if (!mFunctions.empty())
@@ -280,7 +279,6 @@ class FMHAKernelLoader
 
 public:
     //! @throws std::runtime_error if a CUDA driver error occurs
-    //! @throws std::bad_alloc if a memory allocation error occurs
     FMHAKernelList* getFMHAKernelList(FMHADataType type, int32_t sm)
     {
         static std::mutex s_mutex;
@@ -317,7 +315,6 @@ private:
 };
 
 //! @throws std::runtime_error if a CUDA driver error occurs
-//! @throws std::bad_alloc if a memory allocation error occurs
 inline FMHAKernelList* getFMHAKernels(FMHADataType type, int32_t sm)
 {
     return FMHAKernelLoader::Get().getFMHAKernelList(type, sm);

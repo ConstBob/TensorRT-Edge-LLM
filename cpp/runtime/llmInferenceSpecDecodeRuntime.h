@@ -94,7 +94,6 @@ struct SpecDecodeInferenceContext
      * @param deepstackFeatures Deepstack features for Qwen3-VL (raw features before embedding)
      * @param loraName LoRA weights name used by this request
      * @param cudaStream CUDA stream for operations
-     * @throws std::bad_alloc if memory allocation fails
      */
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal,
         rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
@@ -155,7 +154,6 @@ public:
      * @param response Output response with generated tokens and text
      * @param stream CUDA stream
      * @return True on success, false on failure
-     * @throws std::bad_alloc if memory allocation fails
      * @throws std::runtime_error if an LLM or CUDA operation fails
      */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
@@ -249,7 +247,6 @@ private:
     // Key functions to drive the spec-decode runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     //! @throws std::runtime_error if a CUDA error occurs
-    //! @throws std::bad_alloc if memory allocation fails
     bool runBaseModelPrefill(SpecDecodeInferenceContext& context);
 
     // Consume the base model hidden states and input token of the sequence. Produce the draft hidden states and logits
@@ -259,12 +256,10 @@ private:
 
     // Consume the draft hidden states and logits for the last token of the sequence. Produce a speculative draft tree
     // that described by a sequence of draft tokens and tree mask that describe the tree structure.
-    //! @throws std::bad_alloc if memory allocation fails
     //! @throws std::runtime_error if tensor shapes are invalid, or a CUDA operation fails
     bool constructDraftTree(SpecDecodeInferenceContext& context);
 
     // Consume the speculative draft tree, produce selected tokens and corresponding hidden states.
-    //! @throws std::bad_alloc if memory allocation fails
     //! @throws std::runtime_error if tensor shapes are invalid, or a CUDA operation fails
     bool runBaseModelVerification(SpecDecodeInferenceContext& context);
 
@@ -277,13 +272,11 @@ private:
     bool runVanillaDecoding(SpecDecodeInferenceContext& context);
 
     // Consume system prompt, produce the hash table of system prompt KVCache if kv cache reuse is enabled.
-    //! @throws std::bad_alloc if memory allocation fails
     //! @throws std::runtime_error if a CUDA operation fails
     bool genAndSaveSystemPromptKVCache(SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx);
 
     // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
     // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.
-    //! @throws std::bad_alloc if memory allocation fails
     //! @throws std::runtime_error if system prompt is malformed
     bool setUpForPrefillExecution(SpecDecodeInferenceContext& context);
 
@@ -291,7 +284,6 @@ private:
     //! @brief Perform batch eviction
     //! @param context Inference context
     //! @return True on success, false on failure
-    //! @throws std::bad_alloc if memory allocation fails
     //! @throws std::runtime_error if a CUDA error occurs
     bool performBatchEvict(SpecDecodeInferenceContext& context);
 

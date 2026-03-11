@@ -123,7 +123,6 @@ public:
     //! \param[in] useSpecDecodeKernels Whether to load spec-decode kernels
     //! \return True if kernels loaded successfully, false otherwise
     //! \throws std::runtime_error if a CUDA driver error occurs
-    //! \throws std::bad_alloc if memory allocation fails
     static bool loadDecodeXQAKernels(
         int32_t smVersion, nvinfer1::DataType dataType, nvinfer1::DataType kvDataType, bool useSpecDecodeKernels);
 

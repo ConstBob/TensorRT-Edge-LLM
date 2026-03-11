@@ -31,7 +31,6 @@ namespace format
  * @param ... Variable arguments
  * @return Formatted string
  * @throws std::runtime_error If vsnprintf size mismatch occurs
- * @throws std::bad_alloc If memory allocation fails
  */
 std::string fmtstr(char const* format, ...);
 

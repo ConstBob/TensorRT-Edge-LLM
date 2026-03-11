@@ -56,7 +56,6 @@ public:
      * @param engineDir Directory containing engine files
      * @param stream CUDA stream for operations
      * @throws std::runtime_error If engine loading or initialization fails
-     * @throws std::bad_alloc If memory allocation fails
      */
     MultimodalRunner(std::string const& engineDir, cudaStream_t stream);
 
@@ -74,7 +73,6 @@ public:
      * @param stream CUDA stream for operations
      * @return Unique pointer to created runner
      * @throws std::runtime_error If model type is unknown or runner creation fails
-     * @throws std::bad_alloc If memory allocation fails
      */
     static std::unique_ptr<MultimodalRunner> create(std::string const& multimodalEngineDir, int32_t llmMaxBatchSize,
         int64_t llmMaxPositionEmbeddings, cudaStream_t stream);

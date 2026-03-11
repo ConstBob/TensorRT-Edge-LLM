@@ -62,7 +62,6 @@ public:
      * @param specialTokens Special tokens mapping
      * @return true if vocab is non-empty and initialization completes;
      *         false if vocab is empty
-     * @throws std::bad_alloc If vector allocation fails
      */
     bool initialize(TokenToRanks const& vocab, TokenToRanks const& specialTokens = {});
 
@@ -121,19 +120,16 @@ public:
      * @brief Get token string from rank
      * @param rank Token rank/ID
      * @return Token string
-     * @throws std::bad_alloc If string allocation fails
      */
     std::string getRankToken(Rank rank) const;
 
 private:
     /**
      * @brief Byte Pair Encoding implementation
-     * @throws std::bad_alloc If string or vector allocation fails
      */
     void bytePairEncode(std::string const& piece, std::vector<Rank>& output) const;
     /**
      * @brief Get string representation of encoder type
-     * @throws std::bad_alloc If string allocation fails
      */
     std::string getTypeString(Type type) const;
 

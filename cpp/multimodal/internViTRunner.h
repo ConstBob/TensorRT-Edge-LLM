@@ -62,7 +62,6 @@ public:
     //! \throws std::runtime_error if engineDir does not contain valid engine files
     //! \throws std::runtime_error if buffer allocation fails
     //! \throws std::runtime_error if a CUDA error occurs
-    //! \throws std::bad_alloc if memory allocation fails
     InternViTRunner(std::string const& engineDir, cudaStream_t stream);
 
     ~InternViTRunner() noexcept = default;
@@ -86,7 +85,6 @@ public:
     //! \brief Validate and load configuration from JSON file
     //! \param[in] engineDir Path to engine directory
     //! \return True if configuration is valid and loaded successfully, false otherwise
-    //! \throws std::bad_alloc if memory allocation fails
     bool validateAndFillConfig(std::string const& engineDir) override;
 
     //! \brief Allocate buffers for inference
@@ -101,7 +99,6 @@ private:
     //! \param[in] numImages Number of images per request
     //! \param[in] imageTokenLengths Token lengths for each image
     //! \param[in] tokenizer Tokenizer for text processing
-    //! \throws std::bad_alloc if memory allocation fails
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         trt_edgellm::tokenizer::Tokenizer const* tokenizer);
@@ -113,7 +110,6 @@ private:
     //! \param[out] totalNumBlocks Total number of image blocks
     //! \param[in] isThumbnail Whether the image is a thumbnail
     //! \param[in] stream CUDA stream for execution
-    //! \throws std::bad_alloc if memory allocation fails
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
         int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
@@ -124,7 +120,6 @@ private:
     //! \param[out] numImages Number of images per request
     //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
-    //! \throws std::bad_alloc if memory allocation fails
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
