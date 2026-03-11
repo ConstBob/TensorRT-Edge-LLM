@@ -26,8 +26,14 @@
 #include "kernels/posEncoding/applyRopeWriteKV.h"
 #include "plugins/utils/pluginUtils.h"
 
+// CuTe DSL FMHA kernel (Blackwell SM100+)
+#ifdef CUTE_DSL_FMHA_ENABLED
+#include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
+#endif
+
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -148,22 +154,62 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t enableTreeAttention, int32_t enableFp8KVCache)
+    int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t slidingWindowSize)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
     , mHeadSize(headSize)
     , mEnableTreeAttention(enableTreeAttention)
     , mEnableFp8KVCache(enableFp8KVCache)
+    , mSlidingWindowSize(slidingWindowSize)
 {
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    // Plugin constructor does not know runtime execution mode yet, so keep this check conservative.
-    bool canImplementFMHA = ContextFMHARunner::canImplement(
-        mHeadSize, mSMVersion, mDataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL);
+    LOG_DEBUG("AttentionPlugin FMHA path: %s, sliding_window: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2",
+        mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
+
+    // Check FMHA implementation support and load the corresponding kernel module.
+    bool canImplementFMHA = false;
+#ifdef CUTE_DSL_FMHA_ENABLED
+    if (mUseCuteDslFMHA && CuteDslFMHARunner::canImplement(mHeadSize, mSMVersion))
+    {
+        if (CuteDslFMHARunner::loadKernelModule())
+        {
+            canImplementFMHA = true;
+            LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", mSMVersion);
+        }
+        else
+        {
+            LOG_WARNING("CuTe DSL FMHA kernel failed to load, falling back to FMHA_v2");
+            mUseCuteDslFMHA = false;
+        }
+    }
+    if (!canImplementFMHA)
+#endif
+    {
+        // Fallback to FMHA_v2 cubins.
+        canImplementFMHA = ContextFMHARunner::canImplement(
+            mHeadSize, mSMVersion, mDataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL);
+        if (canImplementFMHA)
+        {
+            if (!ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType))
+            {
+                LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", mSMVersion);
+                canImplementFMHA = false;
+            }
+        }
+    }
+
+    // XQA decode kernels are always needed regardless of FMHA path.
+    bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
     bool canImplementXQA = DecoderXQARunner::canImplement(
         mNumQHeads, mNumKVHeads, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
+    if (canImplementXQA)
+    {
+        DecoderXQARunner::loadDecodeXQAKernels(
+            mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode);
+    }
 
     if (!canImplementFMHA || !canImplementXQA)
     {
@@ -174,14 +220,6 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
             mSMVersion, mHeadSize, mNumQHeads, mNumKVHeads);
         throw std::runtime_error("Cannot implement the AttentionPlugin configuration.");
     }
-
-    // Load FMHA and XQA kernels to device. The kernel code will only be loaded once if
-    // multiple AttentionPlugin instances exist in the model.
-    // TODO: Fix me to pass spec-decode support through plugin attributes.
-    bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
-    ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
-    DecoderXQARunner::loadDecodeXQAKernels(
-        mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode);
 }
 
 AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data, size_t length)
@@ -192,12 +230,33 @@ AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data,
     deserializeValue(&data, &length, &mHeadSize);
     deserializeValue(&data, &length, &mEnableTreeAttention);
     deserializeValue(&data, &length, &mEnableFp8KVCache);
+    deserializeValue(&data, &length, &mSlidingWindowSize);
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
-    // TODO: Fix me too pass spec-deocde support through plugin attributes.
+    LOG_DEBUG("AttentionPlugin FMHA path: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2");
+
+    // Load FMHA kernel module based on implementation support.
+#ifdef CUTE_DSL_FMHA_ENABLED
+    if (mUseCuteDslFMHA && CuteDslFMHARunner::canImplement(mHeadSize, mSMVersion))
+    {
+        if (!CuteDslFMHARunner::loadKernelModule())
+        {
+            LOG_WARNING("CuTe DSL FMHA kernel failed to load, falling back to FMHA_v2");
+            mUseCuteDslFMHA = false;
+        }
+    }
+    if (!mUseCuteDslFMHA)
+#endif
+    {
+        if (!ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType))
+        {
+            LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", mSMVersion);
+        }
+    }
+
+    // XQA decode kernels are always needed regardless of FMHA path.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
     DecoderXQARunner::loadDecodeXQAKernels(
         mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode);
@@ -207,8 +266,8 @@ AttentionPlugin::~AttentionPlugin() {}
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin
-        = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention, mEnableFp8KVCache);
+    AttentionPlugin* plugin = new AttentionPlugin(
+        mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention, mEnableFp8KVCache, mSlidingWindowSize);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -660,50 +719,75 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
             cuKVSeqLensTensor, kvCacheEndIdxsTensor, runtimeSeqLen, stream);
 
-        AttentionInputLayout attentionInputLayout = executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
-            ? AttentionInputLayout::CONTIGUOUS_Q_KV
-            : AttentionInputLayout::SEPARATE_Q_K_V;
-        auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
-            mHeadSize, mSMVersion, attentionInputLayout);
-
-        // Prepare FMHA_v2 params to launch FMHA kernel
-        FusedMultiheadAttentionParamsV2 params{};
-        fmhaRunner.setupParams(params);
-        params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
-
-        if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
+#ifdef CUTE_DSL_FMHA_ENABLED
+        // CuTe DSL FMHA currently only supports FP16 KV cache
+        if (mUseCuteDslFMHA && !mEnableFp8KVCache)
         {
-            // FMHA kernel with CONTIGUOUS_Q_KV input layout currently only supports FP16 KV cache.
-            // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
-            kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream, false);
+            kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
+                vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
 
-            rt::Tensor transposedKVTensor = assignTensorFromWorkspace(
-                alignedWorkspacePtr, {runtimeBatchSize, kvCacheCapacity, 2, mNumKVHeads, mHeadSize}, DataType::kHALF);
-            kernel::cvtKVLayoutBHSDToBSHD(kvCacheTensor, transposedKVTensor, kvScaleQuantOrigTensor, stream);
-
-            // Set device ptr for FMHA kernel.
-            params.s_kv = kvCacheCapacity;
-            params.q_ptr = qInputTensor.dataPointer<half>();
-            params.kv_ptr = transposedKVTensor.dataPointer<half>();
-            params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
-            params.o_ptr = attentionOutputTensor.dataPointer<half>();
+            // Run CuTe DSL FMHA kernel with combined KV tensor
+            // Expected layouts: Q [b, s_q, h_q, d], KV [b, 2, hkv, cap, d], O [b, s_q, h_q, d]
+            CuteDslFMHARunner runner(runtimeBatchSize,     // b
+                runtimeSeqLen,                             // s_q
+                kvCacheCapacity,                           // KV cache capacity (for strides)
+                mNumQHeads,                                // h_q
+                mNumKVHeads,                               // h_k
+                mHeadSize);                                // d
+            runner.run(qInputTensor.dataPointer<half>(),   // qPtr [b, s_q, h_q, d]
+                kvCacheTensor.dataPointer<half>(),         // kvPtr [b, 2, h_k, cap, d]
+                attentionOutputTensor.dataPointer<half>(), // oPtr [b, s_q, h_q, d]
+                cuKVSeqLensTensor.dataPointer<int32_t>(),  // cu_kv_seqlens [b+1]
+                stream, mSlidingWindowSize > 0 ? mSlidingWindowSize : INT_MAX);
         }
         else
-        { // SEPARATE_Q_K_V
-            kernel::launchApplyRopeWriteKV(ropeCosSinTensor, std::nullopt, qInputTensor, kInputTensor, vInputTensor,
-                kvCacheTensor, kvScaleQuantOrigTensor, stream, true);
+#endif
+        {
+            AttentionInputLayout attentionInputLayout = executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
+                ? AttentionInputLayout::CONTIGUOUS_Q_KV
+                : AttentionInputLayout::SEPARATE_Q_K_V;
+            auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
+                mHeadSize, mSMVersion, attentionInputLayout);
 
-            params.s_kv = runtimeSeqLen;
-            params.q_ptr = qInputTensor.dataPointer<half>();
-            params.k_ptr = kInputTensor.dataPointer<half>();
-            params.v_ptr = vInputTensor.dataPointer<half>();
-            params.cu_kv_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
-            params.o_ptr = attentionOutputTensor.dataPointer<half>();
+            // Prepare FMHA_v2 params to launch FMHA kernel
+            FusedMultiheadAttentionParamsV2 params{};
+            fmhaRunner.setupParams(params);
+            params.cu_q_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
+
+            if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
+            {
+                // FMHA kernel with CONTIGUOUS_Q_KV input layout currently only supports FP16 KV cache.
+                // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
+                kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
+                    vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream, false);
+
+                rt::Tensor transposedKVTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {runtimeBatchSize, kvCacheCapacity, 2, mNumKVHeads, mHeadSize}, DataType::kHALF);
+                kernel::cvtKVLayoutBHSDToBSHD(kvCacheTensor, transposedKVTensor, kvScaleQuantOrigTensor, stream);
+
+                // Set device ptr for FMHA kernel.
+                params.s_kv = kvCacheCapacity;
+                params.q_ptr = qInputTensor.dataPointer<half>();
+                params.kv_ptr = transposedKVTensor.dataPointer<half>();
+                params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
+                params.o_ptr = attentionOutputTensor.dataPointer<half>();
+            }
+            else
+            { // SEPARATE_Q_K_V
+                kernel::launchApplyRopeWriteKV(ropeCosSinTensor, std::nullopt, qInputTensor, kInputTensor, vInputTensor,
+                    kvCacheTensor, kvScaleQuantOrigTensor, stream, true);
+
+                params.s_kv = runtimeSeqLen;
+                params.q_ptr = qInputTensor.dataPointer<half>();
+                params.k_ptr = kInputTensor.dataPointer<half>();
+                params.v_ptr = vInputTensor.dataPointer<half>();
+                params.cu_kv_seqlens = cuQSeqLensTensor.dataPointer<int32_t>();
+                params.o_ptr = attentionOutputTensor.dataPointer<half>();
+            }
+
+            // Dispatch FMHA kernel
+            fmhaRunner.dispatchFMHAKernel(params, stream);
         }
-
-        // Dispatch FMHA kernel
-        fmhaRunner.dispatchFMHAKernel(params, stream);
     }
     else
     {
@@ -754,7 +838,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mNumQHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mEnableTreeAttention)
-        + sizeof(mEnableFp8KVCache);
+        + sizeof(mEnableFp8KVCache) + sizeof(int32_t) /* slidingWindowSize */;
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
@@ -765,6 +849,7 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&byteBuffer, mHeadSize);
     serializeValue(&byteBuffer, mEnableTreeAttention);
     serializeValue(&byteBuffer, mEnableFp8KVCache);
+    serializeValue(&byteBuffer, mSlidingWindowSize);
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -791,6 +876,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     // Make enable_fp8_kv_cache optional with default value 0 (disable by default)
     mPluginAttributes.emplace_back(PluginField("enable_tree_attention", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
+    // Sliding window size (-1 = no sliding window, >0 = window size)
+    mPluginAttributes.emplace_back(PluginField("sliding_window_size", nullptr, PluginFieldType::kINT32, 0));
     // Enforce Core parameters are specified.
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
@@ -831,6 +918,8 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
         std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
         std::optional<int32_t> enableFp8KVCache = parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc);
+        // sliding_window_size: -1 = no sliding window (default), >0 = sliding window size
+        int32_t slidingWindowSize = parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1);
         // Make enable_fp8_kv_cache optional with default value 0 (disable by default)
         int32_t enableFp8KVCacheValue = enableFp8KVCache.value_or(0);
 
@@ -843,7 +932,7 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
         }
 
         AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
-            headSize.value(), enableTreeAttention.value(), enableFp8KVCacheValue);
+            headSize.value(), enableTreeAttention.value(), enableFp8KVCacheValue, slidingWindowSize);
 
         return plugin;
     }

@@ -29,6 +29,7 @@ from typing import Optional, Tuple
 import onnx
 import torch
 from onnx.defs import OpSchema
+from torch._C import Value
 from torch.onnx import register_custom_op_symbolic, symbolic_helper
 from torch.onnx.symbolic_helper import _get_tensor_sizes
 
@@ -155,6 +156,13 @@ attention_plugin_schema = OpSchema(
             "Whether to use FP8 KV cache (0(false), 1(true)). Optional.",
             required=False,
         ),
+        OpSchema.Attribute(
+            name="sliding_window_size",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Sliding window size for attention (-1 = no sliding window, >0 = window size).",
+            required=False,
+        ),
     ],
 )
 onnx.defs.register_schema(attention_plugin_schema)
@@ -227,7 +235,7 @@ onnx.defs.register_schema(vit_attention_plugin_schema)
 
 
 @symbolic_helper.parse_args("v", "v", "v", "v", "v", "v", "v", "i", "i", "b",
-                            "i", "b", "v", "v", "v")
+                            "i", "b", "i", "v", "v", "v")
 def symbolic_attention_plugin(
     g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
     q: torch._C.Value,
@@ -242,6 +250,7 @@ def symbolic_attention_plugin(
     enable_tree_attention: torch._C.Value,
     head_size: torch._C.Value,
     enable_fp8_kv_cache: torch._C.Value,
+    sliding_window_size: torch._C.Value,
     attention_mask: Optional[torch._C.Value] = None,
     position_ids: Optional[torch._C.Value] = None,
     k_v_scale_quant_orig: Optional[torch._C.Value] = None,
@@ -270,15 +279,19 @@ def symbolic_attention_plugin(
 
     q_type = q.type()
     past_key_value_type = past_key_value.type()
-    attn_output, present_key_value = g.op(
-        "trt::AttentionPlugin",
-        *inputs,
+    attrs = dict[str, Value | int](
         num_q_heads_i=num_q_heads,
         num_kv_heads_i=num_kv_heads,
         head_size_i=head_size,
         enable_tree_attention_i=1 if enable_tree_attention else 0,
         enable_fp8_kv_cache_i=1 if enable_fp8_kv_cache else 0,
-        outputs=2)
+        sliding_window_size_i=sliding_window_size,
+    )
+
+    attn_output, present_key_value = g.op("trt::AttentionPlugin",
+                                          *inputs,
+                                          **attrs,
+                                          outputs=2)
 
     q_sizes = _get_tensor_sizes(q)
     attn_output_sizes = q_sizes[:-1] + [num_q_heads, head_size]
@@ -334,6 +347,7 @@ def attention_plugin(
     enable_tree_attention: bool,
     head_size: int,
     enable_fp8_kv_cache: bool,
+    sliding_window_size: int = -1,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
     k_v_scale_quant_orig: Optional[torch.Tensor] = None,
@@ -359,6 +373,7 @@ def attention_plugin(
         head_size: Size of each attention head
         enable_fp8_kv_cache: Whether to use FP8 KV cache
         attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
+        sliding_window_size: Sliding window size for attention, optional
         position_ids: Position IDs tensor of shape (batch_size, seq_len), optional
         k_v_scale_quant_orig: Packed KV dequant scales for FP8 KV cache, shape (2), optional.
             Layout: [k_scale_quant_orig, v_scale_quant_orig]

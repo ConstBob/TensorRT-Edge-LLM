@@ -69,5 +69,24 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
     rt::Tensor const& tokenPosIds, rt::Tensor& q, rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache,
     rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
+//! @brief Launch kernel to apply RoPE to Q (in-place), apply RoPE to K and write K/V to KVCache.
+//!
+//! Optimized for the CuTe DSL FMHA path: applies RoPE to Q in-place, writes roped K and V into
+//! KV cache [B, 2, H_kv, S, D]. Does NOT write roped K back to the K input tensor.
+//! The downstream FMHA kernel reads Q from the Q tensor and K/V from the KV cache directly.
+//!
+//! @param[in] cosSinCache FP32 type tensor with layout of [cosSinCacheBatchSize, cosSinCacheSeqLen, rotaryDim]
+//! @param[in] kvCacheEndLens INT32 type tensor with layout of [batchSize], the end position of KVCache after writing.
+//! @param[in,out] q FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hq, headDim]. RoPE applied in-place.
+//! @param[in] k FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
+//! @param[in] v FP16 type tensor with layout of [batchSize, runtimeSeqLen, Hkv, headDim]
+//! @param[out] kvCache FP16/FP8 type tensor with layout of [batchSize, 2, Hkv, kvCacheCapacity, headDim]
+//! @param[in] kvScaleQuantOrig FP32 type tensor with layout of [2] for FP8 KV cache quantization scales. Empty for
+//! FP16.
+//! @param[in] stream CUDA stream to launch the kernel
+void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q,
+    rt::Tensor const& k, rt::Tensor const& v, rt::Tensor& kvCache, rt::Tensor const& kvScaleQuantOrig,
+    cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

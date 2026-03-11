@@ -1,0 +1,1090 @@
+diff --git a/examples/python/CuTeDSL/blackwell/fmha.py b/examples/python/CuTeDSL/blackwell/fmha.py
+index 7b91051a..a7018ee4 100644
+--- a/examples/python/CuTeDSL/blackwell/fmha.py
++++ b/examples/python/CuTeDSL/blackwell/fmha.py
+@@ -34,23 +34,23 @@ import time
+ from typing import Type, Tuple, Union, Optional
+ 
+ import cuda.bindings.driver as cuda
+-import torch
+-
++import cupy as cp
+ import cutlass
+ import cutlass.cute as cute
+ import cutlass.cute.nvgpu.tcgen05 as tcgen05
+-import cutlass.utils as utils
++import cutlass.cute.testing as testing
+ import cutlass.pipeline as pipeline
++import cutlass.utils as utils
+ import cutlass.utils.blackwell_helpers as sm100_utils
+-import cutlass.cute.testing as testing
++import numpy as np
+ from cutlass.cute.runtime import from_dlpack
+-from cutlass.cute.typing import Int32, Int64, Float32
++from cutlass.cute.typing import Float32, Int32, Int64
+ 
+ if __name__ == "__main__":
+     current_dir = os.path.dirname(os.path.abspath(__file__))
+     sys.path.insert(0, os.path.join(current_dir, ".."))
+ 
+-from helpers import fmha_helpers as fmha_utils
++import fmha_helpers as fmha_utils  # isort: skip
+ 
+ """
+ A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
+@@ -106,6 +106,8 @@ def make_thread_cooperative_group(size: int):
+ 
+ 
+ class BlackwellFusedMultiHeadAttentionForward:
++    WINDOW_NO_LIMIT = 1 << 30
++
+     def __init__(
+         self,
+         qk_acc_dtype: Type[cutlass.Numeric],
+@@ -113,6 +115,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+         mma_tiler: Tuple[int, int, int],
+         is_persistent: bool,
+         mask_type: fmha_utils.MaskEnum,
++        use_sliding_window: bool = False,
+     ):
+         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
+ 
+@@ -130,7 +133,7 @@ class BlackwellFusedMultiHeadAttentionForward:
+         3.  Kernel Execution Mode:
+             - is_persistent: Boolean indicating whether to use persistent kernel mode
+             - mask_type: Specifies the type of mask to use (no mask, residual mask, or causal mask)
+-            - window_size_left/right: Sliding window size for attention masking
++            - use_sliding_window: Whether to compile with sliding window support
+ 
+         :param qk_acc_dtype: Data type for Q*K^T matrix multiplication accumulator
+         :type qk_acc_dtype: Type[cutlass.Numeric]
+@@ -142,14 +145,15 @@ class BlackwellFusedMultiHeadAttentionForward:
+         :type is_persistent: bool
+         :param mask_type: Type of mask to use
+         :type mask_type: fmha_utils.MaskEnum
+-        :param window_size_left: Left-side sliding window size for attention masking
+-        :type window_size_left: int
+-        :param window_size_right: Right-side sliding window size for attention masking
+-        :type window_size_right: int
++        :param use_sliding_window: If True, compile with sliding window masking code.
++            If False, window_size_left is treated as None at compile time,
++            eliminating left-side window masking code for better performance.
++        :type use_sliding_window: bool
+         """
+ 
+         self.qk_acc_dtype = qk_acc_dtype
+         self.pv_acc_dtype = pv_acc_dtype
++        self.head_dim = mma_tiler[2]
+         self.cta_tiler = (
+             2 * mma_tiler[0],  # 2 Q tile per CTA
+             mma_tiler[1],
+@@ -164,6 +168,8 @@ class BlackwellFusedMultiHeadAttentionForward:
+         self.cluster_shape_mn = (1, 1)
+         self.is_persistent = is_persistent
+         self.mask_type = mask_type
++        self.use_sliding_window = use_sliding_window
++        self.window_size_right = Int32(0)  # always causal, compile-time constant
+ 
+         self.softmax0_warp_ids = (0, 1, 2, 3)
+         self.softmax1_warp_ids = (4, 5, 6, 7)
+@@ -240,19 +246,13 @@ class BlackwellFusedMultiHeadAttentionForward:
+     @cute.jit
+     def __call__(
+         self,
+-        q_iter: cute.Pointer,
+-        k_iter: cute.Pointer,
+-        v_iter: cute.Pointer,
+-        o_iter: cute.Pointer,
+-        problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32, Int32],
+-        cum_seqlen_q: Optional[cute.Tensor],
+-        cum_seqlen_k: Optional[cute.Tensor],
+-        lse_iter: Optional[cute.Pointer],
++        q_tensor: cute.Tensor,  # (B, S_q, H_q, D) — B,S_q,H_q dynamic; D static
++        kv_cache: cute.Tensor,  # (B, 2, H_kv, S_k, D) — B,H_kv,S_k dynamic; D static
++        o_tensor: cute.Tensor,  # (B, S_q, H_q, D) — same layout as Q
++        window_size_left: Int32,
+         scale_softmax_log2: Float32,
+         scale_softmax: Float32,
+         scale_output: Float32,
+-        window_size_left: Optional[Int32],
+-        window_size_right: Optional[Int32],
+         stream: cuda.CUstream,
+     ):
+         """Execute the Fused Multi-Head Attention operation on the provided tensors.
+@@ -268,43 +268,51 @@ class BlackwellFusedMultiHeadAttentionForward:
+         5. Grid and work scheduling computation
+         6. Kernel launch with appropriate parameters
+ 
+-        :param q_iter: The query tensor pointer
+-        :type q_iter: cute.Pointer
+-        :param k_iter: The key tensor pointer
+-        :type k_iter: cute.Pointer
+-        :param v_iter: The value tensor pointer
+-        :type v_iter: cute.Pointer
+-        :param o_iter: The output tensor pointer
+-        :type o_iter: cute.Pointer
+-        :param problem_size: The problem size with shape [b, s_q, s_lse, s_k, h_q, h_k, d]. If cum_seqlen_q or cum_seqlen_k is not None, s_q and s_k are the max of the cumulative sequence length respectively.
+-        :type problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32]
+-        :param cum_seqlen_q: The cumulative sequence length tensor for query
+-        :type cum_seqlen_q: Optional[cute.Tensor]
+-        :param cum_seqlen_k: The cumulative sequence length tensor for key
+-        :type cum_seqlen_k: Optional[cute.Tensor]
++        :param q_tensor: The query tensor (B, S_q, H_q, D) with dynamic B, S_q, H_q
++        :type q_tensor: cute.Tensor
++        :param kv_cache: The KV cache tensor (B, 2, H_kv, S_k, D) with dynamic B, H_kv, S_k
++        :type kv_cache: cute.Tensor
++        :param o_tensor: The output tensor (B, S_q, H_q, D)
++        :type o_tensor: cute.Tensor
++        :param window_size_left: Left-side sliding window size for attention masking.
++        :type window_size_left: Int32
+         :param scale_softmax_log2: The log2 scale factor for softmax
+         :type scale_softmax_log2: Float32
+         :param scale_softmax: The scale factor for softmax
+         :type scale_softmax: Float32
+         :param scale_output: The scale factor for the output
+         :type scale_output: Float32
+-        :param window_size_left: Left-side sliding window size for attention masking.
+-        :type window_size_left: Optional[Int32]
+-        :param window_size_right: Right-side sliding window size for attention masking.
+-        :type window_size_right: Optional[Int32]
+         :param stream: The CUDA stream to execute the kernel on
+         :type stream: cuda.CUstream
+         :raises TypeError: If tensor data types don't match or aren't supported
+         :raises RuntimeError: If tensor layouts aren't in supported formats
+         """
+-        b, s_q, s_lse, s_k, h_q, h_k, d = problem_size
++        b = q_tensor.layout.shape[0]
++        s_q = q_tensor.layout.shape[1]
++        h_q = q_tensor.layout.shape[2]
++        h_k = kv_cache.layout.shape[2]
++        s_k = kv_cache.layout.shape[3]
++        s_lse = s_q
++        d = self.head_dim
++
++        q_iter = q_tensor.iterator
++        # KV cache: (B, 2, H_kv, S, D) — K at index 0, V at index 1 of dim 1
++        kv_base = kv_cache.iterator
++        stride_kv_select = h_k * s_k * d
++        k_iter = kv_base
++        v_iter = kv_base + stride_kv_select
++        o_iter = o_tensor.iterator
++
++        cum_seqlen_q = None
++        cum_seqlen_k = None
++        lse_iter = None
+         h_r = h_q // h_k
+         qo_offset = 0 if cum_seqlen_q is None else -s_q * d * h_r * h_k
+         kv_offset = 0 if cum_seqlen_k is None else -s_k * d * h_k
+         b_qo = b if cum_seqlen_q is None else s_q * (1 + b)
+         b_kv = b if cum_seqlen_k is None else s_k * (1 + b)
+         stride_b_qo = h_r * h_k * s_q * d if cum_seqlen_q is None else d * h_r * h_k
+-        stride_b_kv = h_k * s_k * d if cum_seqlen_k is None else d * h_k
++        stride_b_kv = 2 * h_k * s_k * d if cum_seqlen_k is None else d * h_k
+         b_lse = b if cum_seqlen_q is None else 1
+         stride_b_lse = h_r * h_k * s_lse if cum_seqlen_q is None else 0
+ 
+@@ -315,15 +323,17 @@ class BlackwellFusedMultiHeadAttentionForward:
+         )
+         q = cute.make_tensor(q_iter + qo_offset, q_layout)
+         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
++        # KV cache strides: S stride = D, H stride = S*D
+         k_layout = cute.make_layout(
+             (s_k, d, ((h_r, h_k), b_kv)),
+-            stride=(d * h_k, 1, ((0, d), stride_b_kv)),
++            stride=(d, 1, ((0, s_k * d), stride_b_kv)),
+         )
+         k = cute.make_tensor(k_iter + kv_offset, k_layout)
+         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
++        # KV cache strides: S stride = D, H stride = S*D
+         v_layout = cute.make_layout(
+             (d, s_k, ((h_r, h_k), b_kv)),
+-            stride=(1, d * h_k, ((0, d), stride_b_kv)),
++            stride=(1, d, ((0, s_k * d), stride_b_kv)),
+         )
+         v = cute.make_tensor(v_iter + kv_offset, v_layout)
+         # (s, d, ((h_r, h_k), b))
+@@ -516,6 +526,13 @@ class BlackwellFusedMultiHeadAttentionForward:
+ 
+         self.shared_storage = SharedStorage
+ 
++        # Compile-time dispatch: when use_sliding_window is False, pass None for
++        # window_size_left to eliminate left-side window masking code in the kernel.
++        if cutlass.const_expr(self.use_sliding_window):
++            _wsl = window_size_left
++        else:
++            _wsl = None
++
+         # Launch the kernel synchronously
+         self.kernel(
+             qk_tiled_mma,
+@@ -534,8 +551,8 @@ class BlackwellFusedMultiHeadAttentionForward:
+             scale_softmax_log2,
+             scale_softmax,
+             scale_output,
+-            window_size_left,
+-            window_size_right,
++            _wsl,
++            self.window_size_right,
+             q_smem_layout_staged,
+             k_smem_layout_staged,
+             p_tmem_layout_staged,
+@@ -2347,6 +2364,10 @@ def run(
+     iterations: int,
+     skip_ref_check: bool,
+     use_cold_l2: bool = False,
++    output_dir: str = "./fmha_aot_artifacts",
++    export_only: bool = False,
++    file_name: str = "fmha",
++    function_prefix: str = "fmha",
+     **kwargs,
+ ):
+     """Execute Fused Multi-Head Attention (FMHA) on Blackwell architecture and validate results.
+@@ -2413,39 +2434,56 @@ def run(
+     :rtype: float
+     """
+ 
+-    print("Running Blackwell SM100 FMHA test with:")
+-    print(f"  q_shape: {q_shape}")
+-    print(f"  k_shape: {k_shape}")
+-    print(f"  in_dtype: {in_dtype}")
+-    print(f"  out_dtype: {out_dtype}")
+-    print(f"  qk_acc_dtype: {qk_acc_dtype}")
+-    print(f"  pv_acc_dtype: {pv_acc_dtype}")
+-    print(f"  mma_tiler_mn: {mma_tiler_mn}")
+-    print(f"  is_persistent: {is_persistent}")
+-    print(f"  is_causal: {is_causal}")
+-    print(f"  bottom_right_align: {bottom_right_align}")
+-    print(f"  lse_calculation: {lse_calculation}")
+-    print(f"  window_size: {window_size}")
+-    print(f"  scale_q: {scale_q}")
+-    print(f"  scale_k: {scale_k}")
+-    print(f"  scale_v: {scale_v}")
+-    print(f"  inv_scale_o: {inv_scale_o}")
+-    print(f"  scale_softmax: {scale_softmax}")
+-    print(f"  tolerance: {tolerance}")
+-    print(f"  warmup_iterations: {warmup_iterations}")
+-    print(f"  iterations: {iterations}")
+-    print(f"  skip_ref_check: {skip_ref_check}")
+-    print(f"  use_cold_l2: {use_cold_l2}")
+-    import cutlass.torch as cutlass_torch
++    # Use file_name as tag so parallel process output is identifiable
++    _tag = f"[{file_name}]"
++
++    if export_only:
++        print(
++            f"{_tag} Compiling: head_dim={q_shape[-1]}, in_dtype={in_dtype}, "
++            f"causal={is_causal}, window={window_size}, "
++            f"mma_tiler_mn={mma_tiler_mn}, persistent={is_persistent}")
++    else:
++        print(f"{_tag} Running Blackwell SM100 FMHA test with:")
++        print(f"{_tag}   q_shape={q_shape}, k_shape={k_shape}")
++        print(f"{_tag}   in_dtype={in_dtype}, out_dtype={out_dtype}")
++        print(
++            f"{_tag}   qk_acc_dtype={qk_acc_dtype}, pv_acc_dtype={pv_acc_dtype}"
++        )
++        print(
++            f"{_tag}   mma_tiler_mn={mma_tiler_mn}, is_persistent={is_persistent}"
++        )
++        print(f"{_tag}   is_causal={is_causal}, window_size={window_size}")
++        print(
++            f"{_tag}   tolerance={tolerance}, warmup={warmup_iterations}, iterations={iterations}"
++        )
++
++    # ---- CuPy/NumPy helpers (replacing cutlass.torch) ----
++    def _cutlass_to_cupy_dtype(cutlass_dtype):
++        if cutlass_dtype == cutlass.Float16:
++            return cp.float16
++        elif cutlass_dtype in (cutlass.Float32, Float32):
++            return cp.float32
++        elif (cutlass_dtype.is_float
++              and cutlass_dtype.width <= 8) or (cutlass_dtype.is_integer
++                                                and cutlass_dtype.width == 4):
++            return cp.uint8  # FP8/Int4 stored as bytes
++        else:
++            raise ValueError(f"Unsupported dtype for CuPy: {cutlass_dtype}")
++
++    def _get_leading_dim(cp_array):
++        for i, s in enumerate(cp_array.strides):
++            if s == cp_array.itemsize:
++                return i
++        return len(cp_array.shape) - 1
+ 
+     # Unpack parameters
+     b, s_q, h_q, d = q_shape
+     b_, s_k, h_k, d_ = k_shape
+-    window_size_left, window_size_right = window_size
++    window_size_left, _ = window_size
+     if window_size_left == -1:
+         window_size_left = None
+-    if window_size_right == -1:
+-        window_size_right = None
++    # window_size_right is always 0 (causal-only); ignore the CLI value
++    window_size_right = 0
+ 
+     if b != b_:
+         raise ValueError("q & k must have the same batch size")
+@@ -2481,175 +2519,114 @@ def run(
+ 
+     h_r = h_q // h_k
+ 
+-    # Prepare pytorch tensors: Q, K, V (random from 0 to 2) and O (all zero)
+-    if not torch.cuda.is_available():
++    # Prepare GPU tensors: Q, KV cache, O
++    if cp.cuda.runtime.getDeviceCount() == 0:
+         raise RuntimeError("GPU is required to run this example!")
+ 
+-    torch.manual_seed(1111)
+-
+-    def create_cumulative_sequence_lengths(s):
+-        s_cumsum = [0]
+-        for i in range(len(s)):
+-            s_cumsum.append(s_cumsum[-1] + s[i])
+-
+-        s_cumsum_cute_tensor, s_cumsum_torch_tensor = cutlass_torch.cute_tensor_like(
+-            torch.tensor(s_cumsum, dtype=torch.int32),
+-            Int32,
+-            is_dynamic_layout=True,
+-            assumed_align=16,
+-        )
++    cp.random.seed(1111)
++    np.random.seed(1111)
+ 
+-        return s_cumsum_cute_tensor, s_cumsum_torch_tensor
++    if isinstance(s_q, tuple) or isinstance(s_k, tuple):
++        raise NotImplementedError(
++            "Variable-length sequences (nested tensors) require PyTorch. "
++            "Use fmha_runtimeargs_kvcache.py for variable-length support.")
+ 
+-    cum_seqlen_q, cum_seqlen_q_torch = (
+-        create_cumulative_sequence_lengths(s_q)
+-        if isinstance(s_q, tuple)
+-        else (None, None)
+-    )
+-    cum_seqlen_k, cum_seqlen_k_torch = (
+-        create_cumulative_sequence_lengths(s_k)
+-        if isinstance(s_k, tuple)
+-        else (None, None)
+-    )
+-
+-    def create_and_pad_tensor(
+-        shape, padding, dtype, s_cumsum=None, is_dynamic_layout=True
+-    ):
+-        # (b, s, h, d)
++    def create_and_pad_tensor(shape, padding, dtype, is_dynamic_layout=True):
+         shape_ = tuple(map(lambda x, y: x + y, shape, padding))
+-        if s_cumsum is not None:
+-            if shape_[0] != 1 or padding[0] != 0:
+-                raise ValueError("Invalid tensor creation for variable sequence length")
+-            # (s_total + padding, h, d)
+-            shape_ = shape_[1:]
+-            padding = padding[1:]
+-
+-        # Create f32 torch tensor (cpu)
+-        f32_torch_tensor_full = cutlass_torch.create_and_permute_torch_tensor(
+-            shape_,
+-            torch.float32,
+-            permute_order=None,
+-            init_type=cutlass.torch.TensorInitType.RANDOM,
+-            init_config=cutlass.torch.RandomInitConfig(
+-                min_val=-2 if dtype.is_float or dtype.signed else 0, max_val=2
+-            ),
+-        )
+-        # Create dtype cute & torch tensor (gpu)
+-        _, torch_tensor_full = cutlass_torch.cute_tensor_like(
+-            f32_torch_tensor_full,
+-            dtype,
+-            is_dynamic_layout,
+-            assumed_align=16,
+-        )
+ 
+-        # Offset the tensor
++        # Create random f32 data on GPU
++        min_val = -2 if dtype.is_float or dtype.signed else 0
++        f32_gpu_full = cp.random.randint(min_val, 2, shape_).astype(cp.float32)
++
++        # Create dtype GPU buffer and initialize
++        cp_dtype = _cutlass_to_cupy_dtype(dtype)
++        is_narrow = (dtype.is_float
++                     and dtype.width <= 8) or (dtype.is_integer
++                                               and dtype.width == 4)
++        dtype_gpu_full = cp.empty(shape_, dtype=cp_dtype)
++
++        if is_narrow:
++            # FP8/Int4: use cute.testing.convert
++            f32_cute = from_dlpack(f32_gpu_full)
++            if is_dynamic_layout:
++                f32_cute = f32_cute.mark_layout_dynamic(
++                    leading_dim=_get_leading_dim(f32_gpu_full))
++            dtype_cute_full = from_dlpack(dtype_gpu_full, assumed_align=16)
++            dtype_cute_full.element_type = dtype
++            if is_dynamic_layout:
++                dtype_cute_full = dtype_cute_full.mark_layout_dynamic(
++                    leading_dim=_get_leading_dim(dtype_gpu_full))
++            cute.testing.convert(f32_cute, dtype_cute_full)
++        else:
++            dtype_gpu_full[:] = f32_gpu_full.astype(cp_dtype)
++
++        # Offset the tensor (slice into padded region)
+         slices = tuple(slice(s, e) for s, e in zip(padding, shape_))
+-        torch_tensor = torch_tensor_full[slices].detach()
+-        f32_torch_tensor = f32_torch_tensor_full[slices].detach()
+-        torch_tensor._keep_alive = torch_tensor_full
+-        f32_torch_tensor._keep_alive = f32_torch_tensor_full
++        dtype_gpu = dtype_gpu_full[slices]
++        f32_gpu = f32_gpu_full[slices]
+ 
+-        # Create dtype cute tensor with offset (gpu)
+-        cute_tensor = from_dlpack(torch_tensor, assumed_align=16)
++        # Create cute tensor from sliced GPU buffer
++        cute_tensor = from_dlpack(dtype_gpu, assumed_align=16)
+         cute_tensor.element_type = dtype
+ 
+-        # From ragged to jagged
+-        if s_cumsum is not None:
+-            if len(shape) == 4:
+-                jagged_dim = 1  # for q,k,v,o
+-            else:
+-                jagged_dim = 2  # for lse
+-            torch_tensor = torch.nested.nested_tensor_from_jagged(
+-                values=torch_tensor, offsets=s_cumsum, jagged_dim=jagged_dim
+-            )
+-            f32_torch_tensor = torch.nested.nested_tensor_from_jagged(
+-                values=f32_torch_tensor, offsets=s_cumsum.cpu(), jagged_dim=jagged_dim
+-            )
++        # f32 reference on CPU (numpy) for comparison
++        f32_ref = f32_gpu.get()
+ 
+-        return (
+-            f32_torch_tensor,
+-            cute_tensor,
+-            torch_tensor,
+-        )
++        # Return full buffers too to prevent GC
++        return (f32_ref, cute_tensor, dtype_gpu, dtype_gpu_full, f32_gpu_full)
+ 
+     qo_shape = (b, s_q, h_r * h_k, d)
+-    kv_shape = (b, s_k, h_k, d)
++    kvcache_shape = (b, 2, h_k, s_k, d)
+     lse_shape = (b, h_r * h_k, s_q)
+     qo_padding = (0, 0, 0, 0, 0)
+-    kv_padding = (0, 0, 0, 0, 0)
++    kvcache_padding = (0, 0, 0, 0, 0, 0)
+     lse_padding = (0, 0, 0, 0)
+ 
+-    if isinstance(s_q, tuple):
+-        qo_shape = (1, sum(s_q), h_r * h_k, d)
+-        qo_padding = (0, max(s_q), 0, 0, 0)
+-        lse_shape = (1, h_r * h_k, sum(s_q))
+-
+-    if isinstance(s_k, tuple):
+-        kv_shape = (1, sum(s_k), h_k, d)
+-        kv_padding = (0, max(s_k), 0, 0, 0)
+-
+-    q_ref, q_tensor, q_torch = create_and_pad_tensor(
++    q_ref, q_tensor, q_cp, *_q_keep = create_and_pad_tensor(
+         qo_shape,
+         qo_padding,
+         in_dtype,
+-        s_cumsum=cum_seqlen_q_torch,
+         is_dynamic_layout=True,
+     )
+-    k_ref, k_tensor, k_torch = create_and_pad_tensor(
+-        kv_shape,
+-        kv_padding,
++    kvcache_ref, kvcache_tensor, kvcache_cp, *_kv_keep = create_and_pad_tensor(
++        kvcache_shape,
++        kvcache_padding,
+         in_dtype,
+-        s_cumsum=cum_seqlen_k_torch,
+         is_dynamic_layout=True,
+     )
+-    v_ref, v_tensor, v_torch = create_and_pad_tensor(
+-        kv_shape,
+-        kv_padding,
+-        in_dtype,
+-        s_cumsum=cum_seqlen_k_torch,
+-        is_dynamic_layout=True,
+-    )
+-    _, o_tensor, o_torch = create_and_pad_tensor(
++    # Extract K/V references for numpy comparison (BHSD -> BSHD)
++    k_ref = np.ascontiguousarray(kvcache_ref[:, 0].transpose(0, 2, 1, 3))
++    v_ref = np.ascontiguousarray(kvcache_ref[:, 1].transpose(0, 2, 1, 3))
++    _, o_tensor, o_cp, *_o_keep = create_and_pad_tensor(
+         qo_shape,
+         qo_padding,
+         out_dtype,
+-        s_cumsum=cum_seqlen_q_torch,
+         is_dynamic_layout=True,
+     )
+     if lse_calculation:
+-        _, lse_tensor, lse_torch = create_and_pad_tensor(
++        _, lse_tensor, lse_cp, *_lse_keep = create_and_pad_tensor(
+             lse_shape,
+             lse_padding,
+             cutlass.Float32,
+             is_dynamic_layout=True,
+         )
+     else:
+-        lse_tensor = None
+-        lse_torch = None
++        lse_cp = None
+ 
+     mma_tiler = (*mma_tiler_mn, d)
+ 
+     mask_type = fmha_utils.MaskEnum.WINDOW_MASK
+     if bottom_right_align:
+         mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
+-    if is_causal:
+-        window_size_right = 0
+-    elif window_size_left is None and window_size_right is None:
+-        if isinstance(s_k, tuple):
+-            for i in range(len(s_k)):
+-                if s_k[i] % mma_tiler_mn[1] != 0:
+-                    mask_type = fmha_utils.MaskEnum.RESIDUAL_MASK
+-        else:
+-            if s_k % mma_tiler_mn[1] != 0:
+-                mask_type = fmha_utils.MaskEnum.RESIDUAL_MASK
++    # Note: window_size_right is always 0 (causal), so window/causal masking is
++    # always active. RESIDUAL_MASK fallback (no masking) is not reachable.
+ 
+     s_q_list = s_q if isinstance(s_q, tuple) else [s_q] * b
+     s_k_list = s_k if isinstance(s_k, tuple) else [s_k] * b
+ 
+     # To avoid mask out the whole row which results in NaN in softmax
+-    def check_seqlen_valid(
+-        s_q, s_k, window_size_left, window_size_right, bottom_right_align
+-    ):
++    def check_seqlen_valid(s_q, s_k, window_size_left, window_size_right,
++                           bottom_right_align):
+         for i in range(s_q):
+             offset = 0 if not bottom_right_align else s_k - s_q
+ 
+@@ -2677,16 +2654,18 @@ def run(
+         ):
+             raise ValueError("sliding window doesn't support current setting")
+ 
++    use_sliding_window = window_size_left is not None
+     fmha = BlackwellFusedMultiHeadAttentionForward(
+         qk_acc_dtype,
+         pv_acc_dtype,
+         mma_tiler,
+         is_persistent,
+         mask_type,
++        use_sliding_window=use_sliding_window,
+     )
+ 
+     # Initialize Stream
+-    current_stream = cutlass_torch.default_stream()
++    current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+ 
+     if scale_softmax == 0.0:  # default to 1/sqrt(d)
+         scale_softmax = 1.0 / math.sqrt(d)
+@@ -2698,40 +2677,78 @@ def run(
+     scale_softmax_log2 = scale_softmax * log2_e
+     scale_output = scale_v * inv_scale_o
+ 
+-    problem_size = (
+-        b,
+-        max(s_q) if isinstance(s_q, tuple) else s_q,
+-        sum(s_q) if isinstance(s_q, tuple) else s_q,  # s_lse
+-        max(s_k) if isinstance(s_k, tuple) else s_k,
+-        h_q,
+-        h_k,
+-        d,
+-    )
++    def mark_bshd_dynamic(tensor):
++        so = (0, 1, 2, 3)  # outermost-to-innermost for contiguous BSHD
++        return (tensor.mark_layout_dynamic(
++            leading_dim=3).mark_compact_shape_dynamic(
++                mode=0, stride_order=so).mark_compact_shape_dynamic(
++                    mode=1, stride_order=so).mark_compact_shape_dynamic(
++                        mode=2, stride_order=so))
++
++    def mark_kv_cache_dynamic(tensor):
++        so = (0, 1, 2, 3, 4
++              )  # outermost-to-innermost for contiguous (B,2,H,S,D)
++        return (tensor.mark_layout_dynamic(
++            leading_dim=4).mark_compact_shape_dynamic(mode=0,
++                                                      stride_order=so)  # B
++                .mark_compact_shape_dynamic(mode=2, stride_order=so)  # H_kv
++                .mark_compact_shape_dynamic(mode=3, stride_order=so)  # S
++                )
+ 
+-    print("Compiling kernel with cute.compile ...")
++    q_dyn = mark_bshd_dynamic(q_tensor)
++    kv_dyn = mark_kv_cache_dynamic(kvcache_tensor)
++    o_dyn = mark_bshd_dynamic(o_tensor)
++
++    # __call__ takes Int32 for window_size_left (export_to_c requires concrete types, not Optional).
++    # Compile-time dispatch is handled inside __call__ via self.use_sliding_window:
++    # when False, window_size_left is passed as None to internal kernel methods,
++    # eliminating left-side window masking code at compile time.
++    # For non-SWA: window_size_left value is unused (ignored by kernel), pass 0 as placeholder.
++    # window_size_right is always 0 (causal) — set as self.window_size_right compile-time constant.
++    _wsl = Int32(window_size_left) if window_size_left is not None else Int32(
++        0)
++
++    print(f"{_tag} Compiling kernel (sliding_window={use_sliding_window}) ...")
+     start_time = time.time()
+     # compile fmha kernel
+     compiled_fmha = cute.compile(
+         fmha,
+-        q_tensor.iterator,
+-        k_tensor.iterator,
+-        v_tensor.iterator,
+-        o_tensor.iterator,
+-        problem_size,
+-        cum_seqlen_q,
+-        cum_seqlen_k,
+-        lse_tensor.iterator if lse_calculation else None,
++        q_dyn,
++        kv_dyn,
++        o_dyn,
++        _wsl,
+         scale_softmax_log2,
+         scale_softmax,
+         scale_output,
+-        window_size_left if window_size_left is None else Int32(window_size_left),
+-        window_size_right if window_size_right is None else Int32(window_size_right),
+         current_stream,
+     )
+     compilation_time = time.time() - start_time
+-    print(f"Compilation time: {compilation_time:.4f} seconds")
++    print(f"{_tag} Compilation time: {compilation_time:.4f}s")
+ 
+-    def run_torch_fmha(
++    os.makedirs(output_dir, exist_ok=True)
++    compiled_fmha.export_to_c(
++        file_path=output_dir,
++        file_name=file_name,
++        function_prefix=function_prefix,
++    )
++    print(f"{_tag} Exported to {output_dir}/{file_name}.h and {file_name}.o")
++
++    def _numpy_softmax(x, axis=-1):
++        x_max = np.max(x, axis=axis, keepdims=True)
++        # Handle rows that are all -inf
++        x_max = np.where(np.isfinite(x_max), x_max, 0.0)
++        e_x = np.exp(x - x_max)
++        s = np.sum(e_x, axis=axis, keepdims=True)
++        s = np.where(s == 0, 1.0, s)
++        return e_x / s
++
++    def _numpy_logsumexp(x, axis=-1):
++        x_max = np.max(x, axis=axis)
++        x_max_safe = np.where(np.isfinite(x_max), x_max, 0.0)
++        return np.log(
++            np.sum(np.exp(x - x_max_safe[..., np.newaxis]), axis=axis)) + x_max
++
++    def run_numpy_fmha(
+         q,
+         k,
+         v,
+@@ -2743,109 +2760,76 @@ def run(
+         window_size_left=None,
+         window_size_right=None,
+     ):
++        # q, k, v are numpy arrays with shape (B, S, H, D)
+         h_q = q.shape[2]
+         h_k = k.shape[2]
+ 
+-        if not h_q == h_k:
++        if h_q != h_k:
+             repeat_factor = h_q // h_k
+-            # nested tensor can not be broadcasted directly
+-            if k.is_nested:
+-                k_offsets = k.offsets()
+-                v_offsets = v.offsets()
+-                k_values = k.values().repeat_interleave(repeat_factor, dim=1)
+-                v_values = v.values().repeat_interleave(repeat_factor, dim=1)
+-
+-                k = torch.nested.nested_tensor_from_jagged(
+-                    values=k_values, offsets=k_offsets
+-                )
+-                v = torch.nested.nested_tensor_from_jagged(
+-                    values=v_values, offsets=v_offsets
+-                )
+-            else:
+-                k = k.repeat_interleave(repeat_factor, dim=2)
+-                v = v.repeat_interleave(repeat_factor, dim=2)
++            k = np.repeat(k, repeat_factor, axis=2)
++            v = np.repeat(v, repeat_factor, axis=2)
+ 
+-        # as we initialize q, k, v with shape (b, s, h, d) and SDPA of torch needs them to be (b, h, s, d)
+-        q = q.transpose(1, 2)
+-        k = k.transpose(1, 2)
+-        v = v.transpose(1, 2)
++        # BSHD -> BHSD
++        q = q.transpose(0, 2, 1, 3)
++        k = k.transpose(0, 2, 1, 3)
++        v = v.transpose(0, 2, 1, 3)
+ 
+-        batch_size = q.size(0)
++        batch_size = q.shape[0]
+         ref_list = []
+         lse_list = []
+         for batch_idx in range(batch_size):
+             q_i = q[batch_idx]
+             k_i = k[batch_idx]
+             v_i = v[batch_idx]
+-            s_i = torch.einsum("hqd,hkd->hqk", q_i, k_i) * scale_softmax
++            s_i = np.einsum("hqd,hkd->hqk", q_i, k_i) * scale_softmax
+             s_q = q_i.shape[1]
+             s_k = k_i.shape[1]
+             if is_causal:
+                 window_size_right = 0
+             if window_size_left is not None or window_size_right is not None:
+-                q_coords = torch.arange(0, s_q).cuda().view(-1, 1)
+-                k_coords = torch.arange(0, s_k).cuda().view(1, -1)
++                q_coords = np.arange(s_q).reshape(-1, 1)
++                k_coords = np.arange(s_k).reshape(1, -1)
+                 offset = 0 if not bottom_right_align else s_k - s_q
+                 if window_size_left is None:
+                     _mask = k_coords > q_coords + offset + window_size_right
+                 elif window_size_right is None:
+                     _mask = k_coords < q_coords + offset - window_size_left
+                 else:
+-                    _mask = (k_coords > q_coords + offset + window_size_right) | (
+-                        k_coords < q_coords + offset - window_size_left
+-                    )
+-                s_i = s_i.masked_fill(_mask.cpu(), -torch.inf)
++                    _mask = (k_coords > q_coords + offset +
++                             window_size_right) | (k_coords < q_coords +
++                                                   offset - window_size_left)
++                s_i = np.where(_mask, -np.inf, s_i)
+ 
+             if lse_calculation:
+-                lse_i = torch.logsumexp(s_i, dim=-1)
++                lse_i = _numpy_logsumexp(s_i, axis=-1)
+             else:
+                 lse_i = None
+ 
+-            p_i = torch.softmax(s_i, dim=-1)
+-            ref_i = torch.einsum("hqk,hkd->hqd", p_i, v_i)
+-            ref_i = ref_i.transpose(0, 1) * scale_output
++            p_i = _numpy_softmax(s_i, axis=-1)
++            ref_i = np.einsum("hqk,hkd->hqd", p_i, v_i)
++            ref_i = ref_i.transpose(1, 0, 2) * scale_output
+             ref_list.append(ref_i)
+             if lse_calculation:
+                 lse_list.append(lse_i)
+-        if q.is_nested:
+-            ref = torch.nested.nested_tensor(ref_list, layout=torch.jagged)
+-            if lse_calculation:
+-                lse = torch.cat(lse_list, dim=1).unsqueeze(0)
+-            else:
+-                lse = None
+-        else:
+-            ref = torch.stack(ref_list)
+-            if lse_calculation:
+-                lse = torch.stack(lse_list)
+-            else:
+-                lse = None
+ 
++        ref = np.stack(ref_list)
++        lse = np.stack(lse_list) if lse_calculation else None
+         return ref, lse
+ 
+     if not skip_ref_check:
+         # Execute kernel once for reference checking
+         compiled_fmha(
+-            q_tensor.iterator,
+-            k_tensor.iterator,
+-            v_tensor.iterator,
+-            o_tensor.iterator,
+-            problem_size,
+-            cum_seqlen_q,
+-            cum_seqlen_k,
+-            lse_tensor.iterator if lse_calculation else None,
++            q_tensor,
++            kvcache_tensor,
++            o_tensor,
++            _wsl,
+             scale_softmax_log2,
+             scale_softmax,
+             scale_output,
+-            window_size_left if window_size_left is None else Int32(window_size_left),
+-            (
+-                window_size_right
+-                if window_size_right is None
+-                else Int32(window_size_right)
+-            ),
+             current_stream,
+         )
+-        print("Verifying results...")
+-        o_ref, lse_ref = run_torch_fmha(
++        print(f"{_tag} Verifying accuracy ...")
++        o_ref, lse_ref = run_numpy_fmha(
+             q_ref,
+             k_ref,
+             v_ref,
+@@ -2858,143 +2842,105 @@ def run(
+             window_size_right,
+         )
+ 
+-        if o_ref.is_nested:
+-            o_ref = o_ref.values()
+-
+-        if o_torch.is_nested:
+-            o_torch = o_torch.values()
+-
+         # convert o back to f32 for comparison
+-        o_fp32, o_fp32_torch = cutlass_torch.cute_tensor_like(
+-            torch.empty(*o_torch.shape, dtype=torch.float32),
+-            Float32,
+-            is_dynamic_layout=True,
+-            assumed_align=16,
+-        )
+-        cute.testing.convert(o_tensor, o_fp32)
+-        o_result = o_fp32_torch.cpu()
++        o_fp32_cp = cp.empty(o_cp.shape, dtype=cp.float32)
++        o_fp32_cute = from_dlpack(o_fp32_cp, assumed_align=16)
++        o_fp32_cute.element_type = Float32
++        o_fp32_cute = o_fp32_cute.mark_layout_dynamic(
++            leading_dim=_get_leading_dim(o_fp32_cp))
++        cute.testing.convert(o_tensor, o_fp32_cute)
++        o_result = o_fp32_cp.get()
+ 
+         if out_dtype.is_float and out_dtype.width <= 8:
+-            ref_narrow_precision, _ = cutlass_torch.cute_tensor_like(
+-                torch.empty(*o_ref.shape, dtype=torch.uint8),
+-                out_dtype,
+-                is_dynamic_layout=True,
+-                assumed_align=16,
+-            )
+-
+-            ref_o_f32, ref_o_f32_torch = cutlass_torch.cute_tensor_like(
+-                o_ref,
+-                cutlass.Float32,
+-                is_dynamic_layout=True,
+-                assumed_align=16,
+-            )
++            # Quantize ref through narrow precision: f32 -> fp8 -> f32
++            ref_narrow_cp = cp.empty(o_ref.shape, dtype=cp.uint8)
++            ref_narrow_cute = from_dlpack(ref_narrow_cp, assumed_align=16)
++            ref_narrow_cute.element_type = out_dtype
++            ref_narrow_cute = ref_narrow_cute.mark_layout_dynamic(
++                leading_dim=_get_leading_dim(ref_narrow_cp))
++
++            ref_o_f32_cp = cp.asarray(o_ref)
++            ref_o_f32_cute = from_dlpack(ref_o_f32_cp, assumed_align=16)
++            ref_o_f32_cute.element_type = cutlass.Float32
++            ref_o_f32_cute = ref_o_f32_cute.mark_layout_dynamic(
++                leading_dim=_get_leading_dim(ref_o_f32_cp))
+ 
+             # convert ref : f32 -> fp4/fp8 -> f32
+-            cute.testing.convert(ref_o_f32, ref_narrow_precision)
+-            cute.testing.convert(ref_narrow_precision, ref_o_f32)
++            cute.testing.convert(ref_o_f32_cute, ref_narrow_cute)
++            cute.testing.convert(ref_narrow_cute, ref_o_f32_cute)
+ 
+-            o_ref = ref_o_f32_torch.cpu()
++            o_ref = ref_o_f32_cp.get()
+ 
+             # override tolerance
+             tolerance = 0.13
+ 
+         # Assert close results
+-        torch.testing.assert_close(o_result, o_ref, atol=tolerance, rtol=1e-05)
++        np.testing.assert_allclose(o_result, o_ref, atol=tolerance, rtol=1e-05)
+         if lse_calculation:
+-            torch.testing.assert_close(
+-                lse_torch.cpu(), lse_ref, atol=tolerance, rtol=1e-05
+-            )
+-        print("Results verified successfully!")
++            lse_result = lse_cp.get()
++            np.testing.assert_allclose(lse_result,
++                                       lse_ref,
++                                       atol=tolerance,
++                                       rtol=1e-05)
++        print(f"{_tag} Accuracy check passed.")
++
++    if export_only:
++        return 0.0
+ 
+     def generate_tensors():
+-        _, q_tensor_workspace, _ = create_and_pad_tensor(
++        _, q_tensor_workspace, *_gq = create_and_pad_tensor(
+             qo_shape,
+             qo_padding,
+             in_dtype,
+-            s_cumsum=cum_seqlen_q_torch,
+-            is_dynamic_layout=True,
+-        )
+-        _, k_tensor_workspace, _ = create_and_pad_tensor(
+-            kv_shape,
+-            kv_padding,
+-            in_dtype,
+-            s_cumsum=cum_seqlen_k_torch,
+             is_dynamic_layout=True,
+         )
+-        _, v_tensor_workspace, _ = create_and_pad_tensor(
+-            kv_shape,
+-            kv_padding,
++        _, kvcache_tensor_workspace, *_gkv = create_and_pad_tensor(
++            kvcache_shape,
++            kvcache_padding,
+             in_dtype,
+-            s_cumsum=cum_seqlen_k_torch,
+             is_dynamic_layout=True,
+         )
+-        _, o_tensor_workspace, _ = create_and_pad_tensor(
++        _, o_tensor_workspace, *_go = create_and_pad_tensor(
+             qo_shape,
+             qo_padding,
+             out_dtype,
+-            s_cumsum=cum_seqlen_q_torch,
+             is_dynamic_layout=True,
+         )
+         if lse_calculation:
+-            _, lse_tensor, lse_torch = create_and_pad_tensor(
++            _, lse_tensor, *_gl = create_and_pad_tensor(
+                 lse_shape,
+                 lse_padding,
+                 cutlass.Float32,
+                 is_dynamic_layout=True,
+             )
+         else:
+-            lse_tensor = None
++            pass
++
++        q_ws = mark_bshd_dynamic(q_tensor_workspace)
++        kv_ws = mark_kv_cache_dynamic(kvcache_tensor_workspace)
++        o_ws = mark_bshd_dynamic(o_tensor_workspace)
+ 
+         args = testing.JitArguments(
+-            q_tensor_workspace.iterator,
+-            k_tensor_workspace.iterator,
+-            v_tensor_workspace.iterator,
+-            o_tensor_workspace.iterator,
+-            problem_size,
+-            cum_seqlen_q,
+-            cum_seqlen_k,
+-            lse_tensor,
++            q_ws,
++            kv_ws,
++            o_ws,
++            _wsl,
+             scale_softmax_log2,
+             scale_softmax,
+             scale_output,
+-            window_size_left if window_size_left is None else Int32(window_size_left),
+-            (
+-                window_size_right
+-                if window_size_right is None
+-                else Int32(window_size_right)
+-            ),
+             current_stream,
+         )
+-        args.add_to_scope(
+-            [
+-                q_tensor_workspace,
+-                k_tensor_workspace,
+-                v_tensor_workspace,
+-                o_tensor_workspace,
+-            ]
+-        )
+         return args
+ 
+     workspace_count = 1
+     if use_cold_l2:
+-        q_torch_effective = q_torch.values() if q_torch.is_nested else q_torch
+-        k_torch_effective = k_torch.values() if k_torch.is_nested else k_torch
+-        v_torch_effective = v_torch.values() if v_torch.is_nested else v_torch
+-        o_torch_effective = o_torch.values() if o_torch.is_nested else o_torch
+         one_workspace_bytes = (
+-            q_torch_effective.numel() * q_torch_effective.element_size()
+-            + k_torch_effective.numel() * k_torch_effective.element_size()
+-            + v_torch_effective.numel() * v_torch_effective.element_size()
+-            + o_torch_effective.numel() * o_torch_effective.element_size()
+-            + (
+-                lse_torch.numel() * lse_torch.element_size()
+-                if lse_torch is not None
+-                else 0
+-            )
+-        )
+-        workspace_count = testing.get_workspace_count(
+-            one_workspace_bytes, warmup_iterations, iterations
+-        )
++            q_cp.size * q_cp.itemsize + kvcache_cp.size * kvcache_cp.itemsize +
++            o_cp.size * o_cp.itemsize +
++            (lse_cp.size * lse_cp.itemsize if lse_cp is not None else 0))
++        workspace_count = testing.get_workspace_count(one_workspace_bytes,
++                                                      warmup_iterations,
++                                                      iterations)
+ 
+     exec_time = testing.benchmark(
+         compiled_fmha,
+@@ -3118,8 +3064,8 @@ if __name__ == "__main__":
+     parser.add_argument(
+         "--window_size",
+         type=parse_comma_separated_ints,
+-        default=(-1, -1),
+-        help="Sliding window size (left, right) for attention masking.",
++        default=(-1, 0),
++        help="Sliding window size (left, right). Right is always forced to 0 (causal). Left: -1 = no sliding window, >0 = window size.",
+     )
+ 
+     parser.add_argument(
+@@ -3202,6 +3148,33 @@ if __name__ == "__main__":
+         help="Use circular buffer tensor sets to ensure L2 cold cache",
+     )
+ 
++    parser.add_argument(
++        "--output_dir",
++        type=str,
++        default="./fmha_aot_artifacts",
++        help="Output directory for AOT compiled artifacts (fmha.h and fmha.o)",
++    )
++
++    parser.add_argument(
++        "--export_only",
++        action="store_true",
++        help="Compile and export only; skip reference check and benchmark",
++    )
++
++    parser.add_argument(
++        "--file_name",
++        type=str,
++        default="fmha",
++        help="Base file name for exported artifacts (e.g., fmha_d64 -> fmha_d64.h, fmha_d64.o)",
++    )
++
++    parser.add_argument(
++        "--function_prefix",
++        type=str,
++        default="fmha",
++        help="Function prefix for exported C symbols (avoids conflicts when compiling multiple variants)",
++    )
++
+     args = parser.parse_args()
+ 
+     if len(args.q_shape) != 4:
+@@ -3213,12 +3186,13 @@ if __name__ == "__main__":
+     if len(args.mma_tiler_mn) != 2:
+         parser.error("--mma_tiler_mn must contain exactly 2 values")
+ 
+-    if not torch.cuda.is_available():
++    if cp.cuda.runtime.getDeviceCount() == 0:
+         raise RuntimeError("GPU is required to run this example!")
+ 
+-    torch.manual_seed(1111)
++    cp.random.seed(1111)
++    np.random.seed(1111)
+ 
+-    run(
++    latency = run(
+         args.q_shape,
+         args.k_shape,
+         args.in_dtype,
+@@ -3241,6 +3215,8 @@ if __name__ == "__main__":
+         args.iterations,
+         args.skip_ref_check,
+         args.use_cold_l2,
++        output_dir=args.output_dir,
++        export_only=args.export_only,
++        file_name=args.file_name,
++        function_prefix=args.function_prefix,
+     )
+-
+-    print("PASS")
