@@ -6,6 +6,8 @@ onnx==1.19.0
 datasets==4.4.2
 tqdm~=4.67.1
 numpy~=2.2.6
+pillow==12.1.1
+torchvision==0.25.0
 # For Phi-4MM model
 peft==0.18.1
 backoff==2.2.1
