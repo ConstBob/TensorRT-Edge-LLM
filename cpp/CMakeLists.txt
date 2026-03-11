@@ -128,5 +128,12 @@ target_include_directories(NvInfer_edgellm_plugin
 target_compile_definitions(NvInfer_edgellm_plugin
                            PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt edgellmKernels
-                      ${CUDA_DRIVER_LIB})
+                      ${CUDA_DRIVER_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
+
+# CuTe DSL FMHA (Blackwell SM100+): build-time kernel compilation
+if(ENABLE_CUTE_DSL_FMHA)
+  include(${CMAKE_SOURCE_DIR}/cmake/CuteDslFMHA.cmake)
+  cute_dsl_fmha_setup(TARGETS edgellmKernels edgellmCore PLUGIN_TARGET
+                      NvInfer_edgellm_plugin)
+endif()

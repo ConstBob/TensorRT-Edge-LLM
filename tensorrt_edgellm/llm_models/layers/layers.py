@@ -146,6 +146,10 @@ class EdgeLLMAttention(nn.Module):
         else:
             self.head_dim: int = attention_module.config.hidden_size // self.num_attention_heads
 
+        # Sliding window size (from model config, None = no sliding window)
+        self.sliding_window_size: Optional[int] = getattr(
+            attention_module.config, 'sliding_window', None) or None
+
         self.qkv_proj = EdgeLLMQKVProj(attention_module, eagle3_draft)
         self.o_proj = attention_module.o_proj
 
@@ -249,6 +253,8 @@ class EdgeLLMAttention(nn.Module):
             enable_tree_attention,
             self.head_dim,
             fp8_kv_cache,
+            self.sliding_window_size
+            if self.sliding_window_size is not None else -1,
             attention_mask,
             position_ids,
             k_v_scale_quant_orig=self.k_v_scale_quant_orig,

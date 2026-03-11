@@ -3,6 +3,7 @@ exclude: |
     (?x)^(
         3rdParty/.*|
         cpp/common/json/jsmn\.h$|
+        kernelSrcs/.*|
     )$
 
 repos:
@@ -16,7 +17,6 @@ repos:
     -   id: remove-crlf
     -   id: insert-license
         files: \.py$
-        exclude: kernelSrcs/.*
         args:
         - --license-filepath
         - LICENSE_HEADER
@@ -29,7 +29,6 @@ repos:
             (?x)^(
                 .*cubin.cpp$ |
                 .*_cubin.h |
-                kernelSrcs/xqa/.* |
                 3rdParty/.*
             )$
         args:
@@ -51,7 +50,6 @@ repos:
             (?x)^(
                 .*cubin.cpp$ |
                 .*_cubin.h |
-                kernelSrcs/xqa/.* |
                 3rdParty/.*
             )$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
