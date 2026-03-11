@@ -73,6 +73,15 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
         LOG_ERROR("Cannot open plugin library: %s", dlerror());
         return std::unique_ptr<void, DlDeleter>(nullptr);
     }
+
+    // Sync log level with the plugin (follows the TRT initLibNvInferPlugins pattern).
+    using InitPluginsFn = bool (*)(void*, char const*);
+    auto initPlugins = reinterpret_cast<InitPluginsFn>(dlsym(handle.get(), "initEdgellmPlugins"));
+    if (initPlugins)
+    {
+        initPlugins(static_cast<nvinfer1::ILogger*>(&gLogger), "");
+    }
+
     return handle;
 }
 

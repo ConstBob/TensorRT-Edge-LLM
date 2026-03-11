@@ -115,7 +115,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         mma_tiler: Tuple[int, int, int],
         is_persistent: bool,
         mask_type: fmha_utils.MaskEnum,
+        is_causal: bool = False,
         use_sliding_window: bool = False,
+        actual_head_dim: Optional[int] = None,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -133,6 +135,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         3.  Kernel Execution Mode:
             - is_persistent: Boolean indicating whether to use persistent kernel mode
             - mask_type: Specifies the type of mask to use (no mask, residual mask, or causal mask)
+            - is_causal: Whether to apply causal masking (window_size_right = 0)
             - use_sliding_window: Whether to compile with sliding window support
 
         :param qk_acc_dtype: Data type for Q*K^T matrix multiplication accumulator
@@ -145,6 +148,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type is_persistent: bool
         :param mask_type: Type of mask to use
         :type mask_type: fmha_utils.MaskEnum
+        :param is_causal: Whether to apply causal masking. When True, window_size_right
+            is set to Int32(0) as a compile-time constant so tokens cannot attend
+            to future positions. When False, window_size_right is None (bidirectional).
+        :type is_causal: bool
         :param use_sliding_window: If True, compile with sliding window masking code.
             If False, window_size_left is treated as None at compile time,
             eliminating left-side window masking code for better performance.
@@ -153,7 +160,10 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
-        self.head_dim = mma_tiler[2]
+        # head_dim = actual tensor dimension (e.g. 72).
+        # MMA/SMEM/CTA tilers below use mma_tiler[2] (padded, e.g. 80).
+        # TMA ZFILL bridges the gap on loads; OOB drop on stores.
+        self.head_dim = actual_head_dim if actual_head_dim is not None else mma_tiler[2]
         self.cta_tiler = (
             2 * mma_tiler[0],  # 2 Q tile per CTA
             mma_tiler[1],
@@ -168,8 +178,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.cluster_shape_mn = (1, 1)
         self.is_persistent = is_persistent
         self.mask_type = mask_type
+        self.is_causal = is_causal
         self.use_sliding_window = use_sliding_window
-        self.window_size_right = Int32(0)  # always causal, compile-time constant
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
@@ -535,6 +545,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             _wsl = None
 
+        _wsr = Int32(0) if cutlass.const_expr(self.is_causal) else None
+
         # Launch the kernel synchronously
         self.kernel(
             qk_tiled_mma,
@@ -554,7 +566,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             scale_softmax,
             scale_output,
             _wsl,
-            self.window_size_right,
+            _wsr,
             q_smem_layout_staged,
             k_smem_layout_staged,
             p_tmem_layout_staged,
@@ -566,6 +578,217 @@ class BlackwellFusedMultiHeadAttentionForward:
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
+            min_blocks_per_mp=1,
+        )
+
+    @cute.jit
+    def __call_vit__(
+        self,
+        q_tensor: cute.Tensor,   # (total_S, H_q, D) — packed varlen
+        k_tensor: cute.Tensor,   # (total_S, H_kv, D) — packed varlen
+        v_tensor: cute.Tensor,   # (total_S, H_kv, D) — packed varlen
+        o_tensor: cute.Tensor,   # (total_S, H_q, D)
+        cu_seqlens: cute.Tensor,  # (B+1,) Int32
+        max_seqlen: Int32,
+        scale_softmax_log2: Float32,
+        scale_softmax: Float32,
+        scale_output: Float32,
+        stream: cuda.CUstream,
+    ):
+        """ViT FMHA: packed varlen, separate Q/K/V, bidirectional (no causal mask).
+
+        All sequences are packed into flat [total_S, H, D] tensors with boundaries
+        defined by cu_seqlens.  Each sequence attends to all tokens in that sequence
+        (PADDING / RESIDUAL_MASK — no causal ordering).
+
+        max_seqlen is the longest individual sequence length (not total_S).
+        It controls the grid size and CuTe layout tile counts.
+        Per-batch boundaries come from cu_seqlens via domain_offset.
+        """
+        s_q = max_seqlen
+        h_q = q_tensor.layout.shape[1]
+        h_k = k_tensor.layout.shape[1]
+        s_k = max_seqlen
+        s_lse = s_q
+        d = self.head_dim
+
+        b = cu_seqlens.layout.shape[0] - 1
+        h_r = h_q // h_k
+
+        q_iter = q_tensor.iterator
+        k_iter = k_tensor.iterator
+        v_iter = v_tensor.iterator
+        o_iter = o_tensor.iterator
+
+        cum_seqlen_q = cu_seqlens
+        cum_seqlen_k = cu_seqlens
+        lse_iter = None
+
+        qo_offset = -s_q * d * h_r * h_k
+        kv_offset = -s_k * d * h_k
+        b_qo = s_q * (1 + b)
+        b_kv = s_k * (1 + b)
+        stride_b_qo = d * h_r * h_k
+        stride_b_kv = d * h_k
+        b_lse = 1
+        stride_b_lse = 0
+
+        # (s, d, ((h_r, h_k), b))
+        q_layout = cute.make_layout(
+            (s_q, d, ((h_r, h_k), b_qo)),
+            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+        )
+        q = cute.make_tensor(q_iter + qo_offset, q_layout)
+        k_layout = cute.make_layout(
+            (s_k, d, ((h_r, h_k), b_kv)),
+            stride=(d * h_k, 1, ((0, d), stride_b_kv)),
+        )
+        k = cute.make_tensor(k_iter + kv_offset, k_layout)
+        v_layout = cute.make_layout(
+            (d, s_k, ((h_r, h_k), b_kv)),
+            stride=(1, d * h_k, ((0, d), stride_b_kv)),
+        )
+        v = cute.make_tensor(v_iter + kv_offset, v_layout)
+        o_layout = cute.make_layout(
+            (s_q, d, ((h_r, h_k), b_qo)),
+            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+        )
+        o = cute.make_tensor(o_iter + qo_offset, o_layout)
+        lse = None
+
+        self.q_dtype = q.element_type
+        self.k_dtype = k.element_type
+        self.v_dtype = v.element_type
+        self.o_dtype = o.element_type
+
+        self.tile_sched_params, grid = fmha_utils.compute_grid(
+            cute.shape((s_q, d, ((h_r, h_k), b))),
+            self.cta_tiler,
+            self.is_persistent,
+        )
+
+        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
+        self.o_layout = utils.LayoutEnum.from_tensor(o)
+
+        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+            raise RuntimeError("The layout of q is not supported")
+        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+            raise RuntimeError("The layout of k is not supported")
+        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+            raise RuntimeError("The layout of v is not supported")
+
+        if cutlass.const_expr(self.q_dtype != self.k_dtype):
+            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
+        if cutlass.const_expr(self.q_dtype != self.v_dtype):
+            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        self._setup_attributes()
+
+        cta_group = tcgen05.CtaGroup.ONE
+        p_source = tcgen05.OperandSource.TMEM
+        p_major_mode = tcgen05.OperandMajorMode.K
+        qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype, self.q_major_mode, self.k_major_mode,
+            self.qk_acc_dtype, cta_group, self.qk_mma_tiler[:2],
+        )
+        pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype, p_major_mode, self.v_major_mode,
+            self.pv_acc_dtype, cta_group, self.pv_mma_tiler[:2], p_source,
+        )
+
+        self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
+        self.cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk),
+            (qk_tiled_mma.thr_id.shape,),
+        )
+        self.epi_tile = self.pv_mma_tiler[:2]
+
+        q_smem_layout_staged = sm100_utils.make_smem_layout_a(
+            qk_tiled_mma, self.qk_mma_tiler, self.q_dtype, self.q_stage)
+        k_smem_layout_staged = sm100_utils.make_smem_layout_b(
+            qk_tiled_mma, self.qk_mma_tiler, self.k_dtype, self.kv_stage)
+        p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
+            pv_tiled_mma, self.pv_mma_tiler, self.q_dtype, self.acc_stage)
+        v_smem_layout_staged = sm100_utils.make_smem_layout_b(
+            pv_tiled_mma, self.pv_mma_tiler, self.v_dtype, self.kv_stage)
+        o_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+            self.o_dtype, self.o_layout, self.epi_tile, self.epi_stage)
+
+        tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
+        tma_store_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
+
+        q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
+        tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op, q, q_smem_layout, self.qk_mma_tiler,
+            qk_tiled_mma, self.cluster_layout_vmnk.shape)
+
+        k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
+        tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_load_op, k, k_smem_layout, self.qk_mma_tiler,
+            qk_tiled_mma, self.cluster_layout_vmnk.shape)
+
+        v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
+        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_load_op, v, v_smem_layout, self.pv_mma_tiler,
+            pv_tiled_mma, self.cluster_layout_vmnk.shape)
+
+        o_smem_layout = cute.select(o_smem_layout_staged, mode=[0, 1])
+        tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_store_op, o, o_smem_layout, self.epi_tile)
+
+        q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
+        k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
+        self.tma_copy_q_bytes = q_copy_size
+        self.tma_copy_kv_bytes = k_copy_size
+
+        @cute.struct
+        class SharedStorage:
+            load_q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2]
+            load_kv_mbar_ptr: cute.struct.MemRange[Int64, self.kv_stage * 2]
+            mma_s0_mbar_ptr: cute.struct.MemRange[Int64, self.mma_softmax_stage * 2]
+            mma_s1_mbar_ptr: cute.struct.MemRange[Int64, self.mma_softmax_stage * 2]
+            s0_corr_mbar_ptr: cute.struct.MemRange[Int64, self.softmax_corr_stage * 2]
+            s1_corr_mbar_ptr: cute.struct.MemRange[Int64, self.softmax_corr_stage * 2]
+            s0_s1_sequence_mbar_ptr: cute.struct.MemRange[
+                Int64, self.softmax_warpgroup_count]
+            corr_epi_mbar_ptr: cute.struct.MemRange[Int64, self.epi_stage * 2]
+            mma_corr_mbar_ptr: cute.struct.MemRange[Int64, self.mma_corr_stage * 2]
+            tmem_dealloc_mbar_ptr: cute.struct.MemRange[Int64, 1]
+            tmem_holding_buf: Int32
+            sO: cute.struct.Align[
+                cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
+                self.buffer_align_bytes]
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, cute.cosize(q_smem_layout_staged)],
+                self.buffer_align_bytes]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[self.k_dtype, cute.cosize(k_smem_layout_staged)],
+                self.buffer_align_bytes]
+
+        self.shared_storage = SharedStorage
+
+        # ViT: bidirectional — no sliding window, no causal masking.
+        # Both window sizes are None (is_causal=False) so apply_mask only
+        # applies RESIDUAL_MASK for out-of-bounds elements on partial tiles.
+        _wsl = None
+        _wsr = Int32(0) if cutlass.const_expr(self.is_causal) else None
+
+        self.kernel(
+            qk_tiled_mma, pv_tiled_mma,
+            tma_atom_q, tma_tensor_q,
+            tma_atom_k, tma_tensor_k,
+            tma_atom_v, tma_tensor_v,
+            tma_atom_o, tma_tensor_o,
+            cum_seqlen_q, cum_seqlen_k, lse,
+            scale_softmax_log2, scale_softmax, scale_output,
+            _wsl, _wsr,
+            q_smem_layout_staged, k_smem_layout_staged,
+            p_tmem_layout_staged, v_smem_layout_staged,
+            o_smem_layout_staged, self.tile_sched_params,
+        ).launch(
+            grid=grid, block=[self.threads_per_cta, 1, 1],
+            cluster=self.cluster_shape_mnk, stream=stream,
             min_blocks_per_mp=1,
         )
 
@@ -2371,6 +2594,7 @@ def run(
     export_only: bool = False,
     file_name: str = "fmha",
     function_prefix: str = "fmha",
+    vit_mode: bool = False,
     **kwargs,
 ):
     """Execute Fused Multi-Head Attention (FMHA) on Blackwell architecture and validate results.
@@ -2484,11 +2708,13 @@ def run(
     # Unpack parameters
     b, s_q, h_q, d = q_shape
     b_, s_k, h_k, d_ = k_shape
-    window_size_left, _ = window_size
+    window_size_left, window_size_right = window_size
     if window_size_left == -1:
         window_size_left = None
-    # window_size_right is always 0 (causal-only); ignore the CLI value
-    window_size_right = 0
+    if window_size_right == -1:
+        window_size_right = None
+    if is_causal:
+        window_size_right = 0
 
     if b != b_:
         raise ValueError("q & k must have the same batch size")
@@ -2496,8 +2722,8 @@ def run(
     if d != d_:
         raise ValueError("q & k must have the same head dimension")
 
-    if d not in {32, 64, 128}:
-        raise ValueError("head dimension must be 32, 64, or 128")
+    # if d not in {32, 64, 128}:
+    #     raise ValueError("head dimension must be 32, 64, or 128")
 
     if h_q % h_k != 0:
         raise ValueError("h_q must be divisible by h_k")
@@ -2618,7 +2844,17 @@ def run(
     else:
         lse_cp = None
 
-    mma_tiler = (*mma_tiler_mn, d)
+    # SM100 tcgen05.mma atom K = 256 bits / element_bits.  For fp16: 16 elems.
+    # The MMA tiler K must be a multiple of this atom.  Non-aligned dims like
+    # 72 are padded up (→ 80); TMA ZFILL/OOB-drop bridge the gap at zero cost.
+    _MMA_K_ATOM = 256 // 16  # 16 for fp16
+    padded_d = ((d + _MMA_K_ATOM - 1) // _MMA_K_ATOM) * _MMA_K_ATOM
+    actual_head_dim = d if padded_d != d else None
+    if actual_head_dim is not None:
+        print(f"[fmha] head_dim {d} not MMA-aligned; "
+              f"tiler K padded to {padded_d}, tensors stay at {d}")
+
+    mma_tiler = (*mma_tiler_mn, padded_d)
 
     mask_type = fmha_utils.MaskEnum.WINDOW_MASK
     if bottom_right_align:
@@ -2660,13 +2896,17 @@ def run(
             raise ValueError("sliding window doesn't support current setting")
 
     use_sliding_window = window_size_left is not None
+    if vit_mode:
+        mask_type = fmha_utils.MaskEnum.RESIDUAL_MASK
     fmha = BlackwellFusedMultiHeadAttentionForward(
         qk_acc_dtype,
         pv_acc_dtype,
         mma_tiler,
         is_persistent,
         mask_type,
-        use_sliding_window=use_sliding_window,
+        is_causal=(is_causal and not vit_mode),
+        use_sliding_window=(use_sliding_window and not vit_mode),
+        actual_head_dim=actual_head_dim,
     )
 
     # Initialize Stream
@@ -2690,6 +2930,13 @@ def run(
                     mode=1, stride_order=so).mark_compact_shape_dynamic(
                         mode=2, stride_order=so))
 
+    def mark_shd_dynamic(tensor):
+        so = (0, 1, 2)  # outermost-to-innermost for packed (total_S, H, D)
+        return (tensor.mark_layout_dynamic(
+            leading_dim=2).mark_compact_shape_dynamic(
+                mode=0, stride_order=so).mark_compact_shape_dynamic(
+                    mode=1, stride_order=so))
+
     def mark_kv_cache_dynamic(tensor):
         so = (0, 1, 2, 3, 4
               )  # outermost-to-innermost for contiguous (B,2,H,S,D)
@@ -2700,53 +2947,81 @@ def run(
                 .mark_compact_shape_dynamic(mode=3, stride_order=so)  # S
                 )
 
-    q_dyn = mark_bshd_dynamic(q_tensor)
-    kv_dyn = mark_kv_cache_dynamic(kvcache_tensor)
-    o_dyn = mark_bshd_dynamic(o_tensor)
+    def mark_1d_dynamic(tensor):
+        return tensor.mark_layout_dynamic(
+            leading_dim=0).mark_compact_shape_dynamic(
+                mode=0, stride_order=(0,))
 
-    # __call__ takes Int32 for window_size_left (export_to_c requires concrete types, not Optional).
-    # Compile-time dispatch is handled inside __call__ via self.use_sliding_window:
-    # when False, window_size_left is passed as None to internal kernel methods,
-    # eliminating left-side window masking code at compile time.
-    # For non-SWA: window_size_left value is unused (ignored by kernel), pass 0 as placeholder.
-    # window_size_right is always 0 (causal) — set as self.window_size_right compile-time constant.
-    _wsl = Int32(window_size_left) if window_size_left is not None else Int32(
-        0)
+    if vit_mode:
+        # ViT: packed [total_S, H, D] with cu_seqlens for ragged batching.
+        # For the reference test, total_S = b * s_q, uniform lengths.
+        _s = s_q if not isinstance(s_q, tuple) else max(s_q)
+        total_S = b * _s
 
-    # Cumulative KV sequence lengths: uniform s_k for all batches in reference run.
-    _s_k = s_k if not isinstance(s_k, tuple) else max(s_k)
-    cu_kv_seqlens_np = np.arange(b + 1, dtype=np.int32) * _s_k
-    cu_kv_seqlens_cp = cp.asarray(cu_kv_seqlens_np)
-    cu_kv_seqlens = from_dlpack(cu_kv_seqlens_cp, assumed_align=16)
-    cu_kv_seqlens = cu_kv_seqlens.mark_layout_dynamic(
-        leading_dim=0).mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+        # Reshape Q, K, V from (B, S, H, D) → (total_S, H, D)
+        q_vit_shape = (total_S, h_r * h_k, d)
+        k_vit_shape = (total_S, h_k, d)
+        q_vit_ref, q_vit_tensor, q_vit_cp, *_qv = create_and_pad_tensor(
+            q_vit_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
+        k_vit_ref, k_vit_tensor, k_vit_cp, *_kv = create_and_pad_tensor(
+            k_vit_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
+        v_vit_ref, v_vit_tensor, v_vit_cp, *_vv = create_and_pad_tensor(
+            k_vit_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
+        _, o_vit_tensor, o_vit_cp, *_ov = create_and_pad_tensor(
+            q_vit_shape, (0, 0, 0, 0), out_dtype, is_dynamic_layout=True)
 
-    start_time = time.time()
-    # compile fmha kernel
-    compiled_fmha = cute.compile(
-        fmha,
-        q_dyn,
-        kv_dyn,
-        o_dyn,
-        cu_kv_seqlens,
-        _wsl,
-        scale_softmax_log2,
-        scale_softmax,
-        scale_output,
-        current_stream,
-    )
+        cu_seqlens_np = np.arange(b + 1, dtype=np.int32) * _s
+        cu_seqlens_cp = cp.asarray(cu_seqlens_np)
+        cu_seqlens = from_dlpack(cu_seqlens_cp, assumed_align=16)
+
+        q_dyn = mark_shd_dynamic(q_vit_tensor)
+        k_dyn = mark_shd_dynamic(k_vit_tensor)
+        v_dyn = mark_shd_dynamic(v_vit_tensor)
+        o_dyn = mark_shd_dynamic(o_vit_tensor)
+        cu_dyn = mark_1d_dynamic(cu_seqlens)
+
+        _max_seqlen = Int32(_s)
+
+        start_time = time.time()
+        compiled_fmha = cute.compile(
+            fmha.__call_vit__,
+            q_dyn, k_dyn, v_dyn, o_dyn, cu_dyn, _max_seqlen,
+            scale_softmax_log2, scale_softmax, scale_output,
+            current_stream,
+        )
+    else:
+        # LLM: batched Q [B,S,H,D] + combined KV cache [B,2,H,Cap,D]
+        q_dyn = mark_bshd_dynamic(q_tensor)
+        kv_dyn = mark_kv_cache_dynamic(kvcache_tensor)
+        o_dyn = mark_bshd_dynamic(o_tensor)
+
+        _wsl = Int32(window_size_left) if window_size_left is not None else Int32(0)
+
+        _s_k = s_k if not isinstance(s_k, tuple) else max(s_k)
+        cu_kv_seqlens_np = np.arange(b + 1, dtype=np.int32) * _s_k
+        cu_kv_seqlens_cp = cp.asarray(cu_kv_seqlens_np)
+        cu_kv_seqlens = from_dlpack(cu_kv_seqlens_cp, assumed_align=16)
+        cu_kv_seqlens = mark_1d_dynamic(cu_kv_seqlens)
+
+        start_time = time.time()
+        compiled_fmha = cute.compile(
+            fmha,
+            q_dyn, kv_dyn, o_dyn, cu_kv_seqlens, _wsl,
+            scale_softmax_log2, scale_softmax, scale_output,
+            current_stream,
+        )
+
     compilation_time = time.time() - start_time
     print(f"{_tag} Compilation time: {compilation_time:.4f}s")
 
-    os.makedirs(output_dir, exist_ok=True)
-    compiled_fmha.export_to_c(
-        file_path=output_dir,
-        file_name=file_name,
-        function_prefix=function_prefix,
-    )
-    print(f"{_tag} Exported to {output_dir}/{file_name}.h and {file_name}.o")
-
     if export_only:
+        os.makedirs(output_dir, exist_ok=True)
+        compiled_fmha.export_to_c(
+            file_path=output_dir,
+            file_name=file_name,
+            function_prefix=function_prefix,
+        )
+        print(f"{_tag} Exported to {output_dir}/{file_name}.h and {file_name}.o")
         return None
 
     def _numpy_softmax(x, axis=-1):
@@ -2764,10 +3039,12 @@ def run(
         return np.log(
             np.sum(np.exp(x - x_max_safe[..., np.newaxis]), axis=axis)) + x_max
 
-    def run_numpy_fmha(
-        q,
-        k,
-        v,
+    def run_numpy_single_shot_reference_packed(
+        q_packed,
+        k_packed,
+        v_packed,
+        cu_seqlens_q,
+        cu_seqlens_k,
         scale_softmax=1.0,
         scale_output=1.0,
         is_causal=False,
@@ -2776,44 +3053,52 @@ def run(
         window_size_left=None,
         window_size_right=None,
     ):
-        # q, k, v are numpy arrays with shape (B, S, H, D)
-        h_q = q.shape[2]
-        h_k = k.shape[2]
+        """Packed (ViT-style) numpy reference for single-shot attention.
 
-        if h_q != h_k:
-            repeat_factor = h_q // h_k
-            k = np.repeat(k, repeat_factor, axis=2)
-            v = np.repeat(v, repeat_factor, axis=2)
+        q_packed: [total_q, H_q, D]
+        k_packed/v_packed: [total_k, H_k, D]
+        cu_seqlens_q/cu_seqlens_k: cumulative offsets of length B+1.
+        """
+        h_q_local = q_packed.shape[1]
+        h_k_local = k_packed.shape[1]
+        if h_q_local % h_k_local != 0:
+            raise ValueError("H_q must be divisible by H_k in packed reference")
+        repeat_factor = h_q_local // h_k_local
+        _wsr = 0 if is_causal else window_size_right
 
-        # BSHD -> BHSD
-        q = q.transpose(0, 2, 1, 3)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
-
-        batch_size = q.shape[0]
         ref_list = []
         lse_list = []
+        batch_size = len(cu_seqlens_q) - 1
         for batch_idx in range(batch_size):
-            q_i = q[batch_idx]
-            k_i = k[batch_idx]
-            v_i = v[batch_idx]
+            q_start = cu_seqlens_q[batch_idx]
+            q_end = cu_seqlens_q[batch_idx + 1]
+            k_start = cu_seqlens_k[batch_idx]
+            k_end = cu_seqlens_k[batch_idx + 1]
+
+            q_i = q_packed[q_start:q_end].transpose(1, 0, 2)  # (H_q, S_q, D)
+            k_i = k_packed[k_start:k_end].transpose(1, 0, 2)  # (H_k, S_k, D)
+            v_i = v_packed[k_start:k_end].transpose(1, 0, 2)  # (H_k, S_k, D)
+
+            if repeat_factor > 1:
+                k_i = np.repeat(k_i, repeat_factor, axis=0)
+                v_i = np.repeat(v_i, repeat_factor, axis=0)
+
             s_i = np.einsum("hqd,hkd->hqk", q_i, k_i) * scale_softmax
-            s_q = q_i.shape[1]
-            s_k = k_i.shape[1]
-            if is_causal:
-                window_size_right = 0
-            if window_size_left is not None or window_size_right is not None:
-                q_coords = np.arange(s_q).reshape(-1, 1)
-                k_coords = np.arange(s_k).reshape(1, -1)
-                offset = 0 if not bottom_right_align else s_k - s_q
+            s_q_local = q_i.shape[1]
+            s_k_local = k_i.shape[1]
+
+            if window_size_left is not None or _wsr is not None:
+                q_coords = np.arange(s_q_local).reshape(-1, 1)
+                k_coords = np.arange(s_k_local).reshape(1, -1)
+                offset = 0 if not bottom_right_align else s_k_local - s_q_local
                 if window_size_left is None:
-                    _mask = k_coords > q_coords + offset + window_size_right
-                elif window_size_right is None:
+                    _mask = k_coords > q_coords + offset + _wsr
+                elif _wsr is None:
                     _mask = k_coords < q_coords + offset - window_size_left
                 else:
                     _mask = (k_coords > q_coords + offset +
-                             window_size_right) | (k_coords < q_coords +
-                                                   offset - window_size_left)
+                             _wsr) | (k_coords < q_coords + offset -
+                                      window_size_left)
                 s_i = np.where(_mask, -np.inf, s_i)
 
             if lse_calculation:
@@ -2826,91 +3111,120 @@ def run(
             ref_i = ref_i.transpose(1, 0, 2) * scale_output
             ref_list.append(ref_i)
             if lse_calculation:
-                lse_list.append(lse_i)
+                # (H_q, S_q) -> (S_q, H_q) to align packed output order.
+                lse_list.append(lse_i.transpose(1, 0))
 
-        ref = np.stack(ref_list)
-        lse = np.stack(lse_list) if lse_calculation else None
+        ref = np.concatenate(ref_list, axis=0)
+        lse = np.concatenate(lse_list, axis=0) if lse_calculation else None
         return ref, lse
 
-    if not skip_ref_check:
-        # Execute kernel once for reference checking
-        compiled_fmha(
-            q_tensor,
-            kvcache_tensor,
-            o_tensor,
-            cu_kv_seqlens,
-            _wsl,
-            scale_softmax_log2,
-            scale_softmax,
-            scale_output,
-            current_stream,
-        )
-        print(f"{_tag} Verifying accuracy ...")
-        o_ref, lse_ref = run_numpy_fmha(
-            q_ref,
-            k_ref,
-            v_ref,
-            scale_softmax,
-            scale_output,
-            is_causal,
-            bottom_right_align,
-            lse_calculation,
-            window_size_left,
-            window_size_right,
-        )
+    def _maybe_quantize_ref_for_narrow_out(o_ref_np):
+        if not (out_dtype.is_float and out_dtype.width <= 8):
+            return o_ref_np, tolerance
+        ref_narrow_cp = cp.empty(o_ref_np.shape, dtype=cp.uint8)
+        ref_narrow_cute = from_dlpack(ref_narrow_cp, assumed_align=16)
+        ref_narrow_cute.element_type = out_dtype
+        ref_narrow_cute = ref_narrow_cute.mark_layout_dynamic(
+            leading_dim=_get_leading_dim(ref_narrow_cp))
 
-        # convert o back to f32 for comparison
-        o_fp32_cp = cp.empty(o_cp.shape, dtype=cp.float32)
-        o_fp32_cute = from_dlpack(o_fp32_cp, assumed_align=16)
-        o_fp32_cute.element_type = Float32
-        o_fp32_cute = o_fp32_cute.mark_layout_dynamic(
-            leading_dim=_get_leading_dim(o_fp32_cp))
-        cute.testing.convert(o_tensor, o_fp32_cute)
-        o_result = o_fp32_cp.get()
+        ref_o_f32_cp = cp.asarray(o_ref_np)
+        ref_o_f32_cute = from_dlpack(ref_o_f32_cp, assumed_align=16)
+        ref_o_f32_cute.element_type = cutlass.Float32
+        ref_o_f32_cute = ref_o_f32_cute.mark_layout_dynamic(
+            leading_dim=_get_leading_dim(ref_o_f32_cp))
 
-        if out_dtype.is_float and out_dtype.width <= 8:
-            # Quantize ref through narrow precision: f32 -> fp8 -> f32
-            ref_narrow_cp = cp.empty(o_ref.shape, dtype=cp.uint8)
-            ref_narrow_cute = from_dlpack(ref_narrow_cp, assumed_align=16)
-            ref_narrow_cute.element_type = out_dtype
-            ref_narrow_cute = ref_narrow_cute.mark_layout_dynamic(
-                leading_dim=_get_leading_dim(ref_narrow_cp))
+        cute.testing.convert(ref_o_f32_cute, ref_narrow_cute)
+        cute.testing.convert(ref_narrow_cute, ref_o_f32_cute)
+        return ref_o_f32_cp.get(), 0.13
 
-            ref_o_f32_cp = cp.asarray(o_ref)
-            ref_o_f32_cute = from_dlpack(ref_o_f32_cp, assumed_align=16)
-            ref_o_f32_cute.element_type = cutlass.Float32
-            ref_o_f32_cute = ref_o_f32_cute.mark_layout_dynamic(
-                leading_dim=_get_leading_dim(ref_o_f32_cp))
+    if vit_mode:
+        _vit_test_tag = "[vit_single_shot_test]"
+        if not skip_ref_check:
+            print(f"{_vit_test_tag} Running single-shot packed accuracy test:")
+            print(f"{_vit_test_tag}   b={b}, seq_len={_s}, total_s={total_S}, "
+                  f"h_q={h_q}, h_k={h_k}, d={d}, is_causal=False")
+            print(f"{_vit_test_tag}   layout=[total_S,H,D], "
+                  f"uniform cu_seqlens, max_seqlen={_s}")
+            compiled_fmha(
+                q_vit_tensor, k_vit_tensor, v_vit_tensor, o_vit_tensor,
+                cu_seqlens, _max_seqlen,
+                scale_softmax_log2, scale_softmax, scale_output,
+                current_stream,
+            )
 
-            # convert ref : f32 -> fp4/fp8 -> f32
-            cute.testing.convert(ref_o_f32_cute, ref_narrow_cute)
-            cute.testing.convert(ref_narrow_cute, ref_o_f32_cute)
+            o_fp32_cp = cp.empty(o_vit_cp.shape, dtype=cp.float32)
+            o_fp32_cute = from_dlpack(o_fp32_cp, assumed_align=16)
+            o_fp32_cute.element_type = Float32
+            o_fp32_cute = o_fp32_cute.mark_layout_dynamic(leading_dim=2)
+            cute.testing.convert(o_vit_tensor, o_fp32_cute)
+            o_result = o_fp32_cp.get()
 
-            o_ref = ref_o_f32_cp.get()
-
-            # override tolerance
-            tolerance = 0.13
-
-        # Assert close results
-        np.testing.assert_allclose(o_result, o_ref, atol=tolerance, rtol=1e-05)
-        if lse_calculation:
-            lse_result = lse_cp.get()
-            np.testing.assert_allclose(lse_result,
-                                       lse_ref,
-                                       atol=tolerance,
+            cu_q_np = np.arange(b + 1, dtype=np.int32) * _s
+            cu_k_np = np.arange(b + 1, dtype=np.int32) * _s
+            o_ref, _ = run_numpy_single_shot_reference_packed(
+                q_vit_ref,
+                k_vit_ref,
+                v_vit_ref,
+                cu_q_np,
+                cu_k_np,
+                scale_softmax=scale_softmax,
+                scale_output=scale_output,
+                is_causal=False,
+                bottom_right_align=False,
+                lse_calculation=False,
+                window_size_left=None,
+                window_size_right=None,
+            )
+            o_ref, tol_for_check = _maybe_quantize_ref_for_narrow_out(o_ref)
+            np.testing.assert_allclose(o_result,
+                                       o_ref,
+                                       atol=tol_for_check,
                                        rtol=1e-05)
-        print(f"{_tag} Accuracy check passed.")
+            print(f"{_vit_test_tag} ViT single-shot accuracy check passed.")
 
-        # Multi-round prefill test: exercises cap != s_k stride logic
-        # by using a capacity 3x larger than the per-round sequence length.
+        def generate_vit_tensors():
+            _, q_ws, *_gq = create_and_pad_tensor(
+                q_vit_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
+            _, k_ws, *_gk = create_and_pad_tensor(
+                k_vit_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
+            _, v_ws, *_gv = create_and_pad_tensor(
+                k_vit_shape, (0, 0, 0, 0), in_dtype, is_dynamic_layout=True)
+            _, o_ws, *_go = create_and_pad_tensor(
+                q_vit_shape, (0, 0, 0, 0), out_dtype, is_dynamic_layout=True)
+            return testing.JitArguments(
+                mark_shd_dynamic(q_ws), mark_shd_dynamic(k_ws),
+                mark_shd_dynamic(v_ws), mark_shd_dynamic(o_ws),
+                cu_dyn, _max_seqlen,
+                scale_softmax_log2, scale_softmax, scale_output,
+                current_stream,
+            )
+
+        exec_time = testing.benchmark(
+            compiled_fmha,
+            workspace_generator=generate_vit_tensors,
+            workspace_count=1,
+            stream=current_stream,
+            warmup_iterations=warmup_iterations,
+            iterations=iterations,
+        )
+        return exec_time
+
+    # LLM path only below: plugin-aligned multi-round prefill regression.
+    if not skip_ref_check:
+        # LLM-only regression that mirrors attention plugin unit test
+        # (`test_plugin_vs_numpy_prefill`) and exercises cap != s_k stride.
+        # Keep this as the only LLM correctness check.
+        llm_prefill_tolerance = (
+            0.13 if (out_dtype.is_float and out_dtype.width <= 8) else tolerance
+        )
         if not isinstance(s_q, tuple) and not isinstance(s_k, tuple):
             _num_rounds = 3
             _prefill_seq = min(s_q, s_k)
             _cap = _prefill_seq * _num_rounds
-            print(f"{_tag} Running multi-round prefill test "
+            print(f"{_tag} Running LLM multi-round prefill test "
                   f"(cap={_cap}, seq_len={_prefill_seq}, "
                   f"rounds={_num_rounds}) ...")
-            run_multi_round_prefill_test(
+            run_llm_multi_round_prefill_test(
                 batch_size=b,
                 seq_len=_prefill_seq,
                 num_rounds=_num_rounds,
@@ -2920,14 +3234,15 @@ def run(
                 kv_cache_capacity=_cap,
                 mma_tiler_mn=mma_tiler_mn,
                 is_persistent=is_persistent,
+                is_causal=is_causal,
                 bottom_right_align=bottom_right_align,
                 use_sliding_window=use_sliding_window,
                 window_size_left_val=(window_size_left
                                      if window_size_left is not None
                                      else -1),
-                tolerance=tolerance,
+                tolerance=llm_prefill_tolerance,
             )
-            print(f"{_tag} Multi-round prefill test passed.")
+            print(f"{_tag} LLM multi-round prefill test passed.")
 
     def generate_tensors():
         _, q_tensor_workspace, *_gq = create_and_pad_tensor(
@@ -2997,7 +3312,7 @@ def run(
     return exec_time  # Return execution time in microseconds
 
 
-def run_multi_round_prefill_test(
+def run_llm_multi_round_prefill_test(
     batch_size: int = 4,
     seq_len: int = 8,
     num_rounds: int = 3,
@@ -3007,17 +3322,21 @@ def run_multi_round_prefill_test(
     kv_cache_capacity: int = 64,
     mma_tiler_mn: Tuple[int, int] = (128, 128),
     is_persistent: bool = True,
+    is_causal: bool = True,
     bottom_right_align: bool = True,
     use_sliding_window: bool = False,
     window_size_left_val: int = -1,
     tolerance: float = 0.1,
 ):
-    """Multi-round prefill accuracy test that mimics test_plugin_vs_numpy_prefill.
+    """LLM FMHA multi-round prefill accuracy test aligned with plugin unit test.
 
     Each round appends seq_len new tokens to a KV cache with physical capacity
     kv_cache_capacity >> effective_kv_len, exercising the cap vs s_k stride
     distinction.  After each round the CuTe DSL FMHA output is compared against
     a numpy reference.
+
+    This helper is intentionally LLM-only: it validates the [B,S,H,D] query path
+    with KV cache layout [B,2,H,cap,D], matching attention plugin prefill tests.
 
     :param batch_size: Number of batches.
     :param seq_len: Tokens per prefill round (same for Q and new K/V).
@@ -3028,24 +3347,27 @@ def run_multi_round_prefill_test(
     :param kv_cache_capacity: Physical KV cache capacity (cap).
     :param mma_tiler_mn: MMA tile shape.
     :param is_persistent: Use persistent kernel.
+    :param is_causal: Enable causal masking (window_size_right = 0).
     :param bottom_right_align: bottom-right causal mask alignment.
     :param use_sliding_window: Enable sliding window masking.
     :param window_size_left_val: Left window size (-1 = disabled).
     :param tolerance: Max absolute error tolerance.
     """
-    _tag = "[prefill_test]"
+    _tag = "[llm_prefill_test]"
     b = batch_size
     cap = kv_cache_capacity
     h_r = h_q // h_k
     window_size_left = window_size_left_val if use_sliding_window else None
-    window_size_right = 0
+    window_size_right = 0 if is_causal else None
 
     print(f"{_tag} Running multi-round prefill accuracy test:")
     print(f"{_tag}   b={b}, seq_len={seq_len}, rounds={num_rounds}, "
-          f"cap={cap}, h_q={h_q}, h_k={h_k}, d={d}")
+          f"cap={cap}, h_q={h_q}, h_k={h_k}, d={d}, is_causal={is_causal}")
 
-    if d not in {64, 128}:
-        raise ValueError("head dimension must be 64 or 128")
+    _MMA_K_ATOM = 256 // 16
+    padded_d = ((d + _MMA_K_ATOM - 1) // _MMA_K_ATOM) * _MMA_K_ATOM
+    actual_head_dim = d if padded_d != d else None
+
     if h_q % h_k != 0:
         raise ValueError("h_q must be divisible by h_k")
     if num_rounds * seq_len > cap:
@@ -3065,8 +3387,10 @@ def run_multi_round_prefill_test(
         mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
 
     fmha_op = BlackwellFusedMultiHeadAttentionForward(
-        Float32, Float32, (*mma_tiler_mn, d),
+        Float32, Float32, (*mma_tiler_mn, padded_d),
         is_persistent, mask_type, use_sliding_window=use_sliding_window,
+        is_causal=is_causal,
+        actual_head_dim=actual_head_dim,
     )
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
     _wsl = Int32(window_size_left_val) if use_sliding_window else Int32(0)
@@ -3180,16 +3504,18 @@ def run_multi_round_prefill_test(
                       * scale_softmax)
 
             s_k = effective_kv_len
-            q_coords = np.arange(seq_len).reshape(-1, 1)
-            k_coords = np.arange(s_k).reshape(1, -1)
-            offset = (s_k - seq_len) if bottom_right_align else 0
-
-            mask = np.zeros((seq_len, s_k), dtype=bool)
-            mask |= (k_coords > q_coords + offset + window_size_right)
-            if window_size_left is not None:
-                mask |= (k_coords < q_coords + offset - window_size_left)
-
-            scores = np.where(mask, -np.inf, scores)
+            if window_size_left is not None or window_size_right is not None:
+                q_coords = np.arange(seq_len).reshape(-1, 1)
+                k_coords = np.arange(s_k).reshape(1, -1)
+                offset = (s_k - seq_len) if bottom_right_align else 0
+                if window_size_left is None:
+                    mask = k_coords > q_coords + offset + window_size_right
+                elif window_size_right is None:
+                    mask = k_coords < q_coords + offset - window_size_left
+                else:
+                    mask = ((k_coords > q_coords + offset + window_size_right)
+                            | (k_coords < q_coords + offset - window_size_left))
+                scores = np.where(mask, -np.inf, scores)
             probs = _numpy_softmax(scores, axis=-1)
             o_ref = np.einsum("hqk,hkd->hqd", probs, v_b)
             o_ref = o_ref.transpose(1, 0, 2) * scale_output
@@ -3326,8 +3652,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--window_size",
         type=parse_comma_separated_ints,
-        default=(-1, 0),
-        help="Sliding window size (left, right). Right is always forced to 0 (causal). Left: -1 = no sliding window, >0 = window size.",
+        default=(-1, -1),
+        help="Sliding window size (left, right) for attention masking.",
     )
 
     parser.add_argument(
@@ -3437,6 +3763,13 @@ if __name__ == "__main__":
         help="Function prefix for exported C symbols (avoids conflicts when compiling multiple variants)",
     )
 
+    parser.add_argument(
+        "--vit_mode",
+        action="store_true",
+        help="Compile ViT FMHA variant: packed varlen with separate Q/K/V, "
+        "bidirectional (no causal mask). Produces a different ABI.",
+    )
+
     args = parser.parse_args()
 
     if cp.cuda.runtime.getDeviceCount() == 0:
@@ -3453,6 +3786,15 @@ if __name__ == "__main__":
 
     if len(args.mma_tiler_mn) != 2:
         parser.error("--mma_tiler_mn must contain exactly 2 values")
+
+    if args.vit_mode:
+        assert args.k_shape == args.q_shape, (
+            f"vit_mode requires k_shape == q_shape; got k_shape={args.k_shape}, q_shape={args.q_shape}"
+        )
+        assert not args.is_causal, "vit_mode is bidirectional; --is_causal must not be set"
+        assert args.window_size == (-1, -1), (
+            f"vit_mode does not support sliding window; got --window_size={args.window_size}"
+        )
 
     latency = run(
         args.q_shape,
@@ -3481,6 +3823,7 @@ if __name__ == "__main__":
         export_only=args.export_only,
         file_name=args.file_name,
         function_prefix=args.function_prefix,
+        vit_mode=args.vit_mode,
     )
 
     if latency is not None:

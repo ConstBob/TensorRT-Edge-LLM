@@ -17,10 +17,14 @@
 
 #pragma once
 
-#include "cuteDSLArtifact/fmha_d128.h"    // CuTe DSL generated header (head_dim=128)
-#include "cuteDSLArtifact/fmha_d128_sw.h" // CuTe DSL generated header (head_dim=128, sliding window)
-#include "cuteDSLArtifact/fmha_d64.h"     // CuTe DSL generated header (head_dim=64)
-#include "cuteDSLArtifact/fmha_d64_sw.h"  // CuTe DSL generated header (head_dim=64, sliding window)
+#include "cuteDSLArtifact/fmha_d128.h"
+#include "cuteDSLArtifact/fmha_d128_sw.h"
+#include "cuteDSLArtifact/fmha_d64.h"
+#include "cuteDSLArtifact/fmha_d64_sw.h"
+#include "cuteDSLArtifact/vit_fmha_d128.h"
+#include "cuteDSLArtifact/vit_fmha_d64.h"
+#include "cuteDSLArtifact/vit_fmha_d72.h"
+#include "cuteDSLArtifact/vit_fmha_d80.h"
 
 #include <climits>
 #include <cstdint>
@@ -32,74 +36,91 @@ namespace trt_edgellm
 {
 
 /**
- * @brief Runner class for CuTe DSL compiled FMHA kernels (Blackwell SM100+)
+ * @brief Unified runner for CuTe DSL compiled FMHA kernels (Blackwell SM100+).
  *
- * Supports head_dim=64 and head_dim=128 via separate AOT-compiled kernels.
- * Supports sliding window attention via separate AOT-compiled kernel variants.
- * At runtime, dispatches to the correct kernel based on head dimension and
- * whether sliding window is enabled (slidingWindowSize < INT_MAX).
- * The kernel expects a combined KV tensor with layout [B, 2, H_kv, S, D].
+ * Supports two execution modes via separate AOT-compiled kernel variants:
+ *
+ * 1. LLM prefill/chunked-prefill: batched Q [B,S_q,H_q,D] + combined KV cache
+ *    [B,2,H_kv,Cap,D] with causal masking and optional sliding window.
+ *
+ * 2. ViT: packed varlen separate Q/K/V [total_S,H,D] with cu_seqlens [B+1]
+ *    for ragged batching, bidirectional attention (no causal mask).
+ *
+ * Each mode has its own kernel modules and run() overload.
  */
 class CuteDslFMHARunner
 {
 public:
-    CuteDslFMHARunner(int32_t b, int32_t s_q, int32_t kvCacheCapacity, int32_t h_q, int32_t h_k, int32_t d);
+    CuteDslFMHARunner(int32_t numQHeads, int32_t numKVHeads, int32_t headDim, int32_t batchSize = 0,
+        int32_t seqLenQ = 0, int32_t kvCacheCapacity = 0);
 
     ~CuteDslFMHARunner() = default;
-
     CuteDslFMHARunner(CuteDslFMHARunner const&) = delete;
     CuteDslFMHARunner& operator=(CuteDslFMHARunner const&) = delete;
 
-    /**
-     * @brief Load all CuTe DSL FMHA kernel modules (thread-safe, idempotent)
-     * @return true if initialization succeeded
-     */
-    static bool loadKernelModule();
-
-    /**
-     * @brief Unload all CuTe DSL FMHA kernel modules
-     */
-    static void unloadKernelModule();
-
-    /**
-     * @brief Check if the CuTe DSL FMHA kernel supports the given configuration
-     *
-     * @param headSize Head dimension (supports 64, 128)
-     * @param smVersion CUDA SM version (requires SM100+)
-     * @return true if the kernel can handle this configuration
-     */
     static bool canImplement(int32_t headSize, int32_t smVersion);
+    static bool canImplementViT(int32_t headSize, int32_t smVersion);
+
+    // ---- LLM kernel loading ----
+    static bool loadLLMKernelModule();
+    static void unloadLLMKernelModule();
+
+    // ---- ViT kernel loading ----
+    static bool loadViTKernelModule();
+    static void unloadViTKernelModule();
 
     /**
-     * @brief Run the FMHA kernel with combined KV tensor
+     * @brief LLM FMHA: batched Q + combined KV cache with causal masking.
      *
-     * @param qPtr Query tensor [B, S_q, H_q, D]
-     * @param kvPtr Combined KV cache tensor [B, 2, H_kv, Cap, D]
-     * @param oPtr Output tensor [B, S_q, H_q, D]
-     * @param cuKVSeqLens Cumulative KV sequence lengths [B+1] (int32, device pointer)
+     * @param qPtr Query [B, S_q, H_q, D]
+     * @param kvPtr Combined KV cache [B, 2, H_kv, Cap, D]
+     * @param oPtr Output [B, S_q, H_q, D]
+     * @param cuKVSeqLens Cumulative KV sequence lengths [B+1]
      * @param stream CUDA stream
-     * @param slidingWindowSize Sliding window size (INT_MAX = no sliding window)
+     * @param slidingWindowSize Sliding window size (INT_MAX = disabled)
      */
     void run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream,
         int32_t slidingWindowSize = INT_MAX);
 
+    /**
+     * @brief ViT FMHA: packed varlen separate Q/K/V, bidirectional.
+     *
+     * @param qPtr  Query  [total_S, H, D]
+     * @param kPtr  Key    [total_S, H, D]
+     * @param vPtr  Value  [total_S, H, D]
+     * @param oPtr  Output [total_S, H, D]
+     * @param cuSeqLens Cumulative sequence lengths [B+1]
+     * @param totalSeqLen Sum of all sequence lengths
+     * @param maxSeqLen Longest individual sequence length
+     * @param batchSize Number of sequences
+     * @param stream CUDA stream
+     */
+    void run(void const* qPtr, void const* kPtr, void const* vPtr, void* oPtr, int32_t const* cuSeqLens,
+        int32_t totalSeqLen, int32_t maxSeqLen, int32_t batchSize, cudaStream_t stream);
+
 private:
-    int32_t mBatchSize;
-    int32_t mSeqLenQ;
-    int32_t mKVCacheCapacity;
-    int32_t mNumHeadsQ;
-    int32_t mNumHeadsK;
-    int32_t mHeadDim;
+    int32_t mBatchSize{};
+    int32_t mSeqLenQ{};
+    int32_t mKVCacheCapacity{};
+    int32_t mNumHeadsQ{};
+    int32_t mNumHeadsK{};
+    int32_t mHeadDim{};
 
-    // Non-sliding-window kernel modules
-    static fmha_d64_Kernel_Module_t sKernelModule_d64;
-    static fmha_d128_Kernel_Module_t sKernelModule_d128;
-    // Sliding window kernel modules
-    static fmha_d64_sw_Kernel_Module_t sKernelModule_d64_sw;
-    static fmha_d128_sw_Kernel_Module_t sKernelModule_d128_sw;
+    // LLM kernel modules
+    static fmha_d64_Kernel_Module_t sLLM_d64;
+    static fmha_d128_Kernel_Module_t sLLM_d128;
+    static fmha_d64_sw_Kernel_Module_t sLLM_d64_sw;
+    static fmha_d128_sw_Kernel_Module_t sLLM_d128_sw;
+    static bool sLLMLoaded;
+    static std::mutex sLLMMutex;
 
-    static bool sModuleLoaded;
-    static std::mutex sLoadMutex;
+    // ViT kernel modules
+    static vit_fmha_d64_Kernel_Module_t sViT_d64;
+    static vit_fmha_d72_Kernel_Module_t sViT_d72;
+    static vit_fmha_d80_Kernel_Module_t sViT_d80;
+    static vit_fmha_d128_Kernel_Module_t sViT_d128;
+    static bool sViTLoaded;
+    static std::mutex sViTMutex;
 };
 
 } // namespace trt_edgellm

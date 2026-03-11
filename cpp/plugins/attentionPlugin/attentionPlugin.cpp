@@ -174,7 +174,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
 #ifdef CUTE_DSL_FMHA_ENABLED
     if (mUseCuteDslFMHA && CuteDslFMHARunner::canImplement(mHeadSize, mSMVersion))
     {
-        if (CuteDslFMHARunner::loadKernelModule())
+        if (CuteDslFMHARunner::loadLLMKernelModule())
         {
             canImplementFMHA = true;
             LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", mSMVersion);
@@ -241,7 +241,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data,
 #ifdef CUTE_DSL_FMHA_ENABLED
     if (mUseCuteDslFMHA && CuteDslFMHARunner::canImplement(mHeadSize, mSMVersion))
     {
-        if (!CuteDslFMHARunner::loadKernelModule())
+        if (!CuteDslFMHARunner::loadLLMKernelModule())
         {
             LOG_WARNING("CuTe DSL FMHA kernel failed to load, falling back to FMHA_v2");
             mUseCuteDslFMHA = false;
@@ -728,12 +728,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
             // Run CuTe DSL FMHA kernel with combined KV tensor
             // Expected layouts: Q [b, s_q, h_q, d], KV [b, 2, hkv, cap, d], O [b, s_q, h_q, d]
-            CuteDslFMHARunner runner(runtimeBatchSize,     // b
-                runtimeSeqLen,                             // s_q
-                kvCacheCapacity,                           // KV cache capacity (for strides)
-                mNumQHeads,                                // h_q
-                mNumKVHeads,                               // h_k
-                mHeadSize);                                // d
+            CuteDslFMHARunner runner(
+                mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
             runner.run(qInputTensor.dataPointer<half>(),   // qPtr [b, s_q, h_q, d]
                 kvCacheTensor.dataPointer<half>(),         // kvPtr [b, 2, h_k, cap, d]
                 attentionOutputTensor.dataPointer<half>(), // oPtr [b, s_q, h_q, d]
