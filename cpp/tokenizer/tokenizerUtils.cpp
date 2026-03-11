@@ -149,13 +149,13 @@ std::string normalizeRegex(std::string const& expr)
 
     for (size_t i = 0; i < expr.size();)
     {
-        // case 1: (?i) case-insensitive modifier
+        // case 1: (?i) case-insensitive modifier at current position
         // e.g. (?i:'s|'t|'re|'ve|'m|'ll|'d) => (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
-        if (expr.find("(?i:", i) != std::string::npos)
+        if (i + 3 < expr.size() && expr.substr(i, 4) == "(?i:")
         {
             normalizedExpr += "(?:";
 
-            size_t next = expr.find("(?i:", i) + 4;
+            size_t next = i + 4;
             size_t end = expr.find(")", next);
             auto part = expr.substr(next, end - next);
 
@@ -354,24 +354,28 @@ bool unicodeCollapseRegex(std::string const& expr, std::regex& regex)
                     continue;
                 }
 
-                if (expr[i + 0] == '\\' && i + 4 < expr.size() && expr[i + 1] == 'p' && expr[i + 2] == '{'
-                    && expr[i + 4] == '}')
+                if (expr[i + 0] == '\\' && i + 3 < expr.size() && expr[i + 1] == 'p' && expr[i + 2] == '{')
                 {
-                    std::string const pat = expr.substr(i, 5);
-                    if (kUatEnum.find(pat) != kUatEnum.end())
+                    // Find the closing '}' — handles both \p{L} (5-char) and \p{Lu} (6-char) patterns
+                    size_t closePos = expr.find('}', i + 3);
+                    if (closePos != std::string::npos && closePos > i + 3)
                     {
-                        if (!inside)
+                        std::string const pat = expr.substr(i, closePos - i + 1);
+                        if (kUatEnum.find(pat) != kUatEnum.end())
                         {
-                            regexExprCollapsed += '[';
+                            if (!inside)
+                            {
+                                regexExprCollapsed += '[';
+                            }
+                            regexExprCollapsed += static_cast<char>(kUcatCpt.at(kUatEnum.at(pat)));
+                            regexExprCollapsed += kUcatMap.at(kUatEnum.at(pat));
+                            if (!inside)
+                            {
+                                regexExprCollapsed += ']';
+                            }
+                            i = closePos; // for loop does ++i, so this advances past the closing '}'
+                            continue;
                         }
-                        regexExprCollapsed += kUcatCpt.at(kUatEnum.at(pat));
-                        regexExprCollapsed += kUcatMap.at(kUatEnum.at(pat));
-                        if (!inside)
-                        {
-                            regexExprCollapsed += ']';
-                        }
-                        i += 4;
-                        continue;
                     }
                 }
 

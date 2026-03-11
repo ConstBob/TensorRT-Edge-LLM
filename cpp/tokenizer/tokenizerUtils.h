@@ -166,26 +166,43 @@ struct codepointFlags
 
 /// \cond INTERNAL
 // Unicode category mappings
-//! @brief Map from regex patterns to category flags
+//! @brief Map from regex patterns to category flags.
+//! Covers both single-letter categories (e.g. \\p{L}) and two-letter subcategories
+//! (e.g. \\p{Lu}, \\p{Ll}) that appear in tokenizer pre-tokenizer regexes such as
+//! the PreTrainedTokenizer / LLaMA-style split pattern.
 static std::map<std::string, int> const kUatEnum = {
-    {"\\p{N}", codepointFlags::NUMBER},
-    {"\\p{L}", codepointFlags::LETTER},
-    {"\\p{P}", codepointFlags::PUNCTUATION},
+    // Top-level categories
+    {"\\p{N}", codepointFlags::NUMBER}, {"\\p{L}", codepointFlags::LETTER}, {"\\p{P}", codepointFlags::PUNCTUATION},
+    {"\\p{M}", codepointFlags::ACCENT_MARK},
+    // Letter subcategories — all collapsed to LETTER for ASCII approximation
+    {"\\p{Lu}", codepointFlags::LETTER}, //!< Uppercase Letter
+    {"\\p{Ll}", codepointFlags::LETTER}, //!< Lowercase Letter
+    {"\\p{Lt}", codepointFlags::LETTER}, //!< Titlecase Letter
+    {"\\p{Lm}", codepointFlags::LETTER}, //!< Modifier Letter
+    {"\\p{Lo}", codepointFlags::LETTER}, //!< Other Letter
+    // Mark subcategories — all collapsed to ACCENT_MARK
+    {"\\p{Mn}", codepointFlags::ACCENT_MARK}, //!< Nonspacing Mark
+    {"\\p{Mc}", codepointFlags::ACCENT_MARK}, //!< Spacing Combining Mark
+    {"\\p{Me}", codepointFlags::ACCENT_MARK}, //!< Enclosing Mark
+    // Number subcategories
+    {"\\p{Nd}", codepointFlags::NUMBER}, //!< Decimal Number
+    {"\\p{Nl}", codepointFlags::NUMBER}, //!< Letter Number
+    {"\\p{No}", codepointFlags::NUMBER}, //!< Other Number
 };
 
-//! @brief Map from category flags to codepoints
+//! @brief Map from category flags to collapsed proxy codepoints (single bytes used in collapsed text)
 static std::map<int, int> const kUcatCpt = {
-    {codepointFlags::NUMBER, 0xD1},
-    {codepointFlags::LETTER, 0xD2},
-    {codepointFlags::PUNCTUATION, 0xD3},
+    {codepointFlags::NUMBER, 0xD1}, {codepointFlags::LETTER, 0xD2}, {codepointFlags::PUNCTUATION, 0xD3},
+    {codepointFlags::ACCENT_MARK, 0x0B}, //!< Vertical-tab as mark proxy (matches unicodeCollapseText)
 };
 
-//! @brief Map from category flags to character ranges
+//! @brief Map from category flags to ASCII character ranges used inside collapsed regex character classes
 static std::map<int, std::string> const kUcatMap = {
     {codepointFlags::NUMBER, "\x30-\x39"},          // 0-9
     {codepointFlags::LETTER, "\x41-\x5A\x61-\x7A"}, // A-Za-z
     {codepointFlags::PUNCTUATION,
         "\x21-\x23\x25-\x2A\x2C-\x2F\x3A-\x3B\x3F-\x40\\\x5B-\\\x5D\x5F\\\x7B\\\x7D"}, // !-#%-*,-/:-;?-@\[-\]_\{\}
+    {codepointFlags::ACCENT_MARK, ""}, //!< No ASCII marks; proxy byte 0x0B covers collapsed non-ASCII marks
 };
 /// \endcond
 
