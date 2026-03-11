@@ -232,6 +232,7 @@ def _is_qwen3_asr_model(model_dir: str) -> bool:
 # Models that require explicit chat template because auto-extraction fails
 INCOMPATIBLE_CHAT_TEMPLATE_MODELS = [
     "phi4mm",  # Phi-4-multimodal: tokenizer lacks proper chat template
+    "nemotron_h",  # NemotronH: tokenizer lacks proper chat template
 ]
 
 

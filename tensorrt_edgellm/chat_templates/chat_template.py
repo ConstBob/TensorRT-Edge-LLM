@@ -346,52 +346,12 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
 
     # Extract system role patterns (base case)
     system_prompt = SystemMessage()
-    user_prompt = UserMessage()
-
-    try:
-        system_formatted = _format_messages(tokenizer, [system_prompt])
-        system_prefix, system_suffix = _extract_prefix_suffix(
-            system_formatted, system_prompt.content)
-    except (ValueError, Exception):
-        # Fallback for templates that mandate non-system messages (e.g., Nemotron).
-        # Use variant system/user content to isolate prefix boundaries.
-        _sys_a = SystemMessage(content="AAAA")
-        _sys_b = SystemMessage(content="BBBB")
-
-        _fmt_a = _format_messages(tokenizer, [_sys_a, user_prompt])
-        _fmt_b = _format_messages(tokenizer, [_sys_b, user_prompt])
-
-        # Common prefix before system content varies = system_prefix
-        _cp = 0
-        while _cp < min(len(_fmt_a),
-                        len(_fmt_b)) and _fmt_a[_cp] == _fmt_b[_cp]:
-            _cp += 1
-        system_prefix = _fmt_a[:_cp]
-
-        # Vary user content to find the boundary before user content
-        _usr_alt = UserMessage(content="CCCC")
-        _fmt_orig = _format_messages(tokenizer, [system_prompt, user_prompt])
-        _fmt_ualt = _format_messages(tokenizer, [system_prompt, _usr_alt])
-
-        _cp2 = 0
-        while _cp2 < min(
-                len(_fmt_orig),
-                len(_fmt_ualt)) and _fmt_orig[_cp2] == _fmt_ualt[_cp2]:
-            _cp2 += 1
-        # _cp2 = len(system_prefix + system_content + system_suffix + user_prefix)
-        _ssup = _fmt_orig[len(system_prefix) + len(system_prompt.content):_cp2]
-
-        # Heuristic: split at first '<' (special token marker) to separate
-        # system_suffix (e.g. "\n") from user_prefix (e.g. "<SPECIAL_11>User\n").
-        _lt = _ssup.find('<')
-        if _lt > 0:
-            system_suffix = _ssup[:_lt]
-        else:
-            system_suffix = _ssup
-
-        system_formatted = system_prefix + system_prompt.content + system_suffix
+    system_formatted = _format_messages(tokenizer, [system_prompt])
+    system_prefix, system_suffix = _extract_prefix_suffix(
+        system_formatted, system_prompt.content)
 
     # Extract user role patterns (compare with system base)
+    user_prompt = UserMessage()
     user_formatted = _format_messages(tokenizer, [system_prompt, user_prompt])
     user_prefix, user_suffix = _extract_prefix_suffix(
         user_formatted[len(system_formatted):], user_prompt.content)
@@ -419,29 +379,12 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                     f"prefix={repr(user_prefix)}, suffix={repr(user_suffix)}")
                 break
 
-    # Extract assistant role patterns.
-    # Use a 4-message conversation [system, user, assistant, user2] so the
-    # assistant message is in the middle of the history.  Some templates (e.g.
-    # Nemotron) treat the *last* assistant message specially (adding <think>
-    # tags), which would pollute the prefix if it were the final message.
+    # Extract assistant role patterns (compare with user case)
     assistant_prompt = AssistantMessage()
-    user2_prompt = UserMessage(content='<placeholder_user_text_2>')
-    four_msg_formatted = _format_messages(
-        tokenizer,
-        [system_prompt, user_prompt, assistant_prompt, user2_prompt])
-    after_first_user = four_msg_formatted[len(user_formatted):]
-
-    asst_pos = after_first_user.find(assistant_prompt.content)
-    assistant_prefix = after_first_user[:asst_pos]
-
-    user2_pos = after_first_user.find(user2_prompt.content)
-    asst_end = asst_pos + len(assistant_prompt.content)
-    gap = after_first_user[asst_end:user2_pos]
-
-    if user_prefix and gap.endswith(user_prefix):
-        assistant_suffix = gap[:-len(user_prefix)]
-    else:
-        assistant_suffix = gap
+    assistant_formatted = _format_messages(
+        tokenizer, [system_prompt, user_prompt, assistant_prompt])
+    assistant_prefix, assistant_suffix = _extract_prefix_suffix(
+        assistant_formatted[len(user_formatted):], assistant_prompt.content)
 
     # Extract standard generation prompt with thinking disabled
     generation_formatted = _format_messages(tokenizer,
@@ -540,13 +483,6 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             # Remove the placeholder if it appears
             if default_system_prompt == system_prompt.content:
                 default_system_prompt = ""
-
-    # Some templates (e.g. Nemotron) unconditionally emit a system header even
-    # when no system message is provided.  Our C++ runtime only emits the system
-    # prefix/suffix when default_system_prompt is non-empty, so use a single
-    # space to force the header to appear.
-    if default_system_prompt == "" and system_start != -1:
-        default_system_prompt = " "
 
     # Build the final JSON structure
     chat_template_data = {
