@@ -187,14 +187,32 @@ private:
     {
         for (int32_t t = 0; t < config.numTokens; t++)
         {
+            // Collect (expert_index, weight) pairs for this token
+            std::vector<std::pair<int32_t, float>> resultPairs(config.topk);
+            std::vector<std::pair<int32_t, float>> expectedPairs(config.topk);
             for (int32_t k = 0; k < config.topk; k++)
             {
                 int32_t idx = t * config.topk + k;
-                EXPECT_EQ(result.indices[idx], expectedIndices[idx])
+                resultPairs[k] = {result.indices[idx], result.weights[idx]};
+                expectedPairs[k] = {expectedIndices[idx], expectedWeights[idx]};
+            }
+
+            // Sort by expert index for order-independent comparison.
+            // Near-equal experts can legitimately appear in different positional order
+            // between the GPU kernel (parallel warp reduction) and the CPU reference
+            // (sequential), because different floating-point summation orders yield
+            // slightly different softmax values that can flip the relative ranking of
+            // borderline candidates.
+            std::sort(resultPairs.begin(), resultPairs.end());
+            std::sort(expectedPairs.begin(), expectedPairs.end());
+
+            for (int32_t k = 0; k < config.topk; k++)
+            {
+                EXPECT_EQ(resultPairs[k].first, expectedPairs[k].first)
                     << config.description << " Token " << t << ", TopK " << k << ": index mismatch";
-                EXPECT_TRUE(isclose(result.weights[idx], expectedWeights[idx], config.rtol, config.atol))
+                EXPECT_TRUE(isclose(resultPairs[k].second, expectedPairs[k].second, config.rtol, config.atol))
                     << config.description << " Token " << t << ", TopK " << k << ": weight mismatch. Expected "
-                    << expectedWeights[idx] << ", got " << result.weights[idx];
+                    << expectedPairs[k].second << ", got " << resultPairs[k].second;
             }
         }
     }
