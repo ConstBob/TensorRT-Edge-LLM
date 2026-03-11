@@ -19,6 +19,7 @@
 
 #include <NvInferRuntime.h>
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -165,6 +166,12 @@ protected:
     //! Datatype of attention. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
+#ifdef CUTE_DSL_FMHA_ENABLED
+    //! Use CuTe DSL FMHA. Enabled by default on SM100+; set DISABLE_CUTE_DSL_FMHA=1 to fall back to FMHA_v2.
+    bool mUseCuteDslFMHA{!std::getenv("DISABLE_CUTE_DSL_FMHA")};
+#else
+    bool mUseCuteDslFMHA{false};
+#endif
 };
 
 //! \brief Factory class for creating ViTAttentionPlugin instances

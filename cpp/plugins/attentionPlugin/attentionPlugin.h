@@ -19,6 +19,7 @@
 
 #include <NvInferRuntime.h>
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -182,7 +183,8 @@ protected:
     int32_t mSlidingWindowSize = -1;
 
 #ifdef CUTE_DSL_FMHA_ENABLED
-    bool mUseCuteDslFMHA{true}; //!< Use CuTe DSL FMHA (set to false at runtime if kernel load fails)
+    //! Use CuTe DSL FMHA. Enabled by default on SM100+; set DISABLE_CUTE_DSL_FMHA=1 to fall back to FMHA_v2.
+    bool mUseCuteDslFMHA{!std::getenv("DISABLE_CUTE_DSL_FMHA")};
 #else
     bool mUseCuteDslFMHA{false};
 #endif

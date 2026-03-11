@@ -46,21 +46,23 @@ function(cute_dsl_fmha_setup)
   set(CUTE_DSL_FMHA_DEPENDS
       ${CUTE_DSL_FMHA_SCRIPT}
       ${CMAKE_SOURCE_DIR}/kernelSrcs/fmha_cutedsl_blackwell/fmha_helpers.py)
-  set(CUTE_DSL_FMHA_COMMON_FLAGS
+  set(CUTE_DSL_FMHA_LLM_FLAGS
       --is_causal --is_persistent --export_only --bottom_right_align
       --output_dir ${CUTE_DSL_FMHA_OUTPUT_DIR})
+  set(CUTE_DSL_FMHA_VIT_FLAGS --is_persistent --export_only --vit_mode
+                              --output_dir ${CUTE_DSL_FMHA_OUTPUT_DIR})
 
   # ---------- kernel variant definitions ------------------------------------
   set(_ALL_ARTIFACTS "")
 
   # Helper macro to avoid repeating the add_custom_command boilerplate for each
   # head-dim / sliding-window variant.
-  macro(_add_fmha_variant NAME Q_SHAPE K_SHAPE)
+  macro(_add_fmha_variant NAME Q_SHAPE K_SHAPE BASE_FLAGS)
     set(_OBJ "${CUTE_DSL_FMHA_OUTPUT_DIR}/${NAME}.o")
     set(_HDR "${CUTE_DSL_FMHA_OUTPUT_DIR}/${NAME}.h")
     list(APPEND _ALL_ARTIFACTS ${_OBJ} ${_HDR})
 
-    # Collect any extra flags (e.g. --window_size) passed after the three
+    # Collect any extra flags (e.g. --window_size) passed after the four
     # positional arguments.
     set(_EXTRA_FLAGS ${ARGN})
 
@@ -68,9 +70,9 @@ function(cute_dsl_fmha_setup)
       OUTPUT ${_OBJ} ${_HDR}
       COMMAND ${CMAKE_COMMAND} -E remove -f ${_OBJ} ${_HDR}
       COMMAND
-        ${CUTE_DSL_PYTHON} ${CUTE_DSL_FMHA_SCRIPT} ${CUTE_DSL_FMHA_COMMON_FLAGS}
-        --q_shape ${Q_SHAPE} --k_shape ${K_SHAPE} --file_name ${NAME}
-        --function_prefix ${NAME} ${_EXTRA_FLAGS}
+        ${CUTE_DSL_PYTHON} ${CUTE_DSL_FMHA_SCRIPT} ${${BASE_FLAGS}} --q_shape
+        ${Q_SHAPE} --k_shape ${K_SHAPE} --file_name ${NAME} --function_prefix
+        ${NAME} ${_EXTRA_FLAGS}
       DEPENDS ${CUTE_DSL_FMHA_DEPENDS}
       WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/kernelSrcs/fmha_cutedsl_blackwell
       COMMENT "Compiling CuTe DSL FMHA kernel (${NAME})...")
@@ -79,11 +81,24 @@ function(cute_dsl_fmha_setup)
     set(CUTE_DSL_FMHA_${NAME}_OBJ ${_OBJ})
   endmacro()
 
-  _add_fmha_variant(fmha_d64 1,1024,14,64 1,1024,1,64)
-  _add_fmha_variant(fmha_d128 1,1024,14,128 1,1024,1,128)
-  _add_fmha_variant(fmha_d64_sw 1,1024,14,64 1,1024,1,64 --window_size 4096,-1)
-  _add_fmha_variant(fmha_d128_sw 1,1024,14,128 1,1024,1,128 --window_size
-                    4096,-1)
+  # LLM variants: causal, bottom-right-aligned, with KV cache
+  _add_fmha_variant(fmha_d64 1,1024,14,64 1,1024,1,64 CUTE_DSL_FMHA_LLM_FLAGS)
+  _add_fmha_variant(fmha_d128 1,1024,14,128 1,1024,1,128
+                    CUTE_DSL_FMHA_LLM_FLAGS)
+  _add_fmha_variant(fmha_d64_sw 1,1024,14,64 1,1024,1,64
+                    CUTE_DSL_FMHA_LLM_FLAGS --window_size 4096,-1)
+  _add_fmha_variant(fmha_d128_sw 1,1024,14,128 1,1024,1,128
+                    CUTE_DSL_FMHA_LLM_FLAGS --window_size 4096,-1)
+
+  # ViT variants: non-causal, packed varlen, separate Q/K/V
+  _add_fmha_variant(vit_fmha_d64 1,1024,14,64 1,1024,14,64
+                    CUTE_DSL_FMHA_VIT_FLAGS)
+  _add_fmha_variant(vit_fmha_d72 1,1024,14,72 1,1024,14,72
+                    CUTE_DSL_FMHA_VIT_FLAGS)
+  _add_fmha_variant(vit_fmha_d80 1,1024,14,80 1,1024,14,80
+                    CUTE_DSL_FMHA_VIT_FLAGS)
+  _add_fmha_variant(vit_fmha_d128 1,1024,14,128 1,1024,14,128
+                    CUTE_DSL_FMHA_VIT_FLAGS)
 
   add_custom_target(cute_dsl_fmha_gen ALL DEPENDS ${_ALL_ARTIFACTS})
 
@@ -113,9 +128,16 @@ function(cute_dsl_fmha_setup)
     target_compile_definitions(${ARG_PLUGIN_TARGET}
                                PRIVATE CUTE_DSL_FMHA_ENABLED)
     target_link_libraries(
-      ${ARG_PLUGIN_TARGET} ${CUTE_DSL_FMHA_fmha_d64_OBJ}
-      ${CUTE_DSL_FMHA_fmha_d128_OBJ} ${CUTE_DSL_FMHA_fmha_d64_sw_OBJ}
-      ${CUTE_DSL_FMHA_fmha_d128_sw_OBJ} ${CUDA_DIALECT_RUNTIME_LIB})
+      ${ARG_PLUGIN_TARGET}
+      ${CUTE_DSL_FMHA_fmha_d64_OBJ}
+      ${CUTE_DSL_FMHA_fmha_d128_OBJ}
+      ${CUTE_DSL_FMHA_fmha_d64_sw_OBJ}
+      ${CUTE_DSL_FMHA_fmha_d128_sw_OBJ}
+      ${CUTE_DSL_FMHA_vit_fmha_d64_OBJ}
+      ${CUTE_DSL_FMHA_vit_fmha_d72_OBJ}
+      ${CUTE_DSL_FMHA_vit_fmha_d80_OBJ}
+      ${CUTE_DSL_FMHA_vit_fmha_d128_OBJ}
+      ${CUDA_DIALECT_RUNTIME_LIB})
   endif()
 
   message(
