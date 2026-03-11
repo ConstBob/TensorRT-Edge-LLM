@@ -657,14 +657,12 @@ bool LLMInferenceRuntime::handleRequest(
     if (audioEmbeddings.has_value())
     {
         // Audio present: use embeddingLookupMultimodal (handles audio and/or vision)
-        // Copy inputIds to CPU for index generation
         auto const inputShape = mInputIds.getShape();
         size_t const inputSizeBytes = inputShape.volume() * sizeof(int32_t);
         rt::Tensor inputIdsCPU(inputShape, rt::DeviceType::kCPU, mInputIds.getDataType());
         CUDA_CHECK(
             cudaMemcpy(inputIdsCPU.rawPointer(), mInputIds.rawPointer(), inputSizeBytes, cudaMemcpyDeviceToHost));
 
-        // Generate multimodal indices
         std::optional<int32_t> audioTokenId
             = (mEngineConfig.audioTokenId != 0) ? std::optional{mEngineConfig.audioTokenId} : std::nullopt;
         std::optional<int32_t> imageTokenId
@@ -672,20 +670,18 @@ bool LLMInferenceRuntime::handleRequest(
         rt::Tensor multimodalIndicesCPU
             = generateMultimodalIndices(inputIdsCPU, audioTokenId, imageTokenId, mEngineConfig.vocabSize);
 
-        // Copy to GPU
         auto const indicesShape = multimodalIndicesCPU.getShape();
         size_t const indicesSizeBytes = indicesShape.volume() * sizeof(int32_t);
         mMultimodalIndices = rt::Tensor(indicesShape, rt::DeviceType::kGPU, multimodalIndicesCPU.getDataType());
         CUDA_CHECK(cudaMemcpy(mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesSizeBytes,
             cudaMemcpyHostToDevice));
 
-        // Call embedding lookup
         kernel::embeddingLookupMultimodal(mInputIds, mEmbeddingTable, std::optional{std::ref(mMultimodalIndices)},
             imageTokenId, visionEmbeddings, audioTokenId, audioEmbeddings, mInputsEmbeds, stream);
     }
     else if (visionEmbeddings.has_value())
     {
-        // Vision-only (Qwen2-VL, InternVL, etc.)
+        // Legacy vision path (Qwen2.5-VL, InternVL: imageTokenId >= vocabSize or not set)
         rt::Tensor const& imageEmbedsTensor = visionEmbeddings.value().get();
         kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
     }
@@ -701,6 +697,14 @@ bool LLMInferenceRuntime::handleRequest(
     if (mEngineConfig.numDeepstackFeatures > 0 && mVisionRunner)
     {
         rt::OptionalInputTensors deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+
+        // Prepare multimodal indices for deepstack assembly (needed when imageTokenId < vocabSize)
+        rt::OptionalInputTensor deepstackMultimodalIndices{std::nullopt};
+        if (mMultimodalIndices.getShape().volume() > 0)
+        {
+            deepstackMultimodalIndices = std::ref(mMultimodalIndices);
+        }
+
         for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
         {
             rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
@@ -709,8 +713,8 @@ bool LLMInferenceRuntime::handleRequest(
             check::check(
                 mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
                 "Tensor reshape failed");
-            kernel::assembleDeepstackEmbedding(
-                mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
+            kernel::assembleDeepstackEmbedding(mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx],
+                stream, mEngineConfig.imageTokenId, deepstackMultimodalIndices);
 
             // Add to output vector (engine will bind by index)
             deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
@@ -719,8 +723,6 @@ bool LLMInferenceRuntime::handleRequest(
 
     // Profile all sampling operations as one stage
     // Prefill profiling session
-    // For non-spec decode, we don't need to output hidden states.
-    rt::OptionalOutputTensor outputHiddenStates{std::nullopt};
     {
         TIME_STAGE(metrics::StageNames::kLLM_PREFILL, stream);
         // Enhanced NVTX range with detailed information
@@ -731,8 +733,8 @@ bool LLMInferenceRuntime::handleRequest(
                 .c_str(),
             nvtx_colors::BLUE);
 
-        bool prefillStatus = mLLMEngineRunner->executePrefillStep(
-            mInputsEmbeds, mHostContextLengths, deepstackEmbeds, mOutputLogits, outputHiddenStates, stream);
+        bool prefillStatus = mLLMEngineRunner->executePrefillStep(mInputsEmbeds, mHostContextLengths, deepstackEmbeds,
+            mOutputLogits, rt::OptionalOutputTensor{std::nullopt}, stream);
         if (!prefillStatus)
         {
             LOG_ERROR(
@@ -772,7 +774,10 @@ bool LLMInferenceRuntime::handleRequest(
             kernel::embeddingLookup(mSelectedIndices, mEmbeddingTable, mInputsEmbeds, stream);
 
             // Use the embedded tokens as input for the decoding step.
-            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(mInputsEmbeds, mOutputLogits, stream);
+            // No hidden states output needed for standard LLM decoding.
+            rt::OptionalOutputTensor const outputHiddenStates{std::nullopt};
+            bool decodingStatus = mLLMEngineRunner->executeVanillaDecodingStep(
+                mInputsEmbeds, mOutputLogits, outputHiddenStates, stream);
             if (!decodingStatus)
             {
                 LOG_ERROR("LLMInferenceRuntime(): Failed to execute decoding step.");
@@ -798,6 +803,7 @@ bool LLMInferenceRuntime::handleRequest(
     // Clean the response field and fill the generated outputIds and decoded texts.
     response.outputIds.clear();
     response.outputTexts.clear();
+
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         response.outputIds.emplace_back(outputIds[i]);
@@ -934,14 +940,12 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     if (audioEmbeddings.has_value())
     {
         // Audio present: use embeddingLookupMultimodal (handles audio and/or vision)
-        // Copy inputIds to CPU for index generation
         auto const inputShape = mInputIds.getShape();
         size_t const inputSizeBytes = inputShape.volume() * sizeof(int32_t);
         rt::Tensor inputIdsCPU(inputShape, rt::DeviceType::kCPU, mInputIds.getDataType());
         CUDA_CHECK(
             cudaMemcpy(inputIdsCPU.rawPointer(), mInputIds.rawPointer(), inputSizeBytes, cudaMemcpyDeviceToHost));
 
-        // Generate multimodal indices
         std::optional<int32_t> audioTokenId
             = (mEngineConfig.audioTokenId != 0) ? std::optional{mEngineConfig.audioTokenId} : std::nullopt;
         std::optional<int32_t> imageTokenId
@@ -949,14 +953,12 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
         rt::Tensor multimodalIndicesCPU
             = generateMultimodalIndices(inputIdsCPU, audioTokenId, imageTokenId, mEngineConfig.vocabSize);
 
-        // Copy to GPU
         auto const indicesShape = multimodalIndicesCPU.getShape();
         size_t const indicesSizeBytes = indicesShape.volume() * sizeof(int32_t);
         mMultimodalIndices = rt::Tensor(indicesShape, rt::DeviceType::kGPU, multimodalIndicesCPU.getDataType());
         CUDA_CHECK(cudaMemcpy(mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesSizeBytes,
             cudaMemcpyHostToDevice));
 
-        // Call embedding lookup
         kernel::embeddingLookupMultimodal(mInputIds, mEmbeddingTable, std::optional{std::ref(mMultimodalIndices)},
             imageTokenId, visionEmbeddings, audioTokenId, audioEmbeddings, mInputsEmbeds, stream);
     }
@@ -973,23 +975,27 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
     }
 
     // Process deepstack features: perform embedding lookup if vision runner is available
-    // Note: Deepstack features are only provided by VisionRunner, not Qwen3OmniAudioRunner
     rt::OptionalInputTensors deepstackEmbeds{};
     if (mEngineConfig.numDeepstackFeatures > 0 && mVisionRunner)
     {
         rt::OptionalInputTensors deepstackFeatures = mVisionRunner->getDeepstackFeatures();
+
+        rt::OptionalInputTensor deepstackMultimodalIndices{std::nullopt};
+        if (mMultimodalIndices.getShape().volume() > 0)
+        {
+            deepstackMultimodalIndices = std::ref(mMultimodalIndices);
+        }
+
         for (int32_t idx = 0; idx < static_cast<int32_t>(deepstackFeatures.size()); ++idx)
         {
             rt::Tensor const& featureTensor = deepstackFeatures[idx].get();
 
-            // Reshape and perform embedding lookup for this feature
             check::check(
                 mDeepstackEmbeds[idx].reshape({activeBatchSize, prefillSequenceLength, mEngineConfig.hiddenSize}),
                 "Tensor reshape failed");
-            kernel::assembleDeepstackEmbedding(
-                mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx], stream);
+            kernel::assembleDeepstackEmbedding(mInputIds, featureTensor, mEngineConfig.vocabSize, mDeepstackEmbeds[idx],
+                stream, mEngineConfig.imageTokenId, deepstackMultimodalIndices);
 
-            // Add to output vector (engine will bind by index)
             deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
         }
     }

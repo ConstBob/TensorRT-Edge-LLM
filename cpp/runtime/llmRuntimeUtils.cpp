@@ -89,6 +89,7 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
             if (ropeTypeStr == "default" && mropeSectionIt != ropeScalingIt->end())
             {
                 // transformers `Qwen2_5_VLVisionConfig` change type from 'mrope' to 'default'
+                // Talker uses same config (3D position_ids + interleaved MRoPE) as in PyTorch.
                 ropeConfig.type = RopeType::kMRope;
             }
             else if (ropeTypeStr == "default" || ropeTypeStr == "llama3")

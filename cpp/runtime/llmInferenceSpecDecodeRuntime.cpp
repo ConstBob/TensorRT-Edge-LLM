@@ -758,8 +758,8 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
                 check::check(
                     mDeepstackEmbeds[idx].reshape({activeBatchSize, inputIdsLength, mBaseEngineConfig.hiddenSize}),
                     "Tensor reshape failed");
-                kernel::assembleDeepstackEmbedding(
-                    mIdsInput, featureTensor, mBaseEngineConfig.vocabSize, mDeepstackEmbeds[idx], context.stream);
+                kernel::assembleDeepstackEmbedding(mIdsInput, featureTensor, mBaseEngineConfig.vocabSize,
+                    mDeepstackEmbeds[idx], context.stream, mBaseEngineConfig.imageTokenId);
 
                 // Add to output vector (engine will bind by index)
                 deepstackEmbeds.push_back(std::ref(mDeepstackEmbeds[idx]));
@@ -1206,8 +1206,10 @@ bool LLMInferenceSpecDecodeRuntime::runVanillaDecoding(SpecDecodeInferenceContex
 
     check::check(mLogitsOutput.reshape({activeBatchSize, mBaseEngineConfig.outputVocabSize}), "Tensor reshape failed");
 
-    bool const vanillaDecodingSuccess
-        = mBaseEngineRunner->executeVanillaDecodingStep(mInputsEmbeds, mLogitsOutput, context.stream);
+    // No hidden states output needed for speculative decoding base model.
+    rt::OptionalOutputTensor const outputHiddenStates{std::nullopt};
+    bool const vanillaDecodingSuccess = mBaseEngineRunner->executeVanillaDecodingStep(
+        mInputsEmbeds, mLogitsOutput, outputHiddenStates, context.stream);
     if (!vanillaDecodingSuccess)
     {
         LOG_ERROR("Failed to execute vanilla decoding step for base model.");

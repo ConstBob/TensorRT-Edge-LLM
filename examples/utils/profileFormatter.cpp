@@ -335,6 +335,25 @@ void outputMultimodalProfile(std::ostream& output, metrics::MultimodalMetrics co
     }
 }
 
+void outputTalkerProfile(std::ostream& output, metrics::MultimodalMetrics const& talkerMetrics)
+{
+    if (talkerMetrics.getTotalRuns() > 0)
+    {
+        output << "=== Talker Audio Generation ===" << std::endl;
+        output << "Total Audio Outputs: " << talkerMetrics.totalAudios << std::endl;
+        output << "Total Audio Codes: " << talkerMetrics.totalAudioTokens << std::endl;
+
+        if (talkerMetrics.totalAudioTokens > 0)
+        {
+            output << "Average Codes per Output: " << std::fixed << std::setprecision(1)
+                   << static_cast<float>(talkerMetrics.totalAudioTokens) / talkerMetrics.totalAudios << std::endl;
+        }
+
+        appendStageTimingData(output, metrics::StageNames::kTALKER_GENERATION, "Talker Generation");
+        appendStageTimingData(output, metrics::StageNames::kCODE_PREDICTOR, "CodePredictor");
+    }
+}
+
 void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor)
 {
     output << "=== Memory Usage ===" << std::endl;
@@ -413,6 +432,19 @@ void addJsonMultimodalSummary(nlohmann::json& summary, metrics::MultimodalMetric
             {"total_audios", multimodalMetrics.totalAudios}, {"total_audio_tokens", multimodalMetrics.totalAudioTokens},
             {"total_multimodal_tokens", totalTokens},
             {"average_time_per_token_ms", getMultimodalAverageTimePerToken(multimodalMetrics)}};
+    }
+}
+
+void addJsonTalkerSummary(nlohmann::json& summary, metrics::MultimodalMetrics const& talkerMetrics)
+{
+    if (talkerMetrics.getTotalRuns() > 0)
+    {
+        summary["talker"] = {{"total_runs", talkerMetrics.getTotalRuns()},
+            {"total_audio_outputs", talkerMetrics.totalAudios}, {"total_audio_codes", talkerMetrics.totalAudioTokens},
+            {"average_codes_per_output",
+                talkerMetrics.totalAudios > 0
+                    ? static_cast<float>(talkerMetrics.totalAudioTokens) / talkerMetrics.totalAudios
+                    : 0.0f}};
     }
 }
 

@@ -90,6 +90,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     }
 
     mConfig.visionStartTokenId = jsonConfig["vision_start_token_id"].get<int32_t>();
+    mConfig.visionEndTokenId = jsonConfig.value("vision_end_token_id", 0);
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
     mConfig.videoTokenId = jsonConfig["video_token_id"].get<int32_t>();
 
@@ -674,8 +675,11 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     }
 
     int64_t imageIndex = 0;
-    // Image token id will start from vocabSize and increment for each image token position
-    int32_t imageTokenId = mConfig.vocabSize;
+    // For Qwen2.5-VL/Qwen3-VL: use incrementing IDs (>= vocabSize) for embeddingLookupWithImageInsertion
+    // For Qwen3-Omni: keep original imageTokenId and wrap with vision_start/vision_end to match PyTorch,
+    // since embeddingLookupMultimodal uses multimodalIndices for indexing
+    bool const isQwen3Omni = (mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER);
+    int32_t nextImageTokenId = mConfig.vocabSize;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -700,10 +704,26 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             if (ids[j] == mConfig.imageTokenId || ids[j] == mConfig.videoTokenId)
             {
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
-                for (int64_t k = 0; k < numImageTokens; ++k)
+
+                if (isQwen3Omni)
                 {
-                    newIds.push_back(imageTokenId);
-                    ++imageTokenId;
+                    // Qwen3-Omni: <|vision_start|> + N×<|image_pad|> + <|vision_end|>
+                    // TRT chat template only has <|image_pad|>, no start/end markers
+                    newIds.push_back(mConfig.visionStartTokenId);
+                    for (int64_t k = 0; k < numImageTokens; ++k)
+                    {
+                        newIds.push_back(mConfig.imageTokenId);
+                    }
+                    newIds.push_back(mConfig.visionEndTokenId);
+                }
+                else
+                {
+                    // Qwen2.5-VL/Qwen3-VL: use incrementing IDs
+                    for (int64_t k = 0; k < numImageTokens; ++k)
+                    {
+                        newIds.push_back(nextImageTokenId);
+                        ++nextImageTokenId;
+                    }
                 }
                 ++imageIndex;
             }
@@ -837,7 +857,7 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
 
 rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
 {
-    if (mModelType != multimodal::ModelType::QWEN3_VL)
+    if (mModelType != multimodal::ModelType::QWEN3_VL && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         return {};
     }

@@ -21,7 +21,6 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 
-#include <cub/cub.cuh>
 #include <cuda_fp16.h>
 #include <dlfcn.h>
 
@@ -286,51 +285,6 @@ __global__ void scatterKernelVectorized(half const* __restrict__ source, int32_t
     }
 }
 
-//! \brief GPU Sum Reduction Kernel using CUB WarpReduce
-//!
-//! Each warp handles one dimension position, threads within warp load seqLen values.
-//! Uses CUB's WarpReduce for efficient parallel reduction.
-//!
-//! \param[in] input Input tensor [seqLen, hiddenDim] (FP16)
-//! \param[out] output Output tensor [hiddenDim] (FP16)
-//! \param[in] seqLen Sequence length to sum over
-//! \param[in] hiddenDim Hidden dimension size
-__global__ void sumReduceKernelCUB(
-    half const* __restrict__ input, half* __restrict__ output, int32_t seqLen, int32_t hiddenDim)
-{
-    constexpr int32_t kWarpSize = 32;
-    constexpr int32_t kWarpsPerBlock = 256 / kWarpSize;
-
-    // Each warp handles one dimension position
-    int32_t const warpId = (blockIdx.x * blockDim.x + threadIdx.x) / kWarpSize;
-    int32_t const laneId = threadIdx.x % kWarpSize;
-
-    if (warpId >= hiddenDim)
-    {
-        return;
-    }
-
-    // Each lane loads one element from the sequence (if within range)
-    float val = 0.0f;
-    if (laneId < seqLen)
-    {
-        val = __half2float(input[laneId * hiddenDim + warpId]);
-    }
-
-    // Use CUB WarpReduce for efficient parallel sum
-    using WarpReduce = cub::WarpReduce<float>;
-    __shared__ typename WarpReduce::TempStorage tempStorage[kWarpsPerBlock];
-
-    int32_t const warpIdInBlock = threadIdx.x / kWarpSize;
-    float sum = WarpReduce(tempStorage[warpIdInBlock]).Sum(val);
-
-    // Lane 0 writes the result
-    if (laneId == 0)
-    {
-        output[warpId] = __float2half(sum);
-    }
-}
-
 // Internal host function wrappers for kernel launches (not exposed in header)
 
 void invokeBiasAndSiLU(rt::Tensor& data, rt::Tensor const& bias, cudaStream_t stream)
@@ -493,6 +447,64 @@ void invokeTalkerMLP(void* cublasHandle, rt::Tensor const& input, rt::Tensor con
     invokeAddBias(output, fc2Bias, stream);
 }
 
+void invokeLinearLayer(void* cublasHandle, rt::Tensor const& input, rt::Tensor const& weight, rt::Tensor const& bias,
+    rt::Tensor& output, cudaStream_t stream)
+{
+    auto inputShape = input.getShape();
+    auto outputShape = output.getShape();
+    auto weightShape = weight.getShape();
+
+    if (input.getDataType() != nvinfer1::DataType::kHALF || weight.getDataType() != nvinfer1::DataType::kHALF
+        || bias.getDataType() != nvinfer1::DataType::kHALF || output.getDataType() != nvinfer1::DataType::kHALF)
+    {
+        LOG_ERROR("All tensors must be FP16");
+        return;
+    }
+
+    if (inputShape.getNumDims() != 2 || outputShape.getNumDims() != 2 || weightShape.getNumDims() != 2)
+    {
+        LOG_ERROR("Tensors must be 2D [N, dim]");
+        return;
+    }
+
+    int64_t const numTokens = inputShape[0];
+    int64_t const inputDim = inputShape[1];
+    int64_t const outputDim = weightShape[0];
+
+    if (weightShape[1] != inputDim)
+    {
+        LOG_ERROR("Weight shape mismatch: expected [%ld, %ld], got [%ld, %ld]", outputDim, inputDim, weightShape[0],
+            weightShape[1]);
+        return;
+    }
+
+    auto& cublas = CublasLoader::getInstance();
+    if (!cublas.libHandle)
+    {
+        LOG_ERROR("cuBLAS not available (dlopen failed)");
+        return;
+    }
+
+    cublas.setStream(cublasHandle, stream);
+
+    float const alphaF32 = 1.0f;
+    float const betaF32 = 0.0f;
+
+    // GEMM: output = input @ weight.T
+    // cuBLAS column-major: output^T = weight @ input^T
+    int status = cublas.gemmEx(cublasHandle, kCUBLAS_OP_T, kCUBLAS_OP_N, outputDim, numTokens, inputDim, &alphaF32,
+        weight.rawPointer(), CUDA_R_16F, inputDim, input.rawPointer(), CUDA_R_16F, inputDim, &betaF32,
+        output.rawPointer(), CUDA_R_16F, outputDim, kCUBLAS_COMPUTE_FP32, kCUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    if (status != kCUBLAS_STATUS_SUCCESS)
+    {
+        LOG_ERROR("Linear layer GEMM failed with status %d", status);
+        return;
+    }
+
+    invokeAddBias(output, bias, stream);
+}
+
 void invokeGather(rt::Tensor const& source, rt::Tensor const& indices, rt::Tensor& output, cudaStream_t stream)
 {
     check::check(source.getDataType() == nvinfer1::DataType::kHALF, "Source tensor must be FP16");
@@ -541,202 +553,265 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
-void sumReduceOverSequence(rt::Tensor const& input, rt::Tensor& output, cudaStream_t stream)
-{
-    // input: [1, seqLen, hiddenDim] → output: [1, 1, hiddenDim]
-    // Sum over sequence dimension (dim=1)
-
-    check::check(input.getDataType() == nvinfer1::DataType::kHALF, "Input tensor must be FP16");
-    check::check(output.getDataType() == nvinfer1::DataType::kHALF, "Output tensor must be FP16");
-
-    auto inputShape = input.getShape();
-    auto outputShape = output.getShape();
-
-    check::check(inputShape.getNumDims() == 3, "Input must be 3D [1, seqLen, hiddenDim]");
-    check::check(outputShape.getNumDims() == 3, "Output must be 3D [1, 1, hiddenDim]");
-    check::check(inputShape[0] == 1 && outputShape[0] == 1, "Batch size must be 1");
-    check::check(outputShape[1] == 1, "Output seqLen must be 1");
-    check::check(inputShape[2] == outputShape[2], "Hidden dimension must match");
-    check::check(inputShape[1] <= 32, "seqLen must be <= 32 for warp-based reduction");
-
-    int64_t const seqLen = inputShape[1];
-    int64_t const hiddenDim = inputShape[2];
-
-    half const* inputPtr = static_cast<half const*>(input.rawPointer());
-    half* outputPtr = static_cast<half*>(output.rawPointer());
-
-    // Launch CUB-based kernel: each warp handles one dimension position
-    // 256 threads = 8 warps per block, need hiddenDim/8 blocks
-    constexpr int32_t BLOCK_SIZE = 256;
-    constexpr int32_t WARPS_PER_BLOCK = BLOCK_SIZE / 32;
-    dim3 const block(BLOCK_SIZE);
-    dim3 const grid((hiddenDim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
-
-    sumReduceKernelCUB<<<grid, block, 0, stream>>>(
-        inputPtr, outputPtr, static_cast<int32_t>(seqLen), static_cast<int32_t>(hiddenDim));
-
-    CUDA_CHECK(cudaPeekAtLastError());
-}
-
-// ========== Vectorized Elementwise Add Kernels ==========
-
-//! \brief Vectorized elementwise add using half2 (2x throughput)
+//! \brief Non-streaming fused assistant preamble construction kernel
+//!
+//! Each block handles one output row (blockIdx.x). Total rows = 8 + textLen + 2.
+//!
+//! Row definitions:
+//!   0-2:        copy projected[0-2]
+//!   3:          ttsPad + embTable[codecNothinkId]
+//!   4:          ttsPad + embTable[codecThinkBosId]
+//!   5:          ttsPad + embTable[codecThinkEosId]
+//!   6:          ttsPad + embTable[speakerId]
+//!   7:          ttsBos + embTable[codecPadId]
+//!   8..8+N-1:   projected[3+i] + embTable[codecPadId]  (i = rowIdx-8)
+//!   8+N:        ttsEos + embTable[codecPadId]
+//!   8+N+1:      ttsPad + embTable[codecBosId]
 template <int32_t VEC_SIZE = 8>
-__global__ void elementwiseAddKernelVectorized(
-    half* __restrict__ output, half const* __restrict__ a, half const* __restrict__ b, int32_t size)
+__global__ void assistantPreambleKernel(half const* __restrict__ projected, half const* __restrict__ ttsPadEmbed,
+    half const* __restrict__ ttsBosEmbed, half const* __restrict__ ttsEosEmbed, half const* __restrict__ embTable,
+    int32_t codecNothinkId, int32_t codecThinkBosId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId,
+    int32_t codecBosId, int32_t textLen, int32_t hiddenDim, half* __restrict__ output)
 {
-    using vec_t = uint4; // 8 half = 16 bytes
+    constexpr int32_t kFixedPrefixLen = 8; // rows 0-7
+    int32_t const rowIdx = blockIdx.x;
+    int32_t const numVecs = hiddenDim / VEC_SIZE;
 
-    int32_t const vecIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int32_t const numVecs = size / VEC_SIZE;
-
-    if (vecIdx < numVecs)
-    {
-        vec_t aVec = reinterpret_cast<vec_t const*>(a)[vecIdx];
-        vec_t bVec = reinterpret_cast<vec_t const*>(b)[vecIdx];
-
-        half2* aPtr = reinterpret_cast<half2*>(&aVec);
-        half2 const* bPtr = reinterpret_cast<half2 const*>(&bVec);
-
-        // Use __hadd2 for vectorized FP16 addition
-#pragma unroll
-        for (int32_t i = 0; i < VEC_SIZE / 2; ++i)
-        {
-            aPtr[i] = __hadd2(aPtr[i], bPtr[i]);
-        }
-
-        reinterpret_cast<vec_t*>(output)[vecIdx] = aVec;
-    }
-
-    // Handle remainder (single thread handles tail elements)
-    if (vecIdx == 0)
-    {
-        int32_t const remainderStart = numVecs * VEC_SIZE;
-        for (int32_t i = remainderStart; i < size; ++i)
-        {
-            output[i] = __hadd(a[i], b[i]);
-        }
-    }
-}
-
-//! \brief Vectorized inplace elementwise add using half2
-template <int32_t VEC_SIZE = 8>
-__global__ void elementwiseAddInplaceKernelVectorized(
-    half* __restrict__ data, half const* __restrict__ addend, int32_t size)
-{
     using vec_t = uint4;
 
-    int32_t const vecIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int32_t const numVecs = size / VEC_SIZE;
+    half const* srcA;
+    half const* srcB = nullptr;
+    half* const dstRow = output + static_cast<int64_t>(rowIdx) * hiddenDim;
 
-    if (vecIdx < numVecs)
+    if (rowIdx < kFixedPrefixLen)
     {
-        vec_t dataVec = reinterpret_cast<vec_t const*>(data)[vecIdx];
-        vec_t addVec = reinterpret_cast<vec_t const*>(addend)[vecIdx];
+        switch (rowIdx)
+        {
+        case 0: srcA = projected; break;
+        case 1: srcA = projected + hiddenDim; break;
+        case 2: srcA = projected + 2 * hiddenDim; break;
+        case 3:
+            srcA = ttsPadEmbed;
+            srcB = embTable + static_cast<int64_t>(codecNothinkId) * hiddenDim;
+            break;
+        case 4:
+            srcA = ttsPadEmbed;
+            srcB = embTable + static_cast<int64_t>(codecThinkBosId) * hiddenDim;
+            break;
+        case 5:
+            srcA = ttsPadEmbed;
+            srcB = embTable + static_cast<int64_t>(codecThinkEosId) * hiddenDim;
+            break;
+        case 6:
+            srcA = ttsPadEmbed;
+            srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
+            break;
+        default: // rowIdx == 7
+            srcA = ttsBosEmbed;
+            srcB = embTable + static_cast<int64_t>(codecPadId) * hiddenDim;
+            break;
+        }
+    }
+    else if (rowIdx < kFixedPrefixLen + textLen)
+    {
+        // Text token rows: projected[3 + (rowIdx-8)] + embTable[codecPadId]
+        int32_t const textIdx = rowIdx - kFixedPrefixLen;
+        srcA = projected + static_cast<int64_t>(3 + textIdx) * hiddenDim;
+        srcB = embTable + static_cast<int64_t>(codecPadId) * hiddenDim;
+    }
+    else if (rowIdx == kFixedPrefixLen + textLen)
+    {
+        // ttsEos + embTable[codecPadId]
+        srcA = ttsEosEmbed;
+        srcB = embTable + static_cast<int64_t>(codecPadId) * hiddenDim;
+    }
+    else
+    {
+        // ttsPad + embTable[codecBosId]
+        srcA = ttsPadEmbed;
+        srcB = embTable + static_cast<int64_t>(codecBosId) * hiddenDim;
+    }
 
-        half2* dataPtr = reinterpret_cast<half2*>(&dataVec);
-        half2 const* addPtr = reinterpret_cast<half2 const*>(&addVec);
-
+    // Vectorized copy-and-optionally-add
+    for (int32_t i = threadIdx.x; i < numVecs; i += blockDim.x)
+    {
+        vec_t va = reinterpret_cast<vec_t const*>(srcA)[i];
+        if (srcB != nullptr)
+        {
+            vec_t vb = reinterpret_cast<vec_t const*>(srcB)[i];
+            half2* aPtr = reinterpret_cast<half2*>(&va);
+            half2 const* bPtr = reinterpret_cast<half2 const*>(&vb);
 #pragma unroll
-        for (int32_t i = 0; i < VEC_SIZE / 2; ++i)
-        {
-            dataPtr[i] = __hadd2(dataPtr[i], addPtr[i]);
+            for (int32_t j = 0; j < VEC_SIZE / 2; ++j)
+            {
+                aPtr[j] = __hadd2(aPtr[j], bPtr[j]);
+            }
         }
-
-        reinterpret_cast<vec_t*>(data)[vecIdx] = dataVec;
-    }
-
-    // Handle remainder
-    if (vecIdx == 0)
-    {
-        int32_t const remainderStart = numVecs * VEC_SIZE;
-        for (int32_t i = remainderStart; i < size; ++i)
-        {
-            data[i] = __hadd(data[i], addend[i]);
-        }
+        reinterpret_cast<vec_t*>(dstRow)[i] = va;
     }
 }
 
-void invokeElementwiseAdd(rt::Tensor& output, rt::Tensor const& a, rt::Tensor const& b, cudaStream_t stream)
+void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
+    rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
+    int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
+    rt::Tensor& output, cudaStream_t stream)
 {
-    int64_t const size = a.getShape().volume();
-    constexpr int32_t kVEC_SIZE = 8;
-    int32_t const numVecs = static_cast<int32_t>((size + kVEC_SIZE - 1) / kVEC_SIZE);
-    dim3 const block(256);
-    dim3 const grid((numVecs + block.x - 1) / block.x);
+    constexpr int32_t kVecSize = 8;
 
-    elementwiseAddKernelVectorized<kVEC_SIZE><<<grid, block, 0, stream>>>(static_cast<half*>(output.rawPointer()),
-        a.dataPointer<half>(), b.dataPointer<half>(), static_cast<int32_t>(size));
+    int32_t const hiddenDim = static_cast<int32_t>(projected.getShape()[1]);
+    int32_t const numVecs = hiddenDim / kVecSize;
+    // totalRows = 8 fixed prefix + textLen text rows + 2 suffix rows
+    int32_t const totalRows = 8 + textLen + 2;
+
+    // 128 threads covers H=1024 with VEC_SIZE=8 in one pass
+    dim3 const block(std::min(numVecs, 128));
+    dim3 const grid(totalRows);
+
+    half const* projPtr = projected.dataPointer<half>();
+    half const* padPtr = ttsPadEmbed.dataPointer<half>();
+    half const* bosPtr = ttsBosEmbed.dataPointer<half>();
+    half const* eosPtr = ttsEosEmbed.dataPointer<half>();
+    half const* embPtr = talkerEmbTable.dataPointer<half>();
+    half* outPtr = static_cast<half*>(output.rawPointer());
+
+    assistantPreambleKernel<kVecSize><<<grid, block, 0, stream>>>(projPtr, padPtr, bosPtr, eosPtr, embPtr,
+        codecNothinkId, codecThinkBosId, codecThinkEosId, speakerId, codecPadId, codecBosId, textLen, hiddenDim,
+        outPtr);
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
-void invokeElementwiseAddInplace(rt::Tensor& data, rt::Tensor const& addend, int64_t numElements, int64_t dataOffset,
-    int64_t addendOffset, cudaStream_t stream)
+//! Fused residual connection kernel
+//!
+//! Computes: output[j] = embed0[code0,j] + embed15[code15,j] + addend[j] + sum_{k=1}^{14}(codecHiddens[k,j])
+//! Single block of (hiddenDim/VEC_SIZE) threads; FP32 accumulators for precision.
+template <int32_t VEC_SIZE = 8>
+__global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, half const* __restrict__ embTable0,
+    half const* __restrict__ embTable15, int32_t code0, int32_t code15, half const* __restrict__ addend,
+    int32_t hiddenDim, half* __restrict__ output)
 {
-    int64_t const size = (numElements > 0) ? numElements : data.getShape().volume();
-    half* dataPtr = static_cast<half*>(data.rawPointer()) + dataOffset;
-    half const* addendPtr = addend.dataPointer<half>() + addendOffset;
-
-    constexpr int32_t kVEC_SIZE = 8;
-    int32_t const numVecs = static_cast<int32_t>((size + kVEC_SIZE - 1) / kVEC_SIZE);
-    dim3 const block(256);
-    dim3 const grid((numVecs + block.x - 1) / block.x);
-
-    elementwiseAddInplaceKernelVectorized<kVEC_SIZE>
-        <<<grid, block, 0, stream>>>(dataPtr, addendPtr, static_cast<int32_t>(size));
-    CUDA_CHECK(cudaPeekAtLastError());
-}
-
-void invokeSuppressLogits(
-    rt::Tensor& logits, int32_t suppressStart, int32_t suppressEnd, int32_t exceptTokenId, cudaStream_t stream)
-{
-    check::check(logits.getDataType() == nvinfer1::DataType::kFLOAT, "Logits tensor must be FP32");
-
-    int32_t const count = suppressEnd - suppressStart;
-    if (count <= 0)
+    using vec_t = uint4;
+    int32_t const vecIdx = static_cast<int32_t>(threadIdx.x);
+    int32_t const numVecs = hiddenDim / VEC_SIZE;
+    if (vecIdx >= numVecs)
     {
         return;
     }
 
-    // Pre-built host buffer of -inf values (allocated once, never freed).
-    static constexpr int32_t kMaxSuppressRange = 2048;
-    static float const* sNegInfBuffer = []() {
-        static float buf[kMaxSuppressRange];
-        for (int32_t i = 0; i < kMaxSuppressRange; ++i)
+    float acc[VEC_SIZE];
+
+    // embed(code0) from Talker embedding table
+    {
+        vec_t v = reinterpret_cast<vec_t const*>(embTable0 + static_cast<int64_t>(code0) * hiddenDim)[vecIdx];
+        half const* p = reinterpret_cast<half const*>(&v);
+#pragma unroll
+        for (int32_t i = 0; i < VEC_SIZE; ++i)
         {
-            buf[i] = -INFINITY;
+            acc[i] = __half2float(p[i]);
         }
-        return buf;
-    }();
+    }
+    // embed(code15) from CodePredictor embedding table
+    {
+        vec_t v = reinterpret_cast<vec_t const*>(embTable15 + static_cast<int64_t>(code15) * hiddenDim)[vecIdx];
+        half const* p = reinterpret_cast<half const*>(&v);
+#pragma unroll
+        for (int32_t i = 0; i < VEC_SIZE; ++i)
+        {
+            acc[i] += __half2float(p[i]);
+        }
+    }
+    // addend: trailing_text_hidden[generationStep] or tts_pad_embed
+    {
+        vec_t v = reinterpret_cast<vec_t const*>(addend)[vecIdx];
+        half const* p = reinterpret_cast<half const*>(&v);
+#pragma unroll
+        for (int32_t i = 0; i < VEC_SIZE; ++i)
+        {
+            acc[i] += __half2float(p[i]);
+        }
+    }
+    // sum codecHiddens rows 1..14 (row 0 and 15 replaced by direct embedding lookups above)
+    for (int32_t k = 1; k <= 14; ++k)
+    {
+        vec_t v = reinterpret_cast<vec_t const*>(codecHiddens + static_cast<int64_t>(k) * hiddenDim)[vecIdx];
+        half const* p = reinterpret_cast<half const*>(&v);
+#pragma unroll
+        for (int32_t i = 0; i < VEC_SIZE; ++i)
+        {
+            acc[i] += __half2float(p[i]);
+        }
+    }
 
-    check::check(count <= kMaxSuppressRange, "Suppress range exceeds pre-allocated buffer");
+    // store as FP16
+    vec_t result;
+    half* rp = reinterpret_cast<half*>(&result);
+#pragma unroll
+    for (int32_t i = 0; i < VEC_SIZE; ++i)
+    {
+        rp[i] = __float2half(acc[i]);
+    }
+    reinterpret_cast<vec_t*>(output)[vecIdx] = result;
+}
 
+void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& embTable0, rt::Tensor const& embTable15,
+    int32_t code0, int32_t code15, half const* addend, rt::Tensor& output, cudaStream_t stream)
+{
+    int32_t const hiddenDim = static_cast<int32_t>(embTable0.getShape()[1]);
+    constexpr int32_t kVecSize = 8;
+    int32_t const numVecs = hiddenDim / kVecSize;
+
+    // codecHiddens has shape [1, 16, H]: skip leading batch dim
+    half const* codecPtr = codecHiddens.dataPointer<half>();
+
+    residualConnectionKernel<kVecSize><<<1, numVecs, 0, stream>>>(codecPtr, embTable0.dataPointer<half>(),
+        embTable15.dataPointer<half>(), code0, code15, addend, hiddenDim, static_cast<half*>(output.rawPointer()));
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+// Each thread handles one work item. The total work is (suppressCount + numSeenTokens).
+// Threads [0, suppressCount) do suppression; threads [suppressCount, suppressCount+numSeenTokens) apply penalty.
+// The two ranges never overlap: suppression covers [suppressStart, suppressEnd) which is always in the
+// upper special-token region, while seenTokens are sampled from the normal codec range below suppressStart.
+__global__ void talkerLogitAdjustKernel(float* logits, int32_t suppressStart, int32_t suppressCount, int32_t codecEosId,
+    int32_t const* seenTokens, int32_t numSeenTokens, float repetitionPenalty)
+{
+    int32_t const idx = static_cast<int32_t>(blockIdx.x) * blockDim.x + static_cast<int32_t>(threadIdx.x);
+
+    if (idx < suppressCount)
+    {
+        int32_t const tokenId = suppressStart + idx;
+        if (tokenId != codecEosId)
+        {
+            logits[tokenId] = -INFINITY;
+        }
+    }
+    else if (idx < suppressCount + numSeenTokens)
+    {
+        int32_t const tokenId = seenTokens[idx - suppressCount];
+        float const logit = logits[tokenId];
+        logits[tokenId] = (logit >= 0.0f) ? logit / repetitionPenalty : logit * repetitionPenalty;
+    }
+}
+
+void invokeTalkerLogitAdjust(rt::Tensor const& seenTokens, rt::Tensor& logits, int32_t suppressStart,
+    int32_t suppressEnd, int32_t codecEosId, int32_t numSeenTokens, float repetitionPenalty, cudaStream_t stream)
+{
+    check::check(logits.getDataType() == nvinfer1::DataType::kFLOAT, "Logits tensor must be FP32");
+    check::check(seenTokens.getDataType() == nvinfer1::DataType::kINT32, "seenTokens tensor must be INT32");
+
+    int32_t const suppressCount = suppressEnd - suppressStart;
+    int32_t const totalWork = suppressCount + numSeenTokens;
+    if (totalWork <= 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kBlockSize = 128;
+    int32_t const gridSize = (totalWork + kBlockSize - 1) / kBlockSize;
     float* logitsPtr = static_cast<float*>(logits.rawPointer());
 
-    bool const exceptInRange = (exceptTokenId >= suppressStart && exceptTokenId < suppressEnd);
-
-    if (!exceptInRange)
-    {
-        CUDA_CHECK(cudaMemcpyAsync(
-            logitsPtr + suppressStart, sNegInfBuffer, count * sizeof(float), cudaMemcpyHostToDevice, stream));
-    }
-    else
-    {
-        // Write -inf in two segments, skipping the excepted token to preserve its logit value.
-        int32_t const seg1Count = exceptTokenId - suppressStart;
-        int32_t const seg2Count = suppressEnd - exceptTokenId - 1;
-
-        if (seg1Count > 0)
-        {
-            CUDA_CHECK(cudaMemcpyAsync(
-                logitsPtr + suppressStart, sNegInfBuffer, seg1Count * sizeof(float), cudaMemcpyHostToDevice, stream));
-        }
-        if (seg2Count > 0)
-        {
-            CUDA_CHECK(cudaMemcpyAsync(logitsPtr + exceptTokenId + 1, sNegInfBuffer, seg2Count * sizeof(float),
-                cudaMemcpyHostToDevice, stream));
-        }
-    }
+    talkerLogitAdjustKernel<<<gridSize, kBlockSize, 0, stream>>>(logitsPtr, suppressStart, suppressCount, codecEosId,
+        seenTokens.dataPointer<int32_t>(), numSeenTokens, repetitionPenalty);
+    CUDA_CHECK(cudaPeekAtLastError());
 }
 
 } // namespace kernel

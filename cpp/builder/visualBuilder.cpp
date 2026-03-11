@@ -57,7 +57,7 @@ bool VisualBuilder::build()
     }
 
     // Parse ONNX model
-    std::string onnxPath = mOnnxDir.string() + "/model.onnx";
+    std::string const onnxPath = (mOnnxDir / "model.onnx").string();
     auto parser = parseOnnxModel(network.get(), onnxPath);
     if (!parser)
     {
@@ -126,7 +126,7 @@ bool VisualBuilder::build()
 
 bool VisualBuilder::parseConfig()
 {
-    std::string configPath = mOnnxDir.string() + "/config.json";
+    std::string const configPath = (mOnnxDir / "config.json").string();
     if (!loadJsonConfig(configPath, mModelConfig))
     {
         return false;

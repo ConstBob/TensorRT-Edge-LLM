@@ -36,13 +36,17 @@ namespace audioUtils
 struct AudioData
 {
     // For audio input: pre-computed Mel-spectrogram
-    std::string melSpectrogramPath;          //!< Path to pre-computed Mel-spectrogram file (.npy or .raw)
-    std::string melSpectrogramFormat{"npy"}; //!< Format of the mel-spectrogram file: "npy" or "raw"
+    std::string melSpectrogramPath;   //!< Path to pre-computed Mel-spectrogram file (.npy or .raw)
+    std::string melSpectrogramFormat; //!< Format of the mel-spectrogram file: "npy" or "raw"
 
     // For audio output: generated waveform
-    std::vector<float> data;   //!< Audio waveform samples (float32, range [-1, 1])
-    int32_t sampleRate{24000}; //!< Sample rate in Hz
-    int32_t numChannels{1};    //!< Number of audio channels (typically 1 for mono)
+    std::shared_ptr<Tensor> waveform; //!< Waveform samples [1, numSamples], FP16, range [-1, 1], CPU
+    int32_t sampleRate{24000};        //!< Sample rate in Hz
+    int32_t numChannels{1};           //!< Number of audio channels (typically 1 for mono)
+
+    // For audio output: codebook codes (if waveform generation is not available)
+    std::vector<std::vector<int32_t>> codebookCodes; //!< RVQ codebook codes [numCodebooks][seqLen]
+    bool hasWaveform{false};                         //!< True if waveform contains valid data
 };
 
 } // namespace audioUtils

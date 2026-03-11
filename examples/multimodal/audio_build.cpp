@@ -16,11 +16,12 @@
  */
 
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Audio model builder for Qwen3-Omni
+ * Builds TensorRT engines for audio encoder (speech input) and Code2Wav vocoder (speech output)
  *
- * Audio encoder builder for Qwen3-Omni
- * Builds TensorRT engine from ONNX audio encoder model
+ * Build type is auto-detected from config.json:
+ *   - audio_config present -> builds audio_encoder.engine
+ *   - code2wav_config present -> builds code2wav.engine
  */
 
 #include "builder/audioBuilder.h"
@@ -40,37 +41,67 @@ struct AudioBuildArgs
     std::string engineDir;
     bool help{false};
     bool debug{false};
+
+    // Optimization profile config (applies to both build types)
+    // Audio encoder profile
     int64_t minTimeSteps{100};
     int64_t maxTimeSteps{6000};
+
+    // Code2Wav profile
+    int64_t minCodeLen{1};
+    int64_t optCodeLen{300};
+    int64_t maxCodeLen{2000};
 };
 
 void printUsage(char const* programName)
 {
-    std::cerr << "Usage: " << programName
-              << " [--help] <--onnxDir str> <--engineDir str> [--debug] "
-                 "[--minTimeSteps int] [--maxTimeSteps int]"
-              << std::endl;
-    std::cerr << "Options:" << std::endl;
+    std::cerr << "Usage: " << programName << " [--help] <--onnxDir str> <--engineDir str> [--debug]" << std::endl;
+    std::cerr << "       Audio encoder profile: [--minTimeSteps int] [--maxTimeSteps int]" << std::endl;
+    std::cerr << "       Code2Wav profile: [--minCodeLen int] [--optCodeLen int] [--maxCodeLen int]" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "General Options:" << std::endl;
     std::cerr << "  --help               Display this help message" << std::endl;
-    std::cerr << "  --onnxDir            Directory containing audio encoder ONNX file (model.onnx). Required."
+    std::cerr << "  --onnxDir            Directory containing ONNX model (model.onnx) and config.json. Required."
               << std::endl;
-    std::cerr << "  --engineDir          Base output directory for audio encoder. Required." << std::endl;
-    std::cerr << "                       Note: Engine will be saved to <engineDir>/audio/" << std::endl;
+    std::cerr << "  --engineDir          Output directory for the engine. Required." << std::endl;
     std::cerr << "  --debug              Use debug mode with verbose output" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "Build Type Auto-Detection (from config.json):" << std::endl;
+    std::cerr << "  - If 'audio_config' exists: builds audio_encoder.engine" << std::endl;
+    std::cerr << "  - If 'code2wav_config' exists: builds code2wav.engine" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "Audio Encoder Profile Options (when audio_config detected):" << std::endl;
     std::cerr << "  --minTimeSteps       Minimum audio time steps. Default = 100 (~0.64s audio)" << std::endl;
     std::cerr << "  --maxTimeSteps       Maximum audio time steps. Default = 6000 (~38.4s audio)" << std::endl;
+    std::cerr << "  Time steps formula: duration_seconds = (time_steps * 160) / 16000" << std::endl;
     std::cerr << std::endl;
-    std::cerr << "Time steps calculation (with hop_length=160, sample_rate=16000):" << std::endl;
-    std::cerr << "  Audio duration (seconds) = (time_steps * 160) / 16000" << std::endl;
-    std::cerr << "  Example: 290 steps = 1.86s, 1000 steps = 6.4s, 6000 steps = 38.4s" << std::endl;
+    std::cerr << "Code2Wav Profile Options (when code2wav_config detected):" << std::endl;
+    std::cerr << "  --minCodeLen         Minimum code sequence length (frames). Default = 1" << std::endl;
+    std::cerr << "  --optCodeLen         Optimal code sequence length (frames). Default = 300" << std::endl;
+    std::cerr << "  --maxCodeLen         Maximum code sequence length (frames). Default = 2000" << std::endl;
+    std::cerr << "  Duration formula: duration_seconds = code_len * 0.08 (at 24kHz, 1920 upsample)" << std::endl;
+    std::cerr << "  Example: 300 frames = 24s, 1000 frames = 80s, 2000 frames = 160s" << std::endl;
 }
 
 bool parseAudioBuildArgs(AudioBuildArgs& args, int argc, char* argv[])
 {
-    static struct option longOptions[] = {{"help", no_argument, nullptr, 'h'},
-        {"onnxDir", required_argument, nullptr, 'o'}, {"engineDir", required_argument, nullptr, 'e'},
-        {"debug", no_argument, nullptr, 'd'}, {"minTimeSteps", required_argument, nullptr, 'm'},
-        {"maxTimeSteps", required_argument, nullptr, 'M'}, {nullptr, 0, nullptr, 0}};
+    // Option IDs for long options without short equivalents
+    enum OptionId
+    {
+        OPT_MIN_CODE_LEN,
+        OPT_OPT_CODE_LEN,
+        OPT_MAX_CODE_LEN
+    };
+
+    static struct option longOptions[]
+        = {{"help", no_argument, nullptr, 'h'}, {"onnxDir", required_argument, nullptr, 'o'},
+            {"engineDir", required_argument, nullptr, 'e'}, {"debug", no_argument, nullptr, 'd'},
+            // Audio encoder profile options
+            {"minTimeSteps", required_argument, nullptr, 'm'}, {"maxTimeSteps", required_argument, nullptr, 'M'},
+            // Code2Wav profile options
+            {"minCodeLen", required_argument, nullptr, OPT_MIN_CODE_LEN},
+            {"optCodeLen", required_argument, nullptr, OPT_OPT_CODE_LEN},
+            {"maxCodeLen", required_argument, nullptr, OPT_MAX_CODE_LEN}, {nullptr, 0, nullptr, 0}};
 
     int optionIndex = 0;
     int opt;
@@ -82,8 +113,13 @@ bool parseAudioBuildArgs(AudioBuildArgs& args, int argc, char* argv[])
         case 'o': args.onnxDir = optarg; break;
         case 'e': args.engineDir = optarg; break;
         case 'd': args.debug = true; break;
+        // Audio encoder profile options
         case 'm': args.minTimeSteps = std::stoll(optarg); break;
         case 'M': args.maxTimeSteps = std::stoll(optarg); break;
+        // Code2Wav profile options
+        case OPT_MIN_CODE_LEN: args.minCodeLen = std::stoll(optarg); break;
+        case OPT_OPT_CODE_LEN: args.optCodeLen = std::stoll(optarg); break;
+        case OPT_MAX_CODE_LEN: args.maxCodeLen = std::stoll(optarg); break;
         default:
             std::cerr << "Error: Invalid argument" << std::endl;
             printUsage(argv[0]);
@@ -125,34 +161,38 @@ int main(int argc, char* argv[])
         gLogger.setLevel(nvinfer1::ILogger::Severity::kINFO);
     }
 
-    // Validate input directory and required files
+    // Validate input directory - config.json is required for auto-detection
     std::string configPath = args.onnxDir + "/config.json";
     std::ifstream configFile(configPath);
     if (!configFile.good())
     {
-        LOG_WARNING("config.json not found in onnx directory: %s. Using default parameters.", args.onnxDir.c_str());
+        LOG_ERROR("config.json not found in onnx directory: %s", args.onnxDir.c_str());
+        LOG_ERROR("config.json is required for auto-detecting build type (audio_config or code2wav_config)");
+        return EXIT_FAILURE;
     }
     configFile.close();
 
-    std::string actualEngineDir = args.engineDir + "/audio";
-
-    LOG_INFO("Building audio encoder for model in: %s", args.onnxDir.c_str());
-    LOG_INFO("Output engine directory: %s", actualEngineDir.c_str());
-    LOG_INFO("Time steps range: [%ld, %ld]", args.minTimeSteps, args.maxTimeSteps);
-
-    // Create AudioBuilderConfig from args
+    // Create AudioBuilderConfig with all profile parameters
+    // Build type will be auto-detected from config.json by AudioBuilder
     builder::AudioBuilderConfig config;
     config.minTimeSteps = args.minTimeSteps;
     config.maxTimeSteps = args.maxTimeSteps;
+    config.minCodeLen = args.minCodeLen;
+    config.optCodeLen = args.optCodeLen;
+    config.maxCodeLen = args.maxCodeLen;
+
+    LOG_INFO("Building audio model from: %s", args.onnxDir.c_str());
+    LOG_INFO("Output directory: %s", args.engineDir.c_str());
+    LOG_INFO("Build type will be auto-detected from config.json");
 
     // Create and run the builder
-    builder::AudioBuilder audioBuilder(args.onnxDir, actualEngineDir, config);
+    // AudioBuilder auto-detects whether to build audio_encoder or code2wav from config.json
+    builder::AudioBuilder audioBuilder(args.onnxDir, args.engineDir, config);
     if (!audioBuilder.build())
     {
-        LOG_ERROR("Failed to build Audio engine.");
+        LOG_ERROR("Failed to build audio engine.");
         return EXIT_FAILURE;
     }
 
-    LOG_INFO("Audio engine built successfully.");
     return EXIT_SUCCESS;
 }

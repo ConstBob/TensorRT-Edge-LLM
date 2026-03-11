@@ -223,6 +223,15 @@ private:
     bool setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextProfile,
         nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
+    //! Set up optimization profiles for lm_head_weight input (CodePredictor models).
+    //! CodePredictor has 15 different lm_heads for RVQ layers, and the weight is dynamically bound at runtime.
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @param network TensorRT network definition for input analysis
+    //! @return true if setup was successful, false otherwise
+    bool setupLmHeadWeightProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+
     //! Set up optimization profiles for LoRA-enabled models.
     //! Configures LoRA weight matrices with dynamic rank support.
     //! @param contextProfile Optimization profile for context processing

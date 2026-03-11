@@ -114,6 +114,21 @@ public:
     //! @return Engine configuration structure
     LLMEngineRunnerConfig getEngineConfig() const noexcept;
 
+    //! @brief Set an extra input tensor for the engine
+    //!
+    //! This is a temporary API for binding additional input tensors that are not part of
+    //! the standard LLM input set.
+    //! @note This is not a good design but we put it here temporarily to support TTS inference.
+    //! @note The API will be replaced soon with a better design. Please don't follow this schema.
+    //!
+    //! Example use case: CodePredictor's lm_head_weight input for dynamic lm_head selection.
+    //!
+    //! @param name The name of the LMHead input weights in the ONNX/TRT model
+    //! @param tensor The tensor to bind (must be on GPU, shape must match engine expectation)
+    //! @return True if the binding was successful
+    //! @note Must be called before executePrefillStep/executeVanillaDecodingStep
+    bool setLMHeadWeights(std::string const& name, rt::Tensor const& tensor);
+
     //! API entry to execute one prefill engine action for a batched request. The API will clear existing KVCache for
     //! last
     //!     batch of requests and perform prefill operations to fill the KVCache and produce the output logits.
@@ -142,7 +157,8 @@ public:
     //! Returns:
     //!     True if the decoding step is successful, false otherwise.
     //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
-    bool executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream);
+    bool executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
+        rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream);
 
     //! API entry to execute eagle base tree decoding step. The API will takes a draft tree of input embeddings.
     //!     baseTreeDecodingMask denote the relationship between the draft tree nodes.
@@ -171,7 +187,8 @@ public:
     //!     True if the CUDA graph capture is successful, false otherwise.
     //! @throws std::runtime_error if setting optimization profile fails, or a CUDA operation fails
     bool captureVanillaDecodingCudaGraph(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
-        std::string const& loraWeightsName, cudaStream_t stream);
+        std::string const& loraWeightsName, cudaStream_t stream,
+        rt::OptionalOutputTensor outputHiddenStates = std::nullopt);
 
     //! API entry to switch the LoRA weights of the LLM engine.
     //! Inputs:
@@ -301,8 +318,8 @@ private:
     bool vanillaDecodingStepPrepareInputs(int32_t activeBatchSize, cudaStream_t stream);
 
     //! @brief Bind tensors for vanilla decoding step (shared between execute and capture)
-    bool vanillaDecodingStepBindTensors(
-        rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, int32_t activeBatchSize);
+    bool vanillaDecodingStepBindTensors(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
+        rt::OptionalOutputTensor outputHiddenStates, int32_t activeBatchSize);
 
     //! @brief Validate inputs for Eagle base tree decoding step
     bool eagleBaseTreeDecodingStepInputValidation(rt::Tensor const& baseTreeDecodingInputsEmbeds,

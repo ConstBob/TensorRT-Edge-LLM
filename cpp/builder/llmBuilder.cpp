@@ -63,13 +63,13 @@ bool LLMBuilder::build()
     std::string onnxFilePath;
     if (mBuilderConfig.maxLoraRank > 0)
     {
-        onnxFilePath = mOnnxDir.string() + "/lora_model.onnx";
-        LOG_INFO("Parsing LoRA-enabled ONNX model. Please ensure %s exists.", onnxFilePath.c_str());
+        onnxFilePath = (mOnnxDir / "lora_model.onnx").string();
+        LOG_INFO("Parsing LoRA-enabled ONNX model: %s", onnxFilePath.c_str());
     }
     else
     {
-        onnxFilePath = mOnnxDir.string() + "/model.onnx";
-        LOG_INFO("Parsing ONNX model. Please ensure %s exists.", onnxFilePath.c_str());
+        onnxFilePath = (mOnnxDir / "model.onnx").string();
+        LOG_INFO("Parsing ONNX model: %s", onnxFilePath.c_str());
     }
 
     // Parse ONNX model
@@ -126,7 +126,7 @@ bool LLMBuilder::build()
     }
 
     // Build and save engine
-    std::string engineFilePath = mEngineDir.string() + "/" + engineFileName;
+    std::string const engineFilePath = (mEngineDir / engineFileName).string();
     if (!buildAndSerializeEngine(builder.get(), network.get(), config.get(), engineFilePath))
     {
         return false;
@@ -178,7 +178,7 @@ bool LLMBuilder::build()
 
 bool LLMBuilder::parseConfig()
 {
-    std::string jsonPath = mOnnxDir.string() + "/config.json";
+    std::string const jsonPath = (mOnnxDir / "config.json").string();
     if (!loadJsonConfig(jsonPath, mModelConfig))
     {
         return false;
@@ -260,6 +260,9 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
 
     // Setup Deepstack profiles for Qwen3VL models
     result &= setupDeepstackProfiles(*contextProfile, *generationProfile, network);
+
+    // Setup lm_head_weight profile for CodePredictor (Qwen3-Omni)
+    result &= setupLmHeadWeightProfiles(*contextProfile, *generationProfile, network);
 
     if (mBuilderConfig.maxLoraRank > 0)
     {
@@ -472,6 +475,51 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
     return result;
 }
 
+bool LLMBuilder::setupLmHeadWeightProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+
+    // Detect if lm_head_weight input exists (CodePredictor model)
+    bool hasLmHeadWeight = false;
+    for (int32_t idx = 0; idx < network.getNbInputs(); idx++)
+    {
+        std::string const inputName = network.getInput(idx)->getName();
+        if (inputName == binding_names::kLmHeadWeight)
+        {
+            hasLmHeadWeight = true;
+            break;
+        }
+    }
+
+    // If no lm_head_weight input found, return early (not a CodePredictor model)
+    if (!hasLmHeadWeight)
+    {
+        return true;
+    }
+
+    LOG_INFO("Detected lm_head_weight input (CodePredictor model)");
+
+    // lm_head_weight shape: [vocab_size, hidden_size]
+    // For CodePredictor: vocab_size=2048 (codebook size), hidden_size=1024
+    // This is a fixed-size weight tensor that gets bound at runtime
+    int64_t const vocabSize = mModelConfig["vocab_size"].get<int64_t>();
+    int64_t const hiddenSize = mHiddenSize;
+
+    // Both context and generation profiles use the same shape since this is a weight tensor
+    result &= setOptimizationProfile(&contextProfile, binding_names::kLmHeadWeight, createDims({vocabSize, hiddenSize}),
+        createDims({vocabSize, hiddenSize}), createDims({vocabSize, hiddenSize}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kLmHeadWeight,
+        createDims({vocabSize, hiddenSize}), createDims({vocabSize, hiddenSize}), createDims({vocabSize, hiddenSize}));
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup optimization profiles for lm_head_weight.");
+    }
+
+    return result;
+}
+
 bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfile,
     nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
@@ -662,19 +710,21 @@ bool LLMBuilder::setupConvStateProfiles(
 bool LLMBuilder::copyConfig()
 {
     // Determine config file name based on model type
-    std::string targetConfigPath;
+    std::string configFileName;
     if (mBuilderConfig.eagleDraft)
     {
-        targetConfigPath = mEngineDir.string() + "/draft_config.json";
+        configFileName = "draft_config.json";
     }
     else if (mBuilderConfig.eagleBase)
     {
-        targetConfigPath = mEngineDir.string() + "/base_config.json";
+        configFileName = "base_config.json";
     }
     else
     {
-        targetConfigPath = mEngineDir.string() + "/config.json";
+        configFileName = "config.json";
     }
+
+    std::string const targetConfigPath = (mEngineDir / configFileName).string();
 
     // Create a copy of mModelConfig and add builder config
     Json configWithBuilder = mModelConfig;
@@ -705,14 +755,22 @@ bool LLMBuilder::copyTokenizerFiles()
         return true;
     }
 
+    // Models that use embeddings as input (e.g., Talker, CodePredictor) don't need tokenizer
+    bool useEmbeddingsInput = mModelConfig.value("use_embeddings_input", false);
+    if (useEmbeddingsInput)
+    {
+        LOG_INFO("Skipping tokenizer files (model uses embeddings input)");
+        return true;
+    }
+
     std::vector<std::string> tokenizerFiles
         = {"tokenizer_config.json", "tokenizer.json", "processed_chat_template.json"};
     bool allSuccess = true;
 
     for (auto const& filename : tokenizerFiles)
     {
-        std::string srcPath = mOnnxDir.string() + "/" + filename;
-        std::string dstPath = mEngineDir.string() + "/" + filename;
+        std::string const srcPath = (mOnnxDir / filename).string();
+        std::string const dstPath = (mEngineDir / filename).string();
 
         if (file_io::copyFile(srcPath, dstPath))
         {
@@ -733,8 +791,8 @@ bool LLMBuilder::copyEagleFiles()
     // Copy d2t.safetensors for Eagle3 draft models
     if (mBuilderConfig.eagleDraft)
     {
-        std::string d2tPath = mOnnxDir.string() + "/d2t.safetensors";
-        std::string targetD2tPath = mEngineDir.string() + "/d2t.safetensors";
+        std::string const d2tPath = (mOnnxDir / "d2t.safetensors").string();
+        std::string const targetD2tPath = (mEngineDir / "d2t.safetensors").string();
 
         if (file_io::copyFile(d2tPath, targetD2tPath))
         {
@@ -756,8 +814,8 @@ bool LLMBuilder::copyVocabMappingFiles()
     if (mModelConfig.contains(binding_names::kReducedVocabSizeKey)
         && mModelConfig[binding_names::kReducedVocabSizeKey].get<int32_t>() > 0)
     {
-        std::string vocabMapPath = mOnnxDir.string() + "/" + binding_names::kVocabMapFileName;
-        std::string targetVocabMapPath = mEngineDir.string() + "/" + binding_names::kVocabMapFileName;
+        std::string const vocabMapPath = (mOnnxDir / binding_names::kVocabMapFileName).string();
+        std::string const targetVocabMapPath = (mEngineDir / binding_names::kVocabMapFileName).string();
 
         if (file_io::copyFile(vocabMapPath, targetVocabMapPath))
         {
@@ -781,9 +839,79 @@ bool LLMBuilder::copyEmbeddingFile()
         return true;
     }
 
-    // Copy embedding.safetensors for eagleBase and vanilla LLM models
-    std::string embeddingPath = mOnnxDir.string() + "/embedding.safetensors";
-    std::string targetEmbeddingPath = mEngineDir.string() + "/embedding.safetensors";
+    // Check if this is a Talker model (has text_projection.safetensors)
+    std::filesystem::path const textProjectionPath = mOnnxDir / "text_projection.safetensors";
+    if (std::filesystem::exists(textProjectionPath))
+    {
+        // Talker: copy embedding + text_projection + hidden_projection (optional, text-only TTS omits it)
+        LOG_INFO("Detected Talker model, copying projection files...");
+
+        std::vector<std::string> requiredFiles
+            = {"embedding.safetensors", "text_projection.safetensors", "text_embedding.safetensors"};
+        std::vector<std::string> optionalFiles = {"hidden_projection.safetensors"};
+
+        bool allSuccess = true;
+        for (auto const& filename : requiredFiles)
+        {
+            std::string const srcPath = (mOnnxDir / filename).string();
+            std::string const dstPath = (mEngineDir / filename).string();
+
+            if (file_io::copyFile(srcPath, dstPath))
+            {
+                LOG_INFO("Copied %s", filename.c_str());
+            }
+            else
+            {
+                LOG_ERROR("Failed to copy %s", filename.c_str());
+                allSuccess = false;
+            }
+        }
+        for (auto const& filename : optionalFiles)
+        {
+            std::string const srcPath = (mOnnxDir / filename).string();
+            std::string const dstPath = (mEngineDir / filename).string();
+
+            if (file_io::copyFile(srcPath, dstPath))
+            {
+                LOG_INFO("Copied %s", filename.c_str());
+            }
+            else
+            {
+                LOG_INFO("Optional %s not found, skipping", filename.c_str());
+            }
+        }
+
+        return allSuccess;
+    }
+
+    // Check if this is a CodePredictor model (has codec_embeddings.safetensors)
+    std::filesystem::path const codecEmbedPath = mOnnxDir / "codec_embeddings.safetensors";
+    if (std::filesystem::exists(codecEmbedPath))
+    {
+        LOG_INFO("Detected CodePredictor model, copying codec files...");
+        std::vector<std::string> cpFiles
+            = {"codec_embeddings.safetensors", "lm_heads.safetensors", "small_to_mtp_projection.safetensors"};
+        bool allSuccess = true;
+        for (auto const& filename : cpFiles)
+        {
+            std::string const srcPath = (mOnnxDir / filename).string();
+            std::string const dstPath = (mEngineDir / filename).string();
+            if (file_io::copyFile(srcPath, dstPath))
+            {
+                LOG_INFO("Copied %s", filename.c_str());
+            }
+            else
+            {
+                LOG_ERROR("Failed to copy required CodePredictor file: %s", filename.c_str());
+                allSuccess = false;
+            }
+        }
+        return allSuccess;
+    }
+
+    // Copy embedding.safetensors for vanilla LLM models
+    std::string const embeddingPath = (mOnnxDir / "embedding.safetensors").string();
+    std::string const targetEmbeddingPath = (mEngineDir / "embedding.safetensors").string();
 
     if (file_io::copyFile(embeddingPath, targetEmbeddingPath))
     {

@@ -207,7 +207,13 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
         this->mPosEncCosSinCache
             = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
                 rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
-        CUDA_CHECK(cudaMemsetAsync(mPosEncCosSinCache.rawPointer(), 0, mPosEncCosSinCache.getMemoryCapacity(), stream));
+
+        // Initialize the MRope into form to support text-only and audio-only modes.
+        // The initialization is important for Qwen3-TTS model where we support text-only modes.
+        check::check(
+            mPosEncCosSinCache.reshape({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}), "Tensor reshape failed");
+        kernel::initializeTextOnlyMRopeCosSin(mPosEncCosSinCache.dataPointer<float>(), ropeConfig.rotaryTheta,
+            mConfig.rotaryDim, mConfig.maxKVCacheCapacity, stream);
         break;
     }
     case RopeType::kNoRope:
@@ -352,6 +358,9 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyInputTensor.rawPointer(), 0, mDummyInputTensor.getMemoryCapacity(), stream));
 
+    // Allocate dummy output tensor for hidden_states for Eagle speculative decoding.
+    // TRT engine under this mode will produce output hidden states. we reserve this buffer to hold the data when
+    // conduct vanilla decoding. This will make runtime design cleaner.
     if (mConfig.enableEagleSpecDecode)
     {
         int64_t const dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * mConfig.outputHiddenDim;
@@ -523,7 +532,7 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         // Set actual output vocab size: use reduced size if enabled, otherwise full size
         mConfig.outputVocabSize = (mConfig.reducedVocabSize > 0) ? mConfig.reducedVocabSize : mConfig.vocabSize;
         // Read num_deepstack_features if present (Qwen3-VL and Qwen3-Omni models)
-        mConfig.numDeepstackFeatures = configJson["num_deepstack_features"].get<int32_t>();
+        mConfig.numDeepstackFeatures = configJson.value("num_deepstack_features", 0);
 
         // Read audio and image token IDs for Qwen3-Omni (used by embeddingLookupQwen3Omni kernel)
         mConfig.audioTokenId = configJson.value("audio_token_id", 0);
@@ -947,6 +956,26 @@ rt::LinearKVCache& LLMEngineRunner::getLinearKVCache() noexcept
     return mKVCache;
 }
 
+bool LLMEngineRunner::setLMHeadWeights(std::string const& name, rt::Tensor const& tensor)
+{
+    bool status = mTRTExecutionContext->setTensorAddress(name.c_str(), const_cast<void*>(tensor.rawPointer()));
+    if (!status)
+    {
+        LOG_ERROR("setTensorAddress failed for '%s'", name.c_str());
+        return false;
+    }
+
+    bool shapeStatus = mTRTExecutionContext->setInputShape(name.c_str(), tensor.getShape().getTRTDims());
+    if (!shapeStatus)
+    {
+        LOG_ERROR(
+            "setInputShape failed for '%s' with shape %s", name.c_str(), tensor.getShape().formatString().c_str());
+        return false;
+    }
+
+    return true;
+}
+
 bool LLMEngineRunner::prefillStepInputValidation(rt::Tensor const& inputsEmbeds, rt::Tensor const& contextLengths,
     rt::Tensor const& outputLogits, OptionalOutputTensor outputHiddenStates,
     rt::OptionalInputTensors deepstackEmbeds) noexcept
@@ -1126,13 +1155,8 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     }
 
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
-    // For MRope, the cache is initialized with maxBatchSize and does not need reshaping during prefill.
-    // For non-MRope, the cache is fixed at {1, maxSeqLen, rotaryDim} and shared across all batches.
-    if (mConfig.ropeConfig.type == RopeType::kMRope)
-    {
-        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
-            "Tensor reshape failed");
-    }
+    // For ND-RoPE like MRope, the runtime will update the tensor shape and contents based on multimodal inputs.
+    // For persistent rope, the cache is fixed at {1, maxSeqLen, rotaryDim} and shared across all batches.
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
 
@@ -1152,12 +1176,16 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
                 &= mTRTExecutionContext->setInputShape(embedName.c_str(), embedTensor.getShape().getTRTDims());
         }
     }
-    if (mConfig.enableEagleSpecDecode)
+    // Bind hidden states output if requested
+    if (outputHiddenStates.has_value())
     {
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
+    }
 
-        // Plugin path: masks and position IDs are not used during prefill, set to dummy data
+    if (mConfig.enableEagleSpecDecode)
+    {
+        // Mask input and optional token pos-ids are not used, set to dummy data.
         setEngineIOStatus
             &= mTRTExecutionContext->setTensorAddress(binding_names::kAttentionMask, mDummyInputTensor.rawPointer());
         setEngineIOStatus &= mTRTExecutionContext->setInputShape(
@@ -1274,8 +1302,8 @@ bool LLMEngineRunner::vanillaDecodingStepPrepareInputs(int32_t activeBatchSize, 
     return true;
 }
 
-bool LLMEngineRunner::vanillaDecodingStepBindTensors(
-    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, int32_t activeBatchSize)
+bool LLMEngineRunner::vanillaDecodingStepBindTensors(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
+    rt::OptionalOutputTensor outputHiddenStates, int32_t activeBatchSize)
 {
     bool setEngineIOStatus{true};
     // Engine input tensors - bind inputs_embeds directly
@@ -1320,10 +1348,15 @@ bool LLMEngineRunner::vanillaDecodingStepBindTensors(
     // Engine output tensors.
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(binding_names::kLogits, outputLogits.rawPointer());
 
-    // Bind output hidden states tensor if engine enable Eagle SpecDecode. Since TensorRT engine will always write
-    // this output tensor even if the content is not needed afterwards.
-    if (mConfig.enableEagleSpecDecode)
+    if (outputHiddenStates.has_value())
     {
+        setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
+            binding_names::kOutputHiddenStates, outputHiddenStates.value().get().rawPointer());
+    }
+    else if (mDummyOutputTensor.getMemoryCapacity() > 0)
+    {
+        // Engine has hidden_states output but user doesn't need it
+        // Bind to dummy buffer (EAGLE or Qwen3-Omni text-only mode)
         setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
             binding_names::kOutputHiddenStates, mDummyOutputTensor.rawPointer());
     }
@@ -1331,8 +1364,8 @@ bool LLMEngineRunner::vanillaDecodingStepBindTensors(
     return setEngineIOStatus;
 }
 
-bool LLMEngineRunner::executeVanillaDecodingStep(
-    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, cudaStream_t stream)
+bool LLMEngineRunner::executeVanillaDecodingStep(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
+    rt::OptionalOutputTensor outputHiddenStates, cudaStream_t stream)
 {
     bool const validateInputStatus = this->vanillaDecodingStepInputValidation(inputsEmbeds, outputLogits);
     if (!validateInputStatus)
@@ -1368,7 +1401,7 @@ bool LLMEngineRunner::executeVanillaDecodingStep(
         }
 
         LOG_INFO("Vanilla decoding step CUDA graph not captured.");
-        if (!vanillaDecodingStepBindTensors(inputsEmbeds, outputLogits, activeBatchSize))
+        if (!vanillaDecodingStepBindTensors(inputsEmbeds, outputLogits, outputHiddenStates, activeBatchSize))
         {
             LOG_ERROR("Failed to bind tensors.");
             return false;
@@ -1630,8 +1663,8 @@ bool LLMEngineRunner::executeEagleBaseTreeDecodingStep(rt::Tensor const& baseTre
     return true;
 }
 
-bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
-    rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits, std::string const& loraWeightsPath, cudaStream_t stream)
+bool LLMEngineRunner::captureVanillaDecodingCudaGraph(rt::Tensor const& inputsEmbeds, rt::Tensor& outputLogits,
+    std::string const& loraWeightsPath, cudaStream_t stream, rt::OptionalOutputTensor outputHiddenStates)
 {
     bool setOptimizationProfileStatus{true};
     setOptimizationProfileStatus
@@ -1677,7 +1710,7 @@ bool LLMEngineRunner::captureVanillaDecodingCudaGraph(
         return false;
     }
 
-    if (!vanillaDecodingStepBindTensors(inputsEmbeds, outputLogits, activeBatchSize))
+    if (!vanillaDecodingStepBindTensors(inputsEmbeds, outputLogits, outputHiddenStates, activeBatchSize))
     {
         LOG_ERROR("Failed to bind engine input and output tensors.");
         return false;
