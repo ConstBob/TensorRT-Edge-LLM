@@ -38,46 +38,43 @@ namespace mamba_ssm
 {
 
 /*!
- * \brief Input/output tensors for the prefill causal depthwise conv1d.
+ * \brief Prefill causal depthwise conv1d.
  *
  * x:      [batch, seq_len, dim]
  * weight: [dim, 1, width]
- * bias:   [dim]
+ * bias:   [dim] (optional)
  * out:    [batch, out_seq_len, dim]
  */
-struct CausalConv1dTensors
-{
-    trt_edgellm::rt::Tensor const* x;
-    trt_edgellm::rt::Tensor const* weight;
-    trt_edgellm::rt::Tensor const* bias;
-    trt_edgellm::rt::Tensor* out;
-};
+void invokeCausalConv1d(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor const& weight,
+    trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out, int32_t stride, int32_t padding,
+    int32_t dilation, cudaStream_t stream);
 
-template <typename T>
-void invokeCausalConv1d(
-    CausalConv1dTensors const& tensors, int32_t stride, int32_t padding, int32_t dilation, cudaStream_t stream);
+/*!
+ * \brief Decode-mode conv1d (dot product).
+ *
+ * convState: [batch, dim, width]
+ * weight:    [dim, 1, width]
+ * bias:      [dim] (optional)
+ * out:       [batch, 1, dim]
+ */
+void invokeCausalConv1dDecode(trt_edgellm::rt::Tensor const& convState, trt_edgellm::rt::Tensor const& weight,
+    trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out, cudaStream_t stream);
 
-//! Decode-mode conv1d: dot product of conv_state and weight per channel.
-//! conv_state: [batch, dim, width]
-//! weight:     [dim, 1, width]
-//! bias:       [dim]
-//! output:     [batch, 1, dim]
-template <typename T>
-void invokeCausalConv1dDecode(void const* convState, void const* weight, void const* bias, void* output, int32_t batch,
-    int32_t dim, int32_t width, cudaStream_t stream);
+/*!
+ * \brief Capture conv state from prefill input.
+ *
+ * x:         [batch, seqLen, dim]
+ * convState: [batch, dim, width]  (output, zero-initialized before call)
+ */
+void invokeCaptureConvState(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor& convState, cudaStream_t stream);
 
-//! Capture the last `width` columns of x into conv_state (transposed).
-//! x:          [batch, seqLen, dim]
-//! convState:  [batch, dim, width]  (output, zero-initialized before call)
-template <typename T>
-void invokeCaptureConvState(
-    void const* x, void* convState, int32_t batch, int32_t seqLen, int32_t dim, int32_t width, cudaStream_t stream);
-
-//! Shift conv_state left by 1 and insert new values at position width-1.
-//! convState:  [batch, dim, width]  (in-place)
-//! newCol:     [batch, 1, dim]  (the new single-token input)
-template <typename T>
+/*!
+ * \brief Shift conv_state left by 1 and insert new values at position width-1.
+ *
+ * convState: [batch, dim, width]  (in-place)
+ * newCol:    [batch, 1, dim]  (the new single-token input)
+ */
 void invokeConvStateShiftInsert(
-    void* convState, void const* newCol, int32_t batch, int32_t dim, int32_t width, cudaStream_t stream);
+    trt_edgellm::rt::Tensor& convState, trt_edgellm::rt::Tensor const& newCol, cudaStream_t stream);
 
 } // namespace mamba_ssm

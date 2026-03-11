@@ -123,13 +123,13 @@ int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbI
     DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs, int32_t nbOutputs,
     IExprBuilder& /* exprBuilder */) noexcept
 {
-    // output: same shape as x [batch, seq_len, dim]
+    // Output: same shape as x [batch, seq_len, dim].
     outputs[kOUT_IDX].nbDims = inputs[kIN_X_IDX].nbDims;
     for (int32_t i = 0; i < outputs[kOUT_IDX].nbDims; ++i)
     {
         outputs[kOUT_IDX].d[i] = inputs[kIN_X_IDX].d[i];
     }
-    // conv_state_out: same shape as conv_state input [batch, dim, kernel]
+    // Conv state output: same shape as conv_state input [batch, dim, kernel].
     outputs[kOUT_CONV_STATE_IDX].nbDims = inputs[kIN_CONV_STATE_IDX].nbDims;
     for (int32_t i = 0; i < outputs[kOUT_CONV_STATE_IDX].nbDims; ++i)
     {
@@ -208,14 +208,14 @@ int32_t CausalConv1dPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
     void* convStateOut = outputs[kOUT_CONV_STATE_IDX];
 
+    namespace rt = trt_edgellm::rt;
+
     if (seqLen > 1)
     {
-        // ---- PREFILL PATH ----
+        // PREFILL path
         int32_t const outSeqLen = static_cast<int32_t>(outDesc.dims.d[1]);
-        namespace rt = trt_edgellm::rt;
 
-        // Non-owning tensor views — const_cast is safe because these tensors do not own memory
-        // and will only be read via rawPointer() const inside the kernel.
+        // Non-owning tensor views; const_cast is safe (read-only in kernel).
         auto xTensor = rt::Tensor{
             const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
         auto weightTensor = rt::Tensor{const_cast<void*>(inputs[kIN_WEIGHT_IDX]),
@@ -225,23 +225,38 @@ int32_t CausalConv1dPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         auto outTensor
             = rt::Tensor{outputs[kOUT_IDX], rt::Coords{batch, outSeqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
 
-        mamba_ssm::CausalConv1dTensors tensors{&xTensor, &weightTensor, &biasTensor, &outTensor};
-        mamba_ssm::invokeCausalConv1d<half>(tensors, mStride, mPadding, mDilation, stream);
-        mamba_ssm::invokeCaptureConvState<half>(inputs[kIN_X_IDX], convStateOut, batch, seqLen, dim, width, stream);
+        trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasTensor));
+        mamba_ssm::invokeCausalConv1d(xTensor, weightTensor, biasOpt, outTensor, mStride, mPadding, mDilation, stream);
+        auto captureXTensor = rt::Tensor{
+            const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
+        auto captureStateTensor
+            = rt::Tensor{convStateOut, rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
+        mamba_ssm::invokeCaptureConvState(captureXTensor, captureStateTensor, stream);
     }
     else
     {
-        // ---- DECODE PATH (seqLen == 1) ----
-        // Copy input conv_state to output, then shift+insert and compute dot product.
+        // DECODE path (seqLen == 1): copy conv_state to output, then shift+insert and compute dot product.
         if (convStateOut != inputs[kIN_CONV_STATE_IDX])
         {
             size_t const stateBytes = static_cast<size_t>(batch) * dim * width * sizeof(half);
             cudaMemcpyAsync(convStateOut, inputs[kIN_CONV_STATE_IDX], stateBytes, cudaMemcpyDeviceToDevice, stream);
         }
 
-        mamba_ssm::invokeConvStateShiftInsert<half>(convStateOut, inputs[kIN_X_IDX], batch, dim, width, stream);
-        mamba_ssm::invokeCausalConv1dDecode<half>(
-            convStateOut, inputs[kIN_WEIGHT_IDX], inputs[kIN_BIAS_IDX], outputs[kOUT_IDX], batch, dim, width, stream);
+        auto decodeStateTensor
+            = rt::Tensor{convStateOut, rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
+        auto decodeNewColTensor = rt::Tensor{
+            const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, 1, dim}, rt::DeviceType::kGPU, xDesc.type};
+        mamba_ssm::invokeConvStateShiftInsert(decodeStateTensor, decodeNewColTensor, stream);
+
+        auto decodeWeightTensor = rt::Tensor{const_cast<void*>(inputs[kIN_WEIGHT_IDX]),
+            rt::Coords{wDesc.dims.d[0], wDesc.dims.d[1], wDesc.dims.d[2]}, rt::DeviceType::kGPU, xDesc.type};
+        auto decodeBiasTensor
+            = rt::Tensor{const_cast<void*>(inputs[kIN_BIAS_IDX]), rt::Coords{dim}, rt::DeviceType::kGPU, xDesc.type};
+        auto decodeOutTensor
+            = rt::Tensor{outputs[kOUT_IDX], rt::Coords{batch, 1, dim}, rt::DeviceType::kGPU, xDesc.type};
+        trt_edgellm::rt::OptionalInputTensor decodeBiasOpt = std::optional(std::cref(decodeBiasTensor));
+        mamba_ssm::invokeCausalConv1dDecode(
+            decodeStateTensor, decodeWeightTensor, decodeBiasOpt, decodeOutTensor, stream);
     }
 
     return 0;

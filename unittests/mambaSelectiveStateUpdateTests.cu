@@ -493,20 +493,13 @@ void runMambaSelectiveStateUpdateTest(MambaTestConfig const& config)
         CDevice = std::move(CPadded);
     }
 
-    SsmUpdateTensors tensors{};
-    tensors.x = &xDevice;
-    tensors.A = &ADevice;
-    tensors.B = &BDevice;
-    tensors.C = &CDevice;
-    tensors.dt = &dtDevice;
-    tensors.dt_bias = dtBiasDevice.isEmpty() ? nullptr : &dtBiasDevice;
-    tensors.D = DDevice.isEmpty() ? nullptr : &DDevice;
-    tensors.z = zDevice.isEmpty() ? nullptr : &zDevice;
-    tensors.state = &stateDevice;
-    tensors.output = &outputDevice;
+    namespace rt = trt_edgellm::rt;
+    rt::OptionalInputTensor dtBiasOpt = dtBiasDevice.isEmpty() ? std::nullopt : std::optional(std::cref(dtBiasDevice));
+    rt::OptionalInputTensor DOpt = DDevice.isEmpty() ? std::nullopt : std::optional(std::cref(DDevice));
+    rt::OptionalInputTensor zOpt = zDevice.isEmpty() ? std::nullopt : std::optional(std::cref(zDevice));
 
-    // Launch kernel
-    invokeSelectiveStateUpdate<half, float, float, half, int32_t>(tensors, config.dtSoftplus, stream);
+    invokeSelectiveStateUpdate(xDevice, ADevice, BDevice, CDevice, dtDevice, dtBiasOpt, DOpt, zOpt, stateDevice,
+        outputDevice, config.dtSoftplus, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<half> outputFromGpu(outputGpuSize);
@@ -837,19 +830,13 @@ void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
         CUDA_CHECK(cudaMemcpy(zDevice.rawPointer(), zHost.data(), xSize * sizeof(half), cudaMemcpyHostToDevice));
     }
 
-    SsmUpdateTensors tensors{};
-    tensors.x = &xDevice;
-    tensors.A = &ADevice;
-    tensors.B = &BDevice;
-    tensors.C = &CDevice;
-    tensors.dt = &dtDevice;
-    tensors.dt_bias = dtBiasDevice.isEmpty() ? nullptr : &dtBiasDevice;
-    tensors.D = DDevice.isEmpty() ? nullptr : &DDevice;
-    tensors.z = zDevice.isEmpty() ? nullptr : &zDevice;
-    tensors.state = &stateDevice;
-    tensors.output = &outputDevice;
+    namespace rt = trt_edgellm::rt;
+    rt::OptionalInputTensor dtBiasOpt = dtBiasDevice.isEmpty() ? std::nullopt : std::optional(std::cref(dtBiasDevice));
+    rt::OptionalInputTensor DOpt = DDevice.isEmpty() ? std::nullopt : std::optional(std::cref(DDevice));
+    rt::OptionalInputTensor zOpt = zDevice.isEmpty() ? std::nullopt : std::optional(std::cref(zDevice));
 
-    invokeSelectiveStateUpdatePrefill<half, half, float, half, int32_t>(tensors, config.dtSoftplus, stream);
+    invokeSelectiveStateUpdatePrefill(xDevice, ADevice, BDevice, CDevice, dtDevice, dtBiasOpt, DOpt, zOpt, stateDevice,
+        outputDevice, config.dtSoftplus, stream);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
