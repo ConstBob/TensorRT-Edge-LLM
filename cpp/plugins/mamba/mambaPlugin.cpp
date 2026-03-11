@@ -266,43 +266,32 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     auto dtBiasTensor = rt::Tensor{
         const_cast<void*>(inputs[kIN_DT_BIAS_IDX]), inputDesc[kIN_DT_BIAS_IDX].dims, rt::DeviceType::kGPU, xDesc.type};
 
-    // Optional D — nullptr when not connected
+    // Optional D — keep tensor in scope for the duration of the invoke call
     std::optional<rt::Tensor> dTensorOpt;
     if (inputs[kIN_D_IDX])
     {
         dTensorOpt.emplace(
             const_cast<void*>(inputs[kIN_D_IDX]), inputDesc[kIN_D_IDX].dims, rt::DeviceType::kGPU, xDesc.type);
     }
+    rt::OptionalInputTensor dOpt = dTensorOpt.has_value() ? std::optional(std::cref(dTensorOpt.value())) : std::nullopt;
 
     // Output tensors (mutable)
     auto stateTensor = rt::Tensor{outputState, inputDesc[kIN_STATE_IDX].dims, rt::DeviceType::kGPU, xDesc.type};
     auto outTensor
         = rt::Tensor{outputs[kOUT_OUTPUT_IDX], outputDesc[kOUT_OUTPUT_IDX].dims, rt::DeviceType::kGPU, xDesc.type};
 
-    mamba_ssm::SsmUpdateTensors tensors{};
-    tensors.x = &xTensor;
-    tensors.A = &aTensor;
-    tensors.B = &bTensor;
-    tensors.C = &cTensor;
-    tensors.dt = &dtTensor;
-    tensors.dt_bias = &dtBiasTensor;
-    tensors.D = dTensorOpt.has_value() ? &dTensorOpt.value() : nullptr;
-    tensors.z = nullptr;
-    tensors.state = &stateTensor;
-    tensors.output = &outTensor;
-
+    rt::OptionalInputTensor dtBiasOpt = std::optional(std::cref(dtBiasTensor));
     bool const dt_softplus = static_cast<bool>(mDtSoftplus);
 
     if (hasSeqLen)
     {
-        // Prefill path: x is 4D [batch, seq_len, nheads, dim].  The dispatcher
-        // reads all strides from the tensor layout — no manual stride arithmetic needed.
-        mamba_ssm::invokeSelectiveStateUpdatePrefill<half, half, float, half, int32_t>(tensors, dt_softplus, stream);
+        mamba_ssm::invokeSelectiveStateUpdatePrefill(xTensor, aTensor, bTensor, cTensor, dtTensor, dtBiasOpt, dOpt,
+            std::nullopt, stateTensor, outTensor, dt_softplus, stream);
     }
     else
     {
-        // Decode path: x is 3D [batch, nheads, dim].
-        mamba_ssm::invokeSelectiveStateUpdate<half, half, float, half, int32_t>(tensors, dt_softplus, stream);
+        mamba_ssm::invokeSelectiveStateUpdate(xTensor, aTensor, bTensor, cTensor, dtTensor, dtBiasOpt, dOpt,
+            std::nullopt, stateTensor, outTensor, dt_softplus, stream);
     }
 
     return 0;
@@ -332,9 +321,7 @@ PluginFieldCollection const* MambaPlugin::getFieldsToSerialize() noexcept
     return &mFCToSerialize;
 }
 
-// =============================================================================
-// Plugin Creator Implementation
-// =============================================================================
+// Plugin Creator implementation.
 
 MambaPluginCreator::MambaPluginCreator()
 {
@@ -394,7 +381,7 @@ IPluginV3* MambaPluginCreator::createPlugin(
 
         if (phase == TensorRTPhase::kBUILD)
         {
-            // --- Accepted but not yet supported: provided by the ONNX node ---
+            // Accepted but not yet supported (provided by the ONNX node):
             // chunk_size: Mamba2 prefill uses a chunked parallel scan when > 1.
             //   TODO: implement mamba_chunk_scan_combined kernel for chunk_size > 1.
             std::optional<int32_t> chunkSize = parsePluginScalarField<int32_t>("chunk_size", fc);

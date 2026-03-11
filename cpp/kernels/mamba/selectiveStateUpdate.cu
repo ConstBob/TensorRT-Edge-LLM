@@ -40,9 +40,7 @@
 namespace mamba_ssm
 {
 
-// =============================================================================
-// Internal parameter struct (not exposed in the public header)
-// =============================================================================
+// Internal parameter struct (not exposed in the public header).
 struct SelectiveStateUpdateParams
 {
     uint32_t batch{}, nheads{}, dim{}, dstate{}, ngroups{}, state_cache_size{};
@@ -106,9 +104,11 @@ inline void setContiguousStrides(SelectiveStateUpdateParams& params)
 
 using namespace conversion;
 
-// =============================================================================
-// Shared memory structure for simple kernel
-// =============================================================================
+// Allowed (dim, dstate) for kernel instantiation
+using AllowedDims = std::integer_sequence<int, 64, 80, 128, 256>;
+using AllowedDstates = std::integer_sequence<int, 64, 80, 128, 256>;
+
+// Shared memory structure for simple kernel.
 template <typename input_t, int dim, int dstate>
 struct SharedStorageSimple
 {
@@ -119,9 +119,7 @@ struct SharedStorageSimple
     float out[dim];
 };
 
-// =============================================================================
-// Simple selective state update kernel (works on all GPU architectures)
-// =============================================================================
+// Simple selective state update kernel (works on all GPU architectures).
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, typename stateIndex_t, int DIM,
     int DSTATE, int numWarps>
 __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams params)
@@ -272,10 +270,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
     }
 }
 
-// =============================================================================
-// Prefill kernel: full-sequence SSM scan with fp32 state kept in registers
-// =============================================================================
-//
+// Prefill kernel: full-sequence SSM scan with fp32 state kept in registers.
 // Unlike selective_state_update_kernel_simple (which is launched once per token
 // from a host-side loop), this kernel processes the entire token sequence inside
 // a single CUDA kernel.  The running SSM state is accumulated as float in
@@ -328,9 +323,7 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
         if (_d >= DIM)
             break;
 
-        // ----------------------------------------------------------------
         // Load initial SSM state into fp32 registers (no quantisation here).
-        // ----------------------------------------------------------------
         float runState[dstatePerLane];
         bool const validSlot = (params.pad_slot_id < 0 || batch != static_cast<uint32_t>(params.pad_slot_id));
 #pragma unroll
@@ -340,9 +333,7 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
             runState[ii] = (validSlot && i < DSTATE) ? toFloat(state[_d * params.state_stride_dim + i]) : 0.f;
         }
 
-        // ----------------------------------------------------------------
         // Scan over the token sequence, state stays fp32 in registers.
-        // ----------------------------------------------------------------
         for (int32_t t = 0; t < seqLen; ++t)
         {
             // dt[batch, t, head]
@@ -390,9 +381,7 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
             }
         }
 
-        // ----------------------------------------------------------------
-        // Write final state to global memory — ONE quantisation per sequence.
-        // ----------------------------------------------------------------
+        // Write final state to global memory (one quantisation per sequence).
         if (params.update_state && validSlot)
         {
 #pragma unroll
@@ -406,9 +395,7 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
     }
 }
 
-// =============================================================================
-// Kernel launcher functors (at namespace scope for nvcc compatibility)
-// =============================================================================
+// Kernel launcher functors (at namespace scope for nvcc compatibility).
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, typename stateIndex_t>
 struct SsmKernelLauncher
 {
@@ -452,9 +439,7 @@ struct SsmPrefillKernelLauncher
     }
 };
 
-// =============================================================================
-// Internal kernel dispatch (params-based) — not part of the public API
-// =============================================================================
+// Internal kernel dispatch (params-based); not part of the public API.
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, typename stateIndex_t>
 static void invokeSelectiveStateUpdateImpl(SelectiveStateUpdateParams& params, cudaStream_t stream)
 {
@@ -473,122 +458,116 @@ static void invokeSelectiveStateUpdatePrefillImpl(SelectiveStateUpdateParams& pa
     dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, launcher);
 }
 
-// =============================================================================
-// Public tensor-based dispatchers
-// =============================================================================
-
-// Helper: fill the fields that are common to both decode and prefill
-static void fillCommonParams(
-    SsmUpdateTensors const& tensors, bool dt_softplus, SelectiveStateUpdateParams& params, int headDim)
+// Fill params from Tensor refs (common for decode and prefill).
+static void fillCommonParamsFromTensors(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor const& A,
+    trt_edgellm::rt::Tensor const& B, trt_edgellm::rt::Tensor const& C, trt_edgellm::rt::Tensor const& dt,
+    trt_edgellm::rt::OptionalInputTensor dt_bias, trt_edgellm::rt::OptionalInputTensor D,
+    trt_edgellm::rt::OptionalInputTensor z, trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor& output,
+    bool dt_softplus, SelectiveStateUpdateParams& params)
 {
-    // Dimensions are read from the state tensor [batch, nheads, dim, dstate]
-    params.batch = static_cast<uint32_t>(tensors.state->getShape()[0]);
-    params.nheads = static_cast<uint32_t>(tensors.state->getShape()[1]);
-    params.dim = static_cast<uint32_t>(tensors.state->getShape()[2]);
-    params.dstate = static_cast<uint32_t>(tensors.state->getShape()[3]);
-    // B is [batch, (seq_len,) ngroups, dstate]; ngroups is at dim (ndims-2)
-    auto const bndims = tensors.B->getShape().getNumDims();
-    params.ngroups = static_cast<uint32_t>(tensors.B->getShape()[bndims - 2]);
+    params.batch = static_cast<uint32_t>(state.getShape()[0]);
+    params.nheads = static_cast<uint32_t>(state.getShape()[1]);
+    params.dim = static_cast<uint32_t>(state.getShape()[2]);
+    params.dstate = static_cast<uint32_t>(state.getShape()[3]);
+    auto const bndims = B.getShape().getNumDims();
+    params.ngroups = static_cast<uint32_t>(B.getShape()[bndims - 2]);
     params.dt_softplus = dt_softplus;
     params.update_state = true;
 
-    // State strides: [batch, nheads, dim, dstate]
-    params.state_stride_batch = tensors.state->getStride(0);
-    params.state_stride_head = tensors.state->getStride(1);
-    params.state_stride_dim = tensors.state->getStride(2);
+    params.state_stride_batch = state.getStride(0);
+    params.state_stride_head = state.getStride(1);
+    params.state_stride_dim = state.getStride(2);
 
-    // Pointers
-    params.x = const_cast<void*>(tensors.x->rawPointer());
-    params.A = const_cast<void*>(tensors.A->rawPointer());
-    params.B = const_cast<void*>(tensors.B->rawPointer());
-    params.C = const_cast<void*>(tensors.C->rawPointer());
-    params.dt = const_cast<void*>(tensors.dt->rawPointer());
-    params.dt_bias = tensors.dt_bias ? const_cast<void*>(tensors.dt_bias->rawPointer()) : nullptr;
-    params.D = tensors.D ? const_cast<void*>(tensors.D->rawPointer()) : nullptr;
-    params.z = tensors.z ? const_cast<void*>(tensors.z->rawPointer()) : nullptr;
-    params.state = tensors.state->rawPointer();
-    params.output = tensors.output->rawPointer();
+    params.x = const_cast<void*>(x.rawPointer());
+    params.A = const_cast<void*>(A.rawPointer());
+    params.B = const_cast<void*>(B.rawPointer());
+    params.C = const_cast<void*>(C.rawPointer());
+    params.dt = const_cast<void*>(dt.rawPointer());
+    params.dt_bias = dt_bias.has_value() ? const_cast<void*>(dt_bias->get().rawPointer()) : nullptr;
+    params.D = D.has_value() ? const_cast<void*>(D->get().rawPointer()) : nullptr;
+    params.z = z.has_value() ? const_cast<void*>(z->get().rawPointer()) : nullptr;
+    params.state = state.rawPointer();
+    params.output = output.rawPointer();
 }
 
-/*!
- * \brief Decode dispatcher: x is 3D [batch, nheads, dim].
- *
- * All strides are read directly from the tensor layout, so non-contiguous
- * buffers (e.g. padded heads) are handled automatically.
- */
-template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, typename stateIndex_t>
-void invokeSelectiveStateUpdate(SsmUpdateTensors const& tensors, bool dt_softplus, cudaStream_t stream)
+// Public non-templated API (decode).
+void invokeSelectiveStateUpdate(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor const& A,
+    trt_edgellm::rt::Tensor const& B, trt_edgellm::rt::Tensor const& C, trt_edgellm::rt::Tensor const& dt,
+    trt_edgellm::rt::OptionalInputTensor dt_bias, trt_edgellm::rt::OptionalInputTensor D,
+    trt_edgellm::rt::OptionalInputTensor z, trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor& output,
+    bool dt_softplus, cudaStream_t stream)
 {
     SelectiveStateUpdateParams params{};
-    fillCommonParams(tensors, dt_softplus, params, /*headDim=*/0);
+    fillCommonParamsFromTensors(x, A, B, C, dt, dt_bias, D, z, state, output, dt_softplus, params);
 
-    // x: [batch, nheads, dim]
-    params.x_stride_batch = tensors.x->getStride(0);
-    params.x_stride_head = tensors.x->getStride(1);
-    params.dt_stride_batch = tensors.dt->getStride(0);
-    params.B_stride_batch = tensors.B->getStride(0);
-    params.C_stride_batch = tensors.C->getStride(0);
-    params.out_stride_batch = tensors.output->getStride(0);
-    params.out_stride_head = tensors.output->getStride(1);
-    if (tensors.z)
+    params.x_stride_batch = x.getStride(0);
+    params.x_stride_head = x.getStride(1);
+    params.dt_stride_batch = dt.getStride(0);
+    params.B_stride_batch = B.getStride(0);
+    params.C_stride_batch = C.getStride(0);
+    params.out_stride_batch = output.getStride(0);
+    params.out_stride_head = output.getStride(1);
+    if (z.has_value())
     {
-        params.z_stride_batch = tensors.z->getStride(0);
-        params.z_stride_head = tensors.z->getStride(1);
+        params.z_stride_batch = z->get().getStride(0);
+        params.z_stride_head = z->get().getStride(1);
     }
 
-    invokeSelectiveStateUpdateImpl<input_t, weight_t, matrixA_t, state_t, stateIndex_t>(params, stream);
+    if (x.getDataType() == nvinfer1::DataType::kHALF && dt.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        invokeSelectiveStateUpdateImpl<half, half, float, half, int32_t>(params, stream);
+    }
+    else if (x.getDataType() == nvinfer1::DataType::kHALF && dt.getDataType() == nvinfer1::DataType::kFLOAT)
+    {
+        invokeSelectiveStateUpdateImpl<half, float, float, half, int32_t>(params, stream);
+    }
+    else
+    {
+        throw std::runtime_error("invokeSelectiveStateUpdate: only (x=half, dt=half or float) is supported.");
+    }
 }
 
-/*!
- * \brief Prefill dispatcher: x is 4D [batch, seq_len, nheads, dim].
- *
- * Per-token strides (seq dimension) are read from the tensor layout.
- */
-template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, typename stateIndex_t>
-void invokeSelectiveStateUpdatePrefill(SsmUpdateTensors const& tensors, bool dt_softplus, cudaStream_t stream)
+// Public non-templated API (prefill).
+void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor const& A,
+    trt_edgellm::rt::Tensor const& B, trt_edgellm::rt::Tensor const& C, trt_edgellm::rt::Tensor const& dt,
+    trt_edgellm::rt::OptionalInputTensor dt_bias, trt_edgellm::rt::OptionalInputTensor D,
+    trt_edgellm::rt::OptionalInputTensor z, trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor& output,
+    bool dt_softplus, cudaStream_t stream)
 {
     SelectiveStateUpdateParams params{};
-    fillCommonParams(tensors, dt_softplus, params, /*headDim=*/0);
+    fillCommonParamsFromTensors(x, A, B, C, dt, dt_bias, D, z, state, output, dt_softplus, params);
 
-    // x: [batch, seq_len, nheads, dim]
-    params.seq_len = static_cast<int32_t>(tensors.x->getShape()[1]);
-    params.x_stride_batch = tensors.x->getStride(0);
-    params.x_stride_seq = tensors.x->getStride(1);
-    params.x_stride_head = tensors.x->getStride(2);
-    params.dt_stride_batch = tensors.dt->getStride(0);
-    params.dt_stride_seq = tensors.dt->getStride(1);
-    params.B_stride_batch = tensors.B->getStride(0);
-    params.B_stride_seq = tensors.B->getStride(1);
-    params.C_stride_batch = tensors.C->getStride(0);
-    params.C_stride_seq = tensors.C->getStride(1);
-    params.out_stride_batch = tensors.output->getStride(0);
-    params.out_stride_seq = tensors.output->getStride(1);
-    params.out_stride_head = tensors.output->getStride(2);
-    if (tensors.z)
+    params.seq_len = static_cast<int32_t>(x.getShape()[1]);
+    params.x_stride_batch = x.getStride(0);
+    params.x_stride_seq = x.getStride(1);
+    params.x_stride_head = x.getStride(2);
+    params.dt_stride_batch = dt.getStride(0);
+    params.dt_stride_seq = dt.getStride(1);
+    params.B_stride_batch = B.getStride(0);
+    params.B_stride_seq = B.getStride(1);
+    params.C_stride_batch = C.getStride(0);
+    params.C_stride_seq = C.getStride(1);
+    params.out_stride_batch = output.getStride(0);
+    params.out_stride_seq = output.getStride(1);
+    params.out_stride_head = output.getStride(2);
+    if (z.has_value())
     {
-        params.z_stride_batch = tensors.z->getStride(0);
-        params.z_stride_head = tensors.z->getStride(2);
+        params.z_stride_batch = z->get().getStride(0);
+        params.z_stride_head = z->get().getStride(2);
     }
 
-    invokeSelectiveStateUpdatePrefillImpl<input_t, weight_t, matrixA_t, state_t, stateIndex_t>(params, stream);
+    if (x.getDataType() == nvinfer1::DataType::kHALF && dt.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        invokeSelectiveStateUpdatePrefillImpl<half, half, float, half, int32_t>(params, stream);
+    }
+    else if (x.getDataType() == nvinfer1::DataType::kHALF && dt.getDataType() == nvinfer1::DataType::kFLOAT)
+    {
+        invokeSelectiveStateUpdatePrefillImpl<half, float, float, half, int32_t>(params, stream);
+    }
+    else
+    {
+        throw std::runtime_error("invokeSelectiveStateUpdatePrefill: only (x=half, dt=half or float) is supported.");
+    }
 }
-
-// =============================================================================
-// Explicit template instantiations
-// =============================================================================
-// FP16 main precision. A is always FP32. Accumulation inside the kernel is FP32.
-// Two weight_t variants: half (plugin path) and float (test/debug path).
-// TODO: Use Tensor class to dispatch the kernels based on dtype of the input tensors.
-template void invokeSelectiveStateUpdate<half, half, float, half, int32_t>(
-    SsmUpdateTensors const& tensors, bool dt_softplus, cudaStream_t stream);
-
-template void invokeSelectiveStateUpdate<half, float, float, half, int32_t>(
-    SsmUpdateTensors const& tensors, bool dt_softplus, cudaStream_t stream);
-
-template void invokeSelectiveStateUpdatePrefill<half, half, float, half, int32_t>(
-    SsmUpdateTensors const& tensors, bool dt_softplus, cudaStream_t stream);
-
-template void invokeSelectiveStateUpdatePrefill<half, float, float, half, int32_t>(
-    SsmUpdateTensors const& tensors, bool dt_softplus, cudaStream_t stream);
 
 } // namespace mamba_ssm
