@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,8 +51,7 @@ protected:
         std::string const& testName,
         std::function<void(std::vector<int32_t> const&, std::vector<int32_t> const&, std::vector<int32_t> const&,
             EagleAcceptResult const&)>
-            validator
-        = nullptr,
+            validator = nullptr,
         std::vector<int32_t> const& vocabMappingTableData = {})
     {
         // Create GPU tensors with proper shapes

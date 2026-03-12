@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -105,7 +105,7 @@ public:
     using FragZP = Vec<nv_bfloat162, 4>;
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-    static __device__ float inline num2float(const nv_bfloat16 x)
+    static __device__ float inline num2float(nv_bfloat16 const x)
     {
         return __bfloat162float(x);
     }
