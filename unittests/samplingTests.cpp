@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -447,9 +447,18 @@ TEST_F(SamplingTestSuites, SamplingAccuracy)
     };
 
     std::vector<SamplingConfig> configs = {
-        {"TopK", 20, 1.0f, 1.0f}, {"TopK", 50, 1.0f, 1.0f}, {"TopK", 100, 1.0f, 1.0f}, {"TopP", 0, 0.9f, 1.0f},
-        {"TopP", 0, 0.95f, 1.0f}, {"TopP", 0, 0.99f, 1.0f}, {"TopKTopP", 20, 0.9f, 1.0f}, {"TopKTopP", 50, 0.95f, 1.0f},
-        {"TopKTopP", 100, 0.99f, 1.0f}, {"TopK", 20, 1.0f, 0.5f}, {"TopK", 20, 1.0f, 1.5f}, {"TopP", 0, 0.9f, 0.5f},
+        {"TopK", 20, 1.0f, 1.0f},
+        {"TopK", 50, 1.0f, 1.0f},
+        {"TopK", 100, 1.0f, 1.0f},
+        {"TopP", 0, 0.9f, 1.0f},
+        {"TopP", 0, 0.95f, 1.0f},
+        {"TopP", 0, 0.99f, 1.0f},
+        {"TopKTopP", 20, 0.9f, 1.0f},
+        {"TopKTopP", 50, 0.95f, 1.0f},
+        {"TopKTopP", 100, 0.99f, 1.0f},
+        {"TopK", 20, 1.0f, 0.5f},
+        {"TopK", 20, 1.0f, 1.5f},
+        {"TopP", 0, 0.9f, 0.5f},
         {"TopP", 0, 0.9f, 1.5f},
         // Temperature = 0.0f tests - should always pick topK = 1 regardless of config
         {"TempZero", 1, 1.0f, 0.0f},  // Correct config for temperature = 0.0f
