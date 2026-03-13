@@ -1,5 +1,5 @@
 {
-    "model_path": "nemotron_nano_v2",
+    "model_path": "nemotron_h",
     "roles": {
     "system": {
       "prefix": "<SPECIAL_10>System\n",

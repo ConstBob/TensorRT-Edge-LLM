@@ -863,6 +863,10 @@ class EdgeLLMMambaLayer(nn.Module):
             dim=-1,
         )
 
+        hidden_states_B_C = hidden_states_B_C.to(torch.float16)
+        dt = dt.to(torch.float16)
+        conv_state = conv_state.to(torch.float16)
+
         # 2. Causal conv1d via plugin (no activation baked in)
         hidden_states_B_C, conv_state_out = causal_conv1d_plugin(
             hidden_states_B_C,
