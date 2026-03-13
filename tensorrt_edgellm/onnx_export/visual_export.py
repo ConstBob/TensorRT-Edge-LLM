@@ -133,6 +133,11 @@ def visual_export(model_dir: str,
     # Get visual model from the multimodal model
     model_type = model.config.model_type
 
+    # For Alpamayo 1, extract the VLM
+    if model_type == 'alpamayo_r1':
+        model = model.vlm
+        model_type = model.config.model_type
+
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 

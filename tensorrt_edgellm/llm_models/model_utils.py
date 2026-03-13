@@ -33,7 +33,9 @@ from modelopt.torch.quantization.utils import is_quantized_linear
 from safetensors.torch import safe_open
 from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoProcessor,
-                          AutoTokenizer, PreTrainedModel)
+                          AutoTokenizer, PretrainedConfig, PreTrainedModel,
+                          Qwen2VLImageProcessorFast, Qwen3VLProcessor,
+                          Qwen3VLVideoProcessor)
 
 from .models.eagle3_draft import Eagle3DraftModel
 
@@ -82,11 +84,15 @@ def is_vlm(model_dir: str) -> bool:
         True if the model is a VLM, False otherwise
     """
     try:
-        cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        cfg_dict = cfg.to_dict()
+        try:
+            cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+            cfg_dict = cfg.to_dict()
+        except Exception:
+            cfg_dict, _ = PretrainedConfig.get_config_dict(model_dir)
         has_vision = "vision_config" in cfg_dict
         has_phi4_vision = "image_embd_layer" in cfg_dict.get("embd_layer", {})
-        return has_vision or has_phi4_vision
+        has_vlm_backend = "vlm_backend" in cfg_dict
+        return has_vision or has_phi4_vision or has_vlm_backend
     except Exception:
         return False
 
@@ -227,6 +233,12 @@ def _is_qwen3_tts_model(model_dir: str) -> bool:
 def _is_qwen3_asr_model(model_dir: str) -> bool:
     """Qwen3-ASR is not integrated into transformers yet."""
     return "Qwen3-ASR" in model_dir
+
+
+def _is_alpamayo_1_model(model_dir: str) -> bool:
+    """Check if the model is an Alpamayo 1 model."""
+    cfg, _ = PretrainedConfig.get_config_dict(model_dir)
+    return cfg.get("model_type", None) == "alpamayo_r1"
 
 
 # Models that require explicit chat template because auto-extraction fails
@@ -377,18 +389,30 @@ def load_hf_model(
         raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_dir,
-                                              trust_remote_code=True)
+    # Alpamayo loads tokenizer internally; AutoTokenizer.from_pretrained does not work for alpamayo_r1.
+    if not _is_alpamayo_1_model(model_dir):
+        tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                                  trust_remote_code=True)
 
+    if _is_alpamayo_1_model(model_dir):
+        from ..action_models import alpamayo_r1 as _alpamayo_r1_pkg
+        sys.modules["alpamayo_r1"] = _alpamayo_r1_pkg
+        from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+
+        model = AlpamayoR1.from_pretrained(
+            model_dir,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        ).to(device)
+        tokenizer = model.tokenizer
     # NemotronH: apply mamba_ssm stub before import to avoid ABI-broken CUDA extension errors.
     # The model runs on the pure-PyTorch slow path for ONNX export.
-    if _is_nemotron_h_model(model_dir):
+    elif _is_nemotron_h_model(model_dir):
         from .models.nemotron_h_patch import apply as _apply_nemotron_h_patch
         _apply_nemotron_h_patch()
         model = AutoModelForCausalLM.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).to(device)
-
     # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
     # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
     elif _is_phi4mm_model(model_dir):
@@ -462,19 +486,41 @@ def load_hf_model(
 
     # Try to load processor if available
     processor = None
-    try:
-        processor = AutoProcessor.from_pretrained(
-            model_dir,
-            trust_remote_code=True,
-            # The fields are required because during quantization it may OOM due to large images in the dataset.
-            min_pixels=128 * 28 * 28,
-            max_pixels=2048 * 32 * 32)
-        print(
-            f"Warning: Loaded processor from {model_dir}. The processor will skip image processing for images smaller than 128x28x28 or bigger than 2048x32x32 due to excessive memory usage during image quntization."
+    if _is_alpamayo_1_model(model_dir):
+        preprocessor_config = {
+            "size": {
+                "longest_edge": 16777216,
+                "shortest_edge": 65536
+            },
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "min_pixels": 128 * 28 * 28,
+            "max_pixels": 2048 * 32 * 32,
+        }
+        video_processor = Qwen3VLVideoProcessor(**preprocessor_config)
+        image_processor = Qwen2VLImageProcessorFast(**preprocessor_config)
+        processor = Qwen3VLProcessor(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            video_processor=video_processor,
         )
-    except Exception:
-        # Processor not available for this model
-        pass
+    else:
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_dir,
+                trust_remote_code=True,
+                # The fields are required because during quantization it may OOM due to large images in the dataset.
+                min_pixels=128 * 28 * 28,
+                max_pixels=2048 * 32 * 32)
+            print(
+                f"Warning: Loaded processor from {model_dir}. The processor will skip image processing for images smaller than 128x28x28 or bigger than 2048x32x32 due to excessive memory usage during image quantization."
+            )
+        except Exception:
+            # Processor not available for this model
+            pass
 
     return model, tokenizer, processor
 
@@ -516,8 +562,19 @@ def load_llm_model(
     model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
     set_dynamic_quant(model, dtype)
 
+    # Create EdgeLLMModelForCausalLM wrapper
+    if _is_alpamayo_1_model(model_dir):
+        # For Alpamayo 1, extract the VLM backbone (Qwen3-VL)
+        hf_model = model.vlm
+        if not trt_native_ops:
+            edge_model = {}
+            edge_model["model"] = EdgeLLMModelForCausalLM(
+                hf_model, is_eagle_base, reduced_vocab_size, vocab_map)
+        else:
+            edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
+                                               reduced_vocab_size, vocab_map)
     # Create EdgeLLMModel wrappers based on model type
-    if _is_qwen3_tts_model(model_dir):
+    elif _is_qwen3_tts_model(model_dir):
         # Qwen3-TTS: Talker + CodePredictor only (no Thinker)
         from .models.qwen3_omni_talker import (Qwen3OmniCodePredictorPatch,
                                                Qwen3OmniTalkerPatch)
