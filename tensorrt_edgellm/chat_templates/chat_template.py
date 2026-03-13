@@ -42,9 +42,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from transformers import AutoProcessor, AutoTokenizer
-
-from ..llm_models.model_utils import (_is_qwen3_asr_model,
+from ..llm_models.model_utils import (_is_alpamayo_1_model,
+                                      _is_qwen3_asr_model,
                                       _is_qwen3_omni_model, is_vlm)
 
 
@@ -305,7 +304,8 @@ def validate_chat_template(chat_template_path: str) -> Dict[str, Any]:
     print("Chat template validation successful!")
 
 
-def process_chat_template(model_dir: str, output_dir: str) -> None:
+def process_chat_template(model_dir: str, model_tokenizer: Any,
+                          model_processor: Any, output_dir: str) -> None:
     """
     Process the chat template from model's tokenizer and create a JSON file
     with parsed template information.
@@ -314,28 +314,26 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     test cases to extract the actual prefix/suffix patterns. 
 
     Args:
-        model_dir: Path to the model directory containing tokenizer files
+        model_dir: The directory containing the model
+        model_tokenizer: The tokenizer to use to process the chat template
+        model_processor: The processor to use to process the chat template
         output_dir: Path to save the chat_template.json file
     
     Returns:
         None
     """
-    print(f"Processing chat template from {model_dir}")
+    print(f"Processing chat template for {model_dir}")
 
     tokenizer = None
-    loaders = [AutoProcessor, AutoTokenizer
-               ] if is_vlm(model_dir) else [AutoTokenizer, AutoProcessor]
+    loaders = [model_processor, model_tokenizer
+               ] if is_vlm(model_dir) else [model_tokenizer, model_processor]
     for ldr in loaders:
-        try:
-            tokenizer = ldr.from_pretrained(model_dir, trust_remote_code=True)
-            if getattr(tokenizer, 'chat_template', None):
-                print(f"Successfully loaded chat template from {ldr.__name__}")
-                break
-            else:
-                print(f"{ldr.__name__} loaded but no chat template found")
-                tokenizer = None
-        except Exception as e:
-            print(f"Failed to load {ldr.__name__}: {e}")
+        if getattr(ldr, 'chat_template', None):
+            print(f"Successfully loaded chat template")
+            tokenizer = ldr
+            break
+        else:
+            print(f"No chat template found")
             tokenizer = None
 
     if tokenizer is None:
@@ -463,6 +461,12 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
         print(
             "Text-only LLM detected, skipping multimodal content pattern extraction"
         )
+
+    if _is_alpamayo_1_model(model_dir):
+        print(
+            "Detected Alpamayo 1 model, adding <|cot_start|> to generation prompt"
+        )
+        generation_prompt = generation_prompt + "<|cot_start|>"
 
     # Extract default system prompt by testing without system message
     user_only_prompt = UserMessage()

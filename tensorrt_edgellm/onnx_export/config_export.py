@@ -316,6 +316,14 @@ def export_audio_config(config: Any) -> Dict[str, Any]:
     return config_dict
 
 
+def export_action_config(config: Any) -> Dict[str, Any]:
+    """Export action configuration without modification."""
+    config_dict = config.to_dict()
+    # Add TensorRT Edge-LLM version
+    config_dict['edgellm_version'] = __version__
+    return config_dict
+
+
 def export_code2wav_config(config: Any) -> Dict[str, Any]:
     """Export code2wav configuration with proper model_type."""
     config_dict = config.to_dict()

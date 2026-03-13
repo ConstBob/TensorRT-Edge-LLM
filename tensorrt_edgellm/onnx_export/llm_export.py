@@ -1034,7 +1034,8 @@ def export_llm_model(model_dir: str,
         print(f"Chat template saved to {output_template_path}")
     else:
         # Generate chat template from model
-        process_chat_template(model_dir, tokenizer_save_dir)
+        process_chat_template(model_dir, tokenizer, processor,
+                              tokenizer_save_dir)
 
     # Copy vocab_map.safetensors to output directory if reduced_vocab_dir is provided
     if reduced_vocab_dir is not None:
