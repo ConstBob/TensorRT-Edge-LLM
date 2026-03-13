@@ -67,6 +67,7 @@
 | [Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) | 2B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) | 4B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) | 8B | ✅ | ✅ | ✅ | ✅ |
+| [Cosmos-Reason2-8B](https://huggingface.co/nvidia/Cosmos-Reason2-8B) | 8B | ✅ | ✅ | ✅ | ✅ |
 | [InternVL3-1B](https://huggingface.co/OpenGVLab/InternVL3-1B-hf) | 1B | ✅ | ✅ | ✅ | ✅ |
 | [InternVL3-2B](https://huggingface.co/OpenGVLab/InternVL3-2B-hf) | 2B | ✅ | ✅ | ✅ | ✅ |
 | [Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) | 5.6B | ✅ | ✅ | ✅ | ✅ |
@@ -79,6 +80,14 @@
 |-------|-----------|------|-----|------|-------|
 | [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | 0.6B | ✅ | — | — | — |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | 1.7B | ✅ | — | — | — |
+
+---
+
+## Text-to-Speech (TTS) Models
+
+| Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
+|-------|-----------|------|-----|------|-------|
+| [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | 1.7B | ✅ | — | — | — |
 
 ---
 
