@@ -538,15 +538,6 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
     """Export a hybrid Mamba+Attention model to ONNX."""
     print(f"Exporting hybrid model to ONNX format: {output_dir}")
 
-    # Move to CPU before tracing to avoid float16 CUBLAS failures on some GPU/CUDA
-    # configurations (CUBLAS_STATUS_INVALID_VALUE). The ONNX graph is device-agnostic
-    # and all plugin stubs (mamba, attention, gather_nd) work correctly on CPU.
-    original_device = next(model.parameters()).device
-    if original_device.type != "cpu":
-        print(
-            f"Moving model to CPU for ONNX tracing (was on {original_device})")
-        model.cpu()
-
     dummy_inputs = create_hybrid_dummy_inputs(model)
     model.eval()
 
