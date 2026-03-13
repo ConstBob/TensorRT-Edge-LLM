@@ -35,7 +35,7 @@ tensorrt-edgellm-export-llm \
     --output_dir $MODEL_NAME/onnx
 ```
 
-> **⚠️ Troubleshooting Export Issues:** If you encounter issues during quantization or export, see the [Python Export Pipeline - Common Issues and Solutions](../software-design/python-export-pipeline.md#common-issues-and-solutions).
+> **⚠️ Troubleshooting Export Issues:** If you encounter issues during quantization or export, see the [Python Export Pipeline - Common Issues and Solutions](../../developer_guide/software-design/python-export-pipeline.md#common-issues-and-solutions).
 
 ### Transfer to Device
 
@@ -138,9 +138,12 @@ You should see a JSON response with the model's answer, similar to:
 
 ## Next Steps
 
-**For more advanced workflows, see [Examples](examples.md):**
-- **VLM Inference** - Vision-language models with image understanding
-- **EAGLE Speculative Decoding** - Accelerated generation for LLM and VLM
-- **LoRA Support** - Dynamic adapter loading at runtime
+**For more advanced workflows, see the example guides:**
+- **[VLM Inference](../examples/vlm.md)** - Vision-language models with image understanding
+- **[Speculative Decoding](../examples/speculative-decoding.md)** - Speculative decoding for LLM and VLM
+- **[Phi-4-Multimodal](../examples/phi4.md)** - Phi-4 Multimodal
+- **[ASR](../examples/asr.md)** - Automatic speech recognition
+- **[MoE](../examples/moe.md)** - Mixture of Experts models (CPU-only export, Qwen3-30B-A3B-GPTQ-Int4)
+- **[TTS](../examples/tts.md)** - Text-to-speech synthesis
 
-**Input Format:** Our format matches closely with the OpenAI API format. See [Input Format Guide](input-format.md) for detailed specifications. Example input files are available in `tests/test_cases/` (e.g., `llm_basic.json`, `vlm_basic.json`).
+**Input Format:** Our format matches closely with the OpenAI API format. See [Input Format Guide](../format/input-format.md) for detailed specifications. Example input files are available in `tests/test_cases/` (e.g., `llm_basic.json`, `vlm_basic.json`).

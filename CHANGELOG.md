@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.6.0
+- Added Nemotron-Nano-9B-v2 support via mamba_ssm and causal_conv1d
+- Added Qwen3-30B-A3B-GPTQ-Int4 support via INT4 MoE Plugin
+- Added Qwen3-ASR and Qwen3-TTS end-to-end support
+- Added cutedsl FMHA kernels to speed up prefill performance on Blackwell
+- Used ViT Attention Plugin with fmha-v2 and cutedsl kernels to speed up multi image ViT performance
+
 ## 0.5.0
 - Implemented and used standalone embedding processing module to reduce multi-modal modeling complexity and reduce Eagle inference memory footprint
 - Added FP8 KV Cache support
