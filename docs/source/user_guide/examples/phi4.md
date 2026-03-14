@@ -13,6 +13,7 @@ Phi-4-Multimodal requires merging its vision LoRA adapter into the base model be
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Phi-4-multimodal-instruct
+export EDGE_LLM_PATH=$HOME/tensorrt-edge-llm   # path to TensorRT-Edge-LLM repo root
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
@@ -35,7 +36,8 @@ tensorrt-edgellm-quantize-llm \
 # Export language model
 tensorrt-edgellm-export-llm \
   --model_dir $MODEL_NAME/quantized \
-  --output_dir $MODEL_NAME/onnx/llm
+  --output_dir $MODEL_NAME/onnx/llm \
+  --chat_template $EDGE_LLM_PATH/tensorrt_edgellm/chat_templates/templates/phi4mm.json
 
 # Export visual encoder (use original weights, not merged)
 tensorrt-edgellm-export-visual \

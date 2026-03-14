@@ -1009,7 +1009,7 @@ def export_llm_model(model_dir: str,
                 f"This model type does not have a compatible chat template that can be "
                 f"automatically extracted from its tokenizer, and no template is available.\n"
                 f"Please provide a chat template JSON file using: --chat_template /path/to/template.json\n"
-                f"See docs/source/developer_guide/06_Chat_Template_Format.md for the required format."
+                f"See docs/source/user_guide/format/chat-template-format.md for the required format."
             )
     else:
         template_source = None
