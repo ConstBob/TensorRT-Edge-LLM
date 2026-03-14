@@ -720,8 +720,10 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             cuKVSeqLensTensor, kvCacheEndIdxsTensor, runtimeSeqLen, stream);
 
 #ifdef CUTE_DSL_FMHA_ENABLED
-        // CuTe DSL FMHA currently only supports FP16 KV cache
-        if (mUseCuteDslFMHA && !mEnableFp8KVCache)
+        // Enable CuteDSL FMHA for single batch prefill usecase when FP8 KVCache is disabled.
+        // TODO: Enable multi-batch prefill and FP8 KVCache after we improve the kernel implementation.
+        bool const enableCuteDslFMHA = mUseCuteDslFMHA && !mEnableFp8KVCache && runtimeBatchSize == 1;
+        if (enableCuteDslFMHA)
         {
             kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
                 vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
