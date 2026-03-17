@@ -407,6 +407,12 @@ def quantize_and_save_llm(model_dir: str,
     # Save the quantized model
     os.makedirs(output_dir, exist_ok=True)
 
+    # Clear top_p when do_sample=False — newer transformers rejects this combination on save
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        gc = model.generation_config
+        if not gc.do_sample and gc.top_p is not None and gc.top_p < 1.0:
+            gc.top_p = None
+
     with torch.inference_mode():
         model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
