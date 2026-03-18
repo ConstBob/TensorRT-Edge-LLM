@@ -55,7 +55,7 @@
 
 > **Note:**
 > - Nemotron Nano models (9B, 4B) do not support INT4 because TensorRT Edge-LLM currently only supports group_size = 128, and these models have weight dimensions that are not multiples of 128.
-> - Nemotron Nano models require passing `--chat_template tensorrt_edgellm/chat_templates/templates/nemotron_nano_v2.json` during model export.
+> - The 9B model requires passing `--chat_template tensorrt_edgellm/chat_templates/templates/nemotron_nano_v2.json` during model export; the 4B model does not.
 
 ---
 
