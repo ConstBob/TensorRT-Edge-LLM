@@ -50,9 +50,13 @@
 
 | Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
 |-------|-----------|------|-----|------|-------|
-| [NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2) | 9B | ✅ | — | — | — |
+| [NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2) | 9B | ✅ | ✅ | — | ✅ |
 
-> **Note:** NVIDIA-Nemotron-Nano-9B-v2 is verified with FP16 only.
+> **Note:** 
+- NVIDIA-Nemotron-Nano-9B-v2 does not support INT4 because TensorRT Edge-LLM currently only supports group_size = 128, and this model has weight dimensions that are not multiples of 128. 
+> **Note:** 
+> - NVIDIA-Nemotron-Nano-9B-v2 does not support INT4 because TensorRT Edge-LLM currently only supports group_size = 128, and this model has weight dimensions that are not multiples of 128. 
+> - NVIDIA-Nemotron-Nano-9B-v2 requires passing `--chat_template tensorrt_edgellm/chat_templates/templates/nemotron_nano_v2.json` during model export. 
 
 ---
 
@@ -67,6 +71,7 @@
 | [Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) | 2B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) | 4B | ✅ | ✅ | ✅ | ✅ |
 | [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) | 8B | ✅ | ✅ | ✅ | ✅ |
+| [Cosmos-Reason2-8B](https://huggingface.co/nvidia/Cosmos-Reason2-8B) | 8B | ✅ | ✅ | ✅ | ✅ |
 | [InternVL3-1B](https://huggingface.co/OpenGVLab/InternVL3-1B-hf) | 1B | ✅ | ✅ | ✅ | ✅ |
 | [InternVL3-2B](https://huggingface.co/OpenGVLab/InternVL3-2B-hf) | 2B | ✅ | ✅ | ✅ | ✅ |
 | [Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) | 5.6B | ✅ | ✅ | ✅ | ✅ |
@@ -79,6 +84,14 @@
 |-------|-----------|------|-----|------|-------|
 | [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | 0.6B | ✅ | — | — | — |
 | [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | 1.7B | ✅ | — | — | — |
+
+---
+
+## Text-to-Speech (TTS) Models
+
+| Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
+|-------|-----------|------|-----|------|-------|
+| [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | 1.7B | ✅ | — | — | — |
 
 ---
 

@@ -228,7 +228,20 @@ cmake .. \
 | `EMBEDDED_TARGET` | **Required for Edge devices**: Target platform (`jetson-thor`). **Not needed for GPU builds** | N/A |
 | `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
-| `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](code-coverage.md)) | OFF |
+| `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
+| `ENABLE_CUTE_DSL_FMHA` | Enable CuTe DSL FMHA kernels (SM100/SM110 only, see below) | OFF |
+
+**Building with CuTe DSL FMHA (Optional and experimental, Blackwell/Thor only)**
+
+CuTe DSL FMHA provides optimized attention kernels for Blackwell/Thor GPUs (SM100/SM110). When enabled, CMake automatically installs `nvidia-cutlass-dsl==4.4.1` and the matching `cupy` package into the active Python environment.
+
+> **Warning:** Installing these dependencies directly into the system Python may corrupt your environment due to version conflicts with existing packages. It is strongly recommended to use a virtual environment.
+
+Create and activate a venv first, then add `-DENABLE_CUTE_DSL_FMHA=ON` to the cmake command:
+
+```bash
+python3 -m venv edgellm-build-venv && source edgellm-build-venv/bin/activate
+```
 
 > **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
 
@@ -254,7 +267,7 @@ Build time: ~1-2 minutes depending on hardware.
 
 ## Next Steps
 
-After installation, proceed to the [Quick Start Guide](quick-start-guide.md) for a complete end-to-end workflow, or see the [Examples Guide](examples.md) for detailed pipeline stages and advanced use cases.
+After installation, proceed to the [Quick Start Guide](quick-start-guide.md) for a complete end-to-end workflow, or see the [Examples](../examples/) for detailed pipeline stages and advanced use cases.
 
 ---
 

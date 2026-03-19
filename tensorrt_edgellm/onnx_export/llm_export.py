@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -538,15 +538,6 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
     """Export a hybrid Mamba+Attention model to ONNX."""
     print(f"Exporting hybrid model to ONNX format: {output_dir}")
 
-    # Move to CPU before tracing to avoid float16 CUBLAS failures on some GPU/CUDA
-    # configurations (CUBLAS_STATUS_INVALID_VALUE). The ONNX graph is device-agnostic
-    # and all plugin stubs (mamba, attention, gather_nd) work correctly on CPU.
-    original_device = next(model.parameters()).device
-    if original_device.type != "cpu":
-        print(
-            f"Moving model to CPU for ONNX tracing (was on {original_device})")
-        model.cpu()
-
     dummy_inputs = create_hybrid_dummy_inputs(model)
     model.eval()
 
@@ -1018,7 +1009,7 @@ def export_llm_model(model_dir: str,
                 f"This model type does not have a compatible chat template that can be "
                 f"automatically extracted from its tokenizer, and no template is available.\n"
                 f"Please provide a chat template JSON file using: --chat_template /path/to/template.json\n"
-                f"See docs/source/developer_guide/06_Chat_Template_Format.md for the required format."
+                f"See docs/source/user_guide/format/chat-template-format.md for the required format."
             )
     else:
         template_source = None

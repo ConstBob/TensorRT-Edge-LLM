@@ -4,8 +4,6 @@
 # CuTe DSL FMHA: compile kernelSrcs/fmha_cutedsl_blackwell/fmha.py during build
 # to generate fmha.h / fmha.o for the current GPU architecture.
 #
-# Requires: python3, pip3 (packages installed into system Python)
-#
 # Usage: include(cmake/CuteDslFMHA.cmake) then call cute_dsl_fmha_setup(TARGETS
 # target1 target2 ... PLUGIN_TARGET plugin_target)
 
@@ -22,6 +20,8 @@
 function(cute_dsl_fmha_setup)
   cmake_parse_arguments(ARG "" "PLUGIN_TARGET" "TARGETS" ${ARGN})
 
+  # Prefer an activated virtual environment ($VIRTUAL_ENV or $CONDA_PREFIX).
+  set(Python3_FIND_VIRTUALENV FIRST)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
   # ---------- dependency management -----------------------------------------
@@ -147,9 +147,9 @@ endfunction()
 # ---------------------------------------------------------------------------
 # _cute_dsl_fmha_ensure_dependencies  (internal)
 #
-# Ensures the pinned versions of cupy and nvidia-cutlass-dsl are installed in
-# the system Python (using --break-system-packages for PEP 668 compatibility),
-# then propagates CUTE_DSL_PYTHON and CUTLASS_DSL_LIB_DIR to parent scope.
+# Ensures the pinned versions of cupy and nvidia-cutlass-dsl are installed,
+# respecting an activated virtual environment if present, then propagates
+# CUTE_DSL_PYTHON and CUTLASS_DSL_LIB_DIR to parent scope.
 # ---------------------------------------------------------------------------
 function(_cute_dsl_fmha_ensure_dependencies)
   set(CUTLASS_DSL_REQUIRED_VERSION "4.4.1")
@@ -234,6 +234,14 @@ function(_cute_dsl_fmha_ensure_dependencies)
       STATUS
         "Installing nvidia-cutlass-dsl==${CUTLASS_DSL_REQUIRED_VERSION} and ${_cupy_package} ..."
     )
+    # Warn if installing into the system Python (no active venv).
+    if(NOT DEFINED ENV{VIRTUAL_ENV} AND NOT DEFINED ENV{CONDA_PREFIX})
+      message(
+        WARNING
+          "No active virtual environment detected ($VIRTUAL_ENV / $CONDA_PREFIX). "
+          "Installing CuTe DSL dependencies into the system Python. "
+          "Consider activating a venv to avoid polluting the system Python.")
+    endif()
     execute_process(
       COMMAND
         ${_python} -m pip install --break-system-packages

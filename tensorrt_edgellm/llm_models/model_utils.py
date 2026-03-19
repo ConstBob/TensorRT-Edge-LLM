@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -244,7 +244,6 @@ def _is_alpamayo_1_model(model_dir: str) -> bool:
 # Models that require explicit chat template because auto-extraction fails
 INCOMPATIBLE_CHAT_TEMPLATE_MODELS = [
     "phi4mm",  # Phi-4-multimodal: tokenizer lacks proper chat template
-    "nemotron_h",  # NemotronH: tokenizer lacks proper chat template
     "Qwen3-TTS",  # Qwen3-TTS: Special model that does not come with chat template
 ]
 

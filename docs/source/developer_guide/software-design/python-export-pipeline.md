@@ -181,7 +181,7 @@ The `tensorrt-edgellm` package provides seven specialized command-line tools for
 
 The export pipeline supports multiple quantization methods optimized for different hardware platforms and performance requirements.
 
-For complete details on quantization methods, precision requirements, platform compatibility, and memory reduction, see the **[Precision Support](../getting-started/supported-models.md#precision-support)** section in the Supported Models guide.
+For complete details on quantization methods, precision requirements, platform compatibility, and memory reduction, see the **[Precision Support](../../user_guide/getting_started/supported-models.md#precision-support)** section in the Supported Models guide.
 
 **Note**: INT4 GPTQ models can be loaded directly from HuggingFace Hub or quantized using [GPTQModel](https://github.com/ModelCloud/GPTQModel). No additional quantization step with `tensorrt-edgellm-quantize-llm` is required for pre-quantized GPTQ checkpoints.
 
