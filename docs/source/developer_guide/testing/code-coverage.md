@@ -193,7 +193,7 @@ sonar-scanner
 
 ## CI Integration Example
 
-Below is a minimal GitLab CI job that produces coverage for SonarQube:
+Below is a minimal CI job that produces coverage for SonarQube:
 
 ```yaml
 coverage:

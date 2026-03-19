@@ -6,21 +6,45 @@
 TensorRT Edge-LLM Documentation
 ================================
 
-Welcome to the TensorRT Edge-LLM documentation. This library provides optimized inference capabilities 
+Welcome to the TensorRT Edge-LLM documentation. This library provides optimized inference capabilities
 for large language models and vision-language models on edge devices.
 
 .. toctree::
    :maxdepth: 2
    :caption: Getting Started
 
-   developer_guide/getting-started/overview.md
-   developer_guide/getting-started/supported-models.md
-   developer_guide/getting-started/installation.md
-   developer_guide/getting-started/quick-start-guide.md
-   developer_guide/getting-started/examples.md
-   developer_guide/getting-started/input-format.md
-   developer_guide/getting-started/chat-template-format.md
-   developer_guide/getting-started/code-coverage.md
+   overview.md
+   user_guide/getting_started/supported-models.md
+   user_guide/getting_started/installation.md
+   user_guide/getting_started/quick-start-guide.md
+   user_guide/getting_started/limitations.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Examples
+
+   user_guide/examples/vlm.md
+   user_guide/examples/speculative-decoding.md
+   user_guide/examples/phi4.md
+   user_guide/examples/asr.md
+   user_guide/examples/moe.md
+   user_guide/examples/tts.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Features
+
+   user_guide/features/lora.md
+   user_guide/features/reduce-vocab.md
+   user_guide/features/FP8KV.md
+   user_guide/features/system-prompt-cache.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Input & Chat Format
+
+   user_guide/format/input-format.md
+   user_guide/format/chat-template-format.md
 
 .. toctree::
    :maxdepth: 2
@@ -34,19 +58,16 @@ for large language models and vision-language models on edge devices.
 
 .. toctree::
    :maxdepth: 2
-   :caption: Advanced Features
-
-   developer_guide/features/lora.md
-   developer_guide/features/reduce-vocab.md
-   developer_guide/features/FP8KV.md
-   developer_guide/features/system-prompt-cache.md
-
-.. toctree::
-   :maxdepth: 2
    :caption: Customization
 
    developer_guide/customization/customization-guide.md
    developer_guide/customization/tensorrt-plugins.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Testing
+
+   developer_guide/testing/code-coverage.md
 
 .. toctree::
    :maxdepth: 2
@@ -55,9 +76,13 @@ for large language models and vision-language models on edge devices.
    python_api
    cpp_api
 
-----
+.. toctree::
+   :maxdepth: 2
+   :caption: Quick Links
 
-**Need help?** Visit our `GitHub repository <https://github.com/NVIDIA/TensorRT-Edge-LLM>`_ for issues and discussions.
+   Releases <https://github.com/NVIDIA/TensorRT-Edge-LLM/releases>
+   GitHub <https://github.com/NVIDIA/TensorRT-Edge-LLM>
+   Roadmap <https://github.com/NVIDIA/TensorRT-Edge-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3ARoadmap>
 
 Indices and tables
 ==================

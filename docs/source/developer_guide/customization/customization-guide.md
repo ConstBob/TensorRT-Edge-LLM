@@ -73,7 +73,7 @@ graph TB
 | **C++ Runtime** | Sampling Parameters | **Configuration:** Temperature, top-k, top-p values in input JSON. **Inherit/Adapt:** Extend `sampling.cu` for custom algorithms |
 | **C++ Runtime** | Multimodal Runner | **Inherit/Adapt:** `MultimodalRunner` base class for new multimodal encoders |
 | **C++ Runtime** | Runtime Behavior | **Configuration:** EAGLE parameters, warmup iterations, CUDA graphs, system prompt caching, profiling |
-| **Application** | Custom Applications | Use examples as templates (see [Examples](05_Examples.md)) |
+| **Application** | Custom Applications | Use the example applications as templates |
 
 ### Customization Methods Summary
 
@@ -118,7 +118,7 @@ TensorRT Edge-LLM supports **drop-in replacement** of model weights. Any fine-tu
 
 **Compatible Fine-Tuning Methods:**
 - Full fine-tuning
-- [LoRA (Low-Rank Adaptation)](features/advanced-runtime-features.md#lora-low-rank-adaptation-support)
+- [LoRA (Low-Rank Adaptation)](../../user_guide/features/lora.md)
 - PEFT adapters (merged)
 - GPTQ pre-quantized models
 

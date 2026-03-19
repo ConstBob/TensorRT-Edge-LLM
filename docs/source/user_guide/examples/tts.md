@@ -1,4 +1,4 @@
-# Qwen3-TTS Quick Start Guide
+# TTS (Text-to-Speech)
 
 This guide covers the full pipeline for running Qwen3-TTS: export on x86 host, engine build on device, and inference.
 
@@ -6,13 +6,15 @@ This guide covers the full pipeline for running Qwen3-TTS: export on x86 host, e
 
 > **Note:** Unlike Qwen3-Omni, Qwen3-TTS has no Thinker or visual encoder. The text embedding is self-contained in the Talker and exported as `text_embedding.safetensors`.
 
+> **Prerequisites:** Complete the [Installation Guide](../getting_started/installation.md) before proceeding.
+
 ---
 
 ## Part 0: Install TTS Dependency (x86 Host)
 
 The export pipeline loads the Qwen3-TTS model via the `qwen-tts` package. Install it before exporting:
 
-> **⚠️ Warning:** Installing `qwen-tts` may break package versions in your current environment (e.g. `transformers`, `torch`). **Use a dedicated virtual environment for Qwen3-TTS export only** — do not share it with other model workflows. We need this special workflow until Qwen3-TTS get merged to HuggingFace transformers.
+> **Warning:** Installing `qwen-tts` may break package versions in your current environment (e.g. `transformers`, `torch`). **Use a dedicated virtual environment for Qwen3-TTS export only** — do not share it with other model workflows. We need this special workflow until Qwen3-TTS gets merged into HuggingFace transformers.
 
 ```bash
 cd TensorRT-Edge-LLM
@@ -33,8 +35,8 @@ Qwen3-TTS has three components. Export them separately.
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export TTS_MODEL=Qwen3-TTS-12Hz-1.7B-CustomVoice
-export ONNX_OUTPUT_DIR=Qwen3-TTS-1.7B-CustomVoice-ONNX
-export TTS_CHAT_TEMPLATE=$TENSORRT_EDGE_LLM/tensorrt_edgellm/chat_templates/templates/qwne3tts.json
+export ONNX_OUTPUT_DIR=$WORKSPACE_DIR/$TTS_MODEL/onnx
+export TTS_CHAT_TEMPLATE=./tensorrt_edgellm/chat_templates/templates/qwen3tts.json
 
 # Exports talker/ and code_predictor/ subdirectories
 tensorrt-edgellm-export-llm \
@@ -57,7 +59,7 @@ tensorrt-edgellm-export-audio \
 ### Expected Export Output
 
 ```
-$TTS_MODEL/onnx/
+$ONNX_OUTPUT_DIR/
 ├── llm/
 │   ├── talker/
 │   │   ├── model.onnx + onnx_model.data   # Talker ONNX
@@ -72,6 +74,7 @@ $TTS_MODEL/onnx/
 │   │   ├── lm_heads.safetensors           # 15 lm_heads
 │   │   └── small_to_mtp_projection.safetensors  # if not Identity
 │   ├── tokenizer_config.json              # at top level (no thinker/)
+│   ├── processed_chat_template.json       # chat template for runtime
 │   └── tokenizer files                    # tokenizer vocab/merges copied from model
 └── audio/
     ├── tokenizer_decoder/
@@ -85,7 +88,7 @@ $TTS_MODEL/onnx/
 ### Transfer to Device
 
 ```bash
-scp -r $WORKSPACE_DIR/$TTS_MODEL/onnx <user>@<device>:~/tensorrt-edgellm-workspace/$TTS_MODEL/
+scp -r $ONNX_OUTPUT_DIR <user>@<device>:~/tensorrt-edgellm-workspace/$TTS_MODEL/
 ```
 
 ---
@@ -105,13 +108,17 @@ export ENG=$WORKSPACE_DIR/$TTS_MODEL/engines
 ./build/examples/llm/llm_build \
     --onnxDir $ONNX/llm/talker \
     --engineDir $ENG/talker \
-    --maxBatchSize 1 \
+    --maxInputLen 4096 \
+    --maxKVCacheCapacity 4096 \
+    --maxBatchSize 1
 
 # 2. Build CodePredictor LLM engine
 ./build/examples/llm/llm_build \
     --onnxDir $ONNX/llm/code_predictor \
     --engineDir $ENG/code_predictor \
-    --maxBatchSize 1 \
+    --maxInputLen 4096 \
+    --maxKVCacheCapacity 4096 \
+    --maxBatchSize 1
 
 # 3. Build Code2Wav engine
 ./build/examples/multimodal/audio_build \
@@ -119,14 +126,16 @@ export ENG=$WORKSPACE_DIR/$TTS_MODEL/engines
     --engineDir $ENG/code2wav
 ```
 
-Build time: ~5–10 minutes total.
+> **Note:** `--maxBatchSize` must be set to **1**. The Qwen3-TTS ONNX export uses a fixed batch size of 1; larger values are not supported.
 
-### Copy Tokenizer Files to Engine Folder
+Build time: < 5 minutes
 
-The runtime loads the tokenizer from the engine directory. Copy the JSON files from the ONNX export output:
+### Copy Tokenizer and Chat Template Files to Engine Folder
+
+The runtime loads the tokenizer and chat template from the engine directory. Copy the required files from the ONNX export output:
 
 ```bash
-cp $ONNX/llm/*.json $ENG/
+cp $ONNX/llm/*.json $ENG/   # includes tokenizer_config.json, processed_chat_template.json, etc.
 ```
 
 ---
@@ -164,7 +173,7 @@ Each request specifies a `messages` array and an optional per-request `speaker`.
 | `talker_temperature` | 0.9 | Sampling temperature |
 | `talker_top_k` | 50 | Top-K sampling |
 | `talker_top_p` | 1.0 | Top-P sampling |
-| `repetition_penalty` | 1.05 | Penalise repeated codec tokens |
+| `repetition_penalty` | 1.05 | Penalize repeated codec tokens |
 | `max_audio_length` | 4096 | Max codec frames per request |
 | `speaker` | config default | Top-level speaker fallback |
 
@@ -207,4 +216,4 @@ Generated `.wav` files are named `audio_req{N}.wav` (one per request). The outpu
 ## Notes
 
 - `--code2wavEngineDir` is optional: auto-detected as `parent(talkerEngineDir)/code2wav` if not set.
-- RVQ code files (`.safetensors`) are saved alongside audio when `--outputAudioDir` is set and can be used to re-synthesise audio without re-running the TTS model.
+- RVQ code files (`.safetensors`) are saved alongside audio when `--outputAudioDir` is set and can be used to re-synthesize audio without re-running the TTS model.

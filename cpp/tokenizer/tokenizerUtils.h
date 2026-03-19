@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -172,7 +172,9 @@ struct codepointFlags
 //! the PreTrainedTokenizer / LLaMA-style split pattern.
 static std::map<std::string, int> const kUatEnum = {
     // Top-level categories
-    {"\\p{N}", codepointFlags::NUMBER}, {"\\p{L}", codepointFlags::LETTER}, {"\\p{P}", codepointFlags::PUNCTUATION},
+    {"\\p{N}", codepointFlags::NUMBER},
+    {"\\p{L}", codepointFlags::LETTER},
+    {"\\p{P}", codepointFlags::PUNCTUATION},
     {"\\p{M}", codepointFlags::ACCENT_MARK},
     // Letter subcategories — all collapsed to LETTER for ASCII approximation
     {"\\p{Lu}", codepointFlags::LETTER}, //!< Uppercase Letter
@@ -192,7 +194,9 @@ static std::map<std::string, int> const kUatEnum = {
 
 //! @brief Map from category flags to collapsed proxy codepoints (single bytes used in collapsed text)
 static std::map<int, int> const kUcatCpt = {
-    {codepointFlags::NUMBER, 0xD1}, {codepointFlags::LETTER, 0xD2}, {codepointFlags::PUNCTUATION, 0xD3},
+    {codepointFlags::NUMBER, 0xD1},
+    {codepointFlags::LETTER, 0xD2},
+    {codepointFlags::PUNCTUATION, 0xD3},
     {codepointFlags::ACCENT_MARK, 0x0B}, //!< Vertical-tab as mark proxy (matches unicodeCollapseText)
 };
 
