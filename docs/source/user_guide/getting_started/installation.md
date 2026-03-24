@@ -231,17 +231,9 @@ cmake .. \
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
 | `ENABLE_CUTE_DSL_FMHA` | Enable CuTe DSL FMHA kernels (SM100/SM110 only, see below) | OFF |
 
-**Building with CuTe DSL FMHA (Optional and experimental, Blackwell/Thor only)**
+**Building with CuTe DSL FMHA (Optional, Blackwell/Thor only)**
 
-CuTe DSL FMHA provides optimized attention kernels for Blackwell/Thor GPUs (SM100/SM110). When enabled, CMake automatically installs `nvidia-cutlass-dsl==4.4.1` and the matching `cupy` package into the active Python environment.
-
-> **Warning:** Installing these dependencies directly into the system Python may corrupt your environment due to version conflicts with existing packages. It is strongly recommended to use a virtual environment.
-
-Create and activate a venv first, then add `-DENABLE_CUTE_DSL_FMHA=ON` to the cmake command:
-
-```bash
-python3 -m venv edgellm-build-venv && source edgellm-build-venv/bin/activate
-```
+Follow `kernelSrcs/fmha_cutedsl_blackwell/README.md` to generate the prebuilt kernel library, then add `-DENABLE_CUTE_DSL_FMHA=ON` to the CMake command.
 
 > **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
 
