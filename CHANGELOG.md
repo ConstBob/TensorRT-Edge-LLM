@@ -2,6 +2,7 @@
 
 ## 0.6.1
 - Added DriveOS 7.2.4 official support
+- Fixed EAGLE draft model weights loading issue to retrieve acceptance rate
 
 ## 0.6.0
 - Added Nemotron-Nano-9B-v2 support via mamba_ssm and causal_conv1d
