@@ -1,11 +1,10 @@
 # Installation
 
-> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release
 
 TensorRT Edge-LLM has two separate components that need to be installed on different systems:
 
 1. **Python Export Pipeline** (runs on x86 host with GPU)
-2. **C++ Runtime** (builds and runs on Edge devices)
+2. **C++ Runtime** (Jetson Thor, NVIDIA DRIVE / DriveOS, or optional x86 developer build)
 
 ---
 
@@ -143,7 +142,7 @@ huggingface-cli login
 
 ## Part 2: C++ Runtime (Edge Device)
 
-The C++ runtime builds and executes models on the target Edge device. This must be built on or for the target platform.
+The C++ runtime builds and executes models on the target. **Jetson Thor:** follow the steps below on the device and use `EMBEDDED_TARGET=jetson-thor`. **NVIDIA DRIVE / DriveOS:** run the same flow inside the DriveOS SDK Docker image with **`EMBEDDED_TARGET=auto-thor`**, then copy **`build/`** to the DRIVE system. **x86:** optional local build using the **Alternative** `cmake` block (no toolchain).
 
 ### System Requirements
 
@@ -203,6 +202,8 @@ cmake .. \
     -DEMBEDDED_TARGET=jetson-thor
 ```
 
+**NVIDIA DRIVE / DriveOS:** The `cmake` line is the same except **`EMBEDDED_TARGET=auto-thor`**.
+
 **Alternative: Building on x86 GPU Systems (Optional for Developers)**
 
 If you want to build and test on an x86 workstation with NVIDIA GPU (for development purposes before deploying to Edge devices), you can use this configuration instead:
@@ -225,7 +226,7 @@ cmake .. \
 |:-------|:------------|:--------|
 | `TRT_PACKAGE_DIR` | Path to TensorRT installation | Required |
 | `CMAKE_TOOLCHAIN_FILE` | **Required for Edge devices**: Use `cmake/aarch64_linux_toolchain.cmake` for Edge device builds. **Not needed for GPU builds** | N/A |
-| `EMBEDDED_TARGET` | **Required for Edge devices**: Target platform (`jetson-thor`). **Not needed for GPU builds** | N/A |
+| `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson) or `auto-thor` (DRIVE / DriveOS). **Not needed for GPU builds** | N/A |
 | `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
@@ -233,7 +234,7 @@ cmake .. \
 
 **Building with CuTe DSL FMHA (Optional, Blackwell/Thor only)**
 
-Follow `kernelSrcs/fmha_cutedsl_blackwell/README.md` to generate the prebuilt kernel library, then add `-DENABLE_CUTE_DSL_FMHA=ON` to the CMake command.
+If **`cuteDSLArtifact/<arch>/`** already contains the static library and headers (`aarch64` for embedded builds, `x86_64` for native x86), add **`-DENABLE_CUTE_DSL_FMHA=ON`** to CMake. Otherwise run **`build_static_lib.py`** as described in **`kernelSrcs/fmha_cutedsl_blackwell/README.md`**, then enable the same option.
 
 > **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
 
