@@ -578,6 +578,8 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize + 1}, DataType::kINT32);
     // KVCache ends that denote the end index of each KVCache lane after adding current contents.
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize}, DataType::kINT32);
+    // Padded cumulative KV sequence lengths for CuTe DSL FMHA.
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize + 1}, DataType::kINT32);
     // KV Tensor to store concated KV that include pre-cached KV and current KV.
     workspaceSize = accumulateWorkspaceSize(
         workspaceSize, rt::Coords{maxBatchSize, 2, mNumKVHeads, maxKVCacheCapacity, mHeadSize}, DataType::kHALF);
@@ -716,8 +718,11 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         rt::Tensor kvCacheEndIdxsTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
 
+        // Padded cu_kv_seqlens for CuTe DSL FMHA bottom_right_align (see utilKernels.h for details).
+        rt::Tensor paddedCuKVSeqLensTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
         kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
-            cuKVSeqLensTensor, kvCacheEndIdxsTensor, runtimeSeqLen, stream);
+            cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
 
 #ifdef CUTE_DSL_FMHA_ENABLED
         // Enable CuteDSL FMHA for single batch prefill usecase when FP8 KVCache is disabled.
@@ -732,10 +737,10 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             // Expected layouts: Q [b, s_q, h_q, d], KV [b, 2, hkv, cap, d], O [b, s_q, h_q, d]
             CuteDslFMHARunner runner(
                 mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
-            runner.run(qInputTensor.dataPointer<half>(),   // qPtr [b, s_q, h_q, d]
-                kvCacheTensor.dataPointer<half>(),         // kvPtr [b, 2, h_k, cap, d]
-                attentionOutputTensor.dataPointer<half>(), // oPtr [b, s_q, h_q, d]
-                cuKVSeqLensTensor.dataPointer<int32_t>(),  // cu_kv_seqlens [b+1]
+            runner.run(qInputTensor.dataPointer<half>(),        // qPtr [b, s_q, h_q, d]
+                kvCacheTensor.dataPointer<half>(),              // kvPtr [b, 2, h_k, cap, d]
+                attentionOutputTensor.dataPointer<half>(),      // oPtr [b, s_q, h_q, d]
+                paddedCuKVSeqLensTensor.dataPointer<int32_t>(), // padded cu_kv_seqlens [b+1]
                 stream, mSlidingWindowSize > 0 ? mSlidingWindowSize : INT_MAX);
         }
         else

@@ -2754,7 +2754,8 @@ def run(
     if cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this example!")
 
-    cp.random.seed(1111)
+    if not export_only:
+        cp.random.seed(1111)
     np.random.seed(1111)
 
     if isinstance(s_q, tuple) or isinstance(s_k, tuple):
@@ -2765,9 +2766,11 @@ def run(
     def create_and_pad_tensor(shape, padding, dtype, is_dynamic_layout=True):
         shape_ = tuple(map(lambda x, y: x + y, shape, padding))
 
-        # Create random f32 data on GPU
-        min_val = -2 if dtype.is_float or dtype.signed else 0
-        f32_gpu_full = cp.random.randint(min_val, 2, shape_).astype(cp.float32)
+        if export_only:
+            f32_gpu_full = cp.zeros(shape_, dtype=cp.float32)
+        else:
+            min_val = -2 if dtype.is_float or dtype.signed else 0
+            f32_gpu_full = cp.random.randint(min_val, 2, shape_).astype(cp.float32)
 
         # Create dtype GPU buffer and initialize
         cp_dtype = _cutlass_to_cupy_dtype(dtype)
@@ -3774,9 +3777,6 @@ if __name__ == "__main__":
 
     if cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this example!")
-
-    cp.random.seed(1111)
-    np.random.seed(1111)
 
     if len(args.q_shape) != 4:
         parser.error("--q_shape must contain exactly 4 values")
