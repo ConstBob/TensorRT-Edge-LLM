@@ -101,6 +101,20 @@ public:
     //! @brief Destructor
     ~LLMEngineRunner() noexcept;
 
+    /*!
+     * @brief Get the required context memory size for this engine
+     * @return Required context memory size in bytes
+     */
+    int64_t getRequiredContextMemorySize() const;
+
+    /*!
+     * @brief Set shared context memory for the execution context
+     * @param sharedContextMemory Tensor containing the shared device memory (must be on GPU)
+     * @return True on success, false if the tensor is too small
+     * @note The tensor size must be >= getRequiredContextMemorySize(). Must be called before execution.
+     */
+    bool setContextMemory(rt::Tensor& sharedContextMemory);
+
     //! API entry to get the Rope CosSinCache tensor.
     //! The API is useful when the rope cos/sin cache depends on the context which cannot be initialized
     //! in advance when creating the LLMEngineRunner instance.
@@ -235,7 +249,6 @@ public:
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
-    rt::Tensor mExecContextMemory{};                                   //!< Device memory for the execution contexts
     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
 
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value

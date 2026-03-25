@@ -182,7 +182,8 @@ private:
     LLMEngineRunnerConfig mBaseEngineConfig;         //!< Base engine configuration
     EagleDraftEngineRunnerConfig mDraftEngineConfig; //!< Draft engine configuration
 
-    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;           //!< Base model engine runner
+    rt::Tensor mSharedExecContextMemory{};              //!< Shared device memory for base and draft execution contexts
+    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner; //!< Base model engine runner
     std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;   //!< Draft model engine runner
     std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner (optional)
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;             //!< Tokenizer

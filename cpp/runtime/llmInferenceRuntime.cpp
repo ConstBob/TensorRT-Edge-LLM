@@ -291,6 +291,31 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
             throw std::runtime_error("No valid multimodal engine found in " + multimodalEngineDir);
         }
     }
+
+    // Setup shared execution context memory for LLM and multimodal engines.
+    // All engines execute serially (not concurrently), so they can share a single buffer
+    // sized to the maximum requirement among all engines.
+    int64_t const llmContextMemorySize = mLLMEngineRunner->getRequiredContextMemorySize();
+    int64_t const visionContextMemorySize = mVisionRunner ? mVisionRunner->getRequiredContextMemorySize() : 0;
+    int64_t const audioContextMemorySize = mAudioRunner ? mAudioRunner->getRequiredContextMemorySize() : 0;
+    int64_t const sharedContextMemorySize
+        = std::max({llmContextMemorySize, visionContextMemorySize, audioContextMemorySize});
+    mSharedExecContextMemory = rt::Tensor({sharedContextMemorySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "LLMInferenceRuntime::mSharedExecContextMemory");
+    mLLMEngineRunner->setContextMemory(mSharedExecContextMemory);
+    if (mVisionRunner)
+    {
+        mVisionRunner->setContextMemory(mSharedExecContextMemory);
+    }
+    if (mAudioRunner)
+    {
+        mAudioRunner->setContextMemory(mSharedExecContextMemory);
+    }
+    LOG_INFO(
+        "Setup shared execution context memory: %zu bytes (llm requires: %zu, vision requires: %zu, audio "
+        "requires: %zu)",
+        static_cast<size_t>(sharedContextMemorySize), static_cast<size_t>(llmContextMemorySize),
+        static_cast<size_t>(visionContextMemorySize), static_cast<size_t>(audioContextMemorySize));
 }
 
 bool LLMInferenceRuntime::examineRequest(LLMGenerationRequest const& request) noexcept
