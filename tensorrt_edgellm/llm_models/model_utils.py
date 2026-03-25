@@ -104,6 +104,45 @@ def is_gptq_model(model: PreTrainedModel) -> bool:
     return quant_config and quant_config.get("quant_method") == "gptq"
 
 
+def _is_gptq_quantized_module(module: nn.Module) -> bool:
+    """Heuristically detect GPTQ quantized modules that must not be recast."""
+    module_path = module.__class__.__module__
+    class_name = module.__class__.__name__.lower()
+    if module_path.startswith("gptqmodel."):
+        return True
+    if "quantlinear" in class_name:
+        return True
+    return hasattr(module, "qweight") and (hasattr(module, "qzeros")
+                                           or hasattr(module, "scales"))
+
+
+def _cast_non_gptq_float_tensors_to_dtype(
+        model: nn.Module, target_dtype: torch.dtype) -> Tuple[int, int, int]:
+    """
+    Cast floating tensors to target_dtype while preserving GPTQ quantized modules.
+
+    Returns:
+        Tuple of (casted_param_count, casted_buffer_count, skipped_quantized_module_count).
+    """
+    casted_params = 0
+    casted_buffers = 0
+    skipped_quantized_modules = 0
+    with torch.no_grad():
+        for module in model.modules():
+            if _is_gptq_quantized_module(module):
+                skipped_quantized_modules += 1
+                continue
+            for _, param in module.named_parameters(recurse=False):
+                if param.is_floating_point() and param.dtype != target_dtype:
+                    param.data = param.data.to(dtype=target_dtype)
+                    casted_params += 1
+            for buffer_name, buffer in module.named_buffers(recurse=False):
+                if buffer.is_floating_point() and buffer.dtype != target_dtype:
+                    setattr(module, buffer_name, buffer.to(dtype=target_dtype))
+                    casted_buffers += 1
+    return casted_params, casted_buffers, skipped_quantized_modules
+
+
 def _is_gptq_moe_model(model_dir: str) -> bool:
     """Check if a model directory contains a GPTQ MoE model (before loading)."""
     try:
@@ -476,6 +515,12 @@ def load_hf_model(
                     f"Could not load model from {model_dir}. Error: {e}")
     if not is_gptq_model(model):
         model.to(torch_dtype)
+    else:
+        casted_params, casted_buffers, skipped_quantized_modules = _cast_non_gptq_float_tensors_to_dtype(
+            model, torch_dtype)
+        print(
+            f"GPTQ load dtype normalization: cast {casted_params} params and {casted_buffers} buffers to {torch_dtype}; "
+            f"skipped {skipped_quantized_modules} GPTQ quantized modules.")
 
     # Set tokenizer padding token if needed
     if tokenizer.pad_token != "<unk>":
@@ -770,6 +815,10 @@ def prepare_language_model_and_config(hf_model: nn.Module):
     # Use language_model if available, otherwise use model.model.
     if hasattr(hf_model, 'language_model'):
         language_model = hf_model.language_model
+        config = hf_model.config.text_config
+    elif hasattr(hf_model, 'model') and hasattr(hf_model.model,
+                                                'language_model'):
+        language_model = hf_model.model.language_model
         config = hf_model.config.text_config
     elif getattr(hf_model.config, 'model_type', '') == 'qwen3_omni_thinker':
         language_model = hf_model.model

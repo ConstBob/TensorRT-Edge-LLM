@@ -18,6 +18,89 @@ from typing import Any, Dict
 from ..version import __version__
 
 
+def _select_rope_parameters(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Select effective RoPE parameters from config in transformers-compatible order."""
+    rope_parameters = config_dict.get("rope_parameters")
+    if rope_parameters is None:
+        rope_parameters = config_dict.get("rope_scaling")
+
+    if not isinstance(rope_parameters, dict):
+        return {}
+
+    # Per-layer rope configuration (e.g. Gemma/ModernBERT style nested dict):
+    # choose full_attention first, then first available layer type, then first dict value.
+    layer_types = config_dict.get("layer_types")
+    if layer_types and set(rope_parameters.keys()).issubset(set(layer_types)):
+        if isinstance(rope_parameters.get("full_attention"), dict):
+            return dict(rope_parameters["full_attention"])
+        for layer_type in layer_types:
+            layer_params = rope_parameters.get(layer_type)
+            if isinstance(layer_params, dict):
+                return dict(layer_params)
+        return {}
+
+    if "full_attention" in rope_parameters and isinstance(
+            rope_parameters["full_attention"], dict):
+        return dict(rope_parameters["full_attention"])
+
+    return dict(rope_parameters)
+
+
+def _normalize_rope_scaling(rope_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize rope type aliases for runtime compatibility."""
+    rope_scaling = dict(rope_params)
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+    if rope_type is not None:
+        rope_scaling.setdefault("rope_type", rope_type)
+        rope_scaling.setdefault("type", rope_type)
+    return rope_scaling
+
+
+def _export_rope_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Export RoPE fields with compatibility for old/new transformers config formats."""
+    rope_config = {}
+    rope_params = _select_rope_parameters(config_dict)
+
+    # Rope theta can live in top-level or rope parameter dicts.
+    if "rope_theta" in config_dict:
+        rope_config["rope_theta"] = config_dict["rope_theta"]
+    elif "rope_theta" in rope_params:
+        rope_config["rope_theta"] = rope_params["rope_theta"]
+    else:
+        raise KeyError("Required field 'rope_theta' not found in config")
+
+    if rope_params:
+        rope_config["rope_scaling"] = _normalize_rope_scaling(rope_params)
+    else:
+        rope_config["rope_scaling"] = None
+
+    # Handle LongRoPE original max position field in both old/new layouts.
+    if rope_config["rope_scaling"] is not None:
+        rope_scaling = rope_config["rope_scaling"]
+        rope_type = rope_scaling.get("rope_type")
+        if rope_type == "longrope":
+            original_max = rope_scaling.get(
+                "original_max_position_embeddings",
+                config_dict.get("original_max_position_embeddings"))
+            if original_max is None:
+                raise KeyError(
+                    "Required field 'original_max_position_embeddings' not found in config"
+                )
+            rope_config["original_max_position_embeddings"] = original_max
+
+    # Handle partial_rotary_factor in top-level and rope params.
+    if "partial_rotary_factor" in config_dict:
+        rope_config["partial_rotary_factor"] = config_dict[
+            "partial_rotary_factor"]
+    elif "partial_rotary_factor" in rope_params:
+        rope_config["partial_rotary_factor"] = rope_params[
+            "partial_rotary_factor"]
+    else:
+        rope_config["partial_rotary_factor"] = 1.0
+
+    return rope_config
+
+
 def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
     Export LLM configuration with required fields.
@@ -31,7 +114,7 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     required_fields = [
         "vocab_size", "max_position_embeddings", "hidden_size",
         "intermediate_size", "num_hidden_layers", "num_attention_heads",
-        "num_key_value_heads", "rope_theta", "rope_scaling"
+        "num_key_value_heads"
     ]
 
     llm_config = {}
@@ -40,15 +123,8 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
             raise KeyError(f"Required field '{field}' not found in config")
         llm_config[field] = config_dict[field]
 
-    # Handle LongRoPE (rope_scaling already validated in required_fields)
-    rope_scaling = config_dict["rope_scaling"]
-    if rope_scaling and rope_scaling.get("type", None) == "longrope":
-        if "original_max_position_embeddings" not in config_dict:
-            raise KeyError(
-                f"Required field 'original_max_position_embeddings' not found in config"
-            )
-        llm_config["original_max_position_embeddings"] = config_dict[
-            "original_max_position_embeddings"]
+    # Export rope configuration
+    llm_config.update(_export_rope_config(config_dict))
 
     # Handle head_dim
     if "head_dim" in config_dict:
@@ -59,12 +135,6 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         )
         llm_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
-
-    if "partial_rotary_factor" in config_dict:
-        llm_config["partial_rotary_factor"] = config_dict[
-            "partial_rotary_factor"]
-    else:
-        llm_config["partial_rotary_factor"] = 1.0
 
     # Gemma3n LAuReL config
     if "laurel_rank" in config_dict:
@@ -85,31 +155,26 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         "num_attention_heads",
         "num_key_value_heads",
     ]
-    optional_fields_with_defaults = {
-        "rope_theta": 10000.0,
-        "rope_scaling": None,
-    }
-
     llm_config = {}
     for field in required_fields:
         if field not in config_dict:
             raise KeyError(f"Required field '{field}' not found in config")
         llm_config[field] = config_dict[field]
 
-    for field, default in optional_fields_with_defaults.items():
-        llm_config[field] = config_dict.get(field, default)
+    rope_params = _select_rope_parameters(config_dict)
+    has_rope = ("rope_theta" in config_dict) or ("rope_theta" in rope_params)
+    if has_rope:
+        llm_config.update(_export_rope_config(config_dict))
+    else:
+        llm_config["rope_theta"] = 10000.0
+        llm_config["rope_scaling"] = None
+        llm_config["partial_rotary_factor"] = 1.0
 
     if "head_dim" in config_dict:
         llm_config["head_dim"] = config_dict["head_dim"]
     else:
         llm_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
-
-    if "partial_rotary_factor" in config_dict:
-        llm_config["partial_rotary_factor"] = config_dict[
-            "partial_rotary_factor"]
-    else:
-        llm_config["partial_rotary_factor"] = 1.0
 
     layers_block_type = config_dict.get("layers_block_type", [])
     if not layers_block_type:
@@ -136,7 +201,7 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     llm_config["conv_kernel"] = config_dict.get(
         "conv_kernel", config_dict.get("mamba_d_conv", 4))
 
-    llm_config["use_rope"] = "rope_theta" in config_dict
+    llm_config["use_rope"] = has_rope
 
     llm_config["model_type"] = "hybrid_mamba"
     return llm_config
@@ -147,7 +212,7 @@ def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     required_fields = [
         "vocab_size", "max_position_embeddings", "hidden_size",
         "intermediate_size", "num_hidden_layers", "num_attention_heads",
-        "num_key_value_heads", "rope_theta", "rope_scaling"
+        "num_key_value_heads"
     ]
 
     eagle_config = {}
@@ -155,6 +220,8 @@ def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         if field not in config_dict:
             raise KeyError(f"Required field '{field}' not found in config")
         eagle_config[field] = config_dict[field]
+
+    eagle_config.update(_export_rope_config(config_dict))
 
     # Handle head_dim
     if "head_dim" in config_dict:
@@ -165,11 +232,6 @@ def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         )
         eagle_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
-    if "partial_rotary_factor" in config_dict:
-        eagle_config["partial_rotary_factor"] = config_dict[
-            "partial_rotary_factor"]
-    else:
-        eagle_config["partial_rotary_factor"] = 1.0
 
     eagle_config["model_type"] = f"eagle3_base"
     return eagle_config
@@ -179,8 +241,7 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Export EAGLE draft configuration with required fields."""
     required_fields = [
         "hidden_size", "max_position_embeddings", "intermediate_size",
-        "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
-        "rope_theta", "rope_scaling"
+        "num_hidden_layers", "num_attention_heads", "num_key_value_heads"
     ]
 
     draft_config = {}
@@ -188,6 +249,8 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         if field not in config_dict:
             raise KeyError(f"Required field '{field}' not found in config")
         draft_config[field] = config_dict[field]
+
+    draft_config.update(_export_rope_config(config_dict))
 
     # Handle head_dim
     if "head_dim" in config_dict:
@@ -235,6 +298,13 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
         )
     # Add TensorRT Edge-LLM version
     config_dict['edgellm_version'] = __version__
+
+    # Export RoPE configuration from text_config if it exists, otherwise from top-level config
+    if isinstance(config_dict.get("text_config"), dict):
+        config_dict["text_config"].update(
+            _export_rope_config(config_dict["text_config"]))
+    else:
+        config_dict.update(_export_rope_config(config_dict))
 
     # Set top-level model_type for C++ builder/runtime
     # Check if this is Qwen3-Omni vision (has vision_config.model_type = qwen3_omni_vision_encoder)

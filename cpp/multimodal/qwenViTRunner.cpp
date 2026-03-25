@@ -94,10 +94,9 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
     mConfig.videoTokenId = jsonConfig["video_token_id"].get<int32_t>();
 
-    auto const& subConfig
-        = (mModelType == multimodal::ModelType::QWEN2_VL || mModelType == multimodal::ModelType::QWEN2_5_VL)
-        ? jsonConfig
-        : jsonConfig["text_config"];
+    auto const& subConfig = (jsonConfig.contains("text_config") && jsonConfig["text_config"].is_object())
+        ? jsonConfig["text_config"]
+        : jsonConfig;
     mConfig.vocabSize = subConfig["vocab_size"].get<int32_t>();
     mConfig.mropeTheta = subConfig["rope_theta"].get<float>();
 
@@ -148,11 +147,15 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
         return false;
     }
 
-    mConfig.patchSize = preprocessorConfig["patch_size"].get<int64_t>();
-    mConfig.temporalPatchSize = preprocessorConfig["temporal_patch_size"].get<int64_t>();
-    mConfig.mergeSize = preprocessorConfig["merge_size"].get<int64_t>();
-    mConfig.imageMean = preprocessorConfig["image_mean"].get<std::vector<float>>();
-    mConfig.imageStd = preprocessorConfig["image_std"].get<std::vector<float>>();
+    auto const& imageProcessorConfig
+        = (preprocessorConfig.contains("image_processor") && preprocessorConfig["image_processor"].is_object())
+        ? preprocessorConfig["image_processor"]
+        : preprocessorConfig;
+    mConfig.patchSize = imageProcessorConfig["patch_size"].get<int64_t>();
+    mConfig.temporalPatchSize = imageProcessorConfig["temporal_patch_size"].get<int64_t>();
+    mConfig.mergeSize = imageProcessorConfig["merge_size"].get<int64_t>();
+    mConfig.imageMean = imageProcessorConfig["image_mean"].get<std::vector<float>>();
+    mConfig.imageStd = imageProcessorConfig["image_std"].get<std::vector<float>>();
 
     // Get config from engine shapes
     nvinfer1::Dims const inputShapeMax

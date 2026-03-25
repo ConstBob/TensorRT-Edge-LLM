@@ -21,6 +21,7 @@ to ONNX format with optional quantization support.
 
 import json
 import os
+import shutil
 from typing import Optional
 
 import torch
@@ -49,7 +50,7 @@ def _export_qwen_visual(model, model_type: str, model_dir: str,
     """
     Export visual models in the Qwen family (qwen2/qwen2.5/qwen3/qwen3-omni).
     """
-    visual_model = model.visual if model_type != 'qwen3_omni' else model.thinker.visual
+    visual_model = model.model.visual if model_type != 'qwen3_omni' else model.thinker.visual
 
     # Quantize the original visual model first
     if quantization == "fp8":
@@ -191,11 +192,22 @@ def visual_export(model_dir: str,
 
     # Export processor configuration to JSON if exists
     if processor is not None:
-        # Phi4MMProcessor may not define audio_tokenizer, but transformers'
-        # save_pretrained expects the attribute.
-        if not hasattr(processor, "audio_tokenizer"):
-            processor.audio_tokenizer = None
+        # FIXME: If not commented out, the export will fail for internvl
+        # # Phi4MMProcessor may not define audio_tokenizer, but transformers'
+        # # save_pretrained expects the attribute.
+        # if not hasattr(processor, "audio_tokenizer"):
+        #     processor.audio_tokenizer = None
         processor.save_pretrained(output_dir)
+
+        # Transformers v5 may save processor metadata as processor_config.json.
+        # Keep preprocessor_config.json for C++ runtime compatibility.
+        processor_config_path = os.path.join(output_dir,
+                                             "processor_config.json")
+        preprocessor_config_path = os.path.join(output_dir,
+                                                "preprocessor_config.json")
+        if os.path.exists(processor_config_path
+                          ) and not os.path.exists(preprocessor_config_path):
+            shutil.copyfile(processor_config_path, preprocessor_config_path)
 
     print(
         f"Visual export completed for {model_type} with dtype={dtype}, quantization={quantization}, device={device}"
