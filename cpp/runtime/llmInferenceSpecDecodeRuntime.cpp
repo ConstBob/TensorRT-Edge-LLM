@@ -366,6 +366,27 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
             throw std::runtime_error("No valid multimodal engine found in " + multimodalEngineDir);
         }
     }
+
+    // Setup shared execution context memory for all engines (base, draft, and optionally VIT).
+    // All engines execute serially (not concurrently), so they can share a single buffer
+    // sized to the maximum requirement among all engines.
+    int64_t const baseContextMemorySize = mBaseEngineRunner->getRequiredContextMemorySize();
+    int64_t const draftContextMemorySize = mDraftEngineRunner->getRequiredContextMemorySize();
+    int64_t const vitContextMemorySize = mMultimodalRunner ? mMultimodalRunner->getRequiredContextMemorySize() : 0;
+    int64_t const sharedContextMemorySize
+        = std::max({baseContextMemorySize, draftContextMemorySize, vitContextMemorySize});
+    mSharedExecContextMemory = rt::Tensor({sharedContextMemorySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+        "LLMInferenceSpecDecodeRuntime::mSharedExecContextMemory");
+    mBaseEngineRunner->setContextMemory(mSharedExecContextMemory);
+    mDraftEngineRunner->setContextMemory(mSharedExecContextMemory);
+    if (mMultimodalRunner)
+    {
+        mMultimodalRunner->setContextMemory(mSharedExecContextMemory);
+    }
+    LOG_INFO(
+        "Setup shared execution context memory: %zu bytes (base requires: %zu, draft requires: %zu, vit requires: %zu)",
+        static_cast<size_t>(sharedContextMemorySize), static_cast<size_t>(baseContextMemorySize),
+        static_cast<size_t>(draftContextMemorySize), static_cast<size_t>(vitContextMemorySize));
 }
 
 bool LLMInferenceSpecDecodeRuntime::handleRequest(

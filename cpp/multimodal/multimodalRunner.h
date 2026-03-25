@@ -63,6 +63,20 @@ public:
     virtual ~MultimodalRunner() noexcept = default;
 
     /*!
+     * @brief Get the required context memory size for this engine
+     * @return Required context memory size in bytes
+     */
+    int64_t getRequiredContextMemorySize() const;
+
+    /*!
+     * @brief Set shared context memory for the execution context
+     * @param sharedContextMemory Tensor containing the shared device memory (must be on GPU)
+     * @return True on success, false if the tensor is too small
+     * @note The tensor size must be >= getRequiredContextMemorySize(). Must be called before infer().
+     */
+    bool setContextMemory(rt::Tensor& sharedContextMemory);
+
+    /*!
      * @brief Create appropriate multimodal runner instance
      *
      * Factory method that detects model type and creates corresponding runner.

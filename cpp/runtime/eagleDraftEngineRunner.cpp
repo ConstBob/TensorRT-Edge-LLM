@@ -137,18 +137,11 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
-    int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
-    // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
-    mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
-        "EagleDraftEngineRunner::mExecContextMemory");
-
     // Use single executionContext for both prefill and generation.
+    // Context memory is user-managed to enable sharing with other engines.
+    // The caller must provide shared context memory via setContextMemory() before execution.
     mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
-
-    mTRTExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
-    LOG_INFO("Allocated a shared device memory of %zu bytes for the prefill and generation contexts.",
-        execContextMemoryInBytes);
 
     if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
     {
@@ -252,6 +245,24 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+int64_t EagleDraftEngineRunner::getRequiredContextMemorySize() const
+{
+    return mEngine->getDeviceMemorySizeV2();
+}
+
+bool EagleDraftEngineRunner::setContextMemory(rt::Tensor& sharedContextMemory)
+{
+    int64_t const requiredSize = getRequiredContextMemorySize();
+    if (sharedContextMemory.getMemoryCapacity() < requiredSize)
+    {
+        LOG_ERROR("Shared context memory (%zu bytes) is smaller than required (%zu bytes)",
+            static_cast<size_t>(sharedContextMemory.getMemoryCapacity()), static_cast<size_t>(requiredSize));
+        return false;
+    }
+    mTRTExecutionContext->setDeviceMemoryV2(sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity());
+    return true;
 }
 
 EagleDraftEngineRunner::~EagleDraftEngineRunner() noexcept

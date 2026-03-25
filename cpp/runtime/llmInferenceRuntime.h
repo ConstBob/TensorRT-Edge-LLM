@@ -134,6 +134,7 @@ private:
     TokenCountInfo calculateTokenCounts(std::vector<std::vector<int32_t>> const& batchedInputIds,
         std::vector<std::string> const& systemPrompts, std::string const& loraWeightsName) const noexcept;
 
+    rt::Tensor mSharedExecContextMemory{}; //!< Shared device memory for LLM and multimodal execution contexts
     std::unique_ptr<LLMEngineRunner> mLLMEngineRunner{nullptr}; //!< LLM engine runner instance
     std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};    //!< Audio runner instance (optional)
     std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};   //!< Vision runner instance (optional)

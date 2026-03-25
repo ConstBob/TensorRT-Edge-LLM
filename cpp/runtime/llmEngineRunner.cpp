@@ -146,12 +146,9 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
-    int64_t const execContextMemoryInBytes = mEngine->getDeviceMemorySizeV2();
-    // Allocate device memory for the execution contexts. UINT8 is used to represent raw bytes.
-    mExecContextMemory = rt::Tensor({execContextMemoryInBytes}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
-        "LLMEngineRunner::mExecContextMemory");
-
     // Use single executionContext for both prefill and generation.
+    // Context memory is user-managed to enable sharing with other engines.
+    // The caller must provide shared context memory via setContextMemory() before execution.
     mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
 
@@ -159,10 +156,6 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     {
         mTRTExecutionContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
     }
-
-    mTRTExecutionContext->setDeviceMemoryV2(mExecContextMemory.rawPointer(), execContextMemoryInBytes);
-    LOG_INFO(
-        "Allocated a device memory of %zu bytes for the prefill and generation context.", execContextMemoryInBytes);
 
     if (!this->validateConfigFromEngine())
     {
@@ -391,6 +384,24 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     // Synchronize the stream to ensure all the operations have completed.
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+int64_t LLMEngineRunner::getRequiredContextMemorySize() const
+{
+    return mEngine->getDeviceMemorySizeV2();
+}
+
+bool LLMEngineRunner::setContextMemory(rt::Tensor& sharedContextMemory)
+{
+    int64_t const requiredSize = getRequiredContextMemorySize();
+    if (sharedContextMemory.getMemoryCapacity() < requiredSize)
+    {
+        LOG_ERROR("Shared context memory (%zu bytes) is smaller than required (%zu bytes)",
+            static_cast<size_t>(sharedContextMemory.getMemoryCapacity()), static_cast<size_t>(requiredSize));
+        return false;
+    }
+    mTRTExecutionContext->setDeviceMemoryV2(sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity());
+    return true;
 }
 
 nvinfer1::DataType LLMEngineRunner::getKVCacheType() const

@@ -47,13 +47,40 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
-    // Create context and set optimization profile
-    mContext = std::unique_ptr<nvinfer1::IExecutionContext>(mVisualEngine->createExecutionContext());
+    // Create context with user-managed memory (no device memory allocated here).
+    // The context object is needed by subclasses for tensor binding during initialization.
+    // Device memory must be provided via setContextMemory() before infer().
+    mContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+        mVisualEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
     if (!mContext->setOptimizationProfileAsync(0, stream))
     {
-        LOG_ERROR("Failed to set optimization profile to the engine");
-        throw std::runtime_error("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile for visual engine");
     }
+}
+
+int64_t MultimodalRunner::getRequiredContextMemorySize() const
+{
+    return mVisualEngine ? mVisualEngine->getDeviceMemorySizeV2() : 0;
+}
+
+bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
+{
+    // No visual engine (e.g. audio-only runner), nothing to configure.
+    if (!mVisualEngine)
+    {
+        return true;
+    }
+
+    int64_t const requiredSize = getRequiredContextMemorySize();
+    if (sharedContextMemory.getMemoryCapacity() < requiredSize)
+    {
+        LOG_ERROR("Shared context memory (%zu bytes) is smaller than required (%zu bytes)",
+            static_cast<size_t>(sharedContextMemory.getMemoryCapacity()), static_cast<size_t>(requiredSize));
+        return false;
+    }
+
+    mContext->setDeviceMemoryV2(sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity());
+    return true;
 }
 
 std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir,
