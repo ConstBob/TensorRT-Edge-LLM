@@ -454,10 +454,10 @@ def generate_inference_commands(
     return commands
 
 
-def generate_benchmark_commands(
+def generate_e2e_bench_commands(
         config: TestConfig,
         executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
-    """Generate benchmark commands - returns list of (command, timeout) tuples"""
+    """Generate e2e benchmark commands - returns list of (command, timeout) tuples"""
     commands = []
 
     cmd = [executable_files['llm_inference']]
@@ -488,4 +488,31 @@ def generate_benchmark_commands(
         cmd.append("--debug")
 
     commands.append((cmd, 6000))
+    return commands
+
+
+def generate_kernel_bench_commands(
+        config: TestConfig,
+        executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
+    """Generate kernel_bench commands - returns list of (command, timeout) tuples"""
+    commands = []
+
+    cmd = [executable_files['llm_bench']]
+    cmd.extend([
+        f"--engineDir={config.get_llm_engine_dir()}",
+        f"--batchSize={config.batch_size or 1}",
+        f"--warmup={config.warmup or 2}",
+        f"--iterations=10",
+    ])
+
+    if config.bench_mode:
+        cmd.append(f"--mode={config.bench_mode}")
+
+    if config.input_len:
+        cmd.append(f"--inputLen={config.input_len}")
+
+    if config.debug:
+        cmd.append("--debug")
+
+    commands.append((cmd, 600))
     return commands

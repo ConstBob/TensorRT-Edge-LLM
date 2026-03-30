@@ -474,7 +474,7 @@ int main(int argc, char** argv)
         }
         auto engineConfig = runner->getEngineConfig();
         hiddenSize = engineConfig.hiddenSize;
-        vocabSize = engineConfig.vocabSize;
+        vocabSize = engineConfig.outputVocabSize;
         eagleHiddenDim = engineConfig.outputHiddenDim;
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL || args.mode == BenchMode::kEAGLE_DRAFT_PREFILL)
