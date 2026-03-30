@@ -162,6 +162,7 @@ def executable_files(env_config):
     return {
         'llm_build': f"{build_dir}/examples/llm/llm_build",
         'llm_inference': f"{build_dir}/examples/llm/llm_inference",
+        'llm_bench': f"{build_dir}/examples/llm/llm_bench",
         'visual_build': f"{build_dir}/examples/multimodal/visual_build",
         'unit_test': f"{build_dir}/unitTest"
     }

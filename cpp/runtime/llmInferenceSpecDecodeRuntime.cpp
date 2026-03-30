@@ -208,7 +208,8 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
         // Allocate mLogitsOutput with max capacity to support both draft (smaller vocab) and base (larger vocab)
         // operations Max size needed: batch_size * verify_tree_size * base_vocab_size for base verification
         int32_t const maxLogitsSize = mMaxRuntimeBatchSize * maxDraftTreeSize;
-        int32_t const maxVocabSize = std::max(mBaseEngineConfig.vocabSize, mDraftEngineConfig.draftModelVocabSize);
+        int32_t const maxVocabSize
+            = std::max(mBaseEngineConfig.outputVocabSize, mDraftEngineConfig.draftModelVocabSize);
         mLogitsOutput = rt::Tensor({maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, DataType::kFLOAT,
             "LLMInferenceSpecDecodeRuntime::mLogitsOutput");
         mDraftTreeSize = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,

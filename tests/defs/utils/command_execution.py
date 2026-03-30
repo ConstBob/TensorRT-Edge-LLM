@@ -28,9 +28,10 @@ from pytest_helpers import check_file_exists, run_command, run_with_trt_env
 
 from ..config import ModelType, TaskType, TestConfig
 from .accuracy import check_accuracy_with_dataset
-from .command_generation import (generate_benchmark_commands,
-                                 generate_build_commands,
-                                 generate_inference_commands)
+from .command_generation import (generate_build_commands,
+                                 generate_e2e_bench_commands,
+                                 generate_inference_commands,
+                                 generate_kernel_bench_commands)
 
 
 def execute_build_test(
@@ -89,11 +90,11 @@ def execute_build_test(
     }
 
 
-def execute_benchmark_test(
+def execute_e2e_bench_test(
         config: TestConfig, executable_files: Dict[str, str],
         remote_config: Optional[RemoteConfig], logger,
         env_config: Optional[EnvironmentConfig]) -> Dict[str, Any]:
-    """Execute benchmark test for any model type"""
+    """Execute end-to-end benchmark test for any model type"""
 
     # Handle LoRA weights replacement if needed
     if config.max_lora_rank > 0:
@@ -105,11 +106,11 @@ def execute_benchmark_test(
             test_case_file
         ], remote_config, 300, logger)
         if not result['success']:
-            result['test_type'] = TaskType.BENCHMARK.value
+            result['test_type'] = TaskType.E2E_BENCH.value
             return result
 
-    # Generate all benchmark commands
-    commands = generate_benchmark_commands(config, executable_files)
+    # Generate all e2e benchmark commands
+    commands = generate_e2e_bench_commands(config, executable_files)
 
     all_outputs = []
 
@@ -128,7 +129,7 @@ def execute_benchmark_test(
                 'error':
                 f"{task_name} failed: {result.get('error', 'Unknown error')}",
                 'output': '\n'.join(all_outputs),
-                'test_type': TaskType.BENCHMARK.value
+                'test_type': TaskType.E2E_BENCH.value
             }
 
     # Calculate metrics based on dataset type
@@ -136,7 +137,7 @@ def execute_benchmark_test(
         'success': True,
         'error': None,
         'output': '\n'.join(all_outputs),
-        'test_type': TaskType.BENCHMARK.value
+        'test_type': TaskType.E2E_BENCH.value
     }
 
     try:
@@ -225,3 +226,39 @@ def execute_inference_test(
         final_result['success'] = False
 
     return final_result
+
+
+def execute_kernel_bench_test(
+        config: TestConfig, executable_files: Dict[str, str],
+        remote_config: Optional[RemoteConfig], logger,
+        env_config: Optional[EnvironmentConfig]) -> Dict[str, Any]:
+    """Execute kernel_bench test - validates that the kernel benchmark runs successfully"""
+
+    commands = generate_kernel_bench_commands(config, executable_files)
+
+    all_outputs = []
+
+    for i, (cmd, timeout) in enumerate(commands):
+        task_name = f"kernel_bench step {i+1}/{len(commands)}"
+        if logger:
+            logger.info(f"Starting {task_name}: {' '.join(cmd)}")
+
+        result = run_with_trt_env(cmd, remote_config, timeout, logger,
+                                  env_config)
+        all_outputs.append(result['output'])
+
+        if not result['success']:
+            return {
+                'success': False,
+                'error':
+                f"{task_name} failed: {result.get('error', 'Unknown error')}",
+                'output': '\n'.join(all_outputs),
+                'test_type': TaskType.KERNEL_BENCH.value
+            }
+
+    return {
+        'success': True,
+        'error': None,
+        'output': '\n'.join(all_outputs),
+        'test_type': TaskType.KERNEL_BENCH.value
+    }

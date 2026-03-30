@@ -86,8 +86,9 @@ class TaskType(enum.Enum):
     """Supported task types"""
     EXPORT = "export"
     BUILD = "build"
-    BENCHMARK = "benchmark"
+    E2E_BENCH = "e2e_bench"
     INFERENCE = "inference"
+    KERNEL_BENCH = "kernel_bench"
 
 
 @dataclass
@@ -190,6 +191,10 @@ class TestConfig:
 
     warmup: Optional[int] = None
 
+    # kernel_bench parameters
+    bench_mode: Optional[str] = None
+    input_len: Optional[int] = None
+
     # Add TensorRT native operations flag
     trt_native_ops: Optional[bool] = None
 
@@ -199,18 +204,24 @@ class TestConfig:
     # Declarative parameter specifications
     _PARAMETER_SPECS = [
         # Core parameters for engine identification
-        ParameterSpec("max_batch_size", "mxbs",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM}),
-        ParameterSpec("max_input_len", "mxil",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM}),
-        ParameterSpec("max_seq_len", "mxsl",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM}),
+        ParameterSpec(
+            "max_batch_size", "mxbs", {
+                TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
+                TaskType.KERNEL_BENCH
+            }, {ModelType.LLM, ModelType.VLM}),
+        ParameterSpec(
+            "max_input_len", "mxil", {
+                TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
+                TaskType.KERNEL_BENCH
+            }, {ModelType.LLM, ModelType.VLM}),
+        ParameterSpec(
+            "max_seq_len", "mxsl", {
+                TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
+                TaskType.KERNEL_BENCH
+            }, {ModelType.LLM, ModelType.VLM}),
         ParameterSpec("max_lora_rank",
                       "mxlr",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
@@ -223,83 +234,83 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("fp8_kv_cache",
                       "fp8kv", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("is_eagle",
                       "eagle", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_model_id",
                       "", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_llm_precision",
                       "", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_lm_head_precision",
                       "", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("max_verify_tree_size",
                       "mvts",
-                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("max_draft_tree_size",
                       "mdts",
-                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("eagle_draft_top_k",
-                      "edtk", {TaskType.INFERENCE, TaskType.BENCHMARK},
+                      "edtk", {TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("eagle_draft_step",
-                      "edst", {TaskType.INFERENCE, TaskType.BENCHMARK},
+                      "edst", {TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
         # VLM-specific parameters
         ParameterSpec("min_image_tokens", "mnit",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.VLM}),
         ParameterSpec("max_image_tokens", "mxit",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.VLM}),
         ParameterSpec("max_image_tokens_per_image", "mxpiit",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.VLM}),
         ParameterSpec("visual_precision",
                       "vit", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.VLM},
                       is_required=False),
 
         # Inference/Benchmark parameters
         ParameterSpec("test_case", "",
-                      {TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM}),
         ParameterSpec("batch_size",
-                      "bs", {TaskType.BENCHMARK, TaskType.INFERENCE},
+                      "bs", {TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
         # Vocabulary reduction parameters
         ParameterSpec("reduced_vocab_size",
                       "rvs", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
@@ -312,9 +323,17 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("trt_native_ops",
                       "ootb", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+
+        # kernel_bench parameters
+        ParameterSpec("bench_mode",
+                      "mode", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("input_len",
+                      "il", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
                       is_required=False),
     ]
 
@@ -471,6 +490,11 @@ class TestConfig:
                 parsed_params['vocab_reduction_method'] = part[3:]
             elif part.startswith('vrms'):
                 parsed_params['vocab_reduction_max_samples'] = int(part[4:])
+            # For kernel_bench parameters
+            elif part.startswith('mode_'):
+                parsed_params['bench_mode'] = part[5:]
+            elif part.startswith('il') and part[2:].isdigit():
+                parsed_params['input_len'] = int(part[2:])
             # For inference parameters
             elif part.startswith('ootb'):
                 parsed_params['trt_native_ops'] = True

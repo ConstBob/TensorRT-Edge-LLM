@@ -195,8 +195,8 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
         }
         mHostPackedInputIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.maxSupportedInputLength},
             rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceRuntime::mHostPackedInputIds");
-        mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.vocabSize}, rt::DeviceType::kGPU,
-            DataType::kFLOAT, "LLMInferenceRuntime::mOutputLogits");
+        mOutputLogits = rt::Tensor({mEngineConfig.maxSupportedBatchSize, mEngineConfig.outputVocabSize},
+            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMInferenceRuntime::mOutputLogits");
         mSelectedIndices = rt::Tensor({mEngineConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU, DataType::kINT32,
             "LLMInferenceRuntime::mSelectedIndices");
         mHostSelectedTokenIds = rt::Tensor({mEngineConfig.maxSupportedBatchSize}, rt::DeviceType::kCPU,
