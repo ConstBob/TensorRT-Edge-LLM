@@ -258,6 +258,24 @@ def _is_nemotron_h_model(model_dir: str) -> bool:
     return _check_model_type(model_dir, "nemotron_h")
 
 
+def _is_qwen3_5_model(model_dir: str) -> bool:
+    """Check if the model is a Qwen3.5 model."""
+    return _check_model_type(model_dir, "qwen3_5")
+
+
+def is_hybrid_model(model_dir: str) -> bool:
+    """Check if the model is a hybrid model (Nemotron-H or Qwen3.5)."""
+    return _is_nemotron_h_model(model_dir) or _is_qwen3_5_model(model_dir)
+
+
+HYBRID_MODEL_TYPES = {"nemotron_h", "qwen3_5_text", "qwen3_5"}
+
+
+def is_hybrid_model_type(model_type: str) -> bool:
+    """Check if model_type belongs to a hybrid model. No disk I/O."""
+    return model_type in HYBRID_MODEL_TYPES
+
+
 def _is_qwen3_omni_model(model_dir: str) -> bool:
     """Check if the model is a Qwen3 Omni model by checking config.json for model_type."""
     cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
@@ -495,18 +513,30 @@ def load_hf_model(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).to(device)
         _fix_gptq_moe_gate_weights(model, model_dir)
+    elif is_vlm(model_dir):
+        # Try multimodal loader first; AutoModelForCausalLM would silently
+        # drop the visual tower for models that register both classes.
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_dir, torch_dtype=torch_dtype,
+                trust_remote_code=True).to(device)
+        except Exception as e_vlm:
+            print(f"AutoModelForImageTextToText failed: {e_vlm}")
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_dir, torch_dtype=torch_dtype,
+                    trust_remote_code=True).to(device)
+            except Exception as e:
+                raise ValueError(
+                    f"Could not load model from {model_dir}. Error: {e}")
     else:
-        # Try loading as AutoModelForCausalLM first
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 model_dir, torch_dtype=torch_dtype,
                 trust_remote_code=True).to(device)
         except Exception as e_causal:
             print(f"AutoModelForCausalLM failed: {e_causal}")
-            # If that fails, try AutoModelForImageTextToText
             try:
-                # TODO: Need a WAR to quantize only the language model.
-                # In VLMs, the model has both model.language_model and model.vision_model.
                 model = AutoModelForImageTextToText.from_pretrained(
                     model_dir, torch_dtype=torch_dtype,
                     trust_remote_code=True).to(device)
@@ -652,18 +682,14 @@ def load_llm_model(
             edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
                                                reduced_vocab_size, vocab_map)
 
+    elif is_hybrid_model(model_dir):
+        edge_model = EdgeLLMHybridModelForCausalLM(model, reduced_vocab_size,
+                                                   vocab_map)
     else:
         # Standard LLM / EAGLE
         hf_model = model
 
-        is_hybrid = hasattr(hf_model.config, 'layers_block_type')
-
-        if is_hybrid and not trt_native_ops:
-            print("Detected hybrid (Mamba+Attention) architecture")
-            edge_model = EdgeLLMHybridModelForCausalLM(hf_model,
-                                                       reduced_vocab_size,
-                                                       vocab_map)
-        elif not trt_native_ops:
+        if not trt_native_ops:
             edge_model = {}
             edge_model["model"] = EdgeLLMModelForCausalLM(
                 hf_model, is_eagle_base, reduced_vocab_size, vocab_map)

@@ -207,6 +207,42 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     return llm_config
 
 
+def _export_hybrid_gdn_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Export hybrid GDN model configuration by extending native LLM config."""
+    # Reuse native exporter
+    llm_config = _export_native_llm_config(config_dict)
+
+    # Hybrid stack metadata (full_attention / linear_attention)
+    layer_types = config_dict.get("layer_types", [])
+    llm_config["layer_types"] = layer_types
+    if layer_types:
+        llm_config["num_attention_layers"] = sum(1 for t in layer_types
+                                                 if t == "full_attention")
+        llm_config["num_linear_attn_layers"] = sum(1 for t in layer_types
+                                                   if t == "linear_attention")
+    else:
+        # Fallback for incomplete configs: assume all layers are full attention.
+        llm_config["num_attention_layers"] = config_dict["num_hidden_layers"]
+        llm_config["num_linear_attn_layers"] = 0
+
+    # Linear-attention (GDN) related dimensions
+    llm_config["linear_num_key_heads"] = config_dict["linear_num_key_heads"]
+    llm_config["linear_num_value_heads"] = config_dict[
+        "linear_num_value_heads"]
+    llm_config["linear_key_head_dim"] = config_dict["linear_key_head_dim"]
+    llm_config["linear_value_head_dim"] = config_dict["linear_value_head_dim"]
+    llm_config["linear_conv_kernel_dim"] = config_dict[
+        "linear_conv_kernel_dim"]
+    llm_config["conv_dim"] = (2 * llm_config["linear_num_key_heads"] *
+                              llm_config["linear_key_head_dim"] +
+                              llm_config["linear_num_value_heads"] *
+                              llm_config["linear_value_head_dim"])
+    llm_config["conv_kernel"] = llm_config["linear_conv_kernel_dim"]
+
+    llm_config["model_type"] = "hybrid_gdn"
+    return llm_config
+
+
 def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Export EAGLE base configuration with required fields."""
     required_fields = [
@@ -317,9 +353,17 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
 
 
 def export_llm_config(config: Any,
-                      model_type: str,
+                      export_type: str,
                       trt_native_ops: bool = False) -> Dict[str, Any]:
-    """Export configuration based on model type and EAGLE version."""
+    """Export configuration based on export type and EAGLE version.
+
+    Args:
+        config: HuggingFace model config object.
+        export_type: Edge-LLM export category — one of ``'llm'``,
+            ``'eagle3_base'``, or ``'eagle_draft'``.  Hybrid models
+            (nemotron_h, qwen3_5) are auto-detected via ``config.model_type``.
+        trt_native_ops: Whether TRT native ops are enabled.
+    """
     config_dict = config.to_dict()
 
     # Extract model name from config class
@@ -340,16 +384,18 @@ def export_llm_config(config: Any,
             )
         config_dict = config_dict["text_config"]
 
-    if model_type == 'llm':
-        output_config = _export_native_llm_config(config_dict)
-    elif model_type == 'hybrid_mamba':
+    if config.model_type == 'nemotron_h':
         output_config = _export_hybrid_mamba_config(config_dict)
-    elif model_type == 'eagle3_base':
+    elif config.model_type in ['qwen3_5_text', 'qwen3_5']:
+        output_config = _export_hybrid_gdn_config(config_dict)
+    elif export_type == 'llm':
+        output_config = _export_native_llm_config(config_dict)
+    elif export_type == 'eagle3_base':
         output_config = _export_eagle_base_config(config_dict)
-    elif model_type == 'eagle_draft':
+    elif export_type == 'eagle_draft':
         output_config = _export_eagle_draft_config(config_dict)
     else:
-        raise ValueError(f"Unsupported model type: {model_type}")
+        raise ValueError(f"Unsupported export type: {export_type}")
 
     # Add model name to output
     output_config["model"] = model_name
@@ -473,7 +519,7 @@ def export_talker_config(full_qwen3_omni_config: Any) -> Dict[str, Any]:
     # Top-level LLM fields (vocab_size, hidden_size, etc.)
     result = export_llm_config(
         full_qwen3_omni_config.talker_config.text_config,
-        model_type='llm',
+        export_type='llm',
         trt_native_ops=False)
 
     talker_config_raw = config_dict["talker_config"]

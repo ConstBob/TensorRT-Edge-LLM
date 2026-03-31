@@ -59,6 +59,8 @@ from ..llm_models.layers.attention_plugin import \
     register_attention_plugin_onnx_symbolic_functions
 from ..llm_models.layers.attention_trt import \
     register_trt_native_attention_onnx_symbolic_functions
+from ..llm_models.layers.gated_delta_net_plugin import \
+    register_gated_delta_net_onnx_symbolic_functions
 from ..llm_models.layers.gather_nd import \
     register_gather_nd_onnx_symbolic_functions
 from ..llm_models.layers.int4_gemm_plugin import (
@@ -69,11 +71,10 @@ from ..llm_models.layers.int4_moe_plugin import (
     replace_moe_blocks_with_plugin)
 from ..llm_models.layers.mamba_plugin import \
     register_mamba_plugin_onnx_symbolic_functions
-from ..llm_models.model_utils import (is_gptq_model,
+from ..llm_models.model_utils import (is_gptq_model, is_hybrid_model_type,
                                       is_incompatible_chat_template_model,
                                       load_eagle3_draft_model, load_llm_model,
                                       load_reduced_vocab_map)
-from ..llm_models.models.llm_model import EdgeLLMHybridModelForCausalLM
 from ..llm_models.models.llm_model_trtnative import (Eagle3DraftModelTRTNative,
                                                      EdgeLLMModelTRTNative)
 from ..llm_models.models.qwen3_omni_talker import (
@@ -168,15 +169,12 @@ def get_model_save_weights_hook(model_name: str):
     return save_default_weights
 
 
-def get_model_config_export_hook(model_name: str,
-                                 model_dir: str = None,
-                                 is_eagle_base: bool = False,
-                                 trt_native_ops: bool = False):
-    """
-    Get config export function for each model type.
-    
-    Every model type has an explicit hook that returns a config dict.
-    """
+def export_model_config(model_name: str,
+                        model_config: Any,
+                        model_dir: str = None,
+                        is_eagle_base: bool = False,
+                        trt_native_ops: bool = False) -> Dict[str, Any]:
+    """Export config for a model, with explicit handling for special submodels."""
     if model_name == "talker":
         if not model_dir:
             raise ValueError("model_dir is required for talker config export")
@@ -186,69 +184,53 @@ def get_model_config_export_hook(model_name: str,
         from .config_export import (export_talker_config,
                                     export_tts_talker_config)
 
-        def export_talker_config_hook(model_config):
-            full_config = AutoConfig.from_pretrained(model_dir,
-                                                     trust_remote_code=True)
-            # Omni talker config has thinker_hidden_size; TTS does not
-            has_thinker = hasattr(full_config, 'talker_config') and \
-                          hasattr(full_config.talker_config, 'thinker_hidden_size')
-            if has_thinker:
-                return export_talker_config(full_config)
-            else:
-                return export_tts_talker_config(full_config)
-
-        return export_talker_config_hook
+        full_config = AutoConfig.from_pretrained(model_dir,
+                                                 trust_remote_code=True)
+        # Omni talker config has thinker_hidden_size; TTS does not.
+        has_thinker = hasattr(full_config, 'talker_config') and hasattr(
+            full_config.talker_config, 'thinker_hidden_size')
+        if has_thinker:
+            return export_talker_config(full_config)
+        return export_tts_talker_config(full_config)
 
     if model_name == "code_predictor":
-
-        def export_code_predictor_config_hook(model_config):
-            config = export_llm_config(model_config, 'llm', trt_native_ops)
-            config["use_embeddings_input"] = True
-            return config
-
-        return export_code_predictor_config_hook
+        config = export_llm_config(model_config, 'llm', trt_native_ops)
+        config["use_embeddings_input"] = True
+        return config
 
     if model_name == "thinker":
+        config = export_llm_config(model_config, 'llm', trt_native_ops)
+        if model_dir:
+            from transformers import AutoConfig
+            try:
+                full_config = AutoConfig.from_pretrained(
+                    model_dir, trust_remote_code=True)
+            except Exception:
+                full_config = None
 
-        def export_thinker_config_hook(model_config):
-            config = export_llm_config(model_config, 'llm', trt_native_ops)
-            if model_dir:
-                from transformers import AutoConfig
-                try:
-                    full_config = AutoConfig.from_pretrained(
-                        model_dir, trust_remote_code=True)
-                except Exception:
-                    full_config = None
+            search_configs = [
+                getattr(full_config, 'thinker_config', None)
+                if full_config else None,
+                getattr(full_config, 'text_config', None)
+                if full_config else None,
+                full_config,
+                model_config,
+            ]
+            for field in [
+                    "audio_token_id", "image_token_id", "video_token_id"
+            ]:
+                for cfg in search_configs:
+                    if cfg is None:
+                        continue
+                    val = getattr(cfg, field, None)
+                    if val is not None:
+                        config[field] = val
+                        break
+        return config
 
-                search_configs = [
-                    getattr(full_config, 'thinker_config', None)
-                    if full_config else None,
-                    getattr(full_config, 'text_config', None)
-                    if full_config else None,
-                    full_config,
-                    model_config,
-                ]
-                for field in [
-                        "audio_token_id", "image_token_id", "video_token_id"
-                ]:
-                    for cfg in search_configs:
-                        if cfg is None:
-                            continue
-                        val = getattr(cfg, field, None)
-                        if val is not None:
-                            config[field] = val
-                            break
-            return config
-
-        return export_thinker_config_hook
-
-    # Standard LLM / EAGLE base
+    # Standard LLM / hybrid / EAGLE base:
     model_type = 'eagle3_base' if is_eagle_base else 'llm'
-
-    def export_default_config_hook(model_config):
-        return export_llm_config(model_config, model_type, trt_native_ops)
-
-    return export_default_config_hook
+    return export_llm_config(model_config, model_type, trt_native_ops)
 
 
 def is_qwen3_omni_submodel(model_name: str) -> bool:
@@ -431,8 +413,7 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
     return model
 
 
-def create_hybrid_dummy_inputs(
-        model: EdgeLLMHybridModelForCausalLM) -> Dict[str, Any]:
+def create_hybrid_dummy_inputs(model: nn.Module) -> Dict[str, Any]:
     """Create dummy inputs for hybrid Mamba+Attention ONNX export."""
     batch_size = 1
     seq_len = 2
@@ -457,11 +438,7 @@ def create_hybrid_dummy_inputs(
     device = next(model.parameters()).device
 
     num_attn_layers = model.model.num_attention_layers
-    num_mamba_layers = model.model.num_mamba_layers
-
-    mamba_num_heads = config.mamba_num_heads
-    mamba_head_dim = config.mamba_head_dim
-    ssm_state_size = config.ssm_state_size
+    num_linear_attn_layers = model.model.num_linear_attn_layers
 
     past_key_values = []
     for _ in range(num_attn_layers):
@@ -474,11 +451,35 @@ def create_hybrid_dummy_inputs(
                         dtype=torch.float16,
                         device=device))
 
-    # Conv states (only for mamba layers)
-    conv_dim = config.mamba_num_heads * config.mamba_head_dim + 2 * config.n_groups * ssm_state_size
-    conv_kernel = config.conv_kernel
+    if config.model_type == "nemotron_h":
+        conv_dim = (config.mamba_num_heads * config.mamba_head_dim +
+                    2 * config.n_groups * config.ssm_state_size)
+        conv_kernel = config.conv_kernel
+        recurrent_shape = (
+            int(config.mamba_num_heads),
+            int(config.mamba_head_dim),
+            int(config.ssm_state_size),
+        )
+        recurrent_dtype = torch.float16
+    elif config.model_type == "qwen3_5_text":
+        conv_dim = (
+            2 * config.linear_num_key_heads * config.linear_key_head_dim +
+            config.linear_num_value_heads * config.linear_value_head_dim)
+        conv_kernel = int(config.linear_conv_kernel_dim)
+        recurrent_shape = (
+            int(config.linear_num_value_heads),
+            int(config.linear_key_head_dim),
+            int(config.linear_value_head_dim),
+        )
+        recurrent_dtype = torch.float32
+    else:
+        raise ValueError(
+            f"Unsupported hybrid model_type for dummy inputs: {config.model_type}"
+        )
+
+    # Conv states (for recurrent layers: mamba in Nemotron-H, linear-attn in Qwen3.5)
     conv_states = []
-    for _ in range(num_mamba_layers):
+    for _ in range(num_linear_attn_layers):
         conv_states.append(
             torch.zeros(batch_size,
                         conv_dim,
@@ -486,15 +487,13 @@ def create_hybrid_dummy_inputs(
                         dtype=torch.float16,
                         device=device))
 
-    # SSM states (only for mamba layers)
-    ssm_states = []
-    for _ in range(num_mamba_layers):
-        ssm_states.append(
+    # Recurrent states (shape depends on architecture)
+    recurrent_states = []
+    for _ in range(num_linear_attn_layers):
+        recurrent_states.append(
             torch.zeros(batch_size,
-                        mamba_num_heads,
-                        mamba_head_dim,
-                        ssm_state_size,
-                        dtype=torch.float16,
+                        *recurrent_shape,
+                        dtype=recurrent_dtype,
                         device=device))
 
     inputs_embeds = torch.randn(batch_size,
@@ -510,8 +509,8 @@ def create_hybrid_dummy_inputs(
         tuple(past_key_values),
         'conv_states':
         tuple(conv_states),
-        'ssm_states':
-        tuple(ssm_states),
+        'recurrent_states':
+        tuple(recurrent_states),
         'rope_rotary_cos_sin':
         torch.randn(batch_size,
                     max_position_embeddings,
@@ -533,8 +532,7 @@ def create_hybrid_dummy_inputs(
     }
 
 
-def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
-                                output_dir: str) -> None:
+def export_hybrid_model_to_onnx(model: nn.Module, output_dir: str) -> None:
     """Export a hybrid Mamba+Attention model to ONNX."""
     print(f"Exporting hybrid model to ONNX format: {output_dir}")
 
@@ -542,13 +540,13 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
     model.eval()
 
     num_attn_layers = model.model.num_attention_layers
-    num_mamba_layers = model.model.num_mamba_layers
+    num_linear_attn_layers = model.model.num_linear_attn_layers
 
     inputs = (
         dummy_inputs['inputs_embeds'],
         dummy_inputs['past_key_values'],
         dummy_inputs['conv_states'],
-        dummy_inputs['ssm_states'],
+        dummy_inputs['recurrent_states'],
         dummy_inputs['rope_rotary_cos_sin'],
         dummy_inputs['context_lengths'],
         dummy_inputs['last_token_ids'],
@@ -557,19 +555,21 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
         None,  # attention_mask
     )
 
+    # TODO: Change ssm_state to recurrent_state for better naming consistency
     input_names = (['inputs_embeds'] +
                    [f'past_key_values_{i}' for i in range(num_attn_layers)] +
-                   [f'conv_state_{i}' for i in range(num_mamba_layers)] +
-                   [f'ssm_state_{i}' for i in range(num_mamba_layers)] + [
-                       'rope_rotary_cos_sin', 'context_lengths',
-                       'last_token_ids', 'kvcache_start_index'
-                   ])
+                   [f'conv_state_{i}' for i in range(num_linear_attn_layers)] +
+                   [f'ssm_state_{i}'
+                    for i in range(num_linear_attn_layers)] + [
+                        'rope_rotary_cos_sin', 'context_lengths',
+                        'last_token_ids', 'kvcache_start_index'
+                    ])
 
     output_names = (
         ['logits'] +
         [f'present_key_values_{i}' for i in range(num_attn_layers)] +
-        [f'present_conv_state_{i}' for i in range(num_mamba_layers)] +
-        [f'present_ssm_state_{i}' for i in range(num_mamba_layers)])
+        [f'present_conv_state_{i}' for i in range(num_linear_attn_layers)] +
+        [f'present_ssm_state_{i}' for i in range(num_linear_attn_layers)])
 
     dynamic_axes = {
         'inputs_embeds': {
@@ -600,7 +600,7 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
             0: 'batch_size',
             3: 'present_kv_cache_len'
         }
-    for i in range(num_mamba_layers):
+    for i in range(num_linear_attn_layers):
         dynamic_axes[f'conv_state_{i}'] = {0: 'batch_size'}
         dynamic_axes[f'present_conv_state_{i}'] = {0: 'batch_size'}
         dynamic_axes[f'ssm_state_{i}'] = {0: 'batch_size'}
@@ -608,6 +608,7 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
 
     register_attention_plugin_onnx_symbolic_functions()
     register_mamba_plugin_onnx_symbolic_functions()
+    register_gated_delta_net_onnx_symbolic_functions()
     register_gather_nd_onnx_symbolic_functions()
 
     custom_opsets = {"trt_edgellm": ONNX_OPSET_VERSION}
@@ -941,7 +942,7 @@ def export_llm_model(model_dir: str,
         # Step 2: Export ONNX
         if trt_native_ops:
             export_model_to_onnx_with_trt_native_ops(model, model_output_dir)
-        elif isinstance(model, EdgeLLMHybridModelForCausalLM):
+        elif is_hybrid_model_type(model.config.model_type):
             export_hybrid_model_to_onnx(model, model_output_dir)
         elif is_qwen3_omni_submodel(model_name):
             dummy_inputs = create_qwen3_omni_dummy_inputs(
@@ -953,14 +954,8 @@ def export_llm_model(model_dir: str,
                                  fp8_kv_cache)
 
         # Step 3: Export config
-        if isinstance(model, EdgeLLMHybridModelForCausalLM):
-            model_config = export_llm_config(model.config, 'hybrid_mamba',
-                                             trt_native_ops)
-        else:
-            config_hook = get_model_config_export_hook(model_name, model_dir,
-                                                       is_eagle_base,
-                                                       trt_native_ops)
-            model_config = config_hook(model.config)
+        model_config = export_model_config(model_name, model.config, model_dir,
+                                           is_eagle_base, trt_native_ops)
 
         if reduced_vocab_size is not None:
             model_config['reduced_vocab_size'] = reduced_vocab_size
