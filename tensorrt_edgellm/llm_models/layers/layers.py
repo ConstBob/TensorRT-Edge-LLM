@@ -27,6 +27,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import \
 
 from .attention_plugin import attention_plugin
 from .attention_trt import EdgeLLMAttentionTRTNative
+from .gated_delta_net_plugin import gated_delta_net_plugin
 from .layer_utils import EdgeLLMQKNorm, EdgeLLMQKVProj
 from .mamba_plugin import causal_conv1d_plugin, update_ssm_state_plugin
 
@@ -213,7 +214,8 @@ class EdgeLLMAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        query_states, key_states, value_states = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states, gate_states = self.qkv_proj(
+            hidden_states)
 
         norm_shape = [bsz, q_len, -1, self.head_dim]
         query_states, key_states = self.qk_norm(query_states, key_states,
@@ -262,6 +264,9 @@ class EdgeLLMAttention(nn.Module):
 
         # Reshape output and apply final projection
         attn_output = attn_output.reshape(bsz, q_len, -1).to(dtype)
+        if gate_states is not None:
+            attn_output = attn_output * torch.sigmoid(
+                gate_states.to(attn_output.dtype))
         attn_output = self.o_proj(attn_output)
 
         return attn_output, present_key_value
@@ -284,7 +289,8 @@ class EdgeLLMAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        query_states, key_states, value_states = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states, gate_states = self.qkv_proj(
+            hidden_states)
 
         norm_shape = [bsz, q_len, -1, self.head_dim]
         query_states, key_states = self.qk_norm(query_states, key_states,
@@ -328,6 +334,9 @@ class EdgeLLMAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
+        if gate_states is not None:
+            attn_output = attn_output * torch.sigmoid(
+                gate_states.to(attn_output.dtype))
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -932,7 +941,7 @@ class EdgeLLMMambaLayer(nn.Module):
         return (normed * self.norm_weight).to(x.dtype)
 
 
-class EdgeLLMHybridBlock(nn.Module):
+class EdgeLLMNemotronHBlock(nn.Module):
     """Wraps a single NemotronHBlock for ONNX export.
 
     Supports three block types:
@@ -1009,3 +1018,136 @@ class EdgeLLMHybridBlock(nn.Module):
         hidden_states = self.mixer(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+
+
+class EdgeLLMGatedDeltaNetLayer(nn.Module):
+
+    def __init__(self, hf_layer: nn.Module, torch_dtype: torch.dtype) -> None:
+        super().__init__()
+        self.input_layernorm = hf_layer.input_layernorm.to(torch_dtype)
+        self.post_attention_layernorm = hf_layer.post_attention_layernorm.to(
+            torch_dtype)
+        self.mlp = hf_layer.mlp
+
+        linear_attn = hf_layer.linear_attn
+        self.in_proj_qkv = linear_attn.in_proj_qkv
+        self.in_proj_z = linear_attn.in_proj_z
+        self.in_proj_b = linear_attn.in_proj_b
+        self.in_proj_a = linear_attn.in_proj_a
+        self.norm = linear_attn.norm
+        self.out_proj = linear_attn.out_proj
+
+        self.num_k_heads = linear_attn.num_k_heads
+        self.num_v_heads = linear_attn.num_v_heads
+        self.head_k_dim = linear_attn.head_k_dim
+        self.head_v_dim = linear_attn.head_v_dim
+        self.key_dim = linear_attn.key_dim
+        self.value_dim = linear_attn.value_dim
+        self.conv_dim = linear_attn.conv_dim
+        self.conv_kernel_size = linear_attn.conv_kernel_size
+        self.A_log = linear_attn.A_log
+        self.dt_bias = linear_attn.dt_bias
+
+        self.register_buffer("conv1d_weight", linear_attn.conv1d.weight.data)
+        self.register_buffer(
+            "conv1d_bias",
+            linear_attn.conv1d.bias.data.to(torch_dtype)
+            if linear_attn.conv1d.bias is not None else torch.zeros(
+                self.conv_dim, dtype=torch_dtype),
+        )
+
+    def _gated_delta_net_forward(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        context_lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        # 1. Input projection
+        batch_size, seq_len, _ = hidden_states.shape
+        mixed_qkv = self.in_proj_qkv(hidden_states)
+
+        z = self.in_proj_z(hidden_states)
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+
+        # 2. Causal conv1d via plugin (no activation baked in)
+        mixed_qkv, conv_state_out = causal_conv1d_plugin(
+            mixed_qkv,  # [B, S, conv_dim]
+            self.conv1d_weight,  # [conv_dim, 1, kernel]
+            self.conv1d_bias,  # [conv_dim]
+            conv_state,  # [1, conv_dim, kernel]
+            stride=1,
+            padding=self.conv_kernel_size - 1,
+            dilation=1,
+            groups=self.conv_dim,
+        )  # [B, S, conv_dim]
+        mixed_qkv = torch.nn.functional.silu(mixed_qkv)
+
+        query, key, value = torch.split(
+            mixed_qkv,
+            [
+                self.key_dim,
+                self.key_dim,
+                self.value_dim,
+            ],
+            dim=-1,
+        )
+        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+
+        # 3. GDN plugin internally handles g/beta (A_log, dt_bias, a, b), QK L2 norm, and H/HV head mapping.
+        core_attn_out, recurrent_state_out = gated_delta_net_plugin(
+            query,  # [B, S, H, Dk]
+            key,  # [B, S, H, Dk]
+            value,  # [B, S, Hv, Dv]
+            a,  # [B, S, Hv]
+            b,  # [B, S, Hv]
+            self.A_log.float(),  # [Hv], keep FP32 for numerical stability
+            self.dt_bias,  # [Hv]
+            recurrent_state,  # [B, Hv, Dk, Dv]
+            context_lengths,  # [B]
+            self.head_k_dim,
+            self.head_v_dim,
+        )
+
+        # 4. Norm
+        # core_attn_out: [B, S, Hv, Dv] -> [-1, Dv]
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+
+        # 5. Output projection
+        output = self.out_proj(core_attn_out)
+
+        return output, conv_state_out, recurrent_state_out
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        context_lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Gated Delta Net
+        hidden_states, conv_state_out, recurrent_state_out = self._gated_delta_net_forward(
+            hidden_states=hidden_states,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            context_lengths=context_lengths,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states, conv_state_out, recurrent_state_out

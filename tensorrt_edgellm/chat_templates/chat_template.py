@@ -56,13 +56,13 @@ class Message:
 @dataclass
 class SystemMessage(Message):
     role: str = "system"
-    content: str = '<placeholder_system_prompt>'
+    content: str = '__SENTINEL_SYS_a7f3e2b1__'
 
 
 @dataclass
 class UserMessage(Message):
     role: str = "user"
-    content: str = '<placeholder_user_text>'
+    content: str = '__SENTINEL_USR_c9d4f6e8__'
 
 
 @dataclass
@@ -342,17 +342,56 @@ def process_chat_template(model_dir: str, model_tokenizer: Any,
 
     print("Extracting patterns from chat template...")
 
-    # Extract system role patterns (base case)
+    # Extract system and user role patterns (base case)
     system_prompt = SystemMessage()
-    system_formatted = _format_messages(tokenizer, [system_prompt])
-    system_prefix, system_suffix = _extract_prefix_suffix(
-        system_formatted, system_prompt.content)
-
-    # Extract user role patterns (compare with system base)
     user_prompt = UserMessage()
-    user_formatted = _format_messages(tokenizer, [system_prompt, user_prompt])
-    user_prefix, user_suffix = _extract_prefix_suffix(
-        user_formatted[len(system_formatted):], user_prompt.content)
+    try:
+        system_formatted = _format_messages(tokenizer, [system_prompt])
+        system_prefix, system_suffix = _extract_prefix_suffix(
+            system_formatted, system_prompt.content)
+
+        user_formatted = _format_messages(tokenizer,
+                                          [system_prompt, user_prompt])
+        user_prefix, user_suffix = _extract_prefix_suffix(
+            user_formatted[len(system_formatted):], user_prompt.content)
+
+    except ValueError as e:
+        # Some chat templates (e.g. qwen3.5) reject system-only messages and require
+        # at least one user query. In that case we infer boundaries from
+        # [system, user] and [user] probes.
+        user_only_formatted = _format_messages(tokenizer, [user_prompt])
+        user_prefix_base, user_suffix_base = _extract_prefix_suffix(
+            user_only_formatted, user_prompt.content)
+
+        user_formatted = _format_messages(tokenizer,
+                                          [system_prompt, user_prompt])
+        system_content_start = user_formatted.find(system_prompt.content)
+        user_content_start = user_formatted.find(
+            user_prompt.content,
+            system_content_start + len(system_prompt.content))
+        if system_content_start == -1 or user_content_start == -1:
+            raise ValueError(
+                "Unable to infer system and user boundaries from tokenizer chat template output."
+            ) from e
+
+        system_prefix = user_formatted[:system_content_start]
+        between = user_formatted[system_content_start +
+                                 len(system_prompt.content):user_content_start]
+        if user_prefix_base and between.endswith(user_prefix_base):
+            system_suffix = between[:-len(user_prefix_base)]
+            user_prefix = user_prefix_base
+        elif user_prefix_base and user_prefix_base in between:
+            split_pos = between.rfind(user_prefix_base)
+            system_suffix = between[:split_pos]
+            user_prefix = between[split_pos:]
+        else:
+            # Conservative fallback: preserve all boundary text as user prefix.
+            system_suffix = ""
+            user_prefix = between
+        user_suffix = user_formatted[user_content_start +
+                                     len(user_prompt.content):]
+        if not user_suffix and user_suffix_base:
+            user_suffix = user_suffix_base
 
     # Some models (e.g. Qwen3-ASR) inject extra role blocks into the
     # system-only output (an empty user turn).  This causes system_suffix

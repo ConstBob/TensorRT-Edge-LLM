@@ -48,7 +48,7 @@ def _export_qwen_visual(model, model_type: str, model_dir: str,
                         quantization: Optional[str], processor,
                         dataset_dir: str) -> None:
     """
-    Export visual models in the Qwen family (qwen2/qwen2.5/qwen3/qwen3-omni).
+    Export visual models in the Qwen family (qwen2/qwen2.5/qwen3/qwen3-omni/qwen3.5).
     """
     visual_model = model.model.visual if model_type != 'qwen3_omni' else model.thinker.visual
 
@@ -81,7 +81,7 @@ def _export_qwen_visual(model, model_type: str, model_dir: str,
         wrapped_model.eval().to(device)
         export_qwen2_5_vl_visual(wrapped_model, output_dir, torch_dtype)
     else:
-        # qwen3_vl and qwen3_omni share the same visual wrapper/export path
+        # qwen3_vl, qwen3_omni and qwen3_5 share the same visual wrapper/export path
         wrapped_model = Qwen3VLVisionModelPatch(visual_model)
         wrapped_model.eval().to(device)
         export_qwen3_vl_visual(wrapped_model, output_dir, torch_dtype)
@@ -142,7 +142,13 @@ def visual_export(model_dir: str,
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    if model_type in ['qwen2_vl', 'qwen2_5_vl', 'qwen3_vl', 'qwen3_omni']:
+    if model_type in [
+            'qwen2_vl',
+            'qwen2_5_vl',
+            'qwen3_vl',
+            'qwen3_omni',
+            'qwen3_5',
+    ]:
         _export_qwen_visual(model,
                             model_type,
                             model_dir,
