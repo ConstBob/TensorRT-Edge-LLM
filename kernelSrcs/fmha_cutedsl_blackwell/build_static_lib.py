@@ -44,6 +44,7 @@ _CUTLASS_DSL_VERSION = "4.4.1"
 _CUPY_VERSIONS = {12: ("cupy-cuda12x", "12.3.0"), 13: ("cupy-cuda13x", "13.6.0")}
 
 _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align"]
+_LLM_FP8 = _LLM + ["--in_dtype", "Float8E4M3FN"]
 _VIT = ["--is_persistent", "--export_only", "--vit_mode"]
 
 
@@ -56,14 +57,21 @@ class KernelVariant:
 
 
 KERNEL_VARIANTS = [
-    KernelVariant("fmha_d64",      "1,1024,14,64",  "1,1024,1,64",   _LLM),
-    KernelVariant("fmha_d128",     "1,1024,14,128", "1,1024,1,128",  _LLM),
-    KernelVariant("fmha_d64_sw",   "1,1024,14,64",  "1,1024,1,64",   _LLM + ["--window_size", "4096,-1"]),
-    KernelVariant("fmha_d128_sw",  "1,1024,14,128", "1,1024,1,128",  _LLM + ["--window_size", "4096,-1"]),
-    KernelVariant("vit_fmha_d64",  "1,1024,14,64",  "1,1024,14,64",  _VIT),
-    KernelVariant("vit_fmha_d72",  "1,1024,14,72",  "1,1024,14,72",  _VIT),
-    KernelVariant("vit_fmha_d80",  "1,1024,14,80",  "1,1024,14,80",  _VIT),
-    KernelVariant("vit_fmha_d128", "1,1024,14,128", "1,1024,14,128", _VIT),
+    # LLM FP16
+    KernelVariant("fmha_d64",         "1,1024,14,64",  "1,1024,1,64",   _LLM),
+    KernelVariant("fmha_d128",        "1,1024,14,128", "1,1024,1,128",  _LLM),
+    KernelVariant("fmha_d64_sw",      "1,1024,14,64",  "1,1024,1,64",   _LLM + ["--window_size", "4096,-1"]),
+    KernelVariant("fmha_d128_sw",     "1,1024,14,128", "1,1024,1,128",  _LLM + ["--window_size", "4096,-1"]),
+    # LLM FP8 input → FP16 output
+    KernelVariant("fmha_d64_fp8",     "1,1024,14,64",  "1,1024,1,64",   _LLM_FP8),
+    KernelVariant("fmha_d128_fp8",    "1,1024,14,128", "1,1024,1,128",  _LLM_FP8),
+    KernelVariant("fmha_d64_sw_fp8",  "1,1024,14,64",  "1,1024,1,64",   _LLM_FP8 + ["--window_size", "4096,-1"]),
+    KernelVariant("fmha_d128_sw_fp8", "1,1024,14,128", "1,1024,1,128",  _LLM_FP8 + ["--window_size", "4096,-1"]),
+    # ViT FP16
+    KernelVariant("vit_fmha_d64",     "1,1024,14,64",  "1,1024,14,64",  _VIT),
+    KernelVariant("vit_fmha_d72",     "1,1024,14,72",  "1,1024,14,72",  _VIT),
+    KernelVariant("vit_fmha_d80",     "1,1024,14,80",  "1,1024,14,80",  _VIT),
+    KernelVariant("vit_fmha_d128",    "1,1024,14,128", "1,1024,14,128", _VIT),
 ]
 
 

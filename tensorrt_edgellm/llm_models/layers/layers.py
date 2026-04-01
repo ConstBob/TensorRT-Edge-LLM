@@ -164,27 +164,35 @@ class EdgeLLMAttention(nn.Module):
 
         if hasattr(attention_module, 'k_bmm_quantizer') and hasattr(
                 attention_module, 'v_bmm_quantizer'):
-            k_amax = getattr(attention_module.k_bmm_quantizer, 'amax', None)
-            v_amax = getattr(attention_module.v_bmm_quantizer, 'amax', None)
 
-            # Derive scale so that max(K,V) maps into FP8 E4M3 dynamic range.
             def _scale_quant_orig(amax):
                 return (amax.cpu().float() / FP8_E4M3_MAX
                         ).view(1) if amax is not None else torch.tensor(
                             [1.0], dtype=torch.float32)
 
-            k_scale_quant_orig = _scale_quant_orig(k_amax)
-            v_scale_quant_orig = _scale_quant_orig(v_amax)
-            # Pack dequant scales into a single tensor input for AttentionPlugin:
-            # [k_scale_quant_orig, v_scale_quant_orig]
-            k_v_scale_quant_orig = torch.cat(
-                [k_scale_quant_orig.view(1),
-                 v_scale_quant_orig.view(1)],
-                dim=0).float()
-            self.register_buffer("k_v_scale_quant_orig", k_v_scale_quant_orig)
+            q_amax = getattr(
+                attention_module.q_bmm_quantizer, 'amax', None) if hasattr(
+                    attention_module, 'q_bmm_quantizer') else None
+            k_amax = getattr(attention_module.k_bmm_quantizer, 'amax', None)
+            v_amax = getattr(attention_module.v_bmm_quantizer, 'amax', None)
+
+            if q_amax is None:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "q_bmm_quantizer not found or has no amax; "
+                    "Q scale defaults to 1.0 (FP8 FMHA may be imprecise). "
+                    "Re-quantize with --kv_cache_quantization fp8 to calibrate Q scale."
+                )
+
+            qkv_scale_quant_orig = torch.cat([
+                _scale_quant_orig(q_amax),
+                _scale_quant_orig(k_amax),
+                _scale_quant_orig(v_amax),
+            ],
+                                             dim=0).float()
+            self.register_buffer("qkv_scale_quant_orig", qkv_scale_quant_orig)
         else:
-            # Always define these buffers so downstream code can safely access them.
-            self.register_buffer("k_v_scale_quant_orig", None)
+            self.register_buffer("qkv_scale_quant_orig", None)
 
     def forward(
         self,
@@ -231,17 +239,20 @@ class EdgeLLMAttention(nn.Module):
 
         fp8_kv_cache = past_key_value.dtype == torch.float8_e4m3fn
         if fp8_kv_cache:
-            assert self.k_v_scale_quant_orig is not None, \
-                "k_v_scale_quant_orig must be set when past_key_value is float8_e4m3fn"
+            assert self.qkv_scale_quant_orig is not None, \
+                "qkv_scale_quant_orig must be set when past_key_value is float8_e4m3fn"
         else:
             assert past_key_value.dtype == torch.float16, "past_key_value must be FP16 or FP8 E4M3"
+
+        qkv_scales = self.qkv_scale_quant_orig.tolist() \
+            if self.qkv_scale_quant_orig is not None else None
         # Ensure rope embeddings are FP32
         assert rope_rotary_cos_sin.dtype == torch.float32, "rope_rotary_cos_sin must be FP32"
 
         # Enable tree attention if position info is available
         enable_tree_attention = attention_mask is not None and position_ids is not None
 
-        # Call fused attention plugin
+        # Call fused attention plugin (always outputs FP16)
         attn_output, present_key_value = attention_plugin(
             query_states,
             key_states,
@@ -259,10 +270,9 @@ class EdgeLLMAttention(nn.Module):
             if self.sliding_window_size is not None else -1,
             attention_mask,
             position_ids,
-            k_v_scale_quant_orig=self.k_v_scale_quant_orig,
+            qkv_scales=qkv_scales,
         )
 
-        # Reshape output and apply final projection
         attn_output = attn_output.reshape(bsz, q_len, -1).to(dtype)
         if gate_states is not None:
             attn_output = attn_output * torch.sigmoid(

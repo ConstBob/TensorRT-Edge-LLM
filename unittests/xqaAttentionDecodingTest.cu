@@ -215,9 +215,6 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
 
         thrust::device_vector<__nv_fp8_e4m3> kvInputFp8Device(kvInputFp8);
         thrust::device_vector<half> outFp8Device(batchSize * numQHeads * headSize, __float2half(0.0F));
-        thrust::device_vector<float> kScaleDevice(1, kScaleQuantOrig);
-        thrust::device_vector<float> vScaleDevice(1, vScaleQuantOrig);
-
         EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
             numQHeads, numKVHeads, smVersion, DataType::kHALF, DataType::kFP8));
         trt_edgellm::DecoderXQARunner runnerFp8(
@@ -228,8 +225,8 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         paramsFp8.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthDevice.data());
         paramsFp8.kvCache.capacity = kvCacheCapacity;
         paramsFp8.output = thrust::raw_pointer_cast(outFp8Device.data());
-        paramsFp8.kScale = thrust::raw_pointer_cast(kScaleDevice.data());
-        paramsFp8.vScale = thrust::raw_pointer_cast(vScaleDevice.data());
+        paramsFp8.kScale = kScaleQuantOrig;
+        paramsFp8.vScale = vScaleQuantOrig;
 
         // Reuse the same stream used for FP16 decoding.
         cudaStream_t stream{nullptr};

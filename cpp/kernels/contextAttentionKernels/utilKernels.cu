@@ -18,6 +18,7 @@
 #include "utilKernels.h"
 
 #include "common/checkMacros.h"
+
 namespace trt_edgellm
 {
 namespace kernel
@@ -72,8 +73,7 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
 template <typename T>
 __global__ void cvtKVLayoutBHSDToBSHDKernel(T const* __restrict__ src, // [B, 2, H, S, D]
     half* __restrict__ dst,                                            // [B, S, 2, H, D]
-    float const* __restrict__ kScaleQuantOrig, float const* __restrict__ vScaleQuantOrig, int32_t B, int32_t S,
-    int32_t H, int32_t D)
+    float kScaleQuantOrig, float vScaleQuantOrig, int32_t B, int32_t S, int32_t H, int32_t D)
 {
     // Thread mapping identical to paddedLayoutToCompactKernel but without cuSeqLens.
     //   x-dim: feature dimension  D
@@ -104,7 +104,7 @@ __global__ void cvtKVLayoutBHSDToBSHDKernel(T const* __restrict__ src, // [B, 2,
 #if SUPPORTS_FP8
     if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
     {
-        float const scale = (kv == 0) ? kScaleQuantOrig[0] : vScaleQuantOrig[0];
+        float const scale = (kv == 0) ? kScaleQuantOrig : vScaleQuantOrig;
         dst[dstIdx] = __float2half(static_cast<float>(src[srcIdx]) * scale);
     }
     else
@@ -151,8 +151,7 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
         runtimeBatchSize);
 }
 
-void cvtKVLayoutBHSDToBSHD(
-    rt::Tensor const& src, rt::Tensor& dst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream)
+void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, float kScale, float vScale, cudaStream_t stream)
 {
     rt::Coords srcShape = src.getShape();
     int32_t const B = static_cast<int32_t>(srcShape[0]);
@@ -160,42 +159,30 @@ void cvtKVLayoutBHSDToBSHD(
     int32_t const S = static_cast<int32_t>(srcShape[3]);
     int32_t const D = static_cast<int32_t>(srcShape[4]);
 
-    // Perform necessary shape checks.
     rt::Coords dstShape = dst.getShape();
     check::check(dst.getDataType() == nvinfer1::DataType::kHALF, "Please make sure the output tensor is FP16.");
     check::check(srcShape[1] == 2 && dstShape[2] == 2, "Source and destination tensors separate KV respectively.");
     check::check(dstShape[0] == B && dstShape[1] == S && dstShape[3] == H && dstShape[4] == D,
         "Destination tensor shall have consistent shape of [B, S, 2, H, D].");
 
-    // Block config with safe thread count (≤ 1024)
     uint32_t const tx = (D >= 256) ? 256 : (D >= 128 ? 128 : 64);
-    uint32_t const ty = 4; // token dimension per block
-    uint32_t const tz = 1; // process one head-pair per thread in z
+    uint32_t const ty = 4;
+    uint32_t const tz = 1;
     dim3 block(tx, ty, tz);
 
-    // Grid config
-    uint32_t const hpTilesPerBatch = (2 * H + tz - 1) / tz; // z-blocks needed per batch for head-pairs
-    dim3 grid((D + tx - 1) / tx,                            // x : feature dim
-        (S + ty - 1) / ty,                                  // y : token dim
-        hpTilesPerBatch * B);                               // z : (batch, headPair)
+    uint32_t const hpTilesPerBatch = (2 * H + tz - 1) / tz;
+    dim3 grid((D + tx - 1) / tx, (S + ty - 1) / ty, hpTilesPerBatch * B);
 
     if (src.getDataType() == nvinfer1::DataType::kHALF)
     {
-        cvtKVLayoutBHSDToBSHDKernel<half><<<grid, block, 0, stream>>>(
-            src.dataPointer<half>(), dst.dataPointer<half>(), nullptr, nullptr, B, S, H, D);
+        cvtKVLayoutBHSDToBSHDKernel<half>
+            <<<grid, block, 0, stream>>>(src.dataPointer<half>(), dst.dataPointer<half>(), 1.0f, 1.0f, B, S, H, D);
     }
 #if SUPPORTS_FP8
     else if (src.getDataType() == nvinfer1::DataType::kFP8)
     {
-        check::check(!kvScaleQuantOrig.isEmpty(), "kvScaleQuantOrig is required for FP8 KV cache");
-        check::check(kvScaleQuantOrig.getDataType() == nvinfer1::DataType::kFLOAT, "kvScaleQuantOrig must be FP32.");
-        check::check(kvScaleQuantOrig.getShape().getNumDims() == 1 && kvScaleQuantOrig.getShape()[0] == 2,
-            "kvScaleQuantOrig shall have shape [2] with layout [kScaleQuantOrig, vScaleQuantOrig].");
-        float const* const scales = kvScaleQuantOrig.dataPointer<float>();
-        float const* const kScaleQuantOrigPtr = scales + 0;
-        float const* const vScaleQuantOrigPtr = scales + 1;
-        cvtKVLayoutBHSDToBSHDKernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(src.dataPointer<__nv_fp8_e4m3>(),
-            dst.dataPointer<half>(), kScaleQuantOrigPtr, vScaleQuantOrigPtr, B, S, H, D);
+        cvtKVLayoutBHSDToBSHDKernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(
+            src.dataPointer<__nv_fp8_e4m3>(), dst.dataPointer<half>(), kScale, vScale, B, S, H, D);
     }
 #endif
     else

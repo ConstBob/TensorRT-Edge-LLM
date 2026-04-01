@@ -131,6 +131,29 @@ MXFP8_LM_HEAD_CONFIG: Dict[str, Any] = {
     }
 }
 
+# FP8 attention configuration: enables FP8 Q/K/V BMM quantizers + attention output quantizer.
+# ModelOpt's QuantAttention creates q/k/v_bmm_quantizer on attention modules.
+# FP8_KV_CFG sets "default": {"enable": false}, so we must explicitly enable each.
+FP8_ATTN_CONFIG: Dict[str, Any] = {
+    "quant_cfg": {
+        "*q_bmm_quantizer": {
+            "num_bits": (4, 3),
+            "axis": None,
+            "enable": True,
+        },
+        "*k_bmm_quantizer": {
+            "num_bits": (4, 3),
+            "axis": None,
+            "enable": True,
+        },
+        "*v_bmm_quantizer": {
+            "num_bits": (4, 3),
+            "axis": None,
+            "enable": True,
+        },
+    }
+}
+
 # Configuration to disable visual model quantization.
 DISABLE_VISUAL_CONFIG: Dict[str, Any] = {
     "quant_cfg": {
@@ -215,7 +238,8 @@ def get_llm_quant_config(
     Args:
         quantization: Optional quantization method
         lm_head_quantization: Optional LM head quantization method
-        kv_cache_quantization: Optional KV cache quantization method
+        kv_cache_quantization: Optional attention quantization method
+            (enables FP8 KV cache + FP8 FMHA compute)
         
     Returns:
         Dict containing quantization configuration
@@ -254,10 +278,10 @@ def get_llm_quant_config(
         elif lm_head_quantization == "mxfp8":
             quant_cfg["quant_cfg"].update(MXFP8_LM_HEAD_CONFIG["quant_cfg"])
 
-    # Add KV cache quantization if specified
+    # Add attention module quantization if specified (FP8 KV cache + FP8 FMHA compute)
     if kv_cache_quantization is not None:
         if kv_cache_quantization == "fp8":
-            quant_cfg["quant_cfg"].update(mtq.FP8_KV_CFG["quant_cfg"])
+            quant_cfg["quant_cfg"].update(FP8_ATTN_CONFIG["quant_cfg"])
 
     # Disable visual model
     quant_cfg["quant_cfg"].update(DISABLE_VISUAL_CONFIG["quant_cfg"])
@@ -285,6 +309,8 @@ def quantize_llm(
         quantization: Quantization method ("fp8", "int4_awq", "nvfp4")
         dataset_dir: Dataset for calibration
         lm_head_quantization: Optional LM head quantization method
+        kv_cache_quantization: Optional attention quantization method
+            (enables FP8 KV cache + FP8 FMHA compute)
         
     Returns:
         Quantized model
@@ -336,7 +362,8 @@ def quantize_draft(
         quantization: Quantization method ("fp8", "int4_awq", "nvfp4", "int8_sq")
         dataset_dir: Dataset for calibration
         lm_head_quantization: Optional LM head quantization method
-        kv_cache_quantization: Optional KV cache quantization method
+        kv_cache_quantization: Optional attention quantization method
+            (enables FP8 KV cache + FP8 FMHA compute)
 
     Returns:
         Quantized draft model
@@ -387,6 +414,7 @@ def quantize_and_save_llm(model_dir: str,
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
         lm_head_quantization: Optional separate quantization for language model head (only "fp8", "nvfp4", and "mxfp8" are currently supported)
+        kv_cache_quantization: Optional attention quantization (enables FP8 KV cache + FP8 FMHA compute)
         device: Device to use for model loading and quantization ("cuda", "cpu")
         
     Raises:
@@ -452,7 +480,7 @@ def quantize_and_save_draft(
         dtype: Model data type for loading ("fp16")
         dataset_dir: Dataset name or path for calibration data
         lm_head_quantization: Optional separate quantization for language model head (only "fp8", "nvfp4", and "mxfp8" are currently supported)
-        kv_cache_quantization: Optional separate quantization for KV cache (only "fp8" is currently supported)
+        kv_cache_quantization: Optional attention quantization (enables FP8 KV cache + FP8 FMHA compute)
 
     Raises:
         ValueError: If model loading fails or quantization parameters are invalid

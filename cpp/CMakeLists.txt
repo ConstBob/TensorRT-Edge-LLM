@@ -19,7 +19,7 @@ set(CMAKE_CUDA_FLAGS_RELEASE
     "${CMAKE_CUDA_FLAGS_RELEASE} -lineinfo -res-usage --use_fast_math -Xptxas='${CUDA_PTXAS_FLAGS}'"
 )
 
-set(CMAKE_CUDA_FLAGS_DEBUG "")
+set(CMAKE_CUDA_FLAGS_DEBUG "-g")
 
 # ------------------------------------------------------------------------------
 # FMHA Cubin Conditional Compilation Exclude SM architectures that are not in
