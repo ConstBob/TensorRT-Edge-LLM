@@ -229,11 +229,11 @@ cmake .. \
 | `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
-| `ENABLE_CUTE_DSL_FMHA` | Enable CuTe DSL FMHA kernels (SM100/SM110 only, see below) | OFF |
+| `ENABLE_CUTE_DSL` | Enable CuTe DSL kernels: `OFF` (default), `ALL`, or group list (`fmha;gdn`, `gdn`, `fmha`) | OFF |
 
-**Building with CuTe DSL FMHA (Optional, Blackwell/Thor only)**
+**Building with CuTe DSL Kernels (Optional)**
 
-Follow `kernelSrcs/fmha_cutedsl_blackwell/README.md` to generate the prebuilt kernel library, then add `-DENABLE_CUTE_DSL_FMHA=ON` to the CMake command.
+Follow `kernelSrcs/README.md` to generate the prebuilt kernel library with `python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN>`, then add `-DENABLE_CUTE_DSL=ALL` (or `gdn`, `fmha`) to the CMake command.
 
 > **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
 

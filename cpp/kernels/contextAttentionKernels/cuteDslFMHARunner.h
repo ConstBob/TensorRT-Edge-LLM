@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "cutedsl_fmha_all.h"
+#include "cutedsl_all.h"
 
 #include <climits>
 #include <cstdint>

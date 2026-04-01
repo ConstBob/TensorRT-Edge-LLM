@@ -68,6 +68,12 @@ if(NOT DEFINED AARCH64_BUILD)
   endif()
 endif()
 
+# Orin/JetPack cuda.h may lack cudaLibrary_t; GDN runner uses compat typedef
+# when this is set.
+if(DEFINED EMBEDDED_TARGET AND EMBEDDED_TARGET STREQUAL "jetson-orin")
+  add_compile_definitions(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT)
+endif()
+
 find_path(
   CUDA_RUNTIME_API_INCLUDE_DIR cuda_runtime_api.h
   HINTS ${CUDA_DIR}
@@ -176,6 +182,16 @@ add_subdirectory(examples)
 
 option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
 
+# CuTe DSL unified kernel option — declare here so it is always defined before
+# any subdirectory or include references it. Choices: OFF | ALL | fmha | gdn |
+# semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn).
+set(ENABLE_CUTE_DSL
+    "OFF"
+    CACHE
+      STRING
+      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;gdn)"
+)
+
 if(BUILD_UNIT_TESTS)
   set(BUILD_GMOCK
       OFF
@@ -191,11 +207,9 @@ if(BUILD_UNIT_TESTS)
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore
                                          ${CUDART_LIB} ${CUDA_DRIVER_LIB})
-  add_cross_build_link_options(unitTest)
-
-  # Link prebuilt CuTe DSL FMHA kernels into unit tests
-  if(ENABLE_CUTE_DSL_FMHA)
-    include(${CMAKE_SOURCE_DIR}/cmake/CuteDslFMHA.cmake)
-    cute_dsl_fmha_setup(LINK_TARGETS unitTest)
+  if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
+    include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
+    cute_dsl_setup(LINK_TARGETS unitTest)
   endif()
+  add_cross_build_link_options(unitTest)
 endif()

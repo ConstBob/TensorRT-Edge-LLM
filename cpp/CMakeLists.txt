@@ -132,13 +132,11 @@ target_link_libraries(
                                  ${CUDA_DRIVER_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
 
-# CuTe DSL FMHA (Blackwell SM100+): link prebuilt kernel library. Artifacts are
-# generated offline by: python
-# kernelSrcs/fmha_cutedsl_blackwell/build_static_lib.py Set
-# ENABLE_CUTE_DSL_FMHA=ON to enable (requires prebuilt artifacts).
-option(ENABLE_CUTE_DSL_FMHA "Link prebuilt CuTe DSL FMHA kernels" OFF)
-if(ENABLE_CUTE_DSL_FMHA)
-  include(${CMAKE_SOURCE_DIR}/cmake/CuteDslFMHA.cmake)
-  cute_dsl_fmha_setup(TARGETS edgellmKernels edgellmCore LINK_TARGETS
-                      NvInfer_edgellm_plugin)
+# CuTe DSL unified kernels (FMHA + GDN): link prebuilt static library. Artifacts
+# are generated offline by: python kernelSrcs/build_cutedsl.py --gpu_arch
+# <sm_NN> Set ENABLE_CUTE_DSL to enable (OFF | ALL | fmha | gdn | fmha;gdn).
+if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
+  include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
+  cute_dsl_setup(TARGETS edgellmKernels edgellmCore LINK_TARGETS
+                 NvInfer_edgellm_plugin)
 endif()
