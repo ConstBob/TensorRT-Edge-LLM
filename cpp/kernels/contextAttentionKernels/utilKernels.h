@@ -65,12 +65,11 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
 //!
 //! \param[in] src    Source tensor with shape [B, 2, H, S, D].
 //! \param[out] dst   Destination tensor with shape [B, S, 2, H, D].
-//! \param[in] kvScaleQuantOrig Optional packed dequant scale tensor for FP8 KV cache (shape [2], float).
-//!            Layout: [kScaleQuantOrig, vScaleQuantOrig].
+//! \param[in] kScale K dequant scale (quant→orig). Use 1.0f for FP16.
+//! \param[in] vScale V dequant scale (quant→orig). Use 1.0f for FP16.
 //! \param[in] stream CUDA stream to launch the kernel on
 //! \throws std::runtime_error if tensor shapes or data types are invalid
-void cvtKVLayoutBHSDToBSHD(
-    rt::Tensor const& src, rt::Tensor& dst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
+void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, float kScale, float vScale, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

@@ -85,8 +85,8 @@ def main() -> None:
         required=False,
         choices=["fp8"],
         default=None,
-        help=
-        "Quantization method for KV cache (only fp8 is currently supported)")
+        help="Attention quantization: enables FP8 KV cache and FP8 FMHA compute "
+        "(Q/K/V BMM quantizers + BMM2 output quantizer)")
     parser.add_argument(
         "--device",
         type=str,
