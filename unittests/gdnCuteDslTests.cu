@@ -1,0 +1,574 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifdef CUTE_DSL_GDN_ENABLED
+
+#include <cmath>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <gtest/gtest.h>
+#include <vector>
+
+#include "common/cudaUtils.h"
+#include "kernels/gdnKernels/cuteDslGDNRunner.h"
+#include "testUtils.h"
+
+using namespace trt_edgellm;
+
+namespace
+{
+
+static inline float halfToFloat(__half h)
+{
+    return __half2float(h);
+}
+
+static inline __half floatToHalf(float f)
+{
+    return __float2half_rn(f);
+}
+
+/** softplus(x) = log(1+exp(beta*x))/beta with beta=1, cap at threshold (linear above). */
+static float softplus(float x, float beta = 1.f, float threshold = 20.f)
+{
+    float bx = beta * x;
+    if (bx <= threshold)
+        return (1.f / beta) * std::log(1.f + std::exp(bx));
+    return x;
+}
+
+/**
+ * CPU reference for GDN decode (non-varlen): q/k [n,1,h,k], v [n,1,hv,v], a/b [n,1,hv],
+ * A_log [hv], dt_bias [hv], h0 [n,hv,k,v] batch-dense. Writes o [n,1,hv,v].
+ * Matches Python: scale = 1/sqrt(k), use_qk_l2norm=true.
+ */
+static void gdnDecodeReference(float const* q, float const* k, float const* v, float const* a, float const* b,
+    float const* A_log, float const* dt_bias, float* h0, float* o_ref, int32_t n, int32_t h, int32_t hv, int32_t k_dim,
+    int32_t v_dim)
+{
+    float const scale = 1.f / std::sqrt(static_cast<float>(k_dim));
+    int32_t const hk = h * k_dim;
+    int32_t const hvv = hv * v_dim;
+    int32_t const kv = k_dim * v_dim;
+
+    for (int32_t i_n = 0; i_n < n; ++i_n)
+    {
+        for (int32_t i_hv = 0; i_hv < hv; ++i_hv)
+        {
+            int32_t const i_h = h > 0 ? i_hv / (hv / h) : 0;
+            std::vector<float> H(k_dim * v_dim);
+            for (int32_t ik = 0; ik < k_dim; ++ik)
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                    H[ik * v_dim + iv] = h0[(i_n * hv + i_hv) * kv + ik * v_dim + iv];
+
+            int32_t const q_off = i_n * hk + i_h * k_dim;
+            int32_t const v_off = i_n * hvv + i_hv * v_dim;
+            int32_t const ab_off = i_n * hv + i_hv;
+
+            float nq = 1e-6f, nk = 1e-6f;
+            for (int32_t i = 0; i < k_dim; ++i)
+            {
+                float qv = q[q_off + i], kv = k[q_off + i];
+                nq += qv * qv;
+                nk += kv * kv;
+            }
+            nq = std::sqrt(nq);
+            nk = std::sqrt(nk);
+            std::vector<float> q_eff(k_dim), k_eff(k_dim);
+            for (int32_t i = 0; i < k_dim; ++i)
+            {
+                q_eff[i] = (q[q_off + i] / nq) * scale;
+                k_eff[i] = k[q_off + i] / nk;
+            }
+
+            float const a_val = a[ab_off], b_val = b[ab_off];
+            float const A_val = A_log[i_hv], dt_val = dt_bias[i_hv];
+            float const sp = softplus(a_val + dt_val, 1.f, 20.f);
+            float const g = std::exp(-std::exp(A_val) * sp);
+            float const beta = 1.f / (1.f + std::exp(-b_val));
+
+            std::vector<float> H_gated(k_dim * v_dim);
+            for (int32_t i = 0; i < k_dim * v_dim; ++i)
+                H_gated[i] = H[i] * g;
+
+            std::vector<float> corr(v_dim);
+            for (int32_t iv = 0; iv < v_dim; ++iv)
+            {
+                float dot = 0.f;
+                for (int32_t ik = 0; ik < k_dim; ++ik)
+                    dot += H_gated[ik * v_dim + iv] * k_eff[ik];
+                corr[iv] = (v[v_off + iv] - dot) * beta;
+            }
+
+            for (int32_t ik = 0; ik < k_dim; ++ik)
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                    H[ik * v_dim + iv] = H_gated[ik * v_dim + iv] + k_eff[ik] * corr[iv];
+
+            for (int32_t iv = 0; iv < v_dim; ++iv)
+            {
+                float dot = 0.f;
+                for (int32_t ik = 0; ik < k_dim; ++ik)
+                    dot += H[ik * v_dim + iv] * q_eff[ik];
+                o_ref[i_n * hvv + i_hv * v_dim + iv] = dot;
+            }
+            for (int32_t ik = 0; ik < k_dim; ++ik)
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                    h0[(i_n * hv + i_hv) * kv + ik * v_dim + iv] = H[ik * v_dim + iv];
+        }
+    }
+}
+
+/**
+ * CPU reference for GDN prefill: same math as kernel. context_lengths[i] = valid token count for batch row i.
+ */
+static void gdnPrefillReference(float const* q, float const* k, float const* v, float const* a, float const* b,
+    float const* A_log, float const* dt_bias, float* h0, float* o_ref, int32_t n, int32_t seq_len, int32_t h,
+    int32_t hv, int32_t k_dim, int32_t v_dim, int32_t const* context_lengths)
+{
+    float const scale = 1.f / std::sqrt(static_cast<float>(k_dim));
+    int32_t const t_hk = seq_len * h * k_dim;
+    int32_t const t_hvv = seq_len * hv * v_dim;
+    int32_t const t_hv = seq_len * hv;
+    int32_t const kv = k_dim * v_dim;
+
+    for (int32_t i_n = 0; i_n < n; ++i_n)
+    {
+        int32_t const max_t = context_lengths[i_n];
+        for (int32_t i_hv = 0; i_hv < hv; ++i_hv)
+        {
+            int32_t const i_h = h > 0 ? i_hv / (hv / h) : 0;
+            std::vector<float> H(k_dim * v_dim);
+            for (int32_t ik = 0; ik < k_dim; ++ik)
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                    H[ik * v_dim + iv] = h0[(i_n * hv + i_hv) * kv + ik * v_dim + iv];
+
+            for (int32_t t = 0; t < seq_len; ++t)
+            {
+                int32_t const o_base = i_n * t_hvv + t * hv * v_dim + i_hv * v_dim;
+                if (t >= max_t)
+                {
+                    for (int32_t iv = 0; iv < v_dim; ++iv)
+                        o_ref[o_base + iv] = 0.f;
+                    continue;
+                }
+
+                int32_t const q_off = i_n * t_hk + t * h * k_dim + i_h * k_dim;
+                int32_t const v_off = i_n * t_hvv + t * hv * v_dim + i_hv * v_dim;
+                int32_t const ab_off = i_n * t_hv + t * hv + i_hv;
+
+                float nq = 1e-6f, nk = 1e-6f;
+                for (int32_t i = 0; i < k_dim; ++i)
+                {
+                    nq += q[q_off + i] * q[q_off + i];
+                    nk += k[q_off + i] * k[q_off + i];
+                }
+                nq = std::sqrt(nq);
+                nk = std::sqrt(nk);
+                std::vector<float> q_eff(k_dim), k_eff(k_dim);
+                for (int32_t i = 0; i < k_dim; ++i)
+                {
+                    q_eff[i] = (q[q_off + i] / nq) * scale;
+                    k_eff[i] = k[q_off + i] / nk;
+                }
+
+                float const a_val = a[ab_off], b_val = b[ab_off];
+                float const A_val = A_log[i_hv], dt_val = dt_bias[i_hv];
+                float const sp = softplus(a_val + dt_val, 1.f, 20.f);
+                float const g = std::exp(-std::exp(A_val) * sp);
+                float const beta = 1.f / (1.f + std::exp(-b_val));
+
+                for (int32_t i = 0; i < k_dim * v_dim; ++i)
+                    H[i] *= g;
+
+                std::vector<float> corr(v_dim);
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                {
+                    float dot = 0.f;
+                    for (int32_t ik = 0; ik < k_dim; ++ik)
+                        dot += H[ik * v_dim + iv] * k_eff[ik];
+                    corr[iv] = (v[v_off + iv] - dot) * beta;
+                }
+                for (int32_t ik = 0; ik < k_dim; ++ik)
+                    for (int32_t iv = 0; iv < v_dim; ++iv)
+                        H[ik * v_dim + iv] += k_eff[ik] * corr[iv];
+
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                {
+                    float dot = 0.f;
+                    for (int32_t ik = 0; ik < k_dim; ++ik)
+                        dot += H[ik * v_dim + iv] * q_eff[ik];
+                    o_ref[o_base + iv] = dot;
+                }
+            }
+            for (int32_t ik = 0; ik < k_dim; ++ik)
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                    h0[(i_n * hv + i_hv) * kv + ik * v_dim + iv] = H[ik * v_dim + iv];
+        }
+    }
+}
+
+void runGDNDecodeTest()
+{
+    // Test config: AOT supports dynamic shape; use arbitrary dims.
+    int32_t const n = 4;
+    int32_t const h = 8;
+    int32_t const hv = 8;
+    int32_t const k = 128;
+    int32_t const v = 128;
+
+    size_t const qkvLen = static_cast<size_t>(n) * 1 * h * k;
+    size_t const vLen = static_cast<size_t>(n) * 1 * hv * v;
+    size_t const abLen = static_cast<size_t>(n) * 1 * hv;
+    size_t const h0Len = static_cast<size_t>(n) * hv * k * v;
+    size_t const oLen = static_cast<size_t>(n) * 1 * hv * v;
+
+    size_t const qkvBytes = qkvLen * sizeof(half);
+    size_t const vBytes = vLen * sizeof(half);
+    size_t const abBytes = abLen * sizeof(half);
+    size_t const A_logBytes = static_cast<size_t>(hv) * sizeof(float);
+    size_t const dt_biasBytes = static_cast<size_t>(hv) * sizeof(half);
+    size_t const h0Bytes = h0Len * sizeof(float);
+    size_t const oBytes = oLen * sizeof(half);
+
+    std::vector<float> h_q(qkvLen), h_k(qkvLen), h_v(vLen), h_a(abLen), h_b(abLen);
+    std::vector<float> h_A_log(hv), h_dt_bias(hv), h_h0(h0Len);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_q[i] = 0.1f * (1.f + static_cast<float>(i % 5));
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_k[i] = 0.1f * (1.f + static_cast<float>((i + 1) % 5));
+    for (size_t i = 0; i < vLen; ++i)
+        h_v[i] = 0.1f * (1.f + static_cast<float>((i + 2) % 5));
+    for (size_t i = 0; i < abLen; ++i)
+    {
+        h_a[i] = 0.25f * (static_cast<float>(i % 5) - 2.f);
+        h_b[i] = 0.25f * (static_cast<float>((i + 1) % 5) - 2.f);
+    }
+    for (int32_t i = 0; i < hv; ++i)
+    {
+        h_A_log[i] = -2.f + 0.25f * (i % 4);
+        h_dt_bias[i] = 0.02f * (i + 1);
+    }
+    for (size_t i = 0; i < h0Len; ++i)
+        h_h0[i] = 0.01f * (1.f + static_cast<float>(i % 10));
+
+    std::vector<half> h_q_half(qkvLen), h_k_half(qkvLen), h_v_half(vLen), h_a_half(abLen), h_b_half(abLen),
+        h_dt_half(hv);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_q_half[i] = floatToHalf(h_q[i]);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_k_half[i] = floatToHalf(h_k[i]);
+    for (size_t i = 0; i < vLen; ++i)
+        h_v_half[i] = floatToHalf(h_v[i]);
+    for (size_t i = 0; i < abLen; ++i)
+    {
+        h_a_half[i] = floatToHalf(h_a[i]);
+        h_b_half[i] = floatToHalf(h_b[i]);
+    }
+    for (int32_t i = 0; i < hv; ++i)
+        h_dt_half[i] = floatToHalf(h_dt_bias[i]);
+
+    void* d_q = nullptr;
+    void* d_k = nullptr;
+    void* d_v = nullptr;
+    void* d_a = nullptr;
+    void* d_b = nullptr;
+    void* d_A_log = nullptr;
+    void* d_dt_bias = nullptr;
+    void* d_h0_source = nullptr;
+    void* d_context_lengths = nullptr;
+    void* d_o = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_q, qkvBytes));
+    CUDA_CHECK(cudaMalloc(&d_k, qkvBytes));
+    CUDA_CHECK(cudaMalloc(&d_v, vBytes));
+    CUDA_CHECK(cudaMalloc(&d_a, abBytes));
+    CUDA_CHECK(cudaMalloc(&d_b, abBytes));
+    CUDA_CHECK(cudaMalloc(&d_A_log, A_logBytes));
+    CUDA_CHECK(cudaMalloc(&d_dt_bias, dt_biasBytes));
+    CUDA_CHECK(cudaMalloc(&d_h0_source, h0Bytes));
+    CUDA_CHECK(cudaMalloc(&d_context_lengths, static_cast<size_t>(n) * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_o, oBytes));
+
+    std::vector<int32_t> h_ctx_decode(n, 1);
+    CUDA_CHECK(cudaMemcpy(
+        d_context_lengths, h_ctx_decode.data(), static_cast<size_t>(n) * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q_half.data(), qkvBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k_half.data(), qkvBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v_half.data(), vBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a_half.data(), abBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b_half.data(), abBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A_log, h_A_log.data(), A_logBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dt_bias, h_dt_half.data(), dt_biasBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_h0_source, h_h0.data(), h0Bytes, cudaMemcpyHostToDevice));
+
+    GDNParams params{};
+    params.q = d_q;
+    params.k = d_k;
+    params.v = d_v;
+    params.a = d_a;
+    params.b = d_b;
+    params.A_log = d_A_log;
+    params.dt_bias = d_dt_bias;
+    params.h0_source = d_h0_source;
+    params.context_lengths = d_context_lengths;
+    params.o = d_o;
+    params.n = n;
+    params.seq_len = 1;
+    params.h = h;
+    params.hv = hv;
+    params.k_dim = k;
+    params.v_dim = v;
+
+    bool loaded = CuteDslGDNRunner::loadKernelModules();
+    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
+
+    CuteDslGDNRunner runner;
+    int ret = runner.run(params, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(ret, 0) << "GDN decode run failed";
+
+    std::vector<half> h_o_half(oLen);
+    CUDA_CHECK(cudaMemcpy(h_o_half.data(), d_o, oBytes, cudaMemcpyDeviceToHost));
+    std::vector<float> h_o_float(oLen);
+    for (size_t i = 0; i < oLen; ++i)
+        h_o_float[i] = halfToFloat(h_o_half[i]);
+
+    std::vector<float> h0_ref(h_h0);
+    std::vector<float> o_ref(oLen, 0.f);
+    gdnDecodeReference(h_q.data(), h_k.data(), h_v.data(), h_a.data(), h_b.data(), h_A_log.data(), h_dt_bias.data(),
+        h0_ref.data(), o_ref.data(), n, h, hv, k, v);
+
+    float const atol = 0.2f;
+    float const rtol = 0.02f;
+    for (size_t i = 0; i < oLen; ++i)
+    {
+        EXPECT_TRUE(isclose(h_o_float[i], o_ref[i], rtol, atol))
+            << "Decode output mismatch at " << i << ": got " << h_o_float[i] << ", ref " << o_ref[i];
+    }
+
+    // Second output: updated recurrent state h0 [n, hv, k, v]
+    std::vector<float> h_h0_out(h0Len);
+    CUDA_CHECK(cudaMemcpy(h_h0_out.data(), d_h0_source, h0Bytes, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < h0Len; ++i)
+    {
+        EXPECT_TRUE(isclose(h_h0_out[i], h0_ref[i], rtol, atol))
+            << "Decode h0 output mismatch at " << i << ": got " << h_h0_out[i] << ", ref " << h0_ref[i];
+    }
+
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_A_log));
+    CUDA_CHECK(cudaFree(d_dt_bias));
+    CUDA_CHECK(cudaFree(d_h0_source));
+    CUDA_CHECK(cudaFree(d_context_lengths));
+    CUDA_CHECK(cudaFree(d_o));
+}
+
+void runGDNPrefillTest()
+{
+    // Per-batch variable valid lengths (padded dim = seq_len)
+    int32_t const n = 8;
+    int32_t const seq_len = 16;
+    int32_t const h = 8;
+    int32_t const hv = 8;
+    int32_t const k = 128;
+    int32_t const v = 128;
+
+    size_t const qkvLen = static_cast<size_t>(n) * seq_len * h * k;
+    size_t const vLen = static_cast<size_t>(n) * seq_len * hv * v;
+    size_t const abLen = static_cast<size_t>(n) * seq_len * hv;
+    size_t const h0Len = static_cast<size_t>(n) * hv * k * v;
+    size_t const oLen = static_cast<size_t>(n) * seq_len * hv * v;
+
+    size_t const qkvBytes = qkvLen * sizeof(half);
+    size_t const vBytes = vLen * sizeof(half);
+    size_t const abBytes = abLen * sizeof(half);
+    size_t const A_logBytes = static_cast<size_t>(hv) * sizeof(float);
+    size_t const dt_biasBytes = static_cast<size_t>(hv) * sizeof(half);
+    size_t const h0Bytes = h0Len * sizeof(float);
+    size_t const oBytes = oLen * sizeof(half);
+
+    /* Regular inputs: q/k/v in {0.1..0.5}, a/b in {-0.5..0.5}, A_log/dt_bias/h0 simple steps. */
+    std::vector<float> h_q(qkvLen), h_k(qkvLen), h_v(vLen), h_a(abLen), h_b(abLen);
+    std::vector<float> h_A_log(hv), h_dt_bias(hv), h_h0(h0Len);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_q[i] = 0.1f * (1.f + static_cast<float>(i % 5));
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_k[i] = 0.1f * (1.f + static_cast<float>((i + 1) % 5));
+    for (size_t i = 0; i < vLen; ++i)
+        h_v[i] = 0.1f * (1.f + static_cast<float>((i + 2) % 5));
+    for (size_t i = 0; i < abLen; ++i)
+    {
+        h_a[i] = 0.25f * (static_cast<float>(i % 5) - 2.f);
+        h_b[i] = 0.25f * (static_cast<float>((i + 1) % 5) - 2.f);
+    }
+    for (int32_t i = 0; i < hv; ++i)
+    {
+        h_A_log[i] = -2.f + 0.25f * (i % 4);
+        h_dt_bias[i] = 0.02f * (i + 1);
+    }
+    for (size_t i = 0; i < h0Len; ++i)
+        h_h0[i] = 0.01f * (1.f + static_cast<float>(i % 10));
+
+    std::vector<half> h_q_half(qkvLen), h_k_half(qkvLen), h_v_half(vLen), h_a_half(abLen), h_b_half(abLen),
+        h_dt_half(hv);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_q_half[i] = floatToHalf(h_q[i]);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_k_half[i] = floatToHalf(h_k[i]);
+    for (size_t i = 0; i < vLen; ++i)
+        h_v_half[i] = floatToHalf(h_v[i]);
+    for (size_t i = 0; i < abLen; ++i)
+    {
+        h_a_half[i] = floatToHalf(h_a[i]);
+        h_b_half[i] = floatToHalf(h_b[i]);
+    }
+    for (int32_t i = 0; i < hv; ++i)
+        h_dt_half[i] = floatToHalf(h_dt_bias[i]);
+
+    void* d_q = nullptr;
+    void* d_k = nullptr;
+    void* d_v = nullptr;
+    void* d_a = nullptr;
+    void* d_b = nullptr;
+    void* d_A_log = nullptr;
+    void* d_dt_bias = nullptr;
+    void* d_h0_source = nullptr;
+    void* d_context_lengths = nullptr;
+    void* d_o = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_q, qkvBytes));
+    CUDA_CHECK(cudaMalloc(&d_k, qkvBytes));
+    CUDA_CHECK(cudaMalloc(&d_v, vBytes));
+    CUDA_CHECK(cudaMalloc(&d_a, abBytes));
+    CUDA_CHECK(cudaMalloc(&d_b, abBytes));
+    CUDA_CHECK(cudaMalloc(&d_A_log, A_logBytes));
+    CUDA_CHECK(cudaMalloc(&d_dt_bias, dt_biasBytes));
+    CUDA_CHECK(cudaMalloc(&d_h0_source, h0Bytes));
+    CUDA_CHECK(cudaMalloc(&d_context_lengths, static_cast<size_t>(n) * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_o, oBytes));
+
+    std::vector<int32_t> h_ctx_prefill(n);
+    int32_t const span = (seq_len > 1) ? (seq_len - 1) : 1;
+    for (int32_t i = 0; i < n; ++i)
+    {
+        int32_t const len = seq_len - (i % span);
+        h_ctx_prefill[i] = (len < 1) ? 1 : len;
+    }
+    CUDA_CHECK(cudaMemcpy(
+        d_context_lengths, h_ctx_prefill.data(), static_cast<size_t>(n) * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q_half.data(), qkvBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k_half.data(), qkvBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v_half.data(), vBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a_half.data(), abBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b_half.data(), abBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A_log, h_A_log.data(), A_logBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dt_bias, h_dt_half.data(), dt_biasBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_h0_source, h_h0.data(), h0Bytes, cudaMemcpyHostToDevice));
+
+    GDNParams params{};
+    params.q = d_q;
+    params.k = d_k;
+    params.v = d_v;
+    params.a = d_a;
+    params.b = d_b;
+    params.A_log = d_A_log;
+    params.dt_bias = d_dt_bias;
+    params.h0_source = d_h0_source;
+    params.context_lengths = d_context_lengths;
+    params.o = d_o;
+    params.n = n;
+    params.seq_len = seq_len;
+    params.h = h;
+    params.hv = hv;
+    params.k_dim = k;
+    params.v_dim = v;
+
+    bool loaded = CuteDslGDNRunner::loadKernelModules();
+    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
+
+    CuteDslGDNRunner runner;
+    int ret = runner.run(params, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(ret, 0) << "GDN prefill run failed";
+
+    std::vector<half> h_o_half(oLen);
+    CUDA_CHECK(cudaMemcpy(h_o_half.data(), d_o, oBytes, cudaMemcpyDeviceToHost));
+    std::vector<float> h_o_float(oLen);
+    for (size_t i = 0; i < oLen; ++i)
+        h_o_float[i] = halfToFloat(h_o_half[i]);
+
+    std::vector<float> h0_ref(h_h0);
+    std::vector<float> o_ref(oLen, 0.f);
+    gdnPrefillReference(h_q.data(), h_k.data(), h_v.data(), h_a.data(), h_b.data(), h_A_log.data(), h_dt_bias.data(),
+        h0_ref.data(), o_ref.data(), n, seq_len, h, hv, k, v, h_ctx_prefill.data());
+
+    float const atol = 1e-4f;
+    float const rtol = 1e-4f;
+    for (size_t i = 0; i < oLen; ++i)
+    {
+        EXPECT_TRUE(isclose(h_o_float[i], o_ref[i], rtol, atol))
+            << "Prefill output mismatch at " << i << ": got " << h_o_float[i] << ", ref " << o_ref[i];
+    }
+
+    // Second output: updated recurrent state h0 [n, hv, k, v]
+    std::vector<float> h_h0_out(h0Len);
+    CUDA_CHECK(cudaMemcpy(h_h0_out.data(), d_h0_source, h0Bytes, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < h0Len; ++i)
+    {
+        EXPECT_TRUE(isclose(h_h0_out[i], h0_ref[i], rtol, atol))
+            << "Prefill h0 output mismatch at " << i << ": got " << h_h0_out[i] << ", ref " << h0_ref[i];
+    }
+
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_A_log));
+    CUDA_CHECK(cudaFree(d_dt_bias));
+    CUDA_CHECK(cudaFree(d_h0_source));
+    CUDA_CHECK(cudaFree(d_context_lengths));
+    CUDA_CHECK(cudaFree(d_o));
+}
+
+} // namespace
+
+TEST(GDNCuteDsl, Decode)
+{
+    runGDNDecodeTest();
+}
+
+TEST(GDNCuteDsl, Prefill)
+{
+    runGDNPrefillTest();
+}
+
+TEST(GDNCuteDsl, CanImplement)
+{
+    EXPECT_TRUE(CuteDslGDNRunner::canImplement(128, 128, 80));
+    EXPECT_TRUE(CuteDslGDNRunner::canImplement(128, 128, 89));
+    EXPECT_FALSE(CuteDslGDNRunner::canImplement(64, 128, 80));
+    EXPECT_FALSE(CuteDslGDNRunner::canImplement(128, 128, 70));
+}
+
+#endif // CUTE_DSL_GDN_ENABLED

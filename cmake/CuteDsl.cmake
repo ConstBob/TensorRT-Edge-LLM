@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved. SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+
+# ---------------------------------------------------------------------------
+# CuTe DSL unified kernel library
+#
+# Prebuilt artifacts are generated offline by: python
+# kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN> and committed to the repository
+# under: cpp/kernels/cuteDSLArtifact/{arch}/
+#
+# No Python, CUTLASS DSL, or GPU is needed at CMake build time.
+#
+# ENABLE_CUTE_DSL cache variable controls which kernel groups are linked: OFF —
+# disable entirely (default) ALL              — enable all groups found in
+# metadata.json fmha             — enable only the FMHA group gdn              —
+# enable only the GDN group fmha;gdn         — semicolon-separated list of
+# groups (CMake list syntax)
+#
+# Usage: include(cmake/CuteDsl.cmake) cute_dsl_setup( TARGETS      target1
+# target2 ...   # compile definitions + include path only LINK_TARGETS target3
+# target4 ...   # compile definitions + include path + link )
+#
+# Per-group compile definitions set on each target: CUTE_DSL_FMHA_ENABLED  — set
+# when the fmha group is active CUTE_DSL_GDN_ENABLED   — set when the gdn group
+# is active
+# ---------------------------------------------------------------------------
+
+set(ENABLE_CUTE_DSL
+    "OFF"
+    CACHE
+      STRING
+      "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn)"
+)
+
+# Include guard — safe to include from multiple CMakeLists.txt directories.
+if(DEFINED _CUTE_DSL_CMAKE_INCLUDED)
+  return()
+endif()
+set(_CUTE_DSL_CMAKE_INCLUDED TRUE)
+
+# ---------------------------------------------------------------------------
+# cute_dsl_setup()
+#
+# TARGETS      — targets that need compile definitions + include path
+# LINK_TARGETS — targets that additionally link libcutedsl_<arch>.a
+# ---------------------------------------------------------------------------
+function(cute_dsl_setup)
+  cmake_parse_arguments(ARG "" "" "TARGETS;LINK_TARGETS" ${ARGN})
+
+  string(TOUPPER "${ENABLE_CUTE_DSL}" _cute_dsl_norm)
+
+  if(_cute_dsl_norm STREQUAL "OFF")
+    return()
+  endif()
+
+  # Guard against accidental empty-string assignment (e.g. -DENABLE_CUTE_DSL=).
+  if(_cute_dsl_norm STREQUAL "")
+    message(
+      FATAL_ERROR
+        "ENABLE_CUTE_DSL is set to an empty string.\n"
+        "Set it to OFF, ALL, or a semicolon-separated group list (e.g. fmha;gdn)."
+    )
+  endif()
+
+  # Detect host/target CPU architecture.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(_arch "aarch64")
+  else()
+    set(_arch "x86_64")
+  endif()
+
+  # Unified artifact directory (produced by kernelSrcs/build_cutedsl.py).
+  set(_artifact_dir "${CMAKE_SOURCE_DIR}/cpp/kernels/cuteDSLArtifact/${_arch}")
+  set(_static_lib "${_artifact_dir}/libcutedsl_${_arch}.a")
+  set(_inc_dir "${_artifact_dir}/include")
+  set(_metadata "${_artifact_dir}/metadata.json")
+
+  # Validate artifacts exist.
+  if(NOT EXISTS "${_static_lib}")
+    message(
+      FATAL_ERROR
+        "Prebuilt CuTe DSL library not found:\n"
+        "  ${_static_lib}\n"
+        "Generate it with:\n"
+        "  python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN> --arch ${_arch}\n"
+        "then commit the resulting ${_arch}/ directory under "
+        "cpp/kernels/cuteDSLArtifact/.")
+  endif()
+
+  if(NOT EXISTS "${_metadata}")
+    message(FATAL_ERROR "metadata.json not found in ${_artifact_dir}/\n"
+                        "Re-run build_cutedsl.py to regenerate artifacts.")
+  endif()
+
+  if(NOT EXISTS "${_inc_dir}/cutedsl_all.h")
+    message(
+      FATAL_ERROR "Umbrella header cutedsl_all.h not found in ${_inc_dir}/\n"
+                  "Re-run build_cutedsl.py to regenerate artifacts.")
+  endif()
+
+  # Parse the "groups" array from metadata.json. metadata.json example: {
+  # "groups": ["gdn", "fmha"], "variants": [...] } Requires CMake >= 3.19 for
+  # string(JSON ...).
+  file(READ "${_metadata}" _meta_json)
+  string(JSON _n_groups LENGTH "${_meta_json}" "groups")
+
+  if(_n_groups EQUAL 0)
+    message(
+      WARNING
+        "CuTe DSL: metadata.json has empty 'groups' array in ${_artifact_dir}/. "
+        "Re-run build_cutedsl.py to regenerate artifacts.")
+    return()
+  endif()
+
+  math(EXPR _last_idx "${_n_groups} - 1")
+
+  # Determine which groups to activate based on ENABLE_CUTE_DSL.
+  set(_active_groups)
+  foreach(_i RANGE ${_last_idx})
+    string(JSON _g GET "${_meta_json}" "groups" ${_i})
+    if(_cute_dsl_norm STREQUAL "ALL")
+      list(APPEND _active_groups "${_g}")
+    else()
+      # _cute_dsl_norm is a semicolon-separated list (CMake list), e.g.
+      # "FMHA;GDN".
+      string(TOUPPER "${_g}" _g_upper)
+      if("${_g_upper}" IN_LIST _cute_dsl_norm)
+        list(APPEND _active_groups "${_g}")
+      endif()
+    endif()
+  endforeach()
+
+  if(NOT _active_groups)
+    message(
+      WARNING
+        "CuTe DSL: ENABLE_CUTE_DSL='${ENABLE_CUTE_DSL}' matched no groups in "
+        "${_metadata} (available: ${_meta_json}). Nothing will be linked.")
+    return()
+  endif()
+
+  # Apply compile definitions and include path to all targets.
+  foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+    target_include_directories(${_tgt} PRIVATE "${_inc_dir}")
+    foreach(_g ${_active_groups})
+      string(TOUPPER "${_g}" _gu)
+      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_${_gu}_ENABLED")
+    endforeach()
+  endforeach()
+
+  # Link the static archive into LINK_TARGETS only.
+  foreach(_tgt ${ARG_LINK_TARGETS})
+    target_link_libraries(${_tgt} PRIVATE "${_static_lib}")
+  endforeach()
+
+  message(
+    STATUS
+      "CuTe DSL: arch=${_arch}  groups=[${_active_groups}]  lib=${_static_lib}")
+endfunction()

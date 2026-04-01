@@ -2,7 +2,7 @@
 
 Fused multi-head attention kernels compiled ahead-of-time from CuTe DSL Python
 source. Kernel artifacts (static library + headers) are pre-generated offline by
-`build_static_lib.py` and checked into the repo. CMake simply links the
+`kernelSrcs/build_cutedsl.py` and checked into the repo. CMake simply links the
 prebuilt artifacts — no Python, CUTLASS DSL, CuPy, or Blackwell GPU is needed
 at CMake build time.
 
@@ -27,21 +27,21 @@ pip install cupy-cuda13x==13.6.0  # CUDA 13.x
 **2. Compile all kernel variants into a static library**
 
 > **GPU requirement:** compilation must run on a Blackwell datacenter GPU (e.g. B200, GB200)
-> or on Thor (SM10X or SM110). Other GPUs are not supported.
+> or on Thor (SM100 or SM110). Other GPUs are not supported.
 
 ```bash
 cd tensorrt-edge-llm
-python kernelSrcs/fmha_cutedsl_blackwell/build_static_lib.py [--clean] [-j 4]
+python kernelSrcs/build_cutedsl.py --kernels fmha --gpu_arch sm_100 [--clean] [-j 4]
 ```
 
 This produces the following artifacts under
-`cpp/kernels/contextAttentionKernels/cuteDSLArtifact/{arch}/`:
+`cpp/kernels/cuteDSLArtifact/{arch}/`:
 
 ```
-libcutedsl_fmha_{arch}.a          — all 8 kernel .o files + libcuda_dialect_runtime_static.a merged in
-metadata.json                     — build provenance (CUDA ver, DSL ver, date)
+libcutedsl_{arch}.a          — all 8 kernel .o files + libcuda_dialect_runtime_static.a merged in
+metadata.json                — build provenance (CUDA ver, DSL ver, date, groups)
 include/
-    cutedsl_fmha_all.h            — umbrella header
+    cutedsl_all.h            — umbrella header
     fmha_d64.h, fmha_d128.h, ... — per-variant headers
 ```
 
@@ -58,7 +58,7 @@ cmake .. \
     -DTRT_PACKAGE_DIR=/usr \
     -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
     -DEMBEDDED_TARGET=auto-thor \
-    -DENABLE_CUTE_DSL_FMHA=ON
+    -DENABLE_CUTE_DSL=fmha
 ```
 
 For x86 GPU systems:
@@ -68,7 +68,13 @@ cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
     -DCUDA_CTK_VERSION=<YOUR_CUDA_VERSION> \
-    -DENABLE_CUTE_DSL_FMHA=ON
+    -DENABLE_CUTE_DSL=fmha
+```
+
+To enable both FMHA and GDN:
+
+```bash
+cmake .. -DENABLE_CUTE_DSL=ALL ...
 ```
 
 See [Section 2](#2-building) for full CMake options and details.
@@ -126,10 +132,10 @@ CUTLASS DSL version changes. Run on a machine with a Blackwell GPU:
 
 ```bash
 cd tensorrt-edge-llm
-python kernelSrcs/fmha_cutedsl_blackwell/build_static_lib.py [--clean] [-j 4]
+python kernelSrcs/build_cutedsl.py --kernels fmha --gpu_arch sm_100 [--clean] [-j 4]
 ```
 
-**Prerequisites** (only needed when running `build_static_lib.py`):
+**Prerequisites** (only needed when running `build_cutedsl.py`):
 
 | Dependency | Version | Notes |
 |---|---|---|
@@ -137,17 +143,17 @@ python kernelSrcs/fmha_cutedsl_blackwell/build_static_lib.py [--clean] [-j 4]
 | `cupy-cuda12x` | 12.3.0 | CUDA 12.x |
 | `cupy-cuda13x` | 13.6.0 | CUDA 13.x |
 
-The script compiles all kernel variants in parallel, assembles them into a
-static library, and copies the dialect runtime, placing everything under
-`cpp/kernels/contextAttentionKernels/cuteDSLArtifact/{arch}/`:
+The script compiles all FMHA kernel variants in parallel, assembles them into a
+static library merged with the DSL runtime, placing everything under
+`cpp/kernels/cuteDSLArtifact/{arch}/`:
 
 ```
 cuteDSLArtifact/x86_64/
-    libcutedsl_fmha_x86_64.a          — all 8 kernel .o files + libcuda_dialect_runtime_static.a merged in
-    metadata.json                      — build provenance (CUDA ver, DSL ver, date)
+    libcutedsl_x86_64.a            — all kernel .o files + libcuda_dialect_runtime_static.a merged in
+    metadata.json                  — build provenance (CUDA ver, DSL ver, date, groups)
     include/
-        cutedsl_fmha_all.h             — umbrella header
-        fmha_d64.h, fmha_d128.h, ...  — per-variant headers
+        cutedsl_all.h              — umbrella header
+        fmha_d64.h, fmha_d128.h, ... — per-variant headers
 ```
 
 Commit the `cuteDSLArtifact/{arch}/` directory after generation.
@@ -156,7 +162,9 @@ Commit the `cuteDSLArtifact/{arch}/` directory after generation.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--output_dir DIR` | `cpp/kernels/contextAttentionKernels/cuteDSLArtifact` | Root output dir |
+| `--kernels GROUPS` | `ALL` | `fmha`, `gdn`, `fmha,gdn`, or `ALL` |
+| `--gpu_arch SM` | `` (device native) | e.g. `sm_100` for Blackwell; omit on-device |
+| `--output_dir DIR` | `cpp/kernels/cuteDSLArtifact` | Root output dir |
 | `--arch ARCH` | auto-detected | `x86_64` or `aarch64` |
 | `-j JOBS` | `4` | Parallel compile jobs (use `-j 1` if GPU memory is limited) |
 | `--verbose` | off | Show `fmha.py` output for each variant |
@@ -167,28 +175,28 @@ Commit the `cuteDSLArtifact/{arch}/` directory after generation.
 No Python or GPU required. CMake links the prebuilt artifacts directly:
 
 ```bash
-cmake -DENABLE_CUTE_DSL_FMHA=ON \
+cmake -DENABLE_CUTE_DSL=fmha \
       -DTRT_PACKAGE_DIR=/path/to/TensorRT \
       ..
 ```
 
-`ENABLE_CUTE_DSL_FMHA` defaults to `OFF`. Set it to `ON` to enable CuTe DSL
-FMHA support (requires prebuilt artifacts to be present).
+`ENABLE_CUTE_DSL` defaults to `OFF`. Values: `OFF`, `fmha`, `gdn`, `fmha;gdn`, `ALL`.
 
-`cmake/CuteDslFMHA.cmake`:
+`cmake/CuteDsl.cmake`:
 
 1. Detects host CPU architecture.
-2. Validates that `libcutedsl_fmha_{arch}.a` and `include/cutedsl_fmha_all.h`
+2. Reads `metadata.json` to determine which groups are available.
+3. Validates that `libcutedsl_{arch}.a` and `include/cutedsl_all.h`
    exist under `cuteDSLArtifact/{arch}/`.
-3. Links the single static archive into the plugin and unit tests; defines
-   `CUTE_DSL_FMHA_ENABLED`.
+4. Links the single static archive into the plugin and unit tests; defines
+   `CUTE_DSL_FMHA_ENABLED` (and/or `CUTE_DSL_GDN_ENABLED`).
 
 If artifacts are missing, CMake exits with a clear error pointing to
-`build_static_lib.py`.
+`build_cutedsl.py`.
 
 ### 2.3. Standalone Kernel Compilation
 
-To compile a single variant outside CMake (e.g. for testing):
+To compile a single variant outside the build script (e.g. for testing):
 
 ```bash
 cd kernelSrcs/fmha_cutedsl_blackwell
@@ -306,11 +314,11 @@ and integration into TensorRT Edge-LLM:
 |---|---|
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha.py` | CuTe DSL kernel source (LLM + ViT variants) |
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha_helpers.py` | Helper utilities from CUTLASS |
-| `kernelSrcs/fmha_cutedsl_blackwell/build_static_lib.py` | Pre-build script: compiles all variants and assembles the static library |
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha.patch` | Diff against upstream CUTLASS example |
 | `kernelSrcs/fmha_cutedsl_blackwell/fp8_prescale.patch` | FP8 pre-scaling patch (future) |
-| `cmake/CuteDslFMHA.cmake` | CMake module: validates and links prebuilt artifacts |
-| `cpp/kernels/contextAttentionKernels/cuteDSLArtifact/{arch}/` | Prebuilt artifacts (committed to repo) |
+| `kernelSrcs/build_cutedsl.py` | Unified pre-build script: compiles all CuTe DSL variants (FMHA + GDN) |
+| `cmake/CuteDsl.cmake` | Unified CMake module: validates and links prebuilt artifacts |
+| `cpp/kernels/cuteDSLArtifact/{arch}/` | Prebuilt artifacts (committed to repo) |
 | `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.h` | C++ runner header |
 | `cpp/kernels/contextAttentionKernels/cuteDslFMHARunner.cpp` | C++ runner implementation |
 | `cpp/plugins/attentionPlugin/attentionPlugin.cpp` | TRT plugin integration |
