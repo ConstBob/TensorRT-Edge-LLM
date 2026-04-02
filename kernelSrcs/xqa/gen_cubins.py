@@ -461,21 +461,33 @@ if __name__ == "__main__":
         shutil.rmtree(cubin_dir)
     os.mkdir(cubin_dir)
 
-    edgellm_config_list = [[
-        CompileMacroOption('DTYPE', 'dt', ['__half']),
-        CompileMacroOption('HEAD_ELEMS', 'd', [128, 64, 32]),
-        CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
-        CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
-        CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
-                           [0]),  # 0 denotes contiguous kv cache.
-        CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [1, 2, 3, 4, 5, 6, 7, 8]),
-        CompileMacroOption('M_TILESIZE', 'm', [8]),
-        CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
-    ]]
+    edgellm_config_list = [
+        [
+            CompileMacroOption('DTYPE', 'dt', ['__half']),
+            CompileMacroOption('HEAD_ELEMS', 'd', [128, 64, 32]),
+            CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
+            CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv',
+                               [1, 2, 3, 4, 5, 6, 7, 8]),
+            CompileMacroOption('M_TILESIZE', 'm', [8]),
+            CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
+        ],
+        [
+            CompileMacroOption('DTYPE', 'dt', ['__half']),
+            CompileMacroOption('HEAD_ELEMS', 'd', [256]),
+            CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
+            CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [4, 6]),
+            CompileMacroOption('M_TILESIZE', 'm', [8]),
+            CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
+        ],
+    ]
 
     edgellm_config_list_spec_dec = [[
         CompileMacroOption('DTYPE', 'dt', ['__half']),
-        CompileMacroOption('HEAD_ELEMS', 'd', [128, 64]),
+        CompileMacroOption('HEAD_ELEMS', 'd', [256, 128, 64]),
         CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
         CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
         CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',

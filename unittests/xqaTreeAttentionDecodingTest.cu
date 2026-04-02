@@ -308,6 +308,19 @@ TEST(XQATreeAttentionDecodingTest, accuracyKVRatio7HeadDim64)
     TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 512, 20);
 }
 
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio4HeadDim256)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 16, 4, 256, 512, 10);
+    TestXQATreeAttentionDecodingAccuracy(1, 16, 4, 256, 256, 32);
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 2, 256, 512, 20);
+}
+
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio6HeadDim256)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 512, 10);
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 32);
+}
+
 #if SUPPORTS_FP8
 TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio4HeadDim128)
 {
@@ -341,6 +354,19 @@ TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio7HeadDim64)
     TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 192, 60, true);
     /// KVSequence 512, QSequence 20
     TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 512, 20, true);
+}
+
+TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio4HeadDim256)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 16, 4, 256, 512, 10, true);
+    TestXQATreeAttentionDecodingAccuracy(1, 16, 4, 256, 256, 32, true);
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 2, 256, 512, 20, true);
+}
+
+TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio6HeadDim256)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 512, 10, true);
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 32, true);
 }
 #endif
 
