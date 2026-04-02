@@ -430,7 +430,7 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
         return false;
     }
 
-    if (headSize == 64 || headSize == 128)
+    if (headSize == 64 || headSize == 128 || headSize == 256)
     {
         return true;
     }
@@ -449,7 +449,8 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
         return true;
     }
 
-    LOG_ERROR("ContextFMHARunner::canImplement() unsupported headSize=%d. Supported head sizes are 64, 72, 80, 128.",
+    LOG_ERROR(
+        "ContextFMHARunner::canImplement() unsupported headSize=%d. Supported head sizes are 64, 72, 80, 128, 256.",
         headSize);
     return false;
 }

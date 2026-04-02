@@ -285,6 +285,9 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio4)
     TestXQAAttentionDecodingAccuracy(4, 32, 8, 128, 256);
     TestXQAAttentionDecodingAccuracy(1, 32, 8, 64, 2048);
     TestXQAAttentionDecodingAccuracy(4, 16, 4, 64, 512);
+    TestXQAAttentionDecodingAccuracy(1, 8, 2, 256, 1024);
+    TestXQAAttentionDecodingAccuracy(1, 16, 4, 256, 1024);
+    TestXQAAttentionDecodingAccuracy(2, 16, 4, 256, 512);
 }
 
 TEST(XQAAttentionDecodingTest, accuracyKVRatio5)
@@ -310,6 +313,13 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio8)
     TestXQAAttentionDecodingAccuracy(4, 32, 4, 128, 256);
 }
 
+TEST(XQAAttentionDecodingTest, accuracyKVRatio6)
+{
+    TestXQAAttentionDecodingAccuracy(1, 24, 4, 256, 1024);
+    TestXQAAttentionDecodingAccuracy(2, 24, 4, 256, 512);
+    TestXQAAttentionDecodingAccuracy(4, 24, 4, 256, 256);
+}
+
 #if SUPPORTS_FP8
 TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio3)
 {
@@ -325,6 +335,9 @@ TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio4)
     TestXQAAttentionDecodingAccuracy(4, 32, 8, 128, 256, true);
     TestXQAAttentionDecodingAccuracy(1, 32, 8, 64, 2048, true);
     TestXQAAttentionDecodingAccuracy(4, 16, 4, 64, 512, true);
+    TestXQAAttentionDecodingAccuracy(1, 8, 2, 256, 1024, true);
+    TestXQAAttentionDecodingAccuracy(1, 16, 4, 256, 1024, true);
+    TestXQAAttentionDecodingAccuracy(2, 16, 4, 256, 512, true);
 }
 
 TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio5)
@@ -348,5 +361,12 @@ TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio8)
     TestXQAAttentionDecodingAccuracy(1, 32, 4, 128, 1024, true);
     TestXQAAttentionDecodingAccuracy(2, 32, 4, 128, 512, true);
     TestXQAAttentionDecodingAccuracy(4, 32, 4, 128, 256, true);
+}
+
+TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio6)
+{
+    TestXQAAttentionDecodingAccuracy(1, 24, 4, 256, 1024, true);
+    TestXQAAttentionDecodingAccuracy(2, 24, 4, 256, 512, true);
+    TestXQAAttentionDecodingAccuracy(4, 24, 4, 256, 256, true);
 }
 #endif
