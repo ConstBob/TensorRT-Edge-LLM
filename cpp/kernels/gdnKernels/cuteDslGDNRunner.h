@@ -49,7 +49,8 @@ struct GDNParams
     void* A_log{};
     void* dt_bias{};
     void* h0_source{};
-    void* context_lengths{};
+    void* context_lengths{}; ///< [N] int32 — valid length per batch (decode / sequential prefill)
+    void* cu_seqlens{};      ///< [N+1] int32 — prefix-sum of context_lengths (Blackwell prefill)
     void* o{};
 
     int32_t n{};
@@ -58,6 +59,7 @@ struct GDNParams
     int32_t hv{};
     int32_t k_dim{};
     int32_t v_dim{};
+    int32_t smVersion{}; // GPU SM version for dispatch (e.g. 87, 110)
 };
 
 /** Loads AOT .o, fills tensor structs from GDNParams, calls generated wrapper. */
@@ -74,15 +76,19 @@ public:
     static bool loadKernelModules();
     static void unloadKernelModules();
 
-    /** Run GDN: decode when params.seq_len == 1, else prefill. */
+    /** Run GDN: decode when params.seq_len == 1, else prefill (Blackwell or sequential). */
     int run(GDNParams const& params, cudaStream_t stream);
 
 private:
     int runDecode(GDNParams const& params, cudaStream_t stream);
     int runPrefill(GDNParams const& params, cudaStream_t stream);
+    int runPrefillBlackwell(GDNParams const& params, cudaStream_t stream);
 
     static gdn_decode_Kernel_Module_t sDecodeModule;
     static gdn_prefill_Kernel_Module_t sPrefillModule;
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+    static gdn_prefill_blackwell_Kernel_Module_t sBlackwellPrefillModule;
+#endif
     static bool sLoaded;
 };
 

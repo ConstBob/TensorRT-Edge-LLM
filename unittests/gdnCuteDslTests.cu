@@ -25,9 +25,33 @@
 
 #include "common/cudaUtils.h"
 #include "kernels/gdnKernels/cuteDslGDNRunner.h"
+#include "kernels/gdnKernels/gdnKernelUtils.cuh"
 #include "testUtils.h"
 
 using namespace trt_edgellm;
+
+// ---------------------------------------------------------------------------
+// SM helpers
+// ---------------------------------------------------------------------------
+
+/** True if the SM version supports the Blackwell GDN prefill kernel (SM100+). */
+static inline bool isBlackwellSM(int32_t sm)
+{
+    return sm >= 100;
+}
+
+/**
+ * Allocate a [N+1] int32 device buffer and compute cu_seqlens from context_lengths.
+ * Caller must cudaFree the returned pointer.
+ */
+static void* allocCuSeqlens(void* d_context_lengths, int32_t n, cudaStream_t stream = nullptr)
+{
+    void* d_cu = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_cu, static_cast<size_t>(n + 1) * sizeof(int32_t)));
+    launchGdnCalCuSeqLens(d_context_lengths, d_cu, n, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return d_cu;
+}
 
 namespace
 {
@@ -384,9 +408,13 @@ void runGDNDecodeTest()
 
 void runGDNPrefillTest()
 {
-    // Per-batch variable valid lengths (padded dim = seq_len)
+    // Detect SM version: runner dispatches to Blackwell kernel on SM100+, sequential otherwise.
+    int32_t const smVersion = getSMVersion();
+    bool const onBlackwell = isBlackwellSM(smVersion);
+
+    // seq_len=128 satisfies Blackwell chunk_size=128 requirement and is valid for sequential too.
     int32_t const n = 8;
-    int32_t const seq_len = 16;
+    int32_t const seq_len = 128;
     int32_t const h = 8;
     int32_t const hv = 8;
     int32_t const k = 128;
@@ -485,6 +513,10 @@ void runGDNPrefillTest()
     CUDA_CHECK(cudaMemcpy(d_dt_bias, h_dt_half.data(), dt_biasBytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_h0_source, h_h0.data(), h0Bytes, cudaMemcpyHostToDevice));
 
+    void* d_cu_seqlens = nullptr;
+    if (onBlackwell)
+        d_cu_seqlens = allocCuSeqlens(d_context_lengths, n);
+
     GDNParams params{};
     params.q = d_q;
     params.k = d_k;
@@ -495,6 +527,7 @@ void runGDNPrefillTest()
     params.dt_bias = d_dt_bias;
     params.h0_source = d_h0_source;
     params.context_lengths = d_context_lengths;
+    params.cu_seqlens = d_cu_seqlens;
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
@@ -502,6 +535,7 @@ void runGDNPrefillTest()
     params.hv = hv;
     params.k_dim = k;
     params.v_dim = v;
+    params.smVersion = smVersion;
 
     bool loaded = CuteDslGDNRunner::loadKernelModules();
     ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
@@ -509,7 +543,8 @@ void runGDNPrefillTest()
     CuteDslGDNRunner runner;
     int ret = runner.run(params, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
-    EXPECT_EQ(ret, 0) << "GDN prefill run failed";
+    EXPECT_EQ(ret, 0) << "GDN prefill run failed (SM=" << smVersion
+                      << ", path=" << (onBlackwell ? "Blackwell" : "Sequential") << ")";
 
     std::vector<half> h_o_half(oLen);
     CUDA_CHECK(cudaMemcpy(h_o_half.data(), d_o, oBytes, cudaMemcpyDeviceToHost));
@@ -530,13 +565,12 @@ void runGDNPrefillTest()
             << "Prefill output mismatch at " << i << ": got " << h_o_float[i] << ", ref " << o_ref[i];
     }
 
-    // Second output: updated recurrent state h0 [n, hv, k, v]
     std::vector<float> h_h0_out(h0Len);
     CUDA_CHECK(cudaMemcpy(h_h0_out.data(), d_h0_source, h0Bytes, cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < h0Len; ++i)
     {
         EXPECT_TRUE(isclose(h_h0_out[i], h0_ref[i], rtol, atol))
-            << "Prefill h0 output mismatch at " << i << ": got " << h_h0_out[i] << ", ref " << h0_ref[i];
+            << "Prefill h0 mismatch at " << i << ": got " << h_h0_out[i] << ", ref " << h0_ref[i];
     }
 
     CUDA_CHECK(cudaFree(d_q));
@@ -548,6 +582,180 @@ void runGDNPrefillTest()
     CUDA_CHECK(cudaFree(d_dt_bias));
     CUDA_CHECK(cudaFree(d_h0_source));
     CUDA_CHECK(cudaFree(d_context_lengths));
+    if (d_cu_seqlens)
+        CUDA_CHECK(cudaFree(d_cu_seqlens));
+    CUDA_CHECK(cudaFree(d_o));
+}
+
+/**
+ * SM-aware padding test: context_lengths < seq_len for some batch items.
+ * On SM100+ the runner dispatches to Blackwell kernel (cu_seqlens masking).
+ * On SM80   the runner dispatches to sequential kernel (context_lengths masking).
+ * Verifies: output at padding positions is 0 (or close to 0), valid positions match reference.
+ */
+void runGDNPrefillPaddingTest()
+{
+    int32_t const smVersion = getSMVersion();
+    bool const onBlackwell = isBlackwellSM(smVersion);
+
+    int32_t const n = 4;
+    int32_t const seq_len = 128; // multiple of chunk_size=128
+    int32_t const h = 8;
+    int32_t const hv = 8;
+    int32_t const k = 128;
+    int32_t const v = 128;
+
+    size_t const qkvLen = static_cast<size_t>(n) * seq_len * h * k;
+    size_t const vLen = static_cast<size_t>(n) * seq_len * hv * v;
+    size_t const abLen = static_cast<size_t>(n) * seq_len * hv;
+    size_t const h0Len = static_cast<size_t>(n) * hv * k * v;
+    size_t const oLen = static_cast<size_t>(n) * seq_len * hv * v;
+
+    // Mixed context_lengths: [64, 128, 96, 128] — items 0 and 2 have padding.
+    std::vector<int32_t> h_ctx = {64, 128, 96, 128};
+
+    std::vector<float> h_q(qkvLen), h_k(qkvLen), h_v(vLen), h_a(abLen), h_b(abLen);
+    std::vector<float> h_A_log(hv), h_dt_bias(hv), h_h0(h0Len);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_q[i] = 0.1f * (1.f + static_cast<float>(i % 5));
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_k[i] = 0.1f * (1.f + static_cast<float>((i + 1) % 5));
+    for (size_t i = 0; i < vLen; ++i)
+        h_v[i] = 0.1f * (1.f + static_cast<float>((i + 2) % 5));
+    for (size_t i = 0; i < abLen; ++i)
+    {
+        h_a[i] = 0.25f * (static_cast<float>(i % 5) - 2.f);
+        h_b[i] = 0.25f * (static_cast<float>((i + 1) % 5) - 2.f);
+    }
+    for (int32_t i = 0; i < hv; ++i)
+    {
+        h_A_log[i] = -2.f + 0.25f * (i % 4);
+        h_dt_bias[i] = 0.02f * (i + 1);
+    }
+    for (size_t i = 0; i < h0Len; ++i)
+        h_h0[i] = 0.01f * (1.f + static_cast<float>(i % 10));
+
+    std::vector<half> h_q_h(qkvLen), h_k_h(qkvLen), h_v_h(vLen);
+    std::vector<half> h_a_h(abLen), h_b_h(abLen), h_dt_h(hv);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_q_h[i] = floatToHalf(h_q[i]);
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_k_h[i] = floatToHalf(h_k[i]);
+    for (size_t i = 0; i < vLen; ++i)
+        h_v_h[i] = floatToHalf(h_v[i]);
+    for (size_t i = 0; i < abLen; ++i)
+    {
+        h_a_h[i] = floatToHalf(h_a[i]);
+        h_b_h[i] = floatToHalf(h_b[i]);
+    }
+    for (int32_t i = 0; i < hv; ++i)
+        h_dt_h[i] = floatToHalf(h_dt_bias[i]);
+
+    void *d_q, *d_k, *d_v, *d_a, *d_b, *d_A_log, *d_dt_bias, *d_h0_src, *d_ctx, *d_o;
+    CUDA_CHECK(cudaMalloc(&d_q, qkvLen * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_k, qkvLen * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_v, vLen * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_a, abLen * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_b, abLen * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_A_log, hv * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dt_bias, hv * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_h0_src, h0Len * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ctx, n * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_o, oLen * sizeof(half)));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q_h.data(), qkvLen * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k_h.data(), qkvLen * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v_h.data(), vLen * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a_h.data(), abLen * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b_h.data(), abLen * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A_log, h_A_log.data(), hv * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dt_bias, h_dt_h.data(), hv * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_h0_src, h_h0.data(), h0Len * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ctx, h_ctx.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    void* d_cu_seqlens = nullptr;
+    if (onBlackwell)
+        d_cu_seqlens = allocCuSeqlens(d_ctx, n);
+
+    GDNParams params{};
+    params.q = d_q;
+    params.k = d_k;
+    params.v = d_v;
+    params.a = d_a;
+    params.b = d_b;
+    params.A_log = d_A_log;
+    params.dt_bias = d_dt_bias;
+    params.h0_source = d_h0_src;
+    params.context_lengths = d_ctx;
+    params.cu_seqlens = d_cu_seqlens;
+    params.o = d_o;
+    params.n = n;
+    params.seq_len = seq_len;
+    params.h = h;
+    params.hv = hv;
+    params.k_dim = k;
+    params.v_dim = v;
+    params.smVersion = smVersion;
+
+    bool loaded = CuteDslGDNRunner::loadKernelModules();
+    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
+
+    CuteDslGDNRunner runner;
+    int ret = runner.run(params, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(ret, 0) << "GDN prefill padding run failed (SM=" << smVersion
+                      << ", path=" << (onBlackwell ? "Blackwell" : "Sequential") << ")";
+
+    std::vector<half> h_o_h(oLen);
+    CUDA_CHECK(cudaMemcpy(h_o_h.data(), d_o, oLen * sizeof(half), cudaMemcpyDeviceToHost));
+    std::vector<float> h_o(oLen);
+    for (size_t i = 0; i < oLen; ++i)
+        h_o[i] = halfToFloat(h_o_h[i]);
+
+    // CPU reference (respects context_lengths masking)
+    std::vector<float> h0_ref(h_h0);
+    std::vector<float> o_ref(oLen, 0.f);
+    gdnPrefillReference(h_q.data(), h_k.data(), h_v.data(), h_a.data(), h_b.data(), h_A_log.data(), h_dt_bias.data(),
+        h0_ref.data(), o_ref.data(), n, seq_len, h, hv, k, v, h_ctx.data());
+
+    float const atol = 1e-4f;
+    float const rtol = 1e-4f;
+    size_t const hvv = static_cast<size_t>(hv) * v;
+    for (int32_t b = 0; b < n; ++b)
+    {
+        int32_t const valid = h_ctx[static_cast<size_t>(b)];
+        for (int32_t t = 0; t < seq_len; ++t)
+        {
+            size_t const base = (static_cast<size_t>(b) * seq_len + t) * hvv;
+            if (t >= valid)
+            {
+                // Padding positions: output must be zero.
+                for (size_t idx = 0; idx < hvv; ++idx)
+                    EXPECT_NEAR(h_o[base + idx], 0.f, 1e-3f)
+                        << "Expected zero at padding b=" << b << " t=" << t << " idx=" << idx;
+            }
+            else
+            {
+                // Valid positions: must match reference within tolerance.
+                for (size_t idx = 0; idx < hvv; ++idx)
+                    EXPECT_TRUE(isclose(h_o[base + idx], o_ref[base + idx], rtol, atol))
+                        << "Valid token mismatch b=" << b << " t=" << t << " idx=" << idx << ": got " << h_o[base + idx]
+                        << ", ref " << o_ref[base + idx];
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_A_log));
+    CUDA_CHECK(cudaFree(d_dt_bias));
+    CUDA_CHECK(cudaFree(d_h0_src));
+    CUDA_CHECK(cudaFree(d_ctx));
+    if (d_cu_seqlens)
+        CUDA_CHECK(cudaFree(d_cu_seqlens));
     CUDA_CHECK(cudaFree(d_o));
 }
 
@@ -561,6 +769,11 @@ TEST(GDNCuteDsl, Decode)
 TEST(GDNCuteDsl, Prefill)
 {
     runGDNPrefillTest();
+}
+
+TEST(GDNCuteDsl, PrefillPadding)
+{
+    runGDNPrefillPaddingTest();
 }
 
 TEST(GDNCuteDsl, CanImplement)

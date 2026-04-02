@@ -22,6 +22,7 @@
 #include "plugins/utils/pluginUtils.h"
 #ifdef CUTE_DSL_GDN_ENABLED
 #include "kernels/gdnKernels/cuteDslGDNRunner.h"
+#include "kernels/gdnKernels/gdnKernelUtils.cuh"
 #endif
 
 #include <cstdint>
@@ -70,15 +71,15 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, int32_t kDim, 
     : mLayerName(name)
     , mKDim(kDim)
     , mVDim(vDim)
+    , mSMVersion(getSMVersion())
 {
-    int const smVersion = getSMVersion();
-    if (!CuteDslGDNRunner::canImplement(mKDim, mVDim, smVersion))
+    if (!CuteDslGDNRunner::canImplement(mKDim, mVDim, mSMVersion))
     {
         LOG_ERROR(
             "Cannot implement GatedDeltaNetPlugin (CuTe DSL): k_dim=%d v_dim=%d SM=%d. "
             "CuTe DSL GDN is only built for k=v=128 and requires SM>=80 (Ampere+). "
             "Use k_dim=v_dim=128 on a supported GPU, or rebuild without CuTe DSL GDN if applicable.",
-            mKDim, mVDim, smVersion);
+            mKDim, mVDim, mSMVersion);
         throw std::runtime_error("Cannot implement the GatedDeltaNetPlugin configuration (CuTe DSL GDN).");
     }
 
@@ -208,16 +209,23 @@ int32_t GatedDeltaNetPlugin::configurePlugin(DynamicPluginTensorDesc const* in, 
     if (k_dim != mKDim || v_dim != mVDim)
         return -1;
 #ifdef CUTE_DSL_GDN_ENABLED
-    if (!CuteDslGDNRunner::canImplement(k_dim, v_dim, 80))
-        return -1; // Unsupported k/v or SM; kernel only supports k=v=128, SM>=80
+    if (!CuteDslGDNRunner::canImplement(k_dim, v_dim, mSMVersion))
+        return -1; // Unsupported on this device or k/v config; kernel requires k=v=128 and SM>=80
 #endif
     return 0;
 }
 
-size_t GatedDeltaNetPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */, int32_t /* nbInputs */,
+size_t GatedDeltaNetPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t /* nbInputs */,
     DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+    // cu_seqlens [N+1] int32 workspace: prefix-sum of context_lengths for Blackwell prefill padding masking.
+    int32_t const maxBatchSize = static_cast<int32_t>(inputs[kIN_CONTEXT_LENGTHS].max.d[0]);
+    return static_cast<size_t>(maxBatchSize + 1) * sizeof(int32_t);
+#else
+    (void) inputs;
     return 0;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +233,7 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* i
 // ---------------------------------------------------------------------------
 #ifdef CUTE_DSL_GDN_ENABLED
 int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
-    void const* const* inputs, void* const* outputs, void* /* workspace */, cudaStream_t stream) noexcept
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
     CuteDslGDNRunner::loadKernelModules();
 
@@ -264,9 +272,20 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     params.hv = hv;
     params.k_dim = k_dim;
     params.v_dim = v_dim;
+    params.smVersion = mSMVersion;
+
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+    // Blackwell prefill: convert context_lengths [N] → cu_seqlens [N+1] in workspace.
+    if (seq_len > 1 && mSMVersion >= 100)
+    {
+        launchGdnCalCuSeqLens(inputs[kIN_CONTEXT_LENGTHS], workspace, n, stream);
+        params.cu_seqlens = workspace;
+    }
+#endif
 
     CuteDslGDNRunner runner;
     int ret = runner.run(params, stream);
+
     return (ret == 0) ? 0 : -1;
 }
 #else

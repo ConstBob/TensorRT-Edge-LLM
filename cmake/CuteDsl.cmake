@@ -150,6 +150,29 @@ function(cute_dsl_setup)
     return()
   endif()
 
+  # Parse the "variants" array from metadata.json to determine which kernel
+  # variants are present (used for fine-grained per-variant compile defines).
+  set(_variants)
+  string(JSON _n_variants ERROR_VARIABLE _json_err LENGTH "${_meta_json}"
+                                                          "variants")
+  if(NOT _json_err AND NOT _n_variants EQUAL 0)
+    math(EXPR _last_var_idx "${_n_variants} - 1")
+    foreach(_vi RANGE ${_last_var_idx})
+      string(
+        JSON
+        _vname
+        ERROR_VARIABLE
+        _verr
+        GET
+        "${_meta_json}"
+        "variants"
+        ${_vi})
+      if(NOT _verr AND _vname)
+        list(APPEND _variants "${_vname}")
+      endif()
+    endforeach()
+  endif()
+
   # Apply compile definitions and include path to all targets.
   foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
     target_include_directories(${_tgt} PRIVATE "${_inc_dir}")
@@ -158,6 +181,19 @@ function(cute_dsl_setup)
       target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_${_gu}_ENABLED")
     endforeach()
   endforeach()
+
+  # Check for Blackwell GDN variant specifically and set a clean define.
+  list(FIND _variants "gdn_prefill_blackwell" _bw_idx)
+  if(NOT ${_bw_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_GDN_BLACKWELL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: Blackwell GDN prefill variant found — CUTE_DSL_GDN_BLACKWELL_ENABLED set"
+    )
+  endif()
 
   # Link the static archive into LINK_TARGETS only.
   foreach(_tgt ${ARG_LINK_TARGETS})
