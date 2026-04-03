@@ -23,6 +23,7 @@ for large language models and vision-language models on edge devices.
    :maxdepth: 2
    :caption: Examples
 
+   user_guide/examples/index.md
    user_guide/examples/vlm.md
    user_guide/examples/speculative-decoding.md
    user_guide/examples/phi4.md
