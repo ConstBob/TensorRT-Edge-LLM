@@ -26,7 +26,8 @@ from conftest import EnvironmentConfig, RemoteConfig
 from pytest_helpers import timer_context
 
 from .config import ModelType, TaskType, TestConfig
-from .utils.command_execution import (execute_build_test,
+from .utils.command_execution import (check_result_failures,
+                                      execute_build_test,
                                       execute_e2e_bench_test,
                                       execute_inference_test,
                                       execute_kernel_bench_test)
@@ -65,6 +66,7 @@ class TestLLMPipeline:
                                             env_config)
             if not result['success']:
                 pytest.fail(f"e2e_bench failed: {result['error']}")
+            check_result_failures(result)
 
     def test_kernel_bench(self, test_param: str, executable_files: Dict[str,
                                                                         str],
@@ -99,3 +101,4 @@ class TestLLMPipeline:
                                             env_config)
             if not result['success']:
                 pytest.fail(f"Inference failed: {result['error']}")
+            check_result_failures(result)
