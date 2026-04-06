@@ -135,7 +135,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         {
             numErrorWithin1E_3++;
         }
-        if (__hisnan(outHost[i]))
+        if (isnan(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
@@ -254,11 +254,11 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
             {
                 numClose++;
             }
-            if (__hisnan(outFp8Host[i]))
+            if (isnan(__half2float(outFp8Host[i])))
             {
                 NanValueDetectedFp8 = true;
             }
-            EXPECT_FALSE(__hisnan(outFp8Host[i]));
+            EXPECT_FALSE(isnan(__half2float(outFp8Host[i])));
         }
         float const fp8PassRate1E_3 = static_cast<float>(numClose) / static_cast<float>(outReferenceFp8.size());
 

@@ -120,7 +120,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         {
             numErrorWithin1E_3++;
         }
-        if (__hisnan(outHost[i]))
+        if (isnan(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
@@ -253,11 +253,11 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
             {
                 numClose++;
             }
-            if (__hisnan(outFp8Host[i]))
+            if (isnan(__half2float(outFp8Host[i])))
             {
                 NanValueDetectedFp8 = true;
             }
-            EXPECT_FALSE(__hisnan(outFp8Host[i]));
+            EXPECT_FALSE(isnan(__half2float(outFp8Host[i])));
         }
         float const matchRate = static_cast<float>(numClose) / static_cast<float>(outHost.size());
         std::cout << "XQA Attention Decoding test. [FP8 KV cache] batch_size: " << batchSize

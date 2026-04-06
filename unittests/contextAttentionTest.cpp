@@ -155,7 +155,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
         {
             numCloseWithin1E_3++;
         }
-        if (__hisnan(outHost[i]))
+        if (isnan(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
