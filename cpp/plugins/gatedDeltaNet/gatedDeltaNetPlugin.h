@@ -176,8 +176,9 @@ public:
 private:
     std::string mLayerName;
     std::string mNamespace;
-    int32_t mKDim{128}; //!< Head dimension K (kernel supports 128 only)
-    int32_t mVDim{128}; //!< Head dimension V (kernel supports 128 only)
+    int32_t mKDim{128};    //!< Head dimension K (kernel supports 128 only)
+    int32_t mVDim{128};    //!< Head dimension V (kernel supports 128 only)
+    int32_t mSMVersion{0}; //!< Captured device SM version used for build-time capability checks
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;
 };

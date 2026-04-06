@@ -104,6 +104,13 @@ KERNEL_VARIANTS = [
         script="gdn_cutedsl/gdn_prefill.py",
         script_args=["--export_only"],
     ),
+    KernelVariant(
+        name="gdn_prefill_blackwell",
+        group="gdn",
+        supported_sms=[100, 101, 110, 120, 121],
+        script="gdn_cutedsl/gdn_prefill_blackwell.py",
+        script_args=["--export_only"],
+    ),
     # --- FMHA group ---
     KernelVariant(
         name="fmha_d64",

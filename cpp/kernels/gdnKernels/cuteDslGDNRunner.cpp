@@ -29,6 +29,9 @@ namespace trt_edgellm
 
 gdn_decode_Kernel_Module_t CuteDslGDNRunner::sDecodeModule = {};
 gdn_prefill_Kernel_Module_t CuteDslGDNRunner::sPrefillModule = {};
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+gdn_prefill_blackwell_Kernel_Module_t CuteDslGDNRunner::sBlackwellPrefillModule = {};
+#endif
 bool CuteDslGDNRunner::sLoaded = false;
 
 static std::mutex sGDNMutex;
@@ -80,8 +83,13 @@ bool CuteDslGDNRunner::loadKernelModules()
     {
         gdn_decode_Kernel_Module_Load(&sDecodeModule);
         gdn_prefill_Kernel_Module_Load(&sPrefillModule);
-        sLoaded = true;
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+        gdn_prefill_blackwell_Kernel_Module_Load(&sBlackwellPrefillModule);
+        LOG_DEBUG("CuTe DSL GDN kernel modules (decode + prefill + prefill_blackwell) loaded");
+#else
         LOG_DEBUG("CuTe DSL GDN kernel modules (decode + prefill) loaded");
+#endif
+        sLoaded = true;
         return true;
     }
     catch (...)
@@ -98,13 +106,22 @@ void CuteDslGDNRunner::unloadKernelModules()
     {
         gdn_decode_Kernel_Module_Unload(&sDecodeModule);
         gdn_prefill_Kernel_Module_Unload(&sPrefillModule);
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+        gdn_prefill_blackwell_Kernel_Module_Unload(&sBlackwellPrefillModule);
+#endif
         sLoaded = false;
     }
 }
 
 int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
 {
-    return (params.seq_len == 1) ? runDecode(params, stream) : runPrefill(params, stream);
+    if (params.seq_len == 1)
+        return runDecode(params, stream);
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+    if (params.smVersion >= 100)
+        return runPrefillBlackwell(params, stream);
+#endif
+    return runPrefill(params, stream);
 }
 
 int CuteDslGDNRunner::runDecode(GDNParams const& params, cudaStream_t stream)
@@ -216,6 +233,72 @@ int CuteDslGDNRunner::runPrefill(GDNParams const& params, cudaStream_t stream)
         &dt_biasTensor, &h0_sourceTensor, &contextLengthsTensor, &oTensor, seq_len, stream);
 
     return 0;
+}
+
+int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t stream)
+{
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+    if (!sLoaded)
+    {
+        LOG_ERROR("CuTe DSL GDN Blackwell prefill kernel module not loaded.");
+        return -1;
+    }
+    int32_t const n = params.n;
+    int32_t const seq_len = params.seq_len;
+    int32_t const h = params.h;
+    int32_t const hv = params.hv;
+    int32_t const k = params.k_dim;
+    int32_t const v = params.v_dim;
+
+    // Set up tensor structs for fused Blackwell kernel (g/beta computed inline in warp 7)
+    gdn_prefill_blackwell_Tensor_q_t qTensor{};
+    SET_4D_TENSOR(qTensor, params.q, n, seq_len, h, k);
+
+    gdn_prefill_blackwell_Tensor_k_t kTensor{};
+    SET_4D_TENSOR(kTensor, params.k, n, seq_len, h, k);
+
+    gdn_prefill_blackwell_Tensor_v_t vTensor{};
+    SET_4D_TENSOR(vTensor, params.v, n, seq_len, hv, v);
+
+    gdn_prefill_blackwell_Tensor_a_t aTensor{};
+    SET_3D_TENSOR(aTensor, params.a, n, seq_len, hv);
+
+    gdn_prefill_blackwell_Tensor_b_t bTensor{};
+    SET_3D_TENSOR(bTensor, params.b, n, seq_len, hv);
+
+    gdn_prefill_blackwell_Tensor_A_log_t A_logTensor{};
+    SET_1D_TENSOR(A_logTensor, params.A_log, hv);
+
+    gdn_prefill_blackwell_Tensor_dt_bias_t dt_biasTensor{};
+    SET_1D_TENSOR(dt_biasTensor, params.dt_bias, hv);
+
+    // h0_in and h0_out share the same buffer (in-place state update)
+    gdn_prefill_blackwell_Tensor_h0_in_t h0InTensor{};
+    h0InTensor.data = params.h0_source;
+    h0InTensor.dynamic_shapes[0] = n;
+    h0InTensor.dynamic_shapes[1] = hv;
+    h0InTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    gdn_prefill_blackwell_Tensor_h0_out_t h0OutTensor{};
+    h0OutTensor.data = params.h0_source; // same buffer
+    h0OutTensor.dynamic_shapes[0] = n;
+    h0OutTensor.dynamic_shapes[1] = hv;
+    h0OutTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    // cu_seqlens [N+1]: prefix-sum of context_lengths, computed by the plugin before launch.
+    gdn_prefill_blackwell_Tensor_cu_seqlens_t cuSeqLensTensor{};
+    SET_1D_TENSOR(cuSeqLensTensor, params.cu_seqlens, n + 1);
+
+    gdn_prefill_blackwell_Tensor_o_t oTensor{};
+    SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
+
+    cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
+        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &cuSeqLensTensor, &oTensor, stream);
+    return 0;
+#else
+    LOG_ERROR("Blackwell GDN prefill not compiled in this build.");
+    return -1;
+#endif
 }
 
 } // namespace trt_edgellm
