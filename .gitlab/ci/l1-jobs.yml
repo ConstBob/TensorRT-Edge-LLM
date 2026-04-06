@@ -43,6 +43,7 @@ l1_a30:
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
+    BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/a30.csv"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
