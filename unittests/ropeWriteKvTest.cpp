@@ -335,7 +335,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     std::vector<half> qInput;
     std::vector<half> kInput;
     std::vector<half> vInput;
-    std::vector<half> kvCache(kvCacheVolume, 0);
+    std::vector<half> kvCache(kvCacheVolume, __float2half(0.0f));
 
     // Reference output of Q, K, V all have layout [B, S, H, D].
     std::vector<half> qReference;
