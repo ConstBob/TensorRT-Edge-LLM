@@ -224,6 +224,55 @@ def _fix_gptq_moe_gate_weights(model: PreTrainedModel, model_dir: str) -> None:
     )
 
 
+def _fix_nemotron_h_mamba_weights(model: PreTrainedModel,
+                                  model_dir: str) -> None:
+    """
+    Fix Mamba weights for NemotronH models after from_pretrained.
+
+    In transformers >= 5.x, _init_weights runs AFTER checkpoint weights are
+    loaded (via post-init hooks).  The NemotronH _init_weights destructively
+    overwrites Mamba dt_bias (with random inv-softplus values) and out_proj
+    weights (with kaiming-uniform + residual rescaling), corrupting the trained
+    values.
+
+    This function reloads those parameters directly from the safetensors
+    checkpoint, restoring the trained values.
+    """
+    model_path = _resolve_model_path(model_dir)
+    safetensor_files = sorted(model_path.glob("*.safetensors"))
+    if not safetensor_files:
+        print(f"Warning: No safetensor files found at {model_path}")
+        return
+
+    # Read all affected tensors from checkpoint, grouped by shard file
+    raw_weights = {}
+    for shard_path in safetensor_files:
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if ".mixer.dt_bias" in key or ".mixer.out_proj.weight" in key:
+                    raw_weights[key] = f.get_tensor(key)
+
+    if not raw_weights:
+        return
+
+    # Reload corrupted parameters from checkpoint
+    params_fixed = 0
+    for param_name, param in model.named_parameters():
+        if param_name not in raw_weights:
+            continue
+
+        raw_tensor = raw_weights[param_name].to(dtype=param.dtype,
+                                                device=param.device)
+        if not torch.equal(param.data, raw_tensor):
+            with torch.no_grad():
+                param.data.copy_(raw_tensor)
+            params_fixed += 1
+
+    if params_fixed > 0:
+        print(f"Reloaded {params_fixed} NemotronH Mamba parameters "
+              f"(dt_bias, out_proj.weight) from checkpoint")
+
+
 def _check_model_type(model_dir: str, model_identifier: str) -> bool:
     """
     Check if a model matches a given identifier by checking model_type and architectures.
@@ -469,6 +518,7 @@ def load_hf_model(
         model = AutoModelForCausalLM.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).to(device)
+        _fix_nemotron_h_mamba_weights(model, model_dir)
     # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
     # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
     elif _is_phi4mm_model(model_dir):
