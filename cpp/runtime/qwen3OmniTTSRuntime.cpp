@@ -647,7 +647,7 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     CUDA_CHECK(cudaMemcpyAsync(
         ttsIds.rawPointer(), hostTtsIds.data(), kNumTtsTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, ttsRaw, stream);
+    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
     // Reshape from [1, 3, hidden] to [3, hidden] for MLP (expects 2D input)
     check::check(ttsRaw.reshape({kNumTtsTokens, thinkerHiddenSize}), "Tensor reshape failed");
     kernel::invokeTalkerMLP(mCublasHandle, ttsRaw, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
@@ -782,7 +782,8 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
     int32_t const embedIdx = std::min(embeddingTableIndex, kNumRvqLayers - 1);
     // Lookup into mRawCodecEmbed (talkerHiddenSize=2048) — codec embedding tables are in Talker's space
     check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], mRawCodecEmbed, stream);
+    kernel::embeddingLookup(
+        mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], std::nullopt, mRawCodecEmbed, stream);
 
     // Save raw (2048-dim) embedding to mCodecHiddensBuffer for residual connection
     // Position mapping: generationStep 1->pos 1, 2->pos 2, ..., 14->pos 14
@@ -900,7 +901,7 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
     CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), textTokenIds.data(), seqLen * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
     check::check(mThinkerEmbedBuffer.reshape({1, seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, mThinkerEmbedBuffer, stream);
+    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
     check::check(mThinkerEmbedBuffer.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
 
     // Determine speaker ID
@@ -1140,7 +1141,7 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     CUDA_CHECK(cudaMemcpyAsync(
         mCodePredictorCodecIds.rawPointer(), &codecToken, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mCodePredictorCodecIds, mTalkerEmbeddingTable, mRawCodecEmbed, stream);
+    kernel::embeddingLookup(mCodePredictorCodecIds, mTalkerEmbeddingTable, std::nullopt, mRawCodecEmbed, stream);
 
     // Step 2: Project talkerHiddenState (2048) → mSmallToMtpProjectedHidden (1024)
     // talkerHiddenState is mTalkerLastHidden with shape {1, talkerHiddenSize=2048}

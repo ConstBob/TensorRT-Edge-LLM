@@ -22,9 +22,11 @@
 #include "runtime/imageUtils.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -209,6 +211,49 @@ void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec
  * @return Vector mapping old batch indices to new indices (-1 for evicted batches)
  */
 std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates);
+
+//=============================================================================
+// Embedding Loading Utilities
+//=============================================================================
+
+/*! \brief FP8 embedding block size (fixed at 128)
+ *
+ *  This matches the quantization granularity: scales shape is [vocabSize, hiddenSize/128]
+ */
+inline constexpr int64_t kFP8EmbeddingBlockSize = 128;
+
+/*! \brief Embedding data - supports both FP16 and FP8 formats
+ *
+ *  The embedding table datatype determines the format:
+ *  - FP16: table is FP16, tableScalingFactor is empty
+ *  - FP8: table is FP8 (E4M3), tableScalingFactor contains FP32 per-group scales
+ *
+ *  The kernel functions automatically dispatch based on table.getDataType().
+ */
+struct EmbeddingData
+{
+    rt::Tensor table;              //!< Embedding table [vocabSize, hiddenSize] (FP16 or FP8)
+    rt::Tensor tableScalingFactor; //!< FP32 per-group scales [vocabSize, hiddenSize/128] (only if FP8)
+
+    //! \brief Returns scales as OptionalInputTensor (std::nullopt when FP16, reference when FP8)
+    rt::OptionalInputTensor scalesAsOptional() const
+    {
+        return tableScalingFactor.getShape().volume() > 0 ? rt::OptionalInputTensor{tableScalingFactor} : std::nullopt;
+    }
+};
+
+/*! \brief Load embedding table from safetensors file (auto-detects FP16 vs FP8 by dtype)
+ *
+ *  Loads embedding.safetensors and detects format by checking the "embedding" tensor dtype:
+ *  - FP8: loads "embedding" (FP8) + "embedding_scale" (FP32)
+ *  - FP16: loads "embedding" (FP16)
+ *
+ *  \param embeddingPath Path to embedding.safetensors file
+ *  \param stream CUDA stream for async operations
+ *  \return EmbeddingData with loaded tensors and format flag
+ *  \throws std::runtime_error if file not found, tensors missing, or invalid dtypes
+ */
+EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream);
 
 } // namespace rt
 } // namespace trt_edgellm

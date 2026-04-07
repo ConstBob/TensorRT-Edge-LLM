@@ -92,19 +92,7 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
 
     // Load shared embedding table from embedding.safetensors (shared between base and draft models)
     std::filesystem::path const embeddingPath = std::filesystem::path(engineDir) / "embedding.safetensors";
-    LOG_INFO("Loading shared embedding table from: %s", embeddingPath.string().c_str());
-    std::vector<rt::Tensor> embeddingTensors;
-    if (!safetensors::loadSafetensors(embeddingPath, embeddingTensors, stream))
-    {
-        LOG_ERROR("Failed to load embedding table from: %s", embeddingPath.string().c_str());
-        throw std::runtime_error("Failed to load embedding table from: " + embeddingPath.string());
-    }
-    check::check(embeddingTensors.size() == 1, "embedding.safetensors should contain exactly one tensor");
-    check::check(
-        embeddingTensors[0].getShape().getNumDims() == 2, "embedding tensor should be 2D [vocabSize, hiddenSize]");
-    mEmbeddingTable = std::move(embeddingTensors[0]);
-    LOG_INFO("Shared embedding table loaded successfully with shape [%d, %d]", mEmbeddingTable.getShape()[0],
-        mEmbeddingTable.getShape()[1]);
+    mEmbedding = loadEmbeddingTable(embeddingPath, stream);
 
     std::filesystem::path const enginePath = std::filesystem::path(engineDir) / "eagle_base.engine";
     std::filesystem::path const configPath = std::filesystem::path(engineDir) / "base_config.json";
@@ -756,13 +744,14 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     {
         // Use image insertion variant for multimodal models
         rt::Tensor const& imageEmbedsTensor = context.multimodalEmbeddings.value().get();
-        kernel::embeddingLookupWithImageInsertion(
-            mIdsInput, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, context.stream);
+        kernel::embeddingLookupWithImageInsertion(mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(),
+            imageEmbedsTensor, mInputsEmbeds, context.stream);
     }
     else
     {
         // Standard embedding lookup
-        kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+        kernel::embeddingLookup(
+            mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
     }
 
     // Process deepstack features: perform embedding lookup or provide zero tensors
@@ -896,13 +885,14 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelPrefill(SpecDecodeInferenceCont
     {
         // Use image insertion variant for multimodal models (draft model uses base model hidden dim / 3)
         rt::Tensor const& imageEmbedsTensor = context.multimodalEmbeddings.value().get();
-        kernel::embeddingLookupWithImageInsertion(
-            mIdsInput, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, context.stream);
+        kernel::embeddingLookupWithImageInsertion(mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(),
+            imageEmbedsTensor, mInputsEmbeds, context.stream);
     }
     else
     {
         // Standard embedding lookup
-        kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+        kernel::embeddingLookup(
+            mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
     }
 
     bool const prefillSuccess = mDraftEngineRunner->executeEaglePrefillStep(mInputsEmbeds, mBaseHiddenStatesOutput,
@@ -1029,7 +1019,10 @@ bool LLMInferenceSpecDecodeRuntime::constructDraftTree(SpecDecodeInferenceContex
         check::check(
             mInputsEmbeds.reshape({activeBatchSize, paddedDraftTreeSize, mDraftEngineConfig.draftModelHiddenDim}),
             "Tensor reshape failed");
-        kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+        {
+            kernel::embeddingLookup(
+                mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
+        }
 
         // Invoke the eagle draft engine to produce the new round of logits and hidden states.
         bool const draftProposalStatus = mDraftEngineRunner->executeEagleDraftProposalStep(mInputsEmbeds,
@@ -1108,7 +1101,10 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // Perform embedding lookup for base model verification (Eagle base tree decoding only has text, no images)
     check::check(mInputsEmbeds.reshape({activeBatchSize, mDraftingConfig.verifyTreeSize, mBaseEngineConfig.hiddenSize}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+    {
+        kernel::embeddingLookup(
+            mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
+    }
 
     // Engine expects 2D tensors: [batch_size * verify_tree_size, vocab_size/hidden_dim]
     int32_t const selectTokenSize = activeBatchSize * mDraftingConfig.verifyTreeSize;
@@ -1224,7 +1220,10 @@ bool LLMInferenceSpecDecodeRuntime::runVanillaDecoding(SpecDecodeInferenceContex
         activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, context.stream));
 
     check::check(mInputsEmbeds.reshape({activeBatchSize, 1, mBaseEngineConfig.hiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+    {
+        kernel::embeddingLookup(
+            mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
+    }
 
     check::check(mLogitsOutput.reshape({activeBatchSize, mBaseEngineConfig.outputVocabSize}), "Tensor reshape failed");
 
@@ -1306,7 +1305,10 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInference
     // Perform embedding lookup for draft model accept decode token (only text, no images)
     check::check(mInputsEmbeds.reshape({activeBatchSize, inputIdsLength, mDraftEngineConfig.draftModelHiddenDim}),
         "Tensor reshape failed");
-    kernel::embeddingLookup(mIdsInput, mEmbeddingTable, mInputsEmbeds, context.stream);
+    {
+        kernel::embeddingLookup(
+            mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
+    }
 
     bool const acceptTokenSuccess
         = mDraftEngineRunner->executeEagleAcceptDecodeTokenStep(mInputsEmbeds, mBaseHiddenStatesOutput,

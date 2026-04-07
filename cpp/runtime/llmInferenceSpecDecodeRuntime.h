@@ -195,7 +195,7 @@ private:
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
     // [1] I/O Tensors to work with base and eagle draft engine.
-    rt::Tensor mEmbeddingTable;               //!< Embedding table [vocabSize, hiddenSize]
+    EmbeddingData mEmbedding;                 //!< Embedding table [vocabSize, hiddenSize] and optional FP8 scales
     rt::Tensor mIdsInput;                     //!< Input token IDs (used for embedding lookup)
     rt::Tensor mInputsEmbeds;                 //!< Input embeddings (after embedding lookup)
     std::vector<rt::Tensor> mDeepstackEmbeds; //!< Deepstack embeddings for Qwen3-VL (one per feature)

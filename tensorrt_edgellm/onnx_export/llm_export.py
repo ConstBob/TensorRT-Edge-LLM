@@ -97,10 +97,21 @@ def save_d2t_for_eagle3_draft(draft_model: nn.Module, output_dir: str) -> None:
     print(f"Saved d2t.safetensors to {output_dir}")
 
 
-def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
+def save_embedding_table(base_model: nn.Module,
+                         output_dir: str,
+                         fp8_embedding: bool = False) -> None:
     """Save embedding.safetensors for LLM models (both EAGLE base and regular models).
-    
+
     Note: Draft models do not need embeddings as they use the base model's embeddings.
+
+    Args:
+        base_model: Model containing embed_tokens layer
+        output_dir: Directory to save embedding.safetensors
+        fp8_embedding: If True, quantize to FP8; if False, save as FP16
+
+    Output file format:
+        - FP16 mode: {"embedding": FP16 tensor}
+        - FP8 mode: {"embedding": FP8 tensor, "embedding_scale": FP32 tensor}
     """
     from safetensors.torch import save_file
 
@@ -110,8 +121,21 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
 
     # Save as safetensors with key 'embedding'
     embedding_path = os.path.join(output_dir, "embedding.safetensors")
-    save_file({"embedding": embedding_weight}, embedding_path)
-    print(f"Saved embedding.safetensors to {output_dir}")
+
+    if fp8_embedding:
+        from tensorrt_edgellm.quantization.embedding_quantization import \
+            quantize_embedding_to_fp8
+
+        embedding_fp8, scales = quantize_embedding_to_fp8(embedding_weight)
+        save_file({
+            "embedding": embedding_fp8,
+            "embedding_scale": scales
+        }, embedding_path)
+        print(f"Saved FP8 embedding.safetensors to {output_dir}")
+    else:
+        embedding_fp16 = embedding_weight.half()
+        save_file({"embedding": embedding_fp16}, embedding_path)
+        print(f"Saved FP16 embedding.safetensors to {output_dir}")
 
 
 # ============================================================================
@@ -119,17 +143,26 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
 # ============================================================================
 
 
-def get_model_save_weights_hook(model_name: str):
+def get_model_save_weights_hook(model_name: str, fp8_embedding: bool = False):
     """
     Get weight saving function for each model type.
     
     Every model type has an explicit hook. Talker and CodePredictor have
     additional weights beyond the standard embedding table.
+
+    Args:
+        model_name: Name of the model type
+        fp8_embedding: If True, quantize embedding to FP8
     """
     if model_name == "talker":
+        if fp8_embedding:
+            print("Warning: fp8_embedding is not supported for talker model, "
+                  "will use FP16 embedding instead")
 
         def save_talker_weights(model, output_dir):
-            save_embedding_table(model.transformer, output_dir)
+            save_embedding_table(model.transformer,
+                                 output_dir,
+                                 fp8_embedding=False)
             from ..llm_models.models.qwen3_omni_talker import \
                 save_qwen3_omni_talker_projections
             save_qwen3_omni_talker_projections(model, output_dir)
@@ -137,6 +170,10 @@ def get_model_save_weights_hook(model_name: str):
         return save_talker_weights
 
     if model_name == "code_predictor":
+        if fp8_embedding:
+            print(
+                "Warning: fp8_embedding is not supported for code_predictor model, "
+                "will use FP16 embedding instead")
 
         def save_code_predictor_weights(model, output_dir):
             from ..llm_models.models.qwen3_omni_talker import (
@@ -164,7 +201,7 @@ def get_model_save_weights_hook(model_name: str):
 
     # Standard LLM / Thinker / EAGLE: only need embedding table
     def save_default_weights(model, output_dir):
-        save_embedding_table(model, output_dir)
+        save_embedding_table(model, output_dir, fp8_embedding=fp8_embedding)
 
     return save_default_weights
 
@@ -859,13 +896,14 @@ def export_llm_model(model_dir: str,
                      chat_template_path: Optional[str] = None,
                      fp8_kv_cache: bool = False,
                      trt_native_ops: bool = False,
-                     export_models: Optional[str] = None) -> None:
+                     export_models: Optional[str] = None,
+                     fp8_embedding: bool = False) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
-    
+
     This is the main entry point for exporting standard LLM models and EAGLE base models
     to ONNX format with TensorRT Edge-LLM optimizations.
-    
+
     Args:
         model_dir: Directory containing the HuggingFace model
         output_dir: Directory to save the exported ONNX model
@@ -876,6 +914,7 @@ def export_llm_model(model_dir: str,
         fp8_kv_cache: Whether to use FP8 KV cache
         trt_native_ops: Whether to use TensorRT native operations instead of plugin
         export_models: Comma-separated list of models to export for Qwen3-Omni (e.g., "thinker,talker"). Default: export all models
+        fp8_embedding: Whether to quantize embedding table to FP8 for reduced memory bandwidth
     """
     start_time = time.time()
 
@@ -965,7 +1004,8 @@ def export_llm_model(model_dir: str,
         print(f"Config saved to {model_output_dir}")
 
         # Step 4: Save weights
-        weights_hook = get_model_save_weights_hook(model_name)
+        weights_hook = get_model_save_weights_hook(model_name,
+                                                   fp8_embedding=fp8_embedding)
         weights_hook(model, model_output_dir)
 
     # ========== Save Shared Resources ==========

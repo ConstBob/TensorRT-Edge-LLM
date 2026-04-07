@@ -25,15 +25,13 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP
 from transformers.models.qwen3_moe.modeling_qwen3_moe import \
     Qwen3MoeSparseMoeBlock
 
+from tensorrt_edgellm.quantization import FP8_E4M3_MAX
+
 from .attention_plugin import attention_plugin
 from .attention_trt import EdgeLLMAttentionTRTNative
 from .gated_delta_net_plugin import gated_delta_net_plugin
 from .layer_utils import EdgeLLMQKNorm, EdgeLLMQKVProj
 from .mamba_plugin import causal_conv1d_plugin, update_ssm_state_plugin
-
-# FP8 (E4M3) quantization constants
-# Max finite value representable by NVIDIA FP8 E4M3 format; used to derive per-tensor KV cache scale.
-FP8_E4M3_MAX: float = 448.0
 
 
 class PromptTuningEmbedding(torch.nn.Module):
