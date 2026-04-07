@@ -142,7 +142,7 @@ private:
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCache{}; //!< Cache of system prompts / LORA weights and their KV caches
 
-    rt::Tensor mEmbeddingTable{};    //!< Shared embedding table [vocabSize, hiddenSize]
+    EmbeddingData mEmbedding{};      //!< Shared embedding table [vocabSize, hiddenSize] and optional FP8 scales
     rt::Tensor mSamplingWorkspace{}; //!< Workspace tensor for sampling operations
     rt::Tensor mInputIds{};          //!< Input token IDs tensor
     rt::Tensor mInputsEmbeds{};      //!< Input embeddings tensor [batchSize, seqLen, hiddenSize]

@@ -19,6 +19,7 @@
 
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include <ostream>
@@ -360,6 +361,127 @@ std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates
     }
 
     return mapping;
+}
+
+//=============================================================================
+// Embedding Loading Utilities
+//=============================================================================
+
+EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream)
+{
+    if (!std::filesystem::exists(embeddingPath))
+    {
+        LOG_ERROR("Embedding file not found: %s", embeddingPath.string().c_str());
+        throw std::runtime_error(format::fmtstr("Embedding file not found: %s", embeddingPath.string().c_str()));
+    }
+
+    std::vector<rt::Tensor> tensors;
+    if (!safetensors::loadSafetensors(embeddingPath, tensors, stream))
+    {
+        LOG_ERROR("Failed to load embedding file: %s", embeddingPath.string().c_str());
+        throw std::runtime_error(format::fmtstr("Failed to load embedding file: %s", embeddingPath.string().c_str()));
+    }
+
+    // Find tensors by name
+    rt::Tensor* embeddingPtr = nullptr;
+    rt::Tensor* scalesPtr = nullptr;
+
+    for (auto& tensor : tensors)
+    {
+        if (tensor.getName() == "embedding")
+        {
+            embeddingPtr = &tensor;
+        }
+        else if (tensor.getName() == "embedding_scale")
+        {
+            scalesPtr = &tensor;
+        }
+    }
+
+    if (embeddingPtr == nullptr)
+    {
+        LOG_ERROR("Embedding file missing 'embedding' tensor: %s", embeddingPath.string().c_str());
+        throw std::runtime_error(
+            format::fmtstr("Embedding file missing 'embedding' tensor: %s", embeddingPath.string().c_str()));
+    }
+
+    if (embeddingPtr->getShape().getNumDims() != 2)
+    {
+        LOG_ERROR("Embedding tensor must be 2D, got %d dimensions", embeddingPtr->getShape().getNumDims());
+        throw std::runtime_error(
+            format::fmtstr("Embedding tensor must be 2D, got %d dimensions", embeddingPtr->getShape().getNumDims()));
+    }
+
+    int64_t vocabSize = embeddingPtr->getShape()[0];
+    int64_t hiddenSize = embeddingPtr->getShape()[1];
+
+    EmbeddingData result;
+
+    // Detect FP8 vs FP16 by checking dtype
+    if (embeddingPtr->getDataType() == nvinfer1::DataType::kFP8)
+    {
+        // FP8 format - requires scales
+        if (scalesPtr == nullptr)
+        {
+            LOG_ERROR("FP8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str());
+            throw std::runtime_error(
+                format::fmtstr("FP8 embedding requires 'embedding_scale' tensor: %s", embeddingPath.string().c_str()));
+        }
+
+        if (scalesPtr->getDataType() != nvinfer1::DataType::kFLOAT)
+        {
+            LOG_ERROR("embedding_scale must have FP32 dtype, got %d", static_cast<int>(scalesPtr->getDataType()));
+            throw std::runtime_error(format::fmtstr(
+                "embedding_scale must have FP32 dtype, got %d", static_cast<int>(scalesPtr->getDataType())));
+        }
+
+        if (scalesPtr->getShape().getNumDims() != 2)
+        {
+            LOG_ERROR("embedding_scale must be 2D, got %d dimensions", scalesPtr->getShape().getNumDims());
+            throw std::runtime_error(
+                format::fmtstr("embedding_scale must be 2D, got %d dimensions", scalesPtr->getShape().getNumDims()));
+        }
+
+        int64_t scaleVocabSize = scalesPtr->getShape()[0];
+        int64_t numGroups = scalesPtr->getShape()[1];
+
+        if (vocabSize != scaleVocabSize)
+        {
+            LOG_ERROR("Vocab size mismatch: embedding has %ld, scales has %ld", vocabSize, scaleVocabSize);
+            throw std::runtime_error(
+                format::fmtstr("Vocab size mismatch: embedding has %ld, scales has %ld", vocabSize, scaleVocabSize));
+        }
+
+        if (hiddenSize % kFP8EmbeddingBlockSize != 0)
+        {
+            LOG_ERROR("Hidden size %ld must be divisible by block size %ld", hiddenSize, kFP8EmbeddingBlockSize);
+            throw std::runtime_error(format::fmtstr(
+                "Hidden size %ld must be divisible by block size %ld", hiddenSize, kFP8EmbeddingBlockSize));
+        }
+
+        int64_t expectedNumGroups = hiddenSize / kFP8EmbeddingBlockSize;
+        if (numGroups != expectedNumGroups)
+        {
+            LOG_ERROR("Scale groups mismatch: expected %ld, got %ld", expectedNumGroups, numGroups);
+            throw std::runtime_error(
+                format::fmtstr("Scale groups mismatch: expected %ld, got %ld", expectedNumGroups, numGroups));
+        }
+
+        LOG_INFO(
+            "Loaded FP8 embedding: [%ld, %ld], scales: [%ld, %ld]", vocabSize, hiddenSize, scaleVocabSize, numGroups);
+
+        result.table = std::move(*embeddingPtr);
+        result.tableScalingFactor = std::move(*scalesPtr);
+    }
+    else
+    {
+        // FP16 format
+        LOG_INFO("Loaded FP16 embedding: [%ld, %ld]", vocabSize, hiddenSize);
+
+        result.table = std::move(*embeddingPtr);
+    }
+
+    return result;
 }
 
 } // namespace rt

@@ -132,19 +132,7 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
 
     // Load embedding table from embedding.safetensors
     std::filesystem::path const embeddingPath = std::filesystem::path(engineDir) / "embedding.safetensors";
-    LOG_INFO("Loading embedding table from: %s", embeddingPath.string().c_str());
-    std::vector<rt::Tensor> embeddingTensors;
-    if (!safetensors::loadSafetensors(embeddingPath, embeddingTensors, stream))
-    {
-        LOG_ERROR("Failed to load embedding table from: %s", embeddingPath.string().c_str());
-        throw std::runtime_error("Failed to load embedding table from: " + embeddingPath.string());
-    }
-    check::check(embeddingTensors.size() == 1, "embedding.safetensors should contain exactly one tensor");
-    check::check(
-        embeddingTensors[0].getShape().getNumDims() == 2, "embedding tensor should be 2D [vocabSize, hiddenSize]");
-    mEmbeddingTable = std::move(embeddingTensors[0]);
-    LOG_INFO("Embedding table loaded successfully with shape [%d, %d]", mEmbeddingTable.getShape()[0],
-        mEmbeddingTable.getShape()[1]);
+    mEmbedding = loadEmbeddingTable(embeddingPath, stream);
 
     try
     {
@@ -701,19 +689,21 @@ bool LLMInferenceRuntime::handleRequest(
         CUDA_CHECK(cudaMemcpy(mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesSizeBytes,
             cudaMemcpyHostToDevice));
 
-        kernel::embeddingLookupMultimodal(mInputIds, mEmbeddingTable, std::optional{std::ref(mMultimodalIndices)},
-            imageTokenId, visionEmbeddings, audioTokenId, audioEmbeddings, mInputsEmbeds, stream);
+        kernel::embeddingLookupMultimodal(mInputIds, mEmbedding.table, mEmbedding.scalesAsOptional(),
+            std::optional{std::ref(mMultimodalIndices)}, imageTokenId, visionEmbeddings, audioTokenId, audioEmbeddings,
+            mInputsEmbeds, stream);
     }
     else if (visionEmbeddings.has_value())
     {
         // Legacy vision path (Qwen2.5-VL, InternVL: imageTokenId >= vocabSize or not set)
         rt::Tensor const& imageEmbedsTensor = visionEmbeddings.value().get();
-        kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
+        kernel::embeddingLookupWithImageInsertion(
+            mInputIds, mEmbedding.table, mEmbedding.scalesAsOptional(), imageEmbedsTensor, mInputsEmbeds, stream);
     }
     else
     {
         // Standard embedding lookup (pure text)
-        kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
+        kernel::embeddingLookup(mInputIds, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, stream);
     }
 
     // Process deepstack features: perform embedding assembly if vision runner is available
@@ -796,7 +786,8 @@ bool LLMInferenceRuntime::handleRequest(
                 nvtx_colors::LIGHT_GREEN);
 
             // Perform embedding lookup for the selected token indices (decode only has text, no images)
-            kernel::embeddingLookup(mSelectedIndices, mEmbeddingTable, mInputsEmbeds, stream);
+            kernel::embeddingLookup(
+                mSelectedIndices, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, stream);
 
             // Use the embedded tokens as input for the decoding step.
             // No hidden states output needed for standard LLM decoding.
@@ -984,19 +975,21 @@ bool LLMInferenceRuntime::genAndSaveSystemPromptKVCache(
         CUDA_CHECK(cudaMemcpy(mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesSizeBytes,
             cudaMemcpyHostToDevice));
 
-        kernel::embeddingLookupMultimodal(mInputIds, mEmbeddingTable, std::optional{std::ref(mMultimodalIndices)},
-            imageTokenId, visionEmbeddings, audioTokenId, audioEmbeddings, mInputsEmbeds, stream);
+        kernel::embeddingLookupMultimodal(mInputIds, mEmbedding.table, mEmbedding.scalesAsOptional(),
+            std::optional{std::ref(mMultimodalIndices)}, imageTokenId, visionEmbeddings, audioTokenId, audioEmbeddings,
+            mInputsEmbeds, stream);
     }
     else if (visionEmbeddings.has_value())
     {
         // Vision-only (Qwen2-VL, InternVL, etc.)
         rt::Tensor const& imageEmbedsTensor = visionEmbeddings.value().get();
-        kernel::embeddingLookupWithImageInsertion(mInputIds, mEmbeddingTable, imageEmbedsTensor, mInputsEmbeds, stream);
+        kernel::embeddingLookupWithImageInsertion(
+            mInputIds, mEmbedding.table, mEmbedding.scalesAsOptional(), imageEmbedsTensor, mInputsEmbeds, stream);
     }
     else
     {
         // Standard embedding lookup (pure text)
-        kernel::embeddingLookup(mInputIds, mEmbeddingTable, mInputsEmbeds, stream);
+        kernel::embeddingLookup(mInputIds, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, stream);
     }
 
     // Process deepstack features: perform embedding lookup if vision runner is available
