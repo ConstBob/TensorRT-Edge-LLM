@@ -852,12 +852,14 @@ class EdgeLLMMambaLayer(nn.Module):
         hidden_states: torch.Tensor,
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
+        context_lengths: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             hidden_states: [batch, seq_len, hidden_size]
             conv_state: [batch, conv_dim, conv_kernel_size]
             ssm_state: [batch, num_heads, head_dim, ssm_state_size]
+            context_lengths: [batch]
 
         Returns:
             (output [batch, seq_len, hidden_size],
@@ -890,6 +892,7 @@ class EdgeLLMMambaLayer(nn.Module):
             self.conv1d_weight,
             self.conv1d_bias,
             conv_state,
+            context_lengths,
             stride=1,
             padding=self.conv_kernel_size - 1,
             dilation=1,
@@ -920,6 +923,7 @@ class EdgeLLMMambaLayer(nn.Module):
             dt,
             self.dt_bias,
             ssm_state,
+            context_lengths,
             dt_softplus=1,
             ngroups=self.n_groups,
         )
@@ -982,11 +986,12 @@ class EdgeLLMNemotronHBlock(nn.Module):
         hidden_states: torch.Tensor,
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
+        context_lengths: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         hidden_states, conv_state_out, ssm_state_out = self.mixer(
-            hidden_states, conv_state, ssm_state)
+            hidden_states, conv_state, ssm_state, context_lengths)
         hidden_states = residual + hidden_states
         return hidden_states, conv_state_out, ssm_state_out
 

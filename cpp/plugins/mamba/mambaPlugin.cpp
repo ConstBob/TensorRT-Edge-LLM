@@ -43,21 +43,22 @@ constexpr char const* kMAMBA_PLUGIN_NAME{"update_ssm_state"};
 // Input indices – matches the trt_edgellm::update_ssm_state ONNX op.
 // x, dt, B, C may carry an optional seq_len dimension (4D instead of 3D).
 // When seq_len > 1, the plugin loops over the single-step kernel.
-constexpr int32_t kIN_X_IDX{0};       // [batch, (seq_len,) nheads, dim]
-constexpr int32_t kIN_A_IDX{1};       // [nheads]
-constexpr int32_t kIN_B_IDX{2};       // [batch, (seq_len,) ngroups, dstate]
-constexpr int32_t kIN_C_IDX{3};       // [batch, (seq_len,) ngroups, dstate]
-constexpr int32_t kIN_D_IDX{4};       // [nheads]
-constexpr int32_t kIN_DT_IDX{5};      // [batch, (seq_len,) nheads]
-constexpr int32_t kIN_DT_BIAS_IDX{6}; // [nheads]
-constexpr int32_t kIN_STATE_IDX{7};   // [batch, nheads, dim, dstate]
+constexpr int32_t kIN_X_IDX{0};               // [batch, (seq_len,) nheads, dim]
+constexpr int32_t kIN_A_IDX{1};               // [nheads]
+constexpr int32_t kIN_B_IDX{2};               // [batch, (seq_len,) ngroups, dstate]
+constexpr int32_t kIN_C_IDX{3};               // [batch, (seq_len,) ngroups, dstate]
+constexpr int32_t kIN_D_IDX{4};               // [nheads]
+constexpr int32_t kIN_DT_IDX{5};              // [batch, (seq_len,) nheads]
+constexpr int32_t kIN_DT_BIAS_IDX{6};         // [nheads]
+constexpr int32_t kIN_STATE_IDX{7};           // [batch, nheads, dim, dstate]
+constexpr int32_t kIN_CONTEXT_LENGTHS_IDX{8}; // [batch]
 
 // Output indices
 constexpr int32_t kOUT_OUTPUT_IDX{0}; // [batch, (seq_len,) nheads, dim]
 constexpr int32_t kOUT_STATE_IDX{1};  // [batch, nheads, dim, dstate]
 
 // Number of inputs/outputs
-constexpr int32_t kNUM_INPUTS{8};
+constexpr int32_t kNUM_INPUTS{9};
 constexpr int32_t kNUM_OUTPUTS{2};
 
 } // namespace
@@ -156,36 +157,23 @@ bool MambaPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     if (nbOutputs != kNUM_OUTPUTS || nbInputs != kNUM_INPUTS)
-    {
         return false;
-    }
-
-    if (inOut[pos].desc.format != TensorFormat::kLINEAR)
-    {
+    auto const& desc = inOut[pos].desc;
+    if (desc.format != TensorFormat::kLINEAR)
         return false;
-    }
-
-    auto const type = inOut[pos].desc.type;
-
-    // A is always FP32 (log-space decay rates need full precision).
-    if (pos == kIN_A_IDX)
+    switch (pos)
     {
-        return type == DataType::kFLOAT;
+    case kIN_X_IDX:
+    case kIN_B_IDX:
+    case kIN_C_IDX:
+    case kIN_D_IDX:
+    case kIN_DT_IDX:
+    case kIN_DT_BIAS_IDX:
+    case kIN_STATE_IDX: return desc.type == DataType::kHALF;
+    case kIN_A_IDX: return desc.type == DataType::kFLOAT;
+    case kIN_CONTEXT_LENGTHS_IDX: return desc.type == DataType::kINT32;
+    default: return desc.type == inOut[kIN_X_IDX].desc.type;
     }
-
-    // All other data tensors must be FP16.
-    if (type != DataType::kHALF)
-    {
-        return false;
-    }
-
-    // All data tensors (inputs AND outputs) must agree with x.
-    if (pos > kIN_X_IDX && pos != kIN_A_IDX)
-    {
-        return type == inOut[kIN_X_IDX].desc.type;
-    }
-
-    return true;
 }
 
 int32_t MambaPlugin::configurePlugin(
@@ -285,8 +273,21 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 
     if (hasSeqLen)
     {
+        // Only use context_lengths for actual prefill (seqLen > 1).
+        // During decode, x is 4D with seqLen=1 but context_lengths holds the
+        // cumulative length which would cause an out-of-bounds scan.
+        int32_t const seqLen = static_cast<int32_t>(xDesc.dims.d[1]);
+        rt::OptionalInputTensor contextLengthsOpt = std::nullopt;
+        std::optional<rt::Tensor> clTensorOpt;
+        if (seqLen > 1 && inputs[kIN_CONTEXT_LENGTHS_IDX])
+        {
+            clTensorOpt.emplace(const_cast<void*>(inputs[kIN_CONTEXT_LENGTHS_IDX]), rt::Coords{batch},
+                rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+            contextLengthsOpt = std::optional(std::cref(clTensorOpt.value()));
+        }
+
         mamba_ssm::invokeSelectiveStateUpdatePrefill(xTensor, aTensor, bTensor, cTensor, dtTensor, dtBiasOpt, dOpt,
-            std::nullopt, stateTensor, outTensor, dt_softplus, stream);
+            std::nullopt, stateTensor, outTensor, dt_softplus, contextLengthsOpt, stream);
     }
     else
     {
