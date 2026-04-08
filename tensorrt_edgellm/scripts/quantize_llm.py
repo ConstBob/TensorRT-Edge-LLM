@@ -93,6 +93,9 @@ def main() -> None:
         required=False,
         default="cuda",
         help="Device to use for model loading and quantization")
+    parser.add_argument("--unified_checkpoint",
+                        action="store_true",
+                        help="Whether to export unified checkpoint")
 
     args = parser.parse_args()
 
@@ -104,7 +107,8 @@ def main() -> None:
                               dataset_dir=args.dataset_dir,
                               lm_head_quantization=args.lm_head_quantization,
                               kv_cache_quantization=args.kv_cache_quantization,
-                              device=args.device)
+                              device=args.device,
+                              unified_checkpoint=args.unified_checkpoint)
         print("Model quantization completed successfully!")
     except Exception as e:
         print(f"Error during model quantization: {e}")

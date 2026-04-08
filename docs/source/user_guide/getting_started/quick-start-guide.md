@@ -146,4 +146,6 @@ You should see a JSON response with the model's answer, similar to:
 - **[MoE](../examples/moe.md)** - Mixture of Experts models (CPU-only export, Qwen3-30B-A3B-GPTQ-Int4)
 - **[TTS](../examples/tts.md)** - Text-to-speech synthesis
 
+**Alternative export path:** To export ONNX using TensorRT-LLM AutoDeploy (FX-level graph rewrites) instead of the built-in export tools, see [Export ONNX with AutoDeploy](export-onnx-with-auto-deploy.md).
+
 **Input Format:** Our format matches closely with the OpenAI API format. See [Input Format Guide](../format/input-format.md) for detailed specifications. Example input files are available in `tests/test_cases/` (e.g., `llm_basic.json`, `vlm_basic.json`).

@@ -400,7 +400,8 @@ def quantize_and_save_llm(model_dir: str,
                           dataset_dir: str = "cnn_dailymail",
                           lm_head_quantization: Optional[str] = None,
                           kv_cache_quantization: Optional[str] = None,
-                          device: str = "cuda") -> None:
+                          device: str = "cuda",
+                          unified_checkpoint: bool = False) -> None:
     """
     Load a model, quantize it if specified, and save the result.
     
@@ -416,7 +417,8 @@ def quantize_and_save_llm(model_dir: str,
         lm_head_quantization: Optional separate quantization for language model head (only "fp8", "nvfp4", and "mxfp8" are currently supported)
         kv_cache_quantization: Optional attention quantization (enables FP8 KV cache + FP8 FMHA compute)
         device: Device to use for model loading and quantization ("cuda", "cpu")
-        
+        unified_checkpoint: Whether to export unified checkpoint
+
     Raises:
         ValueError: If model loading fails or quantization parameters are invalid
     """
@@ -436,16 +438,25 @@ def quantize_and_save_llm(model_dir: str,
     # Save the quantized model
     os.makedirs(output_dir, exist_ok=True)
 
-    with torch.inference_mode():
-        model.save_pretrained(output_dir)
+    if unified_checkpoint:  # Original checkpoint read by ModelOpt
+        from modelopt.torch.export import export_hf_checkpoint
+        with torch.inference_mode():
+            export_hf_checkpoint(
+                model,  # The quantized model.
+                export_dir=
+                output_dir,  # The directory where the exported files will be stored.
+            )
+    else:  # Unified checkpoint read by AutoDeploy
+        with torch.inference_mode():
+            model.save_pretrained(output_dir)
+        # Save the quant config
+        quant_config = get_quant_config(model)
+        with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
+            json.dump(quant_config, f)
+
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
         processor.save_pretrained(output_dir)
-
-    # Save the quant config
-    quant_config = get_quant_config(model)
-    with open(os.path.join(output_dir, "hf_quant_config.json"), "w") as f:
-        json.dump(quant_config, f)
 
     end_time = time.time()
     print(
