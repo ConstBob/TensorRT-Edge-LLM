@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
-# All rights reserved. SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
 # use this file except in compliance with the License. You may obtain a copy of
@@ -150,6 +150,59 @@ function(cute_dsl_setup)
     return()
   endif()
 
+  # Shim / --wrap branches follow the toolkit version the project uses:
+  # CUDA_CTK_VERSION (see root CMakeLists.txt). Fall back to
+  # CMAKE_CUDA_COMPILER_VERSION only if CTK is unset.
+  if(DEFINED CUDA_CTK_VERSION AND NOT CUDA_CTK_VERSION STREQUAL "")
+    set(_cute_dsl_cuda_ver "${CUDA_CTK_VERSION}")
+  elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION
+         AND NOT CMAKE_CUDA_COMPILER_VERSION STREQUAL "")
+    set(_cute_dsl_cuda_ver "${CMAKE_CUDA_COMPILER_VERSION}")
+  else()
+    set(_cute_dsl_cuda_ver "")
+  endif()
+
+  if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
+                                            12.0)
+    message(
+      FATAL_ERROR
+        "CuTe DSL requires CUDA Toolkit 12.0+ (detected ${_cute_dsl_cuda_ver}). "
+        "Use -DENABLE_CUTE_DSL=OFF or set -DCUDA_CTK_VERSION to a supported toolkit."
+    )
+  endif()
+
+  # Shim: cudaLibrary* → cu* when libcudart omits exports (e.g. some 12.x
+  # embedded). CUDA 13+: libcudart declares cudaLibrary*; compiling the shim
+  # conflicts; INTERFACE only.
+  set(_cutedsl_cudart_shim_src
+      "${CMAKE_SOURCE_DIR}/cpp/kernels/gdnKernels/cutedsl_cuda_runtime_library_shim.c"
+  )
+  if(NOT TARGET trt_edgellm_cutedsl_cudart_shim)
+    if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver
+                                              VERSION_GREATER_EQUAL 13.0)
+      add_library(trt_edgellm_cutedsl_cudart_shim INTERFACE)
+    else()
+      if(NOT EXISTS "${_cutedsl_cudart_shim_src}")
+        message(
+          FATAL_ERROR
+            "CuTe DSL libcudart shim source missing:\n  ${_cutedsl_cudart_shim_src}\n"
+            "It must be committed with the repository (not generated).")
+      endif()
+      add_library(trt_edgellm_cutedsl_cudart_shim STATIC
+                  "${_cutedsl_cudart_shim_src}")
+      target_include_directories(trt_edgellm_cutedsl_cudart_shim
+                                 PRIVATE ${CUDA_INCLUDE_DIR})
+      # 12.0–12.6: AOT uses cudaKernel_t; shim needs
+      # CUTEDSL_WRAP_LAUNCH_KERNEL_EX.
+      if(NOT _cute_dsl_cuda_ver STREQUAL ""
+         AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
+         AND _cute_dsl_cuda_ver VERSION_LESS 12.7)
+        target_compile_definitions(trt_edgellm_cutedsl_cudart_shim
+                                   PRIVATE CUTEDSL_WRAP_LAUNCH_KERNEL_EX)
+      endif()
+    endif()
+  endif()
+
   # Parse the "variants" array from metadata.json to determine which kernel
   # variants are present (used for fine-grained per-variant compile defines).
   set(_variants)
@@ -195,9 +248,19 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Link the static archive into LINK_TARGETS only.
+  # Link libcuda again after the .a (--as-needed can drop an earlier libcuda).
   foreach(_tgt ${ARG_LINK_TARGETS})
-    target_link_libraries(${_tgt} PRIVATE "${_static_lib}")
+    target_link_libraries(${_tgt} PRIVATE "${_static_lib}"
+                                          trt_edgellm_cutedsl_cudart_shim)
+    if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
+      target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
+    endif()
+    # CUDA < 12.7: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
+    # JetPack 6).
+    if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
+                                              12.7)
+      target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
+    endif()
   endforeach()
 
   message(
