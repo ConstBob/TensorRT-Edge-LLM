@@ -266,11 +266,12 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     gdn_prefill_blackwell_Tensor_b_t bTensor{};
     SET_3D_TENSOR(bTensor, params.b, n, seq_len, hv);
 
+    // A_log and dt_bias are constant-shape tensors in the Blackwell kernel — data pointer only.
     gdn_prefill_blackwell_Tensor_A_log_t A_logTensor{};
-    SET_1D_TENSOR(A_logTensor, params.A_log, hv);
+    A_logTensor.data = params.A_log;
 
     gdn_prefill_blackwell_Tensor_dt_bias_t dt_biasTensor{};
-    SET_1D_TENSOR(dt_biasTensor, params.dt_bias, hv);
+    dt_biasTensor.data = params.dt_bias;
 
     // h0_in and h0_out share the same buffer (in-place state update)
     gdn_prefill_blackwell_Tensor_h0_in_t h0InTensor{};
@@ -292,8 +293,11 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     gdn_prefill_blackwell_Tensor_o_t oTensor{};
     SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
 
+    // scale = 1/sqrt(k_dim), matching the Python kernel default.
+    float const scale = 1.0f / std::sqrt(static_cast<float>(k));
+
     cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
-        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &cuSeqLensTensor, &oTensor, stream);
+        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor, scale, &cuSeqLensTensor, stream);
     return 0;
 #else
     LOG_ERROR("Blackwell GDN prefill not compiled in this build.");
