@@ -41,9 +41,10 @@ constexpr int32_t kIN_X_IDX{0};
 constexpr int32_t kIN_WEIGHT_IDX{1};
 constexpr int32_t kIN_BIAS_IDX{2};
 constexpr int32_t kIN_CONV_STATE_IDX{3};
+constexpr int32_t kIN_CONTEXT_LENGTHS_IDX{4};
 constexpr int32_t kOUT_IDX{0};
 constexpr int32_t kOUT_CONV_STATE_IDX{1};
-constexpr int32_t kNUM_INPUTS{4};
+constexpr int32_t kNUM_INPUTS{5};
 constexpr int32_t kNUM_OUTPUTS{2};
 
 std::optional<int32_t> parsePluginIntField(std::string const& fieldName, PluginFieldCollection const* fc)
@@ -142,20 +143,19 @@ bool CausalConv1dPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     if (nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
-    {
         return false;
-    }
-    bool const isLinear = inOut[pos].desc.format == TensorFormat::kLINEAR;
-    bool const isSupportedType = inOut[pos].desc.type == DataType::kHALF;
-    if (!isLinear || !isSupportedType)
-    {
+    auto const& desc = inOut[pos].desc;
+    if (desc.format != TensorFormat::kLINEAR)
         return false;
-    }
-    if (pos > 0)
+    switch (pos)
     {
-        return inOut[pos].desc.type == inOut[kIN_X_IDX].desc.type;
+    case kIN_X_IDX:
+    case kIN_WEIGHT_IDX:
+    case kIN_BIAS_IDX:
+    case kIN_CONV_STATE_IDX: return desc.type == DataType::kHALF;
+    case kIN_CONTEXT_LENGTHS_IDX: return desc.type == DataType::kINT32;
+    default: return desc.type == inOut[kIN_X_IDX].desc.type;
     }
-    return true;
 }
 
 int32_t CausalConv1dPlugin::configurePlugin(
@@ -225,13 +225,18 @@ int32_t CausalConv1dPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         auto outTensor
             = rt::Tensor{outputs[kOUT_IDX], rt::Coords{batch, outSeqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
 
+        auto contextLengthsTensor = rt::Tensor{const_cast<void*>(inputs[kIN_CONTEXT_LENGTHS_IDX]), rt::Coords{batch},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kINT32};
+        trt_edgellm::rt::OptionalInputTensor contextLengthsOpt = std::optional(std::cref(contextLengthsTensor));
+
         trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasTensor));
-        mamba_ssm::invokeCausalConv1d(xTensor, weightTensor, biasOpt, outTensor, mStride, mPadding, mDilation, stream);
+        mamba_ssm::invokeCausalConv1d(
+            xTensor, weightTensor, biasOpt, outTensor, mStride, mPadding, mDilation, contextLengthsOpt, stream);
         auto captureXTensor = rt::Tensor{
             const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
         auto captureStateTensor
             = rt::Tensor{convStateOut, rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
-        mamba_ssm::invokeCaptureConvState(captureXTensor, captureStateTensor, stream);
+        mamba_ssm::invokeCaptureConvState(captureXTensor, captureStateTensor, contextLengthsOpt, stream);
     }
     else
     {

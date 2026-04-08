@@ -303,7 +303,7 @@ class EdgeLLMNemotronHModel(nn.Module):
             if bt == "mamba":
                 hidden_states, conv_state_out, ssm_state_out = layer.forward_mamba(
                     hidden_states, conv_states[mamba_idx],
-                    recurrent_states[mamba_idx])
+                    recurrent_states[mamba_idx], context_lengths)
                 present_conv_states += (conv_state_out, )
                 present_recurrent_states += (ssm_state_out, )
                 mamba_idx += 1
