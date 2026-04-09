@@ -9,11 +9,13 @@ into the repo; CMake links them directly — no Python or GPU needed at build ti
 Exact `supported_sms` per variant live in `kernelSrcs/build_cutedsl.py`
 (`KERNEL_VARIANTS`); the table below is a summary.
 
-| Variant | seq_len | Target GPUs (summary) | Notes |
-|---|---|---|---|
-| `gdn_decode` | 1 | SM80+ (wide) | small/large-batch dispatch at runtime (threshold n=32) |
-| `gdn_prefill` | > 1 | SM80+ (wide) | per-row context masking via `context_lengths` |
-| `gdn_prefill_blackwell` | > 1 | Blackwell-class (e.g. SM100+) | uses `cu_seqlens` (prefix-sum lengths); not built on Ampere/Orin |
+| Variant | seq_len | Supported SMs | Verified On | Notes |
+|---|---|---|---|---|
+| `gdn_decode` | 1 | SM80+ | Ampere (SM80), Blackwell (SM110) | small/large-batch dispatch at runtime (threshold n=32) |
+| `gdn_prefill` | > 1 | SM80+ | Ampere (SM80), Blackwell (SM110) | per-row context masking via `context_lengths`; should work on Hopper (SM90) but not yet tested |
+| `gdn_prefill_blackwell` | > 1 | SM100+ only | Blackwell (SM110) | uses TMA + warp-level pipeline; requires `cu_seqlens`; not built on Ampere/Hopper/Orin |
+
+All variants require CUDA 12.6+.
 
 ## Building Prebuilt Artifacts
 

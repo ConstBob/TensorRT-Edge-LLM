@@ -40,6 +40,13 @@ static inline bool isBlackwellSM(int32_t sm)
     return sm >= 100;
 }
 
+/** One step of a seeded LCG PRNG; returns a float in [-0.5, 0.5). */
+static float lcgStep(uint32_t& s)
+{
+    s = s * 1664525u + 1013904223u;
+    return (static_cast<float>(s >> 8) / static_cast<float>(1u << 24)) - 0.5f;
+}
+
 /**
  * Allocate a [N+1] int32 device buffer and compute cu_seqlens from context_lengths.
  * Caller must cudaFree the returned pointer.
@@ -441,27 +448,23 @@ void runGDNPrefillTest()
     std::vector<float> h_A_log(hv), h_dt_bias(hv), h_h0(h0Len);
     if (onBlackwell)
     {
-        auto lcg = [](uint32_t& s) -> float {
-            s = s * 1664525u + 1013904223u;
-            return (static_cast<float>(s >> 8) / static_cast<float>(1u << 24)) - 0.5f;
-        };
         uint32_t seed = 0x42u;
         for (size_t i = 0; i < qkvLen; ++i)
-            h_q[i] = lcg(seed) * 0.2f;
+            h_q[i] = lcgStep(seed) * 0.2f;
         for (size_t i = 0; i < qkvLen; ++i)
-            h_k[i] = lcg(seed) * 0.2f;
+            h_k[i] = lcgStep(seed) * 0.2f;
         for (size_t i = 0; i < vLen; ++i)
-            h_v[i] = lcg(seed) * 0.2f;
+            h_v[i] = lcgStep(seed) * 0.2f;
         for (size_t i = 0; i < abLen; ++i)
-            h_a[i] = lcg(seed) * 0.5f;
+            h_a[i] = lcgStep(seed) * 0.5f;
         for (size_t i = 0; i < abLen; ++i)
-            h_b[i] = lcg(seed) * 0.5f;
+            h_b[i] = lcgStep(seed) * 0.5f;
         for (int32_t i = 0; i < hv; ++i)
             h_A_log[i] = -2.f + 0.25f * (i % 4);
         for (int32_t i = 0; i < hv; ++i)
             h_dt_bias[i] = 0.02f * (i + 1);
         for (size_t i = 0; i < h0Len; ++i)
-            h_h0[i] = lcg(seed) * 0.01f;
+            h_h0[i] = lcgStep(seed) * 0.01f;
     }
     else
     {
@@ -547,6 +550,10 @@ void runGDNPrefillTest()
     if (onBlackwell)
         d_cu_seqlens = allocCuSeqlens(d_context_lengths, n);
 
+    void* d_h0_scratch = nullptr;
+    if (onBlackwell)
+        CUDA_CHECK(cudaMalloc(&d_h0_scratch, h0Bytes));
+
     GDNParams params{};
     params.q = d_q;
     params.k = d_k;
@@ -558,6 +565,7 @@ void runGDNPrefillTest()
     params.h0_source = d_h0_source;
     params.context_lengths = d_context_lengths;
     params.cu_seqlens = d_cu_seqlens;
+    params.h0_scratch = d_h0_scratch;
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
@@ -616,6 +624,8 @@ void runGDNPrefillTest()
     CUDA_CHECK(cudaFree(d_context_lengths));
     if (d_cu_seqlens)
         CUDA_CHECK(cudaFree(d_cu_seqlens));
+    if (d_h0_scratch)
+        CUDA_CHECK(cudaFree(d_h0_scratch));
     CUDA_CHECK(cudaFree(d_o));
 }
 
@@ -651,27 +661,23 @@ void runGDNPrefillPaddingTest()
     std::vector<float> h_A_log(hv), h_dt_bias(hv), h_h0(h0Len);
     if (onBlackwell)
     {
-        auto lcg = [](uint32_t& s) -> float {
-            s = s * 1664525u + 1013904223u;
-            return (static_cast<float>(s >> 8) / static_cast<float>(1u << 24)) - 0.5f;
-        };
         uint32_t seed = 0x43u;
         for (size_t i = 0; i < qkvLen; ++i)
-            h_q[i] = lcg(seed) * 0.2f;
+            h_q[i] = lcgStep(seed) * 0.2f;
         for (size_t i = 0; i < qkvLen; ++i)
-            h_k[i] = lcg(seed) * 0.2f;
+            h_k[i] = lcgStep(seed) * 0.2f;
         for (size_t i = 0; i < vLen; ++i)
-            h_v[i] = lcg(seed) * 0.2f;
+            h_v[i] = lcgStep(seed) * 0.2f;
         for (size_t i = 0; i < abLen; ++i)
-            h_a[i] = lcg(seed) * 0.5f;
+            h_a[i] = lcgStep(seed) * 0.5f;
         for (size_t i = 0; i < abLen; ++i)
-            h_b[i] = lcg(seed) * 0.5f;
+            h_b[i] = lcgStep(seed) * 0.5f;
         for (int32_t i = 0; i < hv; ++i)
             h_A_log[i] = -2.f + 0.25f * (i % 4);
         for (int32_t i = 0; i < hv; ++i)
             h_dt_bias[i] = 0.02f * (i + 1);
         for (size_t i = 0; i < h0Len; ++i)
-            h_h0[i] = lcg(seed) * 0.01f;
+            h_h0[i] = lcgStep(seed) * 0.01f;
     }
     else
     {
@@ -737,6 +743,10 @@ void runGDNPrefillPaddingTest()
     if (onBlackwell)
         d_cu_seqlens = allocCuSeqlens(d_ctx, n);
 
+    void* d_h0_scratch = nullptr;
+    if (onBlackwell)
+        CUDA_CHECK(cudaMalloc(&d_h0_scratch, h0Len * sizeof(float)));
+
     GDNParams params{};
     params.q = d_q;
     params.k = d_k;
@@ -748,6 +758,7 @@ void runGDNPrefillPaddingTest()
     params.h0_source = d_h0_src;
     params.context_lengths = d_ctx;
     params.cu_seqlens = d_cu_seqlens;
+    params.h0_scratch = d_h0_scratch;
     params.o = d_o;
     params.n = n;
     params.seq_len = seq_len;
@@ -819,6 +830,8 @@ void runGDNPrefillPaddingTest()
     CUDA_CHECK(cudaFree(d_ctx));
     if (d_cu_seqlens)
         CUDA_CHECK(cudaFree(d_cu_seqlens));
+    if (d_h0_scratch)
+        CUDA_CHECK(cudaFree(d_h0_scratch));
     CUDA_CHECK(cudaFree(d_o));
 }
 

@@ -4593,7 +4593,6 @@ def _get_compiled_gdn_prefill_kernel(
     is_varlen: bool,
     is_initial_state: bool,
     is_output_state: bool,
-    scale: float,
 ):
     """Cache compiled kernel for given configuration (returns mutable dict)."""
     return {}
@@ -4673,9 +4672,8 @@ def chunk_gated_delta_rule(
             dtype=cp.float32,
         )
 
-    if scale is None:
-        scale = float(problem_size[5]) ** -0.5
-    scale_f = float(scale)
+    # Blackwell JIT path (`run_gdn_blackwell`) fixes attention scale as 1/sqrt(D) inside GDN;
+    # the `scale` argument is accepted for API compatibility but is not passed to the kernel.
 
     # JIT wrapper always takes a cu_seqlens tensor (see _create_jit_blackwell). For uniform
     # padded batches, use prefix-sum [0, T, 2T, ...] — matches AOT placeholder convention.
@@ -4726,7 +4724,6 @@ def chunk_gated_delta_rule(
         is_varlen,
         is_initial_state,
         output_final_state,
-        scale_f,
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
 
@@ -4746,7 +4743,6 @@ def chunk_gated_delta_rule(
             t_trace["h0_in"],
             t_trace["h0_out"],
             t_trace["o"],
-            scale_f,
             t_trace["cu_seqlens"],
             stream=current_stream,
         )
@@ -4763,7 +4759,6 @@ def chunk_gated_delta_rule(
         t_run["h0_in"],
         t_run["h0_out"],
         t_run["o"],
-        scale_f,
         t_run["cu_seqlens"],
         stream=current_stream,
     )
@@ -5082,7 +5077,6 @@ def _create_jit_blackwell():
         h0_in: cute.Tensor,      # (n, h_v, d, d) f32     — initial recurrent state
         h0_out: cute.Tensor,     # (n, h_v, d, d) f32     — output final state
         o: cute.Tensor,          # (n, seq_len, h_v, d) fp16 — output
-        scale: cutlass.Float32,
         cu_seqlens: cute.Tensor, # (n+1,) int32 — prefix-sum for padding masking
         stream: cuda.CUstream,
     ):
@@ -5109,7 +5103,7 @@ def _create_jit_blackwell():
             problem_size,
             h0_in.iterator,   # initial_state
             h0_out.iterator,  # state_output
-            scale,
+            None,             # scale=None → kernel computes 1/sqrt(d) internally
             None,             # cum_seqlen_q=None → non-varlen padded layout
             cu_seqlens,       # cu_seqlens for padding masking
             True,             # use_qk_l2norm=True
@@ -5201,7 +5195,6 @@ def _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch=""):
     ph = _make_placeholder_tensors_bw(n, h, hv, k, v, seq_len)
     t = _to_cute_tensors_bw(ph)
     run_fn = _get_jit_blackwell()
-    scale_val = float(k) ** -0.5
 
     compile_opts = ("--gpu-arch " + gpu_arch) if gpu_arch else None
     compiled = cute.compile(
@@ -5211,7 +5204,6 @@ def _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch=""):
         t["A_log"], t["dt_bias"],
         t["h0_in"], t["h0_out"],
         t["o"],
-        scale_val,
         t["cu_seqlens"],   # cu_seqlens for padding masking (non-varlen padded layout)
         stream,
         **(dict(options=compile_opts) if compile_opts else {}),

@@ -21,7 +21,6 @@
 
 #include "common/logger.h"
 
-#include <cmath>
 #include <mutex>
 
 namespace trt_edgellm
@@ -273,7 +272,19 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     gdn_prefill_blackwell_Tensor_dt_bias_t dt_biasTensor{};
     dt_biasTensor.data = params.dt_bias;
 
-    // h0_in and h0_out share the same buffer (in-place state update)
+    // The Blackwell kernel is not in-place safe: h0_in and h0_out must not alias.
+    // Use the pre-allocated scratch buffer from the plugin workspace for h0_out,
+    // then copy the final state back to h0_source on the same stream.
+    size_t const h0ScratchBytes = static_cast<size_t>(n) * hv * k * v * sizeof(float);
+    if (params.h0_scratch == nullptr)
+    {
+        LOG_WARNING(
+            "GDN Blackwell prefill: h0_scratch not provided in GDNParams — "
+            "caller must allocate [n=%d, hv=%d, k=%d, v=%d] f32 scratch and set params.h0_scratch.",
+            n, hv, k, v);
+        return -1;
+    }
+
     gdn_prefill_blackwell_Tensor_h0_in_t h0InTensor{};
     h0InTensor.data = params.h0_source;
     h0InTensor.dynamic_shapes[0] = n;
@@ -281,7 +292,7 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     h0InTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
 
     gdn_prefill_blackwell_Tensor_h0_out_t h0OutTensor{};
-    h0OutTensor.data = params.h0_source; // same buffer
+    h0OutTensor.data = params.h0_scratch; // separate scratch — must not alias h0_in
     h0OutTensor.dynamic_shapes[0] = n;
     h0OutTensor.dynamic_shapes[1] = hv;
     h0OutTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
@@ -293,11 +304,11 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     gdn_prefill_blackwell_Tensor_o_t oTensor{};
     SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
 
-    // scale = 1/sqrt(k_dim), matching the Python kernel default.
-    float const scale = 1.0f / std::sqrt(static_cast<float>(k));
-
     cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
-        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor, scale, &cuSeqLensTensor, stream);
+        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor, &cuSeqLensTensor, stream);
+
+    // Copy final state from scratch back to h0_source (stream-ordered).
+    cudaMemcpyAsync(params.h0_source, params.h0_scratch, h0ScratchBytes, cudaMemcpyDeviceToDevice, stream);
     return 0;
 #else
     LOG_ERROR("Blackwell GDN prefill not compiled in this build.");

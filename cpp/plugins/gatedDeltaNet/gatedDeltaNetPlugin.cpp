@@ -219,9 +219,17 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inpu
     DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    // cu_seqlens [N+1] int32 workspace: prefix-sum of context_lengths for Blackwell prefill padding masking.
-    int32_t const maxBatchSize = static_cast<int32_t>(inputs[kIN_CONTEXT_LENGTHS].max.d[0]);
-    return static_cast<size_t>(maxBatchSize + 1) * sizeof(int32_t);
+    int32_t const maxN = static_cast<int32_t>(inputs[kIN_CONTEXT_LENGTHS].max.d[0]);
+    int32_t const maxHv = static_cast<int32_t>(inputs[kIN_H0_SOURCE].max.d[1]);
+    int32_t const kDim = static_cast<int32_t>(inputs[kIN_H0_SOURCE].max.d[2]);
+    int32_t const vDim = static_cast<int32_t>(inputs[kIN_H0_SOURCE].max.d[3]);
+
+    // cu_seqlens [maxN+1] int32, padded to 128-byte alignment before h0 scratch.
+    size_t const cuSeqBytes = static_cast<size_t>(maxN + 1) * sizeof(int32_t);
+    size_t const cuSeqPadded = (cuSeqBytes + 127u) & ~static_cast<size_t>(127u);
+    // h0 scratch [maxN, maxHv, kDim, vDim] f32 — separate buffer for Blackwell h0_out.
+    size_t const h0ScratchBytes = static_cast<size_t>(maxN) * maxHv * kDim * vDim * sizeof(float);
+    return cuSeqPadded + h0ScratchBytes;
 #else
     (void) inputs;
     return 0;
@@ -275,11 +283,15 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     params.smVersion = mSMVersion;
 
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    // Blackwell prefill: convert context_lengths [N] → cu_seqlens [N+1] in workspace.
+    // Blackwell prefill: carve cu_seqlens and h0 scratch out of the pre-allocated workspace.
+    //   workspace layout: [cu_seqlens: (n+1)*int32, pad to 128B] [h0_scratch: n*hv*k*v*f32]
     if (seq_len > 1 && mSMVersion >= 100)
     {
+        size_t const cuSeqBytes = static_cast<size_t>(n + 1) * sizeof(int32_t);
+        size_t const cuSeqPadded = (cuSeqBytes + 127u) & ~static_cast<size_t>(127u);
         launchGdnCalCuSeqLens(inputs[kIN_CONTEXT_LENGTHS], workspace, n, stream);
         params.cu_seqlens = workspace;
+        params.h0_scratch = static_cast<char*>(workspace) + cuSeqPadded;
     }
 #endif
 

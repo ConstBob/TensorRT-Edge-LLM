@@ -33,30 +33,36 @@
 #else
 #define TRT_EDGELLM_CUTEDSL_SHIM_WEAK
 #endif
+/* CUresult and cudaError_t have different enum values for non-zero codes.
+ * Map success to cudaSuccess and everything else to cudaErrorUnknown to avoid
+ * propagating driver error codes as runtime error codes. */
+#define SHIM_RETURN(r) return (r) == CUDA_SUCCESS ? cudaSuccess : cudaErrorUnknown
+
 TRT_EDGELLM_CUTEDSL_SHIM_WEAK cudaError_t cudaLibraryLoadData(CUlibrary* library, void const* code,
     CUjit_option* jitOptions, void** jitOptionsValues, unsigned int numJitOptions, CUlibraryOption* libraryOptions,
     void** libraryOptionValues, unsigned int numLibraryOptions)
 {
     CUresult const r = cuLibraryLoadData(library, code, jitOptions, jitOptionsValues, numJitOptions, libraryOptions,
         libraryOptionValues, numLibraryOptions);
-    return (cudaError_t) r;
+    SHIM_RETURN(r);
 }
 TRT_EDGELLM_CUTEDSL_SHIM_WEAK cudaError_t cudaLibraryUnload(CUlibrary library)
 {
     CUresult const r = cuLibraryUnload(library);
-    return (cudaError_t) r;
+    SHIM_RETURN(r);
 }
 TRT_EDGELLM_CUTEDSL_SHIM_WEAK cudaError_t cudaLibraryGetKernel(CUkernel* pKernel, CUlibrary library, char const* name)
 {
     CUresult const r = cuLibraryGetKernel(pKernel, library, name);
-    return (cudaError_t) r;
+    SHIM_RETURN(r);
 }
 TRT_EDGELLM_CUTEDSL_SHIM_WEAK cudaError_t cudaKernelSetAttributeForDevice(
     CUkernel kernel, CUfunction_attribute attr, int value, int device)
 {
     CUresult const r = cuKernelSetAttribute(attr, value, kernel, (CUdevice) device);
-    return (cudaError_t) r;
+    SHIM_RETURN(r);
 }
+#undef SHIM_RETURN
 
 #if defined(CUTEDSL_WRAP_LAUNCH_KERNEL_EX)
 /* cudaLaunchKernelExC(config, func, args) expects 'func' to be a host-side runtime

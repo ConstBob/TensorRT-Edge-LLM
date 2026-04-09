@@ -51,6 +51,8 @@ struct GDNParams
     void* h0_source{};
     void* context_lengths{}; ///< [N] int32 — valid length per batch (decode / sequential prefill)
     void* cu_seqlens{};      ///< [N+1] int32 — prefix-sum of context_lengths (Blackwell prefill)
+    void* h0_scratch{};      ///< [N, hv, k, v] f32 — pre-allocated scratch for h0_out (Blackwell prefill);
+                             ///<   must be provided by caller (e.g. plugin workspace).
     void* o{};
 
     int32_t n{};
