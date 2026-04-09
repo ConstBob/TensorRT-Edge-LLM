@@ -1,0 +1,290 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Checkpoint metadata I/O and runtime sidecars next to exported ONNX.
+
+Weights are loaded only via :func:`loader.load_weights`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+from typing import TYPE_CHECKING, Any, Dict, Tuple
+
+if TYPE_CHECKING:
+    from ..models.default.modeling_default import CausalLM
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "RUNTIME_TOKENIZER_FILENAMES",
+    "load_checkpoint_config_dicts",
+    "load_config_dict",
+    "build_runtime_llm_config_dict",
+    "write_runtime_artifacts",
+]
+
+RUNTIME_TOKENIZER_FILENAMES: Tuple[str, ...] = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "tokenizer.model",
+    "special_tokens_map.json",
+    "processed_chat_template.json",
+)
+
+
+def _nested_config_to_dict(sub: Any) -> Dict[str, Any]:
+    if isinstance(sub, dict):
+        return sub
+    if hasattr(sub, "to_dict"):
+        return sub.to_dict()
+    return {}
+
+
+def _promote_llm_subconfig(config: Any, root: Dict[str,
+                                                   Any]) -> Dict[str, Any]:
+    """Return the dict used for LLM architecture fields (text / nested block)."""
+    if root.get("num_attention_heads") is not None:
+        return root
+
+    for name in ("llm_config", "text_config", "language_config"):
+        sub = getattr(config, name, None)
+        if sub is None and name in root:
+            sub = root[name]
+        sub_dict = _nested_config_to_dict(sub)
+        if (sub_dict.get("hidden_size") is not None
+                and sub_dict.get("num_attention_heads") is not None):
+            return sub_dict
+
+    # Qwen3-ASR / Qwen3-Omni: LLM lives at thinker_config.text_config
+    thinker = root.get("thinker_config")
+    if isinstance(thinker, dict):
+        for name in ("text_config", "llm_config", "language_config"):
+            sub_dict = _nested_config_to_dict(thinker.get(name, {}))
+            if (sub_dict.get("hidden_size") is not None
+                    and sub_dict.get("num_attention_heads") is not None):
+                return sub_dict
+
+    # Qwen3-TTS: LLM (talker) lives at talker_config
+    talker = root.get("talker_config")
+    if isinstance(talker, dict):
+        if (talker.get("hidden_size") is not None
+                and talker.get("num_attention_heads") is not None):
+            return talker
+
+    return root
+
+
+def load_checkpoint_config_dicts(
+        model_dir: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return ``(root_dict, llm_dict)`` from the checkpoint config.
+
+    Tries ``AutoConfig.from_pretrained`` first (handles registered HF model
+    types).  Falls back to reading ``config.json`` directly for custom /
+    not-yet-registered model types (e.g. ``qwen3_asr``, ``qwen3_tts``).
+
+    For multimodal models (e.g. Qwen2.5-VL, Qwen3-ASR), the LLM text config
+    is promoted out of the nested sub-object by :func:`_promote_llm_subconfig`.
+    Any fields lost during promotion are patched back from the raw JSON.
+    """
+    from transformers import AutoConfig
+
+    raw_path = os.path.join(model_dir, "config.json")
+    raw: Dict[str, Any] = {}
+    if os.path.exists(raw_path):
+        with open(raw_path) as _f:
+            raw = json.load(_f)
+    elif not os.path.isdir(model_dir):
+        # model_dir is likely an HF model ID (e.g. "Qwen/Qwen3-ASR-0.6B").
+        # Download config.json from HF Hub so the raw fallback works.
+        try:
+            from huggingface_hub import hf_hub_download
+            local = hf_hub_download(model_dir, "config.json")
+            with open(local) as _f:
+                raw = json.load(_f)
+        except (OSError, ImportError, ValueError):
+            pass
+
+    try:
+        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        root = config.to_dict()
+    except (ValueError, OSError) as exc:
+        # Unknown / not-yet-registered model type — fall back to raw JSON.
+        logger.warning(
+            "AutoConfig.from_pretrained failed for %s (%s); "
+            "falling back to raw config.json.",
+            model_dir,
+            exc,
+        )
+        root = raw
+        config = root  # _promote_llm_subconfig handles plain dicts via root
+
+    llm = _promote_llm_subconfig(config, root)
+
+    # Patch: for multimodal models where AutoConfig loses top-level fields,
+    # merge them in from the raw config.json.  Only fields absent from llm
+    # are copied; existing llm fields are never overwritten.
+    for key, val in raw.items():
+        if key not in llm and val is not None:
+            llm[key] = val
+
+    # VLM secondary patch: rope_scaling may live only inside a nested sub-config
+    # (e.g. text_config.rope_scaling for Qwen3-VL) and can be lost when
+    # AutoConfig serialises the promoted sub-object.  Recover it from the raw
+    # JSON so that collectRopeConfig() in C++ correctly detects kMRope.
+    if not llm.get("rope_scaling"):
+        for subkey in ("text_config", "language_config", "llm_config"):
+            raw_sub = raw.get(subkey) or {}
+            if isinstance(raw_sub, dict) and raw_sub.get("rope_scaling"):
+                llm["rope_scaling"] = raw_sub["rope_scaling"]
+                break
+
+    return root, llm
+
+
+def load_config_dict(model_dir: str) -> Dict[str, Any]:
+    """Return only the promoted LLM config dict."""
+    return load_checkpoint_config_dicts(model_dir)[1]
+
+
+def _export_tool_version() -> str:
+    """Version string for runtime ``config.json`` (``edgellm_version`` field)."""
+    from .._version import __version__
+    return __version__
+
+
+def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
+    """JSON object written as ``config.json`` beside the ONNX export."""
+    config = model.config
+    mc = config.mamba_cfg
+
+    out: Dict[str, Any] = {
+        "model": config.model_type,
+        "model_type": "hybrid_mamba" if config.is_hybrid else "llm",
+        "edgellm_version": _export_tool_version(),
+        "trt_native_ops": False,
+        "vocab_size": config.vocab_size,
+        "hidden_size": config.hidden_size,
+        "intermediate_size": config.intermediate_size,
+        "num_hidden_layers": config.num_hidden_layers,
+        "num_attention_heads": config.num_attention_heads,
+        "num_key_value_heads": config.num_key_value_heads,
+        "head_dim": config.head_dim,
+        "max_position_embeddings": config.max_position_embeddings,
+        "rope_theta": config.rope_theta,
+        "rope_scaling": config.rope_scaling,
+        "partial_rotary_factor": config.partial_rotary_factor,
+        "num_deepstack_features": config.num_deepstack_features,
+    }
+
+    # longrope requires original_max_position_embeddings for scaling factor computation.
+    if (isinstance(config.rope_scaling, dict)
+            and config.rope_scaling.get("type") == "longrope"
+            and config.original_max_position_embeddings is not None):
+        out["original_max_position_embeddings"] = config.original_max_position_embeddings
+
+    if config.is_hybrid and mc is not None:
+        out.update({
+            "num_mamba_layers": config.num_mamba_layers,
+            "num_attention_layers": config.num_attn_layers,
+            "mamba_num_heads": mc.num_heads,
+            "mamba_head_dim": mc.head_dim,
+            "ssm_state_size": mc.ssm_state_size,
+            "conv_dim": mc.conv_dim,
+            "conv_kernel": mc.conv_kernel,
+            "use_rope": config.num_attn_layers > 0,
+        })
+
+    return out
+
+
+def write_runtime_artifacts(model: "CausalLM", model_dir: str,
+                            out_dir: str) -> None:
+    """Write ``config.json``, ``embedding.safetensors``, tokenizer copies, chat template."""
+    import torch
+    from safetensors.torch import save_file
+
+    from ..chat_template import (process_chat_template,
+                                 write_fallback_processed_chat_template)
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    cfg_json = build_runtime_llm_config_dict(model)
+
+    # For VLM models, the C++ VLM runner (qwenViTRunner, internViTRunner)
+    # reads vision_config from the LLM config.json.  Preserve it from the
+    # original HF config so the runtime can find deepstack_visual_indexes,
+    # num_position_embeddings, etc.
+    if model_dir:
+        hf_cfg_path = os.path.join(model_dir, "config.json")
+        if os.path.exists(hf_cfg_path):
+            with open(hf_cfg_path) as _f:
+                root_cfg = json.load(_f)
+            if root_cfg.get("vision_config"):
+                cfg_json["vision_config"] = root_cfg["vision_config"]
+
+    with open(os.path.join(out_dir, "config.json"), "w") as f:
+        json.dump(cfg_json, f, indent=2)
+    logger.info("Wrote config.json to %s", out_dir)
+
+    embed = getattr(getattr(model, "model", None), "embed_tokens", None)
+    if embed is None:
+        embed = getattr(getattr(model, "backbone", None), "embeddings", None)
+    if embed is not None:
+        weight = embed.weight.data.cpu()
+        # C++ runtime requires FP16 (or FP8) embedding; cast if needed.
+        if weight.dtype in (torch.float32, torch.bfloat16):
+            weight = weight.to(torch.float16)
+        save_file({"embedding": weight},
+                  os.path.join(out_dir, "embedding.safetensors"))
+        logger.info("Wrote embedding.safetensors (%s)", list(weight.shape))
+    else:
+        logger.warning(
+            "embed_tokens not found; skipping embedding.safetensors")
+
+    for fname in RUNTIME_TOKENIZER_FILENAMES:
+        src = os.path.join(model_dir, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(out_dir, fname))
+            logger.info("Copied %s", fname)
+
+    # If tokenizer.json is missing but vocab.json+merges.txt exist (GPT-2
+    # format, used by Qwen3-ASR/TTS), generate tokenizer.json using the
+    # transformers library so the C++ runtime can load it.
+    tok_json_dst = os.path.join(out_dir, "tokenizer.json")
+    if not os.path.exists(tok_json_dst) and model_dir:
+        vocab_src = os.path.join(model_dir, "vocab.json")
+        merges_src = os.path.join(model_dir, "merges.txt")
+        if os.path.exists(vocab_src) and os.path.exists(merges_src):
+            try:
+                from transformers import AutoTokenizer
+                tok = AutoTokenizer.from_pretrained(model_dir)
+                tok.save_pretrained(out_dir)
+                logger.info(
+                    "Generated tokenizer.json from vocab.json+merges.txt")
+            except (OSError, ValueError, ImportError):
+                logger.warning("Failed to generate tokenizer.json; "
+                               "copying vocab.json and merges.txt as fallback")
+                shutil.copy2(vocab_src, os.path.join(out_dir, "vocab.json"))
+                shutil.copy2(merges_src, os.path.join(out_dir, "merges.txt"))
+
+    template_dst = os.path.join(out_dir, "processed_chat_template.json")
+    if not os.path.exists(template_dst) and model_dir:
+        process_chat_template(model_dir, out_dir)
+    if not os.path.exists(template_dst):
+        write_fallback_processed_chat_template(model_dir, out_dir)
