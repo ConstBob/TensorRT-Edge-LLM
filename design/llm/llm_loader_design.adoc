@@ -1,0 +1,786 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+= LLM Loader: Checkpoint-to-ONNX Export Pipeline
+{nbsp}
+:description: Design notes for the llm_loader Python package — checkpoint loading, model construction, and dynamo ONNX export for TensorRT Edge-LLM.
+
+== Status
+
+**Experimental.**  The package lives under ``experimental/llm_loader/`` and is not yet part of the production build or CI pipeline.  The current implementation covers:
+
+* Standard attention-only LLMs (Llama, Qwen, Mistral, etc.)
+* Hybrid Mamba+Attention models (NemotronH)
+* Vision-Language Models (VLMs): Qwen3-VL, Qwen2.5-VL, InternVL3, Phi-4 Multimodal
+* ASR / Omni speech models: Qwen3-ASR, Qwen3-Omni
+* Text-to-Speech models: Qwen3-TTS (Thinker + Talker + CodePredictor)
+* MoE (Mixture-of-Experts) models
+
+Remaining model families are tracked in <<future-work>>.
+
+== Scope
+
+This document describes the design of ``llm_loader/``, a Python package that:
+
+. Loads a HuggingFace-style checkpoint (FP16, FP8, NVFP4, INT4, INT8, mixed-precision).
+. Constructs a TRT-targeted PyTorch model (with custom plugin stubs).
+. Exports it to ONNX via ``torch.onnx.export(dynamo=True)``.
+. Post-processes the ONNX for TRT compatibility.
+
+Key design principles:
+
+* **No HF runtime dependency** — modules replicate HF architecture with identical checkpoint key names, but never call ``AutoModel.from_pretrained``.
+* **BF16->FP16 at load time** — ``_set_tensor()`` casts bfloat16 tensors to float16 on the fly during weight loading.  No separate post-load sweep.
+* **Generalized fused weight splitting** — checkpoint keys like ``qkv_proj.weight_scale`` or ``gate_up_proj.input_scale`` are automatically split into per-projection tensors (q/k/v or gate/up) regardless of suffix.  Scalar/per-tensor attributes are broadcast; per-channel attributes are split on dim 0.
+* **Per-model-family packages** — each model family (e.g. ``qwen3_vl``, ``phi4mm``) lives in its own sub-package under ``models/``, containing both the LLM text backbone (``_text.py``) and optional visual/audio encoders (``_visual.py``, ``_audio.py``).
+
+== Source References
+
+* ``llm_loader/__init__.py`` — public API surface
+* ``llm_loader/config.py`` — ModelConfig, QuantConfig
+* ``llm_loader/model.py`` — AutoModel factory and register_model
+* ``llm_loader/chat_template.py`` — Chat template extraction (Jinja -> JSON)
+* ``llm_loader/checkpoint/loader.py`` — weight loading, BF16->FP16 cast, fused split
+* ``llm_loader/checkpoint/checkpoint_utils.py`` — config loading, runtime artifact writing
+* ``llm_loader/models/default/modeling_default.py`` — attention-only CausalLM
+* ``llm_loader/models/nemotron_h/modeling_nemotron_h.py`` — hybrid Mamba+Attention NemotronHCausalLM
+* ``llm_loader/models/qwen3_vl/`` — Qwen3-VL text backbone and visual encoder
+* ``llm_loader/models/qwen2_5_vl/`` — Qwen2.5-VL text backbone and visual encoder
+* ``llm_loader/models/internvl3/`` — InternVL3 text backbone and visual encoder
+* ``llm_loader/models/phi4mm/`` — Phi-4 Multimodal text backbone and visual encoder
+* ``llm_loader/models/qwen3_asr/`` — Qwen3-ASR text backbone and audio encoder
+* ``llm_loader/models/qwen3_tts/`` — Qwen3-TTS thinker, talker, code predictor, and audio encoder
+* ``llm_loader/models/linear.py`` — quantized linear layers (FP8, NVFP4, AWQ, etc.)
+* ``llm_loader/models/ops.py`` — custom op stubs (torch.ops.trt_edgellm.*)
+* ``llm_loader/onnx/export.py`` — LLM ONNX export and TRT post-processing passes
+* ``llm_loader/onnx/export_encoder.py`` — visual/audio encoder ONNX export
+* ``llm_loader/onnx/dynamo_translations.py`` — onnxscript translation table
+* ``llm_loader/onnx/onnx_custom_schemas.py`` — ONNX OpSchema registrations
+* ``llm_loader/export_all_cli.py`` — unified CLI: exports LLM + visual + audio + TTS
+
+== Package Layout
+
+[source]
+----
+experimental/llm_loader/
+├── config.py              # ModelConfig (HF config → flat dataclass)
+├── model.py               # AutoModel factory (dispatches on model_type)
+├── chat_template.py       # Chat template extraction (Jinja → JSON)
+├── checkpoint/
+│   ├── checkpoint_utils.py  # Config loading, runtime artifact writing
+│   └── loader.py            # Weight loading (fused split, BF16→FP16 cast)
+├── models/
+│   ├── default/
+│   │   └── modeling_default.py  # CausalLM, Transformer, DecoderLayer, etc.
+│   ├── nemotron_h/
+│   │   └── modeling_nemotron_h.py  # Hybrid Mamba + Attention backbone
+│   ├── qwen3_vl/
+│   │   ├── modeling_qwen3_vl_text.py
+│   │   └── modeling_qwen3_vl_visual.py
+│   ├── qwen2_5_vl/
+│   │   ├── modeling_qwen2_5_vl_text.py
+│   │   └── modeling_qwen2_5_vl_visual.py
+│   ├── internvl3/
+│   │   ├── modeling_internvl3_text.py
+│   │   └── modeling_internvl3_visual.py
+│   ├── phi4mm/
+│   │   ├── modeling_phi4mm_text.py
+│   │   └── modeling_phi4mm_visual.py
+│   ├── qwen3_asr/
+│   │   ├── modeling_qwen3_asr_text.py
+│   │   └── modeling_qwen3_asr_audio.py
+│   ├── qwen3_tts/
+│   │   ├── modeling_qwen3_tts_text.py     # Thinker (standard Qwen3 LLM)
+│   │   ├── modeling_qwen3_tts_talker.py   # TalkerCausalLM (logits + hidden_states)
+│   │   ├── modeling_code_predictor.py     # CodePredictorCausalLM (dynamic lm_head)
+│   │   └── modeling_qwen3_tts_audio.py    # Audio encoder
+│   ├── linear.py          # Quantized linear layers (FP8, NVFP4, AWQ, etc.)
+│   └── ops.py             # Custom op stubs (attention_plugin, causal_conv1d, etc.)
+├── onnx/
+│   ├── export.py              # LLM ONNX export + dtype fixups
+│   ├── export_encoder.py      # Visual/audio encoder ONNX export
+│   ├── dynamo_translations.py # Custom op → ONNX translations
+│   └── onnx_custom_schemas.py # ONNX schema definitions for custom ops
+└── export_all_cli.py      # Unified CLI: exports LLM + visual + audio + TTS
+----
+
+== Architecture Overview
+
+[source]
+----
+HuggingFace checkpoint (safetensors)
+        │
+        ▼
+ModelConfig.from_pretrained()        ← config.json + hf_quant_config.json
+        │
+        ▼
+AutoModel.from_pretrained()
+        │  dispatches on model_type via _MODEL_REGISTRY
+        ▼
+CausalLM  ──────────────────────────────────┐
+  (attention-only default)                   │ or
+NemotronHCausalLM                           │ (registered via register_model)
+  (hybrid Mamba + Attention)                 │
+Qwen3VLVisualModel                          │
+InternVL3VisualModel                        │
+Phi4mmVisualModel                           │
+Qwen3ASRAudioEncoder                        │
+TalkerCausalLM / CodePredictorCausalLM      │
+        │                                   ◄┘
+        │ load_weights()
+        ▼
+model.onnx_export_spec()   →  OnnxSpec{wrapped, args, input_names, output_names, dynamic_shapes}
+        │
+        ▼
+torch.onnx.export(dynamo=True, custom_translation_table=...)
+        │  translates torch.ops.trt_edgellm.* → ONNX custom domain nodes
+        ▼
+ONNX post-processing passes:
+  _fix_initializer_dtypes()      (FP32→FP16 weights, Mamba ssm_A→FP32)
+  _fix_nvfp4_weight_dtype()      (INT8→FLOAT4E2M1 for NVFP4 weights)
+        │
+        ▼
+model.onnx + model.onnx.data + config.json + embedding.safetensors + tokenizer files
+----
+
+== Unified Export CLI
+
+[source,bash]
+----
+# From experimental/ directory:
+python -m llm_loader.export_all_cli /path/to/checkpoint /tmp/output
+
+# Options:
+#   --dtype float16|bfloat16   (for visual/audio, default: float16)
+#   --skip-llm                 (only export encoders)
+#   --skip-visual / --skip-audio
+#   --device cuda|cpu
+----
+
+Model type is auto-detected from ``config.json["model_type"]``.  Outputs:
+
+* ``<output>/llm/model.onnx`` — LLM backbone
+* ``<output>/visual/model.onnx`` — ViT encoder (VLMs only)
+* ``<output>/audio/model.onnx`` — Audio encoder (speech models only)
+* ``<output>/code_predictor/model.onnx`` — TTS CodePredictor (TTS only)
+
+== Components
+
+=== ModelConfig and QuantConfig (``config.py``)
+
+``ModelConfig`` is a flat dataclass populated from ``config.json`` and optionally ``hf_quant_config.json``.  It holds all architecture fields (``hidden_size``, ``num_attention_heads``, ``num_key_value_heads``, ``head_dim``, etc.) plus a ``QuantConfig`` sub-object describing the quantization format.
+
+``QuantConfig`` encodes:
+
+* ``quant_format`` — one of: ``fp16``, ``fp8``, ``nvfp4``, ``int4_awq``, ``int4_awq_modelopt``, ``int4_gptq``, ``int8_sq``, ``mixed_precision``
+* Per-layer overrides for mixed-precision checkpoints
+* Derived flags: ``uses_nvfp4_weights``, ``uses_fp8``, ``uses_int4``, etc.
+
+The ``has_qk_norm`` flag is auto-detected from checkpoint key names (presence of ``q_norm`` weights), not from a model-type string.
+
+=== Config Loading and HF Hub Fallback
+
+``load_checkpoint_config_dicts()`` uses ``AutoConfig.from_pretrained`` when available.  For unregistered model types (e.g. ``qwen3_asr``, ``qwen3_tts``), it falls back to raw ``config.json``.  If ``model_dir`` is an HF model ID (not a local path), it downloads ``config.json`` via ``hf_hub_download`` so the raw fallback works.
+
+The raw config is always loaded alongside AutoConfig to recover fields that AutoConfig discards during sub-config promotion (e.g. ``vision_config``, ``rope_scaling`` from nested ``text_config``).
+
+=== AutoModel and Model Registry (``model.py``)
+
+``AutoModel.from_pretrained(model_dir, device)`` is the primary entry point:
+
+. Builds a ``ModelConfig`` from the checkpoint directory.
+. Looks up the model class in ``_MODEL_REGISTRY`` (keyed by ``model_type`` string).
+. Falls back to the built-in ``CausalLM`` if not registered.
+. Instantiates the model, moves it to ``device``, calls ``load_weights``.
+
+Custom model classes are registered once at package import time:
+
+[source,python]
+----
+register_model("nemotron_h", NemotronHCausalLM)
+register_model("qwen3_vl", Qwen3VLTextModel)
+register_model("internvl_chat", InternVL3TextModel)
+# etc.
+----
+
+This avoids model-type string checks inside the export pipeline.
+
+=== Checkpoint Loader (``checkpoint/loader.py``)
+
+``load_weights(model, model_dir, device)`` loads safetensors shards by name-matching.  Key behaviour:
+
+==== BF16->FP16 cast at load time
+
+The cast happens in ``_set_tensor()`` (the single assignment point for all weights into the model).  This replaces the old ``_cast_bfloat16_to_float16()`` post-load sweep and ensures every tensor is FP16 before ONNX export, including buffers and quantization scales.
+
+==== Generalized fused weight splitting
+
+Checkpoints often store fused projections (``qkv_proj``, ``gate_up_proj``) that must be split for the per-projection module layout.  The split logic in ``_try_split_fused_tensor()`` handles **any attribute suffix**, not just ``.weight``:
+
+[source]
+----
+qkv_proj.weight        → q_proj.weight, k_proj.weight, v_proj.weight
+qkv_proj.weight_scale  → q_proj.weight_scale, k_proj.weight_scale, ...
+qkv_proj.input_scale   → broadcast to all three (scalar/per-tensor)
+gate_up_proj.weight     → gate_proj.weight, up_proj.weight
+gate_up_proj.weight_scale → gate_proj.weight_scale, up_proj.weight_scale
+----
+
+Scalar/per-tensor attributes (dim 0 or shape [1]) are broadcast.  Per-output-channel attributes are split on dim 0.
+
+==== Explicit key_prefix for sub-model loading
+
+``load_weights()`` accepts an optional ``key_prefix`` parameter (e.g. ``"talker."`` or ``"talker.code_predictor."``) to load a specific sub-model from a composite checkpoint.  Keys outside the prefix are skipped.
+
+==== Additional loader features
+
+* INT4 weight repacking (AWQ column-packed -> row-packed) is handled in ``checkpoint/repacking.py``.
+* VL wrapper prefix detection and stripping (e.g. ``language_model.``, ``model.language_model.``)
+* PEFT/LoRA ``.base_layer.`` key stripping
+* Weights are matched by parameter name; unmatched keys are logged as warnings.
+
+=== Custom Op Stubs (``models/ops.py``)
+
+All TRT-targeted ops are registered as ``torch.ops.trt_edgellm.*`` or ``torch.ops.trt.*`` custom operators.  During tracing they are pure stubs (return zeros with the correct shape/dtype) — they are never executed; only the ONNX translation matters.
+
+Defined ops:
+
+[cols="2,3"]
+|===
+|Op |Description
+|``trt_edgellm.attention_plugin`` |Multi-head attention with RoPE, KV cache, tree attention
+|``trt_edgellm.attention_plugin_fp8kv`` |Attention with FP8 KV cache variant
+|``trt_edgellm.vit_attention_plugin`` |ViT flash attention (no KV cache, no RoPE)
+|``trt_edgellm.causal_conv1d`` |Causal 1D depthwise convolution with persistent state
+|``trt_edgellm.update_ssm_state`` |Mamba selective state-space model update
+|``trt_edgellm.int4_groupwise_gemm`` |INT4 groupwise GEMM plugin
+|``trt.gather_nd`` |Batched GatherND for last-token selection
+|``trt.fp4_dynamic_quantize`` |NVFP4 per-block dynamic activation quantization
+|``trt.dequantize_linear`` |NVFP4 per-block dequantization
+|===
+
+=== Default CausalLM (``models/default/modeling_default.py``)
+
+Handles standard attention-only LLMs (Llama, Qwen, Mistral, etc.).
+
+Forward signature (both prefill and decode, single graph):
+
+[source]
+----
+inputs_embeds         [B, S, H]            float16
+past_key_values       B × [B, 2, Hkv, P, D]
+rope_rotary_cos_sin   [B, Mpos, rotary_dim] float32
+context_lengths       [B]                   int32
+kvcache_start_index   [B]                   int32
+─────────────────────────────────────────────────────
+→ logits              [B, S, V]             float32
+→ present_key_values  B × [B, 2, Hkv, P+S, D]
+----
+
+The model uses ``trt_edgellm.attention_plugin`` for attention.
+
+``onnx_export_spec()`` returns an ``OnnxSpec`` with concrete dummy inputs (batch=1, seq=1, past=1), dynamic shape specs, and flat input/output name lists.
+
+=== NemotronHCausalLM (``models/nemotron_h/modeling_nemotron_h.py``)
+
+Hybrid 42-layer model (NemotronH 4B): 21 Mamba layers, 17 MLP-only layers, 4 Attention layers.
+
+Extra I/O versus attention-only:
+
+[source]
+----
+Extra inputs:
+  conv_state_0..M     [B, conv_dim, conv_kernel-1]           float16
+  ssm_state_0..M      [B, num_heads, head_dim, ssm_state]    float16
+
+Extra outputs:
+  present_conv_0..M   updated conv states
+  present_ssm_0..M    updated SSM states
+----
+
+``MambaMixer.forward`` splits ``in_proj`` output as ``[d_inner, conv_dim, num_heads]`` and calls:
+
+. ``trt_edgellm.causal_conv1d`` — depthwise conv over z, B, C with persistent conv state
+. ``trt_edgellm.update_ssm_state`` — selective SSM step with dt, A, B, C, D parameters
+
+For last-token logit selection, ``NemotronHCausalLM`` uses ``trt.gather_nd`` (instead of a Python slice) so TRT can see the gather op in the graph.
+
+The model wraps each Mamba layer in a flat closure (``_make_flat_wrapper_mamba``) to simplify the dynamo trace for state-bearing ops.
+
+==== Custom RMSNorm
+
+Nemotron-H defines its own ``RMSNorm`` using ``F.rms_norm`` instead of the default decomposed implementation.  This is required because:
+
+* TRT's "Force Reduce to FP32" heuristic decomposes standard RMSNorm into FP32 intermediate ops (Mul + ReduceMean + Rsqrt).
+* These FP32 intermediates are incompatible with the Mamba plugin's FP16 input requirements, causing ``ForeignNode`` tactic failures.
+* ``F.rms_norm`` emits a single ``RMSNormalization`` ONNX node that TRT handles natively in FP16.
+
+==== FP16 buffer registration
+
+Mamba buffers (``A_log``, ``D``, ``dt_bias``) are registered as FP16:
+
+* ``A_log`` is cast to FP32 in forward (``.to(torch.float32)``) which creates an explicit ONNX Cast node — the ``update_ssm_state`` plugin requires its A input as FP32.
+* ``D`` and ``dt_bias`` remain FP16 (matching plugin expectations).
+
+==== context_lengths for Mamba plugins
+
+Both ``causal_conv1d`` and ``update_ssm_state`` plugins accept a ``context_lengths`` tensor (``[batch] int32``) to correctly handle prefill length and avoid accuracy issues with batch size > 1.
+
+==== Gated RMSNorm precision
+
+The gated RMSNorm in ``MambaMixer._gated_rmsnorm()`` explicitly computes in FP32 and casts back to FP16 at the end.  This creates an ONNX partition boundary that lets TRT split the ForeignNode at plugin inputs.
+
+=== TTS Talker and CodePredictor Export
+
+Qwen3-TTS has two decoder sub-models beyond the standard LLM (thinker):
+
+==== TalkerCausalLM
+
+A Qwen3 decoder fine-tuned for codec token prediction (``vocab_size=3072``).  Differences from standard CausalLM:
+
+* Returns both ``logits`` and ``hidden_states`` (for residual connection to CodePredictor).
+* Checkpoint keys have ``talker.`` prefix; ``codec_embedding`` is renamed to ``embed_tokens`` via a key_remap callable.
+* Extra sidecar weight files extracted from the checkpoint:
+** ``text_embedding.safetensors`` — thinker text embedding [151936, 2048]
+** ``text_projection.safetensors`` — MLP fc1/fc2 weight+bias
+* ``config.json`` is patched with TTS/codec token IDs and speaker mapping.
+
+==== CodePredictorCausalLM
+
+A small 5-layer Qwen3 decoder for residual codec prediction.  Differences:
+
+* ``lm_head_weight`` is an ONNX **input** tensor (not a fixed weight) — the runtime selects one of 15 different heads per inference step via CUDA graphs.
+* Returns both ``logits`` and ``hidden_states``.
+* An MLP FP16 overflow WAR (``_MLPFloat32WAR``) casts gate*up to FP32 to prevent overflow in layers with large hidden state ranges.
+* Extra sidecar weight files:
+** ``codec_embeddings.safetensors`` — 15 embedding tables
+** ``lm_heads.safetensors`` — 15 lm_head weights
+** ``small_to_mtp_projection.safetensors`` — talker->CP projection
+
+== Weight Loading Design
+
+=== Unified ``load_weights()``
+
+Use the unified ``load_weights()`` from ``checkpoint/loader.py``:
+
+[source,python]
+----
+from llm_loader.checkpoint.loader import load_weights
+
+# Standard LLM — auto-detects and strips VL wrapper prefix
+load_weights(model, model_dir, device="cpu")
+
+# Sub-model — explicit prefix strips "talker." from all keys
+load_weights(model, model_dir, device="cpu",
+             key_prefix="talker.",
+             key_remap=lambda k: k.replace("codec_embedding", "embed_tokens"))
+----
+
+The loader automatically handles:
+
+* VL wrapper prefix detection and stripping (e.g. ``language_model.``, ``model.language_model.``)
+* Fused QKV and gate_up weight splitting (any attribute suffix)
+* BF16->FP16 casting
+* PEFT/LoRA ``.base_layer.`` key stripping
+
+=== Factory function pattern
+
+Every from-scratch model exposes a ``build_<model>_visual(cfg, weights, dtype)`` function:
+
+[source,python]
+----
+def build_qwen3_vl_visual(cfg, weights, dtype=torch.float16):
+    model = Qwen3VLVisualModel(cfg)
+    _load_weights(model, weights, prefix="visual.")
+    return model.to(dtype=dtype).eval()
+----
+
+== Chat Template Handling
+
+``process_chat_template()`` extracts the chat template from the HF tokenizer's Jinja template and converts it to a JSON format for the C++ runtime.
+
+=== Hardcoded templates
+
+Some models require hardcoded templates:
+
+* **Phi-4 Multimodal** — ``phi4mm.json`` (always)
+* **Nemotron-H** — ``nemotron_nano_v2.json`` (only when the tokenizer has ``<SPECIAL_10>`` as a single token, i.e. Nemotron-Nano-9B-v2; Nemotron-3-Nano-4B uses standard ``<|im_start|>`` tokens and falls through to Jinja)
+* **Qwen3-ASR** — ``qwen3asr.json`` (the ASR tokenizer has no ``chat_template`` attribute)
+
+== ONNX Export (``onnx/export.py``)
+
+``export_onnx(model, output_path, model_dir)`` calls ``_export_model`` then ``write_runtime_artifacts``.
+
+``_export_model`` calls ``torch.onnx.export(dynamo=True)`` with:
+
+* ``custom_translation_table`` from ``build_custom_translation_table()`` — maps each ``torch.ops.trt_edgellm.*`` stub to an onnxscript function that emits a custom-domain ONNX node.
+* ONNX opset 24.
+* ``external_data=True`` — all initializers written to ``model.onnx.data``.
+
+=== Post-processing passes
+
+Post-processing passes (applied in order):
+
+[cols="3,4"]
+|===
+|Pass |Purpose
+|``_fix_initializer_dtypes`` |Single-pass correction: (1) FP32 weights -> FP16 for non-scalar, non-quantization-scale tensors; (2) restores Mamba ssm_A initializers to FP32 when constant folding collapses ``A_log->float32->exp->neg`` into FP16.
+|``_fix_nvfp4_weight_dtype`` |Rewrites INT8 NVFP4 weight initializers (``*.weight``) to FLOAT4E2M1 (elem_type 23) and doubles the last dimension for nibble unpacking; required by TRT's ``DequantizeLinear`` block-size logic.
+|===
+
+=== Removed ONNX passes (investigated and found unnecessary)
+
+Three post-processing passes were investigated using a Qwen3-0.6B export and removed:
+
+* **``_fix_custom_op_attr_types``** — Was intended as a defensive guard to correct FLOAT-typed integer attributes in custom-domain nodes back to INT type.  Inspection of the Qwen3 export confirmed that onnxscript emits all integer keyword arguments with ``AttributeProto.type=INT`` (value 2) and the correct value in ``attr.i``.  Zero attributes required correction.  Removed.
+
+* **``_inline_local_functions``** — Was intended to flatten ``this::`` ONNX local function nodes that TRT cannot parse.  Inspection of the Qwen3 export confirmed that onnxscript (as used here) emits 0 local functions; the dynamo exporter inlines custom-op translations directly into the main graph.  Removed.
+
+* **``_fix_reduce_axes_for_trt``** — Was intended to normalise opset-18 input-style ``axes=[-1]`` tensors in ``ReduceMean``/``ReduceSum``/etc. to attribute-style positive values.  Investigated by running TRT 10.14 engine inference on a minimal ONNX model with ``ReduceMean(axes=[-1], keepdims=1)`` (shape ``[2,4,8]``) and comparing output to both the attribute-style positive-axes model and the NumPy reference.  All three produced bit-identical results (max diff < 5x10^-7^).  TRT correctly handles opset-18 input-style negative axes.  Removed.
+
+=== Dynamo Translations (``onnx/dynamo_translations.py``)
+
+``build_custom_translation_table()`` returns the mapping consumed by ``torch.onnx.export``.  Each entry is an ``onnxscript``-decorated function that emits one or more custom-domain ONNX nodes.
+
+All integer arguments (``num_q_heads``, ``padding``, ``dt_softplus``, etc.) are passed as keyword arguments to the onnxscript function.  The onnxscript runtime writes them as ``AttributeProto.INT`` (type 2) fields with the correct value in ``attr.i``.
+
+=== ONNX Custom Schemas (``onnx/onnx_custom_schemas.py``)
+
+Registers ``onnx.defs.OpSchema`` objects for each custom op before ``torch.onnx.export`` runs.  This allows the ONNX checker and optimiser to resolve custom nodes.
+
+Call ``register_llm_loader_onnx_custom_schemas()`` once before export (idempotent).
+
+== ONNX I/O Layout
+
+=== Attention-only model
+
+[source]
+----
+Inputs:
+  inputs_embeds          [B, S, H]            float16  (embedding done before export)
+  past_key_values_N      [B, 2, Hkv, P, D]   float16  (one per attn layer)
+  rope_rotary_cos_sin    [B, Mpos, Rdim]      float32
+  context_lengths        [B]                  int32
+  kvcache_start_index    [B]                  int32
+  last_token_ids         [B, 1]               int64   (index of last real token)
+
+Outputs:
+  logits                 [B, S, V]            float32
+  present_key_values_N   [B, 2, Hkv, P+S, D] float16
+----
+
+=== Hybrid (Mamba) additions
+
+[source]
+----
+Extra inputs:
+  conv_state_N    [B, conv_dim, conv_kernel-1]        float16
+  ssm_state_N     [B, num_heads, head_dim, ssm_state] float16
+
+Extra outputs:
+  present_conv_N  (same shape as conv_state_N)
+  present_ssm_N   (same shape as ssm_state_N)
+----
+
+=== Visual encoders
+
+[cols="1,4,2"]
+|===
+|Model |Input names |Output names
+
+|Qwen3-VL
+|input, rotary_pos_emb, cu_seqlens, max_seqlen_carrier, [fast_pos_embed_idx, fast_pos_embed_weight]
+|output [, deepstack_0..N]
+
+|Qwen2.5-VL
+|input, rotary_pos_emb, cu_seqlens, max_seqlen_carrier, cu_window_seqlens, window_index, reverse_window_index
+|output
+
+|InternVL3
+|input [N, 3, H, W]
+|output [N*tokens, dim]
+
+|Phi-4mm
+|input [N, 3, 448, 448]
+|output [N*256, 3072]
+|===
+
+=== Audio encoders
+
+[cols="1,4,2"]
+|===
+|Model |Input names |Output name
+
+|Qwen3-ASR
+|padded_feature, padded_mask_after_cnn_indices, attention_mask
+|last_hidden_state
+
+|Qwen3-Omni
+|(same)
+|(same)
+|===
+
+=== TTS models
+
+[cols="2,2,2,4"]
+|===
+|Component |Extra inputs |Extra outputs |Sidecar files
+
+|Talker
+|(standard LLM)
+|hidden_states
+|text_embedding, text_projection
+
+|CodePredictor
+|lm_head_weight
+|hidden_states
+|codec_embeddings, lm_heads, small_to_mtp_projection
+|===
+
+== HF Modeling -> Edge-LLM Translation Guide
+
+This section provides a step-by-step guide for translating a HuggingFace model into an llm_loader-compatible from-scratch implementation.
+
+=== Core Principle
+
+Do NOT use ``AutoModel.from_pretrained``.  Instead:
+
+. Read the HF ``modeling_*.py`` file to understand the architecture.
+. Reproduce each ``nn.Module`` with identical checkpoint key names.
+. Load weights via ``load_weights()`` which handles prefix stripping, fused weight splitting, and BF16->FP16 casting automatically.
+. Replace non-exportable ops with custom ops that have ONNX translations.
+
+=== Step 1: Identify the architecture
+
+Read the HF modeling file and identify:
+
+* **Module names** (exactly as they appear in ``__init__``) — these become checkpoint key names.
+* **Normalization type**: ``nn.LayerNorm`` vs ``nn.RMSNorm``.
+* **Activation function**: ``gelu``, ``gelu_pytorch_tanh``, ``silu``, GEGLU, SwiGLU, etc.
+* **Attention variant**: standard SDPA, GQA, window attention, ragged ViT attention.
+* **Positional embeddings**: learned, sinusoidal, RoPE, ALiBi, etc.
+
+=== Step 2: Match checkpoint key names (critical)
+
+Key names must exactly match the safetensors checkpoint.  Check with:
+
+[source,python]
+----
+from safetensors import safe_open
+with safe_open("model.safetensors", framework="pt") as f:
+    keys = sorted(f.keys())
+    print(keys[:30])
+----
+
+Common mismatches to watch for:
+
+* Old vs. new transformers API names (e.g. phi4mm ``img_projection.0`` vs ``img_projection_up``)
+* ``encoder.layer`` (InternVL) vs ``encoder.layers`` (most others)
+* ``merger.mlp.0`` (Qwen2.5-VL) vs ``merger.linear_fc1`` (Qwen3-VL)
+* PEFT/LoRA checkpoints with ``.base_layer.`` in key names — the loader handles fused ``qkv_proj`` and ``gate_up_proj`` splits with any attribute suffix
+
+=== Step 3: Replace non-exportable attention with custom ops
+
+Standard ``F.scaled_dot_product_attention`` exports cleanly for fixed-shape or simple dynamic shapes.
+
+For **ragged / variable-length** sequences (common in ViTs), use:
+
+[source,python]
+----
+from ..models.ops import vit_attention_plugin
+# inputs: q, k, v [T, H, D], cu_seqlens [B+1 int32], max_seqlen_carrier [int32]
+out = vit_attention_plugin(q, k, v, cu_seqlens, max_seqlen_carrier,
+                           num_heads=H, head_size=D)
+----
+
+For **KV-cache attention** in the LLM backbone, use:
+
+[source,python]
+----
+from ..models.ops import attention_plugin
+out, kv = attention_plugin(q, k, v, past_kv, ctx_len, rope_cos_sin,
+                           kvcache_start_idx, ...)
+----
+
+For **Phi-4mm visual attention**, use manual SDPA decomposition (not ``F.scaled_dot_product_attention``) because dynamo export emits F.sdpa as a multi-output ONNX Attention op that TRT cannot parse:
+
+[source,python]
+----
+scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+out = torch.matmul(attn_weights, v)
+----
+
+=== Step 4: Handle model-specific features
+
+**Qwen3-VL:**
+
+* ``fast_pos_embed_interpolate``: bilinear interpolation of a learned position grid.
+* ``deepstack_visual_indexes``: extract intermediate layer outputs at specified indices.
+* PatchMerger: ``norm / linear_fc1 / linear_fc2`` (GEGLU).
+
+**Qwen2.5-VL:**
+
+* Window attention vs full attention determined by ``fullatt_block_indexes`` in config.
+* ``cu_window_seqlens``, ``window_index``, ``reverse_window_index`` as ONNX inputs.
+* PatchMerger: ``ln_q / mlp.0 / mlp.2`` (Sequential RMSNorm->Linear->GELU->Linear).
+
+**InternVL3:**
+
+* Layer scale (``lambda_1``, ``lambda_2`` parameters) on attention/MLP outputs.
+* ``pixel_shuffle`` for spatial downsampling: merge 2x2 blocks -> channel dim.
+* Vision encoder key: ``encoder.layer`` (ModuleList named ``layer``, not ``layers``).
+* Projector key prefix: ``model.multi_modal_projector.*``.
+
+**Phi-4 Multimodal:**
+
+* Checkpoint uses **old transformers key names**: ``img_projection.0`` / ``img_projection.2`` (NOT ``img_projection_up`` / ``img_projection_down`` from newer transformers).
+* ``glb_GN`` / ``sub_GN`` parameters are exported as a sidecar safetensors file (``phi4mm_gn_proj.safetensors``) after projection through ``img_projection``.
+* Feature extraction at ``feature_layer=-2`` (second-to-last encoder layer output).
+
+**Qwen3-ASR / Omni / TTS:**
+
+* CNN downsampling: 3x stride-2 Conv2d (NCHW) -> linear ``conv_out``.
+* Ragged sequence handling: instead of boolean masking (which produces ``NonZero`` nodes in ONNX), use pre-computed ``padded_mask_after_cnn_indices`` (the nonzero indices) as a model input.
+* Block-diagonal ``attention_mask`` (additive, float16) for multi-utterance batching.
+
+=== Step 5: Dynamic shape annotation
+
+Use ``torch.export.Dim`` for variable dimensions:
+
+[source,python]
+----
+T = torch.export.Dim("total_tokens")
+dynamic_shapes = {
+    "pixel_values": {0: T},
+    "cu_seqlens":   {0: torch.export.Dim("batch_p1")},
+}
+----
+
+=== Step 6: Loading weights
+
+See <<Unified ``load_weights()``>> above for the full API.
+
+=== Step 7: Adding a new model (end-to-end)
+
+. Implement ``SomeNewCausalLM(config: ModelConfig)`` in ``llm_loader/models/some_new/modeling_some_new.py``.
+  ** Inherit from or follow the conventions of ``CausalLM`` in ``modeling_default.py``.
+  ** Implement ``onnx_export_spec() -> OnnxSpec`` (dummy args + dynamic shapes).
+  ** Use ``torch.ops.trt_edgellm.*`` stubs for any custom plugin calls.
+. Register in ``llm_loader/__init__.py``:
++
+[source,python]
+----
+from .models.some_new.modeling_some_new import SomeNewCausalLM
+register_model("some_new", SomeNewCausalLM)
+----
+. If the model requires new custom ops:
+  ** Add the stub in ``llm_loader/models/ops.py``.
+  ** Add the translation function in ``llm_loader/onnx/dynamo_translations.py``.
+  ** Register the ONNX schema in ``llm_loader/onnx/onnx_custom_schemas.py``.
+  ** Implement the C++ plugin in ``cpp/plugins/`` and register it in ``cpp/plugins/CMakeLists.txt``.
+  ** Add a specialisation or extend ``parsePluginScalarField`` / ``parsePluginIntField`` in ``pluginUtils.h`` if the new plugin uses integer scalar attributes (which TRT will pass as ``kINT64``).
+
+== Plugin Attribute Handling
+
+=== TRT PluginField type for ONNX INT attributes
+
+When TRT 10.x parses a custom-domain ONNX node with ``AttributeProto.INT`` (type 2) attributes, it creates ``PluginFieldType::kINT64`` fields (protobuf INT is 64-bit).
+
+The C++ plugin helper ``parsePluginScalarField<int32_t>`` in ``cpp/plugins/utils/pluginUtils.h`` was originally specialised only for ``kINT32``.  This caused:
+
+* Debug builds: assertion ``kINT32 != kINT64`` -> SIGABRT during engine build.
+* Release builds: no-op fall-through -> headSize=0 -> SIGFPE in contextFMHARunner.
+
+**Fix (``pluginUtils.h``):** Added an explicit ``parsePluginScalarField<int32_t>`` specialisation that handles both ``kINT32`` and ``kINT64`` (safe ``static_cast<int32_t>`` from the int64 pointer).
+
+Note: ``parsePluginIntField`` (used in ``causalConv1dPlugin``) already handled both types correctly.
+
+=== Custom op attribute types
+
+onnxscript correctly emits all integer keyword arguments with ``AttributeProto.type=INT`` (value 2) and the correct value in ``attr.i``.  No post-processing pass is needed to fix attribute types; this was verified by inspection of a Qwen3-0.6B export (756 INT-typed attrs, 0 FLOAT-typed integer attrs).
+
+== Supported Models
+
+[cols="2,1,1,1,1"]
+|===
+|Model type |LLM |Visual |Audio |TTS (Talker + CP)
+
+|``qwen3_vl``
+|Y
+|Y
+|
+|
+
+|``qwen3_omni``
+|Y
+|Y
+|Y
+|
+
+|``qwen2_5_vl``
+|Y
+|Y
+|
+|
+
+|``internvl`` / ``internvl_chat``
+|Y
+|Y
+|
+|
+
+|``phi4mm`` / ``phi4_multimodal``
+|Y
+|Y
+|
+|
+
+|``qwen3_asr``
+|Y
+|
+|Y
+|
+
+|``qwen3_tts``
+|Y
+|
+|
+|Y
+
+|``nemotron_h`` (hybrid)
+|Y
+|
+|
+|
+
+|All other LLM types
+|Y
+|
+|
+|
+|===
+
+== Known Constraints
+
+* Export must be run on CPU (``--device cpu``) to avoid GPU memory spikes during tracing and to produce deterministic graphs.
+* BF16 checkpoints are cast to FP16 at load time.  The runtime and plugins target FP16.
+* NemotronH Mamba states are stateful I/O tensors (not loop-scoped); the caller manages state across decode steps.
+* ONNX opset 24 is required (TRT 10.16+).
+* ``torch.onnx.export(dynamo=True)`` with onnxscript emits ``AttributeProto.INT`` (not ``FLOAT``) for integer keyword arguments since at least onnxscript 0.1.  The C++ plugin parsers must tolerate ``kINT64`` fields (fixed in ``pluginUtils.h``).
+
+[[future-work]]
+== Future Work
+
+The following model families are not yet supported.  Each requires new model classes under ``experimental/llm_loader/models/``, new custom op stubs and translations, and corresponding C++ plugin work.
+
+[cols="2,5"]
+|===
+|Model family |Notes
+
+|**EAGLE draft models**
+|Export the EAGLE draft model (a shallow decoder that predicts speculative tokens) separately from the base model.  Requires: a draft-model wrapper that shares the base embedding, a separate ``OnnxSpec`` for the draft graph, and end-to-end testing against the existing ``LLMInferenceSpecDecodeRuntime``.
+
+|**Alpamayo models**
+|Support the Alpamayo model family.  Architecture details and required custom ops TBD based on the model spec.
+
+|===

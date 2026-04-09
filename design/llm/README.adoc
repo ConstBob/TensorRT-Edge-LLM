@@ -4,3 +4,4 @@
 
 == Index
 - `laurel_support.adoc`: LAuReL residual support in decoder layers and exports
+- `llm_loader_design.adoc`: llm_loader package — checkpoint loading, model construction, and dynamo ONNX export pipeline (including hybrid Mamba+Attention models). **Status: experimental** (`experimental/llm_loader/`). See the design doc for planned follow-on model support.

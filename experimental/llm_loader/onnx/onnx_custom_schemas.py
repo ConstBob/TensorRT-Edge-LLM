@@ -1,0 +1,574 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Register ONNX OpSchemas for custom ops used by dynamo export in this package.
+
+
+Call :func:`register_llm_loader_onnx_custom_schemas` before
+``torch.onnx.export(..., optimize=True)`` so custom nodes resolve.
+
+Custom op ``since_version`` (ONNX opset) is fixed below; bump if the runtime
+expects a newer schema revision. FP8 here uses standard ``QuantizeLinear`` /
+``DequantizeLinear``, not custom FP8 schemas.
+"""
+
+from __future__ import annotations
+
+import onnx
+from onnx.defs import OpSchema
+
+_SCHEMA_SINCE_VERSION = 23
+
+
+def _safe_register_schema(schema: OpSchema) -> None:
+    """Register *schema* if not already present (idempotent across packages)."""
+    try:
+        onnx.defs.register_schema(schema)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::AttentionPlugin, trt_edgellm::ViTAttentionPlugin
+# ---------------------------------------------------------------------------
+
+_attention_plugin_schema = OpSchema(
+    name="AttentionPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=
+    "Custom TensorRT attention plugin with RoPE, KV cache, and attention computation.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="q",
+            description="Query tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="k",
+            description="Key tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="v",
+            description="Value tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="past_key_value",
+            description="KV cache tensor",
+            type_str="T_KV",
+        ),
+        OpSchema.FormalParameter(
+            name="context_lengths",
+            description="Context length tensor",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="rope_rotary_cos_sin",
+            description="RoPE rotary embeddings (FP32)",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="kvcache_start_index",
+            description=
+            "KV cache start index tensor of shape [kv_cache_start_batch_size]",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="attention_mask",
+            description="Attention mask tensor (optional)",
+            type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="attention_pos_id",
+            description="Position IDs tensor (optional)",
+            type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="attn_output",
+            description="Attention output tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="present_key_value",
+            description="Updated KV cache tensor",
+            type_str="T_KV",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)"],
+            "Input Q/K/V data type.",
+        ),
+        (
+            "T_KV",
+            ["tensor(float16)", "tensor(float8e4m3fn)"],
+            "KV cache data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="num_q_heads",
+            type=OpSchema.AttrType.INT,
+            description="Number of query heads",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="num_kv_heads",
+            type=OpSchema.AttrType.INT,
+            description="Number of key-value heads",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="head_size",
+            type=OpSchema.AttrType.INT,
+            description="Size of each attention head",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="enable_tree_attention",
+            type=OpSchema.AttrType.INT,
+            description="Whether to enable tree attention (0(false), 1(true))",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="enable_fp8_kv_cache",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether to use FP8 KV cache (0(false), 1(true)). Optional.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="sliding_window_size",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Sliding window size for attention (-1 = none, >0 = window size).",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="qkv_scales",
+            type=OpSchema.AttrType.FLOATS,
+            description=
+            "QKV dequant scales for FP8 KV cache: [q_scale, k_scale, v_scale]. "
+            "Defaults to [1.0, 1.0, 1.0] when the checkpoint has no explicit scales.",
+            required=False,
+        ),
+    ],
+)
+
+_vit_attention_plugin_schema = OpSchema(
+    name="ViTAttentionPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=
+    "Custom TensorRT ViT attention plugin (separate Q/K/V, no KV cache, no RoPE).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="q",
+            description="Query tensor [total_S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="k",
+            description="Key tensor [total_S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="v",
+            description="Value tensor [total_S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="cu_seqlens",
+            description="Prefix sum of sequence lengths (int32, shape [B+1])",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="max_seqlen_carrier",
+            description="Shape-only carrier for max sequence length hint",
+            type_str="tensor(int32)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="attn_output",
+            description="Attention output [total_S, H, D]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)"],
+            "Input Q/K/V data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="num_heads",
+            type=OpSchema.AttrType.INT,
+            description="Number of attention heads",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="head_size",
+            type=OpSchema.AttrType.INT,
+            description="Size of each attention head",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# NVFP4 (trt domain)
+# ---------------------------------------------------------------------------
+
+_trt_fp4_dynamic_quantize_schema = OpSchema(
+    name="TRT_FP4DynamicQuantize",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=
+    ("Dynamically quantize float16 activations to NVFP4 with per-block scaling."
+     ),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="x",
+            description="Input activation tensor (float16)",
+            type_str="tensor(float16)",
+        ),
+        OpSchema.FormalParameter(
+            name="global_scale",
+            description="Global scale constant (float16 scalar)",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="x_fp4",
+            description="Packed NVFP4 tensor",
+            type_str="T_fp4",
+        ),
+        OpSchema.FormalParameter(
+            name="x_sf",
+            description="Per-block scale factors (packed)",
+            type_str="T_fp4",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T_fp4",
+            ["tensor(uint8)", "tensor(int8)"],
+            "Packed FP4 tensor representation.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="axis",
+            type=OpSchema.AttrType.INT,
+            description="Quantization axis (default -1)",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="block_size",
+            type=OpSchema.AttrType.INT,
+            description="Elements per block (typically 16)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="scale_type",
+            type=OpSchema.AttrType.INT,
+            description="ONNX elem_type for scale factors (17 = FLOAT8E4M3FN)",
+            required=True,
+        ),
+    ],
+)
+
+_trt_dequantize_linear_schema = OpSchema(
+    name="DequantizeLinear",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TRT-domain DequantizeLinear for NVFP4 per-block dequantization.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="x",
+            description="Quantized input",
+            type_str="T_q",
+        ),
+        OpSchema.FormalParameter(
+            name="x_scale",
+            description="Per-block scale factors",
+            type_str="T_scale",
+        ),
+        OpSchema.FormalParameter(
+            name="x_zero_point",
+            description="Zero-point (optional)",
+            type_str="T_q",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="y",
+            description="Dequantized output",
+            type_str="T_out",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T_q",
+            ["tensor(uint8)", "tensor(int8)", "tensor(float8e4m3fn)"],
+            "Quantized tensor type.",
+        ),
+        (
+            "T_scale",
+            ["tensor(float16)", "tensor(float)", "tensor(float8e4m3fn)"],
+            "Scale tensor type.",
+        ),
+        (
+            "T_out",
+            ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"],
+            "Dequantized output type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="axis",
+            type=OpSchema.AttrType.INT,
+            description="Dequantization axis",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="block_size",
+            type=OpSchema.AttrType.INT,
+            description="Block size (NVFP4 uses 16)",
+            required=False,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::Int4GroupwiseGemmPlugin
+# ---------------------------------------------------------------------------
+
+_int4_groupwise_gemm_schema = OpSchema(
+    name="Int4GroupwiseGemmPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TensorRT Int4 groupwise GEMM plugin.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="input",
+            description="Input tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="qweight",
+            description="Quantized weights (int8)",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="scales",
+            description="Scales (float16)",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Output feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="group_size",
+            type=OpSchema.AttrType.INT,
+            description="Group size",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::causal_conv1d, update_ssm_state
+# ---------------------------------------------------------------------------
+
+_causal_conv1d_schema = OpSchema(
+    name="causal_conv1d",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="Causal 1D depthwise convolution with persistent state.",
+    inputs=[
+        OpSchema.FormalParameter(name="x",
+                                 description="Input tensor",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="weight",
+                                 description="Conv weight",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="bias",
+                                 description="Conv bias",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="conv_state",
+                                 description="Conv state",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="context_lengths",
+                                 description="Context lengths per batch",
+                                 type_str="T_CL"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(name="output",
+                                 description="Conv output",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="conv_state_out",
+                                 description="Updated conv state",
+                                 type_str="T"),
+    ],
+    type_constraints=[
+        ("T", ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"], ""),
+        ("T_CL", ["tensor(int32)"], ""),
+    ],
+    attributes=[
+        OpSchema.Attribute(name="stride",
+                           type=OpSchema.AttrType.INT,
+                           description="Stride",
+                           required=True),
+        OpSchema.Attribute(name="padding",
+                           type=OpSchema.AttrType.INT,
+                           description="Padding",
+                           required=True),
+        OpSchema.Attribute(name="dilation",
+                           type=OpSchema.AttrType.INT,
+                           description="Dilation",
+                           required=True),
+        OpSchema.Attribute(name="groups",
+                           type=OpSchema.AttrType.INT,
+                           description="Groups",
+                           required=True),
+    ],
+)
+
+_update_ssm_state_schema = OpSchema(
+    name="update_ssm_state",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="Mamba selective SSM state update.",
+    inputs=[
+        OpSchema.FormalParameter(name="x", description="Input x",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="A",
+                                 description="A parameter",
+                                 type_str="T_A"),
+        OpSchema.FormalParameter(name="B",
+                                 description="B parameter",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="C",
+                                 description="C parameter",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="D",
+                                 description="D parameter",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="dt",
+                                 description="dt parameter",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="dt_bias",
+                                 description="dt_bias parameter",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="state",
+                                 description="SSM state",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="context_lengths",
+                                 description="Context lengths per batch",
+                                 type_str="T_CL"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(name="output",
+                                 description="SSM output",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="state_out",
+                                 description="Updated SSM state",
+                                 type_str="T"),
+    ],
+    type_constraints=[
+        ("T", ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"], ""),
+        ("T_A", ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"], ""),
+        ("T_CL", ["tensor(int32)"], ""),
+    ],
+    attributes=[
+        OpSchema.Attribute(name="dt_softplus",
+                           type=OpSchema.AttrType.INT,
+                           description="Apply softplus to dt",
+                           required=True),
+        OpSchema.Attribute(name="ngroups",
+                           type=OpSchema.AttrType.INT,
+                           description="Number of groups",
+                           required=True),
+        OpSchema.Attribute(
+            name="chunk_size",
+            type=OpSchema.AttrType.INT,
+            description="Mamba2 prefill chunk size (0=sequential)",
+            required=False),
+        OpSchema.Attribute(name="time_step_limit",
+                           type=OpSchema.AttrType.FLOATS,
+                           description="Time step clamping range",
+                           required=False),
+    ],
+)
+
+_ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
+    _attention_plugin_schema,
+    _vit_attention_plugin_schema,
+    _trt_fp4_dynamic_quantize_schema,
+    _trt_dequantize_linear_schema,
+    _int4_groupwise_gemm_schema,
+    _causal_conv1d_schema,
+    _update_ssm_state_schema,
+)
+
+_registered_llm_loader_schemas: bool = False
+
+
+def register_llm_loader_onnx_custom_schemas() -> None:
+    """Register custom ONNX ops for :mod:`llm_loader.dynamo_translations`. Idempotent."""
+    global _registered_llm_loader_schemas
+    if _registered_llm_loader_schemas:
+        return
+    for s in _ALL_CUSTOM_SCHEMAS:
+        _safe_register_schema(s)
+    _registered_llm_loader_schemas = True
