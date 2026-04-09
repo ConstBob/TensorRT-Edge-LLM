@@ -587,10 +587,10 @@ void runGDNPrefillTest()
     gdnPrefillReference(h_q.data(), h_k.data(), h_v.data(), h_a.data(), h_b.data(), h_A_log.data(), h_dt_bias.data(),
         h0_ref.data(), o_ref.data(), n, seq_len, h, hv, k, v, h_ctx_prefill.data());
 
-    // Blackwell uses fp16 + TF32 matrix inversion: looser tolerance needed.
+    // Blackwell uses fp16 + TF32 matrix inversion, use higher tolerance for Blackwell.
     // Sequential path uses exact fp32 ref: tight tolerance OK.
-    float const atol = onBlackwell ? 0.05f : 1e-4f;
-    float const rtol = onBlackwell ? 0.1f : 1e-4f;
+    float const atol = onBlackwell ? 5e-2f : 1e-4f;
+    float const rtol = onBlackwell ? 5e-2f : 1e-4f;
     for (size_t i = 0; i < oLen; ++i)
     {
         EXPECT_TRUE(isclose(h_o_float[i], o_ref[i], rtol, atol))
@@ -778,9 +778,9 @@ void runGDNPrefillPaddingTest()
     gdnPrefillReference(h_q.data(), h_k.data(), h_v.data(), h_a.data(), h_b.data(), h_A_log.data(), h_dt_bias.data(),
         h0_ref.data(), o_ref.data(), n, seq_len, h, hv, k, v, h_ctx.data());
 
-    // Blackwell uses fp16 + TF32 matrix inversion: looser tolerance needed.
-    float const atol = onBlackwell ? 0.05f : 1e-4f;
-    float const rtol = onBlackwell ? 0.1f : 1e-4f;
+    // Blackwell uses fp16 + TF32 matrix inversion, use higher tolerance for Blackwell.
+    float const atol = onBlackwell ? 5e-2f : 1e-4f;
+    float const rtol = onBlackwell ? 5e-2f : 1e-4f;
     size_t const hvv = static_cast<size_t>(hv) * v;
     for (int32_t b = 0; b < n; ++b)
     {
@@ -791,8 +791,8 @@ void runGDNPrefillPaddingTest()
             if (t >= valid)
             {
                 // Padding positions: output should be near zero.
-                // Blackwell fp16 masking may leave small residuals (~0.001); allow 5e-3.
-                float const pad_tol = onBlackwell ? 5e-3f : 1e-3f;
+                // Blackwell fp16 masking leaves residuals < 2e-3; allow 2e-3.
+                float const pad_tol = onBlackwell ? 2e-3f : 1e-3f;
                 for (size_t idx = 0; idx < hvv; ++idx)
                     EXPECT_NEAR(h_o[base + idx], 0.f, pad_tol)
                         << "Expected zero at padding b=" << b << " t=" << t << " idx=" << idx;

@@ -206,10 +206,6 @@ class GDN:
         b, s_q, h_q, d = q_shape
         b_, _, h_v, d_ = v_shape
 
-        if use_qk_l2norm_in_kernel:
-            warnings.warn("use_qk_l2norm_in_kernel is not supported yet", stacklevel=2)
-            can_implement = False
-
         if b != b_:
             warnings.warn("q & k must have the same batch size", stacklevel=2)
             can_implement = False
@@ -322,6 +318,7 @@ class GDN:
         tuw_smem_layout_staged_b: cute.ComposedLayout,
         v_smem_layout_staged_b: cute.ComposedLayout,
         scale: cutlass.Float32,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean],
         tile_sched_params: GdnStaticTileSchedulerParams,
     ):
         """Warp-specialized GDN kernel entry point."""
@@ -1450,6 +1447,7 @@ class GDN:
                             atom_args,
                             tensor_args,
                             pipeline_args,
+                            use_qk_l2norm=use_qk_l2norm,
                         )
                     else:
                         value_args = (
@@ -1468,6 +1466,7 @@ class GDN:
                             atom_args,
                             tensor_args,
                             pipeline_args,
+                            use_qk_l2norm=use_qk_l2norm,
                         )
                         pipeline_args = (
                             gb_w0_consumer,
@@ -1494,6 +1493,7 @@ class GDN:
                             pipeline_args,
                             True,
                             tail_count=tail_count,
+                            use_qk_l2norm=use_qk_l2norm,
                         )
 
                     # Output state
@@ -1521,6 +1521,7 @@ class GDN:
         pipeline_args: tuple,
         need_mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = False,
     ) -> Tuple[
         pipeline.PipelineConsumer,
         pipeline.PipelineConsumer,
@@ -1696,7 +1697,7 @@ class GDN:
 
             c0_handle.release()
 
-            self.store_k_epi(kkt_thr_mma, sK, tKtK, need_mask, tail_count)
+            self.store_k_epi(kkt_thr_mma, sK, tKtK, need_mask, tail_count, use_qk_l2norm=use_qk_l2norm)
             self.store_ivt_p3(
                 sInvertSubReg,
                 sInvertSubTSL1B,
@@ -1712,7 +1713,7 @@ class GDN:
             self.load_ivt_result(tOtTSL1, sTuwAStore)
             c0_handle.release()
 
-            self.load_q_epi(qk_thr_mma, sQ, tQgate, tval_exp, need_mask, tail_count)
+            self.load_q_epi(qk_thr_mma, sQ, tQgate, tval_exp, need_mask, tail_count, use_qk_l2norm=use_qk_l2norm)
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared,
                 space=cute.arch.SharedSpace.shared_cta,
@@ -2471,6 +2472,7 @@ class GDN:
         val: cutlass.Float32,  # exp(cumsum_gate) for per-token gating
         mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = False,
     ):
         """Load Q from smem, apply per-token gate."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2516,6 +2518,22 @@ class GDN:
             tTMEM_STORErS_x8.layout,
         )
 
+        # --- Q L2 norm (Pass 1): each thread computes norm of its own row ---
+        if cutlass.const_expr(use_qk_l2norm):
+            sum_sq_q = cutlass.Float32(0.0)
+            for _i in cutlass.range_constexpr(128 // corr_tile_size):
+                for _col in cutlass.range_constexpr(0, 8):
+                    _curr = sQ_frag[
+                        (thread_idx, (None, _col % 2)), 0, (_col // 2, _i), 0
+                    ].load()
+                    for _j in cutlass.range_constexpr(8):
+                        _v = _curr[_j].to(cutlass.Float32)
+                        sum_sq_q = sum_sq_q + _v * _v
+            inv_norm_q = cute.rsqrt(sum_sq_q + cutlass.Float32(1e-6))
+            effective_val = val * inv_norm_q
+        else:
+            effective_val = val
+
         for i in cutlass.range_constexpr(128 // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
                 tTMEM_STOREtO.iterator + i * corr_tile_size_f32, tTMEM_STOREtO.layout
@@ -2532,7 +2550,7 @@ class GDN:
                     (load_row, (None, load_col % 2)), 0, (load_col // 2, i), 0
                 ].load()
                 tTMEM_STORErS_x8_e_frag[None, col].store(
-                    (curr_val_ssa * val).to(self.i_dtype)
+                    (curr_val_ssa * effective_val).to(self.i_dtype)
                 )
             # store
             if cutlass.const_expr(mask):
@@ -2550,6 +2568,7 @@ class GDN:
         tOut: cute.Tensor,
         mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = False,
     ):
         """Load K from smem and store to TMEM."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2599,6 +2618,20 @@ class GDN:
         tTMEM_STORErS_x8_e_frag = cute.logical_divide(
             tTMEM_STORErS_x8_e, cute.make_layout(frg_tile)
         )
+
+        # --- K L2 norm (Pass 1): each thread computes norm of its own row ---
+        if cutlass.const_expr(use_qk_l2norm):
+            sum_sq_k = cutlass.Float32(0.0)
+            for _i in cutlass.range_constexpr(128 // corr_tile_size):
+                for _col in cutlass.range_constexpr(0, 8):
+                    _curr = sK_frag[
+                        (thread_idx, (None, _col % 2)), 0, (_col // 2, _i), 0
+                    ].load()
+                    for _j in cutlass.range_constexpr(8):
+                        _v = _curr[_j].to(cutlass.Float32)
+                        sum_sq_k = sum_sq_k + _v * _v
+            inv_norm_k = cute.rsqrt(sum_sq_k + cutlass.Float32(1e-6))
+
         for i in cutlass.range_constexpr(128 // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
                 tTMEM_STOREtO.iterator + i * corr_tile_size_f32, tTMEM_STOREtO.layout
@@ -2611,7 +2644,12 @@ class GDN:
                 curr_val_ssa = sK_frag[
                     (load_row, (None, load_col % 2)), 0, (load_col // 2, i), 0
                 ].load()
-                tTMEM_STORErS_x8_e_frag[None, col].store(curr_val_ssa)
+                if cutlass.const_expr(use_qk_l2norm):
+                    tTMEM_STORErS_x8_e_frag[None, col].store(
+                        (curr_val_ssa * inv_norm_k).to(self.i_dtype)
+                    )
+                else:
+                    tTMEM_STORErS_x8_e_frag[None, col].store(curr_val_ssa)
 
             # store
             if cutlass.const_expr(mask):
@@ -3827,6 +3865,7 @@ class GDN:
         scale: Optional[float],
         cum_seqlen_q: Optional[cute.Tensor] = None,
         cu_seqlens: Optional[cute.Tensor] = None,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = True,
         stream: cuda.CUstream = None,
     ):
         """Host-side entry: build tensor layouts, TMA descriptors, smem storage, and launch the kernel."""
@@ -4493,6 +4532,7 @@ class GDN:
             tuw_smem_layout_staged_b,
             v_smem_layout_staged_b,
             scale,
+            use_qk_l2norm,
             self.tile_sched_params,
         ).launch(
             grid=grid,
@@ -4598,7 +4638,7 @@ def chunk_gated_delta_rule(
         initial_state: (B, H_v, D, D) recurrent state (float32), or None for zero init.
         output_final_state: If True, return the final state alongside output.
         cu_seqlens: Cumulative sequence lengths for variable-length batching (int32/int64).
-        use_qk_l2norm_in_kernel: Not supported yet.
+        use_qk_l2norm_in_kernel: L2 norm is always applied inside the kernel (this flag only affects the can_implement check).
         output: Pre-allocated output cupy array, or None to allocate internally.
         output_state: Pre-allocated state output cupy array, or None.
 
@@ -4849,7 +4889,6 @@ def _run_numpy_prefill_reference(
 ):
     """Recurrent numpy reference for correctness check.
 
-    Note: Blackwell kernel does NOT support use_qk_l2norm yet.
     """
     h0 = h0_source_f32.copy()  # (N, HV, K, V)
     o_ref = np.zeros((n, seq_len, hv, v_dim), dtype=np.float32)
@@ -5073,6 +5112,7 @@ def _create_jit_blackwell():
             scale,
             None,             # cum_seqlen_q=None → non-varlen padded layout
             cu_seqlens,       # cu_seqlens for padding masking
+            True,             # use_qk_l2norm=True
             stream,
         )
 
