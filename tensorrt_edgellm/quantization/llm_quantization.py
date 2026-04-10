@@ -26,15 +26,16 @@ from typing import Any, Dict, Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
-from datasets import load_dataset
 from modelopt.torch.export.quant_utils import get_quant_config
 from modelopt.torch.quantization.utils import is_quantized
-from torch.utils.data import DataLoader
 from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
                           AutoTokenizer)
 
-from ..llm_models.model_utils import load_eagle3_draft_model, load_hf_model
+from ..llm_models.model_utils import (_is_qwen3_asr_model,
+                                      load_eagle3_draft_model, load_hf_model)
 from ..llm_models.models.eagle3_draft import Eagle3DraftModel
+from .calib_dataloaders import (get_audio_llm_calib_dataloader,
+                                get_text_calib_dataloader)
 from .quantization_utils import (enable_huggingface_checkpointing_patch,
                                  quantize_draft_model, quantize_model)
 
@@ -163,6 +164,15 @@ DISABLE_VISUAL_CONFIG: Dict[str, Any] = {
     }
 }
 
+# Configuration to disable audio tower quantization (e.g. Qwen3-ASR).
+DISABLE_AUDIO_TOWER_CONFIG: Dict[str, Any] = {
+    "quant_cfg": {
+        "*audio_tower.*": {
+            "enable": False
+        },
+    }
+}
+
 # Already merged the vision LoRA and audio is currently not supported, so disable them.
 DISABLE_Phi4MM_VISUAL_AUDIO_CONFIG: Dict[str, Any] = {
     "quant_cfg": {
@@ -174,59 +184,6 @@ DISABLE_Phi4MM_VISUAL_AUDIO_CONFIG: Dict[str, Any] = {
         },
     }
 }
-
-
-def get_llm_calib_dataloader(
-    tokenizer: AutoTokenizer,
-    dataset_dir: str,
-    batch_size: int,
-    num_samples: int,
-    max_length: int,
-) -> DataLoader:
-    """
-    Create a calibration dataloader for LLM quantization.
-    
-    Args:
-        tokenizer: HuggingFace tokenizer for text processing
-        dataset_dir: Dataset name or local directory path
-        batch_size: Batch size for the dataloader
-        num_samples: Number of samples to use for calibration
-        max_length: Maximum sequence length for tokenization
-        
-    Returns:
-        DataLoader: Calibration dataloader with tokenized inputs
-        
-    Raises:
-        NotImplementedError: If dataset format is not supported
-    """
-    print(f"Loading calibration dataset from {dataset_dir}")
-    if "cnn_dailymail" in dataset_dir:
-        dataset = load_dataset(dataset_dir, name="3.0.0", split="train")
-        dataset = dataset["article"][:num_samples]
-    elif os.path.isdir(dataset_dir):
-        print(
-            f"Recognized local dataset repo {dataset_dir} for calibration; "
-            "assuming the calibration data are in the train split and text column."
-        )
-        dataset = load_dataset(dataset_dir, split="train")
-        dataset = dataset["text"][:num_samples]
-    else:
-        raise NotImplementedError(
-            f"Unsupported dataset name or local repo directory: {dataset_dir}."
-        )
-
-    # Use tokenizer __call__ for transformers v5-compatible batch tokenization.
-    batch_encoded = tokenizer(dataset,
-                              return_tensors="pt",
-                              padding=True,
-                              truncation=True,
-                              max_length=max_length)
-
-    calib_dataloader = DataLoader(batch_encoded["input_ids"],
-                                  batch_size=batch_size,
-                                  shuffle=False)
-
-    return calib_dataloader
 
 
 def get_llm_quant_config(
@@ -286,6 +243,9 @@ def get_llm_quant_config(
     # Disable visual model
     quant_cfg["quant_cfg"].update(DISABLE_VISUAL_CONFIG["quant_cfg"])
 
+    # Disable audio tower (e.g. Qwen3-ASR)
+    quant_cfg["quant_cfg"].update(DISABLE_AUDIO_TOWER_CONFIG["quant_cfg"])
+
     # Disable vision and audio models in Phi-4MM
     quant_cfg["quant_cfg"].update(
         DISABLE_Phi4MM_VISUAL_AUDIO_CONFIG["quant_cfg"])
@@ -299,10 +259,16 @@ def quantize_llm(
     quantization: Optional[str],
     lm_head_quantization: Optional[str],
     kv_cache_quantization: Optional[str],
+    model_dir: Optional[str] = None,
 ) -> Union[AutoModelForCausalLM, AutoModelForImageTextToText]:
     """
     Quantize a language model using the specified quantization method.
-    
+
+    For ASR models (e.g. Qwen3-ASR), audio calibration data from LibriSpeech
+    is used instead of text so that the LLM backbone sees realistic activations
+    produced by the audio encoder, following the same pattern as Flux
+    transformer quantization in TensorRT OSS.
+
     Args:
         model: The model to quantize (causal LM or image-text model)
         tokenizer: Tokenizer for text processing
@@ -311,10 +277,12 @@ def quantize_llm(
         lm_head_quantization: Optional LM head quantization method
         kv_cache_quantization: Optional attention quantization method
             (enables FP8 KV cache + FP8 FMHA compute)
-        
+        model_dir: Original model directory (used to detect ASR models and
+            load the audio processor).
+
     Returns:
         Quantized model
-        
+
     Raises:
         AssertionError: If quantization method is not supported
     """
@@ -326,16 +294,30 @@ def quantize_llm(
     assert lm_head_quantization in [None, "fp8", "nvfp4", "mxfp8"]
     assert kv_cache_quantization in [None, "fp8"]
 
-    # Get calibration dataloader
-    if quantization is None or "int4" in quantization:
-        batch_size = 16
+    # Get calibration dataloader — use audio data for ASR models
+    use_audio_calib = model_dir is not None and _is_qwen3_asr_model(model_dir)
+
+    if use_audio_calib:
+        if dataset_dir == "cnn_dailymail":
+            dataset_dir = "openslr/librispeech_asr"
+            print("ASR model detected; switching calibration dataset to "
+                  f"'{dataset_dir}' (override with --dataset_dir).")
+        data_loader = get_audio_llm_calib_dataloader(
+            model_dir=model_dir,
+            dataset_dir=dataset_dir,
+            num_samples=512,
+        )
     else:
-        batch_size = 1
-    data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
-                                           dataset_dir=dataset_dir,
-                                           batch_size=batch_size,
-                                           num_samples=512,
-                                           max_length=512)
+        if quantization is None or "int4" in quantization:
+            batch_size = 16
+        else:
+            batch_size = 1
+        data_loader = get_text_calib_dataloader(tokenizer=tokenizer,
+                                                dataset_dir=dataset_dir,
+                                                batch_size=batch_size,
+                                                num_samples=512,
+                                                max_length=512)
+
     quant_config = get_llm_quant_config(quantization, lm_head_quantization,
                                         kv_cache_quantization)
     model = quantize_model(model, quant_config, data_loader)
@@ -380,11 +362,11 @@ def quantize_draft(
         batch_size = 16
     else:
         batch_size = 1
-    data_loader = get_llm_calib_dataloader(tokenizer=tokenizer,
-                                           dataset_dir=dataset_dir,
-                                           batch_size=batch_size,
-                                           num_samples=512,
-                                           max_length=512)
+    data_loader = get_text_calib_dataloader(tokenizer=tokenizer,
+                                            dataset_dir=dataset_dir,
+                                            batch_size=batch_size,
+                                            num_samples=512,
+                                            max_length=512)
     quant_config = get_llm_quant_config(quantization, lm_head_quantization,
                                         kv_cache_quantization)
     model = quantize_draft_model(base_model, draft_model, quant_config,
@@ -426,17 +408,38 @@ def quantize_and_save_llm(model_dir: str,
     # Load model and tokenizer
     model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
 
+    # Qwen3ASRForConditionalGeneration has no forward(); add one that
+    # delegates to the thinker so the calibration loop can call
+    # model(input_ids).
+    if _is_qwen3_asr_model(model_dir):
+        type(model).forward = lambda self, *args, **kwargs: self.thinker(
+            *args, **kwargs)
+
     if is_quantized(model):
         print(f"Model is already quantized, skipping quantization.")
     else:
-        model = quantize_llm(model, tokenizer, dataset_dir, quantization,
-                             lm_head_quantization, kv_cache_quantization)
+        model = quantize_llm(model,
+                             tokenizer,
+                             dataset_dir,
+                             quantization,
+                             lm_head_quantization,
+                             kv_cache_quantization,
+                             model_dir=model_dir)
 
     quant_end_time = time.time()
     print(f"Quantization finished in {quant_end_time - start_time}s.")
 
     # Save the quantized model
     os.makedirs(output_dir, exist_ok=True)
+
+    # Sanitize generation_config so save_pretrained doesn't reject it.
+    # Some upstream models ship with conflicting flags (e.g. temperature set
+    # while do_sample=False).
+    if hasattr(model, "generation_config"):
+        gc = model.generation_config
+        if getattr(gc, "temperature",
+                   None) is not None and not getattr(gc, "do_sample", True):
+            gc.temperature = None
 
     if unified_checkpoint:  # Original checkpoint read by ModelOpt
         from modelopt.torch.export import export_hf_checkpoint
