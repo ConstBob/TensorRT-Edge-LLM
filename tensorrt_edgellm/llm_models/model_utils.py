@@ -21,6 +21,7 @@ checking model types, and setting up quantization.
 
 import gc
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -331,14 +332,32 @@ def _is_qwen3_omni_model(model_dir: str) -> bool:
     return getattr(cfg, "model_type", None) == "qwen3_omni"
 
 
+def _read_model_type(model_dir: str) -> str:
+    """Read model_type directly from config.json, bypassing AutoConfig.
+
+    This is needed for model types not yet registered with transformers
+    (e.g. qwen3_asr, qwen3_tts) where AutoConfig.from_pretrained would fail.
+    """
+    config_path = os.path.join(model_dir, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                return json.load(f).get("model_type", "")
+        except Exception:
+            pass
+    return ""
+
+
 def _is_qwen3_tts_model(model_dir: str) -> bool:
     """Qwen3-TTS is not integrated into transformers yet."""
-    return "Qwen3-TTS" in model_dir
+    return _read_model_type(
+        model_dir) == "qwen3_tts" or "Qwen3-TTS" in model_dir
 
 
 def _is_qwen3_asr_model(model_dir: str) -> bool:
     """Qwen3-ASR is not integrated into transformers yet."""
-    return "Qwen3-ASR" in model_dir
+    return _read_model_type(
+        model_dir) == "qwen3_asr" or "Qwen3-ASR" in model_dir
 
 
 def _is_alpamayo_1_model(model_dir: str) -> bool:
@@ -536,6 +555,11 @@ def load_hf_model(
         model = Qwen3ASRModel.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).model.to(device)
+        # Qwen3ASRForConditionalGeneration has no forward(); add one that
+        # delegates to the thinker so the quantization calibration loop can
+        # call model(input_ids).
+        type(model).forward = lambda self, *args, **kwargs: self.thinker(
+            *args, **kwargs)
     elif _is_qwen3_tts_model(model_dir):
         from qwen_tts.core.models import (Qwen3TTSConfig,
                                           Qwen3TTSForConditionalGeneration)
@@ -896,7 +920,8 @@ def prepare_language_model_and_config(hf_model: nn.Module):
                                                 'language_model'):
         language_model = hf_model.model.language_model
         config = hf_model.config.text_config
-    elif getattr(hf_model.config, 'model_type', '') == 'qwen3_omni_thinker':
+    elif hasattr(hf_model.config, 'text_config') and hasattr(
+            hf_model.config, 'audio_config'):
         language_model = hf_model.model
         config = hf_model.config.text_config
     elif hasattr(hf_model, 'backbone'):

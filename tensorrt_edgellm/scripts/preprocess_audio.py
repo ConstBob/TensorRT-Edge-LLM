@@ -87,6 +87,7 @@ def extract_mel_spectrogram(
     audio: np.ndarray,
     sample_rate: int = 16000,
     preprocessor_config: str = None,
+    feature_size: int = 128,
 ) -> np.ndarray:
     """
     Extract a mel-spectrogram using the Whisper feature extractor, matching
@@ -99,6 +100,8 @@ def extract_mel_spectrogram(
             config JSON.  When provided, the feature extractor is loaded
             from this config so that n_mels / hop_length / n_fft match the
             model.  Otherwise Qwen3-Omni defaults are used.
+        feature_size: Number of mel filter banks. Ignored when
+            *preprocessor_config* is provided.  Default 128 (Qwen3-Omni).
 
     Returns:
         Mel-spectrogram as a float32 numpy array with shape
@@ -115,9 +118,8 @@ def extract_mel_spectrogram(
         config_dir = os.path.dirname(preprocessor_config) or "."
         feature_extractor = WhisperFeatureExtractor.from_pretrained(config_dir)
     else:
-        # Qwen3-Omni default parameters
         feature_extractor = WhisperFeatureExtractor(
-            feature_size=128,
+            feature_size=feature_size,
             sampling_rate=sample_rate,
             hop_length=160,
             n_fft=400,
