@@ -231,6 +231,7 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         int64_t numImage = 0;
         for (auto const& image : req.imageBuffers)
         {
+            int64_t const blocksBeforePatch = totalNumBlocks;
             if (doResize)
             {
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
@@ -243,9 +244,14 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             {
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
-            // Add thumbnail image by default (use separate buffer to avoid race condition)
-            rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
-            formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+            // Only add thumbnail when the image has more than 1 block (matches HuggingFace behavior)
+            int64_t const mainImageBlocks = totalNumBlocks - blocksBeforePatch;
+            if (mainImageBlocks > 1)
+            {
+                rt::imageUtils::resizeImage(
+                    image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
+                formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+            }
         }
         numImages.emplace_back(numImage);
     }
