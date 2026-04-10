@@ -260,6 +260,9 @@ private:
     LLMEngineRunnerConfig mTalkerLLMConfig;     //!< Talker LLM configuration
     LLMEngineRunnerConfig mCodePredictorConfig; //!< CodePredictor configuration
 
+    //! Shared GPU execution context memory for Talker and CodePredictor (kUSER_MANAGED).
+    rt::Tensor mSharedExecContextMemory;
+
     void* mCublasHandle{nullptr}; //!< cuBLAS handle (opaque, managed via dlopen)
 
     // Projects from thinker (embedding) space to talker input space

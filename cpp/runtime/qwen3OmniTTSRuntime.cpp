@@ -122,6 +122,26 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
         throw std::runtime_error("Failed to initialize engine runners");
     }
 
+    // Setup shared execution context memory for Talker and CodePredictor engines.
+    // LLMEngineRunner uses kUSER_MANAGED allocation and requires setContextMemory() before execution.
+    {
+        int64_t const talkerCtxSize = mTalkerLLMRunner->getRequiredContextMemorySize();
+        int64_t const cpCtxSize = mCodePredictorRunner ? mCodePredictorRunner->getRequiredContextMemorySize() : 0;
+        int64_t const sharedCtxSize = std::max(talkerCtxSize, cpCtxSize);
+        LOG_INFO("Setup shared execution context memory: %zu bytes (talker: %zu, code_predictor: %zu)",
+            static_cast<size_t>(sharedCtxSize), static_cast<size_t>(talkerCtxSize), static_cast<size_t>(cpCtxSize));
+        mSharedExecContextMemory = rt::Tensor({sharedCtxSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+            "Qwen3OmniTTSRuntime::mSharedExecContextMemory");
+        if (!mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory))
+        {
+            throw std::runtime_error("Failed to set context memory for Talker LLM engine");
+        }
+        if (mCodePredictorRunner && !mCodePredictorRunner->setContextMemory(mSharedExecContextMemory))
+        {
+            throw std::runtime_error("Failed to set context memory for CodePredictor engine");
+        }
+    }
+
     if (!loadCodePredictorWeights(codePredictorEngineDir))
     {
         throw std::runtime_error("Failed to load CodePredictor weights");
