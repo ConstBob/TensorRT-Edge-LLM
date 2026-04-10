@@ -127,16 +127,17 @@ int32_t MambaPlugin::getNbOutputs() const noexcept
     return kNUM_OUTPUTS;
 }
 
-int32_t MambaPlugin::getOutputDataTypes(
-    DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
+int32_t MambaPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] int32_t nbOutputs,
+    DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
     outputTypes[kOUT_OUTPUT_IDX] = inputTypes[kIN_X_IDX];
     outputTypes[kOUT_STATE_IDX] = inputTypes[kIN_X_IDX];
     return 0;
 }
 
-int32_t MambaPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, DimsExprs const* /* shapeInputs */,
-    int32_t /* nbShapeInputs */, DimsExprs* outputs, int32_t nbOutputs, IExprBuilder& /* exprBuilder */) noexcept
+int32_t MambaPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
+    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& /* exprBuilder */) noexcept
 {
     // Output: same shape as x [batch, (seq_len,) nheads, dim]
     outputs[kOUT_OUTPUT_IDX].nbDims = inputs[kIN_X_IDX].nbDims;
@@ -176,8 +177,8 @@ bool MambaPlugin::supportsFormatCombination(
     }
 }
 
-int32_t MambaPlugin::configurePlugin(
-    DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+int32_t MambaPlugin::configurePlugin(DynamicPluginTensorDesc const* in, [[maybe_unused]] int32_t nbInputs,
+    [[maybe_unused]] DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
     // Derive dim/dstate/nheads/ngroups from input shapes if not provided as attributes.
     // x: [batch, (seq_len,) nheads, dim]  -> last two dims
@@ -220,7 +221,7 @@ size_t MambaPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */
 }
 
 int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+    void const* const* inputs, void* const* outputs, [[maybe_unused]] void* workspace, cudaStream_t stream) noexcept
 {
     auto const& xDesc = inputDesc[kIN_X_IDX];
     size_t const elemSize = sizeof(half);
