@@ -57,19 +57,21 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
     rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream);
 
-//! \brief Converts KV cache layout from BHSD layout to BSHD layout for attention computation.
+//! \brief Converts KV cache layout from [B, 2, H, S, D] into separate K and V tensors of shape [B, S, H, D].
 //!
-//! Converts an input tensor in [B, 2, H, S, D] into [B, S, 2, H, D].
+//! Splits the interleaved KV source into two independent FP16 output tensors, applying FP8 dequantization when
+//! the source is FP8. Used in the chunked-prefill path so that the SEPARATE_Q_K_V FMHA kernels receive
+//! separate K and V pointers.
 //!
-//! \tparam T Element type (half/fp8).
-//!
-//! \param[in] src    Source tensor with shape [B, 2, H, S, D].
-//! \param[out] dst   Destination tensor with shape [B, S, 2, H, D].
-//! \param[in] kScale K dequant scale (quant→orig). Use 1.0f for FP16.
-//! \param[in] vScale V dequant scale (quant→orig). Use 1.0f for FP16.
-//! \param[in] stream CUDA stream to launch the kernel on
-//! \throws std::runtime_error if tensor shapes or data types are invalid
-void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, float kScale, float vScale, cudaStream_t stream);
+//! \param[in]  src             Source tensor with shape [B, 2, H, S, D].
+//! \param[out] kDst            Destination K tensor with shape [B, S, H, D] (FP16).
+//! \param[out] vDst            Destination V tensor with shape [B, S, H, D] (FP16).
+//! \param[in]  kvScaleQuantOrig Optional packed dequant scale tensor for FP8 KV cache (shape [2], float).
+//!             Layout: [kScaleQuantOrig, vScaleQuantOrig]. Pass an empty tensor for FP16 src.
+//! \param[in]  stream          CUDA stream to launch the kernel on.
+//! \throws std::runtime_error if tensor shapes or data types are invalid.
+void cvtKVLayoutBHSDToSplitKV(
+    rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

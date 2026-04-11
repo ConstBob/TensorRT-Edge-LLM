@@ -66,54 +66,6 @@ __global__ void calCuQCuKVSeqLensAndKVEndIdxsKernel(int32_t const* inputSeqLen, 
     }
 }
 
-// ===== kernel: produce [B, S, 2, H, D] (FMHA expected padded layout) =====
-//! This kernel prepares the KV-cache input required by the FMHA kernel when using
-//! the CONTIGUOUS_Q_KV input layout. Currently, that FMHA path only supports FP16 KV cache,
-//! so `dst` is always `half`.
-template <typename T>
-__global__ void cvtKVLayoutBHSDToBSHDKernel(T const* __restrict__ src, // [B, 2, H, S, D]
-    half* __restrict__ dst,                                            // [B, S, 2, H, D]
-    float kScaleQuantOrig, float vScaleQuantOrig, int32_t B, int32_t S, int32_t H, int32_t D)
-{
-    // Thread mapping identical to paddedLayoutToCompactKernel but without cuSeqLens.
-    //   x-dim: feature dimension  D
-    //   y-dim: sequence/token     S
-    //   z-dim: (batch, headPair)  batch * numHpBlocks + hpBlock
-
-    uint32_t const token = blockIdx.y * blockDim.y + threadIdx.y; // 0 .. S-1
-    uint32_t const d = blockIdx.x * blockDim.x + threadIdx.x;     // 0 .. D-1
-
-    // Decode batch index and head-pair tile from z-dimension
-    uint32_t const numHpBlocks = (2 * H + blockDim.z - 1) / blockDim.z; // number of head-pair tiles per batch
-    uint32_t const batch = blockIdx.z / numHpBlocks;                    // 0 .. B-1
-    uint32_t const hpTile = blockIdx.z % numHpBlocks;                   // 0 .. numHpBlocks-1
-    uint32_t const headPair = hpTile * blockDim.z + threadIdx.z;        // 0 .. 2*H-1
-
-    if (batch >= B || headPair >= 2 * H || d >= D || token >= S)
-        return;
-
-    // ---------- flat indices ----------
-    // src layout: [B, 2, H, S, D] -> ((((b * 2 + kv) * H + h) * S + token) * D + d)
-    uint32_t const kv = headPair / H; // 0 = K, 1 = V
-    uint32_t const h = headPair % H;  // head index
-    size_t srcIdx = (((((size_t) batch * 2 + kv) * H + h) * S + token) * D + d);
-
-    // dst layout: [B, S, 2, H, D] -> ((((b * S + token) * 2 + kv) * H + h) * D + d)
-    size_t dstIdx = (((((size_t) batch * S + token) * 2 + kv) * H + h) * D + d);
-
-#if SUPPORTS_FP8
-    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
-    {
-        float const scale = (kv == 0) ? kScaleQuantOrig : vScaleQuantOrig;
-        dst[dstIdx] = __float2half(static_cast<float>(src[srcIdx]) * scale);
-    }
-    else
-#endif
-    {
-        dst[dstIdx] = src[srcIdx];
-    }
-}
-
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
     rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
     rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream)
@@ -151,38 +103,99 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
         runtimeBatchSize);
 }
 
-void cvtKVLayoutBHSDToBSHD(rt::Tensor const& src, rt::Tensor& dst, float kScale, float vScale, cudaStream_t stream)
+// ===== kernel: produce separate K [B, S, H, D] and V [B, S, H, D] =====
+//! Splits the interleaved [B, 2, H, S, D] KV cache into two independent tensors.
+//! Splits the [B, 2, H, S, D] KV cache into separate K [B, S, H, D] and V [B, S, H, D] tensors.
+template <typename T>
+__global__ void cvtKVLayoutBHSDToSplitKVKernel(T const* __restrict__ src, // [B, 2, H, S, D]
+    half* __restrict__ kDst,                                              // [B, S, H, D]
+    half* __restrict__ vDst,                                              // [B, S, H, D]
+    float const* __restrict__ kScaleQuantOrig, float const* __restrict__ vScaleQuantOrig, int32_t B, int32_t S,
+    int32_t H, int32_t D)
 {
-    rt::Coords srcShape = src.getShape();
+    uint32_t const token = blockIdx.y * blockDim.y + threadIdx.y; // 0 .. S-1
+    uint32_t const d = blockIdx.x * blockDim.x + threadIdx.x;     // 0 .. D-1
+
+    uint32_t const numHpBlocks = (2 * H + blockDim.z - 1) / blockDim.z;
+    uint32_t const batch = blockIdx.z / numHpBlocks;
+    uint32_t const hpTile = blockIdx.z % numHpBlocks;
+    uint32_t const headPair = hpTile * blockDim.z + threadIdx.z; // 0 .. 2*H-1
+
+    if (batch >= B || headPair >= 2 * H || d >= D || token >= S)
+        return;
+
+    uint32_t const kv = headPair / H; // 0 = K, 1 = V
+    uint32_t const h = headPair % H;
+
+    // src layout: [B, 2, H, S, D]
+    size_t const srcIdx = (((((size_t) batch * 2 + kv) * H + h) * S + token) * D + d);
+    // dst layout: [B, S, H, D]
+    size_t const dstIdx = ((((size_t) batch * S + token) * H + h) * D + d);
+
+    half* dst = (kv == 0) ? kDst : vDst;
+
+#if SUPPORTS_FP8
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+        float const scale = (kv == 0) ? kScaleQuantOrig[0] : vScaleQuantOrig[0];
+        dst[dstIdx] = __float2half(static_cast<float>(src[srcIdx]) * scale);
+    }
+    else
+#endif
+    {
+        dst[dstIdx] = src[srcIdx];
+    }
+}
+
+void cvtKVLayoutBHSDToSplitKV(
+    rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream)
+{
+    rt::Coords const srcShape = src.getShape();
     int32_t const B = static_cast<int32_t>(srcShape[0]);
     int32_t const H = static_cast<int32_t>(srcShape[2]);
     int32_t const S = static_cast<int32_t>(srcShape[3]);
     int32_t const D = static_cast<int32_t>(srcShape[4]);
 
-    rt::Coords dstShape = dst.getShape();
-    check::check(dst.getDataType() == nvinfer1::DataType::kHALF, "Please make sure the output tensor is FP16.");
-    check::check(srcShape[1] == 2 && dstShape[2] == 2, "Source and destination tensors separate KV respectively.");
-    check::check(dstShape[0] == B && dstShape[1] == S && dstShape[3] == H && dstShape[4] == D,
-        "Destination tensor shall have consistent shape of [B, S, 2, H, D].");
+    check::check(srcShape[1] == 2, "Source tensor must have shape [B, 2, H, S, D].");
+    check::check(kDst.getDataType() == nvinfer1::DataType::kHALF, "kDst must be FP16.");
+    check::check(vDst.getDataType() == nvinfer1::DataType::kHALF, "vDst must be FP16.");
 
+    rt::Coords const kShape = kDst.getShape();
+    rt::Coords const vShape = vDst.getShape();
+    check::check(
+        kShape[0] == B && kShape[1] == S && kShape[2] == H && kShape[3] == D, "kDst must have shape [B, S, H, D].");
+    check::check(
+        vShape[0] == B && vShape[1] == S && vShape[2] == H && vShape[3] == D, "vDst must have shape [B, S, H, D].");
+
+    // Block config with safe thread count (≤ 1024)
     uint32_t const tx = (D >= 256) ? 256 : (D >= 128 ? 128 : 64);
-    uint32_t const ty = 4;
-    uint32_t const tz = 1;
+    uint32_t const ty = 4; // token dimension per block
+    uint32_t const tz = 1; // process one head-pair per thread in z
     dim3 block(tx, ty, tz);
 
-    uint32_t const hpTilesPerBatch = (2 * H + tz - 1) / tz;
-    dim3 grid((D + tx - 1) / tx, (S + ty - 1) / ty, hpTilesPerBatch * B);
+    // Grid config
+    uint32_t const hpTilesPerBatch = (2 * H + tz - 1) / tz; // z-blocks needed per batch for head-pairs
+    dim3 grid((D + tx - 1) / tx,                            // x : feature dim
+        (S + ty - 1) / ty,                                  // y : token dim
+        hpTilesPerBatch * B);                               // z : (batch, headPair)
 
     if (src.getDataType() == nvinfer1::DataType::kHALF)
     {
-        cvtKVLayoutBHSDToBSHDKernel<half>
-            <<<grid, block, 0, stream>>>(src.dataPointer<half>(), dst.dataPointer<half>(), 1.0f, 1.0f, B, S, H, D);
+        cvtKVLayoutBHSDToSplitKVKernel<half><<<grid, block, 0, stream>>>(
+            src.dataPointer<half>(), kDst.dataPointer<half>(), vDst.dataPointer<half>(), nullptr, nullptr, B, S, H, D);
     }
 #if SUPPORTS_FP8
     else if (src.getDataType() == nvinfer1::DataType::kFP8)
     {
-        cvtKVLayoutBHSDToBSHDKernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(
-            src.dataPointer<__nv_fp8_e4m3>(), dst.dataPointer<half>(), kScale, vScale, B, S, H, D);
+        check::check(!kvScaleQuantOrig.isEmpty(), "kvScaleQuantOrig is required for FP8 KV cache");
+        check::check(kvScaleQuantOrig.getDataType() == nvinfer1::DataType::kFLOAT, "kvScaleQuantOrig must be FP32.");
+        check::check(kvScaleQuantOrig.getShape().getNumDims() == 1 && kvScaleQuantOrig.getShape()[0] == 2,
+            "kvScaleQuantOrig shall have shape [2] with layout [kScaleQuantOrig, vScaleQuantOrig].");
+        float const* const scales = kvScaleQuantOrig.dataPointer<float>();
+        float const* const kScaleQuantOrigPtr = scales + 0;
+        float const* const vScaleQuantOrigPtr = scales + 1;
+        cvtKVLayoutBHSDToSplitKVKernel<__nv_fp8_e4m3><<<grid, block, 0, stream>>>(src.dataPointer<__nv_fp8_e4m3>(),
+            kDst.dataPointer<half>(), vDst.dataPointer<half>(), kScaleQuantOrigPtr, vScaleQuantOrigPtr, B, S, H, D);
     }
 #endif
     else

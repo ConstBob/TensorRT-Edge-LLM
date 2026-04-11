@@ -269,7 +269,7 @@ index cc3931caa..c730e68c6 100644
 +            if 'ENABLE_SM10X' in os.environ:
 +                sm_list.extend([100, 101])
 +        for sm in sm_list:
-+            for input_layout in [InputLayout.CONTIGUOUS_Q_KV, InputLayout.SEPARATE_Q_K_V]:
++            for input_layout in [InputLayout.SEPARATE_Q_K_V]:
 +                enumerate_hmma_flash_kernels_edge_llm(specs, sm=sm, dtype='fp16_fp32', input_layout=input_layout)
 +
 +        # TRT-EdgeLLM uses the head_interleaved=False mode.
