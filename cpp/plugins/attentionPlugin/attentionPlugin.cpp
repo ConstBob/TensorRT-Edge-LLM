@@ -605,7 +605,7 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize}, DataType::kINT32);
     // Padded cumulative KV sequence lengths for CuTe DSL FMHA.
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize + 1}, DataType::kINT32);
-    // KV Tensor to store concated KV that include pre-cached KV and current KV.
+    // KV workspace for split K and V tensors (split into K and V halves by pointer arithmetic in enqueue).
     workspaceSize = accumulateWorkspaceSize(
         workspaceSize, rt::Coords{maxBatchSize, 2, mNumKVHeads, maxKVCacheCapacity, mHeadSize}, DataType::kHALF);
 
@@ -785,11 +785,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         else
 #endif
         {
-            AttentionInputLayout attentionInputLayout = executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
-                ? AttentionInputLayout::CONTIGUOUS_Q_KV
-                : AttentionInputLayout::SEPARATE_Q_K_V;
             auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
-                mHeadSize, mSMVersion, attentionInputLayout);
+                mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V);
 
             // Prepare FMHA_v2 params to launch FMHA kernel
             FusedMultiheadAttentionParamsV2 params{};
@@ -798,19 +795,30 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
             if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
             {
-                // FMHA kernel with CONTIGUOUS_Q_KV input layout currently only supports FP16 KV cache.
-                // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
+                // kvCache: [b, 2, hkv, s, d] -> split K [b, s, hkv, d] + V [b, s, hkv, d]
                 kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
                     vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
 
-                rt::Tensor transposedKVTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                    {runtimeBatchSize, kvCacheCapacity, 2, mNumKVHeads, mHeadSize}, DataType::kHALF);
-                kernel::cvtKVLayoutBHSDToBSHD(kvCacheTensor, transposedKVTensor, kScale, vScale, stream);
+                // Allocate a single workspace and split into K and V halves by pointer arithmetic.
+                rt::Tensor kvWorkspaceTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {runtimeBatchSize, 2, mNumKVHeads, kvCacheCapacity, mHeadSize}, DataType::kHALF);
+                size_t const halfSize
+                    = static_cast<size_t>(runtimeBatchSize) * kvCacheCapacity * mNumKVHeads * mHeadSize;
+                half* kvWorkspacePtr = kvWorkspaceTensor.dataPointer<half>();
+                rt::Tensor kWorkspaceTensor(kvWorkspacePtr,
+                    rt::Coords{runtimeBatchSize, kvCacheCapacity, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU,
+                    DataType::kHALF);
+                rt::Tensor vWorkspaceTensor(kvWorkspacePtr + halfSize,
+                    rt::Coords{runtimeBatchSize, kvCacheCapacity, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU,
+                    DataType::kHALF);
+                kernel::cvtKVLayoutBHSDToSplitKV(
+                    kvCacheTensor, kWorkspaceTensor, vWorkspaceTensor, rt::Tensor{}, stream);
 
                 // Set device ptr for FMHA kernel.
                 params.s_kv = kvCacheCapacity;
                 params.q_ptr = qInputTensor.dataPointer<half>();
-                params.kv_ptr = transposedKVTensor.dataPointer<half>();
+                params.k_ptr = kWorkspaceTensor.dataPointer<half>();
+                params.v_ptr = vWorkspaceTensor.dataPointer<half>();
                 params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
                 params.o_ptr = attentionOutputTensor.dataPointer<half>();
             }
