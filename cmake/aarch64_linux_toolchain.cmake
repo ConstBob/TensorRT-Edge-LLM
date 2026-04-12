@@ -78,10 +78,10 @@ elseif("${EMBEDDED_TARGET}" STREQUAL "gb10")
   set_ifndef(CUDA_CTK_VERSION 13.0)
   set(CMAKE_CUDA_ARCHITECTURES 121)
   set(CUDA_DIR
-      /usr/local/cuda/targets/aarch64-linux
+      /usr/local/cuda/targets/sbsa-linux
       CACHE STRING "CUDA toolkit dir")
   set(CUDA_TARGET_DIR
-      /usr/local/cuda/n1/targets/aarch64-linux
+      /usr/local/cuda/n1/targets/sbsa-linux
       CACHE STRING "CUDA toolkit target dir")
   message(STATUS "Using CUDA toolkit dir: ${CUDA_DIR}")
 endif()

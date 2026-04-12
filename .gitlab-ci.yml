@@ -28,6 +28,7 @@ include:
   - local: '.gitlab/ci/sonar-jobs.yml'
   - local: '.gitlab/ci/pages-jobs.yml'
   - local: '.gitlab/ci/.github-pr-jobs.yml'
+  - local: '.gitlab/ci/local-board-jobs.yml'
 
 stages:
 - setup
