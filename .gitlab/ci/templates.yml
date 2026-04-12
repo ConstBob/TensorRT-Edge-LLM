@@ -112,6 +112,8 @@
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
+    - export BOARD_IP=${BOARD_IP:-192.168.55.1}
+    - echo "Board IP:$BOARD_IP"
     - mkdir -p $TEST_LOG_DIR
     - rm -rf $TEST_LOG_DIR/*
     - chmod -R 777 $TEST_LOG_DIR
@@ -122,7 +124,7 @@
     - echo "Copying password to device scripts"
     - sed -i -e "s/{BOARDPASSWORD}/${BOARD_PASSWORD_NVKS}/g" .gitlab/ci/scripts/device_init.sh
     # clean up the packages in the board
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 'bash -s' < .gitlab/ci/scripts/device_init.sh
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP 'bash -s' < .gitlab/ci/scripts/device_init.sh
     - if [ $? -ne 0 ]; then echo "Error occurred during initializing"; exit 1; fi
     - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
@@ -131,10 +133,10 @@
     - export REMOTE_WORKSPACE=/home/$BOARD_USER/tensorrt-edge-llm
     - export ENGINE_DIR=$REMOTE_WORKSPACE/engines
     - echo "Creating remote directories and syncing repo from host to board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "mkdir -p $REMOTE_WORKSPACE $ENGINE_DIR"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@192.168.55.1:$REMOTE_WORKSPACE/
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "mkdir -p $REMOTE_WORKSPACE $ENGINE_DIR"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
     - echo "Setting file permissions to 755 to prevent permission issues"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "chmod -R 755 $REMOTE_WORKSPACE"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
     - echo "Installing pytest dependencies in a virtual environment"
     - python3 -m venv venv && source venv/bin/activate
     - pip3 install -q -r tests/requirements.txt
@@ -142,10 +144,10 @@
     - pip3 install -q -r examples/accuracy/requirements.txt
     - if [ -n "$BASELINE_CSV" ]; then mkdir -p "$(dirname "$BASELINE_CSV")"; fi
     - echo "Setup complete. Running pipeline tests on device with pytest. Time:$(date)"
-    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=192.168.55.1 --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - python3 -m pytest tests/ --priority=$PRIORITY --execution-mode=remote --remote-host=$BOARD_IP --remote-user=$BOARD_USER --remote-password="$BOARD_PASSWORD_NVKS" --remote-workspace=$REMOTE_WORKSPACE -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
     - if [ $? -ne 0 ]; then echo "Error occurred during testing"; exit 1; fi
     - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR. Cleaning up remote workspace."
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@192.168.55.1 "rm -rf $REMOTE_WORKSPACE"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf $REMOTE_WORKSPACE"
     - ls -la $TEST_LOG_DIR
     - deactivate
     - echo "Pipeline end time:$(date)"

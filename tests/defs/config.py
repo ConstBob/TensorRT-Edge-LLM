@@ -64,6 +64,8 @@ def _find_directory(root_dir: str,
 
         if max_depth is None or current_depth < max_depth:
             for entry in entries:
+                if entry == '.git':
+                    continue
                 entry_path = os.path.join(current_dir, entry)
 
                 if os.path.isdir(entry_path):
