@@ -201,12 +201,9 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
             = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
                 rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
 
-        // Initialize the MRope into form to support text-only and audio-only modes.
-        // The initialization is important for Qwen3-TTS model where we support text-only modes.
-        check::check(
-            mPosEncCosSinCache.reshape({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}), "Tensor reshape failed");
+        // Initialize MRoPE cache for all batch slots using text-only sequential positions.
         kernel::initializeTextOnlyMRopeCosSin(mPosEncCosSinCache.dataPointer<float>(), ropeConfig.rotaryTheta,
-            mConfig.rotaryDim, mConfig.maxKVCacheCapacity, stream);
+            mConfig.rotaryDim, mConfig.maxKVCacheCapacity, mConfig.maxSupportedBatchSize, stream);
         break;
     }
     case RopeType::kNoRope:
@@ -257,15 +254,15 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
 
     int32_t const kvCacheLayers
         = (mConfig.numAttentionLayers > 0) ? mConfig.numAttentionLayers : mConfig.numDecoderLayers;
-    DataType const ssmStateType = (mConfig.numMambaLayers > 0) ? getSSMStateType() : DataType::kHALF;
-    DataType const convStateType = (mConfig.numMambaLayers > 0) ? getConvStateType() : DataType::kHALF;
-    this->mKVCache
-        = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{kvCacheLayers, mConfig.maxSupportedBatchSize,
-                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim, kvCacheType,
-                                // Mamba state config (zero for pure-attention models)
-                                mConfig.numMambaLayers, mConfig.mambaNumHeads, mConfig.mambaHeadDim,
-                                mConfig.ssmStateSize, ssmStateType, mConfig.convDim, mConfig.convKernel, convStateType},
-            stream);
+    DataType const recurrentStateType = (mConfig.numLinearAttnLayers > 0) ? getRecurrentStateType() : DataType::kHALF;
+    DataType const convStateType = (mConfig.numLinearAttnLayers > 0) ? getConvStateType() : DataType::kHALF;
+    this->mKVCache = rt::LinearKVCache(
+        rt::LinearKVCache::CacheConfig{kvCacheLayers, mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity,
+            mConfig.numKVHeads, mConfig.headDim, kvCacheType,
+            // Recurrent state config (zero for pure-attention models)
+            mConfig.numLinearAttnLayers, mConfig.recurrentStateNumHeads, mConfig.recurrentStateHeadDim,
+            mConfig.recurrentStateSize, recurrentStateType, mConfig.convDim, mConfig.convKernel, convStateType},
+        stream);
 
     // Instantiate other GPU memory input that needed by the Engine execution.
     this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
@@ -418,15 +415,15 @@ nvinfer1::DataType LLMEngineRunner::getKVCacheType() const
     }
 }
 
-nvinfer1::DataType LLMEngineRunner::getSSMStateType() const
+nvinfer1::DataType LLMEngineRunner::getRecurrentStateType() const
 {
-    std::string const name = binding_names::formatSSMStateName(/*mambaLayerIdx=*/0, /*isPast=*/true);
+    std::string const name = binding_names::formatRecurrentStateName(/*recurrentLayerIdx=*/0, /*isPast=*/true);
     return mEngine->getTensorDataType(name.c_str());
 }
 
 nvinfer1::DataType LLMEngineRunner::getConvStateType() const
 {
-    std::string const name = binding_names::formatConvStateName(/*mambaLayerIdx=*/0, /*isPast=*/true);
+    std::string const name = binding_names::formatConvStateName(/*recurrentLayerIdx=*/0, /*isPast=*/true);
     return mEngine->getTensorDataType(name.c_str());
 }
 
@@ -549,12 +546,12 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
         mConfig.audioTokenId = configJson.value("audio_token_id", 0);
         mConfig.imageTokenId = configJson.value("image_token_id", 0);
 
-        // Hybrid Mamba configuration (optional)
-        mConfig.numMambaLayers = configJson.value("num_mamba_layers", 0);
+        // Hybrid linear attention configuration (Mamba, GDN, or other linear attention)
+        mConfig.numLinearAttnLayers = configJson.value("num_linear_attn_layers", 0);
         mConfig.numAttentionLayers = configJson.value("num_attention_layers", mConfig.numDecoderLayers);
-        mConfig.mambaNumHeads = configJson.value("mamba_num_heads", 0);
-        mConfig.mambaHeadDim = configJson.value("mamba_head_dim", 0);
-        mConfig.ssmStateSize = configJson.value("ssm_state_size", 0);
+        mConfig.recurrentStateNumHeads = configJson.value("recurrent_state_num_heads", 0);
+        mConfig.recurrentStateHeadDim = configJson.value("recurrent_state_head_dim", 0);
+        mConfig.recurrentStateSize = configJson.value("recurrent_state_size", 0);
         mConfig.convDim = configJson.value("conv_dim", 0);
         mConfig.convKernel = configJson.value("conv_kernel", 0);
 
@@ -908,38 +905,39 @@ bool LLMEngineRunner::bindKVCacheToEngine(int32_t activeBatchSize)
     }
 }
 
-bool LLMEngineRunner::bindSSMStateToEngine(int32_t activeBatchSize)
+bool LLMEngineRunner::bindRecurrentStateToEngine(int32_t activeBatchSize)
 {
-    if (mConfig.numMambaLayers == 0)
+    if (mConfig.numLinearAttnLayers == 0)
     {
         return true;
     }
 
-    Dims const ssmStateDims = {4, {activeBatchSize, mConfig.mambaNumHeads, mConfig.mambaHeadDim, mConfig.ssmStateSize}};
+    Dims const recurrentStateDims = {4,
+        {activeBatchSize, mConfig.recurrentStateNumHeads, mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize}};
     bool status{true};
-    for (int32_t i = 0; i < mConfig.numMambaLayers; ++i)
+    for (int32_t i = 0; i < mConfig.numLinearAttnLayers; ++i)
     {
-        rt::Tensor ssmState = mKVCache.getSSMStateForLayer(i);
-        std::string const pastName = binding_names::formatSSMStateName(i, /*isPast=*/true);
-        std::string const presentName = binding_names::formatSSMStateName(i, /*isPast=*/false);
+        rt::Tensor recurrentState = mKVCache.getRecurrentStateForLayer(i);
+        std::string const pastName = binding_names::formatRecurrentStateName(i, /*isPast=*/true);
+        std::string const presentName = binding_names::formatRecurrentStateName(i, /*isPast=*/false);
 
-        status &= mTRTExecutionContext->setTensorAddress(pastName.c_str(), ssmState.rawPointer());
-        status &= mTRTExecutionContext->setTensorAddress(presentName.c_str(), ssmState.rawPointer());
-        status &= mTRTExecutionContext->setInputShape(pastName.c_str(), ssmStateDims);
+        status &= mTRTExecutionContext->setTensorAddress(pastName.c_str(), recurrentState.rawPointer());
+        status &= mTRTExecutionContext->setTensorAddress(presentName.c_str(), recurrentState.rawPointer());
+        status &= mTRTExecutionContext->setInputShape(pastName.c_str(), recurrentStateDims);
     }
     return status;
 }
 
 bool LLMEngineRunner::bindConvStateToEngine(int32_t activeBatchSize)
 {
-    if (mConfig.numMambaLayers == 0)
+    if (mConfig.numLinearAttnLayers == 0)
     {
         return true;
     }
 
     Dims const convStateDims = {3, {activeBatchSize, mConfig.convDim, mConfig.convKernel}};
     bool status{true};
-    for (int32_t i = 0; i < mConfig.numMambaLayers; ++i)
+    for (int32_t i = 0; i < mConfig.numLinearAttnLayers; ++i)
     {
         rt::Tensor convState = mKVCache.getConvStateForLayer(i);
         std::string const pastName = binding_names::formatConvStateName(i, /*isPast=*/true);
@@ -1166,7 +1164,13 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     }
 
     // RopeCosSin tensor address is set during object construction. We only set shape here to accommodate ND-Rope.
-    // For ND-RoPE like MRope, the runtime will update the tensor shape and contents based on multimodal inputs.
+    // For ND-RoPE like MRope, reshape the RopeCosSinCache to match the activeBatchSize
+    if (mConfig.ropeConfig.type == RopeType::kMRope)
+    {
+        check::check(mPosEncCosSinCache.reshape({activeBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}),
+            "Tensor reshape failed");
+    }
+
     // For persistent rope, the cache is fixed at {1, maxSeqLen, rotaryDim} and shared across all batches.
     setEngineIOStatus
         &= mTRTExecutionContext->setInputShape(binding_names::kRopeCosSin, mPosEncCosSinCache.getShape().getTRTDims());
@@ -1213,9 +1217,9 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     // Bind the KVCache IO to the engine
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
 
-    // Bind Mamba state for Mamba layers
+    // Bind recurrent state for hybrid layers
     setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
-    setEngineIOStatus &= this->bindSSMStateToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindRecurrentStateToEngine(activeBatchSize);
 
     if (!setEngineIOStatus)
     {
@@ -1341,7 +1345,7 @@ bool LLMEngineRunner::vanillaDecodingStepBindTensors(rt::Tensor const& inputsEmb
     // Update KV cache shapes to match activeBatchSize
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
     setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
-    setEngineIOStatus &= this->bindSSMStateToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindRecurrentStateToEngine(activeBatchSize);
 
     // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding
     if (mConfig.numDeepstackFeatures > 0)
@@ -1570,7 +1574,7 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepBindTensors(rt::Tensor const& bas
     // Update KV cache shapes to match activeBatchSize
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
     setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
-    setEngineIOStatus &= this->bindSSMStateToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindRecurrentStateToEngine(activeBatchSize);
 
     // Bind packed attention mask for plugin-based attention
     setEngineIOStatus

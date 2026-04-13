@@ -201,6 +201,7 @@ bool VisualBuilder::setupVisualOptimizationProfile(
     case multimodal::ModelType::QWEN2_VL:
     case multimodal::ModelType::QWEN2_5_VL:
     case multimodal::ModelType::QWEN3_VL:
+    case multimodal::ModelType::QWEN3_5:
     case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER: result = setupQwenViTProfile(*visualProfile, network); break;
 
     case multimodal::ModelType::INTERNVL:
@@ -283,7 +284,7 @@ bool VisualBuilder::setupQwenViTProfile(
         result &= setOptimizationProfile(&profile, binding_names::kReverseWindowIndex, createDims({minHW / 4}),
             createDims({optHW / 4}), createDims({maxHW / 4}));
     }
-    else if (mModelType == multimodal::ModelType::QWEN3_VL
+    else if (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5
         || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbIdx, createDims({4, minHW}),

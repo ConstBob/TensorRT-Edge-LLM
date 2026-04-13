@@ -1091,6 +1091,7 @@ class EdgeLLMGatedDeltaNetLayer(nn.Module):
             self.conv1d_weight,  # [conv_dim, 1, kernel]
             self.conv1d_bias,  # [conv_dim]
             conv_state,  # [1, conv_dim, kernel]
+            context_lengths,  # [B]
             stride=1,
             padding=self.conv_kernel_size - 1,
             dilation=1,

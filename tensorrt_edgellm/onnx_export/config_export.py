@@ -144,6 +144,27 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     return llm_config
 
 
+def _validate_hybrid_config(llm_config: Dict[str, Any]) -> None:
+    """Validate that all required hybrid config fields are present."""
+    # Required output fields for any hybrid model config (Mamba, GDN, or future variants).
+    # C++ runtime/builder reads exactly these keys with no fallback.
+    required_fields = [
+        "num_linear_attn_layers",
+        "num_attention_layers",
+        "recurrent_state_num_heads",
+        "recurrent_state_head_dim",
+        "recurrent_state_size",
+        "conv_dim",
+        "conv_kernel",
+    ]
+
+    missing = [f for f in required_fields if f not in llm_config]
+    if missing:
+        raise KeyError(
+            f"Hybrid model config missing required linear attention fields: {missing}. "
+            f"Required fields: {required_fields}")
+
+
 def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Export hybrid Mamba model configuration with Mamba-specific fields."""
     required_fields = [
@@ -163,6 +184,7 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
 
     rope_params = _select_rope_parameters(config_dict)
     has_rope = ("rope_theta" in config_dict) or ("rope_theta" in rope_params)
+    llm_config["use_rope"] = has_rope
     if has_rope:
         llm_config.update(_export_rope_config(config_dict))
     else:
@@ -185,23 +207,21 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         num_mamba = sum(1 for t in layers_block_type if t == "mamba")
         num_attention = sum(1 for t in layers_block_type if t == "attention")
 
-    llm_config["num_mamba_layers"] = num_mamba
+    llm_config["num_linear_attn_layers"] = num_mamba
     llm_config["num_attention_layers"] = num_attention
-    llm_config["mamba_num_heads"] = config_dict.get("mamba_num_heads", 0)
-    llm_config["mamba_head_dim"] = config_dict.get("mamba_head_dim", 0)
-    llm_config["ssm_state_size"] = config_dict.get("ssm_state_size", 0)
-
-    mamba_num_heads = llm_config["mamba_num_heads"]
-    mamba_head_dim = llm_config["mamba_head_dim"]
-    ssm_state_size = llm_config["ssm_state_size"]
+    llm_config["recurrent_state_num_heads"] = config_dict["mamba_num_heads"]
+    llm_config["recurrent_state_head_dim"] = config_dict["mamba_head_dim"]
+    llm_config["recurrent_state_size"] = config_dict["ssm_state_size"]
     n_groups = config_dict.get("n_groups",
                                config_dict.get("mamba_n_groups", 1))
-    llm_config[
-        "conv_dim"] = mamba_num_heads * mamba_head_dim + 2 * n_groups * ssm_state_size
+    llm_config["conv_dim"] = (
+        llm_config["recurrent_state_num_heads"] *
+        llm_config["recurrent_state_head_dim"] +
+        2 * n_groups * llm_config["recurrent_state_size"])
     llm_config["conv_kernel"] = config_dict.get(
         "conv_kernel", config_dict.get("mamba_d_conv", 4))
 
-    llm_config["use_rope"] = has_rope
+    _validate_hybrid_config(llm_config)
 
     llm_config["model_type"] = "hybrid_mamba"
     return llm_config
@@ -227,17 +247,17 @@ def _export_hybrid_gdn_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
 
     # Linear-attention (GDN) related dimensions
     llm_config["linear_num_key_heads"] = config_dict["linear_num_key_heads"]
-    llm_config["linear_num_value_heads"] = config_dict[
+    llm_config["recurrent_state_num_heads"] = config_dict[
         "linear_num_value_heads"]
-    llm_config["linear_key_head_dim"] = config_dict["linear_key_head_dim"]
-    llm_config["linear_value_head_dim"] = config_dict["linear_value_head_dim"]
-    llm_config["linear_conv_kernel_dim"] = config_dict[
-        "linear_conv_kernel_dim"]
+    llm_config["recurrent_state_head_dim"] = config_dict["linear_key_head_dim"]
+    llm_config["recurrent_state_size"] = config_dict["linear_value_head_dim"]
     llm_config["conv_dim"] = (2 * llm_config["linear_num_key_heads"] *
-                              llm_config["linear_key_head_dim"] +
-                              llm_config["linear_num_value_heads"] *
-                              llm_config["linear_value_head_dim"])
-    llm_config["conv_kernel"] = llm_config["linear_conv_kernel_dim"]
+                              llm_config["recurrent_state_head_dim"] +
+                              llm_config["recurrent_state_num_heads"] *
+                              llm_config["recurrent_state_size"])
+    llm_config["conv_kernel"] = config_dict["linear_conv_kernel_dim"]
+
+    _validate_hybrid_config(llm_config)
 
     llm_config["model_type"] = "hybrid_gdn"
     return llm_config

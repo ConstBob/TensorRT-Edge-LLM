@@ -38,14 +38,14 @@ class EdgeLLMQKVProj(nn.Module):
         num_attention_heads: int = attention_module.config.num_attention_heads
         num_key_value_heads: int = attention_module.config.num_key_value_heads
         if hasattr(attention_module.config, 'head_dim'):
-            head_dim: int = attention_module.config.head_dim
+            self.head_dim: int = attention_module.config.head_dim
         else:
-            head_dim: int = attention_module.config.hidden_size // num_attention_heads
+            self.head_dim: int = attention_module.config.hidden_size // num_attention_heads
 
         # Copy projection layers from original attention module
         # Phi4MM uses a fused qkv_proj; we support both split and fused Q/K/V paths for compatibility.
         self.has_qwen3_5_gate = False
-        self.q_dim = num_attention_heads * head_dim
+        self.q_dim = num_attention_heads * self.head_dim
         if hasattr(attention_module, 'q_proj'):
             assert hasattr(attention_module, 'k_proj') and hasattr(attention_module, 'v_proj'), \
                 "q_proj, k_proj, and v_proj must be present"
@@ -55,12 +55,13 @@ class EdgeLLMQKVProj(nn.Module):
             self.v_proj = attention_module.v_proj
             # Qwen3.5 full attention packs (query, gate) into q_proj output.
             if (getattr(attention_module.config, 'model_type',
-                        '') == 'qwen3_5_text' and
-                    attention_module.q_proj.out_features == 2 * self.q_dim):
+                        '') == 'qwen3_5_text'):
+                assert attention_module.q_proj.out_features == 2 * self.q_dim, \
+                    "Qwen3.5 full attention q_proj output dimension must be 2 * q_dim"
                 self.has_qwen3_5_gate = True
         elif hasattr(attention_module, 'qkv_proj'):
             self.fused_qkv_proj = True
-            self.kv_dim = num_key_value_heads * head_dim
+            self.kv_dim = num_key_value_heads * self.head_dim
             self.qkv_proj = attention_module.qkv_proj
         else:
             assert False
@@ -106,8 +107,13 @@ class EdgeLLMQKVProj(nn.Module):
             # Separate q/k/v projections path
             query_states = self.q_proj(hidden_states)
             if self.has_qwen3_5_gate:
-                query_states, gate_states = torch.split(
-                    query_states, [self.q_dim, self.q_dim], dim=-1)
+                input_shape = hidden_states.shape[:-1]
+                query_states, gate_states = torch.chunk(query_states.view(
+                    *input_shape, -1, self.head_dim * 2),
+                                                        2,
+                                                        dim=-1)
+                query_states = query_states.reshape(*input_shape, -1)
+                gate_states = gate_states.reshape(*input_shape, -1)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
         return query_states, key_states, value_states, gate_states

@@ -111,7 +111,7 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     multimodal::ModelType modelType = multimodal::stringToModelType(modelTypeStr);
 
     if (modelType == multimodal::ModelType::QWEN2_VL || modelType == multimodal::ModelType::QWEN2_5_VL
-        || modelType == multimodal::ModelType::QWEN3_VL)
+        || modelType == multimodal::ModelType::QWEN3_VL || modelType == multimodal::ModelType::QWEN3_5)
     {
         multimodalRunner
             = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
