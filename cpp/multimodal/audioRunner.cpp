@@ -569,7 +569,7 @@ bool Qwen3OmniAudioRunner::initializeSequentialMRopeCache(
     {
         kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
             positionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
-            activeBatchSize, interleaved, stream);
+            activeBatchSize, interleaved, mConfig.mropeSectionH, mConfig.mropeSectionW, stream);
     }
     catch (std::exception const& e)
     {

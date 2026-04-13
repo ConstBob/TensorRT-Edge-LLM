@@ -64,14 +64,14 @@ struct LLMEngineRunnerConfig
     int32_t audioTokenId{0};         //!< Special token ID for audio in Qwen3-Omni
     int32_t imageTokenId{0};         //!< Special token ID for image in Qwen3-Omni
 
-    // Hybrid Mamba+Attention model configuration
-    int32_t numMambaLayers{0};     //!< Number of Mamba (SSM) layers (0 for pure attention models)
-    int32_t numAttentionLayers{0}; //!< Number of attention layers (equals numDecoderLayers for pure attention)
-    int32_t mambaNumHeads{0};      //!< Number of Mamba heads
-    int32_t mambaHeadDim{0};       //!< Dimension of each Mamba head
-    int32_t ssmStateSize{0};       //!< SSM state dimension (dstate)
-    int32_t convDim{0};            //!< Conv1d dimension (intermediate_size + 2 * n_groups * ssm_state_size)
-    int32_t convKernel{0};         //!< Conv1d kernel width
+    // Hybrid model configuration
+    int32_t numLinearAttnLayers{0};    //!< Number of recurrent layers (0 for pure attention models)
+    int32_t numAttentionLayers{0};     //!< Number of attention layers (equals numDecoderLayers for pure attention)
+    int32_t recurrentStateNumHeads{0}; //!< Number of recurrent heads (hv for GDN, mamba_num_heads for Mamba)
+    int32_t recurrentStateHeadDim{0};  //!< Dimension of each recurrent head (k for GDN, mamba_head_dim for Mamba)
+    int32_t recurrentStateSize{0};     //!< Recurrent state dimension (v for GDN, dstate for Mamba)
+    int32_t convDim{0};                //!< Conv1d channel dimension
+    int32_t convKernel{0};             //!< Conv1d kernel width
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -120,7 +120,7 @@ public:
     //! in advance when creating the LLMEngineRunner instance.
     rt::Tensor& getRopeCosSinCacheTensor() noexcept;
 
-    //! @brief Get reference to the linear KV cache (also owns Mamba SSM/conv state buffers for hybrid models)
+    //! @brief Get reference to the linear KV cache (also owns recurrent/conv state buffers for hybrid models)
     //! @return Reference to LinearKVCache
     rt::LinearKVCache& getLinearKVCache() noexcept;
 
@@ -282,7 +282,7 @@ private:
     rt::Tensor mSequenceContextLengths{};
 
     //! The LinearKVCache tensor that carried for the LLM model execution.
-    //! Also owns Mamba SSM and conv state buffers for hybrid models.
+    //! Also owns recurrent and conv state buffers for hybrid models.
     rt::LinearKVCache mKVCache{};
 
     //! Dummy input tensor used to reserve space for unused input tensors. We always keep this tensor as zero tensor
@@ -375,8 +375,8 @@ private:
     //! @return The KV cache type
     nvinfer1::DataType getKVCacheType() const;
 
-    //! @brief Get the SSM state dtype from the engine binding (layer 0)
-    nvinfer1::DataType getSSMStateType() const;
+    //! @brief Get the recurrent state dtype from the engine binding (layer 0)
+    nvinfer1::DataType getRecurrentStateType() const;
 
     //! @brief Get the conv state dtype from the engine binding (layer 0)
     nvinfer1::DataType getConvStateType() const;
@@ -402,11 +402,11 @@ private:
     bool bindTRTNativeKVCacheToEngine(int32_t activeBatchSize);
 
     /*!
-     * @brief Bind SSM state buffers for Mamba layers to the engine
+     * @brief Bind recurrent state buffers for recurrent layers to the engine
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
      */
-    bool bindSSMStateToEngine(int32_t activeBatchSize);
+    bool bindRecurrentStateToEngine(int32_t activeBatchSize);
 
     /*!
      * @brief Bind conv state tensors to the TensorRT execution context

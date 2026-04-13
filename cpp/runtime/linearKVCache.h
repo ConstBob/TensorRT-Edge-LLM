@@ -49,15 +49,15 @@ public:
         int64_t headDim{};                   //!< Head dimension
         nvinfer1::DataType kvCacheTypeTRT{}; //!< Storage dtype for KV cache (kHALF or kFP8)
 
-        // Mamba SSM/conv state fields (all zero for pure-attention models; no memory is allocated)
-        int32_t numMambaLayers{0};                                   //!< Number of Mamba layers
-        int32_t mambaNumHeads{0};                                    //!< Number of Mamba heads
-        int32_t mambaHeadDim{0};                                     //!< Dimension of each Mamba head
-        int32_t ssmStateSize{0};                                     //!< SSM state dimension (dstate)
-        nvinfer1::DataType ssmStateType{nvinfer1::DataType::kHALF};  //!< SSM state dtype
-        int32_t convDim{0};                                          //!< Conv1d channel dimension
-        int32_t convKernel{0};                                       //!< Conv1d kernel width
-        nvinfer1::DataType convStateType{nvinfer1::DataType::kHALF}; //!< Conv state dtype
+        // Recurrent state fields (all zero for pure-attention models; no memory is allocated)
+        int32_t numLinearAttnLayers{0};                                   //!< Number of recurrent layers
+        int32_t recurrentStateNumHeads{0};                                //!< Number of recurrent state heads
+        int32_t recurrentStateHeadDim{0};                                 //!< Dimension of each recurrent head
+        int32_t recurrentStateSize{0};                                    //!< Recurrent state dimension
+        nvinfer1::DataType recurrentStateType{nvinfer1::DataType::kHALF}; //!< Recurrent state dtype
+        int32_t convDim{0};                                               //!< Conv1d channel dimension
+        int32_t convKernel{0};                                            //!< Conv1d kernel width
+        nvinfer1::DataType convStateType{nvinfer1::DataType::kHALF};      //!< Conv state dtype
     };
     //! \endcond
 
@@ -108,23 +108,23 @@ public:
     //! Get the full KVCache buffer as a non-owned tensor.
     rt::Tensor getKVCacheBuffer() noexcept;
 
-    //! Get SSM state tensor for a Mamba layer (non-owned view).
-    //! Shape: [maxBatchSize, mambaNumHeads, mambaHeadDim, ssmStateSize]
-    rt::Tensor getSSMStateForLayer(int32_t mambaLayerIdx) noexcept;
+    //! Get recurrent state tensor for a recurrent layer (non-owned view).
+    //! Shape: [maxBatchSize, recurrentStateNumHeads, recurrentStateHeadDim, recurrentStateSize]
+    rt::Tensor getRecurrentStateForLayer(int32_t recurrentLayerIdx) noexcept;
 
-    //! Get conv state tensor for a Mamba layer (non-owned view).
+    //! Get conv state tensor for a recurrent layer (non-owned view).
     //! Shape: [maxBatchSize, convDim, convKernel]
-    rt::Tensor getConvStateForLayer(int32_t mambaLayerIdx) noexcept;
+    rt::Tensor getConvStateForLayer(int32_t recurrentLayerIdx) noexcept;
 
-    //! Zero all SSM and conv state buffers (all layers, all batch slots).
+    //! Zero all recurrent and conv state buffers (all layers, all batch slots).
     //! Called after warmup inference and before CUDA graph capture to ensure a clean starting state.
-    void clearMambaStates(cudaStream_t stream);
+    void clearRecurrentStates(cudaStream_t stream);
 
-    //! Copy one batch slot's SSM states into freshly-allocated tensors (one per Mamba layer).
+    //! Copy one batch slot's recurrent states into freshly-allocated tensors (one per recurrent layer).
     //! Used to snapshot states when saving a system prompt cache entry.
-    std::vector<rt::Tensor> captureSSMStates(int32_t batchIdx, cudaStream_t stream);
+    std::vector<rt::Tensor> captureRecurrentStates(int32_t batchIdx, cudaStream_t stream);
 
-    //! Copy one batch slot's conv states into freshly-allocated tensors (one per Mamba layer).
+    //! Copy one batch slot's conv states into freshly-allocated tensors (one per recurrent layer).
     //! Used to snapshot states when saving a system prompt cache entry.
     std::vector<rt::Tensor> captureConvStates(int32_t batchIdx, cudaStream_t stream);
 
@@ -174,12 +174,12 @@ private:
     rt::Tensor mDeviceKVCacheLengths{}; //!< KV cache lengths on device
     rt::Tensor mDeviceKVCache{};        //!< KV cache memory buffer on device
 
-    //! SSM state buffer: [numMambaLayers, maxBatchSize, mambaNumHeads, mambaHeadDim, ssmStateSize]
-    //! Empty when numMambaLayers == 0.
-    rt::Tensor mDeviceSSMStates{};
+    //! Recurrent state buffer: [numLinearAttnLayers, maxBatchSize, recurrentStateNumHeads, recurrentStateHeadDim,
+    //! recurrentStateSize] Empty when numLinearAttnLayers == 0.
+    rt::Tensor mDeviceRecurrentStates{};
 
-    //! Conv state buffer: [numMambaLayers, maxBatchSize, convDim, convKernel]
-    //! Empty when numMambaLayers == 0.
+    //! Conv state buffer: [numLinearAttnLayers, maxBatchSize, convDim, convKernel]
+    //! Empty when numLinearAttnLayers == 0.
     rt::Tensor mDeviceConvStates{};
 };
 

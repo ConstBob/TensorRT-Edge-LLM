@@ -451,7 +451,7 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
 
 
 def create_hybrid_dummy_inputs(model: nn.Module) -> Dict[str, Any]:
-    """Create dummy inputs for hybrid Mamba+Attention ONNX export."""
+    """Create dummy inputs for hybrid Linear Attention + Full Attention ONNX export."""
     batch_size = 1
     seq_len = 2
     past_len = 2
@@ -570,7 +570,7 @@ def create_hybrid_dummy_inputs(model: nn.Module) -> Dict[str, Any]:
 
 
 def export_hybrid_model_to_onnx(model: nn.Module, output_dir: str) -> None:
-    """Export a hybrid Mamba+Attention model to ONNX."""
+    """Export a hybrid Linear Attention + Full Attention model to ONNX."""
     print(f"Exporting hybrid model to ONNX format: {output_dir}")
 
     dummy_inputs = create_hybrid_dummy_inputs(model)
@@ -592,21 +592,22 @@ def export_hybrid_model_to_onnx(model: nn.Module, output_dir: str) -> None:
         None,  # attention_mask
     )
 
-    # TODO: Change ssm_state to recurrent_state for better naming consistency
-    input_names = (['inputs_embeds'] +
-                   [f'past_key_values_{i}' for i in range(num_attn_layers)] +
-                   [f'conv_state_{i}' for i in range(num_linear_attn_layers)] +
-                   [f'ssm_state_{i}'
-                    for i in range(num_linear_attn_layers)] + [
-                        'rope_rotary_cos_sin', 'context_lengths',
-                        'last_token_ids', 'kvcache_start_index'
-                    ])
+    input_names = (
+        ['inputs_embeds'] +
+        [f'past_key_values_{i}' for i in range(num_attn_layers)] +
+        [f'conv_state_{i}' for i in range(num_linear_attn_layers)] +
+        [f'recurrent_state_{i}' for i in range(num_linear_attn_layers)] + [
+            'rope_rotary_cos_sin', 'context_lengths', 'last_token_ids',
+            'kvcache_start_index'
+        ])
 
     output_names = (
         ['logits'] +
         [f'present_key_values_{i}' for i in range(num_attn_layers)] +
-        [f'present_conv_state_{i}' for i in range(num_linear_attn_layers)] +
-        [f'present_ssm_state_{i}' for i in range(num_linear_attn_layers)])
+        [f'present_conv_state_{i}' for i in range(num_linear_attn_layers)] + [
+            f'present_recurrent_state_{i}'
+            for i in range(num_linear_attn_layers)
+        ])
 
     dynamic_axes = {
         'inputs_embeds': {
@@ -640,8 +641,8 @@ def export_hybrid_model_to_onnx(model: nn.Module, output_dir: str) -> None:
     for i in range(num_linear_attn_layers):
         dynamic_axes[f'conv_state_{i}'] = {0: 'batch_size'}
         dynamic_axes[f'present_conv_state_{i}'] = {0: 'batch_size'}
-        dynamic_axes[f'ssm_state_{i}'] = {0: 'batch_size'}
-        dynamic_axes[f'present_ssm_state_{i}'] = {0: 'batch_size'}
+        dynamic_axes[f'recurrent_state_{i}'] = {0: 'batch_size'}
+        dynamic_axes[f'present_recurrent_state_{i}'] = {0: 'batch_size'}
 
     register_attention_plugin_onnx_symbolic_functions()
     register_mamba_plugin_onnx_symbolic_functions()

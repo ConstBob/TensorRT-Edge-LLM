@@ -82,7 +82,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     std::string modelTypeStr = jsonConfig["model_type"].get<std::string>();
     mModelType = multimodal::stringToModelType(modelTypeStr);
     if (mModelType != multimodal::ModelType::QWEN2_5_VL && mModelType != multimodal::ModelType::QWEN2_VL
-        && mModelType != multimodal::ModelType::QWEN3_VL
+        && mModelType != multimodal::ModelType::QWEN3_VL && mModelType != multimodal::ModelType::QWEN3_5
         && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Invalid model type: %s", modelTypeStr.c_str());
@@ -100,17 +100,37 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     mConfig.vocabSize = subConfig["vocab_size"].get<int32_t>();
     mConfig.mropeTheta = subConfig["rope_theta"].get<float>();
 
+    // Read mrope_section from rope_parameters or rope_scaling
+    auto const& ropeParams = subConfig.contains("rope_scaling") ? subConfig["rope_scaling"] : subConfig;
+    if (ropeParams.contains("mrope_section"))
+    {
+        auto section = ropeParams["mrope_section"].get<std::vector<int32_t>>();
+        if (section.size() >= 3)
+        {
+            mConfig.mropeSectionH = section[1];
+            mConfig.mropeSectionW = section[2];
+        }
+    }
+    if (mConfig.mropeSectionH <= 0 || mConfig.mropeSectionW <= 0)
+    {
+        LOG_ERROR(
+            "QwenViTRunner::validateAndFillConfig(): failed to parse mrope_section in text_config. Got H=%d, W=%d",
+            mConfig.mropeSectionH, mConfig.mropeSectionW);
+        return false;
+    }
+
     if (mModelType == multimodal::ModelType::QWEN2_5_VL)
     {
         mConfig.windowSize = jsonConfig["vision_config"]["window_size"].get<int64_t>();
     }
-    else if (mModelType == multimodal::ModelType::QWEN3_VL
+    else if (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5
         || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         auto visionConfig = jsonConfig["vision_config"];
         auto numPositionEmbeddings = visionConfig["num_position_embeddings"].get<int64_t>();
         mConfig.numGridPerSide = static_cast<int64_t>(std::sqrt(numPositionEmbeddings));
-        mConfig.numDeepstackFeatures = visionConfig["deepstack_visual_indexes"].get<std::vector<int64_t>>().size();
+        auto deepstackIndexes = visionConfig.value("deepstack_visual_indexes", std::vector<int64_t>{});
+        mConfig.numDeepstackFeatures = deepstackIndexes.size();
     }
 
     auto builderConfig = jsonConfig["builder_config"];
@@ -227,7 +247,7 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
         setTensorAddressStatus
             &= mContext->setTensorAddress(binding_names::kReverseWindowIndex, mReverseWindowIndexDevice.rawPointer());
     }
-    else if (mModelType == multimodal::ModelType::QWEN3_VL
+    else if (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5
         || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         mFastPosEmbIdx = rt::Tensor(
@@ -465,7 +485,7 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
 
             getWindowIndex(imageGridTHWs, totalSeqLength, stream);
         }
-        else if (mModelType == multimodal::ModelType::QWEN3_VL
+        else if (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5
             || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
         {
             check::check(mFastPosEmbIdx.reshape({4, totalSeqLength}), "Tensor reshape failed");
@@ -584,10 +604,10 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     // Initialize mrope cosSinCacheDevice
     check::check(
         ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim}), "Tensor reshape failed");
-    bool interleaved = (mModelType == multimodal::ModelType::QWEN3_VL);
+    bool interleaved = (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5);
     kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
         mMropePositionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
-        activeBatchSize, interleaved, stream);
+        activeBatchSize, interleaved, mConfig.mropeSectionH, mConfig.mropeSectionW, stream);
 }
 
 void QwenViTRunner::getWindowIndex(
@@ -832,7 +852,7 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
             setEngineIOStatus &= mContext->setInputShape(
                 binding_names::kReverseWindowIndex, mReverseWindowIndexDevice.getShape().getTRTDims());
         }
-        else if (mModelType == multimodal::ModelType::QWEN3_VL
+        else if (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5
             || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
         {
             setEngineIOStatus
@@ -860,7 +880,7 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
 
 rt::OptionalInputTensors QwenViTRunner::getDeepstackFeatures()
 {
-    if (mModelType != multimodal::ModelType::QWEN3_VL && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
+    if (mConfig.numDeepstackFeatures == 0)
     {
         return {};
     }

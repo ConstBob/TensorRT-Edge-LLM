@@ -459,42 +459,52 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
 
 void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int64_t> const& mropePositionIds,
     float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize,
-    bool interleaved)
+    bool interleaved, int32_t sectionH, int32_t sectionW)
 {
-    // mropePositionIds: (bs, 3, maxPositionEmbeddings)
-    // mropeRotaryCosSin: (bs, maxPositionEmbeddings, rotaryDim)
+    int32_t const halfDim = rotaryDim / 2;
+    int32_t const numTemporalPairs = halfDim - sectionH - sectionW;
 
     std::vector<float> invFreq;
-    for (int32_t i = 0; i < rotaryDim / 2; ++i)
+    for (int32_t i = 0; i < halfDim; ++i)
     {
         float value = pow(rotaryBaseFrequency, 2 * i / (float) rotaryDim);
         invFreq.emplace_back(value);
     }
 
-    std::vector<std::vector<float>> cosOri(rotaryEmbeddingMaxPositions, std::vector<float>(rotaryDim / 2));
-    std::vector<std::vector<float>> sinOri(rotaryEmbeddingMaxPositions, std::vector<float>(rotaryDim / 2));
+    std::vector<std::vector<float>> cosOri(rotaryEmbeddingMaxPositions, std::vector<float>(halfDim));
+    std::vector<std::vector<float>> sinOri(rotaryEmbeddingMaxPositions, std::vector<float>(halfDim));
     for (int32_t i = 0; i < rotaryEmbeddingMaxPositions; ++i)
     {
-        for (int32_t j = 0; j < (rotaryDim / 2); ++j)
+        for (int32_t j = 0; j < halfDim; ++j)
         {
             cosOri[i][j] = std::cos(i / invFreq[j]);
             sinOri[i][j] = std::sin(i / invFreq[j]);
         }
     }
 
-    int32_t sinOffset = rotaryDim / 2;
+    int32_t const interleavedHLimit = sectionH * 3;
+    int32_t const interleavedWLimit = sectionW * 3;
+
+    // Non-interleaved section boundaries
+    std::vector<int32_t> mRopeSections{0, numTemporalPairs, numTemporalPairs + sectionH, halfDim};
+
+    int32_t sinOffset = halfDim;
     for (int32_t b = 0; b < batchSize; ++b)
     {
         for (int32_t i = 0; i < rotaryEmbeddingMaxPositions; ++i)
         {
             if (interleaved)
             {
-                // Interleaved format: [THWTHWHTHW...TTTT] Qwen3-VL
-                //     mrope section is [24, 20, 20]
-                //     [THWTHWHTHW...TTTT] has 20 groups of THW and 4 additional T
-                for (int32_t j = 0; j < (rotaryDim / 2); ++j)
+                for (int32_t j = 0; j < halfDim; ++j)
                 {
-                    int32_t sec = (j >= 60) ? 0 : (j % 3);
+                    int32_t mod3 = j % 3;
+                    int32_t sec;
+                    if (mod3 == 1 && j < interleavedHLimit)
+                        sec = 1;
+                    else if (mod3 == 2 && j < interleavedWLimit)
+                        sec = 2;
+                    else
+                        sec = 0;
                     int32_t pos
                         = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
                     int32_t cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
@@ -504,7 +514,6 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
             }
             else
             {
-                std::vector<int32_t> mRopeSections{0, 16, 40, 64}; // cumsum of {16, 24, 24}
                 for (int32_t sec = 0; sec < 3; ++sec)
                 {
                     int32_t pos
