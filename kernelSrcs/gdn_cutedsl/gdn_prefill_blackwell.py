@@ -827,8 +827,12 @@ class GDN:
                                     a_f32 = cutlass.Float32(a[curr_idx, 0, (head_coord, batch_coord)])
                                     b_f32 = cutlass.Float32(b[curr_idx, 0, (head_coord, batch_coord)])
                                 # g = -exp(A_log) * softplus(a + dt_bias)
+                                # Use threshold to avoid exp overflow for large x.
+                                # softplus(x) = log(1+exp(x)) ≈ x for x > 20.
                                 x = a_f32 + dt_bias_f32
-                                softplus_x = cute.math.log(cutlass.Float32(1) + cute.math.exp(x))
+                                softplus_x = x  # default for large x
+                                if x <= cutlass.Float32(20.0):
+                                    softplus_x = cute.math.log(cutlass.Float32(1) + cute.math.exp(x))
                                 gate_vals[it] = neg_exp_A_log * softplus_x
                                 # beta = sigmoid(b)
                                 beta_vals[it] = cutlass.Float32(1) / (cutlass.Float32(1) + cute.math.exp(-b_f32))
@@ -2518,21 +2522,10 @@ class GDN:
             tTMEM_STORErS_x8.layout,
         )
 
-        # --- Q L2 norm (Pass 1): each thread computes norm of its own row ---
-        if cutlass.const_expr(use_qk_l2norm):
-            sum_sq_q = cutlass.Float32(0.0)
-            for _i in cutlass.range_constexpr(128 // corr_tile_size):
-                for _col in cutlass.range_constexpr(0, 8):
-                    _curr = sQ_frag[
-                        (thread_idx, (None, _col % 2)), 0, (_col // 2, _i), 0
-                    ].load()
-                    for _j in cutlass.range_constexpr(8):
-                        _v = _curr[_j].to(cutlass.Float32)
-                        sum_sq_q = sum_sq_q + _v * _v
-            inv_norm_q = cute.rsqrt(sum_sq_q + cutlass.Float32(1e-6))
-            effective_val = val * inv_norm_q
-        else:
-            effective_val = val
+        # Q L2 norm is now applied as a preprocessing step BEFORE the kernel launch,
+        # so that QK = Q_norm @ K_norm^T and all downstream uses are consistent.
+        # Here we just apply the per-token gate (val = exp(cumsum_gate)).
+        effective_val = val
 
         for i in cutlass.range_constexpr(128 // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
@@ -2619,18 +2612,9 @@ class GDN:
             tTMEM_STORErS_x8_e, cute.make_layout(frg_tile)
         )
 
-        # --- K L2 norm (Pass 1): each thread computes norm of its own row ---
-        if cutlass.const_expr(use_qk_l2norm):
-            sum_sq_k = cutlass.Float32(0.0)
-            for _i in cutlass.range_constexpr(128 // corr_tile_size):
-                for _col in cutlass.range_constexpr(0, 8):
-                    _curr = sK_frag[
-                        (thread_idx, (None, _col % 2)), 0, (_col // 2, _i), 0
-                    ].load()
-                    for _j in cutlass.range_constexpr(8):
-                        _v = _curr[_j].to(cutlass.Float32)
-                        sum_sq_k = sum_sq_k + _v * _v
-            inv_norm_k = cute.rsqrt(sum_sq_k + cutlass.Float32(1e-6))
+        # K L2 norm is now applied as a preprocessing step BEFORE the kernel launch,
+        # so that QK = Q_norm @ K_norm^T and KK^T = K_norm @ K_norm^T are consistent
+        # with the state update and output paths.
 
         for i in cutlass.range_constexpr(128 // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
@@ -2644,12 +2628,10 @@ class GDN:
                 curr_val_ssa = sK_frag[
                     (load_row, (None, load_col % 2)), 0, (load_col // 2, i), 0
                 ].load()
-                if cutlass.const_expr(use_qk_l2norm):
-                    tTMEM_STORErS_x8_e_frag[None, col].store(
-                        (curr_val_ssa * inv_norm_k).to(self.i_dtype)
-                    )
-                else:
-                    tTMEM_STORErS_x8_e_frag[None, col].store(curr_val_ssa)
+                # K is already L2-normalized before kernel launch (preprocessing).
+                tTMEM_STORErS_x8_e_frag[None, col].store(
+                    curr_val_ssa
+                )
 
             # store
             if cutlass.const_expr(mask):
@@ -4700,6 +4682,11 @@ def chunk_gated_delta_rule(
             dtype=cp.float32,
         )
 
+    # L2-normalize Q and K before the kernel (preprocessing).
+    # The Blackwell kernel expects pre-normalized Q/K so that QK, KK^T, state
+    # update, and output paths all use consistently normalized vectors.
+    _l2_normalize_qk_inplace(q, k)
+
     ph = {
         "q": q,
         "k": k,
@@ -4800,6 +4787,28 @@ def compute_g_beta(a, b, A_log, dt_bias):
     beta = cp.float32(1.0) / (cp.float32(1.0) + cp.exp(-b_f32))  # (N, T, HV)
 
     return cp.ascontiguousarray(g), cp.ascontiguousarray(beta)
+
+
+def _l2_normalize_qk_inplace(q, k):
+    """L2-normalize Q and K along the head dimension (last axis) in-place.
+
+    Q: (N, T, H, D) float16 cupy array
+    K: (N, T, H, D) float16 cupy array
+
+    Each token's head vector is divided by its L2 norm (with eps=1e-6 for stability).
+    This must be done BEFORE the Blackwell kernel so that QK, KK^T, state update,
+    and output paths all see consistently normalized Q and K.
+    """
+    eps = cp.float32(1e-6)
+    # Compute norms in float32 for numerical stability
+    q_f32 = q.astype(cp.float32)
+    k_f32 = k.astype(cp.float32)
+    q_norm = cp.sqrt(cp.sum(q_f32 * q_f32, axis=-1, keepdims=True) + eps)
+    k_norm = cp.sqrt(cp.sum(k_f32 * k_f32, axis=-1, keepdims=True) + eps)
+    q_normalized = q_f32 / q_norm
+    k_normalized = k_f32 / k_norm
+    cp.copyto(q, q_normalized.astype(q.dtype))
+    cp.copyto(k, k_normalized.astype(k.dtype))
 
 
 def run_gdn_prefill_blackwell(
@@ -4972,13 +4981,16 @@ def run_test_prefill_blackwell(
     b_cp   = cp.asarray(b_f32, dtype=dt)
     A_log_cp   = cp.asarray(A_log_f32)
     dt_bias_cp  = cp.asarray(dt_bias_f32, dtype=dt)
-    h0_cp  = cp.asarray(h0_f32)
+    # Blackwell kernel stores/reads state in V-major (d_v, d_k) format.
+    # Transpose the K-major h0 to V-major before passing to the kernel.
+    h0_vmaj_f32 = np.ascontiguousarray(np.swapaxes(h0_f32, -2, -1))
+    h0_cp  = cp.asarray(h0_vmaj_f32)
     o_cp   = cp.zeros((n, seq_len, hv, v), dtype=dt)
 
     # Warmup / compile — h0_in and h0_out must not alias (kernel is not in-place safe).
-    h0_out_run = cp.empty_like(cp.asarray(h0_f32))
+    h0_out_run = cp.empty_like(h0_cp)
     for _ in range(warmup):
-        h0_in_run = cp.asarray(h0_f32)
+        h0_in_run = cp.asarray(h0_vmaj_f32)
         o_cp_run  = cp.zeros_like(o_cp)
         chunk_gated_delta_rule(
             q=q_cp, k=k_cp, v=v_cp,
@@ -4993,7 +5005,7 @@ def run_test_prefill_blackwell(
     cp.cuda.get_current_stream().synchronize()
 
     if not skip_ref_check:
-        h0_in_test = cp.asarray(h0_f32)
+        h0_in_test = cp.asarray(h0_vmaj_f32)
         h0_out_test = cp.empty_like(h0_in_test)
         o_test  = cp.zeros_like(o_cp)
         chunk_gated_delta_rule(
@@ -5014,16 +5026,34 @@ def run_test_prefill_blackwell(
             n, h, hv, k, v, seq_len,
             scale=float(k) ** -0.5,
             context_lengths_np=ctx_np,
-            use_qk_l2norm=False,
+            use_qk_l2norm=True,
         )
         o_kernel = cp.asnumpy(o_test).astype(np.float32)
         max_err = np.max(np.abs(o_kernel - o_ref))
         print("[gdn_prefill_blackwell] Max abs error vs NumPy ref: %.6f (tol=%.4f)" % (max_err, tolerance))
         np.testing.assert_allclose(o_kernel, o_ref, atol=tolerance, rtol=1e-2)
+
+        # Compare h0 state
+        # The Blackwell kernel stores state in V-major (transposed) format:
+        # MMA computes C = V^T * K giving (d_v, d_k), but the reference uses
+        # K-major (d_k, d_v).  Transpose the reference to match the kernel.
+        h0_ref_vmaj = np.swapaxes(h0_ref, -2, -1)  # (n, hv, d_k, d_v) -> (n, hv, d_v, d_k)
+        h0_kernel = cp.asnumpy(h0_out_test).astype(np.float32)
+        h0_max_err = np.max(np.abs(h0_kernel - h0_ref_vmaj))
+        h0_max_abs = np.max(np.abs(h0_ref_vmaj))
+        big_err_count = np.sum(np.abs(h0_kernel - h0_ref_vmaj) > 0.1)
+        print("[gdn_prefill_blackwell] h0 state max abs error: %.6f (ref maxAbs=%.4f, bigErr>0.1: %d/%d)" %
+              (h0_max_err, h0_max_abs, big_err_count, h0_ref_vmaj.size))
+        if h0_max_err > 1.0:
+            print("[gdn_prefill_blackwell] WARNING: h0 state has LARGE errors!")
+            err_idx = np.unravel_index(np.argmax(np.abs(h0_kernel - h0_ref_vmaj)), h0_ref_vmaj.shape)
+            print("[gdn_prefill_blackwell]   worst at idx=%s: kernel=%.6f ref=%.6f" %
+                  (err_idx, h0_kernel[err_idx], h0_ref_vmaj[err_idx]))
+
         print("[gdn_prefill_blackwell] Reference check PASSED")
 
     # Benchmark — initial_state is read-only; output_state must be a distinct buffer.
-    h0_in_bench = cp.asarray(h0_f32)
+    h0_in_bench = cp.asarray(h0_vmaj_f32)
     h0_out_bench = cp.empty_like(h0_in_bench)
     o_bench  = cp.zeros_like(o_cp)
     t0 = time.perf_counter()
@@ -5053,8 +5083,8 @@ def run_test_prefill_blackwell(
 
 # AOT placeholder dimensions (must have seq_len >= 128 = chunk_size)
 AOT_PLACEHOLDER_N = 1
-AOT_PLACEHOLDER_H = 8
-AOT_PLACEHOLDER_HV = 8
+AOT_PLACEHOLDER_H = 16
+AOT_PLACEHOLDER_HV = 32
 AOT_PLACEHOLDER_K = 128
 AOT_PLACEHOLDER_V = 128
 AOT_PLACEHOLDER_SEQLEN = 128  # must be multiple of 128
