@@ -51,17 +51,6 @@ void invokeCausalConv1d(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tenso
     int32_t dilation, trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream);
 
 /*!
- * \brief Decode-mode conv1d (dot product).
- *
- * convState: [batch, dim, width]
- * weight:    [dim, 1, width]
- * bias:      [dim] (optional)
- * out:       [batch, 1, dim]
- */
-void invokeCausalConv1dDecode(trt_edgellm::rt::Tensor const& convState, trt_edgellm::rt::Tensor const& weight,
-    trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out, cudaStream_t stream);
-
-/*!
  * \brief Capture conv state from prefill input.
  *
  * x:              [batch, seqLen, dim]
@@ -72,12 +61,16 @@ void invokeCaptureConvState(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::T
     trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream);
 
 /*!
- * \brief Shift conv_state left by 1 and insert new values at position width-1.
+ * \brief Decode-mode conv1d: shift conv_state, insert new column, and compute dot product.
  *
- * convState: [batch, dim, width]  (in-place)
- * newCol:    [batch, 1, dim]  (the new single-token input)
+ * convState: [batch, dim, width]  (in-place update)
+ * newCol:    [batch, 1, dim]  (new single-token input)
+ * weight:    [dim, 1, width]
+ * bias:      [dim] (optional)
+ * out:       [batch, 1, dim]
  */
-void invokeConvStateShiftInsert(
-    trt_edgellm::rt::Tensor& convState, trt_edgellm::rt::Tensor const& newCol, cudaStream_t stream);
+void invokeCausalConv1dDecode(trt_edgellm::rt::Tensor& convState, trt_edgellm::rt::Tensor const& newCol,
+    trt_edgellm::rt::Tensor const& weight, trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out,
+    cudaStream_t stream);
 
 } // namespace mamba_ssm
