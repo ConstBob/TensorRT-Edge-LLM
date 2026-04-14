@@ -49,6 +49,12 @@ for large language models and vision-language models on edge devices.
 
 .. toctree::
    :maxdepth: 2
+   :caption: Performance
+
+   user_guide/performance/performance-benchmarks.md
+
+.. toctree::
+   :maxdepth: 2
    :caption: Software Design
 
    developer_guide/software-design/python-export-pipeline.md
