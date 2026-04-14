@@ -60,7 +60,9 @@ pytest --priority=l0_export_ampere -v
 - `l0_pipeline_a30.yml` - Pipeline tests (A30 GPU)
 - `l0_pipeline_orin.yml` - Pipeline tests (Jetson Orin)
 - `l0_pipeline_rtx5080.yml` - Pipeline tests (RTX 5080)
-- `l0_pipeline_thor_ferrix.yml` - Pipeline tests (Thor/Ferrix)
+- `l0_pipeline_thor_1.yml` - Pipeline tests (Drive Thor 1)
+- `l0_pipeline_thor_2.yml` - Pipeline tests (Drive Thor 2, EAGLE)
+- `l0_pipeline_jedha.yml` - Pipeline tests (Jedha, large models + accuracy + EAGLE)
 
 ## Parameter Format
 

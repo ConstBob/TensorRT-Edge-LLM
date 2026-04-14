@@ -125,9 +125,10 @@ CI runs on GitLab (`.gitlab-ci.yml`). Tests are YAML-driven and parametrized by 
 | `l0_export_blackwell` | B100 (x86) | FP8/NVFP4 ONNX export |
 | `l0_pipeline_a30` | A30 | Full pipeline |
 | `l0_pipeline_orin` | Jetson Orin (remote) | On-device pipeline |
-| `l0_pipeline_rtx5080` | RTX 5080 | Full pipeline |
-| `l0_pipeline_b100` | B100 | Full pipeline + EAGLE |
-| `l0_pipeline_thor_ferrix` | Drive Thor (remote) | On-device pipeline |
+| `l0_pipeline_rtx5080` | RTX 5080 | FP8 small model pipeline |
+| `l0_pipeline_jedha` | Jedha (SM110) | Long accuracy + EAGLE + larger models |
+| `l0_pipeline_thor_1` | Drive Thor 1 (remote) | On-device FP8/NVFP4 pipeline |
+| `l0_pipeline_thor_2` | Drive Thor 2 (remote) | On-device FP8+KV pipeline |
 | `l0_python_ut` | Any | Python unit tests |
 
 Test parameter format: `ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additional-Params]`. See `tests/README.md`.
