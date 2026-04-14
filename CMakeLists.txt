@@ -212,10 +212,4 @@ if(BUILD_UNIT_TESTS)
     cute_dsl_setup(LINK_TARGETS unitTest)
   endif()
   add_cross_build_link_options(unitTest)
-
-  # Link prebuilt CuTe DSL FMHA kernels into unit tests
-  if(ENABLE_CUTE_DSL_FMHA)
-    include(${CMAKE_SOURCE_DIR}/cmake/CuteDslFMHA.cmake)
-    cute_dsl_fmha_setup(LINK_TARGETS unitTest)
-  endif()
 endif()
