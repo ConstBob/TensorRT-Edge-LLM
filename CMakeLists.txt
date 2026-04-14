@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.6.0
+  VERSION 0.6.1
   LANGUAGES CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -212,4 +212,10 @@ if(BUILD_UNIT_TESTS)
     cute_dsl_setup(LINK_TARGETS unitTest)
   endif()
   add_cross_build_link_options(unitTest)
+
+  # Link prebuilt CuTe DSL FMHA kernels into unit tests
+  if(ENABLE_CUTE_DSL_FMHA)
+    include(${CMAKE_SOURCE_DIR}/cmake/CuteDslFMHA.cmake)
+    cute_dsl_fmha_setup(LINK_TARGETS unitTest)
+  endif()
 endif()
