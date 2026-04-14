@@ -18,10 +18,10 @@
 #ifdef CUTE_DSL_GDN_ENABLED
 
 #include "cuteDslGDNRunner.h"
+#include "gdnKernelUtils.cuh"
 
 #include "common/logger.h"
 
-#include <cmath>
 #include <mutex>
 
 namespace trt_edgellm
@@ -250,6 +250,10 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     int32_t const k = params.k_dim;
     int32_t const v = params.v_dim;
 
+    // L2-normalize Q and K in-place.  The Blackwell kernel expects pre-normalized
+    // Q/K so that QK^T, KK^T, state update, and output paths are all consistent.
+    launchGdnL2NormQK(params.q, params.k, n, seq_len, h, k, stream);
+
     // Set up tensor structs for fused Blackwell kernel (g/beta computed inline in warp 7)
     gdn_prefill_blackwell_Tensor_q_t qTensor{};
     SET_4D_TENSOR(qTensor, params.q, n, seq_len, h, k);
@@ -266,21 +270,40 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     gdn_prefill_blackwell_Tensor_b_t bTensor{};
     SET_3D_TENSOR(bTensor, params.b, n, seq_len, hv);
 
+    // A_log and dt_bias are constant-shape tensors in the Blackwell kernel — data pointer only.
     gdn_prefill_blackwell_Tensor_A_log_t A_logTensor{};
-    SET_1D_TENSOR(A_logTensor, params.A_log, hv);
+    A_logTensor.data = params.A_log;
 
     gdn_prefill_blackwell_Tensor_dt_bias_t dt_biasTensor{};
-    SET_1D_TENSOR(dt_biasTensor, params.dt_bias, hv);
+    dt_biasTensor.data = params.dt_bias;
 
-    // h0_in and h0_out share the same buffer (in-place state update)
+    // The Blackwell MMA computes state = V^T * K in V-major (d_v, d_k) order,
+    // while sequential/decode kernels use K-major (d_k, d_v).  We transpose
+    // h0 before and after the kernel to bridge this convention mismatch.
+    // The kernel is not in-place safe, so we ping-pong between h0_source and h0_scratch.
+    size_t const h0ScratchBytes = static_cast<size_t>(n) * hv * k * v * sizeof(float);
+    if (params.h0_scratch == nullptr)
+    {
+        LOG_WARNING(
+            "GDN Blackwell prefill: h0_scratch not provided in GDNParams — "
+            "caller must allocate [n=%d, hv=%d, k=%d, v=%d] f32 scratch and set params.h0_scratch.",
+            n, hv, k, v);
+        return -1;
+    }
+
+    int32_t const numStateBlocks = n * hv;
+
+    // Step 1: Transpose initial state from K-major to V-major into scratch buffer.
+    launchGdnStateTranspose(params.h0_source, params.h0_scratch, numStateBlocks, k, stream);
+
     gdn_prefill_blackwell_Tensor_h0_in_t h0InTensor{};
-    h0InTensor.data = params.h0_source;
+    h0InTensor.data = params.h0_scratch; // V-major initial state
     h0InTensor.dynamic_shapes[0] = n;
     h0InTensor.dynamic_shapes[1] = hv;
     h0InTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
 
     gdn_prefill_blackwell_Tensor_h0_out_t h0OutTensor{};
-    h0OutTensor.data = params.h0_source; // same buffer
+    h0OutTensor.data = params.h0_source; // V-major output written here
     h0OutTensor.dynamic_shapes[0] = n;
     h0OutTensor.dynamic_shapes[1] = hv;
     h0OutTensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
@@ -292,8 +315,15 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     gdn_prefill_blackwell_Tensor_o_t oTensor{};
     SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
 
+    // Step 2: Run the Blackwell prefill kernel.
     cute_dsl_gdn_prefill_blackwell_wrapper(&sBlackwellPrefillModule, &qTensor, &kTensor, &vTensor, &aTensor, &bTensor,
-        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &cuSeqLensTensor, &oTensor, stream);
+        &A_logTensor, &dt_biasTensor, &h0InTensor, &h0OutTensor, &oTensor, &cuSeqLensTensor, stream);
+
+    // Step 3: Transpose V-major output state back to K-major into scratch.
+    launchGdnStateTranspose(params.h0_source, params.h0_scratch, numStateBlocks, k, stream);
+
+    // Step 4: Copy K-major state from scratch back to h0_source (stream-ordered).
+    cudaMemcpyAsync(params.h0_source, params.h0_scratch, h0ScratchBytes, cudaMemcpyDeviceToDevice, stream);
     return 0;
 #else
     LOG_ERROR("Blackwell GDN prefill not compiled in this build.");

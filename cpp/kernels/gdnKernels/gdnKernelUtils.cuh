@@ -22,35 +22,22 @@
 namespace trt_edgellm
 {
 
-/**
- * Single-thread prefix-sum kernel: converts context_lengths[N] to cu_seqlens[N+1].
- *
- * cu_seqlens[0] = 0
- * cu_seqlens[i+1] = cu_seqlens[i] + context_lengths[i]
- */
-__global__ void gdnCalCuSeqLensKernel(int32_t const* context_lengths, // [N]
-    int32_t* cu_seqlens,                                              // [N+1]  output
-    int32_t batchSize)
-{
-    if (threadIdx.x == 0 && blockIdx.x == 0)
-    {
-        cu_seqlens[0] = 0;
-        int32_t running = 0;
-        for (int32_t i = 0; i < batchSize; ++i)
-        {
-            running += context_lengths[i];
-            cu_seqlens[i + 1] = running;
-        }
-    }
-}
-
 /** Launch the context_lengths → cu_seqlens prefix-sum kernel. */
-inline void launchGdnCalCuSeqLens(void const* context_lengths, // [N] int32
-    void* cu_seqlens,                                          // [N+1] int32  (pre-allocated)
-    int32_t batchSize, cudaStream_t stream)
-{
-    gdnCalCuSeqLensKernel<<<1, 1, 0, stream>>>(
-        static_cast<int32_t const*>(context_lengths), static_cast<int32_t*>(cu_seqlens), batchSize);
-}
+void launchGdnCalCuSeqLens(void const* context_lengths, // [N] int32
+    void* cu_seqlens,                                   // [N+1] int32  (pre-allocated)
+    int32_t batchSize, cudaStream_t stream);
+
+/** L2-normalize Q and K in-place along the head dimension.
+ *  Q, K: (N, seqLen, H, headDim) float16 — each token-head vector is divided by its L2 norm.
+ *  Required preprocessing for the Blackwell GDN prefill kernel. */
+void launchGdnL2NormQK(void* q, void* k, int32_t n, int32_t seqLen, int32_t h, int32_t headDim, cudaStream_t stream);
+
+/** Transpose the last two dimensions of the GDN state tensor (out-of-place).
+ *  The Blackwell GDN prefill MMA produces state in V-major (d_v, d_k) order,
+ *  while the sequential/decode kernels use K-major (d_k, d_v).
+ *  src:  (numBlocks, dim, dim) float32 — row-major 2-D blocks
+ *  dst:  (numBlocks, dim, dim) float32 — each block transposed
+ *  numBlocks = n * hv,  dim = head_dim (128). */
+void launchGdnStateTranspose(void const* src, void* dst, int32_t numBlocks, int32_t dim, cudaStream_t stream);
 
 } // namespace trt_edgellm

@@ -107,7 +107,7 @@ KERNEL_VARIANTS = [
     KernelVariant(
         name="gdn_prefill_blackwell",
         group="gdn",
-        supported_sms=[100, 101, 110, 120, 121],
+        supported_sms=[100, 101, 110],
         script="gdn_cutedsl/gdn_prefill_blackwell.py",
         script_args=["--export_only"],
     ),
@@ -287,8 +287,8 @@ def select_variants(sm: int, kernels_arg: str):
 
     kernels_arg:
       "ALL"         — compile variants whose supported_sms contains the SM.
-      "gdn"/"fmha"  — compile all variants in that group; error if SM is incompatible.
-      "gdn,fmha"    — compile all variants in the listed groups.
+      "gdn"/"fmha"  — compile variants in that group whose supported_sms contains the SM.
+      "gdn,fmha"    — same for the listed groups (unsupported variants are skipped).
     """
     groups_requested = kernels_arg.strip().upper()
 
@@ -308,15 +308,20 @@ def select_variants(sm: int, kernels_arg: str):
             f"Valid groups: {sorted(_ALL_GROUPS)}"
         )
 
-    selected = [v for v in KERNEL_VARIANTS if v.group in tokens]
+    in_groups = [v for v in KERNEL_VARIANTS if v.group in tokens]
+    skipped = [v for v in in_groups if sm not in v.supported_sms]
+    selected = [v for v in in_groups if sm in v.supported_sms]
 
-    # Explicit group + incompatible SM → error (almost certainly a user mistake).
-    unsupported = [v for v in selected if sm not in v.supported_sms]
-    if unsupported:
-        names = ", ".join(v.name for v in unsupported)
-        raise ValueError(
-            f"SM{sm} is not in supported_sms for: {names}.\n"
-            f"Use --kernels ALL to auto-filter by SM, or check supported_sms in KERNEL_VARIANTS."
+    if skipped:
+        names = ", ".join(v.name for v in skipped)
+        print(
+            f"NOTE: Skipping {len(skipped)} variant(s) not supported on SM{sm}: {names}"
+        )
+
+    if not selected:
+        print(
+            f"WARNING: No variants in requested group(s) {tokens} support SM{sm}. "
+            f"Check supported_sms in KERNEL_VARIANTS."
         )
 
     return selected
@@ -627,7 +632,8 @@ def main():
         "--kernels",
         default="ALL",
         help="Which kernels to build: ALL (default), a group name (fmha | gdn), "
-             "or a comma-separated list of group names (fmha,gdn).",
+             "or a comma-separated list of group names (fmha,gdn). "
+             "Variants whose supported_sms does not include the target SM are skipped.",
     )
     p.add_argument(
         "--output_dir",

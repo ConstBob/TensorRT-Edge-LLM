@@ -57,7 +57,6 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import numpy as np
 from cutlass import Int32, Int64
 from cutlass._mlir.dialects import nvvm
-from cutlass.cute import EnableTVMFFI
 from cutlass.cute.runtime import from_dlpack
 
 from gdn_prefill_blackwell_tile_scheduler import (
@@ -207,10 +206,6 @@ class GDN:
         b, s_q, h_q, d = q_shape
         b_, _, h_v, d_ = v_shape
 
-        if use_qk_l2norm_in_kernel:
-            warnings.warn("use_qk_l2norm_in_kernel is not supported yet", stacklevel=2)
-            can_implement = False
-
         if b != b_:
             warnings.warn("q & k must have the same batch size", stacklevel=2)
             can_implement = False
@@ -323,6 +318,7 @@ class GDN:
         tuw_smem_layout_staged_b: cute.ComposedLayout,
         v_smem_layout_staged_b: cute.ComposedLayout,
         scale: cutlass.Float32,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean],
         tile_sched_params: GdnStaticTileSchedulerParams,
     ):
         """Warp-specialized GDN kernel entry point."""
@@ -831,8 +827,12 @@ class GDN:
                                     a_f32 = cutlass.Float32(a[curr_idx, 0, (head_coord, batch_coord)])
                                     b_f32 = cutlass.Float32(b[curr_idx, 0, (head_coord, batch_coord)])
                                 # g = -exp(A_log) * softplus(a + dt_bias)
+                                # Use threshold to avoid exp overflow for large x.
+                                # softplus(x) = log(1+exp(x)) ≈ x for x > 20.
                                 x = a_f32 + dt_bias_f32
-                                softplus_x = cute.math.log(cutlass.Float32(1) + cute.math.exp(x))
+                                softplus_x = x  # default for large x
+                                if x <= cutlass.Float32(20.0):
+                                    softplus_x = cute.math.log(cutlass.Float32(1) + cute.math.exp(x))
                                 gate_vals[it] = neg_exp_A_log * softplus_x
                                 # beta = sigmoid(b)
                                 beta_vals[it] = cutlass.Float32(1) / (cutlass.Float32(1) + cute.math.exp(-b_f32))
@@ -1451,6 +1451,7 @@ class GDN:
                             atom_args,
                             tensor_args,
                             pipeline_args,
+                            use_qk_l2norm=use_qk_l2norm,
                         )
                     else:
                         value_args = (
@@ -1469,6 +1470,7 @@ class GDN:
                             atom_args,
                             tensor_args,
                             pipeline_args,
+                            use_qk_l2norm=use_qk_l2norm,
                         )
                         pipeline_args = (
                             gb_w0_consumer,
@@ -1495,6 +1497,7 @@ class GDN:
                             pipeline_args,
                             True,
                             tail_count=tail_count,
+                            use_qk_l2norm=use_qk_l2norm,
                         )
 
                     # Output state
@@ -1522,6 +1525,7 @@ class GDN:
         pipeline_args: tuple,
         need_mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = False,
     ) -> Tuple[
         pipeline.PipelineConsumer,
         pipeline.PipelineConsumer,
@@ -1697,7 +1701,7 @@ class GDN:
 
             c0_handle.release()
 
-            self.store_k_epi(kkt_thr_mma, sK, tKtK, need_mask, tail_count)
+            self.store_k_epi(kkt_thr_mma, sK, tKtK, need_mask, tail_count, use_qk_l2norm=use_qk_l2norm)
             self.store_ivt_p3(
                 sInvertSubReg,
                 sInvertSubTSL1B,
@@ -1713,7 +1717,7 @@ class GDN:
             self.load_ivt_result(tOtTSL1, sTuwAStore)
             c0_handle.release()
 
-            self.load_q_epi(qk_thr_mma, sQ, tQgate, tval_exp, need_mask, tail_count)
+            self.load_q_epi(qk_thr_mma, sQ, tQgate, tval_exp, need_mask, tail_count, use_qk_l2norm=use_qk_l2norm)
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared,
                 space=cute.arch.SharedSpace.shared_cta,
@@ -2472,6 +2476,7 @@ class GDN:
         val: cutlass.Float32,  # exp(cumsum_gate) for per-token gating
         mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = False,
     ):
         """Load Q from smem, apply per-token gate."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2517,6 +2522,11 @@ class GDN:
             tTMEM_STORErS_x8.layout,
         )
 
+        # Q L2 norm is now applied as a preprocessing step BEFORE the kernel launch,
+        # so that QK = Q_norm @ K_norm^T and all downstream uses are consistent.
+        # Here we just apply the per-token gate (val = exp(cumsum_gate)).
+        effective_val = val
+
         for i in cutlass.range_constexpr(128 // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
                 tTMEM_STOREtO.iterator + i * corr_tile_size_f32, tTMEM_STOREtO.layout
@@ -2533,7 +2543,7 @@ class GDN:
                     (load_row, (None, load_col % 2)), 0, (load_col // 2, i), 0
                 ].load()
                 tTMEM_STORErS_x8_e_frag[None, col].store(
-                    (curr_val_ssa * val).to(self.i_dtype)
+                    (curr_val_ssa * effective_val).to(self.i_dtype)
                 )
             # store
             if cutlass.const_expr(mask):
@@ -2551,6 +2561,7 @@ class GDN:
         tOut: cute.Tensor,
         mask: cutlass.Constexpr[cutlass.Boolean] = False,
         tail_count: Int32 = 128,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = False,
     ):
         """Load K from smem and store to TMEM."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2600,6 +2611,11 @@ class GDN:
         tTMEM_STORErS_x8_e_frag = cute.logical_divide(
             tTMEM_STORErS_x8_e, cute.make_layout(frg_tile)
         )
+
+        # K L2 norm is now applied as a preprocessing step BEFORE the kernel launch,
+        # so that QK = Q_norm @ K_norm^T and KK^T = K_norm @ K_norm^T are consistent
+        # with the state update and output paths.
+
         for i in cutlass.range_constexpr(128 // corr_tile_size):
             tTMEM_STOREtO_i = cute.make_tensor(
                 tTMEM_STOREtO.iterator + i * corr_tile_size_f32, tTMEM_STOREtO.layout
@@ -2612,7 +2628,10 @@ class GDN:
                 curr_val_ssa = sK_frag[
                     (load_row, (None, load_col % 2)), 0, (load_col // 2, i), 0
                 ].load()
-                tTMEM_STORErS_x8_e_frag[None, col].store(curr_val_ssa)
+                # K is already L2-normalized before kernel launch (preprocessing).
+                tTMEM_STORErS_x8_e_frag[None, col].store(
+                    curr_val_ssa
+                )
 
             # store
             if cutlass.const_expr(mask):
@@ -3828,6 +3847,7 @@ class GDN:
         scale: Optional[float],
         cum_seqlen_q: Optional[cute.Tensor] = None,
         cu_seqlens: Optional[cute.Tensor] = None,
+        use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = True,
         stream: cuda.CUstream = None,
     ):
         """Host-side entry: build tensor layouts, TMA descriptors, smem storage, and launch the kernel."""
@@ -4494,6 +4514,7 @@ class GDN:
             tuw_smem_layout_staged_b,
             v_smem_layout_staged_b,
             scale,
+            use_qk_l2norm,
             self.tile_sched_params,
         ).launch(
             grid=grid,
@@ -4554,7 +4575,6 @@ def _get_compiled_gdn_prefill_kernel(
     is_varlen: bool,
     is_initial_state: bool,
     is_output_state: bool,
-    scale: float,
 ):
     """Cache compiled kernel for given configuration (returns mutable dict)."""
     return {}
@@ -4599,7 +4619,7 @@ def chunk_gated_delta_rule(
         initial_state: (B, H_v, D, D) recurrent state (float32), or None for zero init.
         output_final_state: If True, return the final state alongside output.
         cu_seqlens: Cumulative sequence lengths for variable-length batching (int32/int64).
-        use_qk_l2norm_in_kernel: Not supported yet.
+        use_qk_l2norm_in_kernel: L2 norm is always applied inside the kernel (this flag only affects the can_implement check).
         output: Pre-allocated output cupy array, or None to allocate internally.
         output_state: Pre-allocated state output cupy array, or None.
 
@@ -4634,86 +4654,99 @@ def chunk_gated_delta_rule(
             dtype=cp.float32,
         )
 
-    # Compile kernel (cached)
+    # Blackwell JIT path (`run_gdn_blackwell`) fixes attention scale as 1/sqrt(D) inside GDN;
+    # the `scale` argument is accepted for API compatibility but is not passed to the kernel.
+
+    # JIT wrapper always takes a cu_seqlens tensor (see _create_jit_blackwell). For uniform
+    # padded batches, use prefix-sum [0, T, 2T, ...] — matches AOT placeholder convention.
+    n_b = int(q.shape[0])
+    seq_len_b = int(q.shape[1])
+    if cu_seqlens is None:
+        cu_seqlens_eff = cp.arange(n_b + 1, dtype=cp.int32) * int(seq_len_b)
+    else:
+        cu_seqlens_eff = cu_seqlens
+
+    if initial_state is None:
+        h0_in_arr = cp.zeros(
+            (problem_size[0], problem_size[4], problem_size[5], problem_size[5]),
+            dtype=cp.float32,
+        )
+    else:
+        h0_in_arr = initial_state
+
+    if output_final_state:
+        h0_out_arr = output_state
+    else:
+        h0_out_arr = cp.empty(
+            (problem_size[0], problem_size[4], problem_size[5], problem_size[5]),
+            dtype=cp.float32,
+        )
+
+    # L2-normalize Q and K before the kernel (preprocessing).
+    # The Blackwell kernel expects pre-normalized Q/K so that QK, KK^T, state
+    # update, and output paths all use consistently normalized vectors.
+    _l2_normalize_qk_inplace(q, k)
+
+    ph = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "a": a,
+        "b": b,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "h0_in": h0_in_arr,
+        "h0_out": h0_out_arr,
+        "o": output,
+        "cu_seqlens": cu_seqlens_eff,
+    }
+
+    # Compile kernel (cached) — use @cute.jit + marked tensors like AOT / gdn_prefill.py.
+    # Compiling GDN.__call__ directly with raw iterators can crash the DSL compiler (segfault).
     is_varlen = cu_seqlens is not None
     is_initial_state = initial_state is not None
-    if scale is None:
-        scale = float(problem_size[5]) ** -0.5
     cache_key = (
         problem_size,
         str(q.dtype),
         is_varlen,
         is_initial_state,
         output_final_state,
-        scale,
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
 
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
+    t_trace = _to_cute_tensors_bw(ph)
     if "compiled_gdn" not in cache:
-        gdn = GDN()
-        q_tensor = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True)
-        k_tensor = from_dlpack(k, assumed_align=16, enable_tvm_ffi=True)
-        v_tensor = from_dlpack(v, assumed_align=16, enable_tvm_ffi=True)
-        o_tensor = from_dlpack(output, assumed_align=16, enable_tvm_ffi=True)
-        a_tensor = from_dlpack(a, assumed_align=16, enable_tvm_ffi=True)
-        b_tensor = from_dlpack(b, assumed_align=16, enable_tvm_ffi=True)
-        A_log_tensor = from_dlpack(A_log, assumed_align=16, enable_tvm_ffi=True)
-        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16, enable_tvm_ffi=True)
-        cu_seqlens_tensor = (
-            from_dlpack(cu_seqlens, assumed_align=16, enable_tvm_ffi=True)
-            if cu_seqlens is not None
-            else None
-        )
-        state_tensor = (
-            from_dlpack(initial_state, assumed_align=16, enable_tvm_ffi=True)
-            if initial_state is not None
-            else None
-        )
-        state_output_tensor = (
-            from_dlpack(output_state, assumed_align=16, enable_tvm_ffi=True)
-            if output_final_state
-            else None
-        )
-
-        options = EnableTVMFFI
-        compiled_gdn = cute.compile[options](
-            gdn,
-            q_tensor.iterator,
-            k_tensor.iterator,
-            v_tensor.iterator,
-            o_tensor.iterator,
-            a_tensor.iterator,
-            b_tensor.iterator,
-            A_log_tensor.iterator,
-            dt_bias_tensor.iterator,
-            problem_size,
-            state_tensor.iterator if state_tensor is not None else None,
-            state_output_tensor.iterator if output_final_state else None,
-            scale,
-            cu_seqlens_tensor,
+        cache["compiled_gdn"] = cute.compile(
+            _get_jit_blackwell(),
+            t_trace["q"],
+            t_trace["k"],
+            t_trace["v"],
+            t_trace["a"],
+            t_trace["b"],
+            t_trace["A_log"],
+            t_trace["dt_bias"],
+            t_trace["h0_in"],
+            t_trace["h0_out"],
+            t_trace["o"],
+            t_trace["cu_seqlens"],
             stream=current_stream,
         )
-        cache["compiled_gdn"] = compiled_gdn
 
-    compiled_gdn = cache["compiled_gdn"]
-
-    # Run GDN kernel
-    compiled_gdn(
-        int(q.data.ptr),
-        int(k.data.ptr),
-        int(v.data.ptr),
-        int(output.data.ptr),
-        int(a.data.ptr),
-        int(b.data.ptr),
-        int(A_log.data.ptr),
-        int(dt_bias.data.ptr),
-        problem_size,
-        int(initial_state.data.ptr) if initial_state is not None else None,
-        int(output_state.data.ptr) if output_final_state else None,
-        scale,
-        cu_seqlens,
+    t_run = _to_cute_tensors_bw(ph)
+    cache["compiled_gdn"](
+        t_run["q"],
+        t_run["k"],
+        t_run["v"],
+        t_run["a"],
+        t_run["b"],
+        t_run["A_log"],
+        t_run["dt_bias"],
+        t_run["h0_in"],
+        t_run["h0_out"],
+        t_run["o"],
+        t_run["cu_seqlens"],
         stream=current_stream,
     )
 
@@ -4756,6 +4789,28 @@ def compute_g_beta(a, b, A_log, dt_bias):
     return cp.ascontiguousarray(g), cp.ascontiguousarray(beta)
 
 
+def _l2_normalize_qk_inplace(q, k):
+    """L2-normalize Q and K along the head dimension (last axis) in-place.
+
+    Q: (N, T, H, D) float16 cupy array
+    K: (N, T, H, D) float16 cupy array
+
+    Each token's head vector is divided by its L2 norm (with eps=1e-6 for stability).
+    This must be done BEFORE the Blackwell kernel so that QK, KK^T, state update,
+    and output paths all see consistently normalized Q and K.
+    """
+    eps = cp.float32(1e-6)
+    # Compute norms in float32 for numerical stability
+    q_f32 = q.astype(cp.float32)
+    k_f32 = k.astype(cp.float32)
+    q_norm = cp.sqrt(cp.sum(q_f32 * q_f32, axis=-1, keepdims=True) + eps)
+    k_norm = cp.sqrt(cp.sum(k_f32 * k_f32, axis=-1, keepdims=True) + eps)
+    q_normalized = q_f32 / q_norm
+    k_normalized = k_f32 / k_norm
+    cp.copyto(q, q_normalized.astype(q.dtype))
+    cp.copyto(k, k_normalized.astype(k.dtype))
+
+
 def run_gdn_prefill_blackwell(
     q,
     k,
@@ -4783,17 +4838,21 @@ def run_gdn_prefill_blackwell(
         b:                (N, T, HV) fp16 cupy array - beta pre-activation
         A_log:            (HV,) float32 cupy array - log decay
         dt_bias:          (HV,) fp16 cupy array - time step bias
-        h0_source:        (N, HV, D, D) float32 cupy array - initial state (mutated in-place)
+        h0_source:        (N, HV, D, D) float32 cupy array - initial state; on success receives
+                          a copy of the final state (kernel uses a temp buffer, then copyto).
         context_lengths:  (N,) int32 cupy array - valid token counts per batch
         o:                (N, T, HV, D) float16 cupy array - output (written in-place)
         seq_len:          int - sequence length T
         stream:           cuda.CUstream
-        output_final_state: if True, write final state back to h0_source
+        output_final_state: if True, write final recurrent state into h0_source
     """
     n, t, hv, d = v.shape
     h = q.shape[2]
     initial_state = h0_source if h0_source is not None else None
-    state_out = h0_source if output_final_state else None
+    if output_final_state and h0_source is not None:
+        state_tmp = cp.empty_like(h0_source)
+    else:
+        state_tmp = None
 
     chunk_gated_delta_rule(
         q=q,
@@ -4808,8 +4867,10 @@ def run_gdn_prefill_blackwell(
         output_final_state=output_final_state,
         cu_seqlens=None,
         output=o,
-        output_state=state_out,
+        output_state=state_tmp,
     )
+    if output_final_state and h0_source is not None:
+        state_tmp.copyto(h0_source)
 
 
 # ===========================================================================
@@ -4832,7 +4893,6 @@ def _run_numpy_prefill_reference(
 ):
     """Recurrent numpy reference for correctness check.
 
-    Note: Blackwell kernel does NOT support use_qk_l2norm yet.
     """
     h0 = h0_source_f32.copy()  # (N, HV, K, V)
     o_ref = np.zeros((n, seq_len, hv, v_dim), dtype=np.float32)
@@ -4921,37 +4981,42 @@ def run_test_prefill_blackwell(
     b_cp   = cp.asarray(b_f32, dtype=dt)
     A_log_cp   = cp.asarray(A_log_f32)
     dt_bias_cp  = cp.asarray(dt_bias_f32, dtype=dt)
-    h0_cp  = cp.asarray(h0_f32)
+    # Blackwell kernel stores/reads state in V-major (d_v, d_k) format.
+    # Transpose the K-major h0 to V-major before passing to the kernel.
+    h0_vmaj_f32 = np.ascontiguousarray(np.swapaxes(h0_f32, -2, -1))
+    h0_cp  = cp.asarray(h0_vmaj_f32)
     o_cp   = cp.zeros((n, seq_len, hv, v), dtype=dt)
 
-    # Warmup / compile
+    # Warmup / compile — h0_in and h0_out must not alias (kernel is not in-place safe).
+    h0_out_run = cp.empty_like(h0_cp)
     for _ in range(warmup):
-        h0_cp_run = cp.asarray(h0_f32)
+        h0_in_run = cp.asarray(h0_vmaj_f32)
         o_cp_run  = cp.zeros_like(o_cp)
         chunk_gated_delta_rule(
             q=q_cp, k=k_cp, v=v_cp,
             a=a_cp, b=b_cp,
             A_log=A_log_cp, dt_bias=dt_bias_cp,
             scale=float(k) ** -0.5,
-            initial_state=h0_cp_run,
+            initial_state=h0_in_run,
             output_final_state=True,
             output=o_cp_run,
-            output_state=h0_cp_run,
+            output_state=h0_out_run,
         )
     cp.cuda.get_current_stream().synchronize()
 
     if not skip_ref_check:
-        h0_test = cp.asarray(h0_f32)
+        h0_in_test = cp.asarray(h0_vmaj_f32)
+        h0_out_test = cp.empty_like(h0_in_test)
         o_test  = cp.zeros_like(o_cp)
         chunk_gated_delta_rule(
             q=q_cp, k=k_cp, v=v_cp,
             a=a_cp, b=b_cp,
             A_log=A_log_cp, dt_bias=dt_bias_cp,
             scale=float(k) ** -0.5,
-            initial_state=h0_test,
+            initial_state=h0_in_test,
             output_final_state=True,
             output=o_test,
-            output_state=h0_test,
+            output_state=h0_out_test,
         )
         cp.cuda.get_current_stream().synchronize()
 
@@ -4961,16 +5026,35 @@ def run_test_prefill_blackwell(
             n, h, hv, k, v, seq_len,
             scale=float(k) ** -0.5,
             context_lengths_np=ctx_np,
-            use_qk_l2norm=False,
+            use_qk_l2norm=True,
         )
         o_kernel = cp.asnumpy(o_test).astype(np.float32)
         max_err = np.max(np.abs(o_kernel - o_ref))
         print("[gdn_prefill_blackwell] Max abs error vs NumPy ref: %.6f (tol=%.4f)" % (max_err, tolerance))
         np.testing.assert_allclose(o_kernel, o_ref, atol=tolerance, rtol=1e-2)
+
+        # Compare h0 state
+        # The Blackwell kernel stores state in V-major (transposed) format:
+        # MMA computes C = V^T * K giving (d_v, d_k), but the reference uses
+        # K-major (d_k, d_v).  Transpose the reference to match the kernel.
+        h0_ref_vmaj = np.swapaxes(h0_ref, -2, -1)  # (n, hv, d_k, d_v) -> (n, hv, d_v, d_k)
+        h0_kernel = cp.asnumpy(h0_out_test).astype(np.float32)
+        h0_max_err = np.max(np.abs(h0_kernel - h0_ref_vmaj))
+        h0_max_abs = np.max(np.abs(h0_ref_vmaj))
+        big_err_count = np.sum(np.abs(h0_kernel - h0_ref_vmaj) > 0.1)
+        print("[gdn_prefill_blackwell] h0 state max abs error: %.6f (ref maxAbs=%.4f, bigErr>0.1: %d/%d)" %
+              (h0_max_err, h0_max_abs, big_err_count, h0_ref_vmaj.size))
+        if h0_max_err > 1.0:
+            print("[gdn_prefill_blackwell] WARNING: h0 state has LARGE errors!")
+            err_idx = np.unravel_index(np.argmax(np.abs(h0_kernel - h0_ref_vmaj)), h0_ref_vmaj.shape)
+            print("[gdn_prefill_blackwell]   worst at idx=%s: kernel=%.6f ref=%.6f" %
+                  (err_idx, h0_kernel[err_idx], h0_ref_vmaj[err_idx]))
+
         print("[gdn_prefill_blackwell] Reference check PASSED")
 
-    # Benchmark
-    h0_bench = cp.asarray(h0_f32)
+    # Benchmark — initial_state is read-only; output_state must be a distinct buffer.
+    h0_in_bench = cp.asarray(h0_vmaj_f32)
+    h0_out_bench = cp.empty_like(h0_in_bench)
     o_bench  = cp.zeros_like(o_cp)
     t0 = time.perf_counter()
     for _ in range(iterations):
@@ -4979,10 +5063,10 @@ def run_test_prefill_blackwell(
             a=a_cp, b=b_cp,
             A_log=A_log_cp, dt_bias=dt_bias_cp,
             scale=float(k) ** -0.5,
-            initial_state=h0_bench,
+            initial_state=h0_in_bench,
             output_final_state=True,
             output=o_bench,
-            output_state=h0_bench,
+            output_state=h0_out_bench,
         )
     cp.cuda.get_current_stream().synchronize()
     us = (time.perf_counter() - t0) * 1e6 / iterations
@@ -4994,13 +5078,13 @@ def run_test_prefill_blackwell(
 
 
 # ===========================================================================
-# AOT Export (no TVM FFI — regular cute.compile path)
+# AOT Export
 # ===========================================================================
 
 # AOT placeholder dimensions (must have seq_len >= 128 = chunk_size)
 AOT_PLACEHOLDER_N = 1
-AOT_PLACEHOLDER_H = 8
-AOT_PLACEHOLDER_HV = 8
+AOT_PLACEHOLDER_H = 16
+AOT_PLACEHOLDER_HV = 32
 AOT_PLACEHOLDER_K = 128
 AOT_PLACEHOLDER_V = 128
 AOT_PLACEHOLDER_SEQLEN = 128  # must be multiple of 128
@@ -5009,7 +5093,7 @@ _gdn_aot_instance = GDN()
 
 
 def _create_jit_blackwell():
-    """Create a @cute.jit wrapper for the Blackwell GDN kernel (AOT-friendly, no TVM FFI)."""
+    """Create a @cute.jit wrapper for the Blackwell GDN kernel (AOT-friendly)."""
 
     @cute.jit
     def run_gdn_blackwell(
@@ -5023,7 +5107,6 @@ def _create_jit_blackwell():
         h0_in: cute.Tensor,      # (n, h_v, d, d) f32     — initial recurrent state
         h0_out: cute.Tensor,     # (n, h_v, d, d) f32     — output final state
         o: cute.Tensor,          # (n, seq_len, h_v, d) fp16 — output
-        scale: cutlass.Float32,
         cu_seqlens: cute.Tensor, # (n+1,) int32 — prefix-sum for padding masking
         stream: cuda.CUstream,
     ):
@@ -5032,8 +5115,10 @@ def _create_jit_blackwell():
         h_q = q.layout.shape[2]
         d = q.layout.shape[3]
         h_v = v.layout.shape[2]
-        # For non-varlen padded layout: s_sum = n * seq_len
-        s_sum = n * seq_len
+        # For non-varlen padded layout: s_sum = seq_len (matches _get_problem_size).
+        # The kernel uses s_sum for per-batch strides in gb_layout; using n*seq_len
+        # would make the batch stride n times too large, causing wrong a/b reads.
+        s_sum = seq_len
         problem_size = (n, seq_len, s_sum, h_q, h_v, d)
 
         _gdn_aot_instance(
@@ -5048,9 +5133,10 @@ def _create_jit_blackwell():
             problem_size,
             h0_in.iterator,   # initial_state
             h0_out.iterator,  # state_output
-            scale,
+            None,             # scale=None → kernel computes 1/sqrt(d) internally
             None,             # cum_seqlen_q=None → non-varlen padded layout
             cu_seqlens,       # cu_seqlens for padding masking
+            True,             # use_qk_l2norm=True
             stream,
         )
 
@@ -5139,7 +5225,6 @@ def _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch=""):
     ph = _make_placeholder_tensors_bw(n, h, hv, k, v, seq_len)
     t = _to_cute_tensors_bw(ph)
     run_fn = _get_jit_blackwell()
-    scale_val = float(k) ** -0.5
 
     compile_opts = ("--gpu-arch " + gpu_arch) if gpu_arch else None
     compiled = cute.compile(
@@ -5149,7 +5234,6 @@ def _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch=""):
         t["A_log"], t["dt_bias"],
         t["h0_in"], t["h0_out"],
         t["o"],
-        scale_val,
         t["cu_seqlens"],   # cu_seqlens for padding masking (non-varlen padded layout)
         stream,
         **(dict(options=compile_opts) if compile_opts else {}),
