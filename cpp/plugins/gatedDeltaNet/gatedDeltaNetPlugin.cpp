@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 
 using namespace nvinfer1;
@@ -103,18 +104,28 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, int32_t kDim, 
 }
 #endif // CUTE_DSL_GDN_ENABLED
 
-GatedDeltaNetPlugin::~GatedDeltaNetPlugin() = default;
-
-IPluginCapability* GatedDeltaNetPlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
+GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, void const* data, size_t length)
+    : mLayerName(name)
 {
-    if (type == PluginCapabilityType::kBUILD)
-        return static_cast<IPluginV3OneBuild*>(this);
-    if (type == PluginCapabilityType::kRUNTIME)
-        return static_cast<IPluginV3OneRuntime*>(this);
-    return static_cast<IPluginV3OneCore*>(this);
+    auto const* d = static_cast<char const*>(data);
+    std::memcpy(&mKDim, d, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(&mVDim, d, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(&mSMVersion, d, sizeof(int32_t));
+
+#ifdef CUTE_DSL_GDN_ENABLED
+    CuteDslGDNRunner::loadKernelModules();
+#endif
 }
 
-IPluginV3* GatedDeltaNetPlugin::clone() noexcept
+GatedDeltaNetPlugin::~GatedDeltaNetPlugin() = default;
+
+// ---------------------------------------------------------------------------
+// IPluginV2DynamicExt
+// ---------------------------------------------------------------------------
+
+IPluginV2DynamicExt* GatedDeltaNetPlugin::clone() const noexcept
 {
     try
     {
@@ -128,112 +139,89 @@ IPluginV3* GatedDeltaNetPlugin::clone() noexcept
     }
 }
 
-char const* GatedDeltaNetPlugin::getPluginName() const noexcept
-{
-    return kGDN_PLUGIN_NAME;
-}
-
-char const* GatedDeltaNetPlugin::getPluginVersion() const noexcept
-{
-    return kGDN_PLUGIN_VERSION;
-}
-
-char const* GatedDeltaNetPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
 int32_t GatedDeltaNetPlugin::getNbOutputs() const noexcept
 {
     return kNUM_OUTPUTS;
 }
 
-int32_t GatedDeltaNetPlugin::getOutputDataTypes(
-    DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
+DataType GatedDeltaNetPlugin::getOutputDataType(
+    int32_t index, DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
-    if (nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
-        return -1;
-    outputTypes[kOUT_O] = inputTypes[kIN_Q];
-    outputTypes[kOUT_H0_SOURCE] = inputTypes[kIN_H0_SOURCE];
-    return 0;
+    if (index == kOUT_O)
+        return inputTypes[kIN_Q];
+    // kOUT_H0_SOURCE
+    return inputTypes[kIN_H0_SOURCE];
 }
 
-int32_t GatedDeltaNetPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
-    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs, int32_t nbOutputs,
-    IExprBuilder& /* exprBuilder */) noexcept
+DimsExprs GatedDeltaNetPlugin::getOutputDimensions(
+    int32_t outputIndex, DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs, IExprBuilder&) noexcept
 {
-    if (nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
-        return -1;
-    outputs[kOUT_O].nbDims = inputs[kIN_V].nbDims;
-    for (int32_t i = 0; i < outputs[kOUT_O].nbDims; ++i)
-        outputs[kOUT_O].d[i] = inputs[kIN_V].d[i];
-    outputs[kOUT_H0_SOURCE].nbDims = inputs[kIN_H0_SOURCE].nbDims;
-    for (int32_t i = 0; i < outputs[kOUT_H0_SOURCE].nbDims; ++i)
-        outputs[kOUT_H0_SOURCE].d[i] = inputs[kIN_H0_SOURCE].d[i];
-    return 0;
+    if (outputIndex == kOUT_O)
+        return inputs[kIN_V]; // o has same shape as v: [n, seq_len, hv, v]
+    // h0_out has same shape as h0_source: [n, hv, k, v]
+    return inputs[kIN_H0_SOURCE];
 }
 
 bool GatedDeltaNetPlugin::supportsFormatCombination(
-    int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+    int32_t pos, PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     if (nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
         return false;
-    if (inOut[pos].desc.format != TensorFormat::kLINEAR)
+    if (inOut[pos].format != TensorFormat::kLINEAR)
         return false;
     if (pos == kIN_A_LOG || pos == kIN_H0_SOURCE)
-        return inOut[pos].desc.type == DataType::kFLOAT;
+        return inOut[pos].type == DataType::kFLOAT;
     if (pos == kIN_CONTEXT_LENGTHS)
-        return inOut[pos].desc.type == DataType::kINT32;
+        return inOut[pos].type == DataType::kINT32;
     if (pos == kNUM_INPUTS + kOUT_H0_SOURCE)
-        return inOut[pos].desc.type == DataType::kFLOAT;
-    return inOut[pos].desc.type == DataType::kHALF;
+        return inOut[pos].type == DataType::kFLOAT;
+    return inOut[pos].type == DataType::kHALF;
 }
 
-int32_t GatedDeltaNetPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
-    DynamicPluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept
+void GatedDeltaNetPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
+    [[maybe_unused]] DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
     if (nbInputs != kNUM_INPUTS)
-        return -1;
+    {
+        LOG_ERROR("gated_delta_net: expected %d inputs, got %d", kNUM_INPUTS, nbInputs);
+    }
     if (in[kIN_Q].desc.type != DataType::kHALF || in[kIN_V].desc.type != DataType::kHALF)
-        return -1;
+    {
+        LOG_ERROR("gated_delta_net: Q and V must be FP16");
+    }
     if (in[kIN_Q].desc.dims.nbDims != 4 || in[kIN_V].desc.dims.nbDims != 4)
-        return -1;
+    {
+        LOG_ERROR("gated_delta_net: Q and V must be 4D");
+    }
     if (in[kIN_CONTEXT_LENGTHS].desc.type != DataType::kINT32 || in[kIN_CONTEXT_LENGTHS].desc.dims.nbDims != 1)
-        return -1;
-    int32_t const n_batch = static_cast<int32_t>(in[kIN_Q].desc.dims.d[0]);
-    int32_t const ctx_len_dim = static_cast<int32_t>(in[kIN_CONTEXT_LENGTHS].desc.dims.d[0]);
-    if (ctx_len_dim != n_batch && ctx_len_dim != -1)
-        return -1;
-    int32_t const k_dim = static_cast<int32_t>(in[kIN_Q].desc.dims.d[3]);
-    int32_t const v_dim = static_cast<int32_t>(in[kIN_V].desc.dims.d[3]);
-    if (k_dim != mKDim || v_dim != mVDim)
-        return -1;
-#ifdef CUTE_DSL_GDN_ENABLED
-    if (!CuteDslGDNRunner::canImplement(k_dim, v_dim, mSMVersion))
-        return -1; // Unsupported on this device or k/v config; kernel requires k=v=128 and SM>=80
-#endif
-    return 0;
+    {
+        LOG_ERROR("gated_delta_net: context_lengths must be 1D INT32");
+    }
 }
 
-size_t GatedDeltaNetPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t /* nbInputs */,
-    DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
+size_t GatedDeltaNetPlugin::getWorkspaceSize([[maybe_unused]] PluginTensorDesc const* inputs,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] PluginTensorDesc const* outputs,
+    [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
-#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    int32_t const maxN = static_cast<int32_t>(inputs[kIN_CONTEXT_LENGTHS].max.d[0]);
-    int32_t const maxHv = static_cast<int32_t>(inputs[kIN_H0_SOURCE].max.d[1]);
-    int32_t const kDim = static_cast<int32_t>(inputs[kIN_H0_SOURCE].max.d[2]);
-    int32_t const vDim = static_cast<int32_t>(inputs[kIN_H0_SOURCE].max.d[3]);
+    // V2 plugin receives contiguous buffers — no a/b compaction workspace needed.
+    size_t total = 0;
 
-    // cu_seqlens [maxN+1] int32, padded to 128-byte alignment before h0 scratch.
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+    int32_t const maxN = static_cast<int32_t>(inputs[kIN_CONTEXT_LENGTHS].dims.d[0]);
+    int32_t const maxHv = static_cast<int32_t>(inputs[kIN_H0_SOURCE].dims.d[1]);
+    int32_t const kDim = static_cast<int32_t>(inputs[kIN_H0_SOURCE].dims.d[2]);
+    int32_t const vDim = static_cast<int32_t>(inputs[kIN_H0_SOURCE].dims.d[3]);
+
+    // cu_seqlens [maxN+1] int32, padded to 128-byte alignment.
     size_t const cuSeqBytes = static_cast<size_t>(maxN + 1) * sizeof(int32_t);
     size_t const cuSeqPadded = (cuSeqBytes + 127u) & ~static_cast<size_t>(127u);
     // h0 scratch [maxN, maxHv, kDim, vDim] f32 — separate buffer for Blackwell h0_out.
     size_t const h0ScratchBytes = static_cast<size_t>(maxN) * maxHv * kDim * vDim * sizeof(float);
-    return cuSeqPadded + h0ScratchBytes;
-#else
-    (void) inputs;
-    return 0;
+
+    total = cuSeqPadded + h0ScratchBytes;
 #endif
+
+    return total;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +251,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
         cudaMemcpyAsync(h0Out, inputs[kIN_H0_SOURCE], h0Bytes, cudaMemcpyDeviceToDevice, stream);
     }
 
+    // V2 plugin: buffers are contiguous, no a/b compaction needed.
     GDNParams params{};
     params.q = const_cast<void*>(inputs[kIN_Q]);
     params.k = const_cast<void*>(inputs[kIN_K]);
@@ -283,15 +272,17 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     params.smVersion = mSMVersion;
 
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    // Blackwell prefill: carve cu_seqlens and h0 scratch out of the pre-allocated workspace.
-    //   workspace layout: [cu_seqlens: (n+1)*int32, pad to 128B] [h0_scratch: n*hv*k*v*f32]
+    // Blackwell prefill: workspace layout (no a/b compaction buffers):
+    //   [cu_seqlens: (n+1)*int32, pad to 128B] [h0_scratch: n*hv*k*v*f32]
     if (seq_len > 1 && mSMVersion >= 100)
     {
         size_t const cuSeqBytes = static_cast<size_t>(n + 1) * sizeof(int32_t);
         size_t const cuSeqPadded = (cuSeqBytes + 127u) & ~static_cast<size_t>(127u);
-        launchGdnCalCuSeqLens(inputs[kIN_CONTEXT_LENGTHS], workspace, n, stream);
-        params.cu_seqlens = workspace;
-        params.h0_scratch = static_cast<char*>(workspace) + cuSeqPadded;
+
+        char* bwBase = static_cast<char*>(workspace);
+        launchGdnCalCuSeqLens(inputs[kIN_CONTEXT_LENGTHS], bwBase, n, stream);
+        params.cu_seqlens = bwBase;
+        params.h0_scratch = bwBase + cuSeqPadded;
     }
 #endif
 
@@ -310,25 +301,42 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* /* inputDesc */, Pl
 }
 #endif // CUTE_DSL_GDN_ENABLED
 
-int32_t GatedDeltaNetPlugin::onShapeChange(PluginTensorDesc const* /* in */, int32_t /* nbInputs */,
-    PluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+size_t GatedDeltaNetPlugin::getSerializationSize() const noexcept
 {
-    return 0;
+    return 3 * sizeof(int32_t); // mKDim, mVDim, mSMVersion
 }
 
-IPluginV3* GatedDeltaNetPlugin::attachToContext(IPluginResourceContext* /* context */) noexcept
+void GatedDeltaNetPlugin::serialize(void* buffer) const noexcept
 {
-    return clone();
+    auto* d = static_cast<char*>(buffer);
+    std::memcpy(d, &mKDim, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(d, &mVDim, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(d, &mSMVersion, sizeof(int32_t));
 }
 
-PluginFieldCollection const* GatedDeltaNetPlugin::getFieldsToSerialize() noexcept
+// ---------------------------------------------------------------------------
+// Metadata
+// ---------------------------------------------------------------------------
+
+char const* GatedDeltaNetPlugin::getPluginType() const noexcept
 {
-    mDataToSerialize.clear();
-    mDataToSerialize.emplace_back("k_dim", &mKDim, nvinfer1::PluginFieldType::kINT32, 1);
-    mDataToSerialize.emplace_back("v_dim", &mVDim, nvinfer1::PluginFieldType::kINT32, 1);
-    mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
-    mFCToSerialize.fields = mDataToSerialize.data();
-    return &mFCToSerialize;
+    return kGDN_PLUGIN_NAME;
+}
+
+char const* GatedDeltaNetPlugin::getPluginVersion() const noexcept
+{
+    return kGDN_PLUGIN_VERSION;
+}
+
+char const* GatedDeltaNetPlugin::getPluginNamespace() const noexcept
+{
+    return mNamespace.c_str();
 }
 
 void GatedDeltaNetPlugin::setPluginNamespace(char const* pluginNamespace) noexcept
@@ -336,9 +344,26 @@ void GatedDeltaNetPlugin::setPluginNamespace(char const* pluginNamespace) noexce
     mNamespace = pluginNamespace ? pluginNamespace : "";
 }
 
+int32_t GatedDeltaNetPlugin::initialize() noexcept
+{
+    return 0;
+}
+
+void GatedDeltaNetPlugin::terminate() noexcept {}
+
+void GatedDeltaNetPlugin::destroy() noexcept
+{
+    delete this;
+}
+
+// ---------------------------------------------------------------------------
 // Creator
+// ---------------------------------------------------------------------------
+
 GatedDeltaNetPluginCreator::GatedDeltaNetPluginCreator()
 {
+    static std::mutex sMutex;
+    std::lock_guard<std::mutex> lock(sMutex);
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("k_dim", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("v_dim", nullptr, PluginFieldType::kINT32, 1));
@@ -371,18 +396,35 @@ void GatedDeltaNetPluginCreator::setPluginNamespace(char const* pluginNamespace)
     mNamespace = pluginNamespace ? pluginNamespace : "";
 }
 
-IPluginV3* GatedDeltaNetPluginCreator::createPlugin(
-    char const* name, PluginFieldCollection const* fc, TensorRTPhase /* phase */) noexcept
+IPluginV2* GatedDeltaNetPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     try
     {
         int32_t kDim = parsePluginScalarField<int32_t>("k_dim", fc).value_or(128);
         int32_t vDim = parsePluginScalarField<int32_t>("v_dim", fc).value_or(128);
-        return new GatedDeltaNetPlugin(name, kDim, vDim);
+        auto* plugin = new GatedDeltaNetPlugin(name, kDim, vDim);
+        plugin->setPluginNamespace(mNamespace.c_str());
+        return plugin;
     }
     catch (std::exception const& e)
     {
         LOG_ERROR("GatedDeltaNetPluginCreator::createPlugin failed: %s", e.what());
+        return nullptr;
+    }
+}
+
+IPluginV2* GatedDeltaNetPluginCreator::deserializePlugin(
+    char const* name, void const* serialData, size_t serialLength) noexcept
+{
+    try
+    {
+        auto* plugin = new GatedDeltaNetPlugin(name, serialData, serialLength);
+        plugin->setPluginNamespace(mNamespace.c_str());
+        return plugin;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to deserialize GatedDeltaNetPlugin: %s", e.what());
         return nullptr;
     }
 }
