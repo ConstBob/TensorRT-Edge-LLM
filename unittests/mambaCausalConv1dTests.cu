@@ -232,18 +232,25 @@ TEST(MambaCaptureConvStatePadding, ShortContext)
 // ---------------------------------------------------------------------------
 
 void runCausalConv1dDecodeReference(int32_t batch, int32_t dim, int32_t width, std::vector<half> const& convState,
-    std::vector<half> const& weight, std::vector<half> const& bias, std::vector<half>& outRef)
+    std::vector<half> const& newCol, std::vector<half> const& weight, std::vector<half> const& bias,
+    std::vector<half>& convStateOut, std::vector<half>& outRef)
 {
+    convStateOut = convState;
     for (int32_t b = 0; b < batch; ++b)
     {
         for (int32_t d = 0; d < dim; ++d)
         {
+            int64_t rowOff = (static_cast<int64_t>(b) * dim + d) * width;
+            for (int32_t k = 0; k < width - 1; ++k)
+            {
+                convStateOut[rowOff + k] = convStateOut[rowOff + k + 1];
+            }
+            convStateOut[rowOff + width - 1] = newCol[static_cast<int64_t>(b) * dim + d];
             float acc = __half2float(bias[d]);
             for (int32_t k = 0; k < width; ++k)
             {
-                int64_t const sIdx = (static_cast<int64_t>(b) * dim + d) * width + k;
                 int64_t const wIdx = static_cast<int64_t>(d) * width + k;
-                acc += __half2float(convState[sIdx]) * __half2float(weight[wIdx]);
+                acc += __half2float(convStateOut[rowOff + k]) * __half2float(weight[wIdx]);
             }
             int64_t const outIdx = static_cast<int64_t>(b) * dim + d;
             outRef[outIdx] = __float2half(acc);
@@ -256,25 +263,30 @@ void runCausalConv1dDecodeTest(int32_t batch, int32_t dim, int32_t width)
     std::vector<half> convStateHost(batch * dim * width);
     std::vector<half> weightHost(dim * width);
     std::vector<half> biasHost(dim);
-
+    std::vector<half> newColHost(batch * dim);
     uniformFloatInitialization<half>(convStateHost, -0.5F, 0.5F);
     uniformFloatInitialization<half>(weightHost, -0.5F, 0.5F);
     uniformFloatInitialization<half>(biasHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(newColHost, -0.5F, 0.5F);
 
+    std::vector<half> convStateRef(convStateHost.size());
     std::vector<half> outRef(batch * dim);
-    runCausalConv1dDecodeReference(batch, dim, width, convStateHost, weightHost, biasHost, outRef);
+    runCausalConv1dDecodeReference(
+        batch, dim, width, convStateHost, newColHost, weightHost, biasHost, convStateRef, outRef);
 
     auto convStateDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
     auto weightDevice = rt::Tensor({dim, 1, width}, rt::DeviceType::kGPU, DataType::kHALF);
     auto biasDevice = rt::Tensor({dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto newColDevice = rt::Tensor({batch, 1, dim}, rt::DeviceType::kGPU, DataType::kHALF);
     auto outDevice = rt::Tensor({batch, 1, dim}, rt::DeviceType::kGPU, DataType::kHALF);
 
     copyHostToDevice(convStateDevice, convStateHost);
     copyHostToDevice(weightDevice, weightHost);
     copyHostToDevice(biasDevice, biasHost);
+    copyHostToDevice(newColDevice, newColHost);
 
     trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasDevice));
-    mamba_ssm::invokeCausalConv1dDecode(convStateDevice, weightDevice, biasOpt, outDevice, nullptr);
+    mamba_ssm::invokeCausalConv1dDecode(convStateDevice, newColDevice, weightDevice, biasOpt, outDevice, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto const outHost = copyDeviceToHost<half>(outDevice);
@@ -282,8 +294,17 @@ void runCausalConv1dDecodeTest(int32_t batch, int32_t dim, int32_t width)
     for (size_t i = 0; i < outRef.size(); ++i)
     {
         EXPECT_TRUE(isclose(outHost[i], outRef[i], 1e-3F, 1e-3F))
-            << "Decode mismatch at index " << i << ": got " << __half2float(outHost[i]) << ", expected "
-            << __half2float(outRef[i]);
+            << "CausalConv1dDecode output mismatch at index " << i << ": got " << __half2float(outHost[i])
+            << ", expected " << __half2float(outRef[i]);
+    }
+
+    auto const stateHost = copyDeviceToHost<half>(convStateDevice);
+
+    for (size_t i = 0; i < convStateRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(stateHost[i], convStateRef[i], 1e-3F, 1e-3F))
+            << "CausalConv1dDecode state mismatch at index " << i << ": got " << __half2float(stateHost[i])
+            << ", expected " << __half2float(convStateRef[i]);
     }
 }
 
