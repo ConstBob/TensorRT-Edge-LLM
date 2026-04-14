@@ -660,34 +660,80 @@ class TestConfig:
             ValueError: If llm_models_dir is not set or model directory is not found
         """
 
-        # Models in llm_models_dir
+        # Models in llm_models_dir (/scratch.trt_llm_data/llm-models)
         LLM_MODELS_DIR_MAP = {
-            "Qwen2.5-0.5B-Instruct": "Qwen2.5-0.5B-Instruct",
-            "Qwen2.5-1.5B-Instruct": "Qwen2.5-1.5B-Instruct",
-            "Qwen2.5-3B-Instruct": "Qwen2.5-3B-Instruct",
-            "Qwen2.5-7B-Instruct": "Qwen2.5-7B-Instruct",
-            "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-3B-Instruct",
-            "Qwen2.5-VL-7B-Instruct": "Qwen2.5-VL-7B-Instruct",
-            "Qwen2-VL-2B-Instruct": "Qwen2-VL-2B-Instruct",
-            "InternVL3-1B": "InternVL3-1B-hf",
-            "InternVL3-2B": "InternVL3-2B-hf",
-            "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
-            "Llama-3.2-1B": "llama-3.2-models/Llama-3.2-1B",
-            "Llama-3.2-3B": "llama-3.2-models/Llama-3.2-3B",
-            "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
-            "Qwen3-1.7B": "Qwen3/Qwen3-1.7B",
-            "Qwen3-8B": "Qwen3/Qwen3-8B",
-            "Qwen3-4B-Instruct-2507": "Qwen3/Qwen3-4B-Instruct-2507",
-            "Qwen3-VL-2B-Instruct": "Qwen3/Qwen3-VL-2B-Instruct",
-            "Qwen3-VL-4B-Instruct": "Qwen3/Qwen3-VL-4B-Instruct",
-            "Qwen3-VL-8B-Instruct": "Qwen3/Qwen3-VL-8B-Instruct",
-            "Phi-4-multimodal-instruct": "Phi-4-multimodal-instruct",
+            "Qwen2.5-0.5B-Instruct":
+            "Qwen2.5-0.5B-Instruct",
+            "Qwen2.5-1.5B-Instruct":
+            "Qwen2.5-1.5B-Instruct",
+            "Qwen2.5-3B-Instruct":
+            "Qwen2.5-3B-Instruct",
+            "Qwen2.5-7B-Instruct":
+            "Qwen2.5-7B-Instruct",
+            "Qwen2.5-VL-3B-Instruct":
+            "Qwen2.5-VL-3B-Instruct",
+            "Qwen2.5-VL-7B-Instruct":
+            "Qwen2.5-VL-7B-Instruct",
+            "Qwen2-VL-2B-Instruct":
+            "Qwen2-VL-2B-Instruct",
+            "InternVL3-1B":
+            "InternVL3-1B-hf",
+            "InternVL3-2B":
+            "InternVL3-2B-hf",
+            "Llama-3.1-8B-Instruct":
+            "llama-3.1-model/Llama-3.1-8B-Instruct",
+            "Llama-3.2-1B":
+            "llama-3.2-models/Llama-3.2-1B",
+            "Llama-3.2-3B":
+            "llama-3.2-models/Llama-3.2-3B",
+            "Qwen3-0.6B":
+            "Qwen3/Qwen3-0.6B",
+            "Qwen3-1.7B":
+            "Qwen3/Qwen3-1.7B",
+            "Qwen3-8B":
+            "Qwen3/Qwen3-8B",
+            "Qwen3-4B-Instruct-2507":
+            "Qwen3/Qwen3-4B-Instruct-2507",
+            "Qwen3-VL-2B-Instruct":
+            "Qwen3/Qwen3-VL-2B-Instruct",
+            "Qwen3-VL-4B-Instruct":
+            "Qwen3/Qwen3-VL-4B-Instruct",
+            "Qwen3-VL-8B-Instruct":
+            "Qwen3/Qwen3-VL-8B-Instruct",
+            "Phi-4-multimodal-instruct":
+            "Phi-4-multimodal-instruct",
+            # Pre-quantized models in llm_models_dir
+            "Llama-3.2-1B-FP8":
+            "llama-3.2-models/Llama-3.2-1B-FP8",
+            "Phi-4-FP8":
+            "Phi-4-FP8",
+            "Phi-4-multimodal-instruct-FP8":
+            "Phi-4-multimodal-instruct-FP8",
+            # ASR and TTS models
+            "Qwen3-ASR-0.6B":
+            "Qwen3/Qwen3-ASR-0.6B",
+            "Qwen3-TTS-12Hz-0.6B-CustomVoice":
+            "Qwen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         }
 
-        # GPTQ models in edgellm_data_dir
+        # GPTQ and pre-quantized models in edgellm_data_dir (/scratch.edge_llm_cache)
         GPTQ_MODELS_DIR_MAP = {
             "Qwen2.5-7B-Instruct-GPTQ-Int4": "Qwen2.5-7B-Instruct-GPTQ-Int4",
             "InternVL3-1B-GPTQ-Int4": "InternVL3-1B-hf-GPTQ-Int4",
+            # Pre-quantized models (edge_llm_cache/models/)
+            "NVIDIA-Nemotron-3-Nano-4B-NVFP4":
+            "NVIDIA-Nemotron-3-Nano-4B-NVFP4",
+            "NVIDIA-Nemotron-3-Nano-4B-FP8": "NVIDIA-Nemotron-3-Nano-4B-FP8",
+            # Pre-quantized unified checkpoints (edge_llm_cache/quantized_models/)
+            "Qwen2.5-0.5B-Instruct-FP8": "Qwen2.5-0.5B-Instruct-FP8",
+            "Qwen2.5-0.5B-Instruct-FP8-KV": "Qwen2.5-0.5B-Instruct-FP8-KV",
+            "Qwen2.5-0.5B-Instruct-NVFP4": "Qwen2.5-0.5B-Instruct-NVFP4",
+            "Qwen3-0.6B-FP8": "Qwen3-0.6B-FP8",
+            "Qwen3-0.6B-INT8-SQ": "Qwen3-0.6B-INT8-SQ",
+            "Qwen3-1.7B-FP8": "Qwen3-1.7B-FP8",
+            "Qwen3-1.7B-NVFP4": "Qwen3-1.7B-NVFP4",
+            "Qwen3-VL-4B-Instruct-NVFP4": "Qwen3-VL-4B-Instruct-NVFP4",
+            "Qwen3-VL-2B-Instruct-INT4-AWQ": "Qwen3-VL-2B-Instruct-INT4-AWQ",
         }
 
         # Determine search directory and model path
@@ -727,7 +773,7 @@ class TestConfig:
                 "eagle3": "EAGLE3-LLaMA3.1-Instruct-8B",
             },
             "Qwen3-8B": {
-                "eagle3": "Qwen3/qwen3_8b_eagle3",
+                "eagle3": "qwen3_8b_eagle3",
             },
             "Qwen3-4B-Instruct-2507": {
                 "v2": "EAGLE3-Qwen3-4B-v2",
@@ -737,10 +783,10 @@ class TestConfig:
                 "eagle3": "EAGLE3-Qwen3-VL-4B-v1.1",
             },
             "Qwen3-1.7B": {
-                "eagle3": "Qwen3/Qwen3-1.7B_eagle3",
+                "eagle3": "Qwen3-1.7B_eagle3",
             },
             "Qwen3-VL-8B-Instruct": {
-                "v0": "Qwen3/qwen3-vl-8b-eagle3-v0",
+                "v0": "qwen3-vl-8b-eagle3-v0",
             },
             # Add more mappings as needed
         }

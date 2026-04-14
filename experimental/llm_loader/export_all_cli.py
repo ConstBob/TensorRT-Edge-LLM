@@ -297,6 +297,9 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # rope_theta live inside text_config.  Fall back to text_config for any
         # key that is absent from the root.
         _text_cfg = config.get("text_config", {}) or {}
+        # rope_theta may live in text_config.rope_parameters (newer transformers)
+        _rope_params = _text_cfg.get("rope_parameters") or _text_cfg.get(
+            "rope_scaling") or {}
         for key in ("vision_start_token_id", "vision_end_token_id",
                     "image_token_id", "video_token_id", "vocab_size",
                     "rope_theta"):
@@ -304,6 +307,18 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                 vis_cfg_out[key] = config[key]
             elif key in _text_cfg:
                 vis_cfg_out[key] = _text_cfg[key]
+            elif key in _rope_params:
+                vis_cfg_out[key] = _rope_params[key]
+        # Include rope_scaling (contains mrope_section) for Qwen VL models.
+        # The C++ QwenViTRunner reads mrope_section from rope_scaling.
+        # Quantized checkpoints may use rope_parameters instead of
+        # rope_scaling — normalize to rope_scaling for the C++ runtime.
+        _rope_scaling = (_text_cfg.get("rope_scaling")
+                         or _text_cfg.get("rope_parameters")
+                         or config.get("rope_scaling")
+                         or config.get("rope_parameters"))
+        if _rope_scaling:
+            vis_cfg_out["rope_scaling"] = _rope_scaling
         # Also copy preprocessor_config.json to the output dir so the runner
         # can find patch_size, temporal_patch_size, merge_size, image_mean, image_std.
         import shutil
@@ -313,8 +328,30 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
             logger.info("[Visual] Copied preprocessor_config.json to %s",
                         visual_out_dir)
         else:
-            logger.warning("[Visual] preprocessor_config.json not found at %s",
-                           pp_src)
+            # Newer quantized checkpoints store image processor config inside
+            # processor_config.json under the "image_processor" key.  Extract
+            # it and write a standalone preprocessor_config.json.
+            proc_src = os.path.join(model_dir, "processor_config.json")
+            if os.path.exists(proc_src):
+                with open(proc_src) as _pf:
+                    proc_cfg = json.load(_pf)
+                img_proc = proc_cfg.get("image_processor", {})
+                if img_proc:
+                    pp_dst = os.path.join(visual_out_dir,
+                                          "preprocessor_config.json")
+                    with open(pp_dst, "w") as _pf:
+                        json.dump(img_proc, _pf, indent=2)
+                    logger.info(
+                        "[Visual] Extracted preprocessor_config.json from "
+                        "processor_config.json to %s", visual_out_dir)
+                else:
+                    logger.warning(
+                        "[Visual] processor_config.json has no "
+                        "image_processor key at %s", proc_src)
+            else:
+                logger.warning(
+                    "[Visual] Neither preprocessor_config.json nor "
+                    "processor_config.json found at %s", model_dir)
     if model_type in ("phi4mm", "phi4_multimodal"):
         # C++ Phi4MMViTRunner reads vocab_size and embd_layer from the top level
         # of config.json.  For phi4mm the raw config.json is flat (no vision_config
