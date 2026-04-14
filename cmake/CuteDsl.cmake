@@ -171,15 +171,16 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Shim: cudaLibrary* → cu* when libcudart omits exports (e.g. some 12.x
-  # embedded). CUDA 13+: libcudart declares cudaLibrary*; compiling the shim
-  # conflicts; INTERFACE only.
+  # Shim: cudaLibrary* → cu* when libcudart omits exports (e.g. some 12.0–12.6
+  # embedded). From CUDA 12.8 onward, cuda_runtime_api.h declares these APIs
+  # with runtime types; compiling the weak shim conflicts with those
+  # declarations. Use INTERFACE only (no .c) for 12.8+.
   set(_cutedsl_cudart_shim_src
       "${CMAKE_SOURCE_DIR}/cpp/kernels/gdnKernels/cutedsl_cuda_runtime_library_shim.c"
   )
   if(NOT TARGET trt_edgellm_cutedsl_cudart_shim)
     if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver
-                                              VERSION_GREATER_EQUAL 13.0)
+                                              VERSION_GREATER_EQUAL 12.8)
       add_library(trt_edgellm_cutedsl_cudart_shim INTERFACE)
     else()
       if(NOT EXISTS "${_cutedsl_cudart_shim_src}")
@@ -196,7 +197,7 @@ function(cute_dsl_setup)
       # CUTEDSL_WRAP_LAUNCH_KERNEL_EX.
       if(NOT _cute_dsl_cuda_ver STREQUAL ""
          AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
-         AND _cute_dsl_cuda_ver VERSION_LESS 12.7)
+         AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
         target_compile_definitions(trt_edgellm_cutedsl_cudart_shim
                                    PRIVATE CUTEDSL_WRAP_LAUNCH_KERNEL_EX)
       endif()
@@ -255,10 +256,10 @@ function(cute_dsl_setup)
     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
       target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
     endif()
-    # CUDA < 12.7: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
+    # CUDA < 12.8: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
     # JetPack 6).
     if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
-                                              12.7)
+                                              12.8)
       target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
     endif()
   endforeach()

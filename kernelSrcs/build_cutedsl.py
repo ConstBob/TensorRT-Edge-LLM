@@ -107,7 +107,7 @@ KERNEL_VARIANTS = [
     KernelVariant(
         name="gdn_prefill_blackwell",
         group="gdn",
-        supported_sms=[100, 101, 110, 120, 121],
+        supported_sms=[100, 101, 110],
         script="gdn_cutedsl/gdn_prefill_blackwell.py",
         script_args=["--export_only"],
     ),
