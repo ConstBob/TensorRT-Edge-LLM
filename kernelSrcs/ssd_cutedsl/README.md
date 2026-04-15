@@ -1,11 +1,20 @@
 # SSD (Structured State Space Duality) CuTe DSL Kernels
 
 CuTe DSL implementation of the Mamba2 SSD chunk-scan prefill kernel for
-TensorRT Edge-LLM.
+TensorRT Edge-LLM. Prebuilt artifacts (static library + headers) are checked
+into the repo; CMake links them directly — no Python or GPU needed at build time.
 
-Translated line-by-line from:
-- [Mamba SSD Triton kernels](https://github.com/state-spaces/mamba/tree/main/mamba_ssm/ops/triton/) (Apache-2.0) — 5-step chunk scan pipeline
-- [FlashInfer PR #2709](https://github.com/flashinfer-ai/flashinfer/pull/2709) (Apache-2.0) — Blackwell kernel reference
+Adapted from:
+- [Mamba SSM Triton kernels](https://github.com/state-spaces/mamba/tree/main/mamba_ssm/ops/triton/) (Apache-2.0) — SM80+ chunk scan pipeline
+- [FlashInfer Mamba2 Blackwell kernel](https://github.com/flashinfer-ai/flashinfer/pull/2709) (Apache-2.0) — SM100+ persistent kernel
+
+Local modifications:
+- **CuTe DSL port** — rewrote Triton kernels as CuTe DSL with SM80 warp MMA + cp.async, removing PyTorch/Triton dependency
+- **Multi-variant AOT compilation** — 4 SM80 variants (D×N ∈ {64,128}²) + 2 Blackwell variants, each a compile-time specialization
+- **Runtime parameter flexibility** — batch, nheads, ngroups, seq_len are runtime arguments
+- **Blackwell N=64 support** — fixed TMA partition shape mismatch in FlashInfer kernel to support dstate=64
+- **C++ plugin integration** — CuteDslSSDRunner with multi-module dispatch, AOT static library pattern matching FMHA/GDN
+- **Dependency removal** — removed PyTorch; uses CuPy/NumPy for standalone testing
 
 ## Kernel Variants
 
