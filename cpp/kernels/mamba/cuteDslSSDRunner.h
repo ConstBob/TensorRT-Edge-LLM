@@ -106,6 +106,7 @@ private:
     static ssd_prefill_d64_n64_Kernel_Module_t sD64N64Module;
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
     static ssd_prefill_blackwell_d64_n128_Kernel_Module_t sBlackwellD64N128Module;
+    static ssd_prefill_blackwell_d64_n64_Kernel_Module_t sBlackwellD64N64Module;
 #endif
     static bool sLoaded;
 };

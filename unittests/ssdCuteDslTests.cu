@@ -467,18 +467,23 @@ TEST_P(SsdCuteDslBlackwellTest, CorrectnessVsSerialReference)
     }
 }
 
-// Blackwell test configurations: D=64 (Blackwell TMA kernel) + D=128 (SM80 fallback on Blackwell GPU)
+// Blackwell test configurations: D=64 (Blackwell TMA kernel) + D=128/N=64 (SM80 fallback)
 INSTANTIATE_TEST_SUITE_P(SsdCuteDslBlackwell, SsdCuteDslBlackwellTest,
     ::testing::Values(
         // batch, seqLen, nheads, dim, dstate, ngroups
-        // D=64: Blackwell persistent kernel
+        // D=64, N=128: Blackwell persistent kernel (native)
         SsdCuteDslTestConfig{1, 128, 8, 64, 128, 1}, SsdCuteDslTestConfig{1, 256, 8, 64, 128, 1},
         SsdCuteDslTestConfig{1, 512, 8, 64, 128, 1}, SsdCuteDslTestConfig{1, 1024, 8, 64, 128, 1},
         SsdCuteDslTestConfig{4, 128, 8, 64, 128, 1}, SsdCuteDslTestConfig{1, 256, 64, 64, 128, 1},
         SsdCuteDslTestConfig{1, 256, 64, 64, 128, 8},
-        // D=128: SM80 cp.async kernel running on Blackwell GPU (fallback)
+        // D=64, N=64: Blackwell persistent kernel (native)
+        SsdCuteDslTestConfig{1, 128, 8, 64, 64, 1}, SsdCuteDslTestConfig{1, 256, 8, 64, 64, 1},
+        SsdCuteDslTestConfig{1, 512, 8, 64, 64, 1}, SsdCuteDslTestConfig{4, 128, 8, 64, 64, 1},
+        // D=128, N=128: SM80 cp.async kernel running on Blackwell GPU (fallback)
         SsdCuteDslTestConfig{1, 128, 8, 128, 128, 1}, SsdCuteDslTestConfig{1, 256, 8, 128, 128, 1},
-        SsdCuteDslTestConfig{1, 1024, 8, 128, 128, 1}),
+        SsdCuteDslTestConfig{1, 1024, 8, 128, 128, 1},
+        // D=128, N=64: SM80 fallback
+        SsdCuteDslTestConfig{1, 128, 8, 128, 64, 1}, SsdCuteDslTestConfig{1, 256, 8, 128, 64, 1}),
     [](testing::TestParamInfo<SsdCuteDslTestConfig> const& info) {
         auto const& c = info.param;
         return "b" + std::to_string(c.batch) + "_s" + std::to_string(c.seqLen) + "_h" + std::to_string(c.nheads) + "_d"

@@ -249,16 +249,23 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Check for Blackwell SSD variant and set a clean define.
-  list(FIND _variants "ssd_prefill_blackwell_d64_n128" _ssd_bw_idx)
-  if(NOT ${_ssd_bw_idx} EQUAL -1)
+  # Check for Blackwell SSD variants and set a clean define.
+  set(_ssd_bw_found FALSE)
+  foreach(_ssd_bw_name "ssd_prefill_blackwell_d64_n128"
+                       "ssd_prefill_blackwell_d64_n64")
+    list(FIND _variants "${_ssd_bw_name}" _ssd_bw_idx)
+    if(NOT ${_ssd_bw_idx} EQUAL -1)
+      set(_ssd_bw_found TRUE)
+    endif()
+  endforeach()
+  if(_ssd_bw_found)
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
       target_compile_definitions(${_tgt}
                                  PRIVATE "CUTE_DSL_SSD_BLACKWELL_ENABLED")
     endforeach()
     message(
       STATUS
-        "CuTe DSL: Blackwell SSD prefill variant found — CUTE_DSL_SSD_BLACKWELL_ENABLED set"
+        "CuTe DSL: Blackwell SSD prefill variant(s) found — CUTE_DSL_SSD_BLACKWELL_ENABLED set"
     )
   endif()
 
