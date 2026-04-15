@@ -145,14 +145,14 @@ KERNEL_VARIANTS = [
     KernelVariant(
         name="ssd_prefill_blackwell_d64_n128",
         group="ssd",
-        supported_sms=[100, 101, 110, 120, 121],
+        supported_sms=[100, 101, 110],
         script="ssd_cutedsl/ssd_prefill_blackwell.py",
         script_args=["--export_only", "--dim", "64", "--dstate", "128"],
     ),
     KernelVariant(
         name="ssd_prefill_blackwell_d64_n64",
         group="ssd",
-        supported_sms=[100, 101, 110, 120, 121],
+        supported_sms=[100, 101, 110],
         script="ssd_cutedsl/ssd_prefill_blackwell.py",
         script_args=["--export_only", "--dim", "64", "--dstate", "64"],
     ),

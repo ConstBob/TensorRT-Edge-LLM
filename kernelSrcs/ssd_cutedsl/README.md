@@ -31,7 +31,9 @@ are **runtime** arguments.
 | `ssd_prefill_d128_n64` | 128 | 64 | — |
 | `ssd_prefill_d64_n64` | 64 | 64 | — |
 
-### Blackwell (SM100+ — TMA + TMEM + WGMMA)
+### Blackwell (SM100-110 — TMA + TMEM + WGMMA)
+
+SM120+ (GB10/GB20) lacks TMEM/wgmma and uses the non-Blackwell fallback.
 
 | Variant | DIM | DSTATE | Notes |
 |---|---|---|---|
