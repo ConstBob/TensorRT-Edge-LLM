@@ -229,7 +229,7 @@ function(cute_dsl_setup)
 
   # Apply compile definitions and include path to all targets.
   foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-    target_include_directories(${_tgt} PRIVATE "${_inc_dir}")
+    target_include_directories(${_tgt} SYSTEM PRIVATE "${_inc_dir}")
     foreach(_g ${_active_groups})
       string(TOUPPER "${_g}" _gu)
       target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_${_gu}_ENABLED")
@@ -246,6 +246,19 @@ function(cute_dsl_setup)
     message(
       STATUS
         "CuTe DSL: Blackwell GDN prefill variant found — CUTE_DSL_GDN_BLACKWELL_ENABLED set"
+    )
+  endif()
+
+  # Check for Blackwell SSD variant and set a clean define.
+  list(FIND _variants "ssd_prefill_blackwell_d64_n128" _ssd_bw_idx)
+  if(NOT ${_ssd_bw_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_SSD_BLACKWELL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: Blackwell SSD prefill variant found — CUTE_DSL_SSD_BLACKWELL_ENABLED set"
     )
   endif()
 
