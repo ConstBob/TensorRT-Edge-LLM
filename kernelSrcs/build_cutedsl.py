@@ -111,6 +111,51 @@ KERNEL_VARIANTS = [
         script="gdn_cutedsl/gdn_prefill_blackwell.py",
         script_args=["--export_only"],
     ),
+    # --- SSD group (Mamba2 SSM chunk scan) ---
+    # --- SSD SM80 variants (D×N combinations) ---
+    KernelVariant(
+        name="ssd_prefill_d128_n128",
+        group="ssd",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="ssd_cutedsl/ssd_prefill.py",
+        script_args=["--export_only", "--dim", "128", "--dstate", "128"],
+    ),
+    KernelVariant(
+        name="ssd_prefill_d64_n128",
+        group="ssd",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="ssd_cutedsl/ssd_prefill.py",
+        script_args=["--export_only", "--dim", "64", "--dstate", "128"],
+    ),
+    KernelVariant(
+        name="ssd_prefill_d128_n64",
+        group="ssd",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="ssd_cutedsl/ssd_prefill.py",
+        script_args=["--export_only", "--dim", "128", "--dstate", "64"],
+    ),
+    KernelVariant(
+        name="ssd_prefill_d64_n64",
+        group="ssd",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="ssd_cutedsl/ssd_prefill.py",
+        script_args=["--export_only", "--dim", "64", "--dstate", "64"],
+    ),
+    # --- SSD Blackwell variants ---
+    KernelVariant(
+        name="ssd_prefill_blackwell_d64_n128",
+        group="ssd",
+        supported_sms=[100, 101, 110],
+        script="ssd_cutedsl/ssd_prefill_blackwell.py",
+        script_args=["--export_only", "--dim", "64", "--dstate", "128"],
+    ),
+    KernelVariant(
+        name="ssd_prefill_blackwell_d64_n64",
+        group="ssd",
+        supported_sms=[100, 101, 110],
+        script="ssd_cutedsl/ssd_prefill_blackwell.py",
+        script_args=["--export_only", "--dim", "64", "--dstate", "64"],
+    ),
     # --- FMHA group ---
     KernelVariant(
         name="fmha_d64",

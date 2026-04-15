@@ -17,8 +17,12 @@
 
 #include "mambaPlugin.h"
 
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "kernels/mamba/selectiveStateUpdate.h"
+#ifdef CUTE_DSL_SSD_ENABLED
+#include "kernels/mamba/cuteDslSSDRunner.h"
+#endif
 #include "plugins/utils/pluginUtils.h"
 
 #include <cassert>
@@ -214,9 +218,21 @@ int32_t MambaPlugin::configurePlugin(DynamicPluginTensorDesc const* in, [[maybe_
     return 0;
 }
 
-size_t MambaPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */, int32_t /* nbInputs */,
+size_t MambaPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t /* nbInputs */,
     DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
+#ifdef CUTE_DSL_SSD_ENABLED
+    auto const& xDesc = inputs[kIN_X_IDX];
+    if (xDesc.desc.dims.nbDims == 4)
+    {
+        int32_t const batch = static_cast<int32_t>(xDesc.max.d[0]);
+        int32_t const seqLen = static_cast<int32_t>(xDesc.max.d[1]);
+        if (trt_edgellm::CuteDslSSDRunner::canImplement(mDim, mDstate, 80) && seqLen >= 128)
+        {
+            return trt_edgellm::CuteDslSSDRunner::getWorkspaceSize(batch, seqLen, mNheads, mDim, mDstate, mNgroups);
+        }
+    }
+#endif
     return 0;
 }
 
@@ -274,21 +290,67 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 
     if (hasSeqLen)
     {
-        // Only use context_lengths for actual prefill (seqLen > 1).
-        // During decode, x is 4D with seqLen=1 but context_lengths holds the
-        // cumulative length which would cause an out-of-bounds scan.
         int32_t const seqLen = static_cast<int32_t>(xDesc.dims.d[1]);
-        rt::OptionalInputTensor contextLengthsOpt = std::nullopt;
-        std::optional<rt::Tensor> clTensorOpt;
-        if (seqLen > 1 && inputs[kIN_CONTEXT_LENGTHS_IDX])
-        {
-            clTensorOpt.emplace(const_cast<void*>(inputs[kIN_CONTEXT_LENGTHS_IDX]), rt::Coords{batch},
-                rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-            contextLengthsOpt = std::optional(std::cref(clTensorOpt.value()));
-        }
 
-        mamba_ssm::invokeSelectiveStateUpdatePrefill(xTensor, aTensor, bTensor, cTensor, dtTensor, dtBiasOpt, dOpt,
-            std::nullopt, stateTensor, outTensor, dt_softplus, contextLengthsOpt, stream);
+#ifdef CUTE_DSL_SSD_ENABLED
+        // CuTe DSL path: chunked SSD prefill (requires seq_len >= 128, multiple of chunk_size).
+        // Falls back to serial scan when context_lengths indicates variable-length sequences,
+        // since the CuTe DSL kernel always processes the full seq_len without per-batch masking.
+        bool usedCuteDsl = false;
+        {
+            int32_t const smVersion = getSMVersion();
+            bool const hasContextLengths = (seqLen > 1 && inputs[kIN_CONTEXT_LENGTHS_IDX] != nullptr);
+            if (trt_edgellm::CuteDslSSDRunner::canImplement(mDim, mDstate, smVersion) && seqLen >= 128
+                && !hasContextLengths)
+            {
+                trt_edgellm::CuteDslSSDRunner runner;
+                trt_edgellm::SSDParams ssdParams{};
+                ssdParams.x = const_cast<void*>(inputs[kIN_X_IDX]);
+                ssdParams.dt = const_cast<void*>(inputs[kIN_DT_IDX]);
+                ssdParams.A = const_cast<void*>(inputs[kIN_A_IDX]);
+                ssdParams.B = const_cast<void*>(inputs[kIN_B_IDX]);
+                ssdParams.C = const_cast<void*>(inputs[kIN_C_IDX]);
+                ssdParams.D = const_cast<void*>(inputs[kIN_D_IDX]);
+                ssdParams.dt_bias = const_cast<void*>(inputs[kIN_DT_BIAS_IDX]);
+                ssdParams.z = nullptr;
+                ssdParams.state = outputState;
+                ssdParams.output = outputs[kOUT_OUTPUT_IDX];
+                ssdParams.workspace = workspace;
+                ssdParams.batch = batch;
+                ssdParams.seq_len = seqLen;
+                ssdParams.nheads = mNheads;
+                ssdParams.dim = mDim;
+                ssdParams.dstate = mDstate;
+                ssdParams.ngroups = mNgroups;
+                ssdParams.smVersion = smVersion;
+                ssdParams.dt_softplus = dt_softplus;
+                ssdParams.has_D = (inputs[kIN_D_IDX] != nullptr);
+                ssdParams.has_z = false;
+                int const rc = runner.run(ssdParams, stream);
+                if (rc != 0)
+                {
+                    LOG_ERROR("CuTe DSL SSD prefill failed with error %d", rc);
+                    return rc;
+                }
+                usedCuteDsl = true;
+            }
+        }
+        if (!usedCuteDsl)
+#endif
+        {
+            // Only use context_lengths for actual prefill (seqLen > 1).
+            rt::OptionalInputTensor contextLengthsOpt = std::nullopt;
+            std::optional<rt::Tensor> clTensorOpt;
+            if (seqLen > 1 && inputs[kIN_CONTEXT_LENGTHS_IDX])
+            {
+                clTensorOpt.emplace(const_cast<void*>(inputs[kIN_CONTEXT_LENGTHS_IDX]), rt::Coords{batch},
+                    rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+                contextLengthsOpt = std::optional(std::cref(clTensorOpt.value()));
+            }
+
+            mamba_ssm::invokeSelectiveStateUpdatePrefill(xTensor, aTensor, bTensor, cTensor, dtTensor, dtBiasOpt, dOpt,
+                std::nullopt, stateTensor, outTensor, dt_softplus, contextLengthsOpt, stream);
+        }
     }
     else
     {
