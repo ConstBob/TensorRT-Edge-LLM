@@ -11,7 +11,7 @@ tests:
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mmlu_0-bs4]
   - tests/defs/test_llm_pipeline.py::test_kernel_bench[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mode_prefill-il128]
-  - tests/defs/test_llm_pipeline.py::test_kernel_bench[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mode_decode]
+  - tests/defs/test_llm_pipeline.py::test_kernel_bench[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mode_decode-pkv128]
 
   # === Qwen2.5-0.5B FP16 + LoRA ===
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mxlr64]

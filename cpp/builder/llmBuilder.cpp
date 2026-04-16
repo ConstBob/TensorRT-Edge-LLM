@@ -93,6 +93,12 @@ bool LLMBuilder::build()
         return false;
     }
 
+    if (mBuilderConfig.profilingDetailed)
+    {
+        config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
+        LOG_INFO("Profiling verbosity set to DETAILED");
+    }
+
     LOG_DEBUG("Builder config created. Setting up optimization profiles...");
 
     // Setup optimization profiles

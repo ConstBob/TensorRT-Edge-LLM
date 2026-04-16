@@ -337,15 +337,18 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) noexcept
+    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, bool imageOnly) noexcept
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
 
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, true, stream);
-        textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        imagePreprocess(request, imageTokenLengths, numImages, !imageOnly, stream);
+        if (!imageOnly)
+        {
+            textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        }
     }
     catch (std::exception const& e)
     {

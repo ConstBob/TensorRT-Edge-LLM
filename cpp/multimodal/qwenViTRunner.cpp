@@ -770,7 +770,7 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, bool imageOnly)
 {
     std::vector<std::vector<int64_t>> imageGridTHWs;
     std::vector<int64_t> imageTokenLengths;
@@ -778,9 +778,12 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
 
     try
     {
-        imagePreprocess(request, imageGridTHWs, imageTokenLengths, numImages, true, stream);
-        textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
-        generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
+        imagePreprocess(request, imageGridTHWs, imageTokenLengths, numImages, !imageOnly, stream);
+        if (!imageOnly)
+        {
+            textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+            generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
+        }
     }
     catch (std::exception const& e)
     {

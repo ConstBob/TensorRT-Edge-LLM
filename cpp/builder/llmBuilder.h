@@ -45,6 +45,7 @@ struct LLMBuilderConfig
     int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
     int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
     bool useTrtNativeOps{false};   //!< Whether to use TensorRT native operations instead of custom plugin
+    bool profilingDetailed{false}; //!< Enable detailed profiling verbosity for layer info extraction
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters

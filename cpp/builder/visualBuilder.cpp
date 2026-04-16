@@ -74,6 +74,12 @@ bool VisualBuilder::build()
         return false;
     }
 
+    if (mBuilderConfig.profilingDetailed)
+    {
+        config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
+        LOG_INFO("Profiling verbosity set to DETAILED");
+    }
+
     // Setup optimization profile
     if (!setupVisualOptimizationProfile(*builder.get(), *config.get(), *network.get()))
     {
