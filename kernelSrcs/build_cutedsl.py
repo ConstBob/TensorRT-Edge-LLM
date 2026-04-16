@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AOT-compile CuTe DSL kernels (FMHA + GDN) into a single static library for CMake linking.
+"""AOT-compile CuTe DSL kernels (FMHA + GDN + NvFP4 MoE) into a single static library for CMake linking.
 
 Usage (run from the repo root):
-  python kernelSrcs/build_cutedsl.py                    # build all kernels supported by this GPU
-  python kernelSrcs/build_cutedsl.py --kernels gdn      # build a specific group only
-  python kernelSrcs/build_cutedsl.py --gpu_arch sm_87   # override SM detection (rarely needed)
+  python kernelSrcs/build_cutedsl.py                          # build all kernels supported by this GPU
+  python kernelSrcs/build_cutedsl.py --kernels gdn            # build a specific group only
+  python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe      # build NvFP4 MoE FC1+FC2 kernels only
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_87         # override SM detection (rarely needed)
 
 The GPU SM is auto-detected via cupy / nvidia-smi and used to filter which kernel variants
 are compiled.  All kernel scripts are invoked without --gpu_arch (device-native JIT), which
@@ -85,7 +86,12 @@ class KernelVariant:
 # FMHA: Fused Multi-Head Attention (Blackwell SM100/SM101). The fmha.py script
 #       is hardcoded to SM100 Blackwell instructions (TMEM, Blackwell MMA).
 #
-# Neither group receives --gpu_arch from the build script; they all compile
+# NvFP4 MoE: Mixture-of-Experts FC1 + FC2 kernels (Blackwell SM100/SM101/SM110).
+#            FC1 is a contiguous grouped GEMM with fused activation (identity/
+#            relu2/swiglu).  FC2 is a grouped GEMM with fused scatter-reduce.
+#            Both use FP4 blockscaled arithmetic (tcgen05.mma).
+#
+# No group receives --gpu_arch from the build script; they all compile
 # device-native, which works uniformly across all platforms.
 # ---------------------------------------------------------------------------
 KERNEL_VARIANTS = [
@@ -245,6 +251,65 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,14,128"] + _VIT,
+    ),
+    # --- NvFP4 MoE group ---
+    # FC1 contiguous grouped GEMM: 3 activations x 2 N-tiles = 6 variants
+    KernelVariant(
+        name="nvfp4_moe_fc1_identity_n128",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
+        script_args=["--activation", "identity", "--mma_tiler_n", "128", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_moe_fc1_identity_n256",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
+        script_args=["--activation", "identity", "--mma_tiler_n", "256", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_moe_fc1_relu2_n128",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
+        script_args=["--activation", "relu2", "--mma_tiler_n", "128", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_moe_fc1_relu2_n256",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
+        script_args=["--activation", "relu2", "--mma_tiler_n", "256", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_moe_fc1_swiglu_n128",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
+        script_args=["--activation", "swiglu", "--mma_tiler_n", "128", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_moe_fc1_swiglu_n256",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
+        script_args=["--activation", "swiglu", "--mma_tiler_n", "256", "--export_only"],
+    ),
+    # FC2 finalize (grouped GEMM + scatter-reduce): 2 N-tiles
+    KernelVariant(
+        name="nvfp4_moe_fc2_n128",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc2_kernel.py",
+        script_args=["--mma_tiler_n", "128", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_moe_fc2_n256",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc2_kernel.py",
+        script_args=["--mma_tiler_n", "256", "--export_only"],
     ),
 ]
 
@@ -623,11 +688,23 @@ def build(args):
         )
         print(f"\n  Created {lib_path.name} ({lib_path.stat().st_size // 1024} KB)")
 
-        # Copy per-variant headers and write umbrella header.
+        # Copy per-variant headers and write umbrella headers.
         inc_dir = output_dir / "include"
         inc_dir.mkdir(exist_ok=True)
         for v in variants:
             shutil.copy2(staging_dirs[v.name] / f"{v.name}.h", inc_dir)
+
+        # Per-group umbrella headers (e.g. cutedsl_nvfp4_moe_all.h).
+        for group in groups_selected:
+            group_variants = [v for v in variants if v.group == group]
+            group_umbrella = inc_dir / f"cutedsl_{group}_all.h"
+            group_umbrella.write_text(
+                "#pragma once\n"
+                f"// Auto-generated by build_cutedsl.py -- do not edit\n"
+                + "".join(f'#include "{v.name}.h"\n' for v in group_variants)
+            )
+
+        # Unified umbrella header (includes everything).
         umbrella = inc_dir / "cutedsl_all.h"
         umbrella.write_text(
             "#pragma once\n"
