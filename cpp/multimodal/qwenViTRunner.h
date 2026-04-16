@@ -84,7 +84,8 @@ public:
     //! \return True if preprocessing succeeded, false otherwise
     //! \throws std::runtime_error if sequence length is invalid, or a CUDA error occurs
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
+        bool imageOnly = false) override;
 
     //! \brief Encode the system prompt and generate ND-RoPE parameters for the system prompt for KVCache saving.
     //! \param[in] systemPrompt System prompt string

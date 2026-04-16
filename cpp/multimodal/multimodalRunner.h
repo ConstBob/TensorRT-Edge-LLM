@@ -98,11 +98,13 @@ public:
      * @param tokenizer Tokenizer instance
      * @param ropeRotaryCosSinDevice RoPE cache tensor (only used by image / language models)
      * @param stream CUDA stream
+     * @param imageOnly When true, only run image preprocessing (skip text tokenization and RoPE
+     *        generation). Used for benchmarking where only the visual engine inputs need to be set up.
      * @return True on success, false on failure
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
-        = 0;
+        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
+        bool imageOnly = false) = 0;
 
     /*!
      * @brief Used for KVCache saving where we need to conduct the tokenization of the system prompt and generate

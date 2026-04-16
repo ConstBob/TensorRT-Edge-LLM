@@ -196,6 +196,7 @@ class TestConfig:
     # kernel_bench parameters
     bench_mode: Optional[str] = None
     input_len: Optional[int] = None
+    past_kv_len: Optional[int] = None
 
     # Add TensorRT native operations flag
     trt_native_ops: Optional[bool] = None
@@ -336,6 +337,9 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("input_len",
                       "il", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("past_kv_len",
+                      "pkv", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
                       is_required=False),
     ]
 
@@ -497,6 +501,8 @@ class TestConfig:
                 parsed_params['bench_mode'] = part[5:]
             elif part.startswith('il') and part[2:].isdigit():
                 parsed_params['input_len'] = int(part[2:])
+            elif part.startswith('pkv') and part[3:].isdigit():
+                parsed_params['past_kv_len'] = int(part[3:])
             # For inference parameters
             elif part.startswith('ootb'):
                 parsed_params['trt_native_ops'] = True

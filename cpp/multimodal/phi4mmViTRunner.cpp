@@ -439,15 +439,18 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream) noexcept
+    rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream, bool imageOnly) noexcept
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
     mImagesBlockGridHW.clear();
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, mImagesBlockGridHW, true, stream);
-        textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        imagePreprocess(request, imageTokenLengths, numImages, mImagesBlockGridHW, !imageOnly, stream);
+        if (!imageOnly)
+        {
+            textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        }
     }
     catch (std::exception const& e)
     {

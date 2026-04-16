@@ -511,6 +511,9 @@ def generate_kernel_bench_commands(
     if config.input_len:
         cmd.append(f"--inputLen={config.input_len}")
 
+    if config.past_kv_len:
+        cmd.append(f"--pastKVLen={config.past_kv_len}")
+
     if config.debug:
         cmd.append("--debug")
 

@@ -21,6 +21,7 @@
 #include "multimodal/internViTRunner.h"
 #include "multimodal/phi4mmViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
+#include "profiling/layerProfiler.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <algorithm>
@@ -55,6 +56,11 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     if (!mContext->setOptimizationProfileAsync(0, stream))
     {
         throw std::runtime_error("Failed to set optimization profile for visual engine");
+    }
+
+    if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
+    {
+        mContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
     }
 }
 
