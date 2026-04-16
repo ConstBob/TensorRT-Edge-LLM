@@ -146,6 +146,10 @@ LLMInferenceRuntime::LLMInferenceRuntime(std::string const& engineDir, std::stri
     LOG_INFO("LLMEngineRunner successfully loaded and initialized llm engine.");
 
     mEngineConfig = mLLMEngineRunner->getEngineConfig();
+    if (mEngineConfig.numDeepstackFeatures > 0 && multimodalEngineDir.empty())
+    {
+        throw std::runtime_error("--multimodalEngineDir is required for VLM engine.");
+    }
 
     // Use TopP sampling parameter to reserve max possible workspace size for sampling.
     int32_t const defaultTopK{0};

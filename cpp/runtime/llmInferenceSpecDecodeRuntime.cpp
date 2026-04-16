@@ -107,6 +107,10 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const& 
     }
     LOG_INFO("LLMEngineRunner successfully loaded and initialized eagle base engine.");
     mBaseEngineConfig = mBaseEngineRunner->getEngineConfig();
+    if (mBaseEngineConfig.numDeepstackFeatures > 0 && multimodalEngineDir.empty())
+    {
+        throw std::runtime_error("--multimodalEngineDir is required for VLM engine.");
+    }
 
     std::filesystem::path const draftEnginePath = std::filesystem::path(engineDir) / "eagle_draft.engine";
     std::filesystem::path const draftConfigPath = std::filesystem::path(engineDir) / "draft_config.json";
