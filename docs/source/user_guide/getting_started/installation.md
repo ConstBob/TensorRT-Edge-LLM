@@ -230,11 +230,17 @@ cmake .. \
 | `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
-| `ENABLE_CUTE_DSL` | Enable CuTe DSL kernels: `OFF` (default), `ALL`, or group list (`fmha;gdn`, `gdn`, `fmha`) | OFF |
+| `ENABLE_CUTE_DSL` | Enable CuTe DSL kernels: `OFF` (default), `ALL`, or group list (`fmha;gdn`, `gdn`, `fmha`, `gemm`) | OFF |
+| `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_110` or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
 
 **Building with CuTe DSL Kernels (Optional)**
 
-Follow `kernelSrcs/README.md` to generate the prebuilt kernel library with `python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN>`, then add `-DENABLE_CUTE_DSL=ALL` (or `gdn`, `fmha`) to the CMake command.
+Generate the local CuTe DSL artifact first with `python kernelSrcs/build_cutedsl.py ...`,
+following `kernelSrcs/README.md`, then add `-DENABLE_CUTE_DSL=ALL` (or a group
+selection such as `gdn`, `fmha`, or `gemm`) to the CMake command.
+
+If you have multiple local artifact tags for the same CPU architecture, also
+pass `-DCUTE_DSL_ARTIFACT_TAG=<tag>`.
 
 > **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
 

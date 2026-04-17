@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AOT-compile CuTe DSL kernels (FMHA + GDN + NvFP4 MoE) into a single static library for CMake linking.
+"""AOT-compile CuTe DSL kernels into a local static library for CMake linking.
 
 Usage (run from the repo root):
   python kernelSrcs/build_cutedsl.py                          # build all kernels supported by this GPU
@@ -25,10 +25,14 @@ The GPU SM is auto-detected via cupy / nvidia-smi and used to filter which kerne
 are compiled.  All kernel scripts are invoked without --gpu_arch (device-native JIT), which
 works uniformly on Linux and QNX.
 
-Output (under {output_dir}/{arch}/):
+Output (under {output_dir}/{arch}/{artifact_tag}/):
+  artifact_tag          — currently sm_<NN>, e.g. sm_80 / sm_110 / sm_121
   libcutedsl_{arch}.a   — merged static archive: kernel objects + DSL runtime
   include/cutedsl_all.h — umbrella header (#includes every variant header)
   metadata.json         — groups / variants list consumed by cmake/CuteDsl.cmake
+
+The generated artifacts are local build inputs. They are not intended to be
+checked into git by default.
 """
 
 import argparse
@@ -311,6 +315,205 @@ KERNEL_VARIANTS = [
         script="nvfp4_moe_cutedsl/export_fc2_kernel.py",
         script_args=["--mma_tiler_n", "256", "--export_only"],
     ),
+    # =====================================================================
+    # GEMM group — Talker MLP cuBLAS replacement
+    #
+    # Dispatch strategy per architecture:
+    #   Ampere (SM80-89):
+    #     M==1           → decode (16×128×128) + Split-K=4 for SM utilization
+    #     M=2-95         → small_prefill (16×128×128)
+    #     M=96-192       → medium_prefill (64×128×64) + Split-K=2
+    #     M=193-383      → medium_prefill (64×128×64)
+    #     M=384-640      → large_prefill (128×128×64) + unpredicated epilogue
+    #     M>640          → medium_prefill (64×128×64)
+    #
+    #   Blackwell DC (SM100-110): single variant, persistent+warp-spec+TMA
+    #
+    #   BW GeForce (SM120-121):
+    #     M<=64          → small (64×128×64) — persistent+warp-spec+TMA
+    #     M>=128         → default (128×128×64)
+    # =====================================================================
+    # --- Ampere (SM80-89) ---
+    KernelVariant(
+        name="gemm_ampere_decode_fp16",
+        group="gemm",
+        supported_sms=[80, 86, 87, 89],
+        script="gemm_cutedsl/gemm_ampere.py",
+        script_args=[
+            "--mnk", "1,2048,2048",
+            "--cta_tiler_mnk", "16,128,128",
+            "--atom_layout_mnk", "1,4,1",
+            "--num_stages", "3",
+            "--use_unpredicated",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_ampere_small_prefill_fp16",
+        group="gemm",
+        supported_sms=[80, 86, 87, 89],
+        script="gemm_cutedsl/gemm_ampere.py",
+        script_args=[
+            "--mnk", "64,2048,2048",
+            "--cta_tiler_mnk", "16,128,128",
+            "--atom_layout_mnk", "1,4,1",
+            "--num_stages", "3",
+            "--use_unpredicated",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_ampere_medium_prefill_fp16",
+        group="gemm",
+        supported_sms=[80, 86, 87, 89],
+        script="gemm_cutedsl/gemm_ampere.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--cta_tiler_mnk", "64,128,64",
+            "--atom_layout_mnk", "1,4,1",
+            "--num_stages", "3",
+            "--use_unpredicated",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_ampere_large_prefill_fp16",
+        group="gemm",
+        supported_sms=[80, 86, 87, 89],
+        script="gemm_cutedsl/gemm_ampere.py",
+        script_args=[
+            "--mnk", "512,2048,2048",
+            "--cta_tiler_mnk", "128,128,64",
+            "--atom_layout_mnk", "2,4,1",
+            "--num_stages", "3",
+            "--use_unpredicated",
+            "--export_only",
+        ],
+    ),
+    # Split-K variant for small M (decode): split_k=4 gives 4x more CTAs.
+    KernelVariant(
+        name="gemm_ampere_splitk4_fp16",
+        group="gemm",
+        supported_sms=[80, 86, 87, 89],
+        script="gemm_cutedsl/gemm_ampere_streamk.py",
+        script_args=[
+            "--mnk", "1,2048,2048",
+            "--cta_tiler_mnk", "16,128,128",
+            "--atom_layout_mnk", "1,4,1",
+            "--num_stages", "3",
+            "--split_k", "4",
+            "--export_only",
+        ],
+    ),
+    # Split-K=2 for medium M (M=128): doubles CTA count from 32 to 64.
+    KernelVariant(
+        name="gemm_ampere_splitk2_fp16",
+        group="gemm",
+        supported_sms=[80, 86, 87, 89],
+        script="gemm_cutedsl/gemm_ampere_streamk.py",
+        script_args=[
+            "--mnk", "128,2048,2048",
+            "--cta_tiler_mnk", "64,128,64",
+            "--atom_layout_mnk", "1,4,1",
+            "--num_stages", "3",
+            "--split_k", "2",
+            "--export_only",
+        ],
+    ),
+    # =====================================================================
+    # Fused MLP epilogue variants (Plan C: 4→2 kernel launches)
+    #
+    # FC1 path: GEMM + bias + SiLU fused in epilogue
+    # FC2 path: GEMM + bias fused in epilogue
+    #
+    # Only medium_prefill tile (64×128×64) is fused — it covers the most
+    # common prefill M range. Decode (M=1) uses separate bias kernels
+    # since the 2us kernel launch is negligible at that scale.
+    # =====================================================================
+    KernelVariant(
+        name="gemm_ampere_medium_bias_silu_fp16",
+        group="gemm",
+        supported_sms=[80, 86, 87, 89],
+        script="gemm_cutedsl/gemm_ampere.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--cta_tiler_mnk", "64,128,64",
+            "--atom_layout_mnk", "1,4,1",
+            "--num_stages", "3",
+            "--use_unpredicated",
+            "--fused_epilogue", "bias_silu",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_ampere_medium_bias_fp16",
+        group="gemm",
+        supported_sms=[80, 86, 87, 89],
+        script="gemm_cutedsl/gemm_ampere.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--cta_tiler_mnk", "64,128,64",
+            "--atom_layout_mnk", "1,4,1",
+            "--num_stages", "3",
+            "--use_unpredicated",
+            "--fused_epilogue", "bias",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=["--mnk", "1024,2048,2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_bias_silu_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=["--mnk", "1024,2048,2048", "--fused_epilogue", "bias_silu", "--export_only"],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_bias_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=["--mnk", "1024,2048,2048", "--fused_epilogue", "bias", "--export_only"],
+    ),
+    # BW GeForce (SM120/121): warp-specialized, TMA, persistent tile scheduling.
+    # Small tile for M<=64 — more CTAs on N1Auto's 20 SMs.
+    KernelVariant(
+        name="gemm_bw_geforce_small_fp16",
+        group="gemm",
+        supported_sms=[120, 121],
+        script="gemm_cutedsl/gemm_blackwell_geforce.py",
+        script_args=["--mnk", "64,2048,2048", "--tile_shape_mnk", "64,128,64", "--export_only"],
+    ),
+    # Default tile for M>=128.
+    KernelVariant(
+        name="gemm_bw_geforce_fp16",
+        group="gemm",
+        supported_sms=[120, 121],
+        script="gemm_cutedsl/gemm_blackwell_geforce.py",
+        script_args=["--mnk", "1024,2048,2048", "--tile_shape_mnk", "128,128,64", "--export_only"],
+    ),
+    KernelVariant(
+        name="gemm_bw_geforce_bias_silu_fp16",
+        group="gemm",
+        supported_sms=[120, 121],
+        script="gemm_cutedsl/gemm_blackwell_geforce.py",
+        script_args=["--mnk", "1024,2048,2048", "--tile_shape_mnk", "128,128,64",
+                     "--fused_epilogue", "bias_silu", "--export_only"],
+    ),
+    KernelVariant(
+        name="gemm_bw_geforce_bias_fp16",
+        group="gemm",
+        supported_sms=[120, 121],
+        script="gemm_cutedsl/gemm_blackwell_geforce.py",
+        script_args=["--mnk", "1024,2048,2048", "--tile_shape_mnk", "128,128,64",
+                     "--fused_epilogue", "bias", "--export_only"],
+    ),
 ]
 
 # All known group names (set for O(1) membership check — no manual maintenance needed).
@@ -428,13 +631,17 @@ def select_variants(sm: int, kernels_arg: str):
             f"NOTE: Skipping {len(skipped)} variant(s) not supported on SM{sm}: {names}"
         )
 
-    if not selected:
-        print(
-            f"WARNING: No variants in requested group(s) {tokens} support SM{sm}. "
-            f"Check supported_sms in KERNEL_VARIANTS."
-        )
+    if selected:
+        return selected
 
-    return selected
+    # Explicit group list requested, but no variant in those groups supports the SM.
+    requested_variants = [v for v in KERNEL_VARIANTS if v.group in tokens]
+    names = ", ".join(v.name for v in requested_variants)
+    raise ValueError(
+        f"No variants in groups {tokens} support SM{sm}.\n"
+        f"Requested variants: {names}\n"
+        f"Use --kernels ALL to auto-filter across all groups, or check supported_sms in KERNEL_VARIANTS."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +664,10 @@ def detect_arch(override=None):
     raise RuntimeError(
         f"Unsupported architecture: {platform.machine()!r}. Use --arch to override."
     )
+
+
+def sm_to_artifact_tag(sm: int) -> str:
+    return f"sm_{sm}"
 
 
 def _nvcc_version():
@@ -540,6 +751,12 @@ def check_dependencies():
     if not shutil.which("ar"):
         errors.append("'ar' not found on PATH. Install binutils.")
 
+    # cuda-python (provides `cuda.bindings.driver`, used by all GEMM/FMHA scripts)
+    try:
+        importlib.metadata.version("cuda-python")
+    except importlib.metadata.PackageNotFoundError:
+        errors.append("cuda-python not found.\n  Fix: pip install cuda-python")
+
     if errors:
         print("Dependency check failed:\n" + "\n".join(f"  • {e}" for e in errors))
         sys.exit(1)
@@ -619,9 +836,6 @@ def _check_obj_name_collision(kernel_objs, runtime_objs):
 # ---------------------------------------------------------------------------
 
 def build(args):
-    arch = detect_arch(args.arch)
-    output_dir = Path(args.output_dir) / arch
-
     # Resolve SM: explicit override or auto-detect from the running GPU.
     if args.gpu_arch:
         sm = _parse_sm(args.gpu_arch)
@@ -630,8 +844,13 @@ def build(args):
         sm = detect_gpu_sm()
         sm_source = "auto-detected"
 
+    arch = detect_arch(args.arch)
+    artifact_tag = sm_to_artifact_tag(sm)
+    output_dir = Path(args.output_dir) / arch / artifact_tag
+
     print(f"Target arch : {arch}")
     print(f"GPU SM      : SM{sm} ({sm_source})")
+    print(f"Artifact tag: {artifact_tag}")
     print(f"Output dir  : {output_dir}")
 
     variants = select_variants(sm, args.kernels)
@@ -717,6 +936,7 @@ def build(args):
             json.dumps(
                 {
                     "arch": arch,
+                    "artifact_tag": artifact_tag,
                     "gpu_arch": f"sm_{sm}",
                     "cuda_version": cuda_ver,
                     "cutlass_dsl_version": dsl_ver,
@@ -760,7 +980,7 @@ def main():
     p.add_argument(
         "--output_dir",
         default=str(_DEFAULT_OUTPUT_DIR),
-        help=f"Root output dir (artifacts go into {{output_dir}}/{{arch}}/). "
+        help=f"Root output dir (artifacts go into {{output_dir}}/{{arch}}/sm_<NN>/). "
              f"Default: {_DEFAULT_OUTPUT_DIR}",
     )
     p.add_argument(

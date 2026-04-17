@@ -23,6 +23,9 @@
 #include "common/stringUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
+#ifdef CUTE_DSL_GEMM_ENABLED
+#include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
+#endif
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
@@ -31,7 +34,6 @@
 #include <chrono>
 #include <cmath>
 #include <cuda_runtime.h>
-#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -147,19 +149,12 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
         throw std::runtime_error("Failed to load CodePredictor weights");
     }
 
-    // Dynamically load cuBLAS to avoid compile-time dependency
-    void* cublasLib = dlopen("libcublas.so", RTLD_LAZY);
-    if (!cublasLib)
+#ifdef CUTE_DSL_GEMM_ENABLED
+    if (!CuteDslGemmRunner::loadKernelModule())
     {
-        throw std::runtime_error("Failed to load libcublas.so");
+        throw std::runtime_error("Failed to load CuTe DSL GEMM kernel module");
     }
-    auto cublasCreateFn = reinterpret_cast<int (*)(void**)>(dlsym(cublasLib, "cublasCreate_v2"));
-    if (!cublasCreateFn || cublasCreateFn(&mCublasHandle) != 0)
-    {
-        throw std::runtime_error("Failed to create cuBLAS handle");
-    }
-    // Note: do NOT dlclose here - cuBLAS handle requires library to remain loaded
-    // Library will be closed in destructor after cublasDestroy
+#endif
 
     if (!allocateBuffer())
     {
@@ -178,20 +173,9 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
 
 Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
 {
-    if (mCublasHandle)
-    {
-        void* cublasLib = dlopen("libcublas.so", RTLD_LAZY);
-        if (cublasLib)
-        {
-            auto cublasDestroyFn = reinterpret_cast<int (*)(void*)>(dlsym(cublasLib, "cublasDestroy_v2"));
-            if (cublasDestroyFn)
-            {
-                cublasDestroyFn(mCublasHandle);
-            }
-            dlclose(cublasLib);
-        }
-        mCublasHandle = nullptr;
-    }
+#ifdef CUTE_DSL_GEMM_ENABLED
+    CuteDslGemmRunner::unloadKernelModule();
+#endif
 }
 
 bool Qwen3OmniTTSRuntime::initializeEngineRunners(
@@ -670,8 +654,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
     // Reshape from [1, 3, hidden] to [3, hidden] for MLP (expects 2D input)
     check::check(ttsRaw.reshape({kNumTtsTokens, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::invokeTalkerMLP(mCublasHandle, ttsRaw, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
-        ttsProjected, workspace, stream);
+    kernel::invokeTalkerMLP(
+        ttsRaw, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, ttsProjected, workspace, stream);
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     mTtsPadEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
@@ -706,8 +690,8 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     // Project all tokens via text_projection MLP
     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
     check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::invokeTalkerMLP(mCublasHandle, thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
-        mProjectedBuffer, mMLPWorkspace, stream);
+    kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, mProjectedBuffer,
+        mMLPWorkspace, stream);
 
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
@@ -818,8 +802,7 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
     // Project mRawCodecEmbed (2048) → mCodePredictorCodecEmbed (1024) via small_to_mtp_projection
     check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
-    kernel::invokeLinearLayer(
-        mCublasHandle, mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
 
     int32_t const lmHeadIdx = std::min(generationStep, kNumRvqLayers - 1);
 
@@ -1166,13 +1149,12 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     // Step 2: Project talkerHiddenState (2048) → mSmallToMtpProjectedHidden (1024)
     // talkerHiddenState is mTalkerLastHidden with shape {1, talkerHiddenSize=2048}
     kernel::invokeLinearLayer(
-        mCublasHandle, talkerHiddenState, mSmallToMtpWeight, mSmallToMtpBias, mSmallToMtpProjectedHidden, stream);
+        talkerHiddenState, mSmallToMtpWeight, mSmallToMtpBias, mSmallToMtpProjectedHidden, stream);
 
     // Step 3: Project mRawCodecEmbed (2048) → mCodePredictorCodecEmbed (1024)
     check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
-    kernel::invokeLinearLayer(
-        mCublasHandle, mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
 
     // Step 4: Concat projected tensors into mCodePredictorPrefillInput [1, 2, codePredictorHiddenSize]
     CUDA_CHECK(cudaMemcpyAsync(mCodePredictorPrefillInput.rawPointer(), mSmallToMtpProjectedHidden.rawPointer(),
