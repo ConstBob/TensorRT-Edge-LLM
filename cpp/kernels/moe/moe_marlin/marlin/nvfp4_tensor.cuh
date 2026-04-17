@@ -50,13 +50,21 @@ using Dim3 = int3;
 //! \ref kNvfp4Int4PerTilePayload contiguous \c int4 vectors. \p strides[d] is the offset in \c int4 elements
 //! when logical tile index component \c d increases by 1 (NumPy-style / sizeof(int4)).
 //!
-//! \p block_scale uses the same linear tile order as \p quantized_data: one packed int32 of four e4m3 scales per
-//! Marlin tile. \ref tileScaleIndex is <tt>tileOffsetInt4(tile) / kNvfp4Int4PerTilePayload</tt> (\c int index into
-//! \c block_scale). Payload and scale buffers must use matching row-major layouts (e.g. MoE up
-//! \c [E, hidden/16, inter] scales with \c [E, hidden/2, inter] payload; down \c [E, inter, hidden/16] with
-//! \c [E, inter, hidden/2]).
+//! \p block_scale uses **atom-layout 128×4 swizzle** (matching Blackwell \c tcgen05.mma block-scaled MMA and TMA
+//! scale-factor multicasts). Each FP8 E4M3 byte is stored at a byte offset computed by \ref tileScaleIndex; four
+//! consecutive bytes (innerK 0..3) form one \c int32 word read by \ref readBlockScaleWord.
 //!
-//! \p block_scale[index] is one int32 of four e4m3 scales (16 elements per scale), matching W4A4 Marlin layout.
+//! Atom-layout byte offset for scale factor at logical (mRow, kChunk):
+//!   innerK = kChunk % 4;  innerM = (mRow % 128) / 32;  outerM = mRow % 32;
+//!   kTile = kChunk / 4;   mTile = mRow / 128;
+//!   byteOffset = mTile * numKTiles * 512 + kTile * 512 + outerM * 16 + innerM * 4 + innerK
+//!
+//! The int32 word index (for \c block_scale pointer) drops innerK:
+//!   mTile * numKTiles * 128 + kTile * 128 + outerM * 4 + innerM
+//!
+//! \p scaleMDimIdx / \p scaleKDimIdx select which \c Dim3 component maps to mRow / kChunk.
+//! \p scaleNumKTiles is \c ceil(numSfCols / 4) where \c numSfCols = K / 16.
+//! \p scaleExpertStride is the int32 element stride between experts (\c ceil(M/128) * numKTiles * 128).
 struct NVFP4Tensor
 {
     int4* quantized_data;
@@ -66,15 +74,59 @@ struct NVFP4Tensor
     //! Stride in \c int4 elements per +1 in tile index dim 0..2 (\c z fastest).
     int64_t strides[3];
 
+    //! Atom-layout scale factor metadata.
+    int32_t scaleNumKTiles;    //!< K-tiles for atom swizzle: ceil(numSfCols / 4) where numSfCols = K_dim / 16.
+    int64_t scaleExpertStride; //!< int32 elements between experts: ceil(M/128) * scaleNumKTiles * 128.
+    int8_t scaleMDimIdx;       //!< Which Dim3 component is the M-row (0 for act, 1 for weights).
+    int8_t scaleKDimIdx;       //!< Which Dim3 component is the K-chunk (1 for act, 2 for weights).
+
     __device__ __forceinline__ int64_t tileOffsetInt4(Dim3 const c) const
     {
         return static_cast<int64_t>(c.x) * strides[0] + static_cast<int64_t>(c.y) * strides[1]
             + static_cast<int64_t>(c.z) * strides[2];
     }
 
+    //! Atom-layout 128×4 swizzle: returns \c int32 index into \c block_scale for the tile at \p c.
     __device__ __forceinline__ int64_t tileScaleIndex(Dim3 const c) const
     {
-        return tileOffsetInt4(c) / kNvfp4Int4PerTilePayload;
+        int32_t const dims[3] = {c.x, c.y, c.z};
+        int32_t const mRow = dims[scaleMDimIdx];
+        int32_t const kChunk = dims[scaleKDimIdx];
+        // Expert dim is the remaining one (neither M nor K).
+        int32_t expertIdx = 0;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (i != scaleMDimIdx && i != scaleKDimIdx)
+            {
+                expertIdx = dims[i];
+                break;
+            }
+        }
+
+        int32_t const mTile = mRow / 128;
+        int32_t const innerM = (mRow % 128) / 32;
+        int32_t const outerM = mRow % 32;
+        return static_cast<int64_t>(expertIdx) * scaleExpertStride + static_cast<int64_t>(mTile) * scaleNumKTiles * 128
+            + static_cast<int64_t>(kChunk) * 128 + static_cast<int64_t>(outerM) * 4 + innerM;
+    }
+
+    //! Read block-scale int32 word with byte-swap for Marlin dequant compatibility.
+    //! Atom stores sequential FP8 bytes {s0,s1,s2,s3}; Marlin \c dequant_fp8_scales expects {s0,s2,s1,s3}.
+    __device__ __forceinline__ int readBlockScaleWord(Dim3 const c) const
+    {
+        int64_t const idx = tileScaleIndex(c);
+        uint32_t const w = static_cast<uint32_t>(block_scale[idx]);
+        // Swap bytes 1 and 2: {s0,s1,s2,s3} → {s0,s2,s1,s3}
+        return static_cast<int>((w & 0xFF0000FFu) | ((w & 0x0000FF00u) << 8) | ((w & 0x00FF0000u) >> 8));
+    }
+
+    //! Read block-scale int32 word using plain linear tile indexing (one scale word per tile payload).
+    //! The word is already in Marlin-packed byte order — no byte-swap. Used for activation scale factors
+    //! whose layout matches \c TRT_DynamicQuantize output (contiguous, not atom-swizzled).
+    __device__ __forceinline__ int readBlockScaleWordLinear(Dim3 const c) const
+    {
+        int64_t const idx = tileOffsetInt4(c) / kNvfp4Int4PerTilePayload;
+        return block_scale[idx];
     }
 
     //! Loads one \c int4 chunk (\c 4× \c uint32 NVFP4 lane packs) from the tile payload.
