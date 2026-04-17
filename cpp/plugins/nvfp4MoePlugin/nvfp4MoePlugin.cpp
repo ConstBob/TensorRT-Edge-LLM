@@ -345,8 +345,7 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
         return s;
     };
 
-    // One Marlin tile scale = four packed FP8 E4M3 bytes (little-endian int32); linear layout matches legacy
-    // \c [E, K/64, inter] INT32 as \c [E, K/16, inter] INT8 (\c mQuantizationGroupSize only).
+    // Block scales: same 3D shape as before [E, K/16, inter] — data is atom-layout swizzled within.
     auto const checkUpBlockScale = [this](PluginTensorDesc const& t) {
         bool s{true};
         s &= t.type == DataType::kINT8;
@@ -670,7 +669,7 @@ int32_t Nvfp4MoePlugin::enqueueDecoding(PluginTensorDesc const* inputDesc, Plugi
     NVFP4Tensor up{};
     // INT8 inputs [E, hidden/2, inter]: same byte stream as Marlin \c int4 tiles (two FP4 nibbles per byte).
     up.quantized_data = reinterpret_cast<int4*>(const_cast<void*>(inputs[4]));
-    // INT8 [E, hidden/16, inter]: same bytes as one int32 scale word per Marlin tile (kernel indexes \c int).
+    // Atom-layout block scales: INT8 [E, atom_sf_bytes] → reinterpret as int* (int32 word index).
     up.block_scale = reinterpret_cast<int*>(const_cast<void*>(inputs[5]));
     up.global_scale = reinterpret_cast<float*>(const_cast<void*>(inputs[6]));
     {
@@ -682,12 +681,18 @@ int32_t Nvfp4MoePlugin::enqueueDecoding(PluginTensorDesc const* inputDesc, Plugi
         up.strides[0] = h * nic * int4PerNvfp4Tile;
         up.strides[1] = nic * int4PerNvfp4Tile;
         up.strides[2] = int4PerNvfp4Tile;
+        // Atom-layout scale metadata: Dim3(expert=x, hidden_row=y, inter_chunk=z)
+        up.scaleMDimIdx = 1; // y = hidden_row (M)
+        up.scaleKDimIdx = 2; // z = inter_chunk (K), each chunk = 64 elements = 4 SF columns
+        int32_t const numSfColsUp = mMoeInterSize / kNvfp4MoeQuantizationGroupSize;
+        up.scaleNumKTiles = (numSfColsUp + 3) / 4;
+        int32_t const numMTilesUp = (mHiddenSize + 127) / 128;
+        up.scaleExpertStride = static_cast<int64_t>(numMTilesUp) * up.scaleNumKTiles * 128;
     }
 
     NVFP4Tensor dn{};
     // INT8 row-major \c [E, inter, hidden/2]: innermost int4 tiles step along \c hidden/2. Tile \c Dim3 is
-    // \c (expert, inter, hidden_chunk) = \c (x,y,z). Block scales \c [E, inter, hidden/16] use the same linear tile
-    // order (\ref NVFP4Tensor::tileScaleIndex from payload \c int4 offset).
+    // \c (expert, inter, hidden_chunk) = \c (x,y,z). Block scales use atom-layout 128×4 swizzle.
     dn.quantized_data = reinterpret_cast<int4*>(const_cast<void*>(inputs[7]));
     dn.block_scale = reinterpret_cast<int*>(const_cast<void*>(inputs[8]));
     dn.global_scale = reinterpret_cast<float*>(const_cast<void*>(inputs[9]));
@@ -697,6 +702,13 @@ int32_t Nvfp4MoePlugin::enqueueDecoding(PluginTensorDesc const* inputDesc, Plugi
         dn.strides[0] = i * h32;
         dn.strides[1] = h32;
         dn.strides[2] = int4PerNvfp4Tile;
+        // Atom-layout scale metadata: Dim3(expert=x, inter_row=y, hidden_chunk=z)
+        dn.scaleMDimIdx = 1; // y = inter_row (M)
+        dn.scaleKDimIdx = 2; // z = hidden_chunk (K), each chunk = 64 elements = 4 SF columns
+        int32_t const numSfColsDn = mHiddenSize / kNvfp4MoeQuantizationGroupSize;
+        dn.scaleNumKTiles = (numSfColsDn + 3) / 4;
+        int32_t const numMTilesDn = (mMoeInterSize + 127) / 128;
+        dn.scaleExpertStride = static_cast<int64_t>(numMTilesDn) * dn.scaleNumKTiles * 128;
     }
 
     MoEActivationKind const activationKind = nvfp4StoredActivationToKernelKind(mActivationType);
@@ -721,6 +733,8 @@ int32_t Nvfp4MoePlugin::enqueueDecoding(PluginTensorDesc const* inputDesc, Plugi
         actNvfp4.strides[0] = strideTokenInt4;
         actNvfp4.strides[1] = int4PerNvfp4Tile;
         actNvfp4.strides[2] = 0;
+        // Activation uses plain linear scale layout (readBlockScaleWordLinear) — no atom-swizzle needed.
+        // Atom-layout fields are unused for activation; zero-init from NVFP4Tensor{} is sufficient.
 
         trt_edgellm::launchNemotronMoeW4A4DecodeUpGemvCuda(batch, seqLen, mHiddenSize, mMoeInterSize, mNumExperts,
             mTopK, topkIndicesPtr, actNvfp4, up, interFp16Scratch, stream, w4a4Tb);

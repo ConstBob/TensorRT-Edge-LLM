@@ -924,6 +924,19 @@ class NemotronHMoEReference:
         return out
 
     @staticmethod
+    def _read_atom_scale_word(buf_u8: np.ndarray, m_idx: int, k_tile: int,
+                              num_sf_cols: int) -> int:
+        """Read 4 raw FP8 bytes from atom-layout positions and return Marlin-packed int32 scale word."""
+        raw = np.zeros(4, dtype=np.uint8)
+        for g in range(4):
+            off = MarlinConverter.atom_sf_offset(m_idx, k_tile * 4 + g,
+                                                 num_sf_cols)
+            raw[g] = buf_u8[off]
+        # Atom stores {s0,s1,s2,s3}; Marlin expects {s0,s2,s1,s3}
+        marlin = np.array([raw[0], raw[2], raw[1], raw[3]], dtype=np.uint8)
+        return int(np.frombuffer(marlin.tobytes(), dtype=np.int32)[0])
+
+    @staticmethod
     def dense_weights_from_nvfp4_plugin_buffers(
         fc_up_qweights: np.ndarray,
         fc_up_blocks_scale: np.ndarray,
@@ -952,29 +965,36 @@ class NemotronHMoEReference:
         assert dn_q8.shape == (e, inter, h // 2)
         assert dn_bs8.shape == (e, inter, h // 16)
 
-        dn_q = dn_q8.view(np.int32).reshape(e, inter, n_h_chunks, 8)
-        dn_bs = dn_bs8.view(np.int32).reshape(e, inter, n_h_chunks)
+        num_sf_cols_up = inter // 16
+        num_sf_cols_dn = h // 16
 
         w_up = np.zeros((e, h, inter), dtype=np.float32)
         w_down = np.zeros((e, inter, h), dtype=np.float32)
         for ex in range(e):
             up_flat = up_q8[ex].reshape(-1)
-            up_bs_flat = up_bs8[ex].reshape(-1)
+            up_bs_u8 = up_bs8[ex].view(np.uint8).reshape(-1)
             for jj in range(h):
                 for c in range(nic):
                     tile_u = jj * nic + c
                     pl = up_flat[tile_u * 32:(tile_u + 1) * 32].view(
                         np.int32).reshape(8)
-                    bs_i32 = int(up_bs_flat[tile_u * 4:(tile_u + 1) * 4].view(
-                        np.int32)[0])
+                    bs_i32 = NemotronHMoEReference._read_atom_scale_word(
+                        up_bs_u8, jj, c, num_sf_cols_up)
                     w_up[ex, jj, c * 64:(c + 1) * 64] = (
                         NemotronHMoEReference.unpack_nvfp4_marlin_tile_64(
                             pl, bs_i32))
-            for c in range(n_h_chunks):
-                for j in range(inter):
-                    tile_d = NemotronHMoEReference.unpack_nvfp4_marlin_tile_64(
-                        dn_q[ex, j, c, :], int(dn_bs[ex, j, c]))
-                    w_down[ex, j, c * 64:(c + 1) * 64] = tile_d
+            dn_bs_u8 = dn_bs8[ex].view(np.uint8).reshape(-1)
+            dn_q_flat = dn_q8[ex].reshape(-1)
+            for j in range(inter):
+                for c in range(n_h_chunks):
+                    tile_d_idx = j * n_h_chunks + c
+                    pl_d = dn_q_flat[tile_d_idx * 32:(tile_d_idx + 1) *
+                                     32].view(np.int32).reshape(8)
+                    bs_d_i32 = NemotronHMoEReference._read_atom_scale_word(
+                        dn_bs_u8, j, c, num_sf_cols_dn)
+                    w_down[ex, j, c * 64:(c + 1) * 64] = (
+                        NemotronHMoEReference.unpack_nvfp4_marlin_tile_64(
+                            pl_d, bs_d_i32))
         return w_up, w_down
 
     @staticmethod

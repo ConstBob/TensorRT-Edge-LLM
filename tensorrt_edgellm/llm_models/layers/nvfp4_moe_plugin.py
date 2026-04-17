@@ -669,40 +669,51 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         up_bs = self.fc_up_blocks_scale
         dn_pl = self.fc_down_qweights
         dn_bs = self.fc_down_blocks_scale
+
+        # Up weights: M=hidden(jj), K=inter. numSfCols = inter/16.
+        num_sf_cols_up = inter // 16
+        # Down weights: M=inter(j), K=hidden. numSfCols = hidden/16.
+        num_sf_cols_dn = h // 16
+
         for ex in range(e):
             s_max_up_ex = float(s_max_up_np[ex])
             s_max_dn_ex = float(s_max_dn_np[ex])
             up_pl_flat = up_pl[ex].reshape(-1)
-            up_bs_flat = up_bs[ex].reshape(-1)
+            up_bs_flat = up_bs[ex].view(torch.uint8).reshape(-1)
             for jj in range(h):
                 for c in range(num_inter_chunks):
                     up_seg = w_up_ehi[ex, jj, c * 64:(c + 1) *
                                       64].float().detach().cpu().numpy()
-                    pl_u, sq_u = MarlinConverter.quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
+                    pl_u, sw_u = MarlinConverter.quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
                         up_seg, expert_block_scale_max_fp32=s_max_up_ex)
                     tile_u = jj * num_inter_chunks + c
                     up_pl_flat[tile_u * 32:(tile_u + 1) * 32].copy_(
                         torch.from_numpy(pl_u.view(np.int8)))
-                    sq_u_t = torch.tensor(
-                        [MarlinConverter.marlin_f8x4_block_scale_as_i32(sq_u)],
-                        dtype=torch.int32,
-                    )
-                    up_bs_flat[tile_u * 4:(tile_u + 1) * 4].copy_(
-                        sq_u_t.view(torch.int8))
+                    # Write 4 individual FP8 bytes at atom-layout positions
+                    fp8_u = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
+                        sw_u)
+                    for g in range(4):
+                        sf_col = c * 4 + g
+                        off = MarlinConverter.atom_sf_offset(
+                            jj, sf_col, num_sf_cols_up)
+                        up_bs_flat[off] = fp8_u[g]
+            dn_bs_flat = dn_bs[ex].view(torch.uint8).reshape(-1)
             for c in range(num_hidden_chunks):
                 for j in range(inter):
                     dn_seg = w_down_eih[ex, j, c * 64:(c + 1) *
                                         64].float().detach().cpu().numpy()
-                    pl_d, sq_d = MarlinConverter.quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
+                    pl_d, sw_d = MarlinConverter.quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
                         dn_seg, expert_block_scale_max_fp32=s_max_dn_ex)
                     dn_pl[ex, j, c * 32:(c + 1) * 32].copy_(
                         torch.from_numpy(pl_d.view(np.int8)))
-                    sq_d_t = torch.tensor(
-                        [MarlinConverter.marlin_f8x4_block_scale_as_i32(sq_d)],
-                        dtype=torch.int32,
-                    )
-                    dn_bs[ex, j,
-                          c * 4:(c + 1) * 4].copy_(sq_d_t.view(torch.int8))
+                    # Write 4 individual FP8 bytes at atom-layout positions
+                    fp8_d = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
+                        sw_d)
+                    for g in range(4):
+                        sf_col = c * 4 + g
+                        off = MarlinConverter.atom_sf_offset(
+                            j, sf_col, num_sf_cols_dn)
+                        dn_bs_flat[off] = fp8_d[g]
 
         self.fc_up_global_scale.copy_(
             (s_max_up / k_fp8).to(device=self.fc_up_global_scale.device,

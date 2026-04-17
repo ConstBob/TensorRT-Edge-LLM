@@ -77,13 +77,12 @@ __device__ __forceinline__ void dequantFp4ToHalf2(uint32_t q, half2* __restrict_
     frag4[3] = *reinterpret_cast<half2 const*>(&h2_3);
 }
 
-// Dequant one 64-element NVFP4 tile to 64 contiguous half values with global scale applied.
-__device__ void testDequantNvfp4TileToHalfScaled(
-    NVFP4Tensor const& tensor, Dim3 const tile, int const globalScaleIndex, __half* __restrict__ out64)
+// Core dequant: 64-element NVFP4 tile → 64 half values, given a pre-read block-scale word.
+__device__ void testDequantNvfp4TileToHalfScaledImpl(NVFP4Tensor const& tensor, Dim3 const tile,
+    int const globalScaleIndex, int const scaleWord, __half* __restrict__ out64)
 {
-    // Decode block scales
     __half scaleH[4];
-    dequantFp8ScalesToHalf(tensor.block_scale[tensor.tileScaleIndex(tile)], scaleH);
+    dequantFp8ScalesToHalf(scaleWord, scaleH);
 
     int outIdx = 0;
     for (int chunk = 0; chunk < static_cast<int>(kNvfp4Int4PerTilePayload); ++chunk)
@@ -115,6 +114,20 @@ __device__ void testDequantNvfp4TileToHalfScaled(
     {
         out64[i] = __hmul(out64[i], gs);
     }
+}
+
+// Dequant using atom-layout scale read (for weights).
+__device__ void testDequantNvfp4TileToHalfScaled(
+    NVFP4Tensor const& tensor, Dim3 const tile, int const globalScaleIndex, __half* __restrict__ out64)
+{
+    testDequantNvfp4TileToHalfScaledImpl(tensor, tile, globalScaleIndex, tensor.readBlockScaleWord(tile), out64);
+}
+
+// Dequant using linear scale read (for activations — plain Marlin-packed layout).
+__device__ void testDequantNvfp4TileToHalfScaledLinear(
+    NVFP4Tensor const& tensor, Dim3 const tile, int const globalScaleIndex, __half* __restrict__ out64)
+{
+    testDequantNvfp4TileToHalfScaledImpl(tensor, tile, globalScaleIndex, tensor.readBlockScaleWordLinear(tile), out64);
 }
 
 // ============================================================================
@@ -262,7 +275,7 @@ __global__ void dequantActivationToFp16Kernel(NVFP4Tensor act, int hiddenDim, in
 
     __half tile64[kNvfp4ElemsPerTile];
     Dim3 const tile = make_int3(t, tileIdx, 0);
-    testDequantNvfp4TileToHalfScaled(act, tile, 0, tile64);
+    testDequantNvfp4TileToHalfScaledLinear(act, tile, 0, tile64);
 
     int64_t const baseIdx = static_cast<int64_t>(t) * hiddenDim + tileIdx * kNvfp4ElemsPerTile;
     for (int i = 0; i < kNvfp4ElemsPerTile; ++i)
@@ -439,32 +452,87 @@ public:
         }
     };
 
+    //! Atom-layout 128×4 byte offset for scale factor at logical (mIdx, kIdx) within one expert plane.
+    //! Matches fp4Quantize.cu get_sf_out_offset_128x4.
+    static size_t atomSfByteOffset(int mIdx, int kIdx, int numSfCols)
+    {
+        int const innerK = kIdx % 4;
+        int const innerM = (mIdx % 128) / 32;
+        int const outerM = mIdx % 32;
+        int const kTile = kIdx / 4;
+        int const numKTiles = (numSfCols + 3) / 4;
+        int const mTile = mIdx / 128;
+        return static_cast<size_t>(mTile) * numKTiles * 512 + static_cast<size_t>(kTile) * 512
+            + static_cast<size_t>(outerM) * 16 + innerM * 4 + innerK;
+    }
+
+    //! Atom-layout buffer size in bytes for one expert's scale factor plane.
+    static size_t atomSfBytesPerExpert(int mDim, int kDim, int sfVec = 16)
+    {
+        int const numSfCols = kDim / sfVec;
+        int const paddedSfCols = ((numSfCols + 3) / 4) * 4;
+        int const paddedM = ((mDim + 127) / 128) * 128;
+        return static_cast<size_t>(paddedM) * paddedSfCols;
+    }
+
     WeightBuffers allocateNvfp4Weight(int numExperts, int dim0, int dim1, std::mt19937& rng)
     {
         WeightBuffers buf;
         int const numTiles = numExperts * dim0 * (dim1 / kNvfp4ElemsPerTile);
         buf.payloadBytes = static_cast<size_t>(numTiles) * kNvfp4Int4PerTilePayload * sizeof(int4);
-        buf.scaleBytes = static_cast<size_t>(numTiles) * sizeof(int);
+
+        // Atom-layout scale buffer: padded per-expert planes
+        size_t const sfBytesPerEx = atomSfBytesPerExpert(dim0, dim1);
+        // int32-aligned: round up to multiple of 4 bytes
+        size_t const sfInt32PerEx = (sfBytesPerEx + 3) / 4;
+        buf.scaleBytes = static_cast<size_t>(numExperts) * sfInt32PerEx * sizeof(int);
         buf.globalScaleBytes = static_cast<size_t>(numExperts) * sizeof(float);
 
-        std::vector<uint8_t> payload, scales;
+        std::vector<uint8_t> payload;
         std::vector<float> globalScales;
         generatePayload(payload, buf.payloadBytes, rng);
-        generateBlockScales(scales, numTiles, rng);
         generateGlobalScales(globalScales, numExperts, rng);
+
+        // Generate atom-layout block scales: write individual FP8 bytes at swizzled positions.
+        // Weight tiles are [E, dim0_row, dim1_chunk] where dim1_chunk = dim1/64.
+        // M = dim0, K = dim1; numSfCols = dim1/16; each tile has 4 SF columns.
+        int const numSfCols = dim1 / 16;
+        int const dim1Chunks = dim1 / kNvfp4ElemsPerTile;
+
+        std::vector<uint8_t> scalesBuf(buf.scaleBytes, 0);
+        std::uniform_int_distribution<int> scaleDist(0x28, 0x50);
+
+        for (int e = 0; e < numExperts; ++e)
+        {
+            size_t const exByteBase = static_cast<size_t>(e) * sfInt32PerEx * 4; // byte offset of expert e
+            for (int mRow = 0; mRow < dim0; ++mRow)
+            {
+                for (int c = 0; c < dim1Chunks; ++c)
+                {
+                    // Each tile (mRow, c) has 4 SF columns: c*4 .. c*4+3
+                    for (int g = 0; g < 4; ++g)
+                    {
+                        int const sfCol = c * 4 + g;
+                        size_t const byteOff = atomSfByteOffset(mRow, sfCol, numSfCols);
+                        scalesBuf[exByteBase + byteOff] = static_cast<uint8_t>(scaleDist(rng));
+                    }
+                }
+            }
+        }
 
         CUDA_CHECK(cudaMalloc(&buf.dPayload, buf.payloadBytes));
         CUDA_CHECK(cudaMalloc(&buf.dBlockScale, buf.scaleBytes));
         CUDA_CHECK(cudaMalloc(&buf.dGlobalScale, buf.globalScaleBytes));
 
         CUDA_CHECK(cudaMemcpy(buf.dPayload, payload.data(), buf.payloadBytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(buf.dBlockScale, scales.data(), buf.scaleBytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf.dBlockScale, scalesBuf.data(), buf.scaleBytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf.dGlobalScale, globalScales.data(), buf.globalScaleBytes, cudaMemcpyHostToDevice));
 
         return buf;
     }
 
-    NVFP4Tensor makeNvfp4Tensor(WeightBuffers const& buf, int64_t s0, int64_t s1, int64_t s2)
+    NVFP4Tensor makeNvfp4Tensor(
+        WeightBuffers const& buf, int64_t s0, int64_t s1, int64_t s2, int mDim, int kDim, int numExperts)
     {
         NVFP4Tensor t{};
         t.quantized_data = buf.dPayload;
@@ -473,6 +541,13 @@ public:
         t.strides[0] = s0;
         t.strides[1] = s1;
         t.strides[2] = s2;
+        // Atom-layout fields for weights: Dim3 = (expert=x, M_row=y, K_chunk=z)
+        t.scaleMDimIdx = 1;
+        t.scaleKDimIdx = 2;
+        int const numSfCols = kDim / 16;
+        t.scaleNumKTiles = (numSfCols + 3) / 4;
+        int const numMTiles = (mDim + 127) / 128;
+        t.scaleExpertStride = static_cast<int64_t>(numMTiles) * t.scaleNumKTiles * 128;
         return t;
     }
 
@@ -542,11 +617,27 @@ public:
         int const numHiddenTiles = hiddenDim / kNvfp4ElemsPerTile;
         int const numTiles = numTokens * numHiddenTiles;
         buf.payloadBytes = static_cast<size_t>(numTiles) * kNvfp4Int4PerTilePayload * sizeof(int4);
+
+        // Plain linear scale buffer: one Marlin-packed int32 per tile.
         buf.scaleBytes = static_cast<size_t>(numTiles) * sizeof(int);
 
-        std::vector<uint8_t> payload, scales;
+        std::vector<uint8_t> payload;
         generatePayload(payload, buf.payloadBytes, rng);
-        generateBlockScales(scales, numTiles, rng);
+
+        // Generate linear Marlin-packed activation block scales (one int32 per tile).
+        std::vector<int> scalesHost(numTiles, 0);
+        std::uniform_int_distribution<int> scaleDist(0x28, 0x50);
+        for (int i = 0; i < numTiles; ++i)
+        {
+            // Pack 4 random FP8 E4M3 bytes in Marlin order {s0, s2, s1, s3}.
+            uint8_t const s0 = static_cast<uint8_t>(scaleDist(rng));
+            uint8_t const s1 = static_cast<uint8_t>(scaleDist(rng));
+            uint8_t const s2 = static_cast<uint8_t>(scaleDist(rng));
+            uint8_t const s3 = static_cast<uint8_t>(scaleDist(rng));
+            // Marlin byte order: {s0, s2, s1, s3}
+            scalesHost[i] = static_cast<int>(static_cast<uint32_t>(s0) | (static_cast<uint32_t>(s2) << 8)
+                | (static_cast<uint32_t>(s1) << 16) | (static_cast<uint32_t>(s3) << 24));
+        }
 
         std::uniform_real_distribution<float> dist(0.5f, 2.0f);
         float const globalScale = dist(rng);
@@ -556,7 +647,7 @@ public:
         CUDA_CHECK(cudaMalloc(&buf.dGlobalScale, sizeof(float)));
 
         CUDA_CHECK(cudaMemcpy(buf.dPayload, payload.data(), buf.payloadBytes, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(buf.dBlockScale, scales.data(), buf.scaleBytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf.dBlockScale, scalesHost.data(), buf.scaleBytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf.dGlobalScale, &globalScale, sizeof(float), cudaMemcpyHostToDevice));
 
         return buf;
@@ -573,6 +664,7 @@ public:
         t.strides[0] = static_cast<int64_t>(numHiddenTiles) * int4PerTile;
         t.strides[1] = int4PerTile;
         t.strides[2] = 0;
+        // Activation uses plain linear scale layout (readBlockScaleWordLinear) — no atom fields needed.
         return t;
     }
 
@@ -641,7 +733,7 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_UpProj_Tier2_Small)
     int64_t const upS2 = int4PerTile;
 
     auto upBuf = allocateNvfp4Weight(E, H, N, rng);
-    NVFP4Tensor up = makeNvfp4Tensor(upBuf, upS0, upS1, upS2);
+    NVFP4Tensor up = makeNvfp4Tensor(upBuf, upS0, upS1, upS2, H, N, E);
 
     // Expert IDs and topk weights
     std::vector<int32_t> expertIdsHost = {0};
@@ -736,7 +828,7 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_DownProj_Tier2_Small)
     int64_t const dnS2 = int4PerTile;
 
     auto dnBuf = allocateNvfp4Weight(E, N, H, rng);
-    NVFP4Tensor dn = makeNvfp4Tensor(dnBuf, dnS0, dnS1, dnS2);
+    NVFP4Tensor dn = makeNvfp4Tensor(dnBuf, dnS0, dnS1, dnS2, N, H, E);
 
     // Expert IDs and topk weights
     std::vector<int32_t> expertIdsHost = {0};
@@ -831,7 +923,7 @@ static E2EResult runE2E(int H, int N, int E, int topK, int numTokens, MoEActivat
     int64_t const upS2 = int4PerTile;
 
     auto upBuf = self->allocateNvfp4Weight(E, H, N, rng);
-    NVFP4Tensor up = self->makeNvfp4Tensor(upBuf, upS0, upS1, upS2);
+    NVFP4Tensor up = self->makeNvfp4Tensor(upBuf, upS0, upS1, upS2, H, N, E);
 
     // Down weights
     int64_t const dnS0 = static_cast<int64_t>(N) * (H / 32);
@@ -839,7 +931,7 @@ static E2EResult runE2E(int H, int N, int E, int topK, int numTokens, MoEActivat
     int64_t const dnS2 = int4PerTile;
 
     auto dnBuf = self->allocateNvfp4Weight(E, N, H, rng);
-    NVFP4Tensor dn = self->makeNvfp4Tensor(dnBuf, dnS0, dnS1, dnS2);
+    NVFP4Tensor dn = self->makeNvfp4Tensor(dnBuf, dnS0, dnS1, dnS2, N, H, E);
 
     // Expert IDs: round-robin assignment
     std::vector<int32_t> expertIdsHost(numTokens * topK);
@@ -1088,11 +1180,11 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_E2E_RouterScaleLinearity)
     int64_t const int4PerTile = kNvfp4Int4PerTilePayload;
     auto upBuf = allocateNvfp4Weight(E, H, N, rng);
     NVFP4Tensor up = makeNvfp4Tensor(
-        upBuf, static_cast<int64_t>(H) * interChunks * int4PerTile, interChunks * int4PerTile, int4PerTile);
+        upBuf, static_cast<int64_t>(H) * interChunks * int4PerTile, interChunks * int4PerTile, int4PerTile, H, N, E);
 
     // Down weights
     auto dnBuf = allocateNvfp4Weight(E, N, H, rng);
-    NVFP4Tensor dn = makeNvfp4Tensor(dnBuf, static_cast<int64_t>(N) * (H / 32), H / 32, int4PerTile);
+    NVFP4Tensor dn = makeNvfp4Tensor(dnBuf, static_cast<int64_t>(N) * (H / 32), H / 32, int4PerTile, N, H, E);
 
     // Expert IDs: token 0 → expert 0
     std::vector<int32_t> expertIdsHost = {0};
@@ -1183,7 +1275,7 @@ static E2EResult runW4A4E2E(int H, int N, int E, int topK, int numTokens, MoEAct
     int64_t const upS2 = int4PerTile;
 
     auto upBuf = self->allocateNvfp4Weight(E, H, N, rng);
-    NVFP4Tensor up = self->makeNvfp4Tensor(upBuf, upS0, upS1, upS2);
+    NVFP4Tensor up = self->makeNvfp4Tensor(upBuf, upS0, upS1, upS2, H, N, E);
 
     // Down weights: tile grid [E, inter_pos, hidden_chunk]
     int64_t const dnS0 = static_cast<int64_t>(N) * (H / 32);
@@ -1191,7 +1283,7 @@ static E2EResult runW4A4E2E(int H, int N, int E, int topK, int numTokens, MoEAct
     int64_t const dnS2 = int4PerTile;
 
     auto dnBuf = self->allocateNvfp4Weight(E, N, H, rng);
-    NVFP4Tensor dn = self->makeNvfp4Tensor(dnBuf, dnS0, dnS1, dnS2);
+    NVFP4Tensor dn = self->makeNvfp4Tensor(dnBuf, dnS0, dnS1, dnS2, N, H, E);
 
     // Expert IDs: round-robin assignment
     std::vector<int32_t> expertIdsHost(numTokens * topK);
@@ -1429,11 +1521,11 @@ TEST_F(Nvfp4MoeDecodeTest, W4A4_E2E_RouterScaleLinearity)
     int64_t const int4PerTile = kNvfp4Int4PerTilePayload;
     auto upBuf = allocateNvfp4Weight(E, H, N, rng);
     NVFP4Tensor up = makeNvfp4Tensor(
-        upBuf, static_cast<int64_t>(H) * interChunks * int4PerTile, interChunks * int4PerTile, int4PerTile);
+        upBuf, static_cast<int64_t>(H) * interChunks * int4PerTile, interChunks * int4PerTile, int4PerTile, H, N, E);
 
     // Down weights
     auto dnBuf = allocateNvfp4Weight(E, N, H, rng);
-    NVFP4Tensor dn = makeNvfp4Tensor(dnBuf, static_cast<int64_t>(N) * (H / 32), H / 32, int4PerTile);
+    NVFP4Tensor dn = makeNvfp4Tensor(dnBuf, static_cast<int64_t>(N) * (H / 32), H / 32, int4PerTile, N, H, E);
 
     // Expert IDs: token 0 → expert 0
     std::vector<int32_t> expertIdsHost = {0};

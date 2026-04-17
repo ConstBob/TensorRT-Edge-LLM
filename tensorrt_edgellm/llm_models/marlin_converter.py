@@ -251,3 +251,34 @@ class MarlinConverter:
             float(scales[3]) / s_max * MarlinConverter.FP8_MAX,
         )
         return out.astype(np.int32), int(scale_q)
+
+    @staticmethod
+    def atom_sf_offset(m_idx: int, k_idx: int, num_sf_cols: int) -> int:
+        """Byte offset for atom-layout 128x4 swizzle (matches ``fp4Quantize.cu`` ``get_sf_out_offset_128x4``)."""
+        inner_k = k_idx % 4
+        inner_m = (m_idx % 128) // 32
+        outer_m = m_idx % 32
+        k_tile = k_idx // 4
+        num_k_tiles = (num_sf_cols + 3) // 4
+        m_tile = m_idx // 128
+        return m_tile * num_k_tiles * 512 + k_tile * 512 + outer_m * 16 + inner_m * 4 + inner_k
+
+    @staticmethod
+    def atom_sf_bytes_per_expert(m_dim: int,
+                                 k_dim: int,
+                                 sf_vec: int = 16) -> int:
+        """Total atom-layout scale factor buffer bytes per expert (or per M x K plane)."""
+        num_sf_cols = k_dim // sf_vec
+        padded_sf_cols = ((num_sf_cols + 3) // 4) * 4
+        padded_m = ((m_dim + 127) // 128) * 128
+        return padded_m * padded_sf_cols
+
+    @staticmethod
+    def marlin_scale_word_to_raw_fp8_bytes(scale_word: int) -> np.ndarray:
+        """Extract 4 raw FP8 E4M3 bytes in natural group order from a Marlin-packed scale int32.
+
+        Marlin byte layout is ``{s0, s2, s1, s3}``; this returns ``uint8[4]`` = ``{s0, s1, s2, s3}``.
+        """
+        b = np.frombuffer(np.uint32(int(scale_word) & 0xFFFFFFFF).tobytes(),
+                          dtype=np.uint8)
+        return np.array([b[0], b[2], b[1], b[3]], dtype=np.uint8)

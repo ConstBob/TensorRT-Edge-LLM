@@ -103,8 +103,7 @@ __device__ __forceinline__ void dequantNvfp4TileToHalf(
 {
     // Decode the 4 packed E4M3 block scales (one int32 → 4 half values).
     half2 scale2[2];
-    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(
-        tensor.block_scale[tensor.tileScaleIndex(tile)], scale2);
+    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(tensor.readBlockScaleWord(tile), scale2);
     __half const scale_h[4] = {
         __low2half(scale2[0]),
         __high2half(scale2[0]),
@@ -143,6 +142,7 @@ __device__ __forceinline__ void dequantNvfp4TileToHalf(
 //! Dequantize one NVFP4 activation scalar within a 64-element tile: one \c uint32 lane load plus block-scale decode.
 //! Returns FP32 (NVFP4 path is computed in FP16 then widened). \p elem_idx_in_tile is \c 0..\c kNvfp4ElemsPerTile-1 in
 //! the same order as \ref dequantNvfp4TileToHalf. Does \b not apply \ref NVFP4Tensor::global_scale.
+//! Uses \ref readBlockScaleWordLinear — activation scale factors use plain linear layout.
 __device__ __forceinline__ float dequantNvfp4TileElemToFloat(
     NVFP4Tensor const& tensor, Dim3 const tile, int const elem_idx_in_tile)
 {
@@ -153,7 +153,7 @@ __device__ __forceinline__ float dequantNvfp4TileElemToFloat(
 
     half2 scale2[2];
     marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(
-        tensor.block_scale[tensor.tileScaleIndex(tile)], scale2);
+        tensor.readBlockScaleWordLinear(tile), scale2);
     __half const scale_h[4] = {
         __low2half(scale2[0]),
         __high2half(scale2[0]),
@@ -243,9 +243,8 @@ __device__ __forceinline__ float nvfp4GemvTileDot(
     half2 a_scale2[2];
     half2 w_scale2[2];
     marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(
-        act.block_scale[act.tileScaleIndex(tile_a)], a_scale2);
-    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(
-        weight.block_scale[weight.tileScaleIndex(tile_w)], w_scale2);
+        act.readBlockScaleWordLinear(tile_a), a_scale2);
+    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(weight.readBlockScaleWord(tile_w), w_scale2);
 
     __half const a_scale_h[4] = {
         __low2half(a_scale2[0]),
@@ -305,9 +304,8 @@ __device__ __forceinline__ float nvfp4GemvTileDotNoActGlobal(
     half2 a_scale2[2];
     half2 w_scale2[2];
     marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(
-        act.block_scale[act.tileScaleIndex(tile_a)], a_scale2);
-    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(
-        weight.block_scale[weight.tileScaleIndex(tile_w)], w_scale2);
+        act.readBlockScaleWordLinear(tile_a), a_scale2);
+    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(weight.readBlockScaleWord(tile_w), w_scale2);
 
     __half const a_scale_h[4] = {
         __low2half(a_scale2[0]),
@@ -458,8 +456,7 @@ __device__ __forceinline__ void accumulateNvfp4GemvTileWarpReduce(
     static __shared__ half2 s_warp_chunk[kMaxWarpCount][kNvfp4Int4PerTilePayload][4][4];
 
     half2 scale2[2];
-    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(
-        weight.block_scale[weight.tileScaleIndex(tile)], scale2);
+    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(weight.readBlockScaleWord(tile), scale2);
     __half const scale_h[4] = {
         __low2half(scale2[0]),
         __high2half(scale2[0]),
@@ -534,8 +531,7 @@ __device__ __forceinline__ void accumulateNvfp4GemvTileWarpReduceToHalf(NVFP4Ten
     static __shared__ half2 floatAccumWarpReduceChunk[kMaxDecodingKernelWarpCount][kNvfp4Int4PerTilePayload][4][4];
 
     half2 scale2[2];
-    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(
-        wt.block_scale[wt.tileScaleIndex(tile)], scale2);
+    marlin::dequant_fp8_scales<half2, nvfp4_tensor_detail::kFe4m3fnTypeId>(wt.readBlockScaleWord(tile), scale2);
     __half const scale_h[4] = {
         __low2half(scale2[0]),
         __high2half(scale2[0]),
