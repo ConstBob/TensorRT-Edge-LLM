@@ -36,17 +36,4 @@ fi
 
 df -h /home
 
-# Configure huge pages for TensorRT engine compilation (needed for larger models like Phi-4-multimodal)
-current_hugepages=$(cat /proc/sys/vm/nr_hugepages)
-echo "Current huge pages: $current_hugepages"
-if [ "$current_hugepages" -lt 15658 ]; then
-  echo "Configuring 15658 huge pages for TRT engine builds"
-  echo $board_password | sudo -S sh -c 'echo 15658 > /proc/sys/vm/nr_hugepages'
-  actual_hugepages=$(cat /proc/sys/vm/nr_hugepages)
-  echo "Huge pages after configuration: $actual_hugepages"
-  if [ "$actual_hugepages" -lt 15658 ]; then
-    echo "WARNING: Only $actual_hugepages huge pages allocated (requested 15658). Engine builds for larger models may fail."
-  fi
-fi
-
 echo "Environment is ready!"
