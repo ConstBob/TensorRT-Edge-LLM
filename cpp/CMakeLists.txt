@@ -38,12 +38,19 @@ set(FMHA_ALL_SM_VERSIONS
 set(FMHA_EXCLUDE_DEFINITIONS "")
 
 # Build a list of required FMHA SM versions based on target architectures. Some
-# SM versions reuse cubins from other SM versions at runtime.
-set(REQUIRED_FMHA_SM_VERSIONS ${CMAKE_CUDA_ARCHITECTURES})
+# SM versions reuse cubins from other SM versions at runtime. Strip the
+# accelerated/virtual/real suffixes (e.g. 100a, 101a, 110a, 90-real) so the
+# IN_LIST checks below compare against plain numeric SM versions.
+set(REQUIRED_FMHA_SM_VERSIONS "")
+foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
+  string(REGEX REPLACE "[^0-9].*$" "" arch_num "${arch}")
+  list(APPEND REQUIRED_FMHA_SM_VERSIONS ${arch_num})
+endforeach()
+list(REMOVE_DUPLICATES REQUIRED_FMHA_SM_VERSIONS)
 
 # SM 110 uses SM 101 FMHA cubins at runtime
-if(110 IN_LIST CMAKE_CUDA_ARCHITECTURES AND NOT 101 IN_LIST
-                                            CMAKE_CUDA_ARCHITECTURES)
+if(110 IN_LIST REQUIRED_FMHA_SM_VERSIONS AND NOT 101 IN_LIST
+                                             REQUIRED_FMHA_SM_VERSIONS)
   list(APPEND REQUIRED_FMHA_SM_VERSIONS 101)
 endif()
 
