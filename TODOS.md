@@ -44,3 +44,27 @@ See `design/llm/llm_loader_design.adoc` for architecture notes.
 **Why:** Alpamayo is a planned NVIDIA model family targeted at edge inference.
 
 ---
+
+### Evaluate generateMultimodalIndices D2H performance
+**Priority:** Low
+**What:** Profile the D2H memcpy + CPU computation + H2D memcpy overhead of `generateMultimodalIndices` for typical audio sequence lengths (1K-8K tokens). If overhead exceeds 1ms, implement a CUDA kernel equivalent.
+**Why:** `runBaseModelPrefill` copies full input IDs D2H to compute multimodal indices on CPU, then copies results H2D. This is a synchronization point on the prefill hot path for audio multimodal requests.
+**Depends on:** Phase 1 landed + audio multimodal integration test available.
+
+### Unify multimodal embedding creation around `mMultimodalIndices`
+**Priority:** Medium
+**What:** Fix inconsistent handling of multimodal input by unifying embedding creation around the `mMultimodalIndices` schema as the common path for multimodal embedding lookup.
+**Why:** The current runtime uses different embedding creation paths for visual-only, audio+visual, and text-only fallback cases. A unified indexing/model would simplify the logic and reduce the risk of request-mode-specific drift or stale-state bugs.
+**Depends on:** Current runtime unification cleanup landing cleanly.
+
+### Add sampling dispatch smoke test
+**Priority:** Low
+**What:** Unit test in `unittests/` that validates the `useNonGreedySampling` boolean logic with various (temperature, topK, topP) combinations. Test the dispatch decision boundary without requiring a TRT engine: default params → greedy, topK>1 → non-greedy, topP<1.0 → non-greedy, temperature ∈ (0.001, 1.0) → non-greedy, temperature ≤ 0.001 → greedy.
+**Why:** The sampling dispatch logic is critical for correctness and currently has no unit test coverage. The logic is pure boolean — testable without engine infrastructure.
+**Depends on:** Nothing — can be built immediately.
+
+### Update runtime documentation for unified architecture
+**Priority:** Low
+**What:** Update `docs/source/developer_guide/software-design/llm-inference-runtime.md` and `docs/source/developer_guide/customization/customization-guide.md` to reflect the unified runtime (`LLMInferenceSpecDecodeRuntime` replaces `LLMInferenceRuntime`). Update architecture diagrams and class references.
+**Why:** Current docs reference the deleted `LLMInferenceRuntime` class and describe the dual-runtime architecture which no longer exists.
+**Depends on:** Phase 1 landed.

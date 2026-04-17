@@ -22,6 +22,7 @@
 #include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -482,6 +483,62 @@ EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cud
     }
 
     return result;
+}
+
+int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectivePrefillLengths,
+    int32_t requestedMaxGenerateLength, int32_t kvCacheCapacity, int32_t kvCacheReserveLength)
+{
+    check::check(!effectivePrefillLengths.empty(), "effectivePrefillLengths must not be empty");
+
+    int32_t clampedMaxGenerateLength = requestedMaxGenerateLength;
+    for (int32_t const prefillLength : effectivePrefillLengths)
+    {
+        int32_t const availableGenerateLength = std::max(0, kvCacheCapacity - prefillLength - kvCacheReserveLength);
+        clampedMaxGenerateLength = std::min(clampedMaxGenerateLength, availableGenerateLength);
+    }
+
+    return clampedMaxGenerateLength;
+}
+
+rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
+    std::optional<int32_t> imageTokenId, int32_t vocabSize)
+{
+    auto const shape = inputIds.getShape();
+    check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
+    int64_t const batchSize = shape[0];
+    int64_t const seqLen = shape[1];
+
+    rt::Tensor multimodalIndices({batchSize, seqLen}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32);
+
+    int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
+    int32_t* indicesPtr = multimodalIndices.dataPointer<int32_t>();
+
+    int32_t audioIndex = 0;
+    int32_t imageIndex = 0;
+
+    for (int64_t b = 0; b < batchSize; ++b)
+    {
+        for (int64_t s = 0; s < seqLen; ++s)
+        {
+            int64_t const pos = b * seqLen + s;
+            int32_t const tokenId = inputIdsPtr[pos];
+
+            if (audioTokenId.has_value() && tokenId == *audioTokenId)
+            {
+                indicesPtr[pos] = audioIndex++;
+            }
+            else if ((imageTokenId.has_value() && tokenId == *imageTokenId) || tokenId >= vocabSize)
+            {
+                indicesPtr[pos] = imageIndex++;
+            }
+            else
+            {
+                indicesPtr[pos] = 0;
+            }
+        }
+    }
+
+    return multimodalIndices;
 }
 
 } // namespace rt

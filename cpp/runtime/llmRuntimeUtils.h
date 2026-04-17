@@ -255,5 +255,35 @@ struct EmbeddingData
  */
 EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream);
 
+/*!
+ * @brief Clamp max generation length against KV-cache capacity across the full active batch
+ *
+ * Uses the smallest remaining KV budget across all active sequences so the shared
+ * generation limit cannot overrun any batch item.
+ *
+ * @param effectivePrefillLengths Effective prefill lengths for each active sequence
+ * @param requestedMaxGenerateLength User-requested max generation length
+ * @param kvCacheCapacity Total KV-cache capacity available to the runtime
+ * @param kvCacheReserveLength Extra KV reserve required by the runtime mode
+ * @return Clamped max generation length, never below 0
+ */
+int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectivePrefillLengths,
+    int32_t requestedMaxGenerateLength, int32_t kvCacheCapacity, int32_t kvCacheReserveLength);
+
+/*!
+ * @brief Generate multimodal indices for embeddingLookupMultimodal kernel
+ *
+ * Scans input IDs and generates sequential indices for audio/image embeddings.
+ * Audio and image indices are tracked independently, both globally across batches.
+ *
+ * @param inputIds Input token IDs on CPU [batchSize, seqLen]
+ * @param audioTokenId Special token ID for audio, or std::nullopt if no audio
+ * @param imageTokenId Special token ID for image, or std::nullopt if no image
+ * @param vocabSize Vocabulary size (tokens >= vocabSize are treated as image tokens)
+ * @return multimodalIndices tensor on CPU [batchSize, seqLen]
+ */
+rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
+    std::optional<int32_t> imageTokenId, int32_t vocabSize);
+
 } // namespace rt
 } // namespace trt_edgellm

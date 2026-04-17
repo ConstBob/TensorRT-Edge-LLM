@@ -15,23 +15,21 @@
  * limitations under the License.
  */
 
-#pragma once
+#include "sampler/sampling.h"
 
-// Compatibility header for in-flight branches (Qwen3-VL, Mamba, LLM Loader).
-// LLMInferenceRuntime has been unified into LLMInferenceSpecDecodeRuntime.
-// This typedef allows existing code to compile without immediate changes.
-// Remove in Phase 2 when the class is renamed to LLMRuntime.
-
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include <cmath>
 
 namespace trt_edgellm
 {
-namespace rt
-{
 
-//! @brief Compatibility typedef — LLMInferenceRuntime is now LLMInferenceSpecDecodeRuntime.
-//! The unified runtime supports both vanilla (no draft model) and Eagle spec-decode modes.
-//! Construct without EagleDraftingConfig for vanilla-only behavior identical to the old LLMInferenceRuntime.
-using LLMInferenceRuntime = LLMInferenceSpecDecodeRuntime;
-} // namespace rt
+bool shouldUseNonGreedySampling(float temperature, int64_t topK, float topP) noexcept
+{
+    // topK == 1 forces greedy regardless of other params (only one candidate token)
+    if (topK == 1)
+    {
+        return false;
+    }
+    return (topK > 1) || (topP < 1.0f - 1e-6f) || (temperature > 1e-3f && std::fabs(temperature - 1.0f) > 1e-3f);
+}
+
 } // namespace trt_edgellm
