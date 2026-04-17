@@ -1,8 +1,8 @@
 # CuTe DSL GDN Kernels (Ampere through Blackwell)
 
 Prefill and decode kernels for Gated Delta Net (GDN), AOT-compiled from CuTe
-DSL Python source. Prebuilt artifacts (static library + headers) are checked
-into the repo; CMake links them directly — no Python or GPU needed at build time.
+DSL Python source. Prebuilt artifacts (static library + headers) are generated
+locally; CMake links them directly — no Python or GPU needed at build time.
 
 ## Kernel Variants
 
@@ -34,7 +34,10 @@ python kernelSrcs/build_cutedsl.py --kernels gdn --gpu_arch sm_87 [--clean]
 python kernelSrcs/build_cutedsl.py --kernels gdn [--clean]
 ```
 
-Output under `cpp/kernels/cuteDSLArtifact/{arch}/`:
+Output under `cpp/kernels/cuteDSLArtifact/{arch}/{artifact_tag}/`:
+
+`artifact_tag` is currently `sm_<NN>` (for example `sm_87`, `sm_110`, or
+`sm_121`).
 
 ```
 libcutedsl_{arch}.a    — per-variant .o + libcuda_dialect_runtime_static.a
@@ -46,8 +49,8 @@ include/
     gdn_prefill_blackwell.h   — present only when that variant was built
 ```
 
-Commit the `cuteDSLArtifact/{arch}/` directory so downstream builds need no
-Python or GPU.
+Keep the `cuteDSLArtifact/{arch}/{artifact_tag}/` directory locally so
+downstream CMake builds can reuse it without re-running Python.
 
 Key script flags: `--kernels gdn`, `--gpu_arch` (e.g. `sm_87` for Orin,
 omit for device-native SM on Thor), `--arch` (default: auto), `--verbose`,
@@ -63,11 +66,15 @@ omit for device-native SM on Thor), `--arch` (default: auto), `--verbose`,
 cmake -DENABLE_CUTE_DSL=gdn ...
 ```
 
-`cmake/CuteDsl.cmake` reads `metadata.json`, validates the prebuilt artifacts,
+`cmake/CuteDsl.cmake` resolves the artifact tag, reads `metadata.json`,
+validates the prebuilt artifacts under `cuteDSLArtifact/{arch}/{artifact_tag}/`,
 and links `libcutedsl_{arch}.a`; defines `CUTE_DSL_GDN_ENABLED`. If
 `gdn_prefill_blackwell` appears in `metadata.json`, it also defines
 `CUTE_DSL_GDN_BLACKWELL_ENABLED` so the C++ runner can load the Blackwell
 prefill module. Fails with a clear error if artifacts are missing.
+
+If multiple artifact tags exist for the same CPU architecture, pass
+`-DCUTE_DSL_ARTIFACT_TAG=<tag>` explicitly.
 
 To enable both GDN and FMHA:
 

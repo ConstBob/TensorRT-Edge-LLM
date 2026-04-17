@@ -16,9 +16,9 @@
 # ---------------------------------------------------------------------------
 # CuTe DSL unified kernel library
 #
-# Prebuilt artifacts are generated offline by: python
-# kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN> and committed to the repository
-# under: cpp/kernels/cuteDSLArtifact/{arch}/
+# Prebuilt artifacts are generated locally by: kernelSrcs/build_cutedsl.py
+# --gpu_arch <sm_NN> and stored under:
+# cpp/kernels/cuteDSLArtifact/{arch}/{artifact_tag}/
 #
 # No Python, CUTLASS DSL, or GPU is needed at CMake build time.
 #
@@ -44,11 +44,121 @@ set(ENABLE_CUTE_DSL
       "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn)"
 )
 
+set(CUTE_DSL_ARTIFACT_TAG
+    ""
+    CACHE
+      STRING
+      "CuTe DSL artifact tag under cuteDSLArtifact/<arch>/ (e.g. sm_80, sm_110, sm_121). Leave empty to auto-select when unambiguous."
+)
+
 # Include guard — safe to include from multiple CMakeLists.txt directories.
 if(DEFINED _CUTE_DSL_CMAKE_INCLUDED)
   return()
 endif()
 set(_CUTE_DSL_CMAKE_INCLUDED TRUE)
+
+function(_cute_dsl_normalize_artifact_tag OUT_VAR INPUT_TAG)
+  string(STRIP "${INPUT_TAG}" _tag)
+  if(_tag STREQUAL "")
+    set(${OUT_VAR}
+        ""
+        PARENT_SCOPE)
+    return()
+  endif()
+
+  string(TOLOWER "${_tag}" _tag)
+  string(REPLACE "-" "_" _tag "${_tag}")
+
+  if(_tag MATCHES "^([0-9]+)$")
+    set(_tag "sm_${CMAKE_MATCH_1}")
+  elseif(_tag MATCHES "^sm([0-9]+)$")
+    set(_tag "sm_${CMAKE_MATCH_1}")
+  endif()
+
+  if(NOT _tag MATCHES "^[a-z0-9_]+$")
+    message(
+      FATAL_ERROR "Invalid CUTE_DSL_ARTIFACT_TAG='${INPUT_TAG}'. "
+                  "Use a simple directory tag such as sm_80, sm_110, or sm_121."
+    )
+  endif()
+
+  set(${OUT_VAR}
+      "${_tag}"
+      PARENT_SCOPE)
+endfunction()
+
+function(_cute_dsl_infer_artifact_tag OUT_VAR ARCH)
+  _cute_dsl_normalize_artifact_tag(_explicit_tag "${CUTE_DSL_ARTIFACT_TAG}")
+  if(NOT _explicit_tag STREQUAL "")
+    set(${OUT_VAR}
+        "${_explicit_tag}"
+        PARENT_SCOPE)
+    return()
+  endif()
+
+  set(_default_tag "")
+  if("${ARCH}" STREQUAL "aarch64"
+     AND DEFINED EMBEDDED_TARGET
+     AND NOT EMBEDDED_TARGET STREQUAL "")
+    string(TOLOWER "${EMBEDDED_TARGET}" _embedded_target)
+    string(REPLACE "-" "_" _embedded_target "${_embedded_target}")
+    if(_embedded_target STREQUAL "gb10")
+      set(_default_tag "sm_121")
+    elseif(_embedded_target STREQUAL "auto_thor" OR _embedded_target STREQUAL
+                                                    "jetson_thor")
+      set(_default_tag "sm_110")
+    elseif(_embedded_target STREQUAL "jetson_orin")
+      set(_default_tag "sm_87")
+    endif()
+  endif()
+
+  if(NOT _default_tag STREQUAL "")
+    set(${OUT_VAR}
+        "${_default_tag}"
+        PARENT_SCOPE)
+    return()
+  endif()
+
+  set(_artifact_root "${CMAKE_SOURCE_DIR}/cpp/kernels/cuteDSLArtifact/${ARCH}")
+  set(_candidate_tags)
+  if(EXISTS "${_artifact_root}")
+    file(
+      GLOB _artifact_children
+      RELATIVE "${_artifact_root}"
+      LIST_DIRECTORIES true
+      "${_artifact_root}/*")
+    foreach(_child ${_artifact_children})
+      if(IS_DIRECTORY "${_artifact_root}/${_child}"
+         AND EXISTS "${_artifact_root}/${_child}/metadata.json")
+        list(APPEND _candidate_tags "${_child}")
+      endif()
+    endforeach()
+  endif()
+
+  list(LENGTH _candidate_tags _num_candidates)
+  if(_num_candidates EQUAL 1)
+    list(GET _candidate_tags 0 _only_tag)
+    message(
+      STATUS
+        "CuTe DSL: inferred artifact tag '${_only_tag}' from ${_artifact_root}")
+    set(${OUT_VAR}
+        "${_only_tag}"
+        PARENT_SCOPE)
+    return()
+  endif()
+
+  if(_num_candidates GREATER 1)
+    message(
+      FATAL_ERROR
+        "CuTe DSL artifact selection is ambiguous for arch=${ARCH}.\n"
+        "Found multiple artifact tags under ${_artifact_root}: ${_candidate_tags}\n"
+        "Set -DCUTE_DSL_ARTIFACT_TAG=<tag> explicitly.")
+  endif()
+
+  set(${OUT_VAR}
+      ""
+      PARENT_SCOPE)
+endfunction()
 
 # ---------------------------------------------------------------------------
 # cute_dsl_setup()
@@ -81,8 +191,38 @@ function(cute_dsl_setup)
     set(_arch "x86_64")
   endif()
 
-  # Unified artifact directory (produced by kernelSrcs/build_cutedsl.py).
-  set(_artifact_dir "${CMAKE_SOURCE_DIR}/cpp/kernels/cuteDSLArtifact/${_arch}")
+  _cute_dsl_infer_artifact_tag(_artifact_tag "${_arch}")
+
+  # Tagged artifact directory (preferred) with compatibility fallback to the
+  # previous flat layout at cuteDSLArtifact/<arch>/.
+  set(_artifact_root "${CMAKE_SOURCE_DIR}/cpp/kernels/cuteDSLArtifact/${_arch}")
+  set(_artifact_dir "${_artifact_root}")
+  if(NOT _artifact_tag STREQUAL "")
+    set(_tagged_artifact_dir "${_artifact_root}/${_artifact_tag}")
+    if(EXISTS "${_tagged_artifact_dir}/metadata.json")
+      set(_artifact_dir "${_tagged_artifact_dir}")
+    elseif(EXISTS "${_artifact_root}/metadata.json")
+      message(
+        WARNING
+          "CuTe DSL: using legacy flat artifact layout at ${_artifact_root}. "
+          "Regenerate artifacts into ${_tagged_artifact_dir} to avoid cross-target overwrites."
+      )
+    else()
+      set(_artifact_dir "${_tagged_artifact_dir}")
+    endif()
+  endif()
+
+  if(_artifact_tag STREQUAL ""
+     AND "${_arch}" STREQUAL "aarch64"
+     AND DEFINED EMBEDDED_TARGET
+     AND EMBEDDED_TARGET STREQUAL "thor-all")
+    message(
+      FATAL_ERROR
+        "CuTe DSL artifact selection is ambiguous for EMBEDDED_TARGET=thor-all.\n"
+        "Set -DCUTE_DSL_ARTIFACT_TAG=sm_110 or -DCUTE_DSL_ARTIFACT_TAG=sm_121 explicitly."
+    )
+  endif()
+
   set(_static_lib "${_artifact_dir}/libcutedsl_${_arch}.a")
   set(_inc_dir "${_artifact_dir}/include")
   set(_metadata "${_artifact_dir}/metadata.json")
@@ -95,8 +235,8 @@ function(cute_dsl_setup)
         "  ${_static_lib}\n"
         "Generate it with:\n"
         "  python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN> --arch ${_arch}\n"
-        "then commit the resulting ${_arch}/ directory under "
-        "cpp/kernels/cuteDSLArtifact/.")
+        "Artifacts are generated locally under:\n"
+        "  cpp/kernels/cuteDSLArtifact/<arch>/<artifact_tag>/")
   endif()
 
   if(NOT EXISTS "${_metadata}")
@@ -114,6 +254,23 @@ function(cute_dsl_setup)
   # "groups": ["gdn", "fmha"], "variants": [...] } Requires CMake >= 3.19 for
   # string(JSON ...).
   file(READ "${_metadata}" _meta_json)
+  string(
+    JSON
+    _meta_gpu_arch
+    ERROR_VARIABLE
+    _meta_gpu_arch_err
+    GET
+    "${_meta_json}"
+    "gpu_arch")
+  if(NOT _meta_gpu_arch_err
+     AND NOT _artifact_tag STREQUAL ""
+     AND NOT _meta_gpu_arch STREQUAL "${_artifact_tag}")
+    message(
+      FATAL_ERROR
+        "CuTe DSL artifact tag mismatch: selected '${_artifact_tag}' but "
+        "metadata.json in ${_artifact_dir} reports gpu_arch='${_meta_gpu_arch}'."
+    )
+  endif()
   string(JSON _n_groups LENGTH "${_meta_json}" "groups")
 
   if(_n_groups EQUAL 0)
@@ -269,10 +426,250 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Link libcuda again after the .a (--as-needed can drop an earlier libcuda).
+  # Per-variant defines for GEMM kernels (Talker MLP cuBLAS replacement). The
+  # runner expects clean architecture-level names rather than raw variant IDs.
+  list(FIND _variants "gemm_ampere_decode_fp16" _gemm_ampere_decode_idx)
+  if(NOT ${_gemm_ampere_decode_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_AMPERE_ENABLED"
+                        "CUTE_DSL_GEMM_AMPERE_DECODE_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_ampere_decode_fp16 variant found — CUTE_DSL_GEMM_AMPERE_DECODE_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_ampere_small_prefill_fp16"
+       _gemm_ampere_small_prefill_idx)
+  if(NOT ${_gemm_ampere_small_prefill_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_AMPERE_ENABLED"
+                        "CUTE_DSL_GEMM_AMPERE_SMALL_PREFILL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_ampere_small_prefill_fp16 variant found — CUTE_DSL_GEMM_AMPERE_SMALL_PREFILL_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_ampere_medium_prefill_fp16"
+       _gemm_ampere_medium_prefill_idx)
+  if(NOT ${_gemm_ampere_medium_prefill_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_AMPERE_ENABLED"
+                        "CUTE_DSL_GEMM_AMPERE_MEDIUM_PREFILL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_ampere_medium_prefill_fp16 variant found — CUTE_DSL_GEMM_AMPERE_MEDIUM_PREFILL_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_ampere_large_prefill_fp16"
+       _gemm_ampere_large_prefill_idx)
+  if(NOT ${_gemm_ampere_large_prefill_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_AMPERE_ENABLED"
+                        "CUTE_DSL_GEMM_AMPERE_LARGE_PREFILL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_ampere_large_prefill_fp16 variant found — CUTE_DSL_GEMM_AMPERE_LARGE_PREFILL_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_ampere_splitk4_fp16" _gemm_ampere_splitk4_idx)
+  if(NOT ${_gemm_ampere_splitk4_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_AMPERE_ENABLED"
+                        "CUTE_DSL_GEMM_AMPERE_SPLITK4_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_ampere_splitk4_fp16 — CUTE_DSL_GEMM_AMPERE_SPLITK4_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_ampere_splitk2_fp16" _gemm_ampere_splitk2_idx)
+  if(NOT ${_gemm_ampere_splitk2_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_AMPERE_ENABLED"
+                        "CUTE_DSL_GEMM_AMPERE_SPLITK2_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_ampere_splitk2_fp16 — CUTE_DSL_GEMM_AMPERE_SPLITK2_ENABLED set"
+    )
+  endif()
+
+  # Fused epilogue variants (Plan C: bias+SiLU for FC1, bias-only for FC2)
+  list(FIND _variants "gemm_ampere_medium_bias_silu_fp16"
+       _gemm_ampere_medium_bias_silu_idx)
+  if(NOT ${_gemm_ampere_medium_bias_silu_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_AMPERE_ENABLED"
+                        "CUTE_DSL_GEMM_AMPERE_MEDIUM_BIAS_SILU_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_ampere_medium_bias_silu_fp16 — CUTE_DSL_GEMM_AMPERE_MEDIUM_BIAS_SILU_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_ampere_medium_bias_fp16"
+       _gemm_ampere_medium_bias_idx)
+  if(NOT ${_gemm_ampere_medium_bias_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_AMPERE_ENABLED"
+                        "CUTE_DSL_GEMM_AMPERE_MEDIUM_BIAS_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_ampere_medium_bias_fp16 — CUTE_DSL_GEMM_AMPERE_MEDIUM_BIAS_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_bw_geforce_small_fp16" _gemm_bw_geforce_small_idx)
+  if(NOT ${_gemm_bw_geforce_small_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_GEFORCE_SMALL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_bw_geforce_small_fp16 variant found — CUTE_DSL_GEMM_BLACKWELL_GEFORCE_SMALL_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_fp16" _gemm_blackwell_idx)
+  if(NOT ${_gemm_blackwell_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_GEMM_BLACKWELL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_fp16 variant found — CUTE_DSL_GEMM_BLACKWELL_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_bw_geforce_fp16" _gemm_bw_geforce_idx)
+  if(NOT ${_gemm_bw_geforce_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_GEFORCE_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_bw_geforce_fp16 variant found — CUTE_DSL_GEMM_BLACKWELL_GEFORCE_ENABLED set"
+    )
+  endif()
+
+  # Blackwell DC fused epilogue variants
+  list(FIND _variants "gemm_blackwell_bias_silu_fp16"
+       _gemm_blackwell_bias_silu_idx)
+  if(NOT ${_gemm_blackwell_bias_silu_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_BIAS_SILU_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_bias_silu_fp16 — CUTE_DSL_GEMM_BLACKWELL_BIAS_SILU_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_bias_fp16" _gemm_blackwell_bias_idx)
+  if(NOT ${_gemm_blackwell_bias_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_GEMM_BLACKWELL_BIAS_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_bias_fp16 — CUTE_DSL_GEMM_BLACKWELL_BIAS_ENABLED set"
+    )
+  endif()
+
+  # BW GeForce fused epilogue variants
+  list(FIND _variants "gemm_bw_geforce_bias_silu_fp16"
+       _gemm_bw_geforce_bias_silu_idx)
+  if(NOT ${_gemm_bw_geforce_bias_silu_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BW_GEFORCE_BIAS_SILU_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_bw_geforce_bias_silu_fp16 — CUTE_DSL_GEMM_BW_GEFORCE_BIAS_SILU_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_bw_geforce_bias_fp16" _gemm_bw_geforce_bias_idx)
+  if(NOT ${_gemm_bw_geforce_bias_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BW_GEFORCE_BIAS_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_bw_geforce_bias_fp16 — CUTE_DSL_GEMM_BW_GEFORCE_BIAS_ENABLED set"
+    )
+  endif()
+
+  # Umbrella CUTE_DSL_GEMM_ENABLED — set if ANY gemm variant was found. Source
+  # files guard the entire GEMM path with this define.
+  set(_any_gemm FALSE)
+  foreach(
+    _gv
+    _gemm_ampere_decode_idx
+    _gemm_ampere_small_prefill_idx
+    _gemm_ampere_medium_prefill_idx
+    _gemm_ampere_large_prefill_idx
+    _gemm_ampere_splitk4_idx
+    _gemm_ampere_splitk2_idx
+    _gemm_ampere_medium_bias_silu_idx
+    _gemm_ampere_medium_bias_idx
+    _gemm_blackwell_idx
+    _gemm_blackwell_bias_silu_idx
+    _gemm_blackwell_bias_idx
+    _gemm_bw_geforce_idx
+    _gemm_bw_geforce_small_idx
+    _gemm_bw_geforce_bias_silu_idx
+    _gemm_bw_geforce_bias_idx)
+    if(DEFINED ${_gv} AND NOT ${${_gv}} EQUAL -1)
+      set(_any_gemm TRUE)
+    endif()
+  endforeach()
+  if(_any_gemm)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_GEMM_ENABLED")
+    endforeach()
+    message(STATUS "CuTe DSL: CUTE_DSL_GEMM_ENABLED set (GEMM variants found)")
+  endif()
+
+  # Link the static archive + shim + driver lib into LINK_TARGETS.
+  #
+  # For STATIC libraries, use PUBLIC so executables that link edgellmCore /
+  # edgellmKernels also inherit the CuTe DSL archive. Otherwise unresolved AOT
+  # wrapper symbols only show up at the final executable link step.
   foreach(_tgt ${ARG_LINK_TARGETS})
-    target_link_libraries(${_tgt} PRIVATE "${_static_lib}"
-                                          trt_edgellm_cutedsl_cudart_shim)
+    get_target_property(_tgt_type ${_tgt} TYPE)
+    if(_tgt_type STREQUAL "STATIC_LIBRARY")
+      target_link_libraries(${_tgt} PUBLIC "${_static_lib}")
+    else()
+      target_link_libraries(${_tgt} PRIVATE "${_static_lib}"
+                                            trt_edgellm_cutedsl_cudart_shim)
+    endif()
     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
       target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
     endif()
@@ -286,5 +683,6 @@ function(cute_dsl_setup)
 
   message(
     STATUS
-      "CuTe DSL: arch=${_arch}  groups=[${_active_groups}]  lib=${_static_lib}")
+      "CuTe DSL: arch=${_arch}  artifact_tag=${_artifact_tag}  groups=[${_active_groups}]  lib=${_static_lib}"
+  )
 endfunction()
