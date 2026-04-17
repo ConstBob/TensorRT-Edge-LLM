@@ -313,19 +313,31 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
 
     try:
         system_prompt = SystemMessage()
-        system_formatted = _format_messages(tokenizer, [system_prompt])
-        system_prefix, system_suffix = _extract_prefix_suffix(
-            system_formatted, system_prompt.content)
-
         user_prompt = UserMessage()
+
+        # Some templates (e.g. Qwen3.5) require at least one user message and
+        # raise TemplateError when formatting a system-only message.  Always
+        # format system+user first (guaranteed to work), then try system-only
+        # as a refinement.
         user_formatted = _format_messages(tokenizer,
                                           [system_prompt, user_prompt])
-        # Find the user segment robustly.  Some tokenizers (e.g. Phi-4MM) emit
-        # a single-message EOS in ``system_formatted`` that is absent when
-        # messages are concatenated, so a len(system_formatted)-based offset
-        # drifts.  Instead, compute user_prefix as the text between the end of
-        # the system placeholder and the start of the user placeholder inside
-        # ``user_formatted``.  This is accurate regardless of EOS tokens.
+
+        system_formatted = None
+        try:
+            system_formatted = _format_messages(tokenizer, [system_prompt])
+        except Exception:
+            pass
+
+        if system_formatted is not None:
+            system_prefix, system_suffix = _extract_prefix_suffix(
+                system_formatted, system_prompt.content)
+        else:
+            # Extract system prefix/suffix from the combined result.
+            # e.g. "<|im_start|>system\n<PLACEHOLDER><|im_end|>\n<|im_start|>user\n..."
+            system_prefix, system_suffix = _extract_prefix_suffix(
+                user_formatted, system_prompt.content)
+            # system_suffix will include user segment — trim it below.
+
         # Find the user segment robustly.  Primary strategy: format a
         # user-only message (no system prompt) to isolate user prefix/suffix
         # without system-related content.  This works for models like Phi-4MM
@@ -334,18 +346,32 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
         # user-only prefix will contain system_prefix, so we fall back to the
         # original len(system_formatted)-based slice but correct for
         # single-message EOS drift.
-        user_only_formatted = _format_messages(tokenizer, [user_prompt])
-        user_only_prefix, user_only_suffix = _extract_prefix_suffix(
-            user_only_formatted, user_prompt.content)
-        if user_only_prefix is not None and system_prefix not in user_only_prefix:
+        user_only_formatted = None
+        try:
+            user_only_formatted = _format_messages(tokenizer, [user_prompt])
+        except Exception:
+            pass
+
+        if (user_only_formatted is not None
+                and system_prefix not in (_extract_prefix_suffix(
+                    user_only_formatted, user_prompt.content)[0] or "")):
             # User-only formatting is clean (no system injection).
-            user_prefix, user_suffix = user_only_prefix, user_only_suffix
-        else:
+            user_prefix, user_suffix = _extract_prefix_suffix(
+                user_only_formatted, user_prompt.content)
+        elif system_formatted is not None:
             # Fall back: original approach using len(system_formatted) offset.
             # This works for models where the tokenizer does NOT add single-
             # message EOS to system_formatted (e.g. Qwen, InternVL).
             user_prefix, user_suffix = _extract_prefix_suffix(
                 user_formatted[len(system_formatted):], user_prompt.content)
+        else:
+            # Neither system-only nor user-only worked.  Extract user
+            # prefix/suffix by locating the user placeholder after the
+            # system placeholder in the combined result.
+            sys_end = user_formatted.find(system_prompt.content) + len(
+                system_prompt.content)
+            user_prefix, user_suffix = _extract_prefix_suffix(
+                user_formatted[sys_end:], user_prompt.content)
 
         if user_prefix and user_prefix in system_suffix:
             system_suffix = system_suffix[:system_suffix.find(user_prefix)]

@@ -365,6 +365,132 @@ _trt_dequantize_linear_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# MXFP8 (trt domain)
+# ---------------------------------------------------------------------------
+
+_trt_mxfp8_dynamic_quantize_schema = OpSchema(
+    name="TRT_MXFP8DynamicQuantize",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("Dynamically quantize float16 activations to MXFP8 with per-block "
+         "E8M0 scaling."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="x",
+            description="Input activation tensor (float16)",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="x_fp8",
+            description="FP8E4M3 quantized tensor",
+            type_str="T_fp8",
+        ),
+        OpSchema.FormalParameter(
+            name="x_scale",
+            description="E8M0 per-block scale factors (uint8)",
+            type_str="T_scale",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T_fp8",
+            ["tensor(float8e4m3fn)", "tensor(uint8)"],
+            "FP8 quantized tensor.",
+        ),
+        (
+            "T_scale",
+            ["tensor(uint8)"],
+            "E8M0 scale tensor (UINT8).",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="axis",
+            type=OpSchema.AttrType.INT,
+            description="Quantization axis (default -1)",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="block_size",
+            type=OpSchema.AttrType.INT,
+            description="Elements per block (typically 32)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="output_dtype",
+            type=OpSchema.AttrType.INT,
+            description="ONNX elem_type for output (17 = FLOAT8E4M3FN)",
+            required=True,
+        ),
+    ],
+)
+
+_trt_mxfp8_dequantize_linear_schema = OpSchema(
+    name="TRT_MXFP8DequantizeLinear",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TRT-domain MXFP8 per-block dequantization with E8M0 scales.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="x",
+            description="Quantized input (FP8E4M3)",
+            type_str="T_q",
+        ),
+        OpSchema.FormalParameter(
+            name="x_scale",
+            description="E8M0 per-block scale factors (uint8)",
+            type_str="T_scale",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="y",
+            description="Dequantized output",
+            type_str="T_out",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T_q",
+            ["tensor(float8e4m3fn)", "tensor(uint8)"],
+            "Quantized tensor type.",
+        ),
+        (
+            "T_scale",
+            ["tensor(uint8)"],
+            "E8M0 scale tensor type.",
+        ),
+        (
+            "T_out",
+            ["tensor(float16)", "tensor(float)"],
+            "Dequantized output type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="axis",
+            type=OpSchema.AttrType.INT,
+            description="Dequantization axis",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="block_size",
+            type=OpSchema.AttrType.INT,
+            description="Block size (MXFP8 uses 32)",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="output_dtype",
+            type=OpSchema.AttrType.INT,
+            description="ONNX elem_type for output (10 = FLOAT16)",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::Int4GroupwiseGemmPlugin
 # ---------------------------------------------------------------------------
 
@@ -551,14 +677,79 @@ _update_ssm_state_schema = OpSchema(
     ],
 )
 
+_gated_delta_net_schema = OpSchema(
+    name="gated_delta_net",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="Qwen3.5 GatedDeltaNet linear attention plugin.",
+    inputs=[
+        OpSchema.FormalParameter(name="q",
+                                 description="Query [n, seq, h, k]",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="k",
+                                 description="Key [n, seq, h, k]",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="v",
+                                 description="Value [n, seq, hv, v]",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="a",
+                                 description="A gating tensor [n, seq, hv]",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="b",
+                                 description="B gating tensor [n, seq, hv]",
+                                 type_str="T"),
+        OpSchema.FormalParameter(name="A_log",
+                                 description="A_log [hv]",
+                                 type_str="T_A"),
+        OpSchema.FormalParameter(name="dt_bias",
+                                 description="dt_bias [hv]",
+                                 type_str="T"),
+        OpSchema.FormalParameter(
+            name="h0_source",
+            description="Recurrent state in [n, hv, k, v]",
+            type_str="T_A"),
+        OpSchema.FormalParameter(
+            name="context_lengths",
+            description="Valid token count per batch row [n]",
+            type_str="T_CL"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(name="o",
+                                 description="Output [n, seq, hv, v]",
+                                 type_str="T"),
+        OpSchema.FormalParameter(
+            name="h0_out",
+            description="Recurrent state out [n, hv, k, v]",
+            type_str="T_A"),
+    ],
+    type_constraints=[
+        ("T", ["tensor(float16)"], ""),
+        ("T_A", ["tensor(float)"], ""),
+        ("T_CL", ["tensor(int32)"], ""),
+    ],
+    attributes=[
+        OpSchema.Attribute(name="k_dim",
+                           type=OpSchema.AttrType.INT,
+                           description="K head dimension",
+                           required=True),
+        OpSchema.Attribute(name="v_dim",
+                           type=OpSchema.AttrType.INT,
+                           description="V head dimension",
+                           required=True),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
     _vit_attention_plugin_schema,
     _trt_fp4_dynamic_quantize_schema,
     _trt_dequantize_linear_schema,
+    _trt_mxfp8_dynamic_quantize_schema,
+    _trt_mxfp8_dequantize_linear_schema,
     _int4_groupwise_gemm_schema,
     _causal_conv1d_schema,
     _update_ssm_state_schema,
+    _gated_delta_net_schema,
 )
 
 _registered_llm_loader_schemas: bool = False

@@ -17,6 +17,17 @@ onnxscript translations for dynamo ONNX export.
 
 Maps ``torch.ops.trt.*`` and ``torch.ops.trt_edgellm.*`` stubs to ONNX graphs.
 Implementation files must be importable; ``onnxscript.script`` parses their AST.
+
+Attention plugin
+----------------
+A single ``_attention_plugin_translation`` covers all feature combinations
+(vanilla, FP8-KV, tree attention, FP8-KV + tree attention).  Its signature
+matches the full ``trt::attention_plugin`` custom-op schema so positional
+alignment with the FX graph (where ``torch.export`` normalizes every kwarg
+into a positional arg) is always correct.  ``attention_mask`` /
+``attention_pos_id`` are optional ONNX inputs (empty when tree attention is
+off); ``qkv_scales`` defaults to ``[1.0, 1.0, 1.0]`` in the op schema so it
+is always a valid FLOATS attribute.
 """
 
 from typing import Sequence
@@ -32,7 +43,7 @@ _trt = onnxscript.values.Opset("trt", 1)
 _trt_edgellm = onnxscript.values.Opset("trt_edgellm", 1)
 
 # ---------------------------------------------------------------------------
-# FP8 ops
+# Attention plugin translation (unified — all feature combinations)
 # ---------------------------------------------------------------------------
 
 
@@ -48,46 +59,21 @@ def _attention_plugin_translation(
     num_q_heads: int,
     num_kv_heads: int,
     head_size: int,
+    sliding_window_size: int,
+    enable_tree_attention: int,
     enable_fp8_kv_cache: int,
-    sliding_window_size: int,
-) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
-    attn_4d, present_kv = _trt_edgellm.AttentionPlugin(
-        query_states,
-        key_states,
-        value_states,
-        past_key_value,
-        context_lengths,
-        rope_rotary_cos_sin,
-        kvcache_start_index,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        enable_tree_attention=0,
-        enable_fp8_kv_cache=0,  # non-FP8-KV path always uses 0
-        sliding_window_size=sliding_window_size,
-        _outputs=2,
-    )
-    return attn_4d, present_kv
-
-
-@script()
-def _attention_plugin_fp8kv_translation(
-    query_states: onnxscript.FLOAT16,
-    key_states: onnxscript.FLOAT16,
-    value_states: onnxscript.FLOAT16,
-    past_key_value: onnxscript.FLOAT16,
-    context_lengths: onnxscript.INT32,
-    rope_rotary_cos_sin: onnxscript.FLOAT,
-    kvcache_start_index: onnxscript.INT32,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    sliding_window_size: int,
+    attention_mask: onnxscript.INT32,
+    attention_pos_id: onnxscript.INT32,
     qkv_scales: Sequence[float],
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
-    # qkv_scales is a FLOATS ONNX attribute [q_scale, k_scale, v_scale]
-    # read by TRT's AttentionPlugin as a PluginField at engine-build time.
-    # Defaults to [1.0, 1.0, 1.0] when the checkpoint has no KV scales.
+    """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
+
+    The signature matches the full ``trt::attention_plugin`` custom-op schema
+    so torch.export's positional-arg normalisation is always aligned.
+    ``attention_mask`` / ``attention_pos_id`` are optional ONNX inputs (empty
+    when tree attention is off).  ``qkv_scales`` defaults to [1, 1, 1] in the
+    op schema and is always a valid FLOATS attribute.
+    """
     attn_4d, present_kv = _trt_edgellm.AttentionPlugin(
         query_states,
         key_states,
@@ -96,16 +82,23 @@ def _attention_plugin_fp8kv_translation(
         context_lengths,
         rope_rotary_cos_sin,
         kvcache_start_index,
+        attention_mask,
+        attention_pos_id,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
-        enable_tree_attention=0,
-        enable_fp8_kv_cache=1,
+        enable_tree_attention=enable_tree_attention,
+        enable_fp8_kv_cache=enable_fp8_kv_cache,
         sliding_window_size=sliding_window_size,
         qkv_scales=qkv_scales,
         _outputs=2,
     )
     return attn_4d, present_kv
+
+
+# ---------------------------------------------------------------------------
+# FP8 ops
+# ---------------------------------------------------------------------------
 
 
 @script()
@@ -187,6 +180,64 @@ def _nvfp4_dequantize_translation(
     w_dq = _op21.DequantizeLinear(weight, ws, axis=-1, block_size=group_size)
     # Cast float32 -> float16 to match activation dtype for MatMul
     return _op21.Cast(w_dq, to=10)  # 10 = ONNX TensorProto.FLOAT16
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 ops
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _mxfp8_act_qdq_translation(
+    hidden_states: onnxscript.FLOAT16, ) -> onnxscript.FLOAT16:
+    """MXFP8 activation: DynQ + DQ.
+
+    Emits::
+
+        TRT_MXFP8DynamicQuantize(x, axis=-1, block_size=32, output_dtype=17)
+            -> (x_f8, sx_e8m0)
+        TRT_MXFP8DequantizeLinear(x_f8, sx_e8m0,
+            axis=-1, block_size=32, output_dtype=10)
+            -> x_dq [float16]
+    """
+    x_f8, sx_e8m0 = _trt.TRT_MXFP8DynamicQuantize(
+        hidden_states,
+        axis=-1,
+        block_size=32,
+        output_dtype=17,  # FLOAT8E4M3FN
+        _outputs=2,
+    )
+    x_dq = _trt.TRT_MXFP8DequantizeLinear(
+        x_f8,
+        sx_e8m0,
+        axis=-1,
+        block_size=32,
+        output_dtype=10,  # FLOAT16
+    )
+    return x_dq
+
+
+@script()
+def _mxfp8_weight_dq_translation(
+    weight: onnxscript.FLOAT8E4M3FN,
+    weight_scale: onnxscript.UINT8,
+    block_size: int,
+) -> onnxscript.FLOAT16:
+    """MXFP8 weight dequantize: TRT_MXFP8DequantizeLinear.
+
+    Emits::
+
+        TRT_MXFP8DequantizeLinear(weight, weight_scale,
+            axis=-1, block_size=block_size, output_dtype=10) -> w_dq [float16]
+    """
+    w_dq = _trt.TRT_MXFP8DequantizeLinear(
+        weight,
+        weight_scale,
+        axis=-1,
+        block_size=block_size,
+        output_dtype=10,  # FLOAT16
+    )
+    return w_dq
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +334,37 @@ def _causal_conv1d_translation(
         _outputs=2,
     )
     return output, conv_state_out
+
+
+@script()
+def _gated_delta_net_translation(
+    q: onnxscript.FLOAT16,
+    k: onnxscript.FLOAT16,
+    v: onnxscript.FLOAT16,
+    a: onnxscript.FLOAT16,
+    b: onnxscript.FLOAT16,
+    A_log: onnxscript.FLOAT,
+    dt_bias: onnxscript.FLOAT16,
+    h0_source: onnxscript.FLOAT,
+    context_lengths: onnxscript.INT32,
+    k_dim: int,
+    v_dim: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT]:
+    output, h0_out = _trt_edgellm.gated_delta_net(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        h0_source,
+        context_lengths,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        _outputs=2,
+    )
+    return output, h0_out
 
 
 @script()
@@ -389,12 +471,12 @@ def build_custom_translation_table() -> dict:
 
     return {
         torch.ops.trt.attention_plugin.default: _attention_plugin_translation,
-        torch.ops.trt.attention_plugin_fp8kv.default:
-        _attention_plugin_fp8kv_translation,
         torch.ops.trt.fp8_quantize.default: _fp8_quantize_translation,
         torch.ops.trt.fp8_dequantize.default: _fp8_dequantize_translation,
         torch.ops.trt.nvfp4_act_qdq.default: _nvfp4_act_qdq_translation,
         torch.ops.trt.nvfp4_dequantize.default: _nvfp4_dequantize_translation,
+        torch.ops.trt.mxfp8_act_qdq.default: _mxfp8_act_qdq_translation,
+        torch.ops.trt.mxfp8_weight_dq.default: _mxfp8_weight_dq_translation,
         torch.ops.trt.int4_groupwise_gemm.default:
         _int4_groupwise_gemm_translation,
         torch.ops.trt.int8_sq_act_qdq.default: _int8_sq_act_qdq_translation,
@@ -404,6 +486,8 @@ def build_custom_translation_table() -> dict:
         _causal_conv1d_translation,
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
+        torch.ops.trt_edgellm.gated_delta_net.default:
+        _gated_delta_net_translation,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
         torch.ops.trt.gather_nd.default: _gather_nd_translation,

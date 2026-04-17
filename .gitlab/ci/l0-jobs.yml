@@ -46,25 +46,6 @@ l0_blackwell_model_export:
     - .l0_environment
   interruptible: true
 
-l0_blackwell_eagle_model_export:
-  stage: l0_test
-  variables:
-    CUDA_VERSION: "13.0"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/blackwell_model_export"
-    PRIORITY: l0_eagle_export_blackwell
-    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-  tags:
-    - a30-edgellm-nvks
-  image: "$IMAGE"
-  extends:
-    - .export_onnx_template
-    - .l0_rules
-    - .l0_environment
-  interruptible: true
-
 # LLM Loader export for Blackwell pre-quantized models
 l0_llm_loader_export:
   stage: l0_test
@@ -242,7 +223,6 @@ l0_drive_thor_1:
 l0_drive_thor_2:
   stage: l0_test
   needs:
-    - l0_blackwell_eagle_model_export
     - l0_llm_loader_export
   variables:
     BOARD_USER: "tensorrt_user"
@@ -271,14 +251,15 @@ l0_jedha:
   stage: l0_test
   needs:
     - l0_blackwell_model_export
-    - l0_blackwell_eagle_model_export
     - l0_llm_loader_export
   variables:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "12.8"
+    TRT_VERSION: "10.16.0.72"
+    TRT_CUDA_VERSION: "13.2"
     L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
     TEST_CACHE_DIR: "$L0_CACHE_DIR/jedha"
-    TRT_PACKAGE_DIR: "/usr"
+    TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.aarch64.cuda-$TRT_CUDA_VERSION"
     PRIORITY: l0_pipeline_jedha
     ONNX_DIR: "$L0_CACHE_DIR/blackwell_model_export/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"

@@ -38,9 +38,11 @@ from .config import ModelConfig, QuantConfig
 from .model import AutoModel, register_model
 # Register model-type-specific implementations
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
+from .models.qwen3_5.modeling_qwen3_5_text import Qwen3_5CausalLM
 from .onnx.export import export_onnx
 
 register_model("nemotron_h", NemotronHCausalLM)
+register_model("qwen3_5_text", Qwen3_5CausalLM)
 
 __all__ = [
     "__version__",

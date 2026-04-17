@@ -58,7 +58,8 @@ class AutoModel:
                         model_dir: str,
                         device: str = "cpu",
                         key_remap=None,
-                        key_prefix: "str | None" = None) -> nn.Module:
+                        key_prefix: "str | None" = None,
+                        eagle_base: bool = False) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -67,14 +68,16 @@ class AutoModel:
         moves it to *device*, and loads safetensors weights.
 
         Args:
-            model_dir:  Local HF checkpoint directory.
-            device:     Target device (e.g. ``"cpu"``, ``"cuda:0"``).
-            key_remap:  Optional callable ``(key: str) -> Optional[str]``.
-                        Passed through to :func:`load_weights` for checkpoint
-                        key remapping (e.g. TTS talker ``codec_embedding``
-                        → ``embed_tokens``).
-            key_prefix: Explicit checkpoint key prefix to strip (e.g.
-                        ``"talker."``).  Passed through to :func:`load_weights`.
+            model_dir:      Local HF checkpoint directory.
+            device:         Target device (e.g. ``"cpu"``, ``"cuda:0"``).
+            key_remap:      Optional callable ``(key: str) -> Optional[str]``.
+                            Passed through to :func:`load_weights` for checkpoint
+                            key remapping (e.g. TTS talker ``codec_embedding``
+                            → ``embed_tokens``).
+            key_prefix:     Explicit checkpoint key prefix to strip (e.g.
+                            ``"talker."``).  Passed through to :func:`load_weights`.
+            eagle_base:     When True, export as EAGLE3 base model with extra
+                            tree-attention inputs and hidden_states output.
 
         Returns:
             Loaded ``nn.Module`` in eval mode.
@@ -82,7 +85,19 @@ class AutoModel:
         from .models.default.modeling_default import CausalLM
 
         config = ModelConfig.from_pretrained(model_dir)
-        model_class = _MODEL_REGISTRY.get(config.model_type, CausalLM)
+        if eagle_base:
+            config.eagle_base = True
+
+        # EAGLE3 draft: auto-detect from draft_vocab_size
+        if config.is_eagle3_draft:
+            from .models.eagle3.modeling_eagle3_draft import Eagle3DraftModel
+            model_class = Eagle3DraftModel
+            # Set up key remapping: midlayer -> layers.0, skip t2d
+            if key_remap is None:
+                key_remap = _eagle3_key_remap
+        else:
+            model_class = _MODEL_REGISTRY.get(config.model_type, CausalLM)
+
         model = model_class(config)
         model.to(device)
         load_weights(model,
@@ -90,6 +105,7 @@ class AutoModel:
                      device=device,
                      key_remap=key_remap,
                      key_prefix=key_prefix)
+
         return model
 
 
@@ -105,3 +121,33 @@ def dtype_summary(model: nn.Module) -> Dict[str, int]:
         name = str(p.dtype).replace("torch.", "")
         out[name] = out.get(name, 0) + p.numel()
     return dict(sorted(out.items(), key=lambda x: -x[1]))
+
+
+# ---------------------------------------------------------------------------
+# EAGLE3 helpers
+# ---------------------------------------------------------------------------
+
+
+def _eagle3_key_remap(key: str) -> "str | None":
+    """Remap EAGLE3 draft checkpoint keys.
+
+    Handles all known EAGLE3 draft checkpoint variations:
+    - ``t2d`` keys are skipped (but ``d2t`` is kept).
+    - ``target_model.*`` keys are skipped (multi-target training artifact).
+    - ``midlayer.*`` -> ``layers.0.*``
+    - ``qkv_proj.{q,k,v}_proj`` -> ``{q,k,v}_proj`` (flatten old pipeline
+      ``EdgeLLMAttention`` wrapper nesting, used by quantized checkpoints).
+    - ``._pre_quant_scale`` -> ``.pre_quant_scale`` (modelopt internal naming;
+      normally stripped by ``postprocess_state_dict()`` but not by per-module
+      export via ``_export_quantized_weight()``).
+    """
+    if "t2d" in key and "d2t" not in key:
+        return None  # skip t2d
+    if key.startswith("target_model."):
+        return None  # skip multi-target training artifact
+    key = key.replace("midlayer.", "layers.0.")
+    key = key.replace("qkv_proj.q_proj", "q_proj")
+    key = key.replace("qkv_proj.k_proj", "k_proj")
+    key = key.replace("qkv_proj.v_proj", "v_proj")
+    key = key.replace("._pre_quant_scale", ".pre_quant_scale")
+    return key

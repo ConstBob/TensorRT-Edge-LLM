@@ -26,7 +26,7 @@ from typing import List, Optional, Tuple
 import torch
 
 # ---------------------------------------------------------------------------
-# Custom op: trt::attention_plugin
+# Custom op: trt::attention_plugin  (unified: vanilla / FP8-KV / EAGLE tree)
 # ---------------------------------------------------------------------------
 
 
@@ -42,16 +42,43 @@ def attention_plugin(
     num_q_heads: int,
     num_kv_heads: int,
     head_size: int,
-    enable_fp8_kv_cache: bool,
     sliding_window_size: int,
-    k_v_scale_quant_orig: Optional[torch.Tensor] = None,
+    enable_tree_attention: bool,
+    enable_fp8_kv_cache: bool,
+    attention_mask: Optional[torch.Tensor] = None,
+    attention_pos_id: Optional[torch.Tensor] = None,
+    qkv_scales: Optional[List[float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub for AttentionPlugin - returns zero tensors of the right shape.
+    """Unified stub for AttentionPlugin covering all feature combinations.
+
+    Feature matrix (all map to the same TRT ``AttentionPlugin``):
+
+    +-----------------------+--------------------+----------------------------+
+    | Mode                  | enable_tree_attn   | enable_fp8_kv_cache        |
+    +=======================+====================+============================+
+    | Vanilla               | False              | False                      |
+    +-----------------------+--------------------+----------------------------+
+    | FP8 KV cache          | False              | True  (qkv_scales set)     |
+    +-----------------------+--------------------+----------------------------+
+    | EAGLE tree attention  | True               | False                      |
+    +-----------------------+--------------------+----------------------------+
+    | EAGLE + FP8 KV        | True               | True  (qkv_scales set)     |
+    +-----------------------+--------------------+----------------------------+
+
+    ``enable_tree_attention`` and ``enable_fp8_kv_cache`` are required (no
+    default) so that ``torch.export`` always includes them in the FX graph
+    — default-matching kwargs get stripped, breaking ONNX translation.
+
+    Callers must always pass ``qkv_scales=[1.0, 1.0, 1.0]`` explicitly so
+    the FX graph contains a valid FLOATS value for the ONNX translation.
+
+    When ``enable_tree_attention=True``, ``attention_mask`` and
+    ``attention_pos_id`` must be provided (non-None).
 
     The TRT AttentionPlugin kernel returns a 4-D tensor
-    [batch, seq_len, num_q_heads, head_size].
-    The caller (Attention.forward) is responsible for reshaping to
-    [batch, seq_len, num_q_heads * head_size].
+    ``[batch, seq_len, num_q_heads, head_size]``.
+    The caller (``Attention.forward``) is responsible for reshaping to
+    ``[batch, seq_len, num_q_heads * head_size]``.
     """
     batch_size, seq_len, _ = query_states.shape
     past_len = past_key_value.shape[3]
@@ -82,84 +109,11 @@ def _(query_states,
       num_q_heads,
       num_kv_heads,
       head_size,
+      sliding_window_size,
+      enable_tree_attention,
       enable_fp8_kv_cache,
-      sliding_window_size,
-      k_v_scale_quant_orig=None):
-    batch_size, seq_len, _ = query_states.shape
-    past_len = past_key_value.shape[3]
-    return (torch.empty(batch_size,
-                        seq_len,
-                        num_q_heads,
-                        head_size,
-                        dtype=query_states.dtype,
-                        device=query_states.device),
-            torch.empty(batch_size,
-                        2,
-                        num_kv_heads,
-                        past_len + seq_len,
-                        head_size,
-                        dtype=past_key_value.dtype,
-                        device=past_key_value.device))
-
-
-# ---------------------------------------------------------------------------
-# Custom op: trt::attention_plugin_fp8kv  (FP8 KV cache variant, 8 inputs)
-# ---------------------------------------------------------------------------
-
-
-@torch.library.custom_op("trt::attention_plugin_fp8kv", mutates_args=())
-def attention_plugin_fp8kv(
-    query_states: torch.Tensor,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
-    past_key_value: torch.Tensor,
-    context_lengths: torch.Tensor,
-    rope_rotary_cos_sin: torch.Tensor,
-    kvcache_start_index: torch.Tensor,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    sliding_window_size: int,
-    qkv_scales: Optional[List[float]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub for AttentionPlugin with FP8 KV cache.
-
-    qkv_scales is a list of three floats [q_scale, k_scale, v_scale]
-    embedded as the ``qkv_scales`` ONNX node attribute (PluginField) so
-    TRT's AttentionPlugin can read them at engine-build time.  Defaults
-    to [1.0, 1.0, 1.0] when the checkpoint carries no explicit scale
-    tensors (q_scale is never in the checkpoint; k/v_scale default to 1.0).
-    """
-    batch_size, seq_len, _ = query_states.shape
-    past_len = past_key_value.shape[3]
-    attn_output = torch.zeros(batch_size,
-                              seq_len,
-                              num_q_heads,
-                              head_size,
-                              dtype=query_states.dtype,
-                              device=query_states.device)
-    present_key_value = torch.zeros(batch_size,
-                                    2,
-                                    num_kv_heads,
-                                    past_len + seq_len,
-                                    head_size,
-                                    dtype=past_key_value.dtype,
-                                    device=past_key_value.device)
-    return attn_output, present_key_value
-
-
-@attention_plugin_fp8kv.register_fake
-def _(query_states,
-      key_states,
-      value_states,
-      past_key_value,
-      context_lengths,
-      rope_rotary_cos_sin,
-      kvcache_start_index,
-      num_q_heads,
-      num_kv_heads,
-      head_size,
-      sliding_window_size,
+      attention_mask=None,
+      attention_pos_id=None,
       qkv_scales=None):
     batch_size, seq_len, _ = query_states.shape
     past_len = past_key_value.shape[3]
@@ -319,6 +273,65 @@ def _(weight, weight_scale, weight_scale_2, group_size):
     out_features, packed_in = weight.shape
     return torch.empty(out_features,
                        packed_in * 2,
+                       dtype=torch.float16,
+                       device=weight.device)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt::mxfp8_act_qdq  (activation DynQ + DQ -> float16)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::mxfp8_act_qdq", mutates_args=())
+def mxfp8_act_qdq(
+        hidden_states: torch.Tensor,  # float16 activation
+) -> torch.Tensor:
+    """Stub: MXFP8 activation DynQ + DQ. Returns float16.
+
+    In the ONNX graph this emits two nodes::
+
+        TRT_MXFP8DynamicQuantize(x, axis=-1, block_size=32, output_dtype=17)
+            -> (x_f8, sx_e8m0)
+        TRT_MXFP8DequantizeLinear(x_f8, sx_e8m0,
+            axis=-1, block_size=32, output_dtype=10)
+            -> x_dq  [float16]
+    """
+    return torch.zeros_like(hidden_states)
+
+
+@mxfp8_act_qdq.register_fake
+def _(hidden_states):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt::mxfp8_weight_dq
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::mxfp8_weight_dq", mutates_args=())
+def mxfp8_weight_dq(
+    weight: torch.Tensor,  # fp8_e4m3fn [out, in]
+    weight_scale: torch.Tensor,  # uint8 (E8M0) [out, in // block_size]
+    block_size: int,
+) -> torch.Tensor:
+    """Stub: dequantize MXFP8 weight (FP8E4M3 + E8M0 scale) to float16.
+
+    Emits::
+
+        TRT_MXFP8DequantizeLinear(weight, weight_scale,
+            axis=-1, block_size=block_size, output_dtype=10) -> w_dq [float16]
+    """
+    return torch.zeros(weight.shape[0],
+                       weight.shape[1],
+                       dtype=torch.float16,
+                       device=weight.device)
+
+
+@mxfp8_weight_dq.register_fake
+def _(weight, weight_scale, block_size):
+    return torch.empty(weight.shape[0],
+                       weight.shape[1],
                        dtype=torch.float16,
                        device=weight.device)
 
@@ -504,3 +517,31 @@ def _(value, indices):
                        hidden_size,
                        dtype=value.dtype,
                        device=value.device)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::gated_delta_net  (Qwen3.5 GDN linear attention)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::gated_delta_net", mutates_args=())
+def gated_delta_net(
+    q: torch.Tensor,  # [batch, seq, num_k_heads, k_dim]
+    k: torch.Tensor,  # [batch, seq, num_k_heads, k_dim]
+    v: torch.Tensor,  # [batch, seq, num_v_heads, v_dim]
+    a: torch.Tensor,  # [batch, seq, num_v_heads]
+    b: torch.Tensor,  # [batch, seq, num_v_heads]
+    A_log: torch.Tensor,  # [num_v_heads] float32
+    dt_bias: torch.Tensor,  # [num_v_heads] float16
+    h0_source: torch.Tensor,  # [batch, num_v_heads, k_dim, v_dim] float32
+    context_lengths: torch.Tensor,  # [batch] int32
+    k_dim: int,
+    v_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stub: Qwen3.5 GatedDeltaNet. Returns same-shape output and cloned state."""
+    return torch.zeros_like(v), h0_source.clone()
+
+
+@gated_delta_net.register_fake
+def _(q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim, v_dim):
+    return torch.empty_like(v), h0_source.clone()

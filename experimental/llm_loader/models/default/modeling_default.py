@@ -45,7 +45,7 @@ import torch.nn.functional as F
 
 from ...config import ModelConfig
 from ..linear import FP16Linear, make_linear
-from ..ops import attention_plugin, attention_plugin_fp8kv
+from ..ops import attention_plugin
 
 __all__ = [
     "OnnxSpec",
@@ -81,7 +81,10 @@ class OnnxSpec:
     dynamic_shapes: list
 
 
-def _make_flat_wrapper(model: nn.Module, Na: int, Nd: int) -> nn.Module:
+def _make_flat_wrapper(model: nn.Module,
+                       Na: int,
+                       Nd: int,
+                       eagle_base: bool = False) -> nn.Module:
     """Build a wrapper with an explicit flat forward signature (no ``*args``).
 
     Using ``*flat_args`` in ``forward`` triggers a PyTorch 2.10 bug where the
@@ -93,24 +96,43 @@ def _make_flat_wrapper(model: nn.Module, Na: int, Nd: int) -> nn.Module:
     embed inputs.  This wrapper is for pure-attention (transformer-only) models.
     For hybrid Mamba models see ``_make_flat_wrapper_mamba`` in
     ``modeling_nemotron_h.py``.
+
+    When ``eagle_base=True``, the wrapper adds ``attention_mask`` and
+    ``attention_pos_id`` inputs and an extra ``hidden_states`` output for
+    EAGLE3 speculative decoding.
     """
     param_names: List[str] = (["inputs_embeds"] +
                               [f"past_key_values_{i}" for i in range(Na)] + [
                                   "rope_rotary_cos_sin", "context_lengths",
                                   "kvcache_start_index", "last_token_ids"
                               ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
+    if eagle_base:
+        param_names += ["attention_pos_id", "attention_mask"]
 
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}" for i in range(Na))) if Na else "()"
     ds_tuple = "({},)".format(", ".join(f"deepstack_embeds_{i}"
                                         for i in range(Nd))) if Nd else "()"
     ds_kwarg = f", deepstack_embeds={ds_tuple}" if Nd > 0 else ""
+    eagle_kwargs = (", attention_mask=attention_mask"
+                    ", attention_pos_id=attention_pos_id"
+                    if eagle_base else "")
 
-    body = (
-        f"    logits, present_key_values = self._model(\n"
-        f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
-        f"context_lengths, kvcache_start_index, last_token_ids{ds_kwarg})\n"
-        f"    return (logits,) + tuple(present_key_values)\n")
+    if eagle_base:
+        body = (
+            f"    logits, hidden_states, present_key_values = self._model(\n"
+            f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
+            f"context_lengths, kvcache_start_index, last_token_ids"
+            f"{ds_kwarg}{eagle_kwargs})\n"
+            f"    return (logits, hidden_states) + tuple(present_key_values)\n"
+        )
+    else:
+        body = (
+            f"    logits, present_key_values = self._model(\n"
+            f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
+            f"context_lengths, kvcache_start_index, last_token_ids"
+            f"{ds_kwarg})\n"
+            f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
     globs: dict = {}
@@ -222,6 +244,8 @@ class Attention(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        attention_mask: "torch.Tensor | None" = None,
+        attention_pos_id: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -242,39 +266,33 @@ class Attention(nn.Module):
                                        batch_size, seq_len,
                                        self.num_kv_heads * self.head_dim)
 
-        common_kwargs: dict = {
+        enable_tree = attention_mask is not None and attention_pos_id is not None
+        kwargs: dict = {
             "num_q_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
             "head_size": self.head_dim,
             "sliding_window_size": self.sliding_window_size,
+            "enable_tree_attention": enable_tree,
+            "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
         }
-        if self.enable_fp8_kv_cache:
-            # _qkv_scales_float is pre-cached by export.py before tracing so
-            # that .item() calls don't create data-dependent sym expressions.
-            qkv_scales = getattr(self, "_qkv_scales_float", [1.0, 1.0, 1.0])
-            attn_output, present_key_value = attention_plugin_fp8kv(
-                query_states,
-                key_states,
-                value_states,
-                past_key_value,
-                context_lengths,
-                rope_rotary_cos_sin,
-                kvcache_start_index,
-                qkv_scales=qkv_scales,
-                **common_kwargs,
-            )
-        else:
-            attn_output, present_key_value = attention_plugin(
-                query_states,
-                key_states,
-                value_states,
-                past_key_value,
-                context_lengths,
-                rope_rotary_cos_sin,
-                kvcache_start_index,
-                enable_fp8_kv_cache=False,
-                **common_kwargs,
-            )
+        if enable_tree:
+            kwargs["attention_mask"] = attention_mask
+            kwargs["attention_pos_id"] = attention_pos_id
+        # Always pass qkv_scales so torch.export includes a valid FLOATS
+        # value in the FX graph for the unified ONNX translation.
+        kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
+                                       [1.0, 1.0, 1.0])
+
+        attn_output, present_key_value = attention_plugin(
+            query_states,
+            key_states,
+            value_states,
+            past_key_value,
+            context_lengths,
+            rope_rotary_cos_sin,
+            kvcache_start_index,
+            **kwargs,
+        )
         # AttentionPlugin returns [batch, seq_len, num_heads, head_dim]; reshape for o_proj.
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)
@@ -333,6 +351,8 @@ class DecoderLayer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        attention_mask: "torch.Tensor | None" = None,
+        attention_pos_id: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         attn_output, present_key_value = self.self_attn(
@@ -341,6 +361,8 @@ class DecoderLayer(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            attention_mask=attention_mask,
+            attention_pos_id=attention_pos_id,
         )
         hidden_states = residual + attn_output
 
@@ -382,17 +404,26 @@ class Transformer(nn.Module):
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
-    ) -> Tuple[torch.Tensor, Tuple]:
+        attention_mask: "torch.Tensor | None" = None,
+        attention_pos_id: "torch.Tensor | None" = None,
+        output_hidden_states: bool = False,
+    ) -> Tuple[torch.Tensor, Tuple, "Tuple | None"]:
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
+        all_hidden_states: list = []
 
         for layer_index, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+
             hidden_states, next_key_value = layer(
                 hidden_states,
                 past_key_values[layer_index],
                 rope_rotary_cos_sin,
                 context_lengths,
                 kvcache_start_index,
+                attention_mask=attention_mask,
+                attention_pos_id=attention_pos_id,
             )
             present_key_values_list.append(next_key_value)
 
@@ -400,7 +431,13 @@ class Transformer(nn.Module):
             if layer_index < len(deepstack_embeds):
                 hidden_states = hidden_states + deepstack_embeds[layer_index]
 
-        return self.norm(hidden_states), tuple(present_key_values_list)
+        normed = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states.append(normed)
+
+        return (normed, tuple(present_key_values_list),
+                tuple(all_hidden_states) if output_hidden_states else None)
 
 
 # ---------------------------------------------------------------------------
@@ -453,10 +490,15 @@ class CausalLM(nn.Module):
 
         Builds dummy inputs, I/O name lists, and dynamic shape descriptors
         matching the flat wrapper signature produced by :func:`_make_flat_wrapper`.
+
+        When ``config.eagle_base`` is True, extra inputs (``attention_pos_id``,
+        ``attention_mask``) and an extra output (``hidden_states``) are added
+        for EAGLE3 base-model tree-attention verification.
         """
         config = self.config
         Na = config.num_hidden_layers
         Nd = config.num_deepstack_features
+        eagle_base = config.eagle_base
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
@@ -523,17 +565,52 @@ class CausalLM(nn.Module):
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
 
+        num_selected = torch.export.Dim("num_selected", min=1,
+                                        max=256) if eagle_base else None
         all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
             all_shapes.append({0: batch, 3: past})  # past_key_values_i
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
-        all_shapes.append({0: batch})  # last_token_ids
+        if eagle_base:
+            all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
+        else:
+            all_shapes.append({0: batch})  # last_token_ids
         for _ in range(Nd):
             all_shapes.append({0: batch, 1: seq})  # deepstack_embeds_i
 
-        wrapped = _make_flat_wrapper(self, Na, Nd)
+        # EAGLE3 base: add tree-attention inputs and hidden_states output.
+        if eagle_base:
+            attention_pos_id = torch.zeros(batch_size,
+                                           seq_len,
+                                           dtype=torch.int32,
+                                           device=device)
+            attention_mask = torch.zeros(batch_size,
+                                         seq_len,
+                                         seq_len + past_len,
+                                         dtype=torch.int32,
+                                         device=device)
+            args = args + (attention_pos_id, attention_mask)
+            input_names = input_names + ["attention_pos_id", "attention_mask"]
+            output_names = ["logits", "hidden_states"
+                            ] + [f"present_key_values_{i}" for i in range(Na)]
+
+            # Use separate dims for attention_mask/pos_id so they don't
+            # share seq_len with inputs_embeds.  The TRT builder sets
+            # different profiles per phase (prefill: attention seq=1,
+            # generation: attention seq=maxVerifyTreeSize).  Shared dims
+            # would force the prefill constraint (1) onto inputs_embeds.
+            eagle_seq = torch.export.Dim("eagle_seq_len", min=1, max=32768)
+            mask_kv_len = torch.export.Dim("mask_kv_len", min=1, max=65536)
+            all_shapes.append({0: batch, 1: eagle_seq})  # attention_pos_id
+            all_shapes.append({
+                0: batch,
+                1: eagle_seq,
+                2: mask_kv_len
+            })  # attention_mask
+
+        wrapped = _make_flat_wrapper(self, Na, Nd, eagle_base=eagle_base)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -543,22 +620,28 @@ class CausalLM(nn.Module):
                         dynamic_shapes=all_shapes)
 
     def forward(
-            self,
-            inputs_embeds: torch.Tensor,
-            past_key_values: Tuple[torch.Tensor, ...],
-            rope_rotary_cos_sin: torch.Tensor,
-            context_lengths: torch.Tensor,
-            kvcache_start_index: torch.Tensor,
-            last_token_ids: torch.Tensor,
-            deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        last_token_ids: torch.Tensor,
+        deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        attention_mask: "torch.Tensor | None" = None,
+        attention_pos_id: "torch.Tensor | None" = None,
     ) -> Tuple:
-        hidden_states, present_key_values = self.model(
+        eagle_base = self.config.eagle_base
+        hidden_states, present_key_values, all_hidden_states = self.model(
             inputs_embeds,
             past_key_values,
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
             deepstack_embeds,
+            attention_mask=attention_mask,
+            attention_pos_id=attention_pos_id,
+            output_hidden_states=eagle_base,
         )
         # Select hidden states for specified token positions before lm_head.
         # last_token_ids: [batch, num_tokens] int64 -- indices into the seq dim.
@@ -567,4 +650,21 @@ class CausalLM(nn.Module):
         hidden_states = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
 
         logits = self.lm_head(hidden_states).to(torch.float32)
+
+        if eagle_base and all_hidden_states is not None:
+            # EAGLE3 base: concatenate hidden states from 3 selected layers.
+            # Layer indices: layer 2, middle layer, near-final layer.
+            # Output the full-sequence hidden states (NOT gathered) — the C++
+            # runtime selects accepted tokens from these after verification.
+            n_layers = len(
+                all_hidden_states) - 1  # last entry is normed output
+            idx = [2, n_layers // 2, n_layers - 4]
+            eagle_hidden = torch.cat([
+                all_hidden_states[idx[0]],
+                all_hidden_states[idx[1]],
+                all_hidden_states[idx[2]],
+            ],
+                                     dim=-1).to(torch.float16)
+            return logits, eagle_hidden, present_key_values
+
         return logits, present_key_values

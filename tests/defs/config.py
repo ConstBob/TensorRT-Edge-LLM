@@ -706,6 +706,18 @@ class TestConfig:
             "Qwen3/Qwen3-VL-4B-Instruct",
             "Qwen3-VL-8B-Instruct":
             "Qwen3/Qwen3-VL-8B-Instruct",
+            "Qwen3.5-0.8B":
+            "Qwen3.5-0.8B",
+            "Qwen3.5-2B":
+            "Qwen3.5-2B",
+            "Qwen3.5-4B":
+            "Qwen3.5-4B",
+            "Qwen3.5-9B":
+            "Qwen3.5-9B",
+            "Qwen3.5-27B":
+            "Qwen3.5-27B",
+            "Qwen3.5-35B-A3B":
+            "Qwen3.5-35B-A3B",
             "Phi-4-multimodal-instruct":
             "Phi-4-multimodal-instruct",
             # Pre-quantized models in llm_models_dir
@@ -790,6 +802,14 @@ class TestConfig:
             },
             "Qwen3-1.7B": {
                 "eagle3": "Qwen3-1.7B_eagle3",
+            },
+            # Pre-quantized base models with pre-quantized EAGLE3 drafts
+            # (unified checkpoints in /scratch.edge_llm_cache/quantized_models/)
+            "Qwen3-1.7B-NVFP4": {
+                "eagle3": "Qwen3-1.7B-eagle3-NVFP4",
+            },
+            "Qwen3-VL-4B-Instruct-NVFP4": {
+                "eagle3": "EAGLE3-Qwen3-VL-4B-v1.1-NVFP4",
             },
             "Qwen3-VL-8B-Instruct": {
                 "v0": "qwen3-vl-8b-eagle3-v0",

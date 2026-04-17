@@ -154,7 +154,7 @@ class CodePredictorCausalLM(CausalLM):
         last_token_ids: torch.Tensor,
         lm_head_weight: torch.Tensor,
     ) -> Tuple:
-        hidden_states, present_key_values = self.model(
+        hidden_states, present_key_values, _ = self.model(
             inputs_embeds,
             past_key_values,
             rope_rotary_cos_sin,

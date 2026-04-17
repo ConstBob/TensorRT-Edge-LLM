@@ -212,7 +212,8 @@ def _dtype_from_str(s: str) -> "torch.dtype":
 
 def _export_llm(model_dir: str,
                 llm_out_dir: str,
-                model_type: str = "") -> None:
+                model_type: str = "",
+                eagle_base: bool = False) -> None:
     """Export LLM backbone via the standard llm_loader pipeline."""
     os.makedirs(llm_out_dir, exist_ok=True)
     output_path = os.path.join(llm_out_dir, "model.onnx")
@@ -220,7 +221,11 @@ def _export_llm(model_dir: str,
     logger.info("[LLM] Loading checkpoint from %s", model_dir)
     try:
         from .model import AutoModel
-        model = AutoModel.from_pretrained(model_dir, device="cpu")
+        model = AutoModel.from_pretrained(
+            model_dir,
+            device="cpu",
+            eagle_base=eagle_base,
+        )
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         logger.exception("[LLM] Failed to load checkpoint")
         raise SystemExit(1) from exc
@@ -782,6 +787,12 @@ def main() -> None:
         help="Skip audio encoder export.",
     )
     p.add_argument(
+        "--eagle-base",
+        action="store_true",
+        help=
+        "Export as EAGLE3 base model (adds tree-attention I/O and hidden_states output).",
+    )
+    p.add_argument(
         "--device",
         default="cuda",
         help="Device for export tracing (default: cuda).",
@@ -821,7 +832,10 @@ def main() -> None:
             cp_out = os.path.join(args.output_dir, "code_predictor")
             _export_code_predictor(model_dir, cp_out)
         else:
-            _export_llm(model_dir, llm_out, model_type=model_type)
+            _export_llm(model_dir,
+                        llm_out,
+                        model_type=model_type,
+                        eagle_base=args.eagle_base)
 
     # --- Visual encoder ---
     if has_vis:
