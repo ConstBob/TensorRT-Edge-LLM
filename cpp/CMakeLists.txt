@@ -76,6 +76,8 @@ file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
 
 # Enable relocatable device code for MoE Marlin kernels
 file(GLOB_RECURSE MOE_MARLIN_CU_SRCS "kernels/moe/moe_marlin/*.cu")
+list(APPEND MOE_MARLIN_CU_SRCS
+     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe/nvf4_w4an/decoding_kernels.cu")
 set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
                                                              "-rdc=true")
 

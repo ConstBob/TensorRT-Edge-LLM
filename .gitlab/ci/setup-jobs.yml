@@ -20,7 +20,7 @@ pre_commit_checks:
     - pip3 install -q pre-commit
     - pre-commit install
     - echo "Running pre-commit checks on all files"
-    - pre-commit run --all-files || (echo "❌ Pre-commit checks failed!" && echo "💡 To fix this locally, run:" && echo "   pip install pre-commit" && echo "   pre-commit install" && echo "   pre-commit run --all-files" && exit 1)
+    - pre-commit run --all-files --show-diff-on-failure || (echo "❌ Pre-commit checks failed!" && echo "💡 To fix this locally, run:" && echo "   pip install pre-commit" && echo "   pre-commit install" && echo "   pre-commit run --all-files" && exit 1)
     - echo "✅ Pre-commit checks passed!"
     - deactivate
     - echo "Pipeline end time:$(date)"
