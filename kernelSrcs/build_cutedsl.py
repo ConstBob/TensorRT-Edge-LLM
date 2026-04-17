@@ -19,6 +19,7 @@ Usage (run from the repo root):
   python kernelSrcs/build_cutedsl.py                          # build all kernels supported by this GPU
   python kernelSrcs/build_cutedsl.py --kernels gdn            # build a specific group only
   python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe      # build NvFP4 MoE FC1+FC2 kernels only
+  python kernelSrcs/build_cutedsl.py --kernels ssd            # build SSD (Mamba2) variants only
   python kernelSrcs/build_cutedsl.py --gpu_arch sm_87         # override SM detection (rarely needed)
 
 The GPU SM is auto-detected via cupy / nvidia-smi and used to filter which kernel variants
@@ -67,7 +68,7 @@ class KernelVariant:
 
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
-        group:         Logical group ("gdn" or "fmha"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
+        group:         Logical group ("gdn", "fmha", "nvfp4_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
         script:        Kernel script path relative to kernelSrcs/.
@@ -94,6 +95,11 @@ class KernelVariant:
 #            FC1 is a contiguous grouped GEMM with fused activation (identity/
 #            relu2/swiglu).  FC2 is a grouped GEMM with fused scatter-reduce.
 #            Both use FP4 blockscaled arithmetic (tcgen05.mma).
+#
+# SSD: Mamba2 Structured State-Space Duality chunk-scan prefill.
+#      ssd_prefill.py targets Ampere SM80+ (warp MMA + cp.async);
+#      ssd_prefill_blackwell.py targets Blackwell SM100/SM101/SM110 (TMEM/wgmma).
+#      Each D×N combination (dim × dstate) is a separate AOT variant.
 #
 # No group receives --gpu_arch from the build script; they all compile
 # device-native, which works uniformly across all platforms.
@@ -973,8 +979,8 @@ def main():
     p.add_argument(
         "--kernels",
         default="ALL",
-        help="Which kernels to build: ALL (default), a group name (fmha | gdn), "
-             "or a comma-separated list of group names (fmha,gdn). "
+        help="Which kernels to build: ALL (default), a group name (fmha | gdn | nvfp4_moe | ssd | gemm), "
+             "or a comma-separated list of group names (fmha,gdn,nvfp4_moe,ssd,gemm). "
              "Variants whose supported_sms does not include the target SM are skipped.",
     )
     p.add_argument(
