@@ -50,7 +50,7 @@ __global__ void compactKVCacheKernel(int32_t const* batchMapping, // [oldActiveB
     int32_t* dstKVLengths)                                        // [newActiveBatch] - output
 {
     // The kernel doesn't deal with leftovers because of the nice alignment.
-    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128, "Only HEAD_DIM = 64 or 128 are supported");
+    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256, "HEAD_DIM must be 64, 128, or 256");
 
     // Unpack config
     int32_t const numLayers = config.numLayers;
@@ -179,9 +179,13 @@ void compactKVCache(rt::Tensor const& batchMapping, rt::Tensor& kvCacheBuffer, r
         compactKVCacheKernel<half, 128><<<gridDim, blockDim, 0, stream>>>(
             batchMappingPtr, srcKVLengthsPtr, config, kvCacheBuffer.dataPointer<half>(), dstKVLengthsPtr);
         break;
+    case 256:
+        compactKVCacheKernel<half, 256><<<gridDim, blockDim, 0, stream>>>(
+            batchMappingPtr, srcKVLengthsPtr, config, kvCacheBuffer.dataPointer<half>(), dstKVLengthsPtr);
+        break;
     default:
         throw std::invalid_argument(
-            format::fmtstr("compactKVCache: Unsupported headDim=%d. Only 64 and 128 are supported.", headDim));
+            format::fmtstr("compactKVCache: Unsupported headDim=%d. Only 64, 128, and 256 are supported.", headDim));
     }
 
     CUDA_CHECK(cudaGetLastError());
