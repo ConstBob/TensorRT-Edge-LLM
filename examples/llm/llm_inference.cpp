@@ -23,7 +23,6 @@
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
-#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
@@ -674,9 +673,8 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    // Create runtime based on mode
-    std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
-    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> eagleInferenceRuntime{nullptr};
+    // Create unified runtime (handles both vanilla and Eagle spec-decode modes)
+    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> runtime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -686,38 +684,33 @@ int main(int argc, char* argv[])
             args.eagleArgs.draftTopK, args.eagleArgs.draftStep, args.eagleArgs.verifyTreeSize};
         try
         {
-            eagleInferenceRuntime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to initialize LLMInferenceSpecDecodeRuntime: %s", e.what());
+            LOG_ERROR("Failed to initialize runtime with Eagle spec-decode: %s", e.what());
             return EXIT_FAILURE;
-        }
-
-        if (!eagleInferenceRuntime->captureDecodingCudaGraph(stream))
-        {
-            LOG_WARNING(
-                "Failed to capture CUDA graph for Eagle decoding usage, proceeding with normal engine execution.");
         }
     }
     else
     {
-        // Standard mode
+        // Standard vanilla-only mode (no draft model)
         try
         {
-            llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to initialize LLMInferenceRuntime: %s", e.what());
+            LOG_ERROR("Failed to initialize runtime: %s", e.what());
             return EXIT_FAILURE;
         }
-        if (!llmInferenceRuntime->captureDecodingCUDAGraph(stream))
-        {
-            LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
-        }
+    }
+
+    if (!runtime->captureDecodingCUDAGraph(stream))
+    {
+        LOG_WARNING("Failed to capture CUDA graph for decoding, proceeding with normal engine execution.");
     }
 
     // Perform warmup runs if requested
@@ -731,15 +724,7 @@ int main(int argc, char* argv[])
         for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
         {
             rt::LLMGenerationResponse warmupResponse;
-            bool requestStatus = false;
-            if (args.eagleArgs.enabled)
-            {
-                requestStatus = eagleInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
-            }
-            else
-            {
-                requestStatus = llmInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
-            }
+            bool requestStatus = runtime->handleRequest(firstRequest, warmupResponse, stream);
 
             if (!requestStatus)
             {
@@ -779,15 +764,7 @@ int main(int argc, char* argv[])
                 100.0 * (requestIdx + 1) / batchedRequests.size());
         }
 
-        bool requestStatus = false;
-        if (args.eagleArgs.enabled)
-        {
-            requestStatus = eagleInferenceRuntime->handleRequest(request, response, stream);
-        }
-        else
-        {
-            requestStatus = llmInferenceRuntime->handleRequest(request, response, stream);
-        }
+        bool requestStatus = runtime->handleRequest(request, response, stream);
 
         if (requestStatus)
         {
@@ -813,7 +790,10 @@ int main(int argc, char* argv[])
         for (size_t batchIdx = 0; batchIdx < request.requests.size(); ++batchIdx)
         {
             nlohmann::json responseJson;
-            std::string outputText = requestStatus ? response.outputTexts[batchIdx] : errorMessage;
+            bool const hasOutputText = requestStatus && batchIdx < response.outputTexts.size();
+            std::string outputText = hasOutputText ? response.outputTexts[batchIdx] : errorMessage;
+            auto const* formattedRequest
+                = batchIdx < request.formattedRequests.size() ? &request.formattedRequests[batchIdx] : nullptr;
             // Validate UTF-8 for output text (inputs are always valid)
             // If invalid UTF-8 detected, error message is returned and original text is logged
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
@@ -848,8 +828,9 @@ int main(int argc, char* argv[])
             }
             responseJson["messages"] = messagesJson;
             // Store formatted prompts for reference
-            responseJson["formatted_system_prompt"] = request.formattedRequests[batchIdx].formattedSystemPrompt;
-            responseJson["formatted_complete_request"] = request.formattedRequests[batchIdx].formattedCompleteRequest;
+            responseJson["formatted_system_prompt"] = formattedRequest ? formattedRequest->formattedSystemPrompt : "";
+            responseJson["formatted_complete_request"]
+                = formattedRequest ? formattedRequest->formattedCompleteRequest : "";
             outputData["responses"].push_back(responseJson);
         }
     }
@@ -874,25 +855,20 @@ int main(int argc, char* argv[])
         std::ostringstream profileOutput;
         profileOutput << std::endl;
         profileOutput << "=== Performance Summary ===" << std::endl;
+        auto prefillMetrics = runtime->getPrefillMetrics();
+        auto multimodalMetrics = runtime->getMultimodalMetrics();
+        outputPrefillProfile(profileOutput, prefillMetrics);
         if (args.eagleArgs.enabled)
         {
-            // Eagle runtime with detailed metrics
-            auto prefillMetrics = eagleInferenceRuntime->getPrefillMetrics();
-            auto eagleGenerationMetrics = eagleInferenceRuntime->getEagleGenerationMetrics();
-            auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
-            outputPrefillProfile(profileOutput, prefillMetrics);
+            auto eagleGenerationMetrics = runtime->getEagleGenerationMetrics();
             outputEagleGenerationProfile(profileOutput, eagleGenerationMetrics);
-            outputMultimodalProfile(profileOutput, multimodalMetrics);
-            outputMemoryProfile(profileOutput, memoryMonitor);
         }
         else
         {
-            auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
-            outputPrefillProfile(profileOutput, llmInferenceRuntime->getPrefillMetrics());
-            outputGenerationProfile(profileOutput, llmInferenceRuntime->getGenerationMetrics());
-            outputMultimodalProfile(profileOutput, multimodalMetrics);
-            outputMemoryProfile(profileOutput, memoryMonitor);
+            outputGenerationProfile(profileOutput, runtime->getGenerationMetrics());
         }
+        outputMultimodalProfile(profileOutput, multimodalMetrics);
+        outputMemoryProfile(profileOutput, memoryMonitor);
         profileOutput << "=====================================" << std::endl;
         LOG_INFO("%s", profileOutput.str().c_str());
     }
@@ -904,39 +880,23 @@ int main(int argc, char* argv[])
         {
             nlohmann::json profileJson;
 
+            // Add high-level metrics from unified runtime
+            addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
             if (args.eagleArgs.enabled)
             {
-                // Eagle runtime with detailed metrics
-                auto prefillMetrics = eagleInferenceRuntime->getPrefillMetrics();
-                auto eagleGenerationMetrics = eagleInferenceRuntime->getEagleGenerationMetrics();
-                auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
-
-                // Add high-level metrics
-                addJsonPrefillSummary(profileJson, prefillMetrics);
-                addJsonEagleGenerationSummary(profileJson, eagleGenerationMetrics);
-                addJsonMultimodalSummary(profileJson, multimodalMetrics);
-
-                // Add detailed timing stages
-                addJsonTimingStages(profileJson);
-
-                // Add memory usage
-                addJsonMemorySummary(profileJson, memoryMonitor);
+                addJsonEagleGenerationSummary(profileJson, runtime->getEagleGenerationMetrics());
             }
             else
             {
-                auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
-
-                // Add high-level metrics
-                addJsonPrefillSummary(profileJson, llmInferenceRuntime->getPrefillMetrics());
-                addJsonGenerationSummary(profileJson, llmInferenceRuntime->getGenerationMetrics());
-                addJsonMultimodalSummary(profileJson, multimodalMetrics);
-
-                // Add detailed timing stages
-                addJsonTimingStages(profileJson);
-
-                // Add memory usage
-                addJsonMemorySummary(profileJson, memoryMonitor);
+                addJsonGenerationSummary(profileJson, runtime->getGenerationMetrics());
             }
+            addJsonMultimodalSummary(profileJson, runtime->getMultimodalMetrics());
+
+            // Add detailed timing stages
+            addJsonTimingStages(profileJson);
+
+            // Add memory usage
+            addJsonMemorySummary(profileJson, memoryMonitor);
 
             std::ofstream profileFile(args.profileOutputFile);
             if (profileFile.is_open())
