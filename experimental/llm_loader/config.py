@@ -61,6 +61,7 @@ from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 
 QUANT_FP16 = "fp16"
 QUANT_FP8 = "fp8"
+QUANT_MXFP8 = "mxfp8"
 QUANT_NVFP4 = "nvfp4"
 QUANT_INT4_AWQ = "int4_awq"
 QUANT_INT4_AWQ_MODELOPT = "int4_awq_modelopt"
@@ -78,6 +79,7 @@ _DEFAULT_ROPE_THETA = 10000.0
 LAYER_ATTN = "attention"
 LAYER_MAMBA = "mamba"
 LAYER_MLP = "mlp"
+LAYER_GDN = "gdn"  # GatedDeltaNet linear attention (Qwen3.5)
 
 
 def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
@@ -124,6 +126,13 @@ class QuantConfig:
             return True
         return any(v == QUANT_NVFP4 for v in self.layer_overrides.values())
 
+    @property
+    def uses_mxfp8_weights(self) -> bool:
+        """True if any linear uses MXFP8 weights (dominant quant or layer override)."""
+        if self.quant_type == QUANT_MXFP8:
+            return True
+        return any(v == QUANT_MXFP8 for v in self.layer_overrides.values())
+
 
 @dataclass
 class MambaConfig:
@@ -140,6 +149,36 @@ class MambaConfig:
     def intermediate_size(self) -> int:
         """num_heads x head_dim - the Mamba intermediate feature dimension."""
         return self.num_heads * self.head_dim
+
+
+@dataclass
+class GdnConfig:
+    """GatedDeltaNet (GDN) hyper-parameters for Qwen3.5 hybrid models.
+
+    GDN layers use a gated delta-net linear attention mechanism with
+    fused QKV projection through causal conv1d.
+    """
+
+    num_key_heads: int  # linear_num_key_heads
+    num_value_heads: int  # linear_num_value_heads
+    key_head_dim: int  # linear_key_head_dim
+    value_head_dim: int  # linear_value_head_dim
+    conv_kernel: int  # linear_conv_kernel_dim (default 4)
+
+    @property
+    def key_dim(self) -> int:
+        """Total key dimension (num_key_heads * key_head_dim)."""
+        return self.num_key_heads * self.key_head_dim
+
+    @property
+    def value_dim(self) -> int:
+        """Total value dimension (num_value_heads * value_head_dim)."""
+        return self.num_value_heads * self.value_head_dim
+
+    @property
+    def conv_dim(self) -> int:
+        """Total conv1d channel count: key + key + value (QKV fused)."""
+        return self.key_dim + self.key_dim + self.value_dim
 
 
 @dataclass
@@ -187,14 +226,34 @@ class ModelConfig:
     quant: QuantConfig = field(default_factory=QuantConfig)
     # ------------------------------------------ mamba / hybrid config
     mamba_cfg: Optional[MambaConfig] = None
+    # ------------------------------------------ gdn / hybrid config
+    gdn_cfg: Optional[GdnConfig] = None
+    # ------------------------------------------ gated attention (Qwen3.5)
+    attn_output_gate: bool = False
+    # ------------------------------------------ EAGLE3 draft config
+    draft_vocab_size: Optional[int] = None
+    target_hidden_size: Optional[int] = None
+    # ------------------------------------------ EAGLE3 base config
+    # When True, the standard CausalLM is exported as an EAGLE3 base model
+    # with tree-attention inputs (attention_mask, attention_pos_id) and
+    # an extra hidden_states output (concatenated from 3 selected layers).
+    eagle_base: bool = False
 
     # ------------------------------------------------------------------
     # Derived properties
     # ------------------------------------------------------------------
 
     @property
+    def is_eagle3_draft(self) -> bool:
+        return self.draft_vocab_size is not None
+
+    @property
+    def eagle3_target_hidden_size(self) -> int:
+        return self.target_hidden_size or self.hidden_size
+
+    @property
     def is_hybrid(self) -> bool:
-        return self.mamba_cfg is not None
+        return self.mamba_cfg is not None or self.gdn_cfg is not None
 
     @property
     def num_attn_layers(self) -> int:
@@ -203,6 +262,10 @@ class ModelConfig:
     @property
     def num_mamba_layers(self) -> int:
         return sum(1 for t in self.layer_types if t == LAYER_MAMBA)
+
+    @property
+    def num_gdn_layers(self) -> int:
+        return sum(1 for t in self.layer_types if t == LAYER_GDN)
 
     @property
     def num_mlp_layers(self) -> int:
@@ -247,7 +310,12 @@ class ModelConfig:
         mamba_cfg = _parse_mamba_cfg(llm_dict,
                                      layer_types,
                                      model_dir=model_dir)
+        gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
         has_qk_norm = _detect_has_qk_norm(model_dir)
+
+        # EAGLE3 draft model fields
+        draft_vocab_size = llm_dict.get("draft_vocab_size", None)
+        target_hidden_size = llm_dict.get("target_hidden_size", None)
 
         return cls(
             model_type=model_type,
@@ -266,8 +334,7 @@ class ModelConfig:
             rope_scaling=llm_dict.get("rope_scaling", None) or None,
             original_max_position_embeddings=llm_dict.get(
                 "original_max_position_embeddings", None),
-            partial_rotary_factor=float(
-                llm_dict.get("partial_rotary_factor", 1.0)),
+            partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
             has_qk_norm=has_qk_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
@@ -275,8 +342,12 @@ class ModelConfig:
             layer_types=layer_types,
             quant=quant,
             mamba_cfg=mamba_cfg,
+            gdn_cfg=gdn_cfg,
+            attn_output_gate=bool(llm_dict.get("attn_output_gate", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
+            draft_vocab_size=draft_vocab_size,
+            target_hidden_size=target_hidden_size,
         )
 
 
@@ -327,17 +398,22 @@ def _parse_num_deepstack_features(
 def _parse_layer_types(config: dict) -> List[str]:
     """Return per-layer block type list from config.
 
-    Reads ``layers_block_type`` directly if present.  For models using
-    ``hybrid_override_pattern`` (e.g. NemotronH), parses the pattern string
-    where ``M`` = mamba, ``-`` = mlp, ``*`` = attention.  Falls back to all
-    attention layers.
+    Reads ``layers_block_type`` or ``layer_types`` directly if present.
+    For models using ``hybrid_override_pattern`` (e.g. NemotronH), parses the
+    pattern string where ``M`` = mamba, ``-`` = mlp, ``*`` = attention.
+    Falls back to all attention layers.
+
+    Qwen3.5 uses ``layer_types`` with values ``"linear_attention"`` (GDN)
+    and ``"full_attention"``.
     """
-    raw = config.get("layers_block_type")
+    raw = config.get("layers_block_type") or config.get("layer_types")
     if raw is not None:
         result = []
         for bt in raw:
             bt_lower = str(bt).lower()
-            if "mamba" in bt_lower:
+            if bt_lower == "linear_attention":
+                result.append(LAYER_GDN)
+            elif "mamba" in bt_lower:
                 result.append(LAYER_MAMBA)
             elif "mlp" in bt_lower:
                 result.append(LAYER_MLP)
@@ -438,6 +514,37 @@ def _detect_mamba_conv_dim(model_dir: str) -> int:
     return 0
 
 
+def _parse_gdn_cfg(config: dict,
+                   layer_types: List[str]) -> Optional[GdnConfig]:
+    """Return a GdnConfig if any layer is a GDN (linear_attention) layer, else None."""
+    if LAYER_GDN not in layer_types:
+        return None
+    return GdnConfig(
+        num_key_heads=config.get("linear_num_key_heads", 0),
+        num_value_heads=config.get("linear_num_value_heads", 0),
+        key_head_dim=config.get("linear_key_head_dim", 0),
+        value_head_dim=config.get("linear_value_head_dim", 0),
+        conv_kernel=config.get("linear_conv_kernel_dim", 4),
+    )
+
+
+def _get_partial_rotary_factor(llm_dict: Dict[str, Any]) -> float:
+    """Extract partial_rotary_factor from config dict.
+
+    Qwen3.5 stores this inside ``rope_parameters`` rather than at top level.
+    """
+    prf = llm_dict.get("partial_rotary_factor")
+    if prf is not None:
+        return float(prf)
+    for key in ("rope_parameters", "rope_scaling"):
+        nested = llm_dict.get(key)
+        if isinstance(
+                nested,
+                dict) and nested.get("partial_rotary_factor") is not None:
+            return float(nested["partial_rotary_factor"])
+    return 1.0
+
+
 def _detect_has_qk_norm(model_dir: str) -> bool:
     """Detect QK-norm by scanning checkpoint key names for ``.q_norm.weight``.
 
@@ -530,7 +637,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         with open(hf_path) as f:
             hq = json.load(f)
         q = hq.get("quantization", {})
-        algo = q.get("quant_algo", "").upper()
+        algo = (q.get("quant_algo") or "").upper()
         if "AWQ" in algo and "W4A16" in algo:
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
@@ -548,9 +655,13 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 excluded=list(q.get("exclude_modules", [])),
                 layer_overrides=layer_overrides,
             )
+        qt = _algo_to_quant_type(algo)
+        gs = int(q.get("group_size", 1))
+        if qt == QUANT_MXFP8 and gs == 1:
+            gs = 32  # MXFP8 default block_size
         return QuantConfig(
-            quant_type=_algo_to_quant_type(algo),
-            group_size=int(q.get("group_size", 1)),
+            quant_type=qt,
+            group_size=gs,
             kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
             excluded=list(q.get("exclude_modules", [])),
         )
@@ -562,7 +673,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
 
     # Embedded block with ``quant_algo`` (export tool formats)
     if "quant_algo" in qc:
-        algo = qc.get("quant_algo", "").upper()
+        algo = (qc.get("quant_algo") or "").upper()
         if "W4A16" in algo and "AWQ" in algo:
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
@@ -605,6 +716,9 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
 
 def _algo_to_quant_type(algo: str) -> str:
     algo = algo.upper()
+    # MXFP8 per-block must be checked before generic FP8
+    if "FP8_PB" in algo or "MXFP8" in algo:
+        return QUANT_MXFP8
     if "FP8" in algo:
         return QUANT_FP8
     if "FP4" in algo or "NVFP4" in algo:

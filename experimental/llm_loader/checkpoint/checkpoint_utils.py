@@ -168,6 +168,17 @@ def _export_tool_version() -> str:
     return __version__
 
 
+def _determine_model_type(config) -> str:
+    """Map ModelConfig to runtime model_type string."""
+    if config.is_eagle3_draft:
+        return "eagle3_draft"
+    if config.eagle_base:
+        return "eagle3_base"
+    if config.is_hybrid:
+        return "hybrid_mamba"
+    return "llm"
+
+
 def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     """JSON object written as ``config.json`` beside the ONNX export."""
     config = model.config
@@ -175,7 +186,7 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
 
     out: Dict[str, Any] = {
         "model": config.model_type,
-        "model_type": "hybrid_mamba" if config.is_hybrid else "llm",
+        "model_type": _determine_model_type(config),
         "edgellm_version": _export_tool_version(),
         "trt_native_ops": False,
         "vocab_size": config.vocab_size,
@@ -210,6 +221,32 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             "use_rope": config.num_attn_layers > 0,
         })
 
+    gc = config.gdn_cfg
+    if config.is_hybrid and gc is not None:
+        out.update({
+            "num_linear_attn_layers": config.num_gdn_layers,
+            "num_attention_layers": config.num_attn_layers,
+            "recurrent_state_num_heads": gc.num_value_heads,
+            "recurrent_state_head_dim": gc.key_head_dim,
+            "recurrent_state_size": gc.value_head_dim,
+            "conv_dim": gc.conv_dim,
+            "conv_kernel": gc.conv_kernel,
+            "use_rope": config.num_attn_layers > 0,
+        })
+
+    if config.is_eagle3_draft:
+        draft_vocab = config.draft_vocab_size or config.vocab_size
+        target_hidden = config.eagle3_target_hidden_size
+        out.update({
+            "draft_vocab_size": draft_vocab,
+            "base_model_hidden_size": target_hidden * 3,
+        })
+
+    if config.eagle_base:
+        # EAGLE3 base: record which layers provide hidden states to the draft.
+        n_layers = config.num_hidden_layers
+        out["eagle_hidden_state_layers"] = [2, n_layers // 2, n_layers - 4]
+
     return out
 
 
@@ -242,20 +279,32 @@ def write_runtime_artifacts(model: "CausalLM", model_dir: str,
         json.dump(cfg_json, f, indent=2)
     logger.info("Wrote config.json to %s", out_dir)
 
-    embed = getattr(getattr(model, "model", None), "embed_tokens", None)
-    if embed is None:
-        embed = getattr(getattr(model, "backbone", None), "embeddings", None)
-    if embed is not None:
-        weight = embed.weight.data.cpu()
-        # C++ runtime requires FP16 (or FP8) embedding; cast if needed.
-        if weight.dtype in (torch.float32, torch.bfloat16):
-            weight = weight.to(torch.float16)
-        save_file({"embedding": weight},
-                  os.path.join(out_dir, "embedding.safetensors"))
-        logger.info("Wrote embedding.safetensors (%s)", list(weight.shape))
+    # EAGLE3 draft models don't need embedding.safetensors — the C++ runtime
+    # uses the base model's shared embedding table (the builder already skips
+    # copying for draft models).
+    is_eagle3_draft = getattr(model.config, "is_eagle3_draft", False)
+    if is_eagle3_draft:
+        logger.info("EAGLE3 draft: skipping embedding.safetensors "
+                    "(uses base model embedding)")
     else:
-        logger.warning(
-            "embed_tokens not found; skipping embedding.safetensors")
+        embed = getattr(model, "embed_tokens", None)
+        if embed is None:
+            embed = getattr(getattr(model, "model", None), "embed_tokens",
+                            None)
+        if embed is None:
+            embed = getattr(getattr(model, "backbone", None), "embeddings",
+                            None)
+        if embed is not None:
+            weight = embed.weight.data.cpu()
+            # C++ runtime requires FP16 (or FP8) embedding; cast if needed.
+            if weight.dtype in (torch.float32, torch.bfloat16):
+                weight = weight.to(torch.float16)
+            save_file({"embedding": weight},
+                      os.path.join(out_dir, "embedding.safetensors"))
+            logger.info("Wrote embedding.safetensors (%s)", list(weight.shape))
+        else:
+            logger.warning(
+                "embed_tokens not found; skipping embedding.safetensors")
 
     for fname in RUNTIME_TOKENIZER_FILENAMES:
         src = os.path.join(model_dir, fname)
@@ -282,6 +331,13 @@ def write_runtime_artifacts(model: "CausalLM", model_dir: str,
                                "copying vocab.json and merges.txt as fallback")
                 shutil.copy2(vocab_src, os.path.join(out_dir, "vocab.json"))
                 shutil.copy2(merges_src, os.path.join(out_dir, "merges.txt"))
+
+    # EAGLE3 draft: save d2t (draft-to-target vocab map)
+    d2t = getattr(model, "d2t", None)
+    if d2t is not None:
+        d2t_cpu = d2t.data.cpu().to(torch.int32)
+        save_file({"d2t": d2t_cpu}, os.path.join(out_dir, "d2t.safetensors"))
+        logger.info("Wrote d2t.safetensors (%s)", list(d2t_cpu.shape))
 
     template_dst = os.path.join(out_dir, "processed_chat_template.json")
     if not os.path.exists(template_dst) and model_dir:

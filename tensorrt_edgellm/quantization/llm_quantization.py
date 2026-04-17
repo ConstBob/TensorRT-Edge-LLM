@@ -21,6 +21,7 @@ It supports various quantization schemes including FP8, INT4 AWQ, and NVFP4.
 
 import json
 import os
+import shutil
 import time
 from typing import Any, Dict, Optional, Union
 
@@ -501,13 +502,14 @@ def quantize_and_save_draft(
     dataset_dir: str = "cnn_dailymail",
     lm_head_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
+    unified_checkpoint: bool = False,
 ) -> None:
     """
     Load an EAGLE draft model, quantize it if specified, and save the result.
-    
+
     This is the main entry point for quantizing EAGLE draft models. It requires
     both a base model and draft model directory.
-    
+
     Args:
         base_model_dir: Directory containing the base HuggingFace model
         draft_model_dir: Directory containing the EAGLE draft model
@@ -518,6 +520,7 @@ def quantize_and_save_draft(
         dataset_dir: Dataset name or path for calibration data
         lm_head_quantization: Optional separate quantization for language model head (only "fp8", "nvfp4", and "mxfp8" are currently supported)
         kv_cache_quantization: Optional attention quantization (enables FP8 KV cache + FP8 FMHA compute)
+        unified_checkpoint: Whether to export as a unified HF checkpoint (compressed safetensors)
 
     Raises:
         ValueError: If model loading fails or quantization parameters are invalid
@@ -541,9 +544,40 @@ def quantize_and_save_draft(
     # Save the quantized model
     os.makedirs(output_dir, exist_ok=True)
 
-    _sanitize_generation_config(draft_model)
-    with torch.inference_mode():
-        draft_model.save_pretrained(output_dir)
+    if unified_checkpoint:
+        # Save as a unified HF checkpoint (compressed safetensors).
+        # We cannot use ``export_hf_checkpoint()`` because it runs
+        # ``requantize_resmooth_fused_llm_layers(model)`` which triggers a
+        # forward pass, but ``Eagle3DraftModel.forward()`` requires
+        # non-standard args.  Instead, manually compress quantized linear
+        # modules and build the state dict.
+        from modelopt.torch.export.unified_export_hf import (
+            QUANTIZATION_NONE, _export_quantized_weight,
+            get_quantization_format, is_quantlinear, postprocess_state_dict)
+        from safetensors.torch import save_file
+
+        model_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
+        with torch.inference_mode():
+            for _name, sub_module in draft_model.named_modules():
+                if get_quantization_format(sub_module) != QUANTIZATION_NONE:
+                    if is_quantlinear(sub_module):
+                        _export_quantized_weight(sub_module, model_dtype)
+
+        quant_config = get_quant_config(draft_model)
+        kv_format = quant_config["quantization"]["kv_cache_quant_algo"]
+        sd = draft_model.state_dict()
+        sd = postprocess_state_dict(sd, 0, kv_format)
+
+        save_file(sd, os.path.join(output_dir, "model.safetensors"))
+
+        # Copy config.json from the original draft model directory
+        src_config = os.path.join(draft_model_dir, "config.json")
+        if os.path.isfile(src_config):
+            shutil.copy2(src_config, os.path.join(output_dir, "config.json"))
+    else:
+        _sanitize_generation_config(draft_model)
+        with torch.inference_mode():
+            draft_model.save_pretrained(output_dir)
 
     # Save the quant config
     quant_config = get_quant_config(draft_model)

@@ -58,8 +58,7 @@ import torch.nn.functional as F
 from ...config import LAYER_MAMBA, LAYER_MLP, MambaConfig, ModelConfig
 from ..default.modeling_default import OnnxSpec
 from ..linear import FP16Linear, make_linear
-from ..ops import (attention_plugin, attention_plugin_fp8kv, causal_conv1d,
-                   update_ssm_state)
+from ..ops import attention_plugin, causal_conv1d, update_ssm_state
 
 
 class RMSNorm(nn.Module):
@@ -410,37 +409,22 @@ class NemotronHAttentionMixer(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        common_kwargs: dict = {
+        kwargs: dict = {
             "num_q_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
             "head_size": self.head_dim,
             "sliding_window_size": self.sliding_window_size,
+            "enable_tree_attention": False,
+            "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
         }
-        if self.enable_fp8_kv_cache:
-            # _qkv_scales_float is pre-cached by export.py before tracing so
-            # that .item() calls don't create data-dependent sym expressions.
-            qkv_scales = getattr(self, "_qkv_scales_float", [1.0, 1.0, 1.0])
-            attn_output, present_key_value = attention_plugin_fp8kv(
-                query_states,
-                key_states,
-                value_states,
-                past_key_value,
-                context_lengths,
-                rope_rotary_cos_sin,
-                kvcache_start_index,
-                qkv_scales=qkv_scales,
-                **common_kwargs)
-        else:
-            attn_output, present_key_value = attention_plugin(
-                query_states,
-                key_states,
-                value_states,
-                past_key_value,
-                context_lengths,
-                rope_rotary_cos_sin,
-                kvcache_start_index,
-                enable_fp8_kv_cache=False,
-                **common_kwargs)
+        # Always pass qkv_scales so torch.export includes a valid FLOATS
+        # value in the FX graph for the unified ONNX translation.
+        kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
+                                       [1.0, 1.0, 1.0])
+        attn_output, present_key_value = attention_plugin(
+            query_states, key_states, value_states, past_key_value,
+            context_lengths, rope_rotary_cos_sin, kvcache_start_index,
+            **kwargs)
 
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)

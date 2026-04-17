@@ -141,6 +141,112 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
     )
 
 
+def _strip_onnxscript_internal_attrs(onnx_path: str) -> None:
+    """Remove ``_outputs`` attributes injected by onnxscript multi-output ops.
+
+    onnxscript emits ``_outputs=N`` on custom-domain nodes with multiple
+    outputs (e.g. TRT_MXFP8DynamicQuantize).  TRT does not recognise this
+    attribute and may reject the graph.  Strip all attrs whose name starts
+    with ``_`` from ``trt::`` domain nodes.
+    """
+    model = onnx.load(onnx_path, load_external_data=False)
+    stripped = 0
+    for node in model.graph.node:
+        if node.domain != "trt":
+            continue
+        internal = [a for a in node.attribute if a.name.startswith("_")]
+        for a in internal:
+            node.attribute.remove(a)
+            stripped += 1
+    if not stripped:
+        return
+    logger.info("TRT fix: stripped %d internal onnxscript attr(s)", stripped)
+    data_file = os.path.basename(onnx_path) + ".data"
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_file,
+        size_threshold=0,
+    )
+
+
+def _dedup_shared_dql_scales(model) -> int:
+    """Duplicate shared DequantizeLinear scale initializers in-place.
+
+    The dynamo exporter deduplicates identical scalar initializers (e.g.
+    per-tensor NVFP4 global scales) into a single initializer referenced
+    by DequantizeLinear nodes across many layers.  TRT's Myelin compiler
+    segfaults when a single scalar initializer fans out to many DQL nodes
+    spanning different transformer layers.
+
+    Only small initializers (≤ 1 KB, i.e. scalars and small vectors) are
+    duplicated.  In practice the shared tensors are 4-byte FP32 scalars so
+    the total overhead is a few hundred bytes.  Large shared tensors are
+    left untouched to avoid doubling model memory.
+
+    Operates on an already-loaded ``onnx.ModelProto`` in-place and returns
+    the number of duplicated references (0 means no changes).
+    """
+    _MAX_DUP_BYTES = 1024  # only duplicate initializers up to 1 KB
+
+    # Collect all initializer names consumed by DQL nodes, counting
+    # how many *distinct* DQL consumers each has.
+    dql_consumers: dict[str, list] = {}  # init_name -> [node_indices]
+    for idx, node in enumerate(model.graph.node):
+        if node.op_type != "DequantizeLinear":
+            continue
+        for inp in node.input:
+            dql_consumers.setdefault(inp, []).append(idx)
+
+    # Only care about initializers with >1 DQL consumer
+    init_map = {init.name: init for init in model.graph.initializer}
+    shared = {
+        name: indices
+        for name, indices in dql_consumers.items()
+        if name in init_map and len(indices) > 1
+    }
+    if not shared:
+        return 0
+
+    duplicated = 0
+    skipped = 0
+    for init_name, node_indices in shared.items():
+        orig = init_map[init_name]
+        nbytes = len(orig.raw_data) if orig.raw_data else 0
+        if nbytes > _MAX_DUP_BYTES:
+            skipped += 1
+            logger.warning(
+                "TRT fix: skipping large shared DQL initializer %s "
+                "(%d bytes, %d consumers) — would double memory", init_name,
+                nbytes, len(node_indices))
+            continue
+
+        # Keep first consumer using the original; duplicate for the rest
+        for seq, nidx in enumerate(node_indices[1:], start=1):
+            clone_name = f"{init_name}__dup{seq}"
+            clone = onnx.TensorProto()
+            clone.CopyFrom(orig)
+            clone.name = clone_name
+            model.graph.initializer.append(clone)
+
+            # Patch the DQL node input to point at the clone
+            node = model.graph.node[nidx]
+            for i, inp in enumerate(node.input):
+                if inp == init_name:
+                    node.input[i] = clone_name
+                    break
+            duplicated += 1
+
+    if duplicated:
+        logger.info(
+            "TRT fix: duplicated %d shared DQL scale ref(s) "
+            "(%d unique, %d skipped as too large)", duplicated,
+            len(shared) - skipped, skipped)
+    return duplicated
+
+
 # ---------------------------------------------------------------------------
 # Core export
 # ---------------------------------------------------------------------------
@@ -214,17 +320,22 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
         ]
 
 
-def _fix_initializer_dtypes(onnx_path: str) -> None:
-    """Single-pass ONNX initializer dtype fixup for TRT compatibility.
+def _fix_initializer_dtypes(onnx_path: str,
+                            dedup_dql_scales: bool = False) -> None:
+    """Single-pass ONNX initializer fixup for TRT compatibility.
 
-    Performs two corrections in one ONNX load+save:
+    Performs up to three corrections in one ONNX load+save:
 
-    1. **FP32 weights → FP16**: The dynamo exporter may emit FP32 constants
+    1. **Shared DQL scales** (when *dedup_dql_scales* is True): duplicate
+       shared scalar DequantizeLinear initializers so each DQL node gets
+       its own copy (see :func:`_dedup_shared_dql_scales`).
+
+    2. **FP32 weights → FP16**: The dynamo exporter may emit FP32 constants
        for FP16 model weights (e.g. tied lm_head in BF16 checkpoints).  TRT
        requires uniform dtype in MatMul inputs.  Scalars and quantization
        scale tensors are left as FP32.
 
-    2. **Mamba ssm_A → FP32**: ONNX constant folding may collapse the
+    3. **Mamba ssm_A → FP32**: ONNX constant folding may collapse the
        ``A_log.to(float32) → exp → neg`` chain into a single initializer.
        The ``update_ssm_state`` plugin requires its A input (position 1) to
        be FP32, so any such initializer is kept (or restored to) FP32.
@@ -234,11 +345,20 @@ def _fix_initializer_dtypes(onnx_path: str) -> None:
     _onnx = __import__("onnx")
     model = _onnx.load(onnx_path)
 
-    # Collect Mamba A-input initializer names — these must stay FP32.
+    # --- Dedup shared DQL scale initializers (NVFP4 dynamo fix) ---
+    n_deduped = 0
+    if dedup_dql_scales:
+        n_deduped = _dedup_shared_dql_scales(model)
+
+    # Collect plugin initializer names that must stay FP32.
+    # - Mamba2 update_ssm_state: input[1] = ssm_A
+    # - gated_delta_net: input[5] = A_log
     mamba_a_names: set = set()
     for node in model.graph.node:
         if node.op_type == "update_ssm_state" and len(node.input) > 1:
             mamba_a_names.add(node.input[1])
+        if node.op_type == "gated_delta_net" and len(node.input) > 5:
+            mamba_a_names.add(node.input[5])
 
     n_to_fp16 = 0
     n_to_fp32 = 0
@@ -275,7 +395,7 @@ def _fix_initializer_dtypes(onnx_path: str) -> None:
         logger.info("_fix_initializer_dtypes: %s %s FP32→FP16", init.name,
                     dims)
 
-    if n_to_fp16 == 0 and n_to_fp32 == 0:
+    if n_to_fp16 == 0 and n_to_fp32 == 0 and n_deduped == 0:
         return
 
     # Update matching value_info entries
@@ -284,8 +404,9 @@ def _fix_initializer_dtypes(onnx_path: str) -> None:
         if init.name in vi_map:
             vi_map[init.name].type.tensor_type.elem_type = init.data_type
 
-    logger.info("_fix_initializer_dtypes: %d→FP16, %d→FP32, saving...",
-                n_to_fp16, n_to_fp32)
+    logger.info(
+        "_fix_initializer_dtypes: %d→FP16, %d→FP32, %d DQL deduped, "
+        "saving...", n_to_fp16, n_to_fp32, n_deduped)
     _onnx.save_model(
         model,
         onnx_path,
@@ -301,6 +422,7 @@ def _export_model(model: "CausalLM",
                   optimize: bool = True) -> None:
     _setup_fp8kv_scales_for_export(model)
     spec = model.onnx_export_spec()
+
     translation_table = build_custom_translation_table()
 
     logger.info("Exporting ONNX to %s (opset %d, dynamo) ...", output_path,
@@ -318,10 +440,14 @@ def _export_model(model: "CausalLM",
             external_data=True,
             optimize=optimize,
         )
-    prog.save(output_path)
+    prog.save(output_path, external_data=True)
     with open(output_path, "rb") as _f:
         os.fsync(_f.fileno())
-    if model.config.quant.uses_nvfp4_weights:
+    nvfp4 = model.config.quant.uses_nvfp4_weights
+    mxfp8 = model.config.quant.uses_mxfp8_weights
+    if nvfp4:
         _fix_nvfp4_weight_dtype(output_path)
-    _fix_initializer_dtypes(output_path)
+    if mxfp8:
+        _strip_onnxscript_internal_attrs(output_path)
+    _fix_initializer_dtypes(output_path, dedup_dql_scales=(nvfp4 or mxfp8))
     logger.info("Export complete: %s", output_path)

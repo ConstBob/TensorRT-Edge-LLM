@@ -33,10 +33,10 @@ import torch.nn.functional as F
 
 from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
-                      QUANT_NVFP4, ModelConfig)
+                      QUANT_MXFP8, QUANT_NVFP4, ModelConfig)
 from .ops import (fp8_dequantize, fp8_quantize, int4_groupwise_gemm,
-                  int8_sq_act_qdq, int8_sq_weight_dq, nvfp4_act_qdq,
-                  nvfp4_dequantize)
+                  int8_sq_act_qdq, int8_sq_weight_dq, mxfp8_act_qdq,
+                  mxfp8_weight_dq, nvfp4_act_qdq, nvfp4_dequantize)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ def _require_fp16_input(hidden_states: torch.Tensor, layer_name: str) -> None:
 __all__ = [
     "FP16Linear",
     "FP8Linear",
+    "MXFP8Linear",
     "NVFP4Linear",
     "AWQLinear",
     "ModelOptAWQPrepackedLinear",
@@ -186,6 +187,58 @@ class NVFP4Linear(nn.Module):
         # Weight: 2xstandard-ONNX DQ -> w_dq (float16)
         w_dq = nvfp4_dequantize(self.weight, self.weight_scale,
                                 self.weight_scale_2, self.group_size)
+        bias = self.bias.to(torch.float16) if self.bias is not None else None
+        return F.linear(hidden_states_dq, w_dq, bias)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8Linear
+# ---------------------------------------------------------------------------
+
+
+class MXFP8Linear(nn.Module):
+    """MXFP8 E4M3 linear with E8M0 per-block scales (block_size=32).
+
+    Expects a **unified checkpoint** from ``modelopt.torch.export.export_hf_checkpoint``
+    (ModelOpt >= 0.42.0) where weights are already FP8E4M3 and E8M0 scales
+    are pre-computed.
+
+    Activation is dynamically quantized at runtime via
+    ``TRT_MXFP8DynamicQuantize`` -> ``TRT_MXFP8DequantizeLinear``.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        block_size: int = 32,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.block_size = block_size
+        num_blocks = in_features // block_size
+
+        # Weight: FP8E4M3 [out, in] — loaded from unified checkpoint.
+        self.register_buffer(
+            "weight",
+            torch.empty(out_features, in_features, dtype=torch.float8_e4m3fn))
+        # E8M0 scale: UINT8 [out, in // block_size]
+        self.register_buffer(
+            "weight_scale",
+            torch.ones(out_features, num_blocks, dtype=torch.uint8))
+        if bias:
+            self.register_buffer("bias", torch.empty(out_features))
+        else:
+            self.bias = None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        _require_fp16_input(hidden_states, "MXFP8Linear")
+        # Activation: DynQ + DQ -> float16
+        hidden_states_dq = mxfp8_act_qdq(hidden_states)
+        # Weight: DQ FP8+E8M0 -> float16
+        w_dq = mxfp8_weight_dq(self.weight, self.weight_scale, self.block_size)
         bias = self.bias.to(torch.float16) if self.bias is not None else None
         return F.linear(hidden_states_dq, w_dq, bias)
 
@@ -482,6 +535,9 @@ def make_linear(
         return FP16Linear(in_features, out_features, bias)
     if quant_type == QUANT_FP8:
         return FP8Linear(in_features, out_features, bias)
+    if quant_type == QUANT_MXFP8:
+        return MXFP8Linear(in_features, out_features, config.quant.group_size,
+                           bias)
     if quant_type == QUANT_NVFP4:
         return NVFP4Linear(in_features, out_features, config.quant.group_size,
                            bias)

@@ -92,7 +92,7 @@ class TalkerCausalLM(CausalLM):
         kvcache_start_index: torch.Tensor,
         last_token_ids: torch.Tensor,
     ) -> Tuple:
-        hidden_states, present_key_values = self.model(
+        hidden_states, present_key_values, _ = self.model(
             inputs_embeds,
             past_key_values,
             rope_rotary_cos_sin,

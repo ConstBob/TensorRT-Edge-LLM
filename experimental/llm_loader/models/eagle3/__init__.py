@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5 model components: visual encoder + LLM backbone."""
-from .modeling_qwen3_5_text import Qwen3_5CausalLM
-from .modeling_qwen3_5_visual import Qwen3_5VLVisualModel, build_qwen3_5_visual
 
-__all__ = ["Qwen3_5VLVisualModel", "build_qwen3_5_visual", "Qwen3_5CausalLM"]
+from .modeling_eagle3_draft import Eagle3DraftModel
+
+__all__ = ["Eagle3DraftModel"]
