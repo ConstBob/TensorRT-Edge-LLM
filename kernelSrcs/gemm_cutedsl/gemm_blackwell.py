@@ -561,17 +561,16 @@ class GemmBlackwellFP16:
             tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
             cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-            acc_vec = tTR_rAcc.load()
             if cutlass.const_expr(mBias is not None):
                 bias_slice = tTR_gBias[(None, None, None, subtile_idx)]
-                for i in cutlass.range(cute.size(acc_vec)):
-                    acc_vec[i] = acc_vec[i] + bias_slice[i].to(self.acc_dtype)
+                for i in cutlass.range(cute.size(tTR_rAcc)):
+                    tTR_rAcc[i] = tTR_rAcc[i] + bias_slice[i].to(self.acc_dtype)
             if cutlass.const_expr(use_silu):
                 for si in cutlass.range(cute.size(tTR_rAcc)):
                     val = tTR_rAcc[si]
-                    tTR_rAcc[si] = val * (1.0 / (1.0 + cute.exp(-val)))
-                acc_vec = tTR_rAcc.load()
-            tTR_rC.store(acc_vec.to(self.c_dtype))
+                    tTR_rAcc[si] = val * cute.arch.rcp_approx(1.0 + cute.exp(-val, fastmath=True))
+
+            tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
 
             cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)])
 

@@ -519,7 +519,7 @@ class GemmAmpereFP16:
             if cutlass.const_expr(use_silu):
                 for i in cutlass.range(cute.size(tCrC)):
                     val = tCrC[i]
-                    tCrC[i] = val * (1.0 / (1.0 + cute.exp(-val)))
+                    tCrC[i] = val * cute.arch.rcp_approx(1.0 + cute.exp(-val, fastmath=True))
 
             tCrD = cute.make_fragment_like(tCrC, self.c_dtype)
             tCrD[None] = tCrC.load().to(self.c_dtype)
@@ -774,7 +774,14 @@ def run(
 
         a_f32 = a_cp.astype(cp.float32)
         b_f32 = b_cp.astype(cp.float32)
-        ref_cp = cp.matmul(a_f32, b_f32.T).astype(cp.float16)
+        ref_f32 = cp.matmul(a_f32, b_f32.T)
+
+        if fused_epilogue in ("bias", "bias_silu"):
+            ref_f32 = ref_f32 + bias_cp.astype(cp.float32)
+        if fused_epilogue == "bias_silu":
+            ref_f32 = ref_f32 * (1.0 / (1.0 + cp.exp(-ref_f32)))
+
+        ref_cp = ref_f32.astype(cp.float16)
 
         c_host = c_cp.get()
         ref_host = ref_cp.get()

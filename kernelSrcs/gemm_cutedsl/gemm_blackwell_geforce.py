@@ -56,6 +56,7 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import numpy as np
 from common import (
+    create_bias_tensor,
     create_row_major_3d_gemm_tensors,
     export_compiled_kernel,
     mark_3d_row_major_dynamic,
@@ -632,6 +633,37 @@ class GemmBlackwellGeforceFP16:
                     )
 
                 # =============================================================
+                # Fused epilogue operators applied directly to the MMA
+                # accumulators (before retile/R2S), so the element-wise index
+                # iteration is aligned with the MMA's thread partitioning.
+                # Bias uses broadcast stride (0, 1) so mBias[n] is correctly
+                # selected for every (m, n) element the thread owns.
+                # =============================================================
+                if cutlass.const_expr(mBias is not None):
+                    tile_n_offset = (
+                        tile_coord_mnl[1] * cutlass.Int32(self.tile_shape_mnk[1])
+                    )
+                    gBias_tile = cute.make_tensor(
+                        mBias.iterator + tile_n_offset,
+                        cute.make_layout(
+                            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
+                            stride=(0, 1),
+                        ),
+                    )
+                    tCgBias = thr_mma.partition_C(gBias_tile)
+                    for i in cutlass.range(cute.size(accumulators)):
+                        accumulators[i] = (
+                            accumulators[i] + tCgBias[i].to(self.acc_dtype)
+                        )
+
+                if cutlass.const_expr(use_silu):
+                    for i in cutlass.range(cute.size(accumulators)):
+                        val = accumulators[i]
+                        accumulators[i] = val * cute.arch.rcp_approx(
+                            1.0 + cute.exp(-val, fastmath=True)
+                        )
+
+                # =============================================================
                 # Epilogue: R2S via StMatrix, then S2G via TMA
                 # =============================================================
                 copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
@@ -687,12 +719,6 @@ class GemmBlackwellGeforceFP16:
                     epi_tile_shape, stride=(1, epi_tile_shape[0])
                 )
 
-                # Precompute the tile-level N-offset for bias indexing.
-                # work_tile.tile_idx = (m_idx, n_idx, l_idx); N-start of this
-                # CTA tile = n_idx * tile_N.
-                if cutlass.const_expr(mBias is not None):
-                    tile_n_offset = work_tile.tile_idx[1] * self.tile_shape_mnk[1]
-
                 for epi_idx in cutlass.range_constexpr(epi_tile_num):
                     for epi_v in cutlass.range_constexpr(size_tRS_rD):
                         tRS_rD[epi_v] = tRS_rAcc[
@@ -702,43 +728,7 @@ class GemmBlackwellGeforceFP16:
                     tRS_rD_out = cute.make_rmem_tensor(
                         tRS_rD_layout.shape, self.c_dtype
                     )
-                    acc_vec = tRS_rD.load()
-
-                    # ---------------------------------------------------------
-                    # Bias addition (FP32, before dtype conversion)
-                    # bias is a 1-D tensor [N].  Each subtile of the epilogue
-                    # tile covers a contiguous slice of N of width
-                    #   epi_tile_N = tile_N / epi_tile_num_n
-                    # The epi_tile layout maps epi_idx -> (m_sub, n_sub) via
-                    # epi_tile_layout.  We use the flat N-coordinate within the
-                    # tile:  n_sub * epi_tile_N_size + per-element offset.
-                    # Because bias[n] is the same for all M rows we load it
-                    # element-by-element using the N-coordinate of each
-                    # accumulator element in acc_vec.
-                    # ---------------------------------------------------------
-                    if cutlass.const_expr(mBias is not None):
-                        # epi_tile_layout maps flat epi_idx -> (row_sub, col_sub)
-                        # in the (num_epi_M, num_epi_N) sub-grid of epilogue
-                        # subtiles.  col_sub is the N-subtile index.
-                        # Each subtile spans self.epi_tile[1] elements in N.
-                        epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
-                        # epi_coord[1] is the N-subtile index within the tile.
-                        # self.epi_tile[1] is the N-size of each subtile.
-                        epi_tile_n_size = self.epi_tile[1]
-                        epi_n_start = tile_n_offset + epi_coord[1] * epi_tile_n_size
-                        for i in cutlass.range_constexpr(cute.size(acc_vec)):
-                            n_idx_elem = epi_n_start + i
-                            acc_vec[i] = acc_vec[i] + mBias[n_idx_elem].to(self.acc_dtype)
-
-                    # ---------------------------------------------------------
-                    # Epilogue activation (identity by default, or e.g. SiLU)
-                    # ---------------------------------------------------------
-                    if cutlass.const_expr(use_silu):
-                        for vi in cutlass.range(cute.size(acc_vec)):
-                            val = acc_vec[vi]
-                            acc_vec[vi] = val * (1.0 / (1.0 + cute.exp(-val)))
-
-                    tRS_rD_out.store(acc_vec.to(self.c_dtype))
+                    tRS_rD_out.store(tRS_rD.load().to(self.c_dtype))
 
                     epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
                     cute.copy(
@@ -992,6 +982,12 @@ def run(
     b_tensor = mark_3d_row_major_dynamic(to_cute_tensor(b_cp))
     c_tensor = mark_3d_row_major_dynamic(to_cute_tensor(c_cp))
 
+    # Bias tensor for fused epilogues.
+    mBias = None
+    bias_cp = None
+    if fused_epilogue in ("bias", "bias_silu"):
+        mBias, bias_cp = create_bias_tensor(n, export_only=export_only)
+
     gemm = GemmBlackwellGeforceFP16(
         acc_dtype=cutlass.Float32,
         tile_shape_mnk=tile_shape_mnk,
@@ -1010,7 +1006,8 @@ def run(
         c_tensor,
         max_active_clusters,
         current_stream,
-        _use_silu,
+        use_silu=_use_silu,
+        mBias=mBias,
     )
     compilation_time = time.time() - start_time
     print(f"{_tag} Compilation time: {compilation_time:.4f}s")
@@ -1026,7 +1023,7 @@ def run(
         return None
 
     # Run the kernel
-    compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream, _use_silu)
+    compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
     cp.cuda.Device().synchronize()
 
     if not skip_ref_check:
@@ -1034,8 +1031,16 @@ def run(
         # C = A @ B^T  =>  for batch L:  C[:,:,l] = A[:,:,l] @ B[:,:,l].T
         a_np = cp.asnumpy(a_cp[:, :, 0]).astype(np.float32)
         b_np = cp.asnumpy(b_cp[:, :, 0]).astype(np.float32)
-        ref_np = (a_np @ b_np.T).astype(np.float16)
+        ref_f32 = a_np @ b_np.T
 
+        if fused_epilogue in ("bias", "bias_silu"):
+            bias_f32 = cp.asnumpy(bias_cp).astype(np.float32)
+            ref_f32 = ref_f32 + bias_f32
+        if fused_epilogue == "bias_silu":
+            # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+            ref_f32 = ref_f32 * (1.0 / (1.0 + np.exp(-ref_f32)))
+
+        ref_np = ref_f32.astype(np.float16)
         result_np = cp.asnumpy(c_cp[:, :, 0])
 
         max_abs_err = np.max(np.abs(result_np.astype(np.float32) - ref_np.astype(np.float32)))
@@ -1049,14 +1054,14 @@ def run(
     # Benchmark
     if iterations > 0:
         for _ in range(warmup_iterations):
-            compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream, _use_silu)
+            compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         cp.cuda.Device().synchronize()
 
         start_event = cp.cuda.Event()
         end_event = cp.cuda.Event()
         start_event.record()
         for _ in range(iterations):
-            compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream, _use_silu)
+            compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         end_event.record()
         end_event.synchronize()
         elapsed_ms = cp.cuda.get_elapsed_time(start_event, end_event)
