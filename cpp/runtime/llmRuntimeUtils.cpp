@@ -22,6 +22,7 @@
 #include "common/safetensorsUtils.h"
 #include "common/stringUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
+#include "runtime/streaming.h" // For SlotStreamState (explicit compactVector instantiation)
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -339,6 +340,7 @@ template void compactVector<int8_t>(std::vector<int32_t> const&, std::vector<int
 template void compactVector<int32_t>(std::vector<int32_t> const&, std::vector<int32_t>&);
 template void compactVector<std::vector<int32_t>>(std::vector<int32_t> const&, std::vector<std::vector<int32_t>>&);
 template void compactVector<std::string>(std::vector<int32_t> const&, std::vector<std::string>&);
+template void compactVector<SlotStreamState>(std::vector<int32_t> const&, std::vector<SlotStreamState>&);
 
 // Build batch mapping from finished states
 // Returns a vector mapping old batch indices to new indices (-1 for evicted batches)

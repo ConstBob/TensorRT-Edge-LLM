@@ -69,6 +69,8 @@ void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _m
     currentGenerateLengths.resize(_activeBatchSize, 0);
     effectivePrefillLengths.resize(_activeBatchSize, 0);
     finishedStates.resize(_activeBatchSize, 0);
+    slotStreams.clear();
+    slotStreams.resize(_activeBatchSize);
 
     // Initialize batch index mapping (identity mapping initially)
     batchIndexMapping.resize(_activeBatchSize);
@@ -479,6 +481,11 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return false;
     }
 
+    if (!validateStreamingSubmission(request))
+    {
+        return false;
+    }
+
     // Speculative decoding only supports greedy; override non-default sampling params.
     bool const hasNonDefaultSampling
         = (request.topK > 1 || request.topP < 1.0f || std::fabs(request.temperature - 1.0f) > 1e-3f);
@@ -574,6 +581,24 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return false;
     }
 
+    // ── Streaming setup ──────────────────────────────────────────────────────
+    // Attach first, record in slotStreams only on success — a throw from attach
+    // keeps foreign channels out of the finalizer's reach. Seed sentTokenCount
+    // to the prompt length so streaming emits only generated tokens.
+    for (int32_t i = 0; i < context.activeBatchSize; ++i)
+    {
+        if (request.streamChannels.empty() || !request.streamChannels[i])
+        {
+            continue;
+        }
+        attachStreamChannel(request.streamChannels[i], context.batchIndexMapping[i]);
+        auto& slot = context.slotStreams[i];
+        slot.channel = request.streamChannels[i];
+        slot.sentTokenCount = context.tokenIds[i].size();
+        slot.lastEmittedTokenCount = slot.sentTokenCount;
+    }
+    StreamChannelFinalizer streamFinalizer(context, *mTokenizer);
+
     int32_t const clampedMaxGenerateLength = clampMaxGenerateLengthForKVCapacity(
         context.effectivePrefillLengths, request.maxGenerateLength, kvCacheCapacity, kvcReserve);
     if (clampedMaxGenerateLength != context.maxGenerateLength)
@@ -612,14 +637,25 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return true;
     };
 
-    // Lambda to update finish states based on EOS and max_length
+    // Lambda to update finish states based on EOS and max_length. Latches
+    // terminalReason atomically with the state flip — the !finishedStates guard
+    // keeps first-writer-wins semantics relative to applyCancellationToFinishStates.
     auto updateFinishStates = [&]() {
         for (int32_t i = 0; i < context.activeBatchSize; ++i)
         {
+            if (context.finishedStates[i])
+            {
+                continue; // Respect first-writer-wins (cancel may have fired).
+            }
+            auto& s = context.slotStreams[i];
             // Check EOS
             if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
             {
                 context.finishedStates[i] = 1;
+                if (s.channel)
+                {
+                    s.terminalReason = FinishReason::kEndId;
+                }
                 LOG_DEBUG("Batch %d finished, reason: EOS", i);
                 continue;
             }
@@ -627,6 +663,10 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
             if (context.currentGenerateLengths[i] >= context.maxGenerateLength)
             {
                 context.finishedStates[i] = 1;
+                if (s.channel)
+                {
+                    s.terminalReason = FinishReason::kLength;
+                }
                 LOG_DEBUG(
                     "Batch %d finished, total tokens=%d, reason: max_length", i, context.currentGenerateLengths[i]);
                 continue;
@@ -634,8 +674,11 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         }
     };
 
-    // Check if any batch finished immediately after prefill
+    // Post-prefill finish-state detection: cancel FIRST (so it wins over natural
+    // finish if both are observable), then natural EOS/length, then emit chunks.
+    applyCancellationToFinishStates(context);
     updateFinishStates();
+    emitChunks(context, *mTokenizer);
 
     // If everything finished during prefill, evict once so activeBatchSize reaches 0
     if (checkAllFinished() && context.activeBatchSize > 0)
@@ -650,6 +693,10 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 
     while (!checkAllFinished())
     {
+        // Observe any consumer cancels at the top of the iteration so they land
+        // first in the per-slot terminalReason latch.
+        applyCancellationToFinishStates(context);
+
         if (enableSpecDecode)
         {
             if (context.generationRound == 0)
@@ -697,6 +744,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
 
         // Update iterations, check finish conditions and increment generation round
         updateFinishStates();
+        emitChunks(context, *mTokenizer);
         context.generationRound += 1;
 
         // Perform batch eviction if needed (after verification, before updating finish states)
@@ -2283,6 +2331,7 @@ bool LLMInferenceSpecDecodeRuntime::performBatchEvict(SpecDecodeInferenceContext
     rt::compactVector(batchMapping, context.rawBatchedInputIds);
     rt::compactVector(batchMapping, context.effectivePrefillLengths);
     rt::compactVector(batchMapping, context.batchIndexMapping);
+    rt::compactVector(batchMapping, context.slotStreams);
 
     // Update active batch size
     context.activeBatchSize = newActiveBatch;
