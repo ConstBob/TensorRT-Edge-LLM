@@ -350,7 +350,7 @@ KERNEL_VARIANTS = [
             "--cta_tiler_mnk", "16,128,128",
             "--atom_layout_mnk", "1,4,1",
             "--num_stages", "3",
-            "--use_unpredicated",
+
             "--export_only",
         ],
     ),
@@ -364,7 +364,7 @@ KERNEL_VARIANTS = [
             "--cta_tiler_mnk", "16,128,128",
             "--atom_layout_mnk", "1,4,1",
             "--num_stages", "3",
-            "--use_unpredicated",
+
             "--export_only",
         ],
     ),
@@ -378,7 +378,7 @@ KERNEL_VARIANTS = [
             "--cta_tiler_mnk", "64,128,64",
             "--atom_layout_mnk", "1,4,1",
             "--num_stages", "3",
-            "--use_unpredicated",
+
             "--export_only",
         ],
     ),
@@ -392,7 +392,7 @@ KERNEL_VARIANTS = [
             "--cta_tiler_mnk", "128,128,64",
             "--atom_layout_mnk", "2,4,1",
             "--num_stages", "3",
-            "--use_unpredicated",
+
             "--export_only",
         ],
     ),
@@ -446,7 +446,7 @@ KERNEL_VARIANTS = [
             "--cta_tiler_mnk", "64,128,64",
             "--atom_layout_mnk", "1,4,1",
             "--num_stages", "3",
-            "--use_unpredicated",
+
             "--fused_epilogue", "bias_silu",
             "--export_only",
         ],
@@ -461,7 +461,7 @@ KERNEL_VARIANTS = [
             "--cta_tiler_mnk", "64,128,64",
             "--atom_layout_mnk", "1,4,1",
             "--num_stages", "3",
-            "--use_unpredicated",
+
             "--fused_epilogue", "bias",
             "--export_only",
         ],
