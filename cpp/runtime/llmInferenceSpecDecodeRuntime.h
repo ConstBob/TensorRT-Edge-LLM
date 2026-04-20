@@ -41,7 +41,7 @@ struct SystemPromptKVCache
 {
     std::string systemPrompt;                     //!< The system prompt text
     std::vector<tokenizer::Rank> tokenizedPrompt; //!< Tokenized version of the system prompt
-    rt::Tensor kvCacheContent;                    //!< Cached KV cache content for the system prompt
+    std::vector<rt::Tensor> kvCacheLayers;        //!< Per-layer KV cache tensors for the system prompt
     std::vector<rt::Tensor>
         recurrentStateContents;                //!< Cached recurrent states for hybrid layers (empty if not applicable)
     std::vector<rt::Tensor> convStateContents; //!< Cached conv states for hybrid layers (empty if not applicable)

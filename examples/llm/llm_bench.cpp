@@ -872,7 +872,7 @@ int main(int argc, char** argv)
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), reuseKVLenVec.data(), reuseKVLenVec.size() * sizeof(int32_t));
-            runner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
+            runner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
         };
         step = [&]() {
             return runner->executePrefillStep(
@@ -902,7 +902,7 @@ int main(int argc, char** argv)
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
-            runner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
+            runner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
         };
         step = [&]() { return runner->executeVanillaDecodingStep(decodeInputs, logits, std::nullopt, stream); };
         captureGraph = [&]() { return runner->captureVanillaDecodingCudaGraph(decodeInputs, logits, {}, stream); };
@@ -943,7 +943,7 @@ int main(int argc, char** argv)
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
-            runner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
+            runner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
         };
         step = [&]() {
             return runner->executeEagleBaseTreeDecodingStep(
@@ -959,7 +959,7 @@ int main(int argc, char** argv)
         {
             useSequentialE2E = true;
             decodeSteps = (args.osl - 1 + args.acceptRate - 1) / args.acceptRate;
-            postStep = [&](int32_t) { runner->getLinearKVCache().commitSequenceLength(args.acceptRate, stream); };
+            postStep = [&](int32_t) { runner->getCacheManager().commitSequenceLength(args.acceptRate, stream); };
         }
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL)
@@ -1002,7 +1002,7 @@ int main(int argc, char** argv)
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
-            draftRunner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
+            draftRunner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
         };
         step = [&]() {
             return draftRunner->executeEagleDraftProposalStep(draftInputs, draftBaseHiddenStates,
@@ -1023,7 +1023,7 @@ int main(int argc, char** argv)
             postStep = [&, draftStepsPerIter](int32_t t) {
                 if ((t + 1) % draftStepsPerIter == 0)
                 {
-                    draftRunner->getLinearKVCache().commitSequenceLength(args.acceptRate, stream);
+                    draftRunner->getCacheManager().commitSequenceLength(args.acceptRate, stream);
                 }
             };
         }
@@ -1064,7 +1064,7 @@ int main(int argc, char** argv)
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), reuseKVLenVec.data(), reuseKVLenVec.size() * sizeof(int32_t));
-            draftRunner->getLinearKVCache().resetForNewSequences(reuseKVCacheLengths, stream);
+            draftRunner->getCacheManager().resetForNewSequences(reuseKVCacheLengths, stream);
         };
         step = [&]() {
             return draftRunner->executeEaglePrefillStep(inputsEmbeds, baseModelHiddenStates,

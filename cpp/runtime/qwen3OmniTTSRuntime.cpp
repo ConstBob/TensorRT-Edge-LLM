@@ -195,7 +195,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
 
         LOG_INFO("Talker LLM engine loaded: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
             mTalkerLLMConfig.hiddenSize);
-        auto talkerKVType = mTalkerLLMRunner->getLinearKVCache().getConfig().kvCacheTypeTRT;
+        auto talkerKVType = mTalkerLLMRunner->getCacheManager().getKVCacheManager().getConfig().kvCacheType;
         LOG_INFO("Talker KV cache dtype: %s",
             talkerKVType == nvinfer1::DataType::kHALF ? "FP16"
                                                       : (talkerKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN"));
@@ -230,7 +230,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
 
         LOG_INFO("CodePredictor engine loaded: vocabSize=%d, hiddenSize=%d, numLayers=%d",
             mCodePredictorConfig.vocabSize, mCodePredictorConfig.hiddenSize, mCodePredictorConfig.numDecoderLayers);
-        auto cpKVType = mCodePredictorRunner->getLinearKVCache().getConfig().kvCacheTypeTRT;
+        auto cpKVType = mCodePredictorRunner->getCacheManager().getKVCacheManager().getConfig().kvCacheType;
         LOG_INFO("CodePredictor KV cache dtype: %s",
             cpKVType == nvinfer1::DataType::kHALF ? "FP16"
                                                   : (cpKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN"));
@@ -710,9 +710,14 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(
     // Reset Talker KV cache for new sequence
     int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
     reuseData[0] = 0; // No KV cache reuse
-    mTalkerLLMRunner->getLinearKVCache().resetForNewSequences(mHostReuseKVCacheLengths, stream);
-    rt::Tensor talkerKV = mTalkerLLMRunner->getLinearKVCache().getKVCacheBuffer();
-    CUDA_CHECK(cudaMemsetAsync(talkerKV.rawPointer(), 0, talkerKV.getMemoryCapacity(), stream));
+    auto& talkerCacheManager = mTalkerLLMRunner->getCacheManager();
+    talkerCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    auto& talkerKVManager = talkerCacheManager.getKVCacheManager();
+    for (int32_t i = 0; i < talkerKVManager.numLayers(); ++i)
+    {
+        rt::Tensor& layerKV = talkerKVManager.getCombinedKVCache(i);
+        CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
+    }
 
     auto inputShape = inputEmbeds.getShape();
     if (inputShape.getNumDims() != 3)
@@ -749,9 +754,14 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& code
     // Reset CodePredictor KV cache for new frame (each frame is independent)
     int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
     reuseData[0] = 0; // No KV cache reuse
-    mCodePredictorRunner->getLinearKVCache().resetForNewSequences(mHostReuseKVCacheLengths, stream);
-    rt::Tensor cpKV = mCodePredictorRunner->getLinearKVCache().getKVCacheBuffer();
-    CUDA_CHECK(cudaMemsetAsync(cpKV.rawPointer(), 0, cpKV.getMemoryCapacity(), stream));
+    auto& cpCacheManager = mCodePredictorRunner->getCacheManager();
+    cpCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    auto& cpKVManager = cpCacheManager.getKVCacheManager();
+    for (int32_t i = 0; i < cpKVManager.numLayers(); ++i)
+    {
+        rt::Tensor& layerKV = cpKVManager.getCombinedKVCache(i);
+        CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
+    }
 
     int32_t* const hostContextLength = mHostCodePredictorContextLength.dataPointer<int32_t>();
     hostContextLength[0] = kCodePredictorPrefillSeqLen;

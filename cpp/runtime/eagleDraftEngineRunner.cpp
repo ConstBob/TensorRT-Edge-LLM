@@ -183,11 +183,17 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
         checkKVCacheDType(layerIdx, /*isPast=*/false);
     }
 
-    // Instantiate the KVCache instance of the EngineRunner.
-    this->mLinearKVCache
-        = rt::LinearKVCache(rt::LinearKVCache::CacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
-                                mConfig.maxKVCacheCapacity, mConfig.numKVHeads, mConfig.headDim, kvCacheType},
-            stream);
+    // Build HybridCacheManager — EAGLE models are pure attention (no Mamba layers).
+    std::vector<rt::HybridCacheManager::LayerType> layerTypes(
+        mConfig.numDecoderLayers, rt::HybridCacheManager::LayerType::kAttention);
+    std::vector<rt::KVLayerConfig> kvLayerConfigs(
+        mConfig.numDecoderLayers, rt::KVLayerConfig{mConfig.numKVHeads, mConfig.headDim});
+    rt::KVCacheManager::Config kvCacheConfig{mConfig.numDecoderLayers, mConfig.maxSupportedBatchSize,
+        mConfig.maxKVCacheCapacity, kvLayerConfigs, kvCacheType};
+    rt::MambaCacheManager::Config mambaConfig{}; // no-op: 0 recurrent layers
+    rt::HybridCacheManager::Config cacheManagerConfig{
+        layerTypes, kvCacheConfig, mambaConfig, mConfig.maxSupportedBatchSize};
+    this->mCacheManager = rt::HybridCacheManager(cacheManagerConfig, stream);
 
     // By design for tree attention kernel we use, the tree mask will be packed into in32_t values where each bit
     // represents the relationship between two
@@ -485,9 +491,9 @@ rt::Tensor& EagleDraftEngineRunner::getRopeCosSinCacheTensor() noexcept
     return mPosEncCosSinCache;
 }
 
-rt::LinearKVCache& EagleDraftEngineRunner::getLinearKVCache() noexcept
+rt::HybridCacheManager& EagleDraftEngineRunner::getCacheManager() noexcept
 {
-    return mLinearKVCache;
+    return mCacheManager;
 }
 
 bool EagleDraftEngineRunner::prefillStepInputValidation(rt::Tensor const& inputsEmbeds,
@@ -645,12 +651,12 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputsEmb
     {
         // Setup the KVCache start index tensor. If all KVCache are empty then we can supply zero tensor to the engine.
         // Otherwise, we shall supply the KVCache lengths tensor to the engine.
-        if (!mLinearKVCache.getKVCacheAllEmpty())
+        if (!mCacheManager.getKVCacheAllEmpty())
         {
             setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-                binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+                binding_names::kKVCacheStartIndex, mCacheManager.getKVCacheLengths().rawPointer());
             setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-                binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
+                binding_names::kKVCacheStartIndex, mCacheManager.getKVCacheLengths().getShape().getTRTDims());
         }
         else
         {
@@ -715,7 +721,7 @@ bool EagleDraftEngineRunner::executeEaglePrefillStep(rt::Tensor const& inputsEmb
         return false;
     }
     // In prefill step. commit all KVCache generated during the execution.
-    mLinearKVCache.commitSequenceLength(mSequenceContextLengths, stream);
+    mCacheManager.commitSequenceLength(mSequenceContextLengths, stream);
 
     LOG_DEBUG("Prefill stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
@@ -913,7 +919,7 @@ bool EagleDraftEngineRunner::captureEagleDraftProposalCudaGraph(rt::Tensor const
     rt::Tensor const reuseKVCacheLengthsTensor(reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU,
         DataType::kINT32, "draft_reuse_kv_cache_lengths");
 
-    mLinearKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
+    mCacheManager.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
 
     // Validate the input tensors.
     bool const validateInputStatus
@@ -1082,7 +1088,7 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepPrepareInputs(
     // sequence context lengths.
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
-    rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
+    rt::Tensor const& sequenceStartIndex = mCacheManager.getKVCacheLengths();
 
     // Prepare inputs for plugin-based attention
     check::check(mSelectTokenIndices.reshape({activeBatchSize, kACCEPT_DECODE_SELECT_TOKEN_LENGTH}),
@@ -1124,9 +1130,9 @@ bool EagleDraftEngineRunner::acceptDecodeTokenStepBindTensors(rt::Tensor const& 
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        binding_names::kKVCacheStartIndex, mCacheManager.getKVCacheLengths().rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
+        binding_names::kKVCacheStartIndex, mCacheManager.getKVCacheLengths().getShape().getTRTDims());
 
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
@@ -1224,7 +1230,7 @@ bool EagleDraftEngineRunner::executeEagleAcceptDecodeTokenStep(rt::Tensor const&
     }
 
     // Commit the KVCache for accepted tokens.
-    mLinearKVCache.commitSequenceLength(acceptedTokenNums, stream);
+    mCacheManager.commitSequenceLength(acceptedTokenNums, stream);
 
     LOG_DEBUG("Accept decode token stage execution completed for request with batch size %d.", activeBatchSize);
     return true;
@@ -1258,7 +1264,7 @@ bool EagleDraftEngineRunner::captureEagleAcceptDecodeTokenCudaGraph(rt::Tensor c
     rt::Tensor const reuseKVCacheLengthsTensor(reuseKVCacheLengths.data(), {activeBatchSize}, rt::DeviceType::kCPU,
         DataType::kINT32, "accept_reuse_kv_cache_lengths");
 
-    mLinearKVCache.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
+    mCacheManager.resetForNewSequences(reuseKVCacheLengthsTensor, stream);
 
     // Validate the input tensors.
     bool const validateInputStatus = this->acceptDecodeTokenStepInputValidation(acceptedTokensEmbeds,
@@ -1317,7 +1323,10 @@ bool EagleDraftEngineRunner::bindPluginKVCacheToEngine(int32_t activeBatchSize)
         std::string const pastKeyValuesName = binding_names::formatKVCacheName(i, true);
         std::string const presentKeyValuesName = binding_names::formatKVCacheName(i, false);
 
-        rt::Tensor kvCacheBlock = mLinearKVCache.getCombinedKVCacheForDecoderLayer(i);
+        // EAGLE draft is pure-attention, so abs-layer-idx == local-KV-idx and either API works today.
+        // Use the KVCacheManager sub-API to match LLMEngineRunner's binding convention and to stay
+        // correct if the draft ever gains non-attention layers.
+        rt::Tensor& kvCacheBlock = mCacheManager.getKVCacheManager().getCombinedKVCache(i);
         status &= mTRTExecutionContext->setTensorAddress(pastKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status &= mTRTExecutionContext->setTensorAddress(presentKeyValuesName.c_str(), kvCacheBlock.rawPointer());
         status &= mTRTExecutionContext->setInputShape(pastKeyValuesName.c_str(), kvCacheDims);
@@ -1343,7 +1352,7 @@ bool EagleDraftEngineRunner::draftProposalStepPrepareInputs(rt::Tensor const& dr
     // sequence context lengths.
     // We can obtain the sequence start index from KVCache, the current KVCache size denote the start index of the "next
     // token" in the sequence.
-    rt::Tensor const& sequenceStartIndex = mLinearKVCache.getKVCacheLengths();
+    rt::Tensor const& sequenceStartIndex = mCacheManager.getKVCacheLengths();
 
     // Prepare inputs for plugin-based attention
     check::check(mSelectTokenIndices.reshape({activeBatchSize, selectTokenSize}),
@@ -1383,9 +1392,9 @@ bool EagleDraftEngineRunner::draftProposalStepBindTensors(rt::Tensor const& draf
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
         binding_names::kLastTokenIds, mSelectTokenIndices.getShape().getTRTDims());
     setEngineIOStatus &= mTRTExecutionContext->setTensorAddress(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().rawPointer());
+        binding_names::kKVCacheStartIndex, mCacheManager.getKVCacheLengths().rawPointer());
     setEngineIOStatus &= mTRTExecutionContext->setInputShape(
-        binding_names::kKVCacheStartIndex, mLinearKVCache.getKVCacheLengths().getShape().getTRTDims());
+        binding_names::kKVCacheStartIndex, mCacheManager.getKVCacheLengths().getShape().getTRTDims());
 
     setEngineIOStatus
         &= mTRTExecutionContext->setTensorAddress(binding_names::kContextLengths, mSequenceContextLengths.rawPointer());
