@@ -25,6 +25,7 @@
 #include "runtime/eagleDraftEngineRunner.h"
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <cassert>
 #include <optional>
@@ -86,6 +87,7 @@ struct SpecDecodeInferenceContext
     // Key: original batch index, Value: complete batch result data
     std::unordered_map<int32_t, BatchResult> completedBatches; //!< Results of completed batches (unified storage)
     std::vector<int32_t> batchIndexMapping;                    //!< Maps current batch index to original index
+    std::vector<SlotStreamState> slotStreams;                  //!< Per-slot streaming state (parallel to tokenIds).
     rt::OptionalInputTensor visualEmbeddings;                  //!< Optional visual embeddings
     rt::OptionalInputTensor audioEmbeddings;                   //!< Optional audio embeddings
     rt::OptionalInputTensors deepstackFeatures; //!< Deepstack features for Qwen3-VL (raw features before embedding)

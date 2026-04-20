@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
@@ -49,6 +50,13 @@ struct Message
     std::string role;                     //!< Message role (system, user, assistant)
     std::vector<MessageContent> contents; //!< Contents of the message
 };
+
+// Streaming types (StreamChannel, StreamChunk, SlotStreamState, FinishReason,
+// StreamChannelFinalizer, and the four streaming free functions) live in
+// `runtime/streaming.h`. LLMGenerationRequest::streamChannels holds a vector
+// of shared_ptr<StreamChannel>, which only needs a forward declaration here —
+// consumers that actually manipulate channels include `runtime/streaming.h`.
+class StreamChannel;
 
 /*! \brief LLM Generation Request structure
  */
@@ -95,6 +103,12 @@ struct LLMGenerationRequest
     bool enableThinking{false};
     // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
     bool disableSpecDecode{false};
+
+    //! Per-slot streaming channels. Size 0 disables streaming globally.
+    //! When non-empty the size must equal `requests.size()` and individual entries may be null
+    //! to opt out on a per-slot basis. Channels must not already be finished or concurrently
+    //! attached to another in-flight request.
+    std::vector<std::shared_ptr<StreamChannel>> streamChannels;
 };
 
 /*! \brief LLM Generation Response structure

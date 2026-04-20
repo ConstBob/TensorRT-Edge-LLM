@@ -174,7 +174,7 @@ target_link_options(commonLibraryExt INTERFACE
                     "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
 # Build Core libraries of the project. attentionPlugin shared library and
-# edgellmCore/edgellmTokenizer/edgellmBuilder static library will be generated.
+# edgellmCore/edgellmBuilder static library will be generated.
 add_subdirectory(cpp)
 
 # Build C++ examples to showcase the usage

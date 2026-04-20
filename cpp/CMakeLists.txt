@@ -97,6 +97,8 @@ target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
+
 add_library(
   edgellmCore STATIC
   ${COMMON_CPP_SRCS}
@@ -107,18 +109,14 @@ add_library(
   ${SAMPLER_CU_SRCS}
   ${MULTIMODAL_CPP_SRCS}
   ${RUNTIME_CPP_SRCS}
-  ${PROFILER_CPP_SRCS})
+  ${PROFILER_CPP_SRCS}
+  ${TOKENIZER_CPP_SRCS})
 target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(edgellmCore PRIVATE dl)
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
-# Generate tokenizer C++ static library
-file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
-add_library(edgellmTokenizer STATIC ${TOKENIZER_CPP_SRCS})
-target_include_directories(edgellmTokenizer PRIVATE ${COMMON_INCLUDE_DIRS})
 
 # Generate builder C++ static library
 file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
