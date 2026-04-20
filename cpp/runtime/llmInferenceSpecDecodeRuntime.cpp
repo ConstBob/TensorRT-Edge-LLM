@@ -23,7 +23,6 @@
 #include "common/mathUtils.h"
 #include "common/safetensorsUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
-#include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "kernels/speculative/batchEvictKernels.h"
 #include "kernels/speculative/eagleAcceptKernels.h"
@@ -31,6 +30,7 @@
 #include "multimodal/multimodalRunner.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
+#include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "sampler/sampling.h"
 #include <algorithm>
@@ -1428,8 +1428,36 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // Inplace update the KVCache and input hidden states from the accepted token indices.
     // Also commit KVCache to reflect the latest KVCache length (We can only do this after knowing how many tokens are
     // accepted).
-    rt::Tensor const& kvCacheLengths = mBaseEngineRunner->getLinearKVCache().getKVCacheLengths();
-    rt::Tensor kvCacheTensor = mBaseEngineRunner->getLinearKVCache().getKVCacheBuffer();
+    auto& baseCacheManager = mBaseEngineRunner->getCacheManager();
+    rt::Tensor const& kvCacheLengths = baseCacheManager.getKVCacheLengths();
+
+    // eagleBaseCommitKVCacheAndAssembleHiddenState operates on a monolithic 6D KV cache buffer
+    // [L, B, 2, H, S, D].  For the per-layer HybridCacheManager we gather the per-layer tensors
+    // into a temporary contiguous buffer and scatter back afterwards.
+    // TODO: adapt the EAGLE kernel to iterate per-layer and remove the gather/scatter copies.
+    auto& kvManager = baseCacheManager.getKVCacheManager();
+    check::check(kvManager.isUniform(),
+        "EAGLE speculative decoding requires uniform KV cache config "
+        "(same numKVHeads and headDim for all layers).");
+
+    auto const& kvConfig = kvManager.getConfig();
+    auto const& lc0 = kvManager.getLayerConfig(0);
+    int32_t const numKVLayers = kvManager.numLayers();
+    size_t const elemSize = rt::utils::getTypeSize(kvConfig.kvCacheType);
+    size_t const perLayerBytes = static_cast<size_t>(kvConfig.maxBatchSize) * 2 * lc0.numKVHeads
+        * kvConfig.maxSequenceLength * lc0.headDim * elemSize;
+
+    // Gather per-layer KV caches into temporary contiguous 6D buffer.
+    rt::Tensor kvCacheTensor({static_cast<int64_t>(numKVLayers), static_cast<int64_t>(kvConfig.maxBatchSize),
+                                 int64_t{2}, static_cast<int64_t>(lc0.numKVHeads),
+                                 static_cast<int64_t>(kvConfig.maxSequenceLength), static_cast<int64_t>(lc0.headDim)},
+        rt::DeviceType::kGPU, kvConfig.kvCacheType, "eagleMonolithicKVCache");
+    for (int32_t i = 0; i < numKVLayers; ++i)
+    {
+        void* dst = static_cast<char*>(kvCacheTensor.rawPointer()) + i * perLayerBytes;
+        CUDA_CHECK(cudaMemcpyAsync(dst, kvManager.getCombinedKVCache(i).rawPointer(), perLayerBytes,
+            cudaMemcpyDeviceToDevice, context.stream));
+    }
 
     // Reshape input hidden states from 2D [batch*verify_tree_size, hidden_dim] to 3D [batch, verify_tree_size,
     // hidden_dim]
@@ -1446,7 +1474,15 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     kernel::eagleBaseCommitKVCacheAndAssembleHiddenState(
         mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, kvCacheTensor, mBaseHiddenStatesOutput, context.stream);
 
-    mBaseEngineRunner->getLinearKVCache().commitSequenceLength(mAcceptLength, context.stream);
+    // Scatter the modified monolithic buffer back to per-layer KV caches.
+    for (int32_t i = 0; i < numKVLayers; ++i)
+    {
+        void const* src = static_cast<char const*>(kvCacheTensor.rawPointer()) + i * perLayerBytes;
+        CUDA_CHECK(cudaMemcpyAsync(kvManager.getCombinedKVCache(i).rawPointer(), src, perLayerBytes,
+            cudaMemcpyDeviceToDevice, context.stream));
+    }
+
+    baseCacheManager.commitSequenceLength(mAcceptLength, context.stream);
 
     // Reshape to reflect the compacted layout [batch, maxAcceptDepth, hiddenDim]
     check::check(mBaseHiddenStatesOutput.reshape({activeBatchSize, maxAcceptDepth, mBaseEngineConfig.outputHiddenDim}),
@@ -1760,19 +1796,19 @@ bool LLMInferenceSpecDecodeRuntime::captureDecodingCUDAGraph(cudaStream_t stream
 void LLMInferenceSpecDecodeRuntime::restoreRecurrentStates(
     int32_t batchIdx, SystemPromptKVCache const& cachedStates, cudaStream_t stream)
 {
-    rt::LinearKVCache& kvCache = mBaseEngineRunner->getLinearKVCache();
-    rt::LinearKVCache::CacheConfig const& cacheConfig = kvCache.getConfig();
-    size_t const recurrentElemSize = rt::utils::getTypeSize(cacheConfig.recurrentStateType);
-    size_t const convElemSize = rt::utils::getTypeSize(cacheConfig.convStateType);
-    size_t const recurrentBatchBytes = static_cast<size_t>(cacheConfig.recurrentStateNumHeads
-                                           * cacheConfig.recurrentStateHeadDim * cacheConfig.recurrentStateSize)
+    rt::MambaCacheManager& mambaCache = mBaseEngineRunner->getCacheManager().getMambaCacheManager();
+    rt::MambaCacheManager::Config const& mambaConfig = mambaCache.getConfig();
+    size_t const recurrentElemSize = rt::utils::getTypeSize(mambaConfig.recurrentStateType);
+    size_t const convElemSize = rt::utils::getTypeSize(mambaConfig.convStateType);
+    size_t const recurrentBatchBytes = static_cast<size_t>(mambaConfig.recurrentStateNumHeads
+                                           * mambaConfig.recurrentStateHeadDim * mambaConfig.recurrentStateSize)
         * recurrentElemSize;
-    size_t const convBatchBytes = static_cast<size_t>(cacheConfig.convDim * cacheConfig.convKernel) * convElemSize;
+    size_t const convBatchBytes = static_cast<size_t>(mambaConfig.convDim * mambaConfig.convKernel) * convElemSize;
 
     for (int32_t layer = 0; layer < mBaseEngineConfig.numLinearAttnLayers; ++layer)
     {
-        rt::Tensor recurrentLayer = kvCache.getRecurrentStateForLayer(layer);
-        rt::Tensor convLayer = kvCache.getConvStateForLayer(layer);
+        rt::Tensor& recurrentLayer = mambaCache.getRecurrentState(layer);
+        rt::Tensor& convLayer = mambaCache.getConvState(layer);
 
         auto* recurrentDst = static_cast<std::byte*>(recurrentLayer.rawPointer()) + batchIdx * recurrentBatchBytes;
         auto* convDst = static_cast<std::byte*>(convLayer.rawPointer()) + batchIdx * convBatchBytes;
@@ -1801,19 +1837,19 @@ void LLMInferenceSpecDecodeRuntime::restoreRecurrentStates(
 
 void LLMInferenceSpecDecodeRuntime::zeroRecurrentStates(int32_t batchIdx, cudaStream_t stream)
 {
-    rt::LinearKVCache& kvCache = mBaseEngineRunner->getLinearKVCache();
-    rt::LinearKVCache::CacheConfig const& cacheConfig = kvCache.getConfig();
-    size_t const recurrentElemSize = rt::utils::getTypeSize(cacheConfig.recurrentStateType);
-    size_t const convElemSize = rt::utils::getTypeSize(cacheConfig.convStateType);
-    size_t const recurrentBatchBytes = static_cast<size_t>(cacheConfig.recurrentStateNumHeads
-                                           * cacheConfig.recurrentStateHeadDim * cacheConfig.recurrentStateSize)
+    rt::MambaCacheManager& mambaCache = mBaseEngineRunner->getCacheManager().getMambaCacheManager();
+    rt::MambaCacheManager::Config const& mambaConfig = mambaCache.getConfig();
+    size_t const recurrentElemSize = rt::utils::getTypeSize(mambaConfig.recurrentStateType);
+    size_t const convElemSize = rt::utils::getTypeSize(mambaConfig.convStateType);
+    size_t const recurrentBatchBytes = static_cast<size_t>(mambaConfig.recurrentStateNumHeads
+                                           * mambaConfig.recurrentStateHeadDim * mambaConfig.recurrentStateSize)
         * recurrentElemSize;
-    size_t const convBatchBytes = static_cast<size_t>(cacheConfig.convDim * cacheConfig.convKernel) * convElemSize;
+    size_t const convBatchBytes = static_cast<size_t>(mambaConfig.convDim * mambaConfig.convKernel) * convElemSize;
 
     for (int32_t layer = 0; layer < mBaseEngineConfig.numLinearAttnLayers; ++layer)
     {
-        rt::Tensor recurrentLayer = kvCache.getRecurrentStateForLayer(layer);
-        rt::Tensor convLayer = kvCache.getConvStateForLayer(layer);
+        rt::Tensor& recurrentLayer = mambaCache.getRecurrentState(layer);
+        rt::Tensor& convLayer = mambaCache.getConvState(layer);
 
         auto* recurrentDst = static_cast<std::byte*>(recurrentLayer.rawPointer()) + batchIdx * recurrentBatchBytes;
         auto* convDst = static_cast<std::byte*>(convLayer.rawPointer()) + batchIdx * convBatchBytes;
@@ -1834,8 +1870,7 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
 
     int32_t const activeBatchSize = context.activeBatchSize;
     std::vector<std::vector<int32_t>> const& batchedInputIds = context.rawBatchedInputIds;
-    rt::LinearKVCache& linearKVCacheBase = mBaseEngineRunner->getLinearKVCache();
-    rt::Tensor kvCacheBufferBase = linearKVCacheBase.getKVCacheBuffer();
+    rt::HybridCacheManager& baseCacheManager = mBaseEngineRunner->getCacheManager();
 
     // Record the length of the reused KVCache for each sequence using pre-allocated tensor.
     // Use activeBatchSize (actual request size)
@@ -1859,17 +1894,15 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
         if (mSystemPromptKVCacheBase.count(promptKey) > 0)
         {
             auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptKey];
-            auto const& kvCacheContentBase = precachedKVCacheBase.kvCacheContent;
-            kernel::instantiateKVCacheFromTensor(kvCacheBufferBase, kvCacheContentBase, i, context.stream);
+            baseCacheManager.restoreKVCache(precachedKVCacheBase.kvCacheLayers, i, context.stream);
 
             if (mDraftEngineRunner != nullptr)
             {
                 check::check(mSystemPromptKVCacheDraft.count(promptKey) > 0,
                     "System prompt cache inconsistency between base and draft model");
                 auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[promptKey];
-                auto const& kvCacheContentDraft = precachedKVCacheDraft.kvCacheContent;
-                rt::Tensor kvCacheBufferDraft = mDraftEngineRunner->getLinearKVCache().getKVCacheBuffer();
-                kernel::instantiateKVCacheFromTensor(kvCacheBufferDraft, kvCacheContentDraft, i, context.stream);
+                mDraftEngineRunner->getCacheManager().restoreKVCache(
+                    precachedKVCacheDraft.kvCacheLayers, i, context.stream);
             }
 
             // Restore recurrent states if applicable
@@ -1878,7 +1911,7 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
                 restoreRecurrentStates(i, precachedKVCacheBase, context.stream);
             }
 
-            auto reuseLength = math::cast<size_t>(kvCacheContentBase.getShape()[3]);
+            auto reuseLength = math::cast<size_t>(precachedKVCacheBase.kvCacheLayers[0].getShape()[2]);
             // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
             check::check(reuseLength > 0 && reuseLength < batchedInputIds[i].size(),
                 "The reuse length shall be larger than 0 and not exceed the input length.");
@@ -1925,12 +1958,11 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
         return false;
     }
 
-    linearKVCacheBase.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+    baseCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
 
     if (mDraftEngineRunner != nullptr)
     {
-        rt::LinearKVCache& linearKVCacheDraft = mDraftEngineRunner->getLinearKVCache();
-        linearKVCacheDraft.resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
+        mDraftEngineRunner->getCacheManager().resetForNewSequences(mHostReuseKVCacheLengths, context.stream);
     }
 
     return true;
@@ -2019,49 +2051,35 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
     // Copy out the KVCache content from the prefill step
-    auto& linearKVCacheBase = mBaseEngineRunner->getLinearKVCache();
-    auto cacheConfigBase = linearKVCacheBase.getConfig();
-    auto kvCacheBufferBase = linearKVCacheBase.getKVCacheBuffer();
-    rt::Coords savedKVCacheShapeBase{
-        cacheConfigBase.numAttentionLayers, 2, cacheConfigBase.numKVHeads, promptIdsLength, cacheConfigBase.headDim};
+    auto& baseCacheManager = mBaseEngineRunner->getCacheManager();
 
     SystemPromptKVCache savedKVCacheBase;
     savedKVCacheBase.systemPrompt = prompt;
     savedKVCacheBase.tokenizedPrompt = tokenizedPrompt;
-    savedKVCacheBase.kvCacheContent
-        = rt::Tensor(savedKVCacheShapeBase, rt::DeviceType::kGPU, linearKVCacheBase.getConfig().kvCacheTypeTRT);
 
     // We only process one sequence at a time
     constexpr int32_t CACHE_BATCH_IDX{0};
-    kernel::saveKVCacheIntoTensor(savedKVCacheBase.kvCacheContent, kvCacheBufferBase, CACHE_BATCH_IDX, context.stream);
+    savedKVCacheBase.kvCacheLayers = baseCacheManager.captureKVCache(CACHE_BATCH_IDX, promptIdsLength, context.stream);
 
     // Save recurrent and conv states for hybrid layers
     if (mBaseEngineConfig.numLinearAttnLayers > 0)
     {
         savedKVCacheBase.recurrentStateContents
-            = mBaseEngineRunner->getLinearKVCache().captureRecurrentStates(CACHE_BATCH_IDX, context.stream);
-        savedKVCacheBase.convStateContents
-            = mBaseEngineRunner->getLinearKVCache().captureConvStates(CACHE_BATCH_IDX, context.stream);
+            = baseCacheManager.captureRecurrentStates(CACHE_BATCH_IDX, context.stream);
+        savedKVCacheBase.convStateContents = baseCacheManager.captureConvStates(CACHE_BATCH_IDX, context.stream);
     }
 
     mSystemPromptKVCacheBase.insert({promptKey, std::move(savedKVCacheBase)});
 
     if (mDraftEngineRunner != nullptr)
     {
-        auto& linearKVCacheDraft = mDraftEngineRunner->getLinearKVCache();
-        auto cacheConfigDraft = linearKVCacheDraft.getConfig();
-        auto kvCacheBufferDraft = linearKVCacheDraft.getKVCacheBuffer();
-        rt::Coords savedKVCacheShapeDraft{cacheConfigDraft.numAttentionLayers, 2, cacheConfigDraft.numKVHeads,
-            promptIdsLength, cacheConfigDraft.headDim};
+        auto& draftCacheManager = mDraftEngineRunner->getCacheManager();
 
         SystemPromptKVCache savedKVCacheDraft;
         savedKVCacheDraft.systemPrompt = prompt;
         savedKVCacheDraft.tokenizedPrompt = tokenizedPrompt;
-        savedKVCacheDraft.kvCacheContent
-            = rt::Tensor(savedKVCacheShapeDraft, rt::DeviceType::kGPU, linearKVCacheDraft.getConfig().kvCacheTypeTRT);
-
-        kernel::saveKVCacheIntoTensor(
-            savedKVCacheDraft.kvCacheContent, kvCacheBufferDraft, CACHE_BATCH_IDX, context.stream);
+        savedKVCacheDraft.kvCacheLayers
+            = draftCacheManager.captureKVCache(CACHE_BATCH_IDX, promptIdsLength, context.stream);
         mSystemPromptKVCacheDraft.insert({promptKey, std::move(savedKVCacheDraft)});
     }
 
@@ -2163,20 +2181,16 @@ bool LLMInferenceSpecDecodeRuntime::performBatchEvict(SpecDecodeInferenceContext
         cudaMemcpyHostToDevice, context.stream));
 
     // Compact Base KV Cache
-    auto& baseLinearKVCache = mBaseEngineRunner->getLinearKVCache();
-    rt::Tensor baseKVCacheBuffer = baseLinearKVCache.getKVCacheBuffer();
-    kernel::compactKVCache(mDeviceBatchMapping, baseKVCacheBuffer, baseLinearKVCache.getKVCacheLengths(),
-        oldActiveBatch, newActiveBatch, context.stream);
-    baseLinearKVCache.setActiveBatchSize(newActiveBatch);
+    mBaseEngineRunner->getCacheManager().compactBatch(
+        mDeviceBatchMapping, oldActiveBatch, newActiveBatch, context.stream);
+    mBaseEngineRunner->getCacheManager().setActiveBatchSize(newActiveBatch);
 
     // Compact Draft KV Cache (only when draft model is present)
     if (mDraftEngineRunner != nullptr)
     {
-        auto& draftLinearKVCache = mDraftEngineRunner->getLinearKVCache();
-        rt::Tensor draftKVCacheBuffer = draftLinearKVCache.getKVCacheBuffer();
-        kernel::compactKVCache(mDeviceBatchMapping, draftKVCacheBuffer, draftLinearKVCache.getKVCacheLengths(),
-            oldActiveBatch, newActiveBatch, context.stream);
-        draftLinearKVCache.setActiveBatchSize(newActiveBatch);
+        mDraftEngineRunner->getCacheManager().compactBatch(
+            mDeviceBatchMapping, oldActiveBatch, newActiveBatch, context.stream);
+        mDraftEngineRunner->getCacheManager().setActiveBatchSize(newActiveBatch);
 
         // Compact Draft Model's RoPE CosSin Cache if it's per-batch (MRope for multimodal)
         rt::Tensor& draftRopeCache = mDraftEngineRunner->getRopeCosSinCacheTensor();

@@ -223,6 +223,32 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
 
     _validate_hybrid_config(llm_config)
 
+    # Emit canonical per-layer config for HybridCacheManager when layers_block_type
+    # is available (e.g. Qwen3.5 GDN models with explicit layer type lists).
+    # For hybrid_override_pattern models (Nemotron-H), the C++ scalar fallback
+    # (num_attention_layers + num_linear_attn_layers) handles routing correctly.
+    layers_block_type = config_dict.get("layers_block_type", [])
+    if layers_block_type:
+        layer_types = []
+        kv_layer_configs = []
+        for lt in layers_block_type:
+            if lt == "mamba":
+                layer_types.append("mamba")
+                kv_layer_configs.append(None)
+            elif lt == "attention":
+                layer_types.append("attention")
+                kv_layer_configs.append({
+                    "num_kv_heads":
+                    llm_config["num_key_value_heads"],
+                    "head_dim":
+                    llm_config["head_dim"],
+                })
+            # Skip non-stateful layer types (e.g. "mlp", "moe") — they
+            # have no KV cache or recurrent state and must not appear in
+            # the per-layer routing table consumed by HybridCacheManager.
+        llm_config["layer_types"] = layer_types
+        llm_config["kv_layer_configs"] = kv_layer_configs
+
     llm_config["model_type"] = "hybrid_mamba"
     return llm_config
 
@@ -244,6 +270,33 @@ def _export_hybrid_gdn_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Fallback for incomplete configs: assume all layers are full attention.
         llm_config["num_attention_layers"] = config_dict["num_hidden_layers"]
         llm_config["num_linear_attn_layers"] = 0
+
+    # Emit canonical per-layer KV config for HybridCacheManager
+    if layer_types:
+        kv_layer_configs = []
+        for lt in layer_types:
+            if lt in ("full_attention", "attention"):
+                kv_layer_configs.append({
+                    "num_kv_heads":
+                    llm_config["num_key_value_heads"],
+                    "head_dim":
+                    llm_config["head_dim"],
+                })
+            elif lt == "linear_attention":
+                kv_layer_configs.append(None)
+            else:
+                kv_layer_configs.append(None)
+        # Normalize layer_types to "attention"/"mamba" for C++ parser
+        normalized_types = []
+        for lt in layer_types:
+            if lt in ("full_attention", "attention"):
+                normalized_types.append("attention")
+            elif lt == "linear_attention":
+                normalized_types.append("mamba")
+            else:
+                normalized_types.append(lt)
+        llm_config["layer_types"] = normalized_types
+        llm_config["kv_layer_configs"] = kv_layer_configs
 
     # Linear-attention (GDN) related dimensions
     llm_config["linear_num_key_heads"] = config_dict["linear_num_key_heads"]

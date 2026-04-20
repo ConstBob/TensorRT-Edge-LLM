@@ -234,6 +234,29 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             "use_rope": config.num_attn_layers > 0,
         })
 
+    # Emit canonical per-layer config consumed by the C++ HybridCacheManager.
+    # Only attention and linear-attention layers carry KV/recurrent state and
+    # must appear in the per-layer routing table. MLP layers are skipped.
+    if config.is_hybrid and config.layer_types:
+        from ..config import LAYER_ATTN, LAYER_GDN, LAYER_MAMBA
+
+        normalized_layer_types: list = []
+        kv_layer_configs: list = []
+        for lt in config.layer_types:
+            if lt == LAYER_ATTN:
+                normalized_layer_types.append("attention")
+                kv_layer_configs.append({
+                    "num_kv_heads": config.num_key_value_heads,
+                    "head_dim": config.head_dim,
+                })
+            elif lt in (LAYER_MAMBA, LAYER_GDN):
+                normalized_layer_types.append("mamba")
+                kv_layer_configs.append(None)
+            # Non-stateful layers (e.g. LAYER_MLP) have no cache slot and are
+            # intentionally omitted from the per-layer routing table.
+        out["layer_types"] = normalized_layer_types
+        out["kv_layer_configs"] = kv_layer_configs
+
     if config.is_eagle3_draft:
         draft_vocab = config.draft_vocab_size or config.vocab_size
         target_hidden = config.eagle3_target_hidden_size

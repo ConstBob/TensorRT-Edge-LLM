@@ -19,7 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "common/tensor.h"
-#include "runtime/linearKVCache.h"
+#include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
 
 #include <NvInferRuntime.h>
@@ -72,6 +72,9 @@ struct LLMEngineRunnerConfig
     int32_t recurrentStateSize{0};     //!< Recurrent state dimension (v for GDN, dstate for Mamba)
     int32_t convDim{0};                //!< Conv1d channel dimension
     int32_t convKernel{0};             //!< Conv1d kernel width
+
+    std::vector<rt::HybridCacheManager::LayerType> layerTypes{}; //!< Per-layer type routing
+    std::vector<rt::KVLayerConfig> kvLayerConfigs{};             //!< Per-layer KV config
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -81,7 +84,7 @@ struct LLMEngineRunnerConfig
 //!     decoding at the same time (no continuous batching).
 //! The LLMEngineRunner will:
 //!     1. Hold TensorRT resources of the LLM engine (TRT IRuntime, CUDA Engine, Execution Contexts).
-//!     2. Hold the LinearKVCache resources that support till maxSupportedBatchSize and maxSequenceLength.
+//!     2. Hold the HybridCacheManager resources that support till maxSupportedBatchSize and maxSequenceLength.
 //!     3. Hold the Rope CosSinCache tensor required for positional encoding.
 class LLMEngineRunner
 {
@@ -120,9 +123,9 @@ public:
     //! in advance when creating the LLMEngineRunner instance.
     rt::Tensor& getRopeCosSinCacheTensor() noexcept;
 
-    //! @brief Get reference to the linear KV cache (also owns recurrent/conv state buffers for hybrid models)
-    //! @return Reference to LinearKVCache
-    rt::LinearKVCache& getLinearKVCache() noexcept;
+    //! @brief Get reference to the cache manager
+    //! @return Reference to HybridCacheManager
+    rt::HybridCacheManager& getCacheManager() noexcept;
 
     //! @brief Get engine configuration
     //! @return Engine configuration structure
@@ -281,9 +284,9 @@ private:
     //!     plus generated tokens (including the length in "current" run).
     rt::Tensor mSequenceContextLengths{};
 
-    //! The LinearKVCache tensor that carried for the LLM model execution.
-    //! Also owns recurrent and conv state buffers for hybrid models.
-    rt::LinearKVCache mKVCache{};
+    //! The HybridCacheManager that carries cache state for the LLM model execution.
+    //! Owns KV caches (attention layers) and recurrent/conv state buffers (Mamba layers).
+    rt::HybridCacheManager mCacheManager{};
 
     //! Dummy input tensor used to reserve space for unused input tensors. We always keep this tensor as zero tensor
     //! because to "void" some computation (ex. use as empty lora weights as if there is no LoRA GEMM).
