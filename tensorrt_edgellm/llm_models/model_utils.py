@@ -144,18 +144,32 @@ def _cast_non_gptq_float_tensors_to_dtype(
     return casted_params, casted_buffers, skipped_quantized_modules
 
 
-def _is_gptq_moe_model(model_dir: str) -> bool:
-    """Check if a model directory contains a GPTQ MoE model (before loading)."""
+def _check_gptq_in_config(model_dir: str) -> bool:
+    """Check if config.json contains GPTQ quantization_config."""
     try:
         cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         cfg_dict = cfg.to_dict()
         quant_config = cfg_dict.get("quantization_config", None)
-        is_gptq = quant_config and quant_config.get("quant_method") == "gptq"
-        model_type = getattr(cfg, "model_type", "")
-        is_moe = "moe" in model_type.lower()
-        return is_gptq and is_moe
+        return bool(quant_config
+                    and quant_config.get("quant_method") == "gptq")
     except Exception:
         return False
+
+
+def _is_gptq_moe_model(model_dir: str) -> bool:
+    """Check if a model directory contains a GPTQ MoE model (before loading)."""
+    return _check_model_type(model_dir,
+                             "moe") and _check_gptq_in_config(model_dir)
+
+
+def _is_gptq_omni_model(model_dir: str) -> bool:
+    """Check if a model directory contains a GPTQ Qwen3-Omni model (before loading).
+    
+    Qwen3-Omni has a nested multi-submodel architecture (thinker/talker) that is
+    not supported by optimum's standard block pattern matching. We use GPTQModel.load()
+    with layers_node_user to handle the non-standard layer paths.
+    """
+    return _is_qwen3_omni_model(model_dir) and _check_gptq_in_config(model_dir)
 
 
 def _resolve_model_path(model_dir: str) -> Path:
@@ -574,6 +588,23 @@ def load_hf_model(
             model_dir,
             torch_dtype=torch_dtype)
         model = model.to(device)
+    elif _is_gptq_omni_model(model_dir):
+        # GPTQ Omni: optimum cannot handle nested thinker/talker block structure,
+        # so we load via GPTQModel.load() with explicit layers_node_user paths.
+        # This is analogous to _is_gptq_moe_model requiring special gate weight handling.
+        # backend=TORCH ensures TorchQuantLinear layers (not Marlin) are used,
+        # which replace_quant_linear_with_plugin() can detect and convert.
+        from gptqmodel import GPTQModel
+        from gptqmodel.utils.backend import BACKEND
+        print(f"Loading GPTQ quantized Qwen3-Omni model from {model_dir}")
+        layers_node = ["thinker.model.layers", "talker.model.layers"]
+        gptq_wrapper = GPTQModel.load(model_dir,
+                                      layers_node_user=layers_node,
+                                      backend=BACKEND.TORCH,
+                                      dtype=torch_dtype)
+        model = gptq_wrapper.model
+        del gptq_wrapper
+        model = model.to(device)
     elif _is_qwen3_omni_model(model_dir):
         from transformers import Qwen3OmniForConditionalGeneration
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
@@ -737,6 +768,21 @@ def load_llm_model(
     elif _is_qwen3_omni_model(model_dir) or _is_qwen3_asr_model(model_dir):
         # Qwen3-Omni / ASR: Thinker + optional Talker + CodePredictor
         hf_model = model.thinker
+
+        # For GPTQ models: propagate quantization_config from top-level Omni config
+        # down to submodel configs so is_gptq_model() can detect quantized layers.
+        # Same pattern as prepare_language_model_and_config() L728.
+        top_quant_config = getattr(model.config, "quantization_config", None)
+        if top_quant_config is not None:
+            configs_to_patch = [hf_model.config]
+            thinker_text_cfg = getattr(hf_model.config, "text_config", None)
+            if thinker_text_cfg is not None:
+                configs_to_patch.append(thinker_text_cfg)
+            if hasattr(model, 'talker'):
+                configs_to_patch.append(model.talker.config)
+                configs_to_patch.append(model.talker.model.config)
+            for cfg in configs_to_patch:
+                cfg.quantization_config = top_quant_config
 
         if not trt_native_ops:
             edge_model = {}

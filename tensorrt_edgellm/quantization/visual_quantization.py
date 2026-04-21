@@ -26,7 +26,11 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
     Qwen2_5_VisionTransformerPretrainedModel
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+
+try:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+except (ImportError, ModuleNotFoundError):
+    Qwen3_5VisionModel = None
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
 try:
