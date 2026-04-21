@@ -522,7 +522,8 @@ def make_linear(
         if module_name in config.quant.excluded:
             return FP16Linear(in_features, out_features, bias)
         if (module_name == "lm_head" and config.tie_word_embeddings
-                and "lm_head" not in config.quant.layer_overrides):
+                and "lm_head" not in config.quant.layer_overrides
+                and config.quant.quant_type == QUANT_FP16):
             return FP16Linear(in_features, out_features, bias)
 
     # Resolve effective quant type: layer_overrides take precedence for

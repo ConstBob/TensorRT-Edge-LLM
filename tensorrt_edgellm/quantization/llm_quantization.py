@@ -21,6 +21,7 @@ It supports various quantization schemes including FP8, INT4 AWQ, and NVFP4.
 For Qwen3-Omni, multimodal calibration is handled by ``omni_quantization.py``.
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -44,6 +45,33 @@ from .quantization_utils import (enable_huggingface_checkpointing_patch,
                                  quantize_draft_model, quantize_model)
 
 enable_huggingface_checkpointing_patch()
+
+
+@contextlib.contextmanager
+def _patch_get_tied_weight_keys():
+    """Temporarily patch ``_get_tied_weight_keys`` to accept list-valued ``_tied_weights_keys``.
+
+    transformers 5.x calls ``tied.keys()`` which fails when a model class
+    (e.g. Nemotron) sets ``_tied_weights_keys`` as a plain list.
+    """
+    import transformers.modeling_utils as _mu
+    _orig = _mu._get_tied_weight_keys
+
+    def _patched(module):
+        tied_weight_keys = []
+        for name, submodule in module.named_modules():
+            tied = getattr(submodule, "_tied_weights_keys", None) or []
+            keys = tied.keys() if isinstance(tied, dict) else tied
+            tied_weight_keys.extend(
+                [f"{name}.{k}" if name else k for k in keys])
+        return tied_weight_keys
+
+    _mu._get_tied_weight_keys = _patched
+    try:
+        yield
+    finally:
+        _mu._get_tied_weight_keys = _orig
+
 
 # Quantization configuration constants
 # FP8 quantization configuration for language model head.
@@ -168,6 +196,9 @@ DISABLE_NON_LLM_CONFIG: Dict[str, Any] = {
         }
         for k in (
             "*visual.*",  # Qwen VLM / Qwen3-Omni visual encoder
+            "*vision_tower.*",  # LLaVA / InternVL-hf vision encoder
+            "*multi_modal_projector.*",  # InternVL-hf projector MLP
+            "*mlp1.*",  # InternVL (original) projector MLP
             "*audio_tower.*",  # Qwen3-Omni audio encoder
             "*audio_embed.*",  # Phi-4MM audio embedding
             "*image_embed.*",  # Phi-4MM image embedding
@@ -527,12 +558,12 @@ def quantize_and_save_llm(model_dir: str,
 
     if unified_checkpoint:  # Original checkpoint read by ModelOpt
         from modelopt.torch.export import export_hf_checkpoint
+
         with torch.inference_mode():
-            export_hf_checkpoint(
-                model,  # The quantized model.
-                export_dir=
-                output_dir,  # The directory where the exported files will be stored.
-            )
+            # WAR: transformers 5.x _get_tied_weight_keys() calls .keys() on
+            # _tied_weights_keys, but some models set it as a list, not a dict.
+            with _patch_get_tied_weight_keys():
+                export_hf_checkpoint(model, export_dir=output_dir)
     else:  # Unified checkpoint read by AutoDeploy
         with torch.inference_mode():
             model.save_pretrained(output_dir)
