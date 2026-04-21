@@ -1132,7 +1132,8 @@ class EdgeLLMGatedDeltaNetLayer(nn.Module):
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len,
+                                              self.value_dim)
 
         # 5. Output projection
         output = self.out_proj(core_attn_out)
