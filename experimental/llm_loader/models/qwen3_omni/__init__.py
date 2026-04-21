@@ -12,9 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3-Omni model components: visual encoder, audio encoder, and LLM backbone."""
+"""Qwen3-Omni model components: visual encoder, audio encoder, LLM backbone,
+and Code2Wav vocoder."""
 from .modeling_qwen3_omni_audio import (Qwen3OmniAudioEncoder,
                                         build_qwen3_omni_audio)
+from .modeling_qwen3_omni_code2wav import (Code2WavModel, build_code2wav,
+                                           export_code2wav_onnx)
 from .modeling_qwen3_omni_text import Qwen3OmniLanguageModel
 from .modeling_qwen3_omni_visual import (Qwen3OmniVisualModel,
                                          build_qwen3_omni_visual)
@@ -25,4 +28,7 @@ __all__ = [
     "Qwen3OmniAudioEncoder",
     "build_qwen3_omni_audio",
     "Qwen3OmniLanguageModel",
+    "Code2WavModel",
+    "build_code2wav",
+    "export_code2wav_onnx",
 ]
