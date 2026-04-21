@@ -423,11 +423,15 @@ def process_chat_template(model_dir: str, model_tokenizer: Any,
     assistant_prefix, assistant_suffix = _extract_prefix_suffix(
         assistant_formatted[len(user_formatted):], assistant_prompt.content)
 
-    # Extract standard generation prompt with thinking disabled
+    # Extract the default generation prompt (model's natural behavior).
+    # Do NOT pass enable_thinking — the default prompt must match what
+    # the model produces with no flags, which is what the C++ runtime
+    # uses for non-thinking inference.  Passing enable_thinking=False
+    # on Qwen3 models injects a <think></think> block that breaks the
+    # Talker prefill token layout.
     generation_formatted = _format_messages(tokenizer,
                                             [system_prompt, user_prompt],
-                                            add_generation_prompt=True,
-                                            enable_thinking=False)
+                                            add_generation_prompt=True)
     generation_prompt = generation_formatted[len(user_formatted):]
 
     # Extract generation prompt with thinking enabled (if supported by model)
@@ -435,7 +439,8 @@ def process_chat_template(model_dir: str, model_tokenizer: Any,
     try:
         thinking_formatted = _format_messages(tokenizer,
                                               [system_prompt, user_prompt],
-                                              add_generation_prompt=True)
+                                              add_generation_prompt=True,
+                                              enable_thinking=False)
         generation_prompt_thinking = thinking_formatted[len(user_formatted):]
 
         # Only keep if different (model supports thinking mode)
@@ -549,8 +554,16 @@ def process_chat_template(model_dir: str, model_tokenizer: Any,
         "default_system_prompt": default_system_prompt
     }
 
-    # Add thinking mode generation prompt if model supports it
+    # Add thinking mode generation prompt if model supports it.
+    # Sanity check: generation_prompt (non-thinking default) must not contain
+    # <think>; if it does the two prompts were extracted in the wrong order
+    # (happens with Qwen3 Jinja2 templates where enable_thinking=False
+    # *adds* the <think> block).  Swap them to fix.
     if generation_prompt_thinking is not None:
+        if '<think>' in generation_prompt and '<think>' not in generation_prompt_thinking:
+            generation_prompt, generation_prompt_thinking = (
+                generation_prompt_thinking, generation_prompt)
+            chat_template_data["generation_prompt"] = generation_prompt
         chat_template_data[
             "generation_prompt_thinking"] = generation_prompt_thinking
 

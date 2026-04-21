@@ -23,7 +23,7 @@ Usage:
     # Export without quantization
     python export_audio.py --model_dir /path/to/model --output_dir /path/to/output
 
-    # Export with FP8 quantization
+    # Export audio encoder with FP8 quantization
     python export_audio.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8
 
     # Export with specific calibration dataset
@@ -75,14 +75,15 @@ def main() -> None:
         required=False,
         choices=["fp8"],
         default=None,
-        help="Quantization method to use (fp8 for FP8 quantization)")
+        help="Quantization method for audio encoder (fp8 for FP8 quantization). "
+        "Only applies to audio_encoder; code2wav is always exported in FP16.")
     parser.add_argument(
         "--dataset_dir",
         type=str,
         required=False,
         default="openslr/librispeech_asr",
         help=
-        "Dataset directory to use for quantization calibration (default: openslr/librispeech_asr)"
+        "Dataset directory to use for audio encoder quantization calibration (default: openslr/librispeech_asr)"
     )
     parser.add_argument(
         "--export_models",
@@ -100,8 +101,8 @@ def main() -> None:
                      output_dir=args.output_dir,
                      dtype=args.dtype,
                      device=args.device,
-                     export_models=args.export_models,
                      quantization=args.quantization,
+                     export_models=args.export_models,
                      dataset_dir=args.dataset_dir)
         print("Audio model export completed successfully!")
     except Exception as e:

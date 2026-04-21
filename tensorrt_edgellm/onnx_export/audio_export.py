@@ -49,7 +49,9 @@ def audio_export(model_dir: str,
         dtype: Data type for export (currently only "fp16" supported)
         device: Device to load the model on (default: "cuda", options: cpu, cuda, cuda:0, cuda:1, etc.)
         export_models: Comma-separated list of models to export for Qwen3-Omni (e.g., 'audio_encoder', 'code2wav', or both. Default is to export both models)
-        quantization: Quantization type ("fp8" or None)
+        quantization: Quantization method for audio encoder ("fp8" or None).
+            For Qwen3-Omni, this only applies to `audio_encoder`; `code2wav`
+            is always exported in FP16.
         dataset_dir: HuggingFace dataset identifier for quantization calibration data
     Returns:
         str: Path to the output directory where the exported model is saved
