@@ -147,12 +147,16 @@ def load_checkpoint_config_dicts(
     # (e.g. text_config.rope_scaling for Qwen3-VL) and can be lost when
     # AutoConfig serialises the promoted sub-object.  Recover it from the raw
     # JSON so that collectRopeConfig() in C++ correctly detects kMRope.
+    # Newer HF checkpoints may store this as "rope_parameters" instead.
     if not llm.get("rope_scaling"):
         for subkey in ("text_config", "language_config", "llm_config"):
             raw_sub = raw.get(subkey) or {}
-            if isinstance(raw_sub, dict) and raw_sub.get("rope_scaling"):
-                llm["rope_scaling"] = raw_sub["rope_scaling"]
-                break
+            if isinstance(raw_sub, dict):
+                rope = raw_sub.get("rope_scaling") or raw_sub.get(
+                    "rope_parameters")
+                if rope:
+                    llm["rope_scaling"] = rope
+                    break
 
     return root, llm
 

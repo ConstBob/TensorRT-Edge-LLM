@@ -331,7 +331,8 @@ class ModelConfig:
             rope_theta=_get_rope_theta(llm_dict),
             max_position_embeddings=llm_dict.get("max_position_embeddings",
                                                  4096),
-            rope_scaling=llm_dict.get("rope_scaling", None) or None,
+            rope_scaling=(llm_dict.get("rope_scaling")
+                          or llm_dict.get("rope_parameters") or None),
             original_max_position_embeddings=llm_dict.get(
                 "original_max_position_embeddings", None),
             partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
