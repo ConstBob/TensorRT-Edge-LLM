@@ -443,6 +443,19 @@ def _load_phi4mm_war(model_dir: str):
     sys.modules[module_name] = module
     sys.modules["modeling_phi4mm"] = module
     assert spec is not None and spec.loader is not None
+
+    # WAR: Phi-4MM's modeling file imports SlidingWindowCache which was removed
+    # in transformers 5.x. Inject a shim so the import succeeds; the class is
+    # never instantiated during quantization.
+    import transformers.cache_utils as _cache_utils
+    if not hasattr(_cache_utils, "SlidingWindowCache"):
+        from transformers.cache_utils import StaticCache
+
+        class _SlidingWindowCacheShim(StaticCache):
+            """Minimal stand-in for SlidingWindowCache (removed in transformers 5.x)."""
+
+        _cache_utils.SlidingWindowCache = _SlidingWindowCacheShim
+
     spec.loader.exec_module(module)
 
     lora_dir = os.path.join(model_dir, "vision-lora")
