@@ -451,6 +451,42 @@ def _vit_attention_plugin_translation(
 
 
 # ---------------------------------------------------------------------------
+# INT4 MoE plugin
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _int4_moe_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc_gate_up_qweights: onnxscript.INT8,
+    fc_gate_up_scales: onnxscript.FLOAT16,
+    fc_down_qweights: onnxscript.INT8,
+    fc_down_scales: onnxscript.FLOAT16,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    quantization_group_size: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Int4MoePlugin(
+        router_logits,
+        hidden_states,
+        fc_gate_up_qweights,
+        fc_gate_up_scales,
+        fc_down_qweights,
+        fc_down_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        quantization_group_size=quantization_group_size,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -470,16 +506,24 @@ def build_custom_translation_table() -> dict:
         ops  # noqa: F401 - side-effect: registers all custom_ops
 
     return {
-        torch.ops.trt.attention_plugin.default: _attention_plugin_translation,
-        torch.ops.trt.fp8_quantize.default: _fp8_quantize_translation,
-        torch.ops.trt.fp8_dequantize.default: _fp8_dequantize_translation,
-        torch.ops.trt.nvfp4_act_qdq.default: _nvfp4_act_qdq_translation,
-        torch.ops.trt.nvfp4_dequantize.default: _nvfp4_dequantize_translation,
-        torch.ops.trt.mxfp8_act_qdq.default: _mxfp8_act_qdq_translation,
-        torch.ops.trt.mxfp8_weight_dq.default: _mxfp8_weight_dq_translation,
+        torch.ops.trt.attention_plugin.default:
+        _attention_plugin_translation,
+        torch.ops.trt.fp8_quantize.default:
+        _fp8_quantize_translation,
+        torch.ops.trt.fp8_dequantize.default:
+        _fp8_dequantize_translation,
+        torch.ops.trt.nvfp4_act_qdq.default:
+        _nvfp4_act_qdq_translation,
+        torch.ops.trt.nvfp4_dequantize.default:
+        _nvfp4_dequantize_translation,
+        torch.ops.trt.mxfp8_act_qdq.default:
+        _mxfp8_act_qdq_translation,
+        torch.ops.trt.mxfp8_weight_dq.default:
+        _mxfp8_weight_dq_translation,
         torch.ops.trt.int4_groupwise_gemm.default:
         _int4_groupwise_gemm_translation,
-        torch.ops.trt.int8_sq_act_qdq.default: _int8_sq_act_qdq_translation,
+        torch.ops.trt.int8_sq_act_qdq.default:
+        _int8_sq_act_qdq_translation,
         torch.ops.trt.int8_sq_weight_dq.default:
         _int8_sq_weight_dq_translation,
         torch.ops.trt_edgellm.causal_conv1d.default:
@@ -490,5 +534,8 @@ def build_custom_translation_table() -> dict:
         _gated_delta_net_translation,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
-        torch.ops.trt.gather_nd.default: _gather_nd_translation,
+        torch.ops.trt.gather_nd.default:
+        _gather_nd_translation,
+        torch.ops.trt_edgellm.int4_moe_plugin.default:
+        _int4_moe_plugin_translation,
     }

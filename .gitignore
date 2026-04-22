@@ -22,6 +22,7 @@ docs/source/cpp_api.rst
 docs/source/python_api.rst
 # CuTe DSL prebuilt artifacts (local build outputs, not committed)
 cpp/kernels/cuteDSLArtifact/
-venv/
+# Virtual environment
+venv*/
 # .claude project commands are tracked; ignore only personal/local overrides
 .claude/settings.local.json

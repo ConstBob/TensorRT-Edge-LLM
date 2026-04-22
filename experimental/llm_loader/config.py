@@ -214,6 +214,8 @@ class ModelConfig:
     torch_dtype: str = "bfloat16"
     # When True, embed_tokens and lm_head share the same weight tensor
     tie_word_embeddings: bool = False
+    # Sliding window attention size; -1 means no sliding window.
+    sliding_window_size: int = -1
     # ------------------------------------------ per-layer block types
     # One entry per hidden layer: LAYER_ATTN or LAYER_MAMBA.
     layer_types: List[str] = field(default_factory=list)
@@ -238,6 +240,20 @@ class ModelConfig:
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output (concatenated from 3 selected layers).
     eagle_base: bool = False
+    # ------------------------------------------ sparse MoE config
+    # num_experts=0 means dense (no MoE).
+    num_experts: int = 0
+    num_experts_per_tok: int = 2
+    # Expert MLP intermediate size (may differ from dense intermediate_size).
+    moe_intermediate_size: int = 0
+    # MoE layer frequency: layer (i+1) % decoder_sparse_step == 0 → MoE.
+    decoder_sparse_step: int = 1
+    # Layer indices that are always dense MLP (overrides decoder_sparse_step).
+    mlp_only_layers: List[int] = field(default_factory=list)
+    # Normalise top-k routing weights to sum to 1.
+    # Note: the C++ Int4MoePlugin hardcodes renormalize=true, so this field
+    # currently serves as documentation of the HF config value.
+    norm_topk_prob: bool = True
 
     # ------------------------------------------------------------------
     # Derived properties
@@ -316,6 +332,21 @@ class ModelConfig:
         # EAGLE3 draft model fields
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
+        # Sliding window: only active when use_sliding_window=True.
+        use_sw = llm_dict.get("use_sliding_window", False)
+        sw_raw = llm_dict.get("sliding_window") if use_sw else None
+        sliding_window_size = int(sw_raw) if sw_raw is not None else -1
+
+        # Sparse MoE fields.  HF uses "num_local_experts" as the internal key
+        # and maps "num_experts" → "num_local_experts" via attribute_map.
+        num_experts = int(
+            llm_dict.get("num_experts", llm_dict.get("num_local_experts", 0))
+            or 0)
+        num_experts_per_tok = int(llm_dict.get("num_experts_per_tok", 2))
+        moe_intermediate_size = int(llm_dict.get("moe_intermediate_size", 0))
+        decoder_sparse_step = int(llm_dict.get("decoder_sparse_step", 1))
+        mlp_only_layers = list(llm_dict.get("mlp_only_layers") or [])
+        norm_topk_prob = bool(llm_dict.get("norm_topk_prob", False))
 
         return cls(
             model_type=model_type,
@@ -339,6 +370,7 @@ class ModelConfig:
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
+            sliding_window_size=sliding_window_size,
             layer_types=layer_types,
             quant=quant,
             mamba_cfg=mamba_cfg,
@@ -348,6 +380,12 @@ class ModelConfig:
                 llm_dict, model_type, root_config=root),
             draft_vocab_size=draft_vocab_size,
             target_hidden_size=target_hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            moe_intermediate_size=moe_intermediate_size,
+            decoder_sparse_step=decoder_sparse_step,
+            mlp_only_layers=mlp_only_layers,
+            norm_topk_prob=norm_topk_prob,
         )
 
 
