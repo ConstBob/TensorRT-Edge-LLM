@@ -324,6 +324,9 @@ class EdgeLLMNemotronHModel(nn.Module):
             elif bt == "mlp":
                 hidden_states = layer.forward_mlp(hidden_states)
 
+            elif bt == "moe":
+                hidden_states = layer.forward_moe(hidden_states)
+
         hidden_states = self.norm(hidden_states)
         return hidden_states, present_key_values, present_conv_states, present_recurrent_states
 

@@ -19,8 +19,8 @@ Centralized command configuration
 import os
 from typing import Dict, List, Tuple
 
-from ..config import (DEFAULT_SEARCH_DEPTH, ModelType, TestConfig,
-                      _find_directory)
+from ..config import (DEFAULT_SEARCH_DEPTH, PRE_QUANTIZED_MODELS, ModelType,
+                      TestConfig, _find_directory)
 
 # Available LoRA weights mapping
 AVAILABLE_LORA_WEIGHTS = {
@@ -51,6 +51,9 @@ def _generate_quantization_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
     """Generate quantization commands if needed"""
     commands = []
+    # Pre-quantized models ship with weights already quantized; skip this step entirely.
+    if config.model_name in PRE_QUANTIZED_MODELS:
+        return commands
     # Quantize weights (for non-fp16) and/or KV cache (when fp8_kv_cache is enabled).
     # NOTE: `tensorrt-edgellm-quantize-llm` requires at least one of:
     #   --quantization, --lm_head_quantization, --kv_cache_quantization
@@ -97,6 +100,9 @@ def _generate_llm_export_commands(
     if config.fp8_kv_cache and config.llm_precision == "fp16":
         # KV-cache-only quantization produces a derived model dir that should be exported.
         model_dir = config.get_kv_cache_quantized_model_dir()
+    elif config.model_name in PRE_QUANTIZED_MODELS:
+        # Model is already quantized; export directly from the HF model dir.
+        model_dir = config.get_torch_model_dir()
     elif config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
         # Use quantized model for export
         model_dir = config.get_quantized_model_dir()

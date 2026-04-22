@@ -491,6 +491,44 @@ def _int4_moe_plugin_translation(
 # ---------------------------------------------------------------------------
 
 
+@script()
+def _nvfp4_moe_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    hidden_block_scale: onnxscript.INT8,
+    hidden_global_scale: onnxscript.FLOAT,
+    up_payload: onnxscript.INT8,
+    up_block_scale: onnxscript.INT8,
+    up_global_scale: onnxscript.FLOAT,
+    down_payload: onnxscript.INT8,
+    down_block_scale: onnxscript.INT8,
+    down_global_scale: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+) -> onnxscript.FLOAT16:
+    output = _trt_edgellm.Nvfp4MoePlugin(
+        router_logits,
+        hidden_states,
+        hidden_block_scale,
+        hidden_global_scale,
+        up_payload,
+        up_block_scale,
+        up_global_scale,
+        down_payload,
+        down_block_scale,
+        down_global_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+    )
+    return output
+
+
 def build_custom_translation_table() -> dict:
     """Return the ``custom_translation_table`` for ``torch.onnx.export(dynamo=True)``.
 
@@ -538,4 +576,6 @@ def build_custom_translation_table() -> dict:
         _gather_nd_translation,
         torch.ops.trt_edgellm.int4_moe_plugin.default:
         _int4_moe_plugin_translation,
+        torch.ops.trt_edgellm.Nvfp4MoePlugin.default:
+        _nvfp4_moe_plugin_translation,
     }

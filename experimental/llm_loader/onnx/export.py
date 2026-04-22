@@ -141,6 +141,55 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
     )
 
 
+def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
+    """Strip trailing empty optional inputs from AttentionPlugin ONNX nodes.
+
+    When ``enable_tree_attention=False``, ``torch.export`` still emits two
+    empty-string inputs (``attention_mask``, ``attention_pos_id``) in the
+    ONNX node.  The TRT AttentionPlugin C++ requires exactly
+    ``kNUM_REQUIRED_INPUTS=7`` inputs for non-tree-attention mode and raises
+    ``(input) != nullptr`` when it encounters the extra null entries via
+    ``INetworkDefinition::addPluginV2``.
+
+    This pass removes trailing empty inputs from every ``AttentionPlugin``
+    node whose ``enable_tree_attention`` attribute equals 0.
+    """
+    _REQUIRED = 7
+    model = onnx.load(onnx_path, load_external_data=False)
+    changed = 0
+    for node in model.graph.node:
+        if node.op_type != "AttentionPlugin":
+            continue
+        tree_attn = next(
+            (a.i for a in node.attribute if a.name == "enable_tree_attention"),
+            0,
+        )
+        if tree_attn:
+            continue  # tree-attention nodes use the extra optional inputs
+        extra = [i for i in list(node.input)[_REQUIRED:] if i == ""]
+        if not extra:
+            continue
+        # Trim to exactly _REQUIRED inputs (drop trailing empty strings)
+        del node.input[_REQUIRED:]
+        changed += len(extra)
+
+    if not changed:
+        return
+    logger.info(
+        "TRT fix: stripped %d empty optional input(s) from AttentionPlugin nodes",
+        changed,
+    )
+    data_file = os.path.basename(onnx_path) + ".data"
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_file,
+        size_threshold=0,
+    )
+
+
 def _strip_onnxscript_internal_attrs(onnx_path: str) -> None:
     """Remove ``_outputs`` attributes injected by onnxscript multi-output ops.
 
@@ -450,4 +499,5 @@ def _export_model(model: "CausalLM",
     if mxfp8:
         _strip_onnxscript_internal_attrs(output_path)
     _fix_initializer_dtypes(output_path, dedup_dql_scales=(nvfp4 or mxfp8))
+    _strip_attention_plugin_optional_inputs(output_path)
     logger.info("Export complete: %s", output_path)

@@ -80,6 +80,7 @@ LAYER_ATTN = "attention"
 LAYER_MAMBA = "mamba"
 LAYER_MLP = "mlp"
 LAYER_GDN = "gdn"  # GatedDeltaNet linear attention (Qwen3.5)
+LAYER_MOE = "moe"
 
 
 def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
@@ -114,6 +115,8 @@ class QuantConfig:
     # make_linear() uses module_name together with ``excluded`` and (for
     # lm_head) ``ModelConfig.tie_word_embeddings`` to pick FP16 vs overrides.
     layer_overrides: dict = field(default_factory=dict)
+    # True when quant_algo is MIXED_PRECISION: unlisted modules are FP16.
+    is_mixed_precision: bool = False
 
     @property
     def is_quantized(self) -> bool:
@@ -217,7 +220,7 @@ class ModelConfig:
     # Sliding window attention size; -1 means no sliding window.
     sliding_window_size: int = -1
     # ------------------------------------------ per-layer block types
-    # One entry per hidden layer: LAYER_ATTN or LAYER_MAMBA.
+    # One entry per hidden layer: LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, or LAYER_MOE.
     layer_types: List[str] = field(default_factory=list)
     # ------------------------------------------ multimodal deepstack (VL)
     # Number of deepstack visual embedding tensors injected into the first N
@@ -243,9 +246,14 @@ class ModelConfig:
     # ------------------------------------------ sparse MoE config
     # num_experts=0 means dense (no MoE).
     num_experts: int = 0
-    num_experts_per_tok: int = 2
+    n_routed_experts: int = 0
+    num_experts_per_tok: int = 0
     # Expert MLP intermediate size (may differ from dense intermediate_size).
     moe_intermediate_size: int = 0
+    moe_shared_expert_intermediate_size: int = 0
+    routed_scaling_factor: float = 1.0
+    n_group: int = 1
+    topk_group: int = 1
     # MoE layer frequency: layer (i+1) % decoder_sparse_step == 0 → MoE.
     decoder_sparse_step: int = 1
     # Layer indices that are always dense MLP (overrides decoder_sparse_step).
@@ -272,6 +280,10 @@ class ModelConfig:
         return self.mamba_cfg is not None or self.gdn_cfg is not None
 
     @property
+    def is_nemotron_h(self) -> bool:
+        return (self.model_type or "").lower().startswith("nemotron_h")
+
+    @property
     def num_attn_layers(self) -> int:
         return sum(1 for t in self.layer_types if t == LAYER_ATTN)
 
@@ -286,6 +298,10 @@ class ModelConfig:
     @property
     def num_mlp_layers(self) -> int:
         return sum(1 for t in self.layer_types if t == LAYER_MLP)
+
+    @property
+    def num_moe_layers(self) -> int:
+        return sum(1 for t in self.layer_types if t == LAYER_MOE)
 
     @property
     def compute_dtype(self) -> "torch.dtype":  # noqa: F821
@@ -342,11 +358,17 @@ class ModelConfig:
         num_experts = int(
             llm_dict.get("num_experts", llm_dict.get("num_local_experts", 0))
             or 0)
-        num_experts_per_tok = int(llm_dict.get("num_experts_per_tok", 2))
+        num_experts_per_tok = int(llm_dict.get("num_experts_per_tok", 0))
         moe_intermediate_size = int(llm_dict.get("moe_intermediate_size", 0))
+        moe_shared_expert_intermediate_size = int(
+            llm_dict.get("moe_shared_expert_intermediate_size", 0))
+        routed_scaling_factor = float(
+            llm_dict.get("routed_scaling_factor", 1.0))
+        n_group = int(llm_dict.get("n_group", 1))
+        topk_group = int(llm_dict.get("topk_group", 1))
         decoder_sparse_step = int(llm_dict.get("decoder_sparse_step", 1))
         mlp_only_layers = list(llm_dict.get("mlp_only_layers") or [])
-        norm_topk_prob = bool(llm_dict.get("norm_topk_prob", False))
+        norm_topk_prob = bool(llm_dict.get("norm_topk_prob", True))
 
         return cls(
             model_type=model_type,
@@ -382,8 +404,14 @@ class ModelConfig:
             draft_vocab_size=draft_vocab_size,
             target_hidden_size=target_hidden_size,
             num_experts=num_experts,
+            n_routed_experts=llm_dict.get("n_routed_experts", 0),
             num_experts_per_tok=num_experts_per_tok,
             moe_intermediate_size=moe_intermediate_size,
+            moe_shared_expert_intermediate_size=
+            moe_shared_expert_intermediate_size,
+            routed_scaling_factor=routed_scaling_factor,
+            n_group=n_group,
+            topk_group=topk_group,
             decoder_sparse_step=decoder_sparse_step,
             mlp_only_layers=mlp_only_layers,
             norm_topk_prob=norm_topk_prob,
@@ -454,6 +482,8 @@ def _parse_layer_types(config: dict) -> List[str]:
                 result.append(LAYER_GDN)
             elif "mamba" in bt_lower:
                 result.append(LAYER_MAMBA)
+            elif bt_lower == "moe":
+                result.append(LAYER_MOE)
             elif "mlp" in bt_lower:
                 result.append(LAYER_MLP)
             else:
@@ -461,7 +491,12 @@ def _parse_layer_types(config: dict) -> List[str]:
         return result
     pattern = config.get("hybrid_override_pattern")
     if pattern is not None:
-        _PATTERN_MAP = {"M": LAYER_MAMBA, "-": LAYER_MLP, "*": LAYER_ATTN}
+        _PATTERN_MAP = {
+            "M": LAYER_MAMBA,
+            "-": LAYER_MLP,
+            "*": LAYER_ATTN,
+            "E": LAYER_MOE,
+        }
         return [_PATTERN_MAP[ch] for ch in pattern if ch in _PATTERN_MAP]
     n = config["num_hidden_layers"]
     return [LAYER_ATTN] * n
@@ -693,6 +728,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
                 excluded=list(q.get("exclude_modules", [])),
                 layer_overrides=layer_overrides,
+                is_mixed_precision=True,
             )
         qt = _algo_to_quant_type(algo)
         gs = int(q.get("group_size", 1))
@@ -773,8 +809,10 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     """Parse MIXED_PRECISION quantized_layers dict.
 
     Returns ``(dominant_quant_type, dominant_group_size, layer_overrides)``.
-    ``layer_overrides`` maps short module names to their quant-type string for
-    layers that differ from the dominant type.
+    ``layer_overrides`` maps **every** quantized module name to its quant-type
+    string.  Modules not listed in ``quantized_layers`` are unquantized (FP16);
+    ``make_linear`` falls back to FP16 when a module_name is absent from
+    ``layer_overrides``.
     """
     from collections import Counter
     algo_count: Counter = Counter()
@@ -790,14 +828,16 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     dominant_algo = algo_count.most_common(1)[0][0]
     dominant_type = _algo_to_quant_type(dominant_algo)
     dominant_group_size = algo_group_size.get(dominant_algo, 1)
+    # Store ALL quantized layers so unlisted modules default to FP16
     layer_overrides: dict = {}
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
-        if algo != dominant_algo:
-            # Normalise: strip leading "model." so keys match module names
-            short_name = name[len("model."):] if name.startswith(
-                "model.") else name
-            layer_overrides[short_name] = _algo_to_quant_type(algo)
+        short_name = name
+        for prefix in ("language_model.", "model."):
+            if short_name.startswith(prefix):
+                short_name = short_name[len(prefix):]
+                break
+        layer_overrides[short_name] = _algo_to_quant_type(algo)
     return dominant_type, dominant_group_size, layer_overrides
 
 

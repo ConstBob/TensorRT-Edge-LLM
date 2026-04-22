@@ -836,6 +836,54 @@ _int4_moe_plugin_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# trt_edgellm::Nvfp4MoePlugin
+# ---------------------------------------------------------------------------
+
+_nvfp4_moe_plugin_schema = OpSchema(
+    name="Nvfp4MoePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="NVFP4 MoE plugin: top-k routing + W4A16 decode GEMV",
+    inputs=[
+        OpSchema.FormalParameter("router_logits", "T1",
+                                 "Router logits [B*S, E] FP32"),
+        OpSchema.FormalParameter("hidden_states", "T2",
+                                 "Hidden states [B, S, H] FP16"),
+        OpSchema.FormalParameter("hidden_block_scale", "T3",
+                                 "Placeholder INT8"),
+        OpSchema.FormalParameter("hidden_global_scale", "T1",
+                                 "Placeholder FP32 [1]"),
+        OpSchema.FormalParameter("up_payload", "T3",
+                                 "Up weights [E, H/2, I] INT8"),
+        OpSchema.FormalParameter("up_block_scale", "T3",
+                                 "Up block scales [E, H/16, I] INT8"),
+        OpSchema.FormalParameter("up_global_scale", "T1",
+                                 "Up global scales [E] FP32"),
+        OpSchema.FormalParameter("down_payload", "T3",
+                                 "Down weights [E, I, H/2] INT8"),
+        OpSchema.FormalParameter("down_block_scale", "T3",
+                                 "Down block scales [E, I, H/16] INT8"),
+        OpSchema.FormalParameter("down_global_scale", "T1",
+                                 "Down global scales [E] FP32"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter("output", "T2", "Output [B, S, H] FP16"),
+    ],
+    type_constraints=[
+        ("T1", ["tensor(float)"], "FP32"),
+        ("T2", ["tensor(float16)"], "FP16"),
+        ("T3", ["tensor(int8)"], "INT8"),
+    ],
+    attributes=[
+        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
+        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
+        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
     _vit_attention_plugin_schema,
@@ -848,6 +896,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _update_ssm_state_schema,
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
+    _nvfp4_moe_plugin_schema,
 )
 
 _registered_llm_loader_schemas: bool = False

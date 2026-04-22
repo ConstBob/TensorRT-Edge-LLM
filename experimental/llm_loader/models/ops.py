@@ -595,3 +595,37 @@ def gated_delta_net(
 @gated_delta_net.register_fake
 def _(q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim, v_dim):
     return torch.empty_like(v), h0_source.clone()
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::Nvfp4MoePlugin
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::Nvfp4MoePlugin", mutates_args=())
+def nvfp4_moe_plugin(
+    router_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_block_scale: torch.Tensor,
+    hidden_global_scale: torch.Tensor,
+    up_payload: torch.Tensor,
+    up_block_scale: torch.Tensor,
+    up_global_scale: torch.Tensor,
+    down_payload: torch.Tensor,
+    down_block_scale: torch.Tensor,
+    down_global_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@nvfp4_moe_plugin.register_fake
+def _(router_logits, hidden_states, hidden_block_scale, hidden_global_scale,
+      up_payload, up_block_scale, up_global_scale, down_payload,
+      down_block_scale, down_global_scale, num_experts, top_k, hidden_size,
+      moe_inter_size, activation_type):
+    return torch.empty_like(hidden_states)

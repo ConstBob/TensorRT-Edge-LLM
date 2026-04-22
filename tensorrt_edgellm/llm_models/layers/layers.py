@@ -956,10 +956,11 @@ class EdgeLLMMambaLayer(nn.Module):
 class EdgeLLMNemotronHBlock(nn.Module):
     """Wraps a single NemotronHBlock for ONNX export.
 
-    Supports three block types:
+    Supports four block types:
       - ``"mamba"``: pre-norm → :class:`EdgeLLMMambaLayer` → residual
       - ``"attention"``: pre-norm → :class:`EdgeLLMAttention` → residual
       - ``"mlp"``: pre-norm → MLP → residual
+      - ``"moe"``: pre-norm → MoE sparse block → residual
     """
 
     def __init__(self,
@@ -974,6 +975,10 @@ class EdgeLLMNemotronHBlock(nn.Module):
         elif self.block_type == "attention":
             self.mixer = EdgeLLMAttention(hf_block.mixer)
         elif self.block_type == "mlp":
+            self.mixer = hf_block.mixer
+        elif self.block_type == "moe":
+            # Reuse the MoE block directly (e.g. Nemotron-3-Nano-30B-A3B).
+            # No extra wrapping needed — the block is already export-compatible.
             self.mixer = hf_block.mixer
         else:
             raise ValueError(f"Unknown block_type: {self.block_type}")
@@ -1029,6 +1034,29 @@ class EdgeLLMNemotronHBlock(nn.Module):
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         hidden_states = self.mixer(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+    # ------------------------------------------------------------------
+    # MoE forward
+    # ------------------------------------------------------------------
+    def forward_moe(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Forward pass for MoE (Mixture-of-Experts) blocks.
+
+        Applies pre-norm, dispatches through the sparse MoE mixer, and adds
+        the residual connection.  The MoE mixer may return either a plain
+        tensor or a ``(hidden_states, router_logits)`` tuple (as in
+        :class:`~transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock`);
+        both forms are handled transparently.
+        """
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        moe_output = self.mixer(hidden_states)
+        # MoE blocks may return (hidden_states, router_logits); discard aux loss.
+        if isinstance(moe_output, tuple):
+            hidden_states = moe_output[0]
+        else:
+            hidden_states = moe_output
         hidden_states = residual + hidden_states
         return hidden_states
 

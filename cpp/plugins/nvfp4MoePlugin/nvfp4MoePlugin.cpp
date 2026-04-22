@@ -345,16 +345,20 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
         return s;
     };
 
-    // Block scales: same 3D shape as before [E, K/16, inter] — data is atom-layout swizzled within.
+    // Atom-layout block scales for up-proj: [E, padded_H, I/16] INT8 (M=hidden padded to 128, K_sf=inter/16 padded to
+    // 4).
     auto const checkUpBlockScale = [this](PluginTensorDesc const& t) {
         bool s{true};
         s &= t.type == DataType::kINT8;
         s &= t.dims.nbDims == 3;
         if (s)
         {
+            int32_t const paddedM = ((mHiddenSize + 127) / 128) * 128;
+            int32_t const numSfCols = mMoeInterSize / kNvfp4MoeQuantizationGroupSize;
+            int32_t const paddedSfCols = ((numSfCols + 3) / 4) * 4;
             s &= t.dims.d[0] == mNumExperts;
-            s &= t.dims.d[1] == mHiddenSize / mQuantizationGroupSize;
-            s &= t.dims.d[2] == mMoeInterSize;
+            s &= t.dims.d[1] == paddedM;
+            s &= t.dims.d[2] == paddedSfCols;
         }
         return s;
     };
@@ -394,15 +398,20 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
         return s;
     };
 
+    // Atom-layout block scales for down-proj: [E, padded_I, H/16] INT8 (M=inter padded to 128, K_sf=hidden/16 padded to
+    // 4).
     auto const checkDownBlockScale = [this](PluginTensorDesc const& t) {
         bool s{true};
         s &= t.type == DataType::kINT8;
         s &= t.dims.nbDims == 3;
         if (s)
         {
+            int32_t const paddedM = ((mMoeInterSize + 127) / 128) * 128;
+            int32_t const numSfCols = mHiddenSize / kNvfp4MoeQuantizationGroupSize;
+            int32_t const paddedSfCols = ((numSfCols + 3) / 4) * 4;
             s &= t.dims.d[0] == mNumExperts;
-            s &= t.dims.d[1] == mMoeInterSize;
-            s &= t.dims.d[2] == mHiddenSize / kNvfp4MoeQuantizationGroupSize;
+            s &= t.dims.d[1] == paddedM;
+            s &= t.dims.d[2] == paddedSfCols;
         }
         return s;
     };
@@ -507,24 +516,29 @@ int32_t Nvfp4MoePlugin::configurePlugin(
             static_cast<int>(mNumExperts), static_cast<int>(mMoeInterSize), static_cast<int>(mHiddenSize / 2));
         return -1;
     }
-    if (static_cast<int32_t>(in[5].max.d[1]) != mHiddenSize / kNvfp4MoeQuantizationGroupSize
-        || static_cast<int32_t>(in[5].max.d[2]) != mMoeInterSize)
+    // Atom-layout block scales: [E, padded_M, padded_sf_cols] where
+    //   up:   M=hidden (padded to 128), sf_cols=inter/16 (padded to 4)
+    //   down: M=inter  (padded to 128), sf_cols=hidden/16 (padded to 4)
+    int32_t const upPaddedM = ((mHiddenSize + 127) / 128) * 128;
+    int32_t const upNumSfCols = mMoeInterSize / kNvfp4MoeQuantizationGroupSize;
+    int32_t const upPaddedSfCols = ((upNumSfCols + 3) / 4) * 4;
+    if (static_cast<int32_t>(in[5].max.d[1]) != upPaddedM || static_cast<int32_t>(in[5].max.d[2]) != upPaddedSfCols)
     {
         LOG_ERROR(
-            "Nvfp4MoePlugin: up_proj block_scale shape mismatch (expected [E, hidden_size/16, moe_inter] = "
+            "Nvfp4MoePlugin: up_proj block_scale shape mismatch (expected [E, padded_hidden, padded_inter/16] = "
             "[%d, %d, %d])",
-            static_cast<int>(mNumExperts), static_cast<int>(mHiddenSize / kNvfp4MoeQuantizationGroupSize),
-            static_cast<int>(mMoeInterSize));
+            static_cast<int>(mNumExperts), static_cast<int>(upPaddedM), static_cast<int>(upPaddedSfCols));
         return -1;
     }
-    if (static_cast<int32_t>(in[8].max.d[1]) != mMoeInterSize
-        || static_cast<int32_t>(in[8].max.d[2]) != mHiddenSize / kNvfp4MoeQuantizationGroupSize)
+    int32_t const dnPaddedM = ((mMoeInterSize + 127) / 128) * 128;
+    int32_t const dnNumSfCols = mHiddenSize / kNvfp4MoeQuantizationGroupSize;
+    int32_t const dnPaddedSfCols = ((dnNumSfCols + 3) / 4) * 4;
+    if (static_cast<int32_t>(in[8].max.d[1]) != dnPaddedM || static_cast<int32_t>(in[8].max.d[2]) != dnPaddedSfCols)
     {
         LOG_ERROR(
-            "Nvfp4MoePlugin: down_proj block_scale shape mismatch (expected [E, moe_inter, hidden_size/16] = "
+            "Nvfp4MoePlugin: down_proj block_scale shape mismatch (expected [E, padded_inter, padded_hidden/16] = "
             "[%d, %d, %d])",
-            static_cast<int>(mNumExperts), static_cast<int>(mMoeInterSize),
-            static_cast<int>(mHiddenSize / kNvfp4MoeQuantizationGroupSize));
+            static_cast<int>(mNumExperts), static_cast<int>(dnPaddedM), static_cast<int>(dnPaddedSfCols));
         return -1;
     }
     // When bounds are static, router token count must match hidden_states batch × seq_len (supports seq_len > 1).

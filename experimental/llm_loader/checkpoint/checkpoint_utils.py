@@ -215,14 +215,23 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
 
     if config.is_hybrid and mc is not None:
         out.update({
-            "num_linear_attn_layers": config.num_mamba_layers,
-            "num_attention_layers": config.num_attn_layers,
-            "recurrent_state_num_heads": mc.num_heads,
-            "recurrent_state_head_dim": mc.head_dim,
-            "recurrent_state_size": mc.ssm_state_size,
-            "conv_dim": mc.conv_dim,
-            "conv_kernel": mc.conv_kernel,
-            "use_rope": config.num_attn_layers > 0,
+            "num_linear_attn_layers":
+            config.num_mamba_layers,
+            "num_attention_layers":
+            config.num_attn_layers,
+            "recurrent_state_num_heads":
+            mc.num_heads,
+            "recurrent_state_head_dim":
+            mc.head_dim,
+            "recurrent_state_size":
+            mc.ssm_state_size,
+            "conv_dim":
+            mc.conv_dim,
+            "conv_kernel":
+            mc.conv_kernel,
+            # Nemotron-H attention is NoPE
+            "use_rope":
+            config.num_attn_layers > 0 and not config.is_nemotron_h,
         })
 
     gc = config.gdn_cfg
