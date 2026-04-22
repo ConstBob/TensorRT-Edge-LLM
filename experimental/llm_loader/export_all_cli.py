@@ -17,8 +17,9 @@ CLI: export ALL components of a multimodal checkpoint to ONNX in one command.
 
 Detects model type from ``config.json`` and exports:
     - LLM backbone        → ``<output_dir>/llm/model.onnx``
-    - Visual encoder      → ``<output_dir>/visual/model.onnx``  (VLMs)
-    - Audio encoder       → ``<output_dir>/audio/model.onnx``   (speech models)
+    - Visual encoder      → ``<output_dir>/visual/model.onnx``    (VLMs)
+    - Audio encoder       → ``<output_dir>/audio/model.onnx``     (speech models)
+    - Code2Wav vocoder    → ``<output_dir>/code2wav/model.onnx``  (Qwen3-Omni)
 
 Usage::
 
@@ -89,6 +90,10 @@ _TTS_MODEL_TYPES = frozenset([
     "qwen3_tts",
 ])
 
+_CODE2WAV_MODEL_TYPES = frozenset([
+    "qwen3_omni",
+])
+
 
 def _has_visual(model_type: str) -> bool:
     return model_type in _VLM_MODEL_TYPES
@@ -100,6 +105,10 @@ def _has_audio(model_type: str) -> bool:
 
 def _is_tts(model_type: str) -> bool:
     return model_type in _TTS_MODEL_TYPES
+
+
+def _has_code2wav(model_type: str) -> bool:
+    return model_type in _CODE2WAV_MODEL_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +295,11 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
     # builds the engine. Fields needed vary by model family:
     #   InternVL*: image_token_id, text_config (for vocab_size)
     #   all:       model_type, vision_config
-    vis_cfg = config.get("vision_config", config)
+    # Qwen3-Omni nests vision_config / text_config / token IDs under
+    # thinker_config; other Qwen VL variants keep them at the root.
+    _thinker_cfg = config.get("thinker_config", {}) or {}
+    vis_cfg = (config.get("vision_config") or _thinker_cfg.get("vision_config")
+               or config)
     # C++ stringToModelType maps "internvl" and "internvl_vision" to INTERNVL;
     # "internvl_chat" is NOT registered.  Normalize both variants to "internvl".
     top_level_model_type = "internvl" if model_type in (
@@ -300,8 +313,10 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # C++ QwenViTRunner reads these token IDs and rope_theta from config.json.
         # For Qwen3-VL the token IDs are at the root level, but vocab_size and
         # rope_theta live inside text_config.  Fall back to text_config for any
-        # key that is absent from the root.
-        _text_cfg = config.get("text_config", {}) or {}
+        # key that is absent from the root.  For Qwen3-Omni all of these live
+        # under thinker_config (token IDs) and thinker_config.text_config.
+        _text_cfg = (config.get("text_config")
+                     or _thinker_cfg.get("text_config") or {})
         # rope_theta may live in text_config.rope_parameters (newer transformers)
         _rope_params = _text_cfg.get("rope_parameters") or _text_cfg.get(
             "rope_scaling") or {}
@@ -310,6 +325,8 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                     "rope_theta"):
             if key in config:
                 vis_cfg_out[key] = config[key]
+            elif key in _thinker_cfg:
+                vis_cfg_out[key] = _thinker_cfg[key]
             elif key in _text_cfg:
                 vis_cfg_out[key] = _text_cfg[key]
             elif key in _rope_params:
@@ -444,6 +461,67 @@ def _export_audio(model_dir: str, audio_out_dir: str, weights: dict,
     with open(cfg_out_path, "w") as f:
         json.dump(audio_cfg_out, f, indent=2)
     logger.info("[Audio] Wrote config.json: %s", cfg_out_path)
+
+
+# ---------------------------------------------------------------------------
+# Code2Wav export (Qwen3-Omni vocoder)
+# ---------------------------------------------------------------------------
+
+
+def _export_code2wav(model_dir: str, c2w_out_dir: str, weights: dict,
+                     config: dict, dtype: "torch.dtype") -> None:
+    """Export Qwen3-Omni Code2Wav vocoder via the standalone llm_loader
+    implementation.
+
+    The vocoder converts discrete RVQ codec tokens
+    ``[batch, num_quantizers, code_length]`` into continuous audio
+    waveforms ``[batch, 1, code_length * total_upsample]``.
+
+    ``code2wav_config`` is expected at the root of ``config.json``; weights
+    are extracted from the shared checkpoint using the ``code2wav.`` prefix.
+    """
+    os.makedirs(c2w_out_dir, exist_ok=True)
+    output_path = os.path.join(c2w_out_dir, "model.onnx")
+
+    c2w_cfg = config.get("code2wav_config")
+    if not c2w_cfg:
+        logger.error(
+            "code2wav_config not found in config.json — cannot export Code2Wav"
+        )
+        sys.exit(1)
+
+    logger.info("[Code2Wav] Building model and loading weights")
+    try:
+        from .models.qwen3_omni import build_code2wav, export_code2wav_onnx
+        model = build_code2wav(c2w_cfg, weights, dtype)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[Code2Wav] Failed to build model")
+        raise SystemExit(1) from exc
+
+    logger.info("[Code2Wav] Exporting ONNX to %s", output_path)
+    try:
+        export_code2wav_onnx(model, output_path, c2w_cfg)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[Code2Wav] ONNX export failed")
+        raise SystemExit(1) from exc
+
+    # Write a config.json that the C++ runtime / engine builder can consume.
+    # Match the layout produced by tensorrt_edgellm.export_code2wav_config:
+    # top-level model_type is "qwen3_omni_code2wav" and the sub-config
+    # carries the same model_type for parser compatibility.
+    c2w_cfg_out = dict(c2w_cfg)
+    c2w_cfg_out["model_type"] = "qwen3_omni_code2wav"
+    cfg_out_path = os.path.join(c2w_out_dir, "config.json")
+    with open(cfg_out_path, "w") as f:
+        json.dump(
+            {
+                "model_type": "qwen3_omni_code2wav",
+                "code2wav_config": c2w_cfg_out,
+            },
+            f,
+            indent=2)
+    logger.info("[Code2Wav] Wrote config.json: %s", cfg_out_path)
+    logger.info("[Code2Wav] Done: %s", output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +865,11 @@ def main() -> None:
         help="Skip audio encoder export.",
     )
     p.add_argument(
+        "--skip-code2wav",
+        action="store_true",
+        help="Skip Code2Wav vocoder export (Qwen3-Omni only).",
+    )
+    p.add_argument(
         "--eagle-base",
         action="store_true",
         help=
@@ -806,20 +889,22 @@ def main() -> None:
 
     has_vis = _has_visual(model_type) and not args.skip_visual
     has_aud = _has_audio(model_type) and not args.skip_audio
+    has_c2w = _has_code2wav(model_type) and not args.skip_code2wav
     is_tts = _is_tts(model_type)
 
     logger.info("=" * 60)
-    logger.info("Model type    : %s", model_type)
-    logger.info("Checkpoint    : %s", model_dir)
-    logger.info("Output dir    : %s", args.output_dir)
-    logger.info("Visual export : %s", "yes" if has_vis else "no")
-    logger.info("Audio export  : %s", "yes" if has_aud else "no")
-    logger.info("TTS talker    : %s", "yes" if is_tts else "no")
+    logger.info("Model type     : %s", model_type)
+    logger.info("Checkpoint     : %s", model_dir)
+    logger.info("Output dir     : %s", args.output_dir)
+    logger.info("Visual export  : %s", "yes" if has_vis else "no")
+    logger.info("Audio export   : %s", "yes" if has_aud else "no")
+    logger.info("Code2Wav export: %s", "yes" if has_c2w else "no")
+    logger.info("TTS talker     : %s", "yes" if is_tts else "no")
     logger.info("=" * 60)
 
-    # Load weights once (shared by visual and audio exporters)
+    # Load weights once (shared by visual, audio, and code2wav exporters)
     weights: dict = {}
-    if has_vis or has_aud:
+    if has_vis or has_aud or has_c2w:
         logger.info("Loading safetensors weights ...")
         weights = _load_all_weights(model_dir)
 
@@ -847,12 +932,17 @@ def main() -> None:
         aud_out = os.path.join(args.output_dir, "audio")
         _export_audio(model_dir, aud_out, weights, config, model_type, dtype)
 
+    # --- Code2Wav vocoder (Qwen3-Omni) ---
+    if has_c2w:
+        c2w_out = os.path.join(args.output_dir, "code2wav")
+        _export_code2wav(model_dir, c2w_out, weights, config, dtype)
+
     # Summary
     print()
     print("=" * 60)
     print("Export complete")
     print(f"  output dir: {args.output_dir}")
-    for sub in ["llm", "code_predictor", "visual", "audio"]:
+    for sub in ["llm", "code_predictor", "visual", "audio", "code2wav"]:
         p_sub = os.path.join(args.output_dir, sub)
         if os.path.isdir(p_sub):
             onnx = os.path.join(p_sub, "model.onnx")

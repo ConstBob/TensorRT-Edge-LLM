@@ -120,7 +120,11 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
     """Extract visual encoder sub-config from the full model config."""
     if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_5", "qwen3_5_moe",
                       "qwen2_5_vl"):
-        return config.get("vision_config", config)
+        # Qwen3-Omni stores vision_config nested under thinker_config; other
+        # Qwen VL variants keep it at the root.
+        return (config.get("vision_config")
+                or config.get("thinker_config", {}).get("vision_config")
+                or config)
     if model_type in ("internvl", "internvl_chat"):
         # InternVL models need the full config (vision + text + downsample_ratio)
         return config
