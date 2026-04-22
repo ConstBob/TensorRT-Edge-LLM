@@ -1573,6 +1573,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
 
 bool LLMInferenceSpecDecodeRuntime::runVanillaDecoding(SpecDecodeInferenceContext& context)
 {
+    TIME_STAGE(metrics::StageNames::kLLM_GENERATION, context.stream);
     NVTX_SCOPED_RANGE(nvtx_vanilla_decoding,
         ("VANILLA_DECODING[R" + std::to_string(context.generationRound) + "," + std::to_string(context.activeBatchSize)
             + "]")
