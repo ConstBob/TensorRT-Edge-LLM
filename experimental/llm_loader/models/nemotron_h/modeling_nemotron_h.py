@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-NemotronH hybrid causal LM (Mamba2 SSM + MLP + Attention).
+NemotronH hybrid causal LM (Mamba2 SSM + MLP + Attention + MoE).
 
 Checkpoint key structure
 ------------------------
@@ -23,11 +23,13 @@ backbone.layers.{i}.mixer.*                    - mixer (type depends on layer)
   Attention  : q_proj, k_proj, v_proj, o_proj
   Mamba2 SSM : in_proj, out_proj, conv1d.{weight,bias}, A_log, D, dt_bias, norm.weight
   MLP        : up_proj, down_proj
+  MoE        : gate.{weight,e_score_correction_bias},
+               experts.{j}.{up_proj,down_proj}, shared_experts.{up_proj,down_proj}
 backbone.norm_f.weight                         - final RMSNorm
 lm_head.weight                                 - output projection (FP16, tied or standalone)
 
 Layer type pattern is read from ``hybrid_override_pattern`` in config.json:
-  'M' -> LAYER_MAMBA   '*' -> LAYER_ATTN   '-' -> LAYER_MLP
+  'M' -> LAYER_MAMBA   '*' -> LAYER_ATTN   '-' -> LAYER_MLP   'E' -> LAYER_MOE
 
 Forward-pass conventions
 ------------------------
@@ -55,10 +57,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...config import LAYER_MAMBA, LAYER_MLP, MambaConfig, ModelConfig
+from ...config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, LAYER_MOE,
+                       MambaConfig, ModelConfig)
 from ..default.modeling_default import OnnxSpec
-from ..linear import FP16Linear, make_linear
-from ..ops import attention_plugin, causal_conv1d, update_ssm_state
+from ..linear import FP16Linear, NVFP4Linear, make_linear
+from ..ops import (attention_plugin, causal_conv1d, nvfp4_moe_plugin,
+                   update_ssm_state)
 
 
 class RMSNorm(nn.Module):
@@ -148,6 +152,8 @@ __all__ = [
     "Conv1dBuffers",
     "MambaMixer",
     "NemotronHMLP",
+    "NemotronHMoEMLP",
+    "NemotronHTopkRouter",
     "NemotronHAttentionMixer",
     "NemotronHDecoderLayer",
     "NemotronHBackbone",
@@ -342,6 +348,232 @@ class NemotronHMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# NemotronHTopkRouter
+# ---------------------------------------------------------------------------
+
+
+class NemotronHTopkRouter(nn.Module):
+    """Sigmoid-based grouped top-k router for MoE layers.
+
+    Submodule names match checkpoint keys:
+        weight                  - [n_routed_experts, hidden_size] (FP32)
+        e_score_correction_bias - [n_routed_experts] (FP32)
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+        self.hidden_size = config.hidden_size
+
+        self.weight = nn.Parameter(
+            torch.empty(self.n_routed_experts,
+                        config.hidden_size,
+                        dtype=torch.float16))
+        self.register_buffer(
+            "e_score_correction_bias",
+            torch.zeros(self.n_routed_experts, dtype=torch.float16))
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        router_logits = F.linear(hidden_states, self.weight).float()
+        scores = router_logits.sigmoid()
+
+        scores_for_choice = scores + self.e_score_correction_bias.float(
+        ).unsqueeze(0)
+        group_scores = (scores_for_choice.view(
+            -1, self.n_group,
+            self.n_routed_experts // self.n_group).topk(2,
+                                                        dim=-1)[0].sum(dim=-1))
+        group_idx = torch.topk(group_scores,
+                               k=self.topk_group,
+                               dim=-1,
+                               sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (group_mask.unsqueeze(-1).expand(
+            -1, self.n_group, self.n_routed_experts // self.n_group).reshape(
+                -1, self.n_routed_experts))
+        scores_for_choice = scores_for_choice.masked_fill(
+            ~score_mask.bool(), 0.0)
+        topk_indices = torch.topk(scores_for_choice,
+                                  k=self.top_k,
+                                  dim=-1,
+                                  sorted=False)[1]
+
+        topk_weights = scores.gather(1, topk_indices)
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / (
+                topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * self.routed_scaling_factor
+        return topk_indices, topk_weights
+
+
+# ---------------------------------------------------------------------------
+# NemotronHMoEMLP
+# ---------------------------------------------------------------------------
+
+
+class NemotronHMoEMLP(nn.Module):
+    """Mixture-of-Experts MLP for NemotronH using Nvfp4MoePlugin.
+
+    Named ``mixer`` inside :class:`NemotronHDecoderLayer` to match checkpoint
+    key prefix ``backbone.layers.N.mixer.*``.
+
+    The routed experts are handled by the ``trt_edgellm::Nvfp4MoePlugin``
+    custom op which takes stacked NVFP4 weights + router logits and performs
+    top-k routing + W4A16 GEMV internally.  The shared expert runs as a
+    separate FP8/FP16 forward pass added to the plugin output.
+
+    Submodule names match checkpoint keys:
+        gate                     - NemotronHTopkRouter (weight + bias)
+        experts.{j}.up_proj     - per-expert up projection (NVFP4)
+        experts.{j}.down_proj   - per-expert down projection (NVFP4)
+        shared_experts.up_proj  - shared expert up projection (FP8)
+        shared_experts.down_proj - shared expert down projection (FP8)
+    """
+
+    def __init__(self, config: ModelConfig, module_prefix: str) -> None:
+        super().__init__()
+        self.n_routed_experts = config.n_routed_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.gate = NemotronHTopkRouter(config)
+
+        self.experts = nn.ModuleList([
+            self._make_expert(config, config.moe_intermediate_size,
+                              f"{module_prefix}.experts.{j}")
+            for j in range(config.n_routed_experts)
+        ])
+
+        self.shared_experts = self._make_expert(
+            config, config.moe_shared_expert_intermediate_size,
+            f"{module_prefix}.shared_experts")
+
+        # Placeholder for W4A16 mode (hidden_block_scale not used)
+        self.register_buffer("_hidden_block_scale_placeholder",
+                             torch.zeros(1, dtype=torch.int8))
+        self.register_buffer("_hidden_global_scale_placeholder",
+                             torch.ones(1, dtype=torch.float32))
+        self._export_ready = False
+
+    @staticmethod
+    def _make_expert(config: ModelConfig, inter_size: int,
+                     prefix: str) -> nn.Module:
+        expert = nn.Module()
+        expert.up_proj = make_linear(config,
+                                     config.hidden_size,
+                                     inter_size,
+                                     module_name=f"{prefix}.up_proj")
+        expert.down_proj = make_linear(config,
+                                       inter_size,
+                                       config.hidden_size,
+                                       module_name=f"{prefix}.down_proj")
+        return expert
+
+    @staticmethod
+    def _expert_forward(expert: nn.Module,
+                        hidden_states: torch.Tensor) -> torch.Tensor:
+        h = expert.up_proj(hidden_states)
+        r = F.relu(h)
+        return expert.down_proj(r * r)
+
+    def prepare_for_export(self) -> None:
+        """Dequantize ModelOpt NVFP4 expert weights and Marlin-pack them.
+
+        ``Nvfp4MoePlugin``'s CUDA kernel expects a tile-packed layout (see
+        :mod:`..marlin_pack`).  Stack the re-packed buffers so the ONNX
+        graph has direct initializer→plugin edges — TRT does not allow
+        quantized dtypes (FP4, FP8, INT8) to flow through Concat.
+        """
+        import numpy as np
+
+        from ..marlin_pack import (decode_modelopt_nvfp4,
+                                   marlin_pack_expert_down,
+                                   marlin_pack_expert_up)
+
+        H = self.hidden_size
+        I = self.moe_intermediate_size
+
+        up_pls, up_scs, up_gs = [], [], []
+        dn_pls, dn_scs, dn_gs = [], [], []
+        for expert in self.experts:
+            up = expert.up_proj
+            dn = expert.down_proj
+            assert isinstance(up, NVFP4Linear) and isinstance(
+                dn, NVFP4Linear), "MoE experts must be NVFP4Linear"
+
+            # up.weight [out=I, in//2=H//2] → dense [I, H] → (H, I) for Marlin.
+            up_dense = decode_modelopt_nvfp4(up.weight, up.weight_scale,
+                                             up.weight_scale_2, up.group_size)
+            if up_dense.shape != (I, H):
+                raise ValueError(
+                    f"up_dense shape {up_dense.shape} != ({I}, {H})")
+            up_pl, up_sc, up_gl = marlin_pack_expert_up(
+                np.ascontiguousarray(up_dense.T))
+
+            # dn.weight [out=H, in//2=I//2] → dense [H, I] → (I, H) for Marlin.
+            dn_dense = decode_modelopt_nvfp4(dn.weight, dn.weight_scale,
+                                             dn.weight_scale_2, dn.group_size)
+            if dn_dense.shape != (H, I):
+                raise ValueError(
+                    f"dn_dense shape {dn_dense.shape} != ({H}, {I})")
+            dn_pl, dn_sc, dn_gl = marlin_pack_expert_down(
+                np.ascontiguousarray(dn_dense.T))
+
+            up_pls.append(torch.from_numpy(up_pl))
+            up_scs.append(torch.from_numpy(up_sc))
+            up_gs.append(up_gl)
+            dn_pls.append(torch.from_numpy(dn_pl))
+            dn_scs.append(torch.from_numpy(dn_sc))
+            dn_gs.append(dn_gl)
+
+        self.register_buffer("_stacked_up_payload", torch.stack(up_pls))
+        self.register_buffer("_stacked_up_block_scale", torch.stack(up_scs))
+        self.register_buffer("_stacked_up_global_scale",
+                             torch.tensor(up_gs, dtype=torch.float32))
+        self.register_buffer("_stacked_down_payload", torch.stack(dn_pls))
+        self.register_buffer("_stacked_down_block_scale", torch.stack(dn_scs))
+        self.register_buffer("_stacked_down_global_scale",
+                             torch.tensor(dn_gs, dtype=torch.float32))
+        self._export_ready = True
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = hidden_states.shape
+        # Router logits: [batch*seq, E] FP32 (plugin expects FP32 input)
+        router_logits = F.linear(hidden_states.view(-1, self.hidden_size),
+                                 self.gate.weight).float()
+
+        moe_out = nvfp4_moe_plugin(
+            router_logits,
+            hidden_states,
+            self._hidden_block_scale_placeholder,
+            self._hidden_global_scale_placeholder,
+            self._stacked_up_payload,
+            self._stacked_up_block_scale,
+            self._stacked_up_global_scale,
+            self._stacked_down_payload,
+            self._stacked_down_block_scale,
+            self._stacked_down_global_scale,
+            num_experts=self.n_routed_experts,
+            top_k=self.num_experts_per_tok,
+            hidden_size=self.hidden_size,
+            moe_inter_size=self.moe_intermediate_size,
+            activation_type=0,  # 0 = ReLU²
+        )
+
+        return moe_out + self._expert_forward(self.shared_experts,
+                                              hidden_states)
+
+
+# ---------------------------------------------------------------------------
 # NemotronHAttentionMixer
 # ---------------------------------------------------------------------------
 
@@ -456,19 +688,23 @@ class NemotronHDecoderLayer(nn.Module):
             self.mixer = MambaMixer(config, config.mamba_cfg, module_prefix)
         elif layer_type == LAYER_MLP:
             self.mixer = NemotronHMLP(config, module_prefix)
-        else:
+        elif layer_type == LAYER_MOE:
+            self.mixer = NemotronHMoEMLP(config, module_prefix)
+        elif layer_type == LAYER_ATTN:
             self.mixer = NemotronHAttentionMixer(config, layer_idx,
                                                  module_prefix)
+        else:
+            raise ValueError(f"Unknown layer type: {layer_type!r}")
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        # Attention-specific (ignored by Mamba/MLP layers)
+        # Attention-specific (ignored by Mamba/MLP/MoE layers)
         past_key_value: Optional[torch.Tensor] = None,
         rope_rotary_cos_sin: Optional[torch.Tensor] = None,
         context_lengths: Optional[torch.Tensor] = None,
         kvcache_start_index: Optional[torch.Tensor] = None,
-        # Mamba-specific (ignored by Attention/MLP layers)
+        # Mamba-specific (ignored by Attention/MLP/MoE layers)
         conv_state: Optional[torch.Tensor] = None,
         ssm_state: Optional[torch.Tensor] = None,
     ):
@@ -478,7 +714,7 @@ class NemotronHDecoderLayer(nn.Module):
             mixer_out, conv_state_out, ssm_state_out = self.mixer(
                 normed, conv_state, ssm_state, context_lengths)
             return residual + mixer_out, conv_state_out, ssm_state_out
-        elif self.layer_type == LAYER_MLP:
+        elif self.layer_type in (LAYER_MLP, LAYER_MOE):
             return residual + self.mixer(normed)
         else:
             attn_out, present_kv = self.mixer(normed, past_key_value,
@@ -541,7 +777,7 @@ class NemotronHBackbone(nn.Module):
                 present_conv_states_list.append(conv_out)
                 present_ssm_states_list.append(ssm_out)
                 mamba_idx += 1
-            elif lt == LAYER_MLP:
+            elif lt in (LAYER_MLP, LAYER_MOE):
                 hidden_states = layer(hidden_states)
             else:
                 hidden_states, present_kv = layer(
@@ -599,6 +835,10 @@ class NemotronHCausalLM(nn.Module):
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return all model-specific parameters needed for ONNX export."""
+        # Pre-process MoE layers: reinterpret FP8 scales as INT8
+        for layer in self.backbone.layers:
+            if hasattr(layer.mixer, 'prepare_for_export'):
+                layer.mixer.prepare_for_export()
         config = self.config
         mc = config.mamba_cfg
         Na = config.num_attn_layers

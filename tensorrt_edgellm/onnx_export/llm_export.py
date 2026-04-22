@@ -69,6 +69,14 @@ from ..llm_models.layers.int4_gemm_plugin import (
 from ..llm_models.layers.int4_moe_plugin import (
     is_moe_model, register_int4_moe_plugin_onnx_symbolic_functions,
     replace_moe_blocks_with_plugin)
+from ..llm_models.layers.nvfp4_moe_plugin import (
+    NemotronHMoEW4A4Plugin, register_nvfp4_moe_plugin_onnx_symbolic_functions,
+    replace_moe_blocks_with_nvfp4_plugin)
+
+try:
+    from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMoE
+except (ImportError, AttributeError):
+    NemotronHMoE = None
 from ..llm_models.layers.mamba_plugin import \
     register_mamba_plugin_onnx_symbolic_functions
 from ..llm_models.model_utils import (is_gptq_model, is_hybrid_model_type,
@@ -242,7 +250,7 @@ def export_model_config(model_name: str,
             try:
                 full_config = AutoConfig.from_pretrained(
                     model_dir, trust_remote_code=True)
-            except Exception:
+            except (OSError, ValueError, EnvironmentError):
                 full_config = None
 
             search_configs = [
@@ -970,7 +978,45 @@ def export_llm_model(model_dir: str,
         model_output_dir = os.path.join(
             output_dir, model_name) if is_multi_model else output_dir
 
-        if is_moe_model(model):
+        # Detect NemotronH MoE blocks by type name — the model is loaded via
+        # trust_remote_code so its class is a different object than the one
+        # imported from transformers (which may not be installed at all).
+        # Both "NemotronHMoE" (Will Guo's naming) and "NemotronHMOE" (HF/patch
+        # naming) are accepted.
+        _nemotron_moe_names = {"NemotronHMoE", "NemotronHMOE"}
+        _nemotron_moe_cls = next((type(m) for m in model.modules()
+                                  if type(m).__name__ in _nemotron_moe_names),
+                                 None)
+        _has_nemotron_moe = _nemotron_moe_cls is not None
+        if _has_nemotron_moe:
+            print(
+                "Detected NemotronH MoE blocks — replacing with Nvfp4MoePlugin"
+            )
+            # Patch module-level NemotronHMoE in Will Guo's plugin to the actual
+            # runtime class so all isinstance() checks inside the plugin work.
+            import tensorrt_edgellm.llm_models.layers.nvfp4_moe_plugin as _nvfp4_mod
+            _nvfp4_mod.NemotronHMoE = _nemotron_moe_cls
+            register_nvfp4_moe_plugin_onnx_symbolic_functions()
+            # Snapshot original NemotronHMoE blocks before replacement
+            original_moe_blocks = {
+                name: mod
+                for name, mod in model.named_modules()
+                if type(mod).__name__ in _nemotron_moe_names
+            }
+            model = replace_moe_blocks_with_nvfp4_plugin(model)
+            # Populate Marlin NVFP4 weight buffers from the HF dense weights.
+            # populate_marlin_plugin_buffers is now vectorized (numpy broadcast
+            # over tiles per expert) — replaces the previous ~20M-iter Python loop.
+            for name, plugin in model.named_modules():
+                if isinstance(plugin, NemotronHMoEW4A4Plugin):
+                    # When wrapped in NemotronHMoEWithSharedExperts the plugin
+                    # lives at "<layer_path>.moe_plugin"; strip the suffix to
+                    # recover the original NemotronHMoE block key.
+                    orig_key = name[:-len(".moe_plugin")] if name.endswith(
+                        ".moe_plugin") else name
+                    plugin.pack_experts_weights_to_marlin(
+                        original_moe_blocks[orig_key])
+        elif is_moe_model(model):
             print(
                 "Detected MoE model, replacing MoE blocks with Int4MoePlugin")
             register_int4_moe_plugin_onnx_symbolic_functions()

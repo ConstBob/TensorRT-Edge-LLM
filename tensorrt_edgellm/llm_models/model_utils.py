@@ -51,6 +51,182 @@ def is_nvfp4_linear(module: nn.Module) -> bool:
     return False
 
 
+def _is_nvfp4_model(model_dir: str) -> bool:
+    """Check if model is NVFP4 quantized by reading hf_quant_config.json."""
+    import json
+    quant_config_path = os.path.join(model_dir, "hf_quant_config.json")
+    if not os.path.exists(quant_config_path):
+        return False
+
+    try:
+        with open(quant_config_path, 'r') as f:
+            config = json.load(f)
+            quant_algo = config.get("quantization", {}).get("quant_algo", "")
+            return quant_algo == "NVFP4"
+    except Exception:
+        return False
+
+
+def _load_nvfp4_nemotron_h(model_dir: str, torch_dtype: torch.dtype,
+                           device: torch.device) -> AutoModelForCausalLM:
+    """Load an NVFP4-quantized NemotronH model for ONNX export.
+
+    The HF NVFP4 checkpoint stores weights in packed FP4 format:
+      - ``*.weight``:        packed uint8 (2 FP4 nibbles per byte), shape ``[out, in/2]``
+      - ``*.weight_scale``:  per-block FP8 scale, shape ``[out, in/group_size]``
+      - ``*.weight_scale_2``: per-tensor float32 scale (scalar)
+      - ``*.input_scale``:   activation per-tensor float32 scale (scalar)
+
+    Strategy:
+    1. Instantiate the model architecture from AutoConfig (no weights loaded).
+    2. Apply ModelOpt NVFP4 weight-only quantization structure via mtq.quantize
+       (input quantizers disabled so forward_loop=None works).
+    3. Load all safetensors shards, build a corrected state dict:
+       - Iterate loaded_tensors directly (robust, no isinstance check needed).
+       - Any *.weight tensor with element_size < 2 is packed FP4: dequantize it.
+       - Scale keys (weight_scale, weight_scale_2, input_scale) are skipped.
+    4. Apply the corrected state dict via model.load_state_dict(strict=False).
+    5. Walk model.named_modules(); for any module with a weight_quantizer,
+       reconstruct _amax from weight_scale_2 stored in loaded_tensors.
+    """
+    import copy
+    import json
+
+    try:
+        import modelopt.torch.quantization as mtq
+        from modelopt.torch.quantization.qtensor.nvfp4_tensor import \
+            NVFP4QTensor
+    except ImportError as exc:
+        raise ImportError(
+            "nvidia-modelopt is required to load NVFP4 checkpoints. "
+            "Install it with: pip install nvidia-modelopt") from exc
+
+    # ------------------------------------------------------------------
+    # 1. Read NVFP4 quant config
+    # ------------------------------------------------------------------
+    with open(os.path.join(model_dir, "hf_quant_config.json")) as f:
+        hf_quant_cfg = json.load(f)
+    exclude_modules: list = hf_quant_cfg.get("quantization",
+                                             {}).get("exclude_modules", [])
+    group_size: int = hf_quant_cfg.get("quantization",
+                                       {}).get("group_size", 16)
+
+    # ------------------------------------------------------------------
+    # 2. Instantiate architecture from config — no checkpoint weights.
+    # ------------------------------------------------------------------
+    auto_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_config(auto_config,
+                                             trust_remote_code=True)
+    model = model.to(torch_dtype)
+
+    # ------------------------------------------------------------------
+    # 3. Apply NVFP4 weight-only quantization structure (no calibration).
+    # ------------------------------------------------------------------
+    nvfp4_cfg = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+    nvfp4_cfg["quant_cfg"]["*input_quantizer"] = {"enable": False}
+    for excl in exclude_modules:
+        nvfp4_cfg["quant_cfg"][excl] = {"enable": False}
+    mtq.quantize(model, nvfp4_cfg, forward_loop=None)
+
+    # ------------------------------------------------------------------
+    # 4. Load all safetensors shards
+    # ------------------------------------------------------------------
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    with open(index_path) as f:
+        weight_map: dict = json.load(f)["weight_map"]
+
+    loaded_tensors: dict[str, torch.Tensor] = {}
+    for shard_file in set(weight_map.values()):
+        with safe_open(os.path.join(model_dir, shard_file),
+                       framework="pt",
+                       device="cpu") as f:
+            for key in f.keys():
+                loaded_tensors[key] = f.get_tensor(key)
+
+    # ------------------------------------------------------------------
+    # 5. Build corrected state dict.
+    #
+    # Iterate loaded_tensors directly — avoids any isinstance / class
+    # identity issues with ModelOpt's QuantLinear HF plugin subclasses.
+    # For every *.weight tensor with element_size < 2 (packed uint8 FP4),
+    # find its companion scales and dequantize back to float.
+    # ------------------------------------------------------------------
+    # Identify all scale keys so we can skip them in the final state dict
+    # (the model has no parameters named weight_scale / input_scale).
+    scale_suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
+    scale_keys: set[str] = {
+        k
+        for k in loaded_tensors if any(k.endswith(s) for s in scale_suffixes)
+    }
+
+    processed: dict[str, torch.Tensor] = {}
+
+    for key, tensor in loaded_tensors.items():
+        if key in scale_keys:
+            continue  # handled separately below
+
+        if key.endswith(".weight") and tensor.element_size() < 2:
+            # Packed uint8 FP4 weight — dequantize back to float.
+            base = key[:-len(".weight")]  # strip trailing ".weight"
+            w_scale = loaded_tensors.get(base + ".weight_scale")
+            w_scale2 = loaded_tensors.get(base + ".weight_scale_2")
+
+            if w_scale is not None and w_scale2 is not None:
+                original_shape = list(tensor.shape)
+                original_shape[-1] *= 2
+                nvfp4_q = NVFP4QTensor(original_shape, torch_dtype, tensor)
+                processed[key] = nvfp4_q.dequantize(
+                    dtype=torch_dtype,
+                    scale=w_scale,
+                    double_scale=w_scale2.float(),
+                    block_sizes={-1: group_size},
+                )
+            else:
+                # Missing scales — insert zero tensor with the correct shape.
+                print(
+                    f"[NVFP4 load] Warning: no scales for {key}, zeroing weight"
+                )
+                original_shape = list(tensor.shape)
+                original_shape[-1] *= 2
+                processed[key] = torch.zeros(original_shape, dtype=torch_dtype)
+        else:
+            # Regular (non-packed) tensor — cast to model dtype if float.
+            processed[key] = tensor.to(
+                torch_dtype) if tensor.is_floating_point() else tensor
+
+    # ------------------------------------------------------------------
+    # 6. Load the corrected state dict.
+    # ------------------------------------------------------------------
+    missing_keys, unexpected_keys = model.load_state_dict(processed,
+                                                          strict=False)
+
+    real_missing = [
+        k for k in missing_keys if "quantizer" not in k and "_amax" not in k
+    ]
+    if real_missing:
+        print(f"[NVFP4 load] Missing keys (first 5): {real_missing[:5]}")
+
+    # ------------------------------------------------------------------
+    # 7. Restore weight_quantizer._amax from weight_scale_2 tensors.
+    #
+    #   weight_scale_2 = _amax / (FP4_maxbound * FP8_maxbound)
+    #   FP4_maxbound = 6.0, FP8_maxbound = 448.0
+    # ------------------------------------------------------------------
+    for name, module in model.named_modules():
+        wq = getattr(module, "weight_quantizer", None)
+        if wq is None:
+            continue
+        scale2_key = f"{name}.weight_scale_2"
+        if scale2_key in loaded_tensors:
+            # Use register_buffer so _amax moves with model.to(device).
+            # Plain attribute assignment (wq._amax = tensor) is not tracked
+            # by nn.Module and stays on CPU even after model.to(cuda).
+            computed_amax = loaded_tensors[scale2_key].float() * (6.0 * 448.0)
+            wq.register_buffer("_amax", computed_amax)
+
+    return model.to(device)
+
+
 def is_mxfp8_linear(module: nn.Module) -> bool:
     """Check if the module is a quantized linear layer with MXFP8 quantization. The test is designed for identification purpose only, not designed to be comprehensive.
     Adapted from TensorRT Model Optimizer: https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/modelopt/torch/_deploy/utils/torch_onnx.py
@@ -561,10 +737,16 @@ def load_hf_model(
     elif _is_nemotron_h_model(model_dir):
         from .models.nemotron_h_patch import apply as _apply_nemotron_h_patch
         _apply_nemotron_h_patch()
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
-        _fix_nemotron_h_mamba_weights(model, model_dir)
+        if _is_nvfp4_model(model_dir):
+            # NVFP4 checkpoints store weights in packed FP4 format; shapes do
+            # not match a standard BF16/FP16 model, so from_pretrained fails.
+            # Use the custom loader that dequantizes on the fly.
+            model = _load_nvfp4_nemotron_h(model_dir, torch_dtype, device)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_dir, torch_dtype=torch_dtype,
+                trust_remote_code=True).to(device)
+            _fix_nemotron_h_mamba_weights(model, model_dir)
     # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
     # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
     elif _is_phi4mm_model(model_dir):

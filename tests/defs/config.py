@@ -31,6 +31,12 @@ from valid_precisions import (VALID_LLM_PRECISIONS, VALID_LM_HEAD_PRECISIONS,
 # Global configuration constants
 DEFAULT_SEARCH_DEPTH = 3
 
+# Models that ship pre-quantized (skip tensorrt-edgellm-quantize-llm step).
+# These are exported directly from the HF checkpoint without a quantize-llm step.
+PRE_QUANTIZED_MODELS: frozenset = frozenset({
+    "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+})
+
 
 def _find_directory(root_dir: str,
                     target_name: str,
@@ -732,6 +738,12 @@ class TestConfig:
             "Qwen3/Qwen3-ASR-0.6B",
             "Qwen3-TTS-12Hz-0.6B-CustomVoice":
             "Qwen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            # Nemotron-H 30B (BF16 base + pre-quantized NVFP4)
+            "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":
+            "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+            # Pre-quantized NVFP4 model: exported directly without quantize-llm step
+            "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":
+            "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
         }
 
         # GPTQ and pre-quantized models in edgellm_data_dir (/scratch.edge_llm_cache)
@@ -1001,11 +1013,10 @@ class TestConfig:
     def get_chat_template_file(self) -> Optional[str]:
         """
         Get custom chat template file path for models that require it.
-        
+
         Returns:
             Path to chat template JSON file, or None if no custom template for this model
         """
-
         return None
 
     def get_output_json_file(self) -> str:

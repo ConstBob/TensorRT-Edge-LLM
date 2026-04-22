@@ -13,9 +13,62 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from ..version import __version__
+
+_NEMOTRON_H_CHAR_TO_BLOCK_TYPE: Dict[str, str] = {
+    "M": "mamba",
+    "*": "attention",
+    "-": "mlp",
+    "E": "moe",
+}
+
+
+def _resolve_hybrid_block_types(config_dict: Dict[str, Any]) -> list[str]:
+    """Resolve hybrid block sequence from config, including Nemotron-H MoE ('E')."""
+    layers_block_type = config_dict.get("layers_block_type", [])
+    if layers_block_type:
+        return [str(block) for block in layers_block_type]
+
+    pattern = config_dict.get("hybrid_override_pattern", "")
+    if not pattern:
+        return []
+
+    return [_NEMOTRON_H_CHAR_TO_BLOCK_TYPE.get(ch, ch) for ch in pattern]
+
+
+def _nemotron_h_config_layers_block_type(self) -> List[str]:
+    """Replacement ``layers_block_type`` property for :class:`NemotronHConfig`.
+
+    Extends the original implementation to support ``'E'`` (MoE expert block)
+    in ``hybrid_override_pattern`` in addition to the existing ``'M'``,
+    ``'*'``, and ``'-'`` characters.
+    """
+    pattern = getattr(self, "hybrid_override_pattern", "")
+    if not pattern:
+        return []
+    return [_NEMOTRON_H_CHAR_TO_BLOCK_TYPE.get(c, c) for c in pattern]
+
+
+def _patch_nemotron_h_config(config) -> None:
+    """Monkey-patch *NemotronHConfig* to support ``'E'`` → ``"moe"`` block type.
+
+    The stock ``configuration_nemotron_h.py`` shipped with the 4B/8B models
+    only recognises ``'M'``, ``'*'``, and ``'-'`` in its
+    ``hybrid_override_pattern``.  The 30B-A3B model introduces ``'E'`` for
+    MoE layers, which causes a ``KeyError`` in the original
+    ``layers_block_type`` property.
+
+    Calling this function replaces the property on the class the first time
+    and is a no-op on subsequent calls (idempotent).
+    """
+    config_class = type(config)
+    if getattr(config_class, "_edgellm_moe_patched", False):
+        return
+    config_class.layers_block_type = property(
+        _nemotron_h_config_layers_block_type)
+    config_class._edgellm_moe_patched = True
 
 
 def _select_rope_parameters(config_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -198,14 +251,16 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         llm_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
 
-    layers_block_type = config_dict.get("layers_block_type", [])
-    if not layers_block_type:
-        pattern = config_dict.get("hybrid_override_pattern", "")
-        num_mamba = pattern.count("M")
-        num_attention = pattern.count("*")
-    else:
-        num_mamba = sum(1 for t in layers_block_type if t == "mamba")
-        num_attention = sum(1 for t in layers_block_type if t == "attention")
+    if "partial_rotary_factor" not in llm_config:
+        if "partial_rotary_factor" in config_dict:
+            llm_config["partial_rotary_factor"] = config_dict[
+                "partial_rotary_factor"]
+        else:
+            llm_config["partial_rotary_factor"] = 1.0
+
+    layers_block_type = _resolve_hybrid_block_types(config_dict)
+    num_mamba = sum(1 for t in layers_block_type if t == "mamba")
+    num_attention = sum(1 for t in layers_block_type if t == "attention")
 
     llm_config["num_linear_attn_layers"] = num_mamba
     llm_config["num_attention_layers"] = num_attention

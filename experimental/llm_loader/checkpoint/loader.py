@@ -187,8 +187,10 @@ def _detect_key_prefix(keys: list) -> Tuple[str, str]:
     key_set = set(keys)
     for prefix in ("language_model.", "text_model.", "llm."):
         if (f"{prefix}model.embed_tokens.weight" in key_set
-                or any(k.startswith(f"{prefix}model.layers.0.")
-                       for k in keys)):
+                or any(k.startswith(f"{prefix}model.layers.0.") for k in keys)
+                or any(
+                    k.startswith(f"{prefix}backbone.layers.0.")
+                    for k in keys)):
             return prefix, ""
     # Qwen3-VL-2B: text decoder is under "model.language_model.*".
     # Strip the outer "model.language_model." and prepend "model." so that

@@ -526,11 +526,13 @@ def make_linear(
                 and config.quant.quant_type == QUANT_FP16):
             return FP16Linear(in_features, out_features, bias)
 
-    # Resolve effective quant type: layer_overrides take precedence for
-    # MIXED_PRECISION checkpoints, and for any checkpoint with per-layer overrides.
+    # Resolve effective quant type: layer_overrides take precedence.
+    # For MIXED_PRECISION, overrides contain ALL quantized layers; unlisted
+    # modules are unquantized (FP16).
     quant_type = config.quant.quant_type
     if module_name and config.quant.layer_overrides:
-        quant_type = config.quant.layer_overrides.get(module_name, quant_type)
+        fallback = QUANT_FP16 if config.quant.is_mixed_precision else quant_type
+        quant_type = config.quant.layer_overrides.get(module_name, fallback)
 
     if quant_type == QUANT_FP16:
         return FP16Linear(in_features, out_features, bias)
