@@ -486,6 +486,56 @@ def _(hidden_states,
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::int4_moe_plugin  (sparse MoE with INT4 expert GEMMs)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::int4_moe_plugin", mutates_args=())
+def int4_moe_plugin(
+    router_logits: torch.
+    Tensor,  # [B*S, E] float32 — gate output before softmax
+    hidden_states: torch.Tensor,  # [B, S, H] float16
+    fc_gate_up_qweights: torch.Tensor,  # [E, K//16, 2*I] Marlin int8
+    fc_gate_up_scales: torch.Tensor,  # [E, num_groups, I] float16
+    fc_down_qweights: torch.Tensor,  # [E, K//16, 2*D] Marlin int8
+    fc_down_scales: torch.Tensor,  # [E, num_groups, D] float16
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    quantization_group_size: int,
+) -> torch.Tensor:
+    """Stub: fused sparse MoE (softmax + topk + expert INT4 grouped GEMMs).
+
+    The gate GEMM (Linear) is traced separately as a standard MatMul.
+    This op receives the router logits and performs softmax + topk routing,
+    then dispatches tokens to experts for gate_up + SiLU + down projections
+    using Marlin-packed INT4 weights.
+
+    Mirrors ``trt_edgellm::Int4MoePlugin`` in tensorrt_edgellm.
+    """
+    batch_size, seq_len, _ = hidden_states.shape
+    return torch.zeros(batch_size,
+                       seq_len,
+                       hidden_size,
+                       dtype=hidden_states.dtype,
+                       device=hidden_states.device)
+
+
+@int4_moe_plugin.register_fake
+def _(router_logits, hidden_states, fc_gate_up_qweights, fc_gate_up_scales,
+      fc_down_qweights, fc_down_scales, num_experts, top_k, hidden_size,
+      moe_inter_size, activation_type, quantization_group_size):
+    batch_size, seq_len, _ = hidden_states.shape
+    return torch.empty(batch_size,
+                       seq_len,
+                       hidden_size,
+                       dtype=hidden_states.dtype,
+                       device=hidden_states.device)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt::gather_nd  (token selection: GatherND with batch_dims=1)
 # ---------------------------------------------------------------------------
 

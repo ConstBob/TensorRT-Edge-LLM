@@ -206,7 +206,7 @@ class Attention(nn.Module):
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
-        self.sliding_window_size = -1  # -1 means no sliding window
+        self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
 
         self.q_proj = make_linear(config,
                                   qkv_in_features,

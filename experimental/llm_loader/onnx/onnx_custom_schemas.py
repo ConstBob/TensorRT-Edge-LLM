@@ -739,6 +739,103 @@ _gated_delta_net_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# trt_edgellm::Int4MoePlugin
+# ---------------------------------------------------------------------------
+
+_int4_moe_plugin_schema = OpSchema(
+    name="Int4MoePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("Fused sparse MoE with INT4 expert GEMMs (Marlin layout).  "
+         "Receives router_logits (FP32, from traced gate GEMM) and "
+         "hidden_states; performs softmax + topk routing, then per-expert "
+         "grouped GEMM (gate_up + SiLU + down) with weighted combine.  "
+         "Mirrors trt_edgellm::Int4MoePlugin in tensorrt_edgellm."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="router_logits",
+            description=
+            "Router logits (B*S, E) FP32, from gate GEMM + cast, before softmax",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="hidden_states",
+            description="Input hidden states (B, S, D)",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_gate_up_qweights",
+            description=
+            "Fused gate+up proj Marlin-packed weights (E, K//16, 2*I) int8",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_gate_up_scales",
+            description="Fused gate+up proj scales (E, num_groups, I)",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_qweights",
+            description="Down proj Marlin-packed weights (E, K//16, 2*D) int8",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_scales",
+            description="Down proj scales (E, num_groups, D)",
+            type_str="T",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor (B, S, D)",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        ("T", ["tensor(float16)"], "FP16 data type."),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="num_experts",
+            type=OpSchema.AttrType.INT,
+            description="Number of experts",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="top_k",
+            type=OpSchema.AttrType.INT,
+            description="Top K experts per token",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="hidden_size",
+            type=OpSchema.AttrType.INT,
+            description="Hidden size D",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="moe_inter_size",
+            type=OpSchema.AttrType.INT,
+            description="MoE intermediate size I",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="activation_type",
+            type=OpSchema.AttrType.INT,
+            description="Activation function type (0=SiLU)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="quantization_group_size",
+            type=OpSchema.AttrType.INT,
+            description="Quantization group size G",
+            required=True,
+        ),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
     _vit_attention_plugin_schema,
@@ -750,6 +847,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _causal_conv1d_schema,
     _update_ssm_state_schema,
     _gated_delta_net_schema,
+    _int4_moe_plugin_schema,
 )
 
 _registered_llm_loader_schemas: bool = False

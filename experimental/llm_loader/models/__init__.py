@@ -22,10 +22,10 @@ Model variants live in sub-packages named after the model family:
   ``qwen3_5/``     - Qwen3.5 visual encoder + LLM (no deepstack)
   ``qwen2_5_vl/``  - Qwen2.5-VL visual encoder + LLM
   ``qwen3_asr/``   - Qwen3-ASR audio encoder + LLM
+  ``qwen3_moe/``   - Qwen3 sparse MoE decoder
   ``qwen3_omni/``  - Qwen3-Omni: visual + audio (re-exports) + LLM
   ``qwen3_tts/``   - Qwen3-TTS: audio encoder + talker + LLM
   ``internvl3/``   - InternVL3 visual encoder + LLM
   ``internvl3_5/`` - InternVL3.5 visual encoder + LLM (re-exports from internvl3)
   ``phi4mm/``      - Phi-4 Multimodal visual encoder + LLM
-
 """

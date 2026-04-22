@@ -8,7 +8,7 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 
 **CRITICAL (YOU MUST):**
 - Read and follow `CODING_GUIDELINES.md` for ALL code changes (C++ and Python)
-- NVIDIA copyright header on ALL new files (update year on modified files) — see `LICENSE_HEADER` for the template
+- NVIDIA copyright header on ALL new files (update year on modified files) — see `LICENSE_HEADER` for the SPDX template (pre-commit `insert-license` hook auto-injects it for `.py`, `.cpp`, `.cu`, `.cuh`, `.h`, `.hpp` files)
 - `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Always rely on `git` to do the sign off instead of directly adding sign off in commit message.
 - Do not add co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
@@ -50,7 +50,30 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 
 **C++ sub-packages:** `common/` (tensor, logging, utils), `kernels/` (FMHA/RoPE/MoE/Mamba/EAGLE), `plugins/` (TRT custom plugins), `builder/` (ONNX→TRT), `tokenizer/`, `multimodal/`, `profiling/`, `sampler/`.
 
-**Python package (`tensorrt_edgellm/`)** mirrors HuggingFace model interfaces with quantization-aware rewrites. CLI entry points are defined in `pyproject.toml`. See `docs/source/developer_guide/software-design/python-export-pipeline.md`.
+**Python package (`tensorrt_edgellm/`)** mirrors HuggingFace model interfaces with quantization-aware rewrites. See `docs/source/developer_guide/software-design/python-export-pipeline.md`.
+
+**Experimental LLM Loader (`experimental/llm_loader/`)** is a next-gen checkpoint-based model loader that implements LLM architectures from scratch using ONNX builtin + custom ops (the only format EdgeLLM's compiler accepts). Instead of tracing HuggingFace FX graphs (which are unstable), it reads the stable HF checkpoint weights directly.
+- `model.py` — `AutoModel.from_pretrained()` factory with registry-based dispatch
+- `config.py` — `ModelConfig`/`QuantConfig` for parsing HF `config.json`
+- `checkpoint/loader.py` — Safetensors weight loading; `repacking.py` — weight repacking
+- `onnx/export.py` — Export via `torch.onnx.export(dynamo=True)`; `onnx_custom_schemas.py` — custom op definitions; `dynamo_translations.py` — custom translation rules
+- `models/` — Per-architecture implementations: `default/` (standard decoder + Mamba hybrid), `nemotron_h/` (hybrid Mamba2), `qwen3_moe/` (sparse MoE)
+- `models/ops.py` — Shared custom operations; `models/linear.py` — Shared linear layer implementations
+- Supported quant formats: `fp16`, `fp8`, `nvfp4`, `int4_awq`, `int4_awq_modelopt`, `int4_gptq`, `int8_sq`, `mixed_precision`
+
+### CLI Entry Points (from `pyproject.toml`)
+
+| Command | Script |
+|---------|--------|
+| `tensorrt-edgellm-quantize-llm` | `tensorrt_edgellm.scripts.quantize_llm:main` |
+| `tensorrt-edgellm-export-llm` | `tensorrt_edgellm.scripts.export_llm:main` |
+| `tensorrt-edgellm-export-visual` | `tensorrt_edgellm.scripts.export_visual:main` |
+| `tensorrt-edgellm-export-audio` | `tensorrt_edgellm.scripts.export_audio:main` |
+| `tensorrt-edgellm-export-action` | `tensorrt_edgellm.scripts.export_action:main` |
+| `tensorrt-edgellm-quantize-draft` | `tensorrt_edgellm.scripts.quantize_draft:main` |
+| `tensorrt-edgellm-export-draft` | `tensorrt_edgellm.scripts.export_draft:main` |
+| `tensorrt-edgellm-insert-lora` | LoRA insertion into ONNX |
+| `tensorrt-edgellm-reduce-vocab` | Vocabulary reduction utility |
 
 ## Key Files
 
@@ -77,6 +100,8 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 - **Plugin shared library** — `NvInfer_edgellm_plugin` is shared (not static) because TRT loads plugins dynamically.
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
 - **HF model consistency** — Python model classes in `llm_models/` must stay consistent with HuggingFace APIs when adding new models.
+- **Pinned dependencies** — `transformers`, `nvidia-modelopt`, `onnx`, and `torch` versions are pinned in `pyproject.toml`. Changing them can break export/quantization. Check compatibility before bumping.
+- **Two model loader paths** — `tensorrt_edgellm/llm_models/` (production, HF-mirroring) and `experimental/llm_loader/models/` (next-gen, checkpoint-based ONNX custom ops) are independent implementations. Don't confuse them.
 
 ## Development Workflow
 
