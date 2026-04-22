@@ -22,14 +22,14 @@
 #include <cuda.h>
 #if defined(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT)
 #include <cuda_runtime.h>
-#if CUDA_VERSION < 12000
+#if CUDA_VERSION < 12800
 typedef CUlibrary cudaLibrary_t;
 static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 {
     CUresult r = cuLibraryUnload(lib);
     return static_cast<cudaError_t>(r);
 }
-#endif // CUDA_VERSION < 12000
+#endif // CUDA_VERSION < 12800
 #endif // TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT
 
 #include "cutedsl_all.h"
