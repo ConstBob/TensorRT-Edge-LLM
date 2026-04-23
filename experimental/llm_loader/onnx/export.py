@@ -456,6 +456,15 @@ def _fix_initializer_dtypes(onnx_path: str,
     logger.info(
         "_fix_initializer_dtypes: %d→FP16, %d→FP32, %d DQL deduped, "
         "saving...", n_to_fp16, n_to_fp32, n_deduped)
+    # Delete existing external data file before re-saving.  onnx.save_model
+    # opens the file in r+b mode and appends new tensors at the end, so the
+    # old data would remain as unreferenced garbage, doubling the file size.
+    ext_path = os.path.join(os.path.dirname(onnx_path), "model.onnx.data")
+    if os.path.isfile(ext_path):
+        old_size = os.path.getsize(ext_path)
+        logger.info("Removing stale external data %s (%.2f GB) before re-save",
+                    ext_path, old_size / 1e9)
+        os.remove(ext_path)
     _onnx.save_model(
         model,
         onnx_path,
