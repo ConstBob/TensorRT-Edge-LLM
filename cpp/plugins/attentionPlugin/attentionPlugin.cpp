@@ -745,10 +745,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
 
 #ifdef CUTE_DSL_FMHA_ENABLED
-        // Enable CuteDSL FMHA for single batch prefill usecase when FP8 KVCache is disabled.
-        // TODO: Enable multi-batch prefill and FP8 KVCache after we improve the kernel implementation.
-        bool const enableCuteDslFMHA = mUseCuteDslFMHA && !mEnableFp8KVCache && runtimeBatchSize == 1;
-        if (enableCuteDslFMHA)
+        if (mUseCuteDslFMHA)
         {
             float const qScale = mQkvScales[0];
             int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize : INT_MAX;
