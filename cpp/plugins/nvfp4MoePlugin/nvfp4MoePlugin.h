@@ -28,15 +28,24 @@ namespace trt_edgellm
 {
 namespace plugins
 {
+//! Router selection kernel chosen by the \c routing_mode plugin attribute.
+enum class Nvfp4MoeRoutingMode : int32_t
+{
+    kSOFTMAX_TOPK = 0,       //!< \c moeTopkSoftmax: softmax over experts + flat top-k + renormalize (default).
+    kSIGMOID_GROUP_TOPK = 1, //!< \c moeSigmoidGroupTopk: sigmoid + grouped top-k + renormalize + scale (NemotronH).
+};
+
 /*!
  * @brief TensorRT plugin: Nemotron-style MoE MLP W4A4 NVFP4 decode (no separate gate projection).
  *
  * Per expert the math is \c down_proj( act( up_proj(x) ) ): one up-projection and one down-projection
  * around a nonlinearity (\c act), matching the Nemotron MoE decode math (split W4A16 up/down GEMV kernels).
  * The up pass writes FP16 intermediate activations \c z; the down pass loads FP16 and evaluates \c act in FP32.
- * Router input is pre-softmax logits; routing applies \c moeTopkSoftmax (same kernel family as Int4MoePlugin)
- * inside \c enqueue() (via private \c enqueueDecoding) before W4A4 GEMVs. There is no separate gate-projection
- * weight tensor or gate GEMV.
+ * Router input is pre-activation router logits; \c enqueue() (via private \c enqueueDecoding) dispatches to one of
+ * two routing kernels before the decode GEMVs, selected by the \c routing_mode attribute:
+ *   - \c 0 (\c kSOFTMAX_TOPK, default): \c moeTopkSoftmax (softmax + flat top-k + renormalize).
+ *   - \c 1 (\c kSIGMOID_GROUP_TOPK): \c moeSigmoidGroupTopk (sigmoid + grouped top-k + renormalize + scale).
+ * There is no separate gate-projection weight tensor or gate GEMV.
  *
  * Layout: router logits are \c [batch * seq_len, num_experts] (2D; leading dim is \c num_tokens). Hidden
  * activations are either FP16 \c [batch, seq_len, hidden_size] (W4A16 path) or INT8 NVFP4-packed
@@ -49,6 +58,8 @@ namespace plugins
  * \c hidden_size); up block scales INT8 \c [E, hidden_size/16, moe_inter_size]. Down quantized weights are INT8
  * \c [E, moe_inter_size, hidden_size/2]; down block scales INT8 \c [E, moe_inter_size, hidden_size/16] (group size 16).
  * Per-expert FP32 global scales \c [E] for up and down.
+ * \c e_score_correction_bias \c [E] FP32 is input [10]: used as optional bias by \c moeTopkSoftmax (mode 0) and as
+ * the expert load-balancing bias by \c moeSigmoidGroupTopk (mode 1). Pass zeros when no bias is desired.
  */
 class Nvfp4MoePlugin : public nvinfer1::IPluginV3,
                        public nvinfer1::IPluginV3OneCore,
@@ -57,7 +68,9 @@ class Nvfp4MoePlugin : public nvinfer1::IPluginV3,
 {
 public:
     Nvfp4MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
-        nvinfer1::ActivationType activationType = static_cast<nvinfer1::ActivationType>(0));
+        nvinfer1::ActivationType activationType = static_cast<nvinfer1::ActivationType>(0), int32_t nGroup = 1,
+        int32_t topkGroup = 1, int32_t normTopkProb = 1, float routedScalingFactor = 1.0f,
+        int32_t routingMode = static_cast<int32_t>(Nvfp4MoeRoutingMode::kSOFTMAX_TOPK));
 
     Nvfp4MoePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
@@ -105,7 +118,7 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 private:
-    //! Top-k softmax then W4A16 or W4A4 decode GEMVs (FP16 or NVFP4-packed hidden; NVFP4 expert weights).
+    //! Sigmoid group top-k routing then W4A16 or W4A4 decode GEMVs (FP16 or NVFP4-packed hidden; NVFP4 expert weights).
     int32_t enqueueDecoding(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
 
@@ -119,6 +132,13 @@ private:
     nvinfer1::ActivationType mActivationType{};
     //! Marlin NVFP4 block scales along \c K; only \c 16 is supported (serialized for parity with \c Int4MoePlugin).
     int32_t mQuantizationGroupSize{};
+    //! NemotronH sigmoid group top-k routing parameters (used when \c mRoutingMode == \c kSIGMOID_GROUP_TOPK).
+    int32_t mNGroup{1};
+    int32_t mTopkGroup{1};
+    int32_t mNormTopkProb{1}; //!< Stored as int32 for serialization; nonzero = true.
+    float mRoutedScalingFactor{1.0f};
+    //! Router selection kernel: see \c Nvfp4MoeRoutingMode.
+    int32_t mRoutingMode{static_cast<int32_t>(Nvfp4MoeRoutingMode::kSOFTMAX_TOPK)};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;

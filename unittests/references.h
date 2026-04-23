@@ -149,3 +149,8 @@ void referenceMoeTopK(std::vector<float> const& softmaxOutput, std::vector<float
 void referenceMoeTopkSoftmax(std::vector<float> const& gatingOutput, std::vector<float> const* correctionBias,
     std::vector<float>& topkWeights, std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts,
     int32_t topk, bool renormalize, float moeSoftcapping = 0.0f);
+
+// MoE Sigmoid Group TopK reference (NemotronH routing)
+void referenceSigmoidGroupTopk(std::vector<float> const& logits, std::vector<float> const* correctionBias,
+    std::vector<float>& topkWeights, std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts,
+    int32_t topK, int32_t nGroup, int32_t topkGroup, bool normTopkProb, float routedScalingFactor);
