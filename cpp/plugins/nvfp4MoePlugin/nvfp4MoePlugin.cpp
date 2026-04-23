@@ -23,6 +23,7 @@
 #include "common/logger.h"
 #include "common/stringUtils.h"
 #include "common/tensor.h"
+#include "kernels/moe/moeSigmoidGroupTopkKernels.h"
 #include "kernels/moe/moeTopkSoftmaxKernels.h"
 #include "kernels/moe/nvf4_w4an/kernels.h"
 #include "plugins/utils/pluginUtils.h"
@@ -51,9 +52,10 @@ namespace plugins
 //   y_e = down_proj_e( act( up_proj_e(x) ) ),
 // then outputs are combined with Top-K router weights. There is no separate gate projection.
 //
-// Gating: input [0] is **pre-softmax** router logits FP32 \c [batch * seq_len, num_experts] (2D row-major;
-// leading dim is \c num_tokens). Like Int4MoePlugin, enqueue() runs kernel::moeTopkSoftmax()
-// (moeTopkSoftmaxKernels) **before** decode GEMVs to produce per-token top-k weights and indices; those are
+// Gating: input [0] is router logits FP32 \c [batch * seq_len, num_experts] (2D row-major;
+// leading dim is \c num_tokens). enqueue() runs one of two routing kernels chosen by the \c routing_mode attribute:
+// \c kSOFTMAX_TOPK (default) calls kernel::moeTopkSoftmax, \c kSIGMOID_GROUP_TOPK calls kernel::moeSigmoidGroupTopk
+// **before** decode GEMVs to produce per-token top-k weights and indices; those are
 // passed to launchNemotronMoeW4A16DecodeUpGemvCuda then launchNemotronMoeW4A16DecodeDownGemvCuda (no dense gate).
 //
 // Shapes: router \c d[0] must equal \c batch * seq_len from hidden_states [1]; hidden states are FP16
@@ -61,7 +63,7 @@ namespace plugins
 // Output is FP16 with the same shape as hidden states \c [batch, seq_len, hidden_size].
 //
 // Inputs (see supportsFormatCombination / enqueue):
-//   [0] router logits FP32 [batch * seq_len, num_experts] (pre-softmax; softmax+top-k inside plugin)
+//   [0] router logits FP32 [batch * seq_len, num_experts] (pre-sigmoid; sigmoid+grouped-top-k inside plugin)
 //   [1] hidden activations: FP16 \c [batch, seq_len, hidden_size] (W4A16), or INT8 NVFP4 packed payload \c
 //   [batch, seq_len, hidden_size/2] (W4A4; two FP4 nibbles per byte along hidden)
 //   [2] hidden_block_scale: INT8 — W4A4: \c [batch, seq_len, hidden_size/16] (Marlin tile scale bytes). W4A16: unused
@@ -71,15 +73,19 @@ namespace plugins
 //   FP32 per-expert global scale \c [E]
 //   [7][8][9] down_proj: INT8 NVFP4 payload \c [E, moe_inter_size, K/2]; INT8 block scales \c [E, moe_inter_size,
 //   K/16]; FP32 per-expert global scale \c [E]
+//   [10] e_score_correction_bias: FP32 \c [num_experts] — NemotronH expert load balancing bias (optional; zeros if
+//   unset)
 
 namespace
 {
 // ONNX custom-op import uses version "1" when the node has no plugin_version (same as Int4MoePlugin).
 constexpr char const* kNVFP4_MOE_PLUGIN_VERSION{"1"};
 constexpr char const* kNVFP4_MOE_PLUGIN_NAME{"Nvfp4MoePlugin"};
-constexpr int32_t kNbPluginInputs{10};
+constexpr int32_t kNbPluginInputs{11};
 //! NVFP4 Marlin tile scale stride along \c hidden_size; other values are rejected at build time.
 constexpr int32_t kNvfp4MoeQuantizationGroupSize{16};
+//! Cutlass Atom tile size in bytes: 128 M-rows × 4 K-columns per tile.
+constexpr int64_t kCutlassAtomTileBytes{512};
 
 #if SUPPORTS_FP4
 //! Map serialized \c activation_type (stored as \c nvinfer1::ActivationType-sized int32, same as \c Int4MoePlugin)
@@ -95,26 +101,29 @@ MoEActivationKind nvfp4StoredActivationToKernelKind(ActivationType const t) noex
 }
 #endif // SUPPORTS_FP4
 
-// Workspace for top-k softmax temporaries. Sized by max num_tokens over the dynamic range.
+// Workspace for sigmoid group top-k routing temporaries. Sized by max num_tokens over the dynamic range.
 // W4A4 decode GEMV kernels take explicit batch and seq_len (same contract as W4A16 decode); num_tokens = batch *
 // seq_len. If a separate prefill GEMM kernel is added for performance, extend this helper (or add a sibling) for any
 // extra temporaries that path requires.
-size_t computeNvfp4MoeDecodeWorkspaceSize(
-    int32_t numTokens, int32_t numExperts, int32_t topK, int32_t moeInterSize, int32_t hiddenSize) noexcept
+size_t computeNvfp4MoeDecodeWorkspaceSize(int32_t numTokens, int32_t numExperts, int32_t topK, int32_t moeInterSize,
+    int32_t hiddenSize, int32_t routingMode) noexcept
 {
     (void) hiddenSize;
     try
     {
-        // Optional temp storage when numExperts is not a power of two (same contract as Int4MoePlugin).
-        size_t softmaxWorkspaceSizeBytes = trt_edgellm::kernel::getMoeTopkSoftmaxWorkspaceSize(numTokens, numExperts);
         size_t size = 0;
-        // moeTopkSoftmax outputs: selected weights and expert indices [numTokens, topK]
+        // Routing kernel outputs: selected weights and expert indices [numTokens, topK].
         size = accumulateWorkspaceSize(size, rt::Coords{numTokens, topK}, DataType::kFLOAT);
         size = accumulateWorkspaceSize(size, rt::Coords{numTokens, topK}, DataType::kINT32);
-        if (softmaxWorkspaceSizeBytes > 0)
+        if (routingMode == static_cast<int32_t>(Nvfp4MoeRoutingMode::kSOFTMAX_TOPK))
         {
-            size = accumulateWorkspaceSize(
-                size, rt::Coords{static_cast<int64_t>(softmaxWorkspaceSizeBytes)}, DataType::kINT8);
+            size_t const softmaxWorkspaceSizeBytes
+                = trt_edgellm::kernel::getMoeTopkSoftmaxWorkspaceSize(numTokens, numExperts);
+            if (softmaxWorkspaceSizeBytes > 0)
+            {
+                size = accumulateWorkspaceSize(
+                    size, rt::Coords{static_cast<int64_t>(softmaxWorkspaceSizeBytes)}, DataType::kINT8);
+            }
         }
         int64_t const interElems = trt_edgellm::nemotronMoeW4A16InterBufferNumElems(numTokens, topK, moeInterSize);
         size = accumulateWorkspaceSize(size, rt::Coords{interElems}, DataType::kHALF);
@@ -134,7 +143,8 @@ std::vector<PluginField> Nvfp4MoePluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(Nvfp4MoePluginCreator);
 
 Nvfp4MoePlugin::Nvfp4MoePlugin(std::string const& name, int32_t const numExperts, int32_t const topK,
-    int32_t const hiddenSize, int32_t const moeInterSize, ActivationType const activationType)
+    int32_t const hiddenSize, int32_t const moeInterSize, ActivationType const activationType, int32_t const nGroup,
+    int32_t const topkGroup, int32_t const normTopkProb, float const routedScalingFactor, int32_t const routingMode)
     : mLayerName(name)
     , mNumExperts(numExperts)
     , mTopK(topK)
@@ -142,6 +152,11 @@ Nvfp4MoePlugin::Nvfp4MoePlugin(std::string const& name, int32_t const numExperts
     , mMoeInterSize(moeInterSize)
     , mActivationType(activationType)
     , mQuantizationGroupSize(kNvfp4MoeQuantizationGroupSize)
+    , mNGroup(nGroup)
+    , mTopkGroup(topkGroup)
+    , mNormTopkProb(normTopkProb)
+    , mRoutedScalingFactor(routedScalingFactor)
+    , mRoutingMode(routingMode)
 {
 }
 
@@ -177,6 +192,26 @@ Nvfp4MoePlugin::Nvfp4MoePlugin(std::string const& name, PluginFieldCollection co
         {
             mQuantizationGroupSize = *static_cast<int32_t const*>(fc->fields[i].data);
         }
+        else if (fieldName == "n_group")
+        {
+            mNGroup = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "topk_group")
+        {
+            mTopkGroup = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "norm_topk_prob")
+        {
+            mNormTopkProb = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "routed_scaling_factor")
+        {
+            mRoutedScalingFactor = *static_cast<float const*>(fc->fields[i].data);
+        }
+        else if (fieldName == "routing_mode")
+        {
+            mRoutingMode = *static_cast<int32_t const*>(fc->fields[i].data);
+        }
     }
     if (mQuantizationGroupSize <= 0)
     {
@@ -186,6 +221,15 @@ Nvfp4MoePlugin::Nvfp4MoePlugin(std::string const& name, PluginFieldCollection co
     {
         throw std::invalid_argument(format::fmtstr("Nvfp4MoePlugin: quantization_group_size must be %d, got %d",
             static_cast<int>(kNvfp4MoeQuantizationGroupSize), static_cast<int>(mQuantizationGroupSize)));
+    }
+    if (mRoutingMode != static_cast<int32_t>(Nvfp4MoeRoutingMode::kSOFTMAX_TOPK)
+        && mRoutingMode != static_cast<int32_t>(Nvfp4MoeRoutingMode::kSIGMOID_GROUP_TOPK))
+    {
+        throw std::invalid_argument(
+            format::fmtstr("Nvfp4MoePlugin: routing_mode must be %d (SOFTMAX_TOPK) or %d "
+                           "(SIGMOID_GROUP_TOPK), got %d",
+                static_cast<int>(Nvfp4MoeRoutingMode::kSOFTMAX_TOPK),
+                static_cast<int>(Nvfp4MoeRoutingMode::kSIGMOID_GROUP_TOPK), static_cast<int>(mRoutingMode)));
     }
 }
 
@@ -208,7 +252,8 @@ IPluginV3* Nvfp4MoePlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Nvfp4MoePlugin(mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType);
+        auto* plugin = new Nvfp4MoePlugin(mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType,
+            mNGroup, mTopkGroup, mNormTopkProb, mRoutedScalingFactor, mRoutingMode);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -277,10 +322,16 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
 {
     assert(nbInputs == kNbPluginInputs && nbOutputs == 1);
     assert(pos < (nbInputs + nbOutputs));
-    (void) nbInputs;
-    (void) nbOutputs;
+
+    if (nbInputs != kNbPluginInputs || nbOutputs != 1)
+    {
+        LOG_WARNING("Nvfp4MoePlugin::supportsFormatCombination: unexpected nbInputs=%d (expected %d) nbOutputs=%d",
+            nbInputs, kNbPluginInputs, nbOutputs);
+        return false;
+    }
 
     auto const& td = inOut[pos].desc;
+
     bool ok{true};
     ok &= td.format == TensorFormat::kLINEAR;
 
@@ -345,20 +396,17 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
         return s;
     };
 
-    // Atom-layout block scales for up-proj: [E, padded_H, I/16] INT8 (M=hidden padded to 128, K_sf=inter/16 padded to
-    // 4).
+    // Block scales: atom-layout swizzled [E, padded_M_sf, inter] — M padded to multiple of 128.
     auto const checkUpBlockScale = [this](PluginTensorDesc const& t) {
         bool s{true};
         s &= t.type == DataType::kINT8;
         s &= t.dims.nbDims == 3;
         if (s)
         {
-            int32_t const paddedM = ((mHiddenSize + 127) / 128) * 128;
-            int32_t const numSfCols = mMoeInterSize / kNvfp4MoeQuantizationGroupSize;
-            int32_t const paddedSfCols = ((numSfCols + 3) / 4) * 4;
+            int32_t const paddedMSfRows = ((mHiddenSize + 127) / 128) * 8;
             s &= t.dims.d[0] == mNumExperts;
-            s &= t.dims.d[1] == paddedM;
-            s &= t.dims.d[2] == paddedSfCols;
+            s &= t.dims.d[1] == paddedMSfRows;
+            s &= t.dims.d[2] == mMoeInterSize;
         }
         return s;
     };
@@ -398,20 +446,17 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
         return s;
     };
 
-    // Atom-layout block scales for down-proj: [E, padded_I, H/16] INT8 (M=inter padded to 128, K_sf=hidden/16 padded to
-    // 4).
+    // Block scales for down-proj: [E, padded_M, H/16] INT8 — M=inter padded to multiple of 128.
     auto const checkDownBlockScale = [this](PluginTensorDesc const& t) {
         bool s{true};
         s &= t.type == DataType::kINT8;
         s &= t.dims.nbDims == 3;
         if (s)
         {
-            int32_t const paddedM = ((mMoeInterSize + 127) / 128) * 128;
-            int32_t const numSfCols = mHiddenSize / kNvfp4MoeQuantizationGroupSize;
-            int32_t const paddedSfCols = ((numSfCols + 3) / 4) * 4;
+            int32_t const paddedMDn = ((mMoeInterSize + 127) / 128) * 128;
             s &= t.dims.d[0] == mNumExperts;
-            s &= t.dims.d[1] == paddedM;
-            s &= t.dims.d[2] == paddedSfCols;
+            s &= t.dims.d[1] == paddedMDn;
+            s &= t.dims.d[2] == mHiddenSize / kNvfp4MoeQuantizationGroupSize;
         }
         return s;
     };
@@ -442,7 +487,19 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
     case 7: return ok && checkDownPayload(td);
     case 8: return ok && checkDownBlockScale(td);
     case 9: return ok && checkDownGlobalScale(td);
-    case 10: return ok && checkOutputFp16(td);
+    case 10:
+    {
+        // e_score_correction_bias: FP32 [num_experts]
+        bool s{true};
+        s &= td.type == DataType::kFLOAT;
+        s &= td.dims.nbDims == 1;
+        if (s)
+        {
+            s &= td.dims.d[0] == mNumExperts;
+        }
+        return ok && s;
+    }
+    case 11: return ok && checkOutputFp16(td);
     default: return false;
     }
 }
@@ -516,30 +573,59 @@ int32_t Nvfp4MoePlugin::configurePlugin(
             static_cast<int>(mNumExperts), static_cast<int>(mMoeInterSize), static_cast<int>(mHiddenSize / 2));
         return -1;
     }
-    // Atom-layout block scales: [E, padded_M, padded_sf_cols] where
-    //   up:   M=hidden (padded to 128), sf_cols=inter/16 (padded to 4)
-    //   down: M=inter  (padded to 128), sf_cols=hidden/16 (padded to 4)
-    int32_t const upPaddedM = ((mHiddenSize + 127) / 128) * 128;
-    int32_t const upNumSfCols = mMoeInterSize / kNvfp4MoeQuantizationGroupSize;
-    int32_t const upPaddedSfCols = ((upNumSfCols + 3) / 4) * 4;
-    if (static_cast<int32_t>(in[5].max.d[1]) != upPaddedM || static_cast<int32_t>(in[5].max.d[2]) != upPaddedSfCols)
     {
-        LOG_ERROR(
-            "Nvfp4MoePlugin: up_proj block_scale shape mismatch (expected [E, padded_hidden, padded_inter/16] = "
-            "[%d, %d, %d])",
-            static_cast<int>(mNumExperts), static_cast<int>(upPaddedM), static_cast<int>(upPaddedSfCols));
-        return -1;
+        int32_t const paddedUpSfM = ((mHiddenSize + 127) / 128) * 8;
+        if (static_cast<int32_t>(in[5].max.d[1]) != paddedUpSfM
+            || static_cast<int32_t>(in[5].max.d[2]) != mMoeInterSize)
+        {
+            LOG_ERROR("Nvfp4MoePlugin: up_proj block_scale shape mismatch (expected [E, %d, %d] with M padded to 128)",
+                paddedUpSfM, static_cast<int>(mMoeInterSize));
+            return -1;
+        }
     }
-    int32_t const dnPaddedM = ((mMoeInterSize + 127) / 128) * 128;
-    int32_t const dnNumSfCols = mHiddenSize / kNvfp4MoeQuantizationGroupSize;
-    int32_t const dnPaddedSfCols = ((dnNumSfCols + 3) / 4) * 4;
-    if (static_cast<int32_t>(in[8].max.d[1]) != dnPaddedM || static_cast<int32_t>(in[8].max.d[2]) != dnPaddedSfCols)
+    // Cutlass Atom layout requires SF buffer per expert to be padded to a multiple of 128.
+    // scaleExpertStride is in int32 units; the INT8 tensor must hold at least that many *bytes* (×4).
     {
-        LOG_ERROR(
-            "Nvfp4MoePlugin: down_proj block_scale shape mismatch (expected [E, padded_inter, padded_hidden/16] = "
-            "[%d, %d, %d])",
-            static_cast<int>(mNumExperts), static_cast<int>(dnPaddedM), static_cast<int>(dnPaddedSfCols));
-        return -1;
+        int64_t const upSfBytesPerExpert = static_cast<int64_t>(in[5].max.d[1]) * static_cast<int64_t>(in[5].max.d[2]);
+        int32_t const numMTilesUp = (mHiddenSize + 127) / 128;
+        int32_t const numSfColsUp = mMoeInterSize / kNvfp4MoeQuantizationGroupSize;
+        int32_t const numKTilesUp = (numSfColsUp + 3) / 4;
+        int64_t const expectedUpSfBytes = static_cast<int64_t>(numMTilesUp) * numKTilesUp * kCutlassAtomTileBytes;
+        if (upSfBytesPerExpert < expectedUpSfBytes)
+        {
+            LOG_ERROR(
+                "Nvfp4MoePlugin: up_proj block_scale per-expert size (%lld bytes) is smaller than Cutlass Atom "
+                "layout requires (%lld bytes); SF must be padded to a multiple of 128",
+                static_cast<long long>(upSfBytesPerExpert), static_cast<long long>(expectedUpSfBytes));
+            return -1;
+        }
+    }
+    {
+        int32_t const paddedDnSfM = ((mMoeInterSize + 127) / 128) * 128;
+        if (static_cast<int32_t>(in[8].max.d[1]) != paddedDnSfM
+            || static_cast<int32_t>(in[8].max.d[2]) != mHiddenSize / kNvfp4MoeQuantizationGroupSize)
+        {
+            LOG_ERROR(
+                "Nvfp4MoePlugin: down_proj block_scale shape mismatch (expected [E, %d, %d] with M padded to 128)",
+                paddedDnSfM, static_cast<int>(mHiddenSize / kNvfp4MoeQuantizationGroupSize));
+            return -1;
+        }
+    }
+    // Cutlass Atom layout requires SF buffer per expert to be padded to a multiple of 128.
+    {
+        int64_t const dnSfBytesPerExpert = static_cast<int64_t>(in[8].max.d[1]) * static_cast<int64_t>(in[8].max.d[2]);
+        int32_t const numMTilesDn = (mMoeInterSize + 127) / 128;
+        int32_t const numSfColsDn = mHiddenSize / kNvfp4MoeQuantizationGroupSize;
+        int32_t const numKTilesDn = (numSfColsDn + 3) / 4;
+        int64_t const expectedDnSfBytes = static_cast<int64_t>(numMTilesDn) * numKTilesDn * kCutlassAtomTileBytes;
+        if (dnSfBytesPerExpert < expectedDnSfBytes)
+        {
+            LOG_ERROR(
+                "Nvfp4MoePlugin: down_proj block_scale per-expert size (%lld bytes) is smaller than Cutlass Atom "
+                "layout requires (%lld bytes); SF must be padded to a multiple of 128",
+                static_cast<long long>(dnSfBytesPerExpert), static_cast<long long>(expectedDnSfBytes));
+            return -1;
+        }
     }
     // When bounds are static, router token count must match hidden_states batch × seq_len (supports seq_len > 1).
     {
@@ -551,6 +637,28 @@ int32_t Nvfp4MoePlugin::configurePlugin(
             LOG_ERROR(
                 "Nvfp4MoePlugin: router_logits max d[0] (%lld) must equal hidden_states max d[0]*d[1] (%lld*%lld)",
                 static_cast<long long>(routerTokens), static_cast<long long>(maxB), static_cast<long long>(maxS));
+            return -1;
+        }
+    }
+    // Validate e_score_correction_bias [10] shape.
+    if (static_cast<int32_t>(in[10].max.d[0]) != mNumExperts)
+    {
+        LOG_ERROR("Nvfp4MoePlugin: e_score_correction_bias d[0] (%d) must equal num_experts (%d)",
+            static_cast<int>(in[10].max.d[0]), mNumExperts);
+        return -1;
+    }
+    // Validate routing group parameters for MoeSigmoidGroupTopk.
+    if (mRoutingMode == static_cast<int32_t>(Nvfp4MoeRoutingMode::kSIGMOID_GROUP_TOPK))
+    {
+        if (mNGroup <= 0 || mNumExperts % mNGroup != 0)
+        {
+            LOG_ERROR("Nvfp4MoePlugin: n_group (%d) must be positive and evenly divide num_experts (%d)", mNGroup,
+                mNumExperts);
+            return -1;
+        }
+        if (mTopkGroup <= 0 || mTopkGroup > mNGroup)
+        {
+            LOG_ERROR("Nvfp4MoePlugin: topk_group (%d) must be in [1, n_group=%d]", mTopkGroup, mNGroup);
             return -1;
         }
     }
@@ -568,7 +676,7 @@ size_t Nvfp4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, i
     int64_t const maxTokens = std::max(static_cast<int64_t>(inputs[0].max.d[0]), maxHiddenTokens);
     int32_t const numTokens
         = static_cast<int32_t>(std::min(maxTokens, static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
-    return computeNvfp4MoeDecodeWorkspaceSize(numTokens, mNumExperts, mTopK, mMoeInterSize, mHiddenSize);
+    return computeNvfp4MoeDecodeWorkspaceSize(numTokens, mNumExperts, mTopK, mMoeInterSize, mHiddenSize, mRoutingMode);
 }
 
 int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
@@ -645,28 +753,44 @@ int32_t Nvfp4MoePlugin::enqueueDecoding(PluginTensorDesc const* inputDesc, Plugi
         return -1;
     }
 
-    size_t const softmaxWsBytes = trt_edgellm::kernel::getMoeTopkSoftmaxWorkspaceSize(numTokens, mNumExperts);
-
     // ==================== Workspace allocation (order matches computeNvfp4MoeDecodeWorkspaceSize) ====================
     std::byte* ws = static_cast<std::byte*>(workspace);
-    // Buffers for kernel::moeTopkSoftmax: FP32 weights and INT32 expert indices per token-slot.
+    // Buffers for routing kernel outputs: FP32 weights and INT32 expert indices per token-slot.
     float* topkWeightsPtr
         = static_cast<float*>(assignTensorFromWorkspace(ws, {numTokens, mTopK}, DataType::kFLOAT).rawPointer());
     int32_t* topkIndicesPtr
         = static_cast<int32_t*>(assignTensorFromWorkspace(ws, {numTokens, mTopK}, DataType::kINT32).rawPointer());
-    void* softmaxWsPtr = (softmaxWsBytes > 0)
-        ? assignTensorFromWorkspace(ws, {static_cast<int64_t>(softmaxWsBytes)}, DataType::kINT8).rawPointer()
-        : nullptr;
+    void* softmaxWsPtr = nullptr;
+    size_t const softmaxWsBytes = trt_edgellm::kernel::getMoeTopkSoftmaxWorkspaceSize(numTokens, mNumExperts);
+    if (mRoutingMode == static_cast<int32_t>(Nvfp4MoeRoutingMode::kSOFTMAX_TOPK) && softmaxWsBytes > 0)
+    {
+        softmaxWsPtr
+            = assignTensorFromWorkspace(ws, {static_cast<int64_t>(softmaxWsBytes)}, DataType::kINT8).rawPointer();
+    }
     rt::Tensor routerLogitsTensor(
         const_cast<void*>(inputs[0]), rt::Coords{inputDesc[0].dims}, rt::DeviceType::kGPU, DataType::kFLOAT);
     rt::Tensor topkWeightsTensor(topkWeightsPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
     rt::Tensor topkIndicesTensor(topkIndicesPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, DataType::kINT32);
 
-    // ==================== Step 1: TopK softmax on router logits (before any W4A4 decode GEMV) ====================
-    // Uses moeTopkSoftmaxKernels::moeTopkSoftmax (same entry point as Int4MoePlugin): softmax over experts,
-    // then top-k selection; renormalize=true so selected weights sum to 1 per token.
-    trt_edgellm::kernel::moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK, softmaxWsPtr,
-        softmaxWsBytes, stream, true, 0.0F);
+    // e_score_correction_bias: input [10] FP32 [num_experts]
+    rt::Tensor correctionBiasTensor(
+        const_cast<void*>(inputs[10]), rt::Coords{mNumExperts}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::OptionalInputTensor correctionBiasOpt = correctionBiasTensor;
+
+    // ==================== Step 1: Route tokens to experts via the selected kernel ====================
+    if (mRoutingMode == static_cast<int32_t>(Nvfp4MoeRoutingMode::kSIGMOID_GROUP_TOPK))
+    {
+        // moeSigmoidGroupTopk: sigmoid activation, grouped top-k selection, optional renormalization and scaling —
+        // matching HuggingFace NemotronHMoE.route_tokens_to_experts.
+        trt_edgellm::kernel::moeSigmoidGroupTopk(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK,
+            mNGroup, mTopkGroup, mNormTopkProb != 0, mRoutedScalingFactor, stream, correctionBiasOpt);
+    }
+    else
+    {
+        // moeTopkSoftmax: softmax over experts, flat top-k, renormalize=true — legacy path used by most MoE models.
+        trt_edgellm::kernel::moeTopkSoftmax(routerLogitsTensor, topkWeightsTensor, topkIndicesTensor, mTopK,
+            softmaxWsPtr, softmaxWsBytes, stream, true, 0.0f, correctionBiasOpt);
+    }
     CUDA_CHECK(cudaGetLastError());
 
 #if SUPPORTS_FP4
@@ -810,6 +934,12 @@ PluginFieldCollection const* Nvfp4MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("moe_inter_size", &mMoeInterSize, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("activation_type", &mActivationType, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("quantization_group_size", &mQuantizationGroupSize, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("n_group", &mNGroup, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("topk_group", &mTopkGroup, PluginFieldType::kINT32, 1);
+        // Serialize bool as INT32 for portability.
+        mDataToSerialize.emplace_back("norm_topk_prob", &mNormTopkProb, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("routed_scaling_factor", &mRoutedScalingFactor, PluginFieldType::kFLOAT32, 1);
+        mDataToSerialize.emplace_back("routing_mode", &mRoutingMode, PluginFieldType::kINT32, 1);
 
         mFCToSerialize.nbFields = mDataToSerialize.size();
         mFCToSerialize.fields = mDataToSerialize.data();
@@ -834,6 +964,11 @@ Nvfp4MoePluginCreator::Nvfp4MoePluginCreator()
     mPluginAttributes.emplace_back(PluginField("moe_inter_size", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("activation_type", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("quantization_group_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("n_group", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("topk_group", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("norm_topk_prob", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("routed_scaling_factor", nullptr, PluginFieldType::kFLOAT32, 1));
+    mPluginAttributes.emplace_back(PluginField("routing_mode", nullptr, PluginFieldType::kINT32, 1));
 
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();

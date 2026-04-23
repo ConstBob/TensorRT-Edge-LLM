@@ -1517,3 +1517,127 @@ void referenceMoeTopkSoftmax(std::vector<float> const& gatingOutput, std::vector
     referenceMoeSoftmax(gatingOutput, correctionBias, softmaxOutput, numTokens, numExperts, moeSoftcapping);
     referenceMoeTopK(softmaxOutput, topkWeights, topkIndices, numTokens, numExperts, topk, renormalize);
 }
+
+void referenceSigmoidGroupTopk(std::vector<float> const& logits, std::vector<float> const* correctionBias,
+    std::vector<float>& topkWeights, std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts,
+    int32_t topK, int32_t nGroup, int32_t topkGroup, bool normTopkProb, float routedScalingFactor)
+{
+    topkWeights.resize(numTokens * topK);
+    topkIndices.resize(numTokens * topK);
+
+    int32_t const expertsPerGroup = numExperts / nGroup;
+
+    for (int32_t t = 0; t < numTokens; t++)
+    {
+        int32_t const tokenOffset = t * numExperts;
+
+        // Step 1: sigmoid
+        std::vector<float> sigmoidScores(numExperts);
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            sigmoidScores[e] = 1.0f / (1.0f + std::exp(-logits[tokenOffset + e]));
+        }
+
+        // Step 2: biased = sigmoid + correction bias
+        std::vector<float> biasedScores(numExperts);
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            biasedScores[e] = sigmoidScores[e];
+            if (correctionBias != nullptr)
+            {
+                biasedScores[e] += (*correctionBias)[e];
+            }
+        }
+
+        // Step 3: top-2 per group → groupScores
+        std::vector<float> groupScores(nGroup);
+        for (int32_t g = 0; g < nGroup; g++)
+        {
+            int32_t const groupStart = g * expertsPerGroup;
+            float top1 = -FLT_MAX;
+            float top2 = -FLT_MAX;
+            for (int32_t i = 0; i < expertsPerGroup; i++)
+            {
+                float val = biasedScores[groupStart + i];
+                if (val > top1)
+                {
+                    top2 = top1;
+                    top1 = val;
+                }
+                else if (val > top2)
+                {
+                    top2 = val;
+                }
+            }
+            groupScores[g] = top1 + top2;
+        }
+
+        // Step 4: select topkGroup groups
+        std::vector<bool> groupSelected(nGroup, false);
+        for (int32_t i = 0; i < topkGroup; i++)
+        {
+            int32_t bestGroup = -1;
+            float bestScore = -FLT_MAX;
+            for (int32_t g = 0; g < nGroup; g++)
+            {
+                if (!groupSelected[g] && groupScores[g] > bestScore)
+                {
+                    bestScore = groupScores[g];
+                    bestGroup = g;
+                }
+            }
+            if (bestGroup >= 0)
+            {
+                groupSelected[bestGroup] = true;
+            }
+        }
+
+        // Step 5: mask unselected groups
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            int32_t const group = e / expertsPerGroup;
+            if (!groupSelected[group])
+            {
+                biasedScores[e] = -FLT_MAX;
+            }
+        }
+
+        // Step 6: top-K from masked biased scores
+        float renormSum = 0.0f;
+        for (int32_t k = 0; k < topK; k++)
+        {
+            int32_t bestExpert = 0;
+            float bestScore = -FLT_MAX;
+            for (int32_t e = 0; e < numExperts; e++)
+            {
+                if (biasedScores[e] > bestScore)
+                {
+                    bestScore = biasedScores[e];
+                    bestExpert = e;
+                }
+            }
+            topkIndices[t * topK + k] = bestExpert;
+            // Gather weight from ORIGINAL sigmoid scores
+            topkWeights[t * topK + k] = sigmoidScores[bestExpert];
+            renormSum += sigmoidScores[bestExpert];
+            // Mask out this expert
+            biasedScores[bestExpert] = -FLT_MAX;
+        }
+
+        // Step 7: renormalize
+        if (normTopkProb && renormSum > 0.0f)
+        {
+            float invSum = 1.0f / renormSum;
+            for (int32_t k = 0; k < topK; k++)
+            {
+                topkWeights[t * topK + k] *= invSum;
+            }
+        }
+
+        // Step 8: scale
+        for (int32_t k = 0; k < topK; k++)
+        {
+            topkWeights[t * topK + k] *= routedScalingFactor;
+        }
+    }
+}

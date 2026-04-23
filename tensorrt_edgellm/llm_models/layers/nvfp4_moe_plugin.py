@@ -21,8 +21,8 @@ and ``nn.Module`` wrapper. TensorRT engine build and inference live in tests (se
 
 The C++ plugin uses router logits ``[batch * seq_len, E]`` and FP16 hidden states
 ``[batch, seq_len, hidden_size]`` (``seq_len`` may be ``> 1``). Routing inside the plugin is
-``kernel::moeTopkSoftmax`` (softmax over experts, top-k, renormalize); see
-:meth:`NemotronHMoEW4A4Plugin.moe_topk_softmax_renormalize_torch`. ``hidden_size`` and ``moe_inter_size`` must be
+``kernel::moeSigmoidGroupTopk`` (NemotronH sigmoid + grouped top-k routing); see
+:meth:`NemotronHMoEW4A4Plugin.sigmoid_group_topk_torch`. ``hidden_size`` and ``moe_inter_size`` must be
 multiples of 64 (decode GEMV / Marlin tile chunks). Expert up
 quantized weights are INT8 ``[E, hidden_size/2, moe_inter_size]`` (two NVFP4 nibbles per byte) with
 INT8 Marlin block scales ``[E, hidden_size/16, moe_inter_size]``. Down weights are INT8
@@ -32,8 +32,9 @@ Plugin output tensors are FP16.
 
 HuggingFace ``NemotronHMoE`` (``transformers.models.nemotron_h.modeling_nemotron_h``) uses
 ``NemotronHTopkRouter`` / ``DeepseekV3TopkRouter`` for **pre-routing logits** (FP32 matmul), then
-``route_tokens_to_experts`` (sigmoid, grouped top-k, correction bias). That post-processing is **not** in
-the TRT plugin; :class:`NemotronHMoEW4A4Plugin` matches the router **linear** only via
+``route_tokens_to_experts`` (sigmoid, grouped top-k, correction bias). That post-processing is now
+implemented inside the TRT plugin via ``kernel::moeSigmoidGroupTopk``.
+:class:`NemotronHMoEW4A4Plugin` computes router logits via
 :meth:`NemotronHMoEW4A4Plugin.nemotron_h_plugin_router_logits`.
 
 **Expert weight layout:** HuggingFace ``NemotronHExperts`` stores ``up_proj`` as ``[E, I, H_in]`` and
@@ -78,7 +79,8 @@ nvfp4_moe_plugin_schema = OpSchema(
             name="router_logits",
             description=
             ("Router logits (batch * seq_len, E) FP32 before plugin routing; Nvfp4MoePlugin applies "
-             "softmax + top-k + renormalize (moeTopkSoftmax) internally."),
+             "sigmoid + grouped top-k routing (moeSigmoidGroupTopk) internally."
+             ),
             type_str="tensor(float)",
         ),
         OpSchema.FormalParameter(
@@ -139,6 +141,12 @@ nvfp4_moe_plugin_schema = OpSchema(
              "(S_max/448)."),
             type_str="tensor(float)",
         ),
+        OpSchema.FormalParameter(
+            name="e_score_correction_bias",
+            description=
+            "NemotronH expert load-balancing correction bias (E) FP32. Zeros if not available.",
+            type_str="tensor(float)",
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -191,6 +199,41 @@ nvfp4_moe_plugin_schema = OpSchema(
             "Marlin NVFP4 block scale group size along hidden_size (must be 16 for Nvfp4MoePlugin).",
             required=True,
         ),
+        OpSchema.Attribute(
+            name="n_group",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Number of expert groups for NemotronH grouped top-k routing.",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="topk_group",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Number of groups to select in NemotronH grouped top-k routing.",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="norm_topk_prob",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether to renormalize top-k weights to sum to 1 (0 or 1).",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="routed_scaling_factor",
+            type=OpSchema.AttrType.FLOAT,
+            description="Scaling factor applied to final top-k weights.",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="routing_mode",
+            type=OpSchema.AttrType.INT,
+            description=
+            ("Router selection kernel: 0 = softmax + flat top-k (moeTopkSoftmax; default), "
+             "1 = sigmoid + grouped top-k (moeSigmoidGroupTopk; NemotronH)."),
+            required=True,
+        ),
     ],
 )
 onnx.defs.register_schema(nvfp4_moe_plugin_schema)
@@ -207,11 +250,17 @@ onnx.defs.register_schema(nvfp4_moe_plugin_schema)
     "v",
     "v",
     "v",
+    "v",
     "i",
     "i",
     "i",
     "i",
     "i",
+    "i",
+    "i",
+    "i",
+    "i",
+    "f",
     "i",
 )
 def symbolic_nvfp4_moe_plugin(
@@ -226,12 +275,18 @@ def symbolic_nvfp4_moe_plugin(
     fc_down_qweights: torch._C.Value,
     fc_down_blocks_scale: torch._C.Value,
     fc_down_global_scale: torch._C.Value,
+    e_score_correction_bias: torch._C.Value,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     moe_inter_size: int,
     activation_type: int,
     quantization_group_size: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
 ):
     output = g.op(
         "trt::Nvfp4MoePlugin",
@@ -245,12 +300,18 @@ def symbolic_nvfp4_moe_plugin(
         fc_down_qweights,
         fc_down_blocks_scale,
         fc_down_global_scale,
+        e_score_correction_bias,
         num_experts_i=num_experts,
         top_k_i=top_k,
         hidden_size_i=hidden_size,
         moe_inter_size_i=moe_inter_size,
         activation_type_i=activation_type,
         quantization_group_size_i=quantization_group_size,
+        n_group_i=n_group,
+        topk_group_i=topk_group,
+        norm_topk_prob_i=norm_topk_prob,
+        routed_scaling_factor_f=routed_scaling_factor,
+        routing_mode_i=routing_mode,
     )
     hs_sizes = _get_tensor_sizes(hidden_states)
     output.setType(router_logits.type().with_dtype(torch.float16).with_sizes(
@@ -270,16 +331,22 @@ def nvfp4_moe_plugin(
     fc_down_qweights: torch.Tensor,
     fc_down_blocks_scale: torch.Tensor,
     fc_down_global_scale: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     moe_inter_size: int,
     activation_type: int,
     quantization_group_size: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
 ) -> torch.Tensor:
     """
-    Placeholder for ONNX tracing; TensorRT ``Nvfp4MoePlugin`` executes the real path (including
-    ``moeTopkSoftmax`` on ``router_logits``).
+    Placeholder for ONNX tracing; TensorRT ``Nvfp4MoePlugin`` executes the real path. The ``routing_mode``
+    attribute selects between ``moeTopkSoftmax`` (0, default) and ``moeSigmoidGroupTopk`` (1, NemotronH).
     """
     del (
         hidden_block_scale,
@@ -290,11 +357,17 @@ def nvfp4_moe_plugin(
         fc_down_qweights,
         fc_down_blocks_scale,
         fc_down_global_scale,
+        e_score_correction_bias,
         num_experts,
         top_k,
         moe_inter_size,
         activation_type,
         quantization_group_size,
+        n_group,
+        topk_group,
+        norm_topk_prob,
+        routed_scaling_factor,
+        routing_mode,
     )
     if hidden_states.dim() != 3:
         raise ValueError(
@@ -327,8 +400,8 @@ class NemotronHMoEW4A4Plugin(nn.Module):
 
     Router logits are computed with :meth:`nemotron_h_plugin_router_logits` so they match
     ``NemotronHTopkRouter``’s FP32 linear (see ``modeling_nemotron_h.py``). The TRT plugin then runs
-    :meth:`moe_topk_softmax_renormalize_torch`’s equivalent in CUDA—not HF ``route_tokens_to_experts``
-    (sigmoid, ``e_score_correction_bias``, grouped top-k).
+    ``moeSigmoidGroupTopk`` — the NemotronH grouped top-k routing algorithm
+    (sigmoid, ``e_score_correction_bias``, grouped top-k, renormalize, scale).
 
     Router logits are ``(num_tokens, num_experts)`` with ``num_tokens = batch * seq_len``; FP16
     ``hidden_states`` are ``(batch, seq_len, hidden_size)`` (same linear memory as a flattened
@@ -341,27 +414,47 @@ class NemotronHMoEW4A4Plugin(nn.Module):
     """
 
     @staticmethod
-    def moe_topk_softmax_renormalize_torch(
+    def sigmoid_group_topk_torch(
         router_logits: torch.Tensor,
         top_k: int,
+        n_group: int,
+        topk_group: int,
+        norm_topk_prob: bool = True,
+        routed_scaling_factor: float = 1.0,
+        correction_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        PyTorch equivalent of TensorRT ``kernel::moeTopkSoftmax`` with ``renormalize=True`` (see
-        ``cpp/kernels/moe/moeTopkSoftmaxKernels.h`` / ``Nvfp4MoePlugin::enqueue``).
-
-        Applies softmax on the expert dimension, takes the top-k probabilities, then renormalizes those
-        weights so each row sums to 1. Returned indices are ``int32`` to match plugin workspace tensors.
-
-        **Tie-breaking:** ``torch.topk`` ordering for equal probabilities is not guaranteed to match CUDA
-        ``moeTopkSoftmax`` (lower expert index wins). For strict parity with the TRT plugin, use
-        :meth:`moe_topk_softmax_renormalize_numpy` on logits in NumPy.
+        PyTorch equivalent of TensorRT ``kernel::moeSigmoidGroupTopk`` matching
+        HuggingFace ``NemotronHMoE.route_tokens_to_experts``.
         """
         logits = router_logits.float()
-        probs = F.softmax(logits, dim=-1)
-        k = min(int(top_k), probs.shape[-1])
-        topw, topi = torch.topk(probs, k, dim=-1)
-        topw = topw / (topw.sum(dim=-1, keepdim=True) + 1e-20)
-        return topw, topi.to(torch.int32)
+        scores = torch.sigmoid(logits)
+        biased = scores.clone()
+        if correction_bias is not None:
+            biased = biased + correction_bias.float()
+        num_experts = logits.shape[-1]
+        experts_per_group = num_experts // n_group
+        # Top-2 per group → group scores
+        grouped = biased.view(-1, n_group, experts_per_group)
+        group_top2, _ = grouped.topk(2, dim=-1)
+        group_scores = group_top2.sum(dim=-1)  # [T, nGroup]
+        # Select topk_group groups
+        _, group_idx = group_scores.topk(topk_group, dim=-1)  # [T, topk_group]
+        # Build group mask
+        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+        group_mask.scatter_(1, group_idx, True)
+        expert_mask = group_mask.unsqueeze(-1).expand(
+            -1, -1, experts_per_group).reshape_as(biased)
+        biased[~expert_mask] = float("-inf")
+        # Top-K from masked biased scores
+        _, topk_idx = biased.topk(top_k, dim=-1)
+        # Gather weights from ORIGINAL sigmoid scores
+        topk_weights = scores.gather(-1, topk_idx)
+        if norm_topk_prob:
+            topk_weights = topk_weights / (
+                topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * routed_scaling_factor
+        return topk_weights, topk_idx.to(torch.int32)
 
     @staticmethod
     def moe_activation_numpy(z: np.ndarray,
@@ -378,41 +471,68 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         return (t * t).astype(np.float32)
 
     @staticmethod
-    def moe_topk_softmax_renormalize_numpy(
+    def sigmoid_group_topk_numpy(
         router_logits: np.ndarray,
         top_k: int,
+        n_group: int,
+        topk_group: int,
+        norm_topk_prob: bool = True,
+        routed_scaling_factor: float = 1.0,
+        correction_bias: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        NumPy softmax + top-k + renormalize aligned with CUDA ``moeTopkSoftmax``: iterative argmax with
-        masking, **lower expert id wins on equal probability** (same as the fused kernel's warp reduce).
+        NumPy sigmoid + grouped top-k aligned with CUDA ``moeSigmoidGroupTopk``: iterative argmax with
+        masking, **lower expert id wins on equal score** (same as the kernel's CUB reduce).
         """
         logits = np.asarray(router_logits, dtype=np.float32)
-        m = np.max(logits, axis=-1, keepdims=True)
-        ex = np.exp(logits - m)
-        probs = (ex / np.sum(ex, axis=-1, keepdims=True)).astype(np.float32)
-        num_tokens, num_experts = probs.shape
+        num_tokens, num_experts = logits.shape
+        sigmoid_scores = (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+        biased = sigmoid_scores.copy()
+        if correction_bias is not None:
+            biased = biased + np.asarray(correction_bias, dtype=np.float32)
+        experts_per_group = num_experts // n_group
         k = min(int(top_k), int(num_experts))
         topw = np.zeros((num_tokens, k), dtype=np.float32)
         topi = np.zeros((num_tokens, k), dtype=np.int32)
         for t in range(int(num_tokens)):
-            row = probs[t]
-            used = np.zeros(num_experts, dtype=bool)
+            b_row = biased[t].copy()
+            s_row = sigmoid_scores[t]
+            # Top-2 per group → group scores
+            group_scores = np.zeros(n_group, dtype=np.float32)
+            for g in range(n_group):
+                gs = g * experts_per_group
+                vals = sorted(b_row[gs:gs + experts_per_group], reverse=True)
+                group_scores[g] = vals[0] + (vals[1] if len(vals) > 1 else 0.0)
+            # Select topk_group groups
+            group_selected = np.zeros(n_group, dtype=bool)
+            for _ in range(topk_group):
+                best_g, best_s = -1, -np.inf
+                for g in range(n_group):
+                    if not group_selected[g] and group_scores[g] > best_s:
+                        best_s = group_scores[g]
+                        best_g = g
+                if best_g >= 0:
+                    group_selected[best_g] = True
+            # Mask unselected groups
+            for e in range(num_experts):
+                if not group_selected[e // experts_per_group]:
+                    b_row[e] = -np.inf
+            # Top-K from masked biased scores
+            renorm_sum = 0.0
             for ki in range(k):
-                best_e = -1
-                best_p = np.float32(-1.0)
-                for e in range(int(num_experts)):
-                    if used[e]:
-                        continue
-                    p = row[e]
-                    if best_e < 0 or p > best_p or (p == best_p
-                                                    and e < best_e):
-                        best_p = p
+                best_e, best_v = 0, -np.inf
+                for e in range(num_experts):
+                    if b_row[e] > best_v or (b_row[e] == best_v
+                                             and e < best_e):
+                        best_v = b_row[e]
                         best_e = e
-                used[best_e] = True
                 topi[t, ki] = np.int32(best_e)
-                topw[t, ki] = best_p
-            denom = float(np.sum(topw[t])) + 1e-20
-            topw[t] = (topw[t] / denom).astype(np.float32)
+                topw[t, ki] = s_row[best_e]
+                renorm_sum += s_row[best_e]
+                b_row[best_e] = -np.inf
+            if norm_topk_prob and renorm_sum > 0:
+                topw[t] = (topw[t] / renorm_sum).astype(np.float32)
+            topw[t] = (topw[t] * routed_scaling_factor).astype(np.float32)
         return topw, topi
 
     @staticmethod
@@ -508,6 +628,20 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         top_k = int(
             getattr(moe_block, "top_k",
                     getattr(moe_block.gate, "top_k", cfg.num_experts_per_tok)))
+
+        # Extract NemotronH routing parameters from config.
+        n_group = int(getattr(cfg, "n_group", 1))
+        topk_group = int(getattr(cfg, "topk_group", 1))
+        norm_topk_prob = bool(getattr(cfg, "norm_topk_prob", True))
+        routed_scaling_factor = float(
+            getattr(cfg, "routed_scaling_factor", 1.0))
+
+        # Extract e_score_correction_bias from the gate/router.
+        correction_bias = getattr(moe_block.gate, "e_score_correction_bias",
+                                  None)
+        if correction_bias is None:
+            correction_bias = getattr(moe_block, "e_score_correction_bias",
+                                      None)
         self._init_from_gate_and_dims(
             num_experts=num_experts,
             top_k=top_k,
@@ -516,6 +650,11 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             gate_layer=gate_linear,
             activation_type=int(activation_type),
             quantization_group_size=int(quantization_group_size),
+            n_group=n_group,
+            topk_group=topk_group,
+            norm_topk_prob=norm_topk_prob,
+            routed_scaling_factor=routed_scaling_factor,
+            correction_bias=correction_bias,
         )
         # routed_scaling_factor: HF NemotronHTopkRouter multiplies topk_weights by this
         # value after sigmoid + renorm (see modeling_nemotron_h.py, line ~917).
@@ -557,6 +696,11 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         gate_layer: nn.Linear,
         activation_type: int = 0,
         quantization_group_size: int = 16,
+        n_group: int = 1,
+        topk_group: int = 1,
+        norm_topk_prob: bool = True,
+        routed_scaling_factor: float = 1.0,
+        correction_bias: torch.Tensor | nn.Parameter | None = None,
     ) -> None:
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
@@ -564,6 +708,12 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         self.moe_inter_size = int(moe_inter_size)
         self.activation_type = int(activation_type)
         self.quantization_group_size = int(quantization_group_size)
+        self.n_group = int(n_group)
+        self.topk_group = int(topk_group)
+        self.norm_topk_prob = int(bool(norm_topk_prob))
+        self.routed_scaling_factor = float(routed_scaling_factor)
+        # NemotronHMoEW4A4Plugin always drives the sigmoid + grouped top-k routing kernel (routing_mode=1).
+        self.routing_mode = 1
 
         if self.quantization_group_size != 16:
             raise ValueError(
@@ -613,18 +763,22 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         e, inter = self.num_experts, self.moe_inter_size
         k_half = self.hidden_size // 2
         k_per_group = self.hidden_size // self.quantization_group_size
+        # Cutlass Atom layout requires SF M-dimension padded to multiple of 128.
+        up_sf_m_padded = ((self.hidden_size + 127) //
+                          128) * 8  # 8 SF rows per 128-row M-tile
+        dn_sf_m_padded = ((inter + 127) // 128) * 128
         self.register_buffer("fc_up_qweights",
                              torch.zeros(e, k_half, inter, dtype=torch.int8))
         self.register_buffer(
             "fc_up_blocks_scale",
-            torch.zeros(e, k_per_group, inter, dtype=torch.int8))
+            torch.zeros(e, up_sf_m_padded, inter, dtype=torch.int8))
         self.register_buffer("fc_up_global_scale",
                              torch.ones(e, dtype=torch.float32))
         self.register_buffer("fc_down_qweights",
                              torch.zeros(e, inter, k_half, dtype=torch.int8))
         self.register_buffer(
             "fc_down_blocks_scale",
-            torch.zeros(e, inter, k_per_group, dtype=torch.int8))
+            torch.zeros(e, dn_sf_m_padded, k_per_group, dtype=torch.int8))
         self.register_buffer("fc_down_global_scale",
                              torch.ones(e, dtype=torch.float32))
         # W4A16 export: unused by the plugin; W4A4 graphs replace with real NVFP4 activation scales.
@@ -637,6 +791,12 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         )
         self.register_buffer("hidden_global_scale",
                              torch.ones(1, dtype=torch.float32))
+        # e_score_correction_bias [E] FP32: NemotronH expert load balancing.
+        if correction_bias is not None:
+            bias_data = correction_bias.data.clone().to(torch.float32)
+        else:
+            bias_data = torch.zeros(e, dtype=torch.float32)
+        self.register_buffer("e_score_correction_bias", bias_data)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -659,12 +819,18 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             self.fc_down_qweights,
             self.fc_down_blocks_scale,
             self.fc_down_global_scale,
+            self.e_score_correction_bias,
             self.num_experts,
             self.top_k,
             self.hidden_size,
             self.moe_inter_size,
             self.activation_type,
             self.quantization_group_size,
+            self.n_group,
+            self.topk_group,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+            self.routing_mode,
         )
         # Apply routed_scaling_factor: HF NemotronHTopkRouter scales topk_weights by
         # this value but moeTopkSoftmax (used inside the C++ plugin) does not.
@@ -820,8 +986,10 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             self.fc_up_qweights[ex].copy_(
                 torch.from_numpy(pl.reshape(h // 2, inter)))
             # sc: [H, nIC] int32 → view [H, nIC, 4] int8 → [H//16, I]
-            self.fc_up_blocks_scale[ex].copy_(
-                torch.from_numpy(sc.view(np.int8).reshape(h // 16, inter)))
+            # Buffer may be padded (atom-layout); copy into the valid rows only.
+            sf_rows_up = h // 16
+            self.fc_up_blocks_scale[ex, :sf_rows_up, :].copy_(
+                torch.from_numpy(sc.view(np.int8).reshape(sf_rows_up, inter)))
 
         self.fc_up_global_scale.copy_(
             torch.from_numpy(s_max_up / k_fp8).to(
@@ -842,7 +1010,8 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             self.fc_down_qweights[ex].copy_(
                 torch.from_numpy(pl.reshape(inter, h // 2)))
             # sc: [I, nHC] int32 → view [I, nHC, 4] int8 → [I, H//16]
-            self.fc_down_blocks_scale[ex].copy_(
+            # Buffer may be padded (atom-layout); copy into the valid rows only.
+            self.fc_down_blocks_scale[ex, :inter, :].copy_(
                 torch.from_numpy(sc.view(np.int8).reshape(inter, h // 16)))
 
         self.fc_down_global_scale.copy_(
