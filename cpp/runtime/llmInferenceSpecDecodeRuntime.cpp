@@ -1021,9 +1021,17 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
 
     // FIXME: Inconsistent handling for multimodal input. We should unify our embedding creation to adopt
     // mMultimodalIndices schema as unified method.
-    if (context.audioEmbeddings.has_value())
+    //
+    // Use the multimodal kernel (dispatches via explicit imageTokenId /
+    // audioTokenId) when audio is present, or for image-only inference on
+    // audio-capable model families that keep ``<image>`` in-stream. Legacy
+    // vision-only families remap to ``vocabSize + k`` and fall through to
+    // the path below.
+    bool const useExplicitMultiModalId = context.audioEmbeddings.has_value()
+        || (context.visualEmbeddings.has_value() && mBaseEngineConfig.audioTokenId != 0);
+    bool const useIncrementalVisualID = context.visualEmbeddings.has_value();
+    if (useExplicitMultiModalId)
     {
-        // Audio present: use embeddingLookupMultimodal (handles audio and/or vision)
         auto const inputShape = mIdsInput.getShape();
         size_t const inputSizeBytes = inputShape.volume() * sizeof(int32_t);
         rt::Tensor inputIdsCPU(inputShape, rt::DeviceType::kCPU, mIdsInput.getDataType());
@@ -1046,9 +1054,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
             std::optional{std::ref(mMultimodalIndices)}, imageTokenId, context.visualEmbeddings, audioTokenId,
             context.audioEmbeddings, mInputsEmbeds, context.stream);
     }
-    else if (context.visualEmbeddings.has_value())
+    else if (useIncrementalVisualID)
     {
-        // Vision-only
+        // Vision-only legacy path (``tokenId >= vocabSize`` remapping).
         rt::Tensor const& imageEmbedsTensor = context.visualEmbeddings.value().get();
         kernel::embeddingLookupWithImageInsertion(mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(),
             imageEmbedsTensor, mInputsEmbeds, context.stream);

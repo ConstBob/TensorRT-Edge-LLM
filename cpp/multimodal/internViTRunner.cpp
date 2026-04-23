@@ -118,13 +118,14 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
     mVitInput
         = rt::Tensor({mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mVitInput");
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
+    setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
     LOG_INFO("InternViTRunner::allocateBuffer() mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d",
         mConfig.maxNumBlocks, mConfig.outHiddenSize);
     // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
     mOutputEmbedding = rt::Tensor({mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "InternViTRunner::mOutputEmbedding");
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
+    setTensorAddressStatus
+        &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
     if (!setTensorAddressStatus)
     {
         LOG_ERROR("Failed to set tensor address to the engine");
@@ -373,14 +374,15 @@ bool InternViTRunner::infer(cudaStream_t stream) noexcept
         TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
 
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
         if (!setEngineIOStatus)
         {
             LOG_ERROR("InternViTRunner::infer(): Failed to bind engine input tensors.");
             return false;
         }
 
-        bool enqueueStatus = mContext->enqueueV3(stream);
+        bool enqueueStatus = mVisualContext->enqueueV3(stream);
         if (!enqueueStatus)
         {
             LOG_ERROR("InternViTRunner::infer(): Failed to enqueue engine.");

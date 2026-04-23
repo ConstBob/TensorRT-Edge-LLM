@@ -145,6 +145,12 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile& profile);
 
+    //! Set up optimization profile for Nemotron-Omni RADIO ViT model.
+    //! Configures input for RADIO vision encoder with dynamic tile batching.
+    //! @param profile Optimization profile to configure
+    //! @return true if setup was successful, false otherwise
+    bool setupNemotronOmniViTProfile(nvinfer1::IOptimizationProfile& profile);
+
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config
     //! and builder configuration parameters.

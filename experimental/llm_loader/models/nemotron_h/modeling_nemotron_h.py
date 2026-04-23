@@ -489,21 +489,19 @@ class NemotronHMoEMLP(nn.Module):
         """Dequantize ModelOpt NVFP4 expert weights and Marlin-pack them.
 
         ``Nvfp4MoePlugin``'s CUDA kernel expects a tile-packed layout (see
-        :mod:`..marlin_pack`).  Stack the re-packed buffers so the ONNX
-        graph has direct initializer→plugin edges — TRT does not allow
+        :mod:`...checkpoint.repacking`).  Stack the re-packed buffers so the
+        ONNX graph has direct initializer→plugin edges — TRT does not allow
         quantized dtypes (FP4, FP8, INT8) to flow through Concat.
         """
-        import numpy as np
-
-        from ..marlin_pack import (decode_modelopt_nvfp4,
-                                   marlin_pack_expert_down,
-                                   marlin_pack_expert_up)
+        from ...checkpoint.repacking import (
+            decode_modelopt_nvfp4, repack_nvfp4_expert_down_to_marlin,
+            repack_nvfp4_expert_up_to_marlin)
 
         H = self.hidden_size
         I = self.moe_intermediate_size
 
-        up_pls, up_scs, up_gs = [], [], []
-        dn_pls, dn_scs, dn_gs = [], [], []
+        up_ws, up_scs, up_gs = [], [], []
+        dn_ws, dn_scs, dn_gs = [], [], []
         for expert in self.experts:
             up = expert.up_proj
             dn = expert.down_proj
@@ -513,36 +511,37 @@ class NemotronHMoEMLP(nn.Module):
             # up.weight [out=I, in//2=H//2] → dense [I, H] → (H, I) for Marlin.
             up_dense = decode_modelopt_nvfp4(up.weight, up.weight_scale,
                                              up.weight_scale_2, up.group_size)
-            if up_dense.shape != (I, H):
+            if tuple(up_dense.shape) != (I, H):
                 raise ValueError(
-                    f"up_dense shape {up_dense.shape} != ({I}, {H})")
-            up_pl, up_sc, up_gl = marlin_pack_expert_up(
-                np.ascontiguousarray(up_dense.T))
+                    f"up_dense shape {tuple(up_dense.shape)} != ({I}, {H})")
+            up_w, up_sc, up_gl = repack_nvfp4_expert_up_to_marlin(up_dense.T)
 
             # dn.weight [out=H, in//2=I//2] → dense [H, I] → (I, H) for Marlin.
             dn_dense = decode_modelopt_nvfp4(dn.weight, dn.weight_scale,
                                              dn.weight_scale_2, dn.group_size)
-            if dn_dense.shape != (H, I):
+            if tuple(dn_dense.shape) != (H, I):
                 raise ValueError(
-                    f"dn_dense shape {dn_dense.shape} != ({H}, {I})")
-            dn_pl, dn_sc, dn_gl = marlin_pack_expert_down(
-                np.ascontiguousarray(dn_dense.T))
+                    f"dn_dense shape {tuple(dn_dense.shape)} != ({H}, {I})")
+            dn_w, dn_sc, dn_gl = repack_nvfp4_expert_down_to_marlin(dn_dense.T)
 
-            up_pls.append(torch.from_numpy(up_pl))
-            up_scs.append(torch.from_numpy(up_sc))
+            up_ws.append(torch.as_tensor(up_w))
+            up_scs.append(torch.as_tensor(up_sc))
             up_gs.append(up_gl)
-            dn_pls.append(torch.from_numpy(dn_pl))
-            dn_scs.append(torch.from_numpy(dn_sc))
+            dn_ws.append(torch.as_tensor(dn_w))
+            dn_scs.append(torch.as_tensor(dn_sc))
             dn_gs.append(dn_gl)
 
-        self.register_buffer("_stacked_up_payload", torch.stack(up_pls))
+        self.register_buffer("_stacked_up_weights", torch.stack(up_ws))
         self.register_buffer("_stacked_up_block_scale", torch.stack(up_scs))
         self.register_buffer("_stacked_up_global_scale",
                              torch.tensor(up_gs, dtype=torch.float32))
-        self.register_buffer("_stacked_down_payload", torch.stack(dn_pls))
+        self.register_buffer("_stacked_down_weights", torch.stack(dn_ws))
         self.register_buffer("_stacked_down_block_scale", torch.stack(dn_scs))
         self.register_buffer("_stacked_down_global_scale",
                              torch.tensor(dn_gs, dtype=torch.float32))
+        self.register_buffer(
+            "_e_score_correction_bias_fp32",
+            self.gate.e_score_correction_bias.data.clone().to(torch.float32))
         self._export_ready = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -556,17 +555,24 @@ class NemotronHMoEMLP(nn.Module):
             hidden_states,
             self._hidden_block_scale_placeholder,
             self._hidden_global_scale_placeholder,
-            self._stacked_up_payload,
+            self._stacked_up_weights,
             self._stacked_up_block_scale,
             self._stacked_up_global_scale,
-            self._stacked_down_payload,
+            self._stacked_down_weights,
             self._stacked_down_block_scale,
             self._stacked_down_global_scale,
+            self._e_score_correction_bias_fp32,
             num_experts=self.n_routed_experts,
             top_k=self.num_experts_per_tok,
             hidden_size=self.hidden_size,
             moe_inter_size=self.moe_intermediate_size,
             activation_type=0,  # 0 = ReLU²
+            n_group=self.gate.n_group,
+            topk_group=self.gate.topk_group,
+            norm_topk_prob=int(bool(self.gate.norm_topk_prob)),
+            routed_scaling_factor=float(self.gate.routed_scaling_factor),
+            # NemotronH always drives the sigmoid + grouped top-k routing kernel (routing_mode=1).
+            routing_mode=1,
         )
 
         return moe_out + self._expert_forward(self.shared_experts,

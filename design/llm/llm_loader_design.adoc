@@ -10,8 +10,8 @@
 
 * Standard attention-only LLMs (Llama, Qwen, Mistral, etc.)
 * Hybrid Mamba+Attention models (NemotronH)
-* Vision-Language Models (VLMs): Qwen3-VL, Qwen2.5-VL, InternVL3, Phi-4 Multimodal
-* ASR / Omni speech models: Qwen3-ASR, Qwen3-Omni
+* Vision-Language Models (VLMs): Qwen3-VL, Qwen2.5-VL, InternVL3, Phi-4 Multimodal, Nemotron-Omni
+* ASR / Omni speech models: Qwen3-ASR, Qwen3-Omni, Nemotron-Omni (Parakeet)
 * Text-to-Speech models: Qwen3-TTS (Thinker + Talker + CodePredictor)
 * MoE (Mixture-of-Experts) models
 
@@ -43,6 +43,7 @@ Key design principles:
 * ``llm_loader/checkpoint/checkpoint_utils.py`` — config loading, runtime artifact writing
 * ``llm_loader/models/default/modeling_default.py`` — attention-only CausalLM
 * ``llm_loader/models/nemotron_h/modeling_nemotron_h.py`` — hybrid Mamba+Attention NemotronHCausalLM
+* ``llm_loader/models/nemotron_omni/`` — Nemotron-Omni RADIO visual encoder and Parakeet audio encoder
 * ``llm_loader/models/qwen3_vl/`` — Qwen3-VL text backbone and visual encoder
 * ``llm_loader/models/qwen2_5_vl/`` — Qwen2.5-VL text backbone and visual encoder
 * ``llm_loader/models/internvl3/`` — InternVL3 text backbone and visual encoder
@@ -73,6 +74,9 @@ experimental/llm_loader/
 │   │   └── modeling_default.py  # CausalLM, Transformer, DecoderLayer, etc.
 │   ├── nemotron_h/
 │   │   └── modeling_nemotron_h.py  # Hybrid Mamba + Attention backbone
+│   ├── nemotron_omni/
+│   │   ├── modeling_nemotron_omni_visual.py  # RADIO vision encoder
+│   │   └── modeling_nemotron_omni_audio.py   # Parakeet Conformer audio encoder
 │   ├── qwen3_vl/
 │   │   ├── modeling_qwen3_vl_text.py
 │   │   └── modeling_qwen3_vl_visual.py
@@ -197,6 +201,7 @@ Custom model classes are registered once at package import time:
 [source,python]
 ----
 register_model("nemotron_h", NemotronHCausalLM)
+register_model("NemotronH_Nano_VL_V2", NemotronHCausalLM)  # Nemotron-Omni reuses NemotronH LLM
 register_model("qwen3_vl", Qwen3VLTextModel)
 register_model("internvl_chat", InternVL3TextModel)
 # etc.
@@ -502,6 +507,10 @@ Extra outputs:
 |Phi-4mm
 |input [N, 3, 448, 448]
 |output [N*256, 3072]
+
+|Nemotron-Omni
+|input [N, 3, 512, 512]
+|output [N, 256, 2688]
 |===
 
 === Audio encoders
@@ -517,6 +526,10 @@ Extra outputs:
 |Qwen3-Omni
 |(same)
 |(same)
+
+|Nemotron-Omni
+|input_features [1, S, 128], attention_mask [1, S]
+|last_hidden_state [1, S/8, 2688]
 |===
 
 === TTS models

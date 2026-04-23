@@ -38,9 +38,11 @@ VLMs (LLM + visual encoder):
     internvl_chat                 (InternVL3)
     internvl                      (InternVL3.5)
     phi4mm, phi4_multimodal       (Phi-4 Multimodal)
+    NemotronH_Nano_VL_V2          (Nemotron-Omni)
 
 Audio models (LLM + audio encoder):
     qwen3_asr, qwen3_omni, qwen3_omni_thinker
+    NemotronH_Nano_VL_V2          (Nemotron-Omni)
 
 LLM + Talker decoder (no audio encoder):
     qwen3_tts    (Talker/CodePredictor are LLM decoders — use --skip-audio)
@@ -76,12 +78,14 @@ _VLM_MODEL_TYPES = frozenset([
     "internvl_chat",
     "phi4mm",
     "phi4_multimodal",
+    "NemotronH_Nano_VL_V2",
 ])
 
 _AUDIO_MODEL_TYPES = frozenset([
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
+    "NemotronH_Nano_VL_V2",
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
     # Its Talker and CodePredictor are LLM decoders exported via the LLM pipeline.
 ])
@@ -250,18 +254,31 @@ def _export_llm(model_dir: str,
     # For VLM models, patch image_token_id into the LLM config so the C++
     # runtime can identify image tokens in the token stream.
     if model_type in _VLM_MODEL_TYPES:
-        image_token_str = "<|image_pad|>"
-        image_token_id = _find_token_id(model_dir, image_token_str)
-        if image_token_id is not None:
-            cfg_path = os.path.join(llm_out_dir, "config.json")
-            if os.path.exists(cfg_path):
-                with open(cfg_path) as _f:
-                    cfg = json.load(_f)
+        cfg_path = os.path.join(llm_out_dir, "config.json")
+        image_token_id = None
+        audio_token_id = None
+        if model_type == "NemotronH_Nano_VL_V2":
+            # Nemotron-Omni keeps the real image/audio token ids in-stream,
+            # so runtime dispatch needs both of them in the engine config.
+            src_cfg = _load_config(model_dir)
+            image_token_id = src_cfg.get("img_context_token_id")
+            audio_token_id = src_cfg.get("sound_context_token_id")
+        else:
+            image_token_id = _find_token_id(model_dir, "<|image_pad|>")
+        if os.path.exists(cfg_path) and (image_token_id is not None
+                                         or audio_token_id is not None):
+            with open(cfg_path) as _f:
+                cfg = json.load(_f)
+            if image_token_id is not None:
                 cfg["image_token_id"] = image_token_id
-                with open(cfg_path, "w") as _f:
-                    json.dump(cfg, _f, indent=2)
                 logger.info("[LLM] Added image_token_id=%d to config.json",
                             image_token_id)
+            if audio_token_id is not None:
+                cfg["audio_token_id"] = audio_token_id
+                logger.info("[LLM] Added audio_token_id=%d to config.json",
+                            audio_token_id)
+            with open(cfg_path, "w") as _f:
+                json.dump(cfg, _f, indent=2)
 
     logger.info("[LLM] Done: %s", output_path)
 
@@ -414,6 +431,22 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
             vis_cfg_out["vision_config"]["image_size"] = [
                 vc_out["image_size"], vc_out["image_size"]
             ]
+    if model_type == "NemotronH_Nano_VL_V2":
+        # The ckpt's "NemotronH_Nano_VL_V2" is not registered in C++
+        # stringToModelType().  Override to the registered tag both at top
+        # level (read by MultimodalRunner::create) and under vision_config
+        # (preferred by visualBuilder).
+        vis_cfg_out["model_type"] = "nemotron_omni_vision_encoder"
+        vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
+        vis_cfg_out["vision_config"][
+            "model_type"] = "nemotron_omni_vision_encoder"
+        # NemotronOmniViTRunner reads these top-level fields; visualBuilder
+        # additionally reads patch_size and downsample_ratio.
+        for key in ("llm_config", "img_context_token_id", "img_start_token_id",
+                    "img_end_token_id", "force_image_size", "norm_mean",
+                    "norm_std", "patch_size", "downsample_ratio"):
+            if key in config:
+                vis_cfg_out[key] = config[key]
     cfg_out_path = os.path.join(visual_out_dir, "config.json")
     with open(cfg_out_path, "w") as f:
         json.dump(vis_cfg_out, f, indent=2)
@@ -444,19 +477,27 @@ def _export_audio(model_dir: str, audio_out_dir: str, weights: dict,
     logger.info("[Audio] Done: %s", output_path)
 
     # Write config.json for the C++ runtime
-    audio_cfg = config.get("thinker_config",
-                           {}).get("audio_config",
-                                   config.get("audio_config", {}))
-    # C++ audio builder recognizes "qwen3_asr_thinker" / "qwen3_omni" but
-    # not "qwen3_asr".  Map to the enum string the runtime expects.
-    _AUDIO_MODEL_TYPE_MAP = {
-        "qwen3_asr": "qwen3_asr_thinker",
-    }
-    audio_model_type = _AUDIO_MODEL_TYPE_MAP.get(model_type, model_type)
-    audio_cfg_out = {
-        "model_type": audio_model_type,
-        "audio_config": audio_cfg,
-    }
+    if model_type == "NemotronH_Nano_VL_V2":
+        audio_cfg_out = dict(config)
+        sound_model_type = config.get("sound_config", {}).get("model_type")
+        if sound_model_type is None:
+            raise ValueError(
+                "sound_config.model_type not found in config.json")
+        audio_cfg_out["model_type"] = sound_model_type
+    elif model_type in ("qwen3_asr", "qwen3_omni", "qwen3_omni_thinker"):
+        audio_cfg = config.get("thinker_config",
+                               {}).get("audio_config",
+                                       config.get("audio_config", {}))
+        _AUDIO_MODEL_TYPE_MAP = {
+            "qwen3_asr": "qwen3_asr_thinker",
+        }
+        audio_model_type = _AUDIO_MODEL_TYPE_MAP.get(model_type, model_type)
+        audio_cfg_out = {
+            "model_type": audio_model_type,
+            "audio_config": audio_cfg,
+        }
+    else:
+        raise ValueError(f"Unsupported audio model_type: {model_type}")
     cfg_out_path = os.path.join(audio_out_dir, "config.json")
     with open(cfg_out_path, "w") as f:
         json.dump(audio_cfg_out, f, indent=2)

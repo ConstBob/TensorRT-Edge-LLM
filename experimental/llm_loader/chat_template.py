@@ -82,6 +82,11 @@ def _is_qwen3_asr_model(model_dir: str) -> bool:
                for a in (root.get("architectures") or []))
 
 
+def _is_nemotron_omni_model(model_dir: str) -> bool:
+    root = _load_root_config(model_dir)
+    return root.get("model_type") == "NemotronH_Nano_VL_V2"
+
+
 @dataclass
 class Message:
     role: str
@@ -431,6 +436,19 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             content_types = {
                 "image": {
                     "format": "<|endoftext10|>"
+                },
+            }
+        elif _is_nemotron_omni_model(model_dir):
+            # Nemotron-Omni's HF chat template dumps a Python repr of the
+            # content list instead of expanding it.  Emit one real placeholder
+            # per item; NemotronOmniViTRunner / NemotronOmniAudioRunner repeat
+            # each to the encoder's output length at textPreprocess time.
+            content_types = {
+                "image": {
+                    "format": "<img><image></img>"
+                },
+                "audio": {
+                    "format": "<so_embedding>"
                 },
             }
         elif is_vlm:

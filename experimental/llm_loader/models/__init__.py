@@ -16,16 +16,18 @@
 Shared model infrastructure (linear layers, ops) and model variants.
 
 Model variants live in sub-packages named after the model family:
-  ``default/``     - standard decoder transformer + Mamba hybrid
-  ``nemotron_h/``  - Nemotron-H hybrid (Mamba2 + attention)
-  ``qwen3_vl/``    - Qwen3-VL visual encoder + LLM
-  ``qwen3_5/``     - Qwen3.5 visual encoder + LLM (no deepstack)
-  ``qwen2_5_vl/``  - Qwen2.5-VL visual encoder + LLM
-  ``qwen3_asr/``   - Qwen3-ASR audio encoder + LLM
-  ``qwen3_moe/``   - Qwen3 sparse MoE decoder
-  ``qwen3_omni/``  - Qwen3-Omni: visual + audio (re-exports) + LLM
-  ``qwen3_tts/``   - Qwen3-TTS: audio encoder + talker + LLM
-  ``internvl3/``   - InternVL3 visual encoder + LLM
-  ``internvl3_5/`` - InternVL3.5 visual encoder + LLM (re-exports from internvl3)
-  ``phi4mm/``      - Phi-4 Multimodal visual encoder + LLM
+  ``default/``       - standard decoder transformer + Mamba hybrid
+  ``nemotron_h/``    - Nemotron-H hybrid (Mamba2 + attention)
+  ``nemotron_omni/`` - Nemotron-Omni: RADIO visual + Parakeet audio (LLM reuses nemotron_h)
+  ``qwen3_vl/``      - Qwen3-VL visual encoder + LLM
+  ``qwen3_5/``       - Qwen3.5 visual encoder + LLM (no deepstack)
+  ``qwen2_5_vl/``    - Qwen2.5-VL visual encoder + LLM
+  ``qwen3_asr/``     - Qwen3-ASR audio encoder + LLM
+  ``qwen3_moe/``     - Qwen3 sparse MoE decoder
+  ``qwen3_omni/``    - Qwen3-Omni: visual + audio (re-exports) + LLM
+  ``qwen3_tts/``     - Qwen3-TTS: audio encoder + talker + LLM
+  ``internvl3/``     - InternVL3 visual encoder + LLM
+  ``internvl3_5/``   - InternVL3.5 visual encoder + LLM (re-exports from internvl3)
+  ``phi4mm/``        - Phi-4 Multimodal visual encoder + LLM
+
 """
