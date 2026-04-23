@@ -402,12 +402,15 @@ def _fix_initializer_dtypes(onnx_path: str,
     # Collect plugin initializer names that must stay FP32.
     # - Mamba2 update_ssm_state: input[1] = ssm_A
     # - gated_delta_net: input[5] = A_log
+    # - Nvfp4MoePlugin: input[10] = e_score_correction_bias
     mamba_a_names: set = set()
     for node in model.graph.node:
         if node.op_type == "update_ssm_state" and len(node.input) > 1:
             mamba_a_names.add(node.input[1])
         if node.op_type == "gated_delta_net" and len(node.input) > 5:
             mamba_a_names.add(node.input[5])
+        if node.op_type == "Nvfp4MoePlugin" and len(node.input) > 10:
+            mamba_a_names.add(node.input[10])
 
     n_to_fp16 = 0
     n_to_fp32 = 0

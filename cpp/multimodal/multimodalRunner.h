@@ -65,6 +65,7 @@ public:
     /*!
      * @brief Get the required context memory size for this engine
      * @return Required context memory size in bytes
+     * @note Handles both visual and audio engines
      */
     int64_t getRequiredContextMemorySize() const;
 
@@ -73,6 +74,7 @@ public:
      * @param sharedContextMemory Tensor containing the shared device memory (must be on GPU)
      * @return True on success, false if the tensor is too small
      * @note The tensor size must be >= getRequiredContextMemorySize(). Must be called before infer().
+     * @note Handles both visual and audio engines
      */
     bool setContextMemory(rt::Tensor& sharedContextMemory);
 
@@ -162,12 +164,14 @@ public:
     }
 
 protected:
-    multimodal::ModelType mModelType;                      //!< Model type identifier
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;          //!< TensorRT runtime
-    std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;  //!< Visual encoder engine
-    std::unique_ptr<nvinfer1::IExecutionContext> mContext; //!< Execution context
-    rt::Tensor mOutputEmbedding;                           //!< Output embeddings
-    metrics::MultimodalMetrics mMultimodalMetrics;         //!< Performance metrics
+    multimodal::ModelType mModelType;                     //!< Model type identifier
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;         //!< TensorRT runtime
+    std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine; //!< Visual encoder engine (null for audio-only runners)
+    std::unique_ptr<nvinfer1::IExecutionContext> mVisualContext; //!< Visual execution context
+    std::unique_ptr<nvinfer1::ICudaEngine> mAudioEngine;        //!< Audio encoder engine (null for visual-only runners)
+    std::unique_ptr<nvinfer1::IExecutionContext> mAudioContext; //!< Audio execution context
+    rt::Tensor mOutputEmbedding;                                //!< Output embeddings
+    metrics::MultimodalMetrics mMultimodalMetrics;              //!< Performance metrics
 };
 
 } // namespace rt

@@ -188,6 +188,24 @@ bool VisualBuilder::parseConfig()
         }
         break;
 
+    case multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER:
+    {
+        mNumChannels = 3;
+        if (mModelConfig.contains("force_image_size"))
+        {
+            int64_t const imgSize = mModelConfig["force_image_size"].get<int64_t>();
+            mImageSizeH = imgSize;
+            mImageSizeW = imgSize;
+        }
+        else
+        {
+            LOG_ERROR("Nemotron-Omni: force_image_size not found in config.json");
+            return false;
+        }
+        LOG_INFO("Nemotron-Omni RADIO: channels=%ld, image_size=%ldx%ld", mNumChannels, mImageSizeH, mImageSizeW);
+        break;
+    }
+
     case multimodal::ModelType::UNKNOWN: LOG_ERROR("Unsupported model type: %s", modelTypeStr.c_str()); return false;
 
     default: break;
@@ -212,6 +230,10 @@ bool VisualBuilder::setupVisualOptimizationProfile(
 
     case multimodal::ModelType::INTERNVL:
     case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
+
+    case multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER:
+        result = setupNemotronOmniViTProfile(*visualProfile);
+        break;
 
     default: LOG_ERROR("Unsupported model type for visual encoder: %d", static_cast<int>(mModelType)); return false;
     }
@@ -331,6 +353,32 @@ bool VisualBuilder::setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile& pr
         createDims({optNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
         createDims({maxNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}));
 
+    return result;
+}
+
+bool VisualBuilder::setupNemotronOmniViTProfile(nvinfer1::IOptimizationProfile& profile)
+{
+    bool result = true;
+
+    // Tokens per tile: (H / patch_size * downsample_ratio)^2
+    int64_t const patchSize = mModelConfig["patch_size"].get<int64_t>();
+    double const downsampleRatio = mModelConfig["downsample_ratio"].get<double>();
+    int64_t const tokensPerSide = static_cast<int64_t>(mImageSizeH / patchSize * downsampleRatio);
+    int64_t const kTokensPerBlock = tokensPerSide * tokensPerSide;
+
+    int64_t maxNumBlocks = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / kTokensPerBlock);
+    int64_t minNumBlocks = std::max<int64_t>(1, mBuilderConfig.minImageTokens / kTokensPerBlock);
+    int64_t optNumBlocks = (minNumBlocks + maxNumBlocks) / 2;
+
+    result &= setOptimizationProfile(&profile, binding_names::kVisualInput,
+        createDims({minNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
+        createDims({optNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
+        createDims({maxNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}));
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Nemotron-Omni ViT optimization profile");
+    }
     return result;
 }
 

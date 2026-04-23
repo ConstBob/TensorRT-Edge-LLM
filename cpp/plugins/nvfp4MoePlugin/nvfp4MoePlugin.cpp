@@ -64,14 +64,14 @@ namespace plugins
 //
 // Inputs (see supportsFormatCombination / enqueue):
 //   [0] router logits FP32 [batch * seq_len, num_experts] (pre-sigmoid; sigmoid+grouped-top-k inside plugin)
-//   [1] hidden activations: FP16 \c [batch, seq_len, hidden_size] (W4A16), or INT8 NVFP4 packed payload \c
+//   [1] hidden activations: FP16 \c [batch, seq_len, hidden_size] (W4A16), or INT8 NVFP4 packed weights \c
 //   [batch, seq_len, hidden_size/2] (W4A4; two FP4 nibbles per byte along hidden)
 //   [2] hidden_block_scale: INT8 — W4A4: \c [batch, seq_len, hidden_size/16] (Marlin tile scale bytes). W4A16: unused
 //   (any INT8 tensor may be bound as a placeholder; shape is ignored).
 //   [3] hidden_global_scale: FP32 length 1 — W4A4: device scalar for \c activation.global_scale[0]; W4A16: unused dummy
-//   [4][5][6] up_proj: INT8 NVFP4 payload \c [E, K/2, moe_inter_size], INT8 block scales \c [E, K/16, moe_inter_size],
+//   [4][5][6] up_proj: INT8 NVFP4 weights \c [E, K/2, moe_inter_size], INT8 block scales \c [E, K/16, moe_inter_size],
 //   FP32 per-expert global scale \c [E]
-//   [7][8][9] down_proj: INT8 NVFP4 payload \c [E, moe_inter_size, K/2]; INT8 block scales \c [E, moe_inter_size,
+//   [7][8][9] down_proj: INT8 NVFP4 weights \c [E, moe_inter_size, K/2]; INT8 block scales \c [E, moe_inter_size,
 //   K/16]; FP32 per-expert global scale \c [E]
 //   [10] e_score_correction_bias: FP32 \c [num_experts] — NemotronH expert load balancing bias (optional; zeros if
 //   unset)
@@ -383,7 +383,7 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
 
     // Marlin NVFP4 tile layout as INT8: \c [E, K/2, inter] with \c K = hidden_size (two FP4 per byte).
     // Same underlying bytes as the legacy INT32 view \c [E, K/64, inter, 8].
-    auto const checkUpPayload = [this](PluginTensorDesc const& t) {
+    auto const checkUpWeights = [this](PluginTensorDesc const& t) {
         bool s{true};
         s &= t.type == DataType::kINT8;
         s &= t.dims.nbDims == 3;
@@ -433,7 +433,7 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
         return s;
     };
 
-    auto const checkDownPayload = [this](PluginTensorDesc const& t) {
+    auto const checkDownWeights = [this](PluginTensorDesc const& t) {
         bool s{true};
         s &= t.type == DataType::kINT8;
         s &= t.dims.nbDims == 3;
@@ -481,10 +481,10 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
         return false;
     }
     case 3: return ok && td.type == DataType::kFLOAT && td.dims.nbDims == 1 && td.dims.d[0] == 1;
-    case 4: return ok && checkUpPayload(td);
+    case 4: return ok && checkUpWeights(td);
     case 5: return ok && checkUpBlockScale(td);
     case 6: return ok && checkUpGlobalScale(td);
-    case 7: return ok && checkDownPayload(td);
+    case 7: return ok && checkDownWeights(td);
     case 8: return ok && checkDownBlockScale(td);
     case 9: return ok && checkDownGlobalScale(td);
     case 10:

@@ -243,7 +243,7 @@ class ModelConfig:
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output (concatenated from 3 selected layers).
     eagle_base: bool = False
-    # ------------------------------------------ sparse MoE config
+    # ------------------------------------------ sparse MoE config (Qwen3-style)
     # num_experts=0 means dense (no MoE).
     num_experts: int = 0
     n_routed_experts: int = 0

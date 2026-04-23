@@ -45,6 +45,7 @@ from .onnx.export import export_onnx
 register_model("nemotron_h", NemotronHCausalLM)
 register_model("qwen3_5_text", Qwen3_5CausalLM)
 register_model("qwen3_moe", Qwen3MoeCausalLM)
+register_model("NemotronH_Nano_VL_V2", NemotronHCausalLM)
 
 __all__ = [
     "__version__",

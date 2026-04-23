@@ -854,18 +854,22 @@ _nvfp4_moe_plugin_schema = OpSchema(
                                  "Placeholder INT8"),
         OpSchema.FormalParameter("hidden_global_scale", "T1",
                                  "Placeholder FP32 [1]"),
-        OpSchema.FormalParameter("up_payload", "T3",
+        OpSchema.FormalParameter("up_weights", "T3",
                                  "Up weights [E, H/2, I] INT8"),
         OpSchema.FormalParameter("up_block_scale", "T3",
                                  "Up block scales [E, H/16, I] INT8"),
         OpSchema.FormalParameter("up_global_scale", "T1",
                                  "Up global scales [E] FP32"),
-        OpSchema.FormalParameter("down_payload", "T3",
+        OpSchema.FormalParameter("down_weights", "T3",
                                  "Down weights [E, I, H/2] INT8"),
         OpSchema.FormalParameter("down_block_scale", "T3",
                                  "Down block scales [E, I, H/16] INT8"),
         OpSchema.FormalParameter("down_global_scale", "T1",
                                  "Down global scales [E] FP32"),
+        OpSchema.FormalParameter(
+            "e_score_correction_bias", "T1",
+            "NemotronH expert load-balancing correction bias [E] FP32; zeros if unused"
+        ),
     ],
     outputs=[
         OpSchema.FormalParameter("output", "T2", "Output [B, S, H] FP16"),
@@ -881,6 +885,11 @@ _nvfp4_moe_plugin_schema = OpSchema(
         OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
         OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
         OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("n_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
+        OpSchema.Attribute("routed_scaling_factor", OpSchema.AttrType.FLOAT),
+        OpSchema.Attribute("routing_mode", OpSchema.AttrType.INT),
     ],
 )
 

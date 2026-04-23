@@ -20,16 +20,18 @@ single unified module.  Both encoder types share the same dynamo export path;
 the only difference is how the model is built and how its I/O spec is provided.
 
 Visual encoders — I/O spec via ``model.get_onnx_export_args(config, device)``:
-    - Qwen3-VL        (model_type ``qwen3_vl``, ``qwen3_omni``)
-    - Qwen3.5         (model_type ``qwen3_5``, ``qwen3_5_moe``)
-    - Qwen2.5-VL      (model_type ``qwen2_5_vl``)
-    - InternVL3       (model_type ``internvl_chat``)
-    - InternVL3 HF    (model_type ``internvl``)
+    - Qwen3-VL         (model_type ``qwen3_vl``, ``qwen3_omni``)
+    - Qwen3.5          (model_type ``qwen3_5``, ``qwen3_5_moe``)
+    - Qwen2.5-VL       (model_type ``qwen2_5_vl``)
+    - InternVL3        (model_type ``internvl_chat``)
+    - InternVL3 HF     (model_type ``internvl``)
     - Phi-4 Multimodal (model_type ``phi4mm``, ``phi4_multimodal``)
+    - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2``)
 
-Audio encoders — I/O spec defined internally (Whisper-style CNN+Transformer):
-    - Qwen3-ASR   (model_type ``qwen3_asr``)
-    - Qwen3-Omni  (model_type ``qwen3_omni``, ``qwen3_omni_thinker``)
+Audio encoders — I/O spec defined internally or via ``model.get_onnx_export_args``:
+    - Qwen3-ASR    (model_type ``qwen3_asr``)
+    - Qwen3-Omni   (model_type ``qwen3_omni``, ``qwen3_omni_thinker``)
+    - Nemotron-Omni (model_type ``NemotronH_Nano_VL_V2``)
 
 Note: Qwen3-TTS has NO audio encoder.  Its Talker/CodePredictor are LLM
 decoders exported via the standard LLM pipeline.
@@ -69,16 +71,25 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "internvl": "internvl3_5",
     "phi4mm": "phi4mm",
     "phi4_multimodal": "phi4mm",
+    "NemotronH_Nano_VL_V2": "nemotron_omni",
 }
 
 # Maps family → dotted module path inside llm_loader
 _VISUAL_FAMILY_MODULE: dict[str, str] = {
-    "qwen3_vl": "llm_loader.models.qwen3_vl.modeling_qwen3_vl_visual",
-    "qwen3_5": "llm_loader.models.qwen3_5.modeling_qwen3_5_visual",
-    "qwen2_5_vl": "llm_loader.models.qwen2_5_vl.modeling_qwen2_5_vl_visual",
-    "internvl3": "llm_loader.models.internvl3.modeling_internvl3_visual",
-    "internvl3_5": "llm_loader.models.internvl3_5.modeling_internvl3_5_visual",
-    "phi4mm": "llm_loader.models.phi4mm.modeling_phi4mm_visual",
+    "qwen3_vl":
+    "llm_loader.models.qwen3_vl.modeling_qwen3_vl_visual",
+    "qwen3_5":
+    "llm_loader.models.qwen3_5.modeling_qwen3_5_visual",
+    "qwen2_5_vl":
+    "llm_loader.models.qwen2_5_vl.modeling_qwen2_5_vl_visual",
+    "internvl3":
+    "llm_loader.models.internvl3.modeling_internvl3_visual",
+    "internvl3_5":
+    "llm_loader.models.internvl3_5.modeling_internvl3_5_visual",
+    "phi4mm":
+    "llm_loader.models.phi4mm.modeling_phi4mm_visual",
+    "nemotron_omni":
+    "llm_loader.models.nemotron_omni.modeling_nemotron_omni_visual",
 }
 
 # Maps family → build function name in that module
@@ -89,6 +100,7 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "internvl3": "build_internvl_visual",
     "internvl3_5": "build_internvl3_5_visual",
     "phi4mm": "build_phi4mm_visual",
+    "nemotron_omni": "build_nemotron_omni_visual",
 }
 
 # ---------------------------------------------------------------------------
@@ -99,6 +111,7 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
+    "NemotronH_Nano_VL_V2",
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
 
@@ -125,8 +138,8 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if model_type in ("internvl", "internvl_chat"):
-        # InternVL models need the full config (vision + text + downsample_ratio)
+    if model_type in ("internvl", "internvl_chat", "NemotronH_Nano_VL_V2"):
+        # InternVL / Nemotron-Omni need the full config (vision + text + downsample_ratio)
         return config
     if model_type in ("phi4mm", "phi4_multimodal"):
         # Phi-4mm visual config is hardcoded (not in config.json).
@@ -321,24 +334,30 @@ def export_audio_onnx(
                          f"Supported: {sorted(_AUDIO_MODEL_TYPES)}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    from ..models.qwen3_asr.modeling_qwen3_asr_audio import build_qwen_audio
-
-    audio_config = config.get("thinker_config",
-                              {}).get("audio_config",
-                                      config.get("audio_config", config))
-    key_prefix = _AUDIO_KEY_PREFIX.get(model_type)
-
-    logger.info("Building %s audio encoder (prefix=%r) ...", model_type,
-                key_prefix)
-    audio_model = build_qwen_audio(audio_config,
-                                   weights,
-                                   dtype,
-                                   prefix=key_prefix)
-    audio_model = audio_model.to(device)
-    audio_model.eval()
-
-    args, input_names, output_names, dynamic_shapes = _make_audio_dummy_inputs(
-        audio_model, audio_config, device)
+    if model_type == "NemotronH_Nano_VL_V2":
+        from ..models.nemotron_omni.modeling_nemotron_omni_audio import \
+            build_nemotron_omni_audio
+        logger.info("Building Nemotron-Omni audio encoder ...")
+        audio_model = build_nemotron_omni_audio(config, weights, dtype)
+        audio_model = audio_model.to(device).eval()
+        args, input_names, output_names, dynamic_shapes = (
+            audio_model.get_onnx_export_args(config, device))
+    else:
+        from ..models.qwen3_asr.modeling_qwen3_asr_audio import \
+            build_qwen_audio
+        audio_config = config.get("thinker_config",
+                                  {}).get("audio_config",
+                                          config.get("audio_config", config))
+        key_prefix = _AUDIO_KEY_PREFIX.get(model_type)
+        logger.info("Building %s audio encoder (prefix=%r) ...", model_type,
+                    key_prefix)
+        audio_model = build_qwen_audio(audio_config,
+                                       weights,
+                                       dtype,
+                                       prefix=key_prefix)
+        audio_model = audio_model.to(device).eval()
+        args, input_names, output_names, dynamic_shapes = (
+            _make_audio_dummy_inputs(audio_model, audio_config, device))
 
     _run_dynamo_export(audio_model, args, output_path, input_names,
                        output_names, dynamic_shapes)

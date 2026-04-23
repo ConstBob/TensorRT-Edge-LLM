@@ -608,24 +608,32 @@ def nvfp4_moe_plugin(
     hidden_states: torch.Tensor,
     hidden_block_scale: torch.Tensor,
     hidden_global_scale: torch.Tensor,
-    up_payload: torch.Tensor,
+    up_weights: torch.Tensor,
     up_block_scale: torch.Tensor,
     up_global_scale: torch.Tensor,
-    down_payload: torch.Tensor,
+    down_weights: torch.Tensor,
     down_block_scale: torch.Tensor,
     down_global_scale: torch.Tensor,
+    e_score_correction_bias: torch.Tensor,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     moe_inter_size: int,
     activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
 ) -> torch.Tensor:
     return torch.zeros_like(hidden_states)
 
 
 @nvfp4_moe_plugin.register_fake
 def _(router_logits, hidden_states, hidden_block_scale, hidden_global_scale,
-      up_payload, up_block_scale, up_global_scale, down_payload,
-      down_block_scale, down_global_scale, num_experts, top_k, hidden_size,
-      moe_inter_size, activation_type):
+      up_weights, up_block_scale, up_global_scale, down_weights,
+      down_block_scale, down_global_scale, e_score_correction_bias,
+      num_experts, top_k, hidden_size, moe_inter_size, activation_type,
+      n_group, topk_group, norm_topk_prob, routed_scaling_factor,
+      routing_mode):
     return torch.empty_like(hidden_states)

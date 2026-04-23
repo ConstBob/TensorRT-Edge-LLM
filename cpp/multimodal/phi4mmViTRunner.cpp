@@ -123,7 +123,7 @@ bool Phi4MMViTRunner::allocateBuffer(cudaStream_t stream)
     mVitInput
         = rt::Tensor({mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "Phi4MMViTRunner::mVitInput");
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
+    setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
     LOG_INFO("mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d", mConfig.maxNumBlocks, mConfig.outHiddenSize);
 
     // In Phi-4MM, each block generates 256 tokens, so output size is maxNumBlocks*256
@@ -142,7 +142,7 @@ bool Phi4MMViTRunner::allocateBuffer(cudaStream_t stream)
     mOutputEmbedding = rt::Tensor({totalCapacity, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "Phi4MMViTRunner::mOutputEmbedding");
     setTensorAddressStatus
-        &= mContext->setTensorAddress(binding_names::kVisualOutput, mEngineOutputEmbedding.rawPointer());
+        &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mEngineOutputEmbedding.rawPointer());
     if (!setTensorAddressStatus)
     {
         LOG_ERROR("Failed to set tensor address to the engine");
@@ -472,7 +472,8 @@ bool Phi4MMViTRunner::infer(cudaStream_t stream)
         TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
 
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
 
         if (!setEngineIOStatus)
         {
@@ -480,7 +481,7 @@ bool Phi4MMViTRunner::infer(cudaStream_t stream)
             return false;
         }
 
-        bool const enqueueStatus = mContext->enqueueV3(stream);
+        bool const enqueueStatus = mVisualContext->enqueueV3(stream);
 
         // Transform raw ViT tokens on GPU in one batched kernel (Phi4MM HD transform)
         // Flatten all images across batches

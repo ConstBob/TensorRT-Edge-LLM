@@ -19,6 +19,8 @@
 #include "common/mmapReader.h"
 #include "multimodal/audioRunner.h"
 #include "multimodal/internViTRunner.h"
+#include "multimodal/nemotronOmniAudioRunner.h"
+#include "multimodal/nemotronOmniViTRunner.h"
 #include "multimodal/phi4mmViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
 #include "profiling/layerProfiler.h"
@@ -51,28 +53,32 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     // Create context with user-managed memory (no device memory allocated here).
     // The context object is needed by subclasses for tensor binding during initialization.
     // Device memory must be provided via setContextMemory() before infer().
-    mContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+    mVisualContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mVisualEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    if (!mContext->setOptimizationProfileAsync(0, stream))
+    if (!mVisualContext->setOptimizationProfileAsync(0, stream))
     {
         throw std::runtime_error("Failed to set optimization profile for visual engine");
     }
 
     if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
     {
-        mContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
+        mVisualContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
     }
 }
 
 int64_t MultimodalRunner::getRequiredContextMemorySize() const
 {
-    return mVisualEngine ? mVisualEngine->getDeviceMemorySizeV2() : 0;
+    auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
+    return engine ? engine->getDeviceMemorySizeV2() : 0;
 }
 
 bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
 {
-    // No visual engine (e.g. audio-only runner), nothing to configure.
-    if (!mVisualEngine)
+    // Pick the audio pair for audio-only runners, otherwise the visual pair.
+    // If neither is populated there is nothing to configure (e.g. default-constructed runner).
+    auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
+    auto* context = mAudioEngine ? mAudioContext.get() : mVisualContext.get();
+    if (!engine)
     {
         return true;
     }
@@ -85,7 +91,7 @@ bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
         return false;
     }
 
-    mContext->setDeviceMemoryV2(sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity());
+    context->setDeviceMemoryV2(sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity());
     return true;
 }
 
@@ -139,6 +145,14 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     else if (modelType == multimodal::ModelType::PHI4MM)
     {
         multimodalRunner = std::make_unique<Phi4MMViTRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER)
+    {
+        multimodalRunner = std::make_unique<NemotronOmniViTRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
+    {
+        multimodalRunner = std::make_unique<NemotronOmniAudioRunner>(multimodalEngineDir, stream);
     }
     else
     {
