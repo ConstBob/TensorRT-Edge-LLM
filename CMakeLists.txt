@@ -181,6 +181,7 @@ add_subdirectory(cpp)
 add_subdirectory(examples)
 
 option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
+option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 # CuTe DSL unified kernel option — declare here so it is always defined before
 # any subdirectory or include references it. Choices: OFF | ALL | fmha | gdn |
@@ -212,4 +213,8 @@ if(BUILD_UNIT_TESTS)
     cute_dsl_setup(LINK_TARGETS unitTest)
   endif()
   add_cross_build_link_options(unitTest)
+endif()
+
+if(BUILD_PYTHON_BINDINGS)
+  add_subdirectory(experimental/pybind)
 endif()

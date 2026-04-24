@@ -33,3 +33,14 @@ tests:
   - tests/defs/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-GPTQ-Int4-int4_gptq-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792]
   - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-GPTQ-Int4-int4_gptq-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-vlm_basic]
   - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-GPTQ-Int4-int4_gptq-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-mmmu-bs2]
+
+  # === Experimental Python Server (pybind E2E) ===
+  - tests/defs/test_server_pipeline.py::test_build_pybind
+  # Low-level pybind runtime tests (LLM + VLM + streaming)
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_inference[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_streaming[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
+  # High-level API tests (LLM.generate + LLM.generate_stream)
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_streaming[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
