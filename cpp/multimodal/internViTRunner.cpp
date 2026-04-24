@@ -238,7 +238,8 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                rt::imageUtils::resizeImage(image, mResizedImageHost, resizedWidth, resizedHeight);
+                rt::imageUtils::resizeImage(
+                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
                 formatPatch(mResizedImageHost, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
             else
@@ -249,8 +250,8 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             int64_t const mainImageBlocks = totalNumBlocks - blocksBeforePatch;
             if (mainImageBlocks > 1)
             {
-                rt::imageUtils::resizeImage(
-                    image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
+                rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
+                    mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC);
                 formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
             }
         }
