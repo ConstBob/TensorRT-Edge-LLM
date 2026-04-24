@@ -126,37 +126,13 @@ else()
   set(NVTX_INCLUDE_DIR "")
 endif()
 
-# Set TensorRT header includes and library dependencies.
-if(NOT DEFINED TRT_PACKAGE_DIR)
-  message(
-    FATAL_ERROR "Please specify the -DTRT_PACKAGE_DIR when invoking CMake.")
-endif()
-
-find_path(
-  TRT_INCLUDE_DIR NvInfer.h
-  HINTS ${TRT_PACKAGE_DIR}
-  PATH_SUFFIXES include ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-find_path(ONNX_PARSER_INCLUDE_DIR NvOnnxParser.h HINTS ${TRT_INCLUDE_DIR})
-if(NOT ONNX_PARSER_INCLUDE_DIR)
-  message(
-    FATAL_ERROR
-      "NvOnnxParser.h not found in TensorRT headers, please specify the -DONNX_PARSER_INCLUDE_DIR when invoking CMake"
-  )
-endif()
-
-find_library(
-  NVINFER_LIB nvinfer
-  HINTS ${TRT_PACKAGE_DIR}
-  PATH_SUFFIXES lib lib64 ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-find_library(
-  NV_ONNX_PARSER_LIB nvonnxparser
-  HINTS ${TRT_PACKAGE_DIR}
-  PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+find_package(TensorRT REQUIRED COMPONENTS OnnxParser)
 
 # TRT and CUDA headers are treated as system includes so that the compiler
 # suppresses warnings originating from them (e.g. -Wunused-parameter in
 # NvInferRuntime.h virtual stubs).
-include_directories(SYSTEM ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR})
+include_directories(SYSTEM ${CUDA_INCLUDE_DIR} ${TensorRT_INCLUDE_DIR})
 
 set(COMMON_INCLUDE_DIRS
     ${NVTX_INCLUDE_DIR}
@@ -166,7 +142,9 @@ set(COMMON_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/3rdParty/stb)
 
 add_library(commonLibraryExt INTERFACE)
-target_link_libraries(commonLibraryExt INTERFACE ${NVINFER_LIB} ${CUDART_LIB})
+target_link_libraries(
+  commonLibraryExt INTERFACE TensorRT::TensorRT TensorRT::OnnxParser
+                             ${CUDART_LIB})
 # Workaround for aarch64 cross compilation where libvninfer.so links to
 # libnvdla_compilers. The libnvinfer dependencies shall be resolved at execution
 # time on an embedded board.
