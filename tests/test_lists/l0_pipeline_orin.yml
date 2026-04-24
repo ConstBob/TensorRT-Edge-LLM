@@ -18,3 +18,7 @@ tests:
   # qwenViTRunner.cpp:787 preprocess() fails when two large images exceed
   # the visual engine's pre-allocated tensor capacity.
   # - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-mmmu-bs2]
+
+  # === Experimental Python Server (pybind E2E) ===
+  - tests/defs/test_server_pipeline.py::test_build_pybind
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mxlr64-llm_basic]

@@ -27,3 +27,4 @@ End-to-end workflows demonstrating TensorRT Edge-LLM capabilities across differe
 - **[ASR (Automatic Speech Recognition)](asr.md)** - Speech-to-text with Whisper models
 - **[MoE (Mixture of Experts)](moe.md)** - Mixture of Experts model deployment
 - **[TTS (Text-to-Speech)](tts.md)** - Text-to-speech synthesis workflows
+- **[Experimental Python Server](experimental-server.md)** - vLLM-style API and OpenAI-compatible server with spec-decode support
