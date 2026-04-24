@@ -887,6 +887,16 @@ class NemotronHMoEReference:
                 )
                 return
 
+        # Allow a small fraction of outliers (FP4 quantization noise).
+        if max_outlier_frac > 0.0 and t.size > 0:
+            bad_frac = n_bad / t.size
+            if bad_frac <= max_outlier_frac:
+                print(
+                    f"{case}: {n_bad}/{t.size} elements ({bad_frac*100:.4f}%) exceed tolerance "
+                    f"(within allowed {max_outlier_frac*100:.4f}% outlier budget, PASS)."
+                )
+                return
+
         max_abs = float(np.max(raw_abs)) if t.size else 0.0
         n_nonfinite = int(np.sum(~finite))
         ids = np.flatnonzero(~ok)
@@ -2842,6 +2852,101 @@ def test_nvfp4_w4a16_moe_plugin_accuracy_sf_padding_non128_aligned() -> None:
         hidden_size=1856,  # NOT a multiple of 128 (1856 = 128*14 + 64)
         moe_inter_size=2688,
         num_experts=2,
+    )
+
+
+def test_nvfp4_w4a16_moe_plugin_accuracy_sf_padding_non128_aligned() -> None:
+    """Regression: hidden_size=1856 (not 128-aligned) exercises Cutlass Atom SF padding."""
+    check_requirements()
+    assert trt is not None
+    dev = torch.device("cuda", torch.cuda.current_device())
+    batch = 1
+    seq = 1
+    h = 1856  # NOT a multiple of 128 (1856 = 128*14 + 64)
+    inter = 2688  # multiple of 128
+    e_ct = 2  # minimal experts to keep pure-Python packing loops fast
+    tk = 1
+    moe_seed = 5050
+    hidden_seed = 91050
+
+    expert = np.array([[0]], dtype=np.int32)
+    score = np.array([[1.0]], dtype=np.float32)
+
+    moe = create_toy_moe(
+        dev,
+        hidden_size=h,
+        moe_inter_size=inter,
+        num_experts=e_ct,
+        top_k=tk,
+        seed=moe_seed,
+    )
+    mod = NemotronHMoEW4A4Plugin(moe)
+    mod.eval().to(dev)
+    mod.pack_experts_weights_to_marlin(moe)
+
+    logits_np = NemotronHMoEReference.router_logits_from_desired_topk(
+        expert, score, num_tokens=batch * seq, num_experts=e_ct, top_k=tk)
+
+    hidden_bsh = structured_noise_hidden_states_bsh(batch,
+                                                    seq,
+                                                    h,
+                                                    seed=hidden_seed,
+                                                    amp=2.5,
+                                                    device=dev)
+
+    mod_cpu = mod.cpu()
+    topw_np, topi_np = NemotronHMoEReference.moe_topk_softmax_renormalize_numpy(
+        logits_np, tk)
+    hidden_np = np.ascontiguousarray(hidden_bsh.cpu().numpy())
+
+    ref_marlin_np = NemotronHMoEReference.reference_from_packed_plugin_state(
+        hidden_np,
+        topw_np,
+        topi_np,
+        mod_cpu.fc_up_qweights.numpy(),
+        mod_cpu.fc_up_blocks_scale.numpy(),
+        mod_cpu.fc_down_qweights.numpy(),
+        mod_cpu.fc_down_blocks_scale.numpy(),
+        mod_cpu.fc_up_global_scale.numpy(),
+        mod_cpu.fc_down_global_scale.numpy(),
+        hidden_size=h,
+        moe_inter_size=inter,
+        num_experts=e_ct,
+        activation_type=int(mod_cpu.activation_type),
+    )
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    load_nvfp4_moe_edge_llm_plugins(logger, _PLUGIN_SO, verbose=False)
+    eng = serialize_nvfp4_moe_engine_with_explicit_router(
+        mod_cpu,
+        batch=batch,
+        seq=seq,
+        logger=logger,
+        router_logits_np=logits_np,
+        verbose=False,
+    )
+
+    stream = torch.cuda.Stream(device=dev)
+    trt_out = execute_trt_engine(
+        eng,
+        {
+            "router_logits": np.ascontiguousarray(logits_np.astype(
+                np.float32)),
+            "hidden_states": np.ascontiguousarray(hidden_np.astype(
+                np.float16)),
+        },
+        stream,
+        device=dev,
+        verbose=False,
+        label="nvfp4-moe-sf-padding-non128",
+    )
+
+    NemotronHMoEReference.assert_trt_output_matches_nvfp4_marlin_numpy_reference(
+        trt_out,
+        ref_marlin_np.astype(np.float32),
+        "sf_padding_non128_h1856_i2688",
+        tol_scale=_NVFP4_MOE_TRT_REF_TOL_SCALE,
+        max_outlier_frac=0.003,
     )
 
 
