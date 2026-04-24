@@ -423,7 +423,8 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
             if (doResize)
             {
                 auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
-                rt::imageUtils::resizeImage(image, mResizedImageHost, resizedWidth, resizedHeight);
+                rt::imageUtils::resizeImage(
+                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
                 formatPatch(mResizedImageHost, imageGridTHWs, imageTokenLengths, cuSeqlensData, cuSeqlensSize,
                     maxSeqLen, stream);
             }
