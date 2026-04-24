@@ -224,7 +224,7 @@ cmake .. \
 
 | Option | Description | Default |
 |:-------|:------------|:--------|
-| `TRT_PACKAGE_DIR` | Path to TensorRT installation | Required |
+| `TRT_PACKAGE_DIR` | Path to TensorRT installation. Auto-detected; manual hint to disambiguate multiple versions. | N/A |
 | `CMAKE_TOOLCHAIN_FILE` | **Required for Edge devices**: Use `cmake/aarch64_linux_toolchain.cmake` for Edge device builds. **Not needed for GPU builds** | N/A |
 | `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson) or `auto-thor` (DRIVE / DriveOS). **Not needed for GPU builds** | N/A |
 | `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
