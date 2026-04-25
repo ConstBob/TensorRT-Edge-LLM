@@ -314,7 +314,7 @@ void HybridCacheManager::compactBatch(
     {
         auto const* layerInfos = static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer());
         kernel::compactKVCacheBatched(layerInfos, batchMapping, mDeviceKVCacheLengths, group.numLayers, group.headDim,
-            group.maxKVHeads, mConfig.maxBatchSize, oldBatch, newBatch, stream);
+            mConfig.kvConfig.kvCacheType, group.maxKVHeads, mConfig.maxBatchSize, oldBatch, newBatch, stream);
     }
 
     // Compact the shared KV cache lengths tensor separately after all layers are done.
