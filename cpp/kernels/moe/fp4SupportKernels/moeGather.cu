@@ -102,9 +102,8 @@ __launch_bounds__(kGatherBlockSize) __global__
 } // namespace
 
 void launchMoeGather(rt::Tensor const& srcFP4, rt::Tensor& dstFP4, rt::Tensor const& srcSF, rt::Tensor& dstSF,
-    rt::Tensor const& permuteMap, int32_t topK, int32_t hiddenSize, cudaStream_t stream)
+    rt::Tensor const& permuteMap, int32_t permutedM, int32_t topK, int32_t hiddenSize, cudaStream_t stream)
 {
-    int32_t const permutedM = static_cast<int32_t>(permuteMap.getShape()[0]);
     if (permutedM <= 0)
         return;
 

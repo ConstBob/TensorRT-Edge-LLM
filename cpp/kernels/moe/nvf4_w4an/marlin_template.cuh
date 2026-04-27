@@ -30,6 +30,14 @@
 namespace trt_edgellm
 {
 
+//! Convert one FP8 E4M3 byte to float using the same bit trick as Marlin \c dequant_fp8_scales.
+//! Result is the raw FP8 value divided by 256; the caller's \c global_scale compensates.
+__device__ __forceinline__ float decodeSfByteToFloat(uint8_t const b)
+{
+    uint16_t const h = static_cast<uint16_t>(b) << 7u;
+    return __half2float(*reinterpret_cast<__half const*>(&h));
+}
+
 //! Apply \p kAct nonlinearity (see \ref MoEActivationKind) to up-proj accumulator \p z before decode post-scaling.
 template <MoEActivationKind kAct>
 __device__ __forceinline__ float moeActivation(float z)
@@ -587,6 +595,133 @@ __device__ __forceinline__ void accumulateNvfp4GemvTileWarpReduceToHalf(NVFP4Ten
     __syncthreads();
 }
 
+//! Like \ref accumulateNvfp4GemvTileWarpReduce but reads per-element FP8 scales from \p sf_base
+//! (decode-friendly row-major layout \c [E, K/16, N]) instead of the NVFP4Tensor's atom-swizzled
+//! block_scale. \p sf_base points at 64 contiguous scale bytes for this tile — one per N-axis
+//! element. Each thread's H-group determines the SF row; the 64 consecutive I (or H for down)
+//! positions provide per-element scales.
+template <int kThreadBlockSize, int kMaxWarpCount = 8>
+__device__ __forceinline__ void accumulateNvfp4GemvTileWarpReduceDecodeSf(NVFP4Tensor const& weight, Dim3 const tile,
+    float const act_scale, uint8_t const* __restrict__ sf_base, __half* __restrict__ output, int const out_base)
+{
+    static_assert(kThreadBlockSize % 32 == 0, "kThreadBlockSize must be a multiple of warp size.");
+    static constexpr int kWarpCount = kThreadBlockSize / 32;
+    static_assert(kWarpCount <= kMaxWarpCount, "kWarpCount exceeds kMaxWarpCount.");
+
+    static __shared__ half2 s_warp_chunk[kMaxWarpCount][kNvfp4Int4PerTilePayload][4][4];
+
+    __half const act_global_h = __float2half_rn(act_scale);
+
+#pragma unroll
+    for (int chunk = 0; chunk < static_cast<int>(kNvfp4Int4PerTilePayload); ++chunk)
+    {
+        uint4 blk;
+        weight.loadTileUint4(tile, chunk, blk);
+        uint32_t const w32[4] = {blk.x, blk.y, blk.z, blk.w};
+
+#pragma unroll
+        for (int lane = 0; lane < 4; ++lane)
+        {
+            int const base = (chunk * 4 + lane) * 8;
+            half2 frag[4];
+            marlin::dequant<half2, nvfp4_tensor_detail::kFe2m1fTypeId>(static_cast<int>(w32[lane]), frag);
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                __half const sf_lo = __float2half_rn(decodeSfByteToFloat(sf_base[base + 2 * k]));
+                __half const sf_hi = __float2half_rn(decodeSfByteToFloat(sf_base[base + 2 * k + 1]));
+                __half const wsum0 = warp_reduce_half(act_global_h * sf_lo * __low2half(frag[k]));
+                __half const wsum1 = warp_reduce_half(act_global_h * sf_hi * __high2half(frag[k]));
+                int const warp_id = static_cast<int>(threadIdx.x) / 32;
+                if ((threadIdx.x & 31) == 0)
+                {
+                    s_warp_chunk[warp_id][chunk][lane][k] = make_half2(wsum0, wsum1);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    int const tid = static_cast<int>(threadIdx.x);
+    if (tid < 32)
+    {
+        int const chunk = tid / 16;
+        int const lane_k = tid - 16 * chunk;
+        int const lane = lane_k / 4;
+        int const k = lane_k - lane * 4;
+
+        half2 const reduced = block_reduce_half2<kWarpCount>(s_warp_chunk, chunk, lane, k);
+        int const i0 = (chunk * 4 + lane) * 8 + 2 * k;
+        atomicAddHalf2Aligned(output + out_base + i0, reduced);
+    }
+    __syncthreads();
+}
+
+//! Like \ref accumulateNvfp4GemvTileWarpReduceToHalf but reads per-element FP8 scales from
+//! \p sf_base (decode-friendly row-major layout). Also applies \c wt.global_scale[tile.x].
+//! \p sf_base points at 64 contiguous scale bytes — one per element in the tile's N-axis.
+template <int kThreadBlockSize>
+__device__ __forceinline__ void accumulateNvfp4GemvTileWarpReduceToHalfDecodeSf(NVFP4Tensor const& wt, Dim3 const tile,
+    float const act_scale, uint8_t const* __restrict__ sf_base, __half* __restrict__ output, int const out_chunk_base)
+{
+    static_assert(kThreadBlockSize == 64 || kThreadBlockSize == 96 || kThreadBlockSize == 128 || kThreadBlockSize == 192
+            || kThreadBlockSize == 256,
+        "accumulateNvfp4GemvTileWarpReduceToHalfDecodeSf: kThreadBlockSize must be 64, 96, 128, 192, or 256");
+    static_assert(kThreadBlockSize % 32 == 0,
+        "accumulateNvfp4GemvTileWarpReduceToHalfDecodeSf: kThreadBlockSize must be a multiple of warp size.");
+    static constexpr int kWarpCount = kThreadBlockSize / 32;
+
+    static __shared__ half2 floatAccumWarpReduceChunk[kMaxDecodingKernelWarpCount][kNvfp4Int4PerTilePayload][4][4];
+
+    float const ds = nvfp4TensorScaleAt(wt.global_scale, tile.x);
+    __half const act_global_h = __float2half_rn(act_scale * ds);
+
+#pragma unroll
+    for (int chunk = 0; chunk < static_cast<int>(kNvfp4Int4PerTilePayload); ++chunk)
+    {
+        uint4 a_blk;
+        wt.loadTileUint4(tile, chunk, a_blk);
+        uint32_t const w32[4] = {a_blk.x, a_blk.y, a_blk.z, a_blk.w};
+
+#pragma unroll
+        for (int lane = 0; lane < 4; ++lane)
+        {
+            uint32_t const wpack = w32[lane];
+            int const base = (chunk * 4 + lane) * 8;
+            half2 frag[4];
+            marlin::dequant<half2, nvfp4_tensor_detail::kFe2m1fTypeId>(static_cast<int>(wpack), frag);
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                __half const sf_lo = __float2half_rn(decodeSfByteToFloat(sf_base[base + 2 * k]));
+                __half const sf_hi = __float2half_rn(decodeSfByteToFloat(sf_base[base + 2 * k + 1]));
+                __half const wsum0 = warp_reduce_half(act_global_h * sf_lo * __low2half(frag[k]));
+                __half const wsum1 = warp_reduce_half(act_global_h * sf_hi * __high2half(frag[k]));
+                int const warp_id = static_cast<int>(threadIdx.x) / 32;
+                if ((threadIdx.x & 31) == 0)
+                {
+                    floatAccumWarpReduceChunk[warp_id][chunk][lane][k] = make_half2(wsum0, wsum1);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    int const tid = static_cast<int>(threadIdx.x);
+    static_assert(kNvfp4Int4PerTilePayload == 2, "kNvfp4Int4PerTilePayload must be 2");
+    if (tid < 32)
+    {
+        int const chunk = tid / 16;
+        int const lane_k = tid - 16 * chunk;
+        int const lane = lane_k / 4;
+        int const k = lane_k - lane * 4;
+        int const i0 = (chunk * 4 + lane) * 8 + 2 * k;
+        half2 const reduced = block_reduce_half2<kWarpCount>(floatAccumWarpReduceChunk, chunk, lane, k);
+        atomicAddHalf2Aligned(output + out_chunk_base + i0, reduced);
+    }
+    __syncthreads();
+}
+
 //! W4A4 decode — up-proj only. Grid = \c batch × seq_len × top_k × (hidden_dim / kThreadBlockSize) (hidden strips).
 //! FP16 scratch row-major \c [batch * seq_len, top_k, inter_dim] (same as \ref moeW4A16DecodeUpGemvKernel).
 //! Each thread dequants its NVFP4 activation scalar at hidden position \c j, multiplies by \c
@@ -595,7 +730,8 @@ __device__ __forceinline__ void accumulateNvfp4GemvTileWarpReduceToHalf(NVFP4Ten
 template <int kThreadBlockSize>
 __global__ void moeW4A4DecodeUpGemvKernel(int const batch, int const seq_len, int const hidden_dim, int const inter_dim,
     int const inter_chunks, int const num_experts, int const top_k, int32_t const* __restrict__ expert_ids,
-    NVFP4Tensor activation, NVFP4Tensor up, __half* __restrict__ inter_fp16_accum)
+    NVFP4Tensor activation, NVFP4Tensor up, uint8_t const* __restrict__ up_decode_sf,
+    __half* __restrict__ inter_fp16_accum)
 {
     static_assert(kThreadBlockSize == 64 || kThreadBlockSize == 96 || kThreadBlockSize == 128 || kThreadBlockSize == 192
             || kThreadBlockSize == 256,
@@ -634,16 +770,20 @@ __global__ void moeW4A4DecodeUpGemvKernel(int const batch, int const seq_len, in
     float const act_val = dequantNvfp4TileElemToFloat(activation, make_int3(token_idx, act_tile_idx, 0), act_elem_idx)
         * nvfp4TensorScaleAt(activation.global_scale, 0);
 
-    // Up weights are packed per \c populate_marlin_plugin_buffers: tile index (jj, inter_chunk) with
-    // \c jj in [0, hidden_dim) one row per hidden element (not per 64-lane hidden tile). Matches \c NVFP4Tensor strides
-    // in \c Nvfp4MoePlugin (second tile axis = hidden row \c jj).
+    // Decode SF base for this thread: up_decode_sf[E, H/16, I], row-major.
+    int const h_group = j / 16;
+    int const sf_expert_offset = e * (hidden_dim / 16) * inter_dim;
+    int const sf_h_offset = h_group * inter_dim;
+
     for (int c = 0; c < inter_chunks; ++c)
     {
         Dim3 const upTile = make_int3(e, j, c);
         int64_t const inter_row = (static_cast<int64_t>(token_idx) * top_k + static_cast<int64_t>(k_slot))
             * static_cast<int64_t>(inter_dim);
         int const out_base = static_cast<int>(inter_row) + c * 64;
-        accumulateNvfp4GemvTileWarpReduceToHalf<kThreadBlockSize>(up, upTile, act_val, inter_fp16_accum, out_base);
+        uint8_t const* sf_base = up_decode_sf + sf_expert_offset + sf_h_offset + c * 64;
+        accumulateNvfp4GemvTileWarpReduceToHalfDecodeSf<kThreadBlockSize>(
+            up, upTile, act_val, sf_base, inter_fp16_accum, out_base);
     }
 }
 
@@ -659,7 +799,7 @@ template <int kThreadBlockSize, MoEActivationKind kAct>
 __global__ void moeW4A4DecodeDownGemvKernel(int const batch, int const seq_len, int const hidden_dim,
     int const inter_dim, int const hidden_chunks, int const num_experts, int const top_k,
     int32_t const* __restrict__ expert_ids, float const* __restrict__ topk_weights, __half const* __restrict__ inter_in,
-    NVFP4Tensor down, __half* __restrict__ output)
+    NVFP4Tensor down, uint8_t const* __restrict__ down_decode_sf, __half* __restrict__ output)
 {
     static_assert(kThreadBlockSize == 64 || kThreadBlockSize == 96 || kThreadBlockSize == 128 || kThreadBlockSize == 192
             || kThreadBlockSize == 256,
@@ -701,12 +841,18 @@ __global__ void moeW4A4DecodeDownGemvKernel(int const batch, int const seq_len, 
     float const down_gs = nvfp4TensorScaleAt(down.global_scale, e);
     float const t = moeActivation<kAct>(z) * score * down_gs;
 
+    // Decode SF base: down_decode_sf[E, I/16, H], row-major.
+    int const i_group = j / 16;
+    int const sf_expert_offset = e * (inter_dim / 16) * hidden_dim;
+    int const sf_i_offset = i_group * hidden_dim;
+
     for (int c = 0; c < hidden_chunks; ++c)
     {
         Dim3 const d_tile = make_int3(e, j, c);
         int const out_base = token_idx * hidden_dim + c * 64;
-        accumulateNvfp4GemvTileWarpReduce<kThreadBlockSize, kMaxDecodingKernelWarpCount>(
-            down, d_tile, t, output, out_base);
+        uint8_t const* sf_base = down_decode_sf + sf_expert_offset + sf_i_offset + c * 64;
+        accumulateNvfp4GemvTileWarpReduceDecodeSf<kThreadBlockSize, kMaxDecodingKernelWarpCount>(
+            down, d_tile, t, sf_base, output, out_base);
     }
 }
 
@@ -717,7 +863,7 @@ template <int kThreadBlockSize>
 __global__ void moeW4A16DecodeUpGemvKernel(int const batch, int const seq_len, int const hidden_dim,
     int const inter_dim, int const inter_chunks, int const num_experts, int const top_k,
     int32_t const* __restrict__ expert_ids, __half const* __restrict__ input, NVFP4Tensor up,
-    __half* __restrict__ inter_fp16_accum)
+    uint8_t const* __restrict__ up_decode_sf, __half* __restrict__ inter_fp16_accum)
 {
     static_assert(kThreadBlockSize == 64 || kThreadBlockSize == 96 || kThreadBlockSize == 128 || kThreadBlockSize == 192
             || kThreadBlockSize == 256,
@@ -754,13 +900,20 @@ __global__ void moeW4A16DecodeUpGemvKernel(int const batch, int const seq_len, i
 
     float const hidden = __half2float(input[in_idx]);
 
+    // Decode SF base: up_decode_sf[E, H/16, I], row-major.
+    int const h_group = j / 16;
+    int const sf_expert_offset = e * (hidden_dim / 16) * inter_dim;
+    int const sf_h_offset = h_group * inter_dim;
+
     for (int c = 0; c < inter_chunks; ++c)
     {
         Dim3 const dTile = make_int3(e, j, c);
         int64_t const inter_row = (static_cast<int64_t>(token_idx) * top_k + static_cast<int64_t>(k_slot))
             * static_cast<int64_t>(inter_dim);
         int const out_base = static_cast<int>(inter_row) + c * 64;
-        accumulateNvfp4GemvTileWarpReduceToHalf<kThreadBlockSize>(up, dTile, hidden, inter_fp16_accum, out_base);
+        uint8_t const* sf_base = up_decode_sf + sf_expert_offset + sf_h_offset + c * 64;
+        accumulateNvfp4GemvTileWarpReduceToHalfDecodeSf<kThreadBlockSize>(
+            up, dTile, hidden, sf_base, inter_fp16_accum, out_base);
     }
 }
 
@@ -774,7 +927,7 @@ template <int kThreadBlockSize, MoEActivationKind kAct>
 __global__ void moeW4A16DecodeDownGemvKernel(int const batch, int const seq_len, int const hidden_dim,
     int const inter_dim, int const hidden_chunks, int const num_experts, int const top_k,
     int32_t const* __restrict__ expert_ids, float const* __restrict__ topk_weights, __half const* __restrict__ inter_in,
-    NVFP4Tensor down, __half* __restrict__ output)
+    NVFP4Tensor down, uint8_t const* __restrict__ down_decode_sf, __half* __restrict__ output)
 {
     static_assert(kThreadBlockSize == 64 || kThreadBlockSize == 96 || kThreadBlockSize == 128 || kThreadBlockSize == 192
             || kThreadBlockSize == 256,
@@ -816,12 +969,18 @@ __global__ void moeW4A16DecodeDownGemvKernel(int const batch, int const seq_len,
     float const down_gs = nvfp4TensorScaleAt(down.global_scale, e);
     float const act = moeActivation<kAct>(inter) * score * down_gs;
 
+    // Decode SF base: down_decode_sf[E, I/16, H], row-major.
+    int const i_group = j / 16;
+    int const sf_expert_offset = e * (inter_dim / 16) * hidden_dim;
+    int const sf_i_offset = i_group * hidden_dim;
+
     for (int c = 0; c < hidden_chunks; ++c)
     {
         Dim3 const dTile = make_int3(e, j, c);
         int const out_base = token_idx * hidden_dim + c * 64;
-        accumulateNvfp4GemvTileWarpReduce<kThreadBlockSize, kMaxDecodingKernelWarpCount>(
-            down, dTile, act, output, out_base);
+        uint8_t const* sf_base = down_decode_sf + sf_expert_offset + sf_i_offset + c * 64;
+        accumulateNvfp4GemvTileWarpReduceDecodeSf<kThreadBlockSize, kMaxDecodingKernelWarpCount>(
+            down, dTile, act, sf_base, output, out_base);
     }
 }
 

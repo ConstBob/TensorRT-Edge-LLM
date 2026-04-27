@@ -14,22 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AOT export script for the FC2 finalize kernel.
+"""AOT export script for the N-major FC2 finalize kernel.
 
-Exports ``BlockScaledContiguousGroupedGemmFinalizeKernel.wrapper`` which
-performs grouped GEMM with fused scatter-reduce for the MoE FC2 output
-projection.  The wrapper takes pointer + scalar arguments and creates
-CuTe tensors with correct layouts inside the JIT context.
+Exports ``BlockScaledContiguousGroupedGemmFinalizeNMajorKernel.wrapper``
+with 11 pointers + 6 int64 + stream. Weight B bytes arrive in
+``[L, K, N/2]`` (N innermost) — what the plugin's
+``populate_prefill_plugin_buffers`` emits for ``fc_down_qweights``. The
+kernel performs an in-flight SMEM nibble transpose so ``tcgen05.mma``
+still sees a K-major B operand.
 
-Like the contiguous FC1 kernel, this uses runtime lookup tables and needs
-only **2 variants** (n128, n256).
+Variant names: ``nvfp4_moe_fc2_n{128,256}_{bf16,fp16}``.
 
 Usage (from kernelSrcs/):
     python nvfp4_moe_cutedsl/export_fc2_kernel.py \
         --mma_tiler_n 128 \
+        --output_dtype bf16 \
         --output_dir /tmp/staging \
-        --file_name nvfp4_moe_fc2_n128 \
-        --function_prefix nvfp4_moe_fc2_n128
+        --file_name nvfp4_moe_fc2_n128_bf16 \
+        --function_prefix nvfp4_moe_fc2_n128_bf16
 
 Usage (invoked by build_cutedsl.py — PYTHONPATH set automatically).
 """
@@ -47,16 +49,17 @@ def export_fc2_finalize_variant(args):
     import cutlass
     import cutlass.cute as cute
 
-    from blockscaled_contiguous_grouped_gemm_finalize import (
-        BlockScaledContiguousGroupedGemmFinalizeKernel,
+    from blockscaled_contiguous_grouped_gemm_finalize_n_major import (
+        BlockScaledContiguousGroupedGemmFinalizeNMajorKernel,
     )
-    from common import create_dummy_pointers, get_max_active_clusters
+    from common import create_dummy_pointers, get_max_active_clusters, resolve_out_dtype
 
     cp.cuda.Device(0).use()
 
     sf_vec_size = 16
     mma_tiler_mn = (128, args.mma_tiler_n)
     cluster_shape_mn = (1, 1)
+    out_dtype = resolve_out_dtype(args.output_dtype)
     verbose = getattr(args, "verbose", False)
 
     # FC2: K=1856 (intermediate_size) -> N=2688 (hidden_size)
@@ -67,14 +70,15 @@ def export_fc2_finalize_variant(args):
     dummy_num_tokens = 128
     dummy_top_k = 6
 
-    print(f"FC2 finalize variant: mma_tiler_mn={mma_tiler_mn}")
+    print(f"N-major FC2 finalize variant: mma_tiler_mn={mma_tiler_mn}, "
+          f"output_dtype={args.output_dtype}")
 
-    gemm = BlockScaledContiguousGroupedGemmFinalizeKernel(
+    gemm = BlockScaledContiguousGroupedGemmFinalizeNMajorKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         use_blkred=True,
-        raster_along_m=True,
+        raster_along_m=False,
     )
 
     max_active_clusters = get_max_active_clusters(
@@ -84,7 +88,8 @@ def export_fc2_finalize_variant(args):
         sf_vec_size=sf_vec_size,
         dummy_m=dummy_m, dummy_n=dummy_n, dummy_k=dummy_k, dummy_l=dummy_l,
         is_swiglu=False, include_fc2_extras=True,
-        dummy_num_tokens=dummy_num_tokens, dummy_top_k=dummy_top_k)
+        dummy_num_tokens=dummy_num_tokens, dummy_top_k=dummy_top_k,
+        out_dtype=out_dtype)
 
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
@@ -150,6 +155,11 @@ def main():
         "--mma_tiler_n", type=int, required=True,
         choices=[128, 256],
         help="N-tile size for MMA (128 or 256)"
+    )
+    parser.add_argument(
+        "--output_dtype", type=str, default="bf16",
+        choices=["bf16", "fp16"],
+        help="Output element type (default: bf16)"
     )
     parser.add_argument(
         "--output_dir", type=str, required=True,

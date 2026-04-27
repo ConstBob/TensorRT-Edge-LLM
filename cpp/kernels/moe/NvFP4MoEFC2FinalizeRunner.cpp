@@ -47,17 +47,21 @@ namespace nvfp4_moe
 {
 
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
-nvfp4_moe_fc2_n128_Kernel_Module_t NvFP4MoEFC2FinalizeRunner::sFC2N128{};
-nvfp4_moe_fc2_n256_Kernel_Module_t NvFP4MoEFC2FinalizeRunner::sFC2N256{};
+nvfp4_moe_fc2_n128_bf16_Kernel_Module_t NvFP4MoEFC2FinalizeRunner::sFC2N128_bf16{};
+nvfp4_moe_fc2_n256_bf16_Kernel_Module_t NvFP4MoEFC2FinalizeRunner::sFC2N256_bf16{};
+nvfp4_moe_fc2_n128_fp16_Kernel_Module_t NvFP4MoEFC2FinalizeRunner::sFC2N128_fp16{};
+nvfp4_moe_fc2_n256_fp16_Kernel_Module_t NvFP4MoEFC2FinalizeRunner::sFC2N256_fp16{};
 #endif
 bool NvFP4MoEFC2FinalizeRunner::sLoaded = false;
 std::mutex NvFP4MoEFC2FinalizeRunner::sMutex{};
 
-NvFP4MoEFC2FinalizeRunner::NvFP4MoEFC2FinalizeRunner(int32_t numLocalExperts, int32_t topK, int32_t n, int32_t k)
+NvFP4MoEFC2FinalizeRunner::NvFP4MoEFC2FinalizeRunner(
+    int32_t numLocalExperts, int32_t topK, int32_t n, int32_t k, OutputDType outDtype)
     : mNumLocalExperts(numLocalExperts)
     , mTopK(topK)
     , mN(n)
     , mK(k)
+    , mOutDtype(outDtype)
 {
 }
 
@@ -68,8 +72,10 @@ bool NvFP4MoEFC2FinalizeRunner::loadKernelModules()
     if (sLoaded)
         return true;
 
-    nvfp4_moe_fc2_n128_Kernel_Module_Load(&sFC2N128);
-    nvfp4_moe_fc2_n256_Kernel_Module_Load(&sFC2N256);
+    nvfp4_moe_fc2_n128_bf16_Kernel_Module_Load(&sFC2N128_bf16);
+    nvfp4_moe_fc2_n256_bf16_Kernel_Module_Load(&sFC2N256_bf16);
+    nvfp4_moe_fc2_n128_fp16_Kernel_Module_Load(&sFC2N128_fp16);
+    nvfp4_moe_fc2_n256_fp16_Kernel_Module_Load(&sFC2N256_fp16);
     sLoaded = true;
     return true;
 #else
@@ -83,8 +89,10 @@ void NvFP4MoEFC2FinalizeRunner::unloadKernelModules()
     std::lock_guard<std::mutex> lock(sMutex);
     if (!sLoaded)
         return;
-    nvfp4_moe_fc2_n128_Kernel_Module_Unload(&sFC2N128);
-    nvfp4_moe_fc2_n256_Kernel_Module_Unload(&sFC2N256);
+    nvfp4_moe_fc2_n128_bf16_Kernel_Module_Unload(&sFC2N128_bf16);
+    nvfp4_moe_fc2_n256_bf16_Kernel_Module_Unload(&sFC2N256_bf16);
+    nvfp4_moe_fc2_n128_fp16_Kernel_Module_Unload(&sFC2N128_fp16);
+    nvfp4_moe_fc2_n256_fp16_Kernel_Module_Unload(&sFC2N256_fp16);
     sLoaded = false;
 #endif
 }
@@ -120,21 +128,44 @@ void NvFP4MoEFC2FinalizeRunner::run(void const* inputFP4, void const* weight, vo
     int64_t const l = static_cast<int64_t>(mNumLocalExperts);
     int64_t const topK = static_cast<int64_t>(mTopK);
 
+    bool const isFP16 = (mOutDtype == OutputDType::kFP16);
     if (tactic == 128)
     {
-        cute_dsl_nvfp4_moe_fc2_n128_wrapper(&sFC2N128, const_cast<void*>(inputFP4), const_cast<void*>(weight),
-            const_cast<void*>(inputSF), const_cast<void*>(weightSF), output, const_cast<void*>(alpha),
-            layout.tileIdxToGroupIdx, layout.tileIdxToMnLimit, layout.permutedIdxToExpandedIdx,
-            layout.numNonExitingTiles, const_cast<void*>(tokenFinalScales), permutedM, n, k, l, numTokens, topK,
-            stream);
+        if (isFP16)
+        {
+            cute_dsl_nvfp4_moe_fc2_n128_fp16_wrapper(&sFC2N128_fp16, const_cast<void*>(inputFP4),
+                const_cast<void*>(weight), const_cast<void*>(inputSF), const_cast<void*>(weightSF), output,
+                const_cast<void*>(alpha), layout.tileIdxToGroupIdx, layout.tileIdxToMnLimit,
+                layout.permutedIdxToExpandedIdx, layout.numNonExitingTiles, const_cast<void*>(tokenFinalScales),
+                permutedM, n, k, l, numTokens, topK, stream);
+        }
+        else
+        {
+            cute_dsl_nvfp4_moe_fc2_n128_bf16_wrapper(&sFC2N128_bf16, const_cast<void*>(inputFP4),
+                const_cast<void*>(weight), const_cast<void*>(inputSF), const_cast<void*>(weightSF), output,
+                const_cast<void*>(alpha), layout.tileIdxToGroupIdx, layout.tileIdxToMnLimit,
+                layout.permutedIdxToExpandedIdx, layout.numNonExitingTiles, const_cast<void*>(tokenFinalScales),
+                permutedM, n, k, l, numTokens, topK, stream);
+        }
     }
     else
     {
-        cute_dsl_nvfp4_moe_fc2_n256_wrapper(&sFC2N256, const_cast<void*>(inputFP4), const_cast<void*>(weight),
-            const_cast<void*>(inputSF), const_cast<void*>(weightSF), output, const_cast<void*>(alpha),
-            layout.tileIdxToGroupIdx, layout.tileIdxToMnLimit, layout.permutedIdxToExpandedIdx,
-            layout.numNonExitingTiles, const_cast<void*>(tokenFinalScales), permutedM, n, k, l, numTokens, topK,
-            stream);
+        if (isFP16)
+        {
+            cute_dsl_nvfp4_moe_fc2_n256_fp16_wrapper(&sFC2N256_fp16, const_cast<void*>(inputFP4),
+                const_cast<void*>(weight), const_cast<void*>(inputSF), const_cast<void*>(weightSF), output,
+                const_cast<void*>(alpha), layout.tileIdxToGroupIdx, layout.tileIdxToMnLimit,
+                layout.permutedIdxToExpandedIdx, layout.numNonExitingTiles, const_cast<void*>(tokenFinalScales),
+                permutedM, n, k, l, numTokens, topK, stream);
+        }
+        else
+        {
+            cute_dsl_nvfp4_moe_fc2_n256_bf16_wrapper(&sFC2N256_bf16, const_cast<void*>(inputFP4),
+                const_cast<void*>(weight), const_cast<void*>(inputSF), const_cast<void*>(weightSF), output,
+                const_cast<void*>(alpha), layout.tileIdxToGroupIdx, layout.tileIdxToMnLimit,
+                layout.permutedIdxToExpandedIdx, layout.numNonExitingTiles, const_cast<void*>(tokenFinalScales),
+                permutedM, n, k, l, numTokens, topK, stream);
+        }
     }
 #else
     (void) inputFP4;

@@ -434,6 +434,11 @@ public:
         size_t payloadBytes = 0;
         size_t scaleBytes = 0;
         size_t globalScaleBytes = 0;
+        // Host-side copies for decode SF generation.
+        std::vector<uint8_t> hostScales;
+        int wDim0 = 0;
+        int wDim1 = 0;
+        int wNumExperts = 0;
 
         void free()
         {
@@ -514,11 +519,27 @@ public:
                     {
                         int const sfCol = c * 4 + g;
                         size_t const byteOff = atomSfByteOffset(mRow, sfCol, numSfCols);
-                        scalesBuf[exByteBase + byteOff] = static_cast<uint8_t>(scaleDist(rng));
+                        if (mRow % 16 == 0)
+                        {
+                            // First row in quant group: generate random scale.
+                            scalesBuf[exByteBase + byteOff] = static_cast<uint8_t>(scaleDist(rng));
+                        }
+                        else
+                        {
+                            // Copy from the first row in the same quant group so all 16 rows share one scale.
+                            int const groupLeader = (mRow / 16) * 16;
+                            size_t const leaderOff = atomSfByteOffset(groupLeader, sfCol, numSfCols);
+                            scalesBuf[exByteBase + byteOff] = scalesBuf[exByteBase + leaderOff];
+                        }
                     }
                 }
             }
         }
+
+        buf.hostScales = scalesBuf;
+        buf.wDim0 = dim0;
+        buf.wDim1 = dim1;
+        buf.wNumExperts = numExperts;
 
         CUDA_CHECK(cudaMalloc(&buf.dPayload, buf.payloadBytes));
         CUDA_CHECK(cudaMalloc(&buf.dBlockScale, buf.scaleBytes));
@@ -668,6 +689,44 @@ public:
         return t;
     }
 
+    //! Generate row-major decode SF [E, dim0/16, dim1] from atom-swizzled block scales.
+    //! For up: dim0=H, dim1=I → decode SF [E, H/16, I].
+    //! For down: dim0=I, dim1=H → decode SF [E, I/16, H].
+    //! Each byte at decode_sf[e, group, pos] equals the atom byte at the group-leader row (group*16).
+    uint8_t* generateDecodeSf(WeightBuffers const& wb)
+    {
+        int const dim0 = wb.wDim0;
+        int const dim1 = wb.wDim1;
+        int const numExperts = wb.wNumExperts;
+        int const numSfCols = dim1 / 16;
+        int const dim0Groups = dim0 / 16;
+        size_t const sfBytesPerEx = atomSfBytesPerExpert(dim0, dim1);
+        size_t const sfInt32PerEx = (sfBytesPerEx + 3) / 4;
+        size_t const totalBytes = static_cast<size_t>(numExperts) * dim0Groups * dim1;
+
+        std::vector<uint8_t> decodeSf(totalBytes, 0);
+        for (int e = 0; e < numExperts; ++e)
+        {
+            size_t const exAtomBase = static_cast<size_t>(e) * sfInt32PerEx * 4;
+            size_t const exDecBase = static_cast<size_t>(e) * dim0Groups * dim1;
+            for (int g = 0; g < dim0Groups; ++g)
+            {
+                int const leaderRow = g * 16;
+                for (int pos = 0; pos < dim1; ++pos)
+                {
+                    int const sfCol = pos / 16;
+                    size_t const atomOff = atomSfByteOffset(leaderRow, sfCol, numSfCols);
+                    decodeSf[exDecBase + static_cast<size_t>(g) * dim1 + pos] = wb.hostScales[exAtomBase + atomOff];
+                }
+            }
+        }
+
+        uint8_t* dDecodeSf = nullptr;
+        CUDA_CHECK(cudaMalloc(&dDecodeSf, totalBytes));
+        CUDA_CHECK(cudaMemcpy(dDecodeSf, decodeSf.data(), totalBytes, cudaMemcpyHostToDevice));
+        return dDecodeSf;
+    }
+
     std::vector<float> dequantActivationToHostFp32(NVFP4Tensor const& act, int numTokens, int hiddenDim)
     {
         size_t const totalElems = static_cast<size_t>(numTokens) * hiddenDim;
@@ -747,6 +806,9 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_UpProj_Tier2_Small)
     CUDA_CHECK(cudaMemcpy(
         dTopkWeights, topkWeightsHost.data(), topkWeightsHost.size() * sizeof(float), cudaMemcpyHostToDevice));
 
+    // Decode SF for up: [E, H/16, N]
+    uint8_t* dUpDecodeSf = generateDecodeSf(upBuf);
+
     // Inter scratch (FP16, zeroed by launch)
     int64_t const interElems = nemotronMoeW4A16InterBufferNumElems(numTokens, topK, N);
     __half* dInter = nullptr;
@@ -754,7 +816,7 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_UpProj_Tier2_Small)
 
     // Launch up-proj kernel
     launchNemotronMoeW4A16DecodeUpGemvCuda(
-        numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dTopkWeights, dAct, up, dInter, mStream);
+        numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dTopkWeights, dAct, up, dUpDecodeSf, dInter, mStream);
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 
     // Get kernel output
@@ -786,6 +848,7 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_UpProj_Tier2_Small)
 
     cudaFree(dAct);
     cudaFree(dInter);
+    cudaFree(dUpDecodeSf);
     cudaFree(dExpertIds);
     cudaFree(dTopkWeights);
     upBuf.free();
@@ -842,13 +905,16 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_DownProj_Tier2_Small)
     CUDA_CHECK(cudaMemcpy(
         dTopkWeights, topkWeightsHost.data(), topkWeightsHost.size() * sizeof(float), cudaMemcpyHostToDevice));
 
+    // Decode SF for down: [E, N/16, H]
+    uint8_t* dDnDecodeSf = generateDecodeSf(dnBuf);
+
     // Output buffer
     __half* dOutput = nullptr;
     CUDA_CHECK(cudaMalloc(&dOutput, numTokens * H * sizeof(__half)));
 
     // Launch down-proj kernel
     launchNemotronMoeW4A16DecodeDownGemvCuda(numTokens, 1, H, N, hiddenChunks, E, topK, dExpertIds, dTopkWeights,
-        dInter, dn, dOutput, mStream, MoEActivationKind::kReLU2);
+        dInter, dn, dDnDecodeSf, dOutput, mStream, MoEActivationKind::kReLU2);
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 
     // Get kernel output
@@ -881,6 +947,7 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_DownProj_Tier2_Small)
 
     cudaFree(dInter);
     cudaFree(dOutput);
+    cudaFree(dDnDecodeSf);
     cudaFree(dExpertIds);
     cudaFree(dTopkWeights);
     dnBuf.free();
@@ -971,6 +1038,10 @@ static E2EResult runE2E(int H, int N, int E, int topK, int numTokens, MoEActivat
     CUDA_CHECK(cudaMemcpy(
         dTopkWeights, topkWeightsHost.data(), topkWeightsHost.size() * sizeof(float), cudaMemcpyHostToDevice));
 
+    // Decode SF
+    uint8_t* dUpDecodeSf = self->generateDecodeSf(upBuf);
+    uint8_t* dDnDecodeSf = self->generateDecodeSf(dnBuf);
+
     // Scratch and output
     int64_t const interElems = nemotronMoeW4A16InterBufferNumElems(numTokens, topK, N);
     __half* dInter = nullptr;
@@ -980,7 +1051,7 @@ static E2EResult runE2E(int H, int N, int E, int topK, int numTokens, MoEActivat
 
     // Launch E2E
     launchNemotronMoeW4A16DecodeGemvCuda(numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dTopkWeights, dAct, up,
-        dn, dInter, dOutput, stream, actKind);
+        dn, dUpDecodeSf, dDnDecodeSf, dInter, dOutput, stream, actKind);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Get kernel output
@@ -1014,6 +1085,8 @@ static E2EResult runE2E(int H, int N, int E, int topK, int numTokens, MoEActivat
     cudaFree(dAct);
     cudaFree(dInter);
     cudaFree(dOutput);
+    cudaFree(dUpDecodeSf);
+    cudaFree(dDnDecodeSf);
     cudaFree(dExpertIds);
     cudaFree(dTopkWeights);
     upBuf.free();
@@ -1186,6 +1259,10 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_E2E_RouterScaleLinearity)
     auto dnBuf = allocateNvfp4Weight(E, N, H, rng);
     NVFP4Tensor dn = makeNvfp4Tensor(dnBuf, static_cast<int64_t>(N) * (H / 32), H / 32, int4PerTile, N, H, E);
 
+    // Decode SF
+    uint8_t* dUpDecodeSf = generateDecodeSf(upBuf);
+    uint8_t* dDnDecodeSf = generateDecodeSf(dnBuf);
+
     // Expert IDs: token 0 → expert 0
     std::vector<int32_t> expertIdsHost = {0};
     int32_t* dExpertIds = nullptr;
@@ -1206,8 +1283,8 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_E2E_RouterScaleLinearity)
     float* dW1 = nullptr;
     CUDA_CHECK(cudaMalloc(&dW1, sizeof(float)));
     CUDA_CHECK(cudaMemcpy(dW1, &w1, sizeof(float), cudaMemcpyHostToDevice));
-    launchNemotronMoeW4A16DecodeGemvCuda(
-        numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dW1, dAct, up, dn, dInter, dOutput1, mStream);
+    launchNemotronMoeW4A16DecodeGemvCuda(numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dW1, dAct, up, dn,
+        dUpDecodeSf, dDnDecodeSf, dInter, dOutput1, mStream);
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 
     // Run with router weight = 2.0
@@ -1215,8 +1292,8 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_E2E_RouterScaleLinearity)
     float* dW2 = nullptr;
     CUDA_CHECK(cudaMalloc(&dW2, sizeof(float)));
     CUDA_CHECK(cudaMemcpy(dW2, &w2, sizeof(float), cudaMemcpyHostToDevice));
-    launchNemotronMoeW4A16DecodeGemvCuda(
-        numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dW2, dAct, up, dn, dInter, dOutput2, mStream);
+    launchNemotronMoeW4A16DecodeGemvCuda(numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dW2, dAct, up, dn,
+        dUpDecodeSf, dDnDecodeSf, dInter, dOutput2, mStream);
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 
     // Read back both outputs
@@ -1247,6 +1324,8 @@ TEST_F(Nvfp4MoeDecodeTest, W4A16_E2E_RouterScaleLinearity)
     cudaFree(dInter);
     cudaFree(dOutput1);
     cudaFree(dOutput2);
+    cudaFree(dUpDecodeSf);
+    cudaFree(dDnDecodeSf);
     cudaFree(dExpertIds);
     cudaFree(dW1);
     cudaFree(dW2);
@@ -1323,6 +1402,10 @@ static E2EResult runW4A4E2E(int H, int N, int E, int topK, int numTokens, MoEAct
     CUDA_CHECK(cudaMemcpy(
         dTopkWeights, topkWeightsHost.data(), topkWeightsHost.size() * sizeof(float), cudaMemcpyHostToDevice));
 
+    // Decode SF
+    uint8_t* dUpDecodeSf = self->generateDecodeSf(upBuf);
+    uint8_t* dDnDecodeSf = self->generateDecodeSf(dnBuf);
+
     // Scratch and output
     int64_t const interElems = nemotronMoeW4A16InterBufferNumElems(numTokens, topK, N);
     __half* dInter = nullptr;
@@ -1335,7 +1418,7 @@ static E2EResult runW4A4E2E(int H, int N, int E, int topK, int numTokens, MoEAct
 
     // Launch E2E W4A4
     launchNemotronMoeW4a4DecodeGemvCuda(numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dTopkWeights, actNvfp4,
-        up, dn, dInter, dOutput, stream, tbSize, actKind);
+        up, dn, dUpDecodeSf, dDnDecodeSf, dInter, dOutput, stream, tbSize, actKind);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Get kernel output
@@ -1363,6 +1446,8 @@ static E2EResult runW4A4E2E(int H, int N, int E, int topK, int numTokens, MoEAct
     // Cleanup
     cudaFree(dInter);
     cudaFree(dOutput);
+    cudaFree(dUpDecodeSf);
+    cudaFree(dDnDecodeSf);
     cudaFree(dExpertIds);
     cudaFree(dTopkWeights);
     actBuf.free();
@@ -1527,6 +1612,10 @@ TEST_F(Nvfp4MoeDecodeTest, W4A4_E2E_RouterScaleLinearity)
     auto dnBuf = allocateNvfp4Weight(E, N, H, rng);
     NVFP4Tensor dn = makeNvfp4Tensor(dnBuf, static_cast<int64_t>(N) * (H / 32), H / 32, int4PerTile, N, H, E);
 
+    // Decode SF
+    uint8_t* dUpDecodeSf = generateDecodeSf(upBuf);
+    uint8_t* dDnDecodeSf = generateDecodeSf(dnBuf);
+
     // Expert IDs: token 0 → expert 0
     std::vector<int32_t> expertIdsHost = {0};
     int32_t* dExpertIds = nullptr;
@@ -1549,8 +1638,8 @@ TEST_F(Nvfp4MoeDecodeTest, W4A4_E2E_RouterScaleLinearity)
     float* dW1 = nullptr;
     CUDA_CHECK(cudaMalloc(&dW1, sizeof(float)));
     CUDA_CHECK(cudaMemcpy(dW1, &w1, sizeof(float), cudaMemcpyHostToDevice));
-    launchNemotronMoeW4a4DecodeGemvCuda(
-        numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dW1, actNvfp4, up, dn, dInter, dOutput1, mStream, tbSize);
+    launchNemotronMoeW4a4DecodeGemvCuda(numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dW1, actNvfp4, up, dn,
+        dUpDecodeSf, dDnDecodeSf, dInter, dOutput1, mStream, tbSize);
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 
     // Run with router weight = 2.0
@@ -1558,8 +1647,8 @@ TEST_F(Nvfp4MoeDecodeTest, W4A4_E2E_RouterScaleLinearity)
     float* dW2 = nullptr;
     CUDA_CHECK(cudaMalloc(&dW2, sizeof(float)));
     CUDA_CHECK(cudaMemcpy(dW2, &w2, sizeof(float), cudaMemcpyHostToDevice));
-    launchNemotronMoeW4a4DecodeGemvCuda(
-        numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dW2, actNvfp4, up, dn, dInter, dOutput2, mStream, tbSize);
+    launchNemotronMoeW4a4DecodeGemvCuda(numTokens, 1, H, N, interChunks, E, topK, dExpertIds, dW2, actNvfp4, up, dn,
+        dUpDecodeSf, dDnDecodeSf, dInter, dOutput2, mStream, tbSize);
     CUDA_CHECK(cudaStreamSynchronize(mStream));
 
     // Read back both outputs
@@ -1589,6 +1678,8 @@ TEST_F(Nvfp4MoeDecodeTest, W4A4_E2E_RouterScaleLinearity)
     cudaFree(dInter);
     cudaFree(dOutput1);
     cudaFree(dOutput2);
+    cudaFree(dUpDecodeSf);
+    cudaFree(dDnDecodeSf);
     cudaFree(dExpertIds);
     cudaFree(dW1);
     cudaFree(dW2);

@@ -51,6 +51,7 @@ import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm
+from cutlass._mlir.dialects import _nvvm_enum_gen as nvvm_enums
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -254,6 +255,28 @@ def vectorized_atomic_add_bf16x8(rOut_epi_packed,
 
 
 @dsl_user_op
+def vectorized_atomic_add_fp16x8(rOut_epi_packed,
+                                 scatter_out_offset,
+                                 loc=None,
+                                 ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
+        ],
+        "red.global.v4.f16x2.add.noftz [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def vectorized_atomic_add_fp32x2(rOut_epi_packed,
                                  scatter_out_offset,
                                  loc=None,
@@ -389,6 +412,112 @@ def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
         constraints="",
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+# ---------------------------------------------------------------------------
+# N-major transpose warp primitives (FC1 in-flight SMEM nibble transpose).
+# Used by ``blockscaled_contiguous_grouped_gemm_n_major`` and
+# ``blockscaled_contiguous_grouped_gemm_finalize_n_major``.
+# ---------------------------------------------------------------------------
+
+def prmt_b32(a_u32, b_u32, sel_u32, *, loc=None, ip=None):
+    """Issue ``prmt.b32 d, a, b, sel``.
+
+    ``d`` bytes [j] = source_byte[sel_j] of the concatenation of ``a`` and
+    ``b`` (a's bytes 0..3 then b's bytes 0..3). ``sel``'s low 16 bits hold
+    four 4-bit selectors s_0..s_3.
+    """
+    return llvm.inline_asm(
+        T.i32(),
+        [
+            a_u32.ir_value() if hasattr(a_u32, "ir_value") else a_u32,
+            b_u32.ir_value() if hasattr(b_u32, "ir_value") else b_u32,
+            sel_u32.ir_value() if hasattr(sel_u32, "ir_value") else sel_u32,
+        ],
+        "prmt.b32 $0, $1, $2, $3;",
+        "=r,r,r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_shared_b16(dst_sub, val_u16, *, loc=None, ip=None):
+    """Issue a 16-bit aligned SMEM store (``st.shared.b16``)."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_sub.iterator.llvm_ptr,
+            val_u16.ir_value() if hasattr(val_u16, "ir_value") else val_u16,
+        ],
+        """{
+            .reg .u64 addr_u64;
+            .reg .u32 addr_u32;
+            .reg .u16 val_u16;
+            cvta.to.shared.u64 addr_u64, $0;
+            cvt.u32.u64 addr_u32, addr_u64;
+            cvt.u16.u32 val_u16, $1;
+            st.shared.b16 [addr_u32], val_u16;
+        }""",
+        "l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ldmatrix_m16n16_trans_b8(smem_ptr, *, loc=None, ip=None):
+    """Issue ``ldmatrix.sync.aligned.m16n16.x1.trans.shared.b8``.
+
+    Reads a 16 row × 16 col u8 tile (= 256 bytes) from SMEM with hardware
+    transpose. Returns ``(r0, r1)`` — two Uint32 registers per lane.
+    """
+    src_ptr_val = (
+        smem_ptr.ir_value() if hasattr(smem_ptr, "ir_value") else smem_ptr
+    )
+    shared_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
+    shared_ptr = llvm.addrspacecast(
+        shared_ptr_ty, src_ptr_val, loc=loc, ip=ip
+    )
+    struct_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    packed = nvvm.ldmatrix(
+        res=struct_ty,
+        ptr=shared_ptr,
+        num=2,  # MLIR num=2 -> PTX .x1 for this srcFormat
+        layout=nvvm_enums.MMALayout.col,
+        shape=nvvm_enums.LoadShape.M16N16,
+        src_format=nvvm_enums.LoadSrcFormat.B8,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = cutlass.Uint32(llvm.extractvalue(T.i32(), packed, [0]))
+    r1 = cutlass.Uint32(llvm.extractvalue(T.i32(), packed, [1]))
+    return r0, r1
+
+
+@dsl_user_op
+def st_shared_b32(dst_sub, val_u32, *, loc=None, ip=None):
+    """Issue a 32-bit aligned SMEM store (``st.shared.b32``)."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_sub.iterator.llvm_ptr,
+            val_u32.ir_value() if hasattr(val_u32, "ir_value") else val_u32,
+        ],
+        """{
+            .reg .u64 addr_u64;
+            .reg .u32 addr_u32;
+            cvta.to.shared.u64 addr_u64, $0;
+            cvt.u32.u64 addr_u32, addr_u64;
+            st.shared.b32 [addr_u32], $1;
+        }""",
+        "l,r",
+        has_side_effects=True,
         loc=loc,
         ip=ip,
     )

@@ -457,11 +457,6 @@ class NemotronHMoEMLP(nn.Module):
             config, config.moe_shared_expert_intermediate_size,
             f"{module_prefix}.shared_experts")
 
-        # Placeholder for W4A16 mode (hidden_block_scale not used)
-        self.register_buffer("_hidden_block_scale_placeholder",
-                             torch.zeros(1, dtype=torch.int8))
-        self.register_buffer("_hidden_global_scale_placeholder",
-                             torch.ones(1, dtype=torch.float32))
         self._export_ready = False
 
     @staticmethod
@@ -486,62 +481,98 @@ class NemotronHMoEMLP(nn.Module):
         return expert.down_proj(r * r)
 
     def prepare_for_export(self) -> None:
-        """Dequantize ModelOpt NVFP4 expert weights and Marlin-pack them.
+        """Pack ModelOpt NVFP4 expert tensors to plugin layout.
 
-        ``Nvfp4MoePlugin``'s CUDA kernel expects a tile-packed layout (see
-        :mod:`...checkpoint.repacking`).  Stack the re-packed buffers so the
-        ONNX graph has direct initializer→plugin edges — TRT does not allow
-        quantized dtypes (FP4, FP8, INT8) to flow through Concat.
+        ``Nvfp4MoePlugin`` expects N-major byte payloads + an atom-swizzled
+        prefill SFB + a Marlin-FP16-top-8-bit-projected decode SFB. Stacked
+        per-expert so TRT sees direct initializer→plugin edges.
+
+        **All buffers are raw-aligned with vLLM**: the checkpoint's FP4 weight
+        nibbles, FP8-E4M3 block scales, and scalar ``weight_scale_2`` are
+        preserved bit-exact — only the on-device layouts change. Specifically:
+
+        * ``_stacked_*_weights`` — FP4 nibble transpose (K-major→N-major).
+        * ``_stacked_*_block_scale`` — checkpoint FP8 bytes atom-swizzled (128×4).
+        * ``_stacked_*_block_scale_decode`` — checkpoint FP8 bytes Marlin-
+          projected (top-8-bits of FP16 representation).
+        * ``_stacked_*_global_scale`` — per-expert raw ``weight_scale_2``.
+
+        With this, both paths use the **same** per-expert global scale and the
+        FP4 × SFB × global_scale product recovers the checkpoint dense
+        bit-exact in prefill and approximately (Marlin-projection loss only)
+        in decode.
+
+        **Activation global scale** (``_hidden_act_input_scale``) follows the
+        plugin's forward-direction convention (``fp4Quantize.cu:212``: *callers
+        pass the forward global SF (e.g. max|x|/(448*6)); the kernel computes
+        its reciprocal internally*). The checkpoint's ``NVFP4Linear.input_scale``
+        already equals ``amax / (6 * 448)`` (see ``models/linear.py:185``), so we
+        pass the per-layer max raw — no ``/6`` adjustment. This matches both
+        :meth:`Nvfp4MoePlugin.populate_hidden_global_scales` and vLLM's
+        ``input_global_scale`` handling.
         """
         from ...checkpoint.repacking import (
-            decode_modelopt_nvfp4, repack_nvfp4_expert_down_to_marlin,
-            repack_nvfp4_expert_up_to_marlin)
+            repack_nvfp4_expert_down_prefill_raw,
+            repack_nvfp4_expert_up_prefill_raw)
 
         H = self.hidden_size
         I = self.moe_intermediate_size
 
-        up_ws, up_scs, up_gs = [], [], []
-        dn_ws, dn_scs, dn_gs = [], [], []
+        up_ws, up_scs, up_scs_dec, up_gs = [], [], [], []
+        dn_ws, dn_scs, dn_scs_dec, dn_gs = [], [], [], []
         for expert in self.experts:
             up = expert.up_proj
             dn = expert.down_proj
             assert isinstance(up, NVFP4Linear) and isinstance(
                 dn, NVFP4Linear), "MoE experts must be NVFP4Linear"
 
-            # up.weight [out=I, in//2=H//2] → dense [I, H] → (H, I) for Marlin.
-            up_dense = decode_modelopt_nvfp4(up.weight, up.weight_scale,
-                                             up.weight_scale_2, up.group_size)
-            if tuple(up_dense.shape) != (I, H):
+            up_w, up_sc, up_sc_dec, up_gl = repack_nvfp4_expert_up_prefill_raw(
+                up.weight, up.weight_scale, up.weight_scale_2, H, I)
+            if up_w.shape != (H, I // 2):
                 raise ValueError(
-                    f"up_dense shape {tuple(up_dense.shape)} != ({I}, {H})")
-            up_w, up_sc, up_gl = repack_nvfp4_expert_up_to_marlin(up_dense.T)
-
-            # dn.weight [out=H, in//2=I//2] → dense [H, I] → (I, H) for Marlin.
-            dn_dense = decode_modelopt_nvfp4(dn.weight, dn.weight_scale,
-                                             dn.weight_scale_2, dn.group_size)
-            if tuple(dn_dense.shape) != (H, I):
+                    f"up weight shape {up_w.shape} != ({H}, {I // 2})")
+            dn_w, dn_sc, dn_sc_dec, dn_gl = (
+                repack_nvfp4_expert_down_prefill_raw(dn.weight,
+                                                     dn.weight_scale,
+                                                     dn.weight_scale_2, H, I))
+            if dn_w.shape != (I, H // 2):
                 raise ValueError(
-                    f"dn_dense shape {tuple(dn_dense.shape)} != ({H}, {I})")
-            dn_w, dn_sc, dn_gl = repack_nvfp4_expert_down_to_marlin(dn_dense.T)
+                    f"down weight shape {dn_w.shape} != ({I}, {H // 2})")
 
             up_ws.append(torch.as_tensor(up_w))
             up_scs.append(torch.as_tensor(up_sc))
+            up_scs_dec.append(torch.as_tensor(up_sc_dec))
             up_gs.append(up_gl)
             dn_ws.append(torch.as_tensor(dn_w))
             dn_scs.append(torch.as_tensor(dn_sc))
+            dn_scs_dec.append(torch.as_tensor(dn_sc_dec))
             dn_gs.append(dn_gl)
 
         self.register_buffer("_stacked_up_weights", torch.stack(up_ws))
         self.register_buffer("_stacked_up_block_scale", torch.stack(up_scs))
+        self.register_buffer("_stacked_up_block_scale_decode",
+                             torch.stack(up_scs_dec))
         self.register_buffer("_stacked_up_global_scale",
                              torch.tensor(up_gs, dtype=torch.float32))
         self.register_buffer("_stacked_down_weights", torch.stack(dn_ws))
         self.register_buffer("_stacked_down_block_scale", torch.stack(dn_scs))
+        self.register_buffer("_stacked_down_block_scale_decode",
+                             torch.stack(dn_scs_dec))
         self.register_buffer("_stacked_down_global_scale",
                              torch.tensor(dn_gs, dtype=torch.float32))
         self.register_buffer(
             "_e_score_correction_bias_fp32",
             self.gate.e_score_correction_bias.data.clone().to(torch.float32))
+        # Forward-direction convention — see method docstring.
+        fc1_scale = max(
+            float(e.up_proj.input_scale.detach().float().max().item())
+            for e in self.experts)
+        fc2_scale = max(
+            float(e.down_proj.input_scale.detach().float().max().item())
+            for e in self.experts)
+        self.register_buffer(
+            "_hidden_act_input_scale",
+            torch.tensor([fc1_scale, fc2_scale], dtype=torch.float32))
         self._export_ready = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -553,14 +584,15 @@ class NemotronHMoEMLP(nn.Module):
         moe_out = nvfp4_moe_plugin(
             router_logits,
             hidden_states,
-            self._hidden_block_scale_placeholder,
-            self._hidden_global_scale_placeholder,
+            self._hidden_act_input_scale,
             self._stacked_up_weights,
             self._stacked_up_block_scale,
             self._stacked_up_global_scale,
             self._stacked_down_weights,
             self._stacked_down_block_scale,
             self._stacked_down_global_scale,
+            self._stacked_up_block_scale_decode,
+            self._stacked_down_block_scale_decode,
             self._e_score_correction_bias_fp32,
             num_experts=self.n_routed_experts,
             top_k=self.num_experts_per_tok,

@@ -39,6 +39,15 @@ enum class Activation : int32_t
     kSwiglu = 2,
 };
 
+// Output element type for FC1 / FC2 runners. Selects which AOT-compiled
+// kernel variant is invoked; the C-ABI wrapper signatures are identical
+// across dtypes, only the compiled binary differs.
+enum class OutputDType : int32_t
+{
+    kBF16 = 0,
+    kFP16 = 1,
+};
+
 // Runtime tile metadata produced by the layout builder and consumed by
 // both the FC1 and FC2 AOT kernel wrappers.
 struct MoELayout

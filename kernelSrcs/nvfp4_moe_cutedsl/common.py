@@ -31,7 +31,8 @@ def compute_sf_buffer_size(m, n, sf_vec_size=16):
 def create_dummy_pointers(sf_vec_size=16,
                           dummy_m=128, dummy_n=1856, dummy_k=2688, dummy_l=16,
                           is_swiglu=False, include_fc2_extras=False,
-                          dummy_num_tokens=128, dummy_top_k=6):
+                          dummy_num_tokens=128, dummy_top_k=6,
+                          out_dtype=None):
     """Create typed GPU pointers for AOT export compilation.
 
     Returns a dict of (name -> typed_ptr) plus backing buffers kept alive
@@ -43,11 +44,20 @@ def create_dummy_pointers(sf_vec_size=16,
     include_fc2_extras : bool
         If True, also creates permuted_idx and token_scales pointers
         needed by the FC2 finalize kernel.
+    out_dtype : cutlass dtype, optional
+        Output element type tag for the c_ptr. Defaults to cutlass.BFloat16.
+        Pass cutlass.Float16 to export an FP16-output kernel variant. Only
+        the pointer type tag matters for AOT specialization; the underlying
+        cupy buffer is allocated as cp.float16 in both cases (2 bytes/elem,
+        matching BF16's size — it's a scratch buffer).
     """
     import cupy as cp
     import cutlass
     import cutlass.cute as cute
     from utils import make_ptr
+
+    if out_dtype is None:
+        out_dtype = cutlass.BFloat16
 
     dummy_n_out = dummy_n // 2 if is_swiglu else dummy_n
     bufs = []  # prevent GC
@@ -89,7 +99,7 @@ def create_dummy_pointers(sf_vec_size=16,
         c_buf = _alloc((dummy_num_tokens, dummy_n), cp.float16)
     else:
         c_buf = _alloc((dummy_m, dummy_n_out), cp.float16)
-    c_ptr = make_ptr(cutlass.BFloat16, c_buf.data.ptr,
+    c_ptr = make_ptr(out_dtype, c_buf.data.ptr,
                      cute.AddressSpace.gmem, assumed_align=32)
 
     # Alpha: [L] float32
@@ -139,3 +149,15 @@ def get_max_active_clusters(cluster_size=1):
     """Query hardware for max active clusters."""
     import cutlass
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size)
+
+
+def resolve_out_dtype(name):
+    """Map CLI string ('bf16' / 'fp16') to a cutlass dtype tag."""
+    import cutlass
+    mapping = {
+        "bf16": cutlass.BFloat16,
+        "fp16": cutlass.Float16,
+    }
+    if name not in mapping:
+        raise ValueError(f"Unsupported output_dtype {name!r}; expected one of {list(mapping)}")
+    return mapping[name]

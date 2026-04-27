@@ -35,6 +35,7 @@
 
 #include "common/cudaMacros.h"
 #include "common/cudaUtils.h"
+#include "kernels/moe/fp4SupportKernels/alphaCompute.h"
 #include "kernels/moe/fp4SupportKernels/buildLayout.h"
 #include "kernels/moe/fp4SupportKernels/fp4Quantize.h"
 #include "kernels/moe/fp4SupportKernels/moeGather.h"
@@ -215,7 +216,7 @@ TEST(NvFP4MoEQuantizeTest, fp4OutputNonZero)
     int32_t const sfBytes = atomSfBytes(M, N, sfVecSize);
 
     Tensor dInput(Coords{M, N}, DeviceType::kGPU, nvinfer1::DataType::kBF16);
-    Tensor dGsfInv(Coords{1}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    Tensor dGsf(Coords{1}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
     Tensor dFP4(Coords{M * (N / 8)}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
     Tensor dSF(Coords{sfBytes}, DeviceType::kGPU, nvinfer1::DataType::kINT8);
 
@@ -224,10 +225,10 @@ TEST(NvFP4MoEQuantizeTest, fp4OutputNonZero)
     CHECK_CUDA(cudaMemset(dFP4.rawPointer(), 0, fp4Bytes));
     CHECK_CUDA(cudaMemset(dSF.rawPointer(), 0, sfBytes));
 
-    // Provide a fixed global SF inverse (1/gsf). For uniform 1.0 input: gsf = 1.0/(448*6).
-    float const hostGsfInv = 1.0f / (1.0f / (448.0f * 6.0f));
-    CHECK_CUDA(cudaMemcpy(dGsfInv.rawPointer(), &hostGsfInv, sizeof(float), cudaMemcpyHostToDevice));
-    fp4Quantize(dInput, dGsfInv, dFP4, dSF, nullptr);
+    // Forward-scale contract: hostGsf is max|x|/(448*6). The kernel inverts in-register.
+    float const hostGsf = 1.0f / (448.0f * 6.0f);
+    CHECK_CUDA(cudaMemcpy(dGsf.rawPointer(), &hostGsf, sizeof(float), cudaMemcpyHostToDevice));
+    fp4Quantize(dInput, dGsf, dFP4, dSF, nullptr);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Verify outputs are non-zero
@@ -257,7 +258,7 @@ TEST(NvFP4MoEQuantizeTest, fp4OutputNonZeroFp16)
     int32_t const sfBytes = atomSfBytes(M, N, sfVecSize);
 
     Tensor dInput(Coords{M, N}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    Tensor dGsfInv(Coords{1}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    Tensor dGsf(Coords{1}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
     Tensor dFP4(Coords{M * (N / 8)}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
     Tensor dSF(Coords{sfBytes}, DeviceType::kGPU, nvinfer1::DataType::kINT8);
 
@@ -265,9 +266,9 @@ TEST(NvFP4MoEQuantizeTest, fp4OutputNonZeroFp16)
     CHECK_CUDA(cudaMemset(dFP4.rawPointer(), 0, fp4Bytes));
     CHECK_CUDA(cudaMemset(dSF.rawPointer(), 0, sfBytes));
 
-    float const hostGsfInv = 1.0f / (1.0f / (448.0f * 6.0f));
-    CHECK_CUDA(cudaMemcpy(dGsfInv.rawPointer(), &hostGsfInv, sizeof(float), cudaMemcpyHostToDevice));
-    fp4Quantize(dInput, dGsfInv, dFP4, dSF, nullptr);
+    float const hostGsf = 1.0f / (448.0f * 6.0f);
+    CHECK_CUDA(cudaMemcpy(dGsf.rawPointer(), &hostGsf, sizeof(float), cudaMemcpyHostToDevice));
+    fp4Quantize(dInput, dGsf, dFP4, dSF, nullptr);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     std::vector<uint8_t> hostFP4(fp4Bytes);
@@ -299,7 +300,7 @@ TEST(NvFP4MoEQuantizeTest, bf16Fp16ProduceSameOutput)
 
     // BF16 path
     Tensor dBf16Input(Coords{M, N}, DeviceType::kGPU, nvinfer1::DataType::kBF16);
-    Tensor dGsfInv(Coords{1}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    Tensor dGsf(Coords{1}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
     Tensor dBf16FP4(Coords{M * (N / 8)}, DeviceType::kGPU, nvinfer1::DataType::kINT32);
     Tensor dBf16SF(Coords{sfBytes}, DeviceType::kGPU, nvinfer1::DataType::kINT8);
 
@@ -308,9 +309,9 @@ TEST(NvFP4MoEQuantizeTest, bf16Fp16ProduceSameOutput)
     CHECK_CUDA(cudaMemset(dBf16FP4.rawPointer(), 0, fp4Bytes));
     CHECK_CUDA(cudaMemset(dBf16SF.rawPointer(), 0, sfBytes));
 
-    float const hostGsfInv = 1.0f / (1.0f / (448.0f * 6.0f));
-    CHECK_CUDA(cudaMemcpy(dGsfInv.rawPointer(), &hostGsfInv, sizeof(float), cudaMemcpyHostToDevice));
-    fp4Quantize(dBf16Input, dGsfInv, dBf16FP4, dBf16SF, nullptr);
+    float const hostGsf = 1.0f / (448.0f * 6.0f);
+    CHECK_CUDA(cudaMemcpy(dGsf.rawPointer(), &hostGsf, sizeof(float), cudaMemcpyHostToDevice));
+    fp4Quantize(dBf16Input, dGsf, dBf16FP4, dBf16SF, nullptr);
 
     // FP16 path
     Tensor dFp16Input(Coords{M, N}, DeviceType::kGPU, nvinfer1::DataType::kHALF);
@@ -321,8 +322,8 @@ TEST(NvFP4MoEQuantizeTest, bf16Fp16ProduceSameOutput)
     CHECK_CUDA(cudaMemset(dFp16FP4.rawPointer(), 0, fp4Bytes));
     CHECK_CUDA(cudaMemset(dFp16SF.rawPointer(), 0, sfBytes));
 
-    CHECK_CUDA(cudaMemcpy(dGsfInv.rawPointer(), &hostGsfInv, sizeof(float), cudaMemcpyHostToDevice));
-    fp4Quantize(dFp16Input, dGsfInv, dFp16FP4, dFp16SF, nullptr);
+    CHECK_CUDA(cudaMemcpy(dGsf.rawPointer(), &hostGsf, sizeof(float), cudaMemcpyHostToDevice));
+    fp4Quantize(dFp16Input, dGsf, dFp16FP4, dFp16SF, nullptr);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Compare outputs — same input value should produce identical FP4 + SF
@@ -386,7 +387,7 @@ TEST(NvFP4MoEGatherTest, identityPermutation)
     CHECK_CUDA(cudaMemset(dDstSF.rawPointer(), 0, dstSfBytes)); // Must pre-zero
     CHECK_CUDA(cudaMemcpy(dPerm.rawPointer(), hostPerm.data(), permutedM * sizeof(int32_t), cudaMemcpyHostToDevice));
 
-    launchMoeGather(dSrcData, dDstData, dSrcSF, dDstSF, dPerm, topK, H, nullptr);
+    launchMoeGather(dSrcData, dDstData, dSrcSF, dDstSF, dPerm, permutedM, topK, H, nullptr);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     std::vector<uint8_t> hostDstData(dataBytes);
@@ -440,7 +441,7 @@ TEST(NvFP4MoEGatherTest, paddingRowsAreZeroed)
     CHECK_CUDA(cudaMemset(dDstSF.rawPointer(), 0, dstSfBytes));
     CHECK_CUDA(cudaMemcpy(dPerm.rawPointer(), hostPerm.data(), permutedM * sizeof(int32_t), cudaMemcpyHostToDevice));
 
-    launchMoeGather(dSrcData, dDstData, dSrcSF, dDstSF, dPerm, topK, H, nullptr);
+    launchMoeGather(dSrcData, dDstData, dSrcSF, dDstSF, dPerm, permutedM, topK, H, nullptr);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     std::vector<int32_t> hostDstData(permutedM * dataRowInt32s);
@@ -523,7 +524,7 @@ TEST(NvFP4MoEGatherTest, dataMatchesExpectedSourceRows)
     CHECK_CUDA(cudaMemset(dDstSF.rawPointer(), 0, dstSfBytes));
     CHECK_CUDA(cudaMemcpy(dPerm.rawPointer(), hostPerm.data(), permutedM * sizeof(int32_t), cudaMemcpyHostToDevice));
 
-    launchMoeGather(dSrcData, dDstData, dSrcSF, dDstSF, dPerm, topK, H, nullptr);
+    launchMoeGather(dSrcData, dDstData, dSrcSF, dDstSF, dPerm, permutedM, topK, H, nullptr);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     std::vector<int32_t> hostDstData(dstDataElems);
@@ -597,7 +598,7 @@ TEST(NvFP4MoEGatherTest, shuffledPermutationAccuracy)
     CHECK_CUDA(cudaMemset(dDstSF.rawPointer(), 0, dstSfBytes));
     CHECK_CUDA(cudaMemcpy(dPerm.rawPointer(), hostPerm.data(), permutedM * sizeof(int32_t), cudaMemcpyHostToDevice));
 
-    launchMoeGather(dSrcData, dDstData, dSrcSF, dDstSF, dPerm, topK, H, nullptr);
+    launchMoeGather(dSrcData, dDstData, dSrcSF, dDstSF, dPerm, permutedM, topK, H, nullptr);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     std::vector<int32_t> hostDstData(dstDataElems);
@@ -894,4 +895,251 @@ TEST(NvFP4MoELayoutTest, gpuPermutationCoversAllTokens)
     EXPECT_EQ(gpuPermCopy, cpuPermCopy) << "GPU and CPU should produce the same set of expanded indices";
 
     cudaFree(dRouting);
+}
+
+// =========================================================================
+// Alpha compute tests (computeFC1Alpha / computeFC2Alpha)
+// =========================================================================
+
+namespace
+{
+
+void runAlphaCase(bool useFC1, int32_t numLocalExperts)
+{
+    std::vector<float> hostWeightGs(static_cast<std::size_t>(numLocalExperts));
+    for (int32_t e = 0; e < numLocalExperts; ++e)
+    {
+        // Distinct per-expert forward weight GS values; span small/large magnitudes.
+        hostWeightGs[e] = 0.25f * static_cast<float>(e + 1);
+    }
+    float const hostActGs = 0.0625f;
+
+    Tensor dActGs(Coords{1}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    Tensor dWeightGs(Coords{numLocalExperts}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    Tensor dAlpha(Coords{numLocalExperts}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+
+    CHECK_CUDA(cudaMemcpy(dActGs.rawPointer(), &hostActGs, sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(
+        dWeightGs.rawPointer(), hostWeightGs.data(), hostWeightGs.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemset(dAlpha.rawPointer(), 0xFF, numLocalExperts * sizeof(float)));
+
+    auto const* actGsPtr = static_cast<float const*>(dActGs.rawPointer());
+    auto const* weightGsPtr = static_cast<float const*>(dWeightGs.rawPointer());
+    auto* alphaPtr = static_cast<float*>(dAlpha.rawPointer());
+    if (useFC1)
+    {
+        computeFC1Alpha(actGsPtr, weightGsPtr, alphaPtr, numLocalExperts, nullptr);
+    }
+    else
+    {
+        computeFC2Alpha(actGsPtr, weightGsPtr, alphaPtr, numLocalExperts, nullptr);
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    std::vector<float> hostAlpha(static_cast<std::size_t>(numLocalExperts));
+    CHECK_CUDA(
+        cudaMemcpy(hostAlpha.data(), dAlpha.rawPointer(), numLocalExperts * sizeof(float), cudaMemcpyDeviceToHost));
+
+    for (int32_t e = 0; e < numLocalExperts; ++e)
+    {
+        float const expected = hostActGs * hostWeightGs[e];
+        EXPECT_EQ(hostAlpha[e], expected) << (useFC1 ? "FC1" : "FC2") << " alpha mismatch at expert " << e;
+    }
+}
+
+} // namespace
+
+TEST(NvFP4MoEAlphaTest, fc1ForwardScaleProduct_E1)
+{
+    runAlphaCase(/*useFC1=*/true, 1);
+}
+
+TEST(NvFP4MoEAlphaTest, fc1ForwardScaleProduct_E8)
+{
+    runAlphaCase(/*useFC1=*/true, 8);
+}
+
+TEST(NvFP4MoEAlphaTest, fc1ForwardScaleProduct_E32)
+{
+    runAlphaCase(/*useFC1=*/true, 32);
+}
+
+TEST(NvFP4MoEAlphaTest, fc1ForwardScaleProduct_E128)
+{
+    runAlphaCase(/*useFC1=*/true, 128);
+}
+
+TEST(NvFP4MoEAlphaTest, fc2ForwardScaleProduct_E128)
+{
+    runAlphaCase(/*useFC1=*/false, 128);
+}
+
+// =========================================================================
+// Worst-case routing stress tests for the GPU layout builder
+//
+// These exercise the `T + L·(tileSize − 1)` worst-case bound baked into the
+// plugin's layout-buffer sizing (see docs/source/developer_guide/software-design/
+// nvfp4-moe-prefill.md § "Worst-case accounting for permutedM_max").
+// =========================================================================
+
+// Each of L=16 experts gets exactly one token; worst-case per-expert padding = 127 each.
+// Worst-case layout buffer is at least `T + L·(tileSize−1) = 16 + 16·127 = 2048` rows.
+TEST(NvFP4MoEWorstCaseRoutingTest, singletonPerExpert)
+{
+    if (!isSupportedSm())
+    {
+        GTEST_SKIP() << "Requires SM100/101/110";
+    }
+
+    constexpr int32_t localNumExperts = 16;
+    constexpr int32_t topK = 1;
+    constexpr int32_t tileSize = 128;
+    constexpr int32_t numTokens = localNumExperts;
+
+    std::vector<int32_t> hostRouting(numTokens * topK);
+    for (int32_t t = 0; t < numTokens; ++t)
+    {
+        hostRouting[t] = t;
+    }
+
+    int32_t* dRouting = nullptr;
+    CHECK_CUDA(cudaMalloc(&dRouting, hostRouting.size() * sizeof(int32_t)));
+    CHECK_CUDA(cudaMemcpy(dRouting, hostRouting.data(), hostRouting.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    MoELayoutBuffers buf = createMoELayoutBuffers(numTokens, topK, localNumExperts, tileSize);
+    int32_t const maxMPadded = static_cast<int32_t>(buf.permutedIdxToExpandedIdx.getShape()[0]);
+    CHECK_CUDA(cudaMemset(buf.permutedIdxToExpandedIdx.rawPointer(), 0x7A, maxMPadded * sizeof(int32_t)));
+    buildLayoutGpu(buf, dRouting, numTokens, topK, localNumExperts, tileSize, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    std::vector<int32_t> hostPerm(maxMPadded);
+    CHECK_CUDA(cudaMemcpy(hostPerm.data(), buf.permutedIdxToExpandedIdx.rawPointer(), maxMPadded * sizeof(int32_t),
+        cudaMemcpyDeviceToHost));
+    int32_t valid = 0;
+    for (int32_t v : hostPerm)
+    {
+        if (v >= 0)
+            ++valid;
+    }
+    EXPECT_EQ(valid, numTokens * topK) << "Exactly one valid entry per token-expert slot expected";
+    cudaFree(dRouting);
+}
+
+// All tokens route to expert 0 — one huge group, no per-expert padding elsewhere.
+TEST(NvFP4MoEWorstCaseRoutingTest, hotExpertHotspot)
+{
+    if (!isSupportedSm())
+    {
+        GTEST_SKIP() << "Requires SM100/101/110";
+    }
+
+    constexpr int32_t localNumExperts = 16;
+    constexpr int32_t topK = 2;
+    constexpr int32_t tileSize = 128;
+    constexpr int32_t numTokens = 256;
+
+    std::vector<int32_t> hostRouting(numTokens * topK, 0);
+    int32_t* dRouting = nullptr;
+    CHECK_CUDA(cudaMalloc(&dRouting, hostRouting.size() * sizeof(int32_t)));
+    CHECK_CUDA(cudaMemcpy(dRouting, hostRouting.data(), hostRouting.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    MoELayoutBuffers buf = createMoELayoutBuffers(numTokens, topK, localNumExperts, tileSize);
+    int32_t const maxMPadded = static_cast<int32_t>(buf.permutedIdxToExpandedIdx.getShape()[0]);
+    buildLayoutGpu(buf, dRouting, numTokens, topK, localNumExperts, tileSize, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    std::vector<int32_t> hostPerm(maxMPadded);
+    CHECK_CUDA(cudaMemcpy(hostPerm.data(), buf.permutedIdxToExpandedIdx.rawPointer(), maxMPadded * sizeof(int32_t),
+        cudaMemcpyDeviceToHost));
+    int32_t valid = 0;
+    for (int32_t v : hostPerm)
+    {
+        if (v >= 0)
+            ++valid;
+    }
+    EXPECT_EQ(valid, numTokens * topK) << "All T*topK entries route to expert 0";
+    cudaFree(dRouting);
+}
+
+// Half the experts receive zero tokens: tile-table must handle empty groups without writing
+// garbage tile metadata for inactive experts.
+TEST(NvFP4MoEWorstCaseRoutingTest, zeroHitExperts)
+{
+    if (!isSupportedSm())
+    {
+        GTEST_SKIP() << "Requires SM100/101/110";
+    }
+
+    constexpr int32_t localNumExperts = 16;
+    constexpr int32_t topK = 2;
+    constexpr int32_t tileSize = 128;
+    constexpr int32_t numTokens = 64;
+
+    std::vector<int32_t> hostRouting(numTokens * topK);
+    for (int32_t t = 0; t < numTokens; ++t)
+    {
+        for (int32_t k = 0; k < topK; ++k)
+        {
+            // Only experts 0..7 receive tokens; experts 8..15 are empty.
+            hostRouting[t * topK + k] = (t + k) % (localNumExperts / 2);
+        }
+    }
+
+    int32_t* dRouting = nullptr;
+    CHECK_CUDA(cudaMalloc(&dRouting, hostRouting.size() * sizeof(int32_t)));
+    CHECK_CUDA(cudaMemcpy(dRouting, hostRouting.data(), hostRouting.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    MoELayoutBuffers buf = createMoELayoutBuffers(numTokens, topK, localNumExperts, tileSize);
+    buildLayoutGpu(buf, dRouting, numTokens, topK, localNumExperts, tileSize, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    int32_t hostNumTiles = 0;
+    CHECK_CUDA(cudaMemcpy(&hostNumTiles, buf.numNonExitingTiles.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost));
+    // No active expert is starved: numNonExitingTiles > 0.
+    EXPECT_GT(hostNumTiles, 0) << "numNonExitingTiles must be > 0 even when half the experts are idle";
+    EXPECT_LE(hostNumTiles, buf.tileIdxToGroupIdx.getShape()[0])
+        << "numNonExitingTiles must not exceed max-tile capacity";
+    cudaFree(dRouting);
+}
+
+// numTokens == 0: empty input. Kernel contract is that numNonExitingTiles == 0 and the
+// permuted-idx buffer is set to all −1 (the plugin's gather kernel relies on this so the
+// kernel short-circuits every row to zero-fill).
+TEST(NvFP4MoEWorstCaseRoutingTest, emptyInput)
+{
+    if (!isSupportedSm())
+    {
+        GTEST_SKIP() << "Requires SM100/101/110";
+    }
+
+    constexpr int32_t localNumExperts = 16;
+    constexpr int32_t topK = 2;
+    constexpr int32_t tileSize = 128;
+    constexpr int32_t numTokensProfile = 32; // profile max; runtime will be zero
+
+    MoELayoutBuffers buf = createMoELayoutBuffers(numTokensProfile, topK, localNumExperts, tileSize);
+    int32_t const maxMPadded = static_cast<int32_t>(buf.permutedIdxToExpandedIdx.getShape()[0]);
+
+    // Dirty the buffer so we can detect the kernel's zero-token path.
+    CHECK_CUDA(cudaMemset(buf.permutedIdxToExpandedIdx.rawPointer(), 0x42, maxMPadded * sizeof(int32_t)));
+    int32_t const prime = 0xDEADBEEF;
+    CHECK_CUDA(cudaMemcpy(buf.numNonExitingTiles.rawPointer(), &prime, sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    buildLayoutGpu(buf, /*dRouting=*/nullptr, /*numTokens=*/0, topK, localNumExperts, tileSize, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    int32_t hostNumTiles = 0x7FFFFFFF;
+    CHECK_CUDA(cudaMemcpy(&hostNumTiles, buf.numNonExitingTiles.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(hostNumTiles, 0) << "Empty input must produce numNonExitingTiles == 0";
+
+    std::vector<int32_t> hostPerm(maxMPadded);
+    CHECK_CUDA(cudaMemcpy(hostPerm.data(), buf.permutedIdxToExpandedIdx.rawPointer(), maxMPadded * sizeof(int32_t),
+        cudaMemcpyDeviceToHost));
+    int32_t bad = 0;
+    for (int32_t v : hostPerm)
+    {
+        if (v != -1)
+        {
+            ++bad;
+        }
+    }
+    EXPECT_EQ(bad, 0) << "Empty input must leave permutedIdxToExpandedIdx filled with −1 sentinels";
 }

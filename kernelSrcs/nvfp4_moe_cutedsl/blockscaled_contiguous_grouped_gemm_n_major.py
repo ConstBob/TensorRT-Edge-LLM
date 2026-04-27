@@ -42,46 +42,52 @@ from utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    ldmatrix_m16n16_trans_b8,
+    prmt_b32,
     silu_f32,
+    st_shared_b16,
+    st_shared_b32,
 )
 
 """
-Blackwell MoE FC1 kernel: contiguous grouped GEMM with fused activation epilogue.
+Blackwell MoE FC1 kernel: N-major weights with in-flight SMEM nibble transpose.
 
-This kernel implements the FC1 (gating/up-projection) layer of Mixture-of-Experts
-blocks with blockscaled (NVF4/MXF4/MXF8) precision on NVIDIA Blackwell GPUs
-(SM100/SM103).
+This is a fork of ``blockscaled_contiguous_grouped_gemm.py``. The goal is to
+accept FC1 weights stored in **N-major** layout on disk/device (the layout
+consumed by the Marlin-style decode GEMV), so that the same weight buffer can
+serve both the prefill GEMM and the decode GEMV with a single copy.
 
-Forked from the FC2 finalize kernel (blockscaled_contiguous_grouped_gemm_finalize.py),
-this kernel replaces the scatter-reduce epilogue with a direct TMA store epilogue
-supporting fused activations (identity, relu2, swiglu). It inherits the FC2 kernel's
-7-warp layout with dedicated scheduler warp and StaticPersistentTileScheduler +
-runtime lookup tables, eliminating the compile-time group_count/total_num_clusters
-parameters and TMA descriptor rebuilds of the original FC1 kernel.
+FP4 ``tcgen05.mma`` only supports K-major B (confirmed by
+``tests/gpu/smoke_mn_major_b_fp4.py``), so the N-major layout has to be
+transposed to K-major *inside* the kernel before the MMA consumes it. The
+kernel grows from 7 to 8 warps:
+
+  warp 0-3  epilogue                (unchanged)
+  warp 4    MMA tcgen05.mma         (unchanged - reads K-major sB)
+  warp 5    TMA loads A / SFA / SFB / B_raw
+  warp 6    scheduler               (unchanged)
+  warp 7    transpose               (new - repacks sB_raw -> sB nibbles)
 
 Matrix layout:
-  - A: MxKx1, row-major("K"), contiguous expert-grouped (gather kernel output)
-  - B: NxKxL, column-major("K"), L is the grouped (expert) dimension
-  - C (out): MxN_outx1, row-major("N"), direct TMA store (no scatter)
-  - N_out = N for identity/relu2, N/2 for swiglu
+  - A      : MxKx1, row-major("K"), contiguous expert-grouped
+  - B      : (N, K, L) logical shape but **N-major** (N innermost) on device
+  - C (out): MxN_outx1, row-major("N"), direct TMA store
+  - SFB    : prefill-friendly atom-swizzle copy (M=N, K=K/16)
 
-Fused activation modes:
-  - identity: Direct pass-through (C = A @ B)
-  - relu2: ReLU squared (C = max(A @ B, 0)^2)
-  - swiglu: SwiGLU (C = up * silu(gate)), N-dim pairs consumed as (up, gate)
-
-Features:
-  - TMA (Tensor Memory Access) for efficient global-to-shared memory loads AND stores
-  - tcgen05.mma blockscaled MMA instructions
-  - TMA multicast with cluster to reduce L2 traffic
-  - Persistent tile scheduling with dedicated scheduler warp (warp 6)
-  - Zero TMA descriptor updates (contiguous A + 3D B tensor)
-  - 1CTA mode only (tile_size=128)
+Other semantics (activation fusion, per-expert alpha, determinism,
+StaticPersistentTileScheduler + runtime tile-info lookup) are identical to the
+K-major kernel. See ``docs/nvfp4_prefill_n_major_weights_design.md`` for the
+design and error budget.
 """
 
 
-class BlockScaledContiguousGroupedGemmKernel:
-    """Blackwell FC1 kernel: contiguous blockscaled grouped GEMM with fused activation.
+# The monkeypatch of PersistentTileSchedulerParams and StaticPersistentTileScheduler
+# that was here has been removed — nvidia-cutlass-dsl >= 4.4 ships the required
+# raster_along_m / FastDivmod support natively.
+
+
+class BlockScaledContiguousGroupedGemmNMajorKernel:
+    """Blackwell FC1 kernel: N-major B with in-flight SMEM nibble transpose.
 
     Implements C = activation((SFA * A) * (SFB * B)) for the gating/up-projection
     (FC1) layer of Mixture-of-Experts blocks. The epilogue applies fused activation
@@ -178,6 +184,18 @@ class BlockScaledContiguousGroupedGemmKernel:
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.sched_warp_id = 6
+        # Transpose warps: N-major B_raw -> K-major sB nibble repack.
+        # With 4 warps × 32 lanes = 128 writer threads, each warp owns a
+        # contiguous 1/num_transpose_warps slice of the output bytes. This is
+        # free occupancy-wise (kernel is SMEM-limited to 1 block/SM already)
+        # and cuts the serial store latency proportionally.
+        self.num_transpose_warps = 4
+        self.transpose_warp_id_base = 7
+        self.transpose_warp_ids = tuple(
+            self.transpose_warp_id_base + i for i in range(self.num_transpose_warps)
+        )
+        # Back-compat alias (single-warp code reads self.transpose_warp_id).
+        self.transpose_warp_id = self.transpose_warp_id_base
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
@@ -185,18 +203,27 @@ class BlockScaledContiguousGroupedGemmKernel:
                 self.mma_warp_id,
                 self.tma_warp_id,
                 self.sched_warp_id,
+                *self.transpose_warp_ids,
             )
         )
+        # Threads excluding the scheduler warp (consumers of the tile-info pipeline).
+        # Transpose warps also consume tile-info so they issue SMEM transposes per tile.
         self.threads_wo_sched = self.threads_per_warp * len(
             (
                 *self.epilog_warp_id,
                 self.mma_warp_id,
                 self.tma_warp_id,
+                *self.transpose_warp_ids,
             )
         )
         self.num_regs_uniform_warps = 64
         self.num_regs_sched_warps = 64
         self.num_regs_epilogue_warps = 216
+        # Transpose warps read/write SMEM only (no TMEM), but each inner
+        # iteration now keeps 8 u8 raw-byte loads + 8 u32 nibble temps + a
+        # packed u32 output live simultaneously, so bump the per-thread
+        # register budget from the TMA/sched default to reduce spills.
+        self.num_regs_transpose_warps = 128
 
         # Set barrier for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -214,6 +241,14 @@ class BlockScaledContiguousGroupedGemmKernel:
         self.sched_sync_barrier = pipeline.NamedBarrier(
             barrier_id=4,
             num_threads=self.threads_per_warp,
+        )
+        # Transpose-warp-group barrier. Used to fence reads of sB_raw across
+        # all transpose warps before warp 0 signals b_raw_pipeline that TMA
+        # can refill — otherwise TMA could overwrite sB_raw while later
+        # transpose warps are still reading it.
+        self.transpose_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=5,
+            num_threads=self.threads_per_warp * self.num_transpose_warps,
         )
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         # TMEM offset for final accumulator
@@ -361,6 +396,17 @@ class BlockScaledContiguousGroupedGemmKernel:
             self.b_dtype,
             self.num_ab_stage,
         )
+        # N-major raw B buffer: TMA drops (N_TILE, K_TILE) tiles with N innermost.
+        # This is a plain unswizzled FP4 layout — the transpose warp will later
+        # repack its contents into ``b_smem_layout_staged`` (K-major, swizzled,
+        # MMA-ready). Stage count matches the K-major sB so the two pipelines
+        # stay symmetric.
+        n_tile = self.mma_tiler[1]
+        k_tile = self.mma_tiler[2]
+        self.b_raw_smem_layout_staged = cute.make_ordered_layout(
+            (n_tile, k_tile, self.num_ab_stage),
+            order=(0, 1, 2),
+        )
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma,
             self.mma_tiler,
@@ -500,9 +546,18 @@ class BlockScaledContiguousGroupedGemmKernel:
             self.cluster_layout_vmnk.shape,
         )
 
-        # Setup TMA load for B
-        b_op = sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id)
+        # Setup TMA load for B.
+        #
+        # N-major variant: the MMA-tied ``make_tiled_tma_atom_B`` helper insists
+        # on a K-major SMEM layout (matches tcgen05 requirements). We instead
+        # target our plain, unswizzled ``sB_raw`` buffer whose innermost axis is
+        # N (same as the gmem layout). The transpose warp later repacks
+        # ``sB_raw`` into the MMA-ready ``sB`` buffer.
+        #
+        # The MMA-tied ``b_smem_layout`` is still used downstream to build
+        # fragments for tcgen05.mma but is no longer the TMA destination.
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
+        b_raw_smem_layout = cute.slice_(self.b_raw_smem_layout_staged, (None, None, 0))
 
         # Setup TMA load for SFA
         sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(self.cluster_shape_mn, tiled_mma.thr_id)
@@ -523,13 +578,15 @@ class BlockScaledContiguousGroupedGemmKernel:
 
         # Helper to create TMA for B tensor
         def _make_tma_b(b_tensor, sfb_tensor):
-            atom_b, tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-                b_op,
+            # N-major B -> unswizzled N-major sB_raw. Use the low-level
+            # ``cpasync.make_tiled_tma_atom`` helper so we are not tied to an
+            # MMA-specific SMEM layout. Non-multicast only for now (cluster
+            # shape (1, 1) is enforced by ``is_valid_mma_tiler_and_cluster_shape``).
+            atom_b, tensor_b = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
                 b_tensor,
-                b_smem_layout,
-                self.mma_tiler,
-                tiled_mma,
-                self.cluster_layout_vmnk.shape,
+                b_raw_smem_layout,
+                (self.mma_tiler[1], self.mma_tiler[2]),
             )
             atom_sfb, tensor_sfb = cute.nvgpu.make_tiled_tma_atom_B(
                 sfb_op,
@@ -564,12 +621,18 @@ class BlockScaledContiguousGroupedGemmKernel:
         tma_atom_b, tma_tensor_b, tma_atom_sfb, tma_tensor_sfb = _make_tma_b(b, sfb)
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
-        b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
+        b_copy_size = cute.size_in_bytes(self.b_dtype, b_raw_smem_layout)
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
-        self.num_tma_load_bytes = (
-            a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
+        # ab_pipeline (TMA -> MMA) covers only A, SFA, SFB; its tx_count
+        # excludes B which is on its own TMA -> transpose pipeline.
+        self.num_tma_load_bytes_ab = (
+            a_copy_size + sfa_copy_size + sfb_copy_size
         ) * atom_thr_size
+        # b_raw_pipeline (TMA -> transpose) covers only B.
+        self.num_tma_load_bytes_b = b_copy_size * atom_thr_size
+        # Keep a combined count for any legacy callers; unused internally.
+        self.num_tma_load_bytes = self.num_tma_load_bytes_ab + self.num_tma_load_bytes_b
 
         self.tile_sched_params, grid = self._compute_grid(
             (a.shape[0], b.shape[0], a.shape[2]),
@@ -600,6 +663,10 @@ class BlockScaledContiguousGroupedGemmKernel:
                 1,
             ]
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            # N-major TMA -> transpose warp (B_raw slot)
+            b_raw_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            # transpose warp -> MMA (B_mma slot)
+            b_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tile_info_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_tile_stage * 2]
             tmem_dealloc_mbar_ptr: cutlass.Int64
@@ -617,9 +684,16 @@ class BlockScaledContiguousGroupedGemmKernel:
                 cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
                 self.buffer_align_bytes,
             ]
-            # (MMA, MMA_N, MMA_K, STAGE)
+            # (MMA, MMA_N, MMA_K, STAGE) — K-major, MMA-ready. Filled by the
+            # transpose warp from sB_raw, consumed by the MMA warp.
             sB: cute.struct.Align[
                 cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
+                self.buffer_align_bytes,
+            ]
+            # (N_TILE, K_TILE, STAGE) — N-major, unswizzled. TMA-filled,
+            # transpose-consumed.
+            sB_raw: cute.struct.Align[
+                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_raw_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             # (granularity_m, repeat_m), (granularity_k, repeat_k), num_scale_stage)
@@ -658,6 +732,7 @@ class BlockScaledContiguousGroupedGemmKernel:
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
+            self.b_raw_smem_layout_staged,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.c_smem_layout_staged,
@@ -741,6 +816,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
+        b_raw_smem_layout_staged: cute.Layout,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: cute.ComposedLayout,
@@ -789,7 +865,9 @@ class BlockScaledContiguousGroupedGemmKernel:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # Initialize mainloop ab_pipeline (barrier) and states
+        # Initialize mainloop ab_pipeline (barrier) and states.
+        # In the N-major kernel the ab_pipeline covers only A, SFA, SFB; B flows
+        # through its own TMA -> transpose -> MMA pair of pipelines (see below).
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
@@ -800,8 +878,49 @@ class BlockScaledContiguousGroupedGemmKernel:
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
-            tx_count=self.num_tma_load_bytes,
+            tx_count=self.num_tma_load_bytes_ab,
             cta_layout_vmnk=cluster_layout_vmnk,
+        )
+
+        # b_raw_pipeline: TMA warp fills sB_raw (N-major); transpose warp
+        # consumes it. ``PipelineTmaAsync.consumer_release`` only arrives
+        # from ``is_signalling_thread`` (one lane per CTA), so the consumer
+        # cooperative group must have size 1 — otherwise the empty barrier's
+        # arrive_count is set to 32 and each release contributes only 1/32,
+        # meaning the barrier never flips and ``producer_tail`` deadlocks at
+        # kernel exit.
+        b_raw_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        b_raw_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        b_raw_pipeline = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.b_raw_mbar_ptr.data_ptr(),
+            num_stages=self.num_ab_stage,
+            producer_group=b_raw_producer_group,
+            consumer_group=b_raw_consumer_group,
+            tx_count=self.num_tma_load_bytes_b,
+            cta_layout_vmnk=cluster_layout_vmnk,
+        )
+
+        # b_mma_pipeline: transpose warps produce sB (K-major, MMA-ready);
+        # MMA warp consumes. Both are plain thread-level cooperative groups
+        # so we use PipelineAsync — the MMA warp does an explicit
+        # consumer_wait / consumer_release pair (UMMA-pipeline implicit
+        # release semantics don't compose with our external transpose step).
+        # Producer side now spans all transpose warps (4 × 32 = 128 threads
+        # by default) so the barrier arrive count matches the number of
+        # threads actually calling producer_commit.
+        b_mma_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            self.threads_per_warp * self.num_transpose_warps,
+        )
+        b_mma_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            self.threads_per_warp,
+        )
+        b_mma_pipeline = pipeline.PipelineAsync.create(
+            barrier_storage=storage.b_mma_mbar_ptr.data_ptr(),
+            num_stages=self.num_ab_stage,
+            producer_group=b_mma_producer_group,
+            consumer_group=b_mma_consumer_group,
         )
 
         # Initialize acc_pipeline (barrier) and states
@@ -852,8 +971,12 @@ class BlockScaledContiguousGroupedGemmKernel:
         #
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-        # (MMA, MMA_N, MMA_K, STAGE)
+        # (MMA, MMA_N, MMA_K, STAGE) — K-major, MMA-ready. Written by the
+        # transpose warp.
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+        # (N_TILE, K_TILE, STAGE) — N-major, TMA destination. Read by the
+        # transpose warp.
+        sB_raw = storage.sB_raw.get_tensor(b_raw_smem_layout_staged)
         # (granularity_m, repeat_m), (granularity_k, repeat_k), num_scale_stage)
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
@@ -945,16 +1068,18 @@ class BlockScaledContiguousGroupedGemmKernel:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
-        # TMA load B partition_S/D
-        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
-        tBsB, tBgB = cpasync.tma_partition(
+        # TMA load B partition_S/D — targets sB_raw (N-major, non-MMA-ready).
+        # Unlike the K-major kernel we do NOT use ``thr_mma.partition_B``
+        # because the MMA partitioning is tied to the K-major swizzled layout.
+        # Here we tile gB_nkl directly and drop it into sB_raw verbatim; the
+        # transpose warp later repacks its contents into sB.
+        b_cta_layout = cute.make_layout(1)  # non-multicast (cluster (1,1))
+        tBsB_raw, tBgB = cpasync.tma_partition(
             tma_atom_b,
-            block_in_cluster_coord_vmnk[1],
+            0,
             b_cta_layout,
-            cute.group_modes(sB, 0, 3),
-            cute.group_modes(tCgB, 0, 3),
+            cute.group_modes(sB_raw, 0, 2),
+            cute.group_modes(gB_nkl, 0, 2),
         )
 
         #  TMA load SFA partition_S/D
@@ -1147,6 +1272,12 @@ class BlockScaledContiguousGroupedGemmKernel:
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
+            # Separate state for the B (TMA -> transpose) pipeline. Kept in
+            # lock-step with ab_producer_state — the same k_tile counter drives
+            # both pipelines.
+            b_raw_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_ab_stage
+            )
 
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
@@ -1187,6 +1318,7 @@ class BlockScaledContiguousGroupedGemmKernel:
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
+                b_raw_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_tile_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
@@ -1197,50 +1329,54 @@ class BlockScaledContiguousGroupedGemmKernel:
                     tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
                     tAgSFA_k = tAgSFA_slice[(None, ab_producer_state.count)]
                     tAsA_pipe = tAsA[(None, ab_producer_state.index)]
-                    tBsB_pipe = tBsB[(None, ab_producer_state.index)]
+                    tBsB_raw_pipe = tBsB_raw[(None, b_raw_producer_state.index)]
                     tAsSFA_pipe = tAsSFA[(None, ab_producer_state.index)]
                     tBsSFB_pipe = tBsSFB[(None, ab_producer_state.index)]
 
-                    tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
+                    tma_bar_ab = ab_pipeline.producer_get_barrier(ab_producer_state)
 
-                    # Conditionally wait for AB buffer empty
+                    # Conditionally wait for AB buffer empty (A, SFA, SFB only)
                     ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                    # B_raw has its own pipeline; acquire independently.
+                    b_raw_pipeline.producer_acquire(b_raw_producer_state)
+                    tma_bar_b = b_raw_pipeline.producer_get_barrier(b_raw_producer_state)
 
-                    # TMA load A/B
+                    # TMA load A
                     cute.copy(
                         tma_atom_a,
                         tAgA_k,
                         tAsA_pipe,
-                        tma_bar_ptr=tma_bar,
+                        tma_bar_ptr=tma_bar_ab,
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_sfa,
                         tAgSFA_k,
                         tAsSFA_pipe,
-                        tma_bar_ptr=tma_bar,
+                        tma_bar_ptr=tma_bar_ab,
                         mcast_mask=sfa_full_mcast_mask,
                     )
-                    # Single B tensor: use expert_idx directly as L index
-                    tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, expert_idx)]
+                    # TMA load SFB (still on ab_pipeline)
                     tBgSFB_slice = tBgSFB[(None, slice_n, None, expert_idx)]
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_slice[(None, ab_producer_state.count)],
-                        tBsB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=b_full_mcast_mask,
-                    )
                     cute.copy(
                         tma_atom_sfb,
                         tBgSFB_slice[(None, ab_producer_state.count)],
                         tBsSFB_pipe,
-                        tma_bar_ptr=tma_bar,
+                        tma_bar_ptr=tma_bar_ab,
                         mcast_mask=sfb_full_mcast_mask,
+                    )
+                    # TMA load B_raw (N-major, own pipeline -> transpose warp)
+                    tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, expert_idx)]
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB_slice[(None, b_raw_producer_state.count)],
+                        tBsB_raw_pipe,
+                        tma_bar_ptr=tma_bar_b,
                     )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
+                    b_raw_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
@@ -1262,6 +1398,262 @@ class BlockScaledContiguousGroupedGemmKernel:
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
+            b_raw_pipeline.producer_tail(b_raw_producer_state)
+
+        #
+        # Specialized Transpose warp
+        # -------------------------
+        # Consumes one stage of sB_raw (N-major, TMA-landed), repacks nibbles
+        # into the K-major ``sB`` buffer, and signals b_mma_pipeline.
+        # This is a first-pass, correctness-oriented implementation: each
+        # thread reads one nibble at a time via CuteDSL's FP4 tensor interface.
+        # The per-tile nibble count is distributed across the 32 threads of
+        # the warp. See ``docs/nvfp4_prefill_n_major_weights_design.md`` §5 for
+        # the optimized sub-block shuffle plan.
+        #
+        # CuteDSL doesn't like Python `and` on tracked boolean values; use two
+        # nested compile-folded comparisons instead. `warp_idx` is runtime but
+        # the pattern matches the existing `warp_idx == self.foo_warp_id`
+        # dispatch style used by the other specialised warps.
+        warp_in_transpose_runtime = warp_idx - self.transpose_warp_id_base
+        if (warp_in_transpose_runtime >= 0) & (
+            warp_in_transpose_runtime < self.num_transpose_warps
+        ):
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_transpose_warps)
+
+            b_raw_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+            )
+            b_mma_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_ab_stage
+            )
+
+            tile_info_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_tile_stage
+            )
+
+            sB_raw_u8 = cute.recast_tensor(sB_raw, cutlass.Uint8)
+
+            n_tile = self.mma_tiler[1]
+            k_tile = self.mma_tiler[2]
+            n_half = n_tile // 2
+            k_half = k_tile // 2
+
+            # Plain K-inner uint8 layout for sB (N rows × K_byte cols × STAGE).
+            sB_u8_plain_layout = cute.make_layout(
+                (n_tile, k_half, self.num_ab_stage),
+                stride=(k_half, 1, n_tile * k_half),
+            )
+            # Compose with the same Swizzle object the FP4 sB uses, so accesses
+            # XOR through the same bit pattern tcgen05 encodes in its matrix
+            # descriptor.
+            sB_u8_composed_layout = cute.make_composed_layout(
+                b_smem_layout_staged.inner,
+                0,
+                sB_u8_plain_layout,
+            )
+            sB_u8_ptr = cute.recast_ptr(sB.iterator, dtype=cutlass.Uint8)
+            sB_u8 = cute.make_tensor(sB_u8_ptr, sB_u8_composed_layout)
+
+            # Work distribution: warp-level ``ldmatrix.m16n16.trans.b8`` loads.
+            # Each call reads a 16 K-row × 16 N-byte tile (= 256 source bytes,
+            # covering 16 K-values and all 32 N-FP4s of a 16-byte N-stripe)
+            # with hardware transpose. The ``.b8`` source format picks 16-byte
+            # rows, which matches ``sB_raw_u8``'s K-axis stride (64 B) and lets
+            # us tile N at 16-byte granularity from N_base_byte ∈ {0, 16, 32,
+            # 48} — the 16-byte row-alignment requirement is met naturally, in
+            # contrast to ``.b4x16_p64`` (8-byte rows) which forces every-other
+            # 16-FP4 stripe to be skipped.
+            #
+            # Warp split: each warp owns 16 N-bytes = 32 N-rows of sB output,
+            # same as before. Per warp: k_tile // 16 ldmatrix calls (one per
+            # K-tile), each producing 4 output u16s per lane at 4 distinct
+            # N-FP4 rows. Total per warp per stage:
+            #   (k_tile // 16) * 4 u16/lane = same 64 output bytes/lane as the
+            # scalar path.
+            #
+            # Per lane TV (l = 16*g + 4*qq + w, g∈0..1, qq∈0..3, w∈0..3):
+            #   Owns dst-rows (qq + 4g, qq + 4g + 8) = N-byte indices within
+            #   the 16-byte tile; dst-cols 4w..4w+3 = K-values within tile.
+            lane = tidx % self.threads_per_warp
+            ldm_g = (lane >> 4) & 1
+            ldm_qq = (lane >> 2) & 3
+            ldm_w = lane & 3
+            # Lane's N-byte offsets within the warp's 16-byte stripe (same for
+            # every tile — only K_base varies across tiles).
+            nb_lo = ldm_qq + 4 * ldm_g             # 0..7  (dst-row of R0)
+            nb_hi = ldm_qq + 4 * ldm_g + 8          # 8..15 (dst-row of R1)
+            # Absolute N-byte in sB_raw_u8 (and sB N-FP4 after *2). The tile
+            # origin is the warp's stripe start, which is 16-aligned because
+            # warp_in_transpose_runtime * 16 ∈ {0, 16, 32, 48}.
+            warp_n_base_byte = warp_in_transpose_runtime * (n_half // self.num_transpose_warps)
+            abs_nb_lo = warp_n_base_byte + nb_lo
+            abs_nb_hi = warp_n_base_byte + nb_hi
+            # Absolute N-FP4 row indices in sB (stride k_half along N):
+            n_fp4_lo_even = 2 * abs_nb_lo
+            n_fp4_lo_odd = n_fp4_lo_even + 1
+            n_fp4_hi_even = 2 * abs_nb_hi
+            n_fp4_hi_odd = n_fp4_hi_even + 1
+            # K-byte base-offset within an N-row for this lane's stripe —
+            # 2 consecutive K-bytes per call (= kb=2w..2w+1).
+            kb_lane_off = 2 * ldm_w
+            # Each lane supplies the pointer to one ldmatrix "row" = K=lane_row
+            # of the current tile. lanes 0..15 carry the 16 row addresses;
+            # lanes 16..31 duplicate (only lanes 0..15 matter for .x1).
+            ldm_row_within_tile = lane & 0xF
+
+            # Masks for the even/odd nibble-compression PTX pattern. See
+            # comment at the pack-site below.
+            MASK_LO8 = cutlass.Uint32(0x0F)
+            MASK_HI8 = cutlass.Uint32(0xF0)
+            MASK_LO16 = cutlass.Uint32(0xF00)
+            MASK_HI16 = cutlass.Uint32(0xF000)
+
+            # Get the first tile info from pipeline
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            for idx in cutlass.range(5, unroll_full=True):
+                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            is_valid_tile = tile_info[3] == 1
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            tile_info_consumer_state.advance()
+
+            while is_valid_tile:
+                for k_iter in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    # Wait for producer TMA to fill sB_raw[stage]
+                    b_raw_pipeline.consumer_wait(b_raw_consumer_state)
+                    # Wait for MMA to signal sB[stage] empty (ready to write)
+                    b_mma_pipeline.producer_acquire(b_mma_producer_state)
+
+                    raw_stage = b_raw_consumer_state.index
+                    mma_stage = b_mma_producer_state.index
+
+                    # One ldmatrix.m16n16.x1.trans.b8 per 16-K-value tile.
+                    # At mma_tiler (K=128) this is k_tile // 16 = 8 calls per
+                    # warp per stage. The instruction loads a 16 K × 16 N-byte
+                    # slab of ``sB_raw_u8`` with byte-transposed destination:
+                    #   dst[r'][c'] = src-u8 at (K=c', N-byte=r')
+                    #                = { FP4(N=2*r', K=c'),
+                    #                    FP4(N=2*r'+1, K=c') } packed.
+                    #
+                    # Per lane ownership (see the lane-TV summary above):
+                    #   R0 = 4 dst bytes at (dst-row=nb_lo, dst-col=4w..4w+3)
+                    #   R1 = 4 dst bytes at (dst-row=nb_hi, dst-col=4w..4w+3)
+                    # i.e. 4 K-values × 2 N-bytes × 2 N-FP4 = 16 FP4s per lane
+                    # per tile, matching the 4-u16-output contribution below.
+                    for tile_idx in cutlass.range_constexpr(k_tile // 16):
+                        k_base = tile_idx * 16
+                        # Per-lane row pointer into sB_raw_u8 — lanes 0..15
+                        # each cover one K-row of the tile; lanes 16..31
+                        # duplicate (only lanes 0..15 matter for .x1).
+                        src_row = cute.domain_offset(
+                            (warp_n_base_byte, k_base + ldm_row_within_tile, raw_stage),
+                            sB_raw_u8,
+                        )
+                        r0, r1 = ldmatrix_m16n16_trans_b8(
+                            src_row.iterator.llvm_ptr
+                        )
+
+                        # Nibble-compress each ri into (even_ri, odd_ri) u16s.
+                        # ri = [b0 b1 b2 b3] where bi is a u8 at one K value
+                        # holding (N=2*nb even: low nib, N=2*nb+1 odd: high nib).
+                        # For N-even u16 at (kb=2w..2w+1):
+                        #   out[3:0]   = b0 low nib  = ri & 0x0F
+                        #   out[7:4]   = b1 low nib  = (ri >> 4) & 0xF0
+                        #   out[11:8]  = b2 low nib  = (ri >> 8) & 0xF00
+                        #   out[15:12] = b3 low nib  = (ri >> 12) & 0xF000
+                        # For N-odd u16: same with shifted source (+4 bits).
+                        even_r0 = (
+                            (r0 & MASK_LO8)
+                            | ((r0 >> 4) & MASK_HI8)
+                            | ((r0 >> 8) & MASK_LO16)
+                            | ((r0 >> 12) & MASK_HI16)
+                        )
+                        odd_r0 = (
+                            ((r0 >> 4) & MASK_LO8)
+                            | ((r0 >> 8) & MASK_HI8)
+                            | ((r0 >> 12) & MASK_LO16)
+                            | ((r0 >> 16) & MASK_HI16)
+                        )
+                        even_r1 = (
+                            (r1 & MASK_LO8)
+                            | ((r1 >> 4) & MASK_HI8)
+                            | ((r1 >> 8) & MASK_LO16)
+                            | ((r1 >> 12) & MASK_HI16)
+                        )
+                        odd_r1 = (
+                            ((r1 >> 4) & MASK_LO8)
+                            | ((r1 >> 8) & MASK_HI8)
+                            | ((r1 >> 12) & MASK_LO16)
+                            | ((r1 >> 16) & MASK_HI16)
+                        )
+
+                        # Store 4 u16s at 4 distinct (N-FP4, kb) destinations.
+                        # kb=k_base/2 + 2w..2w+1 (two K-bytes per u16).
+                        kb_tile_off = (k_base >> 1) + kb_lane_off
+                        dst_lo_even = cute.domain_offset(
+                            (n_fp4_lo_even, kb_tile_off, mma_stage), sB_u8
+                        )
+                        dst_lo_odd = cute.domain_offset(
+                            (n_fp4_lo_odd, kb_tile_off, mma_stage), sB_u8
+                        )
+                        dst_hi_even = cute.domain_offset(
+                            (n_fp4_hi_even, kb_tile_off, mma_stage), sB_u8
+                        )
+                        dst_hi_odd = cute.domain_offset(
+                            (n_fp4_hi_odd, kb_tile_off, mma_stage), sB_u8
+                        )
+                        st_shared_b16(dst_lo_even, even_r0)
+                        st_shared_b16(dst_lo_odd, odd_r0)
+                        st_shared_b16(dst_hi_even, even_r1)
+                        st_shared_b16(dst_hi_odd, odd_r1)
+
+                    # Fence so the MMA warp's async proxy view sees the
+                    # transpose writes before it issues tcgen05.mma.
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+
+                    # Sync across all transpose warps so warp 0 can safely
+                    # release sB_raw back to TMA (otherwise warps 1..N might
+                    # still be reading it).
+                    self.transpose_sync_barrier.arrive_and_wait()
+
+                    # Release sB_raw (TMA-refill slot) — guarded to warp 0 of
+                    # the transpose group because ``PipelineTmaAsync.consumer_release``
+                    # elects ``lane < cluster_size`` (=1) per *warp* as the
+                    # signalling thread; letting all 4 warps call it would
+                    # over-arrive the empty barrier.
+                    if warp_in_transpose_runtime == 0:
+                        b_raw_pipeline.consumer_release(b_raw_consumer_state)
+
+                    # producer_commit on b_mma uses PipelineAsync semantics:
+                    # every thread arrives once, producer_group size matches
+                    # num_transpose_warps * 32 so the barrier flips only after
+                    # all transpose threads have written their share.
+                    b_mma_pipeline.producer_commit(b_mma_producer_state)
+
+                    b_raw_consumer_state.advance()
+                    b_mma_producer_state.advance()
+
+                # Advance to next tile
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                for idx in cutlass.range(5, unroll_full=True):
+                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                is_valid_tile = tile_info[3] == 1
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta,
+                )
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+
+            b_mma_pipeline.producer_tail(b_mma_producer_state)
 
         #
         # Specialized MMA warp
@@ -1323,6 +1715,10 @@ class BlockScaledContiguousGroupedGemmKernel:
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
+            # Consume the transpose warp's output sB before each MMA atom.
+            b_mma_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_ab_stage
+            )
             acc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
@@ -1347,6 +1743,7 @@ class BlockScaledContiguousGroupedGemmKernel:
             while is_valid_tile:
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
+                b_mma_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
                 if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
@@ -1406,8 +1803,12 @@ class BlockScaledContiguousGroupedGemmKernel:
                 #
                 for k_tile in cutlass.range(k_tile_cnt):
                     if is_leader_cta:
-                        # Conditionally wait for AB buffer full
+                        # Conditionally wait for AB buffer full (A, SFA, SFB).
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        # Wait for the transpose warp to finish filling sB for
+                        # this stage. The N-major -> K-major repack is on the
+                        # critical path just like the TMA arrivals.
+                        b_mma_pipeline.consumer_wait(b_mma_consumer_state)
 
                         #  Copy SFA/SFB from smem to tmem
                         s2t_stage_coord = (
@@ -1463,11 +1864,13 @@ class BlockScaledContiguousGroupedGemmKernel:
                             # Enable accumulate on tCtAcc after first kblock
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                        # Async arrive AB buffer empty
+                        # Async arrive AB buffer empty + B_mma empty.
                         ab_pipeline.consumer_release(ab_consumer_state)
+                        b_mma_pipeline.consumer_release(b_mma_consumer_state)
 
                     # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
                     ab_consumer_state.advance()
+                    b_mma_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt:
                         if is_leader_cta:
@@ -1907,9 +2310,13 @@ class BlockScaledContiguousGroupedGemmKernel:
             c_dtype, c_layout, epi_tile, 1,
         )
 
+        # Extra cost for the N-major B_raw staging buffer (same byte count as
+        # the K-major sB, because both are (N_TILE, K_TILE) FP4 tiles).
+        b_raw_bytes_per_stage = cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
         ab_bytes_per_stage = (
             cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
             + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
+            + b_raw_bytes_per_stage
             + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
             + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
         )
@@ -2084,7 +2491,9 @@ class BlockScaledContiguousGroupedGemmKernel:
         """
         is_valid = True
 
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
+        # N-major kernel: A must be K-major, B must be N-major (the in-flight
+        # SMEM transpose produces the K-major layout the MMA needs).
+        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "n"):
             is_valid = False
         if out_dtype is cutlass.Float4E2M1FN and out_major == "m":
             is_valid = False
@@ -2116,21 +2525,10 @@ class BlockScaledContiguousGroupedGemmKernel:
         if mma_tiler_mn[1] not in (64, 128, 192, 256):
             is_valid = False
 
-        # Skip illegal cluster shape
-        if (mma_tiler_mn[0] // cluster_shape_mn[0]) != 128:
-            is_valid = False
-
-        if (
-            cluster_shape_mn[0] * cluster_shape_mn[1] > 16
-            or cluster_shape_mn[0] <= 0
-            or cluster_shape_mn[1] <= 0
-            # Special cluster shape check for scale factor multicasts.
-            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-            or cluster_shape_mn[0] > 4
-            or cluster_shape_mn[1] > 4
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
-        ):
+        # N-major variant: only the trivial cluster shape is supported in
+        # this initial implementation. The B TMA atom is built with the
+        # low-level ``CopyBulkTensorTileG2SOp`` (no multicast).
+        if cluster_shape_mn != (1, 1):
             is_valid = False
 
         return is_valid
@@ -2257,8 +2655,8 @@ class BlockScaledContiguousGroupedGemmKernel:
             m, n, k, l, ab_dtype, out_dtype, a_major, b_major, out_major
         ):
             can_implement = False
-        # Skip unsupported A/B layout
-        if not (a_major == "k" and b_major == "k"):
+        # Skip unsupported A/B layout (this kernel REQUIRES b_major == "n").
+        if not (a_major == "k" and b_major == "n"):
             can_implement = False
         return can_implement
 
@@ -2305,8 +2703,11 @@ class BlockScaledContiguousGroupedGemmKernel:
             c_ptr, layout=cute.make_ordered_layout((m, n_out, 1), order=(1, 0, 2))
         )
 
+        # N-major B layout: N is the innermost axis on device. Only ``order``
+        # differs from the K-major kernel; the logical shape tuple stays
+        # ``(n, k, l)``. Strides become ``(1, n, n*k)``.
         b = cute.make_tensor(
-            b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
+            b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(0, 1, 2))
         )
         b_sf = cute.make_tensor(
             b_sf_ptr,
@@ -2341,6 +2742,48 @@ class BlockScaledContiguousGroupedGemmKernel:
             epilogue_op=epilogue_op,
         )
 
+    @cute.jit
+    def aot_wrapper(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        a_sf: cute.Tensor,
+        b_sf: cute.Tensor,
+        c: cute.Tensor,
+        alpha: cute.Tensor,
+        tile_idx_to_group_idx: cute.Tensor,
+        tile_idx_to_mn_limit: cute.Tensor,
+        num_non_exiting_tiles: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """AOT entry point for contiguous grouped GEMM that accepts pre-formed CuTe tensors.
+
+        Tensor layout contract (callers must match these exactly):
+
+        * ``a``       : ``(m, K, 1)``        order ``(1, 0, 2)``  FP4
+        * ``b``       : ``(N, K, L)``         order ``(1, 0, 2)``  FP4
+        * ``a_sf``    : ``(32, 4, m/128, 4, K/sfv/4, 1)`` order ``(2,1,4,0,3,5)``
+        * ``b_sf``    : ``(32, 4, N/128, 4, K/sfv/4, L)`` order ``(2,1,4,0,3,5)``
+        * ``c``       : ``(m, N_out, 1)`` order ``(1, 0, 2)``
+        * ``alpha``   : ``(L,)`` float32
+        * ``tile_idx_to_group_idx`` : ``(num_tiles,)``
+        * ``tile_idx_to_mn_limit``  : ``(num_tiles,)``
+        * ``num_non_exiting_tiles`` : ``(1,)``
+        """
+        return self(
+            a,
+            b,
+            c,
+            a_sf,
+            b_sf,
+            tile_idx_to_group_idx,
+            num_non_exiting_tiles,
+            tile_idx_to_mn_limit,
+            alpha,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
 
 
 @cute.jit

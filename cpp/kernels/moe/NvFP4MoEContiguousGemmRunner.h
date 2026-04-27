@@ -17,11 +17,20 @@
 
 // C++ runner for the contiguous grouped GEMM kernel (FC1 in decomposed pipeline).
 //
+// As of plugin v4 this drives the **N-major** AOT FC1 kernel: the weight buffer
+// ``[L, K, N/2]`` bytes (N innermost), which matches the Marlin decode byte
+// layout so a single on-device copy serves both decode and prefill. The kernel
+// does an in-flight SMEM nibble transpose to feed the K-major B operand that
+// ``tcgen05.mma`` requires. The AOT function symbols are unchanged from the
+// v3 K-major variants, so the dispatch code is identical — only the caller's
+// weight byte layout contract changes.
+//
 // Replaces the bucketed NvFP4MoEGroupedGemmRunner with a simpler runner that:
 // - Takes contiguous gathered input + 3D stacked weights
 // - Uses runtime lookup tables (no compile-time group_count)
 // - Needs only 2 AOT variants per activation (n128, n256) vs 16 bucketed
-// - Produces bit-identical output to the original grouped GEMM kernel
+// - Produces bit-identical output to the K-major grouped GEMM kernel on
+//   the same logical weight values
 
 #pragma once
 
@@ -49,8 +58,12 @@ public:
     /// @param n                Intermediate size (N)
     /// @param k                Hidden size (K)
     /// @param tileSize         Tile size (128)
+    /// @param activation       Activation function (compiled into the AOT binary).
+    ///                         Only Relu2 and Swiglu are compiled; Identity is not
+    ///                         exported as it has no production use for FC1.
+    /// @param outDtype         Output element type (selects the AOT variant).
     NvFP4MoEContiguousGemmRunner(int32_t numLocalExperts, int32_t topK, int32_t n, int32_t k, int32_t tileSize = 128,
-        Activation activation = Activation::kIdentity);
+        Activation activation = Activation::kRelu2, OutputDType outDtype = OutputDType::kBF16);
 
     static bool loadKernelModules();
     static void unloadKernelModules();
@@ -62,9 +75,13 @@ public:
     /// are applied inside the kernel epilogue in float32.
     ///
     /// @param gatheredFP4    [permutedM, K/2] float4_e2m1fn_x2 on device
-    /// @param weight         [L, N, K/2] float4_e2m1fn_x2 on device (3D stacked)
+    /// @param weight         [L, K, N/2] float4_e2m1fn_x2 on device (3D stacked,
+    ///                       **N-major** byte layout — N axis innermost, 2 FP4
+    ///                       nibbles per byte along N). Matches the plugin v4
+    ///                       fc_up_qweights shape and the Marlin decode layout.
     /// @param gatheredSF     atom-layout SF buffer on device (input A scales)
-    /// @param weightSF       atom-layout SF buffer on device (weight B scales)
+    /// @param weightSF       atom-layout SF buffer on device (weight B scales,
+    ///                       prefill-friendly M=N, K=K/16 — unchanged from v3)
     /// @param output         [permutedM, N_out] bfloat16 on device (output)
     /// @param alpha          [L] float32 per-expert scaling on device
     /// @param layout         MoE layout (tile metadata + permutation indices)
@@ -80,16 +97,19 @@ private:
     int32_t mK;
     int32_t mTileSize;
     Activation mActivation;
+    OutputDType mOutDtype;
 
     static int32_t selectTactic(int64_t n, int64_t k);
 
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
-    static nvfp4_moe_fc1_identity_n128_Kernel_Module_t sIdentityN128;
-    static nvfp4_moe_fc1_identity_n256_Kernel_Module_t sIdentityN256;
-    static nvfp4_moe_fc1_relu2_n128_Kernel_Module_t sRelu2N128;
-    static nvfp4_moe_fc1_relu2_n256_Kernel_Module_t sRelu2N256;
-    static nvfp4_moe_fc1_swiglu_n128_Kernel_Module_t sSwigluN128;
-    static nvfp4_moe_fc1_swiglu_n256_Kernel_Module_t sSwigluN256;
+    static nvfp4_moe_fc1_relu2_n128_bf16_Kernel_Module_t sRelu2N128_bf16;
+    static nvfp4_moe_fc1_relu2_n256_bf16_Kernel_Module_t sRelu2N256_bf16;
+    static nvfp4_moe_fc1_swiglu_n128_bf16_Kernel_Module_t sSwigluN128_bf16;
+    static nvfp4_moe_fc1_swiglu_n256_bf16_Kernel_Module_t sSwigluN256_bf16;
+    static nvfp4_moe_fc1_relu2_n128_fp16_Kernel_Module_t sRelu2N128_fp16;
+    static nvfp4_moe_fc1_relu2_n256_fp16_Kernel_Module_t sRelu2N256_fp16;
+    static nvfp4_moe_fc1_swiglu_n128_fp16_Kernel_Module_t sSwigluN128_fp16;
+    static nvfp4_moe_fc1_swiglu_n256_fp16_Kernel_Module_t sSwigluN256_fp16;
 #endif
     static bool sLoaded;
     static std::mutex sMutex;
