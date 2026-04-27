@@ -267,8 +267,8 @@ find "$SITE_PKG" -name "*.pyc" -delete
 
 | File | Description |
 |---|---|
-| `kernelSrcs/nvfp4_moe_cutedsl/blockscaled_contiguous_grouped_gemm.py` | FC1 kernel: contiguous grouped GEMM + fused activation |
-| `kernelSrcs/nvfp4_moe_cutedsl/blockscaled_contiguous_grouped_gemm_finalize.py` | FC2 kernel: grouped GEMM + fused scatter-reduce |
+| `kernelSrcs/nvfp4_moe_cutedsl/blockscaled_contiguous_grouped_gemm_n_major.py` | FC1 kernel: N-major grouped GEMM with in-flight SMEM nibble transpose + fused activation |
+| `kernelSrcs/nvfp4_moe_cutedsl/blockscaled_contiguous_grouped_gemm_finalize_n_major.py` | FC2 kernel: N-major grouped GEMM with in-flight SMEM nibble transpose + fused scatter-reduce |
 | `kernelSrcs/nvfp4_moe_cutedsl/utils.py` | PTX helpers (make_ptr, atomics, block-reduce, grid dep control) |
 | `kernelSrcs/nvfp4_moe_cutedsl/common.py` | AOT export helpers (dummy pointer creation, SF buffer sizing) |
 | `kernelSrcs/nvfp4_moe_cutedsl/export_fc1_kernel.py` | FC1 AOT export script (invoked by build_cutedsl.py) |

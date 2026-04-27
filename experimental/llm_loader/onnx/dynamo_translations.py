@@ -495,7 +495,6 @@ def _int4_moe_plugin_translation(
 def _nvfp4_moe_plugin_translation(
     router_logits: onnxscript.FLOAT,
     hidden_states: onnxscript.FLOAT16,
-    hidden_block_scale: onnxscript.INT8,
     hidden_global_scale: onnxscript.FLOAT,
     up_weights: onnxscript.INT8,
     up_block_scale: onnxscript.INT8,
@@ -503,6 +502,8 @@ def _nvfp4_moe_plugin_translation(
     down_weights: onnxscript.INT8,
     down_block_scale: onnxscript.INT8,
     down_global_scale: onnxscript.FLOAT,
+    up_block_scale_decode: onnxscript.INT8,
+    down_block_scale_decode: onnxscript.INT8,
     e_score_correction_bias: onnxscript.FLOAT,
     num_experts: int,
     top_k: int,
@@ -518,7 +519,6 @@ def _nvfp4_moe_plugin_translation(
     output = _trt_edgellm.Nvfp4MoePlugin(
         router_logits,
         hidden_states,
-        hidden_block_scale,
         hidden_global_scale,
         up_weights,
         up_block_scale,
@@ -526,6 +526,8 @@ def _nvfp4_moe_plugin_translation(
         down_weights,
         down_block_scale,
         down_global_scale,
+        up_block_scale_decode,
+        down_block_scale_decode,
         e_score_correction_bias,
         num_experts=num_experts,
         top_k=top_k,

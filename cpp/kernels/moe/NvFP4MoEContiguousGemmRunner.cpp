@@ -34,24 +34,27 @@ namespace nvfp4_moe
 {
 
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
-nvfp4_moe_fc1_identity_n128_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sIdentityN128{};
-nvfp4_moe_fc1_identity_n256_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sIdentityN256{};
-nvfp4_moe_fc1_relu2_n128_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sRelu2N128{};
-nvfp4_moe_fc1_relu2_n256_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sRelu2N256{};
-nvfp4_moe_fc1_swiglu_n128_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sSwigluN128{};
-nvfp4_moe_fc1_swiglu_n256_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sSwigluN256{};
+nvfp4_moe_fc1_relu2_n128_bf16_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sRelu2N128_bf16{};
+nvfp4_moe_fc1_relu2_n256_bf16_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sRelu2N256_bf16{};
+nvfp4_moe_fc1_swiglu_n128_bf16_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sSwigluN128_bf16{};
+nvfp4_moe_fc1_swiglu_n256_bf16_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sSwigluN256_bf16{};
+nvfp4_moe_fc1_relu2_n128_fp16_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sRelu2N128_fp16{};
+nvfp4_moe_fc1_relu2_n256_fp16_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sRelu2N256_fp16{};
+nvfp4_moe_fc1_swiglu_n128_fp16_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sSwigluN128_fp16{};
+nvfp4_moe_fc1_swiglu_n256_fp16_Kernel_Module_t NvFP4MoEContiguousGemmRunner::sSwigluN256_fp16{};
 #endif
 bool NvFP4MoEContiguousGemmRunner::sLoaded = false;
 std::mutex NvFP4MoEContiguousGemmRunner::sMutex{};
 
-NvFP4MoEContiguousGemmRunner::NvFP4MoEContiguousGemmRunner(
-    int32_t numLocalExperts, int32_t topK, int32_t n, int32_t k, int32_t tileSize, Activation activation)
+NvFP4MoEContiguousGemmRunner::NvFP4MoEContiguousGemmRunner(int32_t numLocalExperts, int32_t topK, int32_t n, int32_t k,
+    int32_t tileSize, Activation activation, OutputDType outDtype)
     : mNumLocalExperts(numLocalExperts)
     , mTopK(topK)
     , mN(n)
     , mK(k)
     , mTileSize(tileSize)
     , mActivation(activation)
+    , mOutDtype(outDtype)
 {
 }
 
@@ -61,12 +64,14 @@ bool NvFP4MoEContiguousGemmRunner::loadKernelModules()
     std::lock_guard<std::mutex> lock(sMutex);
     if (sLoaded)
         return true;
-    nvfp4_moe_fc1_identity_n128_Kernel_Module_Load(&sIdentityN128);
-    nvfp4_moe_fc1_identity_n256_Kernel_Module_Load(&sIdentityN256);
-    nvfp4_moe_fc1_relu2_n128_Kernel_Module_Load(&sRelu2N128);
-    nvfp4_moe_fc1_relu2_n256_Kernel_Module_Load(&sRelu2N256);
-    nvfp4_moe_fc1_swiglu_n128_Kernel_Module_Load(&sSwigluN128);
-    nvfp4_moe_fc1_swiglu_n256_Kernel_Module_Load(&sSwigluN256);
+    nvfp4_moe_fc1_relu2_n128_bf16_Kernel_Module_Load(&sRelu2N128_bf16);
+    nvfp4_moe_fc1_relu2_n256_bf16_Kernel_Module_Load(&sRelu2N256_bf16);
+    nvfp4_moe_fc1_swiglu_n128_bf16_Kernel_Module_Load(&sSwigluN128_bf16);
+    nvfp4_moe_fc1_swiglu_n256_bf16_Kernel_Module_Load(&sSwigluN256_bf16);
+    nvfp4_moe_fc1_relu2_n128_fp16_Kernel_Module_Load(&sRelu2N128_fp16);
+    nvfp4_moe_fc1_relu2_n256_fp16_Kernel_Module_Load(&sRelu2N256_fp16);
+    nvfp4_moe_fc1_swiglu_n128_fp16_Kernel_Module_Load(&sSwigluN128_fp16);
+    nvfp4_moe_fc1_swiglu_n256_fp16_Kernel_Module_Load(&sSwigluN256_fp16);
     sLoaded = true;
     return true;
 #else
@@ -80,12 +85,14 @@ void NvFP4MoEContiguousGemmRunner::unloadKernelModules()
     std::lock_guard<std::mutex> lock(sMutex);
     if (!sLoaded)
         return;
-    nvfp4_moe_fc1_identity_n128_Kernel_Module_Unload(&sIdentityN128);
-    nvfp4_moe_fc1_identity_n256_Kernel_Module_Unload(&sIdentityN256);
-    nvfp4_moe_fc1_relu2_n128_Kernel_Module_Unload(&sRelu2N128);
-    nvfp4_moe_fc1_relu2_n256_Kernel_Module_Unload(&sRelu2N256);
-    nvfp4_moe_fc1_swiglu_n128_Kernel_Module_Unload(&sSwigluN128);
-    nvfp4_moe_fc1_swiglu_n256_Kernel_Module_Unload(&sSwigluN256);
+    nvfp4_moe_fc1_relu2_n128_bf16_Kernel_Module_Unload(&sRelu2N128_bf16);
+    nvfp4_moe_fc1_relu2_n256_bf16_Kernel_Module_Unload(&sRelu2N256_bf16);
+    nvfp4_moe_fc1_swiglu_n128_bf16_Kernel_Module_Unload(&sSwigluN128_bf16);
+    nvfp4_moe_fc1_swiglu_n256_bf16_Kernel_Module_Unload(&sSwigluN256_bf16);
+    nvfp4_moe_fc1_relu2_n128_fp16_Kernel_Module_Unload(&sRelu2N128_fp16);
+    nvfp4_moe_fc1_relu2_n256_fp16_Kernel_Module_Unload(&sRelu2N256_fp16);
+    nvfp4_moe_fc1_swiglu_n128_fp16_Kernel_Module_Unload(&sSwigluN128_fp16);
+    nvfp4_moe_fc1_swiglu_n256_fp16_Kernel_Module_Unload(&sSwigluN256_fp16);
     sLoaded = false;
 #endif
 }
@@ -129,44 +136,69 @@ void NvFP4MoEContiguousGemmRunner::run(void const* gatheredFP4, void const* weig
     void* tm = layout.tileIdxToMnLimit;
     void* nt = layout.numNonExitingTiles;
 
+    bool const isFP16 = (mOutDtype == OutputDType::kFP16);
     if (mActivation == Activation::kRelu2)
     {
         if (tactic == 128)
         {
-            cute_dsl_nvfp4_moe_fc1_relu2_n128_wrapper(
-                &sRelu2N128, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            if (isFP16)
+            {
+                cute_dsl_nvfp4_moe_fc1_relu2_n128_fp16_wrapper(
+                    &sRelu2N128_fp16, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            }
+            else
+            {
+                cute_dsl_nvfp4_moe_fc1_relu2_n128_bf16_wrapper(
+                    &sRelu2N128_bf16, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            }
         }
         else
         {
-            cute_dsl_nvfp4_moe_fc1_relu2_n256_wrapper(
-                &sRelu2N256, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            if (isFP16)
+            {
+                cute_dsl_nvfp4_moe_fc1_relu2_n256_fp16_wrapper(
+                    &sRelu2N256_fp16, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            }
+            else
+            {
+                cute_dsl_nvfp4_moe_fc1_relu2_n256_bf16_wrapper(
+                    &sRelu2N256_bf16, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            }
         }
     }
     else if (mActivation == Activation::kSwiglu)
     {
         if (tactic == 128)
         {
-            cute_dsl_nvfp4_moe_fc1_swiglu_n128_wrapper(
-                &sSwigluN128, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            if (isFP16)
+            {
+                cute_dsl_nvfp4_moe_fc1_swiglu_n128_fp16_wrapper(
+                    &sSwigluN128_fp16, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            }
+            else
+            {
+                cute_dsl_nvfp4_moe_fc1_swiglu_n128_bf16_wrapper(
+                    &sSwigluN128_bf16, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            }
         }
         else
         {
-            cute_dsl_nvfp4_moe_fc1_swiglu_n256_wrapper(
-                &sSwigluN256, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            if (isFP16)
+            {
+                cute_dsl_nvfp4_moe_fc1_swiglu_n256_fp16_wrapper(
+                    &sSwigluN256_fp16, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            }
+            else
+            {
+                cute_dsl_nvfp4_moe_fc1_swiglu_n256_bf16_wrapper(
+                    &sSwigluN256_bf16, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
+            }
         }
     }
     else
     {
-        if (tactic == 128)
-        {
-            cute_dsl_nvfp4_moe_fc1_identity_n128_wrapper(
-                &sIdentityN128, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
-        }
-        else
-        {
-            cute_dsl_nvfp4_moe_fc1_identity_n256_wrapper(
-                &sIdentityN256, a, b, asf, bsf, output, alp, tg, tm, nt, permutedM, n, n_out, k, l, stream);
-        }
+        throw std::runtime_error(
+            "NvFP4MoEContiguousGemmRunner: activation not supported (only relu2 and swiglu are compiled)");
     }
 #else
     (void) gatheredFP4;

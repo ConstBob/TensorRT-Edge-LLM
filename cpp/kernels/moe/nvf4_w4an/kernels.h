@@ -132,22 +132,25 @@ inline int moeDecodeGemvTopkThreads(int const batch_size, int const top_k, int c
 //! \p num_chunks is legacy (ignored).
 void launchNemotronMoeW4a4DecodeGemvCuda(int batch, int seq_len, int hidden_dim, int inter_dim, int num_chunks,
     int num_experts, int top_k, int32_t const* expert_ids, float const* topk_weights, NVFP4Tensor const activation,
-    NVFP4Tensor const up, NVFP4Tensor const down, __half* inter_fp16_scratch, __half* output, cudaStream_t stream,
+    NVFP4Tensor const up, NVFP4Tensor const down, uint8_t const* up_decode_sf, uint8_t const* down_decode_sf,
+    __half* inter_fp16_scratch, __half* output, cudaStream_t stream,
     int thread_block_size = kDefaultMlpW4a4DecodeThreadBlockSize,
     MoEActivationKind activation_kind = MoEActivationKind::kReLU2);
 
 //! W4A4 up-proj: grid \ref moeW4a4DecodeUpGridDim; inner loop over \c hidden_dim/64 Marlin chunks; FP16 scratch
 //! (zeroed). \p batch / \p seq_len match row-major \c [batch, seq_len, ...] activations; \p num_tokens = batch*seq_len.
+//! \p up_decode_sf is row-major \c [E, H/16, I] FP8 block scales.
 void launchNemotronMoeW4A4DecodeUpGemvCuda(int batch, int seq_len, int hidden_dim, int inter_dim, int num_experts,
-    int top_k, int32_t const* expert_ids, NVFP4Tensor const activation, NVFP4Tensor const up, __half* inter_fp16_out,
-    cudaStream_t stream, int thread_block_size = kDefaultMlpW4a4DecodeThreadBlockSize);
+    int top_k, int32_t const* expert_ids, NVFP4Tensor const activation, NVFP4Tensor const up,
+    uint8_t const* up_decode_sf, __half* inter_fp16_out, cudaStream_t stream,
+    int thread_block_size = kDefaultMlpW4a4DecodeThreadBlockSize);
 
 //! W4A4 down-proj: reads FP16 \p inter_in (up output; already scaled by \c activation.global_scale[0]); converts to
 //! FP32 for nonlinearity and down GEMV. Accumulates into FP16 \p output (zeroed here before atomics; same as W4A16
-//! down).
+//! down). \p down_decode_sf is row-major \c [E, I/16, H] FP8 block scales.
 void launchNemotronMoeW4A4DecodeDownGemvCuda(int batch, int seq_len, int hidden_dim, int inter_dim, int hidden_chunks,
     int num_experts, int top_k, int32_t const* expert_ids, float const* topk_weights, __half const* inter_in,
-    NVFP4Tensor const down, __half* output, cudaStream_t stream, int thread_block_size,
+    NVFP4Tensor const down, uint8_t const* down_decode_sf, __half* output, cudaStream_t stream, int thread_block_size,
     MoEActivationKind activation_kind = MoEActivationKind::kReLU2);
 
 //! FP16 activation \c [batch * seq_len, hidden_dim] row-major; NVFP4 up/down; FP16 output \c [batch * seq_len,
@@ -164,7 +167,8 @@ void launchNemotronMoeW4A4DecodeDownGemvCuda(int batch, int seq_len, int hidden_
 //! before atomics.
 void launchNemotronMoeW4A16DecodeGemvCuda(int batch, int seq_len, int hidden_dim, int inter_dim, int num_chunks,
     int num_experts, int top_k, int32_t const* expert_ids, float const* topk_weights, __half const* activation,
-    NVFP4Tensor const up, NVFP4Tensor const down, __half* inter_fp16_scratch, __half* output, cudaStream_t stream,
+    NVFP4Tensor const up, NVFP4Tensor const down, uint8_t const* up_decode_sf, uint8_t const* down_decode_sf,
+    __half* inter_fp16_scratch, __half* output, cudaStream_t stream,
     MoEActivationKind activation_kind = MoEActivationKind::kReLU2);
 
 //! Up-proj split W4A16 decode: grid \c batch × seq_len × top_k × (hidden_dim / block_size) (hidden strips). Partial
@@ -173,19 +177,20 @@ void launchNemotronMoeW4A16DecodeGemvCuda(int batch, int seq_len, int hidden_dim
 //! launchNemotronMoeW4A16DecodeDownGemvCuda. Block size is \ref nemotronMoeW4A16DecodeThreadBlockSizeForInterDim(\p
 //! hidden_dim). Inner loop count is \c inter_dim/64
 //! (\p num_chunks is ignored). \p topk_weights is unused (nonlinearity×router are applied in the down pass).
+//! \p up_decode_sf is row-major \c [E, H/16, I] FP8 block scales.
 void launchNemotronMoeW4A16DecodeUpGemvCuda(int batch, int seq_len, int hidden_dim, int inter_dim, int num_chunks,
     int num_experts, int top_k, int32_t const* expert_ids, float const* topk_weights, __half const* activation,
-    NVFP4Tensor const up, __half* inter_fp16_out, cudaStream_t stream);
+    NVFP4Tensor const up, uint8_t const* up_decode_sf, __half* inter_fp16_out, cudaStream_t stream);
 
 //! Down-proj: reads FP16 \p inter_in row-major \c [batch * seq_len, top_k, inter_dim] (same as up output); converts to
 //! FP32 for nonlinearity and \p topk_weights, NVFP4 matmul with FP16 tile accumulate (\ref
 //! accumulateNvfp4GemvTileWarpReduce) into \p output (row-major \c [batch * seq_len, hidden_dim]; zeroed by this launch
 //! before atomics).
 //! Grid: \c batch * seq_len * top_k * (inter_dim / block_size). Inner loop over hidden tiles uses \c hidden_dim/64
-//! (\p num_chunks is ignored).
+//! (\p num_chunks is ignored). \p down_decode_sf is row-major \c [E, I/16, H] FP8 block scales.
 void launchNemotronMoeW4A16DecodeDownGemvCuda(int batch, int seq_len, int hidden_dim, int inter_dim, int num_chunks,
     int num_experts, int top_k, int32_t const* expert_ids, float const* topk_weights, __half const* inter_in,
-    NVFP4Tensor const down, __half* output, cudaStream_t stream,
+    NVFP4Tensor const down, uint8_t const* down_decode_sf, __half* output, cudaStream_t stream,
     MoEActivationKind activation_kind = MoEActivationKind::kReLU2);
 
 #endif // SUPPORTS_FP4

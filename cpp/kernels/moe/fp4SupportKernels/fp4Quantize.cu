@@ -199,7 +199,7 @@ inline __device__ int64_t getSfOutOffset128x4(int mIdx, int kIdx, int numRows, i
 template <typename ScalarT>
 __launch_bounds__(512, 4) __global__
     void quantizeToFp4Kernel(int32_t numRows, int32_t numCols, ScalarT const* __restrict__ input,
-        float const* __restrict__ sfScaleInv, uint32_t* __restrict__ outputFP4, uint8_t* __restrict__ outputSF)
+        float const* __restrict__ sfScale, uint32_t* __restrict__ outputFP4, uint8_t* __restrict__ outputSF)
 {
     using Traits = QuantTraits<ScalarT>;
     using Vec2 = typename Traits::Vec2;
@@ -209,7 +209,9 @@ __launch_bounds__(512, 4) __global__
     int const numColThreads = numCols / kEltsPerThread;
     int const numSfCols = numCols / kSfVecSize;
     int const numSfColThreads = numSfCols * kThreadsPerSf;
-    float const SFScaleInv = *sfScaleInv;
+    // Forward-scale contract: callers pass the forward global SF (e.g. max|x|/(448*6));
+    // the FP4 mapping needs its reciprocal, so compute it in-register once per thread.
+    float const SFScaleInv = 1.0f / *sfScale;
 
     // Persistent row loop — blocks cycle through rows.
     for (int rowIdx = blockIdx.x; rowIdx < numPaddedRows; rowIdx += gridDim.x)
@@ -299,7 +301,7 @@ __launch_bounds__(512, 4) __global__
 // Public dispatcher
 // -------------------------------------------------------------------------
 
-void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSFInv, rt::Tensor& outputFP4, rt::Tensor& outputSF,
+void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSF, rt::Tensor& outputFP4, rt::Tensor& outputSF,
     cudaStream_t stream)
 {
     int64_t const M = input.getShape()[0];
@@ -316,19 +318,19 @@ void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSFInv, rt::Ten
     int const numBlocksPerSM = std::max(1, 2048 / blockSize);
     int const gridSize = std::min(numPaddedRows, smCount * numBlocksPerSM);
 
-    auto const* sfInvPtr = static_cast<float const*>(globalSFInv.rawPointer());
+    auto const* sfPtrFwd = static_cast<float const*>(globalSF.rawPointer());
     auto* fp4Ptr = static_cast<uint32_t*>(outputFP4.rawPointer());
     auto* sfPtr = static_cast<uint8_t*>(outputSF.rawPointer());
 
     if (input.getDataType() == nvinfer1::DataType::kBF16)
     {
         quantizeToFp4Kernel<__nv_bfloat16><<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(M),
-            static_cast<int32_t>(N), static_cast<__nv_bfloat16 const*>(input.rawPointer()), sfInvPtr, fp4Ptr, sfPtr);
+            static_cast<int32_t>(N), static_cast<__nv_bfloat16 const*>(input.rawPointer()), sfPtrFwd, fp4Ptr, sfPtr);
     }
     else if (input.getDataType() == nvinfer1::DataType::kHALF)
     {
         quantizeToFp4Kernel<__half><<<gridSize, blockSize, 0, stream>>>(static_cast<int32_t>(M),
-            static_cast<int32_t>(N), static_cast<__half const*>(input.rawPointer()), sfInvPtr, fp4Ptr, sfPtr);
+            static_cast<int32_t>(N), static_cast<__half const*>(input.rawPointer()), sfPtrFwd, fp4Ptr, sfPtr);
     }
     else
     {
@@ -338,7 +340,8 @@ void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSFInv, rt::Ten
 
 #else // !SUPPORTS_FP8
 
-void fp4Quantize(rt::Tensor const&, rt::Tensor const&, rt::Tensor&, rt::Tensor&, cudaStream_t)
+void fp4Quantize(rt::Tensor const& /*input*/, rt::Tensor const& /*globalSF*/, rt::Tensor& /*outputFP4*/,
+    rt::Tensor& /*outputSF*/, cudaStream_t /*stream*/)
 {
     throw std::runtime_error(
         "FP4 quantize emits FP8 E4M3 scale factors but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");

@@ -13,28 +13,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-ONNX / PyTorch integration for TensorRT ``Nvfp4MoePlugin`` (W4A16 decode: FP16 activations, NVFP4 weights).
+ONNX / PyTorch integration for TensorRT ``Nvfp4MoePlugin`` (FP16 hidden + NVFP4 weights).
 
 Mirrors ``int4_moe_plugin.py``: ONNX ``OpSchema``, symbolic export, ``torch.library.custom_op`` stub,
 and ``nn.Module`` wrapper. TensorRT engine build and inference live in tests (see
-``tests/python-unittests/test_moe_w4an_plugin.py``).
+``tests/python-unittests/test_nvfp4_moe_plugin_accuracy.py``).
+
+**Plugin version 2 contract (breaking vs v1):** the plugin accepts FP16 hidden states only.
+``hidden_block_scale`` is removed from the input list; activation FP4 quantization needed by
+the prefill path is computed inside the plugin via ``fp4Quantize``. The user supplies only
+``hidden_global_scale`` — a ``[2]`` FP32 tensor with ``[0]`` = FC1 activation global scale and
+``[1]`` = FC2 activation global scale. Engines emitted by this file are not compatible with
+plugin version 1 — re-export + rebuild is required.
 
 The C++ plugin uses router logits ``[batch * seq_len, E]`` and FP16 hidden states
 ``[batch, seq_len, hidden_size]`` (``seq_len`` may be ``> 1``). Routing inside the plugin is
-``kernel::moeSigmoidGroupTopk`` (NemotronH sigmoid + grouped top-k routing); see
-:meth:`NemotronHMoEW4A4Plugin.sigmoid_group_topk_torch`. ``hidden_size`` and ``moe_inter_size`` must be
-multiples of 64 (decode GEMV / Marlin tile chunks). Expert up
-quantized weights are INT8 ``[E, hidden_size/2, moe_inter_size]`` (two NVFP4 nibbles per byte) with
-INT8 Marlin block scales ``[E, hidden_size/16, moe_inter_size]``. Down weights are INT8
-``[E, moe_inter_size, hidden_size/2]`` with block scales ``[E, moe_inter_size, hidden_size/16]``.
-Activations are dense FP16 (W4A16).
-Plugin output tensors are FP16.
+``kernel::moeTopkSoftmax`` (softmax over experts, top-k, renormalize); see
+:meth:`NemotronHMoEW4A4Plugin.moe_topk_softmax_renormalize_torch`. ``hidden_size`` and ``moe_inter_size`` must be
+multiples of 64 (decode GEMV / Marlin tile chunks). **Plugin v1 weight byte layout (both FCs N-major):**
+Up qweights are INT8 ``[E, hidden_size, moe_inter_size/2]`` (N = moe_inter_size innermost; two NVFP4 nibbles
+per byte along N) with prefill block scales ``[E, moe_inter_size, hidden_size/16]``. Down weights are INT8
+``[E, moe_inter_size, hidden_size/2]`` (N = hidden_size innermost) with block scales
+``[E, hidden_size, moe_inter_size/16]``. Activations are dense FP16. Plugin output tensors are FP16.
 
 HuggingFace ``NemotronHMoE`` (``transformers.models.nemotron_h.modeling_nemotron_h``) uses
 ``NemotronHTopkRouter`` / ``DeepseekV3TopkRouter`` for **pre-routing logits** (FP32 matmul), then
-``route_tokens_to_experts`` (sigmoid, grouped top-k, correction bias). That post-processing is now
-implemented inside the TRT plugin via ``kernel::moeSigmoidGroupTopk``.
-:class:`NemotronHMoEW4A4Plugin` computes router logits via
+``route_tokens_to_experts`` (sigmoid, grouped top-k, correction bias). That post-processing is **not** in
+the TRT plugin; :class:`NemotronHMoEW4A4Plugin` matches the router **linear** only via
 :meth:`NemotronHMoEW4A4Plugin.nemotron_h_plugin_router_logits`.
 
 **Expert weight layout:** HuggingFace ``NemotronHExperts`` stores ``up_proj`` as ``[E, I, H_in]`` and
@@ -45,8 +50,6 @@ implemented inside the TRT plugin via ``kernel::moeSigmoidGroupTopk``.
 """
 
 from __future__ import annotations
-
-import copy
 
 import numpy as np
 import onnx
@@ -70,48 +73,52 @@ nvfp4_moe_plugin_schema = OpSchema(
     domain="trt",
     since_version=ONNX_OPSET_VERSION,
     doc=
-    ("Custom TensorRT Nvfp4MoePlugin: Top-K routing + W4A16 decode GEMV (FP16 hidden states, NVFP4 weights). "
-     "FP32 router logits; up qweights INT8 [E, K/2, inter] + block scales [E, K/16, inter]; "
-     "down qweights INT8 [E, inter, K/2] + block scales [E, inter, K/16] (K=hidden); "
-     "FP32 per-expert scales for up and down."),
+    ("Custom TensorRT Nvfp4MoePlugin (v1): Top-K routing + FP16 hidden + NVFP4 weights; the plugin runtime "
+     "dispatches between decode (per-token GEMV) and prefill (CuteDSL grouped GEMM) based on B*S. "
+     "Hidden states are FP16 only; activation FP4 quantization for prefill is computed inside the plugin. "
+     "FP32 router logits; up qweights INT8 [E, H, I/2] (N-major: N=I innermost) + block scales [E, I, H/16] "
+     "(prefill SF atom M=I, K=H/16); down qweights INT8 [E, I, H/2] (N-major: N=H innermost) + "
+     "block scales [E, H, I/16] (prefill SF atom M=H, K=I/16); FP32 per-expert scales for up and down; "
+     "FP32 length-2 hidden_global_scale (FC1, FC2)."),
     inputs=[
         OpSchema.FormalParameter(
             name="router_logits",
             description=
             ("Router logits (batch * seq_len, E) FP32 before plugin routing; Nvfp4MoePlugin applies "
-             "sigmoid + grouped top-k routing (moeSigmoidGroupTopk) internally."
-             ),
+             "softmax + top-k + renormalize (moeTopkSoftmax) internally."),
             type_str="tensor(float)",
         ),
         OpSchema.FormalParameter(
             name="hidden_states",
             description=
-            "FP16 activations (batch, seq_len, hidden_size) for W4A16, or INT8 NVFP4-packed (batch, seq_len, "
-            "hidden_size/2) for W4A4.",
+            "FP16 activations (batch, seq_len, hidden_size). Activation NVFP4 quantization "
+            "(if needed by the prefill path) is computed inside the plugin.",
             type_str="tensor(float16)",
-        ),
-        OpSchema.FormalParameter(
-            name="hidden_block_scale",
-            description=
-            "W4A4: INT8 Marlin block scales (batch, seq_len, hidden_size/16). W4A16: unused; supply a 1×1×1 dummy.",
-            type_str="tensor(int8)",
         ),
         OpSchema.FormalParameter(
             name="hidden_global_scale",
             description=
-            "W4A4: FP32 length-1 tensor (activation.global_scale[0]). W4A16: unused dummy.",
+            ("FP32 length-2 tensor of calibrated activation global scales. Slot [0] is the FC1 "
+             "(up-proj) activation global scale; slot [1] is the FC2 (down-proj) activation global "
+             "scale. Consumed by the prefill path's internal fp4Quantize / α compute; both slots are "
+             "populated unconditionally. Forward-direction convention — the plugin computes 1/GS "
+             "inside the quantize kernel."),
             type_str="tensor(float)",
         ),
         OpSchema.FormalParameter(
             name="fc_up_qweights",
             description=
-            "NVFP4 up-proj quantized payload (E, K/2, inter) INT8 with K=hidden_size (two FP4 per byte).",
+            ("NVFP4 up-proj quantized payload (E, H, I/2) INT8 with H=hidden_size, "
+             "I=moe_inter_size (N-major byte layout: N axis innermost, 2 FP4 nibbles "
+             "per byte along I)."),
             type_str="tensor(int8)",
         ),
         OpSchema.FormalParameter(
             name="fc_up_blocks_scale",
             description=
-            "Up-proj Marlin block scales (E, K/16, inter) INT8 with K=hidden_size (four FP8 bytes per tile word).",
+            ("Up-proj NVFP4 block scales (E, I, H/16) INT8 — prefill-friendly SF "
+             "atom swizzle with M=I, K=H/16; four raw FP8 E4M3 bytes per 4-group "
+             "K tile."),
             type_str="tensor(int8)",
         ),
         OpSchema.FormalParameter(
@@ -125,13 +132,17 @@ nvfp4_moe_plugin_schema = OpSchema(
         OpSchema.FormalParameter(
             name="fc_down_qweights",
             description=
-            "NVFP4 down-proj quantized payload (E, inter, K/2) INT8 with K=hidden_size (two FP4 per byte).",
+            ("NVFP4 down-proj quantized payload (E, I, H/2) INT8 with H=hidden_size, "
+             "I=moe_inter_size (N-major byte layout: N axis innermost, 2 FP4 nibbles "
+             "per byte along H)."),
             type_str="tensor(int8)",
         ),
         OpSchema.FormalParameter(
             name="fc_down_blocks_scale",
             description=
-            "Down-proj Marlin block scales (E, inter, K/16) INT8 with K=hidden_size (four FP8 bytes per tile word).",
+            ("Down-proj NVFP4 block scales (E, H, I/16) INT8 — prefill-friendly SF "
+             "atom swizzle with M=H, K=I/16; four raw FP8 E4M3 bytes per 4-group "
+             "K tile."),
             type_str="tensor(int8)",
         ),
         OpSchema.FormalParameter(
@@ -142,9 +153,32 @@ nvfp4_moe_plugin_schema = OpSchema(
             type_str="tensor(float)",
         ),
         OpSchema.FormalParameter(
+            name="fc_up_blocks_scale_decode",
+            description=
+            ("Up-proj NVFP4 block scales (E, H/16, I) INT8 — **decode-friendly** "
+             "row-major transposed layout. Same scheme-B scale values as "
+             "fc_up_blocks_scale, transposed so the Marlin decode GEMV reads 64 "
+             "contiguous per-element scale bytes per tile. Bytes are Marlin-"
+             "projected (`decodeSfByteToFloat`-compatible), not raw IEEE FP8 E4M3."
+             ),
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="fc_down_blocks_scale_decode",
+            description=
+            ("Down-proj NVFP4 block scales (E, I/16, H) INT8 — **decode-friendly** "
+             "row-major transposed layout. Same scheme-B scale values as "
+             "fc_down_blocks_scale, transposed for decode GEMV tile reads; "
+             "bytes are Marlin-projected."),
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
             name="e_score_correction_bias",
             description=
-            "NemotronH expert load-balancing correction bias (E) FP32. Zeros if not available.",
+            ("Per-expert bias FP32 (num_experts,). Used as a load-balancing bias by "
+             "``moeSigmoidGroupTopk`` (``routing_mode == 1``) and as an optional pre-softmax "
+             "bias by ``moeTopkSoftmax`` (``routing_mode == 0``). Pass zeros when no bias is "
+             "desired."),
             type_str="tensor(float)",
         ),
     ],
@@ -203,36 +237,42 @@ nvfp4_moe_plugin_schema = OpSchema(
             name="n_group",
             type=OpSchema.AttrType.INT,
             description=
-            "Number of expert groups for NemotronH grouped top-k routing.",
-            required=True,
+            ("Number of expert groups (used when ``routing_mode == 1``; must divide "
+             "``num_experts``)."),
+            required=False,
         ),
         OpSchema.Attribute(
             name="topk_group",
             type=OpSchema.AttrType.INT,
             description=
-            "Number of groups to select in NemotronH grouped top-k routing.",
-            required=True,
+            ("Number of expert groups to select per token (used when ``routing_mode == 1``; "
+             "must be in ``[1, n_group]``)."),
+            required=False,
         ),
         OpSchema.Attribute(
             name="norm_topk_prob",
             type=OpSchema.AttrType.INT,
             description=
-            "Whether to renormalize top-k weights to sum to 1 (0 or 1).",
-            required=True,
+            ("Renormalize the selected top-k weights so they sum to 1 (0 = no, 1 = yes). "
+             "Serialized as INT for ONNX portability."),
+            required=False,
         ),
         OpSchema.Attribute(
             name="routed_scaling_factor",
             type=OpSchema.AttrType.FLOAT,
-            description="Scaling factor applied to final top-k weights.",
-            required=True,
+            description=(
+                "Scalar multiplier applied to the selected top-k weights (only "
+                "``moeSigmoidGroupTopk``; default ``1.0``)."),
+            required=False,
         ),
         OpSchema.Attribute(
             name="routing_mode",
             type=OpSchema.AttrType.INT,
             description=
-            ("Router selection kernel: 0 = softmax + flat top-k (moeTopkSoftmax; default), "
-             "1 = sigmoid + grouped top-k (moeSigmoidGroupTopk; NemotronH)."),
-            required=True,
+            ("Router kernel selector: ``0`` = ``moeTopkSoftmax`` (softmax + flat top-k + "
+             "renormalize, default), ``1`` = ``moeSigmoidGroupTopk`` (sigmoid + grouped top-k "
+             "+ renormalize + scale; NemotronH)."),
+            required=False,
         ),
     ],
 )
@@ -240,6 +280,7 @@ onnx.defs.register_schema(nvfp4_moe_plugin_schema)
 
 
 @symbolic_helper.parse_args(
+    "v",
     "v",
     "v",
     "v",
@@ -267,7 +308,6 @@ def symbolic_nvfp4_moe_plugin(
     g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
     router_logits: torch._C.Value,
     hidden_states: torch._C.Value,
-    hidden_block_scale: torch._C.Value,
     hidden_global_scale: torch._C.Value,
     fc_up_qweights: torch._C.Value,
     fc_up_blocks_scale: torch._C.Value,
@@ -275,6 +315,8 @@ def symbolic_nvfp4_moe_plugin(
     fc_down_qweights: torch._C.Value,
     fc_down_blocks_scale: torch._C.Value,
     fc_down_global_scale: torch._C.Value,
+    fc_up_blocks_scale_decode: torch._C.Value,
+    fc_down_blocks_scale_decode: torch._C.Value,
     e_score_correction_bias: torch._C.Value,
     num_experts: int,
     top_k: int,
@@ -292,7 +334,6 @@ def symbolic_nvfp4_moe_plugin(
         "trt::Nvfp4MoePlugin",
         router_logits,
         hidden_states,
-        hidden_block_scale,
         hidden_global_scale,
         fc_up_qweights,
         fc_up_blocks_scale,
@@ -300,6 +341,8 @@ def symbolic_nvfp4_moe_plugin(
         fc_down_qweights,
         fc_down_blocks_scale,
         fc_down_global_scale,
+        fc_up_blocks_scale_decode,
+        fc_down_blocks_scale_decode,
         e_score_correction_bias,
         num_experts_i=num_experts,
         top_k_i=top_k,
@@ -323,7 +366,6 @@ def symbolic_nvfp4_moe_plugin(
 def nvfp4_moe_plugin(
     router_logits: torch.Tensor,
     hidden_states: torch.Tensor,
-    hidden_block_scale: torch.Tensor,
     hidden_global_scale: torch.Tensor,
     fc_up_qweights: torch.Tensor,
     fc_up_blocks_scale: torch.Tensor,
@@ -331,6 +373,8 @@ def nvfp4_moe_plugin(
     fc_down_qweights: torch.Tensor,
     fc_down_blocks_scale: torch.Tensor,
     fc_down_global_scale: torch.Tensor,
+    fc_up_blocks_scale_decode: torch.Tensor,
+    fc_down_blocks_scale_decode: torch.Tensor,
     e_score_correction_bias: torch.Tensor,
     num_experts: int,
     top_k: int,
@@ -345,11 +389,10 @@ def nvfp4_moe_plugin(
     routing_mode: int,
 ) -> torch.Tensor:
     """
-    Placeholder for ONNX tracing; TensorRT ``Nvfp4MoePlugin`` executes the real path. The ``routing_mode``
-    attribute selects between ``moeTopkSoftmax`` (0, default) and ``moeSigmoidGroupTopk`` (1, NemotronH).
+    Placeholder for ONNX tracing; TensorRT ``Nvfp4MoePlugin`` executes the real path (router
+    kernel dispatch between ``moeTopkSoftmax`` and ``moeSigmoidGroupTopk`` on ``router_logits``).
     """
     del (
-        hidden_block_scale,
         hidden_global_scale,
         fc_up_qweights,
         fc_up_blocks_scale,
@@ -357,6 +400,8 @@ def nvfp4_moe_plugin(
         fc_down_qweights,
         fc_down_blocks_scale,
         fc_down_global_scale,
+        fc_up_blocks_scale_decode,
+        fc_down_blocks_scale_decode,
         e_score_correction_bias,
         num_experts,
         top_k,
@@ -400,8 +445,8 @@ class NemotronHMoEW4A4Plugin(nn.Module):
 
     Router logits are computed with :meth:`nemotron_h_plugin_router_logits` so they match
     ``NemotronHTopkRouter``’s FP32 linear (see ``modeling_nemotron_h.py``). The TRT plugin then runs
-    ``moeSigmoidGroupTopk`` — the NemotronH grouped top-k routing algorithm
-    (sigmoid, ``e_score_correction_bias``, grouped top-k, renormalize, scale).
+    :meth:`moe_topk_softmax_renormalize_torch`’s equivalent in CUDA—not HF ``route_tokens_to_experts``
+    (sigmoid, ``e_score_correction_bias``, grouped top-k).
 
     Router logits are ``(num_tokens, num_experts)`` with ``num_tokens = batch * seq_len``; FP16
     ``hidden_states`` are ``(batch, seq_len, hidden_size)`` (same linear memory as a flattened
@@ -414,47 +459,27 @@ class NemotronHMoEW4A4Plugin(nn.Module):
     """
 
     @staticmethod
-    def sigmoid_group_topk_torch(
+    def moe_topk_softmax_renormalize_torch(
         router_logits: torch.Tensor,
         top_k: int,
-        n_group: int,
-        topk_group: int,
-        norm_topk_prob: bool = True,
-        routed_scaling_factor: float = 1.0,
-        correction_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        PyTorch equivalent of TensorRT ``kernel::moeSigmoidGroupTopk`` matching
-        HuggingFace ``NemotronHMoE.route_tokens_to_experts``.
+        PyTorch equivalent of TensorRT ``kernel::moeTopkSoftmax`` with ``renormalize=True`` (see
+        ``cpp/kernels/moe/moeTopkSoftmaxKernels.h`` / ``Nvfp4MoePlugin::enqueue``).
+
+        Applies softmax on the expert dimension, takes the top-k probabilities, then renormalizes those
+        weights so each row sums to 1. Returned indices are ``int32`` to match plugin workspace tensors.
+
+        **Tie-breaking:** ``torch.topk`` ordering for equal probabilities is not guaranteed to match CUDA
+        ``moeTopkSoftmax`` (lower expert index wins). For strict parity with the TRT plugin, use
+        :meth:`moe_topk_softmax_renormalize_numpy` on logits in NumPy.
         """
         logits = router_logits.float()
-        scores = torch.sigmoid(logits)
-        biased = scores.clone()
-        if correction_bias is not None:
-            biased = biased + correction_bias.float()
-        num_experts = logits.shape[-1]
-        experts_per_group = num_experts // n_group
-        # Top-2 per group → group scores
-        grouped = biased.view(-1, n_group, experts_per_group)
-        group_top2, _ = grouped.topk(2, dim=-1)
-        group_scores = group_top2.sum(dim=-1)  # [T, nGroup]
-        # Select topk_group groups
-        _, group_idx = group_scores.topk(topk_group, dim=-1)  # [T, topk_group]
-        # Build group mask
-        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
-        group_mask.scatter_(1, group_idx, True)
-        expert_mask = group_mask.unsqueeze(-1).expand(
-            -1, -1, experts_per_group).reshape_as(biased)
-        biased[~expert_mask] = float("-inf")
-        # Top-K from masked biased scores
-        _, topk_idx = biased.topk(top_k, dim=-1)
-        # Gather weights from ORIGINAL sigmoid scores
-        topk_weights = scores.gather(-1, topk_idx)
-        if norm_topk_prob:
-            topk_weights = topk_weights / (
-                topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * routed_scaling_factor
-        return topk_weights, topk_idx.to(torch.int32)
+        probs = F.softmax(logits, dim=-1)
+        k = min(int(top_k), probs.shape[-1])
+        topw, topi = torch.topk(probs, k, dim=-1)
+        topw = topw / (topw.sum(dim=-1, keepdim=True) + 1e-20)
+        return topw, topi.to(torch.int32)
 
     @staticmethod
     def moe_activation_numpy(z: np.ndarray,
@@ -471,68 +496,41 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         return (t * t).astype(np.float32)
 
     @staticmethod
-    def sigmoid_group_topk_numpy(
+    def moe_topk_softmax_renormalize_numpy(
         router_logits: np.ndarray,
         top_k: int,
-        n_group: int,
-        topk_group: int,
-        norm_topk_prob: bool = True,
-        routed_scaling_factor: float = 1.0,
-        correction_bias: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        NumPy sigmoid + grouped top-k aligned with CUDA ``moeSigmoidGroupTopk``: iterative argmax with
-        masking, **lower expert id wins on equal score** (same as the kernel's CUB reduce).
+        NumPy softmax + top-k + renormalize aligned with CUDA ``moeTopkSoftmax``: iterative argmax with
+        masking, **lower expert id wins on equal probability** (same as the fused kernel's warp reduce).
         """
         logits = np.asarray(router_logits, dtype=np.float32)
-        num_tokens, num_experts = logits.shape
-        sigmoid_scores = (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
-        biased = sigmoid_scores.copy()
-        if correction_bias is not None:
-            biased = biased + np.asarray(correction_bias, dtype=np.float32)
-        experts_per_group = num_experts // n_group
+        m = np.max(logits, axis=-1, keepdims=True)
+        ex = np.exp(logits - m)
+        probs = (ex / np.sum(ex, axis=-1, keepdims=True)).astype(np.float32)
+        num_tokens, num_experts = probs.shape
         k = min(int(top_k), int(num_experts))
         topw = np.zeros((num_tokens, k), dtype=np.float32)
         topi = np.zeros((num_tokens, k), dtype=np.int32)
         for t in range(int(num_tokens)):
-            b_row = biased[t].copy()
-            s_row = sigmoid_scores[t]
-            # Top-2 per group → group scores
-            group_scores = np.zeros(n_group, dtype=np.float32)
-            for g in range(n_group):
-                gs = g * experts_per_group
-                vals = sorted(b_row[gs:gs + experts_per_group], reverse=True)
-                group_scores[g] = vals[0] + (vals[1] if len(vals) > 1 else 0.0)
-            # Select topk_group groups
-            group_selected = np.zeros(n_group, dtype=bool)
-            for _ in range(topk_group):
-                best_g, best_s = -1, -np.inf
-                for g in range(n_group):
-                    if not group_selected[g] and group_scores[g] > best_s:
-                        best_s = group_scores[g]
-                        best_g = g
-                if best_g >= 0:
-                    group_selected[best_g] = True
-            # Mask unselected groups
-            for e in range(num_experts):
-                if not group_selected[e // experts_per_group]:
-                    b_row[e] = -np.inf
-            # Top-K from masked biased scores
-            renorm_sum = 0.0
+            row = probs[t]
+            used = np.zeros(num_experts, dtype=bool)
             for ki in range(k):
-                best_e, best_v = 0, -np.inf
-                for e in range(num_experts):
-                    if b_row[e] > best_v or (b_row[e] == best_v
-                                             and e < best_e):
-                        best_v = b_row[e]
+                best_e = -1
+                best_p = np.float32(-1.0)
+                for e in range(int(num_experts)):
+                    if used[e]:
+                        continue
+                    p = row[e]
+                    if best_e < 0 or p > best_p or (p == best_p
+                                                    and e < best_e):
+                        best_p = p
                         best_e = e
+                used[best_e] = True
                 topi[t, ki] = np.int32(best_e)
-                topw[t, ki] = s_row[best_e]
-                renorm_sum += s_row[best_e]
-                b_row[best_e] = -np.inf
-            if norm_topk_prob and renorm_sum > 0:
-                topw[t] = (topw[t] / renorm_sum).astype(np.float32)
-            topw[t] = (topw[t] * routed_scaling_factor).astype(np.float32)
+                topw[t, ki] = best_p
+            denom = float(np.sum(topw[t])) + 1e-20
+            topw[t] = (topw[t] / denom).astype(np.float32)
         return topw, topi
 
     @staticmethod
@@ -595,6 +593,11 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         *,
         activation_type: int = 0,
         quantization_group_size: int = 16,
+        n_group: int = 1,
+        topk_group: int = 1,
+        norm_topk_prob: int = 1,
+        routed_scaling_factor: float = 1.0,
+        routing_mode: int = 0,
     ):
         if NemotronHMoE is None:
             raise RuntimeError(
@@ -615,7 +618,7 @@ class NemotronHMoEW4A4Plugin(nn.Module):
                 "NemotronHMoEW4A4Plugin needs expert input dim == hidden_size "
                 f"(set moe_latent_size=None or {hidden_size}); got moe_latent_size={latent}"
             )
-        # trust_remote_code NemotronHMOE: n_routed_experts/top_k live on .gate or
+        # trust_remote_code NemotronHMoE: n_routed_experts/top_k live on .gate or
         # .experts.num_experts (NemotronHExperts has no __len__, use lazy eval).
         if hasattr(moe_block, "n_routed_experts"):
             num_experts = int(moe_block.n_routed_experts)
@@ -625,52 +628,20 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             num_experts = int(moe_block.experts.num_experts)
         gate_linear = NemotronHMoEW4A4Plugin._nemotron_h_moe_gate_as_linear(
             moe_block.gate, hidden_size, num_experts)
-        top_k = int(
-            getattr(moe_block, "top_k",
-                    getattr(moe_block.gate, "top_k", cfg.num_experts_per_tok)))
-
-        # Extract NemotronH routing parameters from config.
-        n_group = int(getattr(cfg, "n_group", 1))
-        topk_group = int(getattr(cfg, "topk_group", 1))
-        norm_topk_prob = bool(getattr(cfg, "norm_topk_prob", True))
-        routed_scaling_factor = float(
-            getattr(cfg, "routed_scaling_factor", 1.0))
-
-        # Extract e_score_correction_bias from the gate/router.
-        correction_bias = getattr(moe_block.gate, "e_score_correction_bias",
-                                  None)
-        if correction_bias is None:
-            correction_bias = getattr(moe_block, "e_score_correction_bias",
-                                      None)
         self._init_from_gate_and_dims(
             num_experts=num_experts,
-            top_k=top_k,
+            top_k=int(moe_block.top_k),
             hidden_size=hidden_size,
             moe_inter_size=int(cfg.moe_intermediate_size),
             gate_layer=gate_linear,
             activation_type=int(activation_type),
             quantization_group_size=int(quantization_group_size),
-            n_group=n_group,
-            topk_group=topk_group,
-            norm_topk_prob=norm_topk_prob,
-            routed_scaling_factor=routed_scaling_factor,
-            correction_bias=correction_bias,
+            n_group=int(n_group),
+            topk_group=int(topk_group),
+            norm_topk_prob=int(norm_topk_prob),
+            routed_scaling_factor=float(routed_scaling_factor),
+            routing_mode=int(routing_mode),
         )
-        # routed_scaling_factor: HF NemotronHTopkRouter multiplies topk_weights by this
-        # value after sigmoid + renorm (see modeling_nemotron_h.py, line ~917).
-        # The C++ moeTopkSoftmax uses softmax + renorm and does NOT apply this factor,
-        # so we compensate by scaling the routed expert output here before returning.
-        # Default 1.0 for models that don't use this (standard softmax routing).
-        self.routed_scaling_factor: float = float(
-            getattr(cfg, "routed_scaling_factor", 1.0))
-
-        # Shared expert is intentionally NOT stored here.
-        # It is handled by NemotronHMoEWithSharedExperts, which wraps this plugin
-        # and registers shared_experts as its own named submodule.  This ensures
-        # each layer's shared expert gets a unique path in the ONNX graph
-        # (e.g. layers.1.mlp.shared_experts vs layers.4.mlp.shared_experts),
-        # avoiding the "Output name is not unique" ONNX error caused by modelopt
-        # quantizer nodes sharing identical names when embedded inside the plugin.
 
     @classmethod
     def from_nemotron_h_moe(
@@ -679,12 +650,22 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         *,
         activation_type: int = 0,
         quantization_group_size: int = 16,
+        n_group: int = 1,
+        topk_group: int = 1,
+        norm_topk_prob: int = 1,
+        routed_scaling_factor: float = 1.0,
+        routing_mode: int = 0,
     ) -> "NemotronHMoEW4A4Plugin":
         """Alias for ``NemotronHMoEW4A4Plugin(moe_block, ...)``."""
         return cls(
             moe_block,
             activation_type=activation_type,
             quantization_group_size=quantization_group_size,
+            n_group=n_group,
+            topk_group=topk_group,
+            norm_topk_prob=norm_topk_prob,
+            routed_scaling_factor=routed_scaling_factor,
+            routing_mode=routing_mode,
         )
 
     def _init_from_gate_and_dims(
@@ -698,9 +679,9 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         quantization_group_size: int = 16,
         n_group: int = 1,
         topk_group: int = 1,
-        norm_topk_prob: bool = True,
+        norm_topk_prob: int = 1,
         routed_scaling_factor: float = 1.0,
-        correction_bias: torch.Tensor | nn.Parameter | None = None,
+        routing_mode: int = 0,
     ) -> None:
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
@@ -710,10 +691,9 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         self.quantization_group_size = int(quantization_group_size)
         self.n_group = int(n_group)
         self.topk_group = int(topk_group)
-        self.norm_topk_prob = int(bool(norm_topk_prob))
+        self.norm_topk_prob = int(norm_topk_prob)
         self.routed_scaling_factor = float(routed_scaling_factor)
-        # NemotronHMoEW4A4Plugin always drives the sigmoid + grouped top-k routing kernel (routing_mode=1).
-        self.routing_mode = 1
+        self.routing_mode = int(routing_mode)
 
         if self.quantization_group_size != 16:
             raise ValueError(
@@ -760,43 +740,75 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             self.gate.bias.data = gate_layer.bias.data.clone().to(
                 torch.float32)
 
+        # Plugin v3 uses K-major (CuteDSL-compatible) weight byte layout to unify decode and
+        # prefill on a single weight copy. FC1: bytes [E, I, H/2] with H as inner (contraction),
+        # 2 FP4 nibbles per byte packed along H. FC2: bytes [E, H, I/2] with I as inner.
+        # SF atom-swizzle has M=N (FC1 M=I, FC2 M=H) and 16-element blocks run along the K axis.
         e, inter = self.num_experts, self.moe_inter_size
-        k_half = self.hidden_size // 2
-        k_per_group = self.hidden_size // self.quantization_group_size
-        # Cutlass Atom layout requires SF M-dimension padded to multiple of 128.
-        up_sf_m_padded = ((self.hidden_size + 127) //
-                          128) * 8  # 8 SF rows per 128-row M-tile
-        dn_sf_m_padded = ((inter + 127) // 128) * 128
-        self.register_buffer("fc_up_qweights",
-                             torch.zeros(e, k_half, inter, dtype=torch.int8))
+        h_half = self.hidden_size // 2
+        i_half = self.moe_inter_size // 2
+        h_per_group = self.hidden_size // self.quantization_group_size
+        i_per_group = self.moe_inter_size // self.quantization_group_size
+        # FC1 up: N-major weight byte layout [E, H, I/2] — N (= I) innermost,
+        # 2 FP4 nibbles per byte along I. Matches what the CuteDSL N-major
+        # prefill kernel and the Marlin decode GEMV both consume.
+        self.register_buffer(
+            "fc_up_qweights",
+            torch.zeros(e, self.hidden_size, i_half, dtype=torch.int8))
+        # FC1 up SF: prefill-friendly atom swizzle (M=I, K=H/16). Scheme-B
+        # quantization — scales per ``(n, k/16) = (i, h/16)`` — matching
+        # ``tcgen05.mma`` block-scaled MMA contract and ModelOpt's NVFP4
+        # convention (quantize along the last/K axis). Atom layout requires
+        # M padded to 128 and K padded to 4 — matches the plugin's
+        # ``supportsFormatCombination`` case 4 contract.
+        up_sf_m_padded = ((inter + 127) // 128) * 128
+        up_sf_k_padded = ((h_per_group + 3) // 4) * 4
         self.register_buffer(
             "fc_up_blocks_scale",
-            torch.zeros(e, up_sf_m_padded, inter, dtype=torch.int8))
+            torch.zeros(e, up_sf_m_padded, up_sf_k_padded, dtype=torch.int8))
         self.register_buffer("fc_up_global_scale",
                              torch.ones(e, dtype=torch.float32))
+        # FC2 down: N-major weight byte layout [E, I, H/2] — N (= H) innermost,
+        # 2 FP4 nibbles per byte along H. Symmetric to FC1 in v5; both FC1 and
+        # FC2 now use N-major bytes and a single weight copy feeds the plugin's
+        # prefill and (when re-enabled) Marlin decode paths.
         self.register_buffer("fc_down_qweights",
-                             torch.zeros(e, inter, k_half, dtype=torch.int8))
+                             torch.zeros(e, inter, h_half, dtype=torch.int8))
+        # FC2 down SF: prefill-friendly atom swizzle (M=H, K=I/16). Scheme-B
+        # scales per ``(h, i/16)``. Atom-padded to match
+        # ``supportsFormatCombination`` case 7.
+        dn_sf_m_padded = ((self.hidden_size + 127) // 128) * 128
+        dn_sf_k_padded = ((i_per_group + 3) // 4) * 4
         self.register_buffer(
             "fc_down_blocks_scale",
-            torch.zeros(e, dn_sf_m_padded, k_per_group, dtype=torch.int8))
+            torch.zeros(e, dn_sf_m_padded, dn_sf_k_padded, dtype=torch.int8))
         self.register_buffer("fc_down_global_scale",
                              torch.ones(e, dtype=torch.float32))
-        # W4A16 export: unused by the plugin; W4A4 graphs replace with real NVFP4 activation scales.
-        # Keep dtype=int8: the C++ plugin's supportsFormatCombination() expects INT8 here.
-        # Identity nodes that torch.onnx.export inserts between the shared initializer and
-        # each plugin node are removed in _elide_int8_identity_nodes() (onnx_utils.py).
+        # Decode-friendly SF: row-major transposed, Marlin-projected FP8 bytes.
+        # Shape [E, H/16, I] / [E, I/16, H] — same scheme-B scale values as the
+        # prefill SFs above, transposed so the Marlin decode GEMV reads 64
+        # contiguous per-element scale bytes per (expert, h_group=j/16, inter
+        # chunk) tile. Byte encoding is Marlin-projected (shift-by-7 recovers
+        # the FP16 after decodeSfByteToFloat), distinct from the raw IEEE FP8
+        # E4M3 bytes CuteDSL consumes from the prefill SF.
         self.register_buffer(
-            "hidden_block_scale",
-            torch.zeros(1, 1, 1, dtype=torch.int8),
-        )
+            "fc_up_blocks_scale_decode",
+            torch.zeros(e, h_per_group, inter, dtype=torch.int8))
+        self.register_buffer(
+            "fc_down_blocks_scale_decode",
+            torch.zeros(e, i_per_group, self.hidden_size, dtype=torch.int8))
+        # FP32 length-2 forward activation global scales: [0] FC1, [1] FC2. Populated by the
+        # calibration pipeline (see populate_hidden_global_scales). Plugin v2 does not consume a
+        # separate block-scale input — activation block scales are produced inside the plugin
+        # via fp4Quantize.
         self.register_buffer("hidden_global_scale",
-                             torch.ones(1, dtype=torch.float32))
-        # e_score_correction_bias [E] FP32: NemotronH expert load balancing.
-        if correction_bias is not None:
-            bias_data = correction_bias.data.clone().to(torch.float32)
-        else:
-            bias_data = torch.zeros(e, dtype=torch.float32)
-        self.register_buffer("e_score_correction_bias", bias_data)
+                             torch.ones(2, dtype=torch.float32))
+        # Per-expert load-balancing bias FP32 (num_experts,). Consumed by moeSigmoidGroupTopk
+        # (routing_mode == 1) and optionally by moeTopkSoftmax (routing_mode == 0). Default zero
+        # so softmax routing is a no-op.
+        self.register_buffer(
+            "e_score_correction_bias",
+            torch.zeros(self.num_experts, dtype=torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -808,10 +820,14 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         router_logits = type(self).nemotron_h_plugin_router_logits(
             hidden_flat, self.gate)
 
+        if hidden_states.dtype != torch.float16:
+            raise TypeError(
+                f"Nvfp4MoePlugin (v2) accepts FP16 hidden_states only; got {hidden_states.dtype}."
+                " Cast with ``.half()`` before passing the tensor to this module."
+            )
         out = nvfp4_moe_plugin(
             router_logits,
             hidden_states,
-            self.hidden_block_scale,
             self.hidden_global_scale,
             self.fc_up_qweights,
             self.fc_up_blocks_scale,
@@ -819,6 +835,8 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             self.fc_down_qweights,
             self.fc_down_blocks_scale,
             self.fc_down_global_scale,
+            self.fc_up_blocks_scale_decode,
+            self.fc_down_blocks_scale_decode,
             self.e_score_correction_bias,
             self.num_experts,
             self.top_k,
@@ -832,27 +850,41 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             self.routed_scaling_factor,
             self.routing_mode,
         )
-        # Apply routed_scaling_factor: HF NemotronHTopkRouter scales topk_weights by
-        # this value but moeTopkSoftmax (used inside the C++ plugin) does not.
-        # This compensates so routed expert contributions match the HF reference.
-        if self.routed_scaling_factor != 1.0:
-            out = out * self.routed_scaling_factor
         return out
 
-    def populate_marlin_plugin_buffers(
+    def populate_prefill_plugin_buffers(
         self,
         w_up_ehi,
         w_down_eih,
     ) -> None:
-        """Pack dense Marlin-layout weights into this plugin's NVFP4 buffers and block scales.
+        """Pack dense weights into the plugin-v5 byte layout (N-major FC1 AND FC2).
 
-        ``w_up_ehi`` is ``[E, H, I]``, ``w_down_eih`` is ``[E, I, H]`` (``Nvfp4MoePlugin`` layout).
-        Per-expert ``fc_*_global_scale`` is ``S_max / MarlinConverter.FP8_MAX`` with ``S_max`` from
-        that expert's up/down tensor.
+        ``w_up_ehi`` is ``[E, H, I]`` dense FP32 / BF16 (same HF-transposed layout the
+        legacy Marlin packer consumes); ``w_down_eih`` is ``[E, I, H]``. The output
+        byte layouts:
 
-        Vectorized over all tiles within each expert (numpy ops) — replaces the previous
-        triple-nested Python loop (~20M calls for 128 experts) with a handful of broadcast
-        operations per expert.  Peak extra RAM: ~50 MB per expert (processed sequentially).
+        - FC1 up: ``fc_up_qweights[E, H, I/2]`` bytes — outer axis H, inner axis I/2,
+          2 FP4 nibbles per byte along I (**N-major**, N = I).
+        - FC2 down: ``fc_down_qweights[E, I, H/2]`` bytes — outer axis I, inner axis H/2,
+          2 FP4 nibbles per byte along H (**N-major**, N = H; new in v5).
+        - Both FC1 and FC2 bytes match the layout the CuteDSL N-major prefill kernels
+          read AND what the Marlin decode GEMV expects, so a single weight copy serves
+          both prefill and decode end-to-end.
+        - SF atom swizzle: 128×4 tile with M = N, K = K/16 — prefill-friendly for both
+          FC1 (M=I, K=H/16) and FC2 (M=H, K=I/16). SF layouts are unchanged vs v3/v4;
+          only weight byte axes move.
+        - SF bytes are **raw IEEE FP8 E4M3 bytes** (not Marlin-projected). CuteDSL
+          reinterprets them directly as ``__nv_fp8_e4m3`` values.
+
+        Implementation note: both FCs quantize in the K-major iteration order (outer =
+        N axis, inner = 64 K values per tile) so the per-tile scales land in the
+        prefill SF layout. The packed FP4 bytes are produced in K-major layout in a
+        per-expert scratch buffer and then nibble-transposed to the final N-major
+        layout. This avoids a second quantization pass while still emitting the
+        correct byte layout.
+
+        Per-expert global scale convention is ``s_max / 448`` with
+        ``s_max = max|W_e| / 6``.
         """
         e, h, inter = w_up_ehi.shape
         assert w_down_eih.shape == (e, inter, h)
@@ -866,158 +898,349 @@ class NemotronHMoEW4A4Plugin(nn.Module):
                 f"w_up_ehi shape ({e},{h},{inter}) mismatches plugin "
                 f"(hidden_size={self.hidden_size}, moe_inter_size={self.moe_inter_size})"
             )
-        nIC = inter // 64  # I-dimension chunks (tiles for up_proj)
-        nHC = h // 64  # H-dimension chunks (tiles for down_proj)
-        assert nIC * 64 == inter
-        assert nHC * 64 == h
+        num_hidden_chunks = h // 64
+        num_inter_chunks = inter // 64
+        assert num_hidden_chunks * 64 == h
+        assert num_inter_chunks * 64 == inter
 
-        w_up_np = w_up_ehi.float().detach().cpu().numpy()  # [E, H, I]
-        w_dn_np = w_down_eih.float().detach().cpu().numpy()  # [E, I, H]
-
-        s_max_up = np.maximum(
-            np.abs(w_up_np).reshape(e, -1).max(axis=1) / 6.0, 1e-12)  # [E]
-        s_max_dn = np.maximum(
-            np.abs(w_dn_np).reshape(e, -1).max(axis=1) / 6.0, 1e-12)  # [E]
-
+        w_up_f = w_up_ehi.float()
+        w_dn_f = w_down_eih.float()
+        s_max_up = (w_up_f.abs().amax(dim=(1, 2)) / 6.0).clamp(min=1e-12)
+        s_max_dn = (w_dn_f.abs().amax(dim=(1, 2)) / 6.0).clamp(min=1e-12)
+        s_max_up_np = s_max_up.detach().cpu().numpy()
+        s_max_dn_np = s_max_dn.detach().cpu().numpy()
         k_fp8 = MarlinConverter.FP8_MAX
 
-        # Midpoint boundaries between consecutive FP4 E2M1 positive levels:
-        # levels = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-        # np.searchsorted(bounds, |x|) gives the correct level index without
-        # materialising an [N, 8] distance tensor.
-        _E2M1_BOUNDS = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-                                dtype=np.float32)
+        up_pl = self.fc_up_qweights
+        up_bs = self.fc_up_blocks_scale
+        dn_pl = self.fc_down_qweights
+        dn_bs = self.fc_down_blocks_scale
+        up_bs_decode = self.fc_up_blocks_scale_decode
+        dn_bs_decode = self.fc_down_blocks_scale_decode
 
-        def _pack_one_expert(
-            w_ah: np.ndarray,
-            s_max_ex: float,
-            nC: int,
-        ):
-            """Vectorized quantization + packing for one expert weight matrix.
+        # v6 scheme-B: quantization blocks run along the **K (contraction) axis**
+        # of the ``[N, K]`` weight — H for FC1, I for FC2 — matching the NVFP4
+        # ecosystem convention (ModelOpt emits per-``(n, k/16)`` scales) and the
+        # ``tcgen05.mma`` block-scaled MMA contract consumed by the CuteDSL
+        # prefill kernel. Prefill SF is stored at atom ``(M=N, K=K/16)`` with
+        # raw IEEE FP8 E4M3 bytes (CuteDSL ``__nv_fp8_e4m3`` cast). Decode SF
+        # is a second atom copy at ``(M=H, K=I/16)`` / ``(M=I, K=H/16)`` with
+        # Marlin-projected bytes — see the decode-SF-orientation analysis doc
+        # for why the decode kernel's tile model forces a different axis; with
+        # scheme-B scales the decode path is approximate (≈0.90 cos) and is
+        # currently gated off at ``kPrefillDispatchThreshold = 0``.
+        num_sf_cols_up = h // 16  # FC1 prefill / decode: K = H → SF cols = H/16
+        num_sf_cols_dn = inter // 16  # FC2 prefill / decode: K = I → SF cols = I/16
 
-            Args:
-                w_ah:     [A, B] float32, B = nC * 64 (tiles along B dimension).
-                s_max_ex: expert-level scale max (scalar float).
-                nC:       number of 64-element tile chunks along B.
+        # Numpy views of the dense weights for fast indexing inside the packing loops.
+        w_up_np = np.ascontiguousarray(w_up_f.detach().cpu().numpy())
+        w_dn_np = np.ascontiguousarray(w_dn_f.detach().cpu().numpy())
 
-            Returns:
-                payload_i8: [A, nC, 32] int8  — 2 FP4 E2M1 nibbles packed per byte.
-                bs_i32:     [A, nC]     int32 — Marlin f8x4 block-scale word per tile.
+        # Helper: quantize 64 FP32 values → (32 bytes FP4 nibbles, 4 raw FP8 E4M3
+        # bytes, 4 FP32 normalized targets).
+        # Unlike MarlinConverter's output, which Marlin-projects the FP8 bits so their
+        # `dequant_fp8_scales` decoder recovers the right FP16, this writes the IEEE
+        # FP8 E4M3 byte directly so CuteDSL's `__nv_fp8_e4m3` cast gets the right value.
+        # The raw FP32 targets (scales / s_max * 448) are returned so callers can
+        # Marlin-project them for the decode SF copy.
+        def _quantize_fp4_tile_with_raw_fp8_sf(
+                vec64: np.ndarray,
+                s_max: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            v = np.asarray(vec64, dtype=np.float32).reshape(64)
+            scales = np.empty(4, dtype=np.float32)
+            for g in range(4):
+                blk = v[g * 16:(g + 1) * 16]
+                scales[g] = max(float(np.max(np.abs(blk))) / 6.0, 1e-12)
+            # FP4 payload (reuse existing tile quantizer — it's layout-agnostic for the nibble side)
+            pl, _ = MarlinConverter.quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
+                v, expert_block_scale_max_fp32=s_max)
+            # FP32 targets for the FP8 step: each is in `[0, 448]` range.
+            sf_targets = (scales / s_max * k_fp8).astype(np.float32)
+            # Raw FP8 E4M3 bytes from the same targets.
+            sf_bytes = torch.from_numpy(sf_targets).to(
+                torch.float8_e4m3fn).view(torch.uint8).numpy()
+            return pl, sf_bytes, sf_targets
 
-            Buffer reshape invariants (caller's responsibility):
-                up:  [H, nIC, 32] int8  → [H//2,   I  ] (H*nIC*32 == (H//2)*I)
-                up:  [H, nIC]     int32 → [H//16,  I  ] (H*nIC*4  == (H//16)*I)
-                dn:  [I, nHC, 32] int8  → [I,      H//2 ] (nHC*32 == H//2)
-                dn:  [I, nHC]     int32 → [I,      H//16] (nHC*4  == H//16)
-            """
-            A, B = w_ah.shape
-            # Reshape into sub-group tiles: [A, nC, 4, 16]
-            w_tiles = w_ah.reshape(A, nC, 4, 16)
-
-            # Per-sub-group scale: max(|tile_group|) / 6.0, clamped
-            group_max = np.abs(w_tiles).max(axis=-1)  # [A, nC, 4]
-            group_scales = np.maximum(group_max / 6.0, 1e-12)  # [A, nC, 4]
-
-            # Scale elements by their sub-group scale and clip to [-6, 6]
-            w_scaled = (w_tiles / group_scales[..., np.newaxis]).clip(
-                -6.0, 6.0)
-            # [A, nC, 4, 16]
-
-            # FP4 E2M1 nearest-neighbour (vectorized via searchsorted on 7 boundaries)
-            x_abs = np.abs(w_scaled)
-            best_idx = np.searchsorted(_E2M1_BOUNDS, x_abs).astype(
-                np.uint8)  # [A, nC, 4, 16]
-            sign_bits = (w_scaled < 0).astype(np.uint8) << np.uint8(3)
-            nibbles = (best_idx | sign_bits).reshape(A, nC,
-                                                     64)  # values 0x0..0xF
-
-            # Pack pairs of nibbles into bytes: lo | (hi << 4) → [A, nC, 32] uint8
-            lo = nibbles[..., ::2] & np.uint8(0xF)
-            hi = nibbles[..., 1::2] & np.uint8(0xF)
-            payload_i8 = (lo | (hi << np.uint8(4))).astype(np.uint8).view(
-                np.int8)
-            # [A, nC, 32] int8
-
-            # Vectorized fp32x4_to_marlin_f8x4_block_scale:
-            # Normalise to FP8 range, cast to FP16, then repack via Marlin bit shuffle.
-            scales_norm = (group_scales / s_max_ex * k_fp8).astype(np.float16)
-            # [A, nC, 4]
-
-            # View each FP16 as uint16, then combine pairs into uint32 half2 words
-            h16 = scales_norm.view(np.uint16).astype(np.uint32)  # [A, nC, 4]
-            # out2 packs s[0],s[1]; out1 packs s[2],s[3]  (matches fp32x4_to_marlin order)
-            out2_raw = h16[..., 0] | (h16[..., 1] << np.uint32(16))  # [A, nC]
-            out1_raw = h16[..., 2] | (h16[..., 3] << np.uint32(16))  # [A, nC]
-
-            # Vectorized fp32x4_to_marlin_f8x4_block_scale end-to-end:
-            #
-            # The scalar path is: project(out_raw) then f16x4_in_u32x2_...(proj1, proj2).
-            # f16x4_in_u32x2 applies another << 1 to proj before extracting bytes, so the
-            # >> 1 inside project and the << 1 inside f16x4 cancel.  Combined formula:
-            #
-            #   u = (out_raw << 1) & 0xFF00FF00          (shift, keep odd bytes)
-            #   b_high = (u >> 24) & 0xFF                (top byte)
-            #   b_low  = (u >>  8) & 0xFF                (second byte)
-            #
-            # out1_raw → b1 (low), b3 (high); out2_raw → b0 (low), b2 (high).
-            u1 = (out1_raw.astype(np.uint64) <<
-                  np.uint64(1)) & np.uint64(0xFF00FF00)
-            u2 = (out2_raw.astype(np.uint64) <<
-                  np.uint64(1)) & np.uint64(0xFF00FF00)
-            b0 = (u2 >> np.uint64(8)) & np.uint64(0xFF)
-            b1 = (u1 >> np.uint64(8)) & np.uint64(0xFF)
-            b2 = (u2 >> np.uint64(24)) & np.uint64(0xFF)
-            b3 = (u1 >> np.uint64(24)) & np.uint64(0xFF)
-            bs_i32 = (b0 | (b1 << np.uint64(8)) | (b2 << np.uint64(16)) |
-                      (b3 << np.uint64(24))).astype(np.int32)  # [A, nC]
-
-            return payload_i8, bs_i32
-
-        # --- up_proj: tile along I; buffer layout [E, H//2, I] / [E, H//16, I] ---
-        # Tile (jj, c): w_up[ex, jj, c*64:(c+1)*64].  Tile index = jj*nIC + c.
-        # Memory: [H, nIC, 32] int8 flattens to H*nIC*32 = H*I//2 = (H//2)*I  ✓
         for ex in range(e):
-            pl, sc = _pack_one_expert(w_up_np[ex], float(s_max_up[ex]), nIC)
-            assert pl.shape == (h, nIC, 32), (
-                f"up pl shape {pl.shape} != ({h}, {nIC}, 32) for expert {ex}")
-            assert sc.shape == (h, nIC), (
-                f"up sc shape {sc.shape} != ({h}, {nIC}) for expert {ex}")
-            # pl: [H, nIC, 32] → [H//2, I]  (H*nIC*32 == (H//2)*I since nIC==I//64)
-            self.fc_up_qweights[ex].copy_(
-                torch.from_numpy(pl.reshape(h // 2, inter)))
-            # sc: [H, nIC] int32 → view [H, nIC, 4] int8 → [H//16, I]
-            # Buffer may be padded (atom-layout); copy into the valid rows only.
-            sf_rows_up = h // 16
-            self.fc_up_blocks_scale[ex, :sf_rows_up, :].copy_(
-                torch.from_numpy(sc.view(np.int8).reshape(sf_rows_up, inter)))
+            s_max_up_ex = float(s_max_up_np[ex])
+            s_max_dn_ex = float(s_max_dn_np[ex])
+
+            # ---- FC1 up (scheme-B): iterate outer I, inner 64-H chunks.
+            # Each tile quantizes 64 consecutive H values at fixed i → scale
+            # per (i, h/16). Accumulate FP4 bytes in a scratch [I, H/2] buffer
+            # (K-major), then nibble-transpose to the N-major [H, I/2] layout
+            # that fc_up_qweights expects.
+            up_kmajor_scratch = torch.zeros(inter,
+                                            self.hidden_size // 2,
+                                            dtype=torch.int8)
+            up_kmajor_flat = up_kmajor_scratch.reshape(-1)
+            up_bs_flat = up_bs[ex].view(torch.uint8).reshape(-1)
+            for i in range(inter):
+                for c in range(num_hidden_chunks):
+                    up_seg = w_up_np[ex, c * 64:(c + 1) * 64,
+                                     i].astype(np.float32, copy=False)
+                    pl_u, fp8_u, _tgt_u = _quantize_fp4_tile_with_raw_fp8_sf(
+                        up_seg, s_max_up_ex)
+                    tile_u = i * num_hidden_chunks + c
+                    up_kmajor_flat[tile_u * 32:(tile_u + 1) * 32].copy_(
+                        torch.from_numpy(pl_u.view(np.int8)))
+                    # Prefill SF: raw IEEE FP8 E4M3 bytes at atom(i, h/16).
+                    for g in range(4):
+                        sf_col = c * 4 + g
+                        off = MarlinConverter.atom_sf_offset(
+                            i, sf_col, num_sf_cols_up)
+                        up_bs_flat[off] = int(fp8_u[g])
+
+            # K-major [I, H/2] → N-major [H, I/2] via nibble transpose.
+            kmajor_u8 = up_kmajor_scratch.view(torch.uint8)
+            lo = kmajor_u8 & 0x0F
+            hi = (kmajor_u8 >> 4) & 0x0F
+            nib_ih = torch.empty(inter, self.hidden_size, dtype=torch.uint8)
+            nib_ih[:, 0::2] = lo
+            nib_ih[:, 1::2] = hi
+            nib_hi = nib_ih.transpose(0, 1).contiguous()
+            i_half_local = inter // 2
+            lo_out = nib_hi[:, 0::2]
+            hi_out = nib_hi[:, 1::2]
+            packed = (lo_out | (hi_out << 4)).view(torch.int8)
+            up_pl[ex].copy_(packed.reshape(self.hidden_size, i_half_local))
+
+            # ---- FC2 down (scheme-B): iterate outer H, inner 64-I chunks.
+            dn_kmajor_scratch = torch.zeros(h, inter // 2, dtype=torch.int8)
+            dn_kmajor_flat = dn_kmajor_scratch.reshape(-1)
+            dn_bs_flat = dn_bs[ex].view(torch.uint8).reshape(-1)
+            for hh in range(h):
+                for c in range(num_inter_chunks):
+                    dn_seg = w_dn_np[ex, c * 64:(c + 1) * 64,
+                                     hh].astype(np.float32, copy=False)
+                    pl_d, fp8_d, _tgt_d = _quantize_fp4_tile_with_raw_fp8_sf(
+                        dn_seg, s_max_dn_ex)
+                    tile_d = hh * num_inter_chunks + c
+                    dn_kmajor_flat[tile_d * 32:(tile_d + 1) * 32].copy_(
+                        torch.from_numpy(pl_d.view(np.int8)))
+                    for g in range(4):
+                        sf_col = c * 4 + g
+                        off = MarlinConverter.atom_sf_offset(
+                            hh, sf_col, num_sf_cols_dn)
+                        dn_bs_flat[off] = int(fp8_d[g])
+
+            # K-major [H, I/2] → N-major [I, H/2].
+            dn_kmajor_u8 = dn_kmajor_scratch.view(torch.uint8)
+            lo = dn_kmajor_u8 & 0x0F
+            hi = (dn_kmajor_u8 >> 4) & 0x0F
+            nib_hi_axis = torch.empty(h, inter, dtype=torch.uint8)
+            nib_hi_axis[:, 0::2] = lo
+            nib_hi_axis[:, 1::2] = hi
+            nib_ih_axis = nib_hi_axis.transpose(0, 1).contiguous()
+            h_half_local = h // 2
+            lo_out = nib_ih_axis[:, 0::2]
+            hi_out = nib_ih_axis[:, 1::2]
+            packed_dn = (lo_out | (hi_out << 4)).view(torch.int8)
+            dn_pl[ex].copy_(packed_dn.reshape(inter, h_half_local))
+
+            # ---- FC1 decode SF (scheme-B grouping, Marlin-projected, row-major [H/16, I]).
+            # Same per-block scales as the prefill SF loop above (16 consecutive H values
+            # per scale at each I). The decode kernel reads 64 contiguous scale bytes per
+            # (e, h_group=j/16, inter_chunk c) tile at linear offset
+            # ``up_bs_decode[ex][h_group * inter + c*64 .. c*64+63]``. Bytes are
+            # Marlin-projected so ``decodeSfByteToFloat`` recovers the FP16 directly.
+            w_up_ex = w_up_np[ex]  # [H, I]
+            # Scheme-B scale per (h_group, i): max over 16 consecutive H rows.
+            sf_up_scheme_b = np.abs(w_up_ex).reshape(num_sf_cols_up, 16,
+                                                     inter).max(axis=1)
+            sf_up_scheme_b = np.maximum(sf_up_scheme_b / 6.0, 1e-12)
+            sf_up_targets_b = (sf_up_scheme_b / s_max_up_ex * k_fp8).astype(
+                np.float32)  # [H/16, I]
+            up_bs_decode_flat = up_bs_decode[ex].view(torch.uint8).reshape(-1)
+            num_i_tiles_up = (inter + 3) // 4
+            for h_g in range(num_sf_cols_up):
+                row_base = h_g * inter
+                for k_tile in range(num_i_tiles_up):
+                    s = [0.0, 0.0, 0.0, 0.0]
+                    for g in range(4):
+                        col = k_tile * 4 + g
+                        if col < inter:
+                            s[g] = float(sf_up_targets_b[h_g, col])
+                    scale_word = MarlinConverter.fp32x4_to_marlin_f8x4_block_scale(
+                        s[0], s[1], s[2], s[3])
+                    marlin_bytes = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
+                        scale_word)
+                    for g in range(4):
+                        col = k_tile * 4 + g
+                        if col < inter:
+                            up_bs_decode_flat[row_base + col] = int(
+                                marlin_bytes[g])
+
+            # ---- FC2 decode SF (scheme-B grouping, Marlin-projected, row-major [I/16, H]).
+            w_dn_ex = w_dn_np[ex]  # [I, H]
+            # Scheme-B scale per (i_group, h): max over 16 consecutive I rows.
+            sf_dn_scheme_b = np.abs(w_dn_ex).reshape(num_sf_cols_dn, 16,
+                                                     h).max(axis=1)
+            sf_dn_scheme_b = np.maximum(sf_dn_scheme_b / 6.0, 1e-12)
+            sf_dn_targets_b = (sf_dn_scheme_b / s_max_dn_ex * k_fp8).astype(
+                np.float32)  # [I/16, H]
+            dn_bs_decode_flat = dn_bs_decode[ex].view(torch.uint8).reshape(-1)
+            num_h_tiles_dn = (h + 3) // 4
+            for i_g in range(num_sf_cols_dn):
+                row_base = i_g * h
+                for k_tile in range(num_h_tiles_dn):
+                    s = [0.0, 0.0, 0.0, 0.0]
+                    for g in range(4):
+                        col = k_tile * 4 + g
+                        if col < h:
+                            s[g] = float(sf_dn_targets_b[i_g, col])
+                    scale_word = MarlinConverter.fp32x4_to_marlin_f8x4_block_scale(
+                        s[0], s[1], s[2], s[3])
+                    marlin_bytes = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
+                        scale_word)
+                    for g in range(4):
+                        col = k_tile * 4 + g
+                        if col < h:
+                            dn_bs_decode_flat[row_base + col] = int(
+                                marlin_bytes[g])
 
         self.fc_up_global_scale.copy_(
-            torch.from_numpy(s_max_up / k_fp8).to(
-                device=self.fc_up_global_scale.device,
-                dtype=self.fc_up_global_scale.dtype))
-
-        # --- down_proj: tile along H; buffer layout [E, I, H//2] / [E, I, H//16] ---
-        # Tile (c, j): w_down[ex, j, c*64:(c+1)*64].  Stored at dn_pl[ex, j, c*32:].
-        # Memory: [I, nHC, 32] int8 → [I, nHC*32] = [I, H//2]  ✓
-        for ex in range(e):
-            pl, sc = _pack_one_expert(w_dn_np[ex], float(s_max_dn[ex]), nHC)
-            assert pl.shape == (inter, nHC, 32), (
-                f"dn pl shape {pl.shape} != ({inter}, {nHC}, 32) for expert {ex}"
-            )
-            assert sc.shape == (inter, nHC), (
-                f"dn sc shape {sc.shape} != ({inter}, {nHC}) for expert {ex}")
-            # pl: [I, nHC, 32] → [I, H//2]  (nHC*32 == H//2 since nHC==H//64)
-            self.fc_down_qweights[ex].copy_(
-                torch.from_numpy(pl.reshape(inter, h // 2)))
-            # sc: [I, nHC] int32 → view [I, nHC, 4] int8 → [I, H//16]
-            # Buffer may be padded (atom-layout); copy into the valid rows only.
-            self.fc_down_blocks_scale[ex, :inter, :].copy_(
-                torch.from_numpy(sc.view(np.int8).reshape(inter, h // 16)))
-
+            (s_max_up / k_fp8).to(device=self.fc_up_global_scale.device,
+                                  dtype=self.fc_up_global_scale.dtype))
         self.fc_down_global_scale.copy_(
-            torch.from_numpy(s_max_dn / k_fp8).to(
-                device=self.fc_down_global_scale.device,
-                dtype=self.fc_down_global_scale.dtype))
+            (s_max_dn / k_fp8).to(device=self.fc_down_global_scale.device,
+                                  dtype=self.fc_down_global_scale.dtype))
+
+    def populate_decode_plugin_buffers(self) -> None:
+        """Populate decode-friendly row-major transposed SF from the prefill SF.
+
+        Reads ``fc_up_blocks_scale`` (atom-swizzled, raw IEEE FP8 E4M3 bytes at
+        ``atom_sf_offset(i, h_group, H/16)``) and writes
+        ``fc_up_blocks_scale_decode`` (row-major ``[E, H/16, I]`` with Marlin-
+        projected bytes at ``[h_group * I + i]``). Similarly for FC2:
+        ``fc_down_blocks_scale`` (atom ``(h, i_group)``) → ``fc_down_blocks_scale_decode``
+        (row-major ``[E, I/16, H]`` at ``[i_group * H + h]``).
+
+        The byte encoding is converted from raw IEEE FP8 E4M3 (CuteDSL-friendly)
+        to Marlin-projected (the W4A16 decode GEMV's ``decodeSfByteToFloat`` shift-by-7
+        trick). ``populate_prefill_plugin_buffers`` already writes both, so calling
+        this afterward is idempotent (produces the same bytes).
+
+        This helper is O(E · H · I / 16) — acceptable as a one-time load step; follow
+        up with a vectorized variant if it becomes a bottleneck.
+        """
+        e = self.num_experts
+        h = self.hidden_size
+        inter = self.moe_inter_size
+        h_per_group = h // self.quantization_group_size  # H/16
+        i_per_group = inter // self.quantization_group_size  # I/16
+        k_fp8 = MarlinConverter.FP8_MAX
+
+        for ex in range(e):
+            # --- FC1: read prefill atom (i, h_group) raw FP8 → decode linear [h_group, i] Marlin.
+            up_bs_flat = self.fc_up_blocks_scale[ex].view(
+                torch.uint8).reshape(-1)
+            up_dec_flat = self.fc_up_blocks_scale_decode[ex].view(
+                torch.uint8).reshape(-1)
+            # Gather raw FP8 bytes at (i, h_g) positions into a [I, H/16] array.
+            raw_up = np.empty((inter, h_per_group), dtype=np.uint8)
+            for i in range(inter):
+                for h_g in range(h_per_group):
+                    off = MarlinConverter.atom_sf_offset(i, h_g, h_per_group)
+                    raw_up[i, h_g] = int(up_bs_flat[off])
+            # FP8 E4M3 byte → FP32 scalar (vectorized via torch FP8 dtype).
+            sf_up_fp32 = torch.from_numpy(raw_up).view(
+                torch.float8_e4m3fn).float().numpy()  # [I, H/16]
+            # Write Marlin-projected bytes at linear [h_g * I + i], groups of 4 along I.
+            num_i_tiles = (inter + 3) // 4
+            for h_g in range(h_per_group):
+                row_base = h_g * inter
+                for k_tile in range(num_i_tiles):
+                    s = [0.0, 0.0, 0.0, 0.0]
+                    for g in range(4):
+                        col = k_tile * 4 + g
+                        if col < inter:
+                            s[g] = float(sf_up_fp32[col, h_g])
+                    scale_word = MarlinConverter.fp32x4_to_marlin_f8x4_block_scale(
+                        s[0], s[1], s[2], s[3])
+                    marlin_bytes = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
+                        scale_word)
+                    for g in range(4):
+                        col = k_tile * 4 + g
+                        if col < inter:
+                            up_dec_flat[row_base + col] = int(marlin_bytes[g])
+
+            # --- FC2: read prefill atom (h, i_group) raw FP8 → decode linear [i_group, h] Marlin.
+            dn_bs_flat = self.fc_down_blocks_scale[ex].view(
+                torch.uint8).reshape(-1)
+            dn_dec_flat = self.fc_down_blocks_scale_decode[ex].view(
+                torch.uint8).reshape(-1)
+            raw_dn = np.empty((h, i_per_group), dtype=np.uint8)
+            for hh in range(h):
+                for i_g in range(i_per_group):
+                    off = MarlinConverter.atom_sf_offset(hh, i_g, i_per_group)
+                    raw_dn[hh, i_g] = int(dn_bs_flat[off])
+            sf_dn_fp32 = torch.from_numpy(raw_dn).view(
+                torch.float8_e4m3fn).float().numpy()  # [H, I/16]
+            num_h_tiles = (h + 3) // 4
+            for i_g in range(i_per_group):
+                row_base = i_g * h
+                for k_tile in range(num_h_tiles):
+                    s = [0.0, 0.0, 0.0, 0.0]
+                    for g in range(4):
+                        col = k_tile * 4 + g
+                        if col < h:
+                            s[g] = float(sf_dn_fp32[col, i_g])
+                    scale_word = MarlinConverter.fp32x4_to_marlin_f8x4_block_scale(
+                        s[0], s[1], s[2], s[3])
+                    marlin_bytes = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
+                        scale_word)
+                    for g in range(4):
+                        col = k_tile * 4 + g
+                        if col < h:
+                            dn_dec_flat[row_base + col] = int(marlin_bytes[g])
+        _ = k_fp8  # retained for symmetry with populate_prefill_plugin_buffers
+
+    def populate_hidden_global_scales(
+        self,
+        fc1_input_scale: torch.Tensor,
+        fc2_input_scale: torch.Tensor,
+        *,
+        atol: float = 1e-6,
+    ) -> None:
+        """Populate :attr:`hidden_global_scale` from calibrated per-expert input scales.
+
+        The checkpoint schema stores one ``input_scale`` per expert (shape ``[E]`` or a
+        scalar). Across the 5,888 FC1 / FC2 tensors verified so far, those values are
+        constant per layer — so the prefill path folds them to a single scalar per FC.
+        This method asserts the per-expert invariance ``(max - min) / mean < atol`` and
+        writes the max value into the corresponding ``hidden_global_scale`` slot. Failing
+        the assertion likely indicates a checkpoint schema change that breaks the design's
+        single-scalar-per-FC contract; fail loud rather than silently collapsing.
+        """
+
+        def _fold(tensor: torch.Tensor, label: str) -> float:
+            flat = tensor.detach().to(torch.float32).flatten()
+            if flat.numel() == 0:
+                raise ValueError(f"{label}: empty tensor")
+            if flat.numel() == 1:
+                return float(flat.item())
+            mean = float(flat.mean().item())
+            if mean <= 0.0:
+                raise ValueError(
+                    f"{label}: non-positive mean ({mean}); expected forward-direction scale"
+                )
+            spread = float((flat.max() - flat.min()).item()) / mean
+            if spread >= atol:
+                raise ValueError(
+                    f"{label}: per-expert spread (max-min)/mean={spread:.3e} exceeds atol={atol:.0e}. "
+                    "The plugin v2 prefill path passes a single scalar per FC per layer; "
+                    "checkpoints with diverging per-expert activation scales are not supported "
+                    "without a kernel-level extension.")
+            return float(flat.max().item())
+
+        fc1_scalar = _fold(fc1_input_scale, "fc1_input_scale")
+        fc2_scalar = _fold(fc2_input_scale, "fc2_input_scale")
+        with torch.no_grad():
+            self.hidden_global_scale.copy_(
+                torch.tensor([fc1_scalar, fc2_scalar],
+                             dtype=self.hidden_global_scale.dtype,
+                             device=self.hidden_global_scale.device))
 
     def pack_experts_weights_to_marlin(self, moe: "NemotronHMoE") -> None:
         """
@@ -1037,8 +1260,8 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         if not hasattr(moe, "experts"):
             raise TypeError(
                 f"moe must have ``experts``; got {type(moe).__name__!r}")
-        # trust_remote_code NemotronHMOE: n_routed_experts lives on .gate or
-        # .experts.num_experts (NemotronHExperts has no __len__, use lazy eval).
+        # trust_remote_code NemotronHMoE: n_routed_experts lives on .gate or
+        # .experts.num_experts (NemotronHExperts has no __len__).
         _gate = getattr(moe, "gate", None)
         if hasattr(moe, "n_routed_experts"):
             _n_experts = int(moe.n_routed_experts)
@@ -1070,34 +1293,27 @@ class NemotronHMoEW4A4Plugin(nn.Module):
                 f"self.hidden_size={self.hidden_size}")
 
         experts = moe.experts
-        e_ct = _n_experts
-        if isinstance(experts, nn.ModuleList):
-            # trust_remote_code NemotronHMOE: individual MLP modules in a ModuleList.
-            # Each expert.up_proj.weight is [I, H], expert.down_proj.weight is [H, I].
-            # Stack into [E, I, H] / [E, H, I] matching the fused NemotronHExperts layout.
-            up_list = [e.up_proj.weight.data for e in experts]
-            down_list = [e.down_proj.weight.data for e in experts]
-            up_stacked = torch.stack(up_list, dim=0)  # [E, I, H]
-            down_stacked = torch.stack(down_list, dim=0)  # [E, H, I]
-        else:
-            up_raw = experts.up_proj
-            down_raw = experts.down_proj
-            if not isinstance(up_raw, nn.Parameter) or not isinstance(
-                    down_raw, nn.Parameter):
-                raise TypeError(
-                    "expected experts.up_proj and experts.down_proj to be nn.Parameter stacked tensors "
-                    f"(got up_proj={type(up_raw).__name__!r}, down_proj={type(down_raw).__name__!r})"
-                )
-            if int(up_raw.shape[0]) != e_ct or int(down_raw.shape[0]) != e_ct:
-                raise ValueError(
-                    f"expert dim mismatch: n_routed_experts={e_ct}, up.shape={tuple(up_raw.shape)}, "
-                    f"down.shape={tuple(down_raw.shape)}")
-            up_stacked = up_raw.data  # [E, I, H]
-            down_stacked = down_raw.data  # [E, H, I]
-        # Marlin layout: w_up [E, H, I], w_down [E, I, H]
-        w_up_ehi = up_stacked.transpose(1, 2).contiguous()
-        w_down_eih = down_stacked.transpose(1, 2).contiguous()
-        self.populate_marlin_plugin_buffers(w_up_ehi, w_down_eih)
+        up = experts.up_proj
+        down = experts.down_proj
+        if not isinstance(up, nn.Parameter) or not isinstance(
+                down, nn.Parameter):
+            raise TypeError(
+                "expected experts.up_proj and experts.down_proj to be nn.Parameter stacked tensors "
+                f"(got up_proj={type(up).__name__!r}, down_proj={type(down).__name__!r})"
+            )
+        e_ct = int(_n_experts)
+        if int(up.shape[0]) != e_ct or int(down.shape[0]) != e_ct:
+            raise ValueError(
+                f"expert dim mismatch: n_routed_experts={e_ct}, up.shape={tuple(up.shape)}, "
+                f"down.shape={tuple(down.shape)}")
+        w_up_ehi = up.data.transpose(1, 2).contiguous()
+        w_down_eih = down.data.transpose(1, 2).contiguous()
+        # Plugin v1: both FC1 and FC2 weights are N-major (Marlin-compatible
+        # bytes); prefill SFs use raw IEEE FP8 E4M3, decode SFs use Marlin
+        # projection. populate_prefill fills both; populate_decode is an
+        # idempotent refill used on weight-reload paths.
+        self.populate_prefill_plugin_buffers(w_up_ehi, w_down_eih)
+        self.populate_decode_plugin_buffers()
 
 
 def register_nvfp4_moe_plugin_onnx_symbolic_functions() -> None:
@@ -1108,77 +1324,50 @@ def register_nvfp4_moe_plugin_onnx_symbolic_functions() -> None:
     )
 
 
-class NemotronHMoEWithSharedExperts(nn.Module):
-    """Thin wrapper that runs NemotronHMoEW4A4Plugin + shared expert in sequence.
-
-    The shared expert is registered as a named submodule (``self.shared_experts``)
-    so that, at each MoE layer position, it appears under a unique path in the model
-    hierarchy (e.g. ``layers.1.mlp.shared_experts`` vs ``layers.4.mlp.shared_experts``).
-
-    Each instance receives a *deepcopy* of the original shared_experts module.  This
-    is required even when the caller passes distinct module objects, because in some
-    Nemotron-H checkpoints the shared_experts attribute is weight-tied across several
-    MoE layers (the same Python object appears in multiple ``NemotronHMoE`` blocks).
-    When torch.onnx.export encounters the same module object called from multiple
-    scopes it collapses the scope names, producing "Output name is not unique" for the
-    shared-expert sub-graph.  The deepcopy gives each wrapper a genuinely independent
-    nn.Module object with its own Python identity, so TorchScript assigns every wrapper
-    a distinct scope path and the duplicate-name error disappears.
-
-    Mirrors ``NemotronHMoE.forward()``:
-        out = moe(hidden_states) + shared_experts(hidden_states)
-    """
-
-    def __init__(
-        self,
-        plugin: "NemotronHMoEW4A4Plugin",
-        shared_experts: nn.Module,
-    ) -> None:
-        super().__init__()
-        self.moe_plugin = plugin
-        # deepcopy so every wrapper instance owns a distinct module object.
-        # Without this, weight-tied shared_experts (same Python id across layers)
-        # collapse into a single ONNX scope → "Output name is not unique".
-        try:
-            self.shared_experts = copy.deepcopy(shared_experts)
-        except Exception as _e:
-            print(
-                f"[NemotronHMoEWithSharedExperts] WARNING: deepcopy failed ({type(_e).__name__}: {_e}), "
-                "using original module — ONNX export may fail with duplicate output names"
-            )
-            self.shared_experts = shared_experts  # fallback: best-effort
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.moe_plugin(hidden_states) + self.shared_experts(
-            hidden_states)
-
-
 def replace_moe_blocks_with_nvfp4_plugin(model: nn.Module) -> nn.Module:
     """Replace ``NemotronHMoE`` blocks with ``NemotronHMoEW4A4Plugin`` (NVFP4 buffers must be filled).
 
-    When the ``NemotronHMoE`` block has a ``shared_experts`` attribute, the replacement
-    is wrapped in ``NemotronHMoEWithSharedExperts`` so that the shared expert is a
-    registered submodule at the layer's position in the hierarchy.  This keeps ONNX
-    node names unique across all MoE layers (each layer gets its own path prefix).
+    Routing parameters (``n_group`` / ``topk_group`` / ``norm_topk_prob`` /
+    ``routed_scaling_factor`` / ``routing_mode``) are inferred from ``moe_block.config``
+    when present; NemotronH configs expose them via the DeepSeek-style sigmoid-group
+    router, so the plugin runs ``moeSigmoidGroupTopk`` by default for those models.
     """
     if NemotronHMoE is None:
         return model
     for name, module in list(model.named_modules()):
         new_module = None
         if isinstance(module, NemotronHMoE):
+            cfg = getattr(module, "config", None)
+            n_group = int(getattr(cfg, "n_group", 1) or 1)
+            topk_group = int(getattr(cfg, "topk_group", 1) or 1)
+            norm_topk_prob = int(bool(getattr(cfg, "norm_topk_prob", True)))
+            routed_scaling_factor = float(
+                getattr(cfg, "routed_scaling_factor", 1.0) or 1.0)
+            # Default to sigmoid-group-topk when the config advertises a grouped router
+            # (n_group > 1), else fall back to the legacy softmax-topk path.
+            routing_mode = 1 if n_group > 1 else 0
             try:
-                plugin = NemotronHMoEW4A4Plugin(module)
-                shared = getattr(module, "shared_experts", None)
-                if shared is not None:
-                    # Wrap: plugin handles routed MoE, wrapper owns shared_experts
-                    # as a registered submodule so each layer gets a unique ONNX path.
-                    new_module = NemotronHMoEWithSharedExperts(plugin, shared)
-                else:
-                    new_module = plugin
-            except Exception as _e:
-                print(
-                    f"[nvfp4_moe_plugin] WARNING: failed to replace {name!r}: {type(_e).__name__}: {_e}"
+                new_module = NemotronHMoEW4A4Plugin(
+                    module,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    norm_topk_prob=norm_topk_prob,
+                    routed_scaling_factor=routed_scaling_factor,
+                    routing_mode=routing_mode,
                 )
+                e_score_bias = getattr(module.gate, "e_score_correction_bias",
+                                       None)
+                if e_score_bias is None:
+                    e_score_bias = getattr(module, "e_score_correction_bias",
+                                           None)
+                if isinstance(e_score_bias, torch.Tensor):
+                    with torch.no_grad():
+                        new_module.e_score_correction_bias.copy_(
+                            e_score_bias.detach().to(
+                                dtype=torch.float32,
+                                device=new_module.e_score_correction_bias.
+                                device))
+            except (TypeError, ValueError):
                 new_module = None
         if new_module is None:
             continue

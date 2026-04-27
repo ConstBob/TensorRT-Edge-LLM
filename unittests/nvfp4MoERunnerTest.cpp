@@ -89,9 +89,6 @@ TEST(NvFP4MoERunnerTest, fc1AllActivations)
     bool const loaded = NvFP4MoEContiguousGemmRunner::loadKernelModules();
     ASSERT_TRUE(loaded) << "Failed to load FC1 kernel modules";
 
-    // Identity (decomposed pipeline)
-    NvFP4MoEContiguousGemmRunner identityRunner(16, 6, 1856, 2688, 128, Activation::kIdentity);
-
     // ReLU2 (Nemotron)
     NvFP4MoEContiguousGemmRunner relu2Runner(16, 6, 1856, 2688, 128, Activation::kRelu2);
 
@@ -99,6 +96,47 @@ TEST(NvFP4MoERunnerTest, fc1AllActivations)
     NvFP4MoEContiguousGemmRunner swigluRunner(128, 8, 1536, 2048, 128, Activation::kSwiglu);
 
     NvFP4MoEContiguousGemmRunner::unloadKernelModules();
+    SUCCEED();
+}
+
+// Verify FC1 runners can be constructed with FP16 output dtype for every
+// compiled activation. Guards against regressions in AOT variant wiring
+// for the fp16 kernel modules.
+TEST(NvFP4MoERunnerTest, fc1Fp16Output)
+{
+    int32_t const smVersion = getSMVersion();
+    if (!isSupportedSm(smVersion))
+    {
+        GTEST_SKIP() << "NvFP4 MoE kernels require SM100/101/110. Current SM=" << smVersion;
+    }
+
+    bool const loaded = NvFP4MoEContiguousGemmRunner::loadKernelModules();
+    ASSERT_TRUE(loaded) << "Failed to load FC1 kernel modules";
+
+    NvFP4MoEContiguousGemmRunner relu2Fp16Runner(16, 6, 1856, 2688, 128, Activation::kRelu2, OutputDType::kFP16);
+
+    NvFP4MoEContiguousGemmRunner swigluFp16Runner(128, 8, 1536, 2048, 128, Activation::kSwiglu, OutputDType::kFP16);
+
+    NvFP4MoEContiguousGemmRunner::unloadKernelModules();
+    SUCCEED();
+}
+
+// Verify FC2 runner can be constructed with FP16 output dtype.
+TEST(NvFP4MoERunnerTest, fc2Fp16Output)
+{
+    int32_t const smVersion = getSMVersion();
+    if (!isSupportedSm(smVersion))
+    {
+        GTEST_SKIP() << "NvFP4 MoE kernels require SM100/101/110. Current SM=" << smVersion;
+    }
+
+    bool const loaded = NvFP4MoEFC2FinalizeRunner::loadKernelModules();
+    ASSERT_TRUE(loaded) << "Failed to load FC2 kernel modules";
+
+    NvFP4MoEFC2FinalizeRunner fc2Fp16Runner(
+        /*numLocalExperts=*/16, /*topK=*/6, /*n=*/2688, /*k=*/1856, OutputDType::kFP16);
+
+    NvFP4MoEFC2FinalizeRunner::unloadKernelModules();
     SUCCEED();
 }
 

@@ -33,50 +33,54 @@ namespace
 template <int threadBlockSize>
 void launchMoeW4A4UpGemvTemplated(int const batch, int const seq_len, int const hidden_dim, int const inter_dim,
     int const inter_chunks, int const num_experts, int const top_k, int32_t const* expert_ids,
-    NVFP4Tensor const activation, NVFP4Tensor const up, __half* inter_fp16_out, cudaStream_t stream)
+    NVFP4Tensor const activation, NVFP4Tensor const up, uint8_t const* up_decode_sf, __half* inter_fp16_out,
+    cudaStream_t stream)
 {
     assert(hidden_dim % 64 == 0);
     assert(hidden_dim % threadBlockSize == 0);
     int const grid = moeDecodeGemvTopkGridDimBatchSeq(batch, seq_len, top_k, hidden_dim, threadBlockSize);
     moeW4A4DecodeUpGemvKernel<threadBlockSize><<<grid, threadBlockSize, 0, stream>>>(batch, seq_len, hidden_dim,
-        inter_dim, inter_chunks, num_experts, top_k, expert_ids, activation, up, inter_fp16_out);
+        inter_dim, inter_chunks, num_experts, top_k, expert_ids, activation, up, up_decode_sf, inter_fp16_out);
 }
 
 template <int threadBlockSize, MoEActivationKind kAct>
 void launchMoeW4A4DownGemvTemplated(int const batch, int const seq_len, int const hidden_dim, int const inter_dim,
     int const hidden_chunks, int const num_experts, int const top_k, int32_t const* expert_ids,
-    float const* topk_weights, __half const* inter_in, NVFP4Tensor const down, __half* output, cudaStream_t stream)
+    float const* topk_weights, __half const* inter_in, NVFP4Tensor const down, uint8_t const* down_decode_sf,
+    __half* output, cudaStream_t stream)
 {
     int const grid = moeDecodeGemvTopkGridDimBatchSeq(batch, seq_len, top_k, inter_dim, threadBlockSize);
     moeW4A4DecodeDownGemvKernel<threadBlockSize, kAct><<<grid, threadBlockSize, 0, stream>>>(batch, seq_len, hidden_dim,
-        inter_dim, hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output);
+        inter_dim, hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output);
 }
 
 template <int threadBlockSize>
 void launchMoeW4A16UpGemvTemplated(int const batch, int const seq_len, int const hidden_dim, int const inter_dim,
     int const inter_chunks, int const num_experts, int const top_k, int32_t const* expert_ids, __half const* activation,
-    NVFP4Tensor const up, __half* inter_fp16_out, cudaStream_t stream)
+    NVFP4Tensor const up, uint8_t const* up_decode_sf, __half* inter_fp16_out, cudaStream_t stream)
 {
     int const grid = moeDecodeGemvTopkGridDimBatchSeq(batch, seq_len, top_k, hidden_dim, threadBlockSize);
     moeW4A16DecodeUpGemvKernel<threadBlockSize><<<grid, threadBlockSize, 0, stream>>>(batch, seq_len, hidden_dim,
-        inter_dim, inter_chunks, num_experts, top_k, expert_ids, activation, up, inter_fp16_out);
+        inter_dim, inter_chunks, num_experts, top_k, expert_ids, activation, up, up_decode_sf, inter_fp16_out);
 }
 
 template <int threadBlockSize, MoEActivationKind kAct>
 void launchMoeW4A16DownGemvTemplated(int const batch, int const seq_len, int const hidden_dim, int const inter_dim,
     int const hidden_chunks, int const num_experts, int const top_k, int32_t const* expert_ids,
-    float const* topk_weights, __half const* inter_in, NVFP4Tensor const down, __half* output, cudaStream_t stream)
+    float const* topk_weights, __half const* inter_in, NVFP4Tensor const down, uint8_t const* down_decode_sf,
+    __half* output, cudaStream_t stream)
 {
     int const grid = moeDecodeGemvTopkGridDimBatchSeq(batch, seq_len, top_k, inter_dim, threadBlockSize);
     moeW4A16DecodeDownGemvKernel<threadBlockSize, kAct><<<grid, threadBlockSize, 0, stream>>>(batch, seq_len,
-        hidden_dim, inter_dim, hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output);
+        hidden_dim, inter_dim, hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down,
+        down_decode_sf, output);
 }
 } // namespace
 
 void launchNemotronMoeW4A4DecodeUpGemvCuda(int const batch, int const seq_len, int const hidden_dim,
     int const inter_dim, int const num_experts, int const top_k, int32_t const* expert_ids,
-    NVFP4Tensor const activation, NVFP4Tensor const up, __half* inter_fp16_out, cudaStream_t stream,
-    int const thread_block_size)
+    NVFP4Tensor const activation, NVFP4Tensor const up, uint8_t const* up_decode_sf, __half* inter_fp16_out,
+    cudaStream_t stream, int const thread_block_size)
 {
     assert(batch >= 1);
     assert(seq_len >= 1);
@@ -86,6 +90,7 @@ void launchNemotronMoeW4A4DecodeUpGemvCuda(int const batch, int const seq_len, i
     assert(hidden_dim % thread_block_size == 0);
     assert(top_k > 0);
     assert(expert_ids != nullptr);
+    assert(up_decode_sf != nullptr);
     assert(inter_fp16_out != nullptr);
 
     int const inter_chunks = inter_dim / 64;
@@ -97,23 +102,23 @@ void launchNemotronMoeW4A4DecodeUpGemvCuda(int const batch, int const seq_len, i
     {
     case 64:
         launchMoeW4A4UpGemvTemplated<64>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     case 96:
         launchMoeW4A4UpGemvTemplated<96>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     case 128:
         launchMoeW4A4UpGemvTemplated<128>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     case 192:
         launchMoeW4A4UpGemvTemplated<192>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     case 256:
         launchMoeW4A4UpGemvTemplated<256>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     default: assert(false && "unsupported thread_block_size"); break;
     }
@@ -121,8 +126,8 @@ void launchNemotronMoeW4A4DecodeUpGemvCuda(int const batch, int const seq_len, i
 
 void launchNemotronMoeW4A4DecodeDownGemvCuda(int const batch, int const seq_len, int const hidden_dim,
     int const inter_dim, int const hidden_chunks, int const num_experts, int const top_k, int32_t const* expert_ids,
-    float const* topk_weights, __half const* inter_in, NVFP4Tensor const down, __half* output, cudaStream_t stream,
-    int const thread_block_size, MoEActivationKind const activation_kind)
+    float const* topk_weights, __half const* inter_in, NVFP4Tensor const down, uint8_t const* down_decode_sf,
+    __half* output, cudaStream_t stream, int const thread_block_size, MoEActivationKind const activation_kind)
 {
     assert(batch >= 1);
     assert(seq_len >= 1);
@@ -133,6 +138,7 @@ void launchNemotronMoeW4A4DecodeDownGemvCuda(int const batch, int const seq_len,
     assert(expert_ids != nullptr);
     assert(topk_weights != nullptr);
     assert(inter_in != nullptr);
+    assert(down_decode_sf != nullptr);
     assert(output != nullptr);
 
     int const num_tokens = batch * seq_len;
@@ -146,60 +152,70 @@ void launchNemotronMoeW4A4DecodeDownGemvCuda(int const batch, int const seq_len,
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A4DownGemvTemplated<64, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A4DownGemvTemplated<64, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     case 96:
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A4DownGemvTemplated<96, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A4DownGemvTemplated<96, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     case 128:
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A4DownGemvTemplated<128, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A4DownGemvTemplated<128, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     case 192:
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A4DownGemvTemplated<192, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A4DownGemvTemplated<192, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     case 256:
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A4DownGemvTemplated<256, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A4DownGemvTemplated<256, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     default: assert(false && "unsupported thread_block_size"); break;
@@ -208,8 +224,9 @@ void launchNemotronMoeW4A4DecodeDownGemvCuda(int const batch, int const seq_len,
 
 void launchNemotronMoeW4a4DecodeGemvCuda(int const batch, int const seq_len, int const hidden_dim, int const inter_dim,
     int const num_chunks, int const num_experts, int const top_k, int32_t const* expert_ids, float const* topk_weights,
-    NVFP4Tensor const activation, NVFP4Tensor const up, NVFP4Tensor const down, __half* inter_fp16_scratch,
-    __half* output, cudaStream_t stream, int const thread_block_size, MoEActivationKind const activation_kind)
+    NVFP4Tensor const activation, NVFP4Tensor const up, NVFP4Tensor const down, uint8_t const* up_decode_sf,
+    uint8_t const* down_decode_sf, __half* inter_fp16_scratch, __half* output, cudaStream_t stream,
+    int const thread_block_size, MoEActivationKind const activation_kind)
 {
     (void) num_chunks;
     assert(batch >= 1);
@@ -219,15 +236,17 @@ void launchNemotronMoeW4a4DecodeGemvCuda(int const batch, int const seq_len, int
     assert(hidden_dim % 64 == 0);
     int const hidden_chunks = hidden_dim / 64;
     launchNemotronMoeW4A4DecodeUpGemvCuda(batch, seq_len, hidden_dim, inter_dim, num_experts, top_k, expert_ids,
-        activation, up, inter_fp16_scratch, stream, thread_block_size);
+        activation, up, up_decode_sf, inter_fp16_scratch, stream, thread_block_size);
     launchNemotronMoeW4A4DecodeDownGemvCuda(batch, seq_len, hidden_dim, inter_dim, hidden_chunks, num_experts, top_k,
-        expert_ids, topk_weights, inter_fp16_scratch, down, output, stream, thread_block_size, activation_kind);
+        expert_ids, topk_weights, inter_fp16_scratch, down, down_decode_sf, output, stream, thread_block_size,
+        activation_kind);
 }
 
 void launchNemotronMoeW4A16DecodeGemvCuda(int const batch, int const seq_len, int const hidden_dim, int const inter_dim,
     int const num_chunks, int const num_experts, int const top_k, int32_t const* expert_ids, float const* topk_weights,
-    __half const* activation, NVFP4Tensor const up, NVFP4Tensor const down, __half* inter_fp16_scratch, __half* output,
-    cudaStream_t stream, MoEActivationKind const activation_kind)
+    __half const* activation, NVFP4Tensor const up, NVFP4Tensor const down, uint8_t const* up_decode_sf,
+    uint8_t const* down_decode_sf, __half* inter_fp16_scratch, __half* output, cudaStream_t stream,
+    MoEActivationKind const activation_kind)
 {
     (void) num_chunks;
     assert(inter_fp16_scratch != nullptr);
@@ -239,15 +258,15 @@ void launchNemotronMoeW4A16DecodeGemvCuda(int const batch, int const seq_len, in
     int const num_chunks_up = inter_dim / 64;
     int const num_chunks_down = hidden_dim / 64;
     launchNemotronMoeW4A16DecodeUpGemvCuda(batch, seq_len, hidden_dim, inter_dim, num_chunks_up, num_experts, top_k,
-        expert_ids, topk_weights, activation, up, inter_fp16_scratch, stream);
+        expert_ids, topk_weights, activation, up, up_decode_sf, inter_fp16_scratch, stream);
     launchNemotronMoeW4A16DecodeDownGemvCuda(batch, seq_len, hidden_dim, inter_dim, num_chunks_down, num_experts, top_k,
-        expert_ids, topk_weights, inter_fp16_scratch, down, output, stream, activation_kind);
+        expert_ids, topk_weights, inter_fp16_scratch, down, down_decode_sf, output, stream, activation_kind);
 }
 
 void launchNemotronMoeW4A16DecodeUpGemvCuda(int const batch, int const seq_len, int const hidden_dim,
     int const inter_dim, int const inter_chunks, int const num_experts, int const top_k, int32_t const* expert_ids,
-    float const* topk_weights, __half const* activation, NVFP4Tensor const up, __half* inter_fp16_out,
-    cudaStream_t stream)
+    float const* topk_weights, __half const* activation, NVFP4Tensor const up, uint8_t const* up_decode_sf,
+    __half* inter_fp16_out, cudaStream_t stream)
 {
     (void) topk_weights;
     assert(inter_dim % 64 == 0);
@@ -261,6 +280,7 @@ void launchNemotronMoeW4A16DecodeUpGemvCuda(int const batch, int const seq_len, 
     assert(top_k > 0);
     assert(expert_ids != nullptr);
     assert(activation != nullptr);
+    assert(up_decode_sf != nullptr);
     assert(inter_fp16_out != nullptr);
 
     int64_t const num_tokens = static_cast<int64_t>(batch) * static_cast<int64_t>(seq_len);
@@ -271,23 +291,23 @@ void launchNemotronMoeW4A16DecodeUpGemvCuda(int const batch, int const seq_len, 
     {
     case 64:
         launchMoeW4A16UpGemvTemplated<64>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     case 96:
         launchMoeW4A16UpGemvTemplated<96>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     case 128:
         launchMoeW4A16UpGemvTemplated<128>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     case 192:
         launchMoeW4A16UpGemvTemplated<192>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     case 256:
         launchMoeW4A16UpGemvTemplated<256>(batch, seq_len, hidden_dim, inter_dim, inter_chunks, num_experts, top_k,
-            expert_ids, activation, up, inter_fp16_out, stream);
+            expert_ids, activation, up, up_decode_sf, inter_fp16_out, stream);
         break;
     default: assert(false && "unsupported thread_block_size"); break;
     }
@@ -295,8 +315,8 @@ void launchNemotronMoeW4A16DecodeUpGemvCuda(int const batch, int const seq_len, 
 
 void launchNemotronMoeW4A16DecodeDownGemvCuda(int const batch, int const seq_len, int const hidden_dim,
     int const inter_dim, int const hidden_chunks, int const num_experts, int const top_k, int32_t const* expert_ids,
-    float const* topk_weights, __half const* inter_in, NVFP4Tensor const down, __half* output, cudaStream_t stream,
-    MoEActivationKind const activation_kind)
+    float const* topk_weights, __half const* inter_in, NVFP4Tensor const down, uint8_t const* down_decode_sf,
+    __half* output, cudaStream_t stream, MoEActivationKind const activation_kind)
 {
     assert(hidden_dim % 64 == 0);
     assert(batch >= 1);
@@ -309,6 +329,7 @@ void launchNemotronMoeW4A16DecodeDownGemvCuda(int const batch, int const seq_len
     assert(expert_ids != nullptr);
     assert(topk_weights != nullptr);
     assert(inter_in != nullptr);
+    assert(down_decode_sf != nullptr);
     assert(output != nullptr);
 
     int64_t const num_tokens = static_cast<int64_t>(batch) * static_cast<int64_t>(seq_len);
@@ -322,60 +343,70 @@ void launchNemotronMoeW4A16DecodeDownGemvCuda(int const batch, int const seq_len
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A16DownGemvTemplated<64, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A16DownGemvTemplated<64, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     case 96:
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A16DownGemvTemplated<96, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A16DownGemvTemplated<96, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     case 128:
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A16DownGemvTemplated<128, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A16DownGemvTemplated<128, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     case 192:
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A16DownGemvTemplated<192, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A16DownGemvTemplated<192, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     case 256:
         if (activation_kind == MoEActivationKind::kSiLU)
         {
             launchMoeW4A16DownGemvTemplated<256, MoEActivationKind::kSiLU>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         else
         {
             launchMoeW4A16DownGemvTemplated<256, MoEActivationKind::kReLU2>(batch, seq_len, hidden_dim, inter_dim,
-                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, output, stream);
+                hidden_chunks, num_experts, top_k, expert_ids, topk_weights, inter_in, down, down_decode_sf, output,
+                stream);
         }
         break;
     default: assert(false && "unsupported thread_block_size"); break;

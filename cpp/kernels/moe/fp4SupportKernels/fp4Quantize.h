@@ -30,7 +30,11 @@ namespace kernel
 /// SM100+: hardware E2M1 conversion. Pre-SM100: software fallback.
 /// input shape [M, N]: M must be multiple of 128, N must be multiple of 16.
 /// input dataType must be kBF16 or kHALF.
-void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSFInv, rt::Tensor& outputFP4, rt::Tensor& outputSF,
+///
+/// \c globalSF is the forward-direction activation global scale (e.g. `max|x|/(448*6)`);
+/// the reciprocal consumed by the FP4 mapping is computed inside the kernel via a single
+/// IEEE divide per thread.
+void fp4Quantize(rt::Tensor const& input, rt::Tensor const& globalSF, rt::Tensor& outputFP4, rt::Tensor& outputSF,
     cudaStream_t stream);
 
 } // namespace kernel

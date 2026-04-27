@@ -14,23 +14,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AOT export script for the contiguous grouped GEMM kernel (FC1).
+"""AOT export script for the N-major contiguous grouped GEMM kernel (FC1).
 
-Exports ``BlockScaledContiguousGroupedGemmKernel.wrapper`` which uses
-pointer + scalar arguments.  The wrapper creates CuTe tensors with the
-correct layouts inside the JIT context.
+Exports ``BlockScaledContiguousGroupedGemmNMajorKernel.wrapper`` with
+9 pointers + 5 int64 + stream. Weight B bytes arrive in ``[L, K, N/2]``
+(N innermost) — what the plugin's ``populate_prefill_plugin_buffers``
+emits for ``fc_up_qweights``. The kernel performs an in-flight SMEM
+nibble transpose so ``tcgen05.mma`` still sees a K-major B operand.
 
-Unlike the original bucketed grouped GEMM that needs 16 variants
-(8 buckets x 2 N-tiles), the contiguous kernel uses runtime lookup tables
-and only needs **2 variants** per activation (n128, n256).
+The kernel is compiled with ``raster_along_m=False`` (Thor-opt Phase-1
+scheduling): the persistent tile scheduler walks N-first within each
+M-tile, which gives ~2x FC1 speedup at Qwen3 SwiGLU T>=2048 EP=1 and
+near-parity with the K-major path at Nemotron. This matches the
+upstream ``cutedsl-nvfp4-moe`` repo's AOT exports, which now compile
+only this scheduling variant.
+
+Variant names: ``nvfp4_moe_fc1_{relu2,swiglu}_n{128,256}_{bf16,fp16}``.
 
 Usage (from kernelSrcs/):
     python nvfp4_moe_cutedsl/export_fc1_kernel.py \
-        --activation identity \
+        --activation relu2 \
         --mma_tiler_n 128 \
+        --output_dtype bf16 \
         --output_dir /tmp/staging \
-        --file_name nvfp4_moe_fc1_identity_n128 \
-        --function_prefix nvfp4_moe_fc1_identity_n128
+        --file_name nvfp4_moe_fc1_relu2_n128_bf16 \
+        --function_prefix nvfp4_moe_fc1_relu2_n128_bf16
 
 Usage (invoked by build_cutedsl.py — PYTHONPATH set automatically).
 """
@@ -43,15 +51,15 @@ import cupy as cp
 
 
 def export_contiguous_gemm_variant(args):
-    """Export a single contiguous grouped GEMM kernel variant."""
+    """Export a single N-major contiguous grouped GEMM kernel variant."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
 
-    from blockscaled_contiguous_grouped_gemm import (
-        BlockScaledContiguousGroupedGemmKernel,
+    from blockscaled_contiguous_grouped_gemm_n_major import (
+        BlockScaledContiguousGroupedGemmNMajorKernel,
     )
-    from common import create_dummy_pointers, get_max_active_clusters
+    from common import create_dummy_pointers, get_max_active_clusters, resolve_out_dtype
 
     cp.cuda.Device(0).use()
 
@@ -59,17 +67,19 @@ def export_contiguous_gemm_variant(args):
     mma_tiler_mn = (128, args.mma_tiler_n)
     cluster_shape_mn = (1, 1)
     activation = args.activation
+    out_dtype = resolve_out_dtype(args.output_dtype)
     verbose = getattr(args, "verbose", False)
 
-    print(f"Contiguous GEMM variant: activation={activation}, "
-          f"mma_tiler_mn={mma_tiler_mn}")
+    print(f"N-major contiguous GEMM variant: activation={activation}, "
+          f"mma_tiler_mn={mma_tiler_mn}, output_dtype={args.output_dtype}")
 
-    gemm = BlockScaledContiguousGroupedGemmKernel(
+    # Thor-opt: walk N-first within each M-tile. See module docstring.
+    gemm = BlockScaledContiguousGroupedGemmNMajorKernel(
         sf_vec_size=sf_vec_size,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
         activation=activation,
-        raster_along_m=True,
+        raster_along_m=False,
     )
 
     max_active_clusters = get_max_active_clusters(
@@ -83,7 +93,8 @@ def export_contiguous_gemm_variant(args):
     ptrs, _bufs = create_dummy_pointers(
         sf_vec_size=sf_vec_size,
         dummy_m=128, dummy_n=dummy_n, dummy_k=2688, dummy_l=16,
-        is_swiglu=is_swiglu)
+        is_swiglu=is_swiglu,
+        out_dtype=out_dtype)
 
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
@@ -151,6 +162,11 @@ def main():
         "--mma_tiler_n", type=int, required=True,
         choices=[128, 256],
         help="N-tile size for MMA (128 or 256)"
+    )
+    parser.add_argument(
+        "--output_dtype", type=str, default="bf16",
+        choices=["bf16", "fp16"],
+        help="Output element type (default: bf16)"
     )
     parser.add_argument(
         "--output_dir", type=str, required=True,

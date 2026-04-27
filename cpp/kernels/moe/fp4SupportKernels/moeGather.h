@@ -36,12 +36,15 @@ namespace kernel
 /// @param dstFP4       Packed FP4 output data (viewed as int32_t*)
 /// @param srcSF        Atom-layout SF buffer (source, viewed as int32_t*)
 /// @param dstSF        Atom-layout SF buffer (dest, viewed as int32_t*, must be pre-zeroed)
-/// @param permuteMap   [permutedM] INT32 permutation map (-1 = padding)
+/// @param permuteMap   INT32 permutation map (-1 = padding). May be sized
+///                     larger than \p permutedM; only the first \p permutedM
+///                     entries are read.
+/// @param permutedM    Number of dst rows to process (must fit dst buffer shape)
 /// @param topK         Experts per token
 /// @param hiddenSize   Hidden dimension K
 /// @param stream       CUDA stream
 void launchMoeGather(rt::Tensor const& srcFP4, rt::Tensor& dstFP4, rt::Tensor const& srcSF, rt::Tensor& dstSF,
-    rt::Tensor const& permuteMap, int32_t topK, int32_t hiddenSize, cudaStream_t stream);
+    rt::Tensor const& permuteMap, int32_t permutedM, int32_t topK, int32_t hiddenSize, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

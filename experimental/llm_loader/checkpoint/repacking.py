@@ -35,8 +35,10 @@ __all__ = [
     "repack_awq_to_plugin",
     "repack_gptq_to_plugin",
     "decode_modelopt_nvfp4",
-    "repack_nvfp4_expert_up_to_marlin",
-    "repack_nvfp4_expert_down_to_marlin",
+    "repack_nvfp4_expert_up",
+    "repack_nvfp4_expert_down",
+    "repack_nvfp4_expert_up_prefill_raw",
+    "repack_nvfp4_expert_down_prefill_raw",
 ]
 
 # ---------------------------------------------------------------------------
@@ -635,128 +637,306 @@ def decode_modelopt_nvfp4(
 
 
 def _atom_sf_offsets(M: int, num_sf_cols: int) -> np.ndarray:
-    """Byte offsets for the 128x4 atom-layout scale-factor swizzle.
-
-    Returns an ``[M, num_sf_cols]`` int64 array into the flat per-expert scale
-    buffer.  Matches ``MarlinConverter.atom_sf_offset`` in
-    ``tensorrt_edgellm/llm_models/marlin_converter.py``.
-    """
-    m_idx = np.arange(M, dtype=np.int64)[:, None]
-    k_idx = np.arange(num_sf_cols, dtype=np.int64)[None, :]
-    inner_k = k_idx % 4
-    inner_m = (m_idx % 128) // 32
-    outer_m = m_idx % 32
-    k_tile = k_idx // 4
+    """Byte offsets for the 128x4 atom-layout scale-factor swizzle; matches ``MarlinConverter.atom_sf_offset``."""
+    m = np.arange(M, dtype=np.int64)[:, None]
+    k = np.arange(num_sf_cols, dtype=np.int64)[None, :]
     num_k_tiles = (num_sf_cols + 3) // 4
-    m_tile = m_idx // 128
-    return (m_tile * num_k_tiles * 512 + k_tile * 512 + outer_m * 16 +
-            inner_m * 4 + inner_k)
+    return (m // 128 * num_k_tiles * 512 + k // 4 * 512 + m % 32 * 16 +
+            (m % 128) // 32 * 4 + k % 4)
 
 
-def _pack_marlin_tiles(
-    w_ah: np.ndarray,
-    s_max_ex: float,
-    n_chunks: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Marlin tile-pack one ``[A, B]`` fp32 matrix (``B == n_chunks * 64``) to ``(payload_i8 [A, n_chunks, 32], block_scale_u8 [A, 4*n_chunks])``.
+def _nvfp4_pack_n_major(
+    dense_w_kn: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Pack one ``[K, N]`` dense weight to ``(weights_i8 [K, N//2], prefill_sf_i8 [padUp(N,128), padUp(K//16,4)], decode_sf_i8 [K//16, N], global_scale_f32)`` — N-major NVFP4 layout.
 
-    The B axis is split into ``n_chunks`` 64-lane tiles, each further split
-    into 4 sub-groups of 16 lanes sharing an FP8 E4M3 block scale.  Sub-group
-    scales pass through the Marlin ``f16 → f8`` bit projection (``(fp16 << 1)
-    >> 8`` top byte); values off the reachable manifold snap (e.g. ``100 → 96``).
-    Scales are returned in natural sub-group order; the caller scatters them
-    into the atom-layout buffer via :func:`_atom_sf_offsets`.
+    Scheme-B per-``(k//16, n)`` block scales. Prefill SF is the 128×4 atom-layout
+    swizzle (M=N, K=K/16) with raw IEEE FP8 E4M3 bytes; M / K_sf are padded to
+    128 / 4 so the last partial atom tile is fully addressable. Decode SF is
+    row-major ``[K/16, N]`` FP16→FP8 Marlin-projected bytes. Global scale is ``s_max/448``.
     """
-    A, B = w_ah.shape
-    if B != n_chunks * 64:
-        raise ValueError(f"B ({B}) must equal n_chunks ({n_chunks}) * 64")
-
-    w_tiles = w_ah.reshape(A, n_chunks, 4, 16)
-
-    group_max = np.abs(w_tiles).max(axis=-1)
-    group_scales = np.maximum(group_max / 6.0, 1e-12)
-    w_scaled = (w_tiles / group_scales[..., np.newaxis]).clip(-6.0, 6.0)
-
-    x_abs = np.abs(w_scaled)
-    best_idx = np.searchsorted(_E2M1_BOUNDS, x_abs).astype(np.uint8)
-    sign_bits = (w_scaled < 0).astype(np.uint8) << np.uint8(3)
-    nibbles = (best_idx | sign_bits).reshape(A, n_chunks, 64)
-
-    lo = nibbles[..., ::2] & np.uint8(0xF)
-    hi = nibbles[..., 1::2] & np.uint8(0xF)
-    payload_i8 = (lo | (hi << np.uint8(4))).astype(np.uint8).view(np.int8)
-
-    scales_norm = (group_scales / s_max_ex * _FP8_MAX).astype(np.float16)
-    # FP16 → FP8 E4M3: shift left 1 to drop sign, take upper byte.
-    h16 = scales_norm.view(np.uint16).astype(np.uint32)
-    fp8_bytes = ((
-        (h16 << np.uint32(1)) & np.uint32(0xFF00)) >> np.uint32(8)).astype(
-            np.uint8)  # [A, n_chunks, 4]
-    # Flatten sub-group axis so output is [A, num_sf_cols=4*n_chunks].
-    block_scale_u8 = fp8_bytes.reshape(A, 4 * n_chunks)
-
-    return payload_i8, block_scale_u8
-
-
-def _scatter_atom_layout(block_scale_mk: np.ndarray,
-                         total_bytes: int) -> np.ndarray:
-    """Scatter a natural-order ``[M, num_sf_cols]`` uint8 plane into a flat atom-layout byte buffer of ``total_bytes`` bytes."""
-    M, num_sf_cols = block_scale_mk.shape
-    flat = np.zeros(total_bytes, dtype=np.uint8)
-    offsets = _atom_sf_offsets(M, num_sf_cols)
-    if offsets.max() >= total_bytes:
+    K, N = dense_w_kn.shape
+    if K % 16 or N % 2:
         raise ValueError(
-            f"atom-layout offset {int(offsets.max())} exceeds buffer "
-            f"{total_bytes} bytes (M={M}, num_sf_cols={num_sf_cols})")
-    flat[offsets] = block_scale_mk
-    return flat
+            f"K ({K}) must be a multiple of 16; N ({N}) must be even")
+    w = np.ascontiguousarray(dense_w_kn, dtype=np.float32)
+
+    K_sf = K // 16
+    group_max = np.abs(w.reshape(K_sf, 16, N)).max(axis=1)
+    group_scales = np.maximum(group_max / 6.0, 1e-12)
+    s_max = max(float(np.abs(w).max()) / 6.0, 1e-12)
+
+    w_scaled = (w / np.repeat(group_scales, 16, axis=0)).clip(-6.0, 6.0)
+    abs_idx = np.searchsorted(_E2M1_BOUNDS, np.abs(w_scaled)).astype(np.uint8)
+    sign_bit = (w_scaled < 0).astype(np.uint8) << np.uint8(3)
+    nibbles = (abs_idx | sign_bit) & np.uint8(0xF)
+
+    # byte[k, j] = nibble[k, 2j] | (nibble[k, 2j+1] << 4)
+    lo = nibbles[:, 0::2]
+    hi = nibbles[:, 1::2]
+    weights_int8 = (lo | (hi << np.uint8(4))).astype(np.uint8).view(
+        np.int8).reshape(K, N // 2).copy()
+
+    sf_targets = (group_scales / s_max * _FP8_MAX).astype(np.float32)
+    sf_fp8_nk = torch.from_numpy(sf_targets.T.copy()).to(
+        torch.float8_e4m3fn).view(torch.uint8).numpy()
+    padded_N = ((N + 127) // 128) * 128
+    padded_K_sf = ((K_sf + 3) // 4) * 4
+    prefill_flat = np.zeros(padded_N * padded_K_sf, dtype=np.uint8)
+    prefill_flat[_atom_sf_offsets(N, K_sf)] = sf_fp8_nk
+    prefill_sf = prefill_flat.view(np.int8).reshape(padded_N,
+                                                    padded_K_sf).copy()
+
+    h16 = sf_targets.astype(np.float16).view(np.uint16).astype(np.uint32)
+    decode_sf = (((
+        (h16 << np.uint32(1)) & np.uint32(0xFF00)) >> np.uint32(8)).astype(
+            np.uint8).view(np.int8).reshape(K_sf, N).copy())
+
+    return weights_int8, prefill_sf, decode_sf, float(s_max / _FP8_MAX)
 
 
-def repack_nvfp4_expert_up_to_marlin(
-    dense_w_hi: np.ndarray, ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Pack dense up_proj weight ``[H, I]`` fp32 to ``(weights_i8 [H//2, I], block_scale_i8 [paddedMSfRows, I], global_scale_f32)``.
+def repack_nvfp4_expert_up(
+    dense_w_hi: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Pack dense up_proj ``[H, I]`` to ``(weights [H, I/2], prefill_sf [padUp(I, 128), padUp(H/16, 4)], decode_sf [H/16, I], global_scale)``."""
+    return _nvfp4_pack_n_major(dense_w_hi)
 
-    ``dense_w_hi`` uses the old-pipeline ``[H, I]`` convention — the transpose
-    of PyTorch's ``weight[out=I, in=H]``.  ``block_scale`` bytes are the
-    atom-layout swizzle (M=H, K_sf=I/16, M padded to 128), viewed as
-    ``[paddedMSfRows = ceil(H/128)*8, I]`` to match ``Nvfp4MoePlugin``.
+
+def repack_nvfp4_expert_down(
+    dense_w_ih: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Pack dense down_proj ``[I, H]`` to ``(weights [I, H/2], prefill_sf [padUp(H, 128), padUp(I/16, 4)], decode_sf [I/16, H], global_scale)``."""
+    return _nvfp4_pack_n_major(dense_w_ih)
+
+
+# ---------------------------------------------------------------------------
+# Raw-aligned prefill repack (layout-only, matches vLLM's weight-scale handling)
+# ---------------------------------------------------------------------------
+#
+# The functions below produce the **prefill-path** plugin buffers
+# (``fc_up_qweights`` / ``fc_up_blocks_scale`` / ``fc_up_global_scale`` and the
+# symmetric down variants) by applying a pure layout transform to the raw
+# ModelOpt checkpoint tensors — no dequantize/requantize round-trip. This
+# matches vLLM's approach (see ``swizzle_blockscale`` in
+# ``vllm/model_executor/layers/quantization/utils/nvfp4_utils.py``): preserve
+# the checkpoint FP4 weight nibbles, FP8 E4M3 block scales, and FP32
+# ``weight_scale_2`` bit-exact; change only the on-device layout to what the
+# kernel expects.
+#
+# The decode-path SF (``fc_*_blocks_scale_decode``) is a separate buffer and is
+# still produced by the dequant-then-requant path — see ``_nvfp4_pack_n_major``.
+
+
+def _nibble_transpose_fp4(w_kmajor: np.ndarray) -> np.ndarray:
+    """Transpose packed FP4 weights from K-major to N-major, bit-exact.
+
+    Input ``w_kmajor`` has shape ``[out, in/2]`` (in innermost) with the byte
+    convention ``byte[o, j] = fp4[o, 2j] | (fp4[o, 2j+1] << 4)`` — ModelOpt's
+    checkpoint layout (also used by :func:`decode_modelopt_nvfp4`).
+
+    Output has shape ``[in, out/2]`` (out innermost) using the same packing
+    convention on the swapped axes. Every FP4 nibble is preserved; no
+    dequant/requant.
     """
-    H, I = dense_w_hi.shape
-    if H % 64 or I % 64:
-        raise ValueError(f"H ({H}) and I ({I}) must both be multiples of 64")
-    n_chunks = I // 64
-    s_max = max(float(np.abs(dense_w_hi).max()) / 6.0, 1e-12)
-    pl, bs_mk = _pack_marlin_tiles(np.ascontiguousarray(dense_w_hi), s_max,
-                                   n_chunks)
-    num_sf_cols = I // 16
-    padded_M = ((H + 127) // 128) * 128
-    padded_sf_cols = ((num_sf_cols + 3) // 4) * 4
-    flat = _scatter_atom_layout(bs_mk, padded_M * padded_sf_cols)
-    padded_M_sf_rows = ((H + 127) // 128) * 8
-    weights = pl.reshape(H // 2, I).copy()
-    block_scale = flat.view(np.int8).reshape(padded_M_sf_rows, I).copy()
-    return weights, block_scale, float(s_max / _FP8_MAX)
+    if w_kmajor.dtype == np.int8:
+        w = w_kmajor.view(np.uint8)
+    elif w_kmajor.dtype == np.uint8:
+        w = w_kmajor
+    else:
+        raise TypeError(f"unexpected weight dtype {w_kmajor.dtype}")
+    out_f, half_in = w.shape
+    in_f = half_in * 2
+    if out_f % 2 != 0:
+        raise ValueError(
+            f"out ({out_f}) must be even for N-major nibble packing")
+    # Unpack K-major bytes -> [out, in] nibbles.
+    lo = w & np.uint8(0x0F)
+    hi = (w >> np.uint8(4)) & np.uint8(0x0F)
+    nibbles = np.empty((out_f, in_f), dtype=np.uint8)
+    nibbles[:, 0::2] = lo
+    nibbles[:, 1::2] = hi
+    # Transpose to [in, out], repack along out (innermost).
+    nibbles_t = np.ascontiguousarray(nibbles.T)  # shape [in, out]
+    lo_t = nibbles_t[:, 0::2]
+    hi_t = nibbles_t[:, 1::2]
+    packed = (lo_t | (hi_t << np.uint8(4))).astype(np.uint8)
+    return packed.view(np.int8).reshape(in_f, out_f // 2).copy()
 
 
-def repack_nvfp4_expert_down_to_marlin(
-    dense_w_ih: np.ndarray, ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Pack dense down_proj weight ``[I, H]`` fp32 to ``(weights_i8 [I, H//2], block_scale_i8 [padded_I, H//16], global_scale_f32)``.
+def _atom_swizzle_raw_sf(raw_sf_bytes: np.ndarray, M: int,
+                         K_sf: int) -> np.ndarray:
+    """Atom-layout (128×4) swizzle for raw FP8 block-scale bytes.
 
-    ``dense_w_ih`` uses the old-pipeline ``[I, H]`` convention.  ``block_scale``
-    is the atom-layout swizzle over (M=I, K_sf=H/16) with M padded up to a
-    multiple of 128.
+    Input ``raw_sf_bytes`` has shape ``[M, K_sf]`` uint8/int8 holding FP8 E4M3
+    bytes (per-(N, K-group) block scales from the checkpoint). Output is the
+    ``[padUp(M, 128), padUp(K_sf, 4)]`` int8 array with bytes placed at the
+    :func:`_atom_sf_offsets` positions — the same atom layout
+    :func:`_nvfp4_pack_n_major` emits for its prefill SF, and bit-identical to
+    vLLM's ``swizzle_blockscale`` permutation.
     """
-    I, H = dense_w_ih.shape
-    if H % 64 or I % 64:
-        raise ValueError(f"H ({H}) and I ({I}) must both be multiples of 64")
-    n_chunks = H // 64
-    s_max = max(float(np.abs(dense_w_ih).max()) / 6.0, 1e-12)
-    pl, bs_mk = _pack_marlin_tiles(np.ascontiguousarray(dense_w_ih), s_max,
-                                   n_chunks)
-    num_sf_cols = H // 16
-    padded_M = ((I + 127) // 128) * 128
-    padded_sf_cols = ((num_sf_cols + 3) // 4) * 4
-    flat = _scatter_atom_layout(bs_mk, padded_M * padded_sf_cols)
-    weights = pl.reshape(I, H // 2).copy()
-    block_scale = flat.view(np.int8).reshape(padded_M, padded_sf_cols).copy()
-    return weights, block_scale, float(s_max / _FP8_MAX)
+    if raw_sf_bytes.dtype == np.int8:
+        sf = raw_sf_bytes.view(np.uint8)
+    elif raw_sf_bytes.dtype == np.uint8:
+        sf = raw_sf_bytes
+    else:
+        raise TypeError(f"unexpected sf dtype {raw_sf_bytes.dtype}")
+    if sf.shape != (M, K_sf):
+        raise ValueError(f"raw sf shape {sf.shape} != ({M}, {K_sf})")
+    padded_M = ((M + 127) // 128) * 128
+    padded_K_sf = ((K_sf + 3) // 4) * 4
+    flat = np.zeros(padded_M * padded_K_sf, dtype=np.uint8)
+    # ``_atom_sf_offsets`` returns a 2-D ``[M, K_sf]`` index; assign the raw
+    # 2-D sf bytes directly so shapes broadcast correctly (mirrors
+    # ``_nvfp4_pack_n_major``'s scatter of ``sf_fp8_nk``).
+    flat[_atom_sf_offsets(M, K_sf)] = sf
+    return flat.view(np.int8).reshape(padded_M, padded_K_sf).copy()
+
+
+def _sf_bytes_from_checkpoint(raw_sf: torch.Tensor) -> np.ndarray:
+    """Extract raw FP8-E4M3 bytes from a checkpoint ``weight_scale`` tensor."""
+    if raw_sf.dtype == torch.float8_e4m3fn:
+        return raw_sf.detach().cpu().view(torch.uint8).numpy()
+    if raw_sf.dtype == torch.int8:
+        return raw_sf.detach().cpu().view(torch.uint8).numpy()
+    if raw_sf.dtype in (torch.float32, torch.float16, torch.bfloat16):
+        # Float-cast fallback (non-ModelOpt checkpoints). Go through FP8 E4M3.
+        return raw_sf.detach().to(torch.float8_e4m3fn).cpu().view(
+            torch.uint8).numpy()
+    raise TypeError(f"unsupported weight_scale dtype {raw_sf.dtype}")
+
+
+def _marlin_project_raw_fp8(raw_sf_bytes: np.ndarray, out_f: int,
+                            K_sf: int) -> np.ndarray:
+    """Marlin (top-8-bit-of-FP16) projection applied to **raw** FP8 bytes.
+
+    ``_nvfp4_pack_n_major``'s decode SF is derived from the requantized
+    normalized ``sf_targets = group_scale / s_max * 448`` so that, at decode
+    runtime, ``marlin_unproject(byte) * (s_max/448)`` recovers the group
+    scale in real magnitude. When the weight global scale is instead the raw
+    checkpoint ``weight_scale_2``, the decode SF must be projected from the
+    raw FP8 values directly so that ``marlin_unproject(byte) * ws2_raw ≈
+    raw_fp8 * ws2_raw = group_scale`` — i.e. the per-expert global scale
+    agrees with both the prefill and decode SFB conventions.
+
+    Input bytes ``[out, K_sf]`` FP8 E4M3 bytes (checkpoint layout). Output
+    shape ``[K_sf, out]`` int8 (decode SF layout of :func:`_nvfp4_pack_n_major`).
+    """
+    if raw_sf_bytes.dtype == np.int8:
+        sf = raw_sf_bytes.view(np.uint8)
+    elif raw_sf_bytes.dtype == np.uint8:
+        sf = raw_sf_bytes
+    else:
+        raise TypeError(f"unexpected sf dtype {raw_sf_bytes.dtype}")
+    if sf.shape != (out_f, K_sf):
+        raise ValueError(f"sf shape {sf.shape} != ({out_f}, {K_sf})")
+    # FP8 E4M3 -> FP32 (lossless cast).
+    sf_fp32 = torch.from_numpy(sf.copy()).view(torch.float8_e4m3fn).to(
+        torch.float32).numpy()
+    # Transpose to [K_sf, out] to match the decode SF layout.
+    sf_fp32_kn = np.ascontiguousarray(sf_fp32.T)
+    # FP16 top-8-bit projection, identical to _nvfp4_pack_n_major's decode
+    # path (applied here to raw FP8 values rather than to re-normalised
+    # sf_targets).
+    h16 = sf_fp32_kn.astype(np.float16).view(np.uint16).astype(np.uint32)
+    return (((
+        (h16 << np.uint32(1)) & np.uint32(0xFF00)) >> np.uint32(8)).astype(
+            np.uint8).view(np.int8).reshape(K_sf, out_f).copy())
+
+
+def _pack_nvfp4_raw_n_major(
+    raw_weight: torch.Tensor,
+    raw_sf_fp8: torch.Tensor,
+    raw_ws2: torch.Tensor,
+    out_f: int,
+    in_f: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Layout-only repack of raw ModelOpt NVFP4 tensors to N-major plugin layout.
+
+    Produces **both** the prefill and the decode SF buffers from the **same**
+    raw checkpoint FP8 block scales + per-tensor ``weight_scale_2``. No
+    dequantize/requantize round-trip; every FP4 nibble and every FP8 block-
+    scale byte is preserved from the checkpoint.
+
+    The prefill SF is 128×4 atom-swizzled; the decode SF is FP16-top-8-bit
+    Marlin-projected from the same raw FP8 bytes (not from the requant-
+    normalised ``sf_targets`` that :func:`_nvfp4_pack_n_major` uses). With the
+    per-expert global scale set to the checkpoint's ``weight_scale_2``, both
+    the prefill kernel (``fp4 × prefill_sfb × ws2``) and the decode kernel
+    (``fp4 × marlin_unproject(decode_sfb) × ws2``) recover the same real
+    group scale ``raw_fp8 × ws2`` — guaranteeing prefill/decode consistency.
+
+    :param raw_weight: checkpoint ``weight``, shape ``[out, in/2]`` uint8/int8
+        (two FP4 nibbles per byte along ``in``).
+    :param raw_sf_fp8: checkpoint ``weight_scale``, shape ``[out, in/16]``
+        FP8-E4M3 (or an ``int8`` / float cast of the same).
+    :param raw_ws2: checkpoint ``weight_scale_2`` scalar FP32 (``[1]`` tensor).
+    :param out_f: output dimension.
+    :param in_f: input dimension; must be a multiple of 16.
+    :return: ``(weights_i8 [in, out/2],
+              prefill_sf_i8 [padUp(out,128), padUp(in/16,4)],
+              decode_sf_i8 [in/16, out],
+              global_scale)``.
+    """
+    if in_f % 16 != 0 or out_f % 2 != 0:
+        raise ValueError(
+            f"in ({in_f}) must be multiple of 16; out ({out_f}) must be even")
+    if tuple(raw_weight.shape) != (out_f, in_f // 2):
+        raise ValueError(f"raw_weight shape {tuple(raw_weight.shape)} != "
+                         f"({out_f}, {in_f // 2})")
+    if tuple(raw_sf_fp8.shape) != (out_f, in_f // 16):
+        raise ValueError(f"raw_sf_fp8 shape {tuple(raw_sf_fp8.shape)} != "
+                         f"({out_f}, {in_f // 16})")
+
+    w_bytes = raw_weight.detach().cpu().numpy()
+    weights_int8 = _nibble_transpose_fp4(w_bytes)
+
+    sf_bytes = _sf_bytes_from_checkpoint(raw_sf_fp8)
+    prefill_sf = _atom_swizzle_raw_sf(sf_bytes, out_f, in_f // 16)
+    decode_sf = _marlin_project_raw_fp8(sf_bytes, out_f, in_f // 16)
+
+    ws2 = float(raw_ws2.detach().reshape(-1)[0].item())
+    return weights_int8, prefill_sf, decode_sf, ws2
+
+
+def repack_nvfp4_expert_up_prefill_raw(
+    raw_weight: torch.Tensor,
+    raw_sf_fp8: torch.Tensor,
+    raw_ws2: torch.Tensor,
+    hidden_size: int,
+    moe_inter_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Raw-aligned ``up_proj`` repack: checkpoint ``[I, H/2]`` → plugin ``[H, I/2]``.
+
+    Returns ``(weights, prefill_sf, decode_sf, global_scale)`` where both SF
+    buffers come from the **same** raw FP8 block scales (different layouts:
+    prefill is atom-swizzled; decode is Marlin FP16-top-8-bit projected).
+    See :func:`_pack_nvfp4_raw_n_major` for semantics.
+    """
+    return _pack_nvfp4_raw_n_major(
+        raw_weight,
+        raw_sf_fp8,
+        raw_ws2,
+        out_f=moe_inter_size,
+        in_f=hidden_size,
+    )
+
+
+def repack_nvfp4_expert_down_prefill_raw(
+    raw_weight: torch.Tensor,
+    raw_sf_fp8: torch.Tensor,
+    raw_ws2: torch.Tensor,
+    hidden_size: int,
+    moe_inter_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Raw-aligned ``down_proj`` repack: checkpoint ``[H, I/2]`` → plugin ``[I, H/2]``.
+
+    Returns ``(weights, prefill_sf, decode_sf, global_scale)``; both SF buffers
+    come from the **same** raw FP8 block scales. See :func:`_pack_nvfp4_raw_n_major`.
+    """
+    return _pack_nvfp4_raw_n_major(
+        raw_weight,
+        raw_sf_fp8,
+        raw_ws2,
+        out_f=hidden_size,
+        in_f=moe_inter_size,
+    )
