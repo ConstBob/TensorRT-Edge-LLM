@@ -360,8 +360,8 @@ __global__ void compactKVCacheBatchedKernel(KVLayerInfo const* __restrict__ laye
 }
 
 void compactKVCacheBatched(KVLayerInfo const* layerInfos, rt::Tensor const& batchMapping,
-    rt::Tensor const& kvCacheLengths, int32_t numLayers, int32_t headDim, int32_t maxKVHeads, int32_t maxBatchSize,
-    int32_t oldActiveBatch, int32_t newActiveBatch, cudaStream_t stream)
+    rt::Tensor const& kvCacheLengths, int32_t numLayers, int32_t headDim, nvinfer1::DataType kvCacheType,
+    int32_t maxKVHeads, int32_t maxBatchSize, int32_t oldActiveBatch, int32_t newActiveBatch, cudaStream_t stream)
 {
     if (oldActiveBatch == newActiveBatch || numLayers == 0)
     {
@@ -375,28 +375,57 @@ void compactKVCacheBatched(KVLayerInfo const* layerInfos, rt::Tensor const& batc
     int32_t const* batchMappingPtr = batchMapping.dataPointer<int32_t>();
     int32_t const* srcKVLengthsPtr = kvCacheLengths.dataPointer<int32_t>();
 
-    switch (headDim)
+    // Dispatch on (kvCacheType, headDim).
+    //
+    // The kernel template parameter T controls pointer arithmetic and vectorised load/store size.
+    // Using the wrong T for a given buffer dtype doubles (or halves) all computed byte offsets,
+    // causing out-of-bounds accesses.  KV caches can be either FP16 (2 bytes) or FP8 (1 byte).
+    //
+    //   kHALF → T = half     (DVec<half>    : vec_size=8,  16 bytes per load)
+    //   kFP8  → T = uint8_t  (DVec<uint8_t> : vec_size=16, 16 bytes per load)
+    //
+    // uint8_t is used for FP8 because it has the correct element size (1 byte) and is a plain
+    // POD type, which avoids FP8 hardware requirements while keeping memcpy semantics correct.
+
+#define LAUNCH_COMPACT_KV_KERNEL(T)                                                                                    \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        switch (headDim)                                                                                               \
+        {                                                                                                              \
+        case 64:                                                                                                       \
+            compactKVCacheBatchedKernel<T, 64><<<grid, block, 0, stream>>>(                                            \
+                layerInfos, batchMappingPtr, srcKVLengthsPtr, maxBatchSize, oldActiveBatch);                           \
+            break;                                                                                                     \
+        case 128:                                                                                                      \
+            compactKVCacheBatchedKernel<T, 128><<<grid, block, 0, stream>>>(                                           \
+                layerInfos, batchMappingPtr, srcKVLengthsPtr, maxBatchSize, oldActiveBatch);                           \
+            break;                                                                                                     \
+        case 256:                                                                                                      \
+            compactKVCacheBatchedKernel<T, 256><<<grid, block, 0, stream>>>(                                           \
+                layerInfos, batchMappingPtr, srcKVLengthsPtr, maxBatchSize, oldActiveBatch);                           \
+            break;                                                                                                     \
+        case 512:                                                                                                      \
+            compactKVCacheBatchedKernel<T, 512><<<grid, block, 0, stream>>>(                                           \
+                layerInfos, batchMappingPtr, srcKVLengthsPtr, maxBatchSize, oldActiveBatch);                           \
+            break;                                                                                                     \
+        default:                                                                                                       \
+            throw std::invalid_argument(                                                                               \
+                format::fmtstr("compactKVCacheBatched: Unsupported headDim=%d. Only 64, 128, 256, or 512.", headDim)); \
+        }                                                                                                              \
+    } while (0)
+
+    switch (kvCacheType)
     {
-    case 64:
-        compactKVCacheBatchedKernel<half, 64>
-            <<<grid, block, 0, stream>>>(layerInfos, batchMappingPtr, srcKVLengthsPtr, maxBatchSize, oldActiveBatch);
-        break;
-    case 128:
-        compactKVCacheBatchedKernel<half, 128>
-            <<<grid, block, 0, stream>>>(layerInfos, batchMappingPtr, srcKVLengthsPtr, maxBatchSize, oldActiveBatch);
-        break;
-    case 256:
-        compactKVCacheBatchedKernel<half, 256>
-            <<<grid, block, 0, stream>>>(layerInfos, batchMappingPtr, srcKVLengthsPtr, maxBatchSize, oldActiveBatch);
-        break;
-    case 512:
-        compactKVCacheBatchedKernel<half, 512>
-            <<<grid, block, 0, stream>>>(layerInfos, batchMappingPtr, srcKVLengthsPtr, maxBatchSize, oldActiveBatch);
-        break;
+    case nvinfer1::DataType::kHALF: LAUNCH_COMPACT_KV_KERNEL(half); break;
+    case nvinfer1::DataType::kFP8: LAUNCH_COMPACT_KV_KERNEL(uint8_t); break;
     default:
         throw std::invalid_argument(
-            format::fmtstr("compactKVCacheBatched: Unsupported headDim=%d. Only 64, 128, 256, or 512.", headDim));
+            format::fmtstr("compactKVCacheBatched: Unsupported kvCacheType=%d. Only kHALF and kFP8 are supported.",
+                static_cast<int>(kvCacheType)));
     }
+
+#undef LAUNCH_COMPACT_KV_KERNEL
+
     CUDA_CHECK(cudaGetLastError());
 }
 
