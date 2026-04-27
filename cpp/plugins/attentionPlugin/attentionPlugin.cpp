@@ -144,6 +144,40 @@ AttentionExecutionMode deduceModeTreeAttention(
     return AttentionExecutionMode::kINVALID;
 }
 
+bool loadFMHAKernels(bool& useCuteDslFMHA, int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
+{
+    bool canImplementFMHA = false;
+#ifdef CUTE_DSL_FMHA_ENABLED
+    if (useCuteDslFMHA)
+    {
+        if (CuteDslFMHARunner::canImplement(headSize, smVersion) && CuteDslFMHARunner::loadLLMKernelModule())
+        {
+            canImplementFMHA = true;
+            LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", smVersion);
+        }
+        else
+        {
+            LOG_DEBUG("CuTe DSL FMHA not available (headSize=%d, SM%d), falling back to FMHA_v2", headSize, smVersion);
+            useCuteDslFMHA = false;
+        }
+    }
+    if (!useCuteDslFMHA)
+#endif
+    {
+        canImplementFMHA = ContextFMHARunner::canImplement(
+            headSize, smVersion, dataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL);
+        if (canImplementFMHA)
+        {
+            if (!ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType))
+            {
+                LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", smVersion);
+                canImplementFMHA = false;
+            }
+        }
+    }
+    return canImplementFMHA;
+}
+
 } // namespace
 
 // Static class fields initialization
@@ -177,37 +211,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     LOG_DEBUG("AttentionPlugin FMHA path: %s, sliding_window: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2",
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
 
-    // Check FMHA implementation support and load the corresponding kernel module.
-    bool canImplementFMHA = false;
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (mUseCuteDslFMHA && CuteDslFMHARunner::canImplement(mHeadSize, mSMVersion))
-    {
-        if (CuteDslFMHARunner::loadLLMKernelModule())
-        {
-            canImplementFMHA = true;
-            LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", mSMVersion);
-        }
-        else
-        {
-            LOG_WARNING("CuTe DSL FMHA kernel failed to load, falling back to FMHA_v2");
-            mUseCuteDslFMHA = false;
-        }
-    }
-    if (!canImplementFMHA)
-#endif
-    {
-        // Fallback to FMHA_v2 cubins.
-        canImplementFMHA = ContextFMHARunner::canImplement(
-            mHeadSize, mSMVersion, mDataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL);
-        if (canImplementFMHA)
-        {
-            if (!ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType))
-            {
-                LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", mSMVersion);
-                canImplementFMHA = false;
-            }
-        }
-    }
+    bool const canImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType);
 
     // XQA decode kernels are always needed regardless of FMHA path.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
@@ -270,24 +274,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data,
 
     LOG_DEBUG("AttentionPlugin FMHA path: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2");
 
-    // Load FMHA kernel module based on implementation support.
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (mUseCuteDslFMHA && CuteDslFMHARunner::canImplement(mHeadSize, mSMVersion))
-    {
-        if (!CuteDslFMHARunner::loadLLMKernelModule())
-        {
-            LOG_WARNING("CuTe DSL FMHA kernel failed to load, falling back to FMHA_v2");
-            mUseCuteDslFMHA = false;
-        }
-    }
-    if (!mUseCuteDslFMHA)
-#endif
-    {
-        if (!ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType))
-        {
-            LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", mSMVersion);
-        }
-    }
+    loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType);
 
     // XQA decode kernels are always needed regardless of FMHA path.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
