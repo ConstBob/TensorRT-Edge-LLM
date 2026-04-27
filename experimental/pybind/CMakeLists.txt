@@ -96,10 +96,12 @@ if(_PYBIND_STANDALONE)
 else()
   # ── Subdirectory: use cmake targets from the parent build ───────────────
   # edgellmCore and edgellmBuilder are already cmake targets. Tokenizer sources
-  # are compiled into edgellmCore. CUDA and TRT variables are inherited from the
-  # parent scope.
+  # are compiled into edgellmCore. CUDA and TRT targets/variables are inherited
+  # from the parent scope (FindTensorRT.cmake creates TensorRT::TensorRT and
+  # TensorRT::OnnxParser; CUDA variables come from the parent find_library
+  # calls).
   set(CUDA_INCLUDE ${CUDA_INCLUDE_DIR})
-  set(TRT_INCLUDE_DIR ${TRT_INCLUDE_DIR})
+  set(TRT_INCLUDE_DIR ${TensorRT_INCLUDE_DIR})
 endif()
 
 # ── pybind11 ──────────────────────────────────────────────────────────────
@@ -167,14 +169,18 @@ if(_PYBIND_STANDALONE)
             ${CUDA_DRIVER_LIB}
             ${CUDART_LIB})
 else()
+  # Subdirectory mode: TRT cmake targets are provided by FindTensorRT.cmake
+  # (find_package(TensorRT REQUIRED COMPONENTS OnnxParser) in the root
+  # CMakeLists.txt). Use them directly instead of the now-gone NVINFER_LIB /
+  # NV_ONNX_PARSER_LIB variables.
   target_link_libraries(
     _edgellm_runtime
     PRIVATE -Wl,--whole-archive
             edgellmCore
             -Wl,--no-whole-archive
             edgellmBuilder
-            ${NVINFER_LIB}
-            ${NV_ONNX_PARSER_LIB}
+            TensorRT::TensorRT
+            TensorRT::OnnxParser
             ${CUDA_DRIVER_LIB}
             ${CUDART_LIB})
 endif()
