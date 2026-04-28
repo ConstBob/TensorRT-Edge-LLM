@@ -31,7 +31,7 @@ from modelopt.torch.quantization.utils import is_quantized
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
-                          AutoTokenizer)
+                          AutoProcessor, AutoTokenizer)
 
 from .quantization_configs import build_quant_config
 
@@ -60,10 +60,17 @@ def _text_calib_dataloader(tokenizer,
 
 
 def _load_model(model_dir, dtype="fp16", device="cuda"):
-    """Load model + tokenizer via Auto* classes."""
+    """Load model + tokenizer + optional processor via Auto* classes."""
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
     tokenizer = AutoTokenizer.from_pretrained(model_dir,
                                               trust_remote_code=True)
+    try:
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  trust_remote_code=True,
+                                                  min_pixels=128 * 28 * 28,
+                                                  max_pixels=2048 * 32 * 32)
+    except Exception:
+        processor = None
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -87,7 +94,7 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    return model, tokenizer
+    return model, tokenizer, processor
 
 
 def _calibrate(model, dataloader):
@@ -109,7 +116,7 @@ def quantize_and_export(
 ) -> str:
     """Load a HuggingFace model, quantize it, and export a unified checkpoint."""
     t0 = time.time()
-    model, tokenizer = _load_model(model_dir, dtype, device)
+    model, tokenizer, processor = _load_model(model_dir, dtype, device)
 
     if is_quantized(model):
         print("Model already quantized — skipping.")
@@ -132,6 +139,8 @@ def quantize_and_export(
     with torch.inference_mode():
         export_hf_checkpoint(model, export_dir=output_dir)
     tokenizer.save_pretrained(output_dir)
+    if processor is not None:
+        processor.save_pretrained(output_dir)
 
     print(f"Saved to {output_dir} (total {time.time() - t0:.1f}s)")
     return output_dir
