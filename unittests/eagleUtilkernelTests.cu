@@ -1989,6 +1989,9 @@ __global__ void eagleBaseCommitKVCacheKernelLegacy(int32_t const* acceptedIndice
 
 TEST(EagleKernels, BenchmarkCommitKVCacheLegacyVsBatched)
 {
+#if !SUPPORTS_FP8
+    GTEST_SKIP() << "FP8 KV cache benchmark requires CUDA >= 11.8 (SUPPORTS_FP8=0).";
+#endif
     cudaStream_t stream = nullptr;
 
     // Realistic Qwen3-8B FP8-KV configuration on a single-batch decode iter.
