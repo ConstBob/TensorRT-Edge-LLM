@@ -232,13 +232,12 @@ def _extract_mel_parakeet(
 def save_audio_safetensors(
     mel: np.ndarray,
     output_path: str,
-    num_frames: int = None,
 ) -> None:
     """
     Save a mel-spectrogram to safetensors format (FP16) as required by the
     C++ audioRunner.
 
-    Saved tensors:
+    Saved tensor:
 
     - ``mel_spectrogram`` (float16): A leading batch dimension is added if
       the input is 2-D.
@@ -246,15 +245,10 @@ def save_audio_safetensors(
       - Whisper input ``[mel_bins, T]`` → ``[1, mel_bins, T]``
       - Parakeet input ``[T, mel_bins]`` → ``[1, T, mel_bins]``
 
-    - ``num_frames`` (int64, scalar): Number of valid (unpadded) time frames.
-      Allows the C++ runtime to reconstruct the attention mask without
-      storing a full boolean tensor.
 
     Args:
         mel: Mel-spectrogram, 2-D or 3-D float32 numpy array.
         output_path: Destination file path (should end with ``.safetensors``).
-        num_frames: Number of valid time frames.  When *None*, all frames
-            are assumed valid.
     """
     try:
         import torch
@@ -270,9 +264,6 @@ def save_audio_safetensors(
         "mel_spectrogram":
         torch.from_numpy(np.ascontiguousarray(mel)).to(torch.float16),
     }
-
-    if num_frames is not None:
-        tensors["num_frames"] = torch.tensor(num_frames, dtype=torch.int64)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     save_file(tensors, output_path)
@@ -311,7 +302,7 @@ def preprocess_single_audio(
           f"(range [{mel.min():.2f}, {mel.max():.2f}], "
           f"{num_frames} valid frames)")
 
-    save_audio_safetensors(mel, output_path, num_frames=num_frames)
+    save_audio_safetensors(mel, output_path)
     size_kb = os.path.getsize(output_path) / 1024
     print(f"  Saved: {output_path} ({size_kb:.1f} KB, fp16)")
 
