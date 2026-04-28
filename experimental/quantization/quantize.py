@@ -21,6 +21,7 @@ checkpoint consumable by ``llm_loader``.  No ``tensorrt_edgellm`` dependency.
 
 import os
 import time
+from contextlib import contextmanager
 from typing import Optional
 
 import modelopt.torch.quantization as mtq
@@ -96,6 +97,59 @@ def _calibrate(model, dataloader):
         model(data.to(model.device))
 
 
+def _is_hybrid_model(model):
+    """Return True if the model has hybrid Mamba+Attention layers.
+
+    Checks multiple signals: ``layers_block_type`` in config (NemotronH),
+    ``mamba_ssm_dtype`` in config (Qwen3.5), or ``linear_attn`` submodules.
+    """
+    config = model.config
+    if hasattr(config, "text_config"):
+        config = config.text_config
+    if getattr(config, "layers_block_type", None) is not None:
+        return True
+    if getattr(config, "mamba_ssm_dtype", None) is not None:
+        return True
+    if any("linear_attn" in n for n, _ in model.named_modules()):
+        return True
+    return False
+
+
+@contextmanager
+def _skip_resmooth_for_hybrid(model):
+    """WAR for ModelOpt resmoothing bug on hybrid Mamba+Attention models.
+
+    ``export_hf_checkpoint`` calls ``requantize_resmooth_fused_llm_layers``
+    which averages AWQ pre_quant_scales across all linear modules that share
+    the same input and re-quantizes their weights.  For hybrid models the
+    dummy forward used to detect shared inputs does not propagate through
+    Mamba layers correctly, and the Mamba projections (qkv, z, a, b) get
+    incorrectly fused — corrupting the int4 weights.
+
+    This context manager patches the resmoothing function to a no-op when the
+    model is a hybrid architecture.  Standard transformer models are
+    unaffected.
+
+    TODO: Remove once ModelOpt fixes hybrid model support upstream.
+    """
+    if not _is_hybrid_model(model):
+        yield
+        return
+
+    import modelopt.torch.export.unified_export_hf as _ueh
+    _orig = _ueh.requantize_resmooth_fused_llm_layers
+
+    def _noop(m):
+        print("[WAR] Skipping requantize_resmooth_fused_llm_layers "
+              "for hybrid model (ModelOpt bug workaround)")
+
+    _ueh.requantize_resmooth_fused_llm_layers = _noop
+    try:
+        yield
+    finally:
+        _ueh.requantize_resmooth_fused_llm_layers = _orig
+
+
 def quantize_and_export(
     model_dir: str,
     output_dir: str,
@@ -129,7 +183,7 @@ def quantize_and_export(
     print(f"Quantization: {time.time() - t0:.1f}s")
 
     os.makedirs(output_dir, exist_ok=True)
-    with torch.inference_mode():
+    with torch.inference_mode(), _skip_resmooth_for_hybrid(model):
         export_hf_checkpoint(model, export_dir=output_dir)
     tokenizer.save_pretrained(output_dir)
 
