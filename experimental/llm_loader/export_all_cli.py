@@ -57,6 +57,8 @@ import logging
 import os
 import sys
 
+from .checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s: %(message)s",
@@ -357,7 +359,8 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                          or config.get("rope_scaling")
                          or config.get("rope_parameters"))
         if _rope_scaling:
-            vis_cfg_out["rope_scaling"] = _rope_scaling
+            vis_cfg_out["rope_scaling"] = normalize_rope_scaling_for_runtime(
+                _rope_scaling)
         # Also copy preprocessor_config.json to the output dir so the runner
         # can find patch_size, temporal_patch_size, merge_size, image_mean, image_std.
         import shutil

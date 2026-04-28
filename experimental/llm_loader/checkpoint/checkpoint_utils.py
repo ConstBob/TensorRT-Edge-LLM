@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "RUNTIME_TOKENIZER_FILENAMES",
+    "normalize_rope_scaling_for_runtime",
     "load_checkpoint_config_dicts",
     "load_config_dict",
     "build_runtime_llm_config_dict",
@@ -46,6 +47,20 @@ RUNTIME_TOKENIZER_FILENAMES: Tuple[str, ...] = (
     "special_tokens_map.json",
     "processed_chat_template.json",
 )
+
+
+def normalize_rope_scaling_for_runtime(rope_scaling: Any) -> Any:
+    """Normalize HF MRoPE metadata to the shape expected by the C++ runtime."""
+    if not isinstance(rope_scaling, dict):
+        return rope_scaling
+
+    normalized = dict(rope_scaling)
+    if "mrope_section" in normalized:
+        rope_type = normalized.get("type") or normalized.get("rope_type")
+        if rope_type in (None, "default", "mrope"):
+            normalized["type"] = "default"
+            normalized["rope_type"] = "default"
+    return normalized
 
 
 def _nested_config_to_dict(sub: Any) -> Dict[str, Any]:
@@ -157,6 +172,9 @@ def load_checkpoint_config_dicts(
                 if rope:
                     llm["rope_scaling"] = rope
                     break
+    if llm.get("rope_scaling"):
+        llm["rope_scaling"] = normalize_rope_scaling_for_runtime(
+            llm["rope_scaling"])
 
     return root, llm
 
@@ -187,6 +205,7 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     """JSON object written as ``config.json`` beside the ONNX export."""
     config = model.config
     mc = config.mamba_cfg
+    rope_scaling = normalize_rope_scaling_for_runtime(config.rope_scaling)
 
     out: Dict[str, Any] = {
         "model": config.model_type,
@@ -202,14 +221,14 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         "head_dim": config.head_dim,
         "max_position_embeddings": config.max_position_embeddings,
         "rope_theta": config.rope_theta,
-        "rope_scaling": config.rope_scaling,
+        "rope_scaling": rope_scaling,
         "partial_rotary_factor": config.partial_rotary_factor,
         "num_deepstack_features": config.num_deepstack_features,
     }
 
     # longrope requires original_max_position_embeddings for scaling factor computation.
-    if (isinstance(config.rope_scaling, dict)
-            and config.rope_scaling.get("type") == "longrope"
+    if (isinstance(rope_scaling, dict)
+            and rope_scaling.get("type") == "longrope"
             and config.original_max_position_embeddings is not None):
         out["original_max_position_embeddings"] = config.original_max_position_embeddings
 
