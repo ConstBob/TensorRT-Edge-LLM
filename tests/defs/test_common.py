@@ -16,7 +16,6 @@
 
 import logging
 import os
-import shlex
 from typing import Optional
 
 import pytest
@@ -60,43 +59,13 @@ def test_build_project(env_config: EnvironmentConfig,
         cmake_cmd.append(
             '-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake')
 
-    # Enable CuteDSL kernels for Blackwell aarch64 targets (Qwen3.5 hybrid)
+    # Enable CuteDSL kernels for Blackwell aarch64 targets.
     if device_config.target in ['auto-thor', 'jetson-thor', 'gb10']:
+        # Prebuilt tarballs are committed in kernelSrcs/cuteDSLPrebuilt/.
+        # CMake auto-extracts them — no on-device build needed.
         cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
-
-        # Install python3-venv on the remote device if missing (device
-        # images may not include it).  Uses sudo with the board password,
-        # same pattern as device_init.sh.
-        if remote_config:
-            test_logger.info(
-                "Ensuring python3-venv is installed on remote device")
-            install_cmd = (f'echo {shlex.quote(remote_config.password)} | '
-                           'sudo -S apt-get install -y -qq python3.12-venv'
-                           ' >/dev/null 2>&1')
-            run_command(cmd=['bash', '-c', install_cmd],
-                        remote_config=remote_config,
-                        timeout=120,
-                        logger=None)
-
-        # CuteDSL artifacts are gitignored — create a venv under the
-        # workspace (venv/ is gitignored), install deps, and generate
-        # before cmake.  --arch aarch64 ensures artifacts land where
-        # the cmake toolchain expects them.
-        test_logger.info("Generating CuteDSL kernel artifacts (venv)")
-        cutedsl_cmd = (
-            'python3 -m venv venv/cutedsl'
-            ' && venv/cutedsl/bin/pip install -q'
-            ' nvidia-cutlass-dsl==4.4.1 cupy-cuda13x==13.6.0'
-            ' && venv/cutedsl/bin/python kernelSrcs/build_cutedsl.py'
-            ' --kernels gdn,ssd,fmha --arch aarch64')
-        with timer_context("CuteDSL kernel generation", test_logger):
-            result = run_command(cmd=['bash', '-c', cutedsl_cmd],
-                                 remote_config=remote_config,
-                                 timeout=600,
-                                 logger=test_logger)
-        if not result['success']:
-            pytest.fail("CuteDSL kernel generation failed: "
-                        f"{result.get('error', 'Unknown error')}")
+        test_logger.info(
+            "CuTe DSL: using prebuilt tarball (CMake auto-extracts)")
 
     build_cmd = ' && '.join([
         f'mkdir -p {build_dir}', f'cd {build_dir}', ' '.join(cmake_cmd),
