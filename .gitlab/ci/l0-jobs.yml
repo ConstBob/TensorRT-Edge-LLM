@@ -26,26 +26,6 @@ l0_ampere_model_export:
     - .l0_environment
   interruptible: true
 
-# Model export for Blackwell/Thor (fp8 or fp4)
-l0_blackwell_model_export:
-  stage: l0_test
-  variables:
-    CUDA_VERSION: "13.0"
-    IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
-    L0_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L0/MR_${CI_MERGE_REQUEST_IID}/${CI_PIPELINE_ID}"
-    TEST_CACHE_DIR: "$L0_CACHE_DIR/blackwell_model_export"
-    PRIORITY: l0_export_blackwell
-    ONNX_DIR: "$TEST_CACHE_DIR/onnx"
-    TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
-  tags:
-    - a30-edgellm-nvks
-  image: "$IMAGE"
-  extends:
-    - .export_onnx_template
-    - .l0_rules
-    - .l0_environment
-  interruptible: true
-
 # LLM Loader export for Blackwell pre-quantized models
 l0_llm_loader_export:
   stage: l0_test
@@ -195,7 +175,6 @@ l0_jetson_orin:
 l0_drive_thor_1:
   stage: l0_test
   needs:
-    - l0_blackwell_model_export
     - l0_llm_loader_export
   variables:
     BOARD_USER: "tensorrt_user"
@@ -250,7 +229,6 @@ l0_drive_thor_2:
 l0_jedha:
   stage: l0_test
   needs:
-    - l0_blackwell_model_export
     - l0_llm_loader_export
   variables:
     BOARD_USER: "tensorrt_user"

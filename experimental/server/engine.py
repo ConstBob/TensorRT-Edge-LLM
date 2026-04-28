@@ -53,7 +53,6 @@ _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
     "qwen3_5",
-    "qwen3_5_moe",
     "qwen2_5_vl",
     "internvl",
     "internvl_chat",

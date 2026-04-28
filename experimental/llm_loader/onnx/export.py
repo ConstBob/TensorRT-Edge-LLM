@@ -68,6 +68,7 @@ def export_onnx(
     model: CausalLM,
     output_path: str,
     model_dir: str = "",
+    fp8_embedding: bool = False,
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
@@ -80,13 +81,18 @@ def export_onnx(
         output_path: Destination ``.onnx`` file path.
         model_dir:   Checkpoint directory (for tokenizer file copying).
                      If empty, tokenizer files are skipped.
+        fp8_embedding: Quantize embedding.safetensors to FP8 E4M3 with
+                       per-row block scales.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
 
     _export_model(model, output_path)
-    write_runtime_artifacts(model, model_dir, out_dir)
+    write_runtime_artifacts(model,
+                            model_dir,
+                            out_dir,
+                            fp8_embedding=fp8_embedding)
 
 
 # ---------------------------------------------------------------------------

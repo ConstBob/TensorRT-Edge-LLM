@@ -1,4 +1,0 @@
-# L0 Export Tests - Blackwell model export (LoRA via old pipeline)
-tests:
-  # FP8 LLM with LoRA support (old pipeline - LoRA requires special ONNX export)
-  - tests/defs/test_model_export.py::test_llm_model_export[Qwen2.5-0.5B-Instruct-fp8-lora]

@@ -1,8 +1,8 @@
-# CLAUDE.md
+# AGENTS.md
 
 TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs and VLMs on edge devices (Jetson Orin, Thor, DRIVE platforms).
 
-> If a `CLAUDE.local.md` file exists alongside this file, read and respect it — it contains developer-specific overrides that supplement this shared guidance.
+> If an `AGENTS.local.md` file exists alongside this file, read and respect it — it contains developer-specific overrides that supplement this shared guidance.
 
 ## Rules (Read First)
 
@@ -122,7 +122,7 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 
 ## CI / Testing
 
-CI runs on GitLab (`.gitlab-ci.yml`). Tests are YAML-driven and parametrized by `--priority`.
+CI tests are YAML-driven and parametrized by `--priority`.
 
 | Layer | Location | Notes |
 |-------|----------|-------|
@@ -146,8 +146,9 @@ CI runs on GitLab (`.gitlab-ci.yml`). Tests are YAML-driven and parametrized by 
 
 | Priority | GPU/Device | Type |
 |----------|-----------|------|
-| `l0_export_ampere` | A30 (x86) | FP16/INT4 ONNX export |
-| `l0_export_blackwell` | B100 (x86) | FP8/NVFP4 ONNX export |
+| `l0_export_ampere` | A30 (x86) | Legacy ONNX export |
+| `l0_llm_loader_export_ampere` | A30 (x86) | `llm_loader` Ampere export |
+| `l0_llm_loader_export` | B100/Thor (x86) | `llm_loader` FP8/NVFP4 export |
 | `l0_pipeline_a30` | A30 | Full pipeline |
 | `l0_pipeline_orin` | Jetson Orin (remote) | On-device pipeline |
 | `l0_pipeline_rtx5080` | RTX 5080 | FP8 small model pipeline |

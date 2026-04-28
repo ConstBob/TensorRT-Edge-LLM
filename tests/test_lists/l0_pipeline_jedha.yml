@@ -12,10 +12,6 @@ tests:
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil4096-llm_basic]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil4096-mmlu_5-bs4]
 
-  # === Qwen2.5-0.5B FP8 + LoRA (old pipeline export) ===
-  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mxlr64]
-  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs4-mxil2048-mxlr64-llm_lora]
-
   # === Qwen3-1.7B NVFP4 (full MMLU 5-shot accuracy) ===
   # mxil4096: MMLU 5-shot prompts can exceed 2048 tokens (up to ~3000)
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-1.7B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil4096]

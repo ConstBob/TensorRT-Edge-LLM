@@ -55,8 +55,9 @@ pytest --priority=l0_export_ampere -v
 - **Common Tests** (`test_common.py`) - Build and unit tests
 
 ### Available Test Suites
-- `l0_export_ampere.yml` - Model export tests (Ampere GPUs)
-- `l0_export_blackwell.yml` - Model export tests (Blackwell GPUs)
+- `l0_export_ampere.yml` - Legacy model export tests (Ampere GPUs)
+- `l0_llm_loader_export_ampere.yml` - Checkpoint-based loader export tests (Ampere GPUs)
+- `l0_llm_loader_export.yml` - Checkpoint-based loader export tests (Blackwell/Thor models)
 - `l0_pipeline_a30.yml` - Pipeline tests (A30 GPU)
 - `l0_pipeline_orin.yml` - Pipeline tests (Jetson Orin)
 - `l0_pipeline_rtx5080.yml` - Pipeline tests (RTX 5080)

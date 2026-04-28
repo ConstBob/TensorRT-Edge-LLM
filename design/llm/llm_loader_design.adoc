@@ -6,7 +6,7 @@
 
 == Status
 
-**Experimental.**  The package lives under ``experimental/llm_loader/`` and is not yet part of the production build or CI pipeline.  The current implementation covers:
+The package is the recommended TensorRT Edge-LLM export path.  Its source currently lives under ``experimental/llm_loader/`` while the public workflow imports it as ``llm_loader``.  The current implementation covers:
 
 * Standard attention-only LLMs (Llama, Qwen, Mistral, etc.)
 * Hybrid Mamba+Attention models (NemotronH)
@@ -35,28 +35,28 @@ Key design principles:
 
 == Source References
 
-* ``llm_loader/__init__.py`` — public API surface
-* ``llm_loader/config.py`` — ModelConfig, QuantConfig
-* ``llm_loader/model.py`` — AutoModel factory and register_model
-* ``llm_loader/chat_template.py`` — Chat template extraction (Jinja -> JSON)
-* ``llm_loader/checkpoint/loader.py`` — weight loading, BF16->FP16 cast, fused split
-* ``llm_loader/checkpoint/checkpoint_utils.py`` — config loading, runtime artifact writing
-* ``llm_loader/models/default/modeling_default.py`` — attention-only CausalLM
-* ``llm_loader/models/nemotron_h/modeling_nemotron_h.py`` — hybrid Mamba+Attention NemotronHCausalLM
-* ``llm_loader/models/nemotron_omni/`` — Nemotron-Omni RADIO visual encoder and Parakeet audio encoder
-* ``llm_loader/models/qwen3_vl/`` — Qwen3-VL text backbone and visual encoder
-* ``llm_loader/models/qwen2_5_vl/`` — Qwen2.5-VL text backbone and visual encoder
-* ``llm_loader/models/internvl3/`` — InternVL3 text backbone and visual encoder
-* ``llm_loader/models/phi4mm/`` — Phi-4 Multimodal text backbone and visual encoder
-* ``llm_loader/models/qwen3_asr/`` — Qwen3-ASR text backbone and audio encoder
-* ``llm_loader/models/qwen3_tts/`` — Qwen3-TTS thinker, talker, code predictor, and audio encoder
-* ``llm_loader/models/linear.py`` — quantized linear layers (FP8, NVFP4, AWQ, etc.)
-* ``llm_loader/models/ops.py`` — custom op stubs (torch.ops.trt_edgellm.*)
-* ``llm_loader/onnx/export.py`` — LLM ONNX export and TRT post-processing passes
-* ``llm_loader/onnx/export_encoder.py`` — visual/audio encoder ONNX export
-* ``llm_loader/onnx/dynamo_translations.py`` — onnxscript translation table
-* ``llm_loader/onnx/onnx_custom_schemas.py`` — ONNX OpSchema registrations
-* ``llm_loader/export_all_cli.py`` — unified CLI: exports LLM + visual + audio + TTS
+* ``experimental/llm_loader/__init__.py`` — public API surface
+* ``experimental/llm_loader/config.py`` — ModelConfig, QuantConfig
+* ``experimental/llm_loader/model.py`` — AutoModel factory and register_model
+* ``experimental/llm_loader/chat_template.py`` — Chat template extraction (Jinja -> JSON)
+* ``experimental/llm_loader/checkpoint/loader.py`` — weight loading, BF16->FP16 cast, fused split
+* ``experimental/llm_loader/checkpoint/checkpoint_utils.py`` — config loading, runtime artifact writing
+* ``experimental/llm_loader/models/default/modeling_default.py`` — attention-only CausalLM
+* ``experimental/llm_loader/models/nemotron_h/modeling_nemotron_h.py`` — hybrid Mamba+Attention NemotronHCausalLM
+* ``experimental/llm_loader/models/nemotron_omni/`` — Nemotron-Omni RADIO visual encoder and Parakeet audio encoder
+* ``experimental/llm_loader/models/qwen3_vl/`` — Qwen3-VL text backbone and visual encoder
+* ``experimental/llm_loader/models/qwen2_5_vl/`` — Qwen2.5-VL text backbone and visual encoder
+* ``experimental/llm_loader/models/internvl3/`` — InternVL3 text backbone and visual encoder
+* ``experimental/llm_loader/models/phi4mm/`` — Phi-4 Multimodal text backbone and visual encoder
+* ``experimental/llm_loader/models/qwen3_asr/`` — Qwen3-ASR text backbone and audio encoder
+* ``experimental/llm_loader/models/qwen3_tts/`` — Qwen3-TTS thinker, talker, code predictor, and audio encoder
+* ``experimental/llm_loader/models/linear.py`` — quantized linear layers (FP8, NVFP4, AWQ, etc.)
+* ``experimental/llm_loader/models/ops.py`` — custom op stubs (torch.ops.trt_edgellm.*)
+* ``experimental/llm_loader/onnx/export.py`` — LLM ONNX export and TRT post-processing passes
+* ``experimental/llm_loader/onnx/export_encoder.py`` — visual/audio encoder ONNX export
+* ``experimental/llm_loader/onnx/dynamo_translations.py`` — onnxscript translation table
+* ``experimental/llm_loader/onnx/onnx_custom_schemas.py`` — ONNX OpSchema registrations
+* ``experimental/llm_loader/export_all_cli.py`` — unified CLI: exports LLM + visual + audio + TTS
 
 == Package Layout
 
@@ -675,7 +675,7 @@ See <<Unified ``load_weights()``>> above for the full API.
 
 === Step 7: Adding a new model (end-to-end)
 
-. Implement ``SomeNewCausalLM(config: ModelConfig)`` in ``llm_loader/models/some_new/modeling_some_new.py``.
+. Implement ``SomeNewCausalLM(config: ModelConfig)`` in ``experimental/llm_loader/models/some_new/modeling_some_new.py``.
   ** Inherit from or follow the conventions of ``CausalLM`` in ``modeling_default.py``.
   ** Implement ``onnx_export_spec() -> OnnxSpec`` (dummy args + dynamic shapes).
   ** Use ``torch.ops.trt_edgellm.*`` stubs for any custom plugin calls.
@@ -687,7 +687,7 @@ from .models.some_new.modeling_some_new import SomeNewCausalLM
 register_model("some_new", SomeNewCausalLM)
 ----
 . If the model requires new custom ops:
-  ** Add the stub in ``llm_loader/models/ops.py``.
+  ** Add the stub in ``experimental/llm_loader/models/ops.py``.
   ** Add the translation function in ``llm_loader/onnx/dynamo_translations.py``.
   ** Register the ONNX schema in ``llm_loader/onnx/onnx_custom_schemas.py``.
   ** Implement the C++ plugin in ``cpp/plugins/`` and register it in ``cpp/plugins/CMakeLists.txt``.

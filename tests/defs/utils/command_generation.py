@@ -25,6 +25,7 @@ from ..config import (DEFAULT_SEARCH_DEPTH, PRE_QUANTIZED_MODELS, ModelType,
 # Available LoRA weights mapping
 AVAILABLE_LORA_WEIGHTS = {
     "Qwen2.5-0.5B-Instruct": "Jailbreak-Detector-2-XL",
+    "Qwen2.5-0.5B-Instruct-FP8": "Jailbreak-Detector-2-XL",
     "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-Diagrams2SQL-v2",
 }
 
