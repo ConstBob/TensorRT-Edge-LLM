@@ -128,6 +128,29 @@ public:
     //! @return Reference to the MambaCacheManager.
     MambaCacheManager& getMambaCacheManager() noexcept;
 
+    //! @brief Minimal read-only view of one pre-computed KV head-dim group.
+    //!
+    //! Exposes just what callers (e.g. EAGLE base-verify) need to launch a
+    //! batched per-layer kernel: a device-resident `KVLayerInfo` array plus
+    //! the dispatch parameters. Internal bookkeeping (`hostInfos`,
+    //! `deviceScratchInfos`, etc.) stays private.
+    struct KVHeadDimGroupView
+    {
+        kernel::KVLayerInfo const* deviceLayerInfos; //!< Device pointer to layer-info array (size == numLayers)
+        int32_t numLayers;                           //!< Number of KV layers in this group
+        int32_t headDim;                             //!< Head dimension shared by all layers in this group
+        int32_t maxKVHeads;                          //!< Maximum numKVHeads across layers in this group
+    };
+
+    //! @brief Read-only views of the pre-computed KV head-dim groups.
+    //!
+    //! Uniform models return a single group; hybrid Gemma4-style models
+    //! return one group per distinct head dim. The underlying
+    //! `KVLayerInfo` arrays are owned by this manager and remain valid
+    //! for its lifetime.
+    //! @return Vector of group views (one per distinct head dim).
+    std::vector<KVHeadDimGroupView> getKVHeadDimGroups() const;
+
     // ------------------------------------------------------------------
     // Shared state
     // ------------------------------------------------------------------

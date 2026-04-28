@@ -219,6 +219,22 @@ MambaCacheManager& HybridCacheManager::getMambaCacheManager() noexcept
     return mMambaCache;
 }
 
+std::vector<HybridCacheManager::KVHeadDimGroupView> HybridCacheManager::getKVHeadDimGroups() const
+{
+    std::vector<KVHeadDimGroupView> views;
+    views.reserve(mHeadDimGroups.size());
+    for (auto const& group : mHeadDimGroups)
+    {
+        views.push_back(KVHeadDimGroupView{
+            static_cast<kernel::KVLayerInfo const*>(group.deviceLayerInfos.rawPointer()),
+            group.numLayers,
+            group.headDim,
+            group.maxKVHeads,
+        });
+    }
+    return views;
+}
+
 // ------------------------------------------------------------------
 // Shared state
 // ------------------------------------------------------------------

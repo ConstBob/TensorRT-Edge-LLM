@@ -1487,56 +1487,33 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     auto& baseCacheManager = mBaseEngineRunner->getCacheManager();
     rt::Tensor const& kvCacheLengths = baseCacheManager.getKVCacheLengths();
 
-    // eagleBaseCommitKVCacheAndAssembleHiddenState operates on a monolithic 6D KV cache buffer
-    // [L, B, 2, H, S, D].  For the per-layer HybridCacheManager we gather the per-layer tensors
-    // into a temporary contiguous buffer and scatter back afterwards.
-    // TODO: adapt the EAGLE kernel to iterate per-layer and remove the gather/scatter copies.
-    auto& kvManager = baseCacheManager.getKVCacheManager();
-    check::check(kvManager.isUniform(),
-        "EAGLE speculative decoding requires uniform KV cache config "
-        "(same numKVHeads and headDim for all layers).");
+    // The EAGLE base verify is per-head-dim-group batched: one launch per group covers
+    // every layer in that group, addressing per-layer storage through a device-resident
+    // KVLayerInfo array owned by HybridCacheManager. Uniform models (every model that goes
+    // through EAGLE today) yield a single group; hybrid Gemma4-style layouts would yield
+    // one group per distinct headDim with no further code change.
+    auto const kvHeadDimGroups = baseCacheManager.getKVHeadDimGroups();
+    auto const kvCacheType = baseCacheManager.getKVCacheManager().getConfig().kvCacheType;
 
-    auto const& kvConfig = kvManager.getConfig();
-    auto const& lc0 = kvManager.getLayerConfig(0);
-    int32_t const numKVLayers = kvManager.numLayers();
-    size_t const elemSize = rt::utils::getTypeSize(kvConfig.kvCacheType);
-    size_t const perLayerBytes = static_cast<size_t>(kvConfig.maxBatchSize) * 2 * lc0.numKVHeads
-        * kvConfig.maxSequenceLength * lc0.headDim * elemSize;
-
-    // Gather per-layer KV caches into temporary contiguous 6D buffer.
-    rt::Tensor kvCacheTensor({static_cast<int64_t>(numKVLayers), static_cast<int64_t>(kvConfig.maxBatchSize),
-                                 int64_t{2}, static_cast<int64_t>(lc0.numKVHeads),
-                                 static_cast<int64_t>(kvConfig.maxSequenceLength), static_cast<int64_t>(lc0.headDim)},
-        rt::DeviceType::kGPU, kvConfig.kvCacheType, "eagleMonolithicKVCache");
-    for (int32_t i = 0; i < numKVLayers; ++i)
-    {
-        void* dst = static_cast<char*>(kvCacheTensor.rawPointer()) + i * perLayerBytes;
-        CUDA_CHECK(cudaMemcpyAsync(dst, kvManager.getCombinedKVCache(i).rawPointer(), perLayerBytes,
-            cudaMemcpyDeviceToDevice, context.stream));
-    }
-
-    // Reshape input hidden states from 2D [batch*verify_tree_size, hidden_dim] to 3D [batch, verify_tree_size,
-    // hidden_dim]
+    // Reshape input hidden states from 2D [batch*verify_tree_size, hidden_dim] to 3D
+    // [batch, verify_tree_size, hidden_dim]
     check::check(mBaseHiddenStatesOutput.reshape(
                      {activeBatchSize, mDraftingConfig->verifyTreeSize, mBaseEngineConfig.outputHiddenDim}),
         "Tensor reshape failed");
 
-    // INPLACE update: The kernel will update accepted tokens directly within the same buffer.
-    //
-    // Memory layout transformation (inplace):
-    //   Before: [Batch0: Token0...Token59][Batch1: Token0...Token59]...  =(stride=60 per batch)
-    //   After:  [Batch0: SelectedToken0...SelectedToken6][Batch1: SelectedToken0...SelectedToken6]... (Select and pad
-    //   to stride=maxAcceptDepth 7)
-    kernel::eagleBaseCommitKVCacheAndAssembleHiddenState(
-        mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, kvCacheTensor, mBaseHiddenStatesOutput, context.stream);
-
-    // Scatter the modified monolithic buffer back to per-layer KV caches.
-    for (int32_t i = 0; i < numKVLayers; ++i)
+    // INPLACE updates:
+    //   - eagleBaseCommitKVCache rewrites each layer's KV cache so accepted tokens occupy
+    //     contiguous slots starting at pastKvCacheLength.
+    //   - eagleBaseAssembleHiddenState compacts the hidden-state buffer:
+    //       Before: [Batch0: Token0...Token59][Batch1: Token0...Token59]...   (stride=60 per batch)
+    //       After:  [Batch0: Sel0...Sel6][Batch1: Sel0...Sel6]...              (stride=maxAcceptDepth)
+    for (auto const& group : kvHeadDimGroups)
     {
-        void const* src = static_cast<char const*>(kvCacheTensor.rawPointer()) + i * perLayerBytes;
-        CUDA_CHECK(cudaMemcpyAsync(kvManager.getCombinedKVCache(i).rawPointer(), src, perLayerBytes,
-            cudaMemcpyDeviceToDevice, context.stream));
+        kernel::eagleBaseCommitKVCache(mAcceptedTokenIndices, mAcceptLength, kvCacheLengths, group.deviceLayerInfos,
+            group.numLayers, group.headDim, group.maxKVHeads, activeBatchSize, maxAcceptDepth, kvCacheType,
+            context.stream);
     }
+    kernel::eagleBaseAssembleHiddenState(mAcceptedTokenIndices, mAcceptLength, mBaseHiddenStatesOutput, context.stream);
 
     baseCacheManager.commitSequenceLength(mAcceptLength, context.stream);
 
