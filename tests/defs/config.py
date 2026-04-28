@@ -722,8 +722,6 @@ class TestConfig:
             "Qwen3.5-9B",
             "Qwen3.5-27B":
             "Qwen3.5-27B",
-            "Qwen3.5-35B-A3B":
-            "Qwen3.5-35B-A3B",
             "Phi-4-multimodal-instruct":
             "Phi-4-multimodal-instruct",
             # Pre-quantized models in llm_models_dir

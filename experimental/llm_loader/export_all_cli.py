@@ -33,7 +33,7 @@ Supported model types
 ----------------------
 VLMs (LLM + visual encoder):
     qwen3_vl, qwen3_omni          (Qwen3-VL / Qwen3-Omni)
-    qwen3_5, qwen3_5_moe          (Qwen3.5)
+    qwen3_5                       (Qwen3.5)
     qwen2_5_vl                    (Qwen2.5-VL)
     internvl_chat                 (InternVL3)
     internvl                      (InternVL3.5)
@@ -74,7 +74,6 @@ _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
     "qwen3_5",
-    "qwen3_5_moe",
     "qwen2_5_vl",
     "internvl",
     "internvl_chat",
@@ -228,7 +227,8 @@ def _dtype_from_str(s: str) -> "torch.dtype":
 def _export_llm(model_dir: str,
                 llm_out_dir: str,
                 model_type: str = "",
-                eagle_base: bool = False) -> None:
+                eagle_base: bool = False,
+                fp8_embedding: bool = False) -> None:
     """Export LLM backbone via the standard llm_loader pipeline."""
     os.makedirs(llm_out_dir, exist_ok=True)
     output_path = os.path.join(llm_out_dir, "model.onnx")
@@ -248,7 +248,10 @@ def _export_llm(model_dir: str,
     logger.info("[LLM] Exporting to %s", output_path)
     try:
         from .onnx.export import export_onnx
-        export_onnx(model, output_path, model_dir=model_dir)
+        export_onnx(model,
+                    output_path,
+                    model_dir=model_dir,
+                    fp8_embedding=fp8_embedding)
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[LLM] ONNX export failed")
         raise SystemExit(1) from exc
@@ -327,8 +330,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         "model_type": top_level_model_type,
         "vision_config": vis_cfg,
     }
-    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_5",
-                      "qwen3_5_moe"):
+    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_5"):
         # C++ QwenViTRunner reads these token IDs and rope_theta from config.json.
         # For Qwen3-VL the token IDs are at the root level, but vocab_size and
         # rope_theta live inside text_config.  Fall back to text_config for any
@@ -920,6 +922,14 @@ def main() -> None:
         "Export as EAGLE3 base model (adds tree-attention I/O and hidden_states output).",
     )
     p.add_argument(
+        "--fp8-embedding",
+        "--fp8_embedding",
+        dest="fp8_embedding",
+        action="store_true",
+        help=
+        "Write embedding.safetensors in FP8 E4M3 format with per-row block scales.",
+    )
+    p.add_argument(
         "--device",
         default="cuda",
         help="Device for export tracing (default: cuda).",
@@ -944,6 +954,7 @@ def main() -> None:
     logger.info("Audio export   : %s", "yes" if has_aud else "no")
     logger.info("Code2Wav export: %s", "yes" if has_c2w else "no")
     logger.info("TTS talker     : %s", "yes" if is_tts else "no")
+    logger.info("FP8 embedding  : %s", "yes" if args.fp8_embedding else "no")
     logger.info("=" * 60)
 
     # Load weights once (shared by visual, audio, and code2wav exporters)
@@ -956,6 +967,10 @@ def main() -> None:
     if not args.skip_llm:
         llm_out = os.path.join(args.output_dir, "llm")
         if is_tts:
+            if args.fp8_embedding:
+                logger.warning(
+                    "--fp8-embedding is not supported for TTS talker/code_predictor; using FP16 embeddings."
+                )
             _export_talker(model_dir, llm_out)
             # CodePredictor: small decoder for residual codec prediction
             cp_out = os.path.join(args.output_dir, "code_predictor")
@@ -964,7 +979,8 @@ def main() -> None:
             _export_llm(model_dir,
                         llm_out,
                         model_type=model_type,
-                        eagle_base=args.eagle_base)
+                        eagle_base=args.eagle_base,
+                        fp8_embedding=args.fp8_embedding)
 
     # --- Visual encoder ---
     if has_vis:

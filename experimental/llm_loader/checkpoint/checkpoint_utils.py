@@ -305,8 +305,10 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     return out
 
 
-def write_runtime_artifacts(model: "CausalLM", model_dir: str,
-                            out_dir: str) -> None:
+def write_runtime_artifacts(model: "CausalLM",
+                            model_dir: str,
+                            out_dir: str,
+                            fp8_embedding: bool = False) -> None:
     """Write ``config.json``, ``embedding.safetensors``, tokenizer copies, chat template."""
     import torch
     from safetensors.torch import save_file
@@ -354,9 +356,21 @@ def write_runtime_artifacts(model: "CausalLM", model_dir: str,
             # C++ runtime requires FP16 (or FP8) embedding; cast if needed.
             if weight.dtype in (torch.float32, torch.bfloat16):
                 weight = weight.to(torch.float16)
-            save_file({"embedding": weight},
-                      os.path.join(out_dir, "embedding.safetensors"))
-            logger.info("Wrote embedding.safetensors (%s)", list(weight.shape))
+            embedding_path = os.path.join(out_dir, "embedding.safetensors")
+            if fp8_embedding:
+                from .embedding_quantization import quantize_embedding_to_fp8
+                embedding_fp8, scales = quantize_embedding_to_fp8(weight)
+                save_file(
+                    {
+                        "embedding": embedding_fp8,
+                        "embedding_scale": scales
+                    }, embedding_path)
+                logger.info("Wrote FP8 embedding.safetensors (%s)",
+                            list(weight.shape))
+            else:
+                save_file({"embedding": weight}, embedding_path)
+                logger.info("Wrote embedding.safetensors (%s)",
+                            list(weight.shape))
         else:
             logger.warning(
                 "embed_tokens not found; skipping embedding.safetensors")

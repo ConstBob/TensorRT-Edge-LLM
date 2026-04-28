@@ -15,9 +15,24 @@ FP8 embedding reduces memory usage by quantizing the embedding table from FP16 t
 
 ## Workflow
 
-### Step 1: Export to ONNX with FP8 Embedding
+### Checkpoint-Based Loader
 
-Export the model to ONNX format with the `--fp8_embedding` flag:
+Export with `--fp8-embedding` to write the runtime embedding sidecar in FP8:
+
+```bash
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+
+python -m llm_loader.export_all_cli \
+  /path/to/Qwen3-8B \
+  /tmp/qwen3_onnx_fp8emb \
+  --fp8-embedding
+```
+
+This flag only changes `embedding.safetensors`; it does not change the ONNX graph or the checkpoint weights. The sidecar contains the FP8 embedding table plus `embedding_scale`.
+
+### Legacy Export Tools
+
+The legacy export CLI uses the underscore spelling:
 
 ```bash
 tensorrt-edgellm-export-llm \
@@ -26,9 +41,7 @@ tensorrt-edgellm-export-llm \
   --fp8_embedding
 ```
 
-**Note**: The `--fp8_embedding` flag quantizes the embedding table to FP8 E4M3 format with per-row block-wise scales. The quantized embedding table and scales are saved in the safetensors file.
-
-### Step 2: Build Engine
+### Build Engine
 
 Build the TensorRT engine as usual. The build process automatically detects FP8 embedding from the safetensors metadata:
 
@@ -41,7 +54,7 @@ Build the TensorRT engine as usual. The build process automatically detects FP8 
 
 No special build flags are required — FP8 embedding is automatically enabled based on the safetensors metadata.
 
-### Step 3: Run Inference
+### Run Inference
 
 Run inference with the built engine. No special flags are needed:
 
@@ -59,17 +72,19 @@ Run inference with the built engine. No special flags are needed:
 FP8 embedding can be combined with weight quantization for maximum memory savings:
 
 ```bash
-# Step 1: Quantize weights
-tensorrt-edgellm-quantize-llm \
-  --model_dir Qwen/Qwen3-8B \
-  --output_dir quantized/qwen3-8b-nvfp4 \
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+
+# Step 1: Quantize weights to a checkpoint
+python -m experimental.quantization.cli llm \
+  --model_dir /path/to/Qwen3-8B \
+  --output_dir /tmp/qwen3_nvfp4 \
   --quantization nvfp4
 
 # Step 2: Export with both NVFP4 weights and FP8 embedding
-tensorrt-edgellm-export-llm \
-  --model_dir quantized/qwen3-8b-nvfp4 \
-  --output_dir onnx_models/qwen3-8b-nvfp4-fp8emb \
-  --fp8_embedding
+python -m llm_loader.export_all_cli \
+  /tmp/qwen3_nvfp4 \
+  /tmp/qwen3_nvfp4_fp8emb_onnx \
+  --fp8-embedding
 ```
 
 ---
@@ -85,7 +100,7 @@ tensorrt-edgellm-export-llm \
 
 ### Quantization Process
 
-During export with `--fp8_embedding`:
+During export with `--fp8-embedding` in `llm_loader` or `--fp8_embedding` in the legacy export tools:
 1. The embedding table is divided into blocks of 128 elements along the hidden dimension
 2. For each block, the maximum absolute value is computed
 3. Quantization scale is computed: `scale = amax / FP8_E4M3_MAX` (where `FP8_E4M3_MAX = 448.0`)
@@ -114,5 +129,5 @@ During inference:
 
 ## Limitations
 
-- **TTS Models Not Supported**: FP8 embedding is not supported for TTS, Qwen3-Omni talker and code_predictor models due to specialized kernel requirements. When `--fp8_embedding` is passed for these models, a warning is logged and FP16 embedding is used instead.
+- **TTS Models Not Supported**: FP8 embedding is not supported for TTS, Qwen3-Omni talker, and code_predictor models due to specialized kernel requirements. When requested for these models, a warning is logged and FP16 embedding is used instead.
 - **Platform Requirements**: Requires CUDA 11.8+ for FP8 support and GPUs with compute capability SM89+ (Ada/Hopper/Blackwell) for native FP8 hardware support.

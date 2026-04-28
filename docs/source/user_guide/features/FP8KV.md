@@ -16,6 +16,30 @@ FP8 KV cache reduces memory usage by quantizing the key-value cache from FP16 to
 
 ## Workflow
 
+### Checkpoint-Based Loader
+
+For `llm_loader`, FP8 KV cache is checkpoint-driven. If the checkpoint metadata marks KV cache quantization as `fp8`, `llm_loader` enables FP8 KV cache in the exported ONNX automatically. There is no `--fp8_kv_cache` export flag in this path.
+
+```bash
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+
+python -m experimental.quantization.cli llm \
+  --model_dir /path/to/Qwen3-8B \
+  --output_dir /tmp/qwen3_nvfp4_fp8kv \
+  --quantization nvfp4 \
+  --kv_cache_quantization fp8
+
+python -m llm_loader.export_all_cli \
+  /tmp/qwen3_nvfp4_fp8kv \
+  /tmp/qwen3_nvfp4_fp8kv_onnx
+```
+
+Engine build and runtime detect FP8 KV cache from the exported ONNX model configuration.
+
+### Legacy Export Tools
+
+The commands below use the legacy `tensorrt_edgellm` export tools, where FP8 KV cache requires an explicit export flag.
+
 ### Vanilla Decode
 
 #### Step 1: Quantize Attention
@@ -236,4 +260,3 @@ Benchmarks were collected on a Blackwell (Thor / SM100) GPU: causal masking, per
 - **Compatibility**: Works with all supported models and features including LoRA, EAGLE speculative decoding, and tree attention.
 - **Memory Benefits**: Most beneficial for long-context models and high batch sizes where KV cache memory dominates.
 - **Platform Requirements**: Requires CUDA 11.8+ for FP8 support (`cuda_fp8.h`). And FP8 KV cache also works on GPUs with compute capability <SM89.
-

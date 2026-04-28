@@ -28,7 +28,9 @@ import pytest
 from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
-from .config import ModelType, TaskType, TestConfig
+from .config import (DEFAULT_SEARCH_DEPTH, ModelType, TaskType, TestConfig,
+                     _find_directory)
+from .utils.command_generation import AVAILABLE_LORA_WEIGHTS
 
 
 def test_llm_loader_export(test_param: str, test_logger,
@@ -221,3 +223,115 @@ def test_llm_loader_eagle_export(test_param: str, test_logger,
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
         pytest.fail(f"Draft ONNX model not found: {draft_onnx}")
+
+
+def test_llm_loader_lora_export(test_param: str, test_logger,
+                                env_config: EnvironmentConfig):
+    """Export a model and insert LoRA patterns via llm_loader.
+
+    Exports a model ONNX, then runs LoRA insertion and verifies the
+    lora_model.onnx has additional LoRA nodes.
+    """
+
+    config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                          TaskType.EXPORT, env_config)
+
+    torch_dir = config.get_torch_model_dir()
+    if not os.path.exists(torch_dir):
+        raise FileNotFoundError(f"Model checkpoint not found: {torch_dir}")
+
+    llm_onnx_dir = config.get_llm_onnx_dir()
+    os.makedirs(llm_onnx_dir, exist_ok=True)
+
+    tmp_dir = tempfile.mkdtemp(prefix="lora_export_")
+
+    try:
+        # Step 1: Export the model
+        export_cmd = [
+            "python3",
+            "-m",
+            "llm_loader.export_all_cli",
+            torch_dir,
+            tmp_dir,
+            "--device",
+            "cpu",
+        ]
+
+        _run_llm_loader_export(
+            export_cmd, 600, test_logger,
+            f"Exporting {config.model_name} for LoRA via llm_loader")
+
+        llm_output = os.path.join(tmp_dir, "llm")
+        if not os.path.isdir(llm_output):
+            pytest.fail(
+                f"llm_loader did not produce llm/ output directory in {tmp_dir}"
+            )
+
+        orig_onnx = os.path.join(llm_output, "model.onnx")
+        if not os.path.exists(orig_onnx):
+            pytest.fail(f"model.onnx not found: {orig_onnx}")
+
+        # Step 2: Insert LoRA patterns
+        lora_cmd = [
+            "python3",
+            "-m",
+            "llm_loader.lora.insert_lora_cli",
+            "--onnx_dir",
+            llm_output,
+        ]
+
+        _run_llm_loader_export(lora_cmd, 120, test_logger,
+                               f"Inserting LoRA into {config.model_name}")
+
+        lora_onnx = os.path.join(llm_output, "lora_model.onnx")
+        if not os.path.exists(lora_onnx):
+            pytest.fail(f"lora_model.onnx not found: {lora_onnx}")
+
+        # Verify LoRA model has more nodes than original
+        import onnx
+        orig_model = onnx.load(orig_onnx, load_external_data=False)
+        lora_model = onnx.load(lora_onnx, load_external_data=False)
+
+        if len(lora_model.graph.node) <= len(orig_model.graph.node):
+            pytest.fail(f"LoRA model should have more nodes than original. "
+                        f"Original: {len(orig_model.graph.node)}, "
+                        f"LoRA: {len(lora_model.graph.node)}")
+
+        # Verify LoRA-specific inputs exist
+        lora_inputs = [
+            i.name for i in lora_model.graph.input if 'lora' in i.name.lower()
+        ]
+        if not lora_inputs:
+            pytest.fail("No LoRA weight inputs found in lora_model.onnx")
+
+        # Step 3: Process LoRA adapter weights for runtime tests.
+        if config.model_name not in AVAILABLE_LORA_WEIGHTS:
+            pytest.fail(f"No LoRA weights configured for {config.model_name}")
+
+        lora_model_name = AVAILABLE_LORA_WEIGHTS[config.model_name]
+        data_dir = config.edgellm_data_dir or os.environ.get(
+            "EDGELLM_DATA_DIR", "/scratch.edge_llm_cache")
+        lora_weights_dir = _find_directory(data_dir, lora_model_name,
+                                           DEFAULT_SEARCH_DEPTH)
+        if not lora_weights_dir:
+            pytest.fail(
+                f"LoRA weights directory '{lora_model_name}' not found under "
+                f"{data_dir}")
+
+        process_cmd = [
+            "python3",
+            "-m",
+            "llm_loader.lora.process_lora_weights_cli",
+            "--input_dir",
+            lora_weights_dir,
+            "--output_dir",
+            config.get_lora_weights_dir(),
+        ]
+        _run_llm_loader_export(
+            process_cmd, 120, test_logger,
+            f"Processing LoRA weights for {config.model_name}")
+
+        shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

@@ -5,6 +5,8 @@ tests:
   - tests/defs/test_llm_loader_export.py::test_llm_loader_export[Qwen2.5-0.5B-Instruct-FP8-fp8]
   # FP8 + FP8 KV cache LLM (pre-quantized with KV cache quantization)
   - tests/defs/test_llm_loader_export.py::test_llm_loader_export[Qwen2.5-0.5B-Instruct-FP8-KV-fp8-fp8kv]
+  # FP8 LLM with LoRA support
+  - tests/defs/test_llm_loader_export.py::test_llm_loader_lora_export[Qwen2.5-0.5B-Instruct-FP8-fp8]
   # NVFP4 LLM (Qwen3 architecture, pre-quantized) - standalone for non-EAGLE tests
   - tests/defs/test_llm_loader_export.py::test_llm_loader_export[Qwen3-1.7B-NVFP4-nvfp4]
   # NVFP4 VLM (Qwen3-VL architecture, pre-quantized) - standalone for non-EAGLE tests

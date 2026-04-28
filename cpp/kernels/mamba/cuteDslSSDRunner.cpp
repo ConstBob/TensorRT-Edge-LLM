@@ -144,7 +144,7 @@ int CuteDslSSDRunner::run(SSDParams const& params, cudaStream_t stream)
 {
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
     // SM100-110 with D=64: use Blackwell persistent kernel (TMA/wgmma/TMEM).
-    // SM120+ (e.g. GB10/GB20) lacks TMEM/wgmma — falls through to SM80 kernel.
+    // SM120+ lacks TMEM/wgmma — falls through to SM80 kernel.
     if (params.smVersion >= 100 && params.smVersion < 120 && params.dim == 64
         && (params.dstate == 128 || params.dstate == 64))
         return runPrefillBlackwell(params, stream);

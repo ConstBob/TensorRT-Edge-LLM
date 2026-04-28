@@ -5,3 +5,5 @@ onnxscript==0.7.0
 safetensors==0.7.0
 numpy==2.4.4
 huggingface_hub==1.11.0
+torchvision==0.25.0
+onnx_graphsurgeon==0.6.1
