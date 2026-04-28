@@ -490,7 +490,7 @@ class GemmBlackwellFP16:
         tmem.relinquish_alloc_permit()
         acc_pipeline.consumer_wait(acc_consumer_state)
 
-        self.epilogue(tidx, mma_tile_coord_mnl, tCtAcc, tCgC, epi_tile, mBias, use_silu)
+        self.epilogue(tidx, mma_tile_coord_mnl, tCtAcc, tCgC, mC_mnl, epi_tile, mBias, use_silu)
 
         pipeline.sync(barrier_id=1)
         tmem.free(tmem_ptr)
@@ -506,6 +506,7 @@ class GemmBlackwellFP16:
         mma_tile_coord_mnl: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
         tCtAcc: cute.Tensor,
         tCgC: cute.Tensor,
+        mC_mnl: cute.Tensor,
         epi_tile: cute.Tile,
         mBias: cute.Tensor,
         use_silu: cutlass.Constexpr,
@@ -556,6 +557,22 @@ class GemmBlackwellFP16:
             tTR_gBias = thr_copy_t2r.partition_D(tCgBias_epi)
             tTR_gBias = cute.group_modes(tTR_gBias, 3, cute.rank(tTR_gBias))
 
+        # Build M-coordinate tensor for boundary predication.
+        # When M < tile_M (128), the epilogue must not store out-of-bounds rows.
+        actual_M = mC_mnl.layout.shape[0]
+        actual_N = mC_mnl.layout.shape[1]
+        m_base = mma_tile_coord_mnl[0] * cutlass.Int32(self.mma_tiler_mn[0])
+        n_base = mma_tile_coord_mnl[1] * cutlass.Int32(self.mma_tiler_mn[1])
+
+        # Identity tensor for the CTA tile → same tiling/partition as gC
+        # to get per-thread M/N coordinates.
+        cC_identity = cute.make_identity_tensor(
+            (self.mma_tiler_mn[0], self.mma_tiler_mn[1])
+        )
+        cC_epi = cute.flat_divide(cC_identity, epi_tile)
+        tTR_cC = thr_copy_t2r.partition_D(cC_epi)
+        tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
+
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         for subtile_idx in cutlass.range(subtile_cnt):
             tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
@@ -572,7 +589,15 @@ class GemmBlackwellFP16:
 
             tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
 
-            cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)])
+            # Predicated store: skip elements whose M or N coordinate exceeds
+            # the actual output dimensions (partial-tile boundary).
+            dst = tTR_gC[(None, None, None, subtile_idx)]
+            coord_slice = tTR_cC[(None, None, None, subtile_idx)]
+            for i in cutlass.range(cute.size(tTR_rC)):
+                m_coord = m_base + coord_slice[i][0]
+                n_coord = n_base + coord_slice[i][1]
+                if m_coord < actual_M and n_coord < actual_N:
+                    dst[i] = tTR_rC[i]
 
     @staticmethod
     def _compute_stages(

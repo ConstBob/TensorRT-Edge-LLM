@@ -13,27 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AOT-compile CuTe DSL kernels into a local static library for CMake linking.
+"""AOT-compile CuTe DSL kernels into a static library for CMake linking.
+
+Kernel groups:
+  gdn        — Gated Delta Net decode/prefill
+  fmha       — Fused Multi-Head Attention (Blackwell persistent)
+  ssd        — Mamba2 SSM chunk-scan prefill
+  gemm       — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
+  nvfp4_moe  — NvFP4 MoE FC1+FC2 grouped GEMM
 
 Usage (run from the repo root):
-  python kernelSrcs/build_cutedsl.py                          # build all kernels supported by this GPU
-  python kernelSrcs/build_cutedsl.py --kernels gdn            # build a specific group only
-  python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe      # build NvFP4 MoE FC1+FC2 kernels only
-  python kernelSrcs/build_cutedsl.py --kernels ssd            # build SSD (Mamba2) variants only
-  python kernelSrcs/build_cutedsl.py --gpu_arch sm_87         # override SM detection (rarely needed)
+  python kernelSrcs/build_cutedsl.py                      # build all groups for this GPU
+  python kernelSrcs/build_cutedsl.py --kernels gdn        # single group
+  python kernelSrcs/build_cutedsl.py --kernels fmha,gdn   # multiple groups
+  python kernelSrcs/build_cutedsl.py --gpu_arch sm_110    # override SM detection
+  python kernelSrcs/build_cutedsl.py --clean --verbose    # clean rebuild
 
-The GPU SM is auto-detected via cupy / nvidia-smi and used to filter which kernel variants
-are compiled.  All kernel scripts are invoked without --gpu_arch (device-native JIT), which
-works uniformly on Linux and QNX.
+The GPU SM is auto-detected via cupy / nvidia-smi and only matching variants
+are built.  See KERNEL_VARIANTS below for the full variant list.
 
 Output (under {output_dir}/{arch}/{artifact_tag}/):
-  artifact_tag          — currently sm_<NN>, e.g. sm_80 / sm_110 / sm_121
-  libcutedsl_{arch}.a   — merged static archive: kernel objects + DSL runtime
+  libcutedsl_{arch}.a   — merged static archive (kernel objects + DSL runtime)
   include/cutedsl_all.h — umbrella header (#includes every variant header)
-  metadata.json         — groups / variants list consumed by cmake/CuteDsl.cmake
+  metadata.json         — build provenance + group/variant list for CMake
 
-The generated artifacts are local build inputs. They are not intended to be
-checked into git by default.
+Prebuilt tarballs:
+  For supported targets (e.g. Thor SM110), prebuilt tarballs are committed
+  under kernelSrcs/cuteDSLPrebuilt/.  CMake auto-extracts them when the
+  artifact directory is absent — no manual build step needed.  To regenerate:
+    python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --arch aarch64 --clean
 """
 
 import argparse
@@ -86,23 +94,16 @@ class KernelVariant:
 # ---------------------------------------------------------------------------
 # Kernel registry — add new groups/variants here.
 #
-# GDN: Gated Delta Net (Ampere SM80+, arch-polymorphic).
+# Each KernelVariant has a supported_sms whitelist.  Only variants matching
+# the target SM are compiled.  All kernel scripts compile device-native
+# (no --gpu_arch forwarded), which works uniformly on Linux and QNX.
 #
-# FMHA: Fused Multi-Head Attention (Blackwell SM100/SM101). The fmha.py script
-#       is hardcoded to SM100 Blackwell instructions (TMEM, Blackwell MMA).
-#
-# NvFP4 MoE: Mixture-of-Experts FC1 + FC2 kernels (Blackwell SM100/SM101/SM110).
-#            FC1 is a contiguous grouped GEMM with fused activation (identity/
-#            relu2/swiglu).  FC2 is a grouped GEMM with fused scatter-reduce.
-#            Both use FP4 blockscaled arithmetic (tcgen05.mma).
-#
-# SSD: Mamba2 Structured State-Space Duality chunk-scan prefill.
-#      ssd_prefill.py targets Ampere SM80+ (warp MMA + cp.async);
-#      ssd_prefill_blackwell.py targets Blackwell SM100/SM101/SM110 (TMEM/wgmma).
-#      Each D×N combination (dim × dstate) is a separate AOT variant.
-#
-# No group receives --gpu_arch from the build script; they all compile
-# device-native, which works uniformly across all platforms.
+# Groups:
+#   gdn        — Gated Delta Net decode/prefill
+#   fmha       — Fused Multi-Head Attention (Blackwell persistent)
+#   ssd        — Mamba2 SSM chunk-scan prefill
+#   gemm       — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
+#   nvfp4_moe  — NvFP4 MoE FC1+FC2 grouped GEMM
 # ---------------------------------------------------------------------------
 KERNEL_VARIANTS = [
     # --- GDN group ---

@@ -13,29 +13,39 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+# cmake-format: off
 # ---------------------------------------------------------------------------
 # CuTe DSL unified kernel library
 #
-# Prebuilt artifacts are generated locally by: kernelSrcs/build_cutedsl.py
-# --gpu_arch <sm_NN> and stored under:
-# cpp/kernels/cuteDSLArtifact/{arch}/{artifact_tag}/
+# Artifacts are looked up from:
+#   cpp/kernels/cuteDSLArtifact/{arch}/{artifact_tag}/
 #
-# No Python, CUTLASS DSL, or GPU is needed at CMake build time.
+# If the directory does not exist, CMake auto-extracts a matching prebuilt
+# tarball from kernelSrcs/cuteDSLPrebuilt/ (e.g. cutedsl_aarch64_sm_110_cuda13.tar.gz).
+# Users can also generate artifacts locally:
+#   python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN>
 #
-# ENABLE_CUTE_DSL cache variable controls which kernel groups are linked: OFF —
-# disable entirely (default) ALL              — enable all groups found in
-# metadata.json fmha             — enable only the FMHA group gdn              —
-# enable only the GDN group fmha;gdn         — semicolon-separated list of
-# groups (CMake list syntax)
+# ENABLE_CUTE_DSL cache variable controls which kernel groups are linked:
+#   OFF      — disable entirely (default)
+#   ALL      — enable all groups found in metadata.json
+#   fmha     — enable only the FMHA group
+#   gdn      — enable only the GDN group
+#   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
 #
-# Usage: include(cmake/CuteDsl.cmake) cute_dsl_setup( TARGETS      target1
-# target2 ...   # compile definitions + include path only LINK_TARGETS target3
-# target4 ...   # compile definitions + include path + link )
+# Usage:
+#   include(cmake/CuteDsl.cmake)
+#   cute_dsl_setup(
+#     TARGETS      target1 target2 ...   # compile definitions + include path only
+#     LINK_TARGETS target3 target4 ...   # compile definitions + include path + link
+#   )
 #
-# Per-group compile definitions set on each target: CUTE_DSL_FMHA_ENABLED  — set
-# when the fmha group is active CUTE_DSL_GDN_ENABLED   — set when the gdn group
-# is active
+# Per-group compile definitions set on each target:
+#   CUTE_DSL_FMHA_ENABLED  — set when the fmha group is active
+#   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
+#   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
+#   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
 # ---------------------------------------------------------------------------
+# cmake-format: on
 
 set(ENABLE_CUTE_DSL
     "OFF"
@@ -226,6 +236,27 @@ function(cute_dsl_setup)
   set(_static_lib "${_artifact_dir}/libcutedsl_${_arch}.a")
   set(_inc_dir "${_artifact_dir}/include")
   set(_metadata "${_artifact_dir}/metadata.json")
+
+  # Auto-extract prebuilt tarball if artifacts are not present. Tarballs live in
+  # kernelSrcs/cuteDSLPrebuilt/ and are named:
+  # cutedsl_{arch}_{artifact_tag}_cuda{VER}.tar.gz
+  if(NOT EXISTS "${_metadata}" AND NOT _artifact_tag STREQUAL "")
+    set(_prebuilt_dir "${CMAKE_SOURCE_DIR}/kernelSrcs/cuteDSLPrebuilt")
+    file(GLOB _prebuilt_tarballs
+         "${_prebuilt_dir}/cutedsl_${_arch}_${_artifact_tag}_cuda*.tar.gz")
+    if(_prebuilt_tarballs)
+      list(GET _prebuilt_tarballs 0 _tarball)
+      message(STATUS "CuTe DSL: extracting prebuilt from ${_tarball}")
+      file(MAKE_DIRECTORY "${_artifact_root}")
+      execute_process(
+        COMMAND ${CMAKE_COMMAND} -E tar xzf "${_tarball}"
+        WORKING_DIRECTORY "${_artifact_root}"
+        RESULT_VARIABLE _tar_rc)
+      if(NOT _tar_rc EQUAL 0)
+        message(FATAL_ERROR "CuTe DSL: failed to extract ${_tarball}")
+      endif()
+    endif()
+  endif()
 
   # Validate artifacts exist.
   if(NOT EXISTS "${_static_lib}")
