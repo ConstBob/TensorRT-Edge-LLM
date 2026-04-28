@@ -34,7 +34,8 @@ from safetensors.torch import load_file, safe_open
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (AutoConfig, AutoModelForCausalLM,
+                          AutoModelForImageTextToText, AutoTokenizer)
 
 from ..quantization_configs import build_quant_config
 
@@ -286,7 +287,7 @@ def quantize_and_export_draft(
         def _calib(dm):
             for data in tqdm(loader, desc="Calibrating draft"):
                 data = data.to(device)
-                out = base(data, output_hidden_states=True)
+                out = base(input_ids=data, output_hidden_states=True)
                 hs = out["hidden_states"]
                 idx = [2, (len(hs) - 1) // 2, len(hs) - 4]
                 cat_hs = torch.cat([hs[i] for i in idx], dim=-1)
@@ -367,11 +368,31 @@ def _fill_embedding(sd, base_dir, device):
     raise ValueError("embed_tokens.weight not found in base model")
 
 
+def _is_vlm_model_type(model_dir):
+    """Return True if model_dir is a VLM requiring AutoModelForImageTextToText."""
+    cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    model_type = getattr(cfg, "model_type", None)
+    if model_type is None:
+        return False
+    causal_types = {
+        str(k)
+        for k in AutoModelForCausalLM._model_mapping._model_mapping
+    }
+    vlm_types = {
+        str(k)
+        for k in AutoModelForImageTextToText._model_mapping._model_mapping
+    }
+    return model_type in vlm_types and model_type not in causal_types
+
+
 def _load_for_draft_calib(model_dir, dtype, device):
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
     tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
+    is_vlm = _is_vlm_model_type(model_dir)
+    auto_cls = AutoModelForImageTextToText if is_vlm else AutoModelForCausalLM
+    model = auto_cls.from_pretrained(model_dir,
+                                     torch_dtype=torch_dtype,
+                                     trust_remote_code=True).to(device)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return model, tok
