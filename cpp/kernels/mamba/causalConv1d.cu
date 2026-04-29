@@ -372,4 +372,99 @@ void invokeCausalConv1dDecode(trt_edgellm::rt::Tensor& convState, trt_edgellm::r
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
+// MTP decode kernel: process T draft tokens, shift+insert+dot per step, checkpoint state.
+template <typename T>
+__global__ void causalConv1dDecodeMTPKernel(T* convState, T const* newCols, T const* weight, T const* bias, T* output,
+    T* intermediateConvStates, int32_t batch, int32_t dim, int32_t width, int32_t numTokens)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const dimIdx = static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
+    if (dimIdx >= dim)
+    {
+        return;
+    }
+
+    // Load current conv_state row into registers (width is small, typically 4).
+    int64_t const rowOffset = (static_cast<int64_t>(batchIdx) * dim + dimIdx) * width;
+    float state[8]; // Max supported kernel width (compile-time upper bound).
+    for (int32_t k = 0; k < width; ++k)
+    {
+        state[k] = conversion::toFloat(convState[rowOffset + k]);
+    }
+
+    float const biasVal = (bias != nullptr) ? conversion::toFloat(bias[dimIdx]) : 0.0F;
+
+    // Load weight into registers.
+    int64_t const wOffset = static_cast<int64_t>(dimIdx) * width;
+    float w[8];
+    for (int32_t k = 0; k < width; ++k)
+    {
+        w[k] = conversion::toFloat(weight[wOffset + k]);
+    }
+
+    for (int32_t t = 0; t < numTokens; ++t)
+    {
+        // Shift state left by 1.
+        for (int32_t k = 0; k < width - 1; ++k)
+        {
+            state[k] = state[k + 1];
+        }
+        // Insert new token at position width-1.
+        int64_t const newColIdx = (static_cast<int64_t>(batchIdx) * numTokens + t) * dim + dimIdx;
+        state[width - 1] = conversion::toFloat(newCols[newColIdx]);
+
+        // Dot product: output = conv_state · weight + bias.
+        float acc = biasVal;
+        for (int32_t k = 0; k < width; ++k)
+        {
+            acc += state[k] * w[k];
+        }
+        int64_t const outIdx = (static_cast<int64_t>(batchIdx) * numTokens + t) * dim + dimIdx;
+        conversion::convertAndStore(&output[outIdx], acc);
+
+        // Checkpoint: save intermediate conv_state for rollback.
+        // Layout: [batch, T, dim, width]
+        int64_t const intermBase = ((static_cast<int64_t>(batchIdx) * numTokens + t) * dim + dimIdx) * width;
+        for (int32_t k = 0; k < width; ++k)
+        {
+            conversion::convertAndStore(&intermediateConvStates[intermBase + k], state[k]);
+        }
+    }
+
+    // Write final state back to convState.
+    for (int32_t k = 0; k < width; ++k)
+    {
+        conversion::convertAndStore(&convState[rowOffset + k], state[k]);
+    }
+}
+
+void invokeCausalConv1dDecodeMTP(trt_edgellm::rt::Tensor& convState, trt_edgellm::rt::Tensor const& newCols,
+    trt_edgellm::rt::Tensor const& weight, trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out,
+    trt_edgellm::rt::Tensor& intermediateConvStates, int32_t T, cudaStream_t stream)
+{
+    int32_t const batch = static_cast<int32_t>(convState.getShape()[0]);
+    int32_t const dim = static_cast<int32_t>(convState.getShape()[1]);
+    int32_t const width = static_cast<int32_t>(convState.getShape()[2]);
+
+    if (width > 8)
+    {
+        throw std::runtime_error("invokeCausalConv1dDecodeMTP: kernel_size > 8 not supported.");
+    }
+    if (convState.getDataType() != nvinfer1::DataType::kHALF || weight.getDataType() != nvinfer1::DataType::kHALF
+        || out.getDataType() != nvinfer1::DataType::kHALF)
+    {
+        throw std::runtime_error("invokeCausalConv1dDecodeMTP: only FP16 (half) is supported.");
+    }
+
+    int32_t constexpr kThreads = 256;
+    dim3 const block(kThreads);
+    dim3 const grid(batch, static_cast<uint32_t>((dim + kThreads - 1) / kThreads));
+    half const* biasPtr = bias.has_value() ? bias->get().dataPointer<half>() : nullptr;
+
+    causalConv1dDecodeMTPKernel<half><<<grid, block, 0, stream>>>(convState.dataPointer<half>(),
+        newCols.dataPointer<half>(), weight.dataPointer<half>(), biasPtr, out.dataPointer<half>(),
+        intermediateConvStates.dataPointer<half>(), batch, dim, width, T);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
 } // namespace mamba_ssm
