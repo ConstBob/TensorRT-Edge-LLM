@@ -19,6 +19,7 @@ fallback for VLMs), runs ModelOpt quantization, and writes a unified safetensors
 checkpoint consumable by ``llm_loader``.  No ``tensorrt_edgellm`` dependency.
 """
 
+import json
 import os
 import time
 from contextlib import contextmanager
@@ -48,7 +49,15 @@ def _text_calib_dataloader(tokenizer,
         texts = ds["article"][:num_samples]
     elif os.path.isdir(dataset_name):
         ds = load_dataset(dataset_name, split="train")
-        texts = ds["text"][:num_samples]
+        if "text" in ds.column_names:
+            col = "text"
+        elif "article" in ds.column_names:
+            col = "article"
+        else:
+            raise ValueError(
+                f"Local dataset {dataset_name!r} has no 'text' or 'article' column: "
+                f"{ds.column_names}")
+        texts = ds[col][:num_samples]
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
@@ -58,6 +67,18 @@ def _text_calib_dataloader(tokenizer,
                     truncation=True,
                     max_length=max_length)
     return DataLoader(enc["input_ids"], batch_size=batch_size, shuffle=False)
+
+
+def _is_nemotron_h_model(model_dir: str) -> bool:
+    """True if ``<model_dir>/config.json`` declares ``model_type == "nemotron_h"``."""
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        return False
+    try:
+        with open(config_path) as f:
+            return json.load(f).get("model_type") == "nemotron_h"
+    except (OSError, ValueError):
+        return False
 
 
 def _load_model(model_dir, dtype="fp16", device="cuda"):
@@ -73,13 +94,29 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
     except Exception:
         processor = None
 
+    # NemotronH (hybrid Mamba+Attention): the custom modeling code imports
+    # ``mamba_ssm.ops.triton.layernorm_gated`` and (when available)
+    # ``causal_conv1d``. Apply the in-package patch BEFORE
+    # AutoModelForCausalLM.from_pretrained so the modeling import resolves
+    # against pure-PyTorch substitutes. This mirrors the legacy
+    # tensorrt-edgellm-quantize-llm flow which applies the same patch via
+    # tensorrt_edgellm.llm_models.models.nemotron_h_patch.
+    if _is_nemotron_h_model(model_dir):
+        from .nemotron_h_patch import apply as _apply_nemotron_h_patch
+        _apply_nemotron_h_patch()
+
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_dir,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
         ).to(device)
-    except Exception:
+    except (ValueError, KeyError):
+        # AutoModelForCausalLM doesn't recognize this config class (e.g. pure
+        # vision-text models registered only under image-text-to-text). We
+        # only fall back for *recognition* failures — not for ImportError or
+        # other runtime errors, which would otherwise be silently masked by
+        # a second, misleading "Unrecognized configuration class" exception.
         model = AutoModelForImageTextToText.from_pretrained(
             model_dir,
             torch_dtype=torch_dtype,
@@ -102,6 +139,53 @@ def _calibrate(model, dataloader):
     """Forward-loop calibration pass."""
     for data in tqdm(dataloader, desc="Calibrating"):
         model(data.to(model.device))
+
+
+def _normalize_tied_weights_keys(model) -> None:
+    """WAR for transformers >= 5.x ``_tied_weights_keys`` format change.
+
+    Newer transformers expects each submodule's ``_tied_weights_keys``
+    attribute to be a *dict-like* (so ``modeling_utils._get_tied_weight_keys``
+    can call ``.keys()``). Older custom modeling code (e.g. NemotronH's
+    ``modeling_nemotron_h.py``) still declares it as a *list*, which
+    crashes ``model.save_pretrained`` with::
+
+        AttributeError: 'list' object has no attribute 'keys'
+
+    Convert list-shaped attributes to ``{key: key}`` dicts in place. The
+    dict's keys exactly match the original list, preserving behavior for
+    downstream tied-weight tracking. No-op for modules that already use
+    the dict format or have no ``_tied_weights_keys`` set.
+    """
+    for module in model.modules():
+        attr = getattr(module, "_tied_weights_keys", None)
+        if isinstance(attr, list):
+            module._tied_weights_keys = {k: k for k in attr}
+
+
+def _fix_generation_config_for_strict_validate(model) -> None:
+    """WAR for transformers >= 5.x ``GenerationConfig.validate(strict=True)``.
+
+    ModelOpt's ``export_hf_checkpoint`` -> ``model.save_pretrained`` ->
+    ``generation_config.save_pretrained`` runs ``validate(strict=True)``
+    which rejects HF model checkpoints whose ``generation_config.json``
+    sets sampling-only kwargs (``top_p`` / ``top_k`` / ``temperature``)
+    without setting ``do_sample = True``. NVIDIA-Nemotron-3-Nano-* and
+    similar checkpoints ship that exact mismatch.
+
+    Force ``do_sample = True`` when any sampling kwarg is present. This
+    only changes the saved ``generation_config.json``; the C++ runtime
+    (llm_inference / llm_bench) reads its own runtime params and does
+    not depend on this file.
+    """
+    gc = getattr(model, "generation_config", None)
+    if gc is None:
+        return
+    sampling_set = (getattr(gc, "top_p", None) not in (None, 1.0)
+                    or getattr(gc, "top_k", None) not in (None, 0, 50)
+                    or getattr(gc, "temperature", None) not in (None, 1.0))
+    if sampling_set and not getattr(gc, "do_sample", False):
+        gc.do_sample = True
 
 
 def _is_hybrid_model(model):
@@ -188,6 +272,9 @@ def quantize_and_export(
         mtq.print_quant_summary(model)
 
     print(f"Quantization: {time.time() - t0:.1f}s")
+
+    _fix_generation_config_for_strict_validate(model)
+    _normalize_tied_weights_keys(model)
 
     os.makedirs(output_dir, exist_ok=True)
     with torch.inference_mode(), _skip_resmooth_for_hybrid(model):
