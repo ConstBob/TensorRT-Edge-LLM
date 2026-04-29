@@ -509,6 +509,7 @@ def generate_kernel_bench_commands(
         f"--batchSize={config.batch_size or 1}",
         f"--warmup={config.warmup or 2}",
         f"--iterations=10",
+        "--profile",
     ])
 
     if config.bench_mode:
