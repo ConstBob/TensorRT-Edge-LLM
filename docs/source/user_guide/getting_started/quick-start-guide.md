@@ -248,6 +248,25 @@ You should see a JSON response with the model's answer, similar to:
 }
 ```
 
+### Inference and Benchmarking Tools
+
+TensorRT Edge-LLM provides two LLM runtime examples for different purposes:
+
+- `llm_inference` is the end-to-end inference example. Use it when you want to run real JSON requests, apply chat templates, generate text, write response JSON, and validate application-level behavior. It can also report overall performance metrics such as tokens/sec.
+- `llm_bench` is the benchmark example. Use it when you want synthetic prefill/decode timing for a built engine without preparing an input JSON file. By default it reports overall E2E timing; pass `--profile` to collect per-layer profiling for kernel-level breakdowns.
+
+For example, benchmark prefill latency for the engine built above:
+
+```bash
+./build/examples/llm/llm_bench \
+    --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
+    --mode prefill \
+    --inputLen 128 \
+    --batchSize 1
+```
+
+To collect layer-level profiling in addition to the benchmark summary, add `--profile`.
+
 **Success!** 🎉 You've successfully run LLM inference on your edge device!
 
 ---

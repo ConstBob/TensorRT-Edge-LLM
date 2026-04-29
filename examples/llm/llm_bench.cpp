@@ -59,14 +59,14 @@ enum ProfileBenchOptionId : int
     VERIFY_TREE_SIZE = 815,
     DRAFT_TREE_SIZE = 816,
     IMAGE_SIZE = 818,
-    NO_PROFILE = 821,
     OSL = 827,
     OUTPUT_DIR = 828,
     SEED = 829,
-    USE_CUDA_GRAPH = 830,
+    NO_CUDA_GRAPH = 830,
     EXTRACT_LAYER_INFO = 831,
     ACCEPT_RATE = 832,
-    DRAFT_STEP = 833
+    DRAFT_STEP = 833,
+    PROFILE = 834
 };
 
 struct ProfileBenchArgs
@@ -78,7 +78,7 @@ struct ProfileBenchArgs
     int32_t inputLen{-1}; // Input sequence length per batch (required for prefill modes)
     int32_t iterations{10};
     int32_t warmup{3};
-    bool noProfile{false};  // Disable layer profiling phase (--noProfile), E2E only
+    bool noProfile{true};   // Layer profiling is disabled by default; --profile enables it.
     std::string outputDir;  // Directory to dump output CSV files (layer profiling and E2E timing)
     int32_t imageHeight{0}; // Image height in pixels (required for visual mode)
     int32_t imageWidth{0};  // Image width in pixels (required for visual mode)
@@ -101,8 +101,8 @@ struct ProfileBenchArgs
     // Random seed for reproducibility
     uint64_t seed{0};
 
-    // CUDA graph optimization
-    bool useCudaGraph{false};
+    // CUDA graph is enabled by default for decode/EAGLE E2E timing.
+    bool noCudaGraph{false};
 
     // Metadata extraction flags - disabled by default for performance.
     // Set via --extractLayerInfo <comma-separated list>.
@@ -171,19 +171,18 @@ void printUsage(char const* programName)
     std::cerr << "  --iterations              Number of profiling iterations (after warmup). Default = 10" << std::endl;
     std::cerr << "  --warmup                  Number of warmup iterations. Default = 3" << std::endl;
     std::cerr << "  --osl                     Output sequence length for decode E2E timing. Default = 1." << std::endl;
-    std::cerr << "                            osl=1: layer profiling + E2E both run --iterations times." << std::endl;
-    std::cerr << "                            osl>1: layer profiling runs --iterations times (single-step),"
-              << std::endl;
-    std::cerr << "                                   E2E runs full sequence decode once." << std::endl;
-    std::cerr << "  --noProfile               Disable per-layer profiling (E2E timing only)." << std::endl;
-    std::cerr << "                            By default both E2E and layer profiling run." << std::endl;
+    std::cerr << "                            osl=1: E2E runs --iterations times." << std::endl;
+    std::cerr << "                            osl>1: E2E runs full sequence decode once." << std::endl;
+    std::cerr << "  --profile                 Enable per-layer profiling. Disabled by default." << std::endl;
     std::cerr << "  --outputDir               Directory to dump output CSV files (layer profiling and E2E timing)"
               << std::endl;
     std::cerr << "  --seed                    Random seed for reproducible data. Default = 0" << std::endl;
-    std::cerr << "  --useCudaGraph            Capture CUDA graph before E2E timing for faster per-step execution."
+    std::cerr << "  --noCudaGraph             Disable CUDA graph capture for decode/EAGLE E2E timing." << std::endl;
+    std::cerr << "                            Capture is enabled by default and falls back to non-graph on failure."
               << std::endl;
     std::cerr << "  --extractLayerInfo <opts>  Comma-separated list of layer info to extract:" << std::endl;
     std::cerr << "                              all, shapes, onnx_ops, tactics, data_types" << std::endl;
+    std::cerr << "                            Implies --profile." << std::endl;
     std::cerr << std::endl;
     std::cerr << "EAGLE-Specific Options:" << std::endl;
     std::cerr << "  --acceptRate              Avg accepted tokens per EAGLE iteration (default: 5)." << std::endl;
@@ -226,12 +225,12 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
         {"pastKVLen", required_argument, 0, ProfileBenchOptionId::PAST_KV_LEN},
         {"verifyTreeSize", required_argument, 0, ProfileBenchOptionId::VERIFY_TREE_SIZE},
         {"draftTreeSize", required_argument, 0, ProfileBenchOptionId::DRAFT_TREE_SIZE},
-        {"noProfile", no_argument, 0, ProfileBenchOptionId::NO_PROFILE},
+        {"profile", no_argument, 0, ProfileBenchOptionId::PROFILE},
         {"outputDir", required_argument, 0, ProfileBenchOptionId::OUTPUT_DIR},
         {"osl", required_argument, 0, ProfileBenchOptionId::OSL},
         {"seed", required_argument, 0, ProfileBenchOptionId::SEED},
         {"imageSize", required_argument, 0, ProfileBenchOptionId::IMAGE_SIZE},
-        {"useCudaGraph", no_argument, 0, ProfileBenchOptionId::USE_CUDA_GRAPH},
+        {"noCudaGraph", no_argument, 0, ProfileBenchOptionId::NO_CUDA_GRAPH},
         {"extractLayerInfo", required_argument, 0, ProfileBenchOptionId::EXTRACT_LAYER_INFO},
         {"acceptRate", required_argument, 0, ProfileBenchOptionId::ACCEPT_RATE},
         {"draftStep", required_argument, 0, ProfileBenchOptionId::DRAFT_STEP}, {0, 0, 0, 0}};
@@ -368,7 +367,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 }
                 break;
             }
-            case ProfileBenchOptionId::NO_PROFILE: args.noProfile = true; break;
+            case ProfileBenchOptionId::PROFILE: args.noProfile = false; break;
             case ProfileBenchOptionId::OUTPUT_DIR: args.outputDir = optarg; break;
             case ProfileBenchOptionId::OSL:
                 args.osl = std::stoi(optarg);
@@ -379,7 +378,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 }
                 break;
             case ProfileBenchOptionId::SEED: args.seed = std::stoull(optarg); break;
-            case ProfileBenchOptionId::USE_CUDA_GRAPH: args.useCudaGraph = true; break;
+            case ProfileBenchOptionId::NO_CUDA_GRAPH: args.noCudaGraph = true; break;
             case ProfileBenchOptionId::EXTRACT_LAYER_INFO:
             {
                 std::string val = optarg;
@@ -422,6 +421,12 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
             LOG_ERROR("Failed to parse argument: %s", e.what());
             return false;
         }
+    }
+
+    // Layer metadata is only emitted through the layer profiling CSV.
+    if (args.extractLayerInfo.any())
+    {
+        args.noProfile = false;
     }
 
     return true;
@@ -543,15 +548,15 @@ int main(int argc, char** argv)
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    // Enable layer profiler unless --noProfile is set (E2E only mode).
+    // Layer profiling is opt-in; E2E timing is the default benchmark path.
     if (!args.noProfile)
     {
         layerProfiler::LayerProfiler::getInstance().setEnabled(true);
-        LOG_INFO("Layer profiling enabled.");
+        LOG_INFO("Layer profiling enabled. E2E CUDA graph timing will be skipped.");
     }
     else
     {
-        LOG_INFO("Layer profiling disabled (--noProfile). E2E timing only.");
+        LOG_INFO("Layer profiling disabled from startup. E2E timing only.");
     }
 
     // Layer metadata (ONNX ops, shapes, tactics, data types) extracted from engine inspector
@@ -887,10 +892,7 @@ int main(int argc, char** argv)
         int32_t osl = args.osl;
         int32_t decodeTokens = (osl > 1) ? (osl - 1) : 1;
         LOG_INFO("OSL=%d: will run %d decode steps for E2E timing", osl, decodeTokens);
-        if (args.useCudaGraph)
-        {
-            LOG_INFO("CUDA graph enabled for faster per-step execution");
-        }
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         decodeInputs
             = rt::Tensor(rt::Coords{args.batchSize, 1, hiddenSize}, rt::DeviceType::kGPU, dtype, "decode_input");
@@ -936,10 +938,7 @@ int main(int argc, char** argv)
         verifyHiddenStates = rt::Tensor(
             rt::Coords{selectTokenSize, eagleHiddenDim}, rt::DeviceType::kGPU, dtype, "verify_hidden_states");
 
-        if (args.useCudaGraph)
-        {
-            LOG_INFO("CUDA graph enabled: will run layer profiling + CUDA graph timing");
-        }
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
@@ -995,10 +994,7 @@ int main(int argc, char** argv)
         draftOutputHiddenStates = rt::Tensor(rt::Coords{args.batchSize, numSelectedTokens, hiddenSize},
             rt::DeviceType::kGPU, dtype, "draft_hidden_output");
 
-        if (args.useCudaGraph)
-        {
-            LOG_INFO("CUDA graph enabled: will run layer profiling + CUDA graph timing");
-        }
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
@@ -1103,6 +1099,16 @@ int main(int argc, char** argv)
             writeLayerInfoCsv(
                 layerTimings, buildLayerCsvPath(args.outputDir, outParams), outParams, imageTokens, layerMetadata);
         }
+
+        // A TensorRT profiler attached to an execution context cannot be fully detached in this benchmark process.
+        // Keep --profile isolated to non-CUDA-graph layer profiling so E2E CUDA graph timing stays uncontaminated.
+        logResultsSummary(args.toOutputParams(), timesPerIter, e2eTimeMsResult, imageTokens);
+        if (!args.outputDir.empty())
+        {
+            LOG_INFO("Output CSV files saved to: %s", args.outputDir.c_str());
+        }
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        return EXIT_SUCCESS;
     }
 
     // ===== Phase 7: E2E Timing =====
@@ -1129,14 +1135,14 @@ int main(int argc, char** argv)
     {
         // osl > 1: full sequence decode, single run
         e2eTimeMsResult = runSequentialE2ETiming(
-            modeName, decodeSteps, resetState, step, postStep, args.useCudaGraph, captureGraph, stream);
+            modeName, decodeSteps, resetState, step, postStep, !args.noCudaGraph, captureGraph, stream);
         e2eNumTokens = decodeSteps;
     }
     else
     {
         // osl=1: single-step, multiple iterations (decode/eagle modes)
         e2eTimeMsResult = runRepeatedE2ETiming(
-            modeName, args.iterations, resetState, step, stream, args.useCudaGraph, captureGraph);
+            modeName, args.iterations, resetState, step, stream, !args.noCudaGraph, captureGraph);
         e2eNumTokens = 1;
     }
 
