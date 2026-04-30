@@ -147,6 +147,40 @@ inline constexpr char const* kPresentVCacheTemplate = "present_v_cache";
 
 /*! @} */
 
+/*! @name Alpamayo 1 action head input/output bindings
+ * @{
+ */
+
+/*!
+ * @brief Noise trajectory input for one denoising step
+ *
+ * Shape: [batch_size, num_waypoints, 2] (FLOAT32)
+ */
+inline constexpr char const* kNoiseTrajectory = "noise_trajectory";
+
+/*!
+ * @brief Denoising time step t0 (start)
+ *
+ * Shape: [1] (FLOAT32)
+ */
+inline constexpr char const* kTimeStepsT0 = "time_steps_t0";
+
+/*!
+ * @brief Denoising time step t1 (end)
+ *
+ * Shape: [1] (FLOAT32)
+ */
+inline constexpr char const* kTimeStepsT1 = "time_steps_t1";
+
+/*!
+ * @brief Denoised trajectory output from one denoising step
+ *
+ * Shape: [batch_size, num_waypoints, 2] (FLOAT32)
+ */
+inline constexpr char const* kDenoisedTrajectory = "denoised_trajectory";
+
+/*! @} */
+
 /*! @name Recurrent State Bindings (Mamba / GDN / linear-attention layers)
  * @{
  */

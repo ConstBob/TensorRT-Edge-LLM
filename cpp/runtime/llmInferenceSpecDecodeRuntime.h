@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "action/alpamayo1ActionRunner.h"
 #include "common/hashUtils.h"
 #include "common/tensor.h"
 #include "multimodal/multimodalRunner.h"
@@ -199,6 +200,11 @@ public:
     bool genAndSaveSystemPromptKVCache(
         std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream);
 
+    /*! \brief Set the random seed used when initializing the action diffusion noise trajectory
+     *  \param seed Random seed value; has no effect if no action runner is loaded
+     */
+    void setActionNoiseSeed(int32_t seed) noexcept;
+
     //! Get LLM prefill stage metrics
     metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
     {
@@ -243,11 +249,12 @@ private:
     LLMEngineRunnerConfig mBaseEngineConfig;            //!< Base engine configuration
     std::optional<EagleDraftEngineRunnerConfig> mDraftEngineConfig; //!< Draft engine configuration (nullopt = no draft)
 
-    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;         //!< Base model engine runner
-    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner; //!< Draft model engine runner (nullptr = no draft)
-    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};   //!< Vision multimodal runner (optional)
-    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};    //!< Audio multimodal runner (optional)
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;           //!< Tokenizer
+    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;            //!< Base model engine runner
+    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;    //!< Draft model engine runner (nullptr = no draft)
+    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};      //!< Vision multimodal runner (optional)
+    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
+    std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;              //!< Tokenizer
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase; //!< System prompt KVCache for base model
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>

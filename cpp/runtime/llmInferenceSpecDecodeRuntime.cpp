@@ -28,6 +28,7 @@
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "multimodal/multimodalRunner.h"
+#include "multimodal/qwenViTRunner.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/hybridCacheManager.h"
@@ -435,6 +436,34 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         {
             throw std::runtime_error("No valid multimodal engine found in " + multimodalEngineDir);
         }
+
+        // Try to load action expert from multimodalEngineDir/action
+        try
+        {
+            std::string actionDir = multimodalEngineDir + "/action";
+            LOG_INFO("Attempting to load Action runner from %s", actionDir.c_str());
+            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(
+                actionDir, stream, mBaseEngineRunner->getCacheManager().getKVCacheManager().getConfig());
+            LOG_INFO("Alpamayo 1 action expert loaded.");
+        }
+        catch (std::exception const& e)
+        {
+            LOG_INFO("Failed to load Action runner from %s: %s", (multimodalEngineDir + "/action").c_str(), e.what());
+        }
+
+        // Validate that the action engine's max KV cache capacity matches the LLM engine's.
+        if (mActionRunner)
+        {
+            int32_t const actionMaxKVCacheCapacity = mActionRunner->getMaxKVCacheCapacity();
+            int32_t const llmMaxKVCacheCapacity = mBaseEngineConfig.maxKVCacheCapacity;
+            if (actionMaxKVCacheCapacity != llmMaxKVCacheCapacity)
+            {
+                throw std::runtime_error(format::fmtstr(
+                    "Action engine max_kv_cache_capacity (%d) does not match LLM engine max_kv_cache_capacity (%d). "
+                    "Re-export and rebuild the action engine with --max_kv_cache_capacity=%d to match the LLM engine.",
+                    actionMaxKVCacheCapacity, llmMaxKVCacheCapacity, llmMaxKVCacheCapacity));
+            }
+        }
     }
 
     // Setup shared execution context memory for all engines (base, draft, and optionally VIT).
@@ -444,8 +473,9 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     int64_t const draftContextMemorySize = mDraftEngineRunner ? mDraftEngineRunner->getRequiredContextMemorySize() : 0;
     int64_t const visionContextMemorySize = mVisionRunner ? mVisionRunner->getRequiredContextMemorySize() : 0;
     int64_t const audioContextMemorySize = mAudioRunner ? mAudioRunner->getRequiredContextMemorySize() : 0;
-    int64_t const sharedContextMemorySize
-        = std::max({baseContextMemorySize, draftContextMemorySize, visionContextMemorySize, audioContextMemorySize});
+    int64_t const actionContextMemorySize = mActionRunner ? mActionRunner->getRequiredContextMemorySize() : 0;
+    int64_t const sharedContextMemorySize = std::max({baseContextMemorySize, draftContextMemorySize,
+        visionContextMemorySize, audioContextMemorySize, actionContextMemorySize});
     mSharedExecContextMemory = rt::Tensor({sharedContextMemorySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "LLMInferenceSpecDecodeRuntime::mSharedExecContextMemory");
     mBaseEngineRunner->setContextMemory(mSharedExecContextMemory);
@@ -461,12 +491,24 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     {
         mAudioRunner->setContextMemory(mSharedExecContextMemory);
     }
+    if (mActionRunner)
+    {
+        mActionRunner->setContextMemory(mSharedExecContextMemory);
+    }
     LOG_INFO(
         "Setup shared execution context memory: %zu bytes (base requires: %zu, draft requires: %zu, vision requires: "
-        "%zu, audio requires: %zu)",
+        "%zu, audio requires: %zu, action requires: %zu)",
         static_cast<size_t>(sharedContextMemorySize), static_cast<size_t>(baseContextMemorySize),
         static_cast<size_t>(draftContextMemorySize), static_cast<size_t>(visionContextMemorySize),
-        static_cast<size_t>(audioContextMemorySize));
+        static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
+}
+
+void LLMInferenceSpecDecodeRuntime::setActionNoiseSeed(int32_t seed) noexcept
+{
+    if (mActionRunner)
+    {
+        mActionRunner->setNoiseSeed(seed);
+    }
 }
 
 bool LLMInferenceSpecDecodeRuntime::handleRequest(
@@ -508,7 +550,8 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     SpecDecodeInferenceContext context;
     context.initialize(
         activeBatchSize, maxGenerateLength, std::nullopt, rt::OptionalInputTensors{}, loraWeightsName, stream);
-    bool const supportsMultimodalInput = (mAudioRunner != nullptr) || (mVisionRunner != nullptr);
+    bool const supportsMultimodalInput
+        = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
 
     if (supportsMultimodalInput)
     {
@@ -637,6 +680,13 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return true;
     };
 
+    // Used for Alpamayo 1
+    int32_t trajFutureStartId = 0;
+    if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
+    {
+        trajFutureStartId = static_cast<int32_t>(mTokenizer->getTokenId("<|traj_future_start|>"));
+    }
+
     // Lambda to update finish states based on EOS and max_length. Latches
     // terminalReason atomically with the state flip — the !finishedStates guard
     // keeps first-writer-wins semantics relative to applyCancellationToFinishStates.
@@ -648,16 +698,33 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
                 continue; // Respect first-writer-wins (cancel may have fired).
             }
             auto& s = context.slotStreams[i];
-            // Check EOS
-            if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
+            if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
             {
-                context.finishedStates[i] = 1;
-                if (s.channel)
+                if (context.tokenIds[i].size() > 1 && trajFutureStartId >= 0
+                    && context.tokenIds[i][context.tokenIds[i].size() - 2] == trajFutureStartId)
                 {
-                    s.terminalReason = FinishReason::kEndId;
+                    context.finishedStates[i] = 1;
+                    if (s.channel)
+                    {
+                        s.terminalReason = FinishReason::kEndId;
+                    }
+                    LOG_DEBUG("Batch %d finished, reason: traj_future_start", i);
+                    continue;
                 }
-                LOG_DEBUG("Batch %d finished, reason: EOS", i);
-                continue;
+            }
+            else
+            {
+                // Check EOS
+                if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
+                {
+                    context.finishedStates[i] = 1;
+                    if (s.channel)
+                    {
+                        s.terminalReason = FinishReason::kEndId;
+                    }
+                    LOG_DEBUG("Batch %d finished, reason: EOS", i);
+                    continue;
+                }
             }
             // Check max length
             if (context.currentGenerateLengths[i] >= context.maxGenerateLength)
@@ -794,8 +861,10 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     // Maintain original batch order using original batch indices
     response.outputIds.clear();
     response.outputTexts.clear();
+    response.outputTrajectories.clear();
     response.outputIds.resize(context.completedBatches.size());
     response.outputTexts.resize(context.completedBatches.size());
+    response.outputTrajectories.resize(context.completedBatches.size());
 
     // Add outputs from completed batches (using saved original indices)
     for (auto const& [originalIdx, batchResult] : context.completedBatches)
@@ -824,6 +893,45 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
     }
 
+    bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
+        [](auto const& req) { return req.pastTrajectory.has_value(); });
+    // If action engine is loaded, run one batched trajectory sample and fill output for all batch items.
+    if (hasTrajectoryHistory && mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
+    {
+        if (!mVisionRunner)
+        {
+            LOG_ERROR("Alpamayo1ActionRunner requires a vision runner (e.g. QwenViTRunner) for MRoPE rope deltas.");
+            return false;
+        }
+
+        multimodal::ModelType const visionType = mVisionRunner->getModelType();
+        bool const isQwen3ViT = visionType == multimodal::ModelType::QWEN3_VL;
+        if (!isQwen3ViT)
+        {
+            LOG_ERROR(
+                "Alpamayo1ActionRunner requires a Qwen3-VL vision runner but a different vision runner is loaded.");
+            return false;
+        }
+        // MultimodalRunner::create() uses QwenViTRunner only for Qwen3-VL.
+        auto* qwenVision = static_cast<rt::QwenViTRunner*>(mVisionRunner.get());
+        std::vector<int64_t> const& ropeDeltas = qwenVision->getMropeRopeDeltasPerBatch();
+        rt::HybridCacheManager& kvcache = mBaseEngineRunner->getCacheManager();
+        std::vector<std::vector<rt::FutureTrajectoryPoint>> trajectories
+            = mActionRunner->sampleTrajectory(stream, activeBatchSize, kvcache, ropeDeltas);
+        if (trajectories.size() != static_cast<size_t>(activeBatchSize))
+        {
+            LOG_ERROR("Alpamayo1ActionRunner trajectory sampling failed.");
+            return false;
+        }
+        for (size_t i = 0; i < trajectories.size() && i < static_cast<size_t>(activeBatchSize); ++i)
+        {
+            if (!trajectories[i].empty())
+            {
+                response.outputTrajectories[i] = std::move(trajectories[i]);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -834,6 +942,8 @@ bool LLMInferenceSpecDecodeRuntime::validateRequestConfig(LLMGenerationRequest c
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.audioBuffers.empty(); });
     bool const hasVision = std::any_of(
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.imageBuffers.empty(); });
+    bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
+        [](auto const& req) { return req.pastTrajectory.has_value(); });
 
     if (activeBatchSize == 0)
     {
@@ -865,6 +975,11 @@ bool LLMInferenceSpecDecodeRuntime::validateRequestConfig(LLMGenerationRequest c
         LOG_ERROR("Request contains vision input, but this runtime does not have a vision runner.");
         return false;
     }
+    if (hasTrajectoryHistory && !mActionRunner)
+    {
+        LOG_ERROR("Request contains trajectory history input, but this runtime does not have an action runner.");
+        return false;
+    }
 
     return true;
 }
@@ -877,6 +992,8 @@ bool LLMInferenceSpecDecodeRuntime::multiModalRuntimePreprocess(
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.audioBuffers.empty(); });
     bool const hasVision = std::any_of(
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.imageBuffers.empty(); });
+    bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
+        [](auto const& req) { return req.pastTrajectory.has_value(); });
 
     // Clear request-scoped multimodal state up front so previous requests cannot leak through reused runtime members.
     context.visualEmbeddings = std::nullopt;
@@ -923,6 +1040,18 @@ bool LLMInferenceSpecDecodeRuntime::multiModalRuntimePreprocess(
         if (!mVisionRunner->infer(stream))
         {
             LOG_ERROR("Vision inference failed. This request cannot be handled.");
+            return false;
+        }
+    }
+
+    // Process action inputs (if present)
+    if (hasTrajectoryHistory && mActionRunner)
+    {
+        LOG_INFO("Processing trajectory history inputs");
+        if (!mActionRunner->preprocess(request, batchedInputIds, mTokenizer.get()))
+        {
+            LOG_ERROR(
+                "LLMInferenceRuntime(): Trajectory history preprocessing failed. This request cannot be handled.");
             return false;
         }
     }
