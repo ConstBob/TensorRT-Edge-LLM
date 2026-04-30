@@ -116,6 +116,14 @@ public:
     //! \return Optional input tensors vector containing deepstack features
     rt::OptionalInputTensors getDeepstackFeatures() override;
 
+    //! \brief Get MRoPE rope deltas for each batch from the last preprocess/infer run.
+    //! \return Vector of length (batch size): delta = maxMropePositionId + 1 - inputIdSize per batch; empty if not yet
+    //! set.
+    std::vector<int64_t> const& getMropeRopeDeltasPerBatch() const noexcept
+    {
+        return mMropeRopeDeltasPerBatch;
+    }
+
 private:
     //! \brief Calculate resized image dimensions based on dynamic resolution constraints
     //! \param[in] height Input image height
@@ -219,6 +227,9 @@ private:
     int32_t mLLMMaxSequenceLength{0}; //!< Maximum sequence length from LLM engine
 
     std::vector<std::vector<int64_t>> mLastImageGridTHWs; //!< Used to determine whether RoPE can be reused.
+    std::vector<int64_t> mMropeRopeDeltasPerBatch{}; //!< Used by downstream runners like Alpamayo1ActionRunner to set
+                                                     //!< base MRoPE positions so the action expert's RoPE continues
+                                                     //!< coherently after the VLM sequence.
 };
 
 } // namespace rt

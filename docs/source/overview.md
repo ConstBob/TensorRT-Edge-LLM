@@ -30,7 +30,7 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 
 ### Supported Model Families
 
-TensorRT Edge-LLM supports Llama/Qwen/Nemotron language models, Qwen and InternVL vision-language models, Phi-4-Multimodal, Qwen3-ASR/TTS, Nemotron-Omni, EAGLE3 draft models, and selected MoE checkpoints. For the complete support matrix, including Transformers class names, example checkpoints, precision requirements, and platform compatibility, see **[Supported Models](user_guide/getting_started/supported-models.md)**.
+TensorRT Edge-LLM supports Llama/Qwen/Nemotron language models, Qwen and InternVL vision-language models, Alpamayo 1, Phi-4-Multimodal, Qwen3-ASR/TTS, Nemotron-Omni, EAGLE3 draft models, and selected MoE checkpoints. For the complete support matrix, including Transformers class names, example checkpoints, precision requirements, and platform compatibility, see **[Supported Models](user_guide/getting_started/supported-models.md)**.
 
 ---
 
@@ -103,7 +103,7 @@ Ready to get started with TensorRT Edge-LLM? Follow these steps:
 
 2. **[Quick Start Guide](user_guide/getting_started/quick-start-guide.md)** - Run your first LLM inference in ~15 minutes with step-by-step instructions
 
-3. **Examples** - Explore advanced workflows including [VLM inference](user_guide/examples/vlm.md), [speculative decoding](user_guide/examples/speculative-decoding.md), [ASR](user_guide/examples/asr.md), [MoE](user_guide/examples/moe.md), and [TTS](user_guide/examples/tts.md)
+3. **Examples** - Explore advanced workflows including [VLM inference](user_guide/examples/vlm.md), [speculative decoding](user_guide/examples/speculative-decoding.md), [ASR](user_guide/examples/asr.md), [MoE](user_guide/examples/moe.md), [TTS](user_guide/examples/tts.md), and [VLA model inference](user_guide/examples/vla.md)
 
 ---
 

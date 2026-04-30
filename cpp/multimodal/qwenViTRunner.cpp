@@ -520,6 +520,7 @@ void QwenViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const&
     int64_t totalImageIdx = 0;
     int64_t batchOffset = 0;
 
+    mMropeRopeDeltasPerBatch.clear();
     for (auto const& inputIds : batchInputIds)
     {
         auto start = inputIds.begin();
@@ -564,6 +565,10 @@ void QwenViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const&
             startIdx += std::max(T, std::max(H, W)) + textLen;
             remainingStartPos = start - inputIds.begin();
         }
+
+        // MRoPE rope delta for this batch: maxMropePositionId + 1 - inputIdSize
+        int64_t const maxMropePositionId = startIdx + inputIds.size() - remainingStartPos - 1;
+        mMropeRopeDeltasPerBatch.push_back(maxMropePositionId + 1 - inputIds.size());
 
         // Remaining text part till maxPositionEmbeddings. Treat all generated tokens as text tokens.
         int64_t textLen = maxPositionEmbeddings - remainingStartPos;

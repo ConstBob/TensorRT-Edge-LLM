@@ -139,6 +139,7 @@ Some models on HuggingFace require you to accept terms before downloading. This 
 **Models that require HuggingFace login:**
 - Llama family (Llama 3.x)
 - Phi-4-Multimodal
+- Alpamayo-R1-10B
 - Other models marked as "gated" on HuggingFace
 
 **To configure access:**

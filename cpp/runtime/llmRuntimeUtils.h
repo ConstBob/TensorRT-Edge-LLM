@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "action/alpamayo1RunnerUtils.h"
 #include "common/tensor.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
@@ -27,7 +28,6 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
-#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -43,9 +43,9 @@ struct Message
 {
     struct MessageContent
     {
-        std::string type;    //!< Content type (text, image)
+        std::string type;    //!< Content type (text, image, trajectory)
         std::string content; //!< Text content when content type is text. Image data will be stored in corresponding
-                             //!< imageBuffers.
+                             //!< imageBuffers. For type "trajectory", data is stored in Request::pastTrajectory.
     };
     std::string role;                     //!< Message role (system, user, assistant)
     std::vector<MessageContent> contents; //!< Contents of the message
@@ -79,6 +79,8 @@ struct LLMGenerationRequest
         std::vector<Message> messages; //!< Structured messages (required - use chat template format)
         std::vector<rt::imageUtils::ImageData> imageBuffers; //!< Optional image data for multimodal inputs
         std::vector<rt::audioUtils::AudioData> audioBuffers; //!< Optional audio data for multimodal inputs (Qwen3-Omni)
+        std::optional<std::vector<PastTrajectoryPoint>>
+            pastTrajectory; //!< Optional past trajectory for Alpamayo (e.g. ego x,y,z history)
 
         mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };
@@ -117,6 +119,8 @@ struct LLMGenerationResponse
 {
     std::vector<std::vector<int32_t>> outputIds; //!< Generated token IDs for each request in the batch
     std::vector<std::string> outputTexts;        //!< Generated text strings for each request in the batch
+    //!< Future trajectory waypoints (e.g. accel, kappa) per batch item; populated when action engine is used
+    std::vector<std::vector<FutureTrajectoryPoint>> outputTrajectories;
 };
 
 /*! \brief RoPE (Rotary Position Embedding) type enumeration
