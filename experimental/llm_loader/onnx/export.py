@@ -375,8 +375,11 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
         ]
 
 
-def _fix_initializer_dtypes(onnx_path: str,
-                            dedup_dql_scales: bool = False) -> None:
+def _fix_initializer_dtypes(
+        onnx_path: str,
+        dedup_dql_scales: bool = False,
+        preserve_fp32_patterns: "tuple[str, ...]" = (),
+) -> None:
     """Single-pass ONNX initializer fixup for TRT compatibility.
 
     Performs up to three corrections in one ONNX load+save:
@@ -389,6 +392,11 @@ def _fix_initializer_dtypes(onnx_path: str,
        for FP16 model weights (e.g. tied lm_head in BF16 checkpoints).  TRT
        requires uniform dtype in MatMul inputs.  Scalars and quantization
        scale tensors are left as FP32.
+
+       Initializers whose name contains any substring in
+       ``preserve_fp32_patterns`` are kept FP32.  This is how a model opts
+       out of the downgrade for weights that must stay FP32 (e.g.
+       CodePredictor's ``down_proj``, see ``_DownProjFP32``).
 
     3. **Mamba ssm_A → FP32**: ONNX constant folding may collapse the
        ``A_log.to(float32) → exp → neg`` chain into a single initializer.
@@ -418,6 +426,10 @@ def _fix_initializer_dtypes(onnx_path: str,
         if node.op_type == "Nvfp4MoePlugin" and len(node.input) > 11:
             mamba_a_names.add(node.input[11])
 
+    def _is_preserved_fp32(init_name: str) -> bool:
+        """Does ``init_name`` match any caller-supplied preserve pattern?"""
+        return any(p in init_name for p in preserve_fp32_patterns)
+
     n_to_fp16 = 0
     n_to_fp32 = 0
     for init in model.graph.initializer:
@@ -436,6 +448,11 @@ def _fix_initializer_dtypes(onnx_path: str,
         if init.data_type != 1:  # not FP32
             continue
         if init.name in mamba_a_names:  # already FP32, must stay
+            continue
+        if _is_preserved_fp32(init.name):  # caller opted this init out
+            logger.info(
+                "_fix_initializer_dtypes: %s %s kept FP32 (preserve pattern)",
+                init.name, list(init.dims))
             continue
         dims = list(init.dims)
         if len(dims) == 0 or (len(dims) == 1 and dims[0] <= 1):
@@ -516,6 +533,12 @@ def _export_model(model: "CausalLM",
         _fix_nvfp4_weight_dtype(output_path)
     if mxfp8:
         _strip_onnxscript_internal_attrs(output_path)
-    _fix_initializer_dtypes(output_path, dedup_dql_scales=(nvfp4 or mxfp8))
+    # Models may opt specific initializer names out of the FP32→FP16
+    # downgrade via a class attribute (see e.g. CodePredictorCausalLM).
+    preserve_patterns = tuple(
+        getattr(model, "preserve_fp32_initializer_patterns", ()))
+    _fix_initializer_dtypes(output_path,
+                            dedup_dql_scales=(nvfp4 or mxfp8),
+                            preserve_fp32_patterns=preserve_patterns)
     _strip_attention_plugin_optional_inputs(output_path)
     logger.info("Export complete: %s", output_path)

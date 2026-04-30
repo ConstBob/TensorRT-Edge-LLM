@@ -428,6 +428,29 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
         except (TypeError, ValueError, KeyError):
             pass
 
+        # Qwen3-Omni override: force both fields to the no-injection variant.
+        #
+        # Qwen3-Omni Instruct is RLHF'd to never emit ``<think>...</think>``
+        # tokens, so the chat template's ``enable_thinking=False`` branch —
+        # which prepends ``<think>\n\n</think>\n\n`` to the prompt — provides
+        # no semantic benefit.  Worse, the prepended tokens shift the
+        # Talker's hardcoded slicing in
+        # ``_get_talker_assistant_parts``: positions ``[:, :3]`` /
+        # ``[:, 3:4]`` / ``[:, 4:]`` assume the first generated token sits at
+        # slice index 3, but the injected ``<think>`` token occupies that
+        # slot, breaking Talker prefill alignment (audio tail with junk codec
+        # frames; talker hits ``max_new_tokens``).
+        #
+        # Picking the no-injection variant for ``generation_prompt`` and
+        # leaving ``generation_prompt_thinking`` empty makes the C++ runtime
+        # fall back to ``generation_prompt`` regardless of the
+        # ``enableThinking`` flag (see tokenizer.h ChatTemplateConfig).
+        # Result: Qwen3-Omni is immune to the flag at any layer of the stack.
+        if _is_qwen3_omni_model(model_dir):
+            if generation_prompt_thinking is not None:
+                generation_prompt = generation_prompt_thinking
+            generation_prompt_thinking = None
+
         content_types: Dict[str, Any] = {}
         if _is_phi4mm_model(model_dir):
             # Phi-4MM uses <|endoftext10|> (token ID 200010) as image placeholder.
