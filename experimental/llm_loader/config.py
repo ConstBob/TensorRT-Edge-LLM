@@ -100,6 +100,33 @@ def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
 
 
 @dataclass
+class ActionConfig:
+    """Action expert hyper-parameters for Alpamayo models.
+
+    Used only for the action expert ONNX export and its sidecar config.json.
+    These fields do NOT feed into the LLM config.json.
+    """
+
+    rope_theta: float = 5_000_000.0
+    mrope_section: List[int] = field(default_factory=lambda: [24, 20, 20])
+    mrope_interleaved: bool = True
+    num_hidden_layers: int = 0
+    num_attention_heads: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 128
+    hidden_size: int = 0
+    intermediate_size: int = 0
+    rms_norm_eps: float = 1e-6
+    num_traj_tokens: int = 1000
+    traj_token_start: int = 0
+    n_diffusion_tokens: int = 64
+    in_proj_hidden_size: int = 512
+    in_proj_num_enc_layers: int = 2
+    in_proj_max_freq: float = 100.0
+    in_proj_num_fourier_feats: int = 20
+
+
+@dataclass
 class QuantConfig:
     """Quantization parameters extracted from the checkpoint config."""
 

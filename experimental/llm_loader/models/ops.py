@@ -570,6 +570,69 @@ def _(value, indices):
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt::rope_onnx  (TRT native RotaryEmbedding)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::rope_onnx", mutates_args=())
+def rope_onnx(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Stub for TRT native RotaryEmbedding — returns tensor with same shape as input."""
+    return x.clone()
+
+
+@rope_onnx.register_fake
+def _(x, cos, sin, position_ids):
+    return torch.empty_like(x)
+
+
+# Custom op: trt::kv_cache_update_onnx  (TRT native KVCacheUpdate)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::kv_cache_update_onnx", mutates_args=())
+def kv_cache_update_onnx(
+    cache: torch.Tensor,
+    new_kv: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Stub for TRT native KVCacheUpdate — returns cache with same shape."""
+    return cache.clone()
+
+
+@kv_cache_update_onnx.register_fake
+def _(cache, new_kv, cache_indices):
+    return torch.empty_like(cache)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt::attention_onnx  (TRT native Attention)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::attention_onnx", mutates_args=())
+def attention_onnx(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    """Stub for TRT native Attention — returns tensor with same shape as query."""
+    return query.clone()
+
+
+@attention_onnx.register_fake
+def _(query, key, value, attn_mask, is_causal, scale):
+    return torch.empty_like(query)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::gated_delta_net  (Qwen3.5 GDN linear attention)
 # ---------------------------------------------------------------------------
 

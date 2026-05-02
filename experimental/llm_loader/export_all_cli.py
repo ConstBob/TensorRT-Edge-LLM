@@ -79,6 +79,7 @@ _VLM_MODEL_TYPES = frozenset([
     "internvl_chat",
     "phi4mm",
     "phi4_multimodal",
+    "alpamayo_r1",
     "NemotronH_Nano_VL_V2",
 ])
 
@@ -95,6 +96,9 @@ _CODE2WAV_MODEL_TYPES = frozenset([
     "qwen3_omni",
 ])
 
+_ACTION_MODEL_TYPES = frozenset([
+    "alpamayo_r1",
+])
 # Which LLM-family components each model ships.  Default (unlisted model types)
 # is ``{"thinker"}``.  Add a new Talker/CP-bearing model by listing it here; no
 # other bookkeeping in this file is needed for component dispatch.
@@ -113,6 +117,10 @@ def _has_audio(model_type: str) -> bool:
     return model_type in _AUDIO_MODEL_TYPES
 
 
+def _has_action(model_type: str) -> bool:
+    return model_type in _ACTION_MODEL_TYPES
+
+
 def _has_code2wav(model_type: str) -> bool:
     return model_type in _CODE2WAV_MODEL_TYPES
 
@@ -126,6 +134,10 @@ def _has_llm_component(model_type: str, component: str) -> bool:
                                             _DEFAULT_LLM_COMPONENTS)
 
 
+def _is_alpamayo(model_type: str) -> bool:
+    return model_type == "alpamayo_r1"
+
+
 # Default output sub-path for every component.  Model types that need a
 # non-default path only list the components that differ in ``_LAYOUT_OVERRIDES``.
 _DEFAULT_LAYOUT: dict[str, str] = {
@@ -135,6 +147,7 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "audio": "audio",
     "code2wav": "code2wav",
     "visual": "visual",
+    "action": "action",
 }
 
 # Per-model overrides on top of ``_DEFAULT_LAYOUT``.
@@ -165,7 +178,6 @@ def _layout_for(model_type: str, component: str) -> str:
                                  {}).get(component, _DEFAULT_LAYOUT[component])
 
 
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -356,6 +368,9 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
     # from the tokenizer's ``<|image_pad|>`` special token.
     if "image_token_id" not in collected and model_type in _VLM_MODEL_TYPES:
         collected.update(_collect_tokens_from_tokenizer_fallback(model_dir))
+        if "image_token_id" not in collected:
+            collected.update(
+                _collect_tokens_from_tokenizer_fallback(llm_out_dir))
 
     if not collected:
         return
@@ -374,6 +389,13 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
 # ---------------------------------------------------------------------------
 
 
+def _alpamayo_llm_key_remap(key: str) -> "Optional[str]":
+    """Remap ``vlm.lm_head.*`` → ``lm_head.*`` (not covered by prefix detection)."""
+    if key.startswith("vlm.lm_head."):
+        return key[len("vlm."):]
+    return key
+
+
 def _export_llm(model_dir: str,
                 llm_out_dir: str,
                 model_type: str = "",
@@ -383,6 +405,9 @@ def _export_llm(model_dir: str,
     os.makedirs(llm_out_dir, exist_ok=True)
     output_path = os.path.join(llm_out_dir, "model.onnx")
 
+    key_remap = (_alpamayo_llm_key_remap
+                 if model_type == "alpamayo_r1" else None)
+
     logger.info("[LLM] Loading checkpoint from %s", model_dir)
     try:
         from .model import AutoModel
@@ -390,6 +415,7 @@ def _export_llm(model_dir: str,
             model_dir,
             device="cpu",
             eagle_base=eagle_base,
+            key_remap=key_remap,
         )
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         logger.exception("[LLM] Failed to load checkpoint")
@@ -510,9 +536,6 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
             logger.info("[Visual] Copied preprocessor_config.json to %s",
                         visual_out_dir)
         else:
-            # Newer quantized checkpoints store image processor config inside
-            # processor_config.json under the "image_processor" key.  Extract
-            # it and write a standalone preprocessor_config.json.
             proc_src = os.path.join(model_dir, "processor_config.json")
             if os.path.exists(proc_src):
                 with open(proc_src) as _pf:
@@ -524,8 +547,8 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                     with open(pp_dst, "w") as _pf:
                         json.dump(img_proc, _pf, indent=2)
                     logger.info(
-                        "[Visual] Extracted preprocessor_config.json from "
-                        "processor_config.json to %s", visual_out_dir)
+                        "[Visual] Extracted preprocessor_config.json "
+                        "from processor_config.json to %s", visual_out_dir)
                 else:
                     logger.warning(
                         "[Visual] processor_config.json has no "
@@ -594,6 +617,15 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
     with open(cfg_out_path, "w") as f:
         json.dump(vis_cfg_out, f, indent=2)
     logger.info("[Visual] Wrote config.json: %s", cfg_out_path)
+
+
+def _export_alpamayo_visual(model_dir: str, visual_out_dir: str, weights: dict,
+                            config: dict, dtype: "torch.dtype") -> None:
+    vis_weights, vis_config, vis_model_type = _prepare_alpamayo_visual_params(
+        config, weights)
+    _export_visual(model_dir, visual_out_dir, vis_weights, vis_config,
+                   vis_model_type, dtype)
+    _save_alpamayo_visual_processor(config, visual_out_dir)
 
 
 def _export_audio(model_dir: str, audio_out_dir: str, weights: dict,
@@ -1200,6 +1232,162 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
 
 
 # ---------------------------------------------------------------------------
+# Action expert export (Alpamayo)
+# ---------------------------------------------------------------------------
+
+
+def _build_action_config(root_cfg: dict, weights: dict) -> "ActionConfig":
+    """Build an ActionConfig from the Alpamayo root config and weight dict."""
+    from .config import ActionConfig
+
+    expert_cfg = root_cfg.get("expert_cfg", {})
+
+    # Infer num_hidden_layers by counting expert.layers.N keys.
+    layer_indices = set()
+    for k in weights:
+        if k.startswith("expert.layers."):
+            parts = k.split(".")
+            if len(parts) > 2 and parts[2].isdigit():
+                layer_indices.add(int(parts[2]))
+    num_hidden_layers = len(layer_indices)
+
+    # Infer num_key_value_heads from k_proj shape.
+    num_kv_heads = expert_cfg.get("num_attention_heads", 0)
+    for k, v in weights.items():
+        if k.endswith("expert.layers.0.self_attn.k_proj.weight"):
+            num_kv_heads = v.shape[0] // expert_cfg.get("head_dim", 128)
+            break
+
+    traj_token_start_idx = root_cfg.get("traj_token_start_idx", 0)
+    traj_cfg = root_cfg.get("traj_tokenizer_cfg", {})
+    num_bins = traj_cfg.get("num_bins", 0)
+    traj_token_start = traj_token_start_idx + num_bins
+
+    in_proj_cfg = root_cfg.get("action_in_proj_cfg", {})
+
+    return ActionConfig(
+        rope_theta=5_000_000.0,
+        mrope_section=[24, 20, 20],
+        mrope_interleaved=True,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=expert_cfg.get("num_attention_heads", 0),
+        num_key_value_heads=num_kv_heads,
+        head_dim=expert_cfg.get("head_dim", 128),
+        hidden_size=expert_cfg.get("hidden_size", 0),
+        intermediate_size=expert_cfg.get("intermediate_size", 0),
+        rms_norm_eps=1e-6,
+        num_traj_tokens=1000,
+        traj_token_start=traj_token_start,
+        n_diffusion_tokens=root_cfg.get("action_space_cfg",
+                                        {}).get("n_waypoints", 64),
+        in_proj_hidden_size=in_proj_cfg.get("hidden_size", 512),
+        in_proj_num_enc_layers=in_proj_cfg.get("num_enc_layers", 2),
+        in_proj_max_freq=in_proj_cfg.get("max_freq", 100.0),
+        in_proj_num_fourier_feats=in_proj_cfg.get("num_fourier_feats", 20),
+    )
+
+
+def _export_action(model_dir: str, action_out_dir: str, weights: dict,
+                   config: dict, max_kv_cache_capacity: int,
+                   dtype: "torch.dtype") -> None:
+    """Export Alpamayo action expert to ONNX."""
+    os.makedirs(action_out_dir, exist_ok=True)
+    output_path = os.path.join(action_out_dir, "model.onnx")
+
+    logger.info("[Action] Building ActionConfig from checkpoint ...")
+    action_cfg = _build_action_config(config, weights)
+    logger.info("[Action] Expert: %d layers, %d heads, hidden=%d",
+                action_cfg.num_hidden_layers, action_cfg.num_attention_heads,
+                action_cfg.hidden_size)
+
+    logger.info("[Action] Exporting to %s", output_path)
+    try:
+        from .onnx.export_encoder import (export_action_onnx,
+                                          write_action_config)
+        export_action_onnx(
+            output_path=output_path,
+            weights=weights,
+            config=action_cfg,
+            max_kv_cache_capacity=max_kv_cache_capacity,
+            dtype=dtype,
+        )
+        write_action_config(action_cfg, max_kv_cache_capacity, action_out_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[Action] ONNX export failed")
+        raise SystemExit(1) from exc
+    logger.info("[Action] Done: %s", output_path)
+
+
+def _prepare_alpamayo_visual_params(
+    config: dict,
+    weights: dict,
+) -> "tuple[str, dict, dict]":
+    """Return (vis_model_type, vis_config, vis_weights) for Alpamayo.
+
+    Alpamayo uses a Qwen3-VL visual encoder.  This resolves the VLM config,
+    remaps weight prefixes, and overrides vocab_size.
+    """
+    vlm_name = config.get("vlm_name_or_path", "Qwen/Qwen3-VL-8B-Instruct")
+    vis_config = config
+    if vlm_name:
+        try:
+            from transformers import AutoConfig
+            vis_config = AutoConfig.from_pretrained(
+                vlm_name, trust_remote_code=True).to_dict()
+        except (ValueError, OSError) as exc:
+            logger.warning(
+                "[Visual] Failed to load VLM config from %s (%s); "
+                "falling back to root config", vlm_name, exc)
+
+    # Remap ``vlm.model.visual.*`` → ``model.visual.*``.
+    vis_weights = {
+        (k.replace("vlm.model.visual.", "model.visual.", 1) if k.startswith("vlm.model.visual.") else k):
+        v
+        for k, v in weights.items()
+    }
+
+    # Override vocab_size so the C++ runtime builds the correct embedding table.
+    alpamayo_vocab = config.get("vocab_size")
+    if alpamayo_vocab and alpamayo_vocab != vis_config.get("vocab_size"):
+        vis_config["vocab_size"] = alpamayo_vocab
+        _tc = vis_config.get("text_config")
+        if isinstance(_tc, dict):
+            _tc["vocab_size"] = alpamayo_vocab
+
+    return vis_weights, vis_config, "qwen3_vl"
+
+
+def _save_alpamayo_visual_processor(config: dict, visual_out_dir: str) -> None:
+    """Save the Qwen3-VL processor with Alpamayo-specific pixel settings."""
+    import shutil
+
+    vlm_name = config.get("vlm_name_or_path", "Qwen/Qwen3-VL-8B-Instruct")
+    try:
+        from transformers import AutoProcessor
+        proc = AutoProcessor.from_pretrained(
+            vlm_name,
+            trust_remote_code=True,
+            min_pixels=128 * 28 * 28,
+            max_pixels=2048 * 32 * 32,
+            size={
+                "longest_edge": 16777216,
+                "shortest_edge": 65536
+            },
+        )
+        proc.save_pretrained(visual_out_dir)
+        # Transformers v5 saves processor_config.json but the C++
+        # runtime expects preprocessor_config.json.  Copy if needed.
+        _proc_cfg = os.path.join(visual_out_dir, "processor_config.json")
+        _pp_cfg = os.path.join(visual_out_dir, "preprocessor_config.json")
+        if os.path.exists(_proc_cfg) and not os.path.exists(_pp_cfg):
+            shutil.copy2(_proc_cfg, _pp_cfg)
+        logger.info("[Visual] Saved Alpamayo processor sidecar files to %s",
+                    visual_out_dir)
+    except (ImportError, OSError, ValueError) as exc:
+        logger.warning("[Visual] Failed to save Alpamayo processor: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1264,6 +1452,18 @@ def main() -> None:
         default="cuda",
         help="Device for export tracing (default: cuda).",
     )
+    p.add_argument(
+        "--max-kv-cache-capacity",
+        type=int,
+        default=4096,
+        help=
+        "Max KV cache capacity for action expert (Alpamayo). Default: 4096.",
+    )
+    p.add_argument(
+        "--skip-action",
+        action="store_true",
+        help="Skip action expert export (Alpamayo).",
+    )
     args = p.parse_args()
 
     model_dir = _resolve_model_dir(args.model)
@@ -1296,15 +1496,22 @@ def main() -> None:
         (_has_llm_component(model_type, "code_predictor")
          and not args.skip_llm, "code_predictor",
          lambda out: _export_code_predictor(model_dir, out, model_type)),
-        (_has_visual(model_type)
+        (_has_visual(model_type) and not _is_alpamayo(model_type)
          and not args.skip_visual, "visual", lambda out: _export_visual(
              model_dir, out, _get_weights(), config, model_type, dtype)),
+        (_has_visual(model_type) and _is_alpamayo(model_type)
+         and not args.skip_visual, "visual",
+         lambda out: _export_alpamayo_visual(model_dir, out, _get_weights(),
+                                             config, dtype)),
         (_has_audio(model_type)
          and not args.skip_audio, "audio", lambda out: _export_audio(
              model_dir, out, _get_weights(), config, model_type, dtype)),
         (_has_code2wav(model_type)
          and not args.skip_code2wav, "code2wav", lambda out: _export_code2wav(
              model_dir, out, _get_weights(), config, dtype)),
+        (_has_action(model_type) and not args.skip_action, "action",
+         lambda out: _export_action(model_dir, out, _get_weights(), config,
+                                    args.max_kv_cache_capacity, dtype))
     ]
 
     logger.info("=" * 60)

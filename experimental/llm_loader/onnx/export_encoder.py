@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "export_visual_onnx",
     "export_audio_onnx",
+    "export_action_onnx",
 ]
 
 # ---------------------------------------------------------------------------
@@ -359,3 +360,77 @@ def export_audio_onnx(
 
     _run_dynamo_export(audio_model, args, output_path, input_names,
                        output_names, dynamic_shapes)
+
+
+# ---------------------------------------------------------------------------
+# Action expert export (Alpamayo)
+# ---------------------------------------------------------------------------
+
+
+def export_action_onnx(
+    output_path: str,
+    weights: dict,
+    config: "ActionConfig",
+    max_kv_cache_capacity: int,
+    dtype: torch.dtype = torch.float16,
+    device: str = "cuda",
+) -> None:
+    """Export Alpamayo action expert (one flow-matching step) to ONNX.
+
+    Args:
+        output_path: Destination ``.onnx`` file path.
+        weights:     Flat ``{key: tensor}`` dict from safetensors (must include
+                     ``expert.*``, ``action_in_proj.*``, ``action_out_proj.*``).
+        config:      :class:`~config.ActionConfig` with expert hyperparameters.
+        max_kv_cache_capacity: Fixed KV cache capacity (must match LLM engine).
+        dtype:       Weight dtype (default ``float16``).
+        device:      CUDA device for tracing (default ``"cuda"``).
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    from ..models.alpamayo.modeling_alpamayo_action import \
+        build_alpamayo_1_action
+    logger.info("Building Alpamayo action expert ...")
+    model = build_alpamayo_1_action(config, weights, dtype)
+    model = model.to(device)
+    model.eval()
+
+    args, input_names, output_names, dynamic_shapes = (
+        model.get_onnx_export_args(max_kv_cache_capacity, device))
+
+    _run_dynamo_export(model, args, output_path, input_names, output_names,
+                       dynamic_shapes)
+
+
+def write_action_config(config: "ActionConfig", max_kv_cache_capacity: int,
+                        out_dir: str) -> None:
+    """Write the action config.json for the C++ runtime."""
+    import json
+    os.makedirs(out_dir, exist_ok=True)
+    rope_scaling = {
+        "mrope_section": config.mrope_section,
+        "mrope_interleaved": config.mrope_interleaved,
+        "rope_type": "mrope",
+        "type": "mrope",
+    }
+    cfg_out = {
+        "rope_theta": config.rope_theta,
+        "rope_scaling": rope_scaling,
+        "num_hidden_layers": config.num_hidden_layers,
+        "num_attention_heads": config.num_attention_heads,
+        "num_key_value_heads": config.num_key_value_heads,
+        "head_dim": config.head_dim,
+        "hidden_size": config.hidden_size,
+        "intermediate_size": config.intermediate_size,
+        "rms_norm_eps": config.rms_norm_eps,
+        "num_traj_tokens": config.num_traj_tokens,
+        "traj_token_start": config.traj_token_start,
+        "n_diffusion_tokens": config.n_diffusion_tokens,
+        "builder_config": {
+            "max_kv_cache_capacity": max_kv_cache_capacity,
+        },
+    }
+    path = os.path.join(out_dir, "config.json")
+    with open(path, "w") as f:
+        json.dump(cfg_out, f, indent=2)
+    logger.info("Wrote action config.json: %s", path)

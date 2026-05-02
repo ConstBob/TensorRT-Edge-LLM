@@ -60,7 +60,13 @@ def _is_vlm(model_dir: str) -> bool:
     has_vision = "vision_config" in root
     embd = root.get("embd_layer") or {}
     has_phi4_vision = "image_embd_layer" in embd
-    return has_vision or has_phi4_vision
+    has_vlm_backend = bool(root.get("vlm_backend"))
+    return has_vision or has_phi4_vision or has_vlm_backend
+
+
+def _is_alpamayo_1_model(model_dir: str) -> bool:
+    root = _load_root_config(model_dir)
+    return root.get("model_type") == "alpamayo_r1"
 
 
 def _is_phi4mm_model(model_dir: str) -> bool:
@@ -303,14 +309,22 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     is_vlm = _is_vlm(model_dir)
     loaders = [AutoProcessor, AutoTokenizer
                ] if is_vlm else [AutoTokenizer, AutoProcessor]
-    for ldr in loaders:
-        try:
-            tok = ldr.from_pretrained(model_dir, trust_remote_code=True)
-            if getattr(tok, "chat_template", None):
-                tokenizer = tok
-                break
-        except (OSError, ValueError, ImportError, KeyError):
-            pass
+    # Try model_dir first, then output_dir as fallback (the tokenizer files
+    # are already copied there by write_runtime_artifacts before this call).
+    search_dirs = [model_dir]
+    if output_dir != model_dir:
+        search_dirs.append(output_dir)
+    for search_dir in search_dirs:
+        for ldr in loaders:
+            try:
+                tok = ldr.from_pretrained(search_dir, trust_remote_code=True)
+                if getattr(tok, "chat_template", None):
+                    tokenizer = tok
+                    break
+            except (OSError, ValueError, ImportError, KeyError):
+                pass
+        if tokenizer is not None:
+            break
 
     if tokenizer is None:
         logger.debug("No chat template found in %s; skipping", model_dir)
@@ -416,6 +430,11 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                     break
                 common_len = i + 1
             generation_prompt = generation_formatted[common_len:]
+
+        if _is_alpamayo_1_model(model_dir):
+            logger.info("Detected Alpamayo 1 model, adding <|cot_start|> to "
+                        "generation prompt")
+            generation_prompt = generation_prompt + "<|cot_start|>"
 
         generation_prompt_thinking = None
         try:
