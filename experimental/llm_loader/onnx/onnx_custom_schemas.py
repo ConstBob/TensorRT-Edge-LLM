@@ -677,6 +677,159 @@ _update_ssm_state_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# TRT native attention ops (domain "" — default ONNX domain)
+# RotaryEmbedding, TensorScatter, Attention are consumed by TRT >= 10.15
+# without any custom plugin; they live in the default ONNX domain.
+# ---------------------------------------------------------------------------
+
+_rotary_embedding_schema = OpSchema(
+    name="RotaryEmbedding",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TRT native rotary position embedding applied to Q or K tensors.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="x",
+            description="Input tensor [batch, heads, seq, head_dim]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="cos",
+            description="Cosine table [max_pos, head_dim//2]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="sin",
+            description="Sine table [max_pos, head_dim//2]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="position_ids",
+            description="Position indices [batch, seq] (int32)",
+            type_str="tensor(int32)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="RoPE-embedded tensor, same shape as x",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)", "tensor(float)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+)
+
+_tensor_scatter_schema = OpSchema(
+    name="TensorScatter",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=
+    "TRT native KV cache scatter update: writes new_kv into cache at cache_indices.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="cache",
+            description="KV cache tensor [batch, kv_heads, capacity, head_dim]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="new_kv",
+            description="New KV values [batch, kv_heads, seq, head_dim]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="cache_indices",
+            description="Write offset per batch item [batch] (int32)",
+            type_str="tensor(int32)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="updated_cache",
+            description="Updated KV cache, same shape as cache",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)", "tensor(float)", "tensor(bfloat16)"],
+            "Cache and new_kv data type.",
+        ),
+    ],
+)
+
+_attention_trt_native_schema = OpSchema(
+    name="Attention",
+    domain="trt",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TRT native scaled dot-product attention (TRT_decomposable=1).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="query",
+            description="Query tensor [batch, heads, seq_q, head_dim]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="key",
+            description="Key tensor [batch, kv_heads, seq_k, head_dim]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="value",
+            description="Value tensor [batch, kv_heads, seq_k, head_dim]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="attn_mask",
+            description=
+            "Additive attention mask [1, 1, seq_q, seq_k] (optional)",
+            type_str="T",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="attn_output",
+            description="Attention output, same shape as query",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)", "tensor(float)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="is_causal",
+            type=OpSchema.AttrType.INT,
+            description="Whether to apply a causal mask (0=false, 1=true)",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="TRT_decomposable",
+            type=OpSchema.AttrType.INT,
+            description="Allow TRT to decompose this node (always 1)",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="scale",
+            type=OpSchema.AttrType.FLOAT,
+            description="Attention scale factor (1.0 when Q is pre-scaled)",
+            required=False,
+        ),
+    ],
+)
+
 _gated_delta_net_schema = OpSchema(
     name="gated_delta_net",
     domain="trt_edgellm",
@@ -905,6 +1058,9 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _int4_groupwise_gemm_schema,
     _causal_conv1d_schema,
     _update_ssm_state_schema,
+    _rotary_embedding_schema,
+    _tensor_scatter_schema,
+    _attention_trt_native_schema,
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,

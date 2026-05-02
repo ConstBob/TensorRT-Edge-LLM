@@ -105,6 +105,51 @@ def _promote_llm_subconfig(config: Any, root: Dict[str,
     return root
 
 
+def _promote_alpamayo_llm_config(root: Dict[str, Any]) -> Dict[str, Any]:
+    """For Alpamayo-R1: load the full VLM text config from ``vlm_name_or_path``.
+
+    The Alpamayo root config.json is flat and does not embed VLM architecture
+    fields.  We load ``AutoConfig.from_pretrained(vlm_name_or_path)`` to get
+    the full Qwen3-VL config and then promote its text sub-config (which
+    contains ``num_attention_heads``, ``hidden_size``, etc.).
+    """
+    from transformers import AutoConfig
+
+    # vlm_name_or_path is a default in AlpamayoR1Config, not persisted in
+    # config.json.  Fall back to the known default for Alpamayo-R1.
+    vlm_name = root.get("vlm_name_or_path", "Qwen/Qwen3-VL-8B-Instruct")
+    if not vlm_name:
+        logger.warning("alpamayo_r1 config missing vlm_name_or_path; "
+                       "falling back to root config")
+        return root
+
+    try:
+        vlm_cfg = AutoConfig.from_pretrained(vlm_name, trust_remote_code=True)
+        vlm_dict = vlm_cfg.to_dict()
+    except (ValueError, OSError) as exc:
+        logger.warning(
+            "Failed to load VLM config from %s (%s); "
+            "falling back to root config", vlm_name, exc)
+        return root
+
+    # The VLM config (e.g. Qwen3-VL) has a text sub-config at text_config
+    # or language_config.  Promote it using the existing helper.
+    llm = _promote_llm_subconfig(vlm_cfg, vlm_dict)
+
+    # Alpamayo extends the vocabulary with trajectory tokens; the root
+    # config carries the true vocab_size which must override the base VLM's.
+    if root.get("vocab_size") is not None:
+        llm["vocab_size"] = root["vocab_size"]
+
+    # Qwen3-VL text_config stores mRoPE info under ``rope_parameters``
+    # rather than ``rope_scaling``.  Promote it so downstream code and the
+    # C++ runtime find it under the expected ``rope_scaling`` key.
+    if not llm.get("rope_scaling") and llm.get("rope_parameters"):
+        llm["rope_scaling"] = llm["rope_parameters"]
+
+    return llm
+
+
 def load_checkpoint_config_dicts(
         model_dir: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Return ``(root_dict, llm_dict)`` from the checkpoint config.
@@ -147,9 +192,15 @@ def load_checkpoint_config_dicts(
             exc,
         )
         root = raw
-        config = root  # _promote_llm_subconfig handles plain dicts via root
+        config = root
 
-    llm = _promote_llm_subconfig(config, root)
+    # Alpamayo-R1: flat config with no embedded VLM sub-config.
+    # Load the full VLM architecture config from vlm_name_or_path and promote
+    # the text sub-config so downstream sees a standard Qwen3-VL text config.
+    if root.get("model_type") == "alpamayo_r1":
+        llm = _promote_alpamayo_llm_config(root)
+    else:
+        llm = _promote_llm_subconfig(config, root)
 
     # Patch: for multimodal models where AutoConfig loses top-level fields,
     # merge them in from the raw config.json.  Only fields absent from llm
@@ -305,6 +356,84 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     return out
 
 
+def _build_alpamayo_tokenizer(config: Dict[str, Any], out_dir: str) -> None:
+    """Build and save the Alpamayo-R1 tokenizer with added trajectory tokens.
+
+    The base tokenizer comes from the VLM (e.g. Qwen3-VL-8B-Instruct).
+    Alpamayo adds discrete trajectory tokens (<i0> .. <i767>) and special
+    trajectory tokens (<|traj_history|>, <|traj_future|>, etc.) on top.
+    """
+    vlm_name = config.get("vlm_name_or_path", "Qwen/Qwen3-VL-8B-Instruct")
+    if not vlm_name:
+        return
+
+    try:
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(vlm_name,
+                                                  trust_remote_code=True)
+        tokenizer = processor.tokenizer
+
+        # Add discrete trajectory tokens
+        traj_vocab_size = config.get("traj_vocab_size", 768)
+        if traj_vocab_size:
+            discrete_tokens = [f"<i{v}>" for v in range(traj_vocab_size)]
+            tokenizer.add_tokens(discrete_tokens)
+
+        # Add special trajectory tokens
+        _TRAJ_TOKENS = [
+            "<|traj_history|>",
+            "<|traj_future|>",
+            "<|traj_history_start|>",
+            "<|traj_future_start|>",
+            "<|traj_history_end|>",
+            "<|traj_future_end|>",
+        ]
+        add_special = config.get("add_special_tokens", False)
+        if add_special:
+            _SPECIAL_TOKENS_KEYS = [
+                "prompt_start",
+                "prompt_end",
+                "image_start",
+                "image_pre_tkn",
+                "image_end",
+                "traj_history_start",
+                "traj_history_pre_tkn",
+                "traj_history_end",
+                "cot_start",
+                "cot_end",
+                "meta_action_start",
+                "meta_action_end",
+                "traj_future_start",
+                "traj_future_pre_tkn",
+                "traj_future_end",
+                "traj_history",
+                "traj_future",
+                "image_pad",
+                "vectorized_wm",
+                "vectorized_wm_start",
+                "vectorized_wm_end",
+                "vectorized_wm_pre_tkn",
+                "route_start",
+                "route_pad",
+                "route_end",
+                "question_start",
+                "question_end",
+                "answer_start",
+                "answer_end",
+            ]
+            special_tokens = ["<|" + k + "|>" for k in _SPECIAL_TOKENS_KEYS]
+            tokenizer.add_tokens(special_tokens, special_tokens=True)
+        else:
+            tokenizer.add_tokens(_TRAJ_TOKENS, special_tokens=True)
+
+        os.makedirs(out_dir, exist_ok=True)
+        tokenizer.save_pretrained(out_dir)
+        logger.info("Saved Alpamayo tokenizer (%d tokens) to %s",
+                    len(tokenizer), out_dir)
+    except (ImportError, OSError, ValueError) as exc:
+        logger.warning("Failed to build Alpamayo tokenizer: %s", exc)
+
+
 def write_runtime_artifacts(model: "CausalLM",
                             model_dir: str,
                             out_dir: str,
@@ -324,6 +453,7 @@ def write_runtime_artifacts(model: "CausalLM",
     # reads vision_config from the LLM config.json.  Preserve it from the
     # original HF config so the runtime can find deepstack_visual_indexes,
     # num_position_embeddings, etc.
+    root_cfg = {}
     if model_dir:
         hf_cfg_path = os.path.join(model_dir, "config.json")
         if os.path.exists(hf_cfg_path):
@@ -374,6 +504,12 @@ def write_runtime_artifacts(model: "CausalLM",
         else:
             logger.warning(
                 "embed_tokens not found; skipping embedding.safetensors")
+
+    # Alpamayo-R1: tokenizer lives in the VLM checkpoint, not in model_dir.
+    # Build it first so that tokenizer files exist before the copy loop
+    # (which is a no-op for Alpamayo) and before process_chat_template.
+    if root_cfg.get("model_type") == "alpamayo_r1":
+        _build_alpamayo_tokenizer(root_cfg, out_dir)
 
     for fname in RUNTIME_TOKENIZER_FILENAMES:
         src = os.path.join(model_dir, fname)

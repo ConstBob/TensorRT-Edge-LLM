@@ -199,6 +199,10 @@ def _detect_key_prefix(keys: list) -> Tuple[str, str]:
     if (any(k.startswith("model.language_model.") for k in keys)
             and "model.embed_tokens.weight" not in key_set):
         return "model.language_model.", "model."
+    # Alpamayo-R1: LLM text decoder is under "vlm.model.language_model.*".
+    # lm_head at "vlm.lm_head.*" falls through and requires key_remap.
+    if any(k.startswith("vlm.model.language_model.") for k in keys):
+        return "vlm.model.language_model.", "model."
     # Qwen3-ASR / Qwen3-Omni: LLM weights are under thinker.model.*
     if (any(k.startswith("thinker.model.layers.0.") for k in keys)
             and not any(k.startswith("model.layers.0.") for k in keys)):

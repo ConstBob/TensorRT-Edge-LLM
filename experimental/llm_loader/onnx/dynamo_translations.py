@@ -451,11 +451,54 @@ def _vit_attention_plugin_translation(
 
 
 # ---------------------------------------------------------------------------
-# INT4 MoE plugin
+# TRT native attention ops (RotaryEmbedding, TensorScatter, Attention)
 # ---------------------------------------------------------------------------
 
 
 @script()
+def _rope_onnx_translation(
+    x: onnxscript.FLOAT16,
+    cos: onnxscript.FLOAT16,
+    sin: onnxscript.FLOAT16,
+    position_ids: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    return _trt.RotaryEmbedding(x, cos, sin, position_ids)
+
+
+@script()
+def _kv_cache_update_onnx_translation(
+    cache: onnxscript.FLOAT16,
+    new_kv: onnxscript.FLOAT16,
+    cache_indices: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    return _trt.TensorScatter(cache, new_kv, cache_indices)
+
+
+@script()
+def _attention_onnx_translation(
+    query: onnxscript.FLOAT16,
+    key: onnxscript.FLOAT16,
+    value: onnxscript.FLOAT16,
+    attn_mask: onnxscript.FLOAT16,
+    is_causal: int,
+    scale: float,
+) -> onnxscript.FLOAT16:
+    return _trt.Attention(
+        query,
+        key,
+        value,
+        attn_mask,
+        is_causal=is_causal,
+        TRT_decomposable=1,
+        scale=scale,
+    )
+
+
+# ---------------------------------------------------------------------------
+# INT4 MoE plugin
+# ---------------------------------------------------------------------------
+
+
 def _int4_moe_plugin_translation(
     router_logits: onnxscript.FLOAT,
     hidden_states: onnxscript.FLOAT16,
@@ -592,4 +635,11 @@ def build_custom_translation_table() -> dict:
         _int4_moe_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4MoePlugin.default:
         _nvfp4_moe_plugin_translation,
+        # TRT native attention ops (used by EdgeLLMAttentionTRTNative / Alpamayo)
+        torch.ops.trt.rope_onnx.default:
+        _rope_onnx_translation,
+        torch.ops.trt.kv_cache_update_onnx.default:
+        _kv_cache_update_onnx_translation,
+        torch.ops.trt.attention_onnx.default:
+        _attention_onnx_translation,
     }
