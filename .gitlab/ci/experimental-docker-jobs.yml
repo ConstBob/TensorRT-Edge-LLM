@@ -8,20 +8,19 @@ l0_experimental_docker_jedha:
     - jedha-edgellm-nvks
   image: "ubuntu:24.04"
   variables:
-    DOCKER_BUILDKIT: "1"
-    GIT_SUBMODULE_STRATEGY: recursive
-    GIT_SUBMODULE_DEPTH: "1"
+    BOARD_USER: "tensorrt_user"
+    BOARD_IP: "192.168.55.1"
+    REMOTE_WORKSPACE: "/home/tensorrt_user/tensorrt-edge-llm-docker-${CI_PIPELINE_ID}-${CI_JOB_ID}"
     EXPERIMENTAL_DOCKER_IMAGE: "tensorrt-edge-llm:experimental-${CI_COMMIT_SHORT_SHA}"
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends openssh-client sshpass rsync
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - docker version
-    - docker build --network=host --shm-size=8g -f experimental/docker/Dockerfile -t "$EXPERIMENTAL_DOCKER_IMAGE" .
-    - docker run --runtime nvidia --rm --network host --shm-size=8g "$EXPERIMENTAL_DOCKER_IMAGE" python3 -m experimental.server --help
-    - docker run --runtime nvidia --rm --network host --shm-size=8g "$EXPERIMENTAL_DOCKER_IMAGE" python3 -c 'from experimental.server.engine import _import_runtime; print(_import_runtime().__name__)'
+    - bash .gitlab/ci/scripts/experimental_docker_board.sh run
   after_script:
-    - docker ps -aq --filter "ancestor=$EXPERIMENTAL_DOCKER_IMAGE" | xargs -r docker rm -f || true
-    - docker rmi "$EXPERIMENTAL_DOCKER_IMAGE" || true
+    - bash .gitlab/ci/scripts/experimental_docker_board.sh cleanup || true
     - echo "Pipeline end time:$(date)"
   rules:
     - if: $L1 == "true"
@@ -33,5 +32,6 @@ l0_experimental_docker_jedha:
         - .dockerignore
         - .gitlab-ci.yml
         - .gitlab/ci/experimental-docker-jobs.yml
+        - .gitlab/ci/scripts/experimental_docker_board.sh
         - experimental/docker/**/*
   interruptible: true
