@@ -62,7 +62,7 @@ cd ~/TensorRT-Edge-LLM
 # Build visual encoder engine
 ./build/examples/multimodal/visual_build \
   --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx/visual \
-  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/visual \
+  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
   --minImageTokens 128 \
   --maxImageTokens 512 \
   --maxImageTokensPerImage 512

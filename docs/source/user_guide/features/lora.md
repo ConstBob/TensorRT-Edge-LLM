@@ -43,20 +43,9 @@ python -m llm_loader.lora.process_lora_weights_cli \
 
 ---
 
-## Alternative: Legacy Export Tools
+## Static LoRA Merge
 
-The legacy `tensorrt_edgellm` tools remain available for compatibility. The `tensorrt_edgellm/` folder will be removed in 0.8.0 after the `experimental/quantization` -> `experimental/llm_loader` workflow reaches full feature parity for all models and features.
-
-| Approach | Scripts | Use Case |
-|----------|---------|----------|
-| **Static Merge** | `tensorrt-edgellm-merge-lora` | Permanently merge LoRA into base model before export |
-| **Dynamic Runtime** | `tensorrt-edgellm-insert-lora` + `tensorrt-edgellm-process-lora` | Switch between multiple adapters at runtime |
-
----
-
-## Approach 1: Static LoRA Merge
-
-Permanently merges LoRA weights into the base model. Use this when:
+Permanently merges LoRA weights into the base model before quantization and export. Use this when:
 - The LoRA is always required (e.g., Phi-4-multimodal vision-lora)
 - You don't need runtime adapter switching
 - You want simpler deployment with a single merged model
@@ -65,27 +54,32 @@ Permanently merges LoRA weights into the base model. Use this when:
 
 ```bash
 # Step 1: Merge LoRA into base model
-tensorrt-edgellm-merge-lora \
+python -m llm_loader.lora.merge_lora_cli \
   --model_dir Phi-4-multimodal-instruct \
   --lora_dir Phi-4-multimodal-instruct/vision-lora \
   --output_dir merged_model
 
-# Step 2: Continue with standard export pipeline
-tensorrt-edgellm-quantize-llm \
+# Step 2: Quantize the merged checkpoint
+python -m experimental.quantization llm \
   --model_dir merged_model \
   --output_dir quantized \
   --quantization fp8
 
-tensorrt-edgellm-export-llm \
-  --model_dir quantized \
-  --output_dir llm_onnx
+# Step 3: Export with llm_loader
+python -m llm_loader.export_all_cli \
+  quantized \
+  onnx_output
 
-# Step 3-4: Build and run as usual (no LoRA flags needed)
+# Build and run as usual (no LoRA flags needed)
 ```
 
 ---
 
-## Approach 2: Dynamic Runtime LoRA
+## Legacy Compatibility Tools
+
+The legacy `tensorrt_edgellm` LoRA scripts remain available for compatibility. The `tensorrt_edgellm/` folder will be removed in 0.8.0 after the `experimental/quantization` -> `experimental/llm_loader` workflow reaches full feature parity for all models and features.
+
+### Dynamic Runtime LoRA
 
 Enables switching between multiple LoRA adapters at runtime without rebuilding engines. Use this when:
 - You have multiple domain-specific adapters
@@ -183,7 +177,7 @@ Processes HuggingFace LoRA adapter weights for runtime use with a `llm_loader` e
 
 **Output**: Creates `processed_adapter_model.safetensors` and `config.json`.
 
-### `tensorrt-edgellm-merge-lora`
+### `llm_loader.lora.merge_lora_cli`
 
 Permanently merges LoRA weights into a base HuggingFace model.
 
@@ -193,6 +187,7 @@ Permanently merges LoRA weights into a base HuggingFace model.
 | `--lora_dir` | Yes | - | LoRA checkpoint directory |
 | `--output_dir` | Yes | - | Output directory for merged model |
 | `--device` | No | `cuda` | Device for loading model |
+| `--torch-dtype` | No | `float16` | Model dtype used while merging |
 
 ### `tensorrt-edgellm-insert-lora`
 

@@ -59,7 +59,8 @@ class AutoModel:
                         device: str = "cpu",
                         key_remap=None,
                         key_prefix: "str | None" = None,
-                        eagle_base: bool = False) -> nn.Module:
+                        eagle_base: bool = False,
+                        reduced_vocab_dir: "str | None" = None) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -78,6 +79,8 @@ class AutoModel:
                             ``"talker."``).  Passed through to :func:`load_weights`.
             eagle_base:     When True, export as EAGLE3 base model with extra
                             tree-attention inputs and hidden_states output.
+            reduced_vocab_dir:
+                            Optional directory containing ``vocab_map.safetensors``.
 
         Returns:
             Loaded ``nn.Module`` in eval mode.
@@ -100,11 +103,33 @@ class AutoModel:
 
         model = model_class(config)
         model.to(device)
+
+        pre_repack_hook = None
+        if reduced_vocab_dir is not None:
+            from .vocab_reduction.onnx_export import (
+                apply_reduced_vocab, load_reduced_vocab_map,
+                should_apply_reduced_vocab_before_repacking)
+            vocab_map = load_reduced_vocab_map(reduced_vocab_dir,
+                                               vocab_size=config.vocab_size,
+                                               device=device)
+            if should_apply_reduced_vocab_before_repacking(model):
+
+                def _apply_pre_repack_reduced_vocab(loaded_model: nn.Module):
+                    apply_reduced_vocab(loaded_model, vocab_map)
+                    loaded_model._reduced_vocab_dir = reduced_vocab_dir
+
+                pre_repack_hook = _apply_pre_repack_reduced_vocab
+
         load_weights(model,
                      model_dir,
                      device=device,
                      key_remap=key_remap,
-                     key_prefix=key_prefix)
+                     key_prefix=key_prefix,
+                     pre_repack_hook=pre_repack_hook)
+        if reduced_vocab_dir is not None and pre_repack_hook is None:
+            from .vocab_reduction.onnx_export import \
+                apply_reduced_vocab_from_dir
+            apply_reduced_vocab_from_dir(model, reduced_vocab_dir)
 
         return model
 

@@ -32,6 +32,21 @@ AVAILABLE_LORA_WEIGHTS = {
 }
 
 
+def _llm_loader_module_shell(module: str, args: List[str]) -> str:
+    edgellm_root = get_tensorrt_edgellm_root()
+    if not edgellm_root:
+        raise ValueError(
+            "Cannot find tensorrt-edge-llm root (need experimental/ next to it). "
+            "Set LLM_SDK_DIR to the SDK root, or run from a full tensorrt-edge-llm tree."
+        )
+    exp_dir = os.path.join(edgellm_root, "experimental")
+    existing = os.environ.get("PYTHONPATH", "")
+    py_path = f"{exp_dir}{os.pathsep}{existing}" if existing else exp_dir
+    cmd = ["python3", "-m", module] + args
+    inner = " ".join(shlex.quote(x) for x in cmd)
+    return f"PYTHONPATH={shlex.quote(py_path)} {inner}"
+
+
 def _generate_merge_lora_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
     """Generate merge LoRA commands for models with embedded LoRA (e.g., Phi-4)"""
@@ -39,13 +54,13 @@ def _generate_merge_lora_commands(
     if not config.merge_lora:
         return commands
 
-    merge_lora_cmd = [
-        "tensorrt-edgellm-merge-lora",
-        f"--model_dir={config.get_torch_model_dir()}",
-        f"--lora_dir={config.get_lora_adapter_dir()}",
-        f"--output_dir={config.get_merged_model_dir()}"
-    ]
-    commands.append((merge_lora_cmd, 600))
+    merge_lora_shell = _llm_loader_module_shell(
+        "llm_loader.lora.merge_lora_cli", [
+            f"--model_dir={config.get_torch_model_dir()}",
+            f"--lora_dir={config.get_lora_adapter_dir()}",
+            f"--output_dir={config.get_merged_model_dir()}"
+        ])
+    commands.append((["bash", "-c", merge_lora_shell], 600))
 
     return commands
 
@@ -96,7 +111,7 @@ def _generate_quantization_commands(
         ``llm_loader.export_all_cli`` knows how to unpack (NVFP4 / INT4-AWQ
         weights are stored in packed form alongside ``hf_quant_config.json``).
 
-      * **legacy export path** (reduced_vocab / trt_native_ops force
+      * **legacy export path** (trt_native_ops forces
         ``tensorrt-edgellm-export-llm``): use ``tensorrt-edgellm-quantize-llm``.
         The legacy exporter loads the model via stock
         ``AutoModelForCausalLM.from_pretrained``, which cannot unpack
@@ -119,10 +134,8 @@ def _generate_quantization_commands(
     )
     needs_kv_cache_quant = bool(config.fp8_kv_cache)
     if needs_weight_quant or needs_kv_cache_quant:
-        # Use merged model if merge_lora is enabled, otherwise the raw
-        # torch checkpoint. llm_loader handles vision-lora natively in the
-        # export step so the merged dir is irrelevant there; here we follow
-        # the legacy convention so behavior is uniform across both paths.
+        # Use the merged checkpoint when a model ships a required LoRA
+        # adapter, otherwise use the raw torch checkpoint.
         if config.merge_lora:
             input_model_dir = config.get_merged_model_dir()
         else:
@@ -350,6 +363,42 @@ def _generate_draft_export_commands(
     return commands
 
 
+def _generate_llm_loader_draft_export_for_vocab_commands(
+        config: TestConfig) -> List[Tuple[List[str], int]]:
+    """Export EAGLE draft early when vocab reduction needs d2t.safetensors."""
+    commands = []
+    if not (config.is_eagle and config.reduced_vocab_size):
+        return commands
+
+    if (config.draft_llm_precision and config.draft_llm_precision != "fp16"
+            and config.draft_llm_precision != "int4_gptq"):
+        draft_model_dir = config.get_quantized_draft_model_dir()
+    else:
+        draft_model_dir = config.get_draft_model_dir()
+    draft_onnx_dir = config.get_draft_onnx_dir()
+
+    edgellm_root = get_tensorrt_edgellm_root()
+    if not edgellm_root:
+        raise ValueError(
+            "Cannot find tensorrt-edge-llm root (need experimental/ next to it). "
+            "Set LLM_SDK_DIR to the SDK root, or run from a full tensorrt-edge-llm tree."
+        )
+    exp_dir = os.path.join(edgellm_root, "experimental")
+    existing = os.environ.get("PYTHONPATH", "")
+    py_path = f"{exp_dir}{os.pathsep}{existing}" if existing else exp_dir
+    export_shell = (
+        f"PYTHONPATH={shlex.quote(py_path)} "
+        "python3 -m llm_loader.export_all_cli "
+        f"{shlex.quote(draft_model_dir)} \"$tmp_dir\" --device cpu")
+    shell = ("tmp_dir=$(mktemp -d); "
+             "trap 'rm -rf \"$tmp_dir\"' EXIT; "
+             f"{export_shell}; "
+             f"mkdir -p {shlex.quote(draft_onnx_dir)}; "
+             f"cp -a \"$tmp_dir/llm/.\" {shlex.quote(draft_onnx_dir)}/")
+    commands.append((["bash", "-c", shell], 600))
+    return commands
+
+
 def _generate_vocab_reduction_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
     """Generate vocabulary reduction commands if needed"""
@@ -360,8 +409,7 @@ def _generate_vocab_reduction_commands(
     torch_model_dir = config.get_torch_model_dir()
     reduced_vocab_dir = config.get_reduced_vocab_dir()
 
-    vocab_reduction_cmd = [
-        "tensorrt-edgellm-reduce-vocab",
+    vocab_reduction_args = [
         f"--model_dir={torch_model_dir}",
         f"--output_dir={reduced_vocab_dir}",
         f"--reduced_vocab_size={config.reduced_vocab_size}",
@@ -373,9 +421,11 @@ def _generate_vocab_reduction_commands(
     if config.is_eagle:
         # d2t.safetensors is in the draft ONNX directory after export
         d2t_path = os.path.join(config.get_draft_onnx_dir(), "d2t.safetensors")
-        vocab_reduction_cmd.append(f"--d2t_path={d2t_path}")
+        vocab_reduction_args.append(f"--d2t_path={d2t_path}")
 
-    commands.append((vocab_reduction_cmd, 600))
+    vocab_reduction_shell = _llm_loader_module_shell(
+        "llm_loader.vocab_reduction", vocab_reduction_args)
+    commands.append((["bash", "-c", vocab_reduction_shell], 600))
     return commands
 
 
@@ -385,11 +435,9 @@ def can_use_llm_loader(config: TestConfig) -> bool:
     llm_loader handles: pre-quantized LLM, fp16 visual, audio/TTS, EAGLE,
     and dynamic LoRA (via ``llm_loader.lora.{insert_lora_cli,
     process_lora_weights_cli}`` as a post-export step).
-    It does NOT support: reduced vocab, trt_native_ops, or fp8 visual
-    calibration (those still require the legacy CLIs).
+    It does NOT support: trt_native_ops or fp8 visual calibration (those still
+    require the legacy CLIs).
     """
-    if config.reduced_vocab_size:
-        return False
     if config.trt_native_ops:
         return False
     return True
@@ -411,16 +459,13 @@ def generate_pre_export_commands(
     needed here.
     """
     commands: List[Tuple[List[str], int]] = []
-    # Merge-lora is still needed even on the llm_loader path: llm_loader itself
-    # reads the raw torch checkpoint (with vision-lora handled natively), but
-    # the legacy fp8 visual calibration post-export step cannot load Phi-4's
-    # raw checkpoint because its bundled ``modeling_phi4mm.py`` imports a
-    # ``SlidingWindowCache`` symbol that has been removed from the transformers
-    # version we pin. The merged-vision dir produced by merge-lora contains
-    # a plain HF checkpoint without that custom module, so the legacy tool
-    # can load it.
+    # Phi-4-Multimodal needs its required vision LoRA merged before
+    # quantization/export. The merged checkpoint is then used by both
+    # experimental.quantization and llm_loader.
     commands.extend(_generate_merge_lora_commands(config))
     commands.extend(_generate_draft_quantization_commands(config))
+    commands.extend(
+        _generate_llm_loader_draft_export_for_vocab_commands(config))
     commands.extend(_generate_vocab_reduction_commands(config))
     commands.extend(_generate_quantization_commands(config))
     return commands
@@ -441,7 +486,7 @@ def generate_post_llm_loader_commands(
         needed.
       * Dynamic LoRA insertion (``config.lora``) — uses the new
         ``llm_loader.lora.{insert_lora_cli, process_lora_weights_cli}``
-        modules (added in release/0.7.0). Mirrors the flow used by
+        modules. Mirrors the flow used by
         ``test_llm_loader_lora_export``.
 
     When ``merge_lora`` is set (e.g. Phi-4 with vision-lora), the merged-vision
@@ -492,7 +537,7 @@ def generate_post_llm_loader_commands(
 
     if config.lora:
         # Dynamic (text-side) LoRA insertion via the new llm_loader.lora
-        # package landed in release/0.7.0.  Mirrors the flow used by
+        # package mirrors the flow used by
         # ``test_llm_loader_lora_export`` — insert LoRA pattern nodes into
         # the exported model.onnx, then process the adapter weights into a
         # runtime-ready safetensors layout.

@@ -12,13 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .lora import (insert_lora_and_save, merge_lora_and_save,
-                   process_lora_weights_and_save)
-from .phi4mm_utils import load_phi4mm_model
+"""Entry point for ``python -m llm_loader.vocab_reduction``."""
 
-__all__ = [
-    "insert_lora_and_save",
-    "load_phi4mm_model",
-    "merge_lora_and_save",
-    "process_lora_weights_and_save",
-]
+from .selection import main
+
+if __name__ == "__main__":
+    main()

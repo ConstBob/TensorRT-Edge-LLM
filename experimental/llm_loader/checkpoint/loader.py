@@ -52,11 +52,13 @@ __all__ = ["load_weights"]
 # ---------------------------------------------------------------------------
 
 
-def load_weights(model: nn.Module,
-                 model_dir: str,
-                 device: str = "cpu",
-                 key_remap: "Optional[Callable[[str], Optional[str]]]" = None,
-                 key_prefix: Optional[str] = None) -> None:
+def load_weights(
+        model: nn.Module,
+        model_dir: str,
+        device: str = "cpu",
+        key_remap: "Optional[Callable[[str], Optional[str]]]" = None,
+        key_prefix: Optional[str] = None,
+        pre_repack_hook: Optional[Callable[[nn.Module], None]] = None) -> None:
     """Load all safetensors weights from *model_dir* into *model* in-place.
 
     Args:
@@ -73,6 +75,9 @@ def load_weights(model: nn.Module,
                     When provided, only keys starting with this prefix are
                     loaded and auto-detection via :func:`_detect_key_prefix`
                     is skipped.
+        pre_repack_hook:
+                    Optional callback invoked after raw checkpoint tensors are
+                    loaded and before quantized weights are repacked.
     """
     shard_map = _build_shard_map(model_dir)
     # Group keys by shard path to open each shard only once
@@ -153,15 +158,23 @@ def load_weights(model: nn.Module,
     logger.info("Loaded %d tensors, skipped %d from %s", loaded, skipped,
                 model_dir)
 
+    if pre_repack_hook is not None:
+        pre_repack_hook(model)
+
     apply_all_repacking(model)
     # Post-process: apply tied embeddings (HF tie_word_embeddings=True models
     # omit lm_head.weight from the checkpoint; tie_weights() restores the share).
-    if hasattr(model, "tie_weights"):
-        model.tie_weights()
-        config = getattr(model, "config", None)
-        if config is not None and getattr(config, "tie_word_embeddings",
-                                          False):
+    config = getattr(model, "config", None)
+    if (hasattr(model, "tie_weights") and config is not None
+            and getattr(config, "tie_word_embeddings", False)):
+        from ..models.linear import FP16Linear
+        if isinstance(getattr(model, "lm_head", None), FP16Linear):
+            model.tie_weights()
             logger.info("Tied lm_head.weight to embed_tokens.weight")
+        else:
+            logger.debug(
+                "Skipping tied lm_head.weight for non-FP16 lm_head type %s",
+                type(getattr(model, "lm_head", None)).__name__)
 
 
 # ---------------------------------------------------------------------------

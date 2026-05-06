@@ -19,6 +19,7 @@ import os
 import shutil
 import time
 from collections import namedtuple
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -27,6 +28,8 @@ import onnx_graphsurgeon as gs
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+from .phi4mm_utils import load_phi4mm_model
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +378,120 @@ def insert_lora_and_save(onnx_dir: str):
     end_time = time.time()
     logger.info("LoRA model saved to %s", output_model_path)
     logger.info("LoRA insertion completed in %.2fs", end_time - start_time)
+
+
+def _model_type_from_config(model_dir: str) -> str:
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        return ""
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        return config.get("model_type", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    return parent == child or parent in child.parents
+
+
+def _prepare_merge_output_dir(output_dir: str, model_dir: str,
+                              lora_dir: str) -> None:
+    output_path = Path(output_dir).expanduser().resolve()
+    model_path = Path(model_dir).expanduser().resolve()
+    lora_path = Path(lora_dir).expanduser().resolve()
+    protected_paths = {Path("/").resolve(), Path.home().resolve()}
+    try:
+        protected_paths.add(Path.cwd().resolve())
+    except OSError:
+        pass
+
+    if output_path in protected_paths:
+        raise ValueError(f"Refusing to remove protected output_dir: "
+                         f"{output_path}")
+    if _path_contains(output_path, model_path) or _path_contains(
+            output_path, lora_path):
+        raise ValueError("Refusing to use an output_dir that contains the "
+                         "input model or LoRA adapter directory")
+
+    if output_path.exists():
+        if not output_path.is_dir():
+            raise ValueError(f"output_dir exists and is not a directory: "
+                             f"{output_path}")
+        logger.warning("Removing existing LoRA merge output directory: %s",
+                       output_path)
+        shutil.rmtree(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+
+def merge_lora_and_save(model_dir: str,
+                        lora_dir: str,
+                        output_dir: str,
+                        device: str = "cuda",
+                        torch_dtype: str = "float16") -> None:
+    """Merge a PEFT LoRA adapter into a HuggingFace checkpoint."""
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+
+    dtype_map = {
+        "auto": "auto",
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    if torch_dtype not in dtype_map:
+        raise ValueError(f"Unsupported torch_dtype={torch_dtype!r}")
+
+    _prepare_merge_output_dir(output_dir, model_dir, lora_dir)
+
+    model_type = _model_type_from_config(model_dir)
+    is_phi4mm = model_type in ("phi4mm", "phi4_multimodal")
+    if is_phi4mm:
+        model = load_phi4mm_model(model_dir,
+                                  dtype_map[torch_dtype],
+                                  patch_peft_generation=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            torch_dtype=dtype_map[torch_dtype],
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager",
+        )
+    if device:
+        model.to(device)
+
+    lora_model = PeftModel.from_pretrained(model, lora_dir)
+    merged_model = lora_model.merge_and_unload()
+    if is_phi4mm:
+        merged_model.config.vision_lora = None
+        merged_model.config.speech_lora = None
+    merged_model.save_pretrained(output_dir, safe_serialization=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                              trust_remote_code=True)
+    tokenizer.save_pretrained(output_dir)
+
+    try:
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  trust_remote_code=True)
+    except (OSError, ValueError):
+        processor = None
+    if processor is not None:
+        if model_type in ("phi4mm", "phi4_multimodal"):
+            for name in ("preprocessor_config.json", "processor_config.json",
+                         "processing_phi4mm.py"):
+                src = os.path.join(model_dir, name)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(output_dir, name))
+        else:
+            processor.save_pretrained(output_dir)
+
+    logger.info("Merged LoRA adapter %s into %s", lora_dir, output_dir)
 
 
 def process_lora_weights_and_save(input_dir: str, output_dir: str):

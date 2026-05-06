@@ -29,6 +29,9 @@ Usage::
     # With explicit dtype
     python -m llm_loader.export_all_cli /path/to/Qwen3-VL-7B /tmp/out --dtype float16
 
+    # With reduced vocabulary
+    python -m llm_loader.export_all_cli /path/to/model /tmp/out --reduced-vocab-dir /path/to/reduced_vocab
+
 Supported model types
 ----------------------
 VLMs (LLM + visual encoder):
@@ -400,7 +403,8 @@ def _export_llm(model_dir: str,
                 llm_out_dir: str,
                 model_type: str = "",
                 eagle_base: bool = False,
-                fp8_embedding: bool = False) -> None:
+                fp8_embedding: bool = False,
+                reduced_vocab_dir: str = "") -> None:
     """Export LLM backbone via the standard llm_loader pipeline."""
     os.makedirs(llm_out_dir, exist_ok=True)
     output_path = os.path.join(llm_out_dir, "model.onnx")
@@ -416,6 +420,7 @@ def _export_llm(model_dir: str,
             device="cpu",
             eagle_base=eagle_base,
             key_remap=key_remap,
+            reduced_vocab_dir=reduced_vocab_dir or None,
         )
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         logger.exception("[LLM] Failed to load checkpoint")
@@ -427,7 +432,8 @@ def _export_llm(model_dir: str,
         export_onnx(model,
                     output_path,
                     model_dir=model_dir,
-                    fp8_embedding=fp8_embedding)
+                    fp8_embedding=fp8_embedding,
+                    reduced_vocab_dir=reduced_vocab_dir)
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[LLM] ONNX export failed")
         raise SystemExit(1) from exc
@@ -1448,6 +1454,14 @@ def main() -> None:
         "Write embedding.safetensors in FP8 E4M3 format with per-row block scales.",
     )
     p.add_argument(
+        "--reduced-vocab-dir",
+        "--reduced_vocab_dir",
+        dest="reduced_vocab_dir",
+        default="",
+        help=
+        "Directory containing vocab_map.safetensors for LLM vocabulary reduction.",
+    )
+    p.add_argument(
         "--device",
         default="cuda",
         help="Device for export tracing (default: cuda).",
@@ -1485,12 +1499,14 @@ def main() -> None:
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
     stages = [
-        (_has_llm_component(model_type, "thinker") and not args.skip_llm,
-         "thinker", lambda out: _export_llm(model_dir,
-                                            out,
-                                            model_type=model_type,
-                                            eagle_base=args.eagle_base,
-                                            fp8_embedding=args.fp8_embedding)),
+        (_has_llm_component(model_type, "thinker")
+         and not args.skip_llm, "thinker",
+         lambda out: _export_llm(model_dir,
+                                 out,
+                                 model_type=model_type,
+                                 eagle_base=args.eagle_base,
+                                 fp8_embedding=args.fp8_embedding,
+                                 reduced_vocab_dir=args.reduced_vocab_dir)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm,
          "talker", lambda out: _export_talker(model_dir, out, model_type)),
         (_has_llm_component(model_type, "code_predictor")
@@ -1521,6 +1537,8 @@ def main() -> None:
     for enabled, component, _ in stages:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
     logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
+    logger.info("Reduced vocab : %s",
+                args.reduced_vocab_dir if args.reduced_vocab_dir else "no")
     logger.info("=" * 60)
 
     # ``--fp8-embedding`` only applies to the LLM thinker.  Models without a
