@@ -384,7 +384,14 @@ KERNEL_VARIANTS = [
     #     M=384-640      → large_prefill (128×128×64) + unpredicated epilogue
     #     M>640          → medium_prefill (64×128×64)
     #
-    #   Blackwell DC (SM100-110): single variant, persistent+warp-spec+TMA
+    #   Blackwell DC (SM100-110):  tcgen05 + TMA store
+    #     M<=4*SMs                 → small  (64×128)  cluster=(1,2)
+    #     low-SM GPU AND M>=256    → 2-CTA  (256×256) cluster=(2,1)
+    #     else                     → default (128×128) cluster=(1,1)
+    #     (e.g. B100 144 SMs → small cap M<=576, no 2-CTA;
+    #      Thor 20 SMs → small cap M<=80, 2-CTA above M>=256;
+    #      see cuteDslGemmRunner sBlackwellSmallTileMaxM /
+    #          sBlackwell2ctaMinM)
     #
     #   BW GeForce (SM120-121):
     #     M<=64          → small (64×128×64) — persistent+warp-spec+TMA
@@ -517,26 +524,134 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    # Blackwell DC GEMM tile variants:
+    #   "default"  tile=(128,128) cluster=(1,1) — wins for M >= 768 (large MM
+    #              has enough M-tiles to keep the GPU busy without sub-tiling)
+    #   "small"    tile=(64,128)  cluster=(1,2) — wins for M <= 512  (more
+    #              CTAs per wave -> better SM utilization on small/medium M;
+    #              cluster (1,2) multicasts B across 2 CTAs in N)
+    # See cuteDslGemmRunner::run() for the M threshold dispatch.
     KernelVariant(
         name="gemm_blackwell_fp16",
         group="gemm",
         supported_sms=[100, 101, 103, 110],
         script="gemm_cutedsl/gemm_blackwell.py",
-        script_args=["--mnk", "1024,2048,2048", "--export_only"],
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "128,128",
+            "--cluster_shape_mn", "1,1",
+            "--export_only",
+        ],
     ),
     KernelVariant(
         name="gemm_blackwell_bias_silu_fp16",
         group="gemm",
         supported_sms=[100, 101, 103, 110],
         script="gemm_cutedsl/gemm_blackwell.py",
-        script_args=["--mnk", "1024,2048,2048", "--fused_epilogue", "bias_silu", "--export_only"],
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "128,128",
+            "--cluster_shape_mn", "1,1",
+            "--fused_epilogue", "bias_silu",
+            "--export_only",
+        ],
     ),
     KernelVariant(
         name="gemm_blackwell_bias_fp16",
         group="gemm",
         supported_sms=[100, 101, 103, 110],
         script="gemm_cutedsl/gemm_blackwell.py",
-        script_args=["--mnk", "1024,2048,2048", "--fused_epilogue", "bias", "--export_only"],
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "128,128",
+            "--cluster_shape_mn", "1,1",
+            "--fused_epilogue", "bias",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_small_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--mma_tiler_mn", "64,128",
+            "--cluster_shape_mn", "1,2",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_small_bias_silu_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--mma_tiler_mn", "64,128",
+            "--cluster_shape_mn", "1,2",
+            "--fused_epilogue", "bias_silu",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_small_bias_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--mma_tiler_mn", "64,128",
+            "--cluster_shape_mn", "1,2",
+            "--fused_epilogue", "bias",
+            "--export_only",
+        ],
+    ),
+    # 2-CTA variants (tile=256x256, cluster=(2,1)): paired CTAs share a
+    # 2x M tile per tcgen05.mma op. On low-SM-count GPUs (Thor 20 SMs)
+    # this beats the single-CTA default for M >= 256 by ~15-25%; on
+    # high-SM-count (B100 144 SMs) the single-CTA default already
+    # saturates compute so 2-CTA isn't dispatched.
+    KernelVariant(
+        name="gemm_blackwell_2cta_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "256,256",
+            "--cluster_shape_mn", "2,1",
+            "--use_2cta",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_2cta_bias_silu_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "256,256",
+            "--cluster_shape_mn", "2,1",
+            "--use_2cta",
+            "--fused_epilogue", "bias_silu",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_2cta_bias_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "256,256",
+            "--cluster_shape_mn", "2,1",
+            "--use_2cta",
+            "--fused_epilogue", "bias",
+            "--export_only",
+        ],
     ),
     # BW GeForce (SM120/121): warp-specialized, TMA, persistent tile scheduling.
     # Small tile for M<=64 — more CTAs on N1Auto's 20 SMs.
