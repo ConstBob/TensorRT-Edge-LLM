@@ -81,6 +81,28 @@ def _is_nemotron_h_model(model_dir: str) -> bool:
         return False
 
 
+def _is_phi4mm_model(model_dir: str) -> bool:
+    """True if ``<model_dir>/config.json`` declares a Phi-4MM checkpoint."""
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        return False
+    try:
+        with open(config_path) as f:
+            model_type = json.load(f).get("model_type")
+        return model_type in ("phi4mm", "phi4_multimodal")
+    except (OSError, ValueError):
+        return False
+
+
+def _copy_phi4mm_processor_files(model_dir: str, output_dir: str) -> None:
+    import shutil
+    for name in ("preprocessor_config.json", "processor_config.json",
+                 "processing_phi4mm.py"):
+        src = os.path.join(model_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(output_dir, name))
+
+
 def _load_model(model_dir, dtype="fp16", device="cuda"):
     """Load model + tokenizer + optional processor via Auto* classes."""
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
@@ -101,27 +123,32 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
     # against pure-PyTorch substitutes. This mirrors the legacy
     # tensorrt-edgellm-quantize-llm flow which applies the same patch via
     # tensorrt_edgellm.llm_models.models.nemotron_h_patch.
-    if _is_nemotron_h_model(model_dir):
-        from .nemotron_h_patch import apply as _apply_nemotron_h_patch
-        _apply_nemotron_h_patch()
+    if _is_phi4mm_model(model_dir):
+        from experimental.llm_loader.lora import load_phi4mm_model
+        model = load_phi4mm_model(model_dir, torch_dtype)
+        model.to(device)
+    else:
+        if _is_nemotron_h_model(model_dir):
+            from .nemotron_h_patch import apply as _apply_nemotron_h_patch
+            _apply_nemotron_h_patch()
 
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-        ).to(device)
-    except (ValueError, KeyError):
-        # AutoModelForCausalLM doesn't recognize this config class (e.g. pure
-        # vision-text models registered only under image-text-to-text). We
-        # only fall back for *recognition* failures — not for ImportError or
-        # other runtime errors, which would otherwise be silently masked by
-        # a second, misleading "Unrecognized configuration class" exception.
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_dir,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-        ).to(device)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_dir,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+            ).to(device)
+        except (ValueError, KeyError):
+            # AutoModelForCausalLM doesn't recognize this config class (e.g. pure
+            # vision-text models registered only under image-text-to-text). We
+            # only fall back for *recognition* failures — not for ImportError or
+            # other runtime errors, which would otherwise be silently masked by
+            # a second, misleading "Unrecognized configuration class" exception.
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_dir,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+            ).to(device)
 
     model.to(torch_dtype)
 
@@ -138,7 +165,12 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
 def _calibrate(model, dataloader):
     """Forward-loop calibration pass."""
     for data in tqdm(dataloader, desc="Calibrating"):
-        model(data.to(model.device))
+        data = data.to(model.device)
+        if getattr(getattr(model, "config", None), "model_type",
+                   "") in ("phi4mm", "phi4_multimodal"):
+            model(input_ids=data, input_mode=0, use_cache=False)
+        else:
+            model(data)
 
 
 def _normalize_tied_weights_keys(model) -> None:
@@ -208,22 +240,25 @@ def _is_hybrid_model(model):
 
 @contextmanager
 def _skip_resmooth_for_hybrid(model):
-    """WAR for ModelOpt resmoothing bug on hybrid Mamba+Attention models.
+    """WAR for ModelOpt resmoothing bugs on selected custom models.
 
     ``export_hf_checkpoint`` calls ``requantize_resmooth_fused_llm_layers``
     which averages AWQ pre_quant_scales across all linear modules that share
     the same input and re-quantizes their weights.  For hybrid models the
     dummy forward used to detect shared inputs does not propagate through
     Mamba layers correctly, and the Mamba projections (qkv, z, a, b) get
-    incorrectly fused — corrupting the int4 weights.
+    incorrectly fused, corrupting the int4 weights.  For Phi-4 multimodal,
+    the dummy forward is incompatible with the required ``input_mode``.
 
     This context manager patches the resmoothing function to a no-op when the
-    model is a hybrid architecture.  Standard transformer models are
-    unaffected.
+    model needs it.  Standard transformer models are unaffected.
 
-    TODO: Remove once ModelOpt fixes hybrid model support upstream.
+    TODO: Remove once ModelOpt fixes these model paths upstream.
     """
-    if not _is_hybrid_model(model):
+    model_type = getattr(getattr(model, "config", None), "model_type", "")
+    should_skip = (_is_hybrid_model(model)
+                   or model_type in ("phi4mm", "phi4_multimodal"))
+    if not should_skip:
         yield
         return
 
@@ -232,7 +267,7 @@ def _skip_resmooth_for_hybrid(model):
 
     def _noop(m):
         print("[WAR] Skipping requantize_resmooth_fused_llm_layers "
-              "for hybrid model (ModelOpt bug workaround)")
+              "for this model (ModelOpt bug workaround)")
 
     _ueh.requantize_resmooth_fused_llm_layers = _noop
     try:
@@ -281,7 +316,10 @@ def quantize_and_export(
         export_hf_checkpoint(model, export_dir=output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
-        processor.save_pretrained(output_dir)
+        if _is_phi4mm_model(model_dir):
+            _copy_phi4mm_processor_files(model_dir, output_dir)
+        else:
+            processor.save_pretrained(output_dir)
 
     print(f"Saved to {output_dir} (total {time.time() - t0:.1f}s)")
     return output_dir

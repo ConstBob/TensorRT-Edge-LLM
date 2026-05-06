@@ -47,11 +47,6 @@ def get_export_model_dir(config: TestConfig,
     After an optional quantization step the weights live in a derived
     directory; otherwise we use the original torch checkpoint.
 
-    When ``use_llm_loader`` is True, the ``merge_lora`` branch is skipped:
-    llm_loader handles Phi-4 vision-lora natively, so we don't run the
-    legacy ``tensorrt-edgellm-merge-lora`` step and there is no merged
-    checkpoint on disk to feed in.
-
     This is the single source of truth — ``_generate_llm_export_commands``
     in ``command_generation.py`` delegates to this function as well.
     """
@@ -59,7 +54,7 @@ def get_export_model_dir(config: TestConfig,
         return config.get_kv_cache_quantized_model_dir()
     if config.llm_precision != "fp16" and not config.is_prequantized():
         return config.get_quantized_model_dir()
-    if config.merge_lora and not use_llm_loader:
+    if config.merge_lora:
         return config.get_merged_model_dir()
     return config.get_torch_model_dir()
 
@@ -289,6 +284,10 @@ def run_llm_loader_export(config: TestConfig,
         if config.fp8_embedding:
             extra_args.append("--fp8-embedding")
             label += " (FP8 embedding)"
+        if config.reduced_vocab_size:
+            extra_args.append(
+                f"--reduced-vocab-dir={config.get_reduced_vocab_dir()}")
+            label += f" (rvs{config.reduced_vocab_size})"
 
         _run_export_subprocess(model_dir,
                                tmp_dir,

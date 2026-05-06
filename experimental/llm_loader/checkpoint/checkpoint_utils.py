@@ -353,6 +353,9 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         n_layers = config.num_hidden_layers
         out["eagle_hidden_state_layers"] = [2, n_layers // 2, n_layers - 4]
 
+    if config.reduced_vocab_size:
+        out["reduced_vocab_size"] = config.reduced_vocab_size
+
     return out
 
 
@@ -437,7 +440,8 @@ def _build_alpamayo_tokenizer(config: Dict[str, Any], out_dir: str) -> None:
 def write_runtime_artifacts(model: "CausalLM",
                             model_dir: str,
                             out_dir: str,
-                            fp8_embedding: bool = False) -> None:
+                            fp8_embedding: bool = False,
+                            reduced_vocab_dir: str = "") -> None:
     """Write ``config.json``, ``embedding.safetensors``, tokenizer copies, chat template."""
     import torch
     from safetensors.torch import save_file
@@ -543,6 +547,9 @@ def write_runtime_artifacts(model: "CausalLM",
         d2t_cpu = d2t.data.cpu().to(torch.int32)
         save_file({"d2t": d2t_cpu}, os.path.join(out_dir, "d2t.safetensors"))
         logger.info("Wrote d2t.safetensors (%s)", list(d2t_cpu.shape))
+
+    from ..vocab_reduction.onnx_export import copy_reduced_vocab_artifacts
+    copy_reduced_vocab_artifacts(model, out_dir, reduced_vocab_dir)
 
     template_dst = os.path.join(out_dir, "processed_chat_template.json")
     if not os.path.exists(template_dst) and model_dir:

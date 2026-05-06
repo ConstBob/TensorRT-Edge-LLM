@@ -38,9 +38,8 @@ step) with the export pipeline, making the venv heavy and brittle.
 **Key decisions:**
 
 1. **Model loading** uses only `AutoModelForCausalLM` /
-   `AutoModelForImageTextToText`.  Model-specific workarounds
-   (Phi-4MM LoRA merge, NemotronH Mamba stub, GPTQ gate fixes) are
-   not yet implemented.
+   `AutoModelForImageTextToText`.  Required preprocessing, such as
+   Phi-4-Multimodal LoRA merge, should be run before this quantization step.
 
 2. **`models/` subfolder** holds standalone model implementations for
    architectures not available in HuggingFace `transformers`.  For
@@ -144,4 +143,3 @@ Steps 3 (TRT engine build) and 4 (inference) run on the **edge device**
 using the C++ runtime.  See the
 [Quick Start Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html)
 for engine build and inference instructions.
-

@@ -1,6 +1,8 @@
 # Release Notes
 
 ## 0.7.0
+- Added `llm_loader` reduced-vocabulary export support
+- Added `llm_loader` static LoRA merge for merge -> quantize -> export workflows such as Phi-4-Multimodal
 - Added Qwen3.5 LLM/VLM support
 - Added Nemotron-Omni support
 - Added Nemotron-3-Nano-30B-A3B NVFP4 MoE support

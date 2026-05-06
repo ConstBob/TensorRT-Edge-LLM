@@ -289,6 +289,9 @@ class ModelConfig:
     # Note: the C++ Int4MoePlugin hardcodes renormalize=true, so this field
     # currently serves as documentation of the HF config value.
     norm_topk_prob: bool = True
+    # Runtime vocabulary reduction. ``vocab_size`` remains the original
+    # tokenizer/embedding size; this field is only the exported logits size.
+    reduced_vocab_size: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Derived properties
@@ -729,6 +732,43 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
     return sorted(excluded)
 
 
+def _detect_quantized_modules(model_dir: str) -> List[str]:
+    """Return modules that have checkpoint quantization sidecars."""
+    all_keys: List[str] = []
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        all_keys = list(index.get("weight_map", {}).keys())
+    else:
+        single_path = os.path.join(model_dir, "model.safetensors")
+        if os.path.exists(single_path):
+            try:
+                from safetensors import safe_open
+                with safe_open(single_path, framework="pt") as f:
+                    all_keys = list(f.keys())
+            except (OSError, ImportError):
+                pass
+
+    suffixes = (".qweight", ".weight_scale", ".weight_scale_2", ".input_scale",
+                ".scales")
+    modules = {
+        _strip_vl_prefix(k.rsplit(".", 1)[0])
+        for k in all_keys if k.endswith(suffixes)
+    }
+    return sorted(modules)
+
+
+def _effective_excluded_modules(model_dir: str,
+                                excluded: List[str]) -> List[str]:
+    """Drop exclusions contradicted by quantized tensors in the checkpoint."""
+    quantized_modules = set(_detect_quantized_modules(model_dir))
+    return [
+        module for module in excluded
+        if _strip_vl_prefix(module) not in quantized_modules
+    ]
+
+
 def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
     """Determine quantisation config from hf_quant_config.json or config.json."""
 
@@ -743,7 +783,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(q.get("group_size", 128)),
-                excluded=list(q.get("exclude_modules", [])),
+                excluded=_effective_excluded_modules(
+                    model_dir, list(q.get("exclude_modules", []))),
             )
         if algo == "MIXED_PRECISION":
             quantized_layers = q.get("quantized_layers", {})
@@ -753,7 +794,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 quant_type=dominant,
                 group_size=group_size,
                 kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
-                excluded=list(q.get("exclude_modules", [])),
+                excluded=_effective_excluded_modules(
+                    model_dir, list(q.get("exclude_modules", []))),
                 layer_overrides=layer_overrides,
                 is_mixed_precision=True,
             )
@@ -765,7 +807,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             quant_type=qt,
             group_size=gs,
             kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
-            excluded=list(q.get("exclude_modules", [])),
+            excluded=_effective_excluded_modules(
+                model_dir, list(q.get("exclude_modules", []))),
         )
 
     # ---- Embedded quantization_config in config.json ------------------------
@@ -780,7 +823,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(qc.get("group_size", 128)),
-                excluded=list(qc.get("ignore", [])),
+                excluded=_effective_excluded_modules(
+                    model_dir, list(qc.get("ignore", []))),
             )
         group_size = 1
         cg = qc.get("config_groups", {})
@@ -794,7 +838,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             quant_type=_algo_to_quant_type(algo),
             group_size=group_size,
             kv_cache_quant=kv_str,
-            excluded=list(qc.get("ignore", [])),
+            excluded=_effective_excluded_modules(model_dir,
+                                                 list(qc.get("ignore", []))),
         )
 
     # quant_method == awq (column-packed int4 checkpoints)

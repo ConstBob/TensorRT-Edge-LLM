@@ -16,8 +16,9 @@
 
 Uses ``llm_loader.export_all_cli`` for the ONNX export step when possible
 (pre-quantized LLM, fp16 visual, ASR/TTS, EAGLE), and falls back to the
-legacy ``tensorrt-edgellm-export-*`` CLI tools for features llm_loader does
-not yet support (LoRA, reduced vocab, trt_native_ops, fp8 visual calibration).
+legacy ``tensorrt-edgellm-export-*`` CLI tools for compatibility-only cases
+such as TensorRT native-ops export. FP8 visual/audio calibration still uses
+legacy post-export tools when needed.
 
 The full pipeline is: ``experimental.quantization`` (ModelOpt; int4_gptq uses
 ``tensorrt-edgellm-quantize-llm``) if needed → export ONNX → (fp8 visual if needed).
@@ -254,7 +255,7 @@ class TestModelExport:
                                  test_logger,
                                  env_vars=_llm_loader_env(test_logger) or None)
         else:
-            # --- Legacy path (LoRA, reduced vocab, trt_native_ops) ---
+            # --- Legacy path (trt_native_ops and compatibility-only cases) ---
             commands = generate_export_commands(config)
 
             with timer_context(

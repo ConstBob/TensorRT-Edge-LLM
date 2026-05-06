@@ -69,6 +69,7 @@ def export_onnx(
     output_path: str,
     model_dir: str = "",
     fp8_embedding: bool = False,
+    reduced_vocab_dir: str = "",
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
@@ -83,6 +84,8 @@ def export_onnx(
                      If empty, tokenizer files are skipped.
         fp8_embedding: Quantize embedding.safetensors to FP8 E4M3 with
                        per-row block scales.
+        reduced_vocab_dir: Directory containing ``vocab_map.safetensors``
+                           when reduced vocabulary is enabled.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -92,7 +95,8 @@ def export_onnx(
     write_runtime_artifacts(model,
                             model_dir,
                             out_dir,
-                            fp8_embedding=fp8_embedding)
+                            fp8_embedding=fp8_embedding,
+                            reduced_vocab_dir=reduced_vocab_dir)
 
 
 # ---------------------------------------------------------------------------

@@ -4,8 +4,8 @@ This page documents the known limitations and issues for each release version of
 
 ## 0.7.0
 
-- Vocabulary reduction is not supported in the checkpoint-based loader workflow. Export full-vocabulary models with `llm_loader`.
 - `llm_loader` exports visual encoders in FP16. FP8 visual encoder export is available through the legacy `tensorrt_edgellm` visual quantization/export tools.
+- Reduced-vocabulary exports with packed INT4 LM heads require `group_size=128` and a reduced vocabulary size that is a multiple of 128.
 
 ## 0.6.1
 - Some large models (7B-8B) may encounter cudaMallocAsync issue. Please increase huge page by `echo 15658 | sudo tee /proc/sys/vm/nr_hugepages`
