@@ -21,6 +21,7 @@ Kernel groups:
   ssd        — Mamba2 SSM chunk-scan prefill
   gemm       — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
   nvfp4_moe  — NvFP4 MoE FC1+FC2 grouped GEMM
+  nvfp4_fused_moe — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 
 Usage (run from the repo root):
   python kernelSrcs/build_cutedsl.py                      # build all groups for this GPU
@@ -49,6 +50,7 @@ import concurrent.futures
 import importlib.metadata
 import importlib.util
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -76,7 +78,7 @@ class KernelVariant:
 
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
-        group:         Logical group ("gdn", "fmha", "nvfp4_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
+        group:         Logical group ("gdn", "fmha", "nvfp4_moe", "nvfp4_fused_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
         script:        Kernel script path relative to kernelSrcs/.
@@ -104,6 +106,7 @@ class KernelVariant:
 #   ssd        — Mamba2 SSM chunk-scan prefill
 #   gemm       — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
 #   nvfp4_moe  — NvFP4 MoE FC1+FC2 grouped GEMM
+#   nvfp4_fused_moe — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 # ---------------------------------------------------------------------------
 KERNEL_VARIANTS = [
     # --- GDN group ---
@@ -372,6 +375,106 @@ KERNEL_VARIANTS = [
         script_args=["--mma_tiler_n", "256",
                      "--output_dtype", "fp16", "--export_only"],
     ),
+    # --- NvFP4 Fused MoE group (SM120/SM121 — Blackwell GeForce) ---
+    # Fused route/pack + FC1 + activation + quant + FC2 + scatter kernels.
+    # Decode backend: resident-grid barrier between route/pack and compute
+    #   phases; best for small routed working sets (num_tokens*top_k <= 640;
+    #   see CuteDslNvfp4MoeRunner::kDecodePrefillCutoverRoutedRows).
+    # Prefill backend: global task-queue driven producer/consumer overlap;
+    #   best for large routed working sets.
+    # NvFP4MoEPluginGeforce scope: FP16 io_dtype + {identity, silu, swiglu, gelu, relu2}
+    # x {decode, prefill} x {n128 MMA N-tile} = 10 variants. Shape axes
+    # N / E / top_k are runtime (shape-polymorphic). The MMA N-tile and the
+    # hidden_size (K) are compile-time variant axes: CuteDslNvfp4MoeRunner
+    # currently dispatches n128 and requires hiddenSize == kSupportedHiddenSize.
+    # The K axis is compile-time
+    # because the Python-level ab_stage divisor loop in _setup_attributes
+    # (moe_{decode,prefill}_kernel.py) cannot be traced with a symbolic K.
+    # Decode backend, N-tile 128
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_identity_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "identity", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_silu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "silu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_swiglu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "swiglu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_gelu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "gelu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_relu2_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "relu2", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+
+    # Prefill backend, N-tile 128
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_identity_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "identity", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_silu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "silu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_swiglu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "swiglu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_gelu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "gelu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_relu2_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "relu2", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    # Prefill backend, N-tile 256 — DISABLED (same bug as decode n256).
+
     # =====================================================================
     # GEMM group — Talker MLP cuBLAS replacement
     #
@@ -938,11 +1041,32 @@ def check_dependencies():
     return ver, lib_dir, cuda_ver
 
 
+def skip_sm121_fused_moe_for_all(variants, sm, kernels_arg):
+    """Skip SM121 fused MoE from ALL builds; it needs a manual CuTeDSL patch."""
+    if sm != 121 or kernels_arg.strip().upper() != "ALL":
+        return variants
+
+    skipped = [v for v in variants if v.group == "nvfp4_fused_moe"]
+    if not skipped:
+        return variants
+
+    print(
+        f"NOTE: Skipping {len(skipped)} SM121 nvfp4_fused_moe variant(s) "
+        "because this group requires the manual CuTeDSL SM121 source patch "
+        "documented in kernelSrcs/nvfp4_fused_moe_cutedsl/README.md."
+    )
+    print(
+        "      To build this group, apply that patch and run "
+        "--kernels nvfp4_fused_moe explicitly."
+    )
+    return [v for v in variants if v.group != "nvfp4_fused_moe"]
+
+
 # ---------------------------------------------------------------------------
 # Compilation
 # ---------------------------------------------------------------------------
 
-def _compile_one(variant, staging_dir, verbose):
+def _compile_one(variant, staging_dir, verbose, sm):
     """Invoke a kernel script to AOT-compile one variant into .o + .h.
 
     Returns (name, ok, elapsed_secs, error_msg).
@@ -953,8 +1077,16 @@ def _compile_one(variant, staging_dir, verbose):
             "--function_prefix", variant.name]
     cmd += variant.script_args
 
+    env = os.environ.copy()
+    if sm == 121 and variant.group == "nvfp4_fused_moe":
+        # Build a real SM121 image for DIGITS/GB10. SM120 cubins link, but
+        # fail at runtime on SM121 with cudaErrorNoKernelImageForDevice.
+        env.setdefault("CUTE_DSL_ARCH", "sm_121a")
+
     t0 = time.monotonic()
-    result = subprocess.run(cmd, cwd=str(_SCRIPT_DIR), capture_output=not verbose, text=True)
+    result = subprocess.run(
+        cmd, cwd=str(_SCRIPT_DIR), capture_output=not verbose, text=True, env=env
+    )
     elapsed = time.monotonic() - t0
 
     if result.returncode != 0:
@@ -972,7 +1104,7 @@ def _compile_one(variant, staging_dir, verbose):
     return variant.name, True, elapsed, ""
 
 
-def compile_variants(variants, staging_dirs, jobs, verbose):
+def compile_variants(variants, staging_dirs, jobs, verbose, sm):
     """Compile all selected variants in parallel via a process pool.
 
     staging_dirs: dict mapping variant.name → Path of its dedicated staging dir.
@@ -982,7 +1114,7 @@ def compile_variants(variants, staging_dirs, jobs, verbose):
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as pool:
         futures = {
-            pool.submit(_compile_one, v, staging_dirs[v.name], verbose): v
+            pool.submit(_compile_one, v, staging_dirs[v.name], verbose, sm): v
             for v in variants
         }
         for future in concurrent.futures.as_completed(futures):
@@ -1035,14 +1167,18 @@ def build(args):
         print("No variants selected — nothing to build.")
         return
 
-    groups_selected = sorted({v.group for v in variants})
-    print(f"Groups      : {groups_selected}")
-    print(f"Variants    : {[v.name for v in variants]}")
-
     # Check dependencies before cleaning — so a failed dep check doesn't
     # silently destroy a previously good build.
     print("\nChecking dependencies...")
     dsl_ver, lib_dir, cuda_ver = check_dependencies()
+    variants = skip_sm121_fused_moe_for_all(variants, sm, args.kernels)
+    if not variants:
+        print("No variants selected — nothing to build.")
+        return
+
+    groups_selected = sorted({v.group for v in variants})
+    print(f"Groups      : {groups_selected}")
+    print(f"Variants    : {[v.name for v in variants]}")
 
     if args.clean and output_dir.exists():
         shutil.rmtree(output_dir)
@@ -1057,7 +1193,7 @@ def build(args):
             d.mkdir()
             staging_dirs[v.name] = d
 
-        compile_variants(variants, staging_dirs, args.jobs, args.verbose)
+        compile_variants(variants, staging_dirs, args.jobs, args.verbose, sm)
 
         # Collect all .o files from per-variant staging dirs.
         # Some variants (e.g. gdn_decode_mtp) produce multiple .o files.
@@ -1160,8 +1296,9 @@ def main():
     p.add_argument(
         "--kernels",
         default="ALL",
-        help="Which kernels to build: ALL (default), a group name (fmha | gdn | nvfp4_moe | ssd | gemm), "
-             "or a comma-separated list of group names (fmha,gdn,nvfp4_moe,ssd,gemm). "
+        help="Which kernels to build: ALL (default), a group name "
+             "(fmha | gdn | nvfp4_moe | nvfp4_fused_moe | ssd | gemm), "
+             "or a comma-separated list of group names. "
              "Variants whose supported_sms does not include the target SM are skipped.",
     )
     p.add_argument(
