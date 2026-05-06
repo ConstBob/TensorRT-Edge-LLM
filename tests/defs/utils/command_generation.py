@@ -647,6 +647,108 @@ def generate_build_commands(
 
         commands.append((visual_cmd, 1200))
 
+    elif config.model_type == ModelType.TTS:
+        # TTS: build talker + code_predictor LLM engines (under
+        # ``llm-<llm_prec>-<lm_head_prec>/<talker|code_predictor>``).
+        # Optional tokenizer_decoder audio engine — skipped when the legacy
+        # ONNX is absent (llm_loader-based exports do not produce it).
+        llm_onnx = config.get_llm_onnx_dir()
+        for sub, engine_dir in (
+            ("talker", config.get_talker_engine_dir()),
+            ("code_predictor", config.get_code_predictor_engine_dir()),
+        ):
+            cmd = [executable_files['llm_build']]
+            cmd.extend([
+                f"--onnxDir={os.path.join(llm_onnx, sub)}",
+                f"--engineDir={engine_dir}",
+                f"--maxInputLen={config.max_input_len}",
+                f"--maxKVCacheCapacity={config.max_seq_len}",
+                f"--maxBatchSize={config.max_batch_size}",
+            ])
+            if config.debug:
+                cmd.append("--debug")
+            commands.append((cmd, 1200))
+
+        tokenizer_decoder_onnx = os.path.join(config.get_audio_onnx_dir(),
+                                              "tokenizer_decoder")
+        if os.path.isdir(tokenizer_decoder_onnx):
+            audio_cmd = [executable_files['audio_build']]
+            audio_cmd.extend([
+                f"--onnxDir={tokenizer_decoder_onnx}",
+                f"--engineDir={config.get_llm_engine_dir()}",
+            ])
+            if config.debug:
+                audio_cmd.append("--debug")
+            commands.append((audio_cmd, 1200))
+
+    elif config.model_type == ModelType.OMNI:
+        # OMNI: shared multimodal engine dir holds both visual + audio engines,
+        # plus a separate base LLM engine.
+        llm_cmd = [executable_files['llm_build']]
+        llm_cmd.extend([
+            f"--onnxDir={config.get_llm_onnx_dir()}",
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--maxInputLen={config.max_input_len}",
+            f"--maxKVCacheCapacity={config.max_seq_len}",
+            f"--maxBatchSize={config.max_batch_size}",
+        ])
+        if config.max_lora_rank > 0:
+            llm_cmd.append(f"--maxLoraRank={config.max_lora_rank}")
+        if config.debug:
+            llm_cmd.append("--debug")
+        commands.append((llm_cmd, 1200))
+
+        multimodal_engine_dir = config.get_multimodal_engine_dir()
+        visual_cmd = [executable_files['visual_build']]
+        visual_cmd.extend([
+            f"--onnxDir={config.get_visual_onnx_dir('fp16')}",
+            f"--engineDir={multimodal_engine_dir}",
+            f"--minImageTokens={config.min_image_tokens}",
+            f"--maxImageTokens={config.max_image_tokens}",
+            f"--maxImageTokensPerImage={config.max_image_tokens_per_image}",
+        ])
+        if config.debug:
+            visual_cmd.append("--debug")
+        commands.append((visual_cmd, 1200))
+
+        audio_cmd = [executable_files['audio_build']]
+        audio_cmd.extend([
+            f"--onnxDir={config.get_audio_onnx_dir()}",
+            f"--engineDir={multimodal_engine_dir}",
+            f"--minTimeSteps={config.min_time_steps}",
+            f"--maxTimeSteps={config.max_time_steps}",
+        ])
+        if config.debug:
+            audio_cmd.append("--debug")
+        commands.append((audio_cmd, 1200))
+
+    elif config.model_type == ModelType.ASR:
+        # ASR: build LLM engine + audio encoder engine.
+        llm_cmd = [executable_files['llm_build']]
+        llm_cmd.extend([
+            f"--onnxDir={config.get_llm_onnx_dir()}",
+            f"--engineDir={config.get_llm_engine_dir()}",
+            f"--maxInputLen={config.max_input_len}",
+            f"--maxKVCacheCapacity={config.max_seq_len}",
+            f"--maxBatchSize={config.max_batch_size}",
+        ])
+        if config.max_lora_rank > 0:
+            llm_cmd.append(f"--maxLoraRank={config.max_lora_rank}")
+        if config.debug:
+            llm_cmd.append("--debug")
+        commands.append((llm_cmd, 1200))
+
+        audio_cmd = [executable_files['audio_build']]
+        audio_cmd.extend([
+            f"--onnxDir={config.get_audio_onnx_dir()}",
+            f"--engineDir={config.get_audio_engine_dir()}",
+            f"--minTimeSteps={config.min_time_steps}",
+            f"--maxTimeSteps={config.max_time_steps}",
+        ])
+        if config.debug:
+            audio_cmd.append("--debug")
+        commands.append((audio_cmd, 1200))
+
     # Add draft model build for EAGLE (must be after base model build)
     commands.extend(_generate_draft_build_commands(config, executable_files))
 
@@ -658,6 +760,23 @@ def generate_inference_commands(
         executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
     """Generate inference commands - returns list of (command, timeout) tuples"""
     commands = []
+
+    if config.model_type == ModelType.TTS:
+        cmd = [executable_files['qwen3_tts_inference']]
+        cmd.extend([
+            f"--talkerEngineDir={config.get_talker_engine_dir()}",
+            f"--tokenizerDir={config.get_tts_tokenizer_dir()}",
+            f"--inputFile={config.get_test_case_file()}",
+            f"--outputFile={config.get_output_json_file()}",
+            f"--outputAudioDir={config.get_output_audio_dir()}",
+            "--dumpProfile",
+        ])
+        if config.batch_size is not None:
+            cmd.append(f"--batchSize={config.batch_size}")
+        if config.debug:
+            cmd.append("--debug")
+        commands.append((cmd, 6000))
+        return commands
 
     cmd = [executable_files['llm_inference']]
     cmd.extend([
@@ -675,6 +794,11 @@ def generate_inference_commands(
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
+    elif config.model_type == ModelType.ASR:
+        cmd.append(f"--multimodalEngineDir={config.get_audio_engine_dir()}")
+    elif config.model_type == ModelType.OMNI:
+        cmd.append(
+            f"--multimodalEngineDir={config.get_multimodal_engine_dir()}")
 
     # Add batch size override if specified
     if config.batch_size is not None:
@@ -709,6 +833,8 @@ def generate_e2e_bench_commands(
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
+    elif config.model_type == ModelType.ASR:
+        cmd.append(f"--multimodalEngineDir={config.get_audio_engine_dir()}")
 
     # Add batch size override if specified
     if config.batch_size is not None:

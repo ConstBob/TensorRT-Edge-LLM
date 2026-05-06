@@ -87,12 +87,14 @@ def test_build_project(env_config: EnvironmentConfig,
         'examples/llm/llm_build',
         'examples/llm/llm_inference',
         'examples/multimodal/visual_build',
+        'examples/multimodal/audio_build',
     ]
     # Executables that support --help smoke test
     help_check_files = [
         'examples/llm/llm_build',
         'examples/llm/llm_inference',
         'examples/multimodal/visual_build',
+        'examples/multimodal/audio_build',
     ]
 
     env_vars = _get_trt_env_vars(env_config)
