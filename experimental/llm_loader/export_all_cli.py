@@ -95,6 +95,13 @@ _AUDIO_MODEL_TYPES = frozenset([
     # Its Talker and CodePredictor are LLM decoders exported via the LLM pipeline.
 ])
 
+# Subset of audio models whose LLM config follows the Qwen-style
+# ``thinker_config`` layout for modality-token IDs and chat-template tokens.
+# Excludes Nemotron-Omni, which has its own field names
+# (``img_context_token_id`` / ``sound_context_token_id``) at the source-config
+# root and is handled by ``_collect_tokens_from_nemotron_root``.
+_ASR_LLM_MODEL_TYPES = _AUDIO_MODEL_TYPES - frozenset(["NemotronH_Nano_VL_V2"])
+
 _CODE2WAV_MODEL_TYPES = frozenset([
     "qwen3_omni",
 ])
@@ -209,7 +216,8 @@ def _load_config(model_dir: str) -> dict:
 
 def _find_token_id(model_dir: str, token_str: str) -> "Optional[int]":
     """Return the token ID for *token_str* by scanning tokenizer files."""
-    # Try tokenizer.json added_tokens list first
+    # tokenizer.json: scan ``added_tokens`` and ``added_tokens_decoder`` in a
+    # single open. Qwen3-Omni / VL-style ckpts ship the special-token IDs here.
     tok_path = os.path.join(model_dir, "tokenizer.json")
     if os.path.exists(tok_path):
         with open(tok_path) as f:
@@ -217,20 +225,26 @@ def _find_token_id(model_dir: str, token_str: str) -> "Optional[int]":
         for entry in tok.get("added_tokens", []):
             if entry.get("content") == token_str:
                 return int(entry["id"])
-    # Fall back to added_tokens_decoder in tokenizer.json
-    if os.path.exists(tok_path):
-        with open(tok_path) as f:
-            tok = json.load(f)
         for id_str, entry in tok.get("added_tokens_decoder", {}).items():
             if entry.get("content") == token_str:
                 return int(id_str)
-    # Try added_tokens.json
+    # added_tokens.json: older HF tokenizer split-file form.
     added_path = os.path.join(model_dir, "added_tokens.json")
     if os.path.exists(added_path):
         with open(added_path) as f:
             added = json.load(f)
         if token_str in added:
             return int(added[token_str])
+    # vocab.json: BPE base vocabulary (regular words, not special tokens).
+    # Required for Qwen3-ASR ckpts which ship only ``vocab.json`` +
+    # ``merges.txt`` (no ``tokenizer.json``), so the literal word ``"user"``
+    # has to be resolved here.
+    vocab_path = os.path.join(model_dir, "vocab.json")
+    if os.path.exists(vocab_path):
+        with open(vocab_path) as f:
+            vocab = json.load(f)
+        if token_str in vocab:
+            return int(vocab[token_str])
     logger.warning("Could not find token ID for %r in %s", token_str,
                    model_dir)
     return None
@@ -345,6 +359,25 @@ def _collect_tokens_from_tokenizer_fallback(model_dir: str) -> dict:
     return out
 
 
+def _collect_user_token_id(model_dir: str, root: dict) -> dict:
+    """Resolve ``user_token_id`` for Qwen3-ASR / Qwen3-Omni.
+
+    Qwen3-ASR's source HF config does not expose this field at the
+    ``thinker_config`` or root level, but the legacy 0.6 reference output
+    writes it (default 872 from the ``Qwen3AsrThinkerConfig`` class default
+    attribute).  When the config does not carry it, fall back to a BPE
+    ``vocab.json`` lookup of the literal ``"user"`` word.
+    """
+    thinker_cfg = root.get("thinker_config") or {}
+    v = thinker_cfg.get("user_token_id", root.get("user_token_id"))
+    if isinstance(v, int):
+        return {"user_token_id": v}
+    v = _find_token_id(model_dir, "user")
+    if v is not None:
+        return {"user_token_id": v}
+    return {}
+
+
 def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
                                 model_type: str) -> None:
     """Inject multimodal special-token IDs into the exported LLM's ``config.json``.
@@ -374,6 +407,16 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
         if "image_token_id" not in collected:
             collected.update(
                 _collect_tokens_from_tokenizer_fallback(llm_out_dir))
+
+    # Qwen3-ASR / Qwen3-Omni byte-parity additions: ``user_token_id`` (with a
+    # BPE vocab fallback) plus the ``model: "qwen3asrthinker"`` tag the legacy
+    # 0.6 reference carries.  No current C++ reader uses these, but the
+    # legacy reference output includes them and downstream tooling matches
+    # against that.
+    if model_type in _ASR_LLM_MODEL_TYPES:
+        collected.update(_collect_user_token_id(model_dir, root))
+        if model_type == "qwen3_asr":
+            collected["model"] = "qwen3asrthinker"
 
     if not collected:
         return
@@ -694,6 +737,16 @@ def _export_audio(model_dir: str, audio_out_dir: str, weights: dict,
                     "audio_end_token_id"):
             if key in thinker_cfg:
                 audio_cfg_out[key] = thinker_cfg[key]
+        # ``user_token_id`` for byte parity with the legacy 0.6 reference.
+        audio_cfg_out.update(_collect_user_token_id(model_dir, config))
+        # ``text_config.rope_theta`` is read by
+        # ``Qwen3OmniAudioRunner::loadConfig`` for MRope initialisation. For
+        # Qwen3-ASR/Omni this lives under ``thinker_config.text_config``.
+        text_cfg = (thinker_cfg.get("text_config") or config.get("text_config")
+                    or {})
+        rope_theta = text_cfg.get("rope_theta")
+        if rope_theta is not None:
+            audio_cfg_out["text_config"] = {"rope_theta": rope_theta}
     cfg_out_path = os.path.join(audio_out_dir, "config.json")
     with open(cfg_out_path, "w") as f:
         json.dump(audio_cfg_out, f, indent=2)
