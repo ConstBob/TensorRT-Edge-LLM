@@ -434,14 +434,43 @@ def causal_conv1d(
     padding: int,
     dilation: int,
     groups: int,
+    collect_intermediate_states: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub: causal conv1d. Returns same-shape activations and cloned conv_state."""
+    """Stub: causal conv1d; with MTP enabled it returns an optional 3rd output."""
+    if collect_intermediate_states:
+        batch_size, seq_len, _ = hidden_states.shape
+        intermediate_conv_state = torch.zeros(batch_size,
+                                              seq_len,
+                                              conv_state.shape[1],
+                                              conv_state.shape[2],
+                                              dtype=conv_state.dtype,
+                                              device=conv_state.device)
+        return (torch.zeros_like(hidden_states), conv_state.clone(),
+                intermediate_conv_state)
     return torch.zeros_like(hidden_states), conv_state.clone()
 
 
 @causal_conv1d.register_fake
-def _(hidden_states, weight, bias, conv_state, context_lengths, stride,
-      padding, dilation, groups):
+def _(hidden_states,
+      weight,
+      bias,
+      conv_state,
+      context_lengths,
+      stride,
+      padding,
+      dilation,
+      groups,
+      collect_intermediate_states=False):
+    if collect_intermediate_states:
+        batch_size, seq_len, _ = hidden_states.shape
+        intermediate_conv_state = torch.empty(batch_size,
+                                              seq_len,
+                                              conv_state.shape[1],
+                                              conv_state.shape[2],
+                                              dtype=conv_state.dtype,
+                                              device=conv_state.device)
+        return (torch.empty_like(hidden_states), conv_state.clone(),
+                intermediate_conv_state)
     return torch.empty_like(hidden_states), conv_state.clone()
 
 
@@ -650,13 +679,47 @@ def gated_delta_net(
     context_lengths: torch.Tensor,  # [batch] int32
     k_dim: int,
     v_dim: int,
+    collect_intermediate_states: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub: Qwen3.5 GatedDeltaNet. Returns same-shape output and cloned state."""
+    """Stub: GatedDeltaNet; with MTP enabled it returns an optional 3rd output."""
+    if collect_intermediate_states:
+        batch_size, seq_len, num_v_heads, _ = v.shape
+        intermediate_recurrent_state = torch.zeros(batch_size,
+                                                   seq_len,
+                                                   num_v_heads,
+                                                   k_dim,
+                                                   v_dim,
+                                                   dtype=h0_source.dtype,
+                                                   device=h0_source.device)
+        return (torch.zeros_like(v), h0_source.clone(),
+                intermediate_recurrent_state)
     return torch.zeros_like(v), h0_source.clone()
 
 
 @gated_delta_net.register_fake
-def _(q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim, v_dim):
+def _(q,
+      k,
+      v,
+      a,
+      b,
+      A_log,
+      dt_bias,
+      h0_source,
+      context_lengths,
+      k_dim,
+      v_dim,
+      collect_intermediate_states=False):
+    if collect_intermediate_states:
+        batch_size, seq_len, num_v_heads, _ = v.shape
+        intermediate_recurrent_state = torch.empty(batch_size,
+                                                   seq_len,
+                                                   num_v_heads,
+                                                   k_dim,
+                                                   v_dim,
+                                                   dtype=h0_source.dtype,
+                                                   device=h0_source.device)
+        return (torch.empty_like(v), h0_source.clone(),
+                intermediate_recurrent_state)
     return torch.empty_like(v), h0_source.clone()
 
 

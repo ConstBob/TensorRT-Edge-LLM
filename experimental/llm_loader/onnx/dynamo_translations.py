@@ -331,9 +331,59 @@ def _causal_conv1d_translation(
         padding=padding,
         dilation=dilation,
         groups=groups,
+        use_mtp=0,
         _outputs=2,
     )
     return output, conv_state_out
+
+
+@script()
+def _causal_conv1d_with_intermediate_translation(
+    hidden_states: onnxscript.FLOAT16,
+    weight: onnxscript.FLOAT16,
+    bias: onnxscript.FLOAT16,
+    conv_state: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT16]:
+    output, conv_state_out, intermediate_conv_state_out = _trt_edgellm.causal_conv1d(
+        hidden_states,
+        weight,
+        bias,
+        conv_state,
+        context_lengths,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+        use_mtp=1,
+        _outputs=3,
+    )
+    return output, conv_state_out, intermediate_conv_state_out
+
+
+def _causal_conv1d_dispatch(
+    hidden_states,
+    weight,
+    bias,
+    conv_state,
+    context_lengths,
+    stride,
+    padding,
+    dilation,
+    groups,
+    collect_intermediate_states=False,
+):
+    if collect_intermediate_states:
+        return _causal_conv1d_with_intermediate_translation(
+            hidden_states, weight, bias, conv_state, context_lengths, stride,
+            padding, dilation, groups)
+    return _causal_conv1d_translation(hidden_states, weight, bias, conv_state,
+                                      context_lengths, stride, padding,
+                                      dilation, groups)
 
 
 @script()
@@ -362,9 +412,65 @@ def _gated_delta_net_translation(
         context_lengths,
         k_dim=k_dim,
         v_dim=v_dim,
+        use_mtp=0,
         _outputs=2,
     )
     return output, h0_out
+
+
+@script()
+def _gated_delta_net_with_intermediate_translation(
+    q: onnxscript.FLOAT16,
+    k: onnxscript.FLOAT16,
+    v: onnxscript.FLOAT16,
+    a: onnxscript.FLOAT16,
+    b: onnxscript.FLOAT16,
+    A_log: onnxscript.FLOAT,
+    dt_bias: onnxscript.FLOAT16,
+    h0_source: onnxscript.FLOAT,
+    context_lengths: onnxscript.INT32,
+    k_dim: int,
+    v_dim: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
+    output, h0_out, intermediate_h0_out = _trt_edgellm.gated_delta_net(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        h0_source,
+        context_lengths,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        use_mtp=1,
+        _outputs=3,
+    )
+    return output, h0_out, intermediate_h0_out
+
+
+def _gated_delta_net_dispatch(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    h0_source,
+    context_lengths,
+    k_dim,
+    v_dim,
+    collect_intermediate_states=False,
+):
+    if collect_intermediate_states:
+        return _gated_delta_net_with_intermediate_translation(
+            q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim,
+            v_dim)
+    return _gated_delta_net_translation(q, k, v, a, b, A_log, dt_bias,
+                                        h0_source, context_lengths, k_dim,
+                                        v_dim)
 
 
 @script()
@@ -622,11 +728,11 @@ def build_custom_translation_table() -> dict:
         torch.ops.trt.int8_sq_weight_dq.default:
         _int8_sq_weight_dq_translation,
         torch.ops.trt_edgellm.causal_conv1d.default:
-        _causal_conv1d_translation,
+        _causal_conv1d_dispatch,
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
         torch.ops.trt_edgellm.gated_delta_net.default:
-        _gated_delta_net_translation,
+        _gated_delta_net_dispatch,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
         torch.ops.trt.gather_nd.default:

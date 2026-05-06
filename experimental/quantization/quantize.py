@@ -291,6 +291,30 @@ def quantize_and_export(
     t0 = time.time()
     model, tokenizer, processor = _load_model(model_dir, dtype, device)
 
+    # --- MTP draft: detect and quantize BEFORE base quantization ----------
+    text_config = getattr(model.config, "text_config", model.config)
+    mtp_layers = getattr(text_config, "mtp_num_hidden_layers", 0) or 0
+    quantized_mtp_draft = None
+
+    if (mtp_layers > 0 and quantization is not None
+            and not is_quantized(model)):
+        from .models.mtp_draft import quantize_mtp_from_base
+        print(f"Detected {mtp_layers} MTP layer(s) — quantizing MTP draft "
+              f"before base model.")
+        quantized_mtp_draft = quantize_mtp_from_base(
+            base_model=model,
+            tokenizer=tokenizer,
+            model_dir=model_dir,
+            quantization=quantization,
+            lm_head_quantization=lm_head_quantization,
+            kv_cache_quantization=kv_cache_quantization,
+            dtype=dtype,
+            device=device,
+            dataset=dataset,
+            num_samples=num_samples,
+        )
+
+    # --- Quantize base model ----------------------------------------------
     if is_quantized(model):
         print("Model already quantized — skipping.")
     else:
@@ -320,6 +344,14 @@ def quantize_and_export(
             _copy_phi4mm_processor_files(model_dir, output_dir)
         else:
             processor.save_pretrained(output_dir)
+
+    # --- MTP draft: merge quantized weights or copy unquantized -----------
+    if mtp_layers > 0:
+        from .models.mtp_draft import copy_unquantized_mtp, save_quantized_mtp
+        if quantized_mtp_draft is not None:
+            save_quantized_mtp(quantized_mtp_draft, output_dir, dtype)
+        else:
+            copy_unquantized_mtp(model_dir, output_dir)
 
     print(f"Saved to {output_dir} (total {time.time() - t0:.1f}s)")
     return output_dir

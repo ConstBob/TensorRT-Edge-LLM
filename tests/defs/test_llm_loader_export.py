@@ -262,6 +262,69 @@ def test_llm_loader_eagle_export(test_param: str, test_logger,
         pytest.fail(f"Draft ONNX model not found: {draft_onnx}")
 
 
+def test_llm_loader_mtp_export(test_param: str, test_logger,
+                               env_config: EnvironmentConfig):
+    """Export MTP base + draft from a single checkpoint via --mtp flag."""
+
+    config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                          TaskType.EXPORT, env_config)
+
+    torch_dir = config.get_torch_model_dir()
+    if not os.path.exists(torch_dir):
+        raise FileNotFoundError(f"Model checkpoint not found: {torch_dir}")
+
+    llm_onnx_dir = config.get_llm_onnx_dir()
+    draft_onnx_dir = config.get_draft_onnx_dir()
+    os.makedirs(llm_onnx_dir, exist_ok=True)
+    os.makedirs(draft_onnx_dir, exist_ok=True)
+
+    tmp_dir = tempfile.mkdtemp(prefix="mtp_export_")
+
+    try:
+        export_cmd = [
+            "python3",
+            "-m",
+            "llm_loader.export_all_cli",
+            torch_dir,
+            tmp_dir,
+            "--mtp",
+            "--device",
+            "cpu",
+        ]
+
+        with timer_context(f"Exporting MTP {config.model_name} via llm_loader",
+                           test_logger):
+            result = run_command(export_cmd,
+                                 timeout=600,
+                                 remote_config=None,
+                                 logger=test_logger)
+            if not result['success']:
+                pytest.fail(
+                    f"MTP export failed: {result.get('error', 'Unknown error')}"
+                )
+
+        llm_output = os.path.join(tmp_dir, "llm")
+        if not os.path.isdir(llm_output):
+            pytest.fail(f"MTP export did not produce llm/ in {tmp_dir}")
+        shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
+
+        draft_output = os.path.join(tmp_dir, "mtp_draft")
+        if not os.path.isdir(draft_output):
+            pytest.fail(f"MTP export did not produce mtp_draft/ in {tmp_dir}")
+        shutil.copytree(draft_output, draft_onnx_dir, dirs_exist_ok=True)
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    base_onnx = os.path.join(llm_onnx_dir, "model.onnx")
+    if not os.path.exists(base_onnx):
+        pytest.fail(f"MTP base ONNX not found: {base_onnx}")
+
+    draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
+    if not os.path.exists(draft_onnx):
+        pytest.fail(f"MTP draft ONNX not found: {draft_onnx}")
+
+
 def test_llm_loader_lora_export(test_param: str, test_logger,
                                 env_config: EnvironmentConfig):
     """Export a model and insert LoRA patterns via llm_loader.

@@ -59,6 +59,9 @@ import json
 import logging
 import os
 import sys
+from typing import Optional
+
+import torch
 
 from .checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
 
@@ -158,6 +161,7 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "code2wav": "code2wav",
     "visual": "visual",
     "action": "action",
+    "mtp_draft": "mtp_draft",
 }
 
 # Per-model overrides on top of ``_DEFAULT_LAYOUT``.
@@ -212,6 +216,21 @@ def _load_config(model_dir: str) -> dict:
         sys.exit(1)
     with open(cfg_path) as f:
         return json.load(f)
+
+
+def _get_llm_text_config(config: dict) -> dict:
+    """Return the promoted text/LLM config dict when present."""
+    for key in ("text_config", "llm_config", "language_config"):
+        sub = config.get(key)
+        if isinstance(sub, dict) and sub.get("hidden_size") is not None:
+            return sub
+    return config
+
+
+def _has_mtp(config: dict) -> bool:
+    """Return True when the checkpoint exposes the MTP branch."""
+    text_cfg = _get_llm_text_config(config)
+    return bool(text_cfg.get("mtp_num_hidden_layers") is not None)
 
 
 def _find_token_id(model_dir: str, token_str: str) -> "Optional[int]":
@@ -447,7 +466,8 @@ def _export_llm(model_dir: str,
                 model_type: str = "",
                 eagle_base: bool = False,
                 fp8_embedding: bool = False,
-                reduced_vocab_dir: str = "") -> None:
+                reduced_vocab_dir: str = "",
+                mtp_base: bool = False) -> None:
     """Export LLM backbone via the standard llm_loader pipeline."""
     os.makedirs(llm_out_dir, exist_ok=True)
     output_path = os.path.join(llm_out_dir, "model.onnx")
@@ -464,6 +484,7 @@ def _export_llm(model_dir: str,
             eagle_base=eagle_base,
             key_remap=key_remap,
             reduced_vocab_dir=reduced_vocab_dir or None,
+            mtp_base=mtp_base,
         )
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         logger.exception("[LLM] Failed to load checkpoint")
@@ -492,6 +513,32 @@ def _export_llm(model_dir: str,
     _patch_multimodal_token_ids(model_dir, llm_out_dir, model_type)
 
     logger.info("[LLM] Done: %s", output_path)
+
+
+def _export_mtp_draft(model_dir: str, draft_out_dir: str) -> None:
+    """Export the MTP draft model."""
+    os.makedirs(draft_out_dir, exist_ok=True)
+    output_path = os.path.join(draft_out_dir, "model.onnx")
+
+    logger.info("[MTP Draft] Loading checkpoint from %s", model_dir)
+    try:
+        from .model import AutoModel
+        model = AutoModel.from_pretrained(model_dir,
+                                          device="cpu",
+                                          mtp_draft=True)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[MTP Draft] Failed to load checkpoint")
+        raise SystemExit(1) from exc
+
+    logger.info("[MTP Draft] Exporting to %s", output_path)
+    try:
+        from .onnx.export import export_onnx
+        export_onnx(model, output_path, model_dir=model_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[MTP Draft] ONNX export failed")
+        raise SystemExit(1) from exc
+
+    logger.info("[MTP Draft] Done: %s", output_path)
 
 
 def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
@@ -1515,6 +1562,13 @@ def main() -> None:
         "Directory containing vocab_map.safetensors for LLM vocabulary reduction.",
     )
     p.add_argument(
+        "--mtp",
+        action="store_true",
+        help=
+        ("Export MTP components from a single checkpoint (llm/ as mtp_base + mtp_draft/)."
+         ),
+    )
+    p.add_argument(
         "--device",
         default="cuda",
         help="Device for export tracing (default: cuda).",
@@ -1537,6 +1591,15 @@ def main() -> None:
     config = _load_config(model_dir)
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
+    has_mtp_draft = _has_mtp(config)
+
+    if args.eagle_base and args.mtp:
+        p.error("--eagle-base and --mtp cannot be enabled together")
+    if args.mtp and args.skip_llm:
+        p.error("--mtp requires LLM export; remove --skip-llm")
+    if args.mtp and not has_mtp_draft:
+        p.error("--mtp was requested, but the checkpoint does not expose "
+                "MTP weights/config")
 
     # Load weights lazily — only needed when a weight-consuming exporter runs.
     _weights: dict = {}
@@ -1558,8 +1621,10 @@ def main() -> None:
                                  out,
                                  model_type=model_type,
                                  eagle_base=args.eagle_base,
+                                 mtp_base=args.mtp,
                                  fp8_embedding=args.fp8_embedding,
                                  reduced_vocab_dir=args.reduced_vocab_dir)),
+        (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(model_dir, out)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm,
          "talker", lambda out: _export_talker(model_dir, out, model_type)),
         (_has_llm_component(model_type, "code_predictor")
@@ -1590,6 +1655,8 @@ def main() -> None:
     for enabled, component, _ in stages:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
     logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
+    logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
+    logger.info("MTP export    : %s", "yes" if args.mtp else "no")
     logger.info("Reduced vocab : %s",
                 args.reduced_vocab_dir if args.reduced_vocab_dir else "no")
     logger.info("=" * 60)

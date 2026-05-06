@@ -226,13 +226,19 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         "runtime",
         effectiveMaxTreeSize, maxSamplingSize, draftFullTableLength);
 
-    // Reserve enough workspace for sampling, accounting for batch dimension in draft proposal stage
+    // Reserve enough workspace for sampling, accounting for batch dimension in draft proposal stage.
+    // Always include vanilla sampling workspace size because per-request disable_spec_decode
+    // can fall back to topK/topP sampling even when draft is loaded.
+    int32_t const vanillaSamplingWorkspaceSize
+        = static_cast<int32_t>(getTopKtopPSamplingWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize,
+            SamplingParams(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1.0f, 0, 0.9f)));
     int32_t const maxSamplingWorkspaceSize = hasDraft
-        ? std::max(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1),
-              getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize * effectiveDraftTopK,
-                  mDraftEngineConfig->draftModelVocabSize, effectiveDraftTopK))
-        : static_cast<int32_t>(getTopKtopPSamplingWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize,
-              SamplingParams(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1.0f, 0, 0.9f)));
+        ? std::max({vanillaSamplingWorkspaceSize,
+              static_cast<int32_t>(
+                  getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1)),
+              static_cast<int32_t>(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize * effectiveDraftTopK,
+                  mDraftEngineConfig->draftModelVocabSize, effectiveDraftTopK))})
+        : vanillaSamplingWorkspaceSize;
 
     try
     {
@@ -348,22 +354,31 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     }
     LOG_INFO("Runtime tensors successfully allocated.");
 
-    // Load conversion table from draft model vocab to base model vocab (draft-only).
+    // Load conversion table from draft model vocab to base model vocab.
+    // MTP draft shares vocab with base (no d2t mapping needed); fill with zeros (identity).
     if (hasDraft)
     {
-        std::vector<rt::Tensor> d2tTensors;
-        if (!safetensors::loadSafetensors(std::filesystem::path(engineDir) / "d2t.safetensors", d2tTensors, stream))
+        std::filesystem::path const d2tPath = std::filesystem::path(engineDir) / "d2t.safetensors";
+        if (std::filesystem::exists(d2tPath))
         {
-            LOG_ERROR("Failed to load d2t.safetensors from model directory: %s", engineDir.c_str());
-            throw std::runtime_error("Failed to load d2t.safetensors from model directory: " + engineDir);
+            std::vector<rt::Tensor> d2tTensors;
+            if (!safetensors::loadSafetensors(d2tPath, d2tTensors, stream))
+            {
+                LOG_ERROR("Failed to load d2t.safetensors from model directory: %s", engineDir.c_str());
+                throw std::runtime_error("Failed to load d2t.safetensors from model directory: " + engineDir);
+            }
+            check::check(d2tTensors.size() == 1, "d2t.safetensors should contain exactly one tensor");
+            check::check(d2tTensors[0].getShape().getNumDims() == 1, "d2t tensor should be 1D");
+            check::check(d2tTensors[0].getShape()[0] == mDraftEngineConfig->draftModelVocabSize,
+                "d2t tensor length should match draft vocab size");
+            mDraftVocabMappingTable = std::move(d2tTensors[0]);
         }
-
-        // Check we have exactly one tensor and use it
-        check::check(d2tTensors.size() == 1, "d2t.safetensors should contain exactly one tensor");
-        check::check(d2tTensors[0].getShape().getNumDims() == 1, "d2t tensor should be 1D");
-        check::check(d2tTensors[0].getShape()[0] == mDraftEngineConfig->draftModelVocabSize,
-            "d2t tensor length should match draft vocab size");
-        mDraftVocabMappingTable = std::move(d2tTensors[0]);
+        else
+        {
+            LOG_INFO("d2t.safetensors not found (MTP draft shares vocab with base), using identity mapping.");
+            CUDA_CHECK(cudaMemsetAsync(
+                mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
+        }
     }
 
     // Optional: Load vocabulary mapping table if base model uses reduced vocabulary
@@ -1565,6 +1580,10 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
 
     int32_t const activeBatchSize = context.activeBatchSize;
 
+    // Cache sub-manager references used throughout this function.
+    auto& baseCacheManager = mBaseEngineRunner->getCacheManager();
+    auto& mambaCacheManager = baseCacheManager.getMambaCacheManager();
+
     // This function will consume idsInput and draftTreeMask. Use base model to verify the draft tree.
     // We need to collect the logits and hidden states (for further drafting step).
     check::check(
@@ -1589,6 +1608,10 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     check::check(mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.outputVocabSize}), "Tensor reshape failed");
     check::check(
         mBaseHiddenStatesOutput.reshape({selectTokenSize, mBaseEngineConfig.outputHiddenDim}), "Tensor reshape failed");
+
+    // Reshape MTP intermediate state outputs to match actual runtime dimensions.
+    // TRT writes these contiguously as [activeBatchSize, verifyTreeSize, ...].
+    mambaCacheManager.reshapeIntermediateStates(activeBatchSize, mDraftingConfig->verifyTreeSize);
 
     bool const verifySuccess = mBaseEngineRunner->executeEagleBaseTreeDecodingStep(
         mInputsEmbeds, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, context.stream);
@@ -1616,7 +1639,6 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // Inplace update the KVCache and input hidden states from the accepted token indices.
     // Also commit KVCache to reflect the latest KVCache length (We can only do this after knowing how many tokens are
     // accepted).
-    auto& baseCacheManager = mBaseEngineRunner->getCacheManager();
     rt::Tensor const& kvCacheLengths = baseCacheManager.getKVCacheLengths();
 
     // The EAGLE base verify is per-head-dim-group batched: one launch per group covers
@@ -1648,6 +1670,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     kernel::eagleBaseAssembleHiddenState(mAcceptedTokenIndices, mAcceptLength, mBaseHiddenStatesOutput, context.stream);
 
     baseCacheManager.commitSequenceLength(mAcceptLength, context.stream);
+
+    // MTP: roll back recurrent/conv states to last accepted step. No-op when MTP is disabled.
+    mambaCacheManager.scatterMtpStates(mAcceptLength, context.stream);
 
     // Reshape to reflect the compacted layout [batch, maxAcceptDepth, hiddenDim]
     check::check(mBaseHiddenStatesOutput.reshape({activeBatchSize, maxAcceptDepth, mBaseEngineConfig.outputHiddenDim}),

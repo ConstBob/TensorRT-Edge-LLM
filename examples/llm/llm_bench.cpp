@@ -90,13 +90,13 @@ struct ProfileBenchArgs
     int32_t reuseKVLen{0}; // For prefill: reused KV cache length per batch
     int32_t pastKVLen{-1}; // For decode/verify/draft: past KV cache length per batch (required)
 
-    // Eagle parameters - no defaults
-    int32_t verifyTreeSize{-1}; // For eagle_verify
-    int32_t draftTreeSize{-1};  // For eagle_draft_proposal/eagle_draft_prefill
+    // Speculative decoding parameters - no defaults
+    int32_t verifyTreeSize{-1}; // For spec_verify
+    int32_t draftTreeSize{-1};  // For spec_draft_proposal/spec_draft_prefill
 
     int32_t osl{1};        // Output sequence length (LLM OSL per batch, default: 1)
-    int32_t acceptRate{5}; // Avg accepted tokens per EAGLE iteration (default: 5)
-    int32_t draftStep{6};  // Number of drafting steps per EAGLE iteration (default: 6)
+    int32_t acceptRate{5}; // Avg accepted tokens per spec-decode iteration (default: 5)
+    int32_t draftStep{6};  // Number of drafting steps per spec-decode iteration (default: 6)
 
     // Random seed for reproducibility
     uint64_t seed{0};
@@ -140,9 +140,13 @@ void printUsage(char const* programName)
     std::cerr << "  --mode                    Benchmarking mode. Required. One of:" << std::endl;
     std::cerr << "                              prefill           - LLM prefill phase" << std::endl;
     std::cerr << "                              decode            - LLM decode phase" << std::endl;
-    std::cerr << "                              eagle_verify      - Eagle base model verification" << std::endl;
-    std::cerr << "                              eagle_draft_proposal - Eagle draft proposal" << std::endl;
-    std::cerr << "                              eagle_draft_prefill - Eagle draft model prefill" << std::endl;
+    std::cerr
+        << "                              spec_verify       - Speculative decoding base model verification (EAGLE/MTP)"
+        << std::endl;
+    std::cerr << "                              spec_draft_proposal - Speculative decoding draft proposal (EAGLE/MTP)"
+              << std::endl;
+    std::cerr << "                              spec_draft_prefill - Speculative decoding draft prefill (EAGLE/MTP)"
+              << std::endl;
     std::cerr << "                              visual            - Visual encoder" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Mode-Specific Required Options:" << std::endl;
@@ -151,13 +155,13 @@ void printUsage(char const* programName)
     std::cerr << "    --reuseKVLen            Reused KV cache length. Optional, default=0." << std::endl;
     std::cerr << "  For decode mode:" << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
-    std::cerr << "  For eagle_verify mode:" << std::endl;
+    std::cerr << "  For spec_verify mode:" << std::endl;
     std::cerr << "    --verifyTreeSize        Verify tree size. Required." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
-    std::cerr << "  For eagle_draft_proposal mode:" << std::endl;
+    std::cerr << "  For spec_draft_proposal mode:" << std::endl;
     std::cerr << "    --draftTreeSize         Draft tree size. Required." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
-    std::cerr << "  For eagle_draft_prefill mode:" << std::endl;
+    std::cerr << "  For spec_draft_prefill mode:" << std::endl;
     std::cerr << "    --inputLen              Input sequence length. Required." << std::endl;
     std::cerr << "    --reuseKVLen            Reused KV cache length. Optional, default=0." << std::endl;
     std::cerr << "  For visual mode:" << std::endl;
@@ -184,10 +188,11 @@ void printUsage(char const* programName)
     std::cerr << "                              all, shapes, onnx_ops, tactics, data_types" << std::endl;
     std::cerr << "                            Implies --profile." << std::endl;
     std::cerr << std::endl;
-    std::cerr << "EAGLE-Specific Options:" << std::endl;
-    std::cerr << "  --acceptRate              Avg accepted tokens per EAGLE iteration (default: 5)." << std::endl;
+    std::cerr << "Speculative Decoding Options:" << std::endl;
+    std::cerr << "  --acceptRate              Avg accepted tokens per spec-decode iteration (default: 5)." << std::endl;
     std::cerr << "                            verify_steps = ceil((osl-1) / acceptRate)." << std::endl;
-    std::cerr << "  --draftStep               Number of drafting steps per EAGLE iteration (default: 6)." << std::endl;
+    std::cerr << "  --draftStep               Number of drafting steps per spec-decode iteration (default: 6)."
+              << std::endl;
     std::cerr << "                            draft_calls = verify_steps * (draftStep-1)." << std::endl;
     std::cerr << std::endl;
     std::cerr << "Examples:" << std::endl;
@@ -197,13 +202,13 @@ void printUsage(char const* programName)
     std::cerr << "  # Decode mode" << std::endl;
     std::cerr << "  " << programName << " --engineDir ./engines --mode decode --pastKVLen 128" << std::endl;
     std::cerr << std::endl;
-    std::cerr << "  # Eagle verify mode" << std::endl;
-    std::cerr << "  " << programName << " --engineDir ./engines --mode eagle_verify --verifyTreeSize 60 --pastKVLen 128"
+    std::cerr << "  # Spec-decode verify mode" << std::endl;
+    std::cerr << "  " << programName << " --engineDir ./engines --mode spec_verify --verifyTreeSize 60 --pastKVLen 128"
               << std::endl;
     std::cerr << std::endl;
-    std::cerr << "  # Eagle draft proposal mode" << std::endl;
+    std::cerr << "  # Spec-decode draft proposal mode" << std::endl;
     std::cerr << "  " << programName
-              << " --engineDir ./engines --mode eagle_draft_proposal --draftTreeSize 60 --pastKVLen 128" << std::endl;
+              << " --engineDir ./engines --mode spec_draft_proposal --draftTreeSize 60 --pastKVLen 128" << std::endl;
     std::cerr << std::endl;
     std::cerr << "  # Visual encoder mode" << std::endl;
     std::cerr << "  " << programName << " --engineDir ./visual_engines --mode visual --imageSize 896x448" << std::endl;
@@ -288,15 +293,15 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 {
                     args.mode = BenchMode::kDECODE;
                 }
-                else if (modeStr == "eagle_verify")
+                else if (modeStr == "spec_verify" || modeStr == "eagle_verify")
                 {
                     args.mode = BenchMode::kEAGLE_VERIFY;
                 }
-                else if (modeStr == "eagle_draft_proposal")
+                else if (modeStr == "spec_draft_proposal" || modeStr == "eagle_draft_proposal")
                 {
                     args.mode = BenchMode::kEAGLE_DRAFT_PROPOSAL;
                 }
-                else if (modeStr == "eagle_draft_prefill")
+                else if (modeStr == "spec_draft_prefill" || modeStr == "eagle_draft_prefill")
                 {
                     args.mode = BenchMode::kEAGLE_DRAFT_PREFILL;
                 }
@@ -466,31 +471,31 @@ bool validateArgs(ProfileBenchArgs const& args)
     case BenchMode::kEAGLE_VERIFY:
         if (args.verifyTreeSize < 0)
         {
-            LOG_ERROR("--verifyTreeSize is required for eagle_verify mode");
+            LOG_ERROR("--verifyTreeSize is required for spec_verify mode");
             return false;
         }
         if (args.pastKVLen < 0)
         {
-            LOG_ERROR("--pastKVLen is required for eagle_verify mode");
+            LOG_ERROR("--pastKVLen is required for spec_verify mode");
             return false;
         }
         break;
     case BenchMode::kEAGLE_DRAFT_PROPOSAL:
         if (args.draftTreeSize < 0)
         {
-            LOG_ERROR("--draftTreeSize is required for eagle_draft_proposal mode");
+            LOG_ERROR("--draftTreeSize is required for spec_draft_proposal mode");
             return false;
         }
         if (args.pastKVLen < 0)
         {
-            LOG_ERROR("--pastKVLen is required for eagle_draft_proposal mode");
+            LOG_ERROR("--pastKVLen is required for spec_draft_proposal mode");
             return false;
         }
         break;
     case BenchMode::kEAGLE_DRAFT_PREFILL:
         if (args.inputLen < 0)
         {
-            LOG_ERROR("--inputLen is required for eagle_draft_prefill mode");
+            LOG_ERROR("--inputLen is required for spec_draft_prefill mode");
             return false;
         }
         break;
@@ -919,8 +924,8 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_VERIFY)
     {
-        modeName = "Eagle Verify";
-        LOG_INFO("Eagle Verify mode: VerifyTreeSize=%d, PastKVLen=%d", args.verifyTreeSize, args.pastKVLen);
+        modeName = "Spec Verify";
+        LOG_INFO("Spec Verify mode: VerifyTreeSize=%d, PastKVLen=%d", args.verifyTreeSize, args.pastKVLen);
 
         pastKVLenVec.assign(args.batchSize, args.pastKVLen);
 
@@ -963,8 +968,8 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL)
     {
-        modeName = "Eagle Draft";
-        LOG_INFO("Eagle Draft mode: DraftTreeSize=%d, PastKVLen=%d", args.draftTreeSize, args.pastKVLen);
+        modeName = "Spec Draft";
+        LOG_INFO("Spec Draft mode: DraftTreeSize=%d, PastKVLen=%d", args.draftTreeSize, args.pastKVLen);
 
         pastKVLenVec.assign(args.batchSize, args.pastKVLen);
 
@@ -1026,8 +1031,8 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PREFILL)
     {
-        modeName = "Eagle Draft Prefill";
-        LOG_INFO("Eagle Draft Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
+        modeName = "Spec Draft Prefill";
+        LOG_INFO("Spec Draft Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
 
         reuseKVLenVec.assign(args.batchSize, args.reuseKVLen);
 
@@ -1128,7 +1133,7 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PREFILL)
     {
-        e2eTimeMsResult = runRepeatedE2ETiming("Eagle Draft Prefill", args.iterations, resetState, step, stream);
+        e2eTimeMsResult = runRepeatedE2ETiming("Spec Draft Prefill", args.iterations, resetState, step, stream);
         e2eNumTokens = args.inputLen;
     }
     else if (useSequentialE2E)
@@ -1140,7 +1145,7 @@ int main(int argc, char** argv)
     }
     else
     {
-        // osl=1: single-step, multiple iterations (decode/eagle modes)
+        // osl=1: single-step, multiple iterations (decode/spec-decode modes)
         e2eTimeMsResult = runRepeatedE2ETiming(
             modeName, args.iterations, resetState, step, stream, !args.noCudaGraph, captureGraph);
         e2eNumTokens = 1;

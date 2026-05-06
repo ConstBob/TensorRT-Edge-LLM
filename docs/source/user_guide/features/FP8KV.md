@@ -141,7 +141,7 @@ tensorrt-edgellm-export-draft \
     --onnxDir=${MODEL_NAME}/onnx/base-nvfp4-fp8kv \
     --engineDir=${MODEL_NAME}/engines/eagle-nvfp4-fp8kv/ \
     --maxBatchSize=1 \
-    --eagleBase
+    --specBase
 ```
 
 #### Step 5: Build Draft Engine
@@ -151,7 +151,7 @@ tensorrt-edgellm-export-draft \
     --onnxDir=${MODEL_NAME}/onnx/draft \
     --engineDir=${MODEL_NAME}/engines/eagle-nvfp4-fp8kv/ \
     --maxBatchSize=1 \
-    --eagleDraft
+    --specDraft
 ```
 
 #### Step 6: Run Inference with EAGLE
@@ -161,7 +161,7 @@ tensorrt-edgellm-export-draft \
     --inputFile=tests/test_cases/llm_basic.json \
     --engineDir=${MODEL_NAME}/engines/eagle-nvfp4-fp8kv/ \
     --outputFile=output.json \
-    --eagle
+    --specDecode
 ```
 
 ---

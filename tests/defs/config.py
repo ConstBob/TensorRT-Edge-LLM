@@ -186,8 +186,9 @@ class TestConfig:
     draft_llm_precision: Optional[str] = None
     draft_lm_head_precision: Optional[str] = None
 
-    # EAGLE model flag
+    # Speculative decoding flags
     is_eagle: Optional[bool] = None
+    is_mtp: Optional[bool] = None
 
     # Directory paths
     llm_models_dir: Optional[str] = None
@@ -532,6 +533,9 @@ class TestConfig:
                 parsed_params['fp8_kv_cache'] = True
             elif part == "fp8emb":
                 parsed_params['fp8_embedding'] = True
+            elif part == "mtp":
+                parsed_params['is_mtp'] = True
+                parsed_params['is_eagle'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -706,16 +710,18 @@ class TestConfig:
                     self.max_image_tokens_per_image = 512
                 if self.is_eagle is None:
                     self.is_eagle = False
+                if self.is_mtp is None:
+                    self.is_mtp = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.eagle_draft_top_k is None:
-                    self.eagle_draft_top_k = 10
+                    self.eagle_draft_top_k = 1 if self.is_mtp else 10
                 if self.eagle_draft_step is None:
-                    self.eagle_draft_step = 6
+                    self.eagle_draft_step = 3 if self.is_mtp else 6
                 if self.max_verify_tree_size is None:
-                    self.max_verify_tree_size = 60
+                    self.max_verify_tree_size = 4 if self.is_mtp else 60
                 if self.max_draft_tree_size is None:
-                    self.max_draft_tree_size = 60
+                    self.max_draft_tree_size = 4 if self.is_mtp else 60
 
         warmup_env = os.environ.get('WARMUP')
         if warmup_env is not None and self.warmup is None:
@@ -1069,7 +1075,12 @@ class TestConfig:
 
     def get_llm_onnx_dir(self) -> str:
         """Get LLM ONNX model directory. For TTS this contains talker/ and code_predictor/."""
-        prefix = "llm-base" if self.is_eagle else "llm"
+        if self.is_mtp:
+            prefix = "llm-base-mtp"
+        elif self.is_eagle:
+            prefix = "llm-base"
+        else:
+            prefix = "llm"
         return os.path.join(self.get_onnx_base_dir(),
                             f"{prefix}-{self.get_onnx_model_id()}")
 
@@ -1119,6 +1130,11 @@ class TestConfig:
 
     def get_draft_onnx_dir(self) -> str:
         """Get draft model ONNX directory"""
+        if self.is_mtp:
+            # MTP draft shares the base checkpoint precision; use the same
+            # onnx_model_id suffix so different precisions don't collide.
+            return os.path.join(self.get_onnx_base_dir(),
+                                f"mtp-draft-{self.get_onnx_model_id()}")
         return os.path.join(self.get_onnx_base_dir(),
                             f"draft-{self.get_draft_onnx_model_id()}")
 
@@ -1145,7 +1161,11 @@ class TestConfig:
             raise ValueError(
                 "LLM engine directory not available for export tasks")
 
-        if self.is_eagle:
+        if self.is_mtp:
+            # MTP shares the base checkpoint; no separate draft_model_id.  Precision
+            # info comes from get_engine_id() (already includes llm/lm_head precision).
+            prefix = "llm-mtp"
+        elif self.is_eagle:
             if self.draft_model_id is None:
                 raise ValueError("draft_model_id not set for EAGLE engine")
             if self.draft_llm_precision is None:
@@ -1345,7 +1365,10 @@ class TestConfig:
         """Get quantized model directory (for export)"""
         if self.llm_precision == "fp16":
             return self.get_torch_model_dir()
-        prefix = "quantized-base" if self.is_eagle else "quantized"
+        if self.is_eagle and not self.is_mtp:
+            prefix = "quantized-base"
+        else:
+            prefix = "quantized"
         quantized_name = f"{self.llm_precision}-{self.lm_head_precision}"
         if self.fp8_kv_cache:
             quantized_name += "-fp8kv"

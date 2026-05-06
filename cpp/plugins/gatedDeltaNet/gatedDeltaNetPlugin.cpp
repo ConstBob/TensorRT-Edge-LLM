@@ -283,8 +283,15 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     int32_t const v_dim = static_cast<int32_t>(vDims[3]);
 
     // Determine if this call should use MTP decode path.
-    // MTP mode: plugin was constructed with use_mtp=true AND seq_len > 1.
-    bool const mtpActive = mUseMTP && (seq_len > 1);
+    // MTP mode activates only for short multi-token verification sequences (tree verify),
+    // not for normal prefill. The MTP kernel writes per-step intermediate states which adds
+    // minor overhead; small prefills (seq_len <= kMTPMaxSeqLen) that happen to pass through
+    // this path pay a small cost for the intermediate state writes, but it is harmless.
+    // TODO: refactor the dispatch logic to explicitly distinguish MTP tree-verify decoding
+    // from prefill when 1 < seq_len <= kMTPMaxSeqLen (e.g. pass an execution-phase flag
+    // from the runtime instead of relying solely on seq_len range heuristics).
+    constexpr int32_t kMTPMaxSeqLen = 8;
+    bool const mtpActive = mUseMTP && (seq_len > 1) && (seq_len <= kMTPMaxSeqLen);
 
     // h0 is batch-dense [n, hv, k, v]
     size_t const h0Bytes = static_cast<size_t>(n) * hv * static_cast<size_t>(k_dim) * v_dim * sizeof(float);

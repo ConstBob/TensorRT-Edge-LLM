@@ -96,8 +96,7 @@ cd ~/TensorRT-Edge-LLM
   --maxInputLen 1024 \
   --maxKVCacheCapacity 4096 \
   --maxVerifyTreeSize 60 \
-  --maxDraftTreeSize 60 \
-  --eagleBase
+  --specBase
 
 # Build draft model engine
 ./build/examples/llm/llm_build \
@@ -106,9 +105,8 @@ cd ~/TensorRT-Edge-LLM
   --maxBatchSize 1 \
   --maxInputLen 1024 \
   --maxKVCacheCapacity 4096 \
-  --maxVerifyTreeSize 60 \
   --maxDraftTreeSize 60 \
-  --eagleDraft
+  --specDraft
 ```
 
 Build time: < 5 minutes
@@ -122,10 +120,8 @@ cd ~/TensorRT-Edge-LLM
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
   --inputFile $WORKSPACE_DIR/input.json \
   --outputFile $WORKSPACE_DIR/output.json \
-  --eagle
+  --specDecode
 ```
-
-**Note:** EAGLE speculative decoding provides 1.5-3x faster generation but is limited to batch size 1.
 
 ---
 
@@ -201,7 +197,7 @@ cd ~/TensorRT-Edge-LLM
   --maxKVCacheCapacity 4096 \
   --maxVerifyTreeSize 60 \
   --maxDraftTreeSize 60 \
-  --eagleBase
+  --specBase
 
 # Build draft model engine
 ./build/examples/llm/llm_build \
@@ -212,7 +208,7 @@ cd ~/TensorRT-Edge-LLM
   --maxKVCacheCapacity 4096 \
   --maxVerifyTreeSize 60 \
   --maxDraftTreeSize 60 \
-  --eagleDraft
+  --specDraft
 
 # Build visual encoder engine
 ./build/examples/multimodal/visual_build \
@@ -235,5 +231,97 @@ cd ~/TensorRT-Edge-LLM
   --multimodalEngineDir $WORKSPACE_DIR/$MODEL_NAME/engines/visual \
   --inputFile $WORKSPACE_DIR/input.json \
   --outputFile $WORKSPACE_DIR/output.json \
-  --eagle
+  --specDecode
 ```
+---
+
+## MTP (Multi-Token Prediction)
+
+MTP is a speculative decoding method built into certain model architectures. Unlike EAGLE which uses a separately trained draft model, MTP uses lightweight prediction heads that are part of the base model checkpoint. The runtime reuses the same EAGLE speculative decoding pipeline with `topK=1` (linear draft chain).
+
+So far any Qwen3.5 dense model with `num_draft_layers > 0` in its config is MTP-capable.
+
+---
+
+### Example
+
+**Example model:** [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)
+
+#### Step 1: Export (x86 Host)
+
+MTP export produces both the base model and draft model ONNX from a single checkpoint using `llm_loader`:
+
+```bash
+export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
+export MODEL_NAME=Qwen3.5-4B
+cd ~/TensorRT-Edge-LLM
+
+# Export
+PYTHONPATH=experimental:$PYTHONPATH python3 -m llm_loader.export_all_cli \
+  $MODEL_NAME \
+  $WORKSPACE_DIR/$MODEL_NAME/onnx \
+  --mtp
+```
+
+This produces:
+- `$WORKSPACE_DIR/$MODEL_NAME/onnx/llm/` — MTP base model (hybrid attention + GDN layers, with tree-attention and intermediate state outputs)
+- `$WORKSPACE_DIR/$MODEL_NAME/onnx/mtp_draft/` — MTP draft head (single attention layer with Add-based hidden state fusion)
+
+
+#### Step 2: Transfer to Device
+
+```bash
+# Transfer ONNX to device
+scp -r $MODEL_NAME/onnx \
+  <device_user>@<device_ip>:~/tensorrt-edgellm-workspace/$MODEL_NAME/
+```
+
+
+#### Step 3: Build Engines
+
+```bash
+export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
+export MODEL_NAME=Qwen3.5-4B
+cd ~/TensorRT-Edge-LLM
+
+# Build MTP base engine
+./build/examples/llm/llm_build \
+  --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx/llm \
+  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
+  --maxBatchSize 1 \
+  --maxInputLen 2048 \
+  --maxKVCacheCapacity 4096 \
+  --maxVerifyTreeSize 7 \
+  --specBase
+
+# Build MTP draft engine
+./build/examples/llm/llm_build \
+  --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx/mtp_draft \
+  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
+  --maxBatchSize 1 \
+  --maxInputLen 2048 \
+  --maxKVCacheCapacity 4096 \
+  --maxDraftTreeSize 7 \
+  --specDraft
+```
+
+
+#### Step 4: Run Inference
+
+```bash
+cd ~/TensorRT-Edge-LLM
+
+./build/examples/llm/llm_inference \
+  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
+  --inputFile $WORKSPACE_DIR/input.json \
+  --outputFile $WORKSPACE_DIR/output.json \
+  --specDecode \
+  --specDraftTopK 1 \
+  --specDraftStep 3 \
+  --specVerifyTreeSize 4
+```
+
+**Key differences from EAGLE:**
+- `--specDraftTopK 1`: MTP uses a linear chain (no branching), so topK=1
+- `--specDraftStep 3`: Number of MTP draft tokens (typically 3-7, matching the model's MTP head count)
+- `--specVerifyTreeSize 4`: Equals `draftStep + 1` for the linear chain

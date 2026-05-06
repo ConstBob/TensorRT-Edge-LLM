@@ -45,6 +45,7 @@ struct LLMEngineRunnerConfig
     RopeConfig ropeConfig{};             //!< Type of rotary positional encoding
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
     bool enableEagleSpecDecode{false};   //!< Enable Eagle speculative decoding
+    bool mtpBase{false};                 //!< MTP base model (gates intermediate-state allocation/binding)
     bool useTrtNativeOps{false};         //!< Use TensorRT native operations instead of custom plugin
     int32_t numDecoderLayers{};          //!< Number of decoder layers
     int32_t numKVHeads{};                //!< Number of key-value heads
@@ -418,6 +419,20 @@ private:
      * @return True on success, false on failure
      */
     bool bindConvStateToEngine(int32_t activeBatchSize);
+
+    /*!
+     * @brief Bind MTP intermediate recurrent state output tensors to engine
+     *
+     * @return True on success, false on failure
+     */
+    bool bindIntermediateRecurrentStateToEngine();
+
+    /*!
+     * @brief Bind MTP intermediate conv state output tensors to engine
+     *
+     * @return True on success, false on failure
+     */
+    bool bindIntermediateConvStateToEngine();
 };
 
 } // namespace rt
