@@ -77,15 +77,29 @@ def test_llm_loader_export(test_param: str, test_logger,
                     f"llm_loader export failed: {result.get('error', 'Unknown error')}"
                 )
 
-        # Move the LLM ONNX output to the expected directory
+        # Move the LLM ONNX output to the expected directory.
+        # TTS exports two LLM-class sub-models (talker + code_predictor); build
+        # expects them under ``<llm_onnx_dir>/{talker,code_predictor}/``. The
+        # standard non-TTS export emits a single ``tmp/llm/`` that maps
+        # directly to ``<llm_onnx_dir>/``.
         llm_output = os.path.join(tmp_dir, "llm")
+        cp_output = os.path.join(tmp_dir, "code_predictor")
         if not os.path.isdir(llm_output):
             pytest.fail(
                 f"llm_loader did not produce llm/ output directory in {tmp_dir}"
             )
-
-        # Copy all files from tmp_dir/llm/ into the final ONNX directory
-        shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
+        if os.path.isdir(cp_output):
+            # TTS layout: tmp/llm/         -> onnx/llm-<prec>/talker/
+            #             tmp/code_predictor/ -> onnx/llm-<prec>/code_predictor/
+            shutil.copytree(llm_output,
+                            os.path.join(llm_onnx_dir, "talker"),
+                            dirs_exist_ok=True)
+            shutil.copytree(cp_output,
+                            os.path.join(llm_onnx_dir, "code_predictor"),
+                            dirs_exist_ok=True)
+        else:
+            # Standard layout: tmp/llm/ -> onnx/llm-<prec>/
+            shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
 
         # If the model also has a visual encoder output, move that too
         visual_output = os.path.join(tmp_dir, "visual")
@@ -94,14 +108,37 @@ def test_llm_loader_export(test_param: str, test_logger,
                                            "visual-fp16")
             shutil.copytree(visual_output, visual_onnx_dir, dirs_exist_ok=True)
 
+        # Same for audio encoder (ASR / Qwen3-Omni / Nemotron-Omni).
+        audio_output = os.path.join(tmp_dir, "audio")
+        if os.path.isdir(audio_output):
+            audio_onnx_dir = os.path.join(config.get_onnx_base_dir(),
+                                          "audio-fp16")
+            shutil.copytree(audio_output, audio_onnx_dir, dirs_exist_ok=True)
+
+        # Same for Qwen3-Omni Code2Wav vocoder.
+        code2wav_output = os.path.join(tmp_dir, "code2wav")
+        if os.path.isdir(code2wav_output):
+            code2wav_onnx_dir = os.path.join(config.get_onnx_base_dir(),
+                                             "code2wav-fp16")
+            shutil.copytree(code2wav_output,
+                            code2wav_onnx_dir,
+                            dirs_exist_ok=True)
+
     finally:
         # Clean up temp directory
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Validate the exported ONNX model exists
-    onnx_model = os.path.join(llm_onnx_dir, "model.onnx")
-    if not os.path.exists(onnx_model):
-        pytest.fail(f"LLM ONNX model not found after export: {onnx_model}")
+    # Validate the exported ONNX model exists. TTS produces model.onnx under
+    # ``talker/`` (the talker is the LLM-class submodel); non-TTS produces it
+    # at the root of llm_onnx_dir.
+    onnx_candidates = [
+        os.path.join(llm_onnx_dir, "model.onnx"),
+        os.path.join(llm_onnx_dir, "talker", "model.onnx"),
+    ]
+    if not any(os.path.exists(p) for p in onnx_candidates):
+        pytest.fail(
+            f"LLM ONNX model not found after export at any of: {onnx_candidates}"
+        )
 
 
 def _run_llm_loader_export(cmd, timeout, test_logger, label):

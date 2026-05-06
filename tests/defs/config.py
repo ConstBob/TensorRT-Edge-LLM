@@ -226,6 +226,14 @@ class TestConfig:
     # Inference parameters
     test_case: Optional[str] = None
 
+    # Path of a per-config preprocessed copy of the test case JSON. Set by
+    # tests/defs/utils/command_execution.py helpers when they need to rewrite
+    # audio paths or substitute LoRA placeholders without mutating the
+    # version-controlled source under tests/test_cases/. ``get_test_case_file``
+    # returns this when populated so downstream command generation
+    # transparently picks up the rewritten document.
+    _test_case_file_override: Optional[str] = None
+
     # KV cache options
     fp8_kv_cache: Optional[
         bool] = None  # If true, export ONNX/config with FP8 KV cache enabled
@@ -379,9 +387,14 @@ class TestConfig:
         ParameterSpec("max_image_tokens", "mxit",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.VLM, ModelType.OMNI}),
-        ParameterSpec("max_image_tokens_per_image", "mxpiit",
+        # mxpiit is optional — most VLM/OMNI test cases use the same value
+        # (512), so set_defaults() falls back to 512 when not in the param
+        # string. Override per-test by including ``-mxpiit<N>``.
+        ParameterSpec("max_image_tokens_per_image",
+                      "mxpiit",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.VLM, ModelType.OMNI}),
+                      {ModelType.VLM, ModelType.OMNI},
+                      is_required=False),
         ParameterSpec("visual_precision",
                       "vit", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
@@ -686,6 +699,11 @@ class TestConfig:
                     self.lora = self.max_lora_rank > 0
                 if self.fp8_kv_cache is None:
                     self.fp8_kv_cache = False
+                # max_image_tokens_per_image: VLM/OMNI default. Most test
+                # cases use 512; override via ``-mxpiit<N>`` in the param.
+                if (self.model_type in (ModelType.VLM, ModelType.OMNI)) and (
+                        self.max_image_tokens_per_image is None):
+                    self.max_image_tokens_per_image = 512
                 if self.is_eagle is None:
                     self.is_eagle = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
@@ -1058,14 +1076,22 @@ class TestConfig:
     def get_tts_tokenizer_dir(self) -> str:
         """
         Get tokenizer directory for TTS benchmark/inference.
-        Prefer ONNX export output (llm/ for TTS) which contains tokenizer.json from export;
-        fallback to torch model dir (vocab.json + tokenizer_config.json).
+
+        Prefer ONNX export output, where ``tokenizer.json`` is written: the
+        llm_loader-based export drops it under ``llm-<prec>/talker/`` (since
+        the talker submodel is what carries the language modeling head), so
+        check there first; older legacy exports placed it directly at
+        ``llm-<prec>/``. Fall back to the torch model dir
+        (``vocab.json`` + ``tokenizer_config.json``) when neither has it.
         """
         onnx_llm_dir = self.get_llm_onnx_dir()
-        if os.path.isdir(onnx_llm_dir):
-            tokenizer_json = os.path.join(onnx_llm_dir, "tokenizer.json")
-            if os.path.isfile(tokenizer_json):
-                return onnx_llm_dir
+        candidates = [
+            os.path.join(onnx_llm_dir, "talker"),
+            onnx_llm_dir,
+        ]
+        for candidate in candidates:
+            if os.path.isfile(os.path.join(candidate, "tokenizer.json")):
+                return candidate
         return self.get_torch_model_dir()
 
     def get_audio_onnx_dir(self, precision: Optional[str] = None) -> str:
@@ -1168,13 +1194,23 @@ class TestConfig:
     def get_test_case_file(self) -> str:
         """
         Get test case file path using test case name mapping.
-        
+
+        When ``_test_case_file_override`` is set (by helpers that have
+        rewritten the test case JSON for this config, e.g. audio
+        preprocessing or LoRA placeholder substitution), that path is
+        returned so downstream command generation operates on the
+        per-config preprocessed copy and never mutates the
+        version-controlled source.
+
         Returns:
             Full path to the test case JSON file
-            
+
         Raises:
             ValueError: If test_case is not set or not supported
         """
+        if self._test_case_file_override:
+            return self._test_case_file_override
+
         if not self.test_case:
             raise ValueError("test_case not set - required for this operation")
 
@@ -1191,6 +1227,10 @@ class TestConfig:
             "tests/test_cases/llm_basic.json",
             "llm_lora":
             "tests/test_cases/llm_lora.json",
+            "asr_basic":
+            "tests/test_cases/asr_basic.json",
+            "tts_basic":
+            "tests/test_cases/tts_basic.json",
             "vlm_basic":
             "tests/test_cases/vlm_basic.json",
             "vlm_lora":
@@ -1245,6 +1285,22 @@ class TestConfig:
         Returns:
             Path to chat template JSON file, or None if no custom template for this model
         """
+        try:
+            from tensorrt_edgellm.chat_templates import get_template_path
+        except ImportError:
+            return None
+
+        MODEL_TO_TEMPLATE = {
+            "NVIDIA-Nemotron-Nano-9B-v2": "nemotron_nano_v2",
+            "NVIDIA-Nemotron-Nano-9B-v2-FP8": "nemotron_nano_v2",
+            "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": "nemotron_nano_v2",
+            "Qwen3-TTS-12Hz-0.6B-CustomVoice": "qwen3tts",
+            "Qwen3-TTS-12Hz-1.7B-CustomVoice": "qwen3tts",
+        }
+
+        template_id = MODEL_TO_TEMPLATE.get(self.model_name)
+        if template_id:
+            return get_template_path(template_id)
         return None
 
     def get_output_json_file(self) -> str:
