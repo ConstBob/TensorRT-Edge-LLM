@@ -585,6 +585,11 @@ _causal_conv1d_schema = OpSchema(
         OpSchema.FormalParameter(name="conv_state_out",
                                  description="Updated conv state",
                                  type_str="T"),
+        OpSchema.FormalParameter(
+            name="intermediate_conv_state_out",
+            description="Per-token conv states [batch, seq, dim, width]",
+            type_str="T",
+            param_option=OpSchema.FormalParameterOption.Optional),
     ],
     type_constraints=[
         ("T", ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"], ""),
@@ -607,6 +612,11 @@ _causal_conv1d_schema = OpSchema(
                            type=OpSchema.AttrType.INT,
                            description="Groups",
                            required=True),
+        OpSchema.Attribute(
+            name="use_mtp",
+            type=OpSchema.AttrType.INT,
+            description="Whether to emit per-token intermediate states",
+            required=False),
     ],
 )
 
@@ -874,6 +884,11 @@ _gated_delta_net_schema = OpSchema(
             name="h0_out",
             description="Recurrent state out [n, hv, k, v]",
             type_str="T_A"),
+        OpSchema.FormalParameter(
+            name="intermediate_h0_out",
+            description="Per-token recurrent states [n, seq, hv, k, v]",
+            type_str="T_A",
+            param_option=OpSchema.FormalParameterOption.Optional),
     ],
     type_constraints=[
         ("T", ["tensor(float16)"], ""),
@@ -889,6 +904,11 @@ _gated_delta_net_schema = OpSchema(
                            type=OpSchema.AttrType.INT,
                            description="V head dimension",
                            required=True),
+        OpSchema.Attribute(
+            name="use_mtp",
+            type=OpSchema.AttrType.INT,
+            description="Whether to emit per-token intermediate states",
+            required=False),
     ],
 )
 

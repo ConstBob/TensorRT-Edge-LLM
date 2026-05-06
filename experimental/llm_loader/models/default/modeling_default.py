@@ -686,9 +686,10 @@ class CausalLM(nn.Module):
         # last_token_ids: [batch, num_tokens] int64 -- indices into the seq dim.
         # Use trt::gather_nd so the ONNX export emits GatherND(batch_dims=1)
         # instead of GatherElements; TRT handles GatherND natively.
-        hidden_states = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
+        selected_hidden_states = torch.ops.trt.gather_nd(
+            hidden_states, last_token_ids)
 
-        logits = self.lm_head(hidden_states).to(torch.float32)
+        logits = self.lm_head(selected_hidden_states).to(torch.float32)
 
         if eagle_base and all_hidden_states is not None:
             # EAGLE3 base: concatenate hidden states from 3 selected layers.

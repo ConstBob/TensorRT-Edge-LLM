@@ -28,7 +28,7 @@ from typing import Dict, Type
 import torch.nn as nn
 
 from .checkpoint.loader import load_weights
-from .config import ModelConfig
+from .config import ModelConfig, make_mtp_draft_config
 
 __all__ = ["AutoModel", "register_model", "dtype_summary", "param_count"]
 
@@ -60,7 +60,9 @@ class AutoModel:
                         key_remap=None,
                         key_prefix: "str | None" = None,
                         eagle_base: bool = False,
-                        reduced_vocab_dir: "str | None" = None) -> nn.Module:
+                        reduced_vocab_dir: "str | None" = None,
+                        mtp_base: bool = False,
+                        mtp_draft: bool = False) -> nn.Module:
         """Construct and load a model from *model_dir*.
 
         Reads ``config.json`` via :class:`~config.ModelConfig`, looks up the
@@ -81,6 +83,10 @@ class AutoModel:
                             tree-attention inputs and hidden_states output.
             reduced_vocab_dir:
                             Optional directory containing ``vocab_map.safetensors``.
+            mtp_base:       When True, export the standard Qwen3.5 text model as
+                            the dense MTP base variant.
+            mtp_draft:      When True, build the dedicated Qwen3.5 dense MTP
+                            draft model from the base checkpoint config.
 
         Returns:
             Loaded ``nn.Module`` in eval mode.
@@ -90,15 +96,37 @@ class AutoModel:
         config = ModelConfig.from_pretrained(model_dir)
         if eagle_base:
             config.eagle_base = True
+        if mtp_base or config.mtp_base:
+            config.mtp_base = True
+
+        variant = _resolve_model_variant(config,
+                                         eagle_base=eagle_base,
+                                         mtp_base=config.mtp_base,
+                                         mtp_draft=mtp_draft)
 
         # EAGLE3 draft: auto-detect from draft_vocab_size
-        if config.is_eagle3_draft:
+        if variant == "eagle3_draft":
             from .models.eagle3.modeling_eagle3_draft import Eagle3DraftModel
             model_class = Eagle3DraftModel
             # Set up key remapping: midlayer -> layers.0, skip t2d
             if key_remap is None:
                 key_remap = _eagle3_key_remap
+        elif variant == "mtp_draft":
+            # TODO: support other model types
+            if config.model_type != "qwen3_5_text":
+                raise NotImplementedError(
+                    "MTP draft is only supported for qwen3_5_text checkpoints."
+                )
+            from .models.qwen3_5 import Qwen3_5MtpDraftModel
+            config = make_mtp_draft_config(config)
+            model_class = Qwen3_5MtpDraftModel
+            if key_remap is None:
+                key_remap = _mtp_key_remap
         else:
+            if variant == "mtp_base" and config.model_type != "qwen3_5_text":
+                raise NotImplementedError(
+                    "Qwen3.5 dense MTP base is only supported for qwen3_5_text checkpoints."
+                )
             model_class = _MODEL_REGISTRY.get(config.model_type, CausalLM)
 
         model = model_class(config)
@@ -153,6 +181,30 @@ def dtype_summary(model: nn.Module) -> Dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_model_variant(config: ModelConfig, *, eagle_base: bool,
+                           mtp_base: bool, mtp_draft: bool) -> str:
+    """Resolve the requested model variant while keeping EAGLE3 behavior intact."""
+    if eagle_base and mtp_base:
+        raise ValueError("eagle_base and mtp_base cannot both be enabled.")
+    if eagle_base and mtp_draft:
+        raise ValueError("eagle_base and mtp_draft cannot both be enabled.")
+    if mtp_base and mtp_draft:
+        raise ValueError("mtp_base and mtp_draft cannot both be enabled.")
+    if config.is_eagle3_draft:
+        if mtp_base or mtp_draft:
+            raise ValueError(
+                "EAGLE3 draft checkpoints cannot be loaded as Qwen3.5 MTP variants."
+            )
+        return "eagle3_draft"
+    if mtp_draft:
+        return "mtp_draft"
+    if mtp_base:
+        return "mtp_base"
+    if eagle_base:
+        return "eagle_base"
+    return "llm"
+
+
 def _eagle3_key_remap(key: str) -> "str | None":
     """Remap EAGLE3 draft checkpoint keys.
 
@@ -176,3 +228,21 @@ def _eagle3_key_remap(key: str) -> "str | None":
     key = key.replace("qkv_proj.v_proj", "v_proj")
     key = key.replace("._pre_quant_scale", ".pre_quant_scale")
     return key
+
+
+def _mtp_key_remap(key: str) -> "str | None":
+    """Remap MTP checkpoint keys for the draft model.
+
+    The draft-private weights live under ``mtp.*`` while ``lm_head.weight``
+    remains shared with the base model.  Everything else is skipped.
+    """
+    if key.startswith("mtp."):
+        return key[len("mtp."):]
+    if key == "lm_head.weight":
+        return key
+    # Some checkpoints omit lm_head.weight when tie_word_embeddings=True and
+    # only store the shared embedding table.
+    if key in ("model.embed_tokens.weight",
+               "model.language_model.embed_tokens.weight"):
+        return "lm_head.weight"
+    return None

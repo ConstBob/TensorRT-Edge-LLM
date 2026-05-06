@@ -616,7 +616,7 @@ def _generate_draft_build_commands(
         f"--engineDir={config.get_llm_engine_dir()}",
         f"--maxInputLen={config.max_input_len}",
         f"--maxKVCacheCapacity={config.max_seq_len}",
-        f"--maxBatchSize={config.max_batch_size}", "--eagleDraft",
+        f"--maxBatchSize={config.max_batch_size}", "--specDraft",
         f"--maxDraftTreeSize={config.max_draft_tree_size}"
     ])
     commands.append((draft_cmd, 1200))
@@ -642,7 +642,7 @@ def generate_build_commands(
         ])
 
         if config.is_eagle:
-            cmd.append("--eagleBase")
+            cmd.append("--specBase")
             cmd.append(f"--maxVerifyTreeSize={config.max_verify_tree_size}")
 
         if config.max_lora_rank > 0:
@@ -665,7 +665,7 @@ def generate_build_commands(
         ])
 
         if config.is_eagle:
-            llm_cmd.append("--eagleBase")
+            llm_cmd.append("--specBase")
             llm_cmd.append(
                 f"--maxVerifyTreeSize={config.max_verify_tree_size}")
 
@@ -832,10 +832,10 @@ def generate_inference_commands(
 
     # Add EAGLE parameters
     if config.is_eagle:
-        cmd.append("--eagle")
-        cmd.append(f"--eagleDraftTopK={config.eagle_draft_top_k}")
-        cmd.append(f"--eagleDraftStep={config.eagle_draft_step}")
-        cmd.append(f"--eagleVerifyTreeSize={config.max_verify_tree_size}")
+        cmd.append("--specDecode")
+        cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
+        cmd.append(f"--specDraftStep={config.eagle_draft_step}")
+        cmd.append(f"--specVerifyTreeSize={config.max_verify_tree_size}")
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
@@ -871,10 +871,10 @@ def generate_e2e_bench_commands(
 
     # Add EAGLE parameters
     if config.is_eagle:
-        cmd.append("--eagle")
-        cmd.append(f"--eagleDraftTopK={config.eagle_draft_top_k}")
-        cmd.append(f"--eagleDraftStep={config.eagle_draft_step}")
-        cmd.append(f"--eagleVerifyTreeSize={config.max_verify_tree_size}")
+        cmd.append("--specDecode")
+        cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
+        cmd.append(f"--specDraftStep={config.eagle_draft_step}")
+        cmd.append(f"--specVerifyTreeSize={config.max_verify_tree_size}")
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")

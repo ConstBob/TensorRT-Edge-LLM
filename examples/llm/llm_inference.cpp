@@ -63,7 +63,7 @@ enum LLMInferenceOptionId : int
     MAX_GENERATE_LENGTH = 915
 };
 
-// Struct to hold Eagle-specific arguments for speculative decoding
+// Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
 struct EagleArgs
 {
     bool enabled{false};
@@ -107,9 +107,9 @@ void printUsage(char const* programName)
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
-                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--eagle] "
-                 "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
-                 "[--eagleVerifyTreeSize=<number>]"
+                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
+                 "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
+                 "[--specVerifyTreeSize=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -126,12 +126,12 @@ void printUsage(char const* programName)
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
-    std::cerr << "  --eagle                   Enable Eagle speculative decoding mode" << std::endl;
-    std::cerr << "  --eagleDraftTopK          Number of tokens selected per drafting step (default: 10)" << std::endl;
+    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE or MTP)" << std::endl;
+    std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
     std::cerr << "                            Controls branching factor at each draft tree level" << std::endl;
-    std::cerr << "  --eagleDraftStep          Number of drafting steps to perform (default: 6)" << std::endl;
+    std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
     std::cerr << "                            Each step extends the draft tree by one more level" << std::endl;
-    std::cerr << "  --eagleVerifyTreeSize     Number of tokens for base model verification (default: 60)" << std::endl;
+    std::cerr << "  --specVerifyTreeSize      Number of tokens for base model verification (default: 60)" << std::endl;
     std::cerr << "                            Total draft tree size: 1 + topK + (step-1) * topK^2" << std::endl;
 }
 
@@ -147,10 +147,14 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"profileOutputFile", required_argument, 0, LLMInferenceOptionId::PROFILE_OUTPUT_FILE},
         {"warmup", required_argument, 0, LLMInferenceOptionId::WARMUP},
         {"dumpOutput", no_argument, 0, LLMInferenceOptionId::DUMP_OUTPUT},
-        {"eagle", no_argument, 0, LLMInferenceOptionId::EAGLE},
-        {"eagleDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K},
-        {"eagleDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP},
-        {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
+        {"specDecode", no_argument, 0, LLMInferenceOptionId::EAGLE},
+        {"eagle", no_argument, 0, LLMInferenceOptionId::EAGLE}, // deprecated alias
+        {"specDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K},
+        {"eagleDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K}, // deprecated alias
+        {"specDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP},
+        {"eagleDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP}, // deprecated alias
+        {"specVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
+        {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE}, // deprecated alias
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH}, {0, 0, 0, 0}};
 
@@ -191,13 +195,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 args.eagleArgs.draftTopK = std::stoi(optarg);
                 if (args.eagleArgs.draftTopK <= 0)
                 {
-                    LOG_ERROR("Invalid eagleDraftTopK value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specDraftTopK value: %s (must be positive)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid eagleDraftTopK value: %s", optarg);
+                LOG_ERROR("Invalid specDraftTopK value: %s", optarg);
                 return false;
             }
             break;
@@ -207,13 +211,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 args.eagleArgs.draftStep = std::stoi(optarg);
                 if (args.eagleArgs.draftStep <= 0)
                 {
-                    LOG_ERROR("Invalid eagleDraftStep value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specDraftStep value: %s (must be positive)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid eagleDraftStep value: %s", optarg);
+                LOG_ERROR("Invalid specDraftStep value: %s", optarg);
                 return false;
             }
             break;
@@ -223,13 +227,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 args.eagleArgs.verifyTreeSize = std::stoi(optarg);
                 if (args.eagleArgs.verifyTreeSize <= 0)
                 {
-                    LOG_ERROR("Invalid eagleVerifyTreeSize value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specVerifyTreeSize value: %s (must be positive)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid eagleVerifyTreeSize value: %s", optarg);
+                LOG_ERROR("Invalid specVerifyTreeSize value: %s", optarg);
                 return false;
             }
             break;
@@ -315,10 +319,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 
     if (args.eagleArgs.enabled)
     {
-        LOG_INFO("Eagle mode enabled");
-        LOG_INFO("Eagle draft topK: %d", args.eagleArgs.draftTopK);
-        LOG_INFO("Eagle draft step: %d", args.eagleArgs.draftStep);
-        LOG_INFO("Eagle verify tree size: %d", args.eagleArgs.verifyTreeSize);
+        LOG_INFO("Speculative decoding enabled");
+        LOG_INFO("Spec draft topK: %d", args.eagleArgs.draftTopK);
+        LOG_INFO("Spec draft step: %d", args.eagleArgs.draftStep);
+        LOG_INFO("Spec verify tree size: %d", args.eagleArgs.verifyTreeSize);
     }
 
     if (args.debug)

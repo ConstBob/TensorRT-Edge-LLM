@@ -422,6 +422,7 @@ int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
     intermTensor.dynamic_strides[0] = static_cast<int64_t>(seq_len) * hv * k * v;
     intermTensor.dynamic_strides[1] = static_cast<int64_t>(hv) * k * v;
     intermTensor.dynamic_strides[2] = static_cast<int64_t>(k) * v;
+    intermTensor.dynamic_strides[3] = static_cast<int64_t>(v);
 
     cute_dsl_gdn_decode_mtp_cache_wrapper(&sMTPDecodeCacheModule, &h0Tensor, &qTensor, &kTensor, &vTensor, &aTensor,
         &bTensor, &A_logTensor, &dt_biasTensor, &oTensor, &intermTensor, seq_len, stream);

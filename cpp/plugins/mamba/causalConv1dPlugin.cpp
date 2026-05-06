@@ -228,8 +228,14 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
 
     void* convStateOut = outputs[kOUT_CONV_STATE_IDX];
 
-    // MTP mode: use_mtp=true AND seq_len > 1 (multi-token decode with state checkpointing).
-    bool const mtpActive = mUseMTP && (seqLen > 1);
+    // MTP mode activates only for short multi-token verification sequences (tree verify),
+    // not for normal prefill. Small prefills (seqLen <= kMTPMaxSeqLen) that happen to pass
+    // through this path pay a minor cost for intermediate state writes, but it is harmless.
+    // TODO: refactor the dispatch logic to explicitly distinguish MTP tree-verify decoding
+    // from prefill when 1 < seqLen <= kMTPMaxSeqLen (e.g. pass an execution-phase flag
+    // from the runtime instead of relying solely on seq_len range heuristics).
+    constexpr int32_t kMTPMaxSeqLen = 8;
+    bool const mtpActive = mUseMTP && (seqLen > 1) && (seqLen <= kMTPMaxSeqLen);
 
     namespace rt = trt_edgellm::rt;
 

@@ -25,290 +25,328 @@
 #include <vector>
 
 using namespace trt_edgellm::kernel;
-using namespace trt_edgellm::rt;
-
-// ============================================================================
-// Helper: create a non-owning GPU Tensor from a device pointer
-// ============================================================================
 
 namespace
 {
 
-/// Fill host buffer with deterministic values: value = batch*10000 + step*100 + elemIdx%100
-inline void fillRecurrentRef(std::vector<float>& buf, int32_t batch, int32_t maxSteps, int32_t stateElems)
+constexpr float kSentinel = -999.0f;
+
+inline float refRecurrent(int32_t layer, int32_t batch, int32_t step, int32_t elem)
 {
-    for (int32_t b = 0; b < batch; ++b)
-    {
-        for (int32_t t = 0; t < maxSteps; ++t)
-        {
-            for (int32_t e = 0; e < stateElems; ++e)
-            {
-                int64_t idx = (static_cast<int64_t>(b) * maxSteps + t) * stateElems + e;
-                buf[idx] = static_cast<float>(b * 10000 + t * 100 + (e % 100));
-            }
-        }
-    }
+    return static_cast<float>(layer * 1000000 + batch * 10000 + step * 100 + (elem % 100));
 }
 
-constexpr float kSentinel = -999.0f;
+template <typename T>
+T* uploadVec(std::vector<T> const& host)
+{
+    T* dev = nullptr;
+    cudaMalloc(&dev, host.size() * sizeof(T));
+    cudaMemcpy(dev, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice);
+    return dev;
+}
 
 } // anonymous namespace
 
 // ============================================================================
-// FP32 Recurrent State Scatter Tests
+// FP32 Recurrent State Scatter Tests (batched across layers)
 // ============================================================================
 
 class MTPStateScatterRecurrentTest : public ::testing::Test
 {
 protected:
-    // stateShape = trailing dims of dst, e.g. {hv, k, v} or {stateElems} for 1D
-    void runTest(int32_t batchSize, int32_t maxSteps, std::vector<int64_t> const& stateShape,
-        std::vector<int32_t> const& acceptedStepsHost)
+    /// Run the batched recurrent scatter and verify per-(layer, batch).
+    /// stateElements must be divisible by 8.  acceptLengths is 1-based (matching eagleAccept).
+    void runTest(int32_t numLayers, int32_t batchSize, int32_t verifyTreeSize, int32_t stateElements,
+        std::vector<int32_t> const& acceptLengthsHost)
     {
-        ASSERT_EQ(static_cast<int32_t>(acceptedStepsHost.size()), batchSize);
+        ASSERT_EQ(static_cast<int32_t>(acceptLengthsHost.size()), batchSize);
+        ASSERT_EQ(stateElements % 8, 0) << "stateElements must be divisible by 8";
 
-        int64_t stateElems = 1;
-        for (auto d : stateShape)
-            stateElems *= d;
-        ASSERT_EQ(stateElems % 8, 0) << "stateElems must be divisible by 8 for DVec<float>";
+        int64_t const srcPerLayer = static_cast<int64_t>(batchSize) * verifyTreeSize * stateElements;
+        int64_t const dstPerLayer = static_cast<int64_t>(batchSize) * stateElements;
 
-        int64_t const srcTotal = static_cast<int64_t>(batchSize) * maxSteps * stateElems;
-        int64_t const dstTotal = static_cast<int64_t>(batchSize) * stateElems;
+        // Allocate per-layer device buffers, populate src.
+        std::vector<float*> dstPerLayerDev(numLayers);
+        std::vector<float*> srcPerLayerDev(numLayers);
+        std::vector<std::vector<float>> hSrc(numLayers, std::vector<float>(srcPerLayer));
+        std::vector<std::vector<float>> hDst(numLayers, std::vector<float>(dstPerLayer, kSentinel));
 
-        // Prepare host data.
-        std::vector<float> hSrc(srcTotal);
-        fillRecurrentRef(hSrc, batchSize, maxSteps, static_cast<int32_t>(stateElems));
-        std::vector<float> hDst(dstTotal, kSentinel);
-
-        // Allocate device memory.
-        float *dSrc, *dDst;
-        int32_t* dAccepted;
-        cudaMalloc(&dSrc, srcTotal * sizeof(float));
-        cudaMalloc(&dDst, dstTotal * sizeof(float));
-        cudaMalloc(&dAccepted, batchSize * sizeof(int32_t));
-
-        cudaMemcpy(dSrc, hSrc.data(), srcTotal * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(dDst, hDst.data(), dstTotal * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(dAccepted, acceptedStepsHost.data(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice);
-
-        // Build rt::Tensor wrappers (non-owning).
-        // dst shape: [batchSize, ...stateShape]
-        std::vector<int64_t> dstDims = {batchSize};
-        dstDims.insert(dstDims.end(), stateShape.begin(), stateShape.end());
-        nvinfer1::Dims dstTrtDims{};
-        dstTrtDims.nbDims = static_cast<int32_t>(dstDims.size());
-        for (int i = 0; i < dstTrtDims.nbDims; ++i)
-            dstTrtDims.d[i] = dstDims[i];
-        Tensor tensorDst(dDst, Coords(dstTrtDims), DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-
-        // src shape: [batchSize, maxSteps, ...stateShape]
-        std::vector<int64_t> srcDims = {batchSize, maxSteps};
-        srcDims.insert(srcDims.end(), stateShape.begin(), stateShape.end());
-        nvinfer1::Dims srcTrtDims{};
-        srcTrtDims.nbDims = static_cast<int32_t>(srcDims.size());
-        for (int i = 0; i < srcTrtDims.nbDims; ++i)
-            srcTrtDims.d[i] = srcDims[i];
-        Tensor tensorSrc(dSrc, Coords(srcTrtDims), DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-
-        // acceptedSteps shape: [batchSize]
-        nvinfer1::Dims accDims{};
-        accDims.nbDims = 1;
-        accDims.d[0] = batchSize;
-        Tensor tensorAcc(dAccepted, Coords(accDims), DeviceType::kGPU, nvinfer1::DataType::kINT32);
-
-        // Run kernel.
-        mtpScatterRecurrentStates(tensorSrc, tensorAcc, tensorDst, nullptr);
-        cudaDeviceSynchronize();
-
-        // Read back.
-        std::vector<float> hResult(dstTotal);
-        cudaMemcpy(hResult.data(), dDst, dstTotal * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // Verify.
-        for (int32_t b = 0; b < batchSize; ++b)
+        std::vector<MtpLayerInfo> hostInfos(numLayers);
+        for (int32_t L = 0; L < numLayers; ++L)
         {
-            int32_t const step = acceptedStepsHost[b];
-            int64_t const dstBase = static_cast<int64_t>(b) * stateElems;
+            for (int32_t b = 0; b < batchSize; ++b)
+            {
+                for (int32_t t = 0; t < verifyTreeSize; ++t)
+                {
+                    for (int32_t e = 0; e < stateElements; ++e)
+                    {
+                        int64_t const idx = (static_cast<int64_t>(b) * verifyTreeSize + t) * stateElements + e;
+                        hSrc[L][idx] = refRecurrent(L, b, t, e);
+                    }
+                }
+            }
+            cudaMalloc(&srcPerLayerDev[L], srcPerLayer * sizeof(float));
+            cudaMalloc(&dstPerLayerDev[L], dstPerLayer * sizeof(float));
+            cudaMemcpy(srcPerLayerDev[L], hSrc[L].data(), srcPerLayer * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(dstPerLayerDev[L], hDst[L].data(), dstPerLayer * sizeof(float), cudaMemcpyHostToDevice);
 
-            if (step < 0 || step >= maxSteps - 1)
-            {
-                // Should be untouched (sentinel).
-                for (int64_t e = 0; e < stateElems; ++e)
-                {
-                    EXPECT_EQ(hResult[dstBase + e], kSentinel)
-                        << "batch=" << b << " elem=" << e << " (step=" << step << ", should be untouched)";
-                }
-            }
-            else
-            {
-                // Should match src[b, step, :].
-                int64_t const srcBase = (static_cast<int64_t>(b) * maxSteps + step) * stateElems;
-                for (int64_t e = 0; e < stateElems; ++e)
-                {
-                    EXPECT_EQ(hResult[dstBase + e], hSrc[srcBase + e])
-                        << "batch=" << b << " step=" << step << " elem=" << e;
-                }
-            }
+            // The recurrent variant only reads recurrentDst/recurrentSrc; conv pointers are unused.
+            hostInfos[L] = {dstPerLayerDev[L], srcPerLayerDev[L], nullptr, nullptr};
         }
 
-        cudaFree(dSrc);
-        cudaFree(dDst);
-        cudaFree(dAccepted);
+        // Upload MtpLayerInfo array + acceptLengths.
+        MtpLayerInfo* dInfos = uploadVec(hostInfos);
+        int32_t* dAccept = uploadVec(acceptLengthsHost);
+
+        mtpScatterRecurrentStates(dInfos, numLayers, batchSize, verifyTreeSize, stateElements, dAccept, nullptr);
+        cudaDeviceSynchronize();
+
+        // Read back and verify.
+        for (int32_t L = 0; L < numLayers; ++L)
+        {
+            std::vector<float> result(dstPerLayer);
+            cudaMemcpy(result.data(), dstPerLayerDev[L], dstPerLayer * sizeof(float), cudaMemcpyDeviceToHost);
+
+            for (int32_t b = 0; b < batchSize; ++b)
+            {
+                int32_t const acceptLen = acceptLengthsHost[b];
+                int32_t const step = acceptLen - 1;
+                int64_t const dstBase = static_cast<int64_t>(b) * stateElements;
+
+                if (step < 0 || step >= verifyTreeSize - 1)
+                {
+                    for (int32_t e = 0; e < stateElements; ++e)
+                    {
+                        EXPECT_EQ(result[dstBase + e], kSentinel) << "L=" << L << " b=" << b << " e=" << e;
+                    }
+                }
+                else
+                {
+                    for (int32_t e = 0; e < stateElements; ++e)
+                    {
+                        EXPECT_EQ(result[dstBase + e], refRecurrent(L, b, step, e))
+                            << "L=" << L << " b=" << b << " step=" << step << " e=" << e;
+                    }
+                }
+            }
+            cudaFree(srcPerLayerDev[L]);
+            cudaFree(dstPerLayerDev[L]);
+        }
+        cudaFree(dInfos);
+        cudaFree(dAccept);
     }
 };
 
-// Basic: partial reject (accepted step 0 out of 4).
-TEST_F(MTPStateScatterRecurrentTest, SingleBatch_PartialReject)
+TEST_F(MTPStateScatterRecurrentTest, SingleLayer_PartialReject)
 {
-    runTest(/*batchSize=*/1, /*maxSteps=*/4, /*stateShape=*/{128}, /*accepted=*/{0});
+    runTest(/*numLayers=*/1, /*batchSize=*/1, /*verifyTreeSize=*/4, /*stateElements=*/128, /*acceptLengths=*/{1});
 }
 
-// All accept: step == maxSteps-1, dst should remain untouched.
-TEST_F(MTPStateScatterRecurrentTest, SingleBatch_AllAccept)
+TEST_F(MTPStateScatterRecurrentTest, SingleLayer_AllAccept)
 {
-    runTest(1, 4, {128}, {3});
+    runTest(1, 1, 4, 128, {4});
 }
 
-// Skip: step == -1, dst should remain untouched.
-TEST_F(MTPStateScatterRecurrentTest, SingleBatch_Skip)
+TEST_F(MTPStateScatterRecurrentTest, SingleLayer_Skip)
 {
-    runTest(1, 4, {128}, {-1});
+    runTest(1, 1, 4, 128, {0});
 }
 
-// Mixed batch: some accept, some reject, some skip.
-TEST_F(MTPStateScatterRecurrentTest, MixedBatch)
+TEST_F(MTPStateScatterRecurrentTest, SingleLayer_MixedBatch)
 {
-    //                                reject  all-accept  skip   partial
-    runTest(/*batchSize=*/4, /*maxSteps=*/4, {256}, {1, 3, -1, 2});
+    runTest(1, 4, 4, 256, {2, 4, 0, 3});
 }
 
-// Multi-dim state shape: [hv=32, k=16, v=16] = 8192 elements (proxy for real 128*128).
-TEST_F(MTPStateScatterRecurrentTest, MultiDimState)
+// 4 layers, 2 batches — verifies layer indexing via blockIdx.y.
+TEST_F(MTPStateScatterRecurrentTest, MultiLayer)
 {
-    runTest(2, 2, {32, 16, 16}, {0, 1});
+    runTest(4, 2, 4, 128, {2, 1});
 }
 
-// Large state: tests vectorized path with stateElems >> blockDim (grid z > 1).
-TEST_F(MTPStateScatterRecurrentTest, LargeState_GridZ)
+// Large state: vectorized path with vecCount > blockDim (grid z > 1).
+TEST_F(MTPStateScatterRecurrentTest, MultiLayer_LargeState)
 {
-    // stateElems=4096 → vecCount=512 → with 256 threads, zBlocks=2
-    runTest(2, 4, {4096}, {1, 2});
+    runTest(3, 2, 4, 4096, {2, 3});
+}
+
+// Regression: src buffer allocated with maxAlloc rows per batch but the plugin packed
+// data with a smaller verifyTreeSize stride. The kernel must use the verifyTreeSize
+// argument (not the buffer's allocation size) when computing the per-batch offset,
+// otherwise bs >= 1 reads garbage.
+//
+// Layout: srcBuf[b * verifyTreeSize * stateElements + step * stateElements] = data
+//         (rest of the [maxAlloc - verifyTreeSize] rows per batch is sentinel and unread)
+TEST(MTPStateScatterRecurrentPackedStrideTest, BatchedReadStride)
+{
+    constexpr int32_t numLayers = 2;
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t verifyTreeSize = 4;
+    constexpr int32_t maxAlloc = 8; // > verifyTreeSize on purpose
+    constexpr int32_t stateElements = 128;
+
+    std::vector<int32_t> acceptLengthsHost = {2, 3}; // step=1 / step=2
+
+    int64_t const allocPerLayer = static_cast<int64_t>(batchSize) * maxAlloc * stateElements;
+    int64_t const dstPerLayer = static_cast<int64_t>(batchSize) * stateElements;
+
+    std::vector<float*> dstDev(numLayers);
+    std::vector<float*> srcDev(numLayers);
+    std::vector<MtpLayerInfo> hostInfos(numLayers);
+
+    for (int32_t L = 0; L < numLayers; ++L)
+    {
+        // Initialise the entire src allocation with sentinel; only fill the packed region.
+        std::vector<float> hSrc(allocPerLayer, kSentinel);
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            for (int32_t t = 0; t < verifyTreeSize; ++t)
+            {
+                for (int32_t e = 0; e < stateElements; ++e)
+                {
+                    int64_t const idx = (static_cast<int64_t>(b) * verifyTreeSize + t) * stateElements + e;
+                    hSrc[idx] = refRecurrent(L, b, t, e);
+                }
+            }
+        }
+        std::vector<float> hDst(dstPerLayer, kSentinel);
+
+        cudaMalloc(&srcDev[L], allocPerLayer * sizeof(float));
+        cudaMalloc(&dstDev[L], dstPerLayer * sizeof(float));
+        cudaMemcpy(srcDev[L], hSrc.data(), allocPerLayer * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(dstDev[L], hDst.data(), dstPerLayer * sizeof(float), cudaMemcpyHostToDevice);
+
+        hostInfos[L] = {dstDev[L], srcDev[L], nullptr, nullptr};
+    }
+
+    MtpLayerInfo* dInfos = uploadVec(hostInfos);
+    int32_t* dAccept = uploadVec(acceptLengthsHost);
+
+    // Pass verifyTreeSize = verifyTreeSize (NOT maxAlloc).
+    mtpScatterRecurrentStates(dInfos, numLayers, batchSize, verifyTreeSize, stateElements, dAccept, nullptr);
+    cudaDeviceSynchronize();
+
+    for (int32_t L = 0; L < numLayers; ++L)
+    {
+        std::vector<float> result(dstPerLayer);
+        cudaMemcpy(result.data(), dstDev[L], dstPerLayer * sizeof(float), cudaMemcpyDeviceToHost);
+        for (int32_t b = 0; b < batchSize; ++b)
+        {
+            int32_t const step = acceptLengthsHost[b] - 1;
+            int64_t const dstBase = static_cast<int64_t>(b) * stateElements;
+            for (int32_t e = 0; e < stateElements; ++e)
+            {
+                EXPECT_EQ(result[dstBase + e], refRecurrent(L, b, step, e))
+                    << "L=" << L << " b=" << b << " step=" << step << " e=" << e;
+            }
+        }
+        cudaFree(srcDev[L]);
+        cudaFree(dstDev[L]);
+    }
+    cudaFree(dInfos);
+    cudaFree(dAccept);
 }
 
 // ============================================================================
-// FP16 Conv State Scatter Tests
+// FP16 Conv State Scatter Tests (batched across layers)
 // ============================================================================
 
 class MTPStateScatterConvTest : public ::testing::Test
 {
 protected:
-    void runTest(int32_t batchSize, int32_t maxSteps, std::vector<int64_t> const& stateShape,
-        std::vector<int32_t> const& acceptedStepsHost)
+    void runTest(int32_t numLayers, int32_t batchSize, int32_t verifyTreeSize, int32_t stateElements,
+        std::vector<int32_t> const& acceptLengthsHost)
     {
-        ASSERT_EQ(static_cast<int32_t>(acceptedStepsHost.size()), batchSize);
+        ASSERT_EQ(static_cast<int32_t>(acceptLengthsHost.size()), batchSize);
+        ASSERT_EQ(stateElements % 8, 0) << "stateElements must be divisible by 8";
 
-        int64_t stateElems = 1;
-        for (auto d : stateShape)
-            stateElems *= d;
-        ASSERT_EQ(stateElems % 8, 0) << "stateElems must be divisible by 8 for DVec<half>";
+        int64_t const srcPerLayer = static_cast<int64_t>(batchSize) * verifyTreeSize * stateElements;
+        int64_t const dstPerLayer = static_cast<int64_t>(batchSize) * stateElements;
 
-        int64_t const srcTotal = static_cast<int64_t>(batchSize) * maxSteps * stateElems;
-        int64_t const dstTotal = static_cast<int64_t>(batchSize) * stateElems;
+        __half const hSentinel = __float2half(kSentinel);
 
-        // Prepare host data.
-        std::vector<__half> hSrc(srcTotal);
-        for (int64_t i = 0; i < srcTotal; ++i)
-            hSrc[i] = __float2half(static_cast<float>(i % 1000));
+        std::vector<__half*> dstPerLayerDev(numLayers);
+        std::vector<__half*> srcPerLayerDev(numLayers);
+        std::vector<std::vector<__half>> hSrc(numLayers, std::vector<__half>(srcPerLayer));
+        std::vector<std::vector<__half>> hDst(numLayers, std::vector<__half>(dstPerLayer, hSentinel));
 
-        __half const hSentinel = __float2half(-999.0f);
-        std::vector<__half> hDst(dstTotal, hSentinel);
-
-        // Allocate device memory.
-        __half *dSrc, *dDst;
-        int32_t* dAccepted;
-        cudaMalloc(&dSrc, srcTotal * sizeof(__half));
-        cudaMalloc(&dDst, dstTotal * sizeof(__half));
-        cudaMalloc(&dAccepted, batchSize * sizeof(int32_t));
-
-        cudaMemcpy(dSrc, hSrc.data(), srcTotal * sizeof(__half), cudaMemcpyHostToDevice);
-        cudaMemcpy(dDst, hDst.data(), dstTotal * sizeof(__half), cudaMemcpyHostToDevice);
-        cudaMemcpy(dAccepted, acceptedStepsHost.data(), batchSize * sizeof(int32_t), cudaMemcpyHostToDevice);
-
-        // Build rt::Tensor wrappers.
-        std::vector<int64_t> dstDims = {batchSize};
-        dstDims.insert(dstDims.end(), stateShape.begin(), stateShape.end());
-        nvinfer1::Dims dstTrtDims{};
-        dstTrtDims.nbDims = static_cast<int32_t>(dstDims.size());
-        for (int i = 0; i < dstTrtDims.nbDims; ++i)
-            dstTrtDims.d[i] = dstDims[i];
-        Tensor tensorDst(dDst, Coords(dstTrtDims), DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-        std::vector<int64_t> srcDims = {batchSize, maxSteps};
-        srcDims.insert(srcDims.end(), stateShape.begin(), stateShape.end());
-        nvinfer1::Dims srcTrtDims{};
-        srcTrtDims.nbDims = static_cast<int32_t>(srcDims.size());
-        for (int i = 0; i < srcTrtDims.nbDims; ++i)
-            srcTrtDims.d[i] = srcDims[i];
-        Tensor tensorSrc(dSrc, Coords(srcTrtDims), DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-        nvinfer1::Dims accDims{};
-        accDims.nbDims = 1;
-        accDims.d[0] = batchSize;
-        Tensor tensorAcc(dAccepted, Coords(accDims), DeviceType::kGPU, nvinfer1::DataType::kINT32);
-
-        // Run kernel.
-        mtpScatterConvStates(tensorSrc, tensorAcc, tensorDst, nullptr);
-        cudaDeviceSynchronize();
-
-        // Read back.
-        std::vector<__half> hResult(dstTotal);
-        cudaMemcpy(hResult.data(), dDst, dstTotal * sizeof(__half), cudaMemcpyDeviceToHost);
-
-        // Verify.
-        for (int32_t b = 0; b < batchSize; ++b)
+        std::vector<MtpLayerInfo> hostInfos(numLayers);
+        for (int32_t L = 0; L < numLayers; ++L)
         {
-            int32_t const step = acceptedStepsHost[b];
-            int64_t const dstBase = static_cast<int64_t>(b) * stateElems;
+            for (int32_t b = 0; b < batchSize; ++b)
+            {
+                for (int32_t t = 0; t < verifyTreeSize; ++t)
+                {
+                    for (int32_t e = 0; e < stateElements; ++e)
+                    {
+                        int64_t const idx = (static_cast<int64_t>(b) * verifyTreeSize + t) * stateElements + e;
+                        hSrc[L][idx] = __float2half(static_cast<float>(L * 1000 + b * 100 + t * 10 + (e % 10)));
+                    }
+                }
+            }
+            cudaMalloc(&srcPerLayerDev[L], srcPerLayer * sizeof(__half));
+            cudaMalloc(&dstPerLayerDev[L], dstPerLayer * sizeof(__half));
+            cudaMemcpy(srcPerLayerDev[L], hSrc[L].data(), srcPerLayer * sizeof(__half), cudaMemcpyHostToDevice);
+            cudaMemcpy(dstPerLayerDev[L], hDst[L].data(), dstPerLayer * sizeof(__half), cudaMemcpyHostToDevice);
 
-            if (step < 0 || step >= maxSteps - 1)
-            {
-                for (int64_t e = 0; e < stateElems; ++e)
-                {
-                    EXPECT_EQ(__half2float(hResult[dstBase + e]), __half2float(hSentinel))
-                        << "batch=" << b << " elem=" << e;
-                }
-            }
-            else
-            {
-                int64_t const srcBase = (static_cast<int64_t>(b) * maxSteps + step) * stateElems;
-                for (int64_t e = 0; e < stateElems; ++e)
-                {
-                    EXPECT_EQ(__half2float(hResult[dstBase + e]), __half2float(hSrc[srcBase + e]))
-                        << "batch=" << b << " step=" << step << " elem=" << e;
-                }
-            }
+            // The conv variant only reads convDst/convSrc; recurrent pointers are unused.
+            hostInfos[L] = {nullptr, nullptr, dstPerLayerDev[L], srcPerLayerDev[L]};
         }
 
-        cudaFree(dSrc);
-        cudaFree(dDst);
-        cudaFree(dAccepted);
+        MtpLayerInfo* dInfos = uploadVec(hostInfos);
+        int32_t* dAccept = uploadVec(acceptLengthsHost);
+
+        mtpScatterConvStates(dInfos, numLayers, batchSize, verifyTreeSize, stateElements, dAccept, nullptr);
+        cudaDeviceSynchronize();
+
+        for (int32_t L = 0; L < numLayers; ++L)
+        {
+            std::vector<__half> result(dstPerLayer);
+            cudaMemcpy(result.data(), dstPerLayerDev[L], dstPerLayer * sizeof(__half), cudaMemcpyDeviceToHost);
+
+            for (int32_t b = 0; b < batchSize; ++b)
+            {
+                int32_t const acceptLen = acceptLengthsHost[b];
+                int32_t const step = acceptLen - 1;
+                int64_t const dstBase = static_cast<int64_t>(b) * stateElements;
+
+                if (step < 0 || step >= verifyTreeSize - 1)
+                {
+                    for (int32_t e = 0; e < stateElements; ++e)
+                    {
+                        EXPECT_EQ(__half2float(result[dstBase + e]), __half2float(hSentinel))
+                            << "L=" << L << " b=" << b << " e=" << e;
+                    }
+                }
+                else
+                {
+                    int64_t const srcBase = (static_cast<int64_t>(b) * verifyTreeSize + step) * stateElements;
+                    for (int32_t e = 0; e < stateElements; ++e)
+                    {
+                        EXPECT_EQ(__half2float(result[dstBase + e]), __half2float(hSrc[L][srcBase + e]))
+                            << "L=" << L << " b=" << b << " step=" << step << " e=" << e;
+                    }
+                }
+            }
+            cudaFree(srcPerLayerDev[L]);
+            cudaFree(dstPerLayerDev[L]);
+        }
+        cudaFree(dInfos);
+        cudaFree(dAccept);
     }
 };
 
-// Conv1d: small config (dim=64, width=4 → stateElems=256).
-TEST_F(MTPStateScatterConvTest, SmallConv_PartialReject)
+TEST_F(MTPStateScatterConvTest, SingleLayer_PartialReject)
 {
-    runTest(/*batchSize=*/2, /*maxSteps=*/4, /*stateShape=*/{64, 4}, /*accepted=*/{1, 0});
+    runTest(/*numLayers=*/1, /*batchSize=*/2, /*verifyTreeSize=*/4, /*stateElements=*/256, /*acceptLengths=*/{2, 1});
 }
 
-// Conv1d: all accept → no scatter.
-TEST_F(MTPStateScatterConvTest, AllAccept)
+TEST_F(MTPStateScatterConvTest, SingleLayer_AllAccept)
 {
-    runTest(2, 4, {64, 4}, {3, 3});
+    runTest(1, 2, 4, 256, {4, 4});
 }
 
-// Conv1d: realistic dim=4096, width=4 → stateElems=16384.
-TEST_F(MTPStateScatterConvTest, LargeDim)
+// 3 layers, 4 batches, mixed accept.
+TEST_F(MTPStateScatterConvTest, MultiLayer_Mixed)
 {
-    runTest(4, 2, {4096, 4}, {0, 1, 0, -1});
+    runTest(3, 4, 2, 16384, {1, 2, 1, 0});
 }

@@ -50,8 +50,11 @@ shape in the checkpoint to break the circular dependency with ``n_groups``.
 
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 
@@ -262,6 +265,13 @@ class ModelConfig:
     gdn_cfg: Optional[GdnConfig] = None
     # ------------------------------------------ gated attention (Qwen3.5)
     attn_output_gate: bool = False
+    # ------------------------------------------ MTP config
+    mtp_num_hidden_layers: Optional[int] = None
+    mtp_use_dedicated_embeddings: bool = False
+    # When True, the standard CausalLM is exported as the MTP base model variant
+    # with tree-attention inputs (attention_mask, attention_pos_id) and
+    # an extra hidden_states output.
+    mtp_base: bool = False
     # ------------------------------------------ EAGLE3 draft config
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
@@ -300,6 +310,13 @@ class ModelConfig:
     @property
     def is_eagle3_draft(self) -> bool:
         return self.draft_vocab_size is not None
+
+    @property
+    def is_mtp_draft(self) -> bool:
+        """True for a derived MTP draft config built from a base checkpoint."""
+        return bool(self.mtp_num_hidden_layers is not None
+                    and self.gdn_cfg is None and not self.mtp_base
+                    and not self.is_eagle3_draft)
 
     @property
     def eagle3_target_hidden_size(self) -> int:
@@ -375,6 +392,18 @@ class ModelConfig:
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
         has_qk_norm = _detect_has_qk_norm(model_dir)
 
+        # MTP config
+        mtp_num_hidden_layers = llm_dict.get("mtp_num_hidden_layers")
+        if mtp_num_hidden_layers is not None:
+            mtp_num_hidden_layers = int(mtp_num_hidden_layers)
+        mtp_use_dedicated_embeddings = bool(
+            llm_dict.get("mtp_use_dedicated_embeddings", False))
+        _validate_mtp_constraints(
+            model_type=model_type,
+            mtp_num_hidden_layers=mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
+        )
+
         # EAGLE3 draft model fields
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
@@ -429,6 +458,9 @@ class ModelConfig:
             mamba_cfg=mamba_cfg,
             gdn_cfg=gdn_cfg,
             attn_output_gate=bool(llm_dict.get("attn_output_gate", False)),
+            mtp_num_hidden_layers=mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
+            mtp_base=bool(llm_dict.get("mtp_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
             draft_vocab_size=draft_vocab_size,
@@ -455,6 +487,41 @@ class ModelConfig:
 # When HF omits ``deepstack_visual_indexes`` / ``num_deepstack_features``,
 # these model families still expect three visual deepstack injections (legacy).
 _DEEPSTACK_MODEL_TYPES = ("qwen3_vl", "qwen3_omni")
+
+
+def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
+    """Derive the currently supported MTP draft config from a base config."""
+    _validate_mtp_constraints(
+        model_type=base_config.model_type,
+        mtp_num_hidden_layers=base_config.mtp_num_hidden_layers,
+        mtp_use_dedicated_embeddings=base_config.mtp_use_dedicated_embeddings,
+    )
+    mtp_num_hidden_layers = base_config.mtp_num_hidden_layers
+    if mtp_num_hidden_layers is None:
+        raise ValueError(
+            "MTP draft config requires mtp_num_hidden_layers in the base config."
+        )
+
+    # MTP modules in the exclude list → unquantized (FP16); otherwise inherit base quant.
+    mtp_is_quantized = not any(
+        e.startswith("mtp.") for e in base_config.quant.excluded)
+
+    if mtp_is_quantized:
+        # MTP draft modules are independently quantized — clear the base
+        # excluded list so make_linear() builds quantized linears for all.
+        draft_quant = replace(base_config.quant, excluded=[])
+    else:
+        draft_quant = QuantConfig()
+
+    return replace(
+        base_config,
+        num_hidden_layers=mtp_num_hidden_layers,
+        layer_types=[LAYER_ATTN] * mtp_num_hidden_layers,
+        gdn_cfg=None,
+        mtp_base=False,
+        quant=draft_quant,
+        tie_word_embeddings=False,
+    )
 
 
 def _parse_num_deepstack_features(
@@ -490,6 +557,29 @@ def _parse_num_deepstack_features(
     if any(t in merged for t in _DEEPSTACK_MODEL_TYPES):
         return 3
     return 0
+
+
+def _validate_mtp_constraints(
+    *,
+    model_type: str,
+    mtp_num_hidden_layers: Optional[int],
+    mtp_use_dedicated_embeddings: bool,
+) -> None:
+    """Validate the currently supported MTP config subset."""
+    if mtp_num_hidden_layers is None and not mtp_use_dedicated_embeddings:
+        return
+    if model_type != "qwen3_5_text":
+        raise NotImplementedError(
+            "MTP config parsing is only supported for qwen3_5_text checkpoints."
+        )
+    if mtp_num_hidden_layers != 1:
+        raise NotImplementedError(
+            "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 dense MTP."
+        )
+    if mtp_use_dedicated_embeddings:
+        raise NotImplementedError(
+            "Dedicated MTP embeddings are not supported for Qwen3.5 dense MTP."
+        )
 
 
 def _parse_layer_types(config: dict) -> List[str]:

@@ -247,6 +247,10 @@ def _determine_model_type(config) -> str:
         return "eagle3_draft"
     if config.eagle_base:
         return "eagle3_base"
+    if config.is_mtp_draft:
+        return "mtp_draft"
+    if config.mtp_base:
+        return "mtp_base"
     if config.is_hybrid:
         return "hybrid_mamba"
     return "llm"
@@ -346,6 +350,14 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         out.update({
             "draft_vocab_size": draft_vocab,
             "base_model_hidden_size": target_hidden * 3,
+        })
+
+    if config.is_mtp_draft:
+        # MTP draft shares vocab with base (no reduced vocab) and receives
+        # base hidden states of size hidden_size (not 3x like EAGLE3).
+        out.update({
+            "draft_vocab_size": config.vocab_size,
+            "base_model_hidden_size": config.hidden_size,
         })
 
     if config.eagle_base:
@@ -473,10 +485,12 @@ def write_runtime_artifacts(model: "CausalLM",
     # EAGLE3 draft models don't need embedding.safetensors — the C++ runtime
     # uses the base model's shared embedding table (the builder already skips
     # copying for draft models).
-    is_eagle3_draft = getattr(model.config, "is_eagle3_draft", False)
-    if is_eagle3_draft:
-        logger.info("EAGLE3 draft: skipping embedding.safetensors "
-                    "(uses base model embedding)")
+    if model.config.is_eagle3_draft or model.config.is_mtp_draft:
+        kind = ("EAGLE3 draft"
+                if model.config.is_eagle3_draft else "MTP draft")
+        logger.info(
+            "%s: skipping embedding.safetensors (uses base model embedding)",
+            kind)
     else:
         embed = getattr(model, "embed_tokens", None)
         if embed is None:

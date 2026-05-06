@@ -332,7 +332,7 @@ Base and draft engine directories should be the same.
   --maxBatchSize=1 \
   --maxInputLen=1024 \
   --maxKVCacheCapacity=4096 \
-  --eagleBase
+  --specBase
 
 # Build draft model
 ./build/examples/llm/llm_build \
@@ -341,7 +341,7 @@ Base and draft engine directories should be the same.
   --maxBatchSize=1 \
   --maxInputLen=1024 \
   --maxKVCacheCapacity=4096 \
-  --eagleDraft
+  --specDraft
 
 # Build visual encoder (required for VLM)
 ./build/examples/multimodal/visual_build \
