@@ -1134,6 +1134,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     int32_t* hostPackedTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
 
     // Use actual prompt length (not padded length) for context_lengths to ensure we select the last real token
+    // Clear the entire pinned buffer first so trailing pad slots from prior batches don't leak into the
+    // multimodal-indices walk, which scans all inputIdsLength positions per row, not just up to context_length.
+    std::fill(hostPackedTokenIdsData, hostPackedTokenIdsData + activeBatchSize * inputIdsLength, 0);
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         ctxLenData[i]
