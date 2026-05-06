@@ -42,12 +42,18 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
 from .dynamo_translations import build_custom_translation_table
-from .export import _OPSET_VERSION, _permissive_inline_opset
+from .export import (_OPSET_VERSION, _fix_initializer_dtypes,
+                     _fix_nvfp4_weight_dtype, _permissive_inline_opset,
+                     _strip_onnxscript_internal_attrs)
+
+if TYPE_CHECKING:
+    from ..config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -204,20 +210,25 @@ def export_visual_onnx(
     weights: dict,
     config: dict,
     model_type: str,
+    model_config: "ModelConfig",
     dtype: torch.dtype = torch.float16,
     device: str = "cuda",
 ) -> None:
     """Export a from-scratch visual encoder to ONNX.
 
     Args:
-        model_dir:   Source checkpoint directory (for reference; weights already
-                     loaded by the caller).
-        output_path: Destination ``.onnx`` file path.
-        weights:     Flat ``{key: tensor}`` dict loaded from safetensors.
-        config:      Full model ``config.json`` dict.
-        model_type:  Value of ``config.json["model_type"]``.
-        dtype:       Weight dtype (default ``float16``).
-        device:      CUDA device string for tracing (default ``"cuda"``).
+        model_dir:    Source checkpoint directory (for reference; weights
+                      already loaded by the caller).
+        output_path:  Destination ``.onnx`` file path.
+        weights:      Flat ``{key: tensor}`` dict loaded from safetensors.
+        config:       Full model ``config.json`` dict.
+        model_type:   Value of ``config.json["model_type"]``.
+        model_config: Top-level ``ModelConfig``.  All family ``build_fn``s
+                      accept it and dispatch their linear layers through
+                      ``make_linear``; an FP16 checkpoint produces
+                      ``FP16Linear`` everywhere.
+        dtype:        Weight dtype (default ``float16``).
+        device:       CUDA device string for tracing (default ``"cuda"``).
     """
     if model_type not in _VISUAL_REGISTRY:
         raise ValueError(f"Unsupported visual model_type {model_type!r}. "
@@ -228,16 +239,21 @@ def export_visual_onnx(
     vcfg = _get_visual_config(model_type, config)
 
     # Build the from-scratch model.
-    # Use a package-relative import so this works regardless of whether
-    # experimental/ is on sys.path (importlib.import_module with an absolute
-    # "llm_loader.*" name fails when the package was loaded via sys.path on
-    # the experimental/ directory rather than installed).
-    _pkg_root = __package__.split(".")[0]  # "llm_loader"
-    _rel = "." + _VISUAL_FAMILY_MODULE[family][len(_pkg_root):]
+    # Use a package-relative import so this works regardless of whether the
+    # package is loaded as ``llm_loader.*`` (top-level on sys.path) or
+    # ``experimental.llm_loader.*`` (when experimental/ is the package root).
+    # ``_VISUAL_FAMILY_MODULE`` entries are written as ``llm_loader.<sub>``;
+    # strip that fixed prefix and prepend ``..`` so the relative import lands
+    # on the sibling-of-onnx ``models.<family>.*`` either way.
+    _PKG_ROOT = "llm_loader"
+    _rel = "." + _VISUAL_FAMILY_MODULE[family][len(_PKG_ROOT):]
     mod = importlib.import_module(_rel, package=__package__)
     build_fn = getattr(mod, _VISUAL_FAMILY_BUILD_FN[family])
     logger.info("Building %s visual model ...", family)
-    visual_model: nn.Module = build_fn(vcfg, weights, dtype)
+    visual_model: nn.Module = build_fn(vcfg,
+                                       weights,
+                                       model_config=model_config,
+                                       dtype=dtype)
     visual_model = visual_model.to(device)
     visual_model.eval()
 
@@ -247,6 +263,24 @@ def export_visual_onnx(
 
     _run_dynamo_export(visual_model, args, output_path, input_names,
                        output_names, dynamic_shapes)
+
+    # TRT-compat post-processing for quantized weights — same passes the LLM
+    # path runs in ``export.py``.  Without these, NVFP4 weights stay as INT8
+    # initializers and TRT's DequantizeLinear can't expand the packed dim.
+    if model_config is not None:
+        nvfp4 = model_config.quant.uses_nvfp4_weights
+        mxfp8 = model_config.quant.uses_mxfp8_weights
+        if nvfp4:
+            _fix_nvfp4_weight_dtype(output_path)
+        if mxfp8:
+            _strip_onnxscript_internal_attrs(output_path)
+        if nvfp4 or mxfp8:
+            # Visual graphs legitimately keep FP32 constants from in-body
+            # ``.float()`` casts (RMSNorm computes in FP32); skip the FP32→FP16
+            # downgrade that the LLM path uses for tied-lm_head BF16 fixup.
+            _fix_initializer_dtypes(output_path,
+                                    dedup_dql_scales=True,
+                                    cast_fp32_weights_to_fp16=False)
 
     # Phi-4mm sidecar tensors (GN projection weights)
     if family == "phi4mm":

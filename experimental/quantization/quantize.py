@@ -21,9 +21,10 @@ checkpoint consumable by ``llm_loader``.  No ``tensorrt_edgellm`` dependency.
 
 import json
 import os
+import shutil
 import time
 from contextlib import contextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -32,8 +33,9 @@ from modelopt.torch.export import export_hf_checkpoint
 from modelopt.torch.quantization.utils import is_quantized
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
-                          AutoProcessor, AutoTokenizer)
+from transformers import (AutoModel, AutoModelForCausalLM,
+                          AutoModelForImageTextToText, AutoProcessor,
+                          AutoTokenizer)
 
 from .quantization_configs import build_quant_config
 
@@ -95,12 +97,116 @@ def _is_phi4mm_model(model_dir: str) -> bool:
 
 
 def _copy_phi4mm_processor_files(model_dir: str, output_dir: str) -> None:
-    import shutil
     for name in ("preprocessor_config.json", "processor_config.json",
                  "processing_phi4mm.py"):
         src = os.path.join(model_dir, name)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_dir, name))
+
+
+def _iter_image_question_pairs(dataset_name: str):
+    """Yield ``(image, question)`` pairs from a HuggingFace calibration dataset.
+
+    Tolerant of two common schemas:
+      * ScienceQA-style: single ``image`` column.
+      * MMMU-style: numbered ``image_1`` / ``image_2`` / ... columns, no
+        single ``image`` column (one row may carry several images; we take
+        the first non-empty one for calibration).
+
+    Splits are tried in the order ``dev`` → ``validation`` → ``train`` —
+    matches the legacy ``el`` pipeline (``tensorrt_edgellm.quantization.
+    omni_quantization.get_omni_multimodal_calib_dataset``) which uses
+    ``split="dev"`` for ``lmms-lab/MMMU`` and ``split="train"`` for ScienceQA.
+    """
+    last_err: Optional[Exception] = None
+    ds = None
+    for split in ("dev", "validation", "train"):
+        try:
+            ds = load_dataset(dataset_name, split=split, streaming=True)
+            break
+        except Exception as e:  # pylint: disable=broad-except
+            last_err = e
+    if ds is None:
+        raise RuntimeError(f"Could not load {dataset_name!r} via any of "
+                           f"split=dev/validation/train") from last_err
+
+    for example in ds:
+        image = example.get("image")
+        if image is None:
+            for i in range(1, 8):
+                image = example.get(f"image_{i}")
+                if image is not None:
+                    break
+        question = example.get("question") or ""
+        if image is not None and question:
+            yield image, question
+
+
+def _multimodal_calib_dataloader(processor,
+                                 dataset_name: str = "lmms-lab/MMMU",
+                                 num_samples: int = 128,
+                                 max_length: int = 512):
+    """Yield ``BatchFeature`` dicts with ``input_ids`` + ``pixel_values``.
+
+    Streams image-question pairs through the model's own ``AutoProcessor``
+    chat template so the visual tower receives real activations.  Used when
+    ``visual_quantization`` is set — text-only calibration would leave visual
+    quantizers with uninitialised scales.
+
+    Default is ``lmms-lab/MMMU`` (the single-config HF re-pack of MMMU's
+    multi-config original), matching the legacy ``el`` pipeline default.
+    Pass any other HF name to switch (e.g. ``derek-thomas/ScienceQA``).
+    Drops down to 128 samples at batch_size=1 — VLM calibration is
+    GPU-memory bound; small batches are safest.
+    """
+    batches: list[dict[str, Any]] = []
+    for image, question in _iter_image_question_pairs(dataset_name):
+        messages = [{
+            "role":
+            "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": image
+                },
+                {
+                    "type": "text",
+                    "text": question
+                },
+            ],
+        }]
+
+        try:
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        except TypeError:
+            # Older processors do not accept ``tokenize`` / ``return_dict`` /
+            # ``return_tensors`` kwargs; fall back to the two-step path.  Other
+            # exceptions (CUDA OOM, malformed chat template, ...) propagate.
+            text = processor.apply_chat_template(messages,
+                                                 add_generation_prompt=True,
+                                                 tokenize=False)
+            inputs = processor(text=[text],
+                               images=[image],
+                               return_tensors="pt",
+                               padding=True,
+                               truncation=True,
+                               max_length=max_length)
+
+        batches.append({k: v for k, v in inputs.items()})
+        if len(batches) >= num_samples:
+            break
+
+    if not batches:
+        raise RuntimeError(
+            f"No usable multimodal samples from {dataset_name!r}. "
+            "Check dataset access / processor chat template.")
+    return batches
 
 
 def _load_model(model_dir, dtype="fp16", device="cuda"):
@@ -132,23 +238,34 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
             from .nemotron_h_patch import apply as _apply_nemotron_h_patch
             _apply_nemotron_h_patch()
 
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                torch_dtype=torch_dtype,
-                trust_remote_code=True,
-            ).to(device)
-        except (ValueError, KeyError):
-            # AutoModelForCausalLM doesn't recognize this config class (e.g. pure
-            # vision-text models registered only under image-text-to-text). We
-            # only fall back for *recognition* failures — not for ImportError or
-            # other runtime errors, which would otherwise be silently masked by
-            # a second, misleading "Unrecognized configuration class" exception.
-            model = AutoModelForImageTextToText.from_pretrained(
-                model_dir,
-                torch_dtype=torch_dtype,
-                trust_remote_code=True,
-            ).to(device)
+        # Try ImageTextToText, then CausalLM, then the generic AutoModel.
+        # ImageTextToText goes first because Qwen3.5 / Qwen3-VL register both
+        # a CausalLM (text-only) and an ImageTextToText (multimodal)
+        # architecture for the same checkpoint; AutoModelForCausalLM happily
+        # resolves to the text-only entry and silently drops the visual tower
+        # from the loaded model, breaking visual quantization downstream.
+        # Some VLMs (e.g. InternVL3) are custom architectures registered only
+        # under ``AutoModel``; the more specific factories raise
+        # ``ValueError: Unrecognized configuration class``.  We only fall back
+        # for *recognition* failures — not for ImportError or other runtime
+        # errors, which would otherwise be silently masked by a misleading
+        # "Unrecognized configuration class" exception.
+        last_err: Optional[Exception] = None
+        for factory in (AutoModelForImageTextToText, AutoModelForCausalLM,
+                        AutoModel):
+            try:
+                model = factory.from_pretrained(
+                    model_dir,
+                    torch_dtype=torch_dtype,
+                    trust_remote_code=True,
+                ).to(device)
+                break
+            except (ValueError, KeyError) as e:
+                last_err = e
+        else:
+            raise RuntimeError(
+                f"Could not load {model_dir} via any AutoModel factory"
+            ) from last_err
 
     model.to(torch_dtype)
 
@@ -276,18 +393,44 @@ def _skip_resmooth_for_hybrid(model):
         _ueh.requantize_resmooth_fused_llm_layers = _orig
 
 
+def _calibrate_multimodal(model, batches):
+    """Forward-loop calibration pass for multimodal ``BatchFeature`` dicts."""
+    device = model.device
+    for batch in tqdm(batches, desc="Calibrating (multimodal)"):
+        kwargs = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                v = v.to(device)
+                # Float inputs (pixel_values) inherit the model's dtype;
+                # int inputs (input_ids, attention_mask) stay untouched.
+                if v.dtype.is_floating_point:
+                    v = v.to(next(model.parameters()).dtype)
+            kwargs[k] = v
+        with torch.no_grad():
+            model(**kwargs)
+
+
 def quantize_and_export(
     model_dir: str,
     output_dir: str,
     quantization: Optional[str] = None,
     lm_head_quantization: Optional[str] = None,
+    visual_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
     dataset: str = "cnn_dailymail",
     num_samples: int = 512,
 ) -> str:
-    """Load a HuggingFace model, quantize it, and export a unified checkpoint."""
+    """Load a HuggingFace model, quantize it, and export a unified checkpoint.
+
+    ``visual_quantization`` turns on quantization of the visual tower
+    (``visual.*`` / ``vision_tower.*`` / ``multi_modal_projector.*``); when
+    ``None`` (default) the visual tower stays in fp16.  Quantizing the visual
+    tower with text-only calibration produces uninitialised activation scales
+    on the visual path — a multimodal calibration loader is required for
+    accurate visual stats (see ``A3``).
+    """
     t0 = time.time()
     model, tokenizer, processor = _load_model(model_dir, dtype, device)
 
@@ -318,16 +461,43 @@ def quantize_and_export(
     if is_quantized(model):
         print("Model already quantized — skipping.")
     else:
-        quant_cfg = build_quant_config(quantization, lm_head_quantization,
-                                       kv_cache_quantization)
-        batch_size = 16 if quantization in (None, "int4_awq") else 1
-        loader = _text_calib_dataloader(tokenizer,
-                                        dataset,
-                                        batch_size=batch_size,
-                                        num_samples=num_samples)
-        mtq.quantize(model,
-                     quant_cfg,
-                     forward_loop=lambda m: _calibrate(m, loader))
+        quant_cfg = build_quant_config(
+            quantization,
+            lm_head_quantization,
+            kv_cache_quantization,
+            visual_quantization=visual_quantization,
+        )
+        if visual_quantization is not None:
+            # Multimodal calibration: feed (image, text) pairs through the
+            # whole VLM so visual + LLM quantizers both see real activations.
+            processor = AutoProcessor.from_pretrained(model_dir,
+                                                      trust_remote_code=True)
+            mm_samples = min(num_samples, 128)
+            # Use the user's --dataset when it looks like an image+text dataset;
+            # fall back to lmms-lab/MMMU when --dataset is the text-only default
+            # (cnn_dailymail) since that has no images.  MMMU mirrors the
+            # legacy ``el`` pipeline default
+            # (tensorrt_edgellm.quantization.llm_quantization::quantize_llm,
+            # ``visual_dataset_dir="lmms-lab/MMMU"``).
+            mm_dataset = (dataset
+                          if dataset != "cnn_dailymail" else "lmms-lab/MMMU")
+            batches = _multimodal_calib_dataloader(processor,
+                                                   dataset_name=mm_dataset,
+                                                   num_samples=mm_samples)
+            mtq.quantize(
+                model,
+                quant_cfg,
+                forward_loop=lambda m: _calibrate_multimodal(m, batches),
+            )
+        else:
+            batch_size = 16 if quantization in (None, "int4_awq") else 1
+            loader = _text_calib_dataloader(tokenizer,
+                                            dataset,
+                                            batch_size=batch_size,
+                                            num_samples=num_samples)
+            mtq.quantize(model,
+                         quant_cfg,
+                         forward_loop=lambda m: _calibrate(m, loader))
         mtq.print_quant_summary(model)
 
     print(f"Quantization: {time.time() - t0:.1f}s")
@@ -352,6 +522,17 @@ def quantize_and_export(
             save_quantized_mtp(quantized_mtp_draft, output_dir, dtype)
         else:
             copy_unquantized_mtp(model_dir, output_dir)
+
+    # Copy preprocessor / processor configs so downstream tools (llm_loader's
+    # export_all_cli, the C++ visual builder) can find image preprocessing
+    # parameters (patch_size, image_mean, image_std, ...).  ``export_hf_checkpoint``
+    # only writes the model + hf_quant_config; processor metadata is part of the
+    # source HF directory and must be carried over explicitly.
+    for fname in ("preprocessor_config.json", "processor_config.json",
+                  "video_preprocessor_config.json", "chat_template.jinja"):
+        src = os.path.join(model_dir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(output_dir, fname))
 
     print(f"Saved to {output_dir} (total {time.time() - t0:.1f}s)")
     return output_dir

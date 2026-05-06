@@ -775,6 +775,26 @@ def _strip_vl_prefix(name: str) -> str:
     return name
 
 
+def _normalize_module_name(name: str) -> str:
+    """Strip the same prefixes ``_parse_mixed_precision`` strips from
+    ``layer_overrides`` keys, so ``excluded`` and ``layer_overrides`` use the
+    same name space — both matching the ``module_name`` ``make_linear``
+    receives.
+
+    Strips a single leading prefix from ``("language_model.", "text_model.",
+    "llm.", "model.")`` (whichever matches first).  Mirror ``_parse_mixed_precision``'s
+    behaviour: only one strip per key.
+
+    Without this normalisation, a checkpoint that lists ``model.visual.blocks.X.Y``
+    in ``exclude_modules`` would never match ``module_name="visual.blocks.X.Y"``
+    that the visual modeling code passes to ``make_linear``.
+    """
+    for prefix in _VL_LLM_PREFIXES + ("model.", ):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
 def _detect_unquantized_modules(model_dir: str) -> List[str]:
     """Return module names whose weights are plain float (not int4 quantized).
 
@@ -851,12 +871,85 @@ def _detect_quantized_modules(model_dir: str) -> List[str]:
 
 def _effective_excluded_modules(model_dir: str,
                                 excluded: List[str]) -> List[str]:
-    """Drop exclusions contradicted by quantized tensors in the checkpoint."""
+    """Drop exclusions contradicted by quantized tensors in the checkpoint,
+    and normalize remaining names so they match what ``make_linear`` looks up.
+
+    Normalisation mirrors ``_parse_mixed_precision``'s strip on
+    ``layer_overrides`` keys (``language_model.`` / ``text_model.`` / ``llm.``
+    / ``model.``) so a checkpoint that writes ``model.visual.blocks.X.Y`` to
+    ``exclude_modules`` matches the ``visual.blocks.X.Y`` ``module_name`` the
+    modeling code passes.
+    """
     quantized_modules = set(_detect_quantized_modules(model_dir))
     return [
-        module for module in excluded
+        _normalize_module_name(module) for module in excluded
         if _strip_vl_prefix(module) not in quantized_modules
     ]
+
+
+def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
+    """Return module_name strings of Linears the ModelOpt checkpoint left unquantized.
+
+    A ModelOpt-quantized Linear stores both ``<name>.weight`` (packed) and
+    ``<name>.weight_scale`` (scale tensor; FP8 / NVFP4 / MXFP8 / AWQ / INT8-SQ
+    all emit this).  Linears that ModelOpt skipped — typically because their
+    wildcard had ``enable: False`` (visual / audio / lm_head) — only have
+    ``<name>.weight``.
+
+    We compute the set of "has .weight without .weight_scale" modules from the
+    checkpoint index, then return them in the short form ``make_linear`` uses
+    (leading ``model.`` and VL wrapper prefixes stripped).  Norm and embedding
+    names also fall into this set but are harmless: ``make_linear`` only
+    consults ``excluded`` for paths that actually go through it (i.e. real
+    Linears), so extra entries are inert.
+
+    Used by ``_parse_quant`` to plug a long-standing gap: for dominant-quant
+    checkpoints (``quant_algo: FP8 / NVFP4 / W4A16_AWQ / ...``) ModelOpt does
+    NOT populate ``exclude_modules`` even when whole submodules (visual tower,
+    audio encoder) were skipped during PTQ.  Without this augmentation,
+    ``make_linear``'s dominant fallback would build NVFP4Linear / FP8Linear
+    against FP16 weights → shape mismatch on export.
+
+    Complements ``_effective_excluded_modules`` (which drops false-positive
+    excludes when the checkpoint contradicts them).  This helper supplies the
+    opposite direction: false-negative excludes when ``exclude_modules`` is
+    silent on a submodule that was actually skipped during PTQ.
+    """
+    all_keys: List[str] = []
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            all_keys = list(index.get("weight_map", {}).keys())
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not all_keys:
+        single_path = os.path.join(model_dir, "model.safetensors")
+        if os.path.exists(single_path):
+            try:
+                from safetensors import safe_open
+                with safe_open(single_path, framework="pt") as f:
+                    all_keys = list(f.keys())
+            except (OSError, ImportError):
+                pass
+
+    if not all_keys:
+        return []
+
+    weight_modules = {
+        k.rsplit(".", 1)[0]
+        for k in all_keys if k.endswith(".weight")
+    }
+    scale_modules = {
+        k.rsplit(".", 1)[0]
+        for k in all_keys if k.endswith(".weight_scale")
+    }
+    unquantized = weight_modules - scale_modules
+
+    # Normalise to the same name space ``layer_overrides`` and ``excluded``
+    # use, so ``make_linear`` finds entries via its ``module_name`` lookup.
+    return sorted({_normalize_module_name(n) for n in unquantized})
 
 
 def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
@@ -870,11 +963,18 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         q = hq.get("quantization", {})
         algo = (q.get("quant_algo") or "").upper()
         if "AWQ" in algo and "W4A16" in algo:
+            # Drop exclusions that the checkpoint contradicts (false positives),
+            # then augment with submodules ModelOpt actually left unquantized
+            # (false negatives — typically visual tower / audio encoder).
+            excluded = _effective_excluded_modules(
+                model_dir, list(q.get("exclude_modules", [])))
+            excluded.extend(
+                m for m in _detect_modelopt_unquantized_linears(model_dir)
+                if m not in excluded)
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(q.get("group_size", 128)),
-                excluded=_effective_excluded_modules(
-                    model_dir, list(q.get("exclude_modules", []))),
+                excluded=excluded,
             )
         if algo == "MIXED_PRECISION":
             quantized_layers = q.get("quantized_layers", {})
@@ -893,12 +993,16 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         gs = int(q.get("group_size", 1))
         if qt == QUANT_MXFP8 and gs == 1:
             gs = 32  # MXFP8 default block_size
+        excluded = _effective_excluded_modules(
+            model_dir, list(q.get("exclude_modules", [])))
+        excluded.extend(
+            m for m in _detect_modelopt_unquantized_linears(model_dir)
+            if m not in excluded)
         return QuantConfig(
             quant_type=qt,
             group_size=gs,
             kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
-            excluded=_effective_excluded_modules(
-                model_dir, list(q.get("exclude_modules", []))),
+            excluded=excluded,
         )
 
     # ---- Embedded quantization_config in config.json ------------------------
