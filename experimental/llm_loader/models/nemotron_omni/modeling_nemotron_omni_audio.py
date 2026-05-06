@@ -87,9 +87,7 @@ class Subsampling(nn.Module):
         freq_out = mel_bins // 8
         self.linear = nn.Linear(conv_channels * freq_out, hidden_size)
 
-    def forward(self,
-                x: torch.Tensor,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """[B, T, mel_bins] → [B, T//8, hidden_size]"""
         x = x.unsqueeze(1)  # [B, 1, T, mel]
         x = self.layers(x)  # [B, C, T//8, mel//8]
@@ -325,11 +323,9 @@ class ParakeetEncoder(nn.Module):
                            conv_kernel_size) for _ in range(num_layers)
         ])
 
-    def forward(self,
-                input_features: torch.Tensor,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """[B, T, mel_bins] → [B, T//8, hidden_size]"""
-        x = self.subsampling(input_features, attention_mask)
+        x = self.subsampling(input_features)
         pos_emb = self.encode_positions(x)
         for layer in self.layers:
             x = layer(x, pos_emb)
@@ -416,18 +412,20 @@ class NemotronOmniAudioModel(nn.Module):
             bias=sc.get("projection_bias", False),
         )
 
-    def forward(self,
-                input_features: torch.Tensor,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            input_features: [batch, seq_len, mel_bins]
-            attention_mask:  [batch, seq_len]
+            input_features: [1, seq_len, mel_bins]
 
         Returns:
-            [batch, encoded_seq_len, llm_hidden_size]
+            [1, encoded_seq_len, llm_hidden_size]
+
+        The encoder runs at batch=1; the C++ runtime loops over audio clips
+        sequentially. The Conformer's depthwise conv is a local operator that
+        ignores attention masks, so true cross-clip batching with padding
+        causes numerical drift.  Single-clip-per-enqueue avoids that drift.
         """
-        x = self.encoder(input_features, attention_mask)
+        x = self.encoder(input_features)
         return self.projection(x)
 
     def get_onnx_export_args(self, config: dict, device: str):
@@ -439,22 +437,11 @@ class NemotronOmniAudioModel(nn.Module):
                                      mel_bins,
                                      dtype=torch.float16,
                                      device=device)
-        attention_mask = torch.ones(1,
-                                    seq_len,
-                                    dtype=torch.int64,
-                                    device=device)
-        args = (input_features, attention_mask)
-        input_names = ["input_features", "attention_mask"]
+        args = (input_features, )
+        input_names = ["input_features"]
         output_names = ["last_hidden_state"]
         S = torch.export.Dim("seq_len", min=8, max=16384)
-        dynamic_shapes = {
-            "input_features": {
-                1: S
-            },
-            "attention_mask": {
-                1: S
-            },
-        }
+        dynamic_shapes = {"input_features": {1: S}}
         return args, input_names, output_names, dynamic_shapes
 
 

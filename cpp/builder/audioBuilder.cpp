@@ -522,25 +522,26 @@ bool AudioBuilder::setupNemotronOmniAudioEncoderProfile(nvinfer1::IOptimizationP
 {
     bool result = true;
 
-    // Nemotron-Omni Parakeet audio encoder inputs:
-    //   input_features: [batch_size, seq_len, mel_bins]
-    //   attention_mask: [batch_size, seq_len]
-    // The seq_len corresponds to mel spectrogram frames (~16kHz audio / 160 hop_length).
-    // Parakeet subsamples by factor 8, so output is seq_len/8 tokens.
+    // Nemotron-Omni Parakeet audio encoder runs at batch=1: the C++ runtime
+    // encodes each audio clip in a request batch sequentially. Cross-clip
+    // batching with padding would corrupt the Conformer's depthwise conv on
+    // short-clip boundaries (the local kernel reads padded zeros from the
+    // longer batchmate's tail).
+    //
+    // Inputs:
+    //   input_features: [1, seq_len, mel_bins]
+    // seq_len is mel-spectrogram frames (~16 kHz / 160 hop_length); the
+    // 3× stride-2 subsampling requires divisibility by 8.
 
-    // Align to subsampling factor (3× stride-2 CNN requires divisible seq_len)
     constexpr int64_t kSubFactor = 8;
     auto alignUp = [](int64_t x, int64_t a) { return (x + a - 1) / a * a; };
-    int64_t minSeqLen = alignUp(mBuilderConfig.minTimeSteps, kSubFactor);
-    int64_t maxSeqLen = alignUp(mBuilderConfig.maxTimeSteps, kSubFactor);
-    int64_t optSeqLen = alignUp((minSeqLen + maxSeqLen) / 2, kSubFactor);
+    int64_t const minSeqLen = alignUp(mBuilderConfig.minTimeSteps, kSubFactor);
+    int64_t const maxSeqLen = alignUp(mBuilderConfig.maxTimeSteps, kSubFactor);
+    int64_t const optSeqLen = alignUp((minSeqLen + maxSeqLen) / 2, kSubFactor);
     constexpr int64_t kBatch = 1;
 
     result &= setOptimizationProfile(&profile, "input_features", createDims({kBatch, minSeqLen, mMelBins}),
         createDims({kBatch, optSeqLen, mMelBins}), createDims({kBatch, maxSeqLen, mMelBins}));
-
-    result &= setOptimizationProfile(&profile, "attention_mask", createDims({kBatch, minSeqLen}),
-        createDims({kBatch, optSeqLen}), createDims({kBatch, maxSeqLen}));
 
     if (!result)
     {
