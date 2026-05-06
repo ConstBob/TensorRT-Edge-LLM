@@ -382,6 +382,7 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
 def _fix_initializer_dtypes(
         onnx_path: str,
         dedup_dql_scales: bool = False,
+        cast_fp32_weights_to_fp16: bool = True,
         preserve_fp32_patterns: "tuple[str, ...]" = (),
 ) -> None:
     """Single-pass ONNX initializer fixup for TRT compatibility.
@@ -392,10 +393,12 @@ def _fix_initializer_dtypes(
        shared scalar DequantizeLinear initializers so each DQL node gets
        its own copy (see :func:`_dedup_shared_dql_scales`).
 
-    2. **FP32 weights → FP16**: The dynamo exporter may emit FP32 constants
-       for FP16 model weights (e.g. tied lm_head in BF16 checkpoints).  TRT
-       requires uniform dtype in MatMul inputs.  Scalars and quantization
-       scale tensors are left as FP32.
+    2. **FP32 weights → FP16** (when *cast_fp32_weights_to_fp16* is True):
+       The dynamo exporter may emit FP32 constants for FP16 model weights
+       (e.g. tied lm_head in BF16 checkpoints).  TRT requires uniform dtype
+       in MatMul inputs.  Scalars and quantization scale tensors are left as
+       FP32.  Disable this for graphs that legitimately keep FP32 constants
+       (e.g. ``weight.float()`` inside a LayerNorm whose body is FP32).
 
        Initializers whose name contains any substring in
        ``preserve_fp32_patterns`` are kept FP32.  This is how a model opts
@@ -449,6 +452,8 @@ def _fix_initializer_dtypes(
             continue
 
         # --- FP32 weight → FP16 ---
+        if not cast_fp32_weights_to_fp16:
+            continue
         if init.data_type != 1:  # not FP32
             continue
         if init.name in mamba_a_names:  # already FP32, must stay

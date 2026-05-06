@@ -59,9 +59,12 @@ import json
 import logging
 import os
 import sys
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from .config import ModelConfig
 
 from .checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
 
@@ -542,8 +545,8 @@ def _export_mtp_draft(model_dir: str, draft_out_dir: str) -> None:
 
 
 def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
-                   config: dict, model_type: str,
-                   dtype: "torch.dtype") -> None:
+                   config: dict, model_type: str, dtype: "torch.dtype",
+                   model_config: "ModelConfig") -> None:
     """Export visual encoder via from-scratch llm_loader pipeline."""
     os.makedirs(visual_out_dir, exist_ok=True)
     output_path = os.path.join(visual_out_dir, "model.onnx")
@@ -559,6 +562,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
             config=config,
             model_type=model_type,
             dtype=dtype,
+            model_config=model_config,
         )
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[Visual] ONNX export failed")
@@ -623,36 +627,41 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         if _rope_scaling:
             vis_cfg_out["rope_scaling"] = normalize_rope_scaling_for_runtime(
                 _rope_scaling)
-        # Also copy preprocessor_config.json to the output dir so the runner
-        # can find patch_size, temporal_patch_size, merge_size, image_mean, image_std.
-        import shutil
-        pp_src = os.path.join(model_dir, "preprocessor_config.json")
-        if os.path.exists(pp_src):
-            shutil.copy2(pp_src, visual_out_dir)
-            logger.info("[Visual] Copied preprocessor_config.json to %s",
-                        visual_out_dir)
-        else:
-            proc_src = os.path.join(model_dir, "processor_config.json")
-            if os.path.exists(proc_src):
-                with open(proc_src) as _pf:
-                    proc_cfg = json.load(_pf)
-                img_proc = proc_cfg.get("image_processor", {})
-                if img_proc:
-                    pp_dst = os.path.join(visual_out_dir,
-                                          "preprocessor_config.json")
-                    with open(pp_dst, "w") as _pf:
-                        json.dump(img_proc, _pf, indent=2)
-                    logger.info(
-                        "[Visual] Extracted preprocessor_config.json "
-                        "from processor_config.json to %s", visual_out_dir)
-                else:
-                    logger.warning(
-                        "[Visual] processor_config.json has no "
-                        "image_processor key at %s", proc_src)
+    # Copy preprocessor_config.json to the visual output dir so the C++
+    # runtime can find patch_size, image_mean, image_std, etc.  Applies to
+    # every visual family (Qwen VL, InternVL, Phi-4mm) — the C++ visual
+    # runners all read from this file.
+    import shutil
+    pp_src = os.path.join(model_dir, "preprocessor_config.json")
+    if os.path.exists(pp_src):
+        shutil.copy2(pp_src, visual_out_dir)
+        logger.info("[Visual] Copied preprocessor_config.json to %s",
+                    visual_out_dir)
+    else:
+        # Newer quantized checkpoints store image processor config inside
+        # processor_config.json under the "image_processor" key.  Extract
+        # it and write a standalone preprocessor_config.json.
+        proc_src = os.path.join(model_dir, "processor_config.json")
+        if os.path.exists(proc_src):
+            with open(proc_src) as _pf:
+                proc_cfg = json.load(_pf)
+            img_proc = proc_cfg.get("image_processor", {})
+            if img_proc:
+                pp_dst = os.path.join(visual_out_dir,
+                                      "preprocessor_config.json")
+                with open(pp_dst, "w") as _pf:
+                    json.dump(img_proc, _pf, indent=2)
+                logger.info(
+                    "[Visual] Extracted preprocessor_config.json from "
+                    "processor_config.json to %s", visual_out_dir)
             else:
                 logger.warning(
-                    "[Visual] Neither preprocessor_config.json nor "
-                    "processor_config.json found at %s", model_dir)
+                    "[Visual] processor_config.json has no "
+                    "image_processor key at %s", proc_src)
+        else:
+            logger.warning(
+                "[Visual] Neither preprocessor_config.json nor "
+                "processor_config.json found at %s", model_dir)
     if model_type in ("phi4mm", "phi4_multimodal"):
         # C++ Phi4MMViTRunner reads vocab_size and embd_layer from the top level
         # of config.json.  For phi4mm the raw config.json is flat (no vision_config
@@ -1611,6 +1620,19 @@ def main() -> None:
             _weights.update(_load_all_weights(model_dir))
         return _weights
 
+    # Parse ModelConfig lazily so quantized visual towers get the right
+    # Linear dispatch through make_linear.  Non-quantized checkpoints simply
+    # produce a ModelConfig with quant_type=fp16, so this never silently
+    # fails — a real exception means the checkpoint is malformed and we
+    # should surface it.
+    _model_config: "list[Optional[ModelConfig]]" = [None]
+
+    def _get_model_config() -> "ModelConfig":
+        if _model_config[0] is None:
+            from .config import ModelConfig
+            _model_config[0] = ModelConfig.from_pretrained(model_dir)
+        return _model_config[0]
+
     # Each stage is (enabled, component_name, exporter_callable).  Exporter
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
@@ -1631,8 +1653,14 @@ def main() -> None:
          and not args.skip_llm, "code_predictor",
          lambda out: _export_code_predictor(model_dir, out, model_type)),
         (_has_visual(model_type) and not _is_alpamayo(model_type)
-         and not args.skip_visual, "visual", lambda out: _export_visual(
-             model_dir, out, _get_weights(), config, model_type, dtype)),
+         and not args.skip_visual, "visual",
+         lambda out: _export_visual(model_dir,
+                                    out,
+                                    _get_weights(),
+                                    config,
+                                    model_type,
+                                    dtype,
+                                    model_config=_get_model_config())),
         (_has_visual(model_type) and _is_alpamayo(model_type)
          and not args.skip_visual, "visual",
          lambda out: _export_alpamayo_visual(model_dir, out, _get_weights(),

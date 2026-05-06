@@ -45,7 +45,7 @@ from .repacking import apply_all_repacking
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["load_weights"]
+__all__ = ["load_weights", "load_submodule_weights"]
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -440,3 +440,62 @@ def iter_checkpoint_keys(model_dir: str) -> Iterator[str]:
     """Yield all weight keys present in a checkpoint directory (no data)."""
     shard_map = _build_shard_map(model_dir)
     yield from shard_map.keys()
+
+
+def load_submodule_weights(
+    model: nn.Module,
+    weights: Dict[str, torch.Tensor],
+    key_remap: Callable[[str], Optional[str]],
+    *,
+    transform: Optional[Callable[[str, torch.Tensor], torch.Tensor]] = None,
+    label: str = "model",
+    log: Optional[logging.Logger] = None,
+    do_repack: bool = True,
+) -> None:
+    """Load a sliced ``{key: tensor}`` dict into a sub-encoder via ``_set_tensor``.
+
+    Used by visual / audio modeling files that receive a flat weights dict
+    (already loaded from safetensors by the orchestrator) and need to filter
+    and rename keys before assignment.  Sharing this helper avoids duplicating
+    the iterate-remap-set-tensor-track-missing-log pattern across families.
+
+    ``_set_tensor`` is used (not ``load_state_dict``) so that:
+      - ``bfloat16 -> float16`` cast happens automatically;
+      - quantized weights (``float8_e4m3fn`` / packed int8 / ...) keep their
+        original dtype rather than being silently cast.
+
+    :param model: Target sub-encoder module.
+    :param weights: Flat ``{key: tensor}`` dict from safetensors.
+    :param key_remap: Called per checkpoint key. Return the new path inside
+        ``model`` (e.g. ``"encoder.blocks.0.attn.weight"``), or ``None`` to
+        skip the key. Use this to strip / rewrite checkpoint prefixes.
+    :param transform: Optional ``(remapped_key, tensor) -> tensor`` hook for
+        per-tensor reshaping (e.g. flat → conv2d) or interpolation.
+    :param label: Used in the missing-keys warning ("<label>: keys not loaded").
+    :param log: Logger used for the missing-keys warning. Defaults to this
+        module's logger.
+    :param do_repack: When ``True`` (default), call ``apply_all_repacking``
+        after assignment so type-aware fixups (FP8 scale cast, NVFP4 view-cast,
+        AWQ/GPTQ swizzle, ...) run.  Safe to leave on for non-quantized
+        sub-encoders — each fixup is gated by an ``isinstance`` check.
+    """
+    if log is None:
+        log = logger
+    missing: list[str] = []
+    for k, v in weights.items():
+        new_key = key_remap(k)
+        if new_key is None:
+            continue
+        if transform is not None:
+            v = transform(new_key, v)
+        if not _set_tensor(model, new_key, v):
+            missing.append(new_key)
+    if do_repack:
+        apply_all_repacking(model)
+    if missing:
+        log.warning(
+            "%s: keys not loaded: %s%s",
+            label,
+            missing[:10],
+            " ..." if len(missing) > 10 else "",
+        )

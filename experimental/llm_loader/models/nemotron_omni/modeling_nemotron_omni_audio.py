@@ -33,7 +33,6 @@ Checkpoint weight key prefixes:
 
 from __future__ import annotations
 
-import logging
 import math
 
 import torch
@@ -451,31 +450,31 @@ class NemotronOmniAudioModel(nn.Module):
 
 
 def _load_weights(model: NemotronOmniAudioModel, weights: dict) -> None:
-    """Load Parakeet encoder and sound projection weights."""
-    logger = logging.getLogger(__name__)
+    """Load Parakeet encoder and sound projection weights.
+
+    Checkpoint key → model attribute path:
+      ``sound_encoder.encoder.*`` → ``encoder.*``
+      ``sound_projection.*``      → ``projection.*``
+
+    Uses ``_set_tensor`` (via ``load_submodule_weights``) so bf16 weights are
+    automatically cast to fp16 — ``load_state_dict`` would skip that cast.
+    """
+    from ...checkpoint.loader import load_submodule_weights
 
     enc_prefix = "sound_encoder.encoder."
-    enc_state = {
-        k[len(enc_prefix):]: v
-        for k, v in weights.items() if k.startswith(enc_prefix)
-    }
-
     proj_prefix = "sound_projection."
-    proj_state = {
-        k[len(proj_prefix):]: v
-        for k, v in weights.items() if k.startswith(proj_prefix)
-    }
 
-    missing_enc, unexpected_enc = model.encoder.load_state_dict(enc_state,
-                                                                strict=False)
-    missing_proj, _ = model.projection.load_state_dict(proj_state,
-                                                       strict=False)
+    def _remap(k: str) -> "str | None":
+        if k.startswith(enc_prefix):
+            return "encoder." + k[len(enc_prefix):]
+        if k.startswith(proj_prefix):
+            return "projection." + k[len(proj_prefix):]
+        return None
 
-    if missing_enc:
-        logger.warning("Audio encoder: %d missing keys (first 5: %s)",
-                       len(missing_enc), missing_enc[:5])
-    if missing_proj:
-        logger.warning("Audio projection: missing keys: %s", missing_proj)
+    load_submodule_weights(model,
+                           weights,
+                           _remap,
+                           label="NemotronOmniAudioModel")
 
 
 # ---------------------------------------------------------------------------
