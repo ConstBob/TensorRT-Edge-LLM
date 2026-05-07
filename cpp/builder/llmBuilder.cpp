@@ -934,9 +934,8 @@ bool LLMBuilder::copyEmbeddingFile()
         // Talker: copy embedding + text_projection + hidden_projection (optional, text-only TTS omits it)
         LOG_INFO("Detected Talker model, copying projection files...");
 
-        std::vector<std::string> requiredFiles
-            = {"embedding.safetensors", "text_projection.safetensors", "text_embedding.safetensors"};
-        std::vector<std::string> optionalFiles = {"hidden_projection.safetensors"};
+        std::vector<std::string> requiredFiles = {"embedding.safetensors", "text_projection.safetensors"};
+        std::vector<std::string> optionalFiles = {"text_embedding.safetensors", "hidden_projection.safetensors"};
 
         bool allSuccess = true;
         for (auto const& filename : requiredFiles)
@@ -977,10 +976,10 @@ bool LLMBuilder::copyEmbeddingFile()
     if (std::filesystem::exists(codecEmbedPath))
     {
         LOG_INFO("Detected CodePredictor model, copying codec files...");
-        std::vector<std::string> cpFiles
-            = {"codec_embeddings.safetensors", "lm_heads.safetensors", "small_to_mtp_projection.safetensors"};
+        std::vector<std::string> cpRequiredFiles = {"codec_embeddings.safetensors", "lm_heads.safetensors"};
+        std::vector<std::string> cpOptionalFiles = {"small_to_mtp_projection.safetensors"};
         bool allSuccess = true;
-        for (auto const& filename : cpFiles)
+        for (auto const& filename : cpRequiredFiles)
         {
             std::string const srcPath = (mOnnxDir / filename).string();
             std::string const dstPath = (mEngineDir / filename).string();
@@ -992,6 +991,19 @@ bool LLMBuilder::copyEmbeddingFile()
             {
                 LOG_ERROR("Failed to copy required CodePredictor file: %s", filename.c_str());
                 allSuccess = false;
+            }
+        }
+        for (auto const& filename : cpOptionalFiles)
+        {
+            std::string const srcPath = (mOnnxDir / filename).string();
+            std::string const dstPath = (mEngineDir / filename).string();
+            if (file_io::copyFile(srcPath, dstPath))
+            {
+                LOG_INFO("Copied %s", filename.c_str());
+            }
+            else
+            {
+                LOG_INFO("Optional %s not found, skipping", filename.c_str());
             }
         }
         return allSuccess;
