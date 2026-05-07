@@ -360,14 +360,23 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyInputTensor.rawPointer(), 0, mDummyInputTensor.getMemoryCapacity(), stream));
 
-    // Allocate dummy output tensor for hidden_states for Eagle speculative decoding.
-    // TRT engine under this mode will produce output hidden states. we reserve this buffer to hold the data when
-    // conduct vanilla decoding. This will make runtime design cleaner.
-    if (mConfig.enableEagleSpecDecode)
+    // Allocate dummy output tensor for hidden_states when the engine has that output binding.
+    // This is needed for Eagle speculative decoding and Qwen3-Omni audio output (Thinker -> Talker).
+    // The dummy buffer is used during CUDA graph capture and vanilla decoding when the caller
+    // doesn't explicitly request hidden states output.
+    // Auto-detect by querying the engine for the hidden_states binding instead of relying on config flags.
     {
-        int64_t const dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * mConfig.outputHiddenDim;
-        mDummyOutputTensor = rt::Tensor(
-            {dummyOutputSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyOutputTensor");
+        bool const engineHasHiddenStates
+            = mEngine->getTensorIOMode(binding_names::kOutputHiddenStates) == nvinfer1::TensorIOMode::kOUTPUT;
+        if (mConfig.enableEagleSpecDecode || engineHasHiddenStates)
+        {
+            int64_t outputHiddenDim = mConfig.enableEagleSpecDecode ? mConfig.outputHiddenDim : mConfig.hiddenSize;
+            int64_t dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * outputHiddenDim;
+            mDummyOutputTensor = rt::Tensor({dummyOutputSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+                "LLMEngineRunner::mDummyOutputTensor");
+            LOG_INFO("Allocated dummy hidden_states output buffer: %lld elements (engineHasHiddenStates=%d)",
+                dummyOutputSize, engineHasHiddenStates);
+        }
     }
 
     // Initialize kKVCacheStartIndex to dummy tensor for both profiles to avoid "address not set" error
@@ -1098,20 +1107,23 @@ rt::HybridCacheManager& LLMEngineRunner::getCacheManager() noexcept
     return mCacheManager;
 }
 
-bool LLMEngineRunner::setLMHeadWeights(std::string const& name, rt::Tensor const& tensor)
+bool LLMEngineRunner::setLmHeadWeight(rt::Tensor const& lmHeadWeight)
 {
-    bool status = mTRTExecutionContext->setTensorAddress(name.c_str(), const_cast<void*>(tensor.rawPointer()));
+    constexpr char const* kLmHeadWeightName = "lm_head_weight";
+
+    bool status
+        = mTRTExecutionContext->setTensorAddress(kLmHeadWeightName, const_cast<void*>(lmHeadWeight.rawPointer()));
     if (!status)
     {
-        LOG_ERROR("setTensorAddress failed for '%s'", name.c_str());
+        LOG_ERROR("setTensorAddress failed for lm_head_weight");
         return false;
     }
 
-    bool shapeStatus = mTRTExecutionContext->setInputShape(name.c_str(), tensor.getShape().getTRTDims());
+    bool shapeStatus = mTRTExecutionContext->setInputShape(kLmHeadWeightName, lmHeadWeight.getShape().getTRTDims());
     if (!shapeStatus)
     {
         LOG_ERROR(
-            "setInputShape failed for '%s' with shape %s", name.c_str(), tensor.getShape().formatString().c_str());
+            "setInputShape failed for lm_head_weight with shape %s", lmHeadWeight.getShape().formatString().c_str());
         return false;
     }
 

@@ -119,6 +119,23 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
         return false;
     }
 
+    // Read mrope_interleaved from config. Fall back to model-type heuristic for older configs
+    // that lack this field (Qwen3-VL and Qwen3.5 always use interleaved MRoPE).
+    if (subConfig.contains("mrope_interleaved") && subConfig["mrope_interleaved"].is_boolean())
+    {
+        mConfig.mropeInterleaved = subConfig["mrope_interleaved"].get<bool>();
+    }
+    else if (ropeParams.contains("mrope_interleaved") && ropeParams["mrope_interleaved"].is_boolean())
+    {
+        mConfig.mropeInterleaved = ropeParams["mrope_interleaved"].get<bool>();
+    }
+    else
+    {
+        // Legacy fallback: Qwen3-VL and Qwen3.5 use interleaved MRoPE
+        mConfig.mropeInterleaved
+            = (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5);
+    }
+
     if (mModelType == multimodal::ModelType::QWEN2_5_VL)
     {
         mConfig.windowSize = jsonConfig["vision_config"]["window_size"].get<int64_t>();
@@ -612,7 +629,7 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     // Initialize mrope cosSinCacheDevice
     check::check(
         ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim}), "Tensor reshape failed");
-    bool interleaved = (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5);
+    bool interleaved = mConfig.mropeInterleaved;
     kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
         mMropePositionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
         activeBatchSize, interleaved, mConfig.mropeSectionH, mConfig.mropeSectionW, stream);

@@ -634,6 +634,15 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
         mGatherIndicesBuffer
             = rt::Tensor({maxSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mGatherIndicesBuffer");
 
+        // Streaming: single-token workspace for appendTrailingToken
+        mStreamingTokenId = rt::Tensor({1, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mStreamingTokenId");
+        mStreamingTokenEmbed = rt::Tensor(
+            {1, thinkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mStreamingTokenEmbed");
+        mStreamingProjOut
+            = rt::Tensor({1, talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mStreamingProjOut");
+        mStreamingMlpWork
+            = rt::Tensor({1, thinkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mStreamingMlpWork");
+
         LOG_INFO("Talker buffers allocated (maxBS=%d, maxSeqLen=%ld, talkerH=%ld, cpH=%d)", mMaxBatchSize, maxSeqLen,
             talkerHiddenSize, mTalkerConfig.codePredictorHiddenSize);
         return true;
@@ -871,7 +880,7 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& code
     hostContextLength[0] = kCodePredictorPrefillSeqLen;
 
     int32_t const lmHeadIdx = std::min(generationStep, mNumRvqLayers - 1);
-    if (!mCodePredictorRunner->setLMHeadWeights("lm_head_weight", mCodePredictorLmHeadWeights[lmHeadIdx]))
+    if (!mCodePredictorRunner->setLmHeadWeight(mCodePredictorLmHeadWeights[lmHeadIdx]))
     {
         LOG_ERROR("Failed to bind lm_head_weight[%d]", lmHeadIdx);
         return false;
@@ -935,7 +944,7 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
     if (mCodePredictorGraphsCaptured)
     {
         // Graph path: lm_head_weight addresses were bound during capture and remain unchanged,
-        // so setLMHeadWeights is unnecessary. Each graph is keyed by its per-head output buffer.
+        // so setLmHeadWeight is unnecessary. Each graph is keyed by its per-head output buffer.
         if (!mCodePredictorRunner->executeVanillaDecodingStep(mCodePredictorCodecEmbed,
                 mCodePredictorLogitsPerHead[lmHeadIdx], rt::OptionalOutputTensor{std::ref(outputHiddenStates)}, stream))
         {
@@ -948,7 +957,7 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
     else
     {
         // Non-graph path: must bind lm_head_weight before each enqueueV3
-        if (!mCodePredictorRunner->setLMHeadWeights("lm_head_weight", mCodePredictorLmHeadWeights[lmHeadIdx]))
+        if (!mCodePredictorRunner->setLmHeadWeight(mCodePredictorLmHeadWeights[lmHeadIdx]))
         {
             LOG_ERROR("Failed to bind lm_head_weight[%d]", lmHeadIdx);
             return false;
@@ -993,7 +1002,7 @@ bool Qwen3OmniTTSRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 
     for (int32_t i = 0; i < mNumRvqLayers; ++i)
     {
-        if (!mCodePredictorRunner->setLMHeadWeights("lm_head_weight", mCodePredictorLmHeadWeights[i]))
+        if (!mCodePredictorRunner->setLmHeadWeight(mCodePredictorLmHeadWeights[i]))
         {
             LOG_ERROR("Failed to bind lm_head_weight[%d] for CUDA graph capture", i);
             captureStatus = false;
@@ -1570,6 +1579,68 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
     return true;
 }
 
+bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, SamplingParams const& talkerSamplingParams,
+    SamplingParams const& predictorSamplingParams, rt::Tensor const* trailingPtr, int32_t frameIdx,
+    std::unordered_set<int32_t>& seenTokenSet, int32_t& numSeenTokens, float repetitionPenalty,
+    std::vector<std::vector<int32_t>>& rvqCodes, cudaStream_t stream)
+{
+    int32_t const codecEosId = mTalkerConfig.codecEosId;
+
+    // Ensure batch=1 shape for CodePredictor KV cache reset (streaming path is per-batch)
+    check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
+    mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] = 0;
+    mCodePredictorRunner->getCacheManager().resetForNewSequences(mHostReuseKVCacheLengths, stream);
+
+    if (!extractTalkerLastHidden(mTalkerHiddenStatesBuffer, mTalkerLastHidden, stream))
+    {
+        LOG_ERROR("extractTalkerLastHidden failed at frame %d", frameIdx);
+        return false;
+    }
+
+    std::vector<int32_t> frameCodes;
+    if (!runCodePredictorGenerationForFrame(codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, stream))
+    {
+        LOG_ERROR("CodePredictor generation failed at frame %d", frameIdx);
+        return false;
+    }
+
+    rvqCodes.push_back(std::move(frameCodes));
+
+    if (!computeResidualConnection(rvqCodes.back(), trailingPtr, frameIdx, mResidualEmbedBuffer, stream))
+    {
+        LOG_ERROR("Residual connection failed at frame %d", frameIdx);
+        return false;
+    }
+
+    check::check(mResidualEmbedBuffer.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+    check::check(mTalkerHiddenStatesBuffer.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
+
+    if (!mTalkerLLMRunner->executeVanillaDecodingStep(
+            mResidualEmbedBuffer, mTalkerLogits, rt::OptionalOutputTensor{std::ref(mTalkerHiddenStatesBuffer)}, stream))
+    {
+        LOG_ERROR("Talker decoding step failed at frame %d", frameIdx);
+        return false;
+    }
+
+    kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
+        mTalkerConfig.talkerVocabSize, codecEosId, numSeenTokens, repetitionPenalty, stream);
+    trt_edgellm::topKtopPSamplingFromLogits(mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams,
+        mSamplingWorkspace, stream, 42, static_cast<uint64_t>(frameIdx + 1));
+    CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(), sizeof(int32_t),
+        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (seenTokenSet.insert(codecToken).second)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(mSeenCodecTokensBuf.dataPointer<int32_t>() + numSeenTokens,
+            mTalkerSelectedIndices.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+        ++numSeenTokens;
+    }
+
+    codecToken = mHostSelectedTokenIds.dataPointer<int32_t>()[0];
+    return true;
+}
+
 bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
     SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream)
 {
@@ -2007,12 +2078,380 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
 //        Incremental Trailing Hidden Helpers (for streaming)
 // ═══════════════════════════════════════════════════════════════════════════
 
+void Qwen3OmniTTSRuntime::appendTrailingToken(int32_t tokenId, rt::Tensor const& thinkerEmbedTable,
+    rt::Tensor& trailingTextHidden, int32_t trailingIdx, cudaStream_t stream)
+{
+    int64_t const talkerHiddenSize = mTalkerConfig.talkerHiddenSize;
+
+    // Upload token ID (reuse pre-allocated GPU buffer)
+    CUDA_CHECK(
+        cudaMemcpyAsync(mStreamingTokenId.rawPointer(), &tokenId, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    // embed_tokens(tokenId) → mStreamingTokenEmbed [1, thinkerH]
+    // embeddingLookup expects [1, 1, H] output; mStreamingTokenEmbed is [1, H] — same memory, just reshape for kernel
+    rt::Tensor embedView(mStreamingTokenEmbed.rawPointer(), rt::Coords{1, 1, mTalkerConfig.thinkerHiddenSize},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    kernel::embeddingLookup(mStreamingTokenId, thinkerEmbedTable, std::nullopt, embedView, stream);
+
+    // text_projection: mStreamingTokenEmbed [1, thinkerH] → mStreamingProjOut [1, talkerH]
+    kernel::invokeTalkerMLP(mStreamingTokenEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
+        mStreamingProjOut, mStreamingMlpWork, stream);
+
+    // Write to trailingTextHidden[trailingIdx]
+    __half* dst = static_cast<__half*>(trailingTextHidden.rawPointer()) + trailingIdx * talkerHiddenSize;
+    CUDA_CHECK(cudaMemcpyAsync(
+        dst, mStreamingProjOut.rawPointer(), talkerHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+}
+
 void Qwen3OmniTTSRuntime::finalizeTrailing(rt::Tensor& trailingTextHidden, int32_t trailingIdx, cudaStream_t stream)
 {
     int64_t const talkerHiddenSize = mTalkerConfig.talkerHiddenSize;
     __half* dst = static_cast<__half*>(trailingTextHidden.rawPointer()) + trailingIdx * talkerHiddenSize;
     CUDA_CHECK(cudaMemcpyAsync(
         dst, mTtsEosEmbed.rawPointer(), talkerHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//        Thinker-Talker Streaming Pipeline (single CUDA stream)
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceSpecDecodeRuntime& thinkerRuntime,
+    LLMGenerationRequest& thinkerRequest, LLMGenerationResponse& thinkerResponse,
+    ThinkerTalkerStreamingConfig const& streamingConfig, OmniGenerationRequest const& omniBaseRequest,
+    TalkerGenerationResponse& talkerResponse, cudaStream_t stream)
+{
+    NVTX_SCOPED_RANGE(nvtx_range, "TTSRuntime::handleStreamingGeneration", nvtx_colors::PURPLE);
+
+    LOG_INFO(
+        "Starting Thinker-Talker streaming pipeline (prefillThreshold=%d)", streamingConfig.talkerPrefillThreshold);
+
+    talkerResponse.batchRvqCodes.clear();
+    talkerResponse.numFramesPerSample.clear();
+    talkerResponse.success = false;
+
+    float const talkerTemperature = (omniBaseRequest.talkerTemperature > 0) ? omniBaseRequest.talkerTemperature : 0.9f;
+    int32_t const talkerTopK = (omniBaseRequest.talkerTopK > 0) ? omniBaseRequest.talkerTopK : 50;
+    float const talkerTopP = (omniBaseRequest.talkerTopP > 0) ? omniBaseRequest.talkerTopP : 1.0f;
+    float const repetitionPenalty = omniBaseRequest.repetitionPenalty;
+
+    SamplingParams talkerSamplingParams(1, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
+    SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
+
+    int32_t const codecEosId = mTalkerConfig.codecEosId;
+    int32_t numSeenTokens = 0;
+    std::unordered_set<int32_t> seenTokenSet;
+
+    struct StreamingState
+    {
+        std::vector<int32_t> assistantTokens;
+        bool thinkerFinished{false};
+        bool talkerPrefillDone{false};
+        bool talkerError{false};
+        int32_t talkerFrames{0};
+        int32_t codecToken{-1};
+        int32_t trailingIdx{0};
+        int32_t lastChunkEnd{0};
+        std::vector<std::vector<int32_t>> rvqCodes;
+        std::vector<int32_t> inputIds;
+    };
+    StreamingState state;
+    state.rvqCodes.reserve(omniBaseRequest.maxAudioLength);
+
+    int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+    int64_t const trailingStride = mTalkerConfig.maxSeqLen + 1;
+    int32_t const maxTrailingLen = static_cast<int32_t>(trailingStride);
+
+    // Streaming uses batch slot 0 of the trailing buffer
+    size_t const slot0Bytes = trailingStride * hiddenSize * sizeof(__half);
+    CUDA_CHECK(cudaMemsetAsync(mStreamingTrailingHidden.rawPointer(), 0, slot0Bytes, stream));
+
+    rt::Tensor const& thinkerEmbedTable = thinkerRuntime.getEmbeddingTable();
+
+    int32_t speakerId = mTalkerConfig.defaultSpeakerId;
+    if (omniBaseRequest.speakerId >= 0)
+    {
+        speakerId = omniBaseRequest.speakerId;
+    }
+    else if (!omniBaseRequest.speakerName.empty())
+    {
+        speakerId = getSpeakerIdByName(omniBaseRequest.speakerName);
+    }
+
+    int32_t const prefillThreshold = streamingConfig.talkerPrefillThreshold;
+    int32_t const maxAudioLength = omniBaseRequest.maxAudioLength;
+
+    // Reset reuse lengths to batch=1 for streaming (per-batch independent Talker)
+    check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
+    int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
+    reuseData[0] = 0;
+
+    auto makeTrailingView = [&]() -> rt::Tensor {
+        return rt::Tensor(mStreamingTrailingHidden.rawPointer(),
+            rt::Coords{static_cast<int64_t>(state.trailingIdx), hiddenSize}, rt::DeviceType::kGPU,
+            nvinfer1::DataType::kHALF);
+    };
+
+    // ===== Per-token callback for the Thinker decode loop =====
+    // SAFETY: This lambda captures stack-local state by reference. It is ONLY safe because
+    // thinkerRuntime.handleRequest() invokes the callback synchronously on the same thread
+    // (inside cudaStreamSynchronize in the decode loop). Never call this callback asynchronously.
+    auto userCallback = thinkerRequest.onTokenGenerated;
+
+    thinkerRequest.onTokenGenerated = [&, userCallback](TokenCallbackInfo const& info) {
+        if (userCallback.has_value())
+        {
+            userCallback.value()(info);
+        }
+        if (info.batchIdx != 0 || state.talkerError)
+        {
+            return;
+        }
+
+        state.assistantTokens.push_back(info.tokenId);
+        state.thinkerFinished = info.isFinished;
+
+        int32_t const numAssistantTokens = static_cast<int32_t>(state.assistantTokens.size());
+
+        if (!state.talkerPrefillDone && numAssistantTokens >= prefillThreshold)
+        {
+            LOG_INFO("Thinker produced %d assistant tokens, triggering Talker prefill", numAssistantTokens);
+
+            // Reset KV caches
+            auto& talkerCacheManager = mTalkerLLMRunner->getCacheManager();
+            auto& cpCacheManager = mCodePredictorRunner->getCacheManager();
+            talkerCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+            cpCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+            {
+                auto& talkerKVManager = talkerCacheManager.getKVCacheManager();
+                for (int32_t i = 0; i < talkerKVManager.numLayers(); ++i)
+                {
+                    rt::Tensor& layerKV = talkerKVManager.getCombinedKVCache(i);
+                    CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
+                }
+                auto& cpKVManager = cpCacheManager.getKVCacheManager();
+                for (int32_t i = 0; i < cpKVManager.numLayers(); ++i)
+                {
+                    rt::Tensor& layerKV = cpKVManager.getCombinedKVCache(i);
+                    CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
+                }
+            }
+
+            // Build combined token IDs — fetch Thinker input IDs from the runtime portal.
+            auto const& thinkerInputs = thinkerRuntime.getBaseModelInputTokenIds();
+            auto& textTokenIds = state.inputIds;
+            if (textTokenIds.empty() && !thinkerInputs.empty())
+            {
+                textTokenIds = thinkerInputs[0];
+            }
+            textTokenIds.insert(textTokenIds.end(), state.assistantTokens.begin(), state.assistantTokens.end());
+
+            // Use buildTalkerPrefillFromSegments for segment parsing, MLP projection, and prefill assembly
+            auto prefillEmbedPtr = thinkerRuntime.getBaseModelHiddenStates(0);
+            auto prefillHiddenPtr = thinkerRuntime.getBaseModelHiddenStates(thinkerRequest.acceptHiddenLayer);
+            int32_t const prefillLen = thinkerRuntime.getBaseModelPrefillLength();
+
+            int64_t outSeqLen = 0;
+            if (!buildTalkerPrefillFromSegments(textTokenIds, prefillEmbedPtr, prefillHiddenPtr, prefillLen,
+                    thinkerEmbedTable, speakerId, mStreamingTrailingHidden, state.trailingIdx, outSeqLen, stream))
+            {
+                state.talkerError = true;
+                return;
+            }
+
+            // Talker prefill
+            check::check(mTalkerInputEmbeds.reshape({1, outSeqLen, hiddenSize}), "Tensor reshape failed");
+            check::check(mTalkerHiddenStatesBuffer.reshape({1, outSeqLen, mTalkerConfig.talkerHiddenSize}),
+                "Tensor reshape failed");
+
+            {
+                TIME_STAGE(metrics::StageNames::kTALKER_PREFILL, stream);
+                if (!executeTalkerPrefillStep(mTalkerInputEmbeds, mTalkerLogits, mTalkerHiddenStatesBuffer, stream))
+                {
+                    LOG_ERROR("Talker prefill failed during streaming pipeline");
+                    state.talkerError = true;
+                    return;
+                }
+            }
+
+            kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
+                mTalkerConfig.talkerVocabSize, codecEosId, numSeenTokens, repetitionPenalty, stream);
+            trt_edgellm::topKtopPSamplingFromLogits(
+                mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams, mSamplingWorkspace, stream);
+            CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(),
+                sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            state.codecToken = mHostSelectedTokenIds.dataPointer<int32_t>()[0];
+            if (seenTokenSet.insert(state.codecToken).second)
+            {
+                CUDA_CHECK(cudaMemcpyAsync(mSeenCodecTokensBuf.dataPointer<int32_t>() + numSeenTokens,
+                    mTalkerSelectedIndices.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+                ++numSeenTokens;
+            }
+            state.talkerPrefillDone = true;
+            if (getProfilingEnabled())
+            {
+                CUDA_CHECK(cudaEventRecord(mTtfaEnd, stream));
+            }
+            LOG_INFO("Talker prefill done, first codec token: %d", state.codecToken);
+
+            // Generate frame 0 immediately after prefill
+            if (state.codecToken != codecEosId && state.talkerFrames < maxAudioLength)
+            {
+                TIME_STAGE(metrics::StageNames::kTALKER_GENERATION, stream);
+                rt::Tensor trailingView = makeTrailingView();
+                rt::Tensor const* trailingPtr = (state.trailingIdx > 0) ? &trailingView : nullptr;
+
+                if (!runSingleTalkerDecodeFrame(state.codecToken, talkerSamplingParams, predictorSamplingParams,
+                        trailingPtr, state.talkerFrames, seenTokenSet, numSeenTokens, repetitionPenalty, state.rvqCodes,
+                        stream))
+                {
+                    state.talkerError = true;
+                    return;
+                }
+                state.talkerFrames++;
+            }
+        }
+        else if (state.talkerPrefillDone && numAssistantTokens > prefillThreshold)
+        {
+            // Incremental: append new trailing token + run Talker decode step
+            if (state.trailingIdx >= maxTrailingLen - 1)
+            {
+                LOG_WARNING("Trailing buffer full (%d/%d), skipping token append", state.trailingIdx, maxTrailingLen);
+            }
+            else
+            {
+                appendTrailingToken(
+                    info.tokenId, thinkerEmbedTable, mStreamingTrailingHidden, state.trailingIdx, stream);
+                state.trailingIdx++;
+            }
+
+            if (state.codecToken != codecEosId && state.talkerFrames < maxAudioLength)
+            {
+                TIME_STAGE(metrics::StageNames::kTALKER_GENERATION, stream);
+                rt::Tensor trailingView = makeTrailingView();
+                rt::Tensor const* trailingPtr = (state.trailingIdx > 0) ? &trailingView : nullptr;
+
+                if (!runSingleTalkerDecodeFrame(state.codecToken, talkerSamplingParams, predictorSamplingParams,
+                        trailingPtr, state.talkerFrames, seenTokenSet, numSeenTokens, repetitionPenalty, state.rvqCodes,
+                        stream))
+                {
+                    state.talkerError = true;
+                    return;
+                }
+                state.talkerFrames++;
+
+                if (streamingConfig.codecChunkFrames > 0 && streamingConfig.onAudioChunkReady
+                    && (state.talkerFrames - state.lastChunkEnd) >= streamingConfig.codecChunkFrames)
+                {
+                    std::vector<std::vector<int32_t>> chunk(
+                        state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+                    streamingConfig.onAudioChunkReady(chunk);
+                    state.lastChunkEnd = state.talkerFrames;
+                }
+            }
+        }
+    };
+
+    // ===== Run Thinker with the callback installed =====
+    auto hiddenLayers = getThinkerHiddenLayerIndices();
+    thinkerRequest.generateAudio = true;
+    thinkerRequest.acceptHiddenLayer = hiddenLayers[1];
+    bool thinkerSuccess = thinkerRuntime.handleRequest(thinkerRequest, thinkerResponse, stream, true);
+
+    if (!thinkerSuccess)
+    {
+        LOG_ERROR("Thinker handleRequest failed in streaming pipeline");
+        return false;
+    }
+
+    // ===== After Thinker finishes: finalize trailing and flush remaining Talker frames =====
+    if (state.talkerPrefillDone && !state.talkerError)
+    {
+        if (state.trailingIdx < maxTrailingLen)
+        {
+            finalizeTrailing(mStreamingTrailingHidden, state.trailingIdx, stream);
+            state.trailingIdx++;
+        }
+        else
+        {
+            LOG_WARNING("Trailing buffer full, cannot append tts_eos");
+        }
+
+        LOG_INFO("Thinker done. Flushing remaining Talker frames (current: %d, codec=%d, trailingIdx=%d)",
+            state.talkerFrames, state.codecToken, state.trailingIdx);
+
+        rt::Tensor flushTrailingView = makeTrailingView();
+        rt::Tensor const* flushTrailingPtr = (state.trailingIdx > 0) ? &flushTrailingView : nullptr;
+
+        int32_t const chunkSize = streamingConfig.codecChunkFrames;
+
+        while (state.codecToken != codecEosId && state.talkerFrames < maxAudioLength)
+        {
+            {
+                TIME_STAGE(metrics::StageNames::kTALKER_GENERATION, stream);
+                if (!runSingleTalkerDecodeFrame(state.codecToken, talkerSamplingParams, predictorSamplingParams,
+                        flushTrailingPtr, state.talkerFrames, seenTokenSet, numSeenTokens, repetitionPenalty,
+                        state.rvqCodes, stream))
+                {
+                    break;
+                }
+            }
+            state.talkerFrames++;
+
+            if (chunkSize > 0 && streamingConfig.onAudioChunkReady
+                && (state.talkerFrames - state.lastChunkEnd) >= chunkSize)
+            {
+                std::vector<std::vector<int32_t>> chunk(
+                    state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+                streamingConfig.onAudioChunkReady(chunk);
+                state.lastChunkEnd = state.talkerFrames;
+            }
+        }
+
+        if (streamingConfig.onAudioChunkReady && state.lastChunkEnd < state.talkerFrames)
+        {
+            std::vector<std::vector<int32_t>> remainder(
+                state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+            streamingConfig.onAudioChunkReady(remainder);
+        }
+    }
+    else
+    {
+        LOG_WARNING("Thinker finished but Talker prefill was never triggered (only %zu assistant tokens)",
+            state.assistantTokens.size());
+    }
+
+    bool const hitEos = (state.codecToken == codecEosId);
+    LOG_INFO("Streaming pipeline: %d audio frames (exit: %s, codec=%d)", state.talkerFrames,
+        hitEos ? "EOS" : "maxAudioLength", state.codecToken);
+
+    talkerResponse.batchRvqCodes.push_back(std::move(state.rvqCodes));
+    talkerResponse.numFramesPerSample.push_back(state.talkerFrames);
+    talkerResponse.success = state.talkerPrefillDone && !state.talkerError;
+
+    mMultimodalMetrics.recordRun(0, 0, 1, state.talkerFrames);
+
+    if (getProfilingEnabled())
+    {
+        int32_t const codesPerFrame = mTalkerConfig.numCodeGroups;
+        auto talkerPrefillData = gTimer.getTimingData(metrics::StageNames::kTALKER_PREFILL);
+        float prefillMs = talkerPrefillData ? talkerPrefillData->getTotalGpuTimeMs() : 0.0f;
+
+        mOmniTalkerMetrics.recordRun(state.talkerFrames, state.talkerFrames * codesPerFrame, prefillMs,
+            state.talkerPrefillDone ? static_cast<int32_t>(state.assistantTokens.size() + 30) : 0,
+            hitEos ? "eos" : "max_length", true);
+
+        auto talkerGenData = gTimer.getTimingData(metrics::StageNames::kTALKER_GENERATION);
+        float talkerGenMs = talkerGenData ? talkerGenData->getTotalGpuTimeMs() : 0.0f;
+        float audioDurationS = static_cast<float>(state.talkerFrames * 1920) / 24000.0f;
+        mOmniLatencyMetrics.audioDurationSeconds = audioDurationS;
+        mOmniLatencyMetrics.audioSamples = static_cast<int64_t>(state.talkerFrames) * 1920;
+        mOmniLatencyMetrics.sampleRate = 24000;
+        mOmniLatencyMetrics.realTimeFactor = (talkerGenMs > 0.0f) ? (audioDurationS / (talkerGenMs / 1000.0f)) : 0.0f;
+    }
+
+    return true;
 }
 
 } // namespace rt

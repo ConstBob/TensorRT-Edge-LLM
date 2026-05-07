@@ -262,6 +262,9 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
                 mBaseEngineConfig.numDeepstackFeatures, mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength,
                 mBaseEngineConfig.hiddenSize);
         }
+        mOutputHiddenStates = rt::Tensor(
+            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.hiddenSize},
+            rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mOutputHiddenStates");
         mContextLengthsInput = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
             "LLMInferenceSpecDecodeRuntime::mContextLengthsInput");
         // Allocate mLogitsOutput with max capacity to support both draft (smaller vocab) and base (larger vocab)
@@ -526,9 +529,15 @@ void LLMInferenceSpecDecodeRuntime::setActionNoiseSeed(int32_t seed) noexcept
     }
 }
 
-bool LLMInferenceSpecDecodeRuntime::handleRequest(
-    LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
+bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response,
+    cudaStream_t stream, bool outputThinkerEmbeddings)
 {
+    // Clear per-request portal state. Buffers themselves stay allocated and are
+    // reshaped/overwritten when populated below — see getBaseModelHiddenStates() contract.
+    mHiddenStatesRegistry.clear();
+    mLastPrefillLength = 0;
+    mLastInputTokenIds.clear();
+
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
     bool const enableSpecDecode = (mDraftEngineRunner != nullptr) && !request.disableSpecDecode;
     std::string const& loraWeightsName = request.loraWeightsName;
@@ -594,6 +603,8 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     context.temperature = enableSpecDecode ? 1.0f : request.temperature;
     context.topP = enableSpecDecode ? 1.0f : request.topP;
     context.topK = enableSpecDecode ? 0 : request.topK;
+    context.outputThinkerEmbeddings = outputThinkerEmbeddings;
+    context.onTokenGenerated = request.onTokenGenerated;
 
     // The spec-decode path needs extra KV reserve for draft tokens during verification.
     constexpr int32_t kDRAFT_KVCACHE_RESERVE_LENGTH{100};
@@ -676,6 +687,40 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     {
         LOG_ERROR("Failed to execute prefill step for base model.");
         return false;
+    }
+
+    // Populate the base-model hidden-states portal so consumers (Qwen3-Omni Talker via
+    // streaming callback or post-handleRequest sequential consumer) can fetch the buffers
+    // by layer index. See getBaseModelHiddenStates() / getBaseModelInputTokenIds() for the
+    // lifetime contract.
+    int32_t prefillSequenceLength = 0;
+    if (outputThinkerEmbeddings)
+    {
+        prefillSequenceLength
+            = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
+
+        // Layer 0: back up post-multimodal input embeddings before the decode loop reshapes
+        // mInputsEmbeds to {BS,1,H} (scrambling the contiguous {BS,prefillLen,H} layout).
+        // Buffer is allocated once at maxISL and reshaped per request — see
+        // getBaseModelHiddenStates() lifetime contract.
+        if (mPrefillEmbedsBackup.isEmpty())
+        {
+            mPrefillEmbedsBackup = rt::Tensor(
+                {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.hiddenSize},
+                rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mPrefillEmbedsBackup");
+        }
+        check::check(
+            mPrefillEmbedsBackup.reshape({activeBatchSize, prefillSequenceLength, mBaseEngineConfig.hiddenSize}),
+            "Tensor reshape failed");
+        size_t const prefillBytes = static_cast<size_t>(activeBatchSize) * prefillSequenceLength
+            * mBaseEngineConfig.hiddenSize * sizeof(__half);
+        CUDA_CHECK(cudaMemcpyAsync(mPrefillEmbedsBackup.rawPointer(), mInputsEmbeds.rawPointer(), prefillBytes,
+            cudaMemcpyDeviceToDevice, stream));
+
+        mLastPrefillLength = prefillSequenceLength;
+        mLastInputTokenIds = context.rawBatchedInputIds;
+        mHiddenStatesRegistry[0] = &mPrefillEmbedsBackup;
+        // Layer N (acceptHiddenLayer) is registered after the engine-output reshape below.
     }
 
     // Lambda to check if all batches are finished
@@ -947,6 +992,17 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         }
     }
 
+    // Reshape engine-output hidden states to the actual prefill size and register layer N
+    // (acceptHiddenLayer) in the portal. mOutputHiddenStates / mPrefillEmbedsBackup are
+    // owned by the runtime; consumers fetch them via getBaseModelHiddenStates().
+    if (outputThinkerEmbeddings)
+    {
+        check::check(
+            mOutputHiddenStates.reshape({activeBatchSize, prefillSequenceLength, mBaseEngineConfig.hiddenSize}),
+            "Tensor reshape failed");
+        mHiddenStatesRegistry[request.acceptHiddenLayer] = &mOutputHiddenStates;
+    }
+
     return true;
 }
 
@@ -1210,7 +1266,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     }
     else
     {
-        // Standard embedding lookup
+        // Standard embedding lookup (pure text)
         kernel::embeddingLookup(
             mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
     }
@@ -1258,9 +1314,19 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
         }
     }
 
-    // Only request hidden states output when draft model needs them
-    rt::OptionalOutputTensor hiddenStatesOutput
-        = hasDraftModel() ? rt::OptionalOutputTensor{std::ref(mBaseHiddenStatesOutput)} : std::nullopt;
+    // Request hidden states output when draft model needs them or for Thinker embedding capture
+    rt::OptionalOutputTensor hiddenStatesOutput{std::nullopt};
+    if (hasDraftModel())
+    {
+        hiddenStatesOutput = std::ref(mBaseHiddenStatesOutput);
+    }
+    else if (context.outputThinkerEmbeddings)
+    {
+        int64_t const prefillSeqLen = mInputsEmbeds.getShape()[1];
+        check::check(mOutputHiddenStates.reshape({activeBatchSize, prefillSeqLen, mBaseEngineConfig.hiddenSize}),
+            "Tensor reshape failed");
+        hiddenStatesOutput = std::ref(mOutputHiddenStates);
+    }
     bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(
         mInputsEmbeds, mContextLengthsInput, deepstackEmbeds, mLogitsOutput, hiddenStatesOutput, context.stream);
     if (!prefillSuccess)
@@ -1303,6 +1369,16 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
         {
             context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
             context.currentGenerateLengths[i] += 1;
+
+            // Fire the per-token callback for the prefill-sampled token. runVanillaDecoding
+            // dispatches the callback for every decode token, so emitting here keeps the sequence
+            // complete for streaming consumers (e.g. the Qwen3-Omni Thinker-Talker pipeline).
+            if (context.onTokenGenerated.has_value())
+            {
+                bool const isFinished = context.finishedStates[i] != 0;
+                TokenCallbackInfo info{hostSelectedTokenIdsData[i], i, context.generationRound, isFinished};
+                context.onTokenGenerated.value()(info);
+            }
         }
     }
 
@@ -1788,6 +1864,13 @@ bool LLMInferenceSpecDecodeRuntime::runVanillaDecoding(SpecDecodeInferenceContex
     {
         context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
         context.currentGenerateLengths[i] += 1;
+
+        if (context.onTokenGenerated.has_value())
+        {
+            bool const isFinished = context.finishedStates[i] != 0;
+            TokenCallbackInfo info{hostSelectedTokenIdsData[i], i, context.generationRound, isFinished};
+            context.onTokenGenerated.value()(info);
+        }
     }
 
     return true;
