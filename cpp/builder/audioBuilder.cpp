@@ -134,8 +134,10 @@ bool AudioBuilder::build()
         break;
     }
     default:
+    {
         LOG_ERROR("Build type not determined. Check config.json for audio_config or code2wav_config.");
         return false;
+    }
     }
 
     // Print network information
@@ -153,9 +155,20 @@ bool AudioBuilder::build()
     bool profileSetup = false;
     switch (mBuildType)
     {
-    case AudioBuildType::AUDIO_ENCODER: profileSetup = setupAudioEncoderProfile(*builder, *config, *network); break;
-    case AudioBuildType::CODE2WAV: profileSetup = setupCode2WavProfile(*builder, *config, *network); break;
-    default: break;
+    case AudioBuildType::AUDIO_ENCODER:
+    {
+        profileSetup = setupAudioEncoderProfile(*builder, *config, *network);
+        break;
+    }
+    case AudioBuildType::CODE2WAV:
+    {
+        profileSetup = setupCode2WavProfile(*builder, *config, *network);
+        break;
+    }
+    default:
+    {
+        break;
+    }
     }
 
     if (!profileSetup)
@@ -452,8 +465,16 @@ bool AudioBuilder::setupCode2WavProfile(
     // Dispatch to model-specific setup based on model type
     switch (mModelType)
     {
-    case multimodal::ModelType::QWEN3_OMNI_CODE2WAV: result = setupQwen3OmniCode2WavProfile(*profile, network); break;
-    default: LOG_ERROR("Unsupported model type for Code2Wav: %d", static_cast<int>(mModelType)); return false;
+    case multimodal::ModelType::QWEN3_OMNI_CODE2WAV:
+    {
+        result = setupQwen3OmniCode2WavProfile(*profile, network);
+        break;
+    }
+    default:
+    {
+        LOG_ERROR("Unsupported model type for Code2Wav: %d", static_cast<int>(mModelType));
+        return false;
+    }
     }
 
     if (!result)

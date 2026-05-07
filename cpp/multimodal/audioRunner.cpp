@@ -492,6 +492,7 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
         LOG_DEBUG("Audio encoder inference completed");
 
         audioTokenLengths.push_back(totalAudioTokens);
+        mMultimodalMetrics.recordRun(0, 0, 1, totalAudioTokens);
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
