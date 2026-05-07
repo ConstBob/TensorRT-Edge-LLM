@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -405,10 +405,9 @@ def _fix_initializer_dtypes(
        out of the downgrade for weights that must stay FP32 (e.g.
        CodePredictor's ``down_proj``, see ``_DownProjFP32``).
 
-    3. **Mamba ssm_A → FP32**: ONNX constant folding may collapse the
-       ``A_log.to(float32) → exp → neg`` chain into a single initializer.
-       The ``update_ssm_state`` plugin requires its A input (position 1) to
-       be FP32, so any such initializer is kept (or restored to) FP32.
+    3. **Plugin FP32 inputs**: ONNX constant folding may collapse plugin
+       FP32 input expressions into initializers.  Any such initializer is
+       kept (or restored to) FP32 when the consuming plugin requires FP32.
     """
     import numpy as np
 
@@ -424,14 +423,19 @@ def _fix_initializer_dtypes(
     # - Mamba2 update_ssm_state: input[1] = ssm_A
     # - gated_delta_net: input[5] = A_log
     # - Nvfp4MoePlugin: input[11] = e_score_correction_bias
-    mamba_a_names: set = set()
+    # - NvFP4MoEPluginGeforce: inputs[4,7,8,9] are FP32 scale vectors
+    plugin_fp32_init_names: set = set()
     for node in model.graph.node:
         if node.op_type == "update_ssm_state" and len(node.input) > 1:
-            mamba_a_names.add(node.input[1])
+            plugin_fp32_init_names.add(node.input[1])
         if node.op_type == "gated_delta_net" and len(node.input) > 5:
-            mamba_a_names.add(node.input[5])
+            plugin_fp32_init_names.add(node.input[5])
         if node.op_type == "Nvfp4MoePlugin" and len(node.input) > 11:
-            mamba_a_names.add(node.input[11])
+            plugin_fp32_init_names.add(node.input[11])
+        if node.op_type == "NvFP4MoEPluginGeforce":
+            for input_idx in (4, 7, 8, 9):
+                if len(node.input) > input_idx:
+                    plugin_fp32_init_names.add(node.input[input_idx])
 
     def _is_preserved_fp32(init_name: str) -> bool:
         """Does ``init_name`` match any caller-supplied preserve pattern?"""
@@ -440,15 +444,16 @@ def _fix_initializer_dtypes(
     n_to_fp16 = 0
     n_to_fp32 = 0
     for init in model.graph.initializer:
-        # --- Mamba A: ensure FP32 ---
-        if init.name in mamba_a_names and init.data_type == 10:  # FP16
+        # --- Plugin-required FP32 input: ensure FP32 ---
+        if init.name in plugin_fp32_init_names and init.data_type == 10:  # FP16
             dims = list(init.dims)
             data = np.frombuffer(init.raw_data, dtype=np.float16).reshape(dims)
             init.data_type = 1  # FLOAT (FP32)
             init.raw_data = data.astype(np.float32).tobytes()
             n_to_fp32 += 1
-            logger.info("_fix_initializer_dtypes: %s %s FP16→FP32 (mamba A)",
-                        init.name, dims)
+            logger.info(
+                "_fix_initializer_dtypes: %s %s FP16→FP32 (plugin FP32 input)",
+                init.name, dims)
             continue
 
         # --- FP32 weight → FP16 ---
@@ -456,7 +461,7 @@ def _fix_initializer_dtypes(
             continue
         if init.data_type != 1:  # not FP32
             continue
-        if init.name in mamba_a_names:  # already FP32, must stay
+        if init.name in plugin_fp32_init_names:  # already FP32, must stay
             continue
         if _is_preserved_fp32(init.name):  # caller opted this init out
             logger.info(

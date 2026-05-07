@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -692,6 +692,50 @@ def _nvfp4_moe_plugin_translation(
     return output
 
 
+@script()
+def _nvfp4_moe_plugin_geforce_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_qweights: onnxscript.INT8,
+    fc1_blocks_scale: onnxscript.INT8,
+    fc1_alpha: onnxscript.FLOAT,
+    fc2_qweights: onnxscript.INT8,
+    fc2_blocks_scale: onnxscript.INT8,
+    fc2_alpha: onnxscript.FLOAT,
+    input_global_scale: onnxscript.FLOAT,
+    down_input_scale: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    backend: int,
+    io_dtype: int,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    output = _trt_edgellm.NvFP4MoEPluginGeforce(
+        router_logits,
+        hidden_states,
+        fc1_qweights,
+        fc1_blocks_scale,
+        fc1_alpha,
+        fc2_qweights,
+        fc2_blocks_scale,
+        fc2_alpha,
+        input_global_scale,
+        down_input_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        backend=backend,
+        io_dtype=io_dtype,
+        max_routed_rows=max_routed_rows,
+    )
+    return output
+
+
 def build_custom_translation_table() -> dict:
     """Return the ``custom_translation_table`` for ``torch.onnx.export(dynamo=True)``.
 
@@ -741,6 +785,8 @@ def build_custom_translation_table() -> dict:
         _int4_moe_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4MoePlugin.default:
         _nvfp4_moe_plugin_translation,
+        torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
+        _nvfp4_moe_plugin_geforce_translation,
         # TRT native attention ops (used by EdgeLLMAttentionTRTNative / Alpamayo)
         torch.ops.trt.rope_onnx.default:
         _rope_onnx_translation,
