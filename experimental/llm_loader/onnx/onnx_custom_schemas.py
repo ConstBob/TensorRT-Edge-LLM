@@ -1068,6 +1068,61 @@ _nvfp4_moe_plugin_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# trt_edgellm::NvFP4MoEPluginGeforce
+# ---------------------------------------------------------------------------
+
+_nvfp4_moe_plugin_geforce_schema = OpSchema(
+    name="NvFP4MoEPluginGeforce",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("GeForce CuTeDSL NVFP4 MoE plugin: FP16 hidden states, FP4 expert "
+         "weights, and FP8 block scales in 6D MMA layout."),
+    inputs=[
+        OpSchema.FormalParameter("router_logits", "T_ROUTER",
+                                 "Router logits [B*S, E] FP32"),
+        OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
+                                 "Hidden states [B, S, H] FP16"),
+        OpSchema.FormalParameter("fc1_qweights", "T_INT8",
+                                 "FC1 weights [E, N1, H/2] INT8"),
+        OpSchema.FormalParameter(
+            "fc1_blocks_scale", "T_INT8",
+            "FC1 block scales [E, m_tiles, k_tiles, 32, 4, 4] INT8"),
+        OpSchema.FormalParameter("fc1_alpha", "T_ROUTER",
+                                 "FC1 global weight scales [E] FP32"),
+        OpSchema.FormalParameter("fc2_qweights", "T_INT8",
+                                 "FC2 weights [E, H, I/2] INT8"),
+        OpSchema.FormalParameter(
+            "fc2_blocks_scale", "T_INT8",
+            "FC2 block scales [E, m_tiles, k_tiles, 32, 4, 4] INT8"),
+        OpSchema.FormalParameter("fc2_alpha", "T_ROUTER",
+                                 "FC2 global weight scales [E] FP32"),
+        OpSchema.FormalParameter("input_global_scale", "T_ROUTER",
+                                 "FC1 activation scales [E] FP32"),
+        OpSchema.FormalParameter("down_input_scale", "T_ROUTER",
+                                 "FC2 activation scales [E] FP32"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter("output", "T_HIDDEN",
+                                 "Output [B, S, H] FP16"),
+    ],
+    type_constraints=[
+        ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
+        ("T_HIDDEN", ["tensor(float16)"], "FP16 tensors"),
+        ("T_INT8", ["tensor(int8)"], "INT8 byte tensors"),
+    ],
+    attributes=[
+        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
+        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
+        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("backend", OpSchema.AttrType.INT),
+        OpSchema.Attribute("io_dtype", OpSchema.AttrType.INT),
+        OpSchema.Attribute("max_routed_rows", OpSchema.AttrType.INT),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
     _vit_attention_plugin_schema,
@@ -1084,6 +1139,7 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
+    _nvfp4_moe_plugin_geforce_schema,
 )
 
 _registered_llm_loader_schemas: bool = False

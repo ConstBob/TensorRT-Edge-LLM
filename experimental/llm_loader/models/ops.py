@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -763,4 +763,41 @@ def _(router_logits, hidden_states, hidden_global_scale, up_weights,
       e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
       activation_type, n_group, topk_group, norm_topk_prob,
       routed_scaling_factor, routing_mode):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::NvFP4MoEPluginGeforce
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::NvFP4MoEPluginGeforce", mutates_args=())
+def nvfp4_moe_plugin_geforce(
+    router_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_qweights: torch.Tensor,
+    fc1_blocks_scale: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_qweights: torch.Tensor,
+    fc2_blocks_scale: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    backend: int,
+    io_dtype: int,
+    max_routed_rows: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@nvfp4_moe_plugin_geforce.register_fake
+def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
+      fc2_qweights, fc2_blocks_scale, fc2_alpha, input_global_scale,
+      down_input_scale, num_experts, top_k, hidden_size, moe_inter_size,
+      activation_type, backend, io_dtype, max_routed_rows):
     return torch.empty_like(hidden_states)
