@@ -131,31 +131,23 @@ class GdnMixer(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
 
-        # Fused QKV projection -> conv1d input
-        self.in_proj_qkv = make_linear(
+        # Fuse all 4 GDN input projections (QKV, Z, beta, alpha) into a
+        # single GEMM.  For NVFP4 this eliminates 3 of 4 TRT_FP4Dynamic-
+        # Quantize kernels per layer (DQ fuses into the single GEMM).
+        # For FP16 performance is neutral (within run-to-run noise).
+        # Checkpoint stores 4 separate weights; the loader concatenates
+        # them along the output dimension into in_proj_fused (see loader.py).
+        fused_out_dim = (gc.conv_dim + gc.value_dim + gc.num_value_heads +
+                         gc.num_value_heads)
+        self.in_proj_fused = make_linear(
             config,
             hidden_size,
-            gc.conv_dim,
+            fused_out_dim,
             bias=False,
-            module_name=f"{module_prefix}.in_proj_qkv")
-        # Gate z projection -> value_dim
-        self.in_proj_z = make_linear(config,
-                                     hidden_size,
-                                     gc.value_dim,
-                                     bias=False,
-                                     module_name=f"{module_prefix}.in_proj_z")
-        # Beta projection -> num_value_heads
-        self.in_proj_b = make_linear(config,
-                                     hidden_size,
-                                     gc.num_value_heads,
-                                     bias=False,
-                                     module_name=f"{module_prefix}.in_proj_b")
-        # Alpha projection -> num_value_heads
-        self.in_proj_a = make_linear(config,
-                                     hidden_size,
-                                     gc.num_value_heads,
-                                     bias=False,
-                                     module_name=f"{module_prefix}.in_proj_a")
+            module_name=f"{module_prefix}.in_proj_fused")
+        self._fused_splits: List[int] = [
+            gc.conv_dim, gc.value_dim, gc.num_value_heads, gc.num_value_heads
+        ]
 
         self.conv1d = Conv1dBuffers(gc.conv_dim, gc.conv_kernel)
 
@@ -195,11 +187,9 @@ class GdnMixer(nn.Module):
                torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # 1. Input projections
-        mixed_qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        # 1. Fused input projection -> split into QKV, gate_z, beta, alpha
+        fused_out = self.in_proj_fused(hidden_states)
+        mixed_qkv, z, b, a = fused_out.split(self._fused_splits, dim=-1)
 
         # 2. Causal conv1d (no activation baked in)
         conv_outputs = causal_conv1d(
