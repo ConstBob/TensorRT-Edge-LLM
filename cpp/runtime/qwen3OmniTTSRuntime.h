@@ -242,6 +242,39 @@ public:
         return handleAudioGenerationFromThinker(std::vector<OmniGenerationRequest>{request}, response, stream);
     }
 
+    // ========== Thinker-Talker Streaming Pipeline ==========
+
+    /*!
+     * @brief Configuration for Thinker→Talker streaming pipeline
+     */
+    using AudioChunkCallback = std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes)>;
+
+    struct ThinkerTalkerStreamingConfig
+    {
+        int32_t talkerPrefillThreshold{4};    //!< Start Talker prefill after this many assistant tokens
+        int32_t codecChunkFrames{0};          //!< Vocode every N frames during flush (0 = disabled)
+        AudioChunkCallback onAudioChunkReady; //!< Called with chunk RVQ codes [frames][16] when ready
+    };
+
+    /*!
+     * @brief Streaming generation: Thinker and Talker run interleaved on the same CUDA stream
+     *
+     * Uses LLMGenerationRequest::onTokenGenerated to receive per-token callbacks from
+     * the Thinker's decode loop. When enough assistant tokens accumulate, Talker prefill
+     * is triggered. Subsequent Thinker tokens incrementally extend trailing_text_hidden,
+     * and Talker decode steps are interleaved.
+     *
+     * @param thinkerRuntime  Thinker LLM runtime (will call handleRequest internally)
+     * @param thinkerRequest  Thinker request (onTokenGenerated will be overwritten)
+     * @param streamingConfig  Pipeline tuning parameters
+     * @param talkerResponse  Output: generated RVQ codes
+     * @param stream  CUDA stream (shared by Thinker and Talker)
+     * @return True if the full pipeline succeeded
+     */
+    bool handleStreamingGeneration(LLMInferenceSpecDecodeRuntime& thinkerRuntime, LLMGenerationRequest& thinkerRequest,
+        LLMGenerationResponse& thinkerResponse, ThinkerTalkerStreamingConfig const& streamingConfig,
+        OmniGenerationRequest const& omniBaseRequest, TalkerGenerationResponse& talkerResponse, cudaStream_t stream);
+
     /*!
      * @brief Get performance metrics for Talker pipeline (legacy, for backward compat)
      * @return Reference to metrics object
@@ -355,6 +388,18 @@ private:
         SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
         float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
         std::vector<int64_t> const& prefillSeqLens = {});
+
+    /*!
+     * @brief Run a single Talker decode frame (used by the Thinker-Talker streaming path).
+     *
+     * Single-frame variant of runTalkerGenerationLoop's inner step. Called from inside the
+     * Thinker decode callback to interleave Talker frames with Thinker tokens on the same
+     * CUDA stream. Operates on batch=1 internally.
+     */
+    bool runSingleTalkerDecodeFrame(int32_t& codecToken, SamplingParams const& talkerSamplingParams,
+        SamplingParams const& predictorSamplingParams, rt::Tensor const* trailingPtr, int32_t frameIdx,
+        std::unordered_set<int32_t>& seenTokenSet, int32_t& numSeenTokens, float repetitionPenalty,
+        std::vector<std::vector<int32_t>>& rvqCodes, cudaStream_t stream);
 
     // ========== Segment Parsing and Prefill Construction ==========
 
@@ -498,7 +543,7 @@ private:
     std::vector<rt::Tensor>
         mCodePredictorEmbeddingTables; //!< CodePredictor embedding tables (mNumRvqLayers) [codebookSize, hiddenSize]
 
-    // CodePredictor LM Heads (bound via setLMHeadWeights before each decode step)
+    // CodePredictor LM Heads (bound via setLmHeadWeight before each decode step)
     // ONNX has lm_head_weight as a dynamic input tensor, switched per RVQ layer
     std::vector<rt::Tensor>
         mCodePredictorLmHeadWeights; //!< CodePredictor lm_head weights (mNumRvqLayers) [vocabSize, hiddenSize]
@@ -629,16 +674,33 @@ private:
     // ========== Incremental Trailing Hidden Helpers (for Thinker-Talker streaming) ==========
 
     /*!
+     * @brief Project a single token through text_projection and write to trailingTextHidden
+     *
+     * Performs: embed_tokens(tokenId) → text_projection(embed) → trailingTextHidden[trailingIdx]
+     * Uses pre-allocated mStreamingTokenId / mStreamingTokenEmbed / mStreamingMlpWork buffers
+     * to avoid per-call cudaMalloc overhead.
+     */
+    void appendTrailingToken(int32_t tokenId, rt::Tensor const& thinkerEmbedTable, rt::Tensor& trailingTextHidden,
+        int32_t trailingIdx, cudaStream_t stream);
+
+    /*!
      * @brief Append tts_eos embedding at the end of trailingTextHidden
      */
     void finalizeTrailing(rt::Tensor& trailingTextHidden, int32_t trailingIdx, cudaStream_t stream);
 
-    // Pre-allocated trailing text hidden buffer for Omni multi-batch path:
-    // [maxBS, maxSeqLen+1, H] — each batch has its own trailing region.
+    // Pre-allocated trailing text hidden buffer (shared by streaming and non-streaming Omni paths)
+    // Non-streaming multi-batch: [maxBS, maxSeqLen+1, H] — each batch has its own trailing region
+    // Streaming (batch=1): uses slot 0 only
     rt::Tensor mStreamingTrailingHidden; //!< [maxBS * (maxSeqLen+1), talkerHiddenSize] FP16 GPU
 
     // Pre-allocated gather/scatter index buffer for multimodal token projection
     rt::Tensor mGatherIndicesBuffer; //!< [maxSeqLen] INT32 GPU — indices for invokeGather/invokeScatter
+
+    // Pre-allocated single-token workspace for appendTrailingToken (avoids per-call cudaMalloc)
+    rt::Tensor mStreamingTokenId;    //!< [1, 1] INT32 GPU — single token ID upload buffer
+    rt::Tensor mStreamingTokenEmbed; //!< [1, thinkerHiddenSize] FP16 GPU — embedding lookup result
+    rt::Tensor mStreamingProjOut;    //!< [1, talkerHiddenSize] FP16 GPU — text_projection output
+    rt::Tensor mStreamingMlpWork;    //!< [1, thinkerHiddenSize] FP16 GPU — MLP intermediate
 };
 
 } // namespace rt

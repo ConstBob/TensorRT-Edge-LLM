@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -57,6 +58,19 @@ struct Message
 // of shared_ptr<StreamChannel>, which only needs a forward declaration here —
 // consumers that actually manipulate channels include `runtime/streaming.h`.
 class StreamChannel;
+
+/*! \brief Per-token callback info delivered during Thinker decode */
+struct TokenCallbackInfo
+{
+    int32_t tokenId;        //!< Sampled token ID
+    int32_t batchIdx;       //!< Batch index (0-based)
+    int32_t generationStep; //!< Decode iteration (0-based)
+    bool isFinished;        //!< True when this batch element hit EOS
+};
+
+/*! \brief Per-token callback type for streaming Thinker output.
+ *  Invoked inside the decode loop after cudaStreamSynchronize. */
+using TokenCallback = std::function<void(TokenCallbackInfo const&)>;
 
 /*! \brief LLM Generation Request structure
  */
@@ -111,6 +125,18 @@ struct LLMGenerationRequest
     //! to opt out on a per-slot basis. Channels must not already be finished or concurrently
     //! attached to another in-flight request.
     std::vector<std::shared_ptr<StreamChannel>> streamChannels;
+
+    // Audio generation flag (Qwen3-Omni Talker)
+    bool generateAudio{false};
+    //!< Whether to enable hidden states capture for Talker pipeline
+
+    int32_t acceptHiddenLayer{0};
+    //!< Hidden layer index for Talker (from talker_config.accept_hidden_layer)
+
+    //! Optional per-token callback invoked after each decode step.
+    //! Called after cudaStreamSynchronize inside the decode loop.
+    //! When nullopt (default), zero overhead — no callback is invoked.
+    std::optional<TokenCallback> onTokenGenerated;
 };
 
 /*! \brief LLM Generation Response structure
@@ -121,6 +147,8 @@ struct LLMGenerationResponse
     std::vector<std::string> outputTexts;        //!< Generated text strings for each request in the batch
     //!< Future trajectory waypoints (e.g. accel, kappa) per batch item; populated when action engine is used
     std::vector<std::vector<FutureTrajectoryPoint>> outputTrajectories;
+
+    std::vector<rt::audioUtils::AudioData> outputAudios; //!< Generated audio data (Qwen3-Omni only)
 };
 
 /*! \brief RoPE (Rotary Position Embedding) type enumeration
