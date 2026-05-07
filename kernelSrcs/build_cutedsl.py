@@ -171,6 +171,11 @@ KERNEL_VARIANTS = [
         script_args=["--export_only", "--dim", "64", "--dstate", "64"],
     ),
     # --- SSD Blackwell variants ---
+    # Two has_init_states modes per (D, N): the default variant assumes the SSM state
+    # at chunk 0 is zero (fast path; covers all current Nemotron-H prefill calls). The
+    # `_init_states` variant accepts an optional user-provided initial hidden state at
+    # chunk 0, used when prefill carries SSM state across calls (continuous batching,
+    # multi-call prefill) or by the SsdCuteDslBlackwellChunkedPrefill unit test.
     KernelVariant(
         name="ssd_prefill_blackwell_d64_n128",
         group="ssd",
@@ -179,11 +184,31 @@ KERNEL_VARIANTS = [
         script_args=["--export_only", "--dim", "64", "--dstate", "128"],
     ),
     KernelVariant(
+        name="ssd_prefill_blackwell_d64_n128_init_states",
+        group="ssd",
+        supported_sms=[100, 101, 110],
+        script="ssd_cutedsl/ssd_prefill_blackwell.py",
+        script_args=["--export_only", "--dim", "64", "--dstate", "128",
+                     "--has_init_states",
+                     "--file_name", "ssd_prefill_blackwell_d64_n128_init_states",
+                     "--function_prefix", "ssd_prefill_blackwell_d64_n128_init_states"],
+    ),
+    KernelVariant(
         name="ssd_prefill_blackwell_d64_n64",
         group="ssd",
         supported_sms=[100, 101, 110],
         script="ssd_cutedsl/ssd_prefill_blackwell.py",
         script_args=["--export_only", "--dim", "64", "--dstate", "64"],
+    ),
+    KernelVariant(
+        name="ssd_prefill_blackwell_d64_n64_init_states",
+        group="ssd",
+        supported_sms=[100, 101, 110],
+        script="ssd_cutedsl/ssd_prefill_blackwell.py",
+        script_args=["--export_only", "--dim", "64", "--dstate", "64",
+                     "--has_init_states",
+                     "--file_name", "ssd_prefill_blackwell_d64_n64_init_states",
+                     "--function_prefix", "ssd_prefill_blackwell_d64_n64_init_states"],
     ),
     # --- FMHA group ---
     KernelVariant(
