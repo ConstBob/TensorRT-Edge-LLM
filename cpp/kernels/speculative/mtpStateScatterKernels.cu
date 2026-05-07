@@ -43,6 +43,7 @@
 
 #include "kernels/common/vectorizedTypes.cuh"
 
+#include "common/checkMacros.h"
 #include <stdexcept>
 
 namespace trt_edgellm
@@ -125,10 +126,7 @@ void launchScatter(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int3
     }
 
     constexpr int32_t kVecSize = DVec<T>::vec_size;
-    if (stateElements % kVecSize != 0)
-    {
-        throw std::runtime_error("mtpStateScatter: stateElements must be divisible by DVec vec_size (8)");
-    }
+    ELLM_CHECK(stateElements % kVecSize == 0, "stateElements must be divisible by DVec vec_size (8)");
 
     int32_t const vecCount = stateElements / kVecSize;
 

@@ -45,19 +45,13 @@ NemotronOmniAudioRunner::NemotronOmniAudioRunner(std::string const& engineDir, c
 
     mAudioContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mAudioEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    if (!mAudioContext->setOptimizationProfileAsync(0, stream))
-    {
-        throw std::runtime_error("Failed to set optimization profile for audio engine");
-    }
+    bool const profileSet = mAudioContext->setOptimizationProfileAsync(0, stream);
+    ELLM_CHECK(profileSet, "Failed to set optimization profile for audio engine");
 
-    if (!validateAndFillConfig(engineDir))
-    {
-        throw std::runtime_error("NemotronOmniAudioRunner: Failed to validate config");
-    }
-    if (!allocateBuffer(stream))
-    {
-        throw std::runtime_error("NemotronOmniAudioRunner: Failed to allocate buffer");
-    }
+    bool const configValid = validateAndFillConfig(engineDir);
+    ELLM_CHECK(configValid, "NemotronOmniAudioRunner: Failed to validate config");
+    bool const bufferAllocated = allocateBuffer(stream);
+    ELLM_CHECK(bufferAllocated, "NemotronOmniAudioRunner: Failed to allocate buffer");
 }
 
 bool NemotronOmniAudioRunner::validateAndFillConfig(std::string const& engineDir)

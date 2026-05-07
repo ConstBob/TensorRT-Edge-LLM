@@ -110,20 +110,14 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
         : std::filesystem::path(tokenizerDir);
     LOG_INFO("  Tokenizer: %s", tokenizerPath.string().c_str());
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
-    if (!mTokenizer->loadFromHF(tokenizerPath))
-    {
-        throw std::runtime_error("Failed to load tokenizer from: " + tokenizerPath.string());
-    }
+    bool const tokenizerLoaded = mTokenizer->loadFromHF(tokenizerPath);
+    ELLM_CHECK(tokenizerLoaded, "Failed to load tokenizer from: " + tokenizerPath.string());
 
-    if (!validateAndFillConfig(talkerEngineDir))
-    {
-        throw std::runtime_error("Failed to validate and fill config");
-    }
+    bool const configValid = validateAndFillConfig(talkerEngineDir);
+    ELLM_CHECK(configValid, "Failed to validate and fill config");
 
-    if (!initializeEngineRunners(talkerEngineDir, codePredictorEngineDir))
-    {
-        throw std::runtime_error("Failed to initialize engine runners");
-    }
+    bool const runnersInitialized = initializeEngineRunners(talkerEngineDir, codePredictorEngineDir);
+    ELLM_CHECK(runnersInitialized, "Failed to initialize engine runners");
 
     // Setup shared execution context memory for Talker and CodePredictor engines.
     // LLMEngineRunner uses kUSER_MANAGED allocation and requires setContextMemory() before execution.
@@ -135,14 +129,10 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
             static_cast<size_t>(sharedCtxSize), static_cast<size_t>(talkerCtxSize), static_cast<size_t>(cpCtxSize));
         mSharedExecContextMemory = rt::Tensor({sharedCtxSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
             "Qwen3OmniTTSRuntime::mSharedExecContextMemory");
-        if (!mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory))
-        {
-            throw std::runtime_error("Failed to set context memory for Talker LLM engine");
-        }
-        if (mCodePredictorRunner && !mCodePredictorRunner->setContextMemory(mSharedExecContextMemory))
-        {
-            throw std::runtime_error("Failed to set context memory for CodePredictor engine");
-        }
+        bool const talkerCtxSet = mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory);
+        ELLM_CHECK(talkerCtxSet, "Failed to set context memory for Talker LLM engine");
+        ELLM_CHECK(!mCodePredictorRunner || mCodePredictorRunner->setContextMemory(mSharedExecContextMemory),
+            "Failed to set context memory for CodePredictor engine");
     }
 
     // Determine max batch size from engine configs (use the minimum of Talker and CodePredictor)
@@ -151,27 +141,19 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
     LOG_INFO("Max batch size: %d (Talker=%d, CodePredictor=%d)", mMaxBatchSize, mTalkerLLMConfig.maxSupportedBatchSize,
         mCodePredictorConfig.maxSupportedBatchSize);
 
-    if (!loadCodePredictorWeights(codePredictorEngineDir))
-    {
-        throw std::runtime_error("Failed to load CodePredictor weights");
-    }
+    bool const codePredictorWeightsLoaded = loadCodePredictorWeights(codePredictorEngineDir);
+    ELLM_CHECK(codePredictorWeightsLoaded, "Failed to load CodePredictor weights");
 
 #ifdef CUTE_DSL_GEMM_ENABLED
-    if (!CuteDslGemmRunner::loadKernelModule())
-    {
-        throw std::runtime_error("Failed to load CuTe DSL GEMM kernel module");
-    }
+    bool const cuteDslLoaded = CuteDslGemmRunner::loadKernelModule();
+    ELLM_CHECK(cuteDslLoaded, "Failed to load CuTe DSL GEMM kernel module");
 #endif
 
-    if (!allocateBuffer())
-    {
-        throw std::runtime_error("Failed to allocate buffers");
-    }
+    bool const bufferAllocated = allocateBuffer();
+    ELLM_CHECK(bufferAllocated, "Failed to allocate buffers");
 
-    if (!loadTalkerWeights(talkerEngineDir, stream))
-    {
-        throw std::runtime_error("Failed to load Talker weights");
-    }
+    bool const talkerWeightsLoaded = loadTalkerWeights(talkerEngineDir, stream);
+    ELLM_CHECK(talkerWeightsLoaded, "Failed to load Talker weights");
 
     // Load text embedding table (thinker vocab).
     // Used for standalone TTS and for projecting TTS special tokens.
@@ -183,10 +165,8 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
             : std::filesystem::path(talkerEngineDir) / "text_embedding.safetensors";
         LOG_INFO("Loading text embedding from: %s", textEmbedPath.string().c_str());
         std::vector<rt::Tensor> textEmbedTensors;
-        if (!safetensors::loadSafetensors(textEmbedPath, textEmbedTensors, stream))
-        {
-            throw std::runtime_error("Failed to load text embedding from: " + textEmbedPath.string());
-        }
+        bool const textEmbedLoaded = safetensors::loadSafetensors(textEmbedPath, textEmbedTensors, stream);
+        ELLM_CHECK(textEmbedLoaded, "Failed to load text embedding from: " + textEmbedPath.string());
         check::check(!textEmbedTensors.empty(), "text embedding file is empty");
         check::check(textEmbedTensors[0].getShape().getNumDims() == 2,
             "text embedding tensor should be 2D [vocabSize, hiddenSize]");
@@ -203,10 +183,8 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
         std::filesystem::path const embedPath
             = std::filesystem::path(codePredictorEngineDir) / "codec_embeddings.safetensors";
         std::vector<rt::Tensor> allEmbedTensors;
-        if (!safetensors::loadSafetensors(embedPath, allEmbedTensors, stream))
-        {
-            throw std::runtime_error("Failed to load codec_embeddings.safetensors from: " + embedPath.string());
-        }
+        bool const codecEmbedLoaded = safetensors::loadSafetensors(embedPath, allEmbedTensors, stream);
+        ELLM_CHECK(codecEmbedLoaded, "Failed to load codec_embeddings.safetensors from: " + embedPath.string());
         check::check(static_cast<int32_t>(allEmbedTensors.size()) == mNumRvqLayers,
             "codec_embeddings.safetensors has " + std::to_string(allEmbedTensors.size()) + " tensors, expected "
                 + std::to_string(mNumRvqLayers) + " (num_code_groups - 1)");
@@ -713,21 +691,17 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::initializeTTSEmbeddings", nvtx_colors::YELLOW);
 
     auto const shape = mTextEmbeddingTable.getShape();
-    if (shape.getNumDims() != 2)
-    {
-        throw std::runtime_error("Text embedding table must be 2D, got " + std::to_string(shape.getNumDims()) + "D");
-    }
+    ELLM_CHECK(
+        shape.getNumDims() == 2, "Text embedding table must be 2D, got " + std::to_string(shape.getNumDims()) + "D");
 
     int64_t const vocabSize = shape[0];
     int64_t const thinkerHiddenSize = shape[1];
 
-    if (mTalkerConfig.ttsPadTokenId >= vocabSize || mTalkerConfig.ttsBosTokenId >= vocabSize
-        || mTalkerConfig.ttsEosTokenId >= vocabSize)
-    {
-        throw std::runtime_error("TTS token IDs out of vocab range: pad=" + std::to_string(mTalkerConfig.ttsPadTokenId)
+    ELLM_CHECK(mTalkerConfig.ttsPadTokenId < vocabSize && mTalkerConfig.ttsBosTokenId < vocabSize
+            && mTalkerConfig.ttsEosTokenId < vocabSize,
+        "TTS token IDs out of vocab range: pad=" + std::to_string(mTalkerConfig.ttsPadTokenId)
             + ", bos=" + std::to_string(mTalkerConfig.ttsBosTokenId)
             + ", eos=" + std::to_string(mTalkerConfig.ttsEosTokenId) + ", vocabSize=" + std::to_string(vocabSize));
-    }
 
     constexpr int32_t kNumTtsTokens = 3;
     std::vector<int32_t> const hostTtsIds

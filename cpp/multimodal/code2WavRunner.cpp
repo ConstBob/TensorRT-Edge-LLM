@@ -45,43 +45,27 @@ namespace rt
 
 Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream)
 {
-    if (!validateAndFillConfig(engineDir))
-    {
-        throw std::runtime_error("Failed to validate and fill config");
-    }
+    bool const configValid = validateAndFillConfig(engineDir);
+    ELLM_CHECK(configValid, "Failed to validate and fill config");
 
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-    if (!mRuntime)
-    {
-        throw std::runtime_error("Failed to create TensorRT runtime");
-    }
+    ELLM_CHECK(mRuntime, "Failed to create TensorRT runtime");
 
     std::string const code2wavEnginePath = engineDir + "/code2wav.engine";
-    if (!std::filesystem::exists(code2wavEnginePath))
-    {
-        throw std::runtime_error("Code2Wav engine not found at " + code2wavEnginePath);
-    }
+    ELLM_CHECK(std::filesystem::exists(code2wavEnginePath), "Code2Wav engine not found at " + code2wavEnginePath);
 
     try
     {
         auto mmapReader = std::make_unique<file_io::MmapReader>(code2wavEnginePath);
         mCode2WavEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
             mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-        if (!mCode2WavEngine)
-        {
-            throw std::runtime_error("Failed to deserialize Code2Wav engine");
-        }
+        ELLM_CHECK(mCode2WavEngine, "Failed to deserialize Code2Wav engine");
 
         mCode2WavContext = std::unique_ptr<nvinfer1::IExecutionContext>(mCode2WavEngine->createExecutionContext());
-        if (!mCode2WavContext)
-        {
-            throw std::runtime_error("Failed to create Code2Wav execution context");
-        }
+        ELLM_CHECK(mCode2WavContext, "Failed to create Code2Wav execution context");
 
-        if (!mCode2WavContext->setOptimizationProfileAsync(0, stream))
-        {
-            throw std::runtime_error("Failed to set optimization profile");
-        }
+        bool const profileSet = mCode2WavContext->setOptimizationProfileAsync(0, stream);
+        ELLM_CHECK(profileSet, "Failed to set optimization profile");
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
     catch (std::exception const& e)
@@ -90,10 +74,8 @@ Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream
         throw;
     }
 
-    if (!allocateBuffer())
-    {
-        throw std::runtime_error("Failed to allocate buffers");
-    }
+    bool const bufferAllocated = allocateBuffer();
+    ELLM_CHECK(bufferAllocated, "Failed to allocate buffers");
 
     LOG_INFO("Code2Wav runner initialized successfully");
 }

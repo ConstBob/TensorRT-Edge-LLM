@@ -144,40 +144,24 @@ Alpamayo1ActionRunner::Alpamayo1ActionRunner(
 
     // Load runtime and deserialize engine.
     mRuntime = std::unique_ptr<IRuntime>(createInferRuntime(gLogger));
-    if (!mRuntime)
-    {
-        throw std::runtime_error("Failed to create TensorRT runtime");
-    }
+    ELLM_CHECK(mRuntime, "Failed to create TensorRT runtime");
 
     auto mmapReader = std::make_unique<file_io::MmapReader>(actionEnginePath);
-    if (mmapReader->getData() == nullptr)
-    {
-        throw std::runtime_error("Failed to read engine file: " + actionEnginePath);
-    }
+    ELLM_CHECK(mmapReader->getData() != nullptr, "Failed to read engine file: " + actionEnginePath);
 
     mEngine
         = std::unique_ptr<ICudaEngine>(mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-    if (!mEngine)
-    {
-        throw std::runtime_error("Failed to deserialize engine from: " + actionEnginePath);
-    }
+    ELLM_CHECK(mEngine, "Failed to deserialize engine from: " + actionEnginePath);
 
     mContext = std::unique_ptr<IExecutionContext>(
         mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    if (!mContext)
-    {
-        throw std::runtime_error("Failed to create execution context");
-    }
+    ELLM_CHECK(mContext, "Failed to create execution context");
 
-    if (!mContext->setOptimizationProfileAsync(0, stream))
-    {
-        throw std::runtime_error("Failed to set optimization profile");
-    }
+    bool const profileSet = mContext->setOptimizationProfileAsync(0, stream);
+    ELLM_CHECK(profileSet, "Failed to set optimization profile");
 
-    if (!parseModelConfig(engineDir + "/config.json"))
-    {
-        throw std::runtime_error("Failed to parse model config");
-    }
+    bool const configParsed = parseModelConfig(engineDir + "/config.json");
+    ELLM_CHECK(configParsed, "Failed to parse model config");
 
     try
     {
