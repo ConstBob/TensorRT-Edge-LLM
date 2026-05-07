@@ -293,16 +293,17 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         int32_t const seqLen = static_cast<int32_t>(xDesc.dims.d[1]);
 
 #ifdef CUTE_DSL_SSD_ENABLED
-        // CuTe DSL path: chunked SSD prefill (requires seq_len >= 128, multiple of chunk_size).
-        // Falls back to serial scan when context_lengths indicates variable-length sequences,
-        // since the CuTe DSL kernel always processes the full seq_len without per-batch masking.
+        // CuTe DSL path: chunked SSD prefill, requires seq_len >= 128.
         bool usedCuteDsl = false;
         {
             int32_t const smVersion = getSMVersion();
-            bool const hasContextLengths = (seqLen > 1 && inputs[kIN_CONTEXT_LENGTHS_IDX] != nullptr);
-            if (trt_edgellm::CuteDslSSDRunner::canImplement(mDim, mDstate, smVersion) && seqLen >= 128
-                && !hasContextLengths)
+            if (trt_edgellm::CuteDslSSDRunner::canImplement(mDim, mDstate, smVersion) && seqLen >= 128)
             {
+                if (!trt_edgellm::CuteDslSSDRunner::loadKernelModules())
+                {
+                    LOG_ERROR("Failed to load CuTe DSL SSD kernel modules");
+                    return -1;
+                }
                 trt_edgellm::CuteDslSSDRunner runner;
                 trt_edgellm::SSDParams ssdParams{};
                 ssdParams.x = const_cast<void*>(inputs[kIN_X_IDX]);
@@ -326,6 +327,10 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
                 ssdParams.dt_softplus = dt_softplus;
                 ssdParams.has_D = (inputs[kIN_D_IDX] != nullptr);
                 ssdParams.has_z = false;
+                ssdParams.context_lengths = inputs[kIN_CONTEXT_LENGTHS_IDX];
+                // Fresh-prefill contract: state arrives zeroed. Chunked prefill needs a
+                // builder attribute to flip this on per-call.
+                ssdParams.has_init_states = false;
                 int const rc = runner.run(ssdParams, stream);
                 if (rc != 0)
                 {
@@ -339,6 +344,8 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 #endif
         {
             // Only use context_lengths for actual prefill (seqLen > 1).
+            // During decode, x is 4D with seqLen=1 but context_lengths holds the
+            // cumulative length which would cause an out-of-bounds scan.
             rt::OptionalInputTensor contextLengthsOpt = std::nullopt;
             std::optional<rt::Tensor> clTensorOpt;
             if (seqLen > 1 && inputs[kIN_CONTEXT_LENGTHS_IDX])
