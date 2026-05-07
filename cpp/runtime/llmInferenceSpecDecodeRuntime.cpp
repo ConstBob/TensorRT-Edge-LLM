@@ -197,10 +197,8 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         LOG_INFO("Runtime batch size set to: %d (vanilla mode, base engine max)", mMaxRuntimeBatchSize);
     }
 
-    if (mBaseEngineConfig.numDeepstackFeatures > 0 && multimodalEngineDir.empty())
-    {
-        throw std::runtime_error("--multimodalEngineDir is required for VLM engine.");
-    }
+    ELLM_CHECK(mBaseEngineConfig.numDeepstackFeatures <= 0 || !multimodalEngineDir.empty(),
+        "--multimodalEngineDir is required for VLM engine.");
 
     // Allocate runtime tensors till max supported size.
     bool const hasDraft = (mDraftEngineRunner != nullptr);
@@ -447,10 +445,7 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         }
 
         // At least one multimodal runner must be available
-        if (!mAudioRunner && !mVisionRunner)
-        {
-            throw std::runtime_error("No valid multimodal engine found in " + multimodalEngineDir);
-        }
+        ELLM_CHECK(mAudioRunner || mVisionRunner, "No valid multimodal engine found in " + multimodalEngineDir);
 
         // Try to load action expert from multimodalEngineDir/action
         try
@@ -471,13 +466,11 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         {
             int32_t const actionMaxKVCacheCapacity = mActionRunner->getMaxKVCacheCapacity();
             int32_t const llmMaxKVCacheCapacity = mBaseEngineConfig.maxKVCacheCapacity;
-            if (actionMaxKVCacheCapacity != llmMaxKVCacheCapacity)
-            {
-                throw std::runtime_error(format::fmtstr(
+            ELLM_CHECK(actionMaxKVCacheCapacity == llmMaxKVCacheCapacity,
+                format::fmtstr(
                     "Action engine max_kv_cache_capacity (%d) does not match LLM engine max_kv_cache_capacity (%d). "
                     "Re-export and rebuild the action engine with --max_kv_cache_capacity=%d to match the LLM engine.",
                     actionMaxKVCacheCapacity, llmMaxKVCacheCapacity, llmMaxKVCacheCapacity));
-            }
         }
     }
 

@@ -25,6 +25,7 @@
 #endif
 #include "plugins/utils/pluginUtils.h"
 
+#include "common/checkMacros.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -456,13 +457,10 @@ IPluginV3* MambaPluginCreator::createPlugin(
             // chunk_size: Mamba2 prefill uses a chunked parallel scan when > 1.
             //   TODO: implement mamba_chunk_scan_combined kernel for chunk_size > 1.
             std::optional<int32_t> chunkSize = parsePluginScalarField<int32_t>("chunk_size", fc);
-            if (chunkSize.has_value() && chunkSize.value() > 1)
-            {
-                throw std::runtime_error(
-                    "update_ssm_state: chunk_size > 1 is not supported. "
-                    "Only single-step kernel with seq_len loop is implemented. "
-                    "Parallel chunked scan requires a mamba_chunk_scan_combined kernel.");
-            }
+            ELLM_CHECK(!chunkSize.has_value() || chunkSize.value() <= 1,
+                "update_ssm_state: chunk_size > 1 is not supported. "
+                "Only single-step kernel with seq_len loop is implemented. "
+                "Parallel chunked scan requires a mamba_chunk_scan_combined kernel.");
             // time_step_limit: (0.0, inf) is a no-op. Non-trivial clamping not yet in kernel.
             //   TODO: add dt clamping support to the selectiveStateUpdate kernel.
             for (int32_t i = 0; i < fc->nbFields; ++i)
@@ -472,13 +470,10 @@ IPluginV3* MambaPluginCreator::createPlugin(
                 {
                     auto const* limits = static_cast<float const*>(f.data);
                     bool const isNoop = (limits[0] == 0.f && std::isinf(limits[1]) && limits[1] > 0.f);
-                    if (!isNoop)
-                    {
-                        throw std::runtime_error(
-                            "update_ssm_state: non-trivial time_step_limit is not supported. "
-                            "Only the no-op default (0.0, inf) is currently handled. "
-                            "Non-trivial dt clamping requires kernel changes.");
-                    }
+                    ELLM_CHECK(isNoop,
+                        "update_ssm_state: non-trivial time_step_limit is not supported. "
+                        "Only the no-op default (0.0, inf) is currently handled. "
+                        "Non-trivial dt clamping requires kernel changes.");
                 }
             }
         }

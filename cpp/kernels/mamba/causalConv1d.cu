@@ -203,19 +203,15 @@ void invokeCausalConv1d(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tenso
     int32_t const width = static_cast<int32_t>(weight.getShape()[2]);
     int32_t const outSeqLen = static_cast<int32_t>(out.getShape()[1]);
 
-    if (x.getDataType() != nvinfer1::DataType::kHALF || weight.getDataType() != nvinfer1::DataType::kHALF
-        || out.getDataType() != nvinfer1::DataType::kHALF)
-    {
-        throw std::runtime_error("invokeCausalConv1d: only FP16 (half) is supported.");
-    }
+    ELLM_CHECK(x.getDataType() == nvinfer1::DataType::kHALF && weight.getDataType() == nvinfer1::DataType::kHALF
+            && out.getDataType() == nvinfer1::DataType::kHALF,
+        "only FP16 (half) is supported.");
 
     bool const isContiguous = (x.getStride(2) == 1 && x.getStride(1) == dim && out.getStride(2) == 1
         && out.getStride(1) == dim && weight.getStride(2) == 1);
 
-    if (!isContiguous || stride != 1 || dilation != 1 || width > 8)
-    {
-        throw std::runtime_error("invokeCausalConv1d: requires contiguous [B,S,D], stride=1, dilation=1, width<=8.");
-    }
+    ELLM_CHECK(isContiguous && stride == 1 && dilation == 1 && width <= 8,
+        "requires contiguous [B,S,D], stride=1, dilation=1, width<=8.");
 
     int32_t constexpr kThreads = 256;
     dim3 const block(kThreads);
@@ -298,10 +294,8 @@ void invokeCaptureConvState(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::T
     int32_t const dim = static_cast<int32_t>(x.getShape()[2]);
     int32_t const width = static_cast<int32_t>(convState.getShape()[2]);
 
-    if (x.getDataType() != nvinfer1::DataType::kHALF || convState.getDataType() != nvinfer1::DataType::kHALF)
-    {
-        throw std::runtime_error("invokeCaptureConvState: only FP16 (half) is supported.");
-    }
+    ELLM_CHECK(x.getDataType() == nvinfer1::DataType::kHALF && convState.getDataType() == nvinfer1::DataType::kHALF,
+        "only FP16 (half) is supported.");
 
     size_t const elemSize = sizeof(half);
     CUDA_CHECK(cudaMemsetAsync(convState.rawPointer(), 0, static_cast<size_t>(batch) * dim * width * elemSize, stream));
@@ -357,11 +351,9 @@ void invokeCausalConv1dDecode(trt_edgellm::rt::Tensor& convState, trt_edgellm::r
     int32_t const dim = static_cast<int32_t>(convState.getShape()[1]);
     int32_t const width = static_cast<int32_t>(convState.getShape()[2]);
 
-    if (convState.getDataType() != nvinfer1::DataType::kHALF || newCol.getDataType() != nvinfer1::DataType::kHALF
-        || weight.getDataType() != nvinfer1::DataType::kHALF || out.getDataType() != nvinfer1::DataType::kHALF)
-    {
-        throw std::runtime_error("invokeCausalConv1dDecode: only FP16 (half) is supported.");
-    }
+    ELLM_CHECK(convState.getDataType() == nvinfer1::DataType::kHALF && newCol.getDataType() == nvinfer1::DataType::kHALF
+            && weight.getDataType() == nvinfer1::DataType::kHALF && out.getDataType() == nvinfer1::DataType::kHALF,
+        "only FP16 (half) is supported.");
 
     int32_t constexpr kThreads = 256;
     dim3 const block(kThreads);
@@ -446,15 +438,10 @@ void invokeCausalConv1dDecodeMTP(trt_edgellm::rt::Tensor& convState, trt_edgellm
     int32_t const dim = static_cast<int32_t>(convState.getShape()[1]);
     int32_t const width = static_cast<int32_t>(convState.getShape()[2]);
 
-    if (width > 8)
-    {
-        throw std::runtime_error("invokeCausalConv1dDecodeMTP: kernel_size > 8 not supported.");
-    }
-    if (convState.getDataType() != nvinfer1::DataType::kHALF || weight.getDataType() != nvinfer1::DataType::kHALF
-        || out.getDataType() != nvinfer1::DataType::kHALF)
-    {
-        throw std::runtime_error("invokeCausalConv1dDecodeMTP: only FP16 (half) is supported.");
-    }
+    ELLM_CHECK(width <= 8, "kernel_size > 8 not supported.");
+    ELLM_CHECK(convState.getDataType() == nvinfer1::DataType::kHALF && weight.getDataType() == nvinfer1::DataType::kHALF
+            && out.getDataType() == nvinfer1::DataType::kHALF,
+        "only FP16 (half) is supported.");
 
     int32_t constexpr kThreads = 256;
     dim3 const block(kThreads);

@@ -318,23 +318,20 @@ void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
     int64_t channels = image.channels;
     unsigned char* imageData = image.data(); // In hwc order
 
-    if (height % (mConfig.patchSize * mConfig.mergeSize) != 0 || width % (mConfig.patchSize * mConfig.mergeSize) != 0)
-    {
-        throw std::runtime_error("Image height or width is not divisible by patchSize * mergeSize = "
+    ELLM_CHECK(
+        height % (mConfig.patchSize * mConfig.mergeSize) == 0 && width % (mConfig.patchSize * mConfig.mergeSize) == 0,
+        "Image height or width is not divisible by patchSize * mergeSize = "
             + std::to_string(mConfig.patchSize * mConfig.mergeSize) + " got height: " + std::to_string(height)
             + ", width: " + std::to_string(width));
-    }
 
     std::vector<int64_t> curGrid{1, (height / mConfig.patchSize), (width / mConfig.patchSize)};
     imageGridTHWs.emplace_back(curGrid);
     int64_t curSeqLength = (height / mConfig.patchSize) * (width / mConfig.patchSize);
     int64_t prevCuSeqlen = cuSeqlensData[cuSeqlensSize - 1];
-    if (prevCuSeqlen + curSeqLength > mConfig.maxHW || cuSeqlensSize > (mConfig.maxNumImages + 1))
-    {
-        throw std::runtime_error("cuSeqlens " + std::to_string(prevCuSeqlen + curSeqLength)
+    ELLM_CHECK(prevCuSeqlen + curSeqLength <= mConfig.maxHW && cuSeqlensSize <= (mConfig.maxNumImages + 1),
+        "cuSeqlens " + std::to_string(prevCuSeqlen + curSeqLength)
             + " exceeds the limitation, maxHW = " + std::to_string(mConfig.maxHW)
             + " or maxNumImages = " + std::to_string(mConfig.maxNumImages) + " of VIT engine.");
-    }
     imageTokenLengths.emplace_back(curSeqLength / mConfig.mergeSize / mConfig.mergeSize);
     maxSeqLen = std::max(maxSeqLen, curSeqLength);
 
@@ -380,11 +377,9 @@ std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(
         return std::ceil(static_cast<double>(value) / factor) * factor;
     };
 
-    if (std::max(height, width) / std::min(height, width) > maxRatio)
-    {
-        throw std::runtime_error("absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
+    ELLM_CHECK(std::max(height, width) / std::min(height, width) <= maxRatio,
+        "absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
             + std::to_string(std::max(height, width) / std::min(height, width)));
-    }
 
     int64_t hBar = std::max(factor, roundByFactor(height, factor));
     int64_t wBar = std::max(factor, roundByFactor(width, factor));
@@ -444,11 +439,9 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
         return;
     }
 
-    if (totalSeqLength < mConfig.minHW || totalSeqLength > mConfig.maxHW)
-    {
-        throw std::runtime_error("totalSeqLength " + std::to_string(totalSeqLength) + " exceeds the limitation, max = "
+    ELLM_CHECK(totalSeqLength >= mConfig.minHW && totalSeqLength <= mConfig.maxHW,
+        "totalSeqLength " + std::to_string(totalSeqLength) + " exceeds the limitation, max = "
             + std::to_string(mConfig.maxHW) + ", min = " + std::to_string(mConfig.minHW) + " of VIT engine.");
-    }
 
     // Reshape tensors
     int64_t totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
@@ -669,12 +662,9 @@ void QwenViTRunner::getWindowIndex(
         windowIndexValue += T * llmGridH * llmGridW;
     }
 
-    if (windowIndexPos * (mConfig.mergeSize * mConfig.mergeSize) != curHW)
-    {
-        throw std::runtime_error(
-            "windowIndex size * (mergeSize * mergeSize) does not match curHW. Got windowIndex size: "
+    ELLM_CHECK(windowIndexPos * (mConfig.mergeSize * mConfig.mergeSize) == curHW,
+        "windowIndex size * (mergeSize * mergeSize) does not match curHW. Got windowIndex size: "
             + std::to_string(windowIndexPos) + ", curHW: " + std::to_string(curHW));
-    }
 
     // Copy cu_window_seqlens
     check::check(mCuWindowSeqlens.reshape({cuWindowSeqlensSize}), "Tensor reshape failed");

@@ -168,28 +168,20 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     int64_t channels = image.channels;
     unsigned char* imageData = image.data(); // In hwc order
 
-    if (channels != mConfig.numChannels)
-    {
-        throw std::runtime_error("Image channels mismatch, got " + std::to_string(channels) + ", expected "
+    ELLM_CHECK(channels == mConfig.numChannels,
+        "Image channels mismatch, got " + std::to_string(channels) + ", expected "
             + std::to_string(mConfig.numChannels));
-    }
-    if (height % mConfig.blockImageSizeH != 0 || width % mConfig.blockImageSizeW != 0)
-    {
-        throw std::runtime_error(
-            "Image height or width is not divisible by blockImageSizeH or blockImageSizeW, "
-            "got height: "
+    ELLM_CHECK(height % mConfig.blockImageSizeH == 0 && width % mConfig.blockImageSizeW == 0,
+        "Image height or width is not divisible by blockImageSizeH or blockImageSizeW, "
+        "got height: "
             + std::to_string(height) + ", width: " + std::to_string(width)
             + ", blockImageSizeH: " + std::to_string(mConfig.blockImageSizeH)
             + ", blockImageSizeW: " + std::to_string(mConfig.blockImageSizeW));
-    }
 
     int64_t curNumBlocks = (height / mConfig.blockImageSizeH) * (width / mConfig.blockImageSizeW);
-    if (totalNumBlocks + curNumBlocks > mConfig.maxNumBlocks)
-    {
-        throw std::runtime_error("totalNumBlocks " + std::to_string(totalNumBlocks) + " + curNumBlocks "
-            + std::to_string(curNumBlocks) + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
-            + " of VIT engine.");
-    }
+    ELLM_CHECK(totalNumBlocks + curNumBlocks <= mConfig.maxNumBlocks,
+        "totalNumBlocks " + std::to_string(totalNumBlocks) + " + curNumBlocks " + std::to_string(curNumBlocks)
+            + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks) + " of VIT engine.");
 
     int64_t curTokenLength = curNumBlocks * 256;
     if (isThumbnail)
@@ -266,12 +258,10 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         return;
     }
 
-    if (totalNumBlocks < mConfig.minNumBlocks || totalNumBlocks > mConfig.maxNumBlocks)
-    {
-        throw std::runtime_error("totalNumBlocks " + std::to_string(totalNumBlocks)
+    ELLM_CHECK(totalNumBlocks >= mConfig.minNumBlocks && totalNumBlocks <= mConfig.maxNumBlocks,
+        "totalNumBlocks " + std::to_string(totalNumBlocks)
             + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
             + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
-    }
 
     // Calculate total image tokens for profiling (InternVL: each block generates 256 tokens)
     int64_t totalImageTokens = totalNumBlocks * 256;
