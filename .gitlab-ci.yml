@@ -23,6 +23,7 @@ workflow:
 include:
   - local: '.gitlab/ci/templates.yml'
   - local: '.gitlab/ci/setup-jobs.yml'
+  - local: '.gitlab/ci/cutedsl-jobs.yml'
   - local: '.gitlab/ci/l0-jobs.yml'
   - local: '.gitlab/ci/l1-jobs.yml'
   - local: '.gitlab/ci/sonar-jobs.yml'

@@ -176,6 +176,8 @@ l0_drive_thor_1:
   stage: l0_test
   needs:
     - l0_llm_loader_export
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "13.0"
@@ -189,9 +191,19 @@ l0_drive_thor_1:
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_1.csv"
     BOARD_IP: "192.168.55.1"
+  before_script:
+    # CuTeDSL tarball comes from build_cutedsl_sm110_artifact (stage: setup);
+    # GitLab fetches it into $CI_PROJECT_DIR. Move it where cmake/CuteDsl.cmake:244
+    # expects it. `|| true` so a producer failure (allow_failure: true) lets us reach
+    # the cmake step which will then FATAL_ERROR with a clear "run build_cutedsl.py" hint.
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_drive-nvks
   image: "ubuntu:24.04"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   extends:
     - .device_test_template
     - .l0_rules
@@ -203,6 +215,8 @@ l0_drive_thor_2:
   stage: l0_test
   needs:
     - l0_llm_loader_export
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "13.0"
@@ -216,9 +230,19 @@ l0_drive_thor_2:
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     BASELINE_CSV: "$EDGE_LLM_CACHE_DIR/baselines/drive_thor_2.csv"
     BOARD_IP: "192.168.55.1"
+  before_script:
+    # CuTeDSL tarball comes from build_cutedsl_sm110_artifact (stage: setup);
+    # GitLab fetches it into $CI_PROJECT_DIR. Move it where cmake/CuteDsl.cmake:244
+    # expects it. `|| true` so a producer failure (allow_failure: true) lets us reach
+    # the cmake step which will then FATAL_ERROR with a clear "run build_cutedsl.py" hint.
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   tags:
     - thor_ts4_724-nvks
   image: "ubuntu:24.04"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   extends:
     - .device_test_template
     - .l0_rules
@@ -230,6 +254,8 @@ l0_jedha:
   stage: l0_test
   needs:
     - l0_llm_loader_export
+    - job: build_cutedsl_sm110_artifact
+      artifacts: true
   variables:
     BOARD_USER: "tensorrt_user"
     CUDA_VERSION: "12.8"
@@ -245,6 +271,9 @@ l0_jedha:
   tags:
     - jedha-edgellm-nvks
   image: "ubuntu:24.04"
+  before_script:
+    - mkdir -p kernelSrcs/cuteDSLPrebuilt
+    - mv -f cutedsl_aarch64_sm_110_cuda13.tar.gz cutedsl_aarch64_sm_110_cuda13.tar.gz.sha256 kernelSrcs/cuteDSLPrebuilt/ || true
   extends:
     - .device_test_template
     - .l0_rules
