@@ -185,7 +185,7 @@ if(BUILD_UNIT_TESTS)
   target_compile_definitions(unitTest
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore
-                                         ${CUDART_LIB} ${CUDA_DRIVER_LIB})
+                                         commonLibraryExt ${CUDA_DRIVER_LIB})
   if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
     include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
     cute_dsl_setup(LINK_TARGETS unitTest)

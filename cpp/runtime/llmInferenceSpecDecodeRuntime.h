@@ -23,12 +23,20 @@
 #include "multimodal/multimodalRunner.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
-#include "runtime/eagleDraftEngineRunner.h"
-#include "runtime/llmEngineRunner.h"
+#include "runtime/config/deploymentConfig.h"
+#include "runtime/config/llmEngineConfig.h"
+#include "runtime/exec/engineExecutor.h"
+#include "runtime/exec/tensorMap.h"
+#include "runtime/features/deepstackBinding.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/preprocess/embeddingPreprocessor.h"
+#include "runtime/preprocess/stepPreparer.h"
+#include "runtime/state/pipelineIO.h"
+#include "runtime/state/sharedResources.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <cassert>
+#include <memory>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
@@ -120,18 +128,6 @@ struct SpecDecodeInferenceContext
      */
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& visual,
         rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
-};
-
-/*!
- * @brief Drafting configuration for Eagle speculative decoding
- *
- * Configuration parameters to drive Eagle spec-decoding.
- */
-struct EagleDraftingConfig
-{
-    int32_t draftingTopK;   //!< Tokens to select from one predecessor for next draft tree level
-    int32_t draftingStep;   //!< Number of drafting steps with draft model
-    int32_t verifyTreeSize; //!< Number of tokens for base model verification
 };
 
 /*!
@@ -285,7 +281,7 @@ public:
     //! @brief Check if draft model is loaded and spec-decode is available
     bool hasDraftModel() const noexcept
     {
-        return mDraftEngineRunner != nullptr;
+        return mDraftExecutor != nullptr;
     }
 
 private:
@@ -294,14 +290,29 @@ private:
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<EagleDraftingConfig> const& draftingConfig, cudaStream_t stream);
 
-    rt::Tensor mSharedExecContextMemory{};              //!< Shared device memory for all execution contexts
-    int32_t mMaxRuntimeBatchSize{1};                    //!< Maximum runtime batch size
-    std::optional<EagleDraftingConfig> mDraftingConfig; //!< Eagle drafting configuration (nullopt = no draft)
-    LLMEngineRunnerConfig mBaseEngineConfig;            //!< Base engine configuration
-    std::optional<EagleDraftEngineRunnerConfig> mDraftEngineConfig; //!< Draft engine configuration (nullopt = no draft)
+    //! @brief Capture a CUDA graph on the base executor for the default (no-adapter)
+    //! state, then one additional graph per registered LoRA adapter. Returns the
+    //! logical AND of all captures — any single failure flips the aggregate to
+    //! false but capture continues for remaining adapters (graceful degrade).
+    bool captureBaseGraphWithLoraFanout(InferenceDims const& dims, cudaStream_t stream);
 
-    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;            //!< Base model engine runner
-    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;    //!< Draft model engine runner (nullptr = no draft)
+    rt::Tensor mSharedExecContextMemory{}; //!< Shared device memory for all execution contexts
+    int32_t mMaxRuntimeBatchSize{1};       //!< Maximum runtime batch size
+
+    DeploymentConfig mDeployment{};                       //!< Parsed base+draft configs + consolidated EAGLE settings
+    std::unique_ptr<EngineExecutor> mBaseExecutor;        //!< Base model TRT wrapper
+    std::unique_ptr<EngineExecutor> mDraftExecutor;       //!< Draft model TRT wrapper (nullptr if vanilla)
+    std::unique_ptr<SharedResources> mSharedResources;    //!< KV caches / RoPE / LoRA / context memory
+    std::unique_ptr<PipelineIO> mPipelineIO;              //!< Per-pipeline I/O tensors
+    TensorMap mBaseTensorMap;                             //!< Base engine binding map
+    TensorMap mDraftTensorMap;                            //!< Draft engine binding map (EAGLE only)
+    std::unique_ptr<StepPreparer> mStepPreparer;          //!< Per-step sequence preprocessor
+    std::unique_ptr<EmbeddingPreprocessor> mEmbeddingPre; //!< Embedding-lookup preprocessor
+    //! Base-engine deepstack binding (nullptr when the base engine was built
+    //! without deepstack features). Swaps between `io.deepstackEmbeds[i]`
+    //! (prefill) and the shared `zeroDeepstackBroadcast` (all other phases).
+    std::unique_ptr<DeepstackBinding> mDeepstack;
+
     std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};      //!< Vision multimodal runner (optional)
     std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
     std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
@@ -313,20 +324,13 @@ private:
     std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
-    // [1] I/O Tensors to work with base and eagle draft engine.
-    EmbeddingData mEmbedding;                 //!< Embedding table [vocabSize, hiddenSize] and optional FP8 scales
-    rt::Tensor mIdsInput;                     //!< Input token IDs (used for embedding lookup)
-    rt::Tensor mInputsEmbeds;                 //!< Input embeddings (after embedding lookup)
-    std::vector<rt::Tensor> mDeepstackEmbeds; //!< Deepstack embeddings for Qwen3-VL (one per feature)
-    rt::Tensor mContextLengthsInput;
-    rt::Tensor mLogitsOutput;
+    // [1] Runtime-local I/O tensors. Embedding table is shared between base and draft models.
+    // Core per-pipeline tensors (inputsEmbeds, outputLogits, deepstackEmbeds, baseHiddenStates,
+    // draftHiddenStatesIn/Out, contextLengths, mropeCosSin) live on `mPipelineIO`.
+    EmbeddingData mEmbedding; //!< Embedding table [vocabSize, hiddenSize] and optional FP8 scales
+    rt::Tensor mIdsInput;     //!< Input token IDs (used for embedding lookup)
     rt::Tensor mDraftTreeSize;
     rt::Tensor mDraftTreeMask;
-    rt::Tensor mBaseHiddenStatesOutput;
-    // Distinguish draft hidden states input and output since we cannot easily
-    // Perform inplace update for hidden states between drafting steps.
-    rt::Tensor mDraftHiddenStatesInput;
-    rt::Tensor mDraftHiddenStatesOutput;
 
     // [2] Sampling workspace and output tensors that used across all the sampling operations.
     rt::Tensor mSamplingWorkspace;
@@ -368,11 +372,12 @@ private:
     rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
 
     // [8] Base model hidden states portal (Qwen3-Omni audio generation, future MTP).
-    //     Buffers are pre-allocated to {maxBS, maxISL, H} and reshaped per request.
-    //     mHiddenStatesRegistry maps layer index → buffer; populated per handleRequest().
-    //     See getBaseModelHiddenStates() for the lifetime contract.
-    rt::Tensor mOutputHiddenStates{};  //!< Engine-output hidden states (layer N = acceptHiddenLayer)
-    rt::Tensor mPrefillEmbedsBackup{}; //!< Layer-0 input embeddings backup (post-multimodal)
+    //     The actual buffers (engine-output and prefill-embeddings backup) live on
+    //     PipelineIO so they can be wired into the engine TensorMap. The registry
+    //     below holds non-owning pointers into those buffers, populated per request,
+    //     plus the per-request prefill length and the raw input token ids — all are
+    //     transient request-scoped state, not pipeline tensors. See
+    //     getBaseModelHiddenStates() for the lifetime contract.
     std::unordered_map<int32_t, rt::Tensor const*> mHiddenStatesRegistry; //!< Per-request layer→buffer map
     int32_t mLastPrefillLength{0};                                        //!< Valid prefill length in buffers
     std::vector<std::vector<int32_t>> mLastInputTokenIds;                 //!< Per-batch input token IDs

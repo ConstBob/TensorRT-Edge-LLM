@@ -374,6 +374,29 @@ bool LLMBuilder::setupVanillaProfiles(
 bool LLMBuilder::setupEagleProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
+    // TRT-native-ops + EAGLE is a partially-wired path: the Python export
+    // emits a 4D bool `attention_mask` [batch, 1, seq_len, seq_len + past_len]
+    // (see `llm_model_trtnative.py` with `is_eagle_base=True`), and the
+    // `prepareEagleBaseTreeDecodingInputsTrtNative` kernel exists
+    // (`cpp/kernels/speculative/eagleUtilKernels.{h,cu}`). However the
+    // builder's EAGLE profile setup below and the runtime dispatch in
+    // `LLMInferenceSpecDecodeRuntime::runBaseModelVerification` both
+    // hardcode the plugin-path 3D packed-INT32 mask layout. Attempting to
+    // build this combination produces a cryptic TRT error:
+    //
+    //   "Dynamic-shaped input tensor attention_mask has 4 dimensions but
+    //    profile 0 has 3 dimensions"
+    //
+    // Fail fast with an actionable message until the full TRT-native+EAGLE
+    // path (builder profile + registry + runtime dispatch) is completed.
+    if (mBuilderConfig.useTrtNativeOps && (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft))
+    {
+        LOG_ERROR(
+            "TRT-native-ops + EAGLE speculative decoding is not yet supported. "
+            "Re-export the engine ONNX with trt_native_ops=False (plugin attention path).");
+        return false;
+    }
+
     bool result = true;
 
     int const maxTokens

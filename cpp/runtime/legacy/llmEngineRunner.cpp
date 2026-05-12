@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "runtime/llmEngineRunner.h"
+#include "runtime/legacy/llmEngineRunner.h"
 
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"

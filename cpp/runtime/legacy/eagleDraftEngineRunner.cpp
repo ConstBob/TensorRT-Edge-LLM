@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "runtime/eagleDraftEngineRunner.h"
+#include "runtime/legacy/eagleDraftEngineRunner.h"
 
 #include "common/bindingNames.h"
 #include "common/cudaUtils.h"

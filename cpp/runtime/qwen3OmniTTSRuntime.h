@@ -19,7 +19,7 @@
 
 #include "common/tensor.h"
 #include "profiling/metrics.h"
-#include "runtime/llmEngineRunner.h"
+#include "runtime/legacy/llmEngineRunner.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
