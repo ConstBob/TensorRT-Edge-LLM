@@ -458,6 +458,82 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
     return model
 
 
+def hybrid_state_shapes_and_dtypes(config):
+    """Single source of truth for hybrid (mamba / GDN) state tensor layouts.
+
+    Returns a dict with keys:
+        - conv_dim (int)
+        - conv_kernel (int)
+        - conv_dtype (torch.dtype)
+        - recurrent_shape (tuple[int, ...])  # trailing dims after [batch]
+        - recurrent_dtype (torch.dtype)
+
+    The dtypes here dictate (a) the dtype of the dummy tensors fed to the ONNX
+    export, and therefore the dtype of the engine's `conv_state_%d` /
+    `recurrent_state_%d` bindings, and (b) the string written into
+    `config.json` as `conv_state_dtype` / `recurrent_state_dtype`. They MUST
+    agree; the runtime validator cross-checks the two at init.
+
+    The dtype choice is dictated by the plugin math, not by the model name:
+        - Mamba SSM (nemotron_h): state runs in fp16, matching `T` type constraint
+          on `update_ssm_state`'s `state` input.
+        - Qwen3.5 GDN: state is typed `T_A = tensor(float)` (fp32) by the
+          `gated_delta_net` plugin schema — see `gated_delta_net_plugin.py`.
+    """
+    if config.model_type == "nemotron_h":
+        return {
+            "conv_dim": (config.mamba_num_heads * config.mamba_head_dim +
+                         2 * config.n_groups * config.ssm_state_size),
+            "conv_kernel":
+            config.conv_kernel,
+            "conv_dtype":
+            torch.float16,
+            "recurrent_shape": (
+                int(config.mamba_num_heads),
+                int(config.mamba_head_dim),
+                int(config.ssm_state_size),
+            ),
+            "recurrent_dtype":
+            torch.float16,
+        }
+    if config.model_type == "qwen3_5_text":
+        return {
+            "conv_dim":
+            (2 * config.linear_num_key_heads * config.linear_key_head_dim +
+             config.linear_num_value_heads * config.linear_value_head_dim),
+            "conv_kernel":
+            int(config.linear_conv_kernel_dim),
+            "conv_dtype":
+            torch.float16,
+            "recurrent_shape": (
+                int(config.linear_num_value_heads),
+                int(config.linear_key_head_dim),
+                int(config.linear_value_head_dim),
+            ),
+            "recurrent_dtype":
+            torch.float32,
+        }
+    raise ValueError(
+        f"Unsupported hybrid model_type for state dtypes/shapes: {config.model_type}"
+    )
+
+
+_TORCH_DTYPE_TO_STR = {
+    torch.float16: "fp16",
+    torch.float32: "fp32",
+    torch.bfloat16: "bf16",
+}
+
+
+def torch_dtype_to_config_str(dtype: torch.dtype) -> str:
+    """Map a torch dtype to the string token the runtime parser accepts
+    (see cpp/runtime/config/llmEngineConfig.cpp::parseStateDtype)."""
+    if dtype not in _TORCH_DTYPE_TO_STR:
+        raise ValueError(f"No config-string mapping for torch dtype {dtype}. "
+                         f"Supported: {list(_TORCH_DTYPE_TO_STR)}")
+    return _TORCH_DTYPE_TO_STR[dtype]
+
+
 def create_hybrid_dummy_inputs(model: nn.Module) -> Dict[str, Any]:
     """Create dummy inputs for hybrid Linear Attention + Full Attention ONNX export."""
     batch_size = 1
@@ -496,31 +572,12 @@ def create_hybrid_dummy_inputs(model: nn.Module) -> Dict[str, Any]:
                         dtype=torch.float16,
                         device=device))
 
-    if config.model_type == "nemotron_h":
-        conv_dim = (config.mamba_num_heads * config.mamba_head_dim +
-                    2 * config.n_groups * config.ssm_state_size)
-        conv_kernel = config.conv_kernel
-        recurrent_shape = (
-            int(config.mamba_num_heads),
-            int(config.mamba_head_dim),
-            int(config.ssm_state_size),
-        )
-        recurrent_dtype = torch.float16
-    elif config.model_type == "qwen3_5_text":
-        conv_dim = (
-            2 * config.linear_num_key_heads * config.linear_key_head_dim +
-            config.linear_num_value_heads * config.linear_value_head_dim)
-        conv_kernel = int(config.linear_conv_kernel_dim)
-        recurrent_shape = (
-            int(config.linear_num_value_heads),
-            int(config.linear_key_head_dim),
-            int(config.linear_value_head_dim),
-        )
-        recurrent_dtype = torch.float32
-    else:
-        raise ValueError(
-            f"Unsupported hybrid model_type for dummy inputs: {config.model_type}"
-        )
+    state_specs = hybrid_state_shapes_and_dtypes(config)
+    conv_dim = state_specs["conv_dim"]
+    conv_kernel = state_specs["conv_kernel"]
+    conv_dtype = state_specs["conv_dtype"]
+    recurrent_shape = state_specs["recurrent_shape"]
+    recurrent_dtype = state_specs["recurrent_dtype"]
 
     # Conv states (for recurrent layers: mamba in Nemotron-H, linear-attn in Qwen3.5)
     conv_states = []
@@ -529,7 +586,7 @@ def create_hybrid_dummy_inputs(model: nn.Module) -> Dict[str, Any]:
             torch.zeros(batch_size,
                         conv_dim,
                         conv_kernel,
-                        dtype=torch.float16,
+                        dtype=conv_dtype,
                         device=device))
 
     # Recurrent states (shape depends on architecture)
@@ -1046,6 +1103,25 @@ def export_llm_model(model_dir: str,
         if reduced_vocab_size is not None:
             model_config['reduced_vocab_size'] = reduced_vocab_size
 
+        # KV cache dtype is baked in at export time. Write it to config.json so
+        # the C++ builder can propagate it into builder_config, and the C++
+        # runtime can parse/validate it strictly (no engine-introspection
+        # back-patching).
+        model_config['kv_cache_dtype'] = 'fp8' if fp8_kv_cache else 'fp16'
+
+        # Hybrid models (Mamba / Nemotron-H / GDN) bake in recurrent-state and
+        # conv-state dtypes at export time. Derive the dtype strings from the
+        # same helper that sizes the ONNX dummy tensors — that helper IS the
+        # source of truth, since its tensors determine the engine's binding
+        # dtypes. The runtime validator will cross-check the config value
+        # against the engine binding.
+        if model_config.get('num_linear_attn_layers', 0) > 0:
+            state_specs = hybrid_state_shapes_and_dtypes(model.config)
+            model_config['recurrent_state_dtype'] = torch_dtype_to_config_str(
+                state_specs['recurrent_dtype'])
+            model_config['conv_state_dtype'] = torch_dtype_to_config_str(
+                state_specs['conv_dtype'])
+
         with open(os.path.join(model_output_dir, "config.json"), 'w') as f:
             json.dump(model_config, f, indent=2)
         print(f"Config saved to {model_output_dir}")
@@ -1178,6 +1254,11 @@ def export_draft_model(draft_model_dir: str,
     # Save draft model configuration
     draft_config = export_llm_config(draft_model.config, 'eagle_draft',
                                      trt_native_ops)
+
+    # Draft model is always exported with fp16 KV cache (see export_model_to_onnx
+    # call above). Record it so the runtime can parse/validate strictly.
+    draft_config['kv_cache_dtype'] = 'fp16'
+
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, 'w') as f:
         json.dump(draft_config, f, indent=2)

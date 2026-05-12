@@ -851,6 +851,16 @@ class NemotronHCausalLM(nn.Module):
     ``lm_head`` maps directly to ``lm_head.weight``.
     """
 
+    # Dtypes of the Mamba state tensors this model feeds the ONNX graph.
+    # These drive (a) the dummy tensor dtypes in ``export_onnx`` and
+    # (b) the ``recurrent_state_dtype`` / ``conv_state_dtype`` strings written
+    # into ``config.json`` (see checkpoint_utils). They must stay in sync, so
+    # the single source of truth is this class attribute, not a separate table.
+    # The dtype is dictated by the ``trt_edgellm::update_ssm_state`` plugin
+    # schema: ``state`` has type ``T`` where we pick float16.
+    RECURRENT_STATE_DTYPE = torch.float16
+    CONV_STATE_DTYPE = torch.float16
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
@@ -925,7 +935,7 @@ class NemotronHCausalLM(nn.Module):
             torch.zeros(batch_size,
                         mc.conv_dim,
                         mc.conv_kernel,
-                        dtype=dtype16,
+                        dtype=self.CONV_STATE_DTYPE,
                         device=device) for _ in range(Nm)
         ]
         ssm_states: List[torch.Tensor] = [
@@ -933,7 +943,7 @@ class NemotronHCausalLM(nn.Module):
                         mc.num_heads,
                         mc.head_dim,
                         mc.ssm_state_size,
-                        dtype=dtype16,
+                        dtype=self.RECURRENT_STATE_DTYPE,
                         device=device) for _ in range(Nm)
         ]
 

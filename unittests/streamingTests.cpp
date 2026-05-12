@@ -586,7 +586,7 @@ TEST_F(CompactVectorSlotStreamTest, SizeMismatchThrows)
 {
     std::vector<SlotStreamState> v(2);
     std::vector<int32_t> mapping{0, 1, 2};
-    EXPECT_THROW(rt::compactVector(mapping, v), std::invalid_argument);
+    EXPECT_THROW(rt::compactVector(mapping, v), std::runtime_error);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

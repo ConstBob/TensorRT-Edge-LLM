@@ -50,7 +50,9 @@ RUNTIME_TOKENIZER_FILENAMES: Tuple[str, ...] = (
 
 
 def normalize_rope_scaling_for_runtime(rope_scaling: Any) -> Any:
-    """Normalize HF MRoPE metadata to the shape expected by the C++ runtime."""
+    """Normalize HF MRoPE / rope_parameters metadata to the shape expected by
+    the C++ runtime.
+    """
     if not isinstance(rope_scaling, dict):
         return rope_scaling
 
@@ -60,7 +62,32 @@ def normalize_rope_scaling_for_runtime(rope_scaling: Any) -> Any:
         if rope_type in (None, "default", "mrope"):
             normalized["type"] = "default"
             normalized["rope_type"] = "default"
+    # rope_parameters (transformers v5) carries "rope_type" without "type";
+    # propagate the alias so Python callers keyed off "type" still work.
+    # C++ collectRopeConfig() accepts either key.
+    if "type" not in normalized and "rope_type" in normalized:
+        normalized["type"] = normalized["rope_type"]
     return normalized
+
+
+def _torch_dtype_to_config_str(dtype: Any) -> str:
+    """Map a ``torch.dtype`` to the string token the runtime parser accepts
+    (see cpp/runtime/config/llmEngineConfig.cpp::parseStateDtype).
+
+    Deferred import of torch so importing this module does not drag it in on
+    pure-CPU tooling paths.
+    """
+    import torch
+    mapping = {
+        torch.float16: "fp16",
+        torch.float32: "fp32",
+        torch.bfloat16: "bf16",
+    }
+    if dtype not in mapping:
+        raise ValueError(
+            f"No config-string mapping for torch dtype {dtype!r}. "
+            f"Supported: {sorted(v for v in mapping.values())}")
+    return mapping[dtype]
 
 
 def _nested_config_to_dict(sub: Any) -> Dict[str, Any]:
@@ -209,20 +236,25 @@ def load_checkpoint_config_dicts(
         if key not in llm and val is not None:
             llm[key] = val
 
-    # VLM secondary patch: rope_scaling may live only inside a nested sub-config
-    # (e.g. text_config.rope_scaling for Qwen3-VL) and can be lost when
-    # AutoConfig serialises the promoted sub-object.  Recover it from the raw
-    # JSON so that collectRopeConfig() in C++ correctly detects kMRope.
-    # Newer HF checkpoints may store this as "rope_parameters" instead.
+    # VLM / transformers v5 rope compatibility: rope_scaling may be null
+    # while rope_parameters carries the real config (transformers v5
+    # convention), and either may live only in a nested sub-config
+    # (e.g. text_config for Qwen3-VL).  Recover into rope_scaling so
+    # collectRopeConfig() in C++ detects kMRope correctly and Python
+    # readers that key off rope_scaling (e.g. longrope in
+    # build_runtime_llm_config_dict) still work.
     if not llm.get("rope_scaling"):
-        for subkey in ("text_config", "language_config", "llm_config"):
-            raw_sub = raw.get(subkey) or {}
-            if isinstance(raw_sub, dict):
-                rope = raw_sub.get("rope_scaling") or raw_sub.get(
-                    "rope_parameters")
-                if rope:
-                    llm["rope_scaling"] = rope
-                    break
+        candidate = llm.get("rope_parameters")
+        if not candidate:
+            for subkey in ("text_config", "language_config", "llm_config"):
+                raw_sub = raw.get(subkey) or {}
+                if isinstance(raw_sub, dict):
+                    candidate = (raw_sub.get("rope_scaling")
+                                 or raw_sub.get("rope_parameters"))
+                    if candidate:
+                        break
+        if isinstance(candidate, dict):
+            llm["rope_scaling"] = candidate
     if llm.get("rope_scaling"):
         llm["rope_scaling"] = normalize_rope_scaling_for_runtime(
             llm["rope_scaling"])
@@ -367,6 +399,34 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
 
     if config.reduced_vocab_size:
         out["reduced_vocab_size"] = config.reduced_vocab_size
+
+    # KV cache dtype is baked in at export time. The C++ runtime parses it
+    # strictly from config.json (no engine-introspection back-patching).
+    # Mirrors llm_export.py: "fp8" when KV cache is quantised, otherwise "fp16".
+    out["kv_cache_dtype"] = ("fp8" if config.quant.kv_cache_quant == "fp8" else
+                             "fp16")
+
+    # Hybrid models (Mamba / GDN / Nemotron-H) bake in recurrent-state and
+    # conv-state dtypes at export time. The authoritative source is the
+    # model class itself — `export_onnx` constructs dummy tensors with these
+    # dtypes, which in turn fix the ONNX binding dtypes the engine is built
+    # with. Reading them from the same class attribute used there guarantees
+    # the config string cannot drift from the engine binding. The C++ runtime
+    # validator cross-checks the config dtype against the engine binding at
+    # init, so a drift would fail loudly at load time; this keeps both sides
+    # pinned to one source.
+    if out.get("num_linear_attn_layers", 0) > 0:
+        for attr, key in (("RECURRENT_STATE_DTYPE", "recurrent_state_dtype"),
+                          ("CONV_STATE_DTYPE", "conv_state_dtype")):
+            torch_dtype = getattr(model, attr, None)
+            if torch_dtype is None:
+                raise AttributeError(
+                    f"{type(model).__name__} is hybrid (num_linear_attn_layers>0) "
+                    f"but does not expose {attr}. Add a class-level {attr} "
+                    f"(torch.dtype) to the model class; its value must match "
+                    f"the dtype of the dummy state tensor its export_onnx "
+                    f"builds and the dtype mandated by the plugin schema.")
+            out[key] = _torch_dtype_to_config_str(torch_dtype)
 
     return out
 

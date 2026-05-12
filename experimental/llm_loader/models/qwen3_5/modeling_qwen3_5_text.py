@@ -634,6 +634,17 @@ class Qwen3_5CausalLM(nn.Module):
     ``lm_head`` maps directly to ``lm_head.weight``.
     """
 
+    # Dtypes of the GDN state tensors this model feeds the ONNX graph.
+    # These drive (a) the dummy tensor dtypes in ``export_onnx`` and
+    # (b) the ``recurrent_state_dtype`` / ``conv_state_dtype`` strings written
+    # into ``config.json`` (see checkpoint_utils). They must stay in sync, so
+    # the single source of truth is this class attribute, not a separate table.
+    # Dtypes are dictated by the ``trt_edgellm::gated_delta_net`` plugin schema:
+    # ``h0_source`` is typed ``T_A = tensor(float)`` (fp32), ``conv_state``
+    # follows ``T = tensor(float16)``.
+    RECURRENT_STATE_DTYPE = torch.float32
+    CONV_STATE_DTYPE = torch.float16
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
@@ -705,7 +716,7 @@ class Qwen3_5CausalLM(nn.Module):
             torch.zeros(batch_size,
                         gc.conv_dim,
                         gc.conv_kernel,
-                        dtype=dtype16,
+                        dtype=self.CONV_STATE_DTYPE,
                         device=device) for _ in range(Ng)
         ]
         recurrent_states: List[torch.Tensor] = [
@@ -713,7 +724,7 @@ class Qwen3_5CausalLM(nn.Module):
                         gc.num_value_heads,
                         gc.key_head_dim,
                         gc.value_head_dim,
-                        dtype=torch.float32,
+                        dtype=self.RECURRENT_STATE_DTYPE,
                         device=device) for _ in range(Ng)
         ]
 
