@@ -92,7 +92,7 @@ Block scales use the contiguous physical CuTeDSL NVFP4 layout
 
 ## Build
 
-1. Generate the AOT artifact (requires `nvidia-cutlass-dsl==4.4.1`,
+1. Generate the AOT artifact (requires `nvidia-cutlass-dsl==4.5.0`,
    `cuda-python`, `cupy-cuda13x`, and a sm_120 / sm_121 GPU):
 
    ```bash

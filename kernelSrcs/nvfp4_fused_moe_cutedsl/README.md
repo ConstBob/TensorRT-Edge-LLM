@@ -70,7 +70,7 @@ Artifacts land in `cpp/kernels/cuteDSLArtifact/<arch>/<tag>/`:
 
 ## CuTeDSL SM121 Source Patch
 
-`nvidia-cutlass-dsl==4.4.1` has an SM120-only admissible-architecture check
+`nvidia-cutlass-dsl==4.5.0` has an SM120-only admissible-architecture check
 in the block-scaled warp MMA ops used by these fused MoE kernels. The SM121
 fused MoE artifact build sets `CUTE_DSL_ARCH=sm_121a` to generate a real SM121
 image, so the unpatched package rejects the compatible SM120/SM121 op path
@@ -153,7 +153,7 @@ integration with the TRT Edge-LLM plugin system.
 
 ## Dependencies
 
-- `nvidia-cutlass-dsl == 4.4.1`
+- `nvidia-cutlass-dsl == 4.5.0`
 - `cuda-python` (provides `cuda.bindings.driver`)
 - `cupy-cuda13x` (GPU memory allocation during AOT compilation)
 
