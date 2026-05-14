@@ -27,7 +27,7 @@ Run on a machine with a supported GPU and CUDA 12.x or 13.x.
 python3 -m venv build_kernel_venv
 source build_kernel_venv/bin/activate
 
-pip install nvidia-cutlass-dsl==4.4.1
+pip install nvidia-cutlass-dsl==4.5.0
 pip install cuda-python
 
 # Pick the cupy variant that matches your CUDA version:
@@ -190,7 +190,7 @@ Uses `tcgen05.mma` (UMMA) + TMA. Exported ABI is 3D with batch `L=1`:
 - `C`: `[M, N, 1]`
 
 Thor (`SM110`) requires explicitly using Blackwell-family shared-memory
-capacity in the kernel because cuTe DSL 4.4.1 does not auto-detect it
+capacity in the kernel because cuTe DSL 4.5.0 does not auto-detect it
 reliably.
 
 ### Blackwell GeForce / GB10
@@ -228,7 +228,7 @@ replacing the old cuBLAS-based path.
 
 | Dependency | Version |
 |---|---|
-| `nvidia-cutlass-dsl` | `4.4.1` |
+| `nvidia-cutlass-dsl` | `4.5.0` |
 | `cuda-python` | compatible with local CUDA |
 | `cupy-cuda12x` | `12.3.0` for CUDA 12.x |
 | `cupy-cuda13x` | `13.6.0` for CUDA 13.x |

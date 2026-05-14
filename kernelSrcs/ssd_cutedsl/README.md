@@ -87,7 +87,7 @@ z-gating/SiLU (`has_z`), AOT export for C++ plugin integration.
 Run on a machine with the target GPU and CUDA 12.x/13.x:
 
 ```bash
-pip install nvidia-cutlass-dsl==4.4.1
+pip install nvidia-cutlass-dsl==4.5.0
 pip install cupy-cuda12x==12.3.0   # or cupy-cuda13x==13.6.0 for CUDA 13
 
 cd tensorrt-edge-llm

@@ -22,7 +22,7 @@ All variants require CUDA 12.6+.
 Run on a machine with a supported GPU and CUDA 12.x/13.x:
 
 ```bash
-pip install nvidia-cutlass-dsl==4.4.1
+pip install nvidia-cutlass-dsl==4.5.0
 pip install cupy-cuda12x==12.3.0   # or cupy-cuda13x==13.6.0 for CUDA 13
 
 cd tensorrt-edge-llm
@@ -56,7 +56,7 @@ Key script flags: `--kernels gdn`, `--gpu_arch` (e.g. `sm_87` for Orin,
 omit for device-native SM on Thor), `--arch` (default: auto), `--verbose`,
 `--clean`.
 
-> **Note on Thor (SM110):** due to a cutlass-dsl 4.4.1 PIC relocation limitation,
+> **Note on Thor (SM110):** due to a cutlass-dsl 4.5.0 PIC relocation limitation,
 > `--gpu_arch` cannot be specified when building on Thor. Omit it to compile for
 > the device's native SM.
 
