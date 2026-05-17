@@ -317,20 +317,6 @@ void inputWatcherLoop(std::atomic<bool> const& stopSignal)
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-char const* finishReasonName(rt::FinishReason r)
-{
-    switch (r)
-    {
-    case rt::FinishReason::kNotFinished: return "not-finished";
-    case rt::FinishReason::kEndId: return "end-of-sequence";
-    case rt::FinishReason::kLength: return "max-length";
-    case rt::FinishReason::kCancelled: return "cancelled";
-    case rt::FinishReason::kError: return "error";
-    case rt::FinishReason::kStopWords: return "stop-words";
-    }
-    return "?";
-}
-
 //! Extract a short preview of the prompt (last user message).
 std::string promptPreview(rt::LLMGenerationRequest::Request const& req, size_t maxChars = 80)
 {
@@ -452,7 +438,8 @@ void printRequestFooter(RequestResult const& r)
 {
     std::printf("\n  ↳ %zu tokens, TTFT %.1fms, total %.1fms (%.1f tok/s), finish=%s%s\n", r.tokensOut, r.ttftMs,
         r.totalMs, r.totalMs > 0 ? static_cast<double>(r.tokensOut) * 1000.0 / r.totalMs : 0.0,
-        finishReasonName(r.finishReason), r.cancelledBySkip ? " [SKIPPED]" : (r.quitMidGeneration ? " [QUIT]" : ""));
+        rt::finishReasonName(r.finishReason),
+        r.cancelledBySkip ? " [SKIPPED]" : (r.quitMidGeneration ? " [QUIT]" : ""));
     std::fflush(stdout);
 }
 

@@ -29,6 +29,7 @@
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
+#include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
 #include <filesystem>
@@ -901,7 +902,10 @@ int main(int argc, char* argv[])
             {
                 for (size_t batchIdx = 0; batchIdx < response.outputTexts.size(); ++batchIdx)
                 {
-                    LOG_INFO("Response for request %zu batch %zu: %s", requestIdx, batchIdx,
+                    char const* reasonName = batchIdx < response.finishReasons.size()
+                        ? rt::finishReasonName(response.finishReasons[batchIdx])
+                        : "?";
+                    LOG_INFO("Response for request %zu batch %zu [finish=%s]: %s", requestIdx, batchIdx, reasonName,
                         response.outputTexts[batchIdx].c_str());
                     if (batchIdx < audioOutputs.size() && audioOutputs[batchIdx].waveform
                         && !audioOutputs[batchIdx].waveform->isEmpty())
@@ -934,6 +938,9 @@ int main(int argc, char* argv[])
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
             responseJson["request_idx"] = requestIdx;
             responseJson["batch_idx"] = batchIdx;
+            responseJson["finish_reason"] = (requestStatus && batchIdx < response.finishReasons.size())
+                ? rt::finishReasonName(response.finishReasons[batchIdx])
+                : "error";
             // Store messages for reference
             nlohmann::json messagesJson = nlohmann::json::array();
             for (auto const& msg : request.requests[batchIdx].messages)

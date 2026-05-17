@@ -58,7 +58,7 @@ enum class FinishReason : uint8_t {
     kLength      = 2,   // hit maxGenerateLength
     kCancelled   = 3,   // consumer called channel->cancel()
     kError       = 4,   // runtime aborted (rare — OOM, engine error)
-    kStopWords   = 5,   // reserved, not yet implemented
+    kStopWords   = 5,   // a per-request stop string was produced
 };
 ```
 

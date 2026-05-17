@@ -77,6 +77,8 @@ void SpecDecodeInferenceContext::initialize(int32_t _activeBatchSize, int32_t _m
     finishedStates.resize(_activeBatchSize, 0);
     slotStreams.clear();
     slotStreams.resize(_activeBatchSize);
+    stopStringsPerSlot.clear();
+    stopStringsPerSlot.resize(_activeBatchSize);
 
     // Initialize batch index mapping (identity mapping initially)
     batchIndexMapping.resize(_activeBatchSize);
@@ -523,6 +525,13 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
     mLastPrefillLength = 0;
     mLastInputTokenIds.clear();
 
+    // Clear per-request response state. On failure (early return) the four vectors
+    // stay empty; on success they are repopulated together below to matched sizes.
+    response.outputIds.clear();
+    response.outputTexts.clear();
+    response.outputTrajectories.clear();
+    response.finishReasons.clear();
+
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
     bool const enableSpecDecode = hasDraftModel() && !request.disableSpecDecode;
     std::string const& loraWeightsName = request.loraWeightsName;
@@ -590,6 +599,22 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
     context.topK = enableSpecDecode ? 0 : request.topK;
     context.outputThinkerEmbeddings = outputThinkerEmbeddings;
     context.onTokenGenerated = request.onTokenGenerated;
+
+    // Forward per-slot stop strings and cache the longest length to avoid
+    // recomputing it on every emitChunks iteration.
+    for (size_t i = 0; i < request.requests.size(); ++i)
+    {
+        context.stopStringsPerSlot[i] = request.requests[i].stopStrings;
+        size_t maxLen = 0;
+        for (auto const& s : request.requests[i].stopStrings)
+        {
+            if (s.size() > maxLen)
+            {
+                maxLen = s.size();
+            }
+        }
+        context.slotStreams[i].maxStopLen = maxLen;
+    }
 
     // The spec-decode path needs extra KV reserve for draft tokens during verification.
     constexpr int32_t kDRAFT_KVCACHE_RESERVE_LENGTH{100};
@@ -743,16 +768,15 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
                 continue; // Respect first-writer-wins (cancel may have fired).
             }
             auto& s = context.slotStreams[i];
+            // terminalReason is set for all slots; non-streaming slots surface it via
+            // BatchResult.terminalReason → response.finishReasons.
             if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
             {
                 if (context.tokenIds[i].size() > 1 && trajFutureStartId >= 0
                     && context.tokenIds[i][context.tokenIds[i].size() - 2] == trajFutureStartId)
                 {
                     context.finishedStates[i] = 1;
-                    if (s.channel)
-                    {
-                        s.terminalReason = FinishReason::kEndId;
-                    }
+                    s.terminalReason = FinishReason::kEndId;
                     LOG_DEBUG("Batch %d finished, reason: traj_future_start", i);
                     continue;
                 }
@@ -763,10 +787,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
                 if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
                 {
                     context.finishedStates[i] = 1;
-                    if (s.channel)
-                    {
-                        s.terminalReason = FinishReason::kEndId;
-                    }
+                    s.terminalReason = FinishReason::kEndId;
                     LOG_DEBUG("Batch %d finished, reason: EOS", i);
                     continue;
                 }
@@ -775,22 +796,35 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
             if (context.currentGenerateLengths[i] >= context.maxGenerateLength)
             {
                 context.finishedStates[i] = 1;
-                if (s.channel)
-                {
-                    s.terminalReason = FinishReason::kLength;
-                }
+                s.terminalReason = FinishReason::kLength;
                 LOG_DEBUG(
                     "Batch %d finished, total tokens=%d, reason: max_length", i, context.currentGenerateLengths[i]);
                 continue;
             }
         }
+
+        // Stop-string override pass — runs after EOS/length so it can override
+        // kEndId/kLength (user-relevant cause). Cancel/error still win because
+        // decodePerSlot skipped the match when those reasons were latched.
+        for (int32_t i = 0; i < context.activeBatchSize; ++i)
+        {
+            auto& s = context.slotStreams[i];
+            if (s.stopMatchedThisIter && s.terminalReason != FinishReason::kCancelled
+                && s.terminalReason != FinishReason::kError)
+            {
+                context.finishedStates[i] = 1;
+                s.terminalReason = FinishReason::kStopWords;
+                LOG_DEBUG("Batch %d finished, reason: stop_words", i);
+            }
+        }
     };
 
-    // Post-prefill finish-state detection: cancel FIRST (so it wins over natural
-    // finish if both are observable), then natural EOS/length, then emit chunks.
+    // Post-prefill per-iter pipeline:
+    //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
     applyCancellationToFinishStates(context);
+    decodePerSlot(context, *mTokenizer);
     updateFinishStates();
-    emitChunks(context, *mTokenizer);
+    emitChunks(context);
 
     // If everything finished during prefill, evict once so activeBatchSize reaches 0
     if (checkAllFinished() && context.activeBatchSize > 0)
@@ -854,9 +888,10 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
             }
         }
 
-        // Update iterations, check finish conditions and increment generation round
+        // Per-iter pipeline: decode → finalize finish state → emit chunks.
+        decodePerSlot(context, *mTokenizer);
         updateFinishStates();
-        emitChunks(context, *mTokenizer);
+        emitChunks(context);
         context.generationRound += 1;
 
         // Perform batch eviction if needed (after verification, before updating finish states)
@@ -903,13 +938,11 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
     }
 
     // Save output ids and decoded texts to response.
-    // Maintain original batch order using original batch indices
-    response.outputIds.clear();
-    response.outputTexts.clear();
-    response.outputTrajectories.clear();
+    // Maintain original batch order using original batch indices.
     response.outputIds.resize(context.completedBatches.size());
     response.outputTexts.resize(context.completedBatches.size());
     response.outputTrajectories.resize(context.completedBatches.size());
+    response.finishReasons.resize(context.completedBatches.size(), FinishReason::kNotFinished);
 
     // Add outputs from completed batches (using saved original indices)
     for (auto const& [originalIdx, batchResult] : context.completedBatches)
@@ -936,6 +969,32 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
         response.outputIds[originalIdx] = std::vector<int32_t>(
             batchResult.tokenIds.begin() + (totalLength - genLength), batchResult.tokenIds.end());
         response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
+        response.finishReasons[originalIdx] = batchResult.terminalReason;
+
+        // Trim this slot's own stop strings from its output text by delegating
+        // to applyStopStringMatch with isFinal=true — single source of truth
+        // for earliest-position-wins semantics, shared with the streaming path.
+        // outputIds is intentionally left intact (full token stream).
+        if (originalIdx < static_cast<int32_t>(request.requests.size())
+            && !request.requests[originalIdx].stopStrings.empty())
+        {
+            auto const& slotStops = request.requests[originalIdx].stopStrings;
+            size_t maxLen = 0;
+            for (auto const& s : slotStops)
+            {
+                maxLen = std::max(maxLen, s.size());
+            }
+            auto& text = response.outputTexts[originalIdx];
+            auto outcome = applyStopStringMatch(text, slotStops, maxLen, /*isFinal=*/true);
+            text = std::move(outcome.emitted);
+            if (outcome.stopMatched)
+            {
+                // emitDelta (incremental) and one-shot Tokenizer::decode can differ at BPE
+                // piece boundaries — upgrade the reason if one-shot surfaced a stop the
+                // streaming-path matcher missed.
+                response.finishReasons[originalIdx] = FinishReason::kStopWords;
+            }
+        }
     }
 
     bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
@@ -2679,6 +2738,7 @@ bool LLMInferenceSpecDecodeRuntime::performBatchEvict(SpecDecodeInferenceContext
             result.actualIterations = context.generationRound;
             result.rawBatchedInputIds = std::move(context.rawBatchedInputIds[i]);
             result.effectivePrefillLength = context.effectivePrefillLengths[i];
+            result.terminalReason = context.slotStreams[i].terminalReason;
 
             context.completedBatches[originalIdx] = std::move(result);
         }
@@ -2692,6 +2752,7 @@ bool LLMInferenceSpecDecodeRuntime::performBatchEvict(SpecDecodeInferenceContext
     rt::compactVector(batchMapping, context.effectivePrefillLengths);
     rt::compactVector(batchMapping, context.batchIndexMapping);
     rt::compactVector(batchMapping, context.slotStreams);
+    rt::compactVector(batchMapping, context.stopStringsPerSlot);
 
     // Update active batch size
     context.activeBatchSize = newActiveBatch;

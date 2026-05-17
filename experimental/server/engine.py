@@ -75,6 +75,7 @@ class SamplingParams:
     max_tokens: int = 2048
     enable_thinking: bool = False
     disable_spec_decode: bool = False
+    stop: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -642,6 +643,7 @@ class LLM:
             request = self._rt.LLMGenerationRequest()
             req = self._rt.Request(messages=cpp_messages)
             req.image_buffers = image_buffers
+            req.stop_strings = params.stop
             request.requests = [req]
             request.temperature = params.temperature
             request.top_p = params.top_p
@@ -655,7 +657,8 @@ class LLM:
             response = self._runtime.handle_request(request)
             text = response.output_texts[0] if response.output_texts else ""
             ids = response.output_ids[0] if response.output_ids else []
-            reason = ("length" if len(ids) >= params.max_tokens else "stop")
+            reason = finish_reason_name(self._rt, response.finish_reasons[0]) \
+                if response.finish_reasons else "stop"
             outputs.append(
                 CompletionOutput(text=text,
                                  token_ids=ids,
@@ -700,6 +703,7 @@ class LLM:
         request = self._rt.LLMGenerationRequest()
         req = self._rt.Request(messages=cpp_messages)
         req.image_buffers = image_buffers
+        req.stop_strings = params.stop
         request.requests = [req]
         request.stream_channels = [channel]
         request.temperature = params.temperature
@@ -710,13 +714,6 @@ class LLM:
         request.add_generation_prompt = True
         request.enable_thinking = params.enable_thinking
         request.disable_spec_decode = params.disable_spec_decode
-
-        _FINISH_REASON_MAP = {
-            self._rt.FinishReason.END_ID: "stop",
-            self._rt.FinishReason.LENGTH: "length",
-            self._rt.FinishReason.CANCELLED: "cancelled",
-            self._rt.FinishReason.ERROR: "error",
-        }
 
         error_holder = [None]
 
@@ -737,7 +734,8 @@ class LLM:
                     if channel.is_finished() or channel.is_cancelled():
                         break
                     continue
-                reason = _FINISH_REASON_MAP.get(chunk.reason)
+                reason = finish_reason_name(
+                    self._rt, chunk.reason) if chunk.finished else None
                 yield StreamDelta(
                     text=chunk.text,
                     token_ids=list(chunk.token_ids),
@@ -790,6 +788,25 @@ class LLM:
 # ---------------------------------------------------------------------------
 # Message conversion & image loading
 # ---------------------------------------------------------------------------
+
+
+def finish_reason_name(rt_module, reason) -> Optional[str]:
+    """Map a C++ FinishReason enum value to its OpenAI-compatible string.
+
+    NOT_FINISHED maps to None — reaching this function with a non-terminal
+    reason indicates a bug; surfacing None instead of silently returning "stop"
+    makes it visible. The fallback "stop" catches truly-unknown enum values
+    (e.g. future C++ enum additions). STOP_WORDS and END_ID both map to "stop"
+    since OpenAI does not distinguish them.
+    """
+    return {
+        rt_module.FinishReason.NOT_FINISHED: None,
+        rt_module.FinishReason.END_ID: "stop",
+        rt_module.FinishReason.LENGTH: "length",
+        rt_module.FinishReason.CANCELLED: "cancelled",
+        rt_module.FinishReason.ERROR: "error",
+        rt_module.FinishReason.STOP_WORDS: "stop",
+    }.get(reason, "stop")
 
 
 def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
