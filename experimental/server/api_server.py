@@ -36,7 +36,10 @@ import argparse
 import json
 import logging
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+from .engine import (SamplingParams, _convert_messages_to_cpp,
+                     _load_image_buffers, finish_reason_name)
 
 logger = logging.getLogger("edgellm.api_server")
 
@@ -107,8 +110,24 @@ def _create_app(llm_instance):
         enable_thinking = body.get("enable_thinking", False)
         disable_spec_decode = body.get("disable_spec_decode", False)
 
+        # OpenAI-compatible "stop": null | str | list[str]. Reject other types with 400.
+        stop_raw = body.get("stop")
+        stop: List[str] = []
+        if stop_raw is None:
+            pass
+        elif isinstance(stop_raw, str):
+            stop = [stop_raw]
+        elif isinstance(stop_raw, list) and all(
+                isinstance(s, str) for s in stop_raw):
+            stop = stop_raw
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "'stop' must be a string or array of strings"
+                })
+
         rt = llm_instance._rt
-        from .engine import _convert_messages_to_cpp, _load_image_buffers
 
         try:
             cpp_messages = _convert_messages_to_cpp(rt, messages)
@@ -123,6 +142,7 @@ def _create_app(llm_instance):
         request = rt.LLMGenerationRequest()
         req = rt.Request(messages=cpp_messages)
         req.image_buffers = image_buffers
+        req.stop_strings = stop
         request.requests = [req]
         request.temperature = temperature
         request.top_p = top_p
@@ -136,8 +156,6 @@ def _create_app(llm_instance):
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
         if stream:
-            from .engine import SamplingParams
-
             params = SamplingParams(
                 temperature=temperature,
                 top_p=top_p,
@@ -145,6 +163,7 @@ def _create_app(llm_instance):
                 max_tokens=max_tokens,
                 enable_thinking=enable_thinking,
                 disable_spec_decode=disable_spec_decode,
+                stop=stop,
             )
 
             return StreamingResponse(
@@ -181,6 +200,9 @@ def _create_app(llm_instance):
         message_body["content"] = (
             (answer if answer is not None else reasoning) or "")
 
+        finish_reason = (finish_reason_name(rt, response.finish_reasons[0])
+                         if response.finish_reasons else "stop")
+
         return {
             "id":
             response_id,
@@ -189,7 +211,7 @@ def _create_app(llm_instance):
             "choices": [{
                 "index": 0,
                 "message": message_body,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }],
             "usage": {
                 "completion_tokens": completion_tokens,

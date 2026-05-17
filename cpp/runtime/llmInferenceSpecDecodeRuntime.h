@@ -73,6 +73,8 @@ struct BatchResult
     int32_t generateLength{0};               //!< Number of tokens generated
     int32_t actualIterations{0};             //!< Number of iterations executed
     int32_t effectivePrefillLength{0};       //!< Effective prefill length (excluding reused KVCache length)
+    FinishReason terminalReason{
+        FinishReason::kNotFinished}; //!< Why this batch terminated (EOS, length, stop string, cancel, error)
 };
 
 /*!
@@ -110,6 +112,9 @@ struct SpecDecodeInferenceContext
     float temperature{1.0f}; //!< Temperature for sampling
     float topP{1.0f};        //!< Top-P (nucleus) sampling parameter
     int64_t topK{0};         //!< Top-K sampling parameter
+
+    // Per-slot stop strings; empty list disables stop-string termination for that slot.
+    std::vector<std::vector<std::string>> stopStringsPerSlot;
 
     // Thinker embedding output (Qwen3-Omni audio generation)
     bool outputThinkerEmbeddings{false}; //!< Whether to capture hidden states for Talker pipeline

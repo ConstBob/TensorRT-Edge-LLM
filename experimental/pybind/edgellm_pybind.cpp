@@ -282,7 +282,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         }),
             py::arg("messages"))
         .def_readwrite("messages", &LLMGenerationRequest::Request::messages)
-        .def_readwrite("image_buffers", &LLMGenerationRequest::Request::imageBuffers);
+        .def_readwrite("image_buffers", &LLMGenerationRequest::Request::imageBuffers)
+        .def_readwrite("stop_strings", &LLMGenerationRequest::Request::stopStrings);
 
     // ========================================================================
     // Streaming
@@ -340,7 +341,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     py::class_<LLMGenerationResponse>(m, "LLMGenerationResponse")
         .def(py::init<>())
         .def_readwrite("output_ids", &LLMGenerationResponse::outputIds)
-        .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts);
+        .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts)
+        .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons);
 
     // ========================================================================
     // Runtime: unified (vanilla + Eagle speculative decoding)
