@@ -10,9 +10,11 @@ docker build --network=host --shm-size=8g \
   -t tensorrt-edge-llm:experimental .
 ```
 
-The build extracts the shipped CuTe DSL tarball from
-`kernelSrcs/cuteDSLPrebuilt/` and does not generate CuTe DSL artifacts during
-Docker build.
+The build extracts the CuTe DSL tarball from `kernelSrcs/cuteDSLPrebuilt/` and
+does not generate CuTe DSL artifacts during Docker build. In GitLab CI,
+`l0_experimental_docker_jedha` downloads `build_cutedsl_sm110_artifact` first
+and stages the tarball into that directory before sending the Docker context to
+the board.
 
 Run the OpenAI-compatible experimental server with the upstream Python module:
 

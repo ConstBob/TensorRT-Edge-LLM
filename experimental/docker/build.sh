@@ -118,10 +118,26 @@ prebuilt_tarball="${CUTE_DSL_PREBUILT_TARBALL:-kernelSrcs/cuteDSLPrebuilt/cuteds
 
 if [[ ! -f "${artifact_dir}/metadata.json" || ! -f "${artifact_dir}/libcutedsl_${artifact_arch}.a" ]]; then
     if [[ ! -f "${prebuilt_tarball}" ]]; then
+        root_tarball="$(basename "${prebuilt_tarball}")"
+        if [[ -f "${root_tarball}" ]]; then
+            echo "Staging GitLab CuteDSL artifact ${root_tarball} into $(dirname "${prebuilt_tarball}")"
+            mkdir -p "$(dirname "${prebuilt_tarball}")"
+            cp -f "${root_tarball}" "${prebuilt_tarball}"
+            if [[ -f "${root_tarball}.sha256" ]]; then
+                cp -f "${root_tarball}.sha256" "${prebuilt_tarball}.sha256"
+            fi
+        fi
+    fi
+
+    if [[ ! -f "${prebuilt_tarball}" ]]; then
         echo "CuTe DSL is enabled, but the prebuilt artifact tarball was not found: ${prebuilt_tarball}" >&2
         echo "Available upstream prebuilt artifacts:" >&2
         find kernelSrcs/cuteDSLPrebuilt -maxdepth 1 -type f -name '*.tar.gz' -print >&2 || true
         exit 1
+    fi
+
+    if [[ -f "${prebuilt_tarball}.sha256" ]]; then
+        (cd "$(dirname "${prebuilt_tarball}")" && sha256sum -c "$(basename "${prebuilt_tarball}").sha256")
     fi
 
     mkdir -p "${artifact_root}"
