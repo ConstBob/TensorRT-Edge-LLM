@@ -605,6 +605,7 @@ def _attention_onnx_translation(
 # ---------------------------------------------------------------------------
 
 
+@script()
 def _int4_moe_plugin_translation(
     router_logits: onnxscript.FLOAT,
     hidden_states: onnxscript.FLOAT16,

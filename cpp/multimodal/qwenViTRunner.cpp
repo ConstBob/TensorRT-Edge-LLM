@@ -381,8 +381,14 @@ std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(
     int64_t const minPixels = mConfig.minImageTokensPerImage * factor * factor;
     int64_t const maxPixels = mConfig.maxImageTokensPerImage * factor * factor;
 
+    // Banker's rounding (round-half-to-even) to match Python's round() used by the HF reference.
     auto roundByFactor = [](int64_t value, int64_t factor) -> int64_t {
-        return std::round(static_cast<double>(value) / factor) * factor;
+        int64_t q = value / factor;
+        int64_t r = value - q * factor;
+        int64_t twoR = 2 * r;
+        if (twoR > factor || (twoR == factor && (q & 1)))
+            ++q;
+        return q * factor;
     };
     auto floorByFactor = [](int64_t value, int64_t factor) -> int64_t {
         return std::floor(static_cast<double>(value) / factor) * factor;

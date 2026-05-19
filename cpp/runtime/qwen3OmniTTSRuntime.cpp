@@ -450,7 +450,6 @@ bool Qwen3OmniTTSRuntime::loadCodePredictorWeights(std::string const& codePredic
     LOG_INFO("Loaded %d CodePredictor lm_head weights, codebookSize=%d", mNumRvqLayers, mTalkerConfig.codebookSize);
 
     // Load small_to_mtp_projection: projects Talker hidden (2048) → CodePredictor input (1024)
-    // Omni models have matching hidden sizes and no projection file — skip entirely.
     {
         std::filesystem::path const projPath
             = std::filesystem::path(codePredictorEngineDir) / "small_to_mtp_projection.safetensors";
@@ -481,14 +480,14 @@ bool Qwen3OmniTTSRuntime::loadCodePredictorWeights(std::string const& codePredic
                 LOG_ERROR("Missing 'weight' or 'bias' in small_to_mtp_projection.safetensors");
                 return false;
             }
-            mIsOmni = false;
-            LOG_INFO("Loaded small_to_mtp_projection: weight=%ldx%ld, bias=%ld (TTS mode)",
-                mSmallToMtpWeight.getShape()[0], mSmallToMtpWeight.getShape()[1], mSmallToMtpBias.getShape()[0]);
+            mUseSmallToMtpProjection = true;
+            LOG_INFO("Loaded small_to_mtp_projection: weight=%ldx%ld, bias=%ld", mSmallToMtpWeight.getShape()[0],
+                mSmallToMtpWeight.getShape()[1], mSmallToMtpBias.getShape()[0]);
         }
         else if (mTalkerConfig.talkerHiddenSize == mTalkerConfig.codePredictorHiddenSize)
         {
-            mIsOmni = true;
-            LOG_INFO("Omni mode: no small_to_mtp_projection needed (talkerHiddenSize == codePredictorHiddenSize = %d)",
+            mUseSmallToMtpProjection = false;
+            LOG_INFO("No small_to_mtp_projection needed (talkerHiddenSize == codePredictorHiddenSize = %d)",
                 mTalkerConfig.talkerHiddenSize);
         }
         else
@@ -654,6 +653,7 @@ bool Qwen3OmniTTSRuntime::loadTalkerWeights(std::string const& weightsDir, cudaS
     std::filesystem::path const hiddenProjPath = std::filesystem::path(weightsDir) / "hidden_projection.safetensors";
     if (std::filesystem::exists(hiddenProjPath))
     {
+        mIsOmni = true;
         std::vector<rt::Tensor> hiddenTensors;
         if (!safetensors::loadSafetensors(hiddenProjPath, hiddenTensors, stream))
         {
@@ -669,6 +669,7 @@ bool Qwen3OmniTTSRuntime::loadTalkerWeights(std::string const& weightsDir, cudaS
     }
     else
     {
+        mIsOmni = false;
         LOG_INFO("hidden_projection.safetensors not found at %s (multimodal token projection unavailable)",
             hiddenProjPath.string().c_str());
     }
@@ -896,11 +897,10 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
             cudaMemcpyAsync(dst, mRawCodecEmbed.rawPointer(), H * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
     }
 
-    // Project mRawCodecEmbed → mCodePredictorCodecEmbed via small_to_mtp_projection (TTS only)
-    // Omni: dimensions match, copy raw embed directly into CodePredictor embed
+    // Project mRawCodecEmbed → mCodePredictorCodecEmbed if needed.
     check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
-    if (mIsOmni)
+    if (!mUseSmallToMtpProjection)
     {
         CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecEmbed.rawPointer(), mRawCodecEmbed.rawPointer(),
             mTalkerConfig.codePredictorHiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
@@ -1653,10 +1653,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
         check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
         check::check(
             mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
-        if (mIsOmni)
+        if (!mUseSmallToMtpProjection)
         {
-            // Omni: talkerHiddenSize == codePredictorHiddenSize, no projection needed.
-            // Directly copy talkerHiddenState and mRawCodecEmbed into mCodePredictorPrefillInput.
             CUDA_CHECK(cudaMemcpyAsync(mCodePredictorPrefillInput.rawPointer(), talkerHiddenState.rawPointer(),
                 hiddenSize * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync(static_cast<__half*>(mCodePredictorPrefillInput.rawPointer()) + hiddenSize,
@@ -1664,7 +1662,6 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
         }
         else
         {
-            // TTS: project through small_to_mtp_projection, then concat
             kernel::invokeLinearLayer(
                 talkerHiddenState, mSmallToMtpWeight, mSmallToMtpBias, mSmallToMtpProjectedHidden, stream);
             kernel::invokeLinearLayer(

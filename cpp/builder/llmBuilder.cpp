@@ -135,7 +135,9 @@ bool LLMBuilder::build()
 
     // Build and save engine
     std::string const engineFilePath = (mEngineDir / engineFileName).string();
-#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
+#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
+    setenv("__LUNOWUD", "-peep:match_dual_gemm=off", 1);
+#elif NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
     setenv("__LUNOWUD", "-mlir:autotune:num_threads=1 -mlir:collective:fp4=off -cask_fusion:async_policy=1", 1);
 #endif
     if (!buildAndSerializeEngine(builder.get(), network.get(), config.get(), engineFilePath))

@@ -215,19 +215,23 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
+        module_prefix = f"layers.{layer_idx}.self_attn"
 
         self.q_proj = make_linear(config,
                                   qkv_in_features,
                                   num_attention_heads * head_dim,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.q_proj")
         self.k_proj = make_linear(config,
                                   qkv_in_features,
                                   num_key_value_heads * head_dim,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.k_proj")
         self.v_proj = make_linear(config,
                                   qkv_in_features,
                                   num_key_value_heads * head_dim,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.v_proj")
         # FP8 KV-cache scales live on the proj modules (checkpoint keys
         # ``...k_proj.k_scale`` / ``...v_proj.v_scale``); they are not part of
         # FP8Linear's per-tensor weight/input scales.
@@ -235,8 +239,10 @@ class Attention(nn.Module):
             self.k_proj.register_buffer("k_scale", torch.ones(1))
             self.v_proj.register_buffer("v_scale", torch.ones(1))
 
-        self.o_proj = make_linear(config, num_attention_heads * head_dim,
-                                  hidden_size)
+        self.o_proj = make_linear(config,
+                                  num_attention_heads * head_dim,
+                                  hidden_size,
+                                  module_name=f"{module_prefix}.o_proj")
 
         if config.has_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -316,14 +322,24 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     """SwiGLU MLP: gate_proj, up_proj, down_proj."""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, layer_idx: int = -1) -> None:
         super().__init__()
-        self.gate_proj = make_linear(config, config.hidden_size,
-                                     config.intermediate_size)
-        self.up_proj = make_linear(config, config.hidden_size,
-                                   config.intermediate_size)
-        self.down_proj = make_linear(config, config.intermediate_size,
-                                     config.hidden_size)
+        module_prefix = f"layers.{layer_idx}.mlp" if layer_idx >= 0 else ""
+        self.gate_proj = make_linear(
+            config,
+            config.hidden_size,
+            config.intermediate_size,
+            module_name=f"{module_prefix}.gate_proj" if module_prefix else "")
+        self.up_proj = make_linear(
+            config,
+            config.hidden_size,
+            config.intermediate_size,
+            module_name=f"{module_prefix}.up_proj" if module_prefix else "")
+        self.down_proj = make_linear(
+            config,
+            config.intermediate_size,
+            config.hidden_size,
+            module_name=f"{module_prefix}.down_proj" if module_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(
@@ -347,7 +363,7 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx=layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, layer_idx=layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 config.rms_norm_eps)

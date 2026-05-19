@@ -121,6 +121,17 @@ integration with the TRT Edge-LLM plugin system.
 - `cuda-python` (provides `cuda.bindings.driver`)
 - `cupy-cuda13x` (GPU memory allocation during AOT compilation)
 
+Pick the `cuda-python` and CuPy variant that matches your CUDA version before
+installing `nvidia-cutlass-dsl`:
+
+```bash
+pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
+# or
+pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
+
+pip install nvidia-cutlass-dsl==4.4.1
+```
+
 ## TensorRT plugin
 
 The FP16 variants of this kernel family are wrapped as a TensorRT plugin at

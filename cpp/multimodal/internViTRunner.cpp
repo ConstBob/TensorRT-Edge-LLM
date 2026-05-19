@@ -237,9 +237,13 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
             {
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
-            // Only add thumbnail when the image has more than 1 block (matches HuggingFace behavior)
+            // Add a thumbnail tile when (a) the image has more than 1 main block (matches
+            // HuggingFace behavior) or (b) the engine's MIN-profile demands more than 1 block
+            // (engines built with `visual_build --minImageTokens > 256`). Without (b), a
+            // single-block image would invoke the engine with totalNumBlocks=1 and the
+            // optimization profile would reject it at runtime.
             int64_t const mainImageBlocks = totalNumBlocks - blocksBeforePatch;
-            if (mainImageBlocks > 1)
+            if (mainImageBlocks > 1 || mConfig.minNumBlocks > 1)
             {
                 rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
                     mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC);

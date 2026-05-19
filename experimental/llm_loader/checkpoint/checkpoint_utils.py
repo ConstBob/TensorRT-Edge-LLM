@@ -444,8 +444,16 @@ def _build_alpamayo_tokenizer(config: Dict[str, Any], out_dir: str) -> None:
 
     try:
         from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(vlm_name,
-                                                  trust_remote_code=True)
+        try:
+            processor = AutoProcessor.from_pretrained(vlm_name,
+                                                      trust_remote_code=True)
+        except (OSError, ValueError) as online_exc:
+            logger.warning(
+                "Failed to load Alpamayo tokenizer from %s (%s); "
+                "retrying local cache", vlm_name, online_exc)
+            processor = AutoProcessor.from_pretrained(vlm_name,
+                                                      trust_remote_code=True,
+                                                      local_files_only=True)
         tokenizer = processor.tokenizer
 
         # Add discrete trajectory tokens

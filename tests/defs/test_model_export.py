@@ -37,7 +37,8 @@ from .utils.command_generation import (can_use_llm_loader,
                                        generate_pre_export_commands)
 from .utils.llm_loader_helpers import (_llm_loader_env, run_command_list,
                                        run_llm_loader_draft_export,
-                                       run_llm_loader_export)
+                                       run_llm_loader_export,
+                                       run_llm_loader_mtp_export)
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -52,16 +53,11 @@ def validate_export_result(config: TestConfig) -> None:
         expected_onnx = [
             os.path.join(output_dir, "talker", "model.onnx"),
             os.path.join(output_dir, "code_predictor", "model.onnx"),
+            os.path.join(config.get_code2wav_onnx_dir(), "model.onnx"),
         ]
         for path in expected_onnx:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"TTS ONNX not found: {path}")
-        # NOTE: tokenizer_decoder is exported by the legacy audio exporter
-        # but NOT by llm_loader. The downstream TTS build step
-        # (``audio_build --onnxDir=.../tokenizer_decoder``) still needs it
-        # on the legacy path. When using llm_loader, the TTS pipeline must
-        # obtain the tokenizer_decoder separately or the build step should
-        # be updated to handle its absence.
         return
 
     llm_onnx = os.path.join(output_dir, "model.onnx")
@@ -160,7 +156,7 @@ class TestModelExport:
         if not os.path.exists(torch_dir):
             raise FileNotFoundError(f"Torch model not found: {torch_dir}")
 
-        if config.is_eagle:
+        if config.is_eagle and not config.is_mtp:
             draft_torch_dir = config.get_draft_model_dir()
             if not os.path.exists(draft_torch_dir):
                 raise FileNotFoundError(
@@ -178,6 +174,9 @@ class TestModelExport:
             os.makedirs(config.get_audio_onnx_dir("fp16"), exist_ok=True)
             if config.audio_precision == "fp8":
                 os.makedirs(config.get_audio_onnx_dir("fp8"), exist_ok=True)
+
+        if config.model_type == ModelType.TTS:
+            os.makedirs(config.get_code2wav_onnx_dir("fp16"), exist_ok=True)
 
         if config.model_type == ModelType.OMNI:
             visual_onnx_dir = config.get_visual_onnx_dir("fp16")
@@ -197,7 +196,7 @@ class TestModelExport:
         if config.is_eagle:
             draft_onnx_dir = config.get_draft_onnx_dir()
             os.makedirs(draft_onnx_dir, exist_ok=True)
-            if (config.draft_llm_precision
+            if (not config.is_mtp and config.draft_llm_precision
                     and config.draft_llm_precision != "fp16"):
                 quantized_draft_dir = config.get_quantized_draft_model_dir()
                 os.makedirs(quantized_draft_dir, exist_ok=True)
@@ -232,6 +231,7 @@ class TestModelExport:
             #    (chat_template handled internally by llm_loader)
             #    For EAGLE: base is exported with --eagle-base, then the
             #    draft is exported in a second llm_loader invocation.
+            #    For MTP: base + draft are exported together via --mtp.
             # 3. Post-export: fp8 visual calibration (if needed, legacy tool)
             pre_commands = generate_pre_export_commands(config)
             post_commands = generate_post_llm_loader_commands(config)
@@ -240,11 +240,14 @@ class TestModelExport:
                     f"Exporting {config.model_type.value} {config.model_name} "
                     f"to {config.llm_precision} (llm_loader)", test_logger):
                 run_command_list(pre_commands, "Pre-export", test_logger)
-                run_llm_loader_export(config,
-                                      test_logger,
-                                      eagle_base=config.is_eagle)
-                if config.is_eagle:
-                    run_llm_loader_draft_export(config, test_logger)
+                if config.is_mtp:
+                    run_llm_loader_mtp_export(config, test_logger)
+                else:
+                    run_llm_loader_export(config,
+                                          test_logger,
+                                          eagle_base=config.is_eagle)
+                    if config.is_eagle:
+                        run_llm_loader_draft_export(config, test_logger)
                 # post_commands may include `python -m llm_loader.lora.*`
                 # which require PYTHONPATH to include experimental/.
                 # Legacy CLIs in the same list (tensorrt-edgellm-export-{visual,

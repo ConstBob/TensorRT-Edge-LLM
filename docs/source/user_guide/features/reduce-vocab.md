@@ -15,6 +15,15 @@ Vocabulary reduction restricts generation logits to a task-specific subset of to
 Using Qwen3-0.6B as an example — smaller models benefit most from vocabulary reduction since LM head represents a larger fraction of total compute:
 
 ```bash
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+
+# Optional: quantize the source checkpoint first
+python -m experimental.quantization llm \
+  --model_dir Qwen/Qwen3-0.6B \
+  --output_dir qwen3_0_6b_nvfp4 \
+  --quantization nvfp4 \
+  --lm_head_quantization nvfp4
+
 # Step 1: Generate vocabulary mapping
 python -m llm_loader.vocab_reduction \
   --model_dir Qwen/Qwen3-0.6B \
@@ -25,7 +34,7 @@ python -m llm_loader.vocab_reduction \
 
 # Step 2: Export model with reduced vocabulary
 python -m llm_loader.export_all_cli \
-  Qwen/Qwen3-0.6B \
+  qwen3_0_6b_nvfp4 \
   qwen3_0_6b_onnx \
   --reduced-vocab-dir reduced_vocab/
 
@@ -55,12 +64,12 @@ When using vocabulary reduction for EAGLE base models, you must include all toke
 ```bash
 # Step 0: Export EAGLE draft model first (generates d2t.safetensors)
 python -m llm_loader.export_all_cli \
-  EAGLE3-Qwen3-4B-Instruct-2507 \
+  AngelSlim/Qwen3-4B_eagle3 \
   draft_onnx
 
 # Step 1: Generate vocabulary mapping with d2t constraint
 python -m llm_loader.vocab_reduction \
-  --model_dir Qwen/Qwen3-4B-Instruct-2507 \
+  --model_dir Qwen/Qwen3-4B \
   --output_dir reduced_vocab \
   --reduced_vocab_size 16384 \
   --method input_aware \
@@ -68,7 +77,7 @@ python -m llm_loader.vocab_reduction \
 
 # Step 2: Export base model with reduced vocabulary
 python -m llm_loader.export_all_cli \
-  Qwen/Qwen3-4B-Instruct-2507 \
+  Qwen/Qwen3-4B \
   base_onnx \
   --eagle-base \
   --reduced-vocab-dir reduced_vocab/

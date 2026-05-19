@@ -336,6 +336,12 @@ class TestConfig:
                 TaskType.INFERENCE
             }, {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
             is_required=False),
+        ParameterSpec("is_mtp",
+                      "mtp", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
         ParameterSpec("draft_model_id",
                       "", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
@@ -689,6 +695,8 @@ class TestConfig:
                     self.fp8_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
+                if self.is_mtp is None:
+                    self.is_mtp = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.reduced_vocab_size is not None:
@@ -1116,6 +1124,11 @@ class TestConfig:
         """
         p = precision or self.audio_precision
         return os.path.join(self.get_onnx_base_dir(), f"audio-{p}")
+
+    def get_code2wav_onnx_dir(self, precision: Optional[str] = None) -> str:
+        """Code2Wav ONNX directory for TTS models."""
+        p = precision or self.audio_precision
+        return os.path.join(self.get_onnx_base_dir(), f"code2wav-{p}")
 
     def get_draft_onnx_model_id(self) -> str:
         """Generate unique draft model identifier including draft_model_id"""

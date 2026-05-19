@@ -145,7 +145,8 @@ def _iter_image_question_pairs(dataset_name: str):
 def _multimodal_calib_dataloader(processor,
                                  dataset_name: str = "lmms-lab/MMMU",
                                  num_samples: int = 128,
-                                 max_length: int = 512):
+                                 max_length: int = 512,
+                                 is_phi4mm: bool = False):
     """Yield ``BatchFeature`` dicts with ``input_ids`` + ``pixel_values``.
 
     Streams image-question pairs through the model's own ``AutoProcessor``
@@ -185,20 +186,32 @@ def _multimodal_calib_dataloader(processor,
                 return_tensors="pt",
             )
         except TypeError:
-            # Older processors do not accept ``tokenize`` / ``return_dict`` /
-            # ``return_tensors`` kwargs; fall back to the two-step path.  Other
-            # exceptions (CUDA OOM, malformed chat template, ...) propagate.
-            text = processor.apply_chat_template(messages,
-                                                 add_generation_prompt=True,
-                                                 tokenize=False)
-            inputs = processor(text=[text],
+            if not is_phi4mm:
+                raise
+            # Phi-4MM's remote processor has a legacy chat-template signature
+            # that rejects ``tokenize`` / ``return_dict`` / ``return_tensors``.
+            # It also uses textual image placeholders, so keep this fallback
+            # Phi-4MM-only instead of applying ``<|image_1|>`` to other VLMs.
+            fallback_messages = [{
+                "role": "user",
+                "content": f"<|image_1|>{question}",
+            }]
+            template_owner = processor if hasattr(
+                processor, "apply_chat_template") else processor.tokenizer
+            text = template_owner.apply_chat_template(
+                fallback_messages, add_generation_prompt=True, tokenize=False)
+            inputs = processor(text=text,
                                images=[image],
                                return_tensors="pt",
                                padding=True,
                                truncation=True,
                                max_length=max_length)
 
-        batches.append({k: v for k, v in inputs.items()})
+        batches.append({
+            k: v
+            for k, v in inputs.items() if v is not None
+            and not (isinstance(v, torch.Tensor) and v.numel() == 0)
+        })
         if len(batches) >= num_samples:
             break
 
@@ -356,7 +369,7 @@ def _is_hybrid_model(model):
 
 
 @contextmanager
-def _skip_resmooth_for_hybrid(model):
+def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     """WAR for ModelOpt resmoothing bugs on selected custom models.
 
     ``export_hf_checkpoint`` calls ``requantize_resmooth_fused_llm_layers``
@@ -367,13 +380,20 @@ def _skip_resmooth_for_hybrid(model):
     incorrectly fused, corrupting the int4 weights.  For Phi-4 multimodal,
     the dummy forward is incompatible with the required ``input_mode``.
 
+    NVFP4 is exempt: resmoothing works correctly for NVFP4 and is required
+    to equalise per-tensor scales across GDN input projections that share
+    the same input activation, enabling fusion into a single GEMM.
+
     This context manager patches the resmoothing function to a no-op when the
     model needs it.  Standard transformer models are unaffected.
 
     TODO: Remove once ModelOpt fixes these model paths upstream.
     """
     model_type = getattr(getattr(model, "config", None), "model_type", "")
-    should_skip = (_is_hybrid_model(model)
+    # NVFP4 on hybrid models: resmoothing is safe and required for GDN
+    # input projection fusion — do NOT skip.
+    is_nvfp4 = quantization.lower() in ("nvfp4", "fp4")
+    should_skip = ((_is_hybrid_model(model) and not is_nvfp4)
                    or model_type in ("phi4mm", "phi4_multimodal"))
     if not should_skip:
         yield
@@ -406,6 +426,7 @@ def _calibrate_multimodal(model, batches):
                 if v.dtype.is_floating_point:
                     v = v.to(next(model.parameters()).dtype)
             kwargs[k] = v
+        kwargs.setdefault("use_cache", False)
         with torch.no_grad():
             model(**kwargs)
 
@@ -481,9 +502,11 @@ def quantize_and_export(
             # ``visual_dataset_dir="lmms-lab/MMMU"``).
             mm_dataset = (dataset
                           if dataset != "cnn_dailymail" else "lmms-lab/MMMU")
-            batches = _multimodal_calib_dataloader(processor,
-                                                   dataset_name=mm_dataset,
-                                                   num_samples=mm_samples)
+            batches = _multimodal_calib_dataloader(
+                processor,
+                dataset_name=mm_dataset,
+                num_samples=mm_samples,
+                is_phi4mm=_is_phi4mm_model(model_dir))
             mtq.quantize(
                 model,
                 quant_cfg,
@@ -506,7 +529,8 @@ def quantize_and_export(
     _normalize_tied_weights_keys(model)
 
     os.makedirs(output_dir, exist_ok=True)
-    with torch.inference_mode(), _skip_resmooth_for_hybrid(model):
+    with torch.inference_mode(), _skip_resmooth_for_hybrid(
+            model, quantization or ""):
         export_hf_checkpoint(model, export_dir=output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:

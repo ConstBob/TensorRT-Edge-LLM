@@ -1,53 +1,52 @@
-# VLA (Vision-Language-Action) Models
+# Alpamayo-R1-10B (Vision-Language-Action)
 
-Complete workflow for Vision-Language-Action (VLA) models — models that combine a VLM backbone with an action expert to produce low-level robot actions from image and text inputs.
+Complete workflow for running [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B), a Vision-Language-Action (VLA) model that combines a VLM backbone with an action expert.
 
-**Currently supported model:** [Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
+**Currently supported model:** [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
 
-> **Prerequisites:** Complete the [Installation Guide](../getting_started/installation.md) for both x86 host and edge device before proceeding. The Alpamayo 1 model requires HuggingFace login before downloading.
+> **Prerequisites:** Complete the [Installation Guide](../getting_started/installation.md) for both x86 host and edge device before proceeding. The Alpamayo 1 checkpoint may require Hugging Face login and license access before downloading.
 
 ---
 
 ## Architecture Overview
 
-Action models run as a two-stage chained pipeline:
+Alpamayo-R1-10B runs as a chained VLM + action pipeline:
 
-1. **VLM backbone** — processes image, text, and proprioceptive inputs and generates language output
-2. **Action expert** — takes VLM output and produces low-level robot actions
+1. **VLM backbone** — exported through `llm_loader` as `onnx/llm` and `onnx/visual`; it processes image, text, and trajectory-history tokens and generates language output.
+2. **Action expert** — exported through `llm_loader` as `onnx/action`; it consumes the VLM KV cache and produces future action waypoints.
 
 Both stages are run with a single `action_inference` invocation. The engines are built separately and loaded together at runtime.
+
+The current TensorRT Edge-LLM input parser accepts image files, text, and
+trajectory history points as `[x, y, z]`. The action output is written as
+`output_trajectory`, a list of `(accel, kappa)` acceleration and curvature pairs.
 
 ---
 
 ## Step 1: Export (x86 Host)
 
 ```bash
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Alpamayo-R1-10B
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
 # Download Alpamayo-R1-10B from HuggingFace
-hf download nvidia/Alpamayo-R1-10B --local-dir=Alpamayo-R1-10B
+hf auth login
+hf download nvidia/Alpamayo-R1-10B --local-dir $MODEL_NAME
 
-# Export language model backbone
-tensorrt-edgellm-export-llm \
-  --model_dir Alpamayo-R1-10B \
-  --output_dir $MODEL_NAME/onnx/llm
-
-# Export visual encoder
-tensorrt-edgellm-export-visual \
-  --model_dir Alpamayo-R1-10B \
-  --output_dir $MODEL_NAME/onnx/visual
-
-# Export action expert (FP16 only)
-tensorrt-edgellm-export-action \
-  --model_dir Alpamayo-R1-10B \
-  --output_dir $MODEL_NAME/onnx/action \
-  --max_kv_cache_capacity 4096
+# Export language model backbone, visual encoder, and action expert
+python -m llm_loader.export_all_cli \
+  $MODEL_NAME \
+  $MODEL_NAME/onnx \
+  --max-kv-cache-capacity 4096
 ```
 
-> **Note:** Only FP16 is supported for the action expert. The `--max_kv_cache_capacity` value must match the `--maxKVCacheCapacity` used when building the LLM engine in Step 3.
+This creates `onnx/llm`, `onnx/visual`, and `onnx/action`.
+
+> **Note:** Only FP16 is supported for Alpamayo export in this release. The `--max-kv-cache-capacity` value must match the `--maxKVCacheCapacity` used when building the LLM engine in Step 3.
 
 ## Step 2: Transfer to Device
 
@@ -86,11 +85,17 @@ cd ~/TensorRT-Edge-LLM
   --maxBatchSize 6
 ```
 
-Build time: < 5 minutes
+`visual_build` writes `$WORKSPACE_DIR/$MODEL_NAME/engines/visual/`, and
+`action_build` writes `$WORKSPACE_DIR/$MODEL_NAME/engines/action/`. Both
+subdirectories are loaded through `--multimodalEngineDir` during inference.
 
 ## Step 4: Run Inference (Thor Device)
 
-Create an input file `$WORKSPACE_DIR/input_action.json`. The `trajectory` content item provides the robot's past trajectory history as a sequence of `[x, y, z]` positions (replace image paths with actual files):
+Create an input file `$WORKSPACE_DIR/input_action.json`. The `trajectory`
+content item provides past egomotion history as `[x, y, z]` positions. Replace
+the image paths with actual RGB image files. The checkpoint card describes the
+primary setting as 4 cameras over 4 timesteps; the runtime parser accepts the
+images as an ordered list of image content items.
 
 ```json
 {
@@ -176,4 +181,3 @@ cd ~/TensorRT-Edge-LLM
 ```
 
 Check `output_action.json` for the response. Each entry includes `output_text` (VLM language output) and `output_trajectory` (predicted (accel, kappa) acceleration and curvature pairs).
-

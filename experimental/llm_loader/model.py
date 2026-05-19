@@ -125,10 +125,12 @@ class AutoModel:
                     "MTP draft is only supported for qwen3_5_text checkpoints."
                 )
             from .models.qwen3_5 import Qwen3_5MtpDraftModel
+            tie_word_embeddings = config.tie_word_embeddings
             config = make_mtp_draft_config(config)
             model_class = Qwen3_5MtpDraftModel
             if key_remap is None:
-                key_remap = _mtp_key_remap
+                key_remap = lambda key: _mtp_key_remap(
+                    key, tie_word_embeddings=tie_word_embeddings)
         else:
             if variant == "mtp_base" and config.model_type != "qwen3_5_text":
                 raise NotImplementedError(
@@ -165,6 +167,11 @@ class AutoModel:
             from .vocab_reduction.onnx_export import \
                 apply_reduced_vocab_from_dir
             apply_reduced_vocab_from_dir(model, reduced_vocab_dir)
+
+        # Post-load optimisation: fuse GDN input projections for Qwen3.5.
+        if config.model_type == "qwen3_5_text" and not mtp_draft:
+            from .models.qwen3_5 import fuse_gdn_input_projections
+            fuse_gdn_input_projections(model)
 
         return model
 
@@ -237,19 +244,18 @@ def _eagle3_key_remap(key: str) -> "str | None":
     return key
 
 
-def _mtp_key_remap(key: str) -> "str | None":
+def _mtp_key_remap(key: str, *, tie_word_embeddings: bool) -> "str | None":
     """Remap MTP checkpoint keys for the draft model.
 
-    The draft-private weights live under ``mtp.*`` while ``lm_head.weight``
-    remains shared with the base model.  Everything else is skipped.
+    The embedding table is only a valid LM-head fallback when the source
+    checkpoint ties word embeddings.
     """
     if key.startswith("mtp."):
         return key[len("mtp."):]
     if key == "lm_head.weight":
         return key
-    # Some checkpoints omit lm_head.weight when tie_word_embeddings=True and
-    # only store the shared embedding table.
-    if key in ("model.embed_tokens.weight",
-               "model.language_model.embed_tokens.weight"):
+    if tie_word_embeddings and key in (
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight"):
         return "lm_head.weight"
     return None

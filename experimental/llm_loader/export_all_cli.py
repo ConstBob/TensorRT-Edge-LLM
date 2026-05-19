@@ -19,7 +19,7 @@ Detects model type from ``config.json`` and exports:
     - LLM backbone        → ``<output_dir>/llm/model.onnx``
     - Visual encoder      → ``<output_dir>/visual/model.onnx``    (VLMs)
     - Audio encoder       → ``<output_dir>/audio/model.onnx``     (speech models)
-    - Code2Wav vocoder    → ``<output_dir>/code2wav/model.onnx``  (Qwen3-Omni)
+    - Code2Wav vocoder    → ``<output_dir>/code2wav/model.onnx``  (Qwen3-Omni / Qwen3-TTS)
 
 Usage::
 
@@ -41,14 +41,16 @@ VLMs (LLM + visual encoder):
     internvl_chat                 (InternVL3)
     internvl                      (InternVL3.5)
     phi4mm, phi4_multimodal       (Phi-4 Multimodal)
-    NemotronH_Nano_VL_V2          (Nemotron-Omni)
+    NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3
+                                 (Nemotron-Omni)
 
 Audio models (LLM + audio encoder):
     qwen3_asr, qwen3_omni, qwen3_omni_thinker
-    NemotronH_Nano_VL_V2          (Nemotron-Omni)
+    NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3
+                                 (Nemotron-Omni)
 
-LLM + Talker decoder (no audio encoder):
-    qwen3_tts    (Talker/CodePredictor are LLM decoders — use --skip-audio)
+LLM + Talker decoder + Code2Wav (no audio encoder):
+    qwen3_tts    (Talker/CodePredictor are LLM decoders; Code2Wav uses speech_tokenizer/)
 
 LLM-only:
     All other model types supported by :mod:`llm_loader.model.AutoModel`.
@@ -79,6 +81,11 @@ logger = logging.getLogger("llm_loader.export_all_cli")
 # Model type classification
 # ---------------------------------------------------------------------------
 
+_NEMOTRON_OMNI_MODEL_TYPES = frozenset([
+    "NemotronH_Nano_VL_V2",
+    "NemotronH_Nano_Omni_Reasoning_V3",
+])
+
 _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
@@ -89,14 +96,14 @@ _VLM_MODEL_TYPES = frozenset([
     "phi4mm",
     "phi4_multimodal",
     "alpamayo_r1",
-    "NemotronH_Nano_VL_V2",
+    *_NEMOTRON_OMNI_MODEL_TYPES,
 ])
 
 _AUDIO_MODEL_TYPES = frozenset([
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
-    "NemotronH_Nano_VL_V2",
+    *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
     # Its Talker and CodePredictor are LLM decoders exported via the LLM pipeline.
 ])
@@ -106,10 +113,11 @@ _AUDIO_MODEL_TYPES = frozenset([
 # Excludes Nemotron-Omni, which has its own field names
 # (``img_context_token_id`` / ``sound_context_token_id``) at the source-config
 # root and is handled by ``_collect_tokens_from_nemotron_root``.
-_ASR_LLM_MODEL_TYPES = _AUDIO_MODEL_TYPES - frozenset(["NemotronH_Nano_VL_V2"])
+_ASR_LLM_MODEL_TYPES = _AUDIO_MODEL_TYPES - _NEMOTRON_OMNI_MODEL_TYPES
 
 _CODE2WAV_MODEL_TYPES = frozenset([
     "qwen3_omni",
+    "qwen3_tts",
 ])
 
 _ACTION_MODEL_TYPES = frozenset([
@@ -417,7 +425,7 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
     collected: dict = {}
 
     # Primary collectors keyed by model family.
-    if model_type == "NemotronH_Nano_VL_V2":
+    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         collected.update(_collect_tokens_from_nemotron_root(root))
     else:
         collected.update(_collect_tokens_from_thinker_config(root))
@@ -704,11 +712,12 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
             vis_cfg_out["vision_config"]["image_size"] = [
                 vc_out["image_size"], vc_out["image_size"]
             ]
-    if model_type == "NemotronH_Nano_VL_V2":
+    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         # The ckpt's "NemotronH_Nano_VL_V2" is not registered in C++
-        # stringToModelType().  Override to the registered tag both at top
-        # level (read by MultimodalRunner::create) and under vision_config
-        # (preferred by visualBuilder).
+        # stringToModelType(), and newer Nemotron-Omni checkpoints use
+        # "NemotronH_Nano_Omni_Reasoning_V3".  Override both to the registered
+        # runtime tag at top level (read by MultimodalRunner::create) and under
+        # vision_config (preferred by visualBuilder).
         vis_cfg_out["model_type"] = "nemotron_omni_vision_encoder"
         vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
         vis_cfg_out["vision_config"][
@@ -727,11 +736,17 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
 
 
 def _export_alpamayo_visual(model_dir: str, visual_out_dir: str, weights: dict,
-                            config: dict, dtype: "torch.dtype") -> None:
+                            config: dict, dtype: "torch.dtype",
+                            model_config: "ModelConfig") -> None:
     vis_weights, vis_config, vis_model_type = _prepare_alpamayo_visual_params(
         config, weights)
-    _export_visual(model_dir, visual_out_dir, vis_weights, vis_config,
-                   vis_model_type, dtype)
+    _export_visual(model_dir,
+                   visual_out_dir,
+                   vis_weights,
+                   vis_config,
+                   vis_model_type,
+                   dtype,
+                   model_config=model_config)
     _save_alpamayo_visual_processor(config, visual_out_dir)
 
 
@@ -759,7 +774,7 @@ def _export_audio(model_dir: str, audio_out_dir: str, weights: dict,
     logger.info("[Audio] Done: %s", output_path)
 
     # Write config.json for the C++ runtime
-    if model_type == "NemotronH_Nano_VL_V2":
+    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         # Nemotron-Omni carries ``sound_config`` at the root with its own
         # encoder model_type; keep the full root config alongside so the
         # builder sees everything it needs.
@@ -812,24 +827,36 @@ def _export_audio(model_dir: str, audio_out_dir: str, weights: dict,
 
 
 # ---------------------------------------------------------------------------
-# Code2Wav export (Qwen3-Omni vocoder)
+# Code2Wav export
 # ---------------------------------------------------------------------------
 
 
 def _export_code2wav(model_dir: str, c2w_out_dir: str, weights: dict,
-                     config: dict, dtype: "torch.dtype") -> None:
-    """Export Qwen3-Omni Code2Wav vocoder via the standalone llm_loader
-    implementation.
+                     config: dict, model_type: str,
+                     dtype: "torch.dtype") -> None:
+    """Export Code2Wav vocoder via the standalone llm_loader implementation.
 
     The vocoder converts discrete RVQ codec tokens
     ``[batch, num_quantizers, code_length]`` into continuous audio
     waveforms ``[batch, 1, code_length * total_upsample]``.
 
-    ``code2wav_config`` is expected at the root of ``config.json``; weights
-    are extracted from the shared checkpoint using the ``code2wav.`` prefix.
+    Qwen3-Omni stores Code2Wav weights in the shared checkpoint under the
+    ``code2wav.`` prefix. Qwen3-TTS stores the vocoder in the
+    ``speech_tokenizer/`` subdirectory.
     """
     os.makedirs(c2w_out_dir, exist_ok=True)
     output_path = os.path.join(c2w_out_dir, "model.onnx")
+
+    if model_type == "qwen3_tts":
+        logger.info("[Code2Wav] Exporting Qwen3-TTS speech tokenizer")
+        try:
+            from .models.qwen3_tts import export_qwen3_tts_code2wav
+            export_qwen3_tts_code2wav(model_dir, c2w_out_dir, dtype)
+        except (OSError, ValueError, RuntimeError, ImportError) as exc:
+            logger.exception("[Code2Wav] Qwen3-TTS export failed")
+            raise SystemExit(1) from exc
+        logger.info("[Code2Wav] Done: %s", output_path)
+        return
 
     c2w_cfg = config.get("code2wav_config")
     if not c2w_cfg:
@@ -1042,6 +1069,8 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
     for key in ("tts_pad_token_id", "tts_bos_token_id", "tts_eos_token_id"):
         if key in root_config:
             cfg[key] = root_config[key]
+    if "tts_model_type" in root_config:
+        cfg["tts_model_type"] = root_config["tts_model_type"]
 
     # Codec token IDs (from talker_config)
     for key in ("codec_nothink_id", "codec_think_bos_id", "codec_think_eos_id",
@@ -1548,7 +1577,7 @@ def main() -> None:
     p.add_argument(
         "--skip-code2wav",
         action="store_true",
-        help="Skip Code2Wav vocoder export (Qwen3-Omni only).",
+        help="Skip Code2Wav vocoder export.",
     )
     p.add_argument(
         "--eagle-base",
@@ -1591,11 +1620,6 @@ def main() -> None:
          ),
     )
     p.add_argument(
-        "--device",
-        default="cuda",
-        help="Device for export tracing (default: cuda).",
-    )
-    p.add_argument(
         "--max-kv-cache-capacity",
         type=int,
         default=4096,
@@ -1614,6 +1638,11 @@ def main() -> None:
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
     has_mtp_draft = _has_mtp(config)
+
+    if (model_type == "qwen3_tts"
+            and config.get("tts_model_type") != "custom_voice"):
+        p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
+                f"Got tts_model_type={config.get('tts_model_type')!r}.")
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
@@ -1646,6 +1675,11 @@ def main() -> None:
             _model_config[0] = ModelConfig.from_pretrained(model_dir)
         return _model_config[0]
 
+    def _get_code2wav_weights() -> dict:
+        if model_type == "qwen3_tts":
+            return {}
+        return _get_weights()
+
     # Each stage is (enabled, component_name, exporter_callable).  Exporter
     # receives the computed output dir; the (enabled, component) columns also
     # drive both the pre-run log and the post-run summary below.
@@ -1677,17 +1711,26 @@ def main() -> None:
                                     model_config=_get_model_config())),
         (_has_visual(model_type) and _is_alpamayo(model_type)
          and not args.skip_visual, "visual",
-         lambda out: _export_alpamayo_visual(model_dir, out, _get_weights(),
-                                             config, dtype)),
+         lambda out: _export_alpamayo_visual(model_dir,
+                                             out,
+                                             _get_weights(),
+                                             config,
+                                             dtype,
+                                             model_config=_get_model_config())
+         ),
         (_has_audio(model_type)
          and not args.skip_audio, "audio", lambda out: _export_audio(
              model_dir, out, _get_weights(), config, model_type, dtype)),
-        (_has_code2wav(model_type)
-         and not args.skip_code2wav, "code2wav", lambda out: _export_code2wav(
-             model_dir, out, _get_weights(), config, dtype)),
-        (_has_action(model_type) and not args.skip_action, "action",
-         lambda out: _export_action(model_dir, out, _get_weights(), config,
-                                    args.max_kv_cache_capacity, dtype))
+        (_has_code2wav(model_type) and not args.skip_code2wav, "code2wav",
+         lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),
+                                      config, model_type, dtype)),
+        (_has_action(model_type) and not args.skip_action, "action", lambda
+         out: _export_action(model_dir,
+                             out,
+                             _get_weights(),
+                             config,
+                             max_kv_cache_capacity=args.max_kv_cache_capacity,
+                             dtype=dtype))
     ]
 
     logger.info("=" * 60)

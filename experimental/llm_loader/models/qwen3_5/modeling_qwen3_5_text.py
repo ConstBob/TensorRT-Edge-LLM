@@ -50,6 +50,7 @@ lm_head.weight                                             - output projection
 """
 
 import itertools
+import logging
 from typing import List, Tuple
 
 import torch
@@ -58,10 +59,18 @@ import torch.nn.functional as F
 
 from ...config import LAYER_GDN, GdnConfig, ModelConfig
 from ..default.modeling_default import MLP, OnnxSpec, RMSNorm
-from ..linear import FP16Linear, make_linear
+from ..linear import FP16Linear, NVFP4Linear, make_linear
 from ..ops import attention_plugin, causal_conv1d, gated_delta_net
 
 __all__ = ["Qwen3_5CausalLM"]
+
+logger = logging.getLogger(__name__)
+
+# Projection names in canonical concatenation order.
+_GDN_PROJ_NAMES = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+
+# NVFP4 scalar scale suffixes that must be identical for fusion.
+_NVFP4_SCALAR_SCALE_SUFFIXES = ("input_scale", "weight_scale_2")
 
 # ---------------------------------------------------------------------------
 # Qwen3.5 RMSNorm  (residual-weight convention: effective = 1 + weight)
@@ -131,20 +140,30 @@ class GdnMixer(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
 
-        # Fuse all 4 GDN input projections (QKV, Z, beta, alpha) into a
-        # single GEMM.  For NVFP4 this eliminates 3 of 4 TRT_FP4Dynamic-
-        # Quantize kernels per layer (DQ fuses into the single GEMM).
-        # For FP16 performance is neutral (within run-to-run noise).
-        # Checkpoint stores 4 separate weights; the loader concatenates
-        # them along the output dimension into in_proj_fused (see loader.py).
-        fused_out_dim = (gc.conv_dim + gc.value_dim + gc.num_value_heads +
-                         gc.num_value_heads)
-        self.in_proj_fused = make_linear(
+        # Always create 4 separate input projections matching checkpoint keys.
+        # A post-load optimization pass (fuse_gdn_input_projections) may
+        # replace them with a single in_proj_fused when conditions are met.
+        self.in_proj_qkv = make_linear(
             config,
             hidden_size,
-            fused_out_dim,
+            gc.conv_dim,
             bias=False,
-            module_name=f"{module_prefix}.in_proj_fused")
+            module_name=f"{module_prefix}.in_proj_qkv")
+        self.in_proj_z = make_linear(config,
+                                     hidden_size,
+                                     gc.value_dim,
+                                     bias=False,
+                                     module_name=f"{module_prefix}.in_proj_z")
+        self.in_proj_b = make_linear(config,
+                                     hidden_size,
+                                     gc.num_value_heads,
+                                     bias=False,
+                                     module_name=f"{module_prefix}.in_proj_b")
+        self.in_proj_a = make_linear(config,
+                                     hidden_size,
+                                     gc.num_value_heads,
+                                     bias=False,
+                                     module_name=f"{module_prefix}.in_proj_a")
         self._fused_splits: List[int] = [
             gc.conv_dim, gc.value_dim, gc.num_value_heads, gc.num_value_heads
         ]
@@ -187,9 +206,15 @@ class GdnMixer(nn.Module):
                torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # 1. Fused input projection -> split into QKV, gate_z, beta, alpha
-        fused_out = self.in_proj_fused(hidden_states)
-        mixed_qkv, z, b, a = fused_out.split(self._fused_splits, dim=-1)
+        # 1. Input projection(s) -> QKV, gate_z, beta, alpha
+        if hasattr(self, "in_proj_fused"):
+            fused_out = self.in_proj_fused(hidden_states)
+            mixed_qkv, z, b, a = fused_out.split(self._fused_splits, dim=-1)
+        else:
+            mixed_qkv = self.in_proj_qkv(hidden_states)
+            z = self.in_proj_z(hidden_states)
+            b = self.in_proj_b(hidden_states)
+            a = self.in_proj_a(hidden_states)
 
         # 2. Causal conv1d (no activation baked in)
         conv_outputs = causal_conv1d(
@@ -208,7 +233,7 @@ class GdnMixer(nn.Module):
             (mixed_qkv, conv_state_out,
              intermediate_conv_state_out) = conv_outputs
         else:
-            mixed_qkv, conv_state_out = conv_outputs
+            mixed_qkv, conv_state_out = conv_outputs[:2]
             intermediate_conv_state_out = None
         mixed_qkv = F.silu(mixed_qkv)
 
@@ -241,7 +266,7 @@ class GdnMixer(nn.Module):
             (core_attn_out, recurrent_state_out,
              intermediate_recurrent_state_out) = gdn_outputs
         else:
-            core_attn_out, recurrent_state_out = gdn_outputs
+            core_attn_out, recurrent_state_out = gdn_outputs[:2]
             intermediate_recurrent_state_out = None
 
         # 5. Gated norm: norm FIRST, then gate
@@ -619,6 +644,115 @@ def _make_flat_wrapper_hybrid(model: nn.Module,
 
     _Wrapper.forward = globs["_forward"]
     return _Wrapper(model)
+
+
+# ---------------------------------------------------------------------------
+# Post-load optimisation: fuse GDN input projections
+# ---------------------------------------------------------------------------
+
+
+def _can_fuse_nvfp4_scales(mixer: "GdnMixer") -> bool:
+    """Return True if all 4 NVFP4 GDN projections have identical scalar scales."""
+    for suffix in _NVFP4_SCALAR_SCALE_SUFFIXES:
+        tensors = []
+        for name in _GDN_PROJ_NAMES:
+            proj = getattr(mixer, name, None)
+            if proj is None:
+                return False
+            t = getattr(proj, suffix, None)
+            if t is None:
+                return False
+            tensors.append(t)
+        if not all(torch.equal(tensors[0], t) for t in tensors[1:]):
+            return False
+    return True
+
+
+def fuse_gdn_input_projections(model: nn.Module) -> int:
+    """Post-load optimisation: fuse 4 GDN input projections into one GEMM.
+
+    Iterates over all :class:`GdnMixer` modules.  For each mixer:
+    - **FP16**: always fuse (concatenate weights along output dim).
+    - **NVFP4**: fuse only if per-tensor scalar scales (``input_scale``,
+      ``weight_scale_2``) are identical across all 4 projections.  When
+      scales differ, a warning is logged and the layer stays unfused.
+    - **Other quant types** (INT4, FP8, …): skip (weight layouts
+      incompatible with simple concatenation).
+
+    After fusion the 4 original sub-modules are deleted and replaced by
+    a single ``in_proj_fused``.  The forward path auto-detects the fused
+    module via ``hasattr(self, "in_proj_fused")``.
+
+    Returns the number of layers fused.
+    """
+
+    fused_count = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, GdnMixer):
+            continue
+        mixer: GdnMixer = module
+
+        # Check quant type of the first projection.
+        first_proj = mixer.in_proj_qkv
+        if isinstance(first_proj, FP16Linear):
+            pass  # always fusible
+        elif isinstance(first_proj, NVFP4Linear):
+            if not _can_fuse_nvfp4_scales(mixer):
+                logger.warning(
+                    "GDN fusion skipped for %s: NVFP4 scalar scales "
+                    "differ across projections. Re-quantize with "
+                    "resmoothing enabled to equalise scales.", name)
+                continue
+        else:
+            # INT4, FP8, MXFP8, etc. — not fusible.
+            continue
+
+        # --- Fuse: concatenate weights along output dim (dim 0) ----------
+        fused_buffers: dict = {}
+        proj_modules = [getattr(mixer, n) for n in _GDN_PROJ_NAMES]
+        for attr in list(proj_modules[0]._buffers) + list(
+                proj_modules[0]._parameters):
+            parts = [getattr(p, attr) for p in proj_modules]
+            if parts[0] is None:
+                continue
+            if parts[0].dim() >= 1:
+                # Per-output-channel: concat along dim 0.
+                fused_buffers[attr] = torch.cat(parts, dim=0)
+            else:
+                # Scalar / per-tensor: take first (already verified equal
+                # for NVFP4; identical for FP16 which has no scales).
+                fused_buffers[attr] = parts[0]
+
+        # Build a fused linear with correct type.
+        fused_out_dim = sum(mixer._fused_splits)
+        in_features = first_proj.in_features
+        if isinstance(first_proj, NVFP4Linear):
+            fused_linear = NVFP4Linear(in_features, fused_out_dim,
+                                       first_proj.group_size)
+        else:
+            fused_linear = FP16Linear(in_features, fused_out_dim)
+
+        # Assign fused buffers/params.
+        for attr, tensor in fused_buffers.items():
+            if attr in fused_linear._buffers:
+                fused_linear._buffers[attr] = tensor
+            elif attr in fused_linear._parameters:
+                fused_linear._parameters[attr] = nn.Parameter(
+                    tensor, requires_grad=False)
+            else:
+                setattr(fused_linear, attr, tensor)
+
+        # Replace: add fused, delete originals.
+        mixer.in_proj_fused = fused_linear
+        for proj_name in _GDN_PROJ_NAMES:
+            delattr(mixer, proj_name)
+
+        fused_count += 1
+        logger.debug("Fused GDN input projections for %s", name)
+
+    if fused_count:
+        logger.info("Fused GDN input projections in %d layer(s)", fused_count)
+    return fused_count
 
 
 # ---------------------------------------------------------------------------
