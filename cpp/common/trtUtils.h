@@ -122,5 +122,10 @@ constexpr char const* getDataTypeString(nvinfer1::DataType const dataType) noexc
     }
     return "UNKNOWN";
 }
+//! Whether the engine exposes an output binding with the given name.
+//! Use this instead of getTensorIOMode(name) when probing for an optional binding
+//! — getTensorIOMode logs a spurious TensorRT ERROR for unknown names.
+//! @pre engine and tensorName are non-null.
+bool engineHasOutputTensor(nvinfer1::ICudaEngine const* engine, char const* tensorName) noexcept;
 
 } // namespace trt_edgellm

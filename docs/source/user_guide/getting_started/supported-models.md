@@ -29,7 +29,7 @@ The model class names were checked against the installed `transformers==5.3.0` p
 | Llama 3.x Instruct | [`LlamaForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py) | `llama` -> default `CausalLM` | Dense precision set |
 | Qwen2/Qwen2.5 dense | [`Qwen2ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py) | `qwen2` -> default `CausalLM` | Dense precision set |
 | Qwen3 dense | [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `qwen3` -> default `CausalLM` | Dense precision set |
-| Qwen3.5 text | [`Qwen3_5ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5_text` -> `Qwen3_5CausalLM` | Dense precision set |
+| Qwen3.5/3.6 text | [`Qwen3_5ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5_text` -> `Qwen3_5CausalLM` | Dense precision set |
 | Nemotron Nano dense | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | BF16, FP8, NVFP4 |
 
 <details>
@@ -148,8 +148,9 @@ The model class names were checked against the installed `transformers==5.3.0` p
 </details>
 
 <details>
-<summary><b>Qwen3.5 text</b> checkpoints</summary>
+<summary><b>Qwen3.5/3.6 text</b> checkpoints</summary>
 
+**Qwen3.5:**
 - [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)
 - [Qwen/Qwen3.5-0.8B-Base](https://huggingface.co/Qwen/Qwen3.5-0.8B-Base)
 - [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B)
@@ -159,6 +160,12 @@ The model class names were checked against the installed `transformers==5.3.0` p
 - [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)
 - [Qwen/Qwen3.5-9B-Base](https://huggingface.co/Qwen/Qwen3.5-9B-Base)
 - [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B)
+
+**Qwen3.6 (same architecture as Qwen3.5):**
+- [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
+
+**Quantized:**
+- [Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
 
 </details>
 
@@ -220,7 +227,7 @@ python -m llm_loader.export_all_cli \
 |--------------|--------------------|-----------------------|----------------------|
 | Qwen2.5-VL | [`Qwen2_5_VLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py) | `qwen2_5_vl` + `Qwen2_5VLVisualModel` | Dense precision set for LLM backbone |
 | Qwen3-VL / compatible | [`Qwen3VLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py) | `qwen3_vl` + `Qwen3VLVisualModel` | Dense precision set for LLM backbone |
-| Qwen3.5 VLM | [`Qwen3_5ForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5` -> `Qwen3_5CausalLM` + `Qwen3_5VLVisualModel` | VLM original checkpoints only |
+| Qwen3.5/3.6 VLM | [`Qwen3_5ForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5` -> `Qwen3_5CausalLM` + `Qwen3_5VLVisualModel` | VLM original checkpoints only |
 | InternVL3 / InternVL3.5 HF format | [`InternVLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/internvl/modeling_internvl.py) | `internvl_chat` / `internvl` + InternVL visual models | Dense precision set for LLM backbone |
 | Phi-4-Multimodal | [`Phi4MultimodalForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/phi4_multimodal/modeling_phi4_multimodal.py) | `phi4mm` / `phi4_multimodal` + `Phi4MMVisualModel` | Merge vision LoRA, then dense precision set for the LLM backbone |
 
@@ -261,9 +268,9 @@ python -m llm_loader.export_all_cli \
 </details>
 
 <details>
-<summary><b>Qwen3.5 VLM</b> — same checkpoints as Qwen3.5 text</summary>
+<summary><b>Qwen3.5/3.6 VLM</b> — same checkpoints as Qwen3.5/3.6 text</summary>
 
-Qwen3.5 checkpoints are unified text+VLM models. The same checkpoints listed under [Qwen3.5 text](#dense-llm) are used; `llm_loader` selects the VLM path (`qwen3_5` handler) when visual inputs are provided.
+Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoints listed under [Qwen3.5/3.6 text](#dense-llm) are used; `llm_loader` selects the VLM path (`qwen3_5` handler) when visual inputs are provided.
 
 </details>
 
@@ -335,11 +342,12 @@ Qwen3.5 checkpoints are unified text+VLM models. The same checkpoints listed und
 
 | Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
 |--------------|--------------------|-----------------------|----------------------|
-| Qwen3-TTS | Checkpoint architecture `Qwen3TTSForConditionalGeneration`; talker/code-predictor decoders compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `TalkerCausalLM` + `CodePredictorCausalLM` | FP16 |
+| Qwen3-TTS | Checkpoint architecture `Qwen3TTSForConditionalGeneration`; talker/code-predictor decoders compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `TalkerCausalLM` + `CodePredictorCausalLM` + Code2Wav from `speech_tokenizer/` | FP16 |
 
 <details>
 <summary><b>Qwen3-TTS</b> checkpoints</summary>
 
+- [Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
 - [Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)
 
 </details>
@@ -361,7 +369,7 @@ Qwen3.5 checkpoints are unified text+VLM models. The same checkpoints listed und
 
 ---
 
-Qwen3-ASR and Qwen3-TTS use checkpoint architecture names that are not present in the installed `transformers==5.3.0` package, so TensorRT Edge-LLM handles their speech/audio/talker components with local model implementations.
+Qwen3-ASR and Qwen3-TTS use checkpoint architecture names that are not present in the installed `transformers==5.3.0` package, so TensorRT Edge-LLM handles their speech/audio/talker/Code2Wav components with local model implementations. Qwen3-TTS support is limited to the CustomVoice checkpoints listed above.
 
 ## EAGLE3 Draft Models
 

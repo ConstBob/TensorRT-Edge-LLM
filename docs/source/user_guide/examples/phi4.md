@@ -34,7 +34,8 @@ cd $EDGE_LLM_PATH
 python -m experimental.quantization llm \
   --model_dir $MODEL_DIR/merged \
   --output_dir $MODEL_DIR/quantized \
-  --quantization nvfp4
+  --quantization nvfp4 \
+  --lm_head_quantization nvfp4
 
 # Export language model and visual encoder
 python -m llm_loader.export_all_cli \

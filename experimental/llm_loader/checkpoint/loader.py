@@ -35,8 +35,7 @@ Usage
 import json
 import logging
 import os
-import re
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,6 +46,8 @@ from .repacking import apply_all_repacking
 logger = logging.getLogger(__name__)
 
 __all__ = ["load_weights", "load_submodule_weights"]
+
+_FUSED_INPUT_CHANNEL_ATTRS = {"pre_quant_scale"}
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -106,7 +107,6 @@ def load_weights(
             return None
         return key
 
-    gdn_fuser = _GdnFusionAccumulator()
     loaded = skipped = 0
     for shard_path, keys in path_to_keys.items():
         if shard_path.endswith(".bin"):
@@ -133,8 +133,6 @@ def load_weights(
                     loaded += 1
                 elif _try_split_fused_tensor(model, mapped_key, tensor):
                     loaded += 1
-                elif gdn_fuser.try_accumulate(mapped_key, tensor):
-                    pass  # will be fused after the main loop
                 else:
                     logger.debug("Key not found in model: %s", key)
                     skipped += 1
@@ -155,18 +153,9 @@ def load_weights(
                         loaded += 1
                     elif _try_split_fused_tensor(model, mapped_key, tensor):
                         loaded += 1
-                    elif gdn_fuser.try_accumulate(mapped_key, tensor):
-                        pass  # will be fused after the main loop
                     else:
                         logger.debug("Key not found in model: %s", key)
                         skipped += 1
-
-    # Fuse accumulated GDN input projections (4 separate -> 1 fused GEMM).
-    fused, fuse_skipped = gdn_fuser.flush(model)
-    if fused:
-        loaded += fused
-        logger.info("Fused %d GDN input projection tensor(s)", fused)
-    skipped += fuse_skipped
 
     logger.info("Loaded %d tensors, skipped %d from %s", loaded, skipped,
                 model_dir)
@@ -386,9 +375,10 @@ def _try_split_fused_tensor(model: nn.Module, key: str,
         num_q = config.num_attention_heads * config.head_dim
         num_kv = config.num_key_value_heads * config.head_dim
 
-        # Scalar or per-tensor attributes (input_scale, weight_scale_2):
+        # Scalar, per-tensor, or per-input-channel attributes:
         # copy the same value to all three projections.
-        if tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1):
+        if (tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1)
+                or attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS):
             ok = _set_tensor(model, f"{prefix}.self_attn.q_proj.{attr_suffix}",
                              tensor)
             ok |= _set_tensor(model,
@@ -403,13 +393,19 @@ def _try_split_fused_tensor(model: nn.Module, key: str,
             return ok
 
         # Per-output-channel attributes (weight, weight_scale): split dim 0.
-        if tensor.shape[0] != num_q + 2 * num_kv:
+        split_sizes = [num_q, num_kv, num_kv]
+        expected = num_q + 2 * num_kv
+        if attr_suffix == "weight" and tensor.dim(
+        ) >= 2 and tensor.shape[0] * 2 == expected:
+            # ModelOpt W4A16 stores packed int4 weights as [out/2, in].
+            split_sizes = [s // 2 for s in split_sizes]
+            expected //= 2
+        if tensor.shape[0] != expected:
             logger.warning(
                 "qkv_proj.%s shape %s doesn't match expected (%d, %d, %d) "
-                "— skipping split", attr_suffix, tensor.shape, num_q, num_kv,
-                num_kv)
+                "— skipping split", attr_suffix, tensor.shape, *split_sizes)
             return False
-        q, k, v = tensor.split([num_q, num_kv, num_kv], dim=0)
+        q, k, v = tensor.split(split_sizes, dim=0)
         ok = _set_tensor(model, f"{prefix}.self_attn.q_proj.{attr_suffix}", q)
         ok |= _set_tensor(model, f"{prefix}.self_attn.k_proj.{attr_suffix}", k)
         ok |= _set_tensor(model, f"{prefix}.self_attn.v_proj.{attr_suffix}", v)
@@ -424,8 +420,9 @@ def _try_split_fused_tensor(model: nn.Module, key: str,
         prefix = key[:gate_up_idx]
         attr_suffix = key[gate_up_idx + len(".mlp.gate_up_proj."):]
 
-        # Scalar or per-tensor attributes: copy to both.
-        if tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1):
+        # Scalar, per-tensor, or per-input-channel attributes: copy to both.
+        if (tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1)
+                or attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS):
             ok = _set_tensor(model, f"{prefix}.mlp.gate_proj.{attr_suffix}",
                              tensor)
             ok |= _set_tensor(model, f"{prefix}.mlp.up_proj.{attr_suffix}",
@@ -447,108 +444,6 @@ def _try_split_fused_tensor(model: nn.Module, key: str,
         return ok
 
     return False
-
-
-# ---------------------------------------------------------------------------
-# GDN input projection fusion (4 separate -> 1 fused)
-# ---------------------------------------------------------------------------
-
-# Matches checkpoint keys like:
-#   model.layers.3.linear_attn.in_proj_qkv.weight
-#   model.layers.3.linear_attn.in_proj_z.weight_scale
-_GDN_PROJ_RE = re.compile(r"^(?P<prefix>.+\.linear_attn)\."
-                          r"in_proj_(?P<proj>qkv|z|b|a)\."
-                          r"(?P<suffix>.+)$")
-
-# Canonical order for concatenation along the output dimension.
-_GDN_PROJ_ORDER: List[str] = ["qkv", "z", "b", "a"]
-
-# Tensor suffixes that are per-output-channel and must be concatenated
-# along dim 0 when fusing.  All others (scalar / per-tensor) are broadcast.
-_GDN_CONCAT_SUFFIXES = {"weight", "weight_scale"}
-
-# Scalar suffixes whose values must be identical across all projections
-# (they share the same input activation).  Fusion is aborted if they differ.
-_GDN_SCALE_SUFFIXES = {"input_scale", "weight_scale_2"}
-
-
-class _GdnFusionAccumulator:
-    """Collect the 4 GDN input projection tensors per layer and fuse them.
-
-    During checkpoint loading, tensors like ``linear_attn.in_proj_qkv.weight``
-    no longer match any module (the model has ``in_proj_fused`` instead).
-    This accumulator stores them and, once all four projections are present
-    for a given layer+suffix, concatenates them along the output dimension
-    and sets the result on ``in_proj_fused.<suffix>``.
-    """
-
-    def __init__(self) -> None:
-        # {(prefix, suffix): {proj_name: tensor}}
-        self._pending: Dict[Tuple[str, str], Dict[str, torch.Tensor]] = {}
-
-    def try_accumulate(self, key: str, tensor: torch.Tensor) -> bool:
-        """Return True if *key* is a GDN input projection and was accumulated."""
-        m = _GDN_PROJ_RE.match(key)
-        if m is None:
-            return False
-        prefix = m.group("prefix")
-        proj = m.group("proj")
-        suffix = m.group("suffix")
-        bucket = self._pending.setdefault((prefix, suffix), {})
-        bucket[proj] = tensor
-        return True
-
-    def flush(self, model: nn.Module) -> Tuple[int, int]:
-        """Fuse all complete projection groups and set on the model.
-
-        Returns ``(fused_count, skipped_count)`` so the caller can maintain
-        accurate loaded/skipped tallies.
-        """
-        fused_count = 0
-        skipped_count = 0
-        for (prefix, suffix), projs in self._pending.items():
-            if len(projs) != 4:
-                logger.warning(
-                    "Incomplete GDN fusion for %s.in_proj_*.%s — "
-                    "got %d/4 projections (%s), skipping", prefix, suffix,
-                    len(projs), sorted(projs.keys()))
-                skipped_count += len(projs)
-                continue
-
-            fused_key = f"{prefix}.in_proj_fused.{suffix}"
-
-            if suffix in _GDN_CONCAT_SUFFIXES:
-                # Concatenate along output dimension (dim 0).
-                parts = [projs[p] for p in _GDN_PROJ_ORDER]
-                fused_tensor = torch.cat(parts, dim=0)
-            elif suffix in _GDN_SCALE_SUFFIXES:
-                # Scalar scales: all 4 projections share the same input
-                # activation, so the values must be identical.  Assert and
-                # take the first.
-                ref = projs[_GDN_PROJ_ORDER[0]]
-                for p in _GDN_PROJ_ORDER[1:]:
-                    if not torch.equal(ref, projs[p]):
-                        raise ValueError(
-                            f"Cannot fuse GDN input projections: "
-                            f"{prefix}.in_proj_{_GDN_PROJ_ORDER[0]}.{suffix} "
-                            f"!= {prefix}.in_proj_{p}.{suffix}  "
-                            f"(values {ref} vs {projs[p]}). "
-                            f"Scales must be identical for fusion.")
-                fused_tensor = ref
-            else:
-                # Other scalar / per-tensor attributes: take the first.
-                fused_tensor = projs[_GDN_PROJ_ORDER[0]]
-
-            if _set_tensor(model, fused_key, fused_tensor):
-                fused_count += 1
-                logger.debug("Fused GDN projections -> %s (shape %s)",
-                             fused_key, fused_tensor.shape)
-            else:
-                logger.warning("Failed to set fused GDN tensor: %s", fused_key)
-                skipped_count += 4
-
-        self._pending.clear()
-        return fused_count, skipped_count
 
 
 def iter_checkpoint_keys(model_dir: str) -> Iterator[str]:

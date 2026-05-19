@@ -532,10 +532,11 @@ private:
     rt::Tensor mHiddenFC2Weight; //!< FC2 weight [talkerHidden, thinkerHidden] FP16 column-major
     rt::Tensor mHiddenFC2Bias;   //!< FC2 bias [talkerHidden] FP16
 
-    // Projects from Talker space (2048) to CodePredictor space (1024)
-    rt::Tensor mSmallToMtpWeight; //!< Linear weight [1024, 2048] FP16 (TTS only)
-    rt::Tensor mSmallToMtpBias;   //!< Linear bias [1024] FP16 (TTS only)
-    bool mIsOmni{false};          //!< True for Omni (no projection needed, hiddenSizes match)
+    // Optional Talker-to-CodePredictor projection
+    rt::Tensor mSmallToMtpWeight; //!< Linear weight [1024, 2048] FP16
+    rt::Tensor mSmallToMtpBias;   //!< Linear bias [1024] FP16
+    bool mUseSmallToMtpProjection{false};
+    bool mIsOmni{false}; //!< True for Omni family checkpoints
 
     // ========== Embedding Tables ==========
     rt::Tensor mTextEmbeddingTable; //!< Text embedding table [thinkerVocabSize, thinkerHiddenSize] (for standalone TTS)

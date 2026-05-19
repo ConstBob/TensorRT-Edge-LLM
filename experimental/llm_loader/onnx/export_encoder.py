@@ -26,12 +26,14 @@ Visual encoders — I/O spec via ``model.get_onnx_export_args(config, device)``:
     - InternVL3        (model_type ``internvl_chat``)
     - InternVL3 HF     (model_type ``internvl``)
     - Phi-4 Multimodal (model_type ``phi4mm``, ``phi4_multimodal``)
-    - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2``)
+    - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2`` or
+      ``NemotronH_Nano_Omni_Reasoning_V3``)
 
 Audio encoders — I/O spec defined internally or via ``model.get_onnx_export_args``:
     - Qwen3-ASR    (model_type ``qwen3_asr``)
     - Qwen3-Omni   (model_type ``qwen3_omni``, ``qwen3_omni_thinker``)
-    - Nemotron-Omni (model_type ``NemotronH_Nano_VL_V2``)
+    - Nemotron-Omni (model_type ``NemotronH_Nano_VL_V2`` or
+      ``NemotronH_Nano_Omni_Reasoning_V3``)
 
 Note: Qwen3-TTS has NO audio encoder.  Its Talker/CodePredictor are LLM
 decoders exported via the standard LLM pipeline.
@@ -67,6 +69,11 @@ __all__ = [
 # Visual encoder registry
 # ---------------------------------------------------------------------------
 
+_NEMOTRON_OMNI_MODEL_TYPES: frozenset[str] = frozenset([
+    "NemotronH_Nano_VL_V2",
+    "NemotronH_Nano_Omni_Reasoning_V3",
+])
+
 # Maps model_type → internal family name
 _VISUAL_REGISTRY: dict[str, str] = {
     "qwen3_vl": "qwen3_vl",
@@ -78,6 +85,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "phi4mm": "phi4mm",
     "phi4_multimodal": "phi4mm",
     "NemotronH_Nano_VL_V2": "nemotron_omni",
+    "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
 }
 
 # Maps family → dotted module path inside llm_loader
@@ -117,7 +125,7 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
-    "NemotronH_Nano_VL_V2",
+    *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
 
@@ -143,7 +151,8 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if model_type in ("internvl", "internvl_chat", "NemotronH_Nano_VL_V2"):
+    if (model_type in ("internvl", "internvl_chat")
+            or model_type in _NEMOTRON_OMNI_MODEL_TYPES):
         # InternVL / Nemotron-Omni need the full config (vision + text + downsample_ratio)
         return config
     if model_type in ("phi4mm", "phi4_multimodal"):
@@ -212,7 +221,6 @@ def export_visual_onnx(
     model_type: str,
     model_config: "ModelConfig",
     dtype: torch.dtype = torch.float16,
-    device: str = "cuda",
 ) -> None:
     """Export a from-scratch visual encoder to ONNX.
 
@@ -228,8 +236,8 @@ def export_visual_onnx(
                       ``make_linear``; an FP16 checkpoint produces
                       ``FP16Linear`` everywhere.
         dtype:        Weight dtype (default ``float16``).
-        device:       CUDA device string for tracing (default ``"cuda"``).
     """
+    device = "cpu"
     if model_type not in _VISUAL_REGISTRY:
         raise ValueError(f"Unsupported visual model_type {model_type!r}. "
                          f"Supported: {sorted(_VISUAL_REGISTRY)}")
@@ -349,7 +357,6 @@ def export_audio_onnx(
     config: dict,
     model_type: str,
     dtype: torch.dtype = torch.float16,
-    device: str = "cuda",
 ) -> None:
     """Export a from-scratch audio encoder to ONNX.
 
@@ -360,14 +367,14 @@ def export_audio_onnx(
         config:      Full ``config.json`` dict.
         model_type:  Value of ``config.json["model_type"]``.
         dtype:       Weight dtype (default ``float16``).
-        device:      CUDA device for tracing (default ``"cuda"``).
     """
+    device = "cpu"
     if model_type not in _AUDIO_MODEL_TYPES:
         raise ValueError(f"Unsupported audio model_type {model_type!r}. "
                          f"Supported: {sorted(_AUDIO_MODEL_TYPES)}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    if model_type == "NemotronH_Nano_VL_V2":
+    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         from ..models.nemotron_omni.modeling_nemotron_omni_audio import \
             build_nemotron_omni_audio
         logger.info("Building Nemotron-Omni audio encoder ...")
@@ -407,7 +414,6 @@ def export_action_onnx(
     config: "ActionConfig",
     max_kv_cache_capacity: int,
     dtype: torch.dtype = torch.float16,
-    device: str = "cuda",
 ) -> None:
     """Export Alpamayo action expert (one flow-matching step) to ONNX.
 
@@ -418,8 +424,8 @@ def export_action_onnx(
         config:      :class:`~config.ActionConfig` with expert hyperparameters.
         max_kv_cache_capacity: Fixed KV cache capacity (must match LLM engine).
         dtype:       Weight dtype (default ``float16``).
-        device:      CUDA device for tracing (default ``"cuda"``).
     """
+    device = "cpu"
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     from ..models.alpamayo.modeling_alpamayo_action import \

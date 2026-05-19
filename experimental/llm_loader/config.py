@@ -526,14 +526,42 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
             "MTP draft config requires mtp_num_hidden_layers in the base config."
         )
 
-    # MTP modules in the exclude list → unquantized (FP16); otherwise inherit base quant.
+    # MTP modules in the exclude list → unquantized (FP16); otherwise inherit
+    # base quant.  Only *compute linear* modules matter (fc, proj, etc.).
+    # Norms, embeddings, and lm_head always appear in `excluded` when lm_head
+    # is FP16 — their presence does NOT mean the whole draft is unquantized.
+    _MTP_COMPUTE_PREFIXES = ("mtp.fc", "mtp.layers.")
     mtp_is_quantized = not any(
-        e.startswith("mtp.") for e in base_config.quant.excluded)
+        any(e.startswith(p) for p in _MTP_COMPUTE_PREFIXES) and
+        ("norm" not in e and "embed" not in e)
+        for e in base_config.quant.excluded)
 
     if mtp_is_quantized:
-        # MTP draft modules are independently quantized — clear the base
-        # excluded list so make_linear() builds quantized linears for all.
-        draft_quant = replace(base_config.quant, excluded=[])
+        # MTP draft modules are independently quantized.  Strip base-model
+        # layer_overrides that use module paths absent from the draft
+        # (e.g. "model.layers.0.linear_attn.in_proj_qkv") — they would
+        # cause spurious FP16 fallback for draft-specific layers like "fc".
+        # Keep entries whose keys also exist in the draft module namespace
+        # (e.g. "lm_head") so that lm_head_quantization is honoured.
+        _DRAFT_MODULE_PREFIXES = ("lm_head", "fc", "layers.", "norm")
+        draft_overrides = {
+            k: v
+            for k, v in base_config.quant.layer_overrides.items()
+            if any(k == p or k.startswith(p) for p in _DRAFT_MODULE_PREFIXES)
+        }
+        # Preserve MTP-specific exclusions (e.g. mtp.lm_head when lm_head
+        # is FP16) but drop base-model exclusions irrelevant to the draft.
+        draft_excluded = [
+            e[len("mtp."):] for e in base_config.quant.excluded
+            if e.startswith("mtp.")
+        ]
+        # is_mixed_precision=False so unlisted modules (fc, q_proj, etc.)
+        # fall back to the dominant quant type, not FP16.  Explicit
+        # overrides (lm_head→fp8) still take effect via layer_overrides.
+        draft_quant = replace(base_config.quant,
+                              excluded=draft_excluded,
+                              layer_overrides=draft_overrides,
+                              is_mixed_precision=False)
     else:
         draft_quant = QuantConfig()
 
@@ -800,19 +828,23 @@ def _strip_vl_prefix(name: str) -> str:
 
 
 def _normalize_module_name(name: str) -> str:
-    """Strip the same prefixes ``_parse_mixed_precision`` strips from
-    ``layer_overrides`` keys, so ``excluded`` and ``layer_overrides`` use the
-    same name space — both matching the ``module_name`` ``make_linear``
-    receives.
+    """Normalise a checkpoint / hf_quant_config module name to the namespace
+    that ``make_linear`` uses (``model.layers.N...``, ``lm_head``, etc.).
 
-    Strips a single leading prefix from ``("language_model.", "text_model.",
-    "llm.", "model.")`` (whichever matches first).  Mirror ``_parse_mixed_precision``'s
-    behaviour: only one strip per key.
+    Handles compound VL prefixes like ``model.language_model.`` (Qwen3.5-VL)
+    which must be stripped and replaced with ``model.`` to match the module
+    tree built by the modeling code.  Single VL prefixes (``language_model.``,
+    ``text_model.``, ``llm.``) and the generic ``model.`` are stripped
+    without replacement.  At most one prefix is removed per key.
 
-    Without this normalisation, a checkpoint that lists ``model.visual.blocks.X.Y``
-    in ``exclude_modules`` would never match ``module_name="visual.blocks.X.Y"``
-    that the visual modeling code passes to ``make_linear``.
+    Used by ``_effective_excluded_modules``, ``_detect_modelopt_unquantized_linears``,
+    and ``_parse_mixed_precision`` so that ``excluded``, ``layer_overrides``,
+    and ``module_name`` all share the same name space.
     """
+    # Compound VL prefix: strip outer wrapper, keep inner ``model.``.
+    # Must be checked before "model." to avoid partial strip.
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model."):]
     for prefix in _VL_LLM_PREFIXES + ("model.", ):
         if name.startswith(prefix):
             return name[len(prefix):]
@@ -971,9 +1003,23 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
     }
     unquantized = weight_modules - scale_modules
 
+    excluded = set()
+    for name in unquantized:
+        normalized = _normalize_module_name(name)
+        if normalized.endswith(".self_attn.qkv_proj"):
+            prefix = normalized[:-len("qkv_proj")]
+            excluded.update(f"{prefix}{proj}"
+                            for proj in ("q_proj", "k_proj", "v_proj"))
+        elif normalized.endswith(".mlp.gate_up_proj"):
+            prefix = normalized[:-len("gate_up_proj")]
+            excluded.update(f"{prefix}{proj}"
+                            for proj in ("gate_proj", "up_proj"))
+        else:
+            excluded.add(normalized)
+
     # Normalise to the same name space ``layer_overrides`` and ``excluded``
     # use, so ``make_linear`` finds entries via its ``module_name`` lookup.
-    return sorted({_normalize_module_name(n) for n in unquantized})
+    return sorted(excluded)
 
 
 def _parse_nvfp4_moe_backend(blob: dict) -> str:
@@ -1115,6 +1161,10 @@ def _algo_to_quant_type(algo: str) -> str:
         return QUANT_FP8
     if "FP4" in algo or "NVFP4" in algo:
         return QUANT_NVFP4
+    # W4A16_AWQ from ModelOpt unified checkpoints uses prepacked uint8 weights;
+    # plain AWQ / INT4_AWQ from HuggingFace uses column-packed int32 qweight.
+    if "W4A16" in algo and "AWQ" in algo:
+        return QUANT_INT4_AWQ_MODELOPT
     if "AWQ" in algo or "INT4_AWQ" in algo:
         return QUANT_INT4_AWQ
     if "W8A8" in algo or "INT8" in algo:
@@ -1149,11 +1199,7 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     layer_overrides: dict = {}
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
-        short_name = name
-        for prefix in ("language_model.", "model."):
-            if short_name.startswith(prefix):
-                short_name = short_name[len(prefix):]
-                break
+        short_name = _normalize_module_name(name)
         layer_overrides[short_name] = _algo_to_quant_type(algo)
     return dominant_type, dominant_group_size, layer_overrides
 

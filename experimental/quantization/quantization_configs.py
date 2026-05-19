@@ -253,7 +253,7 @@ def build_quant_config(
                                layer an explicit per-visual override on top.
     """
     if quantization is None:
-        cfg = {"quant_cfg": {}, "algorithm": "max"}
+        cfg = {"quant_cfg": {"default": {"enable": False}}, "algorithm": "max"}
     elif quantization in _BACKBONE_CFG_MAP:
         # Deep-copy so subsequent ``cfg["quant_cfg"].update(...)`` calls do
         # not mutate the shared module-level dict that ModelOpt reuses for

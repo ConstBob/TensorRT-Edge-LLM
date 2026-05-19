@@ -82,6 +82,8 @@ _OUTPUT_DIR_MAP = {
     (lambda cfg: cfg.get_visual_onnx_dir("fp16"), "fp16 visual encoder"),
     "audio":
     (lambda cfg: cfg.get_audio_onnx_dir("fp16"), "fp16 audio encoder"),
+    "code2wav":
+    (lambda cfg: cfg.get_code2wav_onnx_dir("fp16"), "fp16 Code2Wav"),
 }
 
 
@@ -222,7 +224,6 @@ def _run_export_subprocess(model_dir: str,
                            tmp_dir: str,
                            label: str,
                            test_logger,
-                           device: str,
                            timeout: int,
                            extra_args: Optional[list] = None,
                            failure_prefix: str = "llm_loader export") -> None:
@@ -233,10 +234,7 @@ def _run_export_subprocess(model_dir: str,
     """
     # Optional: EDGELLM_EXPORT_PYTHON (e.g. export venv vs quant venv) set by test harness.
     ex_py = os.environ.get("EDGELLM_EXPORT_PYTHON", "python3")
-    export_cmd = [
-        ex_py, "-m", "llm_loader.export_all_cli", model_dir, tmp_dir,
-        "--device", device
-    ]
+    export_cmd = [ex_py, "-m", "llm_loader.export_all_cli", model_dir, tmp_dir]
     if extra_args:
         export_cmd.extend(extra_args)
 
@@ -256,7 +254,6 @@ def _run_export_subprocess(model_dir: str,
 def run_llm_loader_export(config: TestConfig,
                           test_logger,
                           model_dir: Optional[str] = None,
-                          device: str = "cpu",
                           timeout: int = 1200,
                           eagle_base: bool = False) -> None:
     """Run ``llm_loader.export_all_cli`` and copy output to final dirs.
@@ -266,7 +263,6 @@ def run_llm_loader_export(config: TestConfig,
         test_logger: Logger for test output.
         model_dir: Checkpoint directory to export. Defaults to
             ``get_export_model_dir(config)``.
-        device: Device for ONNX tracing (``"cpu"`` or ``"cuda"``).
         timeout: Export command timeout in seconds.
         eagle_base: When True, pass ``--eagle-base`` to export an EAGLE3
             base model (adds tree-attention I/O and hidden_states output).
@@ -293,7 +289,6 @@ def run_llm_loader_export(config: TestConfig,
                                tmp_dir,
                                label,
                                test_logger,
-                               device,
                                timeout,
                                extra_args=extra_args)
 
@@ -305,7 +300,6 @@ def run_llm_loader_export(config: TestConfig,
 
 def run_llm_loader_draft_export(config: TestConfig,
                                 test_logger,
-                                device: str = "cpu",
                                 timeout: int = 1200) -> None:
     """Export the EAGLE draft model via ``llm_loader.export_all_cli``.
 
@@ -331,7 +325,6 @@ def run_llm_loader_draft_export(config: TestConfig,
             tmp_dir,
             f"Exporting EAGLE draft {config.draft_model_id} via llm_loader",
             test_logger,
-            device,
             timeout,
             failure_prefix="llm_loader draft export")
 
@@ -345,6 +338,55 @@ def run_llm_loader_draft_export(config: TestConfig,
         shutil.copytree(draft_llm_out, draft_onnx_dir, dirs_exist_ok=True)
         if test_logger:
             test_logger.info(f"Copied draft/ → {draft_onnx_dir}")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def run_llm_loader_mtp_export(config: TestConfig,
+                              test_logger,
+                              timeout: int = 600) -> None:
+    """Export MTP base + draft from a single checkpoint via ``--mtp``.
+
+    Calls ``llm_loader.export_all_cli --mtp`` on the base model checkpoint and
+    copies outputs:
+      - ``llm/``       → ``config.get_llm_onnx_dir()``
+      - ``mtp_draft/`` → ``config.get_draft_onnx_dir()``
+      - ``visual/``    → ``config.get_visual_onnx_dir("fp16")`` (VLM only,
+                          copied when present)
+    """
+    model_dir = get_export_model_dir(config, use_llm_loader=True)
+
+    llm_onnx_dir = config.get_llm_onnx_dir()
+    draft_onnx_dir = config.get_draft_onnx_dir()
+    os.makedirs(llm_onnx_dir, exist_ok=True)
+    os.makedirs(draft_onnx_dir, exist_ok=True)
+    for subdir, (target_fn, _) in _OUTPUT_DIR_MAP.items():
+        os.makedirs(target_fn(config), exist_ok=True)
+
+    tmp_dir = tempfile.mkdtemp(prefix="mtp_export_")
+    try:
+        _run_export_subprocess(
+            model_dir,
+            tmp_dir,
+            f"Exporting MTP {config.model_name} via llm_loader",
+            test_logger,
+            timeout,
+            extra_args=["--mtp"],
+            failure_prefix="MTP export")
+
+        llm_output = os.path.join(tmp_dir, "llm")
+        if not os.path.isdir(llm_output):
+            pytest.fail(f"MTP export did not produce llm/ in {tmp_dir}")
+        shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
+
+        draft_output = os.path.join(tmp_dir, "mtp_draft")
+        if not os.path.isdir(draft_output):
+            pytest.fail(f"MTP export did not produce mtp_draft/ in {tmp_dir}")
+        shutil.copytree(draft_output, draft_onnx_dir, dirs_exist_ok=True)
+
+        for subdir, (target_fn, _) in _OUTPUT_DIR_MAP.items():
+            _copy_subdir(tmp_dir, subdir, target_fn(config))
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

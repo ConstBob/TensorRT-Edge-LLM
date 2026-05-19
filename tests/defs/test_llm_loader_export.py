@@ -62,8 +62,6 @@ def test_llm_loader_export(test_param: str, test_logger,
             "llm_loader.export_all_cli",
             torch_dir,
             tmp_dir,
-            "--device",
-            "cpu",
         ]
 
         with timer_context(f"Exporting {config.model_name} via llm_loader",
@@ -208,8 +206,6 @@ def test_llm_loader_eagle_export(test_param: str, test_logger,
             base_torch_dir,
             tmp_base,
             "--eagle-base",
-            "--device",
-            "cpu",
         ]
         _run_llm_loader_export(
             base_cmd, 600, test_logger,
@@ -235,8 +231,6 @@ def test_llm_loader_eagle_export(test_param: str, test_logger,
             "llm_loader.export_all_cli",
             draft_torch_dir,
             tmp_draft,
-            "--device",
-            "cpu",
         ]
         _run_llm_loader_export(
             draft_cmd, 600, test_logger,
@@ -288,8 +282,6 @@ def test_llm_loader_mtp_export(test_param: str, test_logger,
             torch_dir,
             tmp_dir,
             "--mtp",
-            "--device",
-            "cpu",
         ]
 
         with timer_context(f"Exporting MTP {config.model_name} via llm_loader",
@@ -353,8 +345,6 @@ def test_llm_loader_lora_export(test_param: str, test_logger,
             "llm_loader.export_all_cli",
             torch_dir,
             tmp_dir,
-            "--device",
-            "cpu",
         ]
 
         _run_llm_loader_export(

@@ -528,9 +528,9 @@ def build_phi4mm_visual(
         model_config: Top-level ``ModelConfig`` for quantized Linear dispatch.
         dtype:        Weight dtype (default ``float16``).
     """
-    model = Phi4MMVisualModel(config, model_config=model_config)
+    model = Phi4MMVisualModel(config,
+                              model_config=model_config).to(dtype=dtype)
     _load_phi4mm_weights(model, weights)
-    model = model.to(dtype=dtype)
     model.eval()
     return model
 

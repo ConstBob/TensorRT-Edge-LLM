@@ -43,6 +43,7 @@ _HARDCODED_TEMPLATE_MAP: Dict[str, str] = {
     "phi4mm": "phi4mm.json",
     "phi4_multimodal": "phi4mm.json",
     "qwen3_asr": "qwen3asr.json",
+    "qwen3_tts": "qwen3tts.json",
 }
 
 
@@ -90,7 +91,10 @@ def _is_qwen3_asr_model(model_dir: str) -> bool:
 
 def _is_nemotron_omni_model(model_dir: str) -> bool:
     root = _load_root_config(model_dir)
-    return root.get("model_type") == "NemotronH_Nano_VL_V2"
+    return root.get("model_type") in {
+        "NemotronH_Nano_VL_V2",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+    }
 
 
 @dataclass

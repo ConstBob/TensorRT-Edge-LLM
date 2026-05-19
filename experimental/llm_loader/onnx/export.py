@@ -426,10 +426,11 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
 
 
 def _fix_initializer_dtypes(
-        onnx_path: str,
-        dedup_dql_scales: bool = False,
-        cast_fp32_weights_to_fp16: bool = True,
-        preserve_fp32_patterns: "tuple[str, ...]" = (),
+    onnx_path: str,
+    dedup_dql_scales: bool = False,
+    cast_fp32_weights_to_fp16: bool = True,
+    preserve_fp32_patterns: "tuple[str, ...]" = (),
+    match_fp32_matmul_initializers: bool = False,
 ) -> None:
     """Single-pass ONNX initializer fixup for TRT compatibility.
 
@@ -449,7 +450,10 @@ def _fix_initializer_dtypes(
        Initializers whose name contains any substring in
        ``preserve_fp32_patterns`` are kept FP32.  This is how a model opts
        out of the downgrade for weights that must stay FP32 (e.g.
-       CodePredictor's ``down_proj``, see ``_DownProjFP32``).
+       CodePredictor's ``down_proj``, see ``_DownProjFP32``). Some
+       ``torch.export`` initializers are anonymous, so selected models can
+       additionally request MatMul initializer dtype matching when the other
+       input is known to be FP32.
 
     3. **Plugin FP32 inputs**: ONNX constant folding may collapse plugin
        FP32 input expressions into initializers.  Any such initializer is
@@ -483,6 +487,29 @@ def _fix_initializer_dtypes(
                 if len(node.input) > input_idx:
                     plugin_fp32_init_names.add(node.input[input_idx])
 
+    init_map = {init.name: init for init in model.graph.initializer}
+    elem_types: dict[str, int] = {}
+    if match_fp32_matmul_initializers:
+        for value in (list(model.graph.input) + list(model.graph.value_info) +
+                      list(model.graph.output)):
+            tensor_type = value.type.tensor_type
+            if tensor_type.HasField("elem_type"):
+                elem_types[value.name] = tensor_type.elem_type
+        for init in model.graph.initializer:
+            elem_types[init.name] = init.data_type
+
+    matmul_fp32_init_names: set = set()
+    if match_fp32_matmul_initializers:
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None:
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    matmul_fp32_init_names.add(init.name)
+
     def _is_preserved_fp32(init_name: str) -> bool:
         """Does ``init_name`` match any caller-supplied preserve pattern?"""
         return any(p in init_name for p in preserve_fp32_patterns)
@@ -514,6 +541,11 @@ def _fix_initializer_dtypes(
                 "_fix_initializer_dtypes: %s %s kept FP32 (preserve pattern)",
                 init.name, list(init.dims))
             continue
+        if init.name in matmul_fp32_init_names:
+            logger.info(
+                "_fix_initializer_dtypes: %s %s kept FP32 (MatMul FP32 input)",
+                init.name, list(init.dims))
+            continue
         dims = list(init.dims)
         if len(dims) == 0 or (len(dims) == 1 and dims[0] <= 1):
             continue  # keep scalars as FP32
@@ -529,6 +561,28 @@ def _fix_initializer_dtypes(
         n_to_fp16 += 1
         logger.info("_fix_initializer_dtypes: %s %s FP32→FP16", init.name,
                     dims)
+
+    if match_fp32_matmul_initializers:
+        for init in model.graph.initializer:
+            elem_types[init.name] = init.data_type
+
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None or init.data_type != 10:  # FLOAT16
+                    continue
+                if elem_types.get(node.input[other_idx]) != 1:  # FLOAT
+                    continue
+                data = _onnx.numpy_helper.to_array(init).astype(np.float32)
+                init.CopyFrom(
+                    _onnx.numpy_helper.from_array(data, name=init.name))
+                elem_types[init.name] = init.data_type
+                n_to_fp32 += 1
+                logger.info(
+                    "_fix_initializer_dtypes: %s %s FP16→FP32 "
+                    "(MatMul FP32 input match)", init.name, list(init.dims))
 
     if n_to_fp16 == 0 and n_to_fp32 == 0 and n_deduped == 0:
         return
@@ -599,6 +653,10 @@ def _export_model(model: "CausalLM",
         getattr(model, "preserve_fp32_initializer_patterns", ()))
     _fix_initializer_dtypes(output_path,
                             dedup_dql_scales=(nvfp4 or mxfp8),
-                            preserve_fp32_patterns=preserve_patterns)
+                            preserve_fp32_patterns=preserve_patterns,
+                            match_fp32_matmul_initializers=bool(
+                                getattr(model,
+                                        "match_fp32_matmul_initializers",
+                                        False)))
     _strip_attention_plugin_optional_inputs(output_path)
     logger.info("Export complete: %s", output_path)

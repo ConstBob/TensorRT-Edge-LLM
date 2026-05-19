@@ -364,10 +364,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // This is needed for Eagle speculative decoding and Qwen3-Omni audio output (Thinker -> Talker).
     // The dummy buffer is used during CUDA graph capture and vanilla decoding when the caller
     // doesn't explicitly request hidden states output.
-    // Auto-detect by querying the engine for the hidden_states binding instead of relying on config flags.
     {
-        bool const engineHasHiddenStates
-            = mEngine->getTensorIOMode(binding_names::kOutputHiddenStates) == nvinfer1::TensorIOMode::kOUTPUT;
+        bool const engineHasHiddenStates = engineHasOutputTensor(mEngine.get(), binding_names::kOutputHiddenStates);
         if (mConfig.enableEagleSpecDecode || engineHasHiddenStates)
         {
             int64_t outputHiddenDim = mConfig.enableEagleSpecDecode ? mConfig.outputHiddenDim : mConfig.hiddenSize;

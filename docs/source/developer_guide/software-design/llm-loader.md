@@ -77,7 +77,7 @@ Multimodal and audio checkpoints have additional component dispatch:
 
 - Visual encoders are selected by `_VISUAL_REGISTRY` and family build functions in `experimental/llm_loader/onnx/export_encoder.py`.
 - Audio encoders are selected by audio model-type registries and component-specific key prefixes.
-- TTS exports reuse the LLM export path for talker and code-predictor decoder components, with model-specific key remapping.
+- TTS exports reuse the LLM export path for talker and code-predictor decoder components, with model-specific key remapping. Qwen3-TTS Code2Wav is exported from the checkpoint's `speech_tokenizer/` directory.
 - Omni checkpoints may combine text, visual, audio, and vocoder/code2wav exports under one checkpoint-level orchestration.
 
 This keeps component-specific model code separate while preserving one checkpoint-level export frontend.

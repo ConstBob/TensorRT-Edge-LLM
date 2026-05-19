@@ -320,6 +320,8 @@ def _generate_draft_quantization_commands(
     commands = []
     if not config.is_eagle:
         return commands
+    if config.is_mtp:
+        return commands
 
     if config.draft_llm_precision is None:
         raise ValueError("draft_llm_precision not set for EAGLE mode")
@@ -341,9 +343,13 @@ def _generate_draft_export_commands(
     path: vocab reduction reads ``d2t.safetensors`` from the draft ONNX
     directory, so the draft must be exported before vocab reduction runs.
     llm_loader handles its own draft export via ``run_llm_loader_draft_export``.
+    MTP is skipped: the draft is produced by ``export_all_cli --mtp`` in a
+    single invocation alongside the base model.
     """
     commands = []
     if not config.is_eagle:
+        return commands
+    if config.is_mtp:
         return commands
 
     base_model_dir = config.get_torch_model_dir()
@@ -386,10 +392,9 @@ def _generate_llm_loader_draft_export_for_vocab_commands(
     exp_dir = os.path.join(edgellm_root, "experimental")
     existing = os.environ.get("PYTHONPATH", "")
     py_path = f"{exp_dir}{os.pathsep}{existing}" if existing else exp_dir
-    export_shell = (
-        f"PYTHONPATH={shlex.quote(py_path)} "
-        "python3 -m llm_loader.export_all_cli "
-        f"{shlex.quote(draft_model_dir)} \"$tmp_dir\" --device cpu")
+    export_shell = (f"PYTHONPATH={shlex.quote(py_path)} "
+                    "python3 -m llm_loader.export_all_cli "
+                    f"{shlex.quote(draft_model_dir)} \"$tmp_dir\"")
     shell = ("tmp_dir=$(mktemp -d); "
              "trap 'rm -rf \"$tmp_dir\"' EXIT; "
              f"{export_shell}; "
@@ -714,6 +719,17 @@ def generate_build_commands(
                 cmd.append("--debug")
             commands.append((cmd, 1200))
 
+        code2wav_onnx = config.get_code2wav_onnx_dir()
+        if os.path.isdir(code2wav_onnx):
+            audio_cmd = [executable_files['audio_build']]
+            audio_cmd.extend([
+                f"--onnxDir={code2wav_onnx}",
+                f"--engineDir={config.get_llm_engine_dir()}",
+            ])
+            if config.debug:
+                audio_cmd.append("--debug")
+            commands.append((audio_cmd, 1200))
+
         tokenizer_decoder_onnx = os.path.join(config.get_audio_onnx_dir(),
                                               "tokenizer_decoder")
         if os.path.isdir(tokenizer_decoder_onnx):
@@ -810,6 +826,7 @@ def generate_inference_commands(
         cmd = [executable_files['qwen3_tts_inference']]
         cmd.extend([
             f"--talkerEngineDir={config.get_talker_engine_dir()}",
+            f"--code2wavEngineDir={config.get_code2wav_engine_dir()}",
             f"--tokenizerDir={config.get_tts_tokenizer_dir()}",
             f"--inputFile={config.get_test_case_file()}",
             f"--outputFile={config.get_output_json_file()}",

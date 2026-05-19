@@ -184,6 +184,7 @@ class CodePredictorCausalLM(CausalLM):
     # generic FP32→FP16 downgrade in ``_fix_initializer_dtypes`` — without
     # this, the FP16 round-trip silently re-appears and breaks codec-EOS.
     preserve_fp32_initializer_patterns = ("down_proj.weight", )
+    match_fp32_matmul_initializers = True
 
     def forward(
         self,
