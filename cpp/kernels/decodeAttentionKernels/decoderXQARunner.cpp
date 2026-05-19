@@ -263,13 +263,8 @@ public:
 
     static XQAKernelLoader& Get()
     {
-        static std::unique_ptr<XQAKernelLoader> kernelLoader = nullptr;
-        if (kernelLoader == nullptr)
-        {
-            kernelLoader = std::make_unique<XQAKernelLoader>(XQAKernelLoader());
-        }
-
-        return *kernelLoader;
+        static XQAKernelLoader instance;
+        return instance;
     }
 
 private:
