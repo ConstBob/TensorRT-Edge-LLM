@@ -68,6 +68,12 @@ try:
 except Exception:  # pragma: no cover - optional dependency surface
     NemotronHMoE = None  # type: ignore[misc, assignment]
 
+try:
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import \
+        Qwen3MoeSparseMoeBlock
+except Exception:  # pragma: no cover - optional dependency surface
+    Qwen3MoeSparseMoeBlock = None  # type: ignore[misc, assignment]
+
 nvfp4_moe_plugin_schema = OpSchema(
     name="Nvfp4MoePlugin",
     domain="trt",
@@ -740,27 +746,27 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             self.gate.bias.data = gate_layer.bias.data.clone().to(
                 torch.float32)
 
-        # Plugin v3 uses K-major (CuteDSL-compatible) weight byte layout to unify decode and
-        # prefill on a single weight copy. FC1: bytes [E, I, H/2] with H as inner (contraction),
-        # 2 FP4 nibbles per byte packed along H. FC2: bytes [E, H, I/2] with I as inner.
-        # SF atom-swizzle has M=N (FC1 M=I, FC2 M=H) and 16-element blocks run along the K axis.
+        # Plugin uses K-major (CuteDSL-compatible) weight byte layout to unify decode and
+        # prefill on a single weight copy.
+        # FC1 uses moe_inter_size for its N-dimension (= 2*I for gated SwiGLU, I for non-gated).
+        # FC2 uses nOut (= I for both gated and non-gated) as its contraction dimension.
+        # nOut = nOutFor(activation_type, moe_inter_size) matching the C++ plugin.
         e, inter = self.num_experts, self.moe_inter_size
+        # nOut: FC1 output dim (= FC2 contraction dim) after activation folding.
+        # activation_type == 1 (SiLU) → SwiGLU: nOut = moe_inter_size / 2.
+        # activation_type == 0 (ReLU²) → non-gated: nOut = moe_inter_size.
+        # Matches C++ nOutFor(activation_type, moe_inter_size).
+        nOut = inter // 2 if self.activation_type == 1 else inter
         h_half = self.hidden_size // 2
-        i_half = self.moe_inter_size // 2
+        fc1_bytes = inter // 2  # FC1 payload: moe_inter_size FP4 nibbles → moe_inter_size/2 bytes
         h_per_group = self.hidden_size // self.quantization_group_size
-        i_per_group = self.moe_inter_size // self.quantization_group_size
-        # FC1 up: N-major weight byte layout [E, H, I/2] — N (= I) innermost,
-        # 2 FP4 nibbles per byte along I. Matches what the CuteDSL N-major
-        # prefill kernel and the Marlin decode GEMV both consume.
+        nOut_per_group = nOut // self.quantization_group_size
+        # FC1 up: N-major weight byte layout [E, H, moe_inter_size/2] — N innermost,
+        # 2 FP4 nibbles per byte along N. For gated: N = 2*I (interleaved gate+up).
         self.register_buffer(
             "fc_up_qweights",
-            torch.zeros(e, self.hidden_size, i_half, dtype=torch.int8))
-        # FC1 up SF: prefill-friendly atom swizzle (M=I, K=H/16). Scheme-B
-        # quantization — scales per ``(n, k/16) = (i, h/16)`` — matching
-        # ``tcgen05.mma`` block-scaled MMA contract and ModelOpt's NVFP4
-        # convention (quantize along the last/K axis). Atom layout requires
-        # M padded to 128 and K padded to 4 — matches the plugin's
-        # ``supportsFormatCombination`` case 4 contract.
+            torch.zeros(e, self.hidden_size, fc1_bytes, dtype=torch.int8))
+        # FC1 up SF: prefill-friendly atom swizzle (M=moe_inter_size, K=H/16).
         up_sf_m_padded = ((inter + 127) // 128) * 128
         up_sf_k_padded = ((h_per_group + 3) // 4) * 4
         self.register_buffer(
@@ -768,35 +774,33 @@ class NemotronHMoEW4A4Plugin(nn.Module):
             torch.zeros(e, up_sf_m_padded, up_sf_k_padded, dtype=torch.int8))
         self.register_buffer("fc_up_global_scale",
                              torch.ones(e, dtype=torch.float32))
-        # FC2 down: N-major weight byte layout [E, I, H/2] — N (= H) innermost,
-        # 2 FP4 nibbles per byte along H. Symmetric to FC1 in v5; both FC1 and
-        # FC2 now use N-major bytes and a single weight copy feeds the plugin's
-        # prefill and (when re-enabled) Marlin decode paths.
+        # FC2 down: N-major weight byte layout [E, nOut, H/2] — N (= H) innermost.
+        # nOut = I for both gated and non-gated.
         self.register_buffer("fc_down_qweights",
-                             torch.zeros(e, inter, h_half, dtype=torch.int8))
-        # FC2 down SF: prefill-friendly atom swizzle (M=H, K=I/16). Scheme-B
-        # scales per ``(h, i/16)``. Atom-padded to match
-        # ``supportsFormatCombination`` case 7.
+                             torch.zeros(e, nOut, h_half, dtype=torch.int8))
+        # FC2 down SF: prefill-friendly atom swizzle (M=H, K=nOut/16).
         dn_sf_m_padded = ((self.hidden_size + 127) // 128) * 128
-        dn_sf_k_padded = ((i_per_group + 3) // 4) * 4
+        dn_sf_k_padded = ((nOut_per_group + 3) // 4) * 4
         self.register_buffer(
             "fc_down_blocks_scale",
             torch.zeros(e, dn_sf_m_padded, dn_sf_k_padded, dtype=torch.int8))
         self.register_buffer("fc_down_global_scale",
                              torch.ones(e, dtype=torch.float32))
-        # Decode-friendly SF: row-major transposed, Marlin-projected FP8 bytes.
-        # Shape [E, H/16, I] / [E, I/16, H] — same scheme-B scale values as the
-        # prefill SFs above, transposed so the Marlin decode GEMV reads 64
-        # contiguous per-element scale bytes per (expert, h_group=j/16, inter
-        # chunk) tile. Byte encoding is Marlin-projected (shift-by-7 recovers
-        # the FP16 after decodeSfByteToFloat), distinct from the raw IEEE FP8
-        # E4M3 bytes CuteDSL consumes from the prefill SF.
+        # Decode SF: CuTe DSL atom layout with raw FP8 E4M3 bytes.
+        # Atom layout: M = K_gemv (contraction dim), K = N_gemv/16 (output dim / 16).
+        # FC1 up:   M = padUp(H, 128), K = padUp(moe_inter_size/16, 4)
+        # FC2 down: M = padUp(nOut, 128), K = padUp(H/16, 4)
+        inter_per_group = inter // self.quantization_group_size
+        up_decode_m = ((self.hidden_size + 127) // 128) * 128
+        up_decode_k = ((inter_per_group + 3) // 4) * 4
         self.register_buffer(
             "fc_up_blocks_scale_decode",
-            torch.zeros(e, h_per_group, inter, dtype=torch.int8))
+            torch.zeros(e, up_decode_m, up_decode_k, dtype=torch.int8))
+        dn_decode_m = ((nOut + 127) // 128) * 128
+        dn_decode_k = ((h_per_group + 3) // 4) * 4
         self.register_buffer(
             "fc_down_blocks_scale_decode",
-            torch.zeros(e, i_per_group, self.hidden_size, dtype=torch.int8))
+            torch.zeros(e, dn_decode_m, dn_decode_k, dtype=torch.int8))
         # FP32 length-2 forward activation global scales: [0] FC1, [1] FC2. Populated by the
         # calibration pipeline (see populate_hidden_global_scales). Plugin v2 does not consume a
         # separate block-scale input — activation block scales are produced inside the plugin
@@ -887,7 +891,12 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         ``s_max = max|W_e| / 6``.
         """
         e, h, inter = w_up_ehi.shape
-        assert w_down_eih.shape == (e, inter, h)
+        # FC1: [E, H, moe_inter_size] (= 2*I for gated, I for non-gated).
+        # FC2: [E, nOut, H] where nOut = I (= moe_inter_size/2 for gated).
+        nOut = inter // 2 if self.activation_type == 1 else inter
+        assert w_down_eih.shape == (e, nOut, h), (
+            f"w_down_eih shape {tuple(w_down_eih.shape)} != expected ({e}, {nOut}, {h})"
+        )
         if int(e) != int(self.num_experts):
             raise ValueError(
                 f"w_up_ehi expert count {e} != self.num_experts {self.num_experts}"
@@ -899,9 +908,8 @@ class NemotronHMoEW4A4Plugin(nn.Module):
                 f"(hidden_size={self.hidden_size}, moe_inter_size={self.moe_inter_size})"
             )
         num_hidden_chunks = h // 64
-        num_inter_chunks = inter // 64
         assert num_hidden_chunks * 64 == h
-        assert num_inter_chunks * 64 == inter
+        assert nOut % 64 == 0
 
         w_up_f = w_up_ehi.float()
         w_dn_f = w_down_eih.float()
@@ -924,180 +932,137 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         # ``tcgen05.mma`` block-scaled MMA contract consumed by the CuteDSL
         # prefill kernel. Prefill SF is stored at atom ``(M=N, K=K/16)`` with
         # raw IEEE FP8 E4M3 bytes (CuteDSL ``__nv_fp8_e4m3`` cast). Decode SF
-        # is a second atom copy at ``(M=H, K=I/16)`` / ``(M=I, K=H/16)`` with
-        # Marlin-projected bytes — see the decode-SF-orientation analysis doc
-        # for why the decode kernel's tile model forces a different axis; with
-        # scheme-B scales the decode path is approximate (≈0.90 cos) and is
-        # currently gated off at ``kPrefillDispatchThreshold = 0``.
+        # is stored in CuTe DSL atom layout at ``(M=K, K=N/16)`` — transposed
+        # relative to prefill — with the same raw FP8 E4M3 bytes.
         num_sf_cols_up = h // 16  # FC1 prefill / decode: K = H → SF cols = H/16
-        num_sf_cols_dn = inter // 16  # FC2 prefill / decode: K = I → SF cols = I/16
+        num_sf_cols_dn = nOut // 16  # FC2 prefill / decode: K = nOut → SF cols = nOut/16
 
         # Numpy views of the dense weights for fast indexing inside the packing loops.
         w_up_np = np.ascontiguousarray(w_up_f.detach().cpu().numpy())
         w_dn_np = np.ascontiguousarray(w_dn_f.detach().cpu().numpy())
 
-        # Helper: quantize 64 FP32 values → (32 bytes FP4 nibbles, 4 raw FP8 E4M3
-        # bytes, 4 FP32 normalized targets).
-        # Unlike MarlinConverter's output, which Marlin-projects the FP8 bits so their
-        # `dequant_fp8_scales` decoder recovers the right FP16, this writes the IEEE
-        # FP8 E4M3 byte directly so CuteDSL's `__nv_fp8_e4m3` cast gets the right value.
-        # The raw FP32 targets (scales / s_max * 448) are returned so callers can
-        # Marlin-project them for the decode SF copy.
-        def _quantize_fp4_tile_with_raw_fp8_sf(
-                vec64: np.ndarray,
-                s_max: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            v = np.asarray(vec64, dtype=np.float32).reshape(64)
-            scales = np.empty(4, dtype=np.float32)
-            for g in range(4):
-                blk = v[g * 16:(g + 1) * 16]
-                scales[g] = max(float(np.max(np.abs(blk))) / 6.0, 1e-12)
-            # FP4 payload (reuse existing tile quantizer — it's layout-agnostic for the nibble side)
-            pl, _ = MarlinConverter.quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
-                v, expert_block_scale_max_fp32=s_max)
-            # FP32 targets for the FP8 step: each is in `[0, 448]` range.
-            sf_targets = (scales / s_max * k_fp8).astype(np.float32)
-            # Raw FP8 E4M3 bytes from the same targets.
-            sf_bytes = torch.from_numpy(sf_targets).to(
-                torch.float8_e4m3fn).view(torch.uint8).numpy()
-            return pl, sf_bytes, sf_targets
+        # Vectorized scheme-B quantization helper. Replaces per-tile Python loops
+        # with bulk numpy/torch operations for ~100x speedup.
+        def _vectorized_scheme_b_quantize(
+            w_nk: np.ndarray,
+            s_max_ex: float,
+            num_sf_cols: int,
+            prefill_sf_flat: torch.Tensor,
+            decode_sf_flat: torch.Tensor,
+        ) -> torch.Tensor:
+            """Vectorized scheme-B FP4 quantization + SF encoding for one expert/FC.
+
+            Args:
+                w_nk: [N, K] float32 weight (K-axis has quantization groups of 16).
+                s_max_ex: expert-wide max block scale.
+                num_sf_cols: K // 16.
+                prefill_sf_flat: flat uint8 view of prefill SF buffer (atom-swizzled).
+                decode_sf_flat: flat uint8 view of decode SF buffer (CuTe DSL atom layout).
+
+            Returns:
+                N-major payload [K, N//2] int8 (after nibble transpose).
+            """
+            n_dim, k_dim = w_nk.shape
+
+            # --- Block scales: groups of 16 along K ---
+            blocks = w_nk.reshape(n_dim, num_sf_cols, 16)  # [N, K//16, 16]
+            amax = np.abs(blocks).max(axis=2)  # [N, K//16]
+            block_scale = np.maximum(amax / 6.0, 1e-12)  # [N, K//16]
+
+            # --- FP4 quantization via searchsorted (vectorized) ---
+            normed = blocks / block_scale[:, :, np.newaxis]  # [N, K//16, 16]
+            normed = np.clip(normed, -6.0, 6.0)
+            mag = np.abs(normed)
+            codes = np.searchsorted(MarlinConverter._FP4_MIDPOINTS,
+                                    mag.ravel()).astype(np.uint8).reshape(
+                                        n_dim, k_dim)
+            sign = (w_nk < 0).astype(np.uint8) * 8
+            nibbles = sign | codes  # [N, K] uint8 nibble values 0..15
+
+            # --- Pack nibbles → K-major [N, K//2] int8 ---
+            nibs_2d = nibbles.reshape(n_dim, k_dim // 2, 2)
+            packed_kmajor = ((nibs_2d[:, :, 0] & 0x0F)
+                             | ((nibs_2d[:, :, 1] & 0x0F) << 4)).astype(
+                                 np.int8)
+
+            # --- K-major [N, K//2] → N-major [K, N//2] via nibble transpose ---
+            kmajor_u8 = torch.from_numpy(packed_kmajor.view(np.uint8))
+            lo = kmajor_u8 & 0x0F
+            hi = (kmajor_u8 >> 4) & 0x0F
+            nib_nk = torch.empty(n_dim, k_dim, dtype=torch.uint8)
+            nib_nk[:, 0::2] = lo
+            nib_nk[:, 1::2] = hi
+            nib_kn = nib_nk.transpose(0, 1).contiguous()
+            lo_out = nib_kn[:, 0::2]
+            hi_out = nib_kn[:, 1::2]
+            payload_nmajor = (lo_out | (hi_out << 4)).view(torch.int8)
+
+            # --- Prefill SF: raw IEEE FP8 E4M3 in atom-swizzled 128×4 layout ---
+            targets = np.clip((block_scale / max(s_max_ex, 1e-12) * k_fp8),
+                              0.0, k_fp8).astype(np.float32)
+            sf_fp8 = (torch.from_numpy(targets).to(torch.float8_e4m3fn).view(
+                torch.uint8).numpy())
+            # Apply atom 128×4 swizzle via reshape + transpose
+            m_tiles = (n_dim + 127) // 128
+            k_tiles = (num_sf_cols + 3) // 4
+            padded_m = m_tiles * 128
+            padded_sf_k = k_tiles * 4
+            sf_padded = np.zeros((padded_m, padded_sf_k), dtype=np.uint8)
+            sf_padded[:n_dim, :num_sf_cols] = sf_fp8
+            # Decompose: [m_tiles, 4(inner_m), 32(outer_m), k_tiles, 4(inner_k)]
+            sf_5d = sf_padded.reshape(m_tiles, 4, 32, k_tiles, 4)
+            # Transpose to atom layout: [m_tiles, k_tiles, 32, 4, 4]
+            sf_swizzled = sf_5d.transpose(0, 3, 2, 1, 4).ravel()
+            n_bytes = min(len(sf_swizzled), len(prefill_sf_flat))
+            prefill_sf_flat[:n_bytes] = torch.from_numpy(
+                sf_swizzled[:n_bytes].copy())
+
+            # --- Decode SF: CuTe DSL atom layout (M=K, K_sf=N/16), raw FP8 E4M3 ---
+            # Subsample to N/16 granularity (one representative per 16 N-elements).
+            n_blocks = n_dim // 16
+            sf_sub = sf_fp8[::
+                            16, :]  # [N/16, K/16] — one per N-block per K-group
+            sf_sub_t = sf_sub.T  # [K/16, N/16] — (K-groups, N-blocks)
+            # Place at group-leader M-rows (stride 16) in padded decode layout.
+            dec_padded_m = ((k_dim + 127) // 128) * 128  # padUp(K, 128)
+            dec_padded_k = ((n_blocks + 3) // 4) * 4  # padUp(N/16, 4)
+            sf_dec = np.zeros((dec_padded_m, dec_padded_k), dtype=np.uint8)
+            k_groups = k_dim // 16
+            sf_dec[np.arange(k_groups) * 16, :n_blocks] = sf_sub_t
+            # Apply atom 128×4 swizzle (same formula as prefill, on decode dims).
+            dec_m_tiles = dec_padded_m // 128
+            dec_k_tiles = dec_padded_k // 4
+            sf_dec_5d = sf_dec.reshape(dec_m_tiles, 4, 32, dec_k_tiles, 4)
+            sf_dec_swizzled = sf_dec_5d.transpose(0, 3, 2, 1, 4).ravel()
+            n_decode = min(len(sf_dec_swizzled), len(decode_sf_flat))
+            decode_sf_flat[:n_decode] = torch.from_numpy(
+                sf_dec_swizzled[:n_decode].copy())
+
+            return payload_nmajor  # [K, N//2] int8
 
         for ex in range(e):
             s_max_up_ex = float(s_max_up_np[ex])
             s_max_dn_ex = float(s_max_dn_np[ex])
 
-            # ---- FC1 up (scheme-B): iterate outer I, inner 64-H chunks.
-            # Each tile quantizes 64 consecutive H values at fixed i → scale
-            # per (i, h/16). Accumulate FP4 bytes in a scratch [I, H/2] buffer
-            # (K-major), then nibble-transpose to the N-major [H, I/2] layout
-            # that fc_up_qweights expects.
-            up_kmajor_scratch = torch.zeros(inter,
-                                            self.hidden_size // 2,
-                                            dtype=torch.int8)
-            up_kmajor_flat = up_kmajor_scratch.reshape(-1)
+            # ---- FC1 up (scheme-B): w_up [H, I] → quantize [N=I, K=H].
+            w_up_nk = np.ascontiguousarray(w_up_np[ex].T)  # [I, H]
             up_bs_flat = up_bs[ex].view(torch.uint8).reshape(-1)
-            for i in range(inter):
-                for c in range(num_hidden_chunks):
-                    up_seg = w_up_np[ex, c * 64:(c + 1) * 64,
-                                     i].astype(np.float32, copy=False)
-                    pl_u, fp8_u, _tgt_u = _quantize_fp4_tile_with_raw_fp8_sf(
-                        up_seg, s_max_up_ex)
-                    tile_u = i * num_hidden_chunks + c
-                    up_kmajor_flat[tile_u * 32:(tile_u + 1) * 32].copy_(
-                        torch.from_numpy(pl_u.view(np.int8)))
-                    # Prefill SF: raw IEEE FP8 E4M3 bytes at atom(i, h/16).
-                    for g in range(4):
-                        sf_col = c * 4 + g
-                        off = MarlinConverter.atom_sf_offset(
-                            i, sf_col, num_sf_cols_up)
-                        up_bs_flat[off] = int(fp8_u[g])
-
-            # K-major [I, H/2] → N-major [H, I/2] via nibble transpose.
-            kmajor_u8 = up_kmajor_scratch.view(torch.uint8)
-            lo = kmajor_u8 & 0x0F
-            hi = (kmajor_u8 >> 4) & 0x0F
-            nib_ih = torch.empty(inter, self.hidden_size, dtype=torch.uint8)
-            nib_ih[:, 0::2] = lo
-            nib_ih[:, 1::2] = hi
-            nib_hi = nib_ih.transpose(0, 1).contiguous()
-            i_half_local = inter // 2
-            lo_out = nib_hi[:, 0::2]
-            hi_out = nib_hi[:, 1::2]
-            packed = (lo_out | (hi_out << 4)).view(torch.int8)
-            up_pl[ex].copy_(packed.reshape(self.hidden_size, i_half_local))
-
-            # ---- FC2 down (scheme-B): iterate outer H, inner 64-I chunks.
-            dn_kmajor_scratch = torch.zeros(h, inter // 2, dtype=torch.int8)
-            dn_kmajor_flat = dn_kmajor_scratch.reshape(-1)
-            dn_bs_flat = dn_bs[ex].view(torch.uint8).reshape(-1)
-            for hh in range(h):
-                for c in range(num_inter_chunks):
-                    dn_seg = w_dn_np[ex, c * 64:(c + 1) * 64,
-                                     hh].astype(np.float32, copy=False)
-                    pl_d, fp8_d, _tgt_d = _quantize_fp4_tile_with_raw_fp8_sf(
-                        dn_seg, s_max_dn_ex)
-                    tile_d = hh * num_inter_chunks + c
-                    dn_kmajor_flat[tile_d * 32:(tile_d + 1) * 32].copy_(
-                        torch.from_numpy(pl_d.view(np.int8)))
-                    for g in range(4):
-                        sf_col = c * 4 + g
-                        off = MarlinConverter.atom_sf_offset(
-                            hh, sf_col, num_sf_cols_dn)
-                        dn_bs_flat[off] = int(fp8_d[g])
-
-            # K-major [H, I/2] → N-major [I, H/2].
-            dn_kmajor_u8 = dn_kmajor_scratch.view(torch.uint8)
-            lo = dn_kmajor_u8 & 0x0F
-            hi = (dn_kmajor_u8 >> 4) & 0x0F
-            nib_hi_axis = torch.empty(h, inter, dtype=torch.uint8)
-            nib_hi_axis[:, 0::2] = lo
-            nib_hi_axis[:, 1::2] = hi
-            nib_ih_axis = nib_hi_axis.transpose(0, 1).contiguous()
-            h_half_local = h // 2
-            lo_out = nib_ih_axis[:, 0::2]
-            hi_out = nib_ih_axis[:, 1::2]
-            packed_dn = (lo_out | (hi_out << 4)).view(torch.int8)
-            dn_pl[ex].copy_(packed_dn.reshape(inter, h_half_local))
-
-            # ---- FC1 decode SF (scheme-B grouping, Marlin-projected, row-major [H/16, I]).
-            # Same per-block scales as the prefill SF loop above (16 consecutive H values
-            # per scale at each I). The decode kernel reads 64 contiguous scale bytes per
-            # (e, h_group=j/16, inter_chunk c) tile at linear offset
-            # ``up_bs_decode[ex][h_group * inter + c*64 .. c*64+63]``. Bytes are
-            # Marlin-projected so ``decodeSfByteToFloat`` recovers the FP16 directly.
-            w_up_ex = w_up_np[ex]  # [H, I]
-            # Scheme-B scale per (h_group, i): max over 16 consecutive H rows.
-            sf_up_scheme_b = np.abs(w_up_ex).reshape(num_sf_cols_up, 16,
-                                                     inter).max(axis=1)
-            sf_up_scheme_b = np.maximum(sf_up_scheme_b / 6.0, 1e-12)
-            sf_up_targets_b = (sf_up_scheme_b / s_max_up_ex * k_fp8).astype(
-                np.float32)  # [H/16, I]
             up_bs_decode_flat = up_bs_decode[ex].view(torch.uint8).reshape(-1)
-            num_i_tiles_up = (inter + 3) // 4
-            for h_g in range(num_sf_cols_up):
-                row_base = h_g * inter
-                for k_tile in range(num_i_tiles_up):
-                    s = [0.0, 0.0, 0.0, 0.0]
-                    for g in range(4):
-                        col = k_tile * 4 + g
-                        if col < inter:
-                            s[g] = float(sf_up_targets_b[h_g, col])
-                    scale_word = MarlinConverter.fp32x4_to_marlin_f8x4_block_scale(
-                        s[0], s[1], s[2], s[3])
-                    marlin_bytes = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
-                        scale_word)
-                    for g in range(4):
-                        col = k_tile * 4 + g
-                        if col < inter:
-                            up_bs_decode_flat[row_base + col] = int(
-                                marlin_bytes[g])
+            payload_up = _vectorized_scheme_b_quantize(w_up_nk, s_max_up_ex,
+                                                       num_sf_cols_up,
+                                                       up_bs_flat,
+                                                       up_bs_decode_flat)
+            up_pl[ex].copy_(payload_up.reshape(self.hidden_size, inter // 2))
 
-            # ---- FC2 decode SF (scheme-B grouping, Marlin-projected, row-major [I/16, H]).
-            w_dn_ex = w_dn_np[ex]  # [I, H]
-            # Scheme-B scale per (i_group, h): max over 16 consecutive I rows.
-            sf_dn_scheme_b = np.abs(w_dn_ex).reshape(num_sf_cols_dn, 16,
-                                                     h).max(axis=1)
-            sf_dn_scheme_b = np.maximum(sf_dn_scheme_b / 6.0, 1e-12)
-            sf_dn_targets_b = (sf_dn_scheme_b / s_max_dn_ex * k_fp8).astype(
-                np.float32)  # [I/16, H]
+            # ---- FC2 down (scheme-B): w_dn [nOut, H] → quantize [N=H, K=nOut].
+            w_dn_nk = np.ascontiguousarray(w_dn_np[ex].T)  # [H, nOut]
+            dn_bs_flat = dn_bs[ex].view(torch.uint8).reshape(-1)
             dn_bs_decode_flat = dn_bs_decode[ex].view(torch.uint8).reshape(-1)
-            num_h_tiles_dn = (h + 3) // 4
-            for i_g in range(num_sf_cols_dn):
-                row_base = i_g * h
-                for k_tile in range(num_h_tiles_dn):
-                    s = [0.0, 0.0, 0.0, 0.0]
-                    for g in range(4):
-                        col = k_tile * 4 + g
-                        if col < h:
-                            s[g] = float(sf_dn_targets_b[i_g, col])
-                    scale_word = MarlinConverter.fp32x4_to_marlin_f8x4_block_scale(
-                        s[0], s[1], s[2], s[3])
-                    marlin_bytes = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
-                        scale_word)
-                    for g in range(4):
-                        col = k_tile * 4 + g
-                        if col < h:
-                            dn_bs_decode_flat[row_base + col] = int(
-                                marlin_bytes[g])
+            payload_dn = _vectorized_scheme_b_quantize(w_dn_nk, s_max_dn_ex,
+                                                       num_sf_cols_dn,
+                                                       dn_bs_flat,
+                                                       dn_bs_decode_flat)
+            dn_pl[ex].copy_(payload_dn.reshape(nOut, h // 2))
 
         self.fc_up_global_scale.copy_(
             (s_max_up / k_fp8).to(device=self.fc_up_global_scale.device,
@@ -1107,94 +1072,84 @@ class NemotronHMoEW4A4Plugin(nn.Module):
                                   dtype=self.fc_down_global_scale.dtype))
 
     def populate_decode_plugin_buffers(self) -> None:
-        """Populate decode-friendly row-major transposed SF from the prefill SF.
+        """Populate CuTe DSL atom-layout decode SF from the prefill SF.
 
-        Reads ``fc_up_blocks_scale`` (atom-swizzled, raw IEEE FP8 E4M3 bytes at
-        ``atom_sf_offset(i, h_group, H/16)``) and writes
-        ``fc_up_blocks_scale_decode`` (row-major ``[E, H/16, I]`` with Marlin-
-        projected bytes at ``[h_group * I + i]``). Similarly for FC2:
-        ``fc_down_blocks_scale`` (atom ``(h, i_group)``) → ``fc_down_blocks_scale_decode``
-        (row-major ``[E, I/16, H]`` at ``[i_group * H + h]``).
+        Reads ``fc_up_blocks_scale`` (prefill atom-swizzled, M=N, K=K/16) and writes
+        ``fc_up_blocks_scale_decode`` (CuTe DSL decode atom, M=K, K=N/16). The raw
+        FP8 E4M3 bytes are preserved; only the physical layout changes. The decode
+        atom has coarser N-granularity (one scale per 16 N-elements vs per-element
+        in prefill), so the scale at the first N-element in each block is used as
+        representative.
 
-        The byte encoding is converted from raw IEEE FP8 E4M3 (CuteDSL-friendly)
-        to Marlin-projected (the W4A16 decode GEMV's ``decodeSfByteToFloat`` shift-by-7
-        trick). ``populate_prefill_plugin_buffers`` already writes both, so calling
-        this afterward is idempotent (produces the same bytes).
-
-        This helper is O(E · H · I / 16) — acceptable as a one-time load step; follow
-        up with a vectorized variant if it becomes a bottleneck.
+        ``populate_prefill_plugin_buffers`` already writes both via
+        ``_vectorized_scheme_b_quantize``, so calling this afterward is idempotent.
         """
         e = self.num_experts
         h = self.hidden_size
         inter = self.moe_inter_size
-        h_per_group = h // self.quantization_group_size  # H/16
-        i_per_group = inter // self.quantization_group_size  # I/16
-        k_fp8 = MarlinConverter.FP8_MAX
+        nOut = inter // 2 if self.activation_type == 1 else inter
+        h_per_group = h // self.quantization_group_size
+        nOut_per_group = nOut // self.quantization_group_size
+
+        def _prefill_to_decode_atom(
+            prefill_flat: np.ndarray,
+            prefill_m: int,
+            prefill_sf_cols: int,
+            decode_flat: np.ndarray,
+            decode_padded_m: int,
+            decode_padded_k: int,
+            k_gemv: int,
+            n_gemv: int,
+        ) -> None:
+            """Convert prefill atom layout to CuTe DSL decode atom layout."""
+            k_groups = k_gemv // 16
+            n_blocks = n_gemv // 16
+            # Read prefill atom at (n=c*16, k_group=g) → raw FP8 byte.
+            prefill_padded_sf_cols = ((prefill_sf_cols + 3) // 4) * 4
+            raw = np.empty((n_blocks, k_groups), dtype=np.uint8)
+            for c in range(n_blocks):
+                for g in range(k_groups):
+                    off = MarlinConverter.atom_sf_offset(
+                        c * 16, g, prefill_padded_sf_cols)
+                    raw[c, g] = prefill_flat[off]
+            # raw[c, g] → decode atom at (m=g*16, k=c)
+            sf_dec = np.zeros((decode_padded_m, decode_padded_k),
+                              dtype=np.uint8)
+            sf_dec[np.arange(k_groups) * 16, :n_blocks] = raw.T
+            # Apply 128×4 atom swizzle.
+            m_tiles = decode_padded_m // 128
+            k_tiles = decode_padded_k // 4
+            sf_5d = sf_dec.reshape(m_tiles, 4, 32, k_tiles, 4)
+            sf_swizzled = sf_5d.transpose(0, 3, 2, 1, 4).ravel()
+            n_bytes = min(len(sf_swizzled), len(decode_flat))
+            decode_flat[:n_bytes] = sf_swizzled[:n_bytes]
 
         for ex in range(e):
-            # --- FC1: read prefill atom (i, h_group) raw FP8 → decode linear [h_group, i] Marlin.
-            up_bs_flat = self.fc_up_blocks_scale[ex].view(
-                torch.uint8).reshape(-1)
-            up_dec_flat = self.fc_up_blocks_scale_decode[ex].view(
-                torch.uint8).reshape(-1)
-            # Gather raw FP8 bytes at (i, h_g) positions into a [I, H/16] array.
-            raw_up = np.empty((inter, h_per_group), dtype=np.uint8)
-            for i in range(inter):
-                for h_g in range(h_per_group):
-                    off = MarlinConverter.atom_sf_offset(i, h_g, h_per_group)
-                    raw_up[i, h_g] = int(up_bs_flat[off])
-            # FP8 E4M3 byte → FP32 scalar (vectorized via torch FP8 dtype).
-            sf_up_fp32 = torch.from_numpy(raw_up).view(
-                torch.float8_e4m3fn).float().numpy()  # [I, H/16]
-            # Write Marlin-projected bytes at linear [h_g * I + i], groups of 4 along I.
-            num_i_tiles = (inter + 3) // 4
-            for h_g in range(h_per_group):
-                row_base = h_g * inter
-                for k_tile in range(num_i_tiles):
-                    s = [0.0, 0.0, 0.0, 0.0]
-                    for g in range(4):
-                        col = k_tile * 4 + g
-                        if col < inter:
-                            s[g] = float(sf_up_fp32[col, h_g])
-                    scale_word = MarlinConverter.fp32x4_to_marlin_f8x4_block_scale(
-                        s[0], s[1], s[2], s[3])
-                    marlin_bytes = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
-                        scale_word)
-                    for g in range(4):
-                        col = k_tile * 4 + g
-                        if col < inter:
-                            up_dec_flat[row_base + col] = int(marlin_bytes[g])
+            # FC1 up: prefill atom (M=inter, K=H/16) → decode atom (M=H, K=inter/16).
+            up_bs_flat = self.fc_up_blocks_scale[ex].cpu().view(
+                torch.uint8).reshape(-1).numpy()
+            up_dec_flat = self.fc_up_blocks_scale_decode[ex].cpu().view(
+                torch.uint8).reshape(-1).numpy()
+            up_dec_m = ((h + 127) // 128) * 128
+            up_dec_k = ((inter // 16 + 3) // 4) * 4
+            _prefill_to_decode_atom(up_bs_flat, inter, h_per_group,
+                                    up_dec_flat, up_dec_m, up_dec_k, h, inter)
+            dst = self.fc_up_blocks_scale_decode[ex]
+            self.fc_up_blocks_scale_decode[ex] = torch.from_numpy(
+                up_dec_flat).view(torch.int8).reshape(dst.shape).to(dst.device)
 
-            # --- FC2: read prefill atom (h, i_group) raw FP8 → decode linear [i_group, h] Marlin.
-            dn_bs_flat = self.fc_down_blocks_scale[ex].view(
-                torch.uint8).reshape(-1)
-            dn_dec_flat = self.fc_down_blocks_scale_decode[ex].view(
-                torch.uint8).reshape(-1)
-            raw_dn = np.empty((h, i_per_group), dtype=np.uint8)
-            for hh in range(h):
-                for i_g in range(i_per_group):
-                    off = MarlinConverter.atom_sf_offset(hh, i_g, i_per_group)
-                    raw_dn[hh, i_g] = int(dn_bs_flat[off])
-            sf_dn_fp32 = torch.from_numpy(raw_dn).view(
-                torch.float8_e4m3fn).float().numpy()  # [H, I/16]
-            num_h_tiles = (h + 3) // 4
-            for i_g in range(i_per_group):
-                row_base = i_g * h
-                for k_tile in range(num_h_tiles):
-                    s = [0.0, 0.0, 0.0, 0.0]
-                    for g in range(4):
-                        col = k_tile * 4 + g
-                        if col < h:
-                            s[g] = float(sf_dn_fp32[col, i_g])
-                    scale_word = MarlinConverter.fp32x4_to_marlin_f8x4_block_scale(
-                        s[0], s[1], s[2], s[3])
-                    marlin_bytes = MarlinConverter.marlin_scale_word_to_raw_fp8_bytes(
-                        scale_word)
-                    for g in range(4):
-                        col = k_tile * 4 + g
-                        if col < h:
-                            dn_dec_flat[row_base + col] = int(marlin_bytes[g])
-        _ = k_fp8  # retained for symmetry with populate_prefill_plugin_buffers
+            # FC2 down: prefill atom (M=H, K=nOut/16) → decode atom (M=nOut, K=H/16).
+            dn_bs_flat = self.fc_down_blocks_scale[ex].cpu().view(
+                torch.uint8).reshape(-1).numpy()
+            dn_dec_flat = self.fc_down_blocks_scale_decode[ex].cpu().view(
+                torch.uint8).reshape(-1).numpy()
+            dn_dec_m = ((nOut + 127) // 128) * 128
+            dn_dec_k = ((h_per_group + 3) // 4) * 4
+            _prefill_to_decode_atom(dn_bs_flat, h, nOut_per_group, dn_dec_flat,
+                                    dn_dec_m, dn_dec_k, nOut, h)
+            dst = self.fc_down_blocks_scale_decode[ex]
+            self.fc_down_blocks_scale_decode[ex] = torch.from_numpy(
+                dn_dec_flat).view(torch.int8).reshape(dst.shape).to(dst.device)
 
     def populate_hidden_global_scales(
         self,
@@ -1316,6 +1271,202 @@ class NemotronHMoEW4A4Plugin(nn.Module):
         self.populate_decode_plugin_buffers()
 
 
+# ============================================================================
+# Qwen3-style gated MoE — uses the unified Nvfp4MoePlugin with interleaved
+# gate+up FC1 weights and activation_type=1 (SiLU → SwiGLU in the C++ plugin).
+# ============================================================================
+
+
+class Qwen3MoEW4A4Plugin(nn.Module):
+    """
+    ONNX export wrapper for **gated MoE** (Qwen3/LLaMA SwiGLU) using the unified
+    ``Nvfp4MoePlugin``.
+
+    ``output = down( SiLU(gate(x)) * up(x) )`` — the C++ plugin receives
+    interleaved gate+up FC1 weights ``[E, H, 2*I/2]`` bytes and the attribute
+    ``moe_inter_size = 2*I`` so that ``nOutFor(SiLU, 2*I) = I`` yields the correct
+    post-SwiGLU output dimension.
+
+    This eliminates the separate ``Nvfp4GatedMoePlugin`` by sharing the same TRT
+    plugin as non-gated (NemotronH) models, only differing in ``activation_type``
+    and the interleaved FC1 weight layout.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        moe_inter_size: int,
+        gate_layer: nn.Linear,
+        activation_type: int = 1,
+        quantization_group_size: int = 16,
+    ):
+        super().__init__()
+        # Store the actual intermediate size for weight interleaving.
+        self._actual_inter_size = int(moe_inter_size)
+        # The C++ plugin stores moe_inter_size = 2*I for gated models;
+        # nOutFor(SiLU, 2*I) = I gives the correct FC2 contraction dim.
+        plugin_moe_inter_size = 2 * self._actual_inter_size
+
+        if int(quantization_group_size) != 16:
+            raise ValueError(
+                "Nvfp4MoePlugin only supports quantization_group_size == 16; "
+                f"got {quantization_group_size}")
+        if int(hidden_size) % 64 != 0:
+            raise ValueError(
+                f"hidden_size must be a multiple of 64, got {hidden_size}")
+        if self._actual_inter_size % 64 != 0:
+            raise ValueError(
+                f"moe_inter_size must be a multiple of 64, got {moe_inter_size}"
+            )
+
+        # Delegate to the same init path as NemotronHMoEW4A4Plugin.
+        # This registers all 11 plugin buffers with the correct shapes
+        # (FC1 uses moe_inter_size = 2*I, FC2 uses nOut = I).
+        NemotronHMoEW4A4Plugin._init_from_gate_and_dims(
+            self,
+            num_experts=int(num_experts),
+            top_k=int(top_k),
+            hidden_size=int(hidden_size),
+            moe_inter_size=plugin_moe_inter_size,
+            gate_layer=gate_layer,
+            activation_type=int(activation_type),
+            quantization_group_size=int(quantization_group_size),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        if hidden_dim != self.hidden_size:
+            raise ValueError(
+                f"hidden_dim {hidden_dim} != hidden_size {self.hidden_size}")
+
+        hidden_flat = hidden_states.reshape(-1, hidden_dim)
+        router_logits = NemotronHMoEW4A4Plugin.nemotron_h_plugin_router_logits(
+            hidden_flat, self.gate)
+
+        if hidden_states.dtype != torch.float16:
+            raise TypeError(
+                f"Nvfp4MoePlugin (gated) accepts FP16 hidden_states only; got {hidden_states.dtype}."
+            )
+        out = nvfp4_moe_plugin(
+            router_logits,
+            hidden_states,
+            self.hidden_global_scale,
+            self.fc_up_qweights,
+            self.fc_up_blocks_scale,
+            self.fc_up_global_scale,
+            self.fc_down_qweights,
+            self.fc_down_blocks_scale,
+            self.fc_down_global_scale,
+            self.fc_up_blocks_scale_decode,
+            self.fc_down_blocks_scale_decode,
+            self.e_score_correction_bias,
+            self.num_experts,
+            self.top_k,
+            self.hidden_size,
+            self.moe_inter_size,
+            self.activation_type,
+            self.quantization_group_size,
+            self.n_group,
+            self.topk_group,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+            self.routing_mode,
+        )
+        return out
+
+    def populate_gated_plugin_buffers(
+        self,
+        w_gate_ehi,
+        w_up_ehi,
+        w_down_eih,
+    ) -> None:
+        """Pack gated MoE weights into interleaved Nvfp4MoePlugin layout.
+
+        ``w_gate_ehi`` is ``[E, H, I]`` (gate-proj), ``w_up_ehi`` is ``[E, H, I]``
+        (up-proj), ``w_down_eih`` is ``[E, I, H]`` (down-proj) — all dense FP32/BF16.
+
+        The gate and up weights are interleaved into a single FC1 tensor
+        ``[E, H, 2*I]`` (column-interleaved: cols [0,I) = gate, cols [I,2*I) = up)
+        before scheme-B NVFP4 quantization. This produces:
+        - ``fc_up_qweights [E, H, I]`` bytes (= 2*I FP4 nibbles packed 2 per byte)
+        - ``fc_up_blocks_scale`` atom-layout covering N_full = 2*I
+        - ``fc_up_blocks_scale_decode`` row-major covering N_full = 2*I
+        - ``fc_down_*`` buffers sized for the actual intermediate size I
+
+        Down-proj weights are quantized normally with contraction dim = I.
+        """
+        actual_I = self._actual_inter_size
+        e, h, inter = w_gate_ehi.shape
+        assert inter == actual_I, f"gate width {inter} != actual_inter {actual_I}"
+        assert w_up_ehi.shape == (e, h, actual_I)
+        assert w_down_eih.shape == (e, actual_I, h)
+        if int(e) != self.num_experts:
+            raise ValueError(
+                f"Expert count {e} != self.num_experts {self.num_experts}")
+        if int(h) != self.hidden_size:
+            raise ValueError(
+                f"hidden dim {h} != self.hidden_size {self.hidden_size}")
+
+        # Interleave gate + up into [E, H, 2*I]: cols [0,I) = gate, [I,2*I) = up.
+        w_interleaved = torch.cat([w_gate_ehi, w_up_ehi], dim=2)  # [E, H, 2*I]
+        assert w_interleaved.shape == (e, h, 2 * actual_I)
+
+        # Use the NemotronH populate path with the interleaved FC1 weight.
+        # moe_inter_size on self is already 2*I, so buffer shapes match.
+        NemotronHMoEW4A4Plugin.populate_prefill_plugin_buffers(
+            self, w_interleaved, w_down_eih)
+        NemotronHMoEW4A4Plugin.populate_decode_plugin_buffers(self)
+
+    @classmethod
+    def from_qwen3_moe_block(
+        cls,
+        moe_block: "Qwen3MoeSparseMoeBlock",
+        *,
+        activation_type: int = 1,
+        quantization_group_size: int = 16,
+    ) -> "Qwen3MoEW4A4Plugin":
+        """Construct from a HuggingFace ``Qwen3MoeSparseMoeBlock`` and pack weights."""
+        if Qwen3MoeSparseMoeBlock is None:
+            raise RuntimeError(
+                "Qwen3MoeSparseMoeBlock is not available "
+                "(transformers.models.qwen3_moe import failed).")
+        if not isinstance(moe_block, Qwen3MoeSparseMoeBlock):
+            raise TypeError(
+                f"Expected Qwen3MoeSparseMoeBlock, got {type(moe_block).__name__}"
+            )
+
+        first_expert = moe_block.experts[0]
+        hidden_size = first_expert.hidden_size
+        moe_inter_size = first_expert.intermediate_size
+        num_experts = moe_block.num_experts
+        top_k = moe_block.top_k
+
+        plugin = cls(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            moe_inter_size=moe_inter_size,
+            gate_layer=moe_block.gate,
+            activation_type=activation_type,
+            quantization_group_size=quantization_group_size,
+        )
+
+        # Extract dense weights: gate_proj [I, H] -> [H, I], up_proj [I, H] -> [H, I],
+        # down_proj [H, I] -> [I, H]. Stack across experts.
+        w_gate_ehi = torch.stack(
+            [exp.gate_proj.weight.data.t() for exp in moe_block.experts])
+        w_up_ehi = torch.stack(
+            [exp.up_proj.weight.data.t() for exp in moe_block.experts])
+        w_down_eih = torch.stack(
+            [exp.down_proj.weight.data.t() for exp in moe_block.experts])
+
+        plugin.populate_gated_plugin_buffers(w_gate_ehi, w_up_ehi, w_down_eih)
+        return plugin
+
+
 def register_nvfp4_moe_plugin_onnx_symbolic_functions() -> None:
     register_custom_op_symbolic(
         "trt::nvfp4_moe_plugin",
@@ -1325,18 +1476,19 @@ def register_nvfp4_moe_plugin_onnx_symbolic_functions() -> None:
 
 
 def replace_moe_blocks_with_nvfp4_plugin(model: nn.Module) -> nn.Module:
-    """Replace ``NemotronHMoE`` blocks with ``NemotronHMoEW4A4Plugin`` (NVFP4 buffers must be filled).
+    """Replace MoE blocks with NVFP4 plugin wrappers.
+
+    Handles ``NemotronHMoE`` -> ``NemotronHMoEW4A4Plugin`` and
+    ``Qwen3MoeSparseMoeBlock`` -> ``Qwen3MoEW4A4Plugin``.
 
     Routing parameters (``n_group`` / ``topk_group`` / ``norm_topk_prob`` /
     ``routed_scaling_factor`` / ``routing_mode``) are inferred from ``moe_block.config``
     when present; NemotronH configs expose them via the DeepSeek-style sigmoid-group
     router, so the plugin runs ``moeSigmoidGroupTopk`` by default for those models.
     """
-    if NemotronHMoE is None:
-        return model
     for name, module in list(model.named_modules()):
         new_module = None
-        if isinstance(module, NemotronHMoE):
+        if NemotronHMoE is not None and isinstance(module, NemotronHMoE):
             cfg = getattr(module, "config", None)
             n_group = int(getattr(cfg, "n_group", 1) or 1)
             topk_group = int(getattr(cfg, "topk_group", 1) or 1)
@@ -1367,6 +1519,12 @@ def replace_moe_blocks_with_nvfp4_plugin(model: nn.Module) -> nn.Module:
                                 dtype=torch.float32,
                                 device=new_module.e_score_correction_bias.
                                 device))
+            except (TypeError, ValueError):
+                new_module = None
+        elif Qwen3MoeSparseMoeBlock is not None and isinstance(
+                module, Qwen3MoeSparseMoeBlock):
+            try:
+                new_module = Qwen3MoEW4A4Plugin.from_qwen3_moe_block(module)
             except (TypeError, ValueError):
                 new_module = None
         if new_module is None:
