@@ -62,6 +62,17 @@ python -m llm_loader.export_all_cli \
   --fp8-embedding
 ```
 
+For NVFP4 MoE models (e.g. Qwen3-MoE), use `--nvfp4-moe-backend` to select the plugin backend:
+
+```bash
+python -m llm_loader.export_all_cli \
+  /path/to/Qwen3-MoE-NVFP4 \
+  /tmp/qwen3_moe_onnx \
+  --nvfp4-moe-backend thor
+```
+
+Choices: `thor` (Nvfp4MoePlugin, SM100/101/110) or `geforce` (NvFP4MoEPluginGeforce, SM120/121). Defaults to checkpoint config, then `thor`.
+
 Build engines and run inference with the normal C++ tools. See [Quick Start Guide](../getting_started/quick-start-guide.md).
 
 ## Supported Methods

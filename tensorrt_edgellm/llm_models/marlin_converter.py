@@ -282,3 +282,71 @@ class MarlinConverter:
         b = np.frombuffer(np.uint32(int(scale_word) & 0xFFFFFFFF).tobytes(),
                           dtype=np.uint8)
         return np.array([b[0], b[2], b[1], b[3]], dtype=np.uint8)
+
+    # Midpoints between adjacent FP4 E2M1 levels for vectorized nearest-neighbor quantization.
+    _FP4_MIDPOINTS: ClassVar[np.ndarray] = np.array(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=np.float32)
+
+    @staticmethod
+    def quantize_matrix_to_nvfp4_marlin(
+        w: np.ndarray,
+        s_max: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized: quantize an entire ``[M, K]`` FP32 weight matrix to Marlin NVFP4 tile format.
+
+        Returns ``(payload_int8, block_scale_u8)`` where:
+        - ``payload_int8``: shape ``[M // 2, K]`` int8 — packed FP4 nibbles (lo/hi per byte)
+        - ``block_scale_u8``: flat uint8 array in atom-swizzled 128×4 layout (same as ``fp4Quantize.cu``)
+
+        ``s_max`` is the expert-wide maximum block scale (``max(|block|)/6`` over all groups);
+        the caller stores ``global_scale = s_max / FP8_MAX`` on the plugin module.
+        """
+        w = np.ascontiguousarray(w, dtype=np.float32)
+        m, k = w.shape
+        assert k % 64 == 0, f"K ({k}) must be a multiple of 64"
+        sf_vec = 16
+        sf_k = k // sf_vec  # number of scale-factor columns
+
+        # --- Block scales: max(|group|)/6 for each 16-element group ---
+        blocks = w.reshape(m, sf_k, sf_vec)  # [M, sf_k, 16]
+        amax = np.abs(blocks).max(axis=2)  # [M, sf_k]
+        block_scale = np.maximum(amax / 6.0, 1e-12)  # [M, sf_k]
+
+        # --- Normalize and quantize to FP4 E2M1 nibbles ---
+        normed = blocks / block_scale[:, :, np.newaxis]  # [M, sf_k, 16]
+        normed = np.clip(normed, -6.0, 6.0)
+        mag = np.abs(normed)
+        # searchsorted gives the index of the nearest-higher midpoint → same as argmin distance
+        codes = np.searchsorted(MarlinConverter._FP4_MIDPOINTS,
+                                mag.ravel()).astype(np.uint8)
+        codes = codes.reshape(m, k)
+        sign = (w < 0).astype(np.uint8) * 8
+        nibbles = sign | codes  # [M, K] uint8 nibble values 0..15
+
+        # --- Pack nibbles into bytes (lo, hi per byte) → [M, K//2] ---
+        nibs_2d = nibbles.reshape(m, k // 2, 2)
+        packed = (nibs_2d[:, :, 0] & 0x0F) | ((nibs_2d[:, :, 1] & 0x0F) << 4)
+        payload = packed.astype(np.uint8).view(np.int8)  # [M, K//2] int8
+
+        # --- Encode block scales as Marlin-manifold bytes in atom-swizzled layout ---
+        # Marlin encoding per scale: FP32 → FP16 → stored_byte = fp16_uint16 >> 7
+        k_fp8 = MarlinConverter.FP8_MAX
+        sf_stored = (block_scale / max(s_max, 1e-12) * k_fp8).astype(
+            np.float32)
+        sf_stored = np.clip(sf_stored, 0.0, k_fp8)
+        sf_fp16_u16 = sf_stored.astype(np.float16).view(np.uint16)
+        sf_fp8 = (sf_fp16_u16 >> 7).astype(np.uint8)
+        # sf_fp8: [M, sf_k] uint8 — linear layout; now apply atom 128x4 swizzle
+        m_tiles = (m + 127) // 128
+        k_tiles = (sf_k + 3) // 4
+        padded_m = m_tiles * 128
+        padded_sf_k = k_tiles * 4
+        sf_padded = np.zeros((padded_m, padded_sf_k), dtype=np.uint8)
+        sf_padded[:m, :sf_k] = sf_fp8
+        # Reshape and permute to match atom_sf_offset layout
+        sf_5d = sf_padded.reshape(m_tiles, 4, 32, k_tiles, 4)
+        sf_swizzled = sf_5d.transpose(0, 3, 2, 1,
+                                      4).copy()  # [m_tiles, k_tiles, 32, 4, 4]
+        block_scale_u8 = sf_swizzled.reshape(-1)
+
+        return payload, block_scale_u8

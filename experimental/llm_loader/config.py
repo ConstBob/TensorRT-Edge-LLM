@@ -75,6 +75,19 @@ QUANT_INT8_SQ = "int8_sq"
 # (dominant algo); per-layer differences live in ``layer_overrides``.
 QUANT_MIXED = "mixed_precision"
 
+# Deployment-target backend for NVFP4 MoE plugins. Even though both backends
+# read the same NVFP4 checkpoint, they emit *different* ONNX nodes
+# (``Nvfp4MoePlugin`` vs ``NvFP4MoEPluginGeforce``) with different input
+# contracts and weight layouts, so the backend must be picked at export
+# time. Surfaced through ``QuantConfig`` for convenience (it travels with
+# the rest of the export-time config); override via the checkpoint's
+# ``hf_quant_config.json`` / ``quantization_config`` block (key
+# ``nvfp4_moe_backend``) or by mutating ``config.quant.nvfp4_moe_backend``
+# before construction. Missing keys target the Thor plugin by default.
+NVFP4_MOE_BACKEND_THOR = "thor"  # CuTeDSL Nvfp4MoePlugin (SM100/101/110)
+NVFP4_MOE_BACKEND_GEFORCE = "geforce"  # NvFP4MoEPluginGeforce (SM120/121)
+_VALID_NVFP4_MOE_BACKENDS = (NVFP4_MOE_BACKEND_THOR, NVFP4_MOE_BACKEND_GEFORCE)
+
 # Default RoPE base frequency (used when config omits rope_theta)
 _DEFAULT_ROPE_THETA = 10000.0
 
@@ -147,6 +160,17 @@ class QuantConfig:
     layer_overrides: dict = field(default_factory=dict)
     # True when quant_algo is MIXED_PRECISION: unlisted modules are FP16.
     is_mixed_precision: bool = False
+    # Deployment-target backend for NVFP4 MoE plugins (only consumed when
+    # ``quant_type == QUANT_NVFP4`` *and* the model is an MoE arch). See the
+    # ``NVFP4_MOE_BACKEND_*`` constants above for the supported values.
+    # Default targets Thor SM110.
+    nvfp4_moe_backend: str = NVFP4_MOE_BACKEND_THOR
+
+    def __post_init__(self) -> None:
+        if self.nvfp4_moe_backend not in _VALID_NVFP4_MOE_BACKENDS:
+            raise ValueError(
+                f"QuantConfig.nvfp4_moe_backend must be one of "
+                f"{_VALID_NVFP4_MOE_BACKENDS}, got {self.nvfp4_moe_backend!r}")
 
     @property
     def is_quantized(self) -> bool:
@@ -952,6 +976,24 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
     return sorted({_normalize_module_name(n) for n in unquantized})
 
 
+def _parse_nvfp4_moe_backend(blob: dict) -> str:
+    """Read ``nvfp4_moe_backend`` from a quantization-config blob.
+
+    Accepts ``thor`` / ``geforce`` (case-insensitive). Missing key falls back
+    to :data:`NVFP4_MOE_BACKEND_THOR`. Raises on an unknown explicit value so
+    typos don't silently degrade the deployment target.
+    """
+    raw = blob.get("nvfp4_moe_backend")
+    if raw is None:
+        return NVFP4_MOE_BACKEND_THOR
+    backend = str(raw).strip().lower()
+    if backend not in _VALID_NVFP4_MOE_BACKENDS:
+        raise ValueError(
+            f"nvfp4_moe_backend must be one of {_VALID_NVFP4_MOE_BACKENDS}, "
+            f"got {raw!r}")
+    return backend
+
+
 def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
     """Determine quantisation config from hf_quant_config.json or config.json."""
 
@@ -961,6 +1003,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         with open(hf_path) as f:
             hq = json.load(f)
         q = hq.get("quantization", {})
+        nvfp4_moe_backend = _parse_nvfp4_moe_backend(q)
         algo = (q.get("quant_algo") or "").upper()
         if "AWQ" in algo and "W4A16" in algo:
             # Drop exclusions that the checkpoint contradicts (false positives),
@@ -975,6 +1018,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(q.get("group_size", 128)),
                 excluded=excluded,
+                nvfp4_moe_backend=nvfp4_moe_backend,
             )
         if algo == "MIXED_PRECISION":
             quantized_layers = q.get("quantized_layers", {})
@@ -988,6 +1032,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                     model_dir, list(q.get("exclude_modules", []))),
                 layer_overrides=layer_overrides,
                 is_mixed_precision=True,
+                nvfp4_moe_backend=nvfp4_moe_backend,
             )
         qt = _algo_to_quant_type(algo)
         gs = int(q.get("group_size", 1))
@@ -1003,12 +1048,14 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             group_size=gs,
             kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
             excluded=excluded,
+            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     # ---- Embedded quantization_config in config.json ------------------------
     qc = config.get("quantization_config")
     if qc is None:
         return QuantConfig()
+    nvfp4_moe_backend = _parse_nvfp4_moe_backend(qc)
 
     # Embedded block with ``quant_algo`` (export tool formats)
     if "quant_algo" in qc:
@@ -1019,6 +1066,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 group_size=int(qc.get("group_size", 128)),
                 excluded=_effective_excluded_modules(
                     model_dir, list(qc.get("ignore", []))),
+                nvfp4_moe_backend=nvfp4_moe_backend,
             )
         group_size = 1
         cg = qc.get("config_groups", {})
@@ -1034,6 +1082,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             kv_cache_quant=kv_str,
             excluded=_effective_excluded_modules(model_dir,
                                                  list(qc.get("ignore", []))),
+            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     # quant_method == awq (column-packed int4 checkpoints)
@@ -1042,6 +1091,7 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             quant_type=QUANT_INT4_AWQ,
             group_size=int(qc.get("group_size", 128)),
             excluded=_detect_unquantized_modules(model_dir),
+            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     # quant_method == gptq
@@ -1050,9 +1100,10 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             quant_type=QUANT_INT4_GPTQ,
             group_size=int(qc.get("group_size", 128)),
             excluded=_detect_unquantized_modules(model_dir),
+            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
-    return QuantConfig()
+    return QuantConfig(nvfp4_moe_backend=nvfp4_moe_backend)
 
 
 def _algo_to_quant_type(algo: str) -> str:

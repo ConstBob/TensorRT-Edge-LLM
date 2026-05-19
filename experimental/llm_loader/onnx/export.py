@@ -119,27 +119,73 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
     """
     _FLOAT4E2M1 = 23  # ONNX TensorProto.FLOAT4E2M1
     _INT8 = 3  # ONNX TensorProto.INT8
+    _FLOAT = 1  # ONNX TensorProto.FLOAT
 
     model = onnx.load(onnx_path, load_external_data=False)
+    value_infos = {
+        value_info.name: value_info
+        for value_info in (list(model.graph.input) + list(model.graph.output) +
+                           list(model.graph.value_info))
+    }
+
+    def _set_value_info(name: str, elem_type: int, dims: list[int]) -> bool:
+        value_info = value_infos.get(name)
+        if value_info is None:
+            return False
+        tensor_type = value_info.type.tensor_type
+        tensor_type.elem_type = elem_type
+        del tensor_type.shape.dim[:]
+        for dim_value in dims:
+            dim = tensor_type.shape.dim.add()
+            dim.dim_value = int(dim_value)
+        return True
+
     changed = 0
+    fixed_value_infos = 0
+    fp4_weight_dims = {}
     for init in model.graph.initializer:
-        # Only INT8 tensors whose name ends with ".weight" (not scale / qweight)
-        if (init.data_type != _INT8 or not init.name.endswith(".weight")
-                or "scale" in init.name or "qweight" in init.name):
+        # Only NVFP4 tensors whose name ends with ".weight" (not scale / qweight).
+        if (not init.name.endswith(".weight") or "scale" in init.name
+                or "qweight" in init.name):
             continue
         if len(init.dims) < 1:
             continue
-        # Reinterpret: same raw bytes, element type -> FLOAT4E2M1, last dim *2
-        init.data_type = _FLOAT4E2M1
-        old_dims = list(init.dims)
-        init.dims[-1] = old_dims[-1] * 2
-        changed += 1
 
-    if not changed:
+        if init.data_type == _INT8:
+            # Reinterpret: same raw bytes, element type -> FLOAT4E2M1, last dim *2.
+            init.data_type = _FLOAT4E2M1
+            old_dims = list(init.dims)
+            init.dims[-1] = old_dims[-1] * 2
+            changed += 1
+        elif init.data_type != _FLOAT4E2M1:
+            continue
+
+        new_dims = list(init.dims)
+        fp4_weight_dims[init.name] = new_dims
+        fixed_value_infos += int(
+            _set_value_info(init.name, _FLOAT4E2M1, new_dims))
+
+    if not fp4_weight_dims:
         return
 
-    logger.info("TRT fix: reinterpreted %d NVFP4 weight(s) as FLOAT4E2M1",
-                changed)
+    for node in model.graph.node:
+        if node.op_type != "DequantizeLinear" or not node.input:
+            continue
+        weight_dims = fp4_weight_dims.get(node.input[0])
+        if weight_dims is None:
+            continue
+        for output_name in node.output:
+            fixed_value_infos += int(
+                _set_value_info(output_name, _FLOAT, weight_dims))
+
+    if changed:
+        logger.info("TRT fix: reinterpreted %d NVFP4 weight(s) as FLOAT4E2M1",
+                    changed)
+    if fixed_value_infos:
+        logger.info("TRT fix: updated %d NVFP4 weight value_info entries",
+                    fixed_value_infos)
+    if changed == 0 and fixed_value_infos == 0:
+        return
     data_file = os.path.basename(onnx_path) + ".data"
     onnx.save_model(
         model,

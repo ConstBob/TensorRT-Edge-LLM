@@ -16,12 +16,13 @@
 """AOT-compile CuTe DSL kernels into a static library for CMake linking.
 
 Kernel groups:
-  gdn        — Gated Delta Net decode/prefill
-  fmha       — Fused Multi-Head Attention (Blackwell persistent)
-  ssd        — Mamba2 SSM chunk-scan prefill
-  gemm       — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
-  nvfp4_moe  — NvFP4 MoE FC1+FC2 grouped GEMM
-  nvfp4_fused_moe — End-to-end NvFP4 fused MoE (Blackwell GeForce)
+  gdn              — Gated Delta Net decode/prefill
+  fmha             — Fused Multi-Head Attention (Blackwell persistent)
+  ssd              — Mamba2 SSM chunk-scan prefill
+  gemm             — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
+  nvfp4_moe        — NvFP4 MoE FC1+FC2 grouped GEMM (prefill)
+  nvfp4_moe_decode — NvFP4 MoE decode GEMV (scalar K-parallel dot-product)
+  nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 
 Usage (run from the repo root):
   python kernelSrcs/build_cutedsl.py                      # build all groups for this GPU
@@ -101,12 +102,13 @@ class KernelVariant:
 # (no --gpu_arch forwarded), which works uniformly on Linux and QNX.
 #
 # Groups:
-#   gdn        — Gated Delta Net decode/prefill
-#   fmha       — Fused Multi-Head Attention (Blackwell persistent)
-#   ssd        — Mamba2 SSM chunk-scan prefill
-#   gemm       — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
-#   nvfp4_moe  — NvFP4 MoE FC1+FC2 grouped GEMM
-#   nvfp4_fused_moe — End-to-end NvFP4 fused MoE (Blackwell GeForce)
+#   gdn              — Gated Delta Net decode/prefill
+#   fmha             — Fused Multi-Head Attention (Blackwell persistent)
+#   ssd              — Mamba2 SSM chunk-scan prefill
+#   gemm             — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
+#   nvfp4_moe        — NvFP4 MoE FC1+FC2 grouped GEMM (prefill)
+#   nvfp4_moe_decode — NvFP4 MoE decode GEMV (scalar K-parallel dot-product)
+#   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 # ---------------------------------------------------------------------------
 KERNEL_VARIANTS = [
     # --- GDN group ---
@@ -399,6 +401,48 @@ KERNEL_VARIANTS = [
         script="nvfp4_moe_cutedsl/export_fc2_kernel.py",
         script_args=["--mma_tiler_n", "256",
                      "--output_dtype", "fp16", "--export_only"],
+    ),
+    # --- NvFP4 MoE Decode GEMV group (SM100+) ---
+    # Scalar GEMV for MoE decode: K-parallel vectorized dot-product with
+    # atom-layout FP8 block scales (shared with prefill GEMM — no weight/scale
+    # duplication). 5 kernel variants compose into pipelines:
+    #   Nemotron (relu2):  up_none → dn_relu2
+    #   Mixtral  (silu):   up_none → dn_silu
+    #   LLaMA SwiGLU:      up_swiglu → dn_none     (fused interleaved FC1)
+    KernelVariant(
+        name="gemv_up_none",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
+        script_args=["--activation", "none"],
+    ),
+    KernelVariant(
+        name="gemv_up_swiglu",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
+        script_args=["--swiglu_up"],
+    ),
+    KernelVariant(
+        name="gemv_dn_relu2",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
+        script_args=["--activation", "relu2", "--output_atomic"],
+    ),
+    KernelVariant(
+        name="gemv_dn_silu",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
+        script_args=["--activation", "silu", "--output_atomic"],
+    ),
+    KernelVariant(
+        name="gemv_dn_none",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_decode_gemv_kernel.py",
+        script_args=["--activation", "none", "--output_atomic"],
     ),
     # --- NvFP4 Fused MoE group (SM120/SM121 — Blackwell GeForce) ---
     # Fused route/pack + FC1 + activation + quant + FC2 + scatter kernels.

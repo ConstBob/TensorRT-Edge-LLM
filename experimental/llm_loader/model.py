@@ -61,6 +61,7 @@ class AutoModel:
                         key_prefix: "str | None" = None,
                         eagle_base: bool = False,
                         reduced_vocab_dir: "str | None" = None,
+                        nvfp4_moe_backend: "str | None" = None,
                         mtp_base: bool = False,
                         mtp_draft: bool = False) -> nn.Module:
         """Construct and load a model from *model_dir*.
@@ -83,6 +84,9 @@ class AutoModel:
                             tree-attention inputs and hidden_states output.
             reduced_vocab_dir:
                             Optional directory containing ``vocab_map.safetensors``.
+            nvfp4_moe_backend:
+                            Optional export-time override for Qwen3 NVFP4 MoE
+                            backend selection (``"thor"`` or ``"geforce"``).
             mtp_base:       When True, export the standard Qwen3.5 text model as
                             the dense MTP base variant.
             mtp_draft:      When True, build the dedicated Qwen3.5 dense MTP
@@ -94,6 +98,9 @@ class AutoModel:
         from .models.default.modeling_default import CausalLM
 
         config = ModelConfig.from_pretrained(model_dir)
+        if nvfp4_moe_backend is not None:
+            config.quant.nvfp4_moe_backend = nvfp4_moe_backend
+            config.quant.__post_init__()
         if eagle_base:
             config.eagle_base = True
         if mtp_base or config.mtp_base:
