@@ -61,10 +61,6 @@ Key script flags: `--kernels gdn`, `--gpu_arch` (e.g. `sm_87` for Orin,
 omit for device-native SM on Thor), `--arch` (default: auto), `--verbose`,
 `--clean`.
 
-> **Note on Thor (SM110):** due to a cutlass-dsl 4.5.1 PIC relocation limitation,
-> `--gpu_arch` cannot be specified when building on Thor. Omit it to compile for
-> the device's native SM.
-
 ## CMake
 
 ```bash
