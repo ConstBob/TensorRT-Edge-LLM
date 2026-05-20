@@ -268,7 +268,7 @@ To collect layer-level profiling in addition to the benchmark summary, add `--pr
 - **[Speculative Decoding](../examples/speculative-decoding.md)** - Speculative decoding for LLM and VLM
 - **[Phi-4-Multimodal](../examples/phi4.md)** - Phi-4 Multimodal
 - **[ASR](../examples/asr.md)** - Automatic speech recognition
-- **[MoE](../examples/moe.md)** - Mixture of Experts models (CPU-only export, Qwen3-30B-A3B-GPTQ-Int4)
+- **[MoE](../examples/moe.md)** - Mixture of Experts models (CPU-only export, Qwen3-30B-A3B-GPTQ-Int4/NVFP4)
 - **[TTS](../examples/tts.md)** - Text-to-speech synthesis
 - **[Alpamayo-R1-10B](../examples/vla.md)** - Vision-language-action inference with trajectory prediction
 

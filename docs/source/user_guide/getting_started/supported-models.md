@@ -209,6 +209,7 @@ python -m llm_loader.export_all_cli \
 <summary><b>Qwen3-MoE</b> checkpoints</summary>
 
 - [Qwen/Qwen3-30B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4)
+- [nvidia/Qwen3-30B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3-30B-A3B-NVFP4)
 
 </details>
 
