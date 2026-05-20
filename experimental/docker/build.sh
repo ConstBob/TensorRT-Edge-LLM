@@ -120,7 +120,7 @@ if [[ ! -f "${artifact_dir}/metadata.json" || ! -f "${artifact_dir}/libcutedsl_$
     if [[ ! -f "${prebuilt_tarball}" ]]; then
         root_tarball="$(basename "${prebuilt_tarball}")"
         if [[ -f "${root_tarball}" ]]; then
-            echo "Staging GitLab CuteDSL artifact ${root_tarball} into $(dirname "${prebuilt_tarball}")"
+            echo "Staging CuteDSL artifact ${root_tarball} into $(dirname "${prebuilt_tarball}")"
             mkdir -p "$(dirname "${prebuilt_tarball}")"
             cp -f "${root_tarball}" "${prebuilt_tarball}"
             if [[ -f "${root_tarball}.sha256" ]]; then
