@@ -28,7 +28,7 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-pip install nvidia-cutlass-dsl==4.5.0
+pip install nvidia-cutlass-dsl==4.5.1
 
 cd tensorrt-edge-llm
 
@@ -61,7 +61,7 @@ Key script flags: `--kernels gdn`, `--gpu_arch` (e.g. `sm_87` for Orin,
 omit for device-native SM on Thor), `--arch` (default: auto), `--verbose`,
 `--clean`.
 
-> **Note on Thor (SM110):** due to a cutlass-dsl 4.5.0 PIC relocation limitation,
+> **Note on Thor (SM110):** due to a cutlass-dsl 4.5.1 PIC relocation limitation,
 > `--gpu_arch` cannot be specified when building on Thor. Omit it to compile for
 > the device's native SM.
 
