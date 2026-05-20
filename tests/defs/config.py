@@ -36,6 +36,7 @@ DEFAULT_SEARCH_DEPTH = 3
 # These are exported directly from the HF checkpoint without a quantize-llm step.
 PRE_QUANTIZED_MODELS: frozenset = frozenset({
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+    "Qwen3-30B-A3B-NVFP4",
 })
 
 
@@ -924,6 +925,8 @@ class TestConfig:
             "InternVL3-1B-GPTQ-Int4": "InternVL3-1B-hf-GPTQ-Int4",
             # GPTQ-Int4 large MoE variants
             "Qwen3-30B-A3B-GPTQ-Int4": "Qwen3-30B-A3B-GPTQ-Int4",
+            # NVFP4 MoE (pre-quantized, no quantize-llm step needed)
+            "Qwen3-30B-A3B-NVFP4": "Qwen3-30B-A3B-NVFP4",
             "Qwen3.5-35B-A3B-GPTQ-Int4": "Qwen3.5-35B-A3B-GPTQ-Int4",
             # Multimodal pre-quantized NVFP4 (LLM + visual + audio).  Test list
             # uses ``Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`` as the

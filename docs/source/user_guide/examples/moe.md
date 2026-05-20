@@ -2,7 +2,9 @@
 
 Complete workflow for Mixture of Experts (MoE) models using a pre-quantized GPTQ-Int4 model.
 
-**Currently supported model:** [Qwen3-30B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4)
+**Currently supported models:**
+- [Qwen3-30B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4)
+- [nvidia/Qwen3-30B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3-30B-A3B-NVFP4)
 
 > **Note:** MoE export only works on **CPU** (`--device cpu`). No GPU is required for the export step.
 
