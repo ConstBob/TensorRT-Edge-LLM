@@ -186,6 +186,11 @@ bool LLMBuilder::build()
         return false;
     }
 
+    if (!copyExternalWeightFiles())
+    {
+        return false;
+    }
+
     return true;
 }
 
@@ -1050,6 +1055,45 @@ bool LLMBuilder::copyEmbeddingFile()
     }
 
     return true;
+}
+
+bool LLMBuilder::copyExternalWeightFiles()
+{
+    Json const externalWeightFiles = mModelConfig.value("external_weight_files", Json::array());
+    if (!externalWeightFiles.is_array())
+    {
+        LOG_ERROR("external_weight_files must be an array when present in config.json");
+        return false;
+    }
+    if (externalWeightFiles.empty())
+    {
+        return true;
+    }
+
+    bool allSuccess = true;
+    for (auto const& fileEntry : externalWeightFiles)
+    {
+        if (!fileEntry.is_object() || !fileEntry.contains("file") || !fileEntry["file"].is_string())
+        {
+            LOG_ERROR("Malformed external weight file entry: %s", fileEntry.dump().c_str());
+            return false;
+        }
+        std::string const filename = fileEntry["file"].get<std::string>();
+        std::filesystem::path const srcPath = mOnnxDir / filename;
+        std::filesystem::path const dstPath = mEngineDir / filename;
+
+        if (file_io::copyFile(srcPath.string(), dstPath.string()))
+        {
+            LOG_INFO("Copied external weight file: %s", filename.c_str());
+        }
+        else
+        {
+            LOG_ERROR("Failed to copy external weight file %s from %s to %s", filename.c_str(),
+                srcPath.string().c_str(), dstPath.string().c_str());
+            allSuccess = false;
+        }
+    }
+    return allSuccess;
 }
 
 } // namespace builder

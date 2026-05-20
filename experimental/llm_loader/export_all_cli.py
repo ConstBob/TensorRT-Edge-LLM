@@ -69,6 +69,8 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 from .checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
+from .external_weights import (EXTERNAL_WEIGHT_CHOICES,
+                               resolve_externalize_weights)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -479,7 +481,8 @@ def _export_llm(model_dir: str,
                 fp8_embedding: bool = False,
                 reduced_vocab_dir: str = "",
                 nvfp4_moe_backend: "Optional[str]" = None,
-                mtp_base: bool = False) -> None:
+                mtp_base: bool = False,
+                externalize_weights: "list[str] | None" = None) -> None:
     """Export LLM backbone via the standard llm_loader pipeline."""
     os.makedirs(llm_out_dir, exist_ok=True)
     output_path = os.path.join(llm_out_dir, "model.onnx")
@@ -510,7 +513,8 @@ def _export_llm(model_dir: str,
                     output_path,
                     model_dir=model_dir,
                     fp8_embedding=fp8_embedding,
-                    reduced_vocab_dir=reduced_vocab_dir)
+                    reduced_vocab_dir=reduced_vocab_dir,
+                    externalize_weights=externalize_weights)
     except (OSError, ValueError, RuntimeError) as exc:
         logger.exception("[LLM] ONNX export failed")
         raise SystemExit(1) from exc
@@ -1620,6 +1624,21 @@ def main() -> None:
          ),
     )
     p.add_argument(
+        "--externalize-weights",
+        nargs="+",
+        choices=EXTERNAL_WEIGHT_CHOICES,
+        default=[],
+        metavar="WEIGHT_TYPE",
+        help=("Expose selected model weights as ONNX inputs and write them "
+              "to safetensors external weight files. Values: int4_ffn, "
+              "int4_moe, lm_head, all."),
+    )
+    p.add_argument(
+        "--device",
+        default="cuda",
+        help="Device for export tracing (default: cuda).",
+    )
+    p.add_argument(
         "--max-kv-cache-capacity",
         type=int,
         default=4096,
@@ -1638,6 +1657,7 @@ def main() -> None:
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
     has_mtp_draft = _has_mtp(config)
+    externalize_weights = resolve_externalize_weights(args.externalize_weights)
 
     if (model_type == "qwen3_tts"
             and config.get("tts_model_type") != "custom_voice"):
@@ -1693,7 +1713,8 @@ def main() -> None:
                                  mtp_base=args.mtp,
                                  fp8_embedding=args.fp8_embedding,
                                  reduced_vocab_dir=args.reduced_vocab_dir,
-                                 nvfp4_moe_backend=args.nvfp4_moe_backend)),
+                                 nvfp4_moe_backend=args.nvfp4_moe_backend,
+                                 externalize_weights=externalize_weights)),
         (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(model_dir, out)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm,
          "talker", lambda out: _export_talker(model_dir, out, model_type)),
@@ -1747,6 +1768,9 @@ def main() -> None:
     logger.info("MTP export    : %s", "yes" if args.mtp else "no")
     logger.info("Reduced vocab : %s",
                 args.reduced_vocab_dir if args.reduced_vocab_dir else "no")
+    logger.info(
+        "External weights: %s",
+        ", ".join(externalize_weights) if externalize_weights else "no")
     logger.info("=" * 60)
 
     # ``--fp8-embedding`` only applies to the LLM thinker.  Models without a
@@ -1768,7 +1792,10 @@ def main() -> None:
                  "text_projection.safetensors",
                  "hidden_projection.safetensors",
                  "codec_embeddings.safetensors", "lm_heads.safetensors",
-                 "small_to_mtp_projection.safetensors")
+                 "small_to_mtp_projection.safetensors",
+                 "external_int4_ffn_weights.safetensors",
+                 "external_int4_moe_weights.safetensors",
+                 "external_lm_head_weight.safetensors")
     print()
     print("=" * 60)
     print("Export complete")

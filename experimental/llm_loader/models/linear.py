@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
-                      QUANT_MXFP8, QUANT_NVFP4, ModelConfig)
+                      QUANT_MXFP8, QUANT_NVFP4, ModelConfig, module_quant_type)
 from .ops import (fp8_dequantize, fp8_quantize, int4_groupwise_gemm,
                   int8_sq_act_qdq, int8_sq_weight_dq, mxfp8_act_qdq,
                   mxfp8_weight_dq, nvfp4_act_qdq, nvfp4_dequantize)
@@ -507,7 +507,15 @@ def make_linear(
     bias: bool = False,
     module_name: str = "",
 ) -> nn.Module:
-    """Return the right linear layer class for *config.quant.quant_type*.
+    """Return the right linear layer class for *module_name* under *config*.
+
+    Effective quant type is resolved by :func:`config.module_quant_type` —
+    that helper encodes the full decision tree (``quant.excluded`` forces
+    FP16; tied ``lm_head`` with no ``layer_overrides`` entry and an
+    unquantized backbone is FP16; otherwise ``layer_overrides`` takes
+    precedence over the dominant ``quant_type``).  Effective type is always
+    a concrete quant string (``fp8``, ``nvfp4``, ...), never
+    ``mixed_precision``.
 
     Args:
         config:        Model config (provides quant type and group_size).
@@ -515,29 +523,8 @@ def make_linear(
         out_features:  Output feature dimension.
         bias:          Include bias term.
         module_name:   Module path relative to the model root (e.g. ``"lm_head"``).
-                       ``quant.excluded`` forces FP16 for that module.  For
-                       ``lm_head`` only, ``tie_word_embeddings`` with no
-                       ``layer_overrides`` entry also selects FP16 (HF omits a
-                       separate lm_head when tied).  Otherwise per-layer
-                       overrides and dominant ``quant_type`` apply; effective
-                       type is always a concrete quant string (``fp8``,
-                       ``nvfp4``, ...), never ``mixed_precision``.
     """
-    if module_name:
-        if module_name in config.quant.excluded:
-            return FP16Linear(in_features, out_features, bias)
-        if (module_name == "lm_head" and config.tie_word_embeddings
-                and "lm_head" not in config.quant.layer_overrides
-                and config.quant.quant_type == QUANT_FP16):
-            return FP16Linear(in_features, out_features, bias)
-
-    # Resolve effective quant type: layer_overrides take precedence.
-    # For MIXED_PRECISION, overrides contain ALL quantized layers; unlisted
-    # modules are unquantized (FP16).
-    quant_type = config.quant.quant_type
-    if module_name and config.quant.layer_overrides:
-        fallback = QUANT_FP16 if config.quant.is_mixed_precision else quant_type
-        quant_type = config.quant.layer_overrides.get(module_name, fallback)
+    quant_type = module_quant_type(module_name, config)
 
     if quant_type == QUANT_FP16:
         return FP16Linear(in_features, out_features, bias)

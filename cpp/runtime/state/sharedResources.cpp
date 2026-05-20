@@ -122,6 +122,11 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         }
     }
 
+    // Externalized model weights are immutable base-engine inputs. The manager
+    // is constructed here, but file loading and engine validation are deferred
+    // to runtime initialization with the loaded EngineExecutor.
+    resources->externalWeightManager = std::make_unique<ExternalWeightManager>();
+
     // Zero buffer — sized to the largest shape any consumer binds:
     //  * deepstack_embeds_* during non-prefill phases
     //    (batch × seqLen × hiddenSize HALF; seqLen = maxVerifyTreeSize for EAGLE, else 1)
@@ -241,6 +246,11 @@ std::unique_ptr<SharedResources> SharedResources::createForEagle(DeploymentConfi
             resources->loraManager->loadWeights(loraWeightsName, loraWeightsPath, stream);
         }
     }
+
+    // Externalized model weights currently apply to the base engine only.
+    // The manager is constructed here, but file loading and engine validation
+    // are deferred to runtime initialization with the loaded EngineExecutor.
+    resources->externalWeightManager = std::make_unique<ExternalWeightManager>();
 
     // Zero buffer — sized to the largest shape any consumer binds:
     //  * deepstack_embeds_* during non-prefill phases

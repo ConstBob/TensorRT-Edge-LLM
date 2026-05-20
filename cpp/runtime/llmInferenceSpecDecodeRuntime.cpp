@@ -36,10 +36,10 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace nvinfer1;
@@ -205,11 +205,19 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         mPipelineIO = std::make_unique<PipelineIO>(PipelineIO::createForLLM(mDeployment.base, stream));
     }
 
+    // Externalized model weights: the SharedResources factory only allocates an
+    // empty manager. Load external weights and validate against engine inputs.
+    // External weights currently apply to the base engine only (no draft-engine load call).
+    mSharedResources->externalWeightManager->load(std::filesystem::path(engineDir), baseConfigPath, stream);
+    mSharedResources->externalWeightManager->validateAgainstEngine(*mBaseExecutor, "base");
+
     // -----------------------------------------------------------------------
-    // 7. Build base TensorMap (kvCacheIndex=0). EAGLE adds tree-mask / position
-    //    IDs to this same map further down.
+    // 7. Build base TensorMap (kvCacheIndex=0) and publish static external
+    //    weight bindings. EAGLE adds tree-mask / position IDs to this same
+    //    map further down.
     // -----------------------------------------------------------------------
     buildTensorMap(mBaseTensorMap, *mPipelineIO, *mSharedResources, mDeployment.base, /*kvCacheIndex=*/0);
+    mSharedResources->externalWeightManager->registerTensorMapEntries(mBaseTensorMap);
 
     // -----------------------------------------------------------------------
     // 8. EAGLE tree-building scratch + draft TensorMap. Engine-bound EAGLE

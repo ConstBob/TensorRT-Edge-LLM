@@ -52,6 +52,10 @@ import onnx
 import torch
 
 from ..checkpoint.checkpoint_utils import write_runtime_artifacts
+from ..external_weights import (externalize_model_weights,
+                                patch_external_weight_manifest,
+                                reject_quantized_lm_head_externalization,
+                                resolve_externalize_weights)
 from ..models.default.modeling_default import CausalLM
 from .dynamo_translations import build_custom_translation_table
 
@@ -70,6 +74,7 @@ def export_onnx(
     model_dir: str = "",
     fp8_embedding: bool = False,
     reduced_vocab_dir: str = "",
+    externalize_weights=None,
 ) -> None:
     """Export *model* to ONNX using the dynamo exporter.
 
@@ -86,17 +91,33 @@ def export_onnx(
                        per-row block scales.
         reduced_vocab_dir: Directory containing ``vocab_map.safetensors``
                            when reduced vocabulary is enabled.
+        externalize_weights: Iterable of weight kinds to expose as fixed-shape
+                             ONNX inputs and save to safetensors external
+                             weight files.
+                             Supported kinds: ``int4_ffn``, ``int4_moe``,
+                             ``lm_head``, and ``all``.
     """
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
 
-    _export_model(model, output_path)
+    requested_external_weights = resolve_externalize_weights(
+        externalize_weights)
+    reject_quantized_lm_head_externalization(model, model_dir,
+                                             requested_external_weights)
+
+    external_weight_files = _export_model(
+        model,
+        output_path,
+        externalize_weights=requested_external_weights,
+    )
     write_runtime_artifacts(model,
                             model_dir,
                             out_dir,
                             fp8_embedding=fp8_embedding,
                             reduced_vocab_dir=reduced_vocab_dir)
+    if external_weight_files:
+        patch_external_weight_manifest(out_dir, external_weight_files)
 
 
 # ---------------------------------------------------------------------------
@@ -615,9 +636,12 @@ def _fix_initializer_dtypes(
     )
 
 
-def _export_model(model: "CausalLM",
-                  output_path: str,
-                  optimize: bool = True) -> None:
+def _export_model(
+    model: "CausalLM",
+    output_path: str,
+    optimize: bool = True,
+    externalize_weights=None,
+) -> "list[dict[str, object]]":
     _setup_fp8kv_scales_for_export(model)
     spec = model.onnx_export_spec()
 
@@ -659,4 +683,7 @@ def _export_model(model: "CausalLM",
                                         "match_fp32_matmul_initializers",
                                         False)))
     _strip_attention_plugin_optional_inputs(output_path)
+    external_weight_files = externalize_model_weights(
+        output_path, model, externalize_weights=externalize_weights)
     logger.info("Export complete: %s", output_path)
+    return external_weight_files
