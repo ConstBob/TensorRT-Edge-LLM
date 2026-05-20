@@ -94,6 +94,15 @@ std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
 //! Convert TensorRT dimensions to a string representation.
 std::string dimsToString(nvinfer1::Dims const& dims) noexcept;
 
+//! Return true when a TensorRT dimensions object contains runtime dimensions.
+bool hasDynamicDims(nvinfer1::Dims const& dims) noexcept;
+
+//! Return true when two TensorRT dimensions objects have the same rank and extent.
+bool dimsEqual(nvinfer1::Dims const& lhs, nvinfer1::Dims const& rhs) noexcept;
+
+//! Return true when @p tensorName exists in the engine I/O list and is an input.
+bool isEngineInput(nvinfer1::ICudaEngine const& engine, std::string const& tensorName) noexcept;
+
 //! Print the engine information for a specific profile index.
 std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profileIndex) noexcept;
 

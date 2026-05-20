@@ -191,6 +191,35 @@ class QuantConfig:
         return any(v == QUANT_MXFP8 for v in self.layer_overrides.values())
 
 
+def module_quant_type(module_name: str, model_config: "ModelConfig") -> str:
+    """Return the effective quant type ``make_linear`` will pick for *module_name*.
+
+    Single source of truth for "what precision does this module's Linear end
+    up at?" — used by :func:`make_linear` to pick the Linear class, and by
+    the ONNX exporter to validate that LM-head externalization is only
+    requested for an fp16 head.  Lookup matches the names used elsewhere:
+    ``ModelConfig.quant.excluded`` and ``layer_overrides`` keys are already
+    normalized (VL prefixes / ``model.`` stripped) when parsed, and callers
+    pass the same short ``module_name`` that ``make_linear`` receives
+    (e.g. ``"lm_head"``).
+    """
+    quant = model_config.quant
+    if module_name and module_name in quant.excluded:
+        return QUANT_FP16
+    # Tied lm_head with no explicit override and an unquantized backbone has
+    # no separate lm_head.weight in the checkpoint; treat it as fp16 so the
+    # weight can be cloned from embed_tokens after loading.
+    if (module_name == "lm_head" and model_config.tie_word_embeddings
+            and "lm_head" not in quant.layer_overrides
+            and quant.quant_type == QUANT_FP16):
+        return QUANT_FP16
+    quant_type = quant.quant_type
+    if module_name and quant.layer_overrides:
+        fallback = QUANT_FP16 if quant.is_mixed_precision else quant_type
+        quant_type = quant.layer_overrides.get(module_name, fallback)
+    return quant_type
+
+
 @dataclass
 class MambaConfig:
     """Mamba-layer hyper-parameters for hybrid models."""

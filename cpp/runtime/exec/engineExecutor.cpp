@@ -276,18 +276,9 @@ bool EngineExecutor::BindingSnapshot::operator==(BindingSnapshot const& rhs) con
         {
             return false;
         }
-        nvinfer1::Dims const& lDims = bindings[i].second;
-        nvinfer1::Dims const& rDims = rhs.bindings[i].second;
-        if (lDims.nbDims != rDims.nbDims)
+        if (!dimsEqual(bindings[i].second, rhs.bindings[i].second))
         {
             return false;
-        }
-        for (int32_t d = 0; d < lDims.nbDims; ++d)
-        {
-            if (lDims.d[d] != rDims.d[d])
-            {
-                return false;
-            }
         }
     }
     return true;

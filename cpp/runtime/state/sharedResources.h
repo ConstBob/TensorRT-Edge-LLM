@@ -21,6 +21,7 @@
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/hybridCacheManager.h"
+#include "runtime/state/externalWeightManager.h"
 #include "runtime/state/loraManager.h"
 #include "runtime/state/ropeCache.h"
 
@@ -44,6 +45,7 @@ struct SharedResources
 
     RopeCache ropePool;
     std::unique_ptr<LoRAManager> loraManager;
+    std::unique_ptr<ExternalWeightManager> externalWeightManager;
     Tensor zeroBuffer;
 
     //! Split-K/V view cache. Only populated when `cfg.useTrtNativeOps == true`.
@@ -64,17 +66,28 @@ struct SharedResources
     std::vector<std::vector<Tensor>> vCacheViews;
 
     //! Build SharedResources for the vanilla single-engine LLM runtime
-    //! (KV cache, RoPE pool, LoRA manager, zero buffer).
+    //! (KV cache, RoPE pool, LoRA manager, external weight manager, zero buffer).
     //!
     //! Recurrent / conv state dtypes for hybrid models are read from
     //! `cfg.recurrentStateDtype` / `cfg.convStateDtype` — they are parsed
-    //! strictly from `config.json` by `parseEngineConfig` and no longer
-    //! threaded through this factory.
+    //! strictly from `config.json` by `parseEngineConfig`.
+    //!
+    //! The returned `externalWeightManager` is constructed by this factory; the
+    //! runtime is responsible for loading files, validating against the base
+    //! engine, and publishing it to a TensorMap. This keeps `SharedResources`
+    //! decoupled from `EngineExecutor` (no engine I/O or validation happens
+    //! inside this factory).
     static std::unique_ptr<SharedResources> createForLLM(LLMEngineConfig const& cfg,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
     //! Build SharedResources for the EAGLE two-engine speculative-decoding runtime
-    //! (base + draft KV caches, shared RoPE pool, LoRA manager, zero buffer).
+    //! (base + draft KV caches, shared RoPE pool, LoRA manager, external weight
+    //! manager, zero buffer).
+    //!
+    //! As with `createForLLM`, the returned `externalWeightManager` is
+    //! constructed by this factory, and the runtime must load files, validate
+    //! against the base engine, and publish it to a TensorMap. External weights
+    //! currently apply to the base engine only.
     static std::unique_ptr<SharedResources> createForEagle(DeploymentConfig const& bundle, int32_t maxRuntimeBatchSize,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 };
