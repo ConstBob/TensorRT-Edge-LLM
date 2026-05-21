@@ -26,6 +26,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <string>
 
 using namespace trt_edgellm;
 
@@ -33,6 +34,52 @@ namespace trt_edgellm
 {
 namespace builder
 {
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
+namespace
+{
+
+void appendLunowudFlag(std::string& flags, std::string const& flag)
+{
+    if (flags.find(flag) != std::string::npos)
+    {
+        return;
+    }
+    if (!flags.empty())
+    {
+        flags += ' ';
+    }
+    flags += flag;
+}
+
+std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
+{
+    std::string lunowudFlags;
+    char const* existingLunowud = std::getenv("__LUNOWUD");
+    if (existingLunowud)
+    {
+        lunowudFlags = existingLunowud;
+    }
+#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
+    appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
+    appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
+    appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
+    appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
+    if (maxBatchSize == 1)
+    {
+        appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
+    }
+#endif
+    if (existingLunowud || !lunowudFlags.empty())
+    {
+        setenv("__LUNOWUD", lunowudFlags.c_str(), 1);
+    }
+    return lunowudFlags;
+}
+
+} // namespace
+#endif
 
 LLMBuilder::LLMBuilder(
     std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config)
@@ -44,6 +91,14 @@ LLMBuilder::LLMBuilder(
 
 bool LLMBuilder::build()
 {
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
+    std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
+    if (!lunowudFlags.empty())
+    {
+        LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
+    }
+#endif
+
     // Load plugin library
     auto pluginHandles = loadEdgellmPluginLib();
 
@@ -135,11 +190,6 @@ bool LLMBuilder::build()
 
     // Build and save engine
     std::string const engineFilePath = (mEngineDir / engineFileName).string();
-#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
-    setenv("__LUNOWUD", "-peep:match_dual_gemm=off", 1);
-#elif NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
-    setenv("__LUNOWUD", "-mlir:autotune:num_threads=1 -mlir:collective:fp4=off -cask_fusion:async_policy=1", 1);
-#endif
     if (!buildAndSerializeEngine(builder.get(), network.get(), config.get(), engineFilePath))
     {
         return false;
