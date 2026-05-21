@@ -356,6 +356,7 @@ def export_audio_onnx(
     weights: dict,
     config: dict,
     model_type: str,
+    model_config: "ModelConfig | None" = None,
     dtype: torch.dtype = torch.float16,
 ) -> None:
     """Export a from-scratch audio encoder to ONNX.
@@ -366,6 +367,9 @@ def export_audio_onnx(
         weights:     Flat ``{key: tensor}`` dict from safetensors.
         config:      Full ``config.json`` dict.
         model_type:  Value of ``config.json["model_type"]``.
+        model_config: Top-level :class:`ModelConfig` for ``make_linear``
+            dispatch in :class:`QwenAudioEncoder` Linears (``None`` =
+            FP16-only).
         dtype:       Weight dtype (default ``float16``).
     """
     device = "cpu"
@@ -394,7 +398,8 @@ def export_audio_onnx(
         audio_model = build_qwen_audio(audio_config,
                                        weights,
                                        dtype,
-                                       prefix=key_prefix)
+                                       prefix=key_prefix,
+                                       model_config=model_config)
         audio_model = audio_model.to(device).eval()
         args, input_names, output_names, dynamic_shapes = (
             _make_audio_dummy_inputs(audio_model, audio_config, device))

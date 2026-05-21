@@ -52,6 +52,17 @@ def _add_common_args(parser):
               "precisions are deferred until per-recipe accuracy is "
               "validated. When unset the visual tower stays at fp16 "),
     )
+    parser.add_argument(
+        "--audio_quantization",
+        default=None,
+        choices=["fp8"],
+        help=("Quantize the audio tower (audio_tower / audio_embed). Only "
+              "fp8 is exposed today; lower-bit recipes are deferred until "
+              "WER-validated. For Qwen3-ASR this triggers an ASR-shaped "
+              "multimodal calibration loop (LibriSpeech audio + transcript "
+              "pairs streamed through audio_tower + text decoder). When "
+              "unset the audio tower stays at fp16."),
+    )
     parser.add_argument("--kv_cache_quantization",
                         default=None,
                         choices=["fp8"])
@@ -86,6 +97,7 @@ def main():
             quantization=args.quantization,
             lm_head_quantization=args.lm_head_quantization,
             visual_quantization=args.visual_quantization,
+            audio_quantization=args.audio_quantization,
             kv_cache_quantization=args.kv_cache_quantization,
             dtype=args.dtype,
             device=args.device,

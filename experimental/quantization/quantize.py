@@ -38,6 +38,9 @@ from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoTokenizer)
 
 from .quantization_configs import build_quant_config
+from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
+                               load_qwen3_asr_joint_for_calibration,
+                               postprocess_qwen3_asr_checkpoint)
 
 
 def _text_calib_dataloader(tokenizer,
@@ -246,6 +249,19 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
         from experimental.llm_loader.lora import load_phi4mm_model
         model = load_phi4mm_model(model_dir, torch_dtype)
         model.to(device)
+    elif is_qwen3_asr_model(model_dir):
+        # Qwen3-ASR HF ckpt declares model_type="qwen3_asr" but ships no
+        # modeling code, so the AutoModel factories below would fail. We
+        # build a *joint* calibration model: a vanilla Qwen3ForCausalLM
+        # text decoder with the from-scratch Qwen3ASRAudioEncoder attached
+        # as an ``audio_tower`` submodule plus a custom forward that
+        # splices audio embeddings into the text input embedding stream
+        # at <|audio_pad|> positions. ModelOpt's mtq.quantize walks the
+        # joint module tree, so the same forward_loop drives both halves
+        # under realistic ASR-shaped activations -- the equivalent of
+        # _calibrate_multimodal for VLMs.
+        model, tokenizer, processor = load_qwen3_asr_joint_for_calibration(
+            model_dir, torch_dtype, device)
     else:
         if _is_nemotron_h_model(model_dir):
             from .nemotron_h_patch import apply as _apply_nemotron_h_patch
@@ -431,6 +447,30 @@ def _calibrate_multimodal(model, batches):
             model(**kwargs)
 
 
+def _calibrate_asr_multimodal(model, batch_iter):
+    """Forward-loop calibration pass for joint ASR (audio + text) batches.
+
+    Drives the joint Qwen3-ASR calibration model -- :func:`Qwen3ASR
+    audio_tower` + vanilla ``Qwen3ForCausalLM`` text decoder + audio splice
+    -- with real (audio, transcript) pairs so quantizers on both the audio
+    and text paths see realistic activations. Mirror of
+    :func:`_calibrate_multimodal` but consumes a generator (the LibriSpeech
+    streaming dataloader is finite-but-streamed, not pre-materialised).
+    """
+    device = model.device
+    model_dtype = next(model.parameters()).dtype
+    for batch in tqdm(batch_iter, desc="Calibrating (ASR multimodal)"):
+        kwargs = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                v = v.to(device)
+                if v.dtype.is_floating_point:
+                    v = v.to(model_dtype)
+            kwargs[k] = v
+        with torch.no_grad():
+            model(**kwargs)
+
+
 def quantize_and_export(
     model_dir: str,
     output_dir: str,
@@ -438,6 +478,7 @@ def quantize_and_export(
     lm_head_quantization: Optional[str] = None,
     visual_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
+    audio_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
     dataset: str = "cnn_dailymail",
@@ -487,8 +528,42 @@ def quantize_and_export(
             lm_head_quantization,
             kv_cache_quantization,
             visual_quantization=visual_quantization,
+            audio_quantization=audio_quantization,
         )
-        if visual_quantization is not None:
+        if is_qwen3_asr_model(model_dir):
+            # ASR multimodal calibration: stream real (audio, transcript)
+            # pairs through the joint audio_tower + text decoder so the
+            # text quantizers see audio-embedding-spliced inputs (the
+            # distribution they actually see at runtime). Mirror of the
+            # visual_quantization branch below for VLMs. Uses LibriSpeech
+            # by default; --dataset can override but the loader expects an
+            # ``audio`` + ``text`` schema (LibriSpeech / GigaSpeech / ...).
+            asr_dataset = (dataset if dataset != "cnn_dailymail" else
+                           "openslr/librispeech_asr")
+            asr_samples = min(num_samples, 128)
+            audio_n_window = int(model.audio_tower.config.get("n_window", 100))
+            num_mel_bins = int(
+                model.audio_tower.config.get("num_mel_bins", 128))
+            audio_token_id = int(model._asr_audio_token_id)
+            # Materialize the generator so ModelOpt can re-iterate
+            # forward_loop (e.g. AutoQuantize algorithm selection).
+            # Mirrors the visual path's _multimodal_calib_dataloader,
+            # which returns a list for the same reason.
+            batches = list(
+                asr_calibration_dataloader(
+                    tokenizer=tokenizer,
+                    audio_token_id=audio_token_id,
+                    audio_n_window=audio_n_window,
+                    num_mel_bins=num_mel_bins,
+                    dataset_name=asr_dataset,
+                    num_samples=asr_samples,
+                ))
+            mtq.quantize(
+                model,
+                quant_cfg,
+                forward_loop=lambda m: _calibrate_asr_multimodal(m, batches),
+            )
+        elif visual_quantization is not None:
             # Multimodal calibration: feed (image, text) pairs through the
             # whole VLM so visual + LLM quantizers both see real activations.
             processor = AutoProcessor.from_pretrained(model_dir,
@@ -557,6 +632,14 @@ def quantize_and_export(
         src = os.path.join(model_dir, fname)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(output_dir, fname))
+
+    # Qwen3-ASR: convert the vanilla-Qwen3-shaped output back into the
+    # qwen3_asr layout the runtime expects (re-prefix safetensors keys with
+    # ``thinker.``, restore the qwen3_asr config.json + chat_template +
+    # preprocessor). ``audio_tower.*`` weights are already in the exported
+    # safetensors -- the joint calibration model carries them as a submodule.
+    if is_qwen3_asr_model(model_dir):
+        postprocess_qwen3_asr_checkpoint(model_dir, output_dir)
 
     print(f"Saved to {output_dir} (total {time.time() - t0:.1f}s)")
     return output_dir

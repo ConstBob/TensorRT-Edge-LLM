@@ -190,10 +190,51 @@ FP8_VISUAL = {
 # the ``disable`` patterns here and the per-recipe overrides above.
 _VISUAL_PATTERNS = tuple(f"*{p}.*" for p in _VISUAL_PREFIXES)
 
-_AUDIO_PATTERNS = (
-    "*audio_tower.*",
-    "*audio_embed.*",
+# Audio submodule prefixes. Mirror of ``_VISUAL_PREFIXES`` for the audio
+# tower (Qwen3-ASR / Qwen3-Omni audio encoder, Phi-4mm audio_embed).
+_AUDIO_PREFIXES = (
+    "audio_tower",
+    "audio_embed",
 )
+_AUDIO_PATTERNS = tuple(f"*{p}.*" for p in _AUDIO_PREFIXES)
+
+
+def _audio_quant_cfg(input_cfg: Optional[Dict[str, Any]],
+                     weight_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Expand a single ``input_cfg`` / ``weight_cfg`` pair into wildcard
+    patterns covering every audio prefix.
+
+    Mirrors :func:`_visual_quant_cfg`. ``input_cfg=None`` skips the
+    input-quantizer entries (used for weight-only recipes).
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for prefix in _AUDIO_PREFIXES:
+        out[f"*{prefix}*weight_quantizer"] = weight_cfg
+        if input_cfg is not None:
+            out[f"*{prefix}*input_quantizer"] = input_cfg
+    return out
+
+
+# Per-audio-submodule overrides. Used when the user asks for an audio
+# precision that differs from the backbone (e.g. backbone NVFP4 + audio
+# FP8), mirroring the *_VISUAL pattern. Only FP8 audio is exposed today;
+# lower-bit recipes (NVFP4 / MXFP8) are deferred until validated end-to-end
+# on an ASR eval (WER on LibriSpeech).
+FP8_AUDIO = {
+    "quant_cfg":
+    _audio_quant_cfg(
+        input_cfg={
+            "num_bits": (4, 3),
+            "axis": None,
+            "enable": True,
+        },
+        weight_cfg={
+            "num_bits": (4, 3),
+            "axis": None,
+            "enable": True,
+        },
+    )
+}
 
 _TTS_PATTERNS = (
     "*code_predictor.*",
@@ -219,6 +260,10 @@ _VISUAL_CFG_MAP = {
     "fp8": FP8_VISUAL,
 }
 
+_AUDIO_CFG_MAP = {
+    "fp8": FP8_AUDIO,
+}
+
 
 def _disable_groups(*pattern_groups) -> Dict[str, Dict[str, bool]]:
     """Flatten wildcard pattern groups into a ``{pattern: {enable: False}}`` dict."""
@@ -234,6 +279,7 @@ def build_quant_config(
     lm_head_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
     visual_quantization: Optional[str] = None,
+    audio_quantization: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a composite ModelOpt quantization config from method names.
 
@@ -251,6 +297,10 @@ def build_quant_config(
                                quantized via that method; if it matches the
                                backbone we just stop disabling, otherwise we
                                layer an explicit per-visual override on top.
+        audio_quantization:    Optional audio-tower precision. Mirror of
+                               ``visual_quantization`` for ``audio_tower.*`` /
+                               ``audio_embed.*`` paths. Only ``fp8`` is exposed
+                               today.
     """
     if quantization is None:
         cfg = {"quant_cfg": {"default": {"enable": False}}, "algorithm": "max"}
@@ -281,14 +331,16 @@ def build_quant_config(
         cfg["quant_cfg"].update(mtq.FP8_KV_CFG["quant_cfg"])
         cfg["quant_cfg"].update(FP8_ATTN["quant_cfg"])
 
-    # Disable every non-LLM group by default.  Re-enable the ones the user
+    # Disable every non-LLM group by default. Re-enable the ones the user
     # explicitly asked to quantize.
-    groups_to_disable = [_AUDIO_PATTERNS, _TTS_PATTERNS]
+    groups_to_disable = [_TTS_PATTERNS]
     if visual_quantization is None:
         groups_to_disable.append(_VISUAL_PATTERNS)
+    if audio_quantization is None:
+        groups_to_disable.append(_AUDIO_PATTERNS)
     cfg["quant_cfg"].update(_disable_groups(*groups_to_disable))
 
-    # When visual != backbone, layer an explicit override.  When visual ==
+    # When visual != backbone, layer an explicit override. When visual ==
     # backbone we don't need overrides — the backbone's generic wildcards
     # already cover visual submodules now that we've stopped disabling them.
     if (visual_quantization is not None
@@ -299,5 +351,13 @@ def build_quant_config(
                 f"Choose from: {list(_VISUAL_CFG_MAP)}")
         cfg["quant_cfg"].update(
             _VISUAL_CFG_MAP[visual_quantization]["quant_cfg"])
+
+    if (audio_quantization is not None and audio_quantization != quantization):
+        if audio_quantization not in _AUDIO_CFG_MAP:
+            raise ValueError(
+                f"Unsupported audio_quantization: {audio_quantization}. "
+                f"Choose from: {list(_AUDIO_CFG_MAP)}")
+        cfg["quant_cfg"].update(
+            _AUDIO_CFG_MAP[audio_quantization]["quant_cfg"])
 
     return cfg

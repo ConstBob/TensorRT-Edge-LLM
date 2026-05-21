@@ -750,8 +750,13 @@ def _export_alpamayo_visual(model_dir: str, visual_out_dir: str, weights: dict,
     _save_alpamayo_visual_processor(config, visual_out_dir)
 
 
-def _export_audio(model_dir: str, audio_out_dir: str, weights: dict,
-                  config: dict, model_type: str, dtype: "torch.dtype") -> None:
+def _export_audio(model_dir: str,
+                  audio_out_dir: str,
+                  weights: dict,
+                  config: dict,
+                  model_type: str,
+                  dtype: "torch.dtype",
+                  model_config: "ModelConfig | None" = None) -> None:
     """Export audio encoder via from-scratch llm_loader pipeline."""
     os.makedirs(audio_out_dir, exist_ok=True)
     output_path = os.path.join(audio_out_dir, "model.onnx")
@@ -766,6 +771,7 @@ def _export_audio(model_dir: str, audio_out_dir: str, weights: dict,
             weights=weights,
             config=config,
             model_type=model_type,
+            model_config=model_config,
             dtype=dtype,
         )
     except (OSError, ValueError, RuntimeError) as exc:
@@ -1718,9 +1724,14 @@ def main() -> None:
                                              dtype,
                                              model_config=_get_model_config())
          ),
-        (_has_audio(model_type)
-         and not args.skip_audio, "audio", lambda out: _export_audio(
-             model_dir, out, _get_weights(), config, model_type, dtype)),
+        (_has_audio(model_type) and not args.skip_audio, "audio",
+         lambda out: _export_audio(model_dir,
+                                   out,
+                                   _get_weights(),
+                                   config,
+                                   model_type,
+                                   dtype,
+                                   model_config=_get_model_config())),
         (_has_code2wav(model_type) and not args.skip_code2wav, "code2wav",
          lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),
                                       config, model_type, dtype)),
