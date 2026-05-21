@@ -53,17 +53,17 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
     LOG_INFO("engine loaded successfully (%d I/O tensors)", mEngine->getNbIOTensors());
 }
 
-std::unique_ptr<EngineExecutor> EngineExecutor::createForLLM(
-    std::filesystem::path const& enginePath, LLMEngineConfig const& cfg)
+std::unique_ptr<EngineExecutor> EngineExecutor::createForLLM(std::filesystem::path const& enginePath,
+    LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim)
 {
-    auto registry = buildRegistryForLLM(cfg);
+    auto registry = buildRegistryForLLM(cfg, specDecodeBaseOutputHiddenDim);
     return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
 }
 
-std::unique_ptr<EngineExecutor> EngineExecutor::createForEagleDraft(
+std::unique_ptr<EngineExecutor> EngineExecutor::createForSpecDecodeDraft(
     std::filesystem::path const& enginePath, DeploymentConfig const& bundle)
 {
-    auto registry = buildRegistryForEagleDraft(bundle);
+    auto registry = buildRegistryForSpecDecodeDraft(bundle);
     return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
 }
 
@@ -223,7 +223,7 @@ bool EngineExecutor::captureGraph(cudaStream_t stream)
 int64_t EngineExecutor::getRequiredContextMemorySize() const
 {
     // Use getDeviceMemorySizeV2() to get the max across ALL profiles.
-    // EAGLE base engines have multiple profiles (prefill + verification) with
+    // SpecDecode base engines have multiple profiles (prefill + verification) with
     // different memory requirements. Using per-profile size can underallocate.
     return mEngine->getDeviceMemorySizeV2();
 }

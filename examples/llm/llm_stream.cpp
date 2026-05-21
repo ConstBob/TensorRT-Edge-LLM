@@ -76,10 +76,10 @@ struct Args
     int32_t maxGenerateLength = -1; // Uses value from JSON if < 0.
     int32_t streamInterval = 1;
     bool showSpecialTokens = false; // StreamChannel::setSkipSpecialTokens(!this)
-    bool eagle = false;
-    int32_t eagleDraftTopK = 8;
-    int32_t eagleDraftStep = 4;
-    int32_t eagleVerifyTreeSize = 24;
+    bool specDecode = false;
+    int32_t specDraftTopK = 8;
+    int32_t specDraftStep = 4;
+    int32_t specVerifySize = 24;
 };
 
 void printUsage(char const* argv0)
@@ -89,7 +89,7 @@ void printUsage(char const* argv0)
                  "           [--multimodalEngineDir DIR] [--maxGenerateLength N]\n"
                  "           [--streamInterval N] [--specDecode [--specDraftTopK K]\n"
                  "                                             [--specDraftStep S]\n"
-                 "                                             [--specVerifyTreeSize V]]\n\n"
+                 "                                             [--specVerifySize V]]\n\n"
                  "Hotkeys while streaming:\n"
                  "   s         skip the current request\n"
                  "   q         quit (cancel current + stop)\n"
@@ -169,25 +169,25 @@ bool parseArgs(int argc, char** argv, Args& args)
         }
         else if (a == "--specDecode" || a == "--eagle")
         {
-            args.eagle = true;
+            args.specDecode = true;
         }
         else if (a == "--specDraftTopK" || a == "--eagleDraftTopK")
         {
-            if (!takeInt(i, a, args.eagleDraftTopK))
+            if (!takeInt(i, a, args.specDraftTopK))
             {
                 return false;
             }
         }
         else if (a == "--specDraftStep" || a == "--eagleDraftStep")
         {
-            if (!takeInt(i, a, args.eagleDraftStep))
+            if (!takeInt(i, a, args.specDraftStep))
             {
                 return false;
             }
         }
-        else if (a == "--specVerifyTreeSize" || a == "--eagleVerifyTreeSize")
+        else if (a == "--specVerifySize" || a == "--specVerifyTreeSize" || a == "--eagleVerifyTreeSize")
         {
-            if (!takeInt(i, a, args.eagleVerifyTreeSize))
+            if (!takeInt(i, a, args.specVerifySize))
             {
                 return false;
             }
@@ -513,9 +513,9 @@ int main(int argc, char** argv)
     std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> runtime;
     try
     {
-        if (args.eagle)
+        if (args.specDecode)
         {
-            rt::EagleDraftingConfig draft{args.eagleDraftTopK, args.eagleDraftStep, args.eagleVerifyTreeSize};
+            rt::SpecDecodeDraftingConfig draft{args.specDraftTopK, args.specDraftStep, args.specVerifySize};
             runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraMap, draft, stream);
         }

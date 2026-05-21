@@ -34,35 +34,35 @@ namespace rt
 //!
 //! Fields have NO in-class defaults — every construction site must set every
 //! field explicitly. The canonical construction path is an `LLMEngineConfig`
-//! recipe method (`prefillDims`, `decodeDims`, `treeVerifyDims`,
+//! recipe method (`prefillDims`, `decodeDims`, `specVerifyDims`,
 //! `proposalDims`, `acceptDims`, `resetDims`). Direct construction (aggregate
 //! or designated initializers) is supported for unit tests.
 //!
-//! The eight fields are the complete set of symbolic dims used by LLM and EAGLE
+//! The eight fields are the complete set of symbolic dims used by LLM and SpecDecode
 //! draft engines. Fixed-shape tensor dims do not appear here.
 struct InferenceDims
 {
     int64_t batch;     //!< Active batch size
-    int64_t seqLen;    //!< Work-unit length for this step (prompt / tree / accept / 1)
+    int64_t seqLen;    //!< Work-unit length for this step (prompt / proposal / accept / 1)
     int64_t kvLen;     //!< KV cache capacity (usually LLMEngineConfig::maxKVCacheCapacity)
-    int64_t selectLen; //!< last_token_ids select count (1 except for EAGLE tree verify)
-    //! Effective sequence length for the EAGLE attention_mask / attention_pos_id
+    int64_t selectLen; //!< last_token_ids select count (1 except for SpecDecode verification)
+    //! Effective sequence length for the SpecDecode attention_mask / attention_pos_id
     //! tensors. This is decoupled from `seqLen` because the base engine's
     //! attention plugin treats a "small" mask shape ([B, 1, 1]) as a signal to
-    //! use standard causal attention, while a tree-shaped mask triggers tree
-    //! attention and reads the buffer contents as a bit-packed tree mask.
+    //! use standard causal attention, while a proposal-shaped mask triggers
+    //! proposal attention and reads the buffer contents as a bit-packed mask.
     //!
     //! Set to 1 for prefill / decode / reset (engine applies standard causal
-    //! attention and ignores the dummy mask buffer); set to the effective tree
-    //! size for tree-verify / proposal / accept (engine applies tree attention
+    //! attention and ignores the dummy mask buffer); set to the effective proposal
+    //! size for verify / proposal / accept (engine applies proposal attention
     //! using the prepared bit-packed mask).
     int64_t attnMaskSeqLen;
     int64_t ropeBatch;     //!< RoPE broadcast dim (1 for non-MRope; batch for MRope)
-    int64_t packedMaskLen; //!< divUp(attnMaskSeqLen, 32) for EAGLE tree masks; else 1
+    int64_t packedMaskLen; //!< divUp(attnMaskSeqLen, 32) for SpecDecode masks; else 1
     //! Shape length for `kvcache_start_index`. Zero is the engine's sentinel
     //! for "initial prefill of an empty KV cache" (plugin-path engines only);
     //! `batch` means "use these per-batch start offsets" for chunked prefill,
-    //! decode, tree-verify, and accept. TRT-native-ops engines always use
+    //! decode, verify, and accept. TRT-native-ops engines always use
     //! `batch`. Zero is a legitimate, engine-meaningful value for this dim.
     int64_t startIndexLen;
 };
@@ -76,7 +76,7 @@ struct InferenceDims
 //! construction goes through recipe methods, which always set every field.
 static_assert(sizeof(InferenceDims) == 8 * sizeof(int64_t),
     "InferenceDims layout changed: update kDimNames, toString(), kZeroAllowedMembers, and every recipe "
-    "method in LLMEngineConfig (prefillDims / decodeDims / treeVerifyDims / "
+    "method in LLMEngineConfig (prefillDims / decodeDims / specVerifyDims / "
     "proposalDims / acceptDims / resetDims).");
 static_assert(offsetof(InferenceDims, batch) == 0 * sizeof(int64_t), "InferenceDims::batch reordered");
 static_assert(offsetof(InferenceDims, seqLen) == 1 * sizeof(int64_t), "InferenceDims::seqLen reordered");

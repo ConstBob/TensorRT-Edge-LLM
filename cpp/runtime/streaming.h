@@ -38,10 +38,10 @@ class Tokenizer;
 namespace rt
 {
 
-// Forward declarations. SpecDecodeInferenceContext is defined in the spec-decode
-// runtime header (pulled in by the .cpp that implements the helpers); the request
-// struct lives in llmRuntimeUtils.h and holds the streamChannels vector.
-struct SpecDecodeInferenceContext;
+// Forward declarations. DecodingInferenceContext lives in
+// runtime/state/decodingInferenceContext.h; the request struct lives in
+// llmRuntimeUtils.h and holds the streamChannels vector.
+struct DecodingInferenceContext;
 struct LLMGenerationRequest;
 
 /*!
@@ -94,7 +94,7 @@ class StreamChannel; // For the friend-function signatures below.
 // while consumers remain restricted to consume/tryPop/waitPop/cancel.
 void attachStreamChannel(std::shared_ptr<StreamChannel> const& channel, int32_t originalIdx);
 bool validateStreamingSubmission(LLMGenerationRequest const& request);
-void applyCancellationToFinishStates(SpecDecodeInferenceContext& context);
+void applyCancellationToFinishStates(DecodingInferenceContext& context);
 
 //! Stage 1 of the per-iter pipeline: decode new tokens into per-slot UTF-8 bytes
 //! and run stop-string matching. Sets `s.pendingEmitText` (bytes safe to emit
@@ -102,13 +102,13 @@ void applyCancellationToFinishStates(SpecDecodeInferenceContext& context);
 //! the kStopWords override). Does not push chunks and does not modify
 //! finishedStates / terminalReason — termination decisions live in
 //! updateFinishStates.
-void decodePerSlot(SpecDecodeInferenceContext& context, tokenizer::Tokenizer const& tokenizer);
+void decodePerSlot(DecodingInferenceContext& context, tokenizer::Tokenizer const& tokenizer);
 
 //! Stage 2 of the per-iter pipeline (after updateFinishStates): push chunks
 //! to channels using the pre-computed `pendingEmitText` and finalized
 //! `terminalReason`. Non-streaming slots are skipped here — their output is
 //! assembled at handleRequest finalization.
-void emitChunks(SpecDecodeInferenceContext& context);
+void emitChunks(DecodingInferenceContext& context);
 
 /*! @brief Result of applyStopStringMatch. */
 struct StopMatchOutcome
@@ -206,9 +206,9 @@ private:
     friend class StreamChannelFinalizer;
     friend void attachStreamChannel(std::shared_ptr<StreamChannel> const&, int32_t);
     friend bool validateStreamingSubmission(LLMGenerationRequest const&);
-    friend void applyCancellationToFinishStates(SpecDecodeInferenceContext&);
-    friend void decodePerSlot(SpecDecodeInferenceContext&, tokenizer::Tokenizer const&);
-    friend void emitChunks(SpecDecodeInferenceContext&);
+    friend void applyCancellationToFinishStates(DecodingInferenceContext&);
+    friend void decodePerSlot(DecodingInferenceContext&, tokenizer::Tokenizer const&);
+    friend void emitChunks(DecodingInferenceContext&);
 
     // ── Producer API (runtime-only) ──────────────────────────────────────────
     void push(StreamChunk chunk);
@@ -259,7 +259,7 @@ void StreamChannel::consume(Handler&& handler, std::chrono::milliseconds poll)
 /*!
  * @brief Per-slot detokenization and streaming state.
  *
- * Lives in SpecDecodeInferenceContext, compacted in lockstep with tokenIds.
+ * Lives in DecodingInferenceContext, compacted in lockstep with tokenIds.
  */
 struct SlotStreamState
 {
@@ -309,7 +309,7 @@ struct SlotStreamState
 class StreamChannelFinalizer
 {
 public:
-    StreamChannelFinalizer(SpecDecodeInferenceContext& ctx, tokenizer::Tokenizer const& tok) noexcept;
+    StreamChannelFinalizer(DecodingInferenceContext& ctx, tokenizer::Tokenizer const& tok) noexcept;
     ~StreamChannelFinalizer() noexcept;
 
     StreamChannelFinalizer(StreamChannelFinalizer const&) = delete;
@@ -318,7 +318,7 @@ public:
     StreamChannelFinalizer& operator=(StreamChannelFinalizer&&) = delete;
 
 private:
-    SpecDecodeInferenceContext& mCtx;
+    DecodingInferenceContext& mCtx;
     tokenizer::Tokenizer const& mTok;
 };
 

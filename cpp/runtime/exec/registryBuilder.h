@@ -21,6 +21,8 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/tensorRegistry.h"
 
+#include <optional>
+
 namespace trt_edgellm
 {
 namespace rt
@@ -34,24 +36,27 @@ namespace rt
  * (deepstack, Mamba/recurrent state, EAGLE, LoRA) are included.
  *
  * @param cfg The engine configuration.
+ * @param specDecodeBaseOutputHiddenDim Optional hidden-state output dim for a
+ *        SpecDecode base engine. When absent, the legacy EAGLE-3 convention is used.
  * @return A populated TensorRegistry.
  */
-TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg);
+TensorRegistry buildRegistryForLLM(
+    LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim = std::nullopt);
 
 /*!
- * @brief Build a TensorRegistry for the EAGLE draft engine.
+ * @brief Build a TensorRegistry for a SpecDecode draft engine.
  *
  * Produces a registry with all tensor specs matching the engine's I/O contract
- * for `eagleDraftEngineRunner`. The draft engine always uses plugin-based KV
- * cache and tree-attention tensors.
+ * for the draft runner. The draft engine always uses plugin-based KV cache and
+ * proposal-attention tensors.
  *
- * @param bundle The deployment configuration. `bundle.draft` and `bundle.eagle`
+ * @param bundle The deployment configuration. `bundle.draft` and `bundle.specConfig`
  *               must both be set; the draft registry needs the consolidated
- *               EAGLE settings to size cross-engine bindings (e.g. base hidden
- *               states fed into the draft).
+ *               SpecDecode settings to size cross-engine bindings (e.g. base
+ *               hidden states fed into the draft).
  * @return A populated TensorRegistry.
  */
-TensorRegistry buildRegistryForEagleDraft(DeploymentConfig const& bundle);
+TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle);
 
 } // namespace rt
 } // namespace trt_edgellm

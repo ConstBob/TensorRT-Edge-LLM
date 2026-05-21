@@ -30,8 +30,8 @@
 //
 
 #include "common/utf8.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/decodingInferenceContext.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenEncoder.h"
 #include "tokenizer/tokenizer.h"
@@ -396,13 +396,13 @@ TEST_F(StreamChannelTest, CancelledChannelIsNotFinishedWithoutFinishCall)
 namespace
 {
 // Drive the finalizer to exercise push() + finish() on a channel.
-// Builds a SpecDecodeInferenceContext whose only slotStream carries an aliased
+// Builds a DecodingInferenceContext whose only slotStream carries an aliased
 // shared_ptr to the test-owned channel (no ownership transfer). The finalizer
 // sees tokenIds empty, so it pushes a terminal chunk with no tokens/text and
 // reason=kError, then calls finish(kError).
 void finalizeEmpty(std::shared_ptr<StreamChannel> const& ch)
 {
-    rt::SpecDecodeInferenceContext ctx;
+    rt::DecodingInferenceContext ctx;
     ctx.slotStreams.resize(1);
     ctx.slotStreams[0].channel = ch;
     tokenizer::Tokenizer tok; // unloaded — idToPiece returns "" and will not be called anyway
@@ -441,7 +441,7 @@ TEST_F(StreamChannelTest, FinishIsIdempotentFirstWriterWins)
     // Finalize a fresh context pointing at the same channel — it should skip
     // pushing another terminal chunk because isFinished() is true.
     {
-        rt::SpecDecodeInferenceContext ctx;
+        rt::DecodingInferenceContext ctx;
         ctx.slotStreams.resize(1);
         ctx.slotStreams[0].channel = ch;
         tokenizer::Tokenizer tok;

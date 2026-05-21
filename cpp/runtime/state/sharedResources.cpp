@@ -129,13 +129,13 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
 
     // Zero buffer — sized to the largest shape any consumer binds:
     //  * deepstack_embeds_* during non-prefill phases
-    //    (batch × seqLen × hiddenSize HALF; seqLen = maxVerifyTreeSize for EAGLE, else 1)
+    //    (batch × seqLen × hiddenSize HALF; seqLen = maxVerifyTreeSize for SpecDecode, else 1)
     //  * attention mask / pos ids on paths that still need a dummy bind
     //  * LoRA dummy weights on resetWeights paths
     // kvcache_start_index is now a registry-bound tensor and does not need a dummy.
     {
         int64_t const maxBatch = cfg.maxSupportedBatchSize;
-        int64_t const deepstackSeqLen = cfg.enableEagleSpecDecode ? std::max(cfg.maxVerifyTreeSize, 1) : 1;
+        int64_t const deepstackSeqLen = cfg.isSpecDecodeBase ? std::max(cfg.maxVerifyTreeSize, 1) : 1;
         int64_t deepstackSize = 0;
         if (cfg.numDeepstackFeatures > 0)
         {
@@ -148,26 +148,30 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
     return resources;
 }
 
-std::unique_ptr<SharedResources> SharedResources::createForEagle(DeploymentConfig const& bundle,
+std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(DeploymentConfig const& bundle,
     int32_t maxRuntimeBatchSize, std::unordered_map<std::string, std::string> const& loraWeightsMap,
     cudaStream_t stream)
 {
-    check::check(bundle.draft.has_value(), "SharedResources::createForEagle requires DeploymentConfig.draft to be set");
-    check::check(bundle.eagle.has_value(), "SharedResources::createForEagle requires DeploymentConfig.eagle to be set");
+    check::check(
+        bundle.draft.has_value(), "SharedResources::createForSpecDecode requires DeploymentConfig.draft to be set");
+    check::check(bundle.specConfig.has_value(),
+        "SharedResources::createForSpecDecode requires DeploymentConfig.specConfig to be set");
 
     auto resources = std::make_unique<SharedResources>();
 
-    int32_t const maxDraftTreeSize = bundle.eagle->maxDraftTreeSize;
+    int32_t const maxDraftProposalSize = bundle.specConfig->maxDraftProposalSize;
 
     // Base hybrid cache manager (index 0). EAGLE3 base is pure-attention but
     // an MTP base can be a hybrid model (e.g. Qwen3.5 MTP, 18 mamba layers),
     // so size the Mamba sub-manager from the base's parsed config.
-    // Hybrid MTP base also needs intermediate-state slots sized to the tree
-    // verification budget (legacy gated this on `mtpBase && numLinearAttnLayers>0`;
-    // EAGLE3 has no recurrent layers so the gate collapses to numLinearAttnLayers>0).
+    // MTP base needs intermediate-state slots sized to the verification
+    // budget so the accepted recurrent/conv snapshot can be committed after
+    // base verification.
     {
         int32_t const baseMaxIntermediateSeqLen
-            = (bundle.base.numLinearAttnLayers > 0) ? bundle.eagle->maxVerifyTreeSize : 0;
+            = (bundle.base.specDecodeType == SpecDecodeMode::kMTP && bundle.base.numLinearAttnLayers > 0)
+            ? bundle.specConfig->maxVerifySize
+            : 0;
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,
@@ -254,17 +258,18 @@ std::unique_ptr<SharedResources> SharedResources::createForEagle(DeploymentConfi
 
     // Zero buffer — sized to the largest shape any consumer binds:
     //  * deepstack_embeds_* during non-prefill phases
-    //    (maxRuntimeBatchSize × verifyTreeSize × hiddenSize HALF)
-    //  * attention_pos_id dummy shapes during vanilla-on-EAGLE paths
+    //    (maxRuntimeBatchSize × verifySize × hiddenSize HALF)
+    //  * attention_pos_id dummy shapes during vanilla fallback on a SpecDecode runtime
     {
         int64_t const maxBatch = maxRuntimeBatchSize;
-        int64_t const treeSeqLen = bundle.eagle->verifyTreeSize;
+        int64_t const verifySeqLen = bundle.specConfig->verifySize;
         int64_t deepstackSize = 0;
         if (bundle.base.numDeepstackFeatures > 0)
         {
-            deepstackSize = maxBatch * treeSeqLen * bundle.base.hiddenSize * static_cast<int64_t>(sizeof(uint16_t));
+            deepstackSize = maxBatch * verifySeqLen * bundle.base.hiddenSize * static_cast<int64_t>(sizeof(uint16_t));
         }
-        int64_t const attnPosIdSize = maxBatch * std::max(maxDraftTreeSize, 1) * static_cast<int64_t>(sizeof(int32_t));
+        int64_t const attnPosIdSize
+            = maxBatch * std::max(maxDraftProposalSize, 1) * static_cast<int64_t>(sizeof(int32_t));
         int64_t const zeroBufferBytes = std::max({deepstackSize, attnPosIdSize, static_cast<int64_t>(256)});
         allocateZeroBuffer(*resources, zeroBufferBytes);
     }

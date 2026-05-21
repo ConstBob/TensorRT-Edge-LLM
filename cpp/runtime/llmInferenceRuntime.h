@@ -31,7 +31,7 @@ namespace rt
 
 //! @brief Compatibility typedef — LLMInferenceRuntime is now LLMInferenceSpecDecodeRuntime.
 //! The unified runtime supports both vanilla (no draft model) and Eagle spec-decode modes.
-//! Construct without EagleDraftingConfig for vanilla-only behavior identical to the old LLMInferenceRuntime.
+//! Construct without SpecDecodeDraftingConfig for vanilla-only behavior identical to the old LLMInferenceRuntime.
 using LLMInferenceRuntime = LLMInferenceSpecDecodeRuntime;
 } // namespace rt
 } // namespace trt_edgellm
