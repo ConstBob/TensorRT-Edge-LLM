@@ -38,15 +38,31 @@ ONNX Forward I/O:
 
 The ``padded_mask_after_cnn_indices`` approach avoids non-zero ONNX nodes that are
 TensorRT-unfriendly. The C++ runtime computes this tensor during pre-processing.
+
+All Linear layers route through ``make_linear`` so the same modeling tree
+handles FP16, FP8 (and future NVFP4) checkpoints: ``make_linear`` reads
+the supplied :class:`ModelConfig`'s :class:`QuantConfig` and returns
+``FP16Linear`` / ``FP8Linear`` / ... so the Linear emits the right Q/DQ
+ops in its forward. ``module_name`` is the strip-``model.`` canonical
+path (e.g. ``audio_tower.layers.0.self_attn.q_proj``) so it matches the
+keys ``hf_quant_config.json``'s ``exclude_modules`` / ``layer_overrides``
+use after :func:`llm_loader.config._normalize_module_name`.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ...config import ModelConfig
+from ..linear import make_linear
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Default architecture constants (Qwen3-ASR / Qwen3-Omni)
@@ -60,7 +76,7 @@ _NUM_MEL_BINS = 128
 _MAX_SOURCE_POSITIONS = 1500
 _OUTPUT_DIM = 3584  # LLM hidden size (Qwen3-7.5B)
 _DOWNSAMPLE_HIDDEN = 480
-_N_WINDOW = 100
+_N_WINDOW = 50  # Both 0.6B and 1.7B use 50; runtime overrides from HF config.
 
 # ---------------------------------------------------------------------------
 # Sinusoidal positional embedding (fixed, not learned)
@@ -109,16 +125,38 @@ class QwenAudioAttention(nn.Module):
     """
 
     def __init__(self,
+                 model_config: ModelConfig,
                  d_model: int = _D_MODEL,
-                 num_heads: int = _NUM_HEADS) -> None:
+                 num_heads: int = _NUM_HEADS,
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.scaling = self.head_dim**-0.5
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.q_proj = make_linear(
+            model_config,
+            d_model,
+            d_model,
+            bias=True,
+            module_name=f"{name_prefix}.q_proj" if name_prefix else "")
+        self.k_proj = make_linear(
+            model_config,
+            d_model,
+            d_model,
+            bias=True,
+            module_name=f"{name_prefix}.k_proj" if name_prefix else "")
+        self.v_proj = make_linear(
+            model_config,
+            d_model,
+            d_model,
+            bias=True,
+            module_name=f"{name_prefix}.v_proj" if name_prefix else "")
+        self.out_proj = make_linear(
+            model_config,
+            d_model,
+            d_model,
+            bias=True,
+            module_name=f"{name_prefix}.out_proj" if name_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor) -> torch.Tensor:
@@ -164,17 +202,31 @@ class QwenAudioEncoderLayer(nn.Module):
     """
 
     def __init__(self,
+                 model_config: ModelConfig,
                  d_model: int = _D_MODEL,
                  num_heads: int = _NUM_HEADS,
                  ffn_dim: int = _FFN_DIM,
-                 activation: str = "gelu") -> None:
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.self_attn_layer_norm = nn.LayerNorm(d_model)
-        self.self_attn = QwenAudioAttention(d_model, num_heads)
+        self.self_attn = QwenAudioAttention(
+            model_config,
+            d_model,
+            num_heads,
+            name_prefix=f"{name_prefix}.self_attn" if name_prefix else "")
         self.final_layer_norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, ffn_dim)
-        self.fc2 = nn.Linear(ffn_dim, d_model)
-        self._activation = activation
+        self.fc1 = make_linear(
+            model_config,
+            d_model,
+            ffn_dim,
+            bias=True,
+            module_name=f"{name_prefix}.fc1" if name_prefix else "")
+        self.fc2 = make_linear(
+            model_config,
+            ffn_dim,
+            d_model,
+            bias=True,
+            module_name=f"{name_prefix}.fc2" if name_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor) -> torch.Tensor:
@@ -212,7 +264,9 @@ class QwenAudioEncoder(nn.Module):
         → last_hidden_state            [T, output_dim]               float16
 
     Checkpoint keys are directly under the constructor prefix stripped by
-    :func:`build_qwen_audio`.
+    :func:`build_qwen_audio`. The instance attribute ``config`` exposes the
+    chunking knobs (``n_window`` / ``num_mel_bins`` / etc.) that host-side
+    preprocessing needs to mirror the C++ runtime.
     """
 
     def __init__(self,
@@ -223,9 +277,21 @@ class QwenAudioEncoder(nn.Module):
                  ffn_dim: int = _FFN_DIM,
                  max_source_positions: int = _MAX_SOURCE_POSITIONS,
                  output_dim: int = _OUTPUT_DIM,
-                 downsample_hidden: int = _DOWNSAMPLE_HIDDEN) -> None:
+                 downsample_hidden: int = _DOWNSAMPLE_HIDDEN,
+                 *,
+                 model_config: ModelConfig,
+                 name_prefix: str = "audio_tower") -> None:
         super().__init__()
-        self.num_mel_bins = num_mel_bins
+        self.config: Dict[str, Any] = {
+            "num_mel_bins": num_mel_bins,
+            "d_model": d_model,
+            "encoder_layers": num_layers,
+            "encoder_attention_heads": num_heads,
+            "encoder_ffn_dim": ffn_dim,
+            "max_source_positions": max_source_positions,
+            "output_dim": output_dim,
+            "downsample_hidden_size": downsample_hidden,
+        }
 
         # CNN downsampling stack
         self.conv2d1 = nn.Conv2d(1,
@@ -245,18 +311,36 @@ class QwenAudioEncoder(nn.Module):
                                  padding=1)
         # Compute frequency bins after 3 stride-2 convolutions
         freq_bins = ((((num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2)
-        self.conv_out = nn.Linear(downsample_hidden * freq_bins,
-                                  d_model,
-                                  bias=False)
+        self.conv_out = make_linear(
+            model_config,
+            downsample_hidden * freq_bins,
+            d_model,
+            bias=False,
+            module_name=f"{name_prefix}.conv_out" if name_prefix else "")
         self.positional_embedding = SinusoidsPositionEmbedding(
             max_source_positions, d_model)
         self.layers = nn.ModuleList([
-            QwenAudioEncoderLayer(d_model, num_heads, ffn_dim)
-            for _ in range(num_layers)
+            QwenAudioEncoderLayer(
+                model_config,
+                d_model,
+                num_heads,
+                ffn_dim,
+                name_prefix=f"{name_prefix}.layers.{i}" if name_prefix else "")
+            for i in range(num_layers)
         ])
         self.ln_post = nn.LayerNorm(d_model)
-        self.proj1 = nn.Linear(d_model, d_model)
-        self.proj2 = nn.Linear(d_model, output_dim)
+        self.proj1 = make_linear(
+            model_config,
+            d_model,
+            d_model,
+            bias=True,
+            module_name=f"{name_prefix}.proj1" if name_prefix else "")
+        self.proj2 = make_linear(
+            model_config,
+            d_model,
+            output_dim,
+            bias=True,
+            module_name=f"{name_prefix}.proj2" if name_prefix else "")
 
     def forward(
         self,
@@ -315,15 +399,20 @@ _CANDIDATE_PREFIXES = (
 
 
 def _load_audio_weights(model: QwenAudioEncoder,
-                        weights: dict,
-                        prefix: str | None = None) -> None:
+                        weights: Dict[str, torch.Tensor],
+                        prefix: Optional[str] = None) -> None:
     """Load safetensors weights into *model*, stripping *prefix*.
 
-    If *prefix* is ``None``, the function auto-detects from
-    :data:`_CANDIDATE_PREFIXES`.
+    Uses :func:`load_submodule_weights` so quantized buffers (FP8 / packed
+    int8 / ...) keep their original dtype — ``nn.Module.load_state_dict``'s
+    ``Tensor.copy_()`` silently casts FP8 → FP16, defeating the point of
+    FP8 buffers on ``FP8Linear`` modules. The per-module dispatch
+    (``FP16Linear`` vs ``FP8Linear``) is decided by ``make_linear`` reading
+    the same ``hf_quant_config.json`` that produced the safetensors, so
+    incoming tensor dtypes always match their target buffers' dtypes -- we
+    just hand the dict straight to the loader.
     """
-    import logging
-    logger = logging.getLogger(__name__)
+    from ...checkpoint.loader import load_submodule_weights
 
     if prefix is None:
         for cand in _CANDIDATE_PREFIXES:
@@ -333,14 +422,22 @@ def _load_audio_weights(model: QwenAudioEncoder,
         else:
             prefix = ""
 
-    stripped: dict = {}
+    stripped: Dict[str, torch.Tensor] = {}
     for k, v in weights.items():
-        if k.startswith(prefix):
-            stripped[k[len(prefix):]] = v
+        if not k.startswith(prefix):
+            continue
+        stripped[k[len(prefix):]] = v
 
-    missing, unexpected = model.load_state_dict(stripped, strict=False)
-    if missing:
-        logger.warning("QwenAudioEncoder: missing keys: %s", missing[:10])
+    def _identity_remap(key: str) -> Optional[str]:
+        return key
+
+    load_submodule_weights(
+        model,
+        stripped,
+        key_remap=_identity_remap,
+        label="QwenAudioEncoder",
+        log=logger,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -349,26 +446,39 @@ def _load_audio_weights(model: QwenAudioEncoder,
 
 
 def build_qwen_audio(
-    config: dict,
-    weights: dict,
+    config: Dict[str, Any],
+    weights: Dict[str, torch.Tensor],
     dtype: torch.dtype = torch.float16,
-    prefix: str | None = None,
+    prefix: Optional[str] = None,
+    *,
+    model_config: ModelConfig,
+    name_prefix: str = "audio_tower",
 ) -> QwenAudioEncoder:
     """Build and return a :class:`QwenAudioEncoder` with loaded weights.
 
     Args:
         config:  Model config dict; recognized keys mirror
-                 ``Qwen3ASRAudioEncoderConfig`` field names.
-                 May be a top-level config (with ``audio_config`` sub-key)
-                 or an audio-only sub-config directly.
+                 ``Qwen3ASRAudioEncoderConfig`` field names. May be a
+                 top-level qwen3_asr ``config.json`` (``audio_config``
+                 looked up under ``thinker_config`` or directly), or an
+                 audio-only sub-config.
         weights: Flat ``{key: tensor}`` dict from safetensors.
-        dtype:   Target dtype (default ``float16``).
+        dtype:   Target dtype for FP16 parameters (default ``float16``).
+                 Quantized buffers (FP8 / NVFP4) are loaded as-is.
         prefix:  Checkpoint key prefix to strip. ``None`` = auto-detect.
+        model_config: Top-level :class:`ModelConfig` carrying the
+                 :class:`QuantConfig` for ``make_linear`` dispatch.
+        name_prefix: Module-name prefix passed to ``make_linear`` so
+                 generated ``module_name`` strings match the canonical
+                 strip-``model.`` paths used in
+                 ``hf_quant_config.json::exclude_modules`` /
+                 ``layer_overrides``.
     """
-    # Support both top-level config with audio_config sub-key and direct audio config
-    audio_cfg = config.get("audio_config", config)
+    thinker_cfg = config.get("thinker_config", {})
+    audio_cfg = (thinker_cfg.get("audio_config") or config.get("audio_config")
+                 or config)
 
-    def _get(key: str, default):
+    def _get(key: str, default: Any) -> Any:
         return audio_cfg.get(key, config.get(key, default))
 
     model = QwenAudioEncoder(
@@ -381,9 +491,24 @@ def build_qwen_audio(
                                   _MAX_SOURCE_POSITIONS),
         output_dim=_get("output_dim", _OUTPUT_DIM),
         downsample_hidden=_get("downsample_hidden_size", _DOWNSAMPLE_HIDDEN),
+        model_config=model_config,
+        name_prefix=name_prefix,
     )
-    _load_audio_weights(model, weights, prefix)
+    # Stash chunking knobs on the model so host-side helpers can read them
+    # without separately threading the config through.
+    model.config["n_window"] = _get("n_window", _N_WINDOW)
+    # 0.6B and 1.7B both ship n_window_infer = 800 = 16 * 50; runtime
+    # always overrides this from HF config, the default is just for
+    # tests that build the encoder from scratch.
+    model.config["n_window_infer"] = _get("n_window_infer", _N_WINDOW * 16)
+
+    # Cast FP16 components (LayerNorm / Conv2d / FP16Linear) to ``dtype``
+    # *before* loading weights. load_submodule_weights' _set_tensor
+    # overwrites buffers in-place (preserving FP8 dtype on FP8Linear); if
+    # we cast after load, .to(fp16) would silently downgrade FP8 buffers
+    # that have just been assigned.
     model = model.to(dtype=dtype)
+    _load_audio_weights(model, weights, prefix)
     model.eval()
     return model
 

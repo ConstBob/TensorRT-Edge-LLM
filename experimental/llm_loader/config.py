@@ -845,7 +845,7 @@ def _detect_has_qk_norm(model_dir: str) -> bool:
     return False
 
 
-_VL_LLM_PREFIXES = ("language_model.", "text_model.", "llm.")
+_VL_LLM_PREFIXES = ("language_model.", "text_model.", "llm.", "thinker.")
 
 
 def _strip_vl_prefix(name: str) -> str:

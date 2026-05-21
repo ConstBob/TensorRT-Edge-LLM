@@ -8,7 +8,7 @@ Complete workflow for speech recognition with audio understanding capabilities.
 
 ---
 
-## Part 0: Install ASR Dependency (x86 Host)
+## Step 0: Install ASR Dependency (x86 Host)
 
 The export pipeline loads the Qwen3-ASR model via the `qwen-asr` package. Install it before exporting:
 
@@ -134,3 +134,84 @@ cd ~/TensorRT-Edge-LLM
 ```
 
 Check `output_asr.json` for the speech recognition transcription.
+
+---
+
+## Quantization (Optional)
+
+For deployments where engine size matters more than peak accuracy, the
+new pipeline supports independent precision selection for the LLM
+backbone and the audio encoder. Numbers below are measured on
+Qwen3-ASR-0.6B; 1.7B is noted where it diverges.
+
+### Supported precision combinations
+
+| LLM backbone | Audio encoder | 0.6B status | 1.7B status |
+|---|---|:---:|:---:|
+| FP16 | FP16 | ✅ | ✅ |
+| FP8 | FP16 | ✅ | ✅ |
+| FP8 | FP8 | ✅ | ✅ |
+| NVFP4 | FP16 | ✅ | ✅ |
+| NVFP4 | FP8 | ❌ Empty output (combined quant noise exceeds the first-token EOS-vs-correct logit margin on 0.6B) | ✅ (1.7B tolerates the combined noise) |
+
+> **Mixed-precision rules** (`experimental/quantization/cli.py`):
+> - `--quantization` quantizes the LLM backbone only.
+> - `--audio_quantization fp8` opts the audio tower in. **Omit it to
+>   keep the audio tower at FP16** regardless of `--quantization` --
+>   audio encoders are quantization-sensitive, so the default is
+>   conservative (mirrors the `--visual_quantization` behaviour for
+>   VLMs).
+> - `--lm_head_quantization` is similarly opt-in.
+
+### Three featured recipes
+
+Insert a quantization step before [Step 1: Export](#step-1-export-x86-host),
+then point the export at the quantized output instead of the Hugging
+Face checkpoint. Joint multimodal calibration streams LibriSpeech
+(audio, transcript) pairs through the model -- no `--dataset` flag is
+required.
+
+**Recipe A: 0.6B NVFP4 LLM + FP16 audio**
+
+```bash
+python -m experimental.quantization.cli llm \
+  --model_dir Qwen/Qwen3-ASR-0.6B \
+  --output_dir $WORKSPACE_DIR/$MODEL_NAME-nvfp4-lh.nvfp4 \
+  --quantization nvfp4 \
+  --lm_head_quantization nvfp4
+
+# Then in Step 1, replace ``Qwen/Qwen3-ASR-0.6B`` with the quantized dir:
+python -m llm_loader.export_all_cli \
+  $WORKSPACE_DIR/$MODEL_NAME-nvfp4-lh.nvfp4 \
+  $MODEL_NAME/onnx
+```
+
+**Recipe B: 0.6B FP8 LLM + FP8 audio**
+
+```bash
+python -m experimental.quantization.cli llm \
+  --model_dir Qwen/Qwen3-ASR-0.6B \
+  --output_dir $WORKSPACE_DIR/$MODEL_NAME-fp8-a.fp8 \
+  --quantization fp8 \
+  --audio_quantization fp8
+
+# Then in Step 1, replace ``Qwen/Qwen3-ASR-0.6B`` with the quantized dir:
+python -m llm_loader.export_all_cli \
+  $WORKSPACE_DIR/$MODEL_NAME-fp8-a.fp8 \
+  $MODEL_NAME/onnx
+```
+
+**Recipe C: 1.7B NVFP4 LLM + FP8 audio**
+
+```bash
+python -m experimental.quantization.cli llm \
+  --model_dir Qwen/Qwen3-ASR-1.7B \
+  --output_dir $WORKSPACE_DIR/$MODEL_NAME-nvfp4-a.fp8 \
+  --quantization nvfp4 \
+  --audio_quantization fp8
+
+# Then in Step 1, replace ``Qwen/Qwen3-ASR-1.7B`` with the quantized dir:
+python -m llm_loader.export_all_cli \
+  $WORKSPACE_DIR/$MODEL_NAME-nvfp4-a.fp8 \
+  $MODEL_NAME/onnx
+```
