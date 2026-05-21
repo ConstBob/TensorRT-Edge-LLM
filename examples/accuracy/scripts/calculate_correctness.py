@@ -28,10 +28,12 @@ def clean_text(text):
         Cleaned text string.
     """
 
-    # Drop ``<think>...</think>`` reasoning blocks emitted by reasoning models
-    # (Qwen3-thinking, Nemotron-Reasoning, DeepSeek-R1, etc.) so an MCQ answer
-    # like ``<think>...</think>\nC`` still scores against the clean reference.
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Drop reasoning blocks emitted by reasoning models (Qwen3-thinking,
+    # Nemotron-Reasoning, DeepSeek-R1, etc.) so an MCQ answer like
+    # ``<think>...</think>\nC`` still scores against the clean reference.
+    # The opening tag is optional because some chat templates inject it into
+    # the prompt prefix, so the model output contains only ``</think>``.
+    text = re.sub(r"(?:<think>)?.*?</think>", "", text, flags=re.DOTALL)
     # Drop chat / tokenizer special tokens (e.g. <|endoftext|>, <|im_end|>) so MCQ output
     # like "C<|im_end|>" still scores against "C"
     text = re.sub(r"<\|.*?\|>", "", text)
