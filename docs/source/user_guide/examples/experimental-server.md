@@ -93,6 +93,64 @@ curl -sN http://localhost:8000/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 128, "stream": true}'
 ```
 
+Tool-aware query:
+
+```bash
+curl -sN http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }],
+    "tool_choice": "auto",
+    "max_tokens": 128
+  }'
+```
+
+To continue an agentic loop, include the previous assistant `tool_calls` and
+the matching `tool` response messages in the next request.
+
+Tool response follow-up:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "What is the weather in Paris?"},
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Paris\"}"
+        }
+      }]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temperature\":22,\"unit\":\"celsius\"}"
+    }
+  ],
+  "tools": [{
+    "type": "function",
+    "function": {"name": "get_weather", "parameters": {"type": "object"}}
+  }]
+}
+```
+
 ## Common Inputs
 
 `LLM` requires exactly one source:
@@ -115,6 +173,20 @@ For VLMs, also pass `visual_onnx_dir` or `visual_engine_dir`.
 | `max_tokens` | `2048` | Maximum generated tokens |
 | `enable_thinking` | `False` | Enables Qwen-style thinking output |
 | `disable_spec_decode` | `False` | Disables EAGLE for one request |
+
+## Tool Calls
+
+The OpenAI-compatible server accepts `tools`, `tool_choice`,
+`assistant.tool_calls`, and `tool` messages. Tool-aware requests are formatted
+with the model's Hugging Face chat template before they are sent to the runtime.
+
+`tool_choice` supports `auto`, `none`, `required`, and forced function choices.
+Malformed tools, unknown forced tools, and dangling `tool_call_id` values return
+a 400 response.
+
+When the model returns a supported tool-call format, non-streaming responses
+include `message.tool_calls` and `finish_reason: "tool_calls"`. Streaming
+responses include `delta.tool_calls` chunks.
 
 ## EAGLE
 
@@ -144,6 +216,7 @@ outputs = llm.generate(
 
 ## Notes
 
-- Chat templates are applied in the C++ runtime, not in Python.
+- Standard chat templates are applied in the C++ runtime. Tool-aware requests
+  are formatted in Python with the model's Hugging Face chat template.
 - Thinking output is returned in `reasoning`; final answer text is returned in `content`.
 - Supported finish reasons are `stop`, `length`, `cancelled`, and `error`.
