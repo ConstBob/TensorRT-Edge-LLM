@@ -36,7 +36,7 @@ Supported model types
 ----------------------
 VLMs (LLM + visual encoder):
     qwen3_vl, qwen3_omni          (Qwen3-VL / Qwen3-Omni)
-    qwen3_5                       (Qwen3.5)
+    qwen3_5, qwen3_5_moe          (Qwen3.5)
     qwen2_5_vl                    (Qwen2.5-VL)
     internvl_chat                 (InternVL3)
     internvl                      (InternVL3.5)
@@ -92,6 +92,7 @@ _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
     "qwen3_5",
+    "qwen3_5_moe",
     "qwen2_5_vl",
     "internvl",
     "internvl_chat",
@@ -601,6 +602,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
     _VISUAL_MODEL_TYPE_MAP = {
         "internvl": "internvl",
         "internvl_chat": "internvl",
+        "qwen3_5_moe": "qwen3_5",
         "qwen3_omni": "qwen3_omni_vision_encoder",
     }
     top_level_model_type = _VISUAL_MODEL_TYPE_MAP.get(model_type, model_type)
@@ -608,7 +610,14 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         "model_type": top_level_model_type,
         "vision_config": vis_cfg,
     }
-    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_5"):
+    if model_type == "qwen3_5_moe":
+        # The C++ visual builder prefers vision_config.model_type over the
+        # top-level model_type.  Qwen3.5-MoE uses the same visual encoder as
+        # dense Qwen3.5, so normalize both locations to the registered tag.
+        vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
+        vis_cfg_out["vision_config"]["model_type"] = "qwen3_5"
+    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_5",
+                      "qwen3_5_moe"):
         # C++ QwenViTRunner reads these token IDs and rope_theta from config.json.
         # For Qwen3-VL the token IDs are at the root level, but vocab_size and
         # rope_theta live inside text_config.  Fall back to text_config for any
@@ -1638,11 +1647,6 @@ def main() -> None:
         help=("Expose selected model weights as ONNX inputs and write them "
               "to safetensors external weight files. Values: int4_ffn, "
               "int4_moe, lm_head, all."),
-    )
-    p.add_argument(
-        "--device",
-        default="cuda",
-        help="Device for export tracing (default: cuda).",
     )
     p.add_argument(
         "--max-kv-cache-capacity",

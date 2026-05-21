@@ -388,12 +388,14 @@ class GPTQLinear(nn.Module):
         in_features: int,
         out_features: int,
         group_size: int = 128,
+        zero_point_offset: int = 1,
         bias: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size
+        self.zero_point_offset = int(zero_point_offset)
         # Initialized in GPTQ layout [in//8, out] int32; loader repacks to
         # [out//2, in] int8 (swizzled plugin layout) before inference/export.
         self.register_buffer(
@@ -544,7 +546,7 @@ def make_linear(
                                           config.quant.group_size, bias)
     if quant_type == QUANT_INT4_GPTQ:
         return GPTQLinear(in_features, out_features, config.quant.group_size,
-                          bias)
+                          config.quant.gptq_zero_point_offset, bias)
     if quant_type == QUANT_INT8_SQ:
         return INT8SQLinear(in_features, out_features, bias)
     raise ValueError(f"Unknown quant_type: {quant_type!r}")

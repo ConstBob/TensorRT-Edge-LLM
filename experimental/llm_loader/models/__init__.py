@@ -21,6 +21,7 @@ Model variants live in sub-packages named after the model family:
   ``nemotron_omni/`` - Nemotron-Omni: RADIO visual + Parakeet audio (LLM reuses nemotron_h)
   ``qwen3_vl/``      - Qwen3-VL visual encoder + LLM
   ``qwen3_5/``       - Qwen3.5 visual encoder + LLM (no deepstack)
+  ``qwen3_5_moe/``   - Qwen3.5 hybrid sparse MoE decoder
   ``qwen2_5_vl/``    - Qwen2.5-VL visual encoder + LLM
   ``qwen3_asr/``     - Qwen3-ASR audio encoder + LLM
   ``qwen3_moe/``     - Qwen3 sparse MoE decoder

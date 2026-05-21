@@ -191,6 +191,7 @@ The model class names were checked against the installed `transformers==5.3.0` p
 | Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
 |--------------|--------------------|-----------------------|----------------------|
 | Qwen3-MoE | [`Qwen3MoeForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py) | `qwen3_moe` -> `Qwen3MoeCausalLM` | INT4, NVFP4 |
+| Qwen3.5-MoE | [`Qwen3_5MoeForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py) | `qwen3_5_moe` -> `Qwen3_5MoeCausalLM` + `Qwen3_5VLVisualModel` | INT4 GPTQ |
 | Nemotron3-MoE | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | NVFP4 only |
 
 For NVFP4 MoE exports, the `--nvfp4-moe-backend` flag selects the plugin backend:
@@ -210,6 +211,13 @@ python -m llm_loader.export_all_cli \
 
 - [Qwen/Qwen3-30B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4)
 - [nvidia/Qwen3-30B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3-30B-A3B-NVFP4)
+
+</details>
+
+<details>
+<summary><b>Qwen3.5-MoE</b> checkpoints</summary>
+
+- [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4)
 
 </details>
 

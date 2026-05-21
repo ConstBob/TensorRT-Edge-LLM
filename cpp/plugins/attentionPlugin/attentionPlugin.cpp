@@ -215,7 +215,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     // XQA decode kernels are always needed regardless of FMHA path.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
     bool canImplementXQA = DecoderXQARunner::canImplement(
-        mNumQHeads, mNumKVHeads, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
+        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
     if (canImplementXQA)
     {
         DecoderXQARunner::loadDecodeXQAKernels(

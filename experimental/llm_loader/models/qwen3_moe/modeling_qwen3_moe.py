@@ -223,6 +223,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.hidden_size = config.hidden_size
         self.group_size = config.quant.group_size
+        self.zero_point_offset = config.quant.gptq_zero_point_offset
         self._use_nvfp4_moe = config.quant.quant_type == QUANT_NVFP4
         # NVFP4 backend dispatch: Thor (CuTeDSL ``Nvfp4MoePlugin``,
         # SM100/101/110) or GeForce (``NvFP4MoEPluginGeforce``, SM120/121).
@@ -280,13 +281,16 @@ class Qwen3SparseMoeBlock(nn.Module):
 
         for expert in self.experts:
             gw, gs = _extract_gptq_for_marlin(expert.gate_proj,
-                                              self.group_size)
-            uw, us = _extract_gptq_for_marlin(expert.up_proj, self.group_size)
+                                              self.group_size,
+                                              self.zero_point_offset)
+            uw, us = _extract_gptq_for_marlin(expert.up_proj, self.group_size,
+                                              self.zero_point_offset)
             gate_up_weights_list.append(torch.cat([gw, uw], dim=0))
             gate_up_scales_list.append(torch.cat([gs, us], dim=0))
 
             dw, ds = _extract_gptq_for_marlin(expert.down_proj,
-                                              self.group_size)
+                                              self.group_size,
+                                              self.zero_point_offset)
             down_weights_list.append(dw)
             down_scales_list.append(ds)
 

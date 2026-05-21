@@ -39,6 +39,7 @@ from .model import AutoModel, register_model
 # Register model-type-specific implementations
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
 from .models.qwen3_5.modeling_qwen3_5_text import Qwen3_5CausalLM
+from .models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeCausalLM
 from .models.qwen3_asr.modeling_qwen3_asr_text import Qwen3ASRLanguageModel
 from .models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeCausalLM
 from .models.qwen3_omni.modeling_qwen3_omni_text import Qwen3OmniLanguageModel
@@ -46,6 +47,8 @@ from .onnx.export import export_onnx
 
 register_model("nemotron_h", NemotronHCausalLM)
 register_model("qwen3_5_text", Qwen3_5CausalLM)
+register_model("qwen3_5_moe_text", Qwen3_5MoeCausalLM)
+register_model("qwen3_5_moe", Qwen3_5MoeCausalLM)
 register_model("qwen3_moe", Qwen3MoeCausalLM)
 register_model("NemotronH_Nano_VL_V2", NemotronHCausalLM)
 register_model("NemotronH_Nano_Omni_Reasoning_V3", NemotronHCausalLM)

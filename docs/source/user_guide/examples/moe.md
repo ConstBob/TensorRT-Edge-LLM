@@ -6,7 +6,7 @@ Complete workflow for Mixture of Experts (MoE) models using a pre-quantized GPTQ
 - [Qwen3-30B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4)
 - [nvidia/Qwen3-30B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3-30B-A3B-NVFP4)
 
-> **Note:** MoE export only works on **CPU** (`--device cpu`). No GPU is required for the export step.
+> **Note:** MoE export always runs on **CPU**. No GPU or device flag is required for the export step.
 
 > **Prerequisites:** Complete the [Installation Guide](../getting_started/installation.md) before proceeding.
 
@@ -21,7 +21,7 @@ pip install optimum==2.1.0
 
 ## Step 1: Export (x86 Host, CPU-only)
 
-Export can be run on CPU with `--device cpu`; no GPU is required:
+Export always runs on CPU; no GPU is required:
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
@@ -33,8 +33,7 @@ cd $WORKSPACE_DIR
 
 python -m llm_loader.export_all_cli \
   Qwen/Qwen3-30B-A3B-GPTQ-Int4 \
-  $MODEL_NAME/exported \
-  --device cpu
+  $MODEL_NAME/exported
 
 mkdir -p $MODEL_NAME/onnx
 cp -a $MODEL_NAME/exported/llm/. $MODEL_NAME/onnx/
