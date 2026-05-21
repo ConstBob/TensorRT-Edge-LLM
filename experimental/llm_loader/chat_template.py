@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -138,6 +138,28 @@ class MultimodalUserMessage(Message):
 class AssistantMessage(Message):
     role: str = "assistant"
     content: str = "<placeholder_assistant_text>"
+
+
+@dataclass
+class AssistantToolCallMessage(Message):
+    role: str = "assistant"
+    content: Optional[str] = None
+    tool_calls: List[Dict[str, Any]] = field(default_factory=lambda: [{
+        "id": "__SENTINEL_TOOL_CALL_ID__",
+        "type": "function",
+        "function": {
+            "name": "__sentinel_tool__",
+            "arguments": "{}",
+        },
+    }])
+
+
+@dataclass
+class ToolMessage(Message):
+    role: str = "tool"
+    content: str = "__SENTINEL_TOOL_RESULT__"
+    tool_call_id: str = "__SENTINEL_TOOL_CALL_ID__"
+    name: str = "__sentinel_tool__"
 
 
 def _format_messages(

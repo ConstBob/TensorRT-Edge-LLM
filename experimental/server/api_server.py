@@ -36,10 +36,11 @@ import argparse
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from .engine import (SamplingParams, _convert_messages_to_cpp,
-                     _load_image_buffers, finish_reason_name)
+from .engine import SamplingParams, finish_reason_name
+from .tool_calling import (ToolConfig, parse_assistant_output,
+                           validate_tool_request)
 
 logger = logging.getLogger("edgellm.api_server")
 
@@ -109,6 +110,8 @@ def _create_app(llm_instance):
         stream = body.get("stream", False)
         enable_thinking = body.get("enable_thinking", False)
         disable_spec_decode = body.get("disable_spec_decode", False)
+        tools = body.get("tools")
+        tool_choice = body.get("tool_choice")
 
         # OpenAI-compatible "stop": null | str | list[str]. Reject other types with 400.
         stop_raw = body.get("stop")
@@ -127,45 +130,26 @@ def _create_app(llm_instance):
                     "error": "'stop' must be a string or array of strings"
                 })
 
-        rt = llm_instance._rt
-
         try:
-            cpp_messages = _convert_messages_to_cpp(rt, messages)
-        except (ValueError, KeyError) as exc:
+            tool_config = validate_tool_request(messages, tools, tool_choice)
+        except ValueError as exc:
             return JSONResponse(
                 status_code=400,
-                content={"error": f"Invalid messages: {exc}"},
+                content={"error": str(exc)},
             )
-
-        image_buffers = _load_image_buffers(rt, messages)
-
-        request = rt.LLMGenerationRequest()
-        req = rt.Request(messages=cpp_messages)
-        req.image_buffers = image_buffers
-        req.stop_strings = stop
-        request.requests = [req]
-        request.temperature = temperature
-        request.top_p = top_p
-        request.top_k = top_k
-        request.max_generate_length = max_tokens
-        request.apply_chat_template = True
-        request.add_generation_prompt = True
-        request.enable_thinking = enable_thinking
-        request.disable_spec_decode = disable_spec_decode
 
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+            disable_spec_decode=disable_spec_decode,
+            stop=stop,
+        )
 
         if stream:
-            params = SamplingParams(
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                max_tokens=max_tokens,
-                enable_thinking=enable_thinking,
-                disable_spec_decode=disable_spec_decode,
-                stop=stop,
-            )
-
             return StreamingResponse(
                 _generate_stream_sse(
                     llm_instance,
@@ -173,6 +157,7 @@ def _create_app(llm_instance):
                     params,
                     response_id,
                     enable_thinking,
+                    tool_config=tool_config,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -182,7 +167,19 @@ def _create_app(llm_instance):
             )
 
         try:
+            request = llm_instance._make_generation_request(
+                messages,
+                params,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice,
+                tool_config=tool_config,
+            )
             response = llm_instance._runtime.handle_request(request)
+        except (ValueError, KeyError) as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid messages: {exc}"},
+            )
         except Exception as exc:
             logger.exception("Inference failed")
             return JSONResponse(status_code=500, content={"error": str(exc)})
@@ -192,16 +189,14 @@ def _create_app(llm_instance):
         output_ids = response.output_ids[0] if response.output_ids else []
         completion_tokens = len(output_ids)
 
-        reasoning, answer = _split_reasoning_and_content(output_text)
+        message_body, has_tool_calls = _build_message_body(
+            output_text, tool_config, llm_instance.model_dir)
 
-        message_body: Dict[str, Any] = {"role": "assistant"}
-        if reasoning is not None:
-            message_body["reasoning"] = reasoning
-        message_body["content"] = (
-            (answer if answer is not None else reasoning) or "")
-
-        finish_reason = (finish_reason_name(rt, response.finish_reasons[0])
+        finish_reason = (finish_reason_name(llm_instance._rt,
+                                            response.finish_reasons[0])
                          if response.finish_reasons else "stop")
+        if has_tool_calls:
+            finish_reason = "tool_calls"
 
         return {
             "id":
@@ -278,16 +273,31 @@ class _ThinkingStateMachine:
             self._buf = ""
 
 
-def _generate_stream_sse(llm_instance, messages, params, response_id,
-                         enable_thinking):
+def _generate_stream_sse(llm_instance,
+                         messages,
+                         params,
+                         response_id,
+                         enable_thinking,
+                         tool_config: Optional[ToolConfig] = None):
     """Yield real SSE chunks via StreamChannel streaming."""
     yield _sse_chunk(response_id, {"role": "assistant"})
 
+    if tool_config is not None and tool_config.parse_output:
+        yield from _generate_tool_stream_sse(llm_instance, messages, params,
+                                             response_id, tool_config)
+        return
+
     sm = _ThinkingStateMachine(enable_thinking)
     finish_reason: Optional[str] = None
+    stream_tools = tool_config.tools if tool_config else None
+    stream_tool_choice = tool_config.tool_choice if tool_config else None
 
     try:
-        for delta in llm_instance.generate_stream(messages, params):
+        for delta in llm_instance.generate_stream(
+                messages,
+                params,
+                tools=stream_tools,
+                tool_choice=stream_tool_choice):
             if delta.text:
                 for field, text in sm.feed(delta.text):
                     yield _sse_chunk(response_id, {field: text})
@@ -302,6 +312,87 @@ def _generate_stream_sse(llm_instance, messages, params, response_id,
 
     yield _sse_chunk(response_id, {}, finish_reason=finish_reason or "stop")
     yield "data: [DONE]\n\n"
+
+
+def _generate_tool_stream_sse(llm_instance, messages, params, response_id,
+                              tool_config: ToolConfig):
+    text_parts: List[str] = []
+    finish_reason: Optional[str] = None
+    try:
+        for delta in llm_instance.generate_stream(
+                messages,
+                params,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice):
+            if delta.text:
+                text_parts.append(delta.text)
+            if delta.finished:
+                finish_reason = delta.finish_reason or "stop"
+    except Exception:
+        logger.exception("Streaming inference failed")
+        finish_reason = "error"
+
+    output_text = "".join(text_parts).replace(IM_END_TOKEN, "")
+    parsed = parse_assistant_output(output_text, tool_config,
+                                    llm_instance.model_dir)
+    tool_index = 0
+    for event in parsed.events:
+        if event["type"] == "reasoning" and event["text"]:
+            yield _sse_chunk(response_id, {"reasoning": event["text"]})
+        elif event["type"] == "content" and event["text"]:
+            yield _sse_chunk(response_id, {"content": event["text"]})
+        elif event["type"] == "tool_call":
+            call = event["tool_call"]
+            yield _sse_chunk(
+                response_id, {
+                    "tool_calls": [{
+                        "index": tool_index,
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": "",
+                        },
+                    }]
+                })
+            if call.arguments:
+                yield _sse_chunk(
+                    response_id, {
+                        "tool_calls": [{
+                            "index": tool_index,
+                            "function": {
+                                "arguments": call.arguments,
+                            },
+                        }]
+                    })
+            tool_index += 1
+
+    finish = "tool_calls" if tool_index else finish_reason or "stop"
+    yield _sse_chunk(response_id, {}, finish_reason=finish)
+    yield "data: [DONE]\n\n"
+
+
+def _build_message_body(output_text: str, tool_config: ToolConfig,
+                        model_dir: str) -> Tuple[Dict[str, Any], bool]:
+    if not tool_config.parse_output:
+        reasoning, answer = _split_reasoning_and_content(output_text)
+        message_body: Dict[str, Any] = {"role": "assistant"}
+        if reasoning is not None:
+            message_body["reasoning"] = reasoning
+        message_body["content"] = (
+            (answer if answer is not None else reasoning) or "")
+        return message_body, False
+
+    parsed = parse_assistant_output(output_text, tool_config, model_dir)
+    tool_calls = [call.to_openai() for call in parsed.tool_calls]
+    message_body: Dict[str, Any] = {"role": "assistant"}
+    if parsed.reasoning:
+        message_body["reasoning"] = parsed.reasoning
+    content = parsed.content.strip()
+    message_body["content"] = content if content or not tool_calls else None
+    if tool_calls:
+        message_body["tool_calls"] = tool_calls
+    return message_body, bool(tool_calls)
 
 
 def _sse_chunk(response_id: str,

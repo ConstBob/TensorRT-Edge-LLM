@@ -43,7 +43,12 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Sequence, Union
+
+from .tool_calling import (ToolConfig, parse_assistant_output,
+                           validate_tool_request)
+from .tool_chat_template import (ToolChatTemplateFormatter,
+                                 needs_tool_chat_template)
 
 logger = logging.getLogger("edgellm.server")
 
@@ -85,6 +90,8 @@ class CompletionOutput:
     text: str = ""
     token_ids: List[int] = field(default_factory=list)
     finish_reason: Optional[str] = None
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    reasoning: Optional[str] = None
 
 
 @dataclass
@@ -295,6 +302,8 @@ class LLM:
         self._draft_top_k = draft_top_k
         self._draft_step = draft_step
         self._verify_tree_size = verify_tree_size
+        self._tool_template_formatter: Optional[
+            ToolChatTemplateFormatter] = None
 
         if engine_dir:
             self._init_from_engine(engine_dir, visual_engine_dir)
@@ -603,6 +612,130 @@ class LLM:
             self._visual_engine_dir,
         )
 
+    def _tool_template_dirs(self) -> List[str]:
+        dirs = [self._model_dir, self._engine_dir]
+        if hasattr(self, "_onnx_dir"):
+            dirs.append(self._onnx_dir)
+        return dirs
+
+    def _get_tool_template_formatter(self) -> ToolChatTemplateFormatter:
+        if self._tool_template_formatter is None:
+            self._tool_template_formatter = ToolChatTemplateFormatter(
+                self._tool_template_dirs())
+        return self._tool_template_formatter
+
+    def _tool_choice_for_template(
+            self, tool_config: ToolConfig) -> Union[str, Dict[str, Any]]:
+        if tool_config.forced_name:
+            return {
+                "type": "function",
+                "function": {
+                    "name": tool_config.forced_name
+                },
+            }
+        return tool_config.tool_choice
+
+    def _prepare_messages_for_runtime(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
+        enable_thinking: bool = False,
+    ):
+        """Prepare messages for the C++ runtime."""
+        tool_config = tool_config or validate_tool_request(
+            messages, tools, tool_choice)
+        template_tools = (tool_config.tools
+                          if tool_config.tool_choice != "none" else [])
+        image_buffers = _load_image_buffers(self._rt, messages)
+
+        if needs_tool_chat_template(messages, template_tools,
+                                    tool_config.tool_choice):
+            template_tool_choice = None
+            if tool_config.tool_choice != "none":
+                template_tool_choice = self._tool_choice_for_template(
+                    tool_config)
+            prompt = self._get_tool_template_formatter().format(
+                messages,
+                tools=template_tools,
+                tool_choice=template_tool_choice,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            cpp_messages = _convert_messages_to_cpp(
+                self._rt,
+                [{
+                    "role": "user",
+                    "content": prompt,
+                }],
+            )
+            return cpp_messages, image_buffers, False, False
+
+        cpp_messages = _convert_messages_to_cpp(self._rt, messages)
+        return cpp_messages, image_buffers, True, True
+
+    def _make_generation_request(
+        self,
+        messages: List[Dict[str, Any]],
+        params: SamplingParams,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
+        stream_channel: Optional[Any] = None,
+    ):
+        tool_config = tool_config or validate_tool_request(
+            messages, tools, tool_choice)
+        cpp_messages, image_buffers, apply_template, add_prompt = (
+            self._prepare_messages_for_runtime(
+                messages,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice,
+                tool_config=tool_config,
+                enable_thinking=params.enable_thinking,
+            ))
+
+        request = self._rt.LLMGenerationRequest()
+        req = self._rt.Request(messages=cpp_messages)
+        req.image_buffers = image_buffers
+        req.stop_strings = params.stop
+        request.requests = [req]
+        if stream_channel is not None:
+            request.stream_channels = [stream_channel]
+        request.temperature = params.temperature
+        request.top_p = params.top_p
+        request.top_k = params.top_k
+        request.max_generate_length = params.max_tokens
+        request.apply_chat_template = apply_template
+        request.add_generation_prompt = add_prompt
+        request.enable_thinking = params.enable_thinking
+        request.disable_spec_decode = params.disable_spec_decode
+        return request
+
+    def _parse_generation_output(
+        self,
+        text: str,
+        token_ids: List[int],
+        finish_reason: Optional[str],
+        tool_config: ToolConfig,
+    ) -> CompletionOutput:
+        if not tool_config.parse_output:
+            return CompletionOutput(text=text,
+                                    token_ids=token_ids,
+                                    finish_reason=finish_reason)
+
+        parsed = parse_assistant_output(text, tool_config, self._model_dir)
+        tool_calls = [call.to_openai() for call in parsed.tool_calls]
+        return CompletionOutput(
+            text=parsed.content,
+            token_ids=token_ids,
+            finish_reason="tool_calls" if tool_calls else finish_reason,
+            tool_calls=tool_calls,
+            reasoning=parsed.reasoning or None,
+        )
+
     # ------------------------------------------------------------------
     # Inference API (vLLM-style)
     # ------------------------------------------------------------------
@@ -611,6 +744,9 @@ class LLM:
         self,
         prompts: Union[str, List[str], List[List[Dict[str, Any]]]],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> List[CompletionOutput]:
         """Generate completions for the given prompts.
 
@@ -619,6 +755,8 @@ class LLM:
                 a list of OpenAI-style message lists.
             sampling_params: Sampling configuration. Defaults to
                 ``SamplingParams()``.
+            tools: Optional OpenAI-compatible tool definitions.
+            tool_choice: Optional OpenAI-compatible tool choice.
 
         Returns:
             List of ``CompletionOutput`` objects, one per prompt.
@@ -638,21 +776,14 @@ class LLM:
 
         outputs = []
         for messages in message_batches:
-            cpp_messages = _convert_messages_to_cpp(self._rt, messages)
-            image_buffers = _load_image_buffers(self._rt, messages)
-            request = self._rt.LLMGenerationRequest()
-            req = self._rt.Request(messages=cpp_messages)
-            req.image_buffers = image_buffers
-            req.stop_strings = params.stop
-            request.requests = [req]
-            request.temperature = params.temperature
-            request.top_p = params.top_p
-            request.top_k = params.top_k
-            request.max_generate_length = params.max_tokens
-            request.apply_chat_template = True
-            request.add_generation_prompt = True
-            request.enable_thinking = params.enable_thinking
-            request.disable_spec_decode = params.disable_spec_decode
+            tool_config = validate_tool_request(messages, tools, tool_choice)
+            request = self._make_generation_request(
+                messages,
+                params,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice,
+                tool_config=tool_config,
+            )
 
             response = self._runtime.handle_request(request)
             text = response.output_texts[0] if response.output_texts else ""
@@ -660,9 +791,7 @@ class LLM:
             reason = finish_reason_name(self._rt, response.finish_reasons[0]) \
                 if response.finish_reasons else "stop"
             outputs.append(
-                CompletionOutput(text=text,
-                                 token_ids=ids,
-                                 finish_reason=reason))
+                self._parse_generation_output(text, ids, reason, tool_config))
 
         return outputs
 
@@ -670,22 +799,33 @@ class LLM:
         self,
         messages: List[Dict[str, Any]],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> CompletionOutput:
         """Single-turn chat completion (convenience wrapper).
 
         Args:
             messages: OpenAI-style message list.
             sampling_params: Sampling configuration.
+            tools: Optional OpenAI-compatible tool definitions.
+            tool_choice: Optional OpenAI-compatible tool choice.
 
         Returns:
             A single ``CompletionOutput``.
         """
-        return self.generate([messages], sampling_params)[0]
+        return self.generate([messages],
+                             sampling_params,
+                             tools=tools,
+                             tool_choice=tool_choice)[0]
 
     def generate_stream(
         self,
         messages: List[Dict[str, Any]],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> Generator[StreamDelta, None, None]:
         """Stream generation deltas for a single message list.
 
@@ -694,26 +834,17 @@ class LLM:
         tokens are produced.
         """
         params = sampling_params or SamplingParams()
-        cpp_messages = _convert_messages_to_cpp(self._rt, messages)
-        image_buffers = _load_image_buffers(self._rt, messages)
 
         channel = self._rt.StreamChannel.create()
         channel.set_skip_special_tokens(True)
 
-        request = self._rt.LLMGenerationRequest()
-        req = self._rt.Request(messages=cpp_messages)
-        req.image_buffers = image_buffers
-        req.stop_strings = params.stop
-        request.requests = [req]
-        request.stream_channels = [channel]
-        request.temperature = params.temperature
-        request.top_p = params.top_p
-        request.top_k = params.top_k
-        request.max_generate_length = params.max_tokens
-        request.apply_chat_template = True
-        request.add_generation_prompt = True
-        request.enable_thinking = params.enable_thinking
-        request.disable_spec_decode = params.disable_spec_decode
+        request = self._make_generation_request(
+            messages,
+            params,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream_channel=channel,
+        )
 
         error_holder = [None]
 
