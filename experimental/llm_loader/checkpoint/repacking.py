@@ -170,6 +170,7 @@ def repack_gptq_to_plugin(
     qweight: torch.Tensor,
     qzeros: torch.Tensor,
     g_idx: Optional[torch.Tensor] = None,
+    zero_point_offset: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Repack GPTQ ``qweight`` ``[in//8, out]`` int32 to plugin ``[out//2, in]`` int8.
 
@@ -208,10 +209,12 @@ def repack_gptq_to_plugin(
     # Expand zeros from [num_groups, out] -> [in, out] using per-channel group ids.
     zeros_expanded = zeros[g_idx_t.to(torch.int64)]  # [in, out]
 
-    # GPTQ stores (zero_point - 1) in qzeros, so actual zero_point = stored + 1.
+    # GPTQ checkpoints differ on whether qzeros stores zero or zero-1.
+    # actual_zero = stored_zero + zero_point_offset.
     # Adjust nibbles: kernel does (nibble - 8) * scale; GPTQ does (nibble - actual_zero) * scale
-    # -> repacked = nibble - (stored_zero + 1) + 8
-    nibbles = (nibbles - zeros_expanded - 1 + 8).clamp(0, 15)
+    # -> repacked = nibble - (stored_zero + zero_point_offset) + 8
+    nibbles = (nibbles - zeros_expanded - int(zero_point_offset) + 8).clamp(
+        0, 15)
 
     # Gather K rows by group (identity order when ``g_idx`` is sequential).
     nibbles, permute_idx = _gather_rows_by_gidx_order(nibbles, g_idx_t,
@@ -361,7 +364,8 @@ def _repack_gptq_weights(model: nn.Module) -> None:
             qz = module._buffers.get("qzeros")
             if qw is not None and qw.dtype == torch.int32 and qz is not None:
                 g_idx_buf = module._buffers.get("g_idx")
-                packed, perm = repack_gptq_to_plugin(qw, qz, g_idx_buf)
+                packed, perm = repack_gptq_to_plugin(
+                    qw, qz, g_idx_buf, getattr(module, "zero_point_offset", 1))
                 module._buffers["qweight"] = packed
                 module._buffers["int4_act_perm"] = perm
                 logger.debug("Repacked GPTQ qweight: %s -> %s", list(qw.shape),
@@ -428,15 +432,18 @@ def _unpack_qzeros_moe(qzeros: torch.Tensor) -> torch.Tensor:
 
 
 def _extract_gptq_for_marlin(
-        proj: nn.Module, group_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    proj: nn.Module,
+    group_size: int,
+    zero_point_offset: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Extract ``(weights [N, K] int16, scales [N, num_groups] fp16)`` from a
     GPTQ linear module, remapping zero-points so Marlin's ``(q - 8) * scale``
     equals GPTQ's ``(q - zero) * scale``.
 
-    GPTQ v1 checkpoints store ``zero_point - 1`` in qzeros, so the actual
-    zero-point is ``stored + 1``.  The adjustment is therefore::
+    GPTQ checkpoints differ on whether qzeros stores ``zero_point`` or
+    ``zero_point - 1``.  The adjustment is therefore::
 
-        q_marlin = q - (stored_zero + 1) + 8 = q - stored_zero - 1 + 8
+        q_marlin = q - (stored_zero + zero_point_offset) + 8
     """
     unpacked = _unpack_int4_gptq(proj.qweight)  # [K, N]
 
@@ -445,10 +452,10 @@ def _extract_gptq_for_marlin(
         K, N = unpacked.shape
         group_ids = torch.arange(K, device=unpacked.device) // group_size
         zeros_expanded = zeros[group_ids.clamp(max=zeros.shape[0] - 1)]
-        # GPTQ v1: actual_zero = stored_zero + 1
+        # actual_zero = stored_zero + zero_point_offset
         unpacked = torch.clamp(
-            unpacked.to(torch.int32) - zeros_expanded.to(torch.int32) - 1 + 8,
-            0, 15).to(torch.int16)
+            unpacked.to(torch.int32) - zeros_expanded.to(torch.int32) -
+            int(zero_point_offset) + 8, 0, 15).to(torch.int16)
 
     weights = unpacked.transpose(0, 1).contiguous()  # [N, K]
     scales = proj.scales.data.to(torch.float16).transpose(0, 1).contiguous()

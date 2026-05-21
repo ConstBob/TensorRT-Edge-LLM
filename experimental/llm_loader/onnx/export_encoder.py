@@ -21,7 +21,7 @@ the only difference is how the model is built and how its I/O spec is provided.
 
 Visual encoders — I/O spec via ``model.get_onnx_export_args(config, device)``:
     - Qwen3-VL         (model_type ``qwen3_vl``, ``qwen3_omni``)
-    - Qwen3.5          (model_type ``qwen3_5``)
+    - Qwen3.5          (model_type ``qwen3_5``, ``qwen3_5_moe``)
     - Qwen2.5-VL       (model_type ``qwen2_5_vl``)
     - InternVL3        (model_type ``internvl_chat``)
     - InternVL3 HF     (model_type ``internvl``)
@@ -79,6 +79,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "qwen3_vl": "qwen3_vl",
     "qwen3_omni": "qwen3_vl",
     "qwen3_5": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5",
     "qwen2_5_vl": "qwen2_5_vl",
     "internvl_chat": "internvl3",
     "internvl": "internvl3_5",
@@ -145,7 +146,8 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
 
 def _get_visual_config(model_type: str, config: dict) -> dict:
     """Extract visual encoder sub-config from the full model config."""
-    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_5", "qwen2_5_vl"):
+    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_5", "qwen3_5_moe",
+                      "qwen2_5_vl"):
         # Qwen3-Omni stores vision_config nested under thinker_config; other
         # Qwen VL variants keep it at the root.
         return (config.get("vision_config")

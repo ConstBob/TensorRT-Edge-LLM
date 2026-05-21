@@ -314,26 +314,33 @@ class GatedAttention(nn.Module):
         self.head_dim = head_dim
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = -1
+        module_prefix = f"model.layers.{layer_idx}.self_attn"
 
         # q_proj output is doubled: query + gate
         self.q_proj = make_linear(config,
                                   hidden_size,
                                   num_heads * head_dim * 2,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.q_proj")
         self.k_proj = make_linear(config,
                                   hidden_size,
                                   num_kv_heads * head_dim,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.k_proj")
         self.v_proj = make_linear(config,
                                   hidden_size,
                                   num_kv_heads * head_dim,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.v_proj")
 
         if self.enable_fp8_kv_cache:
             self.k_proj.register_buffer("k_scale", torch.ones(1))
             self.v_proj.register_buffer("v_scale", torch.ones(1))
 
-        self.o_proj = make_linear(config, num_heads * head_dim, hidden_size)
+        self.o_proj = make_linear(config,
+                                  num_heads * head_dim,
+                                  hidden_size,
+                                  module_name=f"{module_prefix}.o_proj")
 
         # Qwen3.5 full attention always has QK norm (residual-weight convention)
         self.q_norm = Qwen3_5RMSNorm(head_dim, eps=config.rms_norm_eps)

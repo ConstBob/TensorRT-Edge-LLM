@@ -149,6 +149,10 @@ class QuantConfig:
     quant_type: str = QUANT_FP16
     # group_size: 1 = per-tensor/per-channel, 16 for NVFP4, 128 for AWQ
     group_size: int = 1
+    # GPTQ checkpoints are not consistent about whether qzeros stores the
+    # actual zero point or (zero point - 1).  The loader uses:
+    # actual_zero = stored_zero + gptq_zero_point_offset.
+    gptq_zero_point_offset: int = 1
     # kv_cache_quant: "fp8" when KV-cache is quantised, None otherwise
     kv_cache_quant: Optional[str] = None
     # module names excluded from quantisation (typically ["lm_head"])
@@ -473,7 +477,9 @@ class ModelConfig:
         num_experts_per_tok = int(llm_dict.get("num_experts_per_tok", 0))
         moe_intermediate_size = int(llm_dict.get("moe_intermediate_size", 0))
         moe_shared_expert_intermediate_size = int(
-            llm_dict.get("moe_shared_expert_intermediate_size", 0))
+            llm_dict.get("moe_shared_expert_intermediate_size",
+                         llm_dict.get("shared_expert_intermediate_size", 0))
+            or 0)
         routed_scaling_factor = float(
             llm_dict.get("routed_scaling_factor", 1.0))
         n_group = int(llm_dict.get("n_group", 1))
@@ -482,6 +488,12 @@ class ModelConfig:
         mlp_only_layers = list(llm_dict.get("mlp_only_layers") or [])
         norm_topk_prob = bool(llm_dict.get("norm_topk_prob", True))
 
+        intermediate_size = int(
+            llm_dict.get("intermediate_size")
+            or llm_dict.get("shared_expert_intermediate_size")
+            or llm_dict.get("moe_shared_expert_intermediate_size")
+            or llm_dict.get("moe_intermediate_size", 0))
+
         return cls(
             model_type=model_type,
             hidden_size=hidden_size,
@@ -489,7 +501,7 @@ class ModelConfig:
             num_attention_heads=num_attn_heads,
             num_key_value_heads=llm_dict.get("num_key_value_heads",
                                              num_attn_heads),
-            intermediate_size=llm_dict["intermediate_size"],
+            intermediate_size=intermediate_size,
             head_dim=head_dim,
             rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
             vocab_size=llm_dict["vocab_size"],
@@ -503,7 +515,8 @@ class ModelConfig:
             partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
             has_qk_norm=has_qk_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
-            torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
+            torch_dtype=llm_dict.get("torch_dtype",
+                                     llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
             layer_types=layer_types,
@@ -649,10 +662,9 @@ def _validate_mtp_constraints(
     """Validate the currently supported MTP config subset."""
     if mtp_num_hidden_layers is None and not mtp_use_dedicated_embeddings:
         return
-    if model_type != "qwen3_5_text":
+    if model_type not in ("qwen3_5_text", "qwen3_5_moe_text"):
         raise NotImplementedError(
-            "MTP config parsing is only supported for qwen3_5_text checkpoints."
-        )
+            "MTP config parsing is only supported for Qwen3.5 checkpoints.")
     if mtp_num_hidden_layers != 1:
         raise NotImplementedError(
             "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 dense MTP."
@@ -850,6 +862,10 @@ _VL_LLM_PREFIXES = ("language_model.", "text_model.", "llm.", "thinker.")
 
 def _strip_vl_prefix(name: str) -> str:
     """Strip a known VL wrapper prefix (e.g. ``language_model.``) if present."""
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model."):]
+    if name.startswith("model.visual."):
+        return "visual." + name[len("model.visual."):]
     for prefix in _VL_LLM_PREFIXES:
         if name.startswith(prefix):
             return name[len(prefix):]
@@ -924,7 +940,27 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
     }
     if "lm_head" not in all_linear_stripped:
         excluded.append("lm_head")
-    return sorted(excluded)
+    return _with_gdn_fused_exclusions(excluded)
+
+
+_GDN_INPUT_PROJ_MODULES = ("in_proj_qkv", "in_proj_z", "in_proj_b",
+                           "in_proj_a")
+
+
+def _with_gdn_fused_exclusions(modules: List[str]) -> List[str]:
+    """Add synthetic GDN fused projections when all source projections are FP16."""
+    result = set(modules)
+    by_prefix: Dict[str, set] = {}
+    for module in result:
+        for proj in _GDN_INPUT_PROJ_MODULES:
+            suffix = f".{proj}"
+            if module.endswith(suffix):
+                by_prefix.setdefault(module[:-len(suffix)], set()).add(proj)
+                break
+    for prefix, projs in by_prefix.items():
+        if all(proj in projs for proj in _GDN_INPUT_PROJ_MODULES):
+            result.add(f"{prefix}.in_proj_fused")
+    return sorted(result)
 
 
 def _detect_quantized_modules(model_dir: str) -> List[str]:
@@ -966,10 +1002,11 @@ def _effective_excluded_modules(model_dir: str,
     modeling code passes.
     """
     quantized_modules = set(_detect_quantized_modules(model_dir))
-    return [
+    normalized = [
         _normalize_module_name(module) for module in excluded
         if _strip_vl_prefix(module) not in quantized_modules
     ]
+    return _with_gdn_fused_exclusions(normalized)
 
 
 def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
@@ -1048,7 +1085,7 @@ def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
 
     # Normalise to the same name space ``layer_overrides`` and ``excluded``
     # use, so ``make_linear`` finds entries via its ``module_name`` lookup.
-    return sorted(excluded)
+    return _with_gdn_fused_exclusions(sorted(excluded))
 
 
 def _parse_nvfp4_moe_backend(blob: dict) -> str:
@@ -1174,11 +1211,64 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         return QuantConfig(
             quant_type=QUANT_INT4_GPTQ,
             group_size=int(qc.get("group_size", 128)),
+            gptq_zero_point_offset=_detect_gptq_zero_point_offset(
+                model_dir, qc),
             excluded=_detect_unquantized_modules(model_dir),
             nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     return QuantConfig(nvfp4_moe_backend=nvfp4_moe_backend)
+
+
+def _detect_gptq_zero_point_offset(model_dir: str, qc: dict) -> int:
+    """Infer whether GPTQ qzeros stores ``zero`` or ``zero - 1``.
+
+    Older symmetric GPTQ checkpoints used by Qwen3 store packed ``0x77777777``
+    for a real zero point of 8.  Qwen3.5 stores packed ``0x88888888`` for the
+    same real zero point.  Inspecting a tiny qzeros sample lets both variants
+    share the same repacking path without depending on GPTQModel/Optimum.
+    """
+    if not bool(qc.get("sym", False)):
+        return 1
+
+    try:
+        from safetensors import safe_open
+
+        index_path = os.path.join(model_dir, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                weight_map: dict = json.load(f).get("weight_map", {})
+            qzeros_key = next((k for k in weight_map if k.endswith(".qzeros")),
+                              None)
+            if qzeros_key is None:
+                return 1
+            shard_path = os.path.join(model_dir, weight_map[qzeros_key])
+        else:
+            shard_path = os.path.join(model_dir, "model.safetensors")
+            if not os.path.exists(shard_path):
+                return 1
+            with safe_open(shard_path, framework="pt") as f:
+                qzeros_key = next(
+                    (k for k in f.keys() if k.endswith(".qzeros")), None)
+            if qzeros_key is None:
+                return 1
+
+        with safe_open(shard_path, framework="pt") as f:
+            qzeros = f.get_tensor(qzeros_key).flatten()[:1024].cpu().tolist()
+    except Exception:
+        return 1
+
+    if not qzeros:
+        return 1
+
+    nibbles = []
+    for value in qzeros:
+        packed = int(value) & 0xFFFFFFFF
+        nibbles.extend((packed >> (4 * i)) & 0xF for i in range(8))
+
+    if nibbles and all(v == 8 for v in nibbles):
+        return 0
+    return 1
 
 
 def _algo_to_quant_type(algo: str) -> str:
