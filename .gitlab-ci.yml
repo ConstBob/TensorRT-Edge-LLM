@@ -30,6 +30,7 @@ include:
   - local: '.gitlab/ci/pages-jobs.yml'
   - local: '.gitlab/ci/.github-pr-jobs.yml'
   - local: '.gitlab/ci/local-board-jobs.yml'
+  - local: '.gitlab/ci/experimental-docker-jobs.yml'
 
 stages:
 - setup
