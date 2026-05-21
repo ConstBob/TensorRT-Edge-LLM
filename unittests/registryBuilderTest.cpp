@@ -249,15 +249,15 @@ TEST(RegistryBuilderTest, NoDeepstackWhenFeatureCountIsZero)
 }
 
 // =====================================================================
-// EAGLE speculative decoding (base engine side)
+// SpecDecode speculative decoding (base engine side)
 // =====================================================================
 
-TEST(RegistryBuilderTest, EagleBaseAddsTreeTensors)
+TEST(RegistryBuilderTest, SpecDecodeBaseAddsProposalTensors)
 {
     LLMEngineConfig cfg = makeBasicLLMConfig();
     cfg.numAttentionLayers = 2;
     cfg.numDecoderLayers = 2;
-    cfg.enableEagleSpecDecode = true;
+    cfg.isSpecDecodeBase = true;
     cfg.maxVerifyTreeSize = 16;
     cfg.maxDraftTreeSize = 16;
 
@@ -269,16 +269,35 @@ TEST(RegistryBuilderTest, EagleBaseAddsTreeTensors)
     EXPECT_TRUE(hasName(names, "attention_mask"));
     EXPECT_TRUE(hasName(names, "attention_pos_id"));
 
-    // 6 core (incl. kvcache_start_index) + 4 KV + 3 EAGLE = 13
+    // 6 core (incl. kvcache_start_index) + 4 KV + 3 SpecDecode = 13
     EXPECT_EQ(names.size(), 13u);
 }
 
-TEST(RegistryBuilderTest, NoEagleTensorsWhenDisabled)
+TEST(RegistryBuilderTest, SpecDecodeBaseUsesConfiguredOutputHiddenDim)
 {
     LLMEngineConfig cfg = makeBasicLLMConfig();
     cfg.numAttentionLayers = 2;
     cfg.numDecoderLayers = 2;
-    cfg.enableEagleSpecDecode = false;
+    cfg.isSpecDecodeBase = true;
+
+    populateHybridFieldsFromScalars(cfg);
+    int32_t constexpr kBaseOutputHiddenDim = 4096;
+    auto reg = buildRegistryForLLM(cfg, kBaseOutputHiddenDim);
+    auto specs = reg.allExpandedSpecs();
+
+    auto hiddenIt
+        = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "hidden_states"; });
+    ASSERT_NE(hiddenIt, specs.end());
+    ASSERT_EQ(hiddenIt->shape.size(), 2u);
+    EXPECT_EQ(hiddenIt->shape[1].value, kBaseOutputHiddenDim);
+}
+
+TEST(RegistryBuilderTest, NoSpecDecodeTensorsWhenDisabled)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.numAttentionLayers = 2;
+    cfg.numDecoderLayers = 2;
+    cfg.isSpecDecodeBase = false;
 
     populateHybridFieldsFromScalars(cfg);
     auto reg = buildRegistryForLLM(cfg);
@@ -384,7 +403,8 @@ TEST(RegistryBuilderTest, AllFeaturesEnabled)
     cfg.numAttentionLayers = 2;
     cfg.numDecoderLayers = 4;
     cfg.numDeepstackFeatures = 2;
-    cfg.enableEagleSpecDecode = true;
+    cfg.isSpecDecodeBase = true;
+    cfg.specDecodeType = SpecDecodeMode::kMTP;
     cfg.numLinearAttnLayers = 2;
     cfg.recurrentStateNumHeads = 16;
     cfg.recurrentStateHeadDim = 64;
@@ -396,10 +416,9 @@ TEST(RegistryBuilderTest, AllFeaturesEnabled)
     auto reg = buildRegistryForLLM(cfg);
     auto names = reg.allTensorNames();
 
-    // 6 core (incl. kvcache_start_index) + 4 KV (2 layers) + 2 deepstack + 3 EAGLE
+    // 6 core (incl. kvcache_start_index) + 4 KV (2 layers) + 2 deepstack + 3 SpecDecode
     //   + 4 recurrent + 4 conv + 4 intermediate (2 layers × {recurrent, conv})
-    // = 27. The extra 4 intermediate-state outputs come from the MTP-base path
-    // (enableEagleSpecDecode + numLinearAttnLayers > 0).
+    // = 27. The extra 4 intermediate-state outputs come from the MTP-base path.
     EXPECT_EQ(names.size(), 27u);
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_0"));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_1"));
@@ -409,12 +428,12 @@ TEST(RegistryBuilderTest, AllFeaturesEnabled)
 
 TEST(RegistryBuilderTest, MtpBaseAddsIntermediateStateOutputs)
 {
-    // Hybrid base + EAGLE/MTP spec-decode → engine emits intermediate state
-    // outputs per mamba layer.
+    // Hybrid MTP base → engine emits intermediate state outputs per mamba layer.
     LLMEngineConfig cfg = makeBasicLLMConfig();
     cfg.numAttentionLayers = 2;
     cfg.numDecoderLayers = 4;
-    cfg.enableEagleSpecDecode = true;
+    cfg.isSpecDecodeBase = true;
+    cfg.specDecodeType = SpecDecodeMode::kMTP;
     cfg.maxVerifyTreeSize = 4;
     cfg.numLinearAttnLayers = 2;
     cfg.recurrentStateNumHeads = 16;
@@ -459,7 +478,7 @@ TEST(RegistryBuilderTest, MtpBaseAddsIntermediateStateOutputs)
 
 TEST(RegistryBuilderTest, NoIntermediateStatesWhenSpecDecodeDisabled)
 {
-    // Hybrid base WITHOUT EAGLE/MTP → no intermediate state outputs.
+    // Hybrid base WITHOUT SpecDecode → no intermediate state outputs.
     LLMEngineConfig cfg = makeBasicLLMConfig();
     cfg.numAttentionLayers = 2;
     cfg.numDecoderLayers = 4;
@@ -479,7 +498,7 @@ TEST(RegistryBuilderTest, NoIntermediateStatesWhenSpecDecodeDisabled)
 }
 
 // =====================================================================
-// buildRegistryForEagleDraft
+// buildRegistryForSpecDecodeDraft
 // =====================================================================
 
 TEST(RegistryBuilderTest, DraftEngineHasExpectedTensors)
@@ -487,18 +506,18 @@ TEST(RegistryBuilderTest, DraftEngineHasExpectedTensors)
     LLMEngineConfig cfg = makeBasicLLMConfig();
     cfg.numAttentionLayers = 4;
     cfg.numDecoderLayers = 4;
-    cfg.enableEagleSpecDecode = true;
+    cfg.isSpecDecodeBase = true;
     cfg.maxVerifyTreeSize = 16;
     cfg.maxDraftTreeSize = 16;
 
     populateHybridFieldsFromScalars(cfg);
     DeploymentConfig bundle;
     bundle.draft = cfg;
-    EagleConfig eagle{};
-    eagle.baseOutputHiddenDim = 12288;
-    eagle.draftHiddenSize = 2048;
-    bundle.eagle = eagle;
-    auto reg = buildRegistryForEagleDraft(bundle);
+    SpecDecodeConfig specConfig{};
+    specConfig.baseOutputHiddenDim = 12288;
+    specConfig.draftHiddenSize = 2048;
+    bundle.specConfig = specConfig;
+    auto reg = buildRegistryForSpecDecodeDraft(bundle);
     auto names = reg.allTensorNames();
 
     // Core I/O
@@ -534,16 +553,16 @@ TEST(RegistryBuilderTest, DraftEngineSpecShapesAreCorrect)
     LLMEngineConfig cfg = makeBasicLLMConfig();
     cfg.numAttentionLayers = 2;
     cfg.numDecoderLayers = 2;
-    cfg.enableEagleSpecDecode = true;
+    cfg.isSpecDecodeBase = true;
 
     populateHybridFieldsFromScalars(cfg);
     DeploymentConfig bundle;
     bundle.draft = cfg;
-    EagleConfig eagle{};
-    eagle.baseOutputHiddenDim = 12288;
-    eagle.draftHiddenSize = 2048;
-    bundle.eagle = eagle;
-    auto reg = buildRegistryForEagleDraft(bundle);
+    SpecDecodeConfig specConfig{};
+    specConfig.baseOutputHiddenDim = 12288;
+    specConfig.draftHiddenSize = 2048;
+    bundle.specConfig = specConfig;
+    auto reg = buildRegistryForSpecDecodeDraft(bundle);
     auto specs = reg.allExpandedSpecs();
 
     // inputs_embeds should use draftHiddenSize
@@ -569,16 +588,16 @@ TEST(RegistryBuilderTest, DraftEngineKVCacheUsesPluginPath)
     LLMEngineConfig cfg = makeBasicLLMConfig();
     cfg.numAttentionLayers = 2;
     cfg.numDecoderLayers = 2;
-    cfg.enableEagleSpecDecode = true;
+    cfg.isSpecDecodeBase = true;
 
     populateHybridFieldsFromScalars(cfg);
     DeploymentConfig bundle;
     bundle.draft = cfg;
-    EagleConfig eagle{};
-    eagle.baseOutputHiddenDim = 12288;
-    eagle.draftHiddenSize = 2048;
-    bundle.eagle = eagle;
-    auto reg = buildRegistryForEagleDraft(bundle);
+    SpecDecodeConfig specConfig{};
+    specConfig.baseOutputHiddenDim = 12288;
+    specConfig.draftHiddenSize = 2048;
+    bundle.specConfig = specConfig;
+    auto reg = buildRegistryForSpecDecodeDraft(bundle);
     auto specs = reg.allExpandedSpecs();
 
     // KV cache should be 5D (plugin path)
@@ -766,16 +785,16 @@ TEST_P(RegistryBuilderKVDtypeTest, DraftEngineKVCacheBindingDtypeMatchesConfig)
     cfg.kvCacheDtype = kvDtype;
     cfg.numAttentionLayers = 3;
     cfg.numDecoderLayers = 3;
-    cfg.enableEagleSpecDecode = true;
+    cfg.isSpecDecodeBase = true;
 
     populateHybridFieldsFromScalars(cfg);
     DeploymentConfig bundle;
     bundle.draft = cfg;
-    EagleConfig eagle{};
-    eagle.baseOutputHiddenDim = 12288;
-    eagle.draftHiddenSize = 2048;
-    bundle.eagle = eagle;
-    auto reg = buildRegistryForEagleDraft(bundle);
+    SpecDecodeConfig specConfig{};
+    specConfig.baseOutputHiddenDim = 12288;
+    specConfig.draftHiddenSize = 2048;
+    bundle.specConfig = specConfig;
+    auto reg = buildRegistryForSpecDecodeDraft(bundle);
     auto specs = reg.allExpandedSpecs();
 
     int kvBindingCount = 0;

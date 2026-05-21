@@ -56,34 +56,35 @@ struct PipelineIO
     Tensor draftHiddenStatesIn;
     Tensor draftHiddenStatesOut;
 
-    // Streaming output (Qwen3-Omni Talker pipeline). For the vanilla (non-EAGLE)
+    // Streaming output (Qwen3-Omni Talker pipeline). For the vanilla
     // LLM runtime the engine writes its layer-N hidden states into
     // `outputHiddenStates`; the runtime exposes them through
     // `LLMInferenceSpecDecodeRuntime::getBaseModelHiddenStates(N)`.
     // `prefillEmbedsBackup` snapshots layer-0 input embeddings before the decode
     // loop reshapes `inputsEmbeds`; it is lazy-allocated on the first request that
-    // sets `outputThinkerEmbeddings`. EAGLE configs reuse `baseHiddenStates`
+    // sets `outputThinkerEmbeddings`. SpecDecode configs reuse `baseHiddenStates`
     // instead and leave these empty.
     Tensor outputHiddenStates;
     Tensor prefillEmbedsBackup;
 
-    // EAGLE engine-bound tensors (empty for vanilla LLM runtime).
-    //! Packed EAGLE attention mask, [batch, treeSize, divUp(treeSize, 32)] INT32.
-    //! Written by the `prepareEagle*Inputs` kernels; consumed by the base and draft
+    // SpecDecode engine-bound tensors (empty for vanilla LLM runtime).
+    //! Packed proposal attention mask, [batch, proposalSize, divUp(proposalSize, 32)] INT32.
+    //! Written by proposal/verify input preparation kernels; consumed by the base and draft
     //! engines via the `kAttentionMask` binding.
     Tensor packedAttentionMask;
-    //! EAGLE position IDs, [batch, treeSize] INT32.
-    //! Written by the `prepareEagle*Inputs` kernels; consumed by the base and draft
+    //! SpecDecode position IDs, [batch, proposalSize] INT32.
+    //! Written by proposal/verify input preparation kernels; consumed by the base and draft
     //! engines via the `kAttentionPosId` binding.
-    Tensor eaglePositionIds;
+    Tensor specDecodePositionIds;
 
     //! Build PipelineIO for the vanilla single-engine LLM runtime
     //! (basic I/O tensors, deepstack embeds, MRope cos/sin cache).
     static PipelineIO createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream);
 
-    //! Build PipelineIO for the EAGLE two-engine speculative-decoding runtime
+    //! Build PipelineIO for a two-engine speculative-decoding runtime
     //! (basic I/O, hidden states, deepstack embeds, MRope cos/sin cache).
-    static PipelineIO createForEagle(DeploymentConfig const& bundle, int32_t maxRuntimeBatchSize, cudaStream_t stream);
+    static PipelineIO createForSpecDecode(
+        DeploymentConfig const& bundle, int32_t maxRuntimeBatchSize, cudaStream_t stream);
 };
 
 void allocateBasicIO(
@@ -92,7 +93,7 @@ void allocateBasicIO(
 void allocateDeepstackEmbeds(PipelineIO& io, int32_t numFeatures, int32_t maxBatch, int32_t maxSeq, int32_t hiddenSize,
     nvinfer1::DataType dtype);
 
-void allocateEagleHiddenStates(PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t baseHiddenDim,
+void allocateSpecDecodeHiddenStates(PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t baseHiddenDim,
     int32_t draftHiddenDim, nvinfer1::DataType dtype);
 
 void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity, int32_t rotaryDim);
@@ -110,20 +111,20 @@ void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity,
 void buildTensorMap(
     TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex);
 
-//! Populate a TensorMap for the EAGLE draft engine. Delegates to `buildTensorMap`
+//! Populate a TensorMap for a SpecDecode draft engine. Delegates to `buildTensorMap`
 //! with `kvCacheIndex=1` for the common bindings, then patches in draft-engine-
-//! specific bindings (base/draft hidden states in+out, packed EAGLE attention mask,
-//! EAGLE position IDs).
+//! specific bindings (base/draft hidden states in+out, packed proposal attention
+//! mask, proposal position IDs).
 //!
-//! Preconditions: `io` must have been constructed via `PipelineIO::createForEagle`
+//! Preconditions: `io` must have been constructed via `PipelineIO::createForSpecDecode`
 //! (baseHiddenStates / draftHiddenStatesIn/Out / packedAttentionMask /
-//! eaglePositionIds populated).
+//! specDecodePositionIds populated).
 //!
 //! @param map Output map for the draft engine's bindings.
-//! @param io  Pipeline I/O (must be the EAGLE-flavoured one).
+//! @param io  Pipeline I/O (must be the SpecDecode-flavoured one).
 //! @param res Shared resources.
 //! @param cfg Draft engine configuration.
-void buildTensorMapForEagleDraft(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg);
+void buildTensorMapForSpecDecodeDraft(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg);
 
 } // namespace rt
 } // namespace trt_edgellm

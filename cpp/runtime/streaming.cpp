@@ -19,8 +19,8 @@
 
 #include "common/logger.h"
 #include "common/utf8.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/decodingInferenceContext.h"
 #include "tokenizer/tokenizer.h"
 
 #include <algorithm>
@@ -273,7 +273,7 @@ StopMatchOutcome applyStopStringMatch(
     return out;
 }
 
-void applyCancellationToFinishStates(SpecDecodeInferenceContext& context)
+void applyCancellationToFinishStates(DecodingInferenceContext& context)
 {
     for (int32_t i = 0; i < context.activeBatchSize; ++i)
     {
@@ -295,7 +295,7 @@ void applyCancellationToFinishStates(SpecDecodeInferenceContext& context)
     }
 }
 
-void decodePerSlot(SpecDecodeInferenceContext& context, tokenizer::Tokenizer const& tok)
+void decodePerSlot(DecodingInferenceContext& context, tokenizer::Tokenizer const& tok)
 {
     for (int32_t i = 0; i < context.activeBatchSize; ++i)
     {
@@ -354,7 +354,7 @@ void decodePerSlot(SpecDecodeInferenceContext& context, tokenizer::Tokenizer con
     }
 }
 
-void emitChunks(SpecDecodeInferenceContext& context)
+void emitChunks(DecodingInferenceContext& context)
 {
     for (int32_t i = 0; i < context.activeBatchSize; ++i)
     {
@@ -396,8 +396,7 @@ void emitChunks(SpecDecodeInferenceContext& context)
 // StreamChannelFinalizer — RAII terminal-chunk guarantee
 //=============================================================================
 
-StreamChannelFinalizer::StreamChannelFinalizer(
-    SpecDecodeInferenceContext& ctx, tokenizer::Tokenizer const& tok) noexcept
+StreamChannelFinalizer::StreamChannelFinalizer(DecodingInferenceContext& ctx, tokenizer::Tokenizer const& tok) noexcept
     : mCtx(ctx)
     , mTok(tok)
 {

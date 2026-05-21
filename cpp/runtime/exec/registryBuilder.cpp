@@ -29,7 +29,7 @@ namespace rt
 // is no longer needed — every symbolic reference is a pointer-to-member of
 // `InferenceDims`, so the set of dims exists by construction of the type.
 
-TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg)
+TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim)
 {
     TensorRegistry reg;
 
@@ -41,9 +41,10 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg)
     reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
         {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
 
-    // logits: [batch, outputVocabSize] FLOAT (for vanilla), or [batch, seq_len, outputVocabSize] for EAGLE
-    // The engine binding shape depends on EAGLE mode, but output address is always set.
-    // For the registry we use the common 2D shape; EAGLE tree decoding resolves via symbolic dims.
+    // logits: [batch, outputVocabSize] FLOAT for vanilla, or
+    // [batch, seq_len, outputVocabSize] for SpecDecode. The engine binding
+    // shape depends on mode, but output address is always set.
+    // For the registry we use the common 2D shape; SpecDecode resolves via symbolic dims.
     reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
         {sym(&InferenceDims::batch), fixed(cfg.outputVocabSize)}});
 
@@ -51,13 +52,13 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg)
     reg.addTensor(
         {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
 
-    // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for EAGLE tree decode
+    // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
     reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
         {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
 
     // kvcache_start_index: [start_index_len] INT32. The engine's context profile
     // uses shape [0] as a sentinel for "initial prefill of an empty KV cache";
-    // chunked prefill, decode, and tree-verify use [batch] start offsets.
+    // chunked prefill, decode, and verification use [batch] start offsets.
     // InferenceDims::startIndexLen carries this per-phase: prefillDims sets it to 0
     // when (!useTrtNativeOps && kvCacheAllEmpty), else batch; all other recipes
     // set it to batch. Shape 0 is engine-valid here — TRT reads 0 bytes from
@@ -129,13 +130,11 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg)
 
             // MTP base only: per-layer intermediate state outputs the engine
             // writes during prefill/tree-verify. The builder emits these only
-            // when `model_type == "mtp_base"`; the runtime proxy for that is
-            // `enableEagleSpecDecode + numLinearAttnLayers > 0` (EAGLE3 base
-            // is pure-attention, so the conjunction matches only MTP base).
+            // when `model_type == "mtp_base"`.
             //
             // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
             // intermediate_conv_state_%d:      [batch, seqLen, convDim, convKernel]
-            if (cfg.enableEagleSpecDecode)
+            if (cfg.specDecodeType == SpecDecodeMode::kMTP)
             {
                 std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
                     fixed(cfg.recurrentStateNumHeads), fixed(cfg.recurrentStateHeadDim), fixed(cfg.recurrentStateSize)};
@@ -167,22 +166,23 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg)
     }
 
     // ---------------------------------------------------------------
-    // EAGLE speculative decoding (base engine side)
+    // SpecDecode verification bindings (base engine side)
     // ---------------------------------------------------------------
-    if (cfg.enableEagleSpecDecode)
+    if (cfg.isSpecDecodeBase)
     {
         // hidden_states: output, [batch, outputHiddenDim] for vanilla decode,
-        // or [batch, seq_len, outputHiddenDim] for prefill/tree — use symbolic.
-        // Output hidden dim follows the EAGLE-3 convention: hiddenSize * 3.
-        int32_t const baseOutputHiddenDim = cfg.hiddenSize * 3;
+        // or [batch, seq_len, outputHiddenDim] for prefill/verification — use symbolic.
+        // The concrete output hidden dim is strategy-specific and is consolidated
+        // in DeploymentConfig::specDecode.
+        int32_t const baseOutputHiddenDim = specDecodeBaseOutputHiddenDim.value_or(cfg.hiddenSize * 3);
         reg.addTensor({binding_names::kOutputHiddenStates, TensorIO::kOutput, nvinfer1::DataType::kHALF,
             {sym(&InferenceDims::batch), fixed(baseOutputHiddenDim)}});
 
-        // attention_mask: [batch, attn_seq_len, packed_mask_len] INT32 for tree decoding
+        // attention_mask: [batch, attn_seq_len, packed_mask_len] INT32 for proposal verification
         // packed_mask_len = divUp(attn_seq_len, 32): each INT32 stores 32 mask bits.
         // attn_seq_len is decoupled from seq_len so prefill/decode/reset can pin
-        // it to 1 (engine then uses standard causal attention) while tree
-        // verify/proposal/accept use the effective tree size.
+        // it to 1 (engine then uses standard causal attention) while verify,
+        // proposal, and accept use the effective proposal size.
         reg.addTensor({binding_names::kAttentionMask, TensorIO::kInput, nvinfer1::DataType::kINT32,
             {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen), sym(&InferenceDims::packedMaskLen)}});
 
@@ -203,15 +203,15 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg)
     return reg;
 }
 
-TensorRegistry buildRegistryForEagleDraft(DeploymentConfig const& bundle)
+TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
 {
-    check::check(bundle.draft.has_value(), "buildRegistryForEagleDraft: bundle.draft must be set");
-    check::check(bundle.eagle.has_value(), "buildRegistryForEagleDraft: bundle.eagle must be set");
+    check::check(bundle.draft.has_value(), "buildRegistryForSpecDecodeDraft: bundle.draft must be set");
+    check::check(bundle.specConfig.has_value(), "buildRegistryForSpecDecodeDraft: bundle.specConfig must be set");
     TensorRegistry reg;
 
     LLMEngineConfig const& cfg = *bundle.draft;
-    int32_t const draftHiddenSize = bundle.eagle->draftHiddenSize;
-    int32_t const baseOutputHiddenDim = bundle.eagle->baseOutputHiddenDim;
+    int32_t const draftHiddenSize = bundle.specConfig->draftHiddenSize;
+    int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
     int32_t const draftVocabSize = cfg.outputVocabSize;
 
     // ---------------------------------------------------------------
@@ -286,7 +286,7 @@ TensorRegistry buildRegistryForEagleDraft(DeploymentConfig const& bundle)
         {
             if (cfg.layerTypes[absIdx] != rt::HybridCacheManager::LayerType::kAttention)
             {
-                // EAGLE draft engines are not expected to contain Mamba layers. If a
+                // Current draft engines are not expected to contain Mamba layers. If a
                 // future config exercises this branch it's a config error, not a
                 // registry-builder concern.
                 continue;

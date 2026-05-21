@@ -39,7 +39,7 @@ namespace rt
 //! Process-lifetime resources shared across runners.
 struct SharedResources
 {
-    //! One HybridCacheManager per engine (index 0 = base, 1 = draft for EAGLE).
+    //! One HybridCacheManager per engine (index 0 = base, 1 = draft for SpecDecode).
     //! unique_ptr because HybridCacheManager is move-only.
     std::vector<std::unique_ptr<HybridCacheManager>> cacheManagers;
 
@@ -80,7 +80,7 @@ struct SharedResources
     static std::unique_ptr<SharedResources> createForLLM(LLMEngineConfig const& cfg,
         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
 
-    //! Build SharedResources for the EAGLE two-engine speculative-decoding runtime
+    //! Build SharedResources for a two-engine speculative-decoding runtime
     //! (base + draft KV caches, shared RoPE pool, LoRA manager, external weight
     //! manager, zero buffer).
     //!
@@ -88,8 +88,9 @@ struct SharedResources
     //! constructed by this factory, and the runtime must load files, validate
     //! against the base engine, and publish it to a TensorMap. External weights
     //! currently apply to the base engine only.
-    static std::unique_ptr<SharedResources> createForEagle(DeploymentConfig const& bundle, int32_t maxRuntimeBatchSize,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+    static std::unique_ptr<SharedResources> createForSpecDecode(DeploymentConfig const& bundle,
+        int32_t maxRuntimeBatchSize, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+        cudaStream_t stream);
 };
 
 void allocateZeroBuffer(SharedResources& res, int64_t bytes);

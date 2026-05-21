@@ -30,14 +30,15 @@ using Json = nlohmann::json;
 namespace
 {
 
-//! Base config JSON with optional EAGLE fields. If `eagleMaxVerifyTreeSize`
-//! is > 0, the config enables EAGLE and writes `max_verify_tree_size`.
+//! Base config JSON with optional SpecDecode fields. If `specDecodeMaxVerifyTreeSize`
+//! is > 0, the config enables SpecDecode and writes `max_verify_tree_size`.
 //!
 //! Note: `max_draft_tree_size` is draft-only and is not written on the base
-//! side (the builder only emits it when `eagleDraft` is set). The
-//! `eagleMaxDraftTreeSize` parameter is accepted for parallelism with
+//! side (the builder only emits it when `specDecodeDraft` is set). The
+//! `specDecodeMaxDraftTreeSize` parameter is accepted for parallelism with
 //! `makeDraftConfig` in call sites but intentionally ignored here.
-Json makeBaseConfig(int32_t eagleMaxVerifyTreeSize = 0, int32_t /*eagleMaxDraftTreeSize*/ = 0, int32_t maxBatchSize = 2)
+Json makeBaseConfig(
+    int32_t specDecodeMaxVerifyTreeSize = 0, int32_t /*specDecodeMaxDraftTreeSize*/ = 0, int32_t maxBatchSize = 2)
 {
     Json config;
     config["num_hidden_layers"] = 12;
@@ -52,10 +53,11 @@ Json makeBaseConfig(int32_t eagleMaxVerifyTreeSize = 0, int32_t /*eagleMaxDraftT
     bc["max_input_len"] = 128;
     bc["max_kv_cache_capacity"] = 256;
     bc["max_lora_rank"] = 0;
-    if (eagleMaxVerifyTreeSize > 0)
+    if (specDecodeMaxVerifyTreeSize > 0)
     {
+        config["model_type"] = "eagle3_base";
         bc["eagle_base"] = true;
-        bc["max_verify_tree_size"] = eagleMaxVerifyTreeSize;
+        bc["max_verify_tree_size"] = specDecodeMaxVerifyTreeSize;
     }
     else
     {
@@ -68,7 +70,7 @@ Json makeBaseConfig(int32_t eagleMaxVerifyTreeSize = 0, int32_t /*eagleMaxDraftT
 //! Draft config JSON. Mirrors `parseDraftEngineConfig`'s expected schema.
 //!
 //! Note: `max_verify_tree_size` is base-only and is not written on the draft
-//! side (the builder only emits it when `eagleBase` is set). The
+//! side (the builder only emits it when `specDecodeBase` is set). The
 //! `maxVerifyTreeSize` parameter is accepted for parallelism with
 //! `makeBaseConfig` but intentionally ignored here.
 Json makeDraftConfig(int32_t /*maxVerifyTreeSize*/, int32_t maxDraftTreeSize, int32_t maxBatchSize = 2)
@@ -122,12 +124,12 @@ TEST_F(DeploymentConfigTest, VanillaBundle)
     DeploymentConfig bundle = createDeploymentConfig(basePath, std::nullopt, std::nullopt);
 
     EXPECT_EQ(bundle.base.hiddenSize, baseJson["hidden_size"].get<int32_t>());
-    EXPECT_FALSE(bundle.base.enableEagleSpecDecode);
+    EXPECT_FALSE(bundle.base.isSpecDecodeBase);
     EXPECT_FALSE(bundle.draft.has_value());
-    EXPECT_FALSE(bundle.eagle.has_value());
+    EXPECT_FALSE(bundle.specConfig.has_value());
 }
 
-TEST_F(DeploymentConfigTest, EagleBundle)
+TEST_F(DeploymentConfigTest, SpecDecodeBundle)
 {
     // Base + draft + drafting with valid values → succeeds, all fields populated.
     Json const baseJson = makeBaseConfig(/*maxVerify=*/16, /*maxDraft=*/16);
@@ -135,21 +137,21 @@ TEST_F(DeploymentConfigTest, EagleBundle)
     auto const basePath = writeJsonToTempFile(baseJson, "base");
     auto const draftPath = writeJsonToTempFile(draftJson, "draft");
 
-    EagleDraftingConfig drafting{};
+    SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 4;
-    drafting.draftingStep = 4;   // draftingStep * draftingTopK = 16 <= 16
-    drafting.verifyTreeSize = 8; // 8 <= 16
+    drafting.draftingStep = 4; // draftingStep * draftingTopK = 16 <= 16
+    drafting.verifySize = 8;   // 8 <= 16
 
     DeploymentConfig bundle = createDeploymentConfig(
-        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<EagleDraftingConfig>{drafting});
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
 
-    EXPECT_TRUE(bundle.base.enableEagleSpecDecode);
+    EXPECT_TRUE(bundle.base.isSpecDecodeBase);
     ASSERT_TRUE(bundle.draft.has_value());
-    // Draft engines set enableEagleSpecDecode=false (they ARE the draft, not the base).
+    // Draft engines set isSpecDecodeBase=false (they ARE the draft, not the base).
     // Presence of a draft engine is indicated by maxDraftTreeSize > 0.
-    EXPECT_FALSE(bundle.draft->enableEagleSpecDecode);
+    EXPECT_FALSE(bundle.draft->isSpecDecodeBase);
     EXPECT_GT(bundle.draft->maxDraftTreeSize, 0);
-    ASSERT_TRUE(bundle.eagle.has_value());
+    ASSERT_TRUE(bundle.specConfig.has_value());
 
     EXPECT_EQ(bundle.base.maxVerifyTreeSize, 16);
     // `maxDraftTreeSize` is only meaningful on the draft side (see makeBaseConfig).
@@ -157,9 +159,9 @@ TEST_F(DeploymentConfigTest, EagleBundle)
     // `maxVerifyTreeSize` is only meaningful on the base side (see makeDraftConfig).
     EXPECT_EQ(bundle.draft->maxVerifyTreeSize, 0);
     EXPECT_EQ(bundle.draft->maxDraftTreeSize, 16);
-    EXPECT_EQ(bundle.eagle->verifyTreeSize, 8);
-    EXPECT_EQ(bundle.eagle->draftingStep, 4);
-    EXPECT_EQ(bundle.eagle->draftingTopK, 4);
+    EXPECT_EQ(bundle.specConfig->verifySize, 8);
+    EXPECT_EQ(bundle.specConfig->draftingStep, 4);
+    EXPECT_EQ(bundle.specConfig->draftingTopK, 4);
 }
 
 TEST_F(DeploymentConfigTest, DraftingWithoutDraftThrows)
@@ -168,30 +170,30 @@ TEST_F(DeploymentConfigTest, DraftingWithoutDraftThrows)
     Json const baseJson = makeBaseConfig(/*maxVerify=*/16, /*maxDraft=*/16);
     auto const basePath = writeJsonToTempFile(baseJson, "base");
 
-    EagleDraftingConfig drafting{};
+    SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 4;
     drafting.draftingStep = 4;
-    drafting.verifyTreeSize = 8;
+    drafting.verifySize = 8;
 
-    EXPECT_THROW(createDeploymentConfig(basePath, std::nullopt, std::optional<EagleDraftingConfig>{drafting}),
+    EXPECT_THROW(createDeploymentConfig(basePath, std::nullopt, std::optional<SpecDecodeDraftingConfig>{drafting}),
         std::runtime_error);
 }
 
 TEST_F(DeploymentConfigTest, DraftingExceedsVerifyCapacityThrows)
 {
-    // User's verifyTreeSize > base.maxVerifyTreeSize → throws.
+    // User's verifySize > base.maxVerifyTreeSize → throws.
     Json const baseJson = makeBaseConfig(/*maxVerify=*/8, /*maxDraft=*/16);
     Json const draftJson = makeDraftConfig(/*maxVerify=*/8, /*maxDraft=*/16);
     auto const basePath = writeJsonToTempFile(baseJson, "base");
     auto const draftPath = writeJsonToTempFile(draftJson, "draft");
 
-    EagleDraftingConfig drafting{};
+    SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 2;
-    drafting.draftingStep = 2;    // 2 * 2 = 4 <= 16 (OK)
-    drafting.verifyTreeSize = 16; // 16 > 8 (violation)
+    drafting.draftingStep = 2; // 2 * 2 = 4 <= 16 (OK)
+    drafting.verifySize = 16;  // 16 > 8 (violation)
 
     EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
-                     std::optional<EagleDraftingConfig>{drafting}),
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
         std::runtime_error);
 }
 
@@ -203,13 +205,13 @@ TEST_F(DeploymentConfigTest, DraftingExceedsDraftCapacityThrows)
     auto const basePath = writeJsonToTempFile(baseJson, "base");
     auto const draftPath = writeJsonToTempFile(draftJson, "draft");
 
-    EagleDraftingConfig drafting{};
+    SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 4;
     drafting.draftingStep = 4; // 4 * 4 = 16 > 8 (violation)
-    drafting.verifyTreeSize = 8;
+    drafting.verifySize = 8;
 
     EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
-                     std::optional<EagleDraftingConfig>{drafting}),
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
         std::runtime_error);
 }
 
@@ -221,17 +223,17 @@ TEST_F(DeploymentConfigTest, ConsistentBundleValidatesOk)
     auto const basePath = writeJsonToTempFile(baseJson, "base");
     auto const draftPath = writeJsonToTempFile(draftJson, "draft");
 
-    EagleDraftingConfig drafting{};
+    SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 3;
-    drafting.draftingStep = 8;    // 3 * 8 = 24 <= 24
-    drafting.verifyTreeSize = 32; // 32 <= 32
+    drafting.draftingStep = 8; // 3 * 8 = 24 <= 24
+    drafting.verifySize = 32;  // 32 <= 32
 
     DeploymentConfig bundle = createDeploymentConfig(
-        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<EagleDraftingConfig>{drafting});
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
 
-    EXPECT_TRUE(bundle.base.enableEagleSpecDecode);
+    EXPECT_TRUE(bundle.base.isSpecDecodeBase);
     EXPECT_TRUE(bundle.draft.has_value());
-    ASSERT_TRUE(bundle.eagle.has_value());
+    ASSERT_TRUE(bundle.specConfig.has_value());
     EXPECT_EQ(bundle.base.maxVerifyTreeSize, 32);
     EXPECT_EQ(bundle.draft->maxDraftTreeSize, 24);
 }
@@ -279,53 +281,53 @@ TEST_F(DeploymentConfigTest, MaxRuntimeBatchSizeMismatchReturnsMin)
 }
 
 // ===========================================================================
-// effectiveMaxDraftTreeSize()
+// effectiveMaxDraftProposalSize()
 // ===========================================================================
 
-TEST_F(DeploymentConfigTest, EffectiveMaxDraftTreeSizeEagle)
+TEST_F(DeploymentConfigTest, EffectiveMaxDraftProposalSizeSpecDecode)
 {
-    // Both engine maxDraftTreeSize (24) and user verifyTreeSize (32) contribute.
+    // Both engine maxDraftTreeSize (24) and user verifySize (32) contribute.
     // Expected: max(24, 32) = 32.
     Json const baseJson = makeBaseConfig(/*maxVerify=*/32, /*maxDraft=*/24);
     Json const draftJson = makeDraftConfig(/*maxVerify=*/32, /*maxDraft=*/24);
     auto const basePath = writeJsonToTempFile(baseJson, "base");
     auto const draftPath = writeJsonToTempFile(draftJson, "draft");
 
-    EagleDraftingConfig drafting{};
+    SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 3;
-    drafting.draftingStep = 8;    // 24
-    drafting.verifyTreeSize = 32; // 32
+    drafting.draftingStep = 8; // 24
+    drafting.verifySize = 32;  // 32
 
     DeploymentConfig bundle = createDeploymentConfig(
-        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<EagleDraftingConfig>{drafting});
-    EXPECT_EQ(bundle.effectiveMaxDraftTreeSize(), 32);
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+    EXPECT_EQ(bundle.effectiveMaxDraftProposalSize(), 32);
 }
 
-TEST_F(DeploymentConfigTest, EffectiveMaxDraftTreeSizeEngineCapacityWins)
+TEST_F(DeploymentConfigTest, EffectiveMaxDraftProposalSizeEngineCapacityWins)
 {
-    // Engine maxDraftTreeSize (16) is larger than verifyTreeSize (8).
+    // Engine maxDraftTreeSize (16) is larger than verifySize (8).
     // Expected: max(16, 8) = 16.
     Json const baseJson = makeBaseConfig(/*maxVerify=*/16, /*maxDraft=*/16);
     Json const draftJson = makeDraftConfig(/*maxVerify=*/16, /*maxDraft=*/16);
     auto const basePath = writeJsonToTempFile(baseJson, "base");
     auto const draftPath = writeJsonToTempFile(draftJson, "draft");
 
-    EagleDraftingConfig drafting{};
+    SpecDecodeDraftingConfig drafting{};
     drafting.draftingTopK = 4;
     drafting.draftingStep = 4;
-    drafting.verifyTreeSize = 8;
+    drafting.verifySize = 8;
 
     DeploymentConfig bundle = createDeploymentConfig(
-        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<EagleDraftingConfig>{drafting});
-    EXPECT_EQ(bundle.effectiveMaxDraftTreeSize(), 16);
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+    EXPECT_EQ(bundle.effectiveMaxDraftProposalSize(), 16);
 }
 
-TEST_F(DeploymentConfigTest, EffectiveMaxDraftTreeSizeNoDraftingThrows)
+TEST_F(DeploymentConfigTest, EffectiveMaxDraftProposalSizeNoDraftingThrows)
 {
     // Vanilla bundle: drafting not set → throws.
     Json const baseJson = makeBaseConfig();
     auto const basePath = writeJsonToTempFile(baseJson, "base");
 
     DeploymentConfig bundle = createDeploymentConfig(basePath, std::nullopt, std::nullopt);
-    EXPECT_THROW(bundle.effectiveMaxDraftTreeSize(), std::runtime_error);
+    EXPECT_THROW(bundle.effectiveMaxDraftProposalSize(), std::runtime_error);
 }

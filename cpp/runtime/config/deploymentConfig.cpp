@@ -51,23 +51,33 @@ int32_t DeploymentConfig::maxRuntimeBatchSize() const
     return std::min(baseMax, draftMax);
 }
 
-int32_t DeploymentConfig::effectiveMaxDraftTreeSize() const
+int32_t DeploymentConfig::effectiveMaxDraftProposalSize() const
 {
-    ELLM_CHECK(eagle.has_value(),
-        "effectiveMaxDraftTreeSize: eagle configuration is not set. "
-        "This method is EAGLE-only; guard the call with eagle.has_value().");
-    return std::max(eagle->maxDraftTreeSize, eagle->verifyTreeSize);
+    ELLM_CHECK(specConfig.has_value(),
+        "effectiveMaxDraftProposalSize: speculative decoding configuration is not set. "
+        "Guard the call with specConfig.has_value().");
+    return std::max(specConfig->maxDraftProposalSize, specConfig->verifySize);
+}
+
+SpecDecodeMode DeploymentConfig::specDecodeMode() const noexcept
+{
+    if (!draft.has_value() || !specConfig.has_value())
+    {
+        return SpecDecodeMode::kNONE;
+    }
+    return base.specDecodeType;
 }
 
 DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigPath,
-    std::optional<std::filesystem::path> const& draftConfigPath, std::optional<EagleDraftingConfig> const& drafting)
+    std::optional<std::filesystem::path> const& draftConfigPath,
+    std::optional<SpecDecodeDraftingConfig> const& draftingConfig)
 {
     DeploymentConfig cfg;
 
     // --- Structural precondition: drafting cannot be set without draft ---
-    ELLM_CHECK(!drafting.has_value() || draftConfigPath.has_value(),
+    ELLM_CHECK(!draftingConfig.has_value() || draftConfigPath.has_value(),
         "drafting configuration was provided but no draftConfigPath was set. "
-        "An EAGLE drafting tree topology requires a draft engine config.");
+        "SpecDecode drafting requires a draft engine config.");
 
     // --- Parse base ---
     cfg.base = parseEngineConfig(baseConfigPath);
@@ -79,14 +89,14 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
     }
 
     // No cross-engine consistency check needed: each engine's builder_config
-    // carries only its own tree-size budget. The base emits
+    // carries only its own sequence budget. The base emits
     // `max_verify_tree_size` (its verification budget); the draft emits
     // `max_draft_tree_size` (its proposal budget). There are no capacity
     // fields shared across the two configs, so there is nothing to
     // cross-check. Consumers read each field from the owning side.
 
-    // --- Build consolidated EagleConfig and validate topology ---
-    if (drafting.has_value())
+    // --- Build consolidated SpecDecodeConfig and validate drafting limits ---
+    if (draftingConfig.has_value())
     {
         // Positivity: each drafting field must be >= 1. Rejecting zero/negative
         // up front lets downstream arithmetic (the topK * step multiply below)
@@ -96,39 +106,39 @@ DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigP
             ELLM_CHECK(
                 value > 0, std::string("drafting.") + name + "=" + std::to_string(value) + " must be positive (>= 1).");
         };
-        requirePositiveField(drafting->draftingTopK, "draftingTopK");
-        requirePositiveField(drafting->draftingStep, "draftingStep");
-        requirePositiveField(drafting->verifyTreeSize, "verifyTreeSize");
+        requirePositiveField(draftingConfig->draftingTopK, "draftingTopK");
+        requirePositiveField(draftingConfig->draftingStep, "draftingStep");
+        requirePositiveField(draftingConfig->verifySize, "verifySize");
 
-        EagleConfig eagle;
+        SpecDecodeConfig specConfig;
         // baseOutputHiddenDim comes from the draft config's `base_model_hidden_size`
         // (= base.hiddenSize * 3 for EAGLE-3, = base.hiddenSize for MTP). Don't
         // derive from base.hiddenSize directly — that's correct only for EAGLE-3.
-        eagle.baseOutputHiddenDim = cfg.draft->baseModelHiddenSize;
-        eagle.draftHiddenSize = cfg.draft->hiddenSize;
-        eagle.maxVerifyTreeSize = cfg.base.maxVerifyTreeSize;
-        eagle.maxDraftTreeSize = cfg.draft->maxDraftTreeSize;
-        eagle.draftingTopK = drafting->draftingTopK;
-        eagle.draftingStep = drafting->draftingStep;
-        eagle.verifyTreeSize = drafting->verifyTreeSize;
+        specConfig.baseOutputHiddenDim = cfg.draft->baseModelHiddenSize;
+        specConfig.draftHiddenSize = cfg.draft->hiddenSize;
+        specConfig.maxVerifySize = cfg.base.maxVerifyTreeSize;
+        specConfig.maxDraftProposalSize = cfg.draft->maxDraftTreeSize;
+        specConfig.draftingTopK = draftingConfig->draftingTopK;
+        specConfig.draftingStep = draftingConfig->draftingStep;
+        specConfig.verifySize = draftingConfig->verifySize;
 
         // In practice both `draftingStep` and `draftingTopK` are <= ~64 (bounded
-        // downstream by `maxDraftTreeSize`, which is tens, not millions), so
+        // downstream by `maxDraftProposalSize`, which is tens, not millions), so
         // int32 multiplication is overflow-safe; keeping it in int32 avoids
         // widening noise.
-        int32_t const requiredDraftInputSize = eagle.draftingStep * eagle.draftingTopK;
+        int32_t const requiredDraftInputSize = specConfig.draftingStep * specConfig.draftingTopK;
 
-        ELLM_CHECK(requiredDraftInputSize <= eagle.maxDraftTreeSize,
-            "drafting.draftingStep=" + std::to_string(eagle.draftingStep) + " * drafting.draftingTopK="
-                + std::to_string(eagle.draftingTopK) + " = " + std::to_string(requiredDraftInputSize)
-                + " exceeds draft.maxDraftTreeSize=" + std::to_string(eagle.maxDraftTreeSize)
-                + ". Drafting configuration exceeds engine draft tree size capability.");
-        ELLM_CHECK(eagle.verifyTreeSize <= eagle.maxVerifyTreeSize,
-            "drafting.verifyTreeSize=" + std::to_string(eagle.verifyTreeSize)
-                + " exceeds base.maxVerifyTreeSize=" + std::to_string(eagle.maxVerifyTreeSize)
-                + ". Verify tree size exceeds base engine maximum verify tree size.");
+        ELLM_CHECK(requiredDraftInputSize <= specConfig.maxDraftProposalSize,
+            "drafting.draftingStep=" + std::to_string(specConfig.draftingStep) + " * drafting.draftingTopK="
+                + std::to_string(specConfig.draftingTopK) + " = " + std::to_string(requiredDraftInputSize)
+                + " exceeds draft.maxDraftTreeSize=" + std::to_string(specConfig.maxDraftProposalSize)
+                + ". Drafting configuration exceeds engine proposal size capability.");
+        ELLM_CHECK(specConfig.verifySize <= specConfig.maxVerifySize,
+            "drafting.verifySize=" + std::to_string(specConfig.verifySize)
+                + " exceeds base.maxVerifyTreeSize=" + std::to_string(specConfig.maxVerifySize)
+                + ". Verification size exceeds base engine maximum verification size.");
 
-        cfg.eagle = eagle;
+        cfg.specConfig = specConfig;
     }
 
     return cfg;

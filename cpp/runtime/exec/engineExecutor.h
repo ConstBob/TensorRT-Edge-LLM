@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -57,15 +58,15 @@ public:
     //! @brief Destructor — destroys all captured CUDA graphs.
     ~EngineExecutor() noexcept;
 
-    //! Build a EngineExecutor for a vanilla single-engine LLM (and for the base
-    //! engine in an EAGLE deployment). The factory builds the TensorRegistry
-    //! internally via `buildRegistryForLLM(cfg)`.
-    static std::unique_ptr<EngineExecutor> createForLLM(
-        std::filesystem::path const& enginePath, LLMEngineConfig const& cfg);
+    //! Build an EngineExecutor for a vanilla single-engine LLM or a SpecDecode
+    //! base engine. The factory builds the TensorRegistry internally via
+    //! `buildRegistryForLLM(cfg)`.
+    static std::unique_ptr<EngineExecutor> createForLLM(std::filesystem::path const& enginePath,
+        LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim = std::nullopt);
 
-    //! Build a EngineExecutor for the EAGLE draft engine. The factory builds the
-    //! TensorRegistry internally via `buildRegistryForEagleDraft(bundle)`.
-    static std::unique_ptr<EngineExecutor> createForEagleDraft(
+    //! Build an EngineExecutor for the SpecDecode draft engine. The factory builds the
+    //! TensorRegistry internally via `buildRegistryForSpecDecodeDraft(bundle)`.
+    static std::unique_ptr<EngineExecutor> createForSpecDecodeDraft(
         std::filesystem::path const& enginePath, DeploymentConfig const& bundle);
 
     EngineExecutor(EngineExecutor const&) = delete;
@@ -149,7 +150,7 @@ private:
      * Reads the engine, creates an IRuntime, deserializes the engine,
      * and creates an IExecutionContext with USER_MANAGED allocation.
      *
-     * Private — use `createForLLM` / `createForEagleDraft` factories.
+     * Private — use `createForLLM` / `createForSpecDecodeDraft` factories.
      *
      * @param enginePath Path to the serialized TRT engine file
      * @param registry TensorRegistry describing the binding layout

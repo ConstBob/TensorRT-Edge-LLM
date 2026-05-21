@@ -61,7 +61,7 @@ void allocateDeepstackEmbeds(
     }
 }
 
-void allocateEagleHiddenStates(PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t baseHiddenDim,
+void allocateSpecDecodeHiddenStates(PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t baseHiddenDim,
     int32_t draftHiddenDim, nvinfer1::DataType dtype)
 {
     io.baseHiddenStates
@@ -161,7 +161,7 @@ void buildTensorMap(
             map.set(binding_names::formatConvStateName(localMambaIdx, /*isPast=*/false), conv);
             // MTP base only: bind the per-layer intermediate state outputs.
             // `hasIntermediateRecurrentStates()` is true iff the MambaCacheManager
-            // was built with `maxIntermediateSeqLen > 0` (set by createForEagle
+            // was built with `maxIntermediateSeqLen > 0` (set by createForSpecDecode
             // for hybrid MTP bases). EAGLE3 base lacks recurrent layers entirely,
             // so this branch wouldn't fire for it regardless.
             if (mambaMgr.hasIntermediateRecurrentStates())
@@ -198,12 +198,12 @@ void buildTensorMap(
         map.set(binding_names::formatDeepstackEmbedsName(static_cast<int32_t>(i)), res.zeroBuffer);
     }
 
-    // Hidden states output. EAGLE writes its layer-N output into baseHiddenStates
-    // (shape uses baseOutputHiddenDim, EAGLE-specific). The vanilla LLM path uses
+    // Hidden states output. SpecDecode base engines write their target features
+    // into baseHiddenStates. The vanilla LLM path uses
     // outputHiddenStates instead (shape uses cfg.hiddenSize). Either or neither is
     // bound here; the engine introspection in EngineExecutor::prepare() will set
     // the address only if the engine actually exposes the binding.
-    if (cfg.enableEagleSpecDecode && !io.baseHiddenStates.isEmpty())
+    if (cfg.isSpecDecodeBase && !io.baseHiddenStates.isEmpty())
     {
         map.set(binding_names::kOutputHiddenStates, io.baseHiddenStates);
     }
@@ -212,14 +212,14 @@ void buildTensorMap(
         map.set(binding_names::kOutputHiddenStates, io.outputHiddenStates);
     }
 
-    // EAGLE base-engine verification bindings. The base engine's verification
+    // SpecDecode base-engine verification bindings. The base engine's verification
     // profile (also reused during prefill/decode via the dummy [B, 1, 1] shape)
     // reads the packed attention mask and position IDs. For vanilla LLMs these
     // tensors are empty and the bindings are not set.
-    if (cfg.enableEagleSpecDecode && !io.packedAttentionMask.isEmpty())
+    if (cfg.isSpecDecodeBase && !io.packedAttentionMask.isEmpty())
     {
         map.set(binding_names::kAttentionMask, io.packedAttentionMask);
-        map.set(binding_names::kAttentionPosId, io.eaglePositionIds);
+        map.set(binding_names::kAttentionPosId, io.specDecodePositionIds);
     }
 
     // LoRA bindings are NOT set here because adapter tensor names may differ
@@ -227,7 +227,7 @@ void buildTensorMap(
     // populates them after buildTensorMap().
 }
 
-void buildTensorMapForEagleDraft(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg)
+void buildTensorMapForSpecDecodeDraft(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg)
 {
     // Reuse the shared buildTensorMap for common bindings (core I/O, RoPE,
     // KV cache, kvcache_start_index). Draft engine uses kvCacheIndex=1.
@@ -236,17 +236,17 @@ void buildTensorMapForEagleDraft(TensorMap& map, PipelineIO& io, SharedResources
     // Draft-specific hidden-state bindings: the base model's hidden states feed
     // the draft engine as input; the draft engine produces its own hidden states
     // on output (the kOutputHiddenStates entry added by buildTensorMap —
-    // gated on cfg.enableEagleSpecDecode which is false for the draft config —
+    // gated on cfg.isSpecDecodeBase which is false for the draft config —
     // is overridden here regardless).
     map.set(binding_names::kBaseModelHiddenStates, io.baseHiddenStates);
     map.set(binding_names::kDraftModelHiddenStates, io.draftHiddenStatesIn);
     map.set(binding_names::kOutputHiddenStates, io.draftHiddenStatesOut);
 
-    // Attention mask and position IDs for tree decoding. The TRT engine expects
+    // Attention mask and position IDs for proposal decoding. The TRT engine expects
     // the INT32 packed mask (not the INT8 unpacked one). Position IDs are written
-    // by prepareEagle*Inputs kernels before each execute.
+    // by proposal/verify input preparation kernels before each execute.
     map.set(binding_names::kAttentionMask, io.packedAttentionMask);
-    map.set(binding_names::kAttentionPosId, io.eaglePositionIds);
+    map.set(binding_names::kAttentionPosId, io.specDecodePositionIds);
 }
 
 PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream)
@@ -282,34 +282,36 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
     return io;
 }
 
-PipelineIO PipelineIO::createForEagle(DeploymentConfig const& bundle, int32_t maxRuntimeBatchSize, cudaStream_t stream)
+PipelineIO PipelineIO::createForSpecDecode(
+    DeploymentConfig const& bundle, int32_t maxRuntimeBatchSize, cudaStream_t stream)
 {
-    check::check(bundle.draft.has_value(), "PipelineIO::createForEagle requires DeploymentConfig.draft to be set");
-    check::check(bundle.eagle.has_value(), "PipelineIO::createForEagle requires DeploymentConfig.eagle to be set");
+    check::check(bundle.draft.has_value(), "PipelineIO::createForSpecDecode requires DeploymentConfig.draft to be set");
+    check::check(bundle.specConfig.has_value(),
+        "PipelineIO::createForSpecDecode requires DeploymentConfig.specConfig to be set");
 
     PipelineIO io;
 
-    int32_t const maxDraftTreeSize = bundle.eagle->maxDraftTreeSize;
-    int32_t const draftHiddenSize = bundle.eagle->draftHiddenSize;
-    int32_t const baseOutputHiddenDim = bundle.eagle->baseOutputHiddenDim;
+    int32_t const maxDraftProposalSize = bundle.specConfig->maxDraftProposalSize;
+    int32_t const draftHiddenSize = bundle.specConfig->draftHiddenSize;
+    int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
     int32_t const draftVocabSize = bundle.draft->vocabSize;
 
     // Use max of base and draft dimensions for shared tensors
     int32_t const maxInputLength = std::max(bundle.base.maxSupportedInputLength, bundle.draft->maxSupportedInputLength);
-    int32_t const effectiveMaxDraftTreeSize = std::max(maxDraftTreeSize, bundle.eagle->verifyTreeSize);
-    int32_t const maxLogitsSize = maxRuntimeBatchSize * effectiveMaxDraftTreeSize;
+    int32_t const effectiveMaxDraftProposalSize = std::max(maxDraftProposalSize, bundle.specConfig->verifySize);
+    int32_t const maxLogitsSize = maxRuntimeBatchSize * effectiveMaxDraftProposalSize;
     int32_t const maxVocabSize = std::max(bundle.base.outputVocabSize, draftVocabSize);
 
     allocateBasicIO(
         io, maxRuntimeBatchSize, maxInputLength, bundle.base.hiddenSize, maxVocabSize, nvinfer1::DataType::kHALF);
 
-    // Override outputLogits to support tree-sized outputs: [maxLogitsSize, maxVocabSize].
-    // dtype is kFLOAT (matching allocateBasicIO); only the shape changes for EAGLE.
+    // Override outputLogits to support proposal-sized outputs: [maxLogitsSize, maxVocabSize].
+    // dtype is kFLOAT (matching allocateBasicIO); only the shape changes for SpecDecode.
     io.outputLogits = rt::Tensor(
         {maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
 
-    // Allocate hidden states for EAGLE
-    allocateEagleHiddenStates(
+    // Allocate hidden states for SpecDecode.
+    allocateSpecDecodeHiddenStates(
         io, maxRuntimeBatchSize, maxInputLength, baseOutputHiddenDim, draftHiddenSize, nvinfer1::DataType::kHALF);
 
     if (bundle.base.numDeepstackFeatures > 0)
@@ -327,22 +329,23 @@ PipelineIO PipelineIO::createForEagle(DeploymentConfig const& bundle, int32_t ma
             bundle.base.rotaryDim, bundle.base.maxKVCacheCapacity, maxRuntimeBatchSize, stream);
     }
 
-    // EAGLE-specific engine I/O: packed attention mask, position IDs, and a
-    // tree-sized selectTokenIndices override (the default allocateBasicIO gives
-    // [maxBatch, 1], but tree decoding needs up to [maxBatch,
-    // effectiveMaxDraftTreeSize]). Zero-initialise the mask buffer so the
+    // SpecDecode-specific engine I/O: packed attention mask, position IDs, and a
+    // proposal-sized selectTokenIndices override (the default allocateBasicIO gives
+    // [maxBatch, 1], but verification needs up to [maxBatch,
+    // effectiveMaxDraftProposalSize]). Zero-initialise the mask buffer so the
     // [B, 1, 1] dummy reshape during prefill/decode sees known-zero bytes.
-    int64_t const packedMaskLen = static_cast<int64_t>(divUp(effectiveMaxDraftTreeSize, 32));
-    io.packedAttentionMask = Tensor({maxRuntimeBatchSize, effectiveMaxDraftTreeSize, packedMaskLen}, DeviceType::kGPU,
-        nvinfer1::DataType::kINT32, "PipelineIO::packedAttentionMask");
+    int64_t const packedMaskLen = static_cast<int64_t>(divUp(effectiveMaxDraftProposalSize, 32));
+    io.packedAttentionMask = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize, packedMaskLen},
+        DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::packedAttentionMask");
     CUDA_CHECK(
         cudaMemsetAsync(io.packedAttentionMask.rawPointer(), 0, io.packedAttentionMask.getMemoryCapacity(), stream));
 
-    io.eaglePositionIds = Tensor({maxRuntimeBatchSize, effectiveMaxDraftTreeSize}, DeviceType::kGPU,
-        nvinfer1::DataType::kINT32, "PipelineIO::eaglePositionIds");
-    CUDA_CHECK(cudaMemsetAsync(io.eaglePositionIds.rawPointer(), 0, io.eaglePositionIds.getMemoryCapacity(), stream));
+    io.specDecodePositionIds = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,
+        nvinfer1::DataType::kINT32, "PipelineIO::specDecodePositionIds");
+    CUDA_CHECK(cudaMemsetAsync(
+        io.specDecodePositionIds.rawPointer(), 0, io.specDecodePositionIds.getMemoryCapacity(), stream));
 
-    io.selectTokenIndices = Tensor({maxRuntimeBatchSize, effectiveMaxDraftTreeSize}, DeviceType::kGPU,
+    io.selectTokenIndices = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,
         nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
     CUDA_CHECK(
         cudaMemsetAsync(io.selectTokenIndices.rawPointer(), 0, io.selectTokenIndices.getMemoryCapacity(), stream));

@@ -29,33 +29,33 @@ namespace rt
 {
 
 /*!
- * @brief User-supplied drafting tree topology for Eagle speculative decoding.
+ * @brief User-supplied drafting parameters for speculative decoding.
  *
  * Caller-side input to `createDeploymentConfig`. The factory consumes this
  * together with the parsed engine configs to produce the consolidated
- * `EagleConfig` stored on `DeploymentConfig::eagle`.
+ * `SpecDecodeConfig` stored on `DeploymentConfig::specConfig`.
  */
-struct EagleDraftingConfig
+struct SpecDecodeDraftingConfig
 {
-    int32_t draftingTopK{0};   //!< Tokens to select from one predecessor for next draft tree level
-    int32_t draftingStep{0};   //!< Number of drafting steps with draft model
-    int32_t verifyTreeSize{0}; //!< Number of tokens for base model verification
+    int32_t draftingTopK{0}; //!< Tokens to select from one predecessor during draft expansion
+    int32_t draftingStep{0}; //!< Number of drafting steps with draft model
+    int32_t verifySize{0};   //!< Number of proposal tokens for base model verification
 };
 
 /*!
- * @brief Consolidated EAGLE deployment configuration.
+ * @brief Consolidated speculative decoding deployment configuration.
  *
- * Holds every EAGLE-specific value the runtime needs in one place, sourced
+ * Holds every draft/verify speculative decoding value the runtime needs in one place, sourced
  * from three inputs:
- *   - the base engine's parsed config (`baseOutputHiddenDim`, `maxVerifyTreeSize`),
- *   - the draft engine's parsed config (`draftHiddenSize`, `maxDraftTreeSize`),
- *   - the caller-supplied `EagleDraftingConfig` tree topology
- *     (`draftingTopK`, `draftingStep`, `verifyTreeSize`).
+ *   - the base engine's parsed config (`baseOutputHiddenDim`, `maxVerifySize`),
+ *   - the draft engine's parsed config (`draftHiddenSize`, `maxDraftProposalSize`),
+ *   - the caller-supplied `SpecDecodeDraftingConfig` drafting parameters
+ *     (`draftingTopK`, `draftingStep`, `verifySize`).
  *
  * `createDeploymentConfig` populates this struct after both engine configs
- * are parsed and validates the topology against the engine capacities.
+ * are parsed and validates the requested drafting shape against the engine capacities.
  */
-struct EagleConfig
+struct SpecDecodeConfig
 {
     // --- Engine-derived capacities ---
     //! Base engine output hidden dim as seen by the draft (= the third dim of
@@ -63,54 +63,61 @@ struct EagleConfig
     //! config's `base_model_hidden_size`: `base.hiddenSize * 3` for EAGLE-3,
     //! `base.hiddenSize` for MTP. NOT a `base.hiddenSize * 3` derivation.
     int32_t baseOutputHiddenDim{};
-    int32_t draftHiddenSize{};   //!< Draft engine hidden dim (= draft.hiddenSize)
-    int32_t maxVerifyTreeSize{}; //!< Max seq_len the base engine accepts for tree verification
-    int32_t maxDraftTreeSize{};  //!< Max seq_len the draft engine accepts for proposal / draft generation
+    //! Draft engine hidden dim (= draft.hiddenSize). Shared across all
+    //! spec-decode strategies; the actual value differs per strategy (EAGLE-3
+    //! draft has its own independent hidden size; MTP draft equals base hidden size).
+    int32_t draftHiddenSize{};
+    int32_t maxVerifySize{};        //!< Max seq_len the base engine accepts for proposal verification
+    int32_t maxDraftProposalSize{}; //!< Max seq_len the draft engine accepts for proposal generation
 
-    // --- User-supplied tree topology ---
-    int32_t draftingTopK{};   //!< Tokens to select from one predecessor for next draft tree level
-    int32_t draftingStep{};   //!< Number of drafting steps with draft model
-    int32_t verifyTreeSize{}; //!< Number of tokens for base model verification
+    // --- User-supplied drafting parameters ---
+    int32_t draftingTopK{}; //!< Tokens to select from one predecessor during draft expansion
+    int32_t draftingStep{}; //!< Number of drafting steps with draft model
+    int32_t verifySize{};   //!< Number of proposal tokens for base model verification
 };
 
-//! Complete EAGLE deployment configuration: the base engine's config, the
-//! draft engine's config, and the consolidated EAGLE settings.
+//! Complete deployment configuration: the base engine's config, optional draft
+//! engine config, and optional consolidated speculative decoding settings.
 //!
-//! For non-EAGLE deployments `draft` and `eagle` are both absent.
-//! When `eagle` is present `draft` must also be present — the factory
+//! For non-speculative deployments `draft` and `specConfig` are both absent.
+//! When `specConfig` is present `draft` must also be present — the factory
 //! enforces this invariant.
 struct DeploymentConfig
 {
-    LLMEngineConfig base;                 //!< Parsed base engine configuration
-    std::optional<LLMEngineConfig> draft; //!< Parsed draft engine configuration (EAGLE only)
-    std::optional<EagleConfig> eagle;     //!< Consolidated EAGLE settings (EAGLE only)
+    LLMEngineConfig base;                       //!< Parsed base engine configuration
+    std::optional<LLMEngineConfig> draft;       //!< Parsed draft engine configuration
+    std::optional<SpecDecodeConfig> specConfig; //!< Consolidated speculative decoding settings
 
     //! Maximum runtime batch size across the bundle. Returns the base engine's
     //! `maxSupportedBatchSize` when there is no draft; otherwise returns the
     //! `min` of base and draft. Logs a warning if base and draft disagree.
     int32_t maxRuntimeBatchSize() const;
 
-    //! Effective maximum EAGLE tree size across drafting and verification.
-    //! Returns `max(eagle->maxDraftTreeSize, eagle->verifyTreeSize)`.
-    //! EAGLE-only — throws `std::runtime_error` if `eagle` is not set.
-    int32_t effectiveMaxDraftTreeSize() const;
+    //! Effective maximum proposal size across drafting and verification.
+    //! Returns `max(specConfig->maxDraftProposalSize, specConfig->verifySize)`.
+    //! Speculative decode only — throws `std::runtime_error` if `specConfig` is not set.
+    int32_t effectiveMaxDraftProposalSize() const;
+
+    //! Return the concrete speculative decoding mode declared by the engine bundle.
+    SpecDecodeMode specDecodeMode() const noexcept;
 };
 
 //! Create a `DeploymentConfig` from engine config paths and optional user-side drafting.
 //!
 //! - Parses `baseConfigPath` via `parseEngineConfig`.
 //! - If `draftConfigPath` is set, parses it via `parseDraftEngineConfig`.
-//! - If `drafting` is set, `draftConfigPath` must also be set (else throws).
-//! - If `drafting` is set, builds `eagle` by combining the engines' EAGLE
-//!   capacities with the user-supplied topology, and validates the topology
+//! - If `draftingConfig` is set, `draftConfigPath` must also be set (else throws).
+//! - If `draftingConfig` is set, builds `specConfig` by combining the engines'
+//!   capacities with the user-supplied drafting parameters, and validates them
 //!   against the engines' capacities:
-//!     - `eagle->verifyTreeSize <= eagle->maxVerifyTreeSize`
-//!     - `eagle->draftingStep * eagle->draftingTopK <= eagle->maxDraftTreeSize`
+//!     - `specConfig->verifySize <= specConfig->maxVerifySize`
+//!     - `specConfig->draftingStep * specConfig->draftingTopK <= specConfig->maxDraftProposalSize`
 //!   Throws with named-fields message on violation.
 //!
 //! @throws std::runtime_error on any validation failure or parse failure.
 DeploymentConfig createDeploymentConfig(std::filesystem::path const& baseConfigPath,
-    std::optional<std::filesystem::path> const& draftConfigPath, std::optional<EagleDraftingConfig> const& drafting);
+    std::optional<std::filesystem::path> const& draftConfigPath,
+    std::optional<SpecDecodeDraftingConfig> const& draftingConfig);
 
 } // namespace rt
 } // namespace trt_edgellm

@@ -91,12 +91,22 @@ nvinfer1::DataType parseStateDtype(std::string const& token, char const* fieldNa
         + "'. Allowed values: fp16, fp8, int8, bf16, fp32. Re-export the engine with a supported value.");
 }
 
+//! Parse a required dtype field. Throws if the field is missing — all current
+//! exports (>= 0.7.0) write dtype fields explicitly to config.json.
+void parseRequiredStateDtype(Json const& json, char const* key, nvinfer1::DataType& out)
+{
+    ELLM_CHECK(json.contains(key),
+        std::string("parseEngineConfig: config.json missing required field '") + key
+            + "'. Re-export the model with the latest llm_export.py to record it.");
+    out = parseStateDtype(json[key].get<std::string>(), key);
+}
+
 //! Fields shared by base and draft engines. Parses top-level model dims and
 //! dtypes (kv_cache_dtype lives at top level — it is a property of the
 //! exported weights written by the Python export step, not a builder knob;
 //! the C++ builder never emits it inside builder_config). Also parses the
 //! common builder_config batch/input/kv limits and RoPE configuration.
-//! Engine-type-specific fields (reduced vocab, hybrid state, EAGLE
+//! Engine-type-specific fields (reduced vocab, hybrid state, SpecDecode
 //! capacities, LoRA, trt_native_ops) are filled in by the calling parser
 //! around this helper.
 void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
@@ -107,9 +117,8 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     cfg.headDim = getRequired<int32_t>(configJson, "head_dim");
     cfg.hiddenSize = getRequired<int32_t>(configJson, "hidden_size");
 
-    // Top-level: kv_cache_dtype. Written by llm_export.py; carried through
-    // the C++ builder's config-copy step without modification.
-    cfg.kvCacheDtype = parseStateDtype(getRequired<std::string>(configJson, "kv_cache_dtype"), "kv_cache_dtype");
+    // Top-level: kv_cache_dtype. Required — all current exports write this.
+    parseRequiredStateDtype(configJson, "kv_cache_dtype", cfg.kvCacheDtype);
 
     // builder_config: required batch / input / kv limits.
     ELLM_CHECK(configJson.contains("builder_config"), "parseEngineConfig: missing required 'builder_config' section");
@@ -239,6 +248,17 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
 
     LLMEngineConfig cfg;
 
+    // Parse speculative decoding type from model_type field.
+    std::string const modelType = configJson.value("model_type", "");
+    if (modelType == "mtp_base" || modelType == "mtp_draft")
+    {
+        cfg.specDecodeType = SpecDecodeMode::kMTP;
+    }
+    else if (modelType == "eagle3_base" || modelType == "eagle3_draft")
+    {
+        cfg.specDecodeType = SpecDecodeMode::kEAGLE;
+    }
+
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
     parseCoreFields(configJson, cfg);
@@ -264,7 +284,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
-    cfg.enableEagleSpecDecode = bc.value("eagle_base", false);
+    cfg.isSpecDecodeBase = (cfg.specDecodeType != SpecDecodeMode::kNONE);
 
     // Recurrent / conv state dtypes are only meaningful for hybrid engines
     // (Mamba / Nemotron-H / GDN). Mirror the Python export gating exactly:
@@ -273,10 +293,8 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     // written to the top level by the Python export step.
     if (cfg.numLinearAttnLayers > 0)
     {
-        cfg.recurrentStateDtype
-            = parseStateDtype(getRequired<std::string>(configJson, "recurrent_state_dtype"), "recurrent_state_dtype");
-        cfg.convStateDtype
-            = parseStateDtype(getRequired<std::string>(configJson, "conv_state_dtype"), "conv_state_dtype");
+        parseRequiredStateDtype(configJson, "recurrent_state_dtype", cfg.recurrentStateDtype);
+        parseRequiredStateDtype(configJson, "conv_state_dtype", cfg.convStateDtype);
     }
 
     // TRT native ops flag.
@@ -292,16 +310,16 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         "parseEngineConfig: invalid max_lora_rank: " + std::to_string(cfg.maxSupportedLoraRank)
             + " (must be non-negative)");
 
-    // --- EAGLE base model ---
+    // --- SpecDecode base model ---
     // `max_verify_tree_size` is the base engine's own input budget (the
-    // seq_len it accepts for tree verification), so it must be present
+    // seq_len it accepts for proposal verification), so it must be present
     // in the base's builder_config. `max_draft_tree_size` is the draft
     // engine's input budget and lives in draft_config.json; the builder
     // correctly omits it from base_config.json (see llmBuilder.h), so
     // `cfg.maxDraftTreeSize` stays at 0 on the base — consumers read the
     // authoritative value from the draft engine config (or from
-    // `DeploymentConfig::eagle`, which consolidates both sides).
-    if (cfg.enableEagleSpecDecode)
+    // `DeploymentConfig::specDecode`, which consolidates both sides).
+    if (cfg.isSpecDecodeBase)
     {
         cfg.maxVerifyTreeSize = getRequired<int32_t>(bc, "max_verify_tree_size");
         requirePositive(cfg.maxVerifyTreeSize, "max_verify_tree_size");
@@ -335,6 +353,17 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
 
     LLMEngineConfig cfg;
 
+    // Parse speculative decoding type from model_type field (draft side).
+    std::string const modelType = configJson.value("model_type", "");
+    if (modelType == "mtp_base" || modelType == "mtp_draft")
+    {
+        cfg.specDecodeType = SpecDecodeMode::kMTP;
+    }
+    else if (modelType == "eagle3_base" || modelType == "eagle3_draft")
+    {
+        cfg.specDecodeType = SpecDecodeMode::kEAGLE;
+    }
+
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
     parseCoreFields(configJson, cfg);
@@ -350,17 +379,17 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     cfg.vocabSize = configJson.value("draft_vocab_size", configJson.value("vocab_size", 0));
     cfg.outputVocabSize = cfg.vocabSize;
 
-    // EAGLE draft engines are never hybrid: no recurrent/conv dtype parse.
-    cfg.enableEagleSpecDecode = false; // This IS the draft engine, not the base.
+    // Draft engines do not own hybrid runtime cache state in this path.
+    cfg.isSpecDecodeBase = false; // This IS the draft engine, not the base.
 
     auto const& bc = configJson["builder_config"];
     // Symmetric to the base side (see parseEngineConfig): each engine's
-    // builder_config carries only its own tree-size budget. The base emits
+    // builder_config carries only its own sequence budget. The base emits
     // `max_verify_tree_size` (its verification budget); the draft emits
     // `max_draft_tree_size` (its proposal/generation budget). So the draft
     // parser only requires `max_draft_tree_size`; `cfg.maxVerifyTreeSize`
     // stays at 0 on the draft — consumers read the consolidated values
-    // from `DeploymentConfig::eagle`.
+    // from `DeploymentConfig::specDecode`.
     cfg.maxDraftTreeSize = getRequired<int32_t>(bc, "max_draft_tree_size");
     requirePositive(cfg.maxDraftTreeSize, "max_draft_tree_size");
 
@@ -394,8 +423,8 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
        << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " useTrtNativeOps=" << cfg.useTrtNativeOps << " enableEagle=" << cfg.enableEagleSpecDecode
-       << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " useTrtNativeOps=" << cfg.useTrtNativeOps << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
+       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
 
     if (cfg.numLinearAttnLayers > 0)
     {
@@ -431,10 +460,10 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     // seqLen drives the inputs_embeds / KV-write length only.
     //
     // attnMaskSeqLen and packedMaskLen are pinned to 1 (NOT derived from seqLen):
-    // the EAGLE base/draft attention plugin treats a `[B, 1, 1]` mask as a
+    // the SpecDecode base/draft attention plugin treats a `[B, 1, 1]` mask as a
     // signal to use standard causal attention and ignores the buffer contents,
     // which matches the dummy-mask binding from the pre-refactor runtime. A
-    // larger attention shape would be interpreted as a tree-attention mask
+    // larger attention shape would be interpreted as a proposal-attention mask
     // and read uninitialized buffer bits, producing garbage outputs.
     //
     // startIndexLen=0 is the plugin-path sentinel for "initial prefill of an
@@ -466,45 +495,45 @@ InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
     };
 }
 
-InferenceDims LLMEngineConfig::treeVerifyDims(int64_t batch, int64_t verifyTreeSize) const
+InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize) const
 {
-    // verifyTreeSize fans out to four fields:
-    //   seqLen, selectLen, attnMaskSeqLen (all = verifyTreeSize), and packedMaskLen.
+    // verifySize fans out to four fields:
+    //   seqLen, selectLen, attnMaskSeqLen (all = verifySize), and packedMaskLen.
     // This is the only recipe where selectLen != 1.
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/verifyTreeSize,
+        /*.seqLen=*/verifySize,
         /*.kvLen=*/maxKVCacheCapacity,
-        /*.selectLen=*/verifyTreeSize,
-        /*.attnMaskSeqLen=*/verifyTreeSize,
+        /*.selectLen=*/verifySize,
+        /*.attnMaskSeqLen=*/verifySize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
-        /*.packedMaskLen=*/static_cast<int64_t>(divUp(verifyTreeSize, 32)),
+        /*.packedMaskLen=*/static_cast<int64_t>(divUp(verifySize, 32)),
         /*.startIndexLen=*/batch,
     };
 }
 
-InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t paddedTreeSize, int64_t draftTopK) const
+InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize, int64_t draftTopK) const
 {
-    // paddedTreeSize fans out to: seqLen, attnMaskSeqLen, and packedMaskLen.
+    // proposalSize fans out to: seqLen, attnMaskSeqLen, and packedMaskLen.
     // draftTopK is selectLen — the draft proposal selects draftTopK tokens per
     // sequence (matches the draft engine's 3D logits output shape
     // [batch, draftTopK, draftVocabSize] and last_token_ids shape
     // [batch, draftTopK]).
     return InferenceDims{
         /*.batch=*/batch,
-        /*.seqLen=*/paddedTreeSize,
+        /*.seqLen=*/proposalSize,
         /*.kvLen=*/maxKVCacheCapacity,
         /*.selectLen=*/draftTopK,
-        /*.attnMaskSeqLen=*/paddedTreeSize,
+        /*.attnMaskSeqLen=*/proposalSize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
-        /*.packedMaskLen=*/static_cast<int64_t>(divUp(paddedTreeSize, 32)),
+        /*.packedMaskLen=*/static_cast<int64_t>(divUp(proposalSize, 32)),
         /*.startIndexLen=*/batch,
     };
 }
 
 InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) const
 {
-    // Precondition: acceptLen >= 1. Caller computes from EAGLE accept result in
+    // Precondition: acceptLen >= 1. Caller computes from the SpecDecode accept result in
     // [1, draftingStep+1]; a zero here would indicate a degenerate batch and
     // will be caught by EngineExecutor::prepare's field-completeness check.
     // acceptLen fans out to: seqLen, attnMaskSeqLen, and packedMaskLen.

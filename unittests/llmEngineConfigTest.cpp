@@ -31,7 +31,7 @@ using Json = nlohmann::json;
 namespace
 {
 
-//! Create a minimal valid config JSON for a base (non-EAGLE) model.
+//! Create a minimal valid config JSON for a base (non-MTP) model.
 Json makeMinimalConfig()
 {
     Json config;
@@ -118,7 +118,7 @@ TEST_F(LLMEngineConfigTest, ParseMinimalConfig)
     EXPECT_EQ(cfg.maxSupportedInputLength, 128);
     EXPECT_EQ(cfg.maxKVCacheCapacity, 256);
     EXPECT_EQ(cfg.maxSupportedLoraRank, 0);
-    EXPECT_FALSE(cfg.enableEagleSpecDecode);
+    EXPECT_FALSE(cfg.isSpecDecodeBase);
     EXPECT_FALSE(cfg.useTrtNativeOps);
     EXPECT_EQ(cfg.maxVerifyTreeSize, 0);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0);
@@ -213,9 +213,10 @@ TEST_F(LLMEngineConfigTest, MissingOptionalFieldsGetDefaults)
     EXPECT_EQ(cfg.numAttentionLayers, cfg.numDecoderLayers);
 }
 
-TEST_F(LLMEngineConfigTest, EagleMaxTreeSizes)
+TEST_F(LLMEngineConfigTest, SpecDecodeMaxProposalSizes)
 {
     Json json = makeMinimalConfig();
+    json["model_type"] = "eagle3_base";
     json["builder_config"]["eagle_base"] = true;
     json["builder_config"]["max_verify_tree_size"] = 16;
     // `max_draft_tree_size` is a draft-engine property and is not written
@@ -223,7 +224,7 @@ TEST_F(LLMEngineConfigTest, EagleMaxTreeSizes)
     auto const path = writeJsonToTempFile(json);
 
     LLMEngineConfig cfg = parseEngineConfig(path);
-    EXPECT_TRUE(cfg.enableEagleSpecDecode);
+    EXPECT_TRUE(cfg.isSpecDecodeBase);
     EXPECT_EQ(cfg.maxVerifyTreeSize, 16);
     EXPECT_EQ(cfg.maxDraftTreeSize, 0); // Base side leaves this at the default.
     // baseOutputHiddenDim = hiddenSize * 3 = 768 * 3 = 2304; computed at DeploymentConfig level
@@ -332,11 +333,12 @@ TEST_F(LLMEngineConfigTest, FormatEngineConfigDoesNotCrash)
     EXPECT_TRUE(formatted.find("LLMEngineConfig") != std::string::npos);
 }
 
-TEST_F(LLMEngineConfigTest, EagleMissingVerifyTreeSizeThrows)
+TEST_F(LLMEngineConfigTest, SpecDecodeMissingVerifyTreeSizeThrows)
 {
     Json json = makeMinimalConfig();
+    json["model_type"] = "eagle3_base";
     json["builder_config"]["eagle_base"] = true;
-    // Intentionally omit max_verify_tree_size (the only required eagle field on the base).
+    // Intentionally omit max_verify_tree_size (the only required specConfig field on the base).
     auto const path = writeJsonToTempFile(json);
 
     EXPECT_THROW(parseEngineConfig(path), std::runtime_error);
@@ -557,15 +559,15 @@ TEST(LLMEngineConfigRecipesTest, DecodeDimsMRope)
     EXPECT_EQ(d.ropeBatch, 4); // MRope → batch
 }
 
-TEST(LLMEngineConfigRecipesTest, TreeVerifyDimsIsOnlyRecipeWithSelectLenNeq1)
+TEST(LLMEngineConfigRecipesTest, SpecVerifyDimsIsOnlyRecipeWithSelectLenNeq1)
 {
     auto const cfg = makeRecipeConfig(/*maxKV=*/8192, /*mrope=*/false);
-    auto const d = cfg.treeVerifyDims(/*batch=*/1, /*verifyTreeSize=*/8);
+    auto const d = cfg.specVerifyDims(/*batch=*/1, /*verifySize=*/8);
     EXPECT_EQ(d.batch, 1);
     EXPECT_EQ(d.seqLen, 8);
     EXPECT_EQ(d.kvLen, 8192);
-    EXPECT_EQ(d.selectLen, 8);      // verifyTreeSize — unique to this recipe
-    EXPECT_EQ(d.attnMaskSeqLen, 8); // verifyTreeSize — tree attention shape
+    EXPECT_EQ(d.selectLen, 8);      // verifySize — unique to this recipe
+    EXPECT_EQ(d.attnMaskSeqLen, 8); // verifySize — proposal attention shape
     EXPECT_EQ(d.ropeBatch, 1);
     EXPECT_EQ(d.packedMaskLen, 1); // divUp(8, 32) = 1
     EXPECT_EQ(d.startIndexLen, 1); // batch (cache non-empty during verify)
@@ -653,9 +655,9 @@ TEST_F(LLMEngineConfigTest, ParseDraftEngineConfigMinimal)
     // No partial_rotary_factor → rotaryDim defaults to headDim.
     EXPECT_EQ(cfg.rotaryDim, 64);
     EXPECT_EQ(cfg.vocabSize, 32000);
-    // Draft engines set enableEagleSpecDecode=false (they ARE the draft, not the base).
+    // Draft engines set isSpecDecodeBase=false (they ARE the draft, not the base).
     // Presence of a draft engine is indicated by maxDraftTreeSize > 0.
-    EXPECT_FALSE(cfg.enableEagleSpecDecode);
+    EXPECT_FALSE(cfg.isSpecDecodeBase);
     EXPECT_EQ(cfg.maxDraftTreeSize, 4);
     EXPECT_EQ(cfg.baseModelHiddenSize, 768);
 }
@@ -663,7 +665,7 @@ TEST_F(LLMEngineConfigTest, ParseDraftEngineConfigMinimal)
 TEST_F(LLMEngineConfigTest, ParseDraftEngineConfigMTPBaseModelHiddenSize)
 {
     // Regression: createDeploymentConfig used to hardcode
-    // `eagle.baseOutputHiddenDim = base.hiddenSize * 3` (EAGLE-3 convention),
+    // `specConfig.baseOutputHiddenDim = base.hiddenSize * 3` (EAGLE-3 convention),
     // which broke MTP — MTP draft expects `base.hiddenSize` (no `* 3`). The
     // value must come from the draft config's `base_model_hidden_size` field.
     Json json = makeMinimalDraftConfig();

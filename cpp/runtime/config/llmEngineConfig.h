@@ -36,7 +36,15 @@ namespace rt
 
 class EngineExecutor;
 
-//! Unified configuration for both base and EAGLE draft engines.
+//! Speculative decoding strategy mode.
+enum class SpecDecodeMode : int32_t
+{
+    kNONE,
+    kEAGLE,
+    kMTP,
+};
+
+//! Unified configuration for base, vanilla decode, and SpecDecode draft engines.
 //!
 //! Replaces `LLMEngineRunnerConfig` and `EagleDraftEngineRunnerConfig` with a
 //! single structure that can be parsed once and used across all runtime
@@ -58,15 +66,17 @@ struct LLMEngineConfig
     int32_t reducedVocabSize{0};       //!< 0 = no vocab reduction
 
     // --- Feature flags ---
-    bool useTrtNativeOps{false};       //!< Use TRT native ops instead of custom plugin
-    bool enableEagleSpecDecode{false}; //!< Enable Eagle speculative decoding
-    //! KV cache data type. Parsed strictly from top-level `kv_cache_dtype` in
+    bool useTrtNativeOps{false};  //!< Use TRT native ops instead of custom plugin
+    bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings
+    SpecDecodeMode specDecodeType{
+        SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from model_type)
+    //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
     //! `config.json` (written by `llm_export.py`). Accepted values:
     //! "fp16" → kHALF, "fp8" → kFP8, "int8" → kINT8, "bf16" → kBF16.
     //! The runtime validates this against the engine's actual KV binding dtype.
-    nvinfer1::DataType kvCacheDtype{};
+    nvinfer1::DataType kvCacheDtype{nvinfer1::DataType::kHALF};
 
-    //! Recurrent state data type (hybrid models only). Parsed strictly from
+    //! Recurrent state data type (hybrid models only). Parsed from required
     //! top-level `recurrent_state_dtype` when `numLinearAttnLayers > 0`;
     //! left at the default otherwise. Runtime validates against the engine's
     //! recurrent-state binding dtype.
@@ -94,17 +104,17 @@ struct LLMEngineConfig
     int32_t convDim{0};                //!< Conv1d channel dimension
     int32_t convKernel{0};             //!< Conv1d kernel width
 
-    // --- EAGLE speculative decoding (per-engine) ---
-    //! Max seq_len the base engine accepts for tree verification. Parsed from
-    //! `builder_config.max_verify_tree_size` when `enableEagleSpecDecode == true`;
-    //! 0 otherwise. Consumers prefer the consolidated `DeploymentConfig::eagle`
+    // --- SpecDecode engine limits (per-engine) ---
+    //! Max seq_len the base engine accepts for proposal verification. Parsed from
+    //! `builder_config.max_verify_tree_size` when `isSpecDecodeBase == true`;
+    //! 0 otherwise. Consumers prefer the consolidated `DeploymentConfig::specDecode`
     //! when the deployment view is available.
     int32_t maxVerifyTreeSize{0};
 
     //! Max seq_len the draft engine accepts for proposal / draft generation.
     //! Parsed from `builder_config.max_draft_tree_size` by `parseDraftEngineConfig`;
     //! 0 on base / vanilla engines. Consumers prefer the consolidated
-    //! `DeploymentConfig::eagle` when the deployment view is available.
+    //! `DeploymentConfig::specDecode` when the deployment view is available.
     int32_t maxDraftTreeSize{0};
 
     //! Hidden dim the draft engine expects for its `hidden_states_input` binding
@@ -113,7 +123,7 @@ struct LLMEngineConfig
     //! left at 0 on base / vanilla engines. Differs from `base.hiddenSize` for
     //! EAGLE-3 (`= base.hiddenSize * 3`, multi-layer concat) and equals
     //! `base.hiddenSize` for MTP. The deployment factory copies this into
-    //! `DeploymentConfig::eagle->baseOutputHiddenDim`.
+    //! `DeploymentConfig::specDecode->baseOutputHiddenDim`.
     int32_t baseModelHiddenSize{0};
 
     // --- Per-layer type routing (hybrid cache) ---
@@ -143,7 +153,7 @@ struct LLMEngineConfig
     // fan-out.
     // ------------------------------------------------------------------
 
-    //! Prefill dims (vanilla LLM, EAGLE base, and EAGLE draft).
+    //! Prefill dims (vanilla LLM, SpecDecode base, and SpecDecode draft).
     //! seqLen is the prompt length being processed this step.
     //! kvCacheAllEmpty signals whether this is the initial prefill of an empty
     //! KV cache — for plugin-path engines, this drives the `kvcache_start_index`
@@ -152,22 +162,22 @@ struct LLMEngineConfig
     InferenceDims prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const;
 
     //! Vanilla single-token decode dims.
-    //! seqLen is always 1 here; packedMaskLen is 1 (no EAGLE mask in vanilla).
+    //! seqLen is always 1 here; packedMaskLen is 1 (no proposal mask in vanilla).
     InferenceDims decodeDims(int64_t batch) const;
 
-    //! EAGLE base tree-verification dims.
-    //! verifyTreeSize feeds three fields: seqLen, selectLen, and packedMaskLen.
+    //! SpecDecode base verification dims.
+    //! verifySize feeds three fields: seqLen, selectLen, and packedMaskLen.
     //! This is the only recipe where selectLen != 1.
-    InferenceDims treeVerifyDims(int64_t batch, int64_t verifyTreeSize) const;
+    InferenceDims specVerifyDims(int64_t batch, int64_t verifySize) const;
 
-    //! EAGLE draft proposal dims.
-    //! paddedTreeSize feeds seqLen, attnMaskSeqLen, and packedMaskLen.
+    //! SpecDecode draft proposal dims.
+    //! proposalSize feeds seqLen, attnMaskSeqLen, and packedMaskLen.
     //! draftTopK feeds selectLen — the draft proposal selects draftTopK tokens
-    //! per sequence (one per tree branch), matching the 3D logits output shape
+    //! per sequence, matching the 3D logits output shape
     //! [batch, draftTopK, draftVocabSize].
-    InferenceDims proposalDims(int64_t batch, int64_t paddedTreeSize, int64_t draftTopK) const;
+    InferenceDims proposalDims(int64_t batch, int64_t proposalSize, int64_t draftTopK) const;
 
-    //! EAGLE draft accept-token dims.
+    //! SpecDecode draft accept-token dims.
     //! acceptLen is in [1, draftingStep+1]; feeds seqLen and packedMaskLen.
     InferenceDims acceptDims(int64_t batch, int64_t acceptLen) const;
 
@@ -186,15 +196,15 @@ struct LLMEngineConfig
 //! @throws std::runtime_error if file cannot be opened/parsed or required fields are missing.
 LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath);
 
-//! Parse an EAGLE draft engine's `config.json` into an `LLMEngineConfig`.
+//! Parse a SpecDecode draft engine's `config.json` into an `LLMEngineConfig`.
 //!
 //! The draft config carries a reduced field set (no `builder_config.eagle_base`,
 //! its own `draft_vocab_size`). `max_draft_tree_size` is required and is
 //! parsed into `cfg.maxDraftTreeSize`; `cfg.maxVerifyTreeSize` stays at 0 on
-//! the draft side. `enableEagleSpecDecode` is left false because this is the
+//! the draft side. `isSpecDecodeBase` is left false because this is the
 //! draft — not the base — engine. Cross-engine fields (`draftHiddenSize`,
 //! `baseOutputHiddenDim`) are not stored on `LLMEngineConfig`; they are
-//! derived in `createDeploymentConfig` and live on `DeploymentConfig::eagle`.
+//! derived in `createDeploymentConfig` and live on `DeploymentConfig::specConfig`.
 //!
 //! @param configPath  Path to the draft engine's `config.json`.
 //! @return Parsed configuration.
