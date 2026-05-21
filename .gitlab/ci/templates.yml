@@ -134,6 +134,37 @@
     - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
     - ls -la $TEST_LOG_DIR
     - echo "Pipeline end time:$(date)"
+
+.x86_unit_test_template:
+  script:
+    - echo "Pipeline start time:$(date)"
+    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
+    - mkdir -p $TEST_LOG_DIR $ENGINE_DIR $ONNX_DIR
+    - rm -rf $TEST_LOG_DIR/* $ENGINE_DIR/* $ONNX_DIR/*
+    - chmod -R 777 $TEST_LOG_DIR
+    - echo "Installing dependencies"
+    - export DEBIAN_FRONTEND=noninteractive
+    - apt update -qq >/dev/null 2>&1
+    - apt install -y -qq python3 python3-pip git >/dev/null 2>&1
+    - echo "Checking TRT x86_64 package"
+    - if [ ! -d "$TRT_PACKAGE_DIR" ]; then echo "TensorRT x86_64 cache not found at $TRT_PACKAGE_DIR"; exit 1; fi
+    - echo "Using TensorRT x86_64 package directly from cache"
+    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
+    # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
+    - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
+    - echo "Installing unit test dependencies"
+    - pip3 install -q pytest pytest-html pyyaml numpy
+    - echo "Installing TensorRT Python package from cache"
+    - pip3 install -q $TRT_PACKAGE_DIR/python/tensorrt-$TRT_VERSION*-cp312*.whl
+    - echo "Installing python cuda dependencies"
+    - pip3 install -q pycuda
+    - export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH
+    - echo "Running unit tests with pytest. Time:$(date)"
+    - python3 -m pytest tests/defs/test_common.py tests/python-unittests/test_attention_native.py tests/python-unittests/test_attention_plugin.py --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
+    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
+    - ls -la $TEST_LOG_DIR
+    - echo "Pipeline end time:$(date)"
   
 .device_test_template:
   script:
@@ -157,10 +188,15 @@
     # clone googletest and nlohmannJson from internal mirror to avoid git submodule network issues
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/googletest-mirror.git 3rdParty/googletest
     - git clone https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git 3rdParty/nlohmannJson
-    - export REMOTE_WORKSPACE=/home/$BOARD_USER/tensorrt-edge-llm
-    - export ENGINE_DIR=$REMOTE_WORKSPACE/engines
-    - echo "Creating remote directories and syncing repo from host to board"
-    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "mkdir -p $REMOTE_WORKSPACE $ENGINE_DIR"
+    - export REMOTE_WORKSPACE=${REMOTE_WORKSPACE:-/home/$BOARD_USER/tensorrt-edge-llm-${CI_JOB_ID:-manual}}
+    - export ENGINE_DIR=${ENGINE_DIR:-$REMOTE_WORKSPACE/engines}
+    - |
+      case "$REMOTE_WORKSPACE" in
+        /home/$BOARD_USER/tensorrt-edge-llm*) ;;
+        *) echo "Unsafe REMOTE_WORKSPACE=$REMOTE_WORKSPACE"; exit 1 ;;
+      esac
+    - echo "Creating isolated remote workspace $REMOTE_WORKSPACE and syncing repo from host to board"
+    - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "rm -rf '$REMOTE_WORKSPACE' && mkdir -p '$REMOTE_WORKSPACE' '$ENGINE_DIR'"
     - sshpass -p "$BOARD_PASSWORD_NVKS" rsync -av -e "ssh -o StrictHostKeyChecking=no" $LLM_SDK_DIR/ $BOARD_USER@$BOARD_IP:$REMOTE_WORKSPACE/
     - echo "Setting file permissions to 755 to prevent permission issues"
     - sshpass -p "$BOARD_PASSWORD_NVKS" ssh -o StrictHostKeyChecking=no $BOARD_USER@$BOARD_IP "chmod -R 755 $REMOTE_WORKSPACE"
@@ -202,4 +238,3 @@
     - make -j$(nproc)
     - echo "Cross-build completed successfully"
     - echo "Pipeline end time:$(date)"
-
