@@ -39,7 +39,7 @@
 #include "common/checkMacros.h"
 #include "common/trtUtils.h"
 #include "requestFileParser.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
@@ -369,7 +369,7 @@ struct RequestResult
     double totalMs{0.0};
 };
 
-RequestResult runOneRequest(rt::LLMInferenceSpecDecodeRuntime& runtime, cudaStream_t stream,
+RequestResult runOneRequest(rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
     rt::LLMGenerationRequest batchRequest, int32_t streamInterval, bool showSpecialTokens)
 {
     RequestResult result;
@@ -510,19 +510,19 @@ int main(int argc, char** argv)
     cudaStream_t stream{};
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> runtime;
+    std::unique_ptr<rt::LLMInferenceRuntime> runtime;
     try
     {
         if (args.specDecode)
         {
             rt::SpecDecodeDraftingConfig draft{args.specDraftTopK, args.specDraftStep, args.specVerifySize};
-            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraMap, draft, stream);
         }
         else
         {
-            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraMap, stream);
+            runtime
+                = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, loraMap, stream);
         }
     }
     catch (std::exception const& e)

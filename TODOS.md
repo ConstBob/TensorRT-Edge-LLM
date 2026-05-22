@@ -35,7 +35,7 @@ See `design/llm/tensorrt_edgellm_design.adoc` for architecture notes.
 
 ### EAGLE draft model support
 **Priority:** High
-**What:** Export the EAGLE draft model as a separate ONNX graph sharing the base embedding.  Wire to the existing `LLMInferenceSpecDecodeRuntime` in C++.
+**What:** Export the EAGLE draft model as a separate ONNX graph sharing the base embedding.  Wire to the existing `LLMInferenceRuntime` in C++.
 **Why:** Speculative decoding with EAGLE is already supported in the C++ runtime; the Python export side is missing.
 
 ### Alpamayo model support
@@ -63,8 +63,3 @@ See `design/llm/tensorrt_edgellm_design.adoc` for architecture notes.
 **Why:** The sampling dispatch logic is critical for correctness and currently has no unit test coverage. The logic is pure boolean — testable without engine infrastructure.
 **Depends on:** Nothing — can be built immediately.
 
-### Update runtime documentation for unified architecture
-**Priority:** Low
-**What:** Update `docs/source/developer_guide/software-design/llm-inference-runtime.md` and `docs/source/developer_guide/customization/customization-guide.md` to reflect the unified runtime (`LLMInferenceSpecDecodeRuntime` replaces `LLMInferenceRuntime`). Update architecture diagrams and class references.
-**Why:** Current docs reference the deleted `LLMInferenceRuntime` class and describe the dual-runtime architecture which no longer exists.
-**Depends on:** Phase 1 landed.

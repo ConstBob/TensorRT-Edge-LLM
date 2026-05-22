@@ -47,9 +47,7 @@ For detailed software design, see `docs/source/developer_guide/software-design/`
 
 The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ Engine Builder (TRT engine) → C++ Runtime (inference)`.
 
-**C++ Runtime (`cpp/`)** has two mutually exclusive inference paths, both via `handleRequest()`:
-- `LLMInferenceRuntime` — standard inference (single engine + tokenizer + optional multimodal)
-- `LLMInferenceSpecDecodeRuntime` — EAGLE speculative decoding (base + draft engines)
+**C++ Runtime (`cpp/`)** uses a single unified `LLMInferenceRuntime` class for all inference via `handleRequest()`. It supports both vanilla autoregressive decoding (single base engine) and speculative decoding modes (EAGLE, MTP — base + draft engines) through a pluggable `DecodingStrategy` layer.
 
 **C++ sub-packages:** `common/` (tensor, logging, utils), `kernels/` (FMHA/RoPE/MoE/Mamba/EAGLE), `plugins/` (TRT custom plugins), `builder/` (ONNX→TRT), `tokenizer/`, `multimodal/`, `profiling/`, `sampler/`.
 
@@ -80,9 +78,8 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 
 | File | Role |
 |------|------|
-| `cpp/runtime/llmInferenceRuntime.{h,cpp}` | Main runtime entry point (`handleRequest()`) |
+| `cpp/runtime/llmInferenceRuntime.{h,cpp}` | Unified runtime entry point — vanilla + speculative decoding (`handleRequest()`) |
 | `cpp/runtime/llmEngineRunner.{h,cpp}` | Core TRT execution engine |
-| `cpp/runtime/llmInferenceSpecDecodeRuntime.{h,cpp}` | EAGLE speculative decoding runtime |
 | `cpp/common/tensor.{h,cpp}` | RAII GPU/CPU tensor abstraction |
 | `cpp/sampler/sampling.{cu,h}` | GPU token sampling |
 | `tensorrt_edgellm/__init__.py` | Python API entry points |

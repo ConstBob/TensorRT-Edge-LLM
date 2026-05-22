@@ -67,7 +67,6 @@ for large language models and vision-language models on edge devices.
    developer_guide/software-design/engine-builder.md
    developer_guide/software-design/cpp-runtime-overview.md
    developer_guide/software-design/llm-inference-runtime.md
-   developer_guide/software-design/llm-inference-specdecode-runtime.md
    developer_guide/software-design/llm-streaming.md
 
 .. toctree::

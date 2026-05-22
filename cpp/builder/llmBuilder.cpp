@@ -437,7 +437,7 @@ bool LLMBuilder::setupEagleProfiles(
     // `prepareEagleBaseTreeDecodingInputsTrtNative` kernel exists
     // (`cpp/kernels/speculative/eagleUtilKernels.{h,cu}`). However the
     // builder's EAGLE profile setup below and the runtime dispatch in
-    // `LLMInferenceSpecDecodeRuntime::runBaseModelVerification` both
+    // `EagleDecoder::runBaseModelVerification` both
     // hardcode the plugin-path 3D packed-INT32 mask layout. Attempting to
     // build this combination produces a cryptic TRT error:
     //

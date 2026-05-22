@@ -1,6 +1,6 @@
 # LLM Streaming — Design
 
-Streaming output on top of `LLMInferenceSpecDecodeRuntime`. Per-slot chunked delivery, works for vanilla + Eagle spec-decode, text + multimodal, with cancellation and per-slot throttling.
+Streaming output on top of `LLMInferenceRuntime`. Per-slot chunked delivery, works for vanilla + Eagle spec-decode, text + multimodal, with cancellation and per-slot throttling.
 
 ## Goals
 
@@ -131,7 +131,7 @@ When `request.streamChannels.empty()`, `slotStreams[i].channel` is null, all fiv
 |---|---|
 | `cpp/runtime/streaming.{h,cpp}` | `StreamChunk`, `StreamChannel`, `SlotStreamState`, `FinishReason`, `StreamChannelFinalizer`, streaming free functions |
 | `cpp/runtime/llmRuntimeUtils.{h,cpp}` | `LLMGenerationRequest::streamChannels` field; forward-declares `StreamChannel` |
-| `cpp/runtime/llmInferenceSpecDecodeRuntime.{h,cpp}` | Wires streaming hooks into `handleRequest` |
+| `cpp/runtime/llmInferenceRuntime.{h,cpp}` | Wires streaming hooks into `handleRequest` |
 | `cpp/common/utf8.{h,cpp}` | `sanitizeUtf8Streaming`, `sanitizeUtf8Flush`, + shared byte-level primitives |
 | `cpp/tokenizer/tokenizer.{h,cpp}` | `idToPiece`, `emitDelta`, `emitDeltaFlush`; `decode` now sanitizes |
 | `examples/llm/llm_stream.cpp` | Interactive demo (JSON input, live chunk printing, hotkey control) |

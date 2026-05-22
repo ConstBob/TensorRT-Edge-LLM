@@ -59,7 +59,7 @@ struct PipelineIO
     // Streaming output (Qwen3-Omni Talker pipeline). For the vanilla
     // LLM runtime the engine writes its layer-N hidden states into
     // `outputHiddenStates`; the runtime exposes them through
-    // `LLMInferenceSpecDecodeRuntime::getBaseModelHiddenStates(N)`.
+    // `LLMInferenceRuntime::getBaseModelHiddenStates(N)`.
     // `prefillEmbedsBackup` snapshots layer-0 input embeddings before the decode
     // loop reshapes `inputsEmbeds`; it is lazy-allocated on the first request that
     // sets `outputThinkerEmbeddings`. SpecDecode configs reuse `baseHiddenStates`
