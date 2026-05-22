@@ -1400,8 +1400,12 @@ class TestConfig:
             prefix = "llm-base"
         else:
             prefix = "llm"
-        return os.path.join(self.get_onnx_base_dir(),
-                            f"{prefix}-{self.get_quantized_model_id()}")
+        onnx_model_id = f"{self.llm_precision.lower()}-{self.lm_head_precision.lower()}"
+        if self.fp8_kv_cache:
+            onnx_model_id += "-fp8kv"
+        if self.reduced_vocab_size:
+            onnx_model_id += f"-rvs{self.reduced_vocab_size}"
+        return os.path.join(self.get_onnx_base_dir(), f"{prefix}-{onnx_model_id}")
 
     def get_tts_tokenizer_dir(self) -> str:
         """
