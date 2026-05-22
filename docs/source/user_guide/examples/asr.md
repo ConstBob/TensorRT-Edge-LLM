@@ -19,7 +19,7 @@ cd TensorRT-Edge-LLM
 python3 -m venv venv-qwen3-asr
 source venv-qwen3-asr/bin/activate
 pip3 install -r requirements.txt
-pip3 install -r experimental/llm_loader/requirements.txt
+pip3 install ".[tools]"
 pip3 install qwen-asr       # install qwen3-asr and its required dependencies.
 ```
 
@@ -29,14 +29,14 @@ pip3 install qwen-asr       # install qwen3-asr and its required dependencies.
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-ASR-0.6B
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
 # Export language model and audio encoder
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   Qwen/Qwen3-ASR-0.6B \
   $MODEL_NAME/onnx
 ```
@@ -77,16 +77,16 @@ cd ~/TensorRT-Edge-LLM
 
 Audio files must be converted to mel-spectrogram safetensors format before inference.
 
-> **Note:** This step uses the `tensorrt_edgellm.scripts.preprocess_audio` utility, which requires the deprecated `tensorrt_edgellm` package. This is an audio preprocessing utility (not the deprecated LLM exporter) and is expected for this release. Set `EDGE_LLM_PATH` if running on a device where it was not defined in Step 1.
+> **Note:** This step uses the `tensorrt-edgellm-preprocess-audio` utility from the installed package. Set `EDGE_LLM_PATH` if running on a device where it was not defined in Step 1.
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 
-pip3 install -e $EDGE_LLM_PATH  # required for tensorrt_edgellm.scripts.preprocess_audio
+pip3 install -e $EDGE_LLM_PATH  # required for tensorrt-edgellm-preprocess-audio
 
-python -m tensorrt_edgellm.scripts.preprocess_audio \
+tensorrt-edgellm-preprocess-audio \
   --input /path/to/audio.wav \
   --output $WORKSPACE_DIR/audio_input.safetensors
 ```
@@ -154,7 +154,7 @@ Qwen3-ASR-0.6B; 1.7B is noted where it diverges.
 | NVFP4 | FP16 | ✅ | ✅ |
 | NVFP4 | FP8 | ❌ Empty output (combined quant noise exceeds the first-token EOS-vs-correct logit margin on 0.6B) | ✅ (1.7B tolerates the combined noise) |
 
-> **Mixed-precision rules** (`experimental/quantization/cli.py`):
+> **Mixed-precision rules** (`tensorrt_edgellm/quantization/cli.py`):
 > - `--quantization` quantizes the LLM backbone only.
 > - `--audio_quantization fp8` opts the audio tower in. **Omit it to
 >   keep the audio tower at FP16** regardless of `--quantization` --
@@ -174,14 +174,14 @@ required.
 **Recipe A: 0.6B NVFP4 LLM + FP16 audio**
 
 ```bash
-python -m experimental.quantization.cli llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-ASR-0.6B \
   --output_dir $WORKSPACE_DIR/$MODEL_NAME-nvfp4-lh.nvfp4 \
   --quantization nvfp4 \
   --lm_head_quantization nvfp4
 
 # Then in Step 1, replace ``Qwen/Qwen3-ASR-0.6B`` with the quantized dir:
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $WORKSPACE_DIR/$MODEL_NAME-nvfp4-lh.nvfp4 \
   $MODEL_NAME/onnx
 ```
@@ -189,14 +189,14 @@ python -m llm_loader.export_all_cli \
 **Recipe B: 0.6B FP8 LLM + FP8 audio**
 
 ```bash
-python -m experimental.quantization.cli llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-ASR-0.6B \
   --output_dir $WORKSPACE_DIR/$MODEL_NAME-fp8-a.fp8 \
   --quantization fp8 \
   --audio_quantization fp8
 
 # Then in Step 1, replace ``Qwen/Qwen3-ASR-0.6B`` with the quantized dir:
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $WORKSPACE_DIR/$MODEL_NAME-fp8-a.fp8 \
   $MODEL_NAME/onnx
 ```
@@ -204,14 +204,14 @@ python -m llm_loader.export_all_cli \
 **Recipe C: 1.7B NVFP4 LLM + FP8 audio**
 
 ```bash
-python -m experimental.quantization.cli llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-ASR-1.7B \
   --output_dir $WORKSPACE_DIR/$MODEL_NAME-nvfp4-a.fp8 \
   --quantization nvfp4 \
   --audio_quantization fp8
 
 # Then in Step 1, replace ``Qwen/Qwen3-ASR-1.7B`` with the quantized dir:
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $WORKSPACE_DIR/$MODEL_NAME-nvfp4-a.fp8 \
   $MODEL_NAME/onnx
 ```

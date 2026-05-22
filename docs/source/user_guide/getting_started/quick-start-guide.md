@@ -48,7 +48,7 @@ cd ..
 After either build:
 
 ```bash
-export PYTHONPATH=$PWD:$PWD/experimental:$PYTHONPATH
+export PYTHONPATH=$PWD:$PYTHONPATH
 
 pip install pybind11 fastapi uvicorn
 ```
@@ -96,9 +96,9 @@ Use this path when you need explicit control over ONNX export, engine build flag
 
 This part runs on a standard x86 host with an NVIDIA GPU. **DriveOS users:** this process does not need to run in DriveOS Docker; use your regular x86 development machine.
 
-#### Recommended: Checkpoint-Based Loader
+#### Recommended: Checkpoint Exporter
 
-The checkpoint-based loader (`llm_loader`) is the recommended export path. It reads FP16/BF16 and pre-quantized HuggingFace checkpoints directly and exports to ONNX in a single command. If you need to create a quantized checkpoint from an FP16/BF16 source model, install the standalone quantization requirements from the Installation Guide, run `experimental.quantization`, and then export the generated checkpoint with `llm_loader`.
+The checkpoint exporter (`tensorrt_edgellm`) is the recommended export path. It reads FP16/BF16 and pre-quantized HuggingFace checkpoints directly and exports to ONNX in a single command. If you need to create a quantized checkpoint from an FP16/BF16 source model, install the standalone quantization requirements from the Installation Guide, run `tensorrt-edgellm-quantize`, and then export the generated checkpoint with `tensorrt_edgellm`.
 
 Let's use [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) as a lightweight example:
 
@@ -110,33 +110,33 @@ mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
 # Set PYTHONPATH to include the quantization package and loader
-export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:$PYTHONPATH
 
 # Export FP16 model to ONNX
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
     Qwen/Qwen3-0.6B \
     $MODEL_NAME/onnx
 
 # Or quantize an FP16/BF16 model first, then export the quantized checkpoint
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
     --model_dir Qwen/Qwen3-0.6B \
     --output_dir $MODEL_NAME/quantized \
     --quantization nvfp4 \
     --lm_head_quantization nvfp4
 
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
     $MODEL_NAME/quantized \
     $MODEL_NAME/onnx
 
 # Or export a pre-quantized NVFP4 checkpoint (no separate quantization step)
 # See https://huggingface.co/nvidia/Qwen3-8B-NVFP4
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
     /path/to/nvidia/Qwen3-8B-NVFP4 \
     Qwen3-8B-NVFP4/onnx
 
 # Or export a pre-quantized INT4-AWQ checkpoint
 # See https://huggingface.co/Qwen/Qwen3-4B-AWQ
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
     /path/to/Qwen/Qwen3-4B-AWQ \
     Qwen3-4B-AWQ/onnx
 ```
@@ -272,9 +272,9 @@ To collect layer-level profiling in addition to the benchmark summary, add `--pr
 - **[TTS](../examples/tts.md)** - Text-to-speech synthesis
 - **[Alpamayo-R1-10B](../examples/vla.md)** - Vision-language-action inference with trajectory prediction
 
-**Checkpoint-Based Loader:** For detailed documentation on the recommended export pipeline, pre-quantized checkpoint support, and migration from the deprecated tools, see [Checkpoint-Based Model Loader](../../developer_guide/software-design/llm-loader.md).
+**Checkpoint Exporter:** For detailed documentation on the export pipeline and pre-quantized checkpoint support, see [Checkpoint Exporter](../../developer_guide/software-design/checkpoint-export.md).
 
-**Quantization:** To create quantized checkpoints for `llm_loader`, see [Quantization](../features/quantization.md).
+**Quantization:** To create quantized checkpoints for `tensorrt_edgellm`, see [Quantization](../features/quantization.md).
 
 **Experimental Python API and Server:** To use the vLLM-style high-level Python API or an OpenAI-compatible chat server, see [Experimental High-Level Python API and Server](../examples/experimental-server.md).
 

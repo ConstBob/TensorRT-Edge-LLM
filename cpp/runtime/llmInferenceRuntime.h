@@ -17,7 +17,7 @@
 
 #pragma once
 
-// Compatibility header for in-flight branches (Qwen3-VL, Mamba, LLM Loader).
+// Compatibility header for in-flight branches (Qwen3-VL, Mamba, Checkpoint Exporter).
 // LLMInferenceRuntime has been unified into LLMInferenceSpecDecodeRuntime.
 // This typedef allows existing code to compile without immediate changes.
 // Remove in Phase 2 when the class is renamed to LLMRuntime.

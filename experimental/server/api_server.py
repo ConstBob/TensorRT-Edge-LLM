@@ -455,14 +455,7 @@ def main():
         help="Max KV cache capacity",
     )
     parser.add_argument(
-        "--use-trt-native-ops",
-        action="store_true",
-        default=False,
-        help="Use TensorRT native ops instead of custom plugins",
-    )
-    parser.add_argument(
         "--spec-decode-engine-dir",
-        "--eagle-engine-dir",  # deprecated alias, kept for backward compat
         dest="spec_decode_engine_dir",
         default="",
         help="Pre-built speculative decoding engine dir (EAGLE or MTP)",
@@ -488,7 +481,6 @@ def main():
         max_input_len=args.max_input_len,
         max_batch_size=args.max_batch_size,
         max_kv_cache_capacity=args.max_kv_cache_capacity,
-        use_trt_native_ops=args.use_trt_native_ops,
         eagle_engine_dir=args.spec_decode_engine_dir,
         draft_top_k=args.draft_top_k,
         draft_step=args.draft_step,

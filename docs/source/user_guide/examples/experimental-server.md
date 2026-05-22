@@ -11,7 +11,7 @@ Build the C++ runtime and pybind extension first:
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
 cd $EDGE_LLM_PATH
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 
 mkdir -p build && cd build
 cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DBUILD_PYTHON_BINDINGS=ON
@@ -23,13 +23,13 @@ Install server dependencies:
 ```bash
 cd $EDGE_LLM_PATH
 pip install -r requirements.txt
-pip install -r experimental/llm_loader/requirements.txt
-pip install pybind11 fastapi uvicorn
+pip install -r requirements-server.txt
+pip install pybind11
 ```
 
 Run examples from the repository root with the same `PYTHONPATH`. The
 repository root makes `experimental.server` importable; the `experimental`
-directory makes the `llm_loader` top-level package importable.
+directory makes the `tensorrt_edgellm` top-level package importable.
 
 ## Python API
 

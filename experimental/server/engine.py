@@ -233,16 +233,15 @@ def _import_runtime():
     )
 
 
-def _llm_loader_dir() -> Path:
-    """Return path to the llm_loader package, adding it to sys.path."""
-    loader_dir = Path(__file__).resolve().parent.parent / "llm_loader"
-    if not loader_dir.is_dir():
-        raise RuntimeError(f"llm_loader not found at {loader_dir}. "
-                           "Ensure experimental/llm_loader/ exists.")
-    experimental_dir = str(loader_dir.parent)
-    if experimental_dir not in sys.path:
-        sys.path.insert(0, experimental_dir)
-    return loader_dir
+def _ensure_export_package() -> None:
+    """Ensure the installed checkpoint export package is importable."""
+    try:
+        import tensorrt_edgellm  # noqa: F401
+        return
+    except ImportError:
+        project_root = str(Path(__file__).resolve().parent.parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +283,6 @@ class LLM:
         max_input_len: int = 4096,
         max_batch_size: int = 1,
         max_kv_cache_capacity: int = 8192,
-        use_trt_native_ops: bool = False,
         eagle_engine_dir: str = "",
         draft_top_k: int = 10,
         draft_step: int = 6,
@@ -314,7 +312,6 @@ class LLM:
                 max_input_len=max_input_len,
                 max_batch_size=max_batch_size,
                 max_kv_cache_capacity=max_kv_cache_capacity,
-                use_trt_native_ops=use_trt_native_ops,
             )
         else:
             self._init_from_model(
@@ -322,7 +319,6 @@ class LLM:
                 max_input_len=max_input_len,
                 max_batch_size=max_batch_size,
                 max_kv_cache_capacity=max_kv_cache_capacity,
-                use_trt_native_ops=use_trt_native_ops,
             )
 
         self._load_runtime()
@@ -367,13 +363,11 @@ class LLM:
         max_input_len: int,
         max_batch_size: int,
         max_kv_cache_capacity: int,
-        use_trt_native_ops: bool,
     ) -> None:
         """Build engine from ONNX directories (no export)."""
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
-        self._use_trt_native_ops = use_trt_native_ops
         self._onnx_dir = onnx_dir
         self._visual_onnx_dir = visual_onnx_dir
         self._model_dir = onnx_dir
@@ -410,13 +404,11 @@ class LLM:
         max_input_len: int,
         max_batch_size: int,
         max_kv_cache_capacity: int,
-        use_trt_native_ops: bool,
     ) -> None:
         """Export ONNX + build engine from HuggingFace checkpoint."""
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
-        self._use_trt_native_ops = use_trt_native_ops
 
         logger.info("Resolving model: %s", model)
         self._model_dir = _resolve_model_dir(model)
@@ -449,7 +441,6 @@ class LLM:
             max_input_len=max_input_len,
             max_batch_size=max_batch_size,
             max_kv_cache_capacity=max_kv_cache_capacity,
-            use_trt_native_ops=use_trt_native_ops,
         )
 
     def _load_runtime(self) -> None:
@@ -489,12 +480,12 @@ class LLM:
     # ------------------------------------------------------------------
 
     def _export_onnx(self) -> None:
-        """Export the model checkpoint to ONNX via llm_loader."""
+        """Export the model checkpoint to ONNX via tensorrt_edgellm."""
         logger.info("Exporting ONNX to %s ...", self._onnx_dir)
         os.makedirs(self._onnx_dir, exist_ok=True)
 
-        _llm_loader_dir()
-        from llm_loader import AutoModel, export_onnx
+        _ensure_export_package()
+        from tensorrt_edgellm import AutoModel, export_onnx
 
         model = AutoModel.from_pretrained(self._model_dir, device="cpu")
         output_path = os.path.join(self._onnx_dir, "model.onnx")
@@ -502,8 +493,8 @@ class LLM:
 
         # Patch image_token_id for VLM models
         if self._is_vlm:
-            _llm_loader_dir()
-            from llm_loader.export_all_cli import _find_token_id
+            _ensure_export_package()
+            from tensorrt_edgellm.scripts.export import _find_token_id
             image_token_id = _find_token_id(self._model_dir, "<|image_pad|>")
             if image_token_id is not None:
                 cfg_path = os.path.join(self._onnx_dir, "config.json")
@@ -521,7 +512,7 @@ class LLM:
         logger.info("ONNX export complete: %s", output_path)
 
     def _export_visual_onnx(self) -> None:
-        """Export the visual encoder to ONNX via llm_loader."""
+        """Export the visual encoder to ONNX via tensorrt_edgellm."""
         logger.info(
             "Exporting visual ONNX to %s ...",
             self._visual_onnx_dir,
@@ -530,9 +521,10 @@ class LLM:
 
         import torch
 
-        _llm_loader_dir()
-        from llm_loader.export_all_cli import (_export_visual,
-                                               _load_all_weights, _load_config)
+        _ensure_export_package()
+        from tensorrt_edgellm.scripts.export import (_export_visual,
+                                                     _load_all_weights,
+                                                     _load_config)
 
         config = _load_config(self._model_dir)
         weights = _load_all_weights(self._model_dir)
@@ -563,7 +555,6 @@ class LLM:
         config.max_input_len = self._max_input_len
         config.max_batch_size = self._max_batch_size
         config.max_kv_cache_capacity = self._max_kv_cache_capacity
-        config.use_trt_native_ops = self._use_trt_native_ops
 
         builder = rt.LLMBuilder(self._onnx_dir, self._engine_dir, config)
         if not builder.build():

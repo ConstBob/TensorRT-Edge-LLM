@@ -45,35 +45,7 @@
     - python3 -c 'import tensorrt_edgellm; print(tensorrt_edgellm.__version__)'
     - echo "Pipeline end time:$(date)"
 
-.export_onnx_template:
-  script:
-    - echo "Pipeline start time:$(date)"
-    - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
-    - mkdir -p $ONNX_DIR $TEST_LOG_DIR
-    - echo "Installing dependencies"
-    - export DEBIAN_FRONTEND=noninteractive
-    - apt update -qq >/dev/null 2>&1
-    - apt install -y -qq python3 python3-pip git curl >/dev/null 2>&1
-    - echo "Testing model export"
-    - ls /scratch.trt_llm_data
-    - export LLM_SDK_DIR=${LLM_SDK_DIR:-$(pwd)}
-    - echo "Installing package dependencies"
-    - cd $LLM_SDK_DIR
-    - pip3 install -q build
-    - python3 -m build --wheel --outdir dist .
-    - pip3 install dist/*.whl
-    - echo "Installing pytest dependencies"
-    - pip3 install -q -r tests/requirements.txt
-    - echo "Setting up test environment"
-    - echo "Running export tests with pytest. Time:$(date)"
-    - python3 -m pytest tests --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
-    - echo "Models exported to cache directory $ONNX_DIR"
-    - ls -la $ONNX_DIR
-    - echo "Command execution logs and pytest reports saved to $TEST_LOG_DIR"
-    - echo "Pipeline end time:$(date)"
-  interruptible: true
-
-.llm_loader_export_template:
+.checkpoint_export_template:
   script:
     - echo "Pipeline start time:$(date)"
     - 'echo "Node name: ${NODE_NAME:-$(hostname)}"'
@@ -90,10 +62,9 @@
     - pip3 install dist/*.whl
     - echo "Installing pytest dependencies"
     - pip3 install -q -r tests/requirements.txt
-    - echo "Installing llm_loader experimental dependencies"
-    - pip3 install -q -r experimental/llm_loader/requirements.txt || true
-    - export PYTHONPATH=$LLM_SDK_DIR/experimental:$PYTHONPATH
-    - echo "Running llm_loader export tests with pytest. Time:$(date)"
+    - echo "Checkpoint exporter dependencies are provided by the package wheel"
+    - export PYTHONPATH=$LLM_SDK_DIR:$PYTHONPATH
+    - echo "Running checkpoint export tests with pytest. Time:$(date)"
     - python3 -m pytest tests --priority=$PRIORITY -v --color=yes --html=$TEST_LOG_DIR/test_report_$PRIORITY.html --self-contained-html --junitxml=$TEST_LOG_DIR/test_report_$PRIORITY.xml
     - echo "Models exported to cache directory $ONNX_DIR"
     - ls -la $ONNX_DIR

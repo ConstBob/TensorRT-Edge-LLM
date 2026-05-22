@@ -41,7 +41,6 @@
 
 # == Experimental ==
 /experimental/ @luxiaoz @amberl
-/experimental/llm_loader/ @luxiaoz @amberl @yuanyao
 
 # == Python frontend ==
 /tensorrt_edgellm/ @luxiaoz @ruochengj @amberl @yuanyao

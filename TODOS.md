@@ -21,9 +21,9 @@
 **Why:** Currently zero unit test coverage for the runtime classes. All testing depends on integration tests via SSH to edge devices. Makes development iteration slow and risky.
 **Depends on:** Phase 2 (stable interface to mock against).
 
-## New Frontend Follow-ups (experimental/llm_loader)
+## New Frontend Follow-ups (tensorrt_edgellm)
 
-The `llm_loader` package is experimental and supports:
+The `tensorrt_edgellm` package is experimental and supports:
 - **Standard LLMs** — Llama, Qwen2/3, Mistral, Gemma, Phi, and all other attention-only architectures (via the default `CausalLM`)
 - **Hybrid models** — NemotronH (Mamba2 + Attention)
 - **VLMs** — Qwen3-VL, Qwen3.5-VL, Qwen2.5-VL, InternVL3, InternVL3.5, Phi-4 Multimodal
@@ -31,7 +31,7 @@ The `llm_loader` package is experimental and supports:
 - **TTS** — Qwen3-TTS (thinker + talker + code predictor)
 - **MoE** — supported through the default CausalLM path (e.g. Qwen-MoE uses standard `int4_groupwise_gemm` plugin for expert GEMMs)
 
-See `design/llm/llm_loader_design.adoc` for architecture notes.
+See `design/llm/tensorrt_edgellm_design.adoc` for architecture notes.
 
 ### EAGLE draft model support
 **Priority:** High

@@ -103,7 +103,7 @@ Follow the existing `spec_decode_runtime_unification_design.md` with these speci
 **1.5 Delete `LLMInferenceRuntime`:**
 - Update all call sites (`examples/llm/llm_inference.cpp`) to use the unified runtime
 - Remove `llmInferenceRuntime.h` and `llmInferenceRuntime.cpp`
-- **[ENG REVIEW]** Keep a compatibility typedef: `using LLMInferenceRuntime = LLMInferenceSpecDecodeRuntime;` in a compat header. Allows in-flight branches (Qwen3-VL, Mamba, LLM Loader) to rebase without immediate breakage. Remove in Phase 2.
+- **[ENG REVIEW]** Keep a compatibility typedef: `using LLMInferenceRuntime = LLMInferenceSpecDecodeRuntime;` in a compat header. Allows in-flight branches (Qwen3-VL, Mamba, Checkpoint Exporter) to rebase without immediate breakage. Remove in Phase 2.
 - **[ADVERSARIAL #11]** Before committing to the typedef, audit the codebase for template specializations, `typeid` usage, or overloads that mention `LLMInferenceRuntime`. A typedef silently changes ADL and SFINAE behavior. If any such patterns exist, use a thin wrapper class instead of a typedef.
 
 **Reviewer guidance for PR 1:**

@@ -2,13 +2,13 @@
 #
 # These tests verify individual components and kernels at a low level.
 # They require:
-#   - TensorRT >= 10.15 (for OOTB attention tests)
+#   - TensorRT >= 10.15 (for TRT native attention tests)
 #   - CUDA-capable GPU
 #   - Built plugin library (for plugin tests)
 
 tests:
-  # OOTB Attention Tests
-  # Tests TensorRT's out-of-the-box attention layers against numpy reference
+  # TRT Native Attention Tests
+  # Tests TensorRT native attention layers against numpy reference
   - tests/defs/test_common.py::test_build_project
   - tests/python-unittests/test_attention_native.py::TestTRTNativeAttentionVsNumpy::test_tensorrt_vs_numpy_prefill
   - tests/python-unittests/test_attention_native.py::TestTRTNativeAttentionVsNumpy::test_tensorrt_vs_numpy_decode

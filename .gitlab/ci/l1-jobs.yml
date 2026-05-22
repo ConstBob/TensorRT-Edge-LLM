@@ -8,22 +8,22 @@
 include:
   - local: '.gitlab/ci/templates.yml'
 
-# L1 Model export for Ampere
-l1_ampere_model_export:
+# L1 checkpoint export for Ampere
+l1_checkpoint_export_ampere:
   stage: l1_test
   variables:
     CUDA_VERSION: "13.0"
     IMAGE: urm.nvidia.com/sw-tensorrt-docker/tensorrt-base:$TRT_BRANCH-native-x86_64-ubuntu24.04-cuda$CUDA_VERSION
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
-    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_ampere_model_export"
-    PRIORITY: l1_export_ampere
+    TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_checkpoint_export_ampere"
+    PRIORITY: l1_checkpoint_export_ampere
     ONNX_DIR: "$TEST_CACHE_DIR/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
   tags:
     - a30-edgellm-nvks
   image: "$IMAGE"
   extends:
-    - .export_onnx_template
+    - .checkpoint_export_template
     - .l1_rules
   interruptible: false
 
@@ -31,7 +31,7 @@ l1_ampere_model_export:
 l1_a30:
   stage: l1_test
   needs:
-    - l1_ampere_model_export
+    - l1_checkpoint_export_ampere
   variables:
     CUDA_VERSION: "13.0"
     TRT_CUDA_VERSION: "13.1"
@@ -39,7 +39,7 @@ l1_a30:
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_a30"
     PRIORITY: l1_pipeline_a30
-    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_model_export/onnx"
+    ONNX_DIR: "$L1_CACHE_DIR/l1_checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"
@@ -55,7 +55,7 @@ l1_a30:
 l1_a30_trt11:
   stage: l1_test
   needs:
-    - l1_ampere_model_export
+    - l1_checkpoint_export_ampere
   variables:
     CUDA_VERSION: "13.2"
     TRT_VERSION: "$TRT11_VERSION"
@@ -64,7 +64,7 @@ l1_a30_trt11:
     L1_CACHE_DIR: "$EDGE_LLM_CACHE_DIR/L1/$CI_PIPELINE_ID"
     TEST_CACHE_DIR: "$L1_CACHE_DIR/l1_a30_trt11"
     PRIORITY: l1_pipeline_a30
-    ONNX_DIR: "$L1_CACHE_DIR/l1_ampere_model_export/onnx"
+    ONNX_DIR: "$L1_CACHE_DIR/l1_checkpoint_export_ampere/onnx"
     TEST_LOG_DIR: "$TEST_CACHE_DIR/logs"
     ENGINE_DIR: "$TEST_CACHE_DIR/engines"
     TRT_PACKAGE_DIR: "$EDGE_LLM_CACHE_DIR/trt_softwares/TensorRT-$TRT_VERSION/TensorRT-$TRT_VERSION.x86_64.cuda-$TRT_CUDA_VERSION"

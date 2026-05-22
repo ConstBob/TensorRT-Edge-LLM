@@ -37,5 +37,10 @@ l0_experimental_docker_jedha:
         - .gitlab-ci.yml
         - .gitlab/ci/experimental-docker-jobs.yml
         - .gitlab/ci/scripts/experimental_docker_board.sh
+        - experimental/server/**/*
         - experimental/docker/**/*
+        - pyproject.toml
+        - requirements.txt
+        - requirements-server.txt
+        - tensorrt_edgellm/**/*
   interruptible: true

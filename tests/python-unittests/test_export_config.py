@@ -19,8 +19,8 @@ engines, also `recurrent_state_dtype` / `conv_state_dtype`. These are
 properties of the exported weights (decided by the Python export step), not
 builder knobs — they live at the top level of `config.json`, never inside
 `builder_config`. Those fields are populated by `export_llm_model` (for base /
-standard engines) and `export_draft_model` (for EAGLE draft engines) right
-before the config.json is written to disk.
+standard engines) and the checkpoint-based export sidecar writer right before
+the config.json is written to disk.
 
 These tests exercise the behavior contract of the dtype-writing snippets and
 verify that the snippets remain present in the source file, without importing
@@ -34,8 +34,8 @@ import re
 # entire ONNX export pipeline (torch, transformers) into a unit test.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _LLM_EXPORT_PATH = os.path.normpath(
-    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "onnx_export",
-                 "llm_export.py"))
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "checkpoint",
+                 "checkpoint_utils.py"))
 
 
 def _load_source():
@@ -161,10 +161,10 @@ def test_draft_always_writes_fp16_kv_cache_dtype():
 def test_llm_export_source_contains_base_dtype_write():
     src = _load_source()
     pattern = re.compile(
-        r"model_config\[['\"]kv_cache_dtype['\"]\]\s*=\s*['\"]fp8['\"]\s+if\s+fp8_kv_cache\s+else\s+['\"]fp16['\"]"
+        r"out\[['\"]kv_cache_dtype['\"]\]\s*=\s*\(\s*['\"]fp8['\"]\s+if\s+config\.quant\.kv_cache_quant\s*==\s*['\"]fp8['\"]\s+else\s+['\"]fp16['\"]"
     )
     assert pattern.search(src), (
-        "Expected base kv_cache_dtype write missing from llm_export.py; "
+        "Expected kv_cache_dtype write missing from checkpoint_utils.py; "
         "the runtime will silently skip parsing and back-patching will regress."
     )
 
@@ -176,19 +176,19 @@ def test_llm_export_source_contains_hybrid_dtype_write():
     # `hybrid_state_shapes_and_dtypes`), but the key being written is what the
     # runtime depends on. The specific dtype values are exercised above by the
     # simulator-driven behavior tests.
-    assert re.search(
-        r"model_config\[['\"]recurrent_state_dtype['\"]\]\s*=", src
-    ), "Expected recurrent_state_dtype assignment missing from llm_export.py for hybrid models."
-    assert re.search(
-        r"model_config\[['\"]conv_state_dtype['\"]\]\s*=", src
-    ), "Expected conv_state_dtype assignment missing from llm_export.py for hybrid models."
+    assert "recurrent_state_dtype" in src, (
+        "Expected recurrent_state_dtype handling missing from checkpoint_utils.py "
+        "for hybrid models.")
+    assert "conv_state_dtype" in src, (
+        "Expected conv_state_dtype handling missing from checkpoint_utils.py "
+        "for hybrid models.")
 
 
 def test_llm_export_source_contains_draft_dtype_write():
     src = _load_source()
     assert re.search(
-        r"draft_config\[['\"]kv_cache_dtype['\"]\]\s*=\s*['\"]fp16['\"]", src
-    ), "Expected draft_config kv_cache_dtype=fp16 write missing from export_draft_model."
+        r"if\s+config\.is_eagle3_draft\s*:", src
+    ), "Expected EAGLE3 draft sidecar block missing from checkpoint_utils.py."
 
 
 def test_llm_export_hybrid_block_is_gated_on_num_linear_attn_layers():

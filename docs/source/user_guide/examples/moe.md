@@ -25,13 +25,13 @@ Export always runs on CPU; no GPU is required:
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-30B-A3B-GPTQ-Int4
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   Qwen/Qwen3-30B-A3B-GPTQ-Int4 \
   $MODEL_NAME/exported
 

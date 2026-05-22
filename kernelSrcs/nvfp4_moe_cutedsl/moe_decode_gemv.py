@@ -761,7 +761,7 @@ class NvFP4MoeGemvSwigluKernel:
             # SwiGLU prefill kernel expects (see
             # `kernelSrcs/nvfp4_moe_cutedsl/README.md` SwiGLU section and the
             # repack at
-            # `experimental/llm_loader/checkpoint/repacking.py`
+            # `tensorrt_edgellm/checkpoint/repacking.py`
             # `repack_nvfp4_qwen3_moe_experts_thor`).
             #
             # For output position p (in [0, N_out)) within a 32-col chunk:
